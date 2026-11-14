@@ -67,7 +67,7 @@
 //! [`roots`] reads the machine's root certificates, outside the core, once per client;
 //! [`proxy_env`] the proxy variables, the same way.
 
-#![feature(register_tool, custom_inner_attributes, allocator_api)]
+#![feature(register_tool, custom_inner_attributes, allocator_api, btreemap_alloc)]
 #![register_tool(blaze)]
 
 pub mod client;

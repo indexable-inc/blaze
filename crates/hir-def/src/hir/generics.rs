@@ -115,6 +115,20 @@ pub enum TypeParamProvenance {
     TypeParamList,
     TraitSelf,
     ArgumentImplTrait,
+    /// A `_` written in a function's parameter types or an impl's header with
+    /// `#![feature(blaze_anon_params)]` (docs/v2/plan/design/implied-bounds.md): a parameter as
+    /// an argument's `impl Trait` is one, unnamed and never given explicitly, its bounds those
+    /// its position implies.
+    Anonymous,
+}
+
+impl TypeParamProvenance {
+    /// Whether the parameter is one no source names, so no explicit generic argument is ever
+    /// matched with it: an argument's `impl Trait` or an anonymous `_`.
+    #[inline]
+    pub fn is_synthetic(self) -> bool {
+        matches!(self, TypeParamProvenance::ArgumentImplTrait | TypeParamProvenance::Anonymous)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]

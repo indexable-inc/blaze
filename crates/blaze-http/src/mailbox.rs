@@ -3,7 +3,8 @@
 //!
 //! - [`channel`]: a queue of items from any number of senders to one reader (which may be
 //!   shared by reference), bounded or not. Its [`Rx::recv`] is a future any executor polls,
-//!   and [`block_on`] polls one on the calling thread, parked on blaze-core's deadline wait.
+//!   and [`block_on`] (blaze-core's, re-exported) polls one on the calling thread, parked on
+//!   blaze-core's deadline wait.
 //! - [`latch`]: a value set once and read by any number of waiters (how a session ended, a
 //!   stream's stop).
 //!
@@ -17,14 +18,10 @@ use std::{
     future::{Future, poll_fn},
     pin::pin,
     sync::Arc,
-    task::{Context, Poll, Wake, Waker},
-    time::Duration,
+    task::{Context, Poll, Waker},
 };
 
-use blaze_core::{
-    lock::Lock,
-    wait::{self, Deadline, Monotonic, Parker, WaitError, Waited},
-};
+use blaze_core::lock::Lock;
 
 /// The waiters one channel or latch keeps: each reader polling it (a session's clones), at
 /// most this many before the oldest is woken and let go, which polls again and leaves its
@@ -257,65 +254,10 @@ impl<M> Inbox<M> {
     }
 }
 
-/// What [`block_on`]'s waker does: unparks the thread polling.
-struct Unpark {
-    parker: Parker,
-}
-
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.parker.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.parker.unpark();
-    }
-}
-
-/// How [`block_on`] ended without the future's output.
-#[derive(Debug)]
-pub enum Blocked {
-    /// `within` passed first: the future is dropped, which cancels what it asked.
-    TimedOut { what: &'static str, within: Duration },
-    /// The wait itself failed.
-    Wait(WaitError),
-}
-
-impl std::fmt::Display for Blocked {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Blocked::TimedOut { what, within } => write!(f, "waiting for {what}: not done in {within:?}"),
-            Blocked::Wait(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for Blocked {}
-
-/// `future` polled on this thread to its end, parked between polls on blaze-core's deadline
-/// wait for `what` (rule every-wait-says-what): at most `within` when given. `None` is for a
-/// future whose every wait is bounded by deadlines of its own (a request's, which the client
-/// ends by its timeout), and says so in `what`.
-pub fn block_on<F: Future>(what: &'static str, within: Option<Duration>, future: F) -> Result<F::Output, Blocked> {
-    let clock = Monotonic::new();
-    let deadline = within.map(|it| Deadline::after(wait::Clock::now(&clock), it));
-    let unpark = Arc::new_in(Unpark { parker: Parker::new() }, Global);
-    let waker = Waker::from(Arc::clone(&unpark));
-    let mut cx = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return Ok(output);
-        }
-        match unpark.parker.park(what, deadline, &clock) {
-            Ok(Waited::Ready(())) => {}
-            Ok(Waited::Deadline) => {
-                return Err(Blocked::TimedOut { what, within: within.unwrap_or(Duration::MAX) });
-            }
-            Err(error) => return Err(Blocked::Wait(error)),
-        }
-    }
-}
+/// The tree's one "poll a future on this thread" lives in blaze-core
+/// ([`blaze_core::wait::block_on`]); these names stay so that the drivers' callers read as
+/// they did.
+pub use blaze_core::wait::{Unfinished as Blocked, block_on};
 
 /// Which of two futures ended first.
 pub enum Either<A, B> {
@@ -342,6 +284,8 @@ pub async fn race<A: Future, B: Future>(first: A, second: B) -> Either<A::Output
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     /// What a sender sends comes to the reader in order; once every sender is gone the reader

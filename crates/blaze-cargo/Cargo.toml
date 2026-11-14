@@ -97,10 +97,6 @@ paths.workspace = true
 syntax.workspace = true
 span.workspace = true
 stdx.workspace = true
-# The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
-# each a feature tokio has on wasm too, so the seed builds the same.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
-futures-util = { workspace = true, features = ["std"] }
 url.workspace = true
 semver.workspace = true
 tar = { workspace = true, features = ["default"] }

@@ -189,7 +189,9 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
                     Some(&i) => {
                         if let Stall::Convoy { waiters, oldest, .. } = &mut stalls[i] {
                             *waiters += 1;
-                            if row.since_ns < oldest.since_ns {
+                            // Two waits that began at one instant: the lower thread is the
+                            // oldest, whatever order the rows came in (rule 25).
+                            if (row.since_ns, row.thread) < (oldest.since_ns, oldest.thread) {
                                 *oldest = *row;
                             }
                         }

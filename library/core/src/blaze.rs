@@ -48,3 +48,21 @@ pub macro unreachable() {
 /// refused there.
 #[unstable(feature = "blaze_const_exprs", issue = "none")]
 pub struct ConstExprs;
+
+/// What carries the name of blaze's implied bounds, `#![feature(blaze_implied_bounds)]`, in the
+/// library's table of features: the bounds a struct, enum, union or trait declares
+/// (`struct C<A: X>`) hold in every function, impl and trait whose header names it
+/// (`impl<A> C<A> {}` has `A: X`) without being written again
+/// (docs/v2/plan/design/implied-bounds.md). The feature is the language's; no program names
+/// this type. rustc has neither, so a crate that enables the feature is refused there.
+#[unstable(feature = "blaze_implied_bounds", issue = "none")]
+pub struct ImpliedBounds;
+
+/// What carries the name of blaze's anonymous parameters, `#![feature(blaze_anon_params)]`,
+/// in the library's table of features: a `_` type argument in a function's parameter types or
+/// an impl's header is a parameter of its own that no one names (`fn len<T>(v: &Vec<T, _>)`),
+/// bounded by what its position implies (docs/v2/plan/design/implied-bounds.md). The feature
+/// is the language's; no program names this type. rustc has neither, so a crate that enables
+/// the feature is refused there.
+#[unstable(feature = "blaze_anon_params", issue = "none")]
+pub struct AnonParams;

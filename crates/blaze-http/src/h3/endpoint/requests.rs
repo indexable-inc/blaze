@@ -83,6 +83,9 @@ pub(crate) enum Plant {
     NoBodyBound,
     /// A connection that ends ends none of its requests.
     NoOutcomeOnClose,
+    /// A finished WebTransport stream's [`super::Event::StreamAcked`] comes as its FIN is
+    /// handed to QUIC, not when the peer acknowledged it (`h3::tests`'s acknowledgement test).
+    AckedAtSent,
 }
 
 /// A client's request.

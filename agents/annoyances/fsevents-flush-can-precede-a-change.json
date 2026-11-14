@@ -1,0 +1,14 @@
+{
+ "id": "fsevents-flush-can-precede-a-change",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (the main agent), integration int-1113",
+ "where": "crates/blaze-core/src/fsevents.rs (the sync cookie of a flush), crates/blaze-core/src/tests.rs `every_watching_driver_tells_a_flush_after_the_changes_before_it` (flushes_follow_the_changes_before_them, line 813)",
+ "what": "On macOS the test fails now and then with `round N: flushed first; []`: a file written by another writer before a flush was submitted is not heard of before `Done::Flushed`. Seen once in a whole `cargo test -p blaze-core` run and 1 of 30 runs of the test alone (the Mac otherwise idle), on the tree of snapshot 63d3388b0.",
+ "cost": "a stale answer where a request trusts the flush as a barrier: an edit made just before a build is not seen by it",
+ "cause": "not found. Ruled out by reading: inside one batch `changed` sends `Done::Changed` before `tell_flushes` sends `Done::Flushed`; the watched directory and the cookies are both under the temporary directory, so on one volume. Left: fseventsd handing a stream the cookie's event in an earlier batch than an older event of another directory, which the module doc says it never does.",
+ "class": "a barrier taken from the arrival order of an OS notification stream, with no check that the stream's own ids agree",
+ "prevention": "compare event ids, which the callback already gets: a flush is told only when its cookie's id is below every id still owed, or put the cookie where the kernel orders it with the watched tree (watchman keeps its cookies inside the watched root). The one-shot host answers its certificate from a stat sweep and does not depend on this.",
+ "workaround": "none",
+ "fix": "not yet",
+ "state": "open"
+}

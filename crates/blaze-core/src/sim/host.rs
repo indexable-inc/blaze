@@ -225,7 +225,7 @@ impl Sim {
     }
 
     /// From now on datagrams to `to` cross the network again.
-    pub fn heal(&mut self, to: SocketAddr) {
+    pub fn clear_black_hole(&mut self, to: SocketAddr) {
         self.host.holes.retain(|it| *it != to);
     }
 
@@ -320,7 +320,7 @@ impl Sim {
                 }
             }
             Effect::Resolve { name, port, tag } => {
-                let done = self.resolve(name, port);
+                let done = self.resolve_name(name, port);
                 self.tell(tag, done, Of::Op);
             }
             Effect::Unbind { sock, tag } => {
@@ -348,7 +348,7 @@ impl Sim {
     }
 
     /// A name from the test's table ([`Sim::name`]), or an address as itself.
-    fn resolve(&mut self, name: String, port: u16) -> Done {
+    fn resolve_name(&mut self, name: String, port: u16) -> Done {
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             let why = "the resolver failed: injected by the simulation".to_owned();
             return Done::Unresolved(dgram::Unresolved { name, port, why });

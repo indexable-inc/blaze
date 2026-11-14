@@ -155,8 +155,19 @@ pub enum Event {
     StreamReset { stream: StreamRef, code: Option<u32> },
     /// The peer stopped this side's sending, with its WebTransport code; `None` as above.
     StreamStopped { stream: StreamRef, code: Option<u32> },
-    /// Everything given to [`Endpoint::send`] on the stream went into QUIC's send buffer.
+    /// Everything given to [`Endpoint::send`] on the stream went into QUIC's send buffer:
+    /// buffered here, not delivered. A session closed on this may still reset the stream at
+    /// the peer before it has read it; wait for [`Event::StreamAcked`] for that.
     StreamSent { stream: StreamRef },
+    /// The peer's QUIC acknowledged every byte sent on this side of the stream and its FIN
+    /// ([`Endpoint::finish`]): the peer's endpoint has the whole of it, so a close after this
+    /// cannot take any of it away (quinn-proto's `StreamEvent::Finished`). It comes once a
+    /// finished stream, after its [`Event::StreamSent`]; never for a stream not finished, nor
+    /// one reset ([`Endpoint::reset`]); and in its place [`Event::StreamStopped`] when the peer
+    /// stops the stream first, or nothing when the session ends first (its
+    /// [`Event::SessionClosed`] is the stream's last word). Whether the peer's application
+    /// read the bytes is not said: only that its QUIC holds them.
+    StreamAcked { stream: StreamRef },
     /// The peer allows more streams: an [`Endpoint::open`] that was refused may now work.
     StreamsAvailable { session: SessionId },
     /// A datagram of an open session.
@@ -220,6 +231,9 @@ struct Conn {
     linger: Option<Duration>,
     /// The CONNECT stream whose FIN, once acknowledged, closes the connection.
     closing: Option<StreamId>,
+    /// The WebTransport streams this side finished whose acknowledgement the asker is owed
+    /// ([`Event::StreamAcked`]), each with its session's CONNECT stream.
+    acking: BTreeMap<StreamId, StreamId>,
     /// The error that closed it, this side's.
     failed: Option<Error>,
     lost: Option<Error>,
@@ -502,6 +516,7 @@ impl Endpoint {
             connect,
             linger: None,
             closing: None,
+            acking: BTreeMap::new(),
             failed: None,
             lost: None,
             reqs: requests::Requests::new(serves),
@@ -791,6 +806,8 @@ impl Endpoint {
             entry.out.clear();
             entry.out_at = 0;
             entry.finished = true;
+            // A reset stream is never acknowledged whole: nothing is owed.
+            conn.acking.remove(&id);
             // A stream already reset or stopped has nothing left to reset.
             _ = conn.quic.send_stream(id).reset(h3_code(frame::wt_to_h3(code)));
             conn.forget_if_done(id);
@@ -1055,6 +1072,8 @@ impl Conn {
             .filter(|(_, it)| matches!(it.kind, Kind::Wt { session, .. } if session == sid))
             .map(|(id, _)| *id)
             .collect();
+        // The session's end is its streams' last word: no acknowledgement is told after it.
+        self.acking.retain(|_, session| *session != sid);
         let gone = h3_code(code::WEBTRANSPORT_SESSION_GONE);
         for id in ids {
             let Some(stream) = self.streams.remove(&id) else { continue };
@@ -1152,7 +1171,21 @@ impl Conn {
         if stream.fin && !stream.finished {
             stream.finished = true;
             match self.quic.send_stream(id).finish() {
-                Ok(()) | Err(FinishError::Stopped(_) | FinishError::ClosedStream) => {}
+                Ok(()) => {
+                    // A stream the asker knows: its acknowledgement is owed to it.
+                    if let Kind::Wt { session, open: true } = stream.kind {
+                        #[cfg(test)]
+                        if self.reqs.plant == requests::Plant::AckedAtSent {
+                            let at = StreamRef { conn: cx.id, stream: u64::from(id) };
+                            cx.events.push_back(Event::StreamAcked { stream: at });
+                            self.forget_if_done(id);
+                            return;
+                        }
+                        self.acking.insert(id, session);
+                    }
+                }
+                // Stopped or gone: no acknowledgement comes, and the stop is its own event.
+                Err(FinishError::Stopped(_) | FinishError::ClosedStream) => {}
             }
         }
         self.forget_if_done(id);
@@ -1223,6 +1256,9 @@ impl Conn {
                     self.closing = None;
                     self.linger = Some(cx.now);
                 }
+                if self.acking.remove(&id).is_some() {
+                    cx.events.push_back(Event::StreamAcked { stream: StreamRef { conn: cx.id, stream: u64::from(id) } });
+                }
             }
             quinn_proto::Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 self.stopped(id, error_code, cx)
@@ -1288,7 +1324,19 @@ impl Conn {
     }
 
     fn stopped(&mut self, id: StreamId, code: VarInt, cx: &mut Cx<'_>) {
-        let Some(stream) = self.streams.get_mut(&id) else { return };
+        // A finished stream the peer stopped before acknowledging it: the stop is what the
+        // asker hears in place of [`Event::StreamAcked`], even when the stream was forgotten
+        // (both its sides over).
+        let acking = self.acking.remove(&id);
+        let Some(stream) = self.streams.get_mut(&id) else {
+            if let Some(session) = acking
+                && self.sessions.contains_key(&session)
+            {
+                let at = StreamRef { conn: cx.id, stream: u64::from(id) };
+                cx.events.push_back(Event::StreamStopped { stream: at, code: frame::h3_to_wt(code.into_inner()) });
+            }
+            return;
+        };
         stream.out.clear();
         stream.out_at = 0;
         stream.finished = true;

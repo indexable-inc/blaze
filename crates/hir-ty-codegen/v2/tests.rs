@@ -142,17 +142,18 @@ fn o3() -> Build {
 /// The invariant (docs/v2/plan/design/tiers.md, "Key shape"): tier 0 code of a crate that is
 /// not the library's is built from its own body alone. A unit at tier 0 (stencils, or LLVM at
 /// `-O0` for a CPU the stencils do not cover) asks for MIR level 1, no inliner and no
-/// devirtualization, so `hir-ty-mir`'s `optimize` runs neither `Inline` nor `SpendFacts` on
-/// it and its body reads no callee's body or effect summary: a body edit changes the key of
-/// one tier 0 function. The optimized tier asks for all three. (The library's own bodies are
-/// at level 2 and inlined under every unit, [`Build::options`]: they are std's, which no edit
-/// of the workspace reaches.)
+/// devirtualization, so `hir-ty-mir`'s `optimize` runs no `Inline` on it and its body reads no
+/// callee's body: a body edit changes the key of one tier 0 function. The optimized tier asks
+/// for all three. No tier runs `SpendFacts` for now (`hir_ty_mir::mir::passes_at`), so no
+/// unit's body reads an effect summary; tier 0's would not even with it switched on, as it
+/// runs only at level 2. (The library's own bodies are at level 2 and inlined under every
+/// unit, [`Build::options`]: they are std's, which no edit of the workspace reaches.)
 #[test]
 fn a_tier_zero_unit_builds_no_callee_into_its_bodies() {
     let tier_zero = [Backend::Stencil, Backend::Llvm { opt: 0 }];
     for backend in tier_zero {
         let build = Build::of(&Spec { backend, ..spec() });
-        assert!(!build.optimized, "{backend:?}: MIR level 2 runs `SpendFacts`");
+        assert!(!build.optimized, "{backend:?}: MIR level 2, which passes on facts run at");
         assert!(!build.inlines, "{backend:?}: the inliner builds callees in");
         assert!(build.world.is_none(), "{backend:?}: devirtualized against the program");
     }
@@ -1594,8 +1595,15 @@ fn a_units_mir_level_is_rustcs() {
 
 /// The invariant: a tier 0 unit builds every body at tier 0, the library's (at level 2) and
 /// the walk's included, so it spends no proof and runs no pass that reads past the body; an
-/// optimizing unit builds the program's bodies at the optimizing tier, spending proofs, and
-/// the library's as shipped, spending none.
+/// optimizing unit builds the program's bodies at the optimizing tier, whose proofs are
+/// `Proofs::Spent`, and the library's as shipped, spending none.
+///
+/// What the optimizing tier's `Proofs::Spent` is spent on: in `hir-ty-mir`'s `optimize` the
+/// tier's proofs go only to the two runs of `SpendFacts`, which no tier's list has for now
+/// (`hir_ty_mir::mir::passes_at`), so a build at the optimizing tier reads no proof today; the
+/// pass's tests run it through `hir_ty_mir::mir::spend_facts_at` and ask with these proofs. The
+/// checks (`#[blaze::nopanic]`, `pure`, ...) are no tier's: they ask `Proofs::Spent` on their
+/// own.
 #[test]
 fn a_tier_zero_unit_spends_no_proof() {
     use hir_ty::facts::{Proofs, Tier, proofs_at};

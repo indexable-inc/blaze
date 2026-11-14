@@ -1164,6 +1164,9 @@ impl Routes {
                         _ = sent.send(Ok(()));
                     }
                 }
+                // A handle's `finish` promises the FIN handed to QUIC, not its acknowledgement:
+                // no handle waits on it.
+                Event::StreamAcked { .. } => {}
                 Event::StreamsAvailable { session } => self.open(endpoint, session),
                 Event::Datagram { session, bytes } => {
                     if let Some(tx) = self.sessions.get(&session) {

@@ -180,6 +180,8 @@ impl Asker {
                         self.seen.entry(i).or_default().end(now, false);
                     }
                 }
+                // The page's own sends need no acknowledgement for the oracle.
+                Event::StreamAcked { .. } => {}
                 _ => {}
             }
         }

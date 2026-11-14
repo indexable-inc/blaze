@@ -82,6 +82,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::negative_effect",
             "blaze::borrow_workaround",
             "blaze::native_contracts",
+            "blaze::implied_bound_written",
             "blaze::dead",
             "blaze::test_only",
             "blaze::cfg_only",

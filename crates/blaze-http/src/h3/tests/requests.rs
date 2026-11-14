@@ -127,6 +127,16 @@ enum Serving {
     Hold,
 }
 
+/// A request as the oracle knows it: the client process that asked it, and its id there. Each
+/// process is a fresh [`Endpoint`], which numbers its connections from `ConnId(0)` again, so a
+/// [`RequestId`] alone names one request of every process: keyed by it alone, the oracle would
+/// hand one process's answers to another's requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Key {
+    process: u32,
+    request: RequestId,
+}
+
 /// A request the workload asked, and what it expects.
 struct Asked {
     object: String,
@@ -155,9 +165,11 @@ struct World {
     rng: Rng,
     objects: BTreeMap<String, Vec<u8>>,
     serving: Serving,
-    asked: BTreeMap<RequestId, Asked>,
-    heard: BTreeMap<RequestId, Heard>,
-    /// Cancels to make: when, and of which.
+    /// The current client process: 0 for the first, one more for each [`World::new_client`].
+    process: u32,
+    asked: BTreeMap<Key, Asked>,
+    heard: BTreeMap<Key, Heard>,
+    /// Cancels to make, of the current client's requests: when, and of which.
     cancels: Vec<(Duration, RequestId), Global>,
     /// Each request the server was handed: its method and whether it came early.
     served: Vec<(String, bool), Global>,
@@ -200,6 +212,7 @@ impl World {
             rng,
             objects,
             serving: Serving::Honest,
+            process: 0,
             asked: BTreeMap::new(),
             heard: BTreeMap::new(),
             cancels: Vec::new_in(Global),
@@ -211,8 +224,12 @@ impl World {
     }
 
     /// A fresh client, as a new process is: it knows only the tickets given it.
+    /// Its requests are told from the last one's by [`Key::process`]; a cancel the last one had
+    /// not made yet has no request left to cancel (the new one reuses its ids), so it goes.
     fn new_client(&mut self) {
         self.client = client(self.epoch, self.pin);
+        self.process += 1;
+        self.cancels.clear();
         for ticket in &self.tickets {
             self.client.add_ticket(ticket).unwrap();
         }
@@ -241,16 +258,21 @@ impl World {
         while let Some(event) = self.client.next_event() {
             match event {
                 Event::ResponseHead { request, head } => {
-                    self.heard.entry(request).or_default().status = Some(head.status);
+                    let key = self.key(request);
+                    self.heard.entry(key).or_default().status = Some(head.status);
                 }
                 Event::ResponseData { request, bytes } => {
                     self.client.consumed_response(request, bytes.len());
-                    self.heard.entry(request).or_default().body.extend_from_slice(&bytes);
+                    let key = self.key(request);
+                    self.heard.entry(key).or_default().body.extend_from_slice(&bytes);
                 }
                 Event::RequestEnded { request, end } => {
-                    self.heard.entry(request).or_default().ends.push((self.now, end));
+                    let key = self.key(request);
+                    self.heard.entry(key).or_default().ends.push((self.now, end));
                 }
                 Event::Ticket { ticket } => self.tickets.push(ticket),
+                // Plain requests open no WebTransport stream to be acknowledged.
+                Event::StreamAcked { .. } => unreachable!("a plain request's client was told a WebTransport stream's acknowledgement"),
                 _ => {}
             }
         }
@@ -348,9 +370,16 @@ impl World {
         self.asked.keys().all(|it| self.heard.get(it).is_some_and(|heard| !heard.ends.is_empty()))
     }
 
+    /// The current client's request `request`, as the oracle keys it.
+    fn key(&self, request: RequestId) -> Key {
+        Key { process: self.process, request }
+    }
+
     fn note(&mut self, id: RequestId, object: String, range: Option<Range>, head: bool) {
         let deadline = self.now + DEADLINE;
-        self.asked.insert(id, Asked { object, range, head, deadline });
+        let key = self.key(id);
+        let before = self.asked.insert(key, Asked { object, range, head, deadline });
+        assert!(before.is_none(), "request {key:?} was noted twice");
     }
 
     /// Asks one request of the workload on `conn`: a ranged GET of a random object (sometimes
@@ -587,7 +616,7 @@ fn a_resumed_connection_sends_its_first_get_as_0rtt_before_hearing_the_server() 
     assert_eq!(world.client.sent_log(conn).as_slice(), &[(0, true)], "the GET's HEADERS went early, once");
     world.run(world.now + DEADLINE + AFTER, World::all_ended);
     assert_eq!(world.check(), Ok(()));
-    assert_eq!(world.heard[&id].ends[0].1, RequestEnd::Done);
+    assert_eq!(world.heard[&world.key(id)].ends[0].1, RequestEnd::Done);
     assert_eq!(world.served.as_slice(), &[("GET".to_owned(), true)], "the server took it as early data");
 }
 
@@ -613,7 +642,7 @@ fn refused_early_data_sends_each_early_request_again_exactly_once() {
     world.run(world.now + DEADLINE + AFTER, World::all_ended);
     assert_eq!(world.check(), Ok(()));
     for id in &ids {
-        assert_eq!(world.heard[id].ends[0].1, RequestEnd::Done, "{id:?}");
+        assert_eq!(world.heard[&world.key(*id)].ends[0].1, RequestEnd::Done, "{id:?}");
     }
     assert_eq!(
         world.client.sent_log(conn).as_slice(),

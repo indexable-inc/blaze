@@ -608,7 +608,7 @@ fn a_black_hole_drops_every_datagram_and_codepoints_cross() {
     lost.push(at, Ecn::Ect0, b"lost");
     let mut effects = vec![Effect::SendTo { sock: from, batch: lost, tag: Tag(3) }];
     run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
-    sim.heal(at);
+    sim.clear_black_hole(at);
     let mut kept = Batch::new();
     kept.push(at, Ecn::Ect1, b"kept");
     let mut effects = vec![

@@ -1,30 +1,47 @@
-//! The session core on a clock of the tests' own, and the server end to end over a test
-//! source: the CONNECT rules, hello first, the token, an answer, an unknown op and the live
-//! stream, as the page sees them.
+//! The session core on a clock of the tests' own; the server's machine ([`super::serving`])
+//! under blaze-core's deterministic simulation, with its HTTP/3 driver loop and a page's
+//! client on one [`Sim`]; and the server end to end on a real socket over a test source: the
+//! CONNECT rules, hello first, the token, an answer, an unknown op, a late request, the live
+//! stream and the stop, as the page sees them.
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
-use blaze_http::h3::{
-    ClientConfig, Closed, Transport, Trust,
-    driver::{Driver, Session as Connection},
+use blaze_core::{
+    Driver as _, Effect, Tag,
+    sim::{Datagrams, Faults, Sim},
 };
+use blaze_http::{
+    h3::{
+        ClientConfig, Closed, Direction, Endpoint, Event, ServerConfig, SessionId, StreamRef,
+        Transport, Trust,
+        driver::{self as h3_driver, Driver, Loop, Session as Connection},
+    },
+    mailbox,
+};
+use hegel::{HealthCheck, TestCase, generators as gs};
 use serde_json::Value;
 
 use super::{
     Answer, Config, Explorer, Hello, Kind, Layer, Live, OpError, PROTOCOL, Rule, Source, Stop,
-    Table, Tick, frame, link,
-    link::Token,
+    Table, Tick,
+    cert::{Cert, Rotation},
+    frame, link,
+    link::{Origins, Token},
     serve,
+    server::work_on,
+    serving::{self, Clock, Done, JobId, Plant, Serving, Setup},
     session::{
-        self, CLOSE_BAD_TOKEN, Emit, Feed, MAX_IN_FLIGHT, Phase, Served, Session, Step,
+        self, CLOSE_BAD_TOKEN, CLOSE_STOPPED, Emit, Feed, MAX_IN_FLIGHT, Phase, REQUEST_WAIT,
+        Served, Session, Step,
     },
 };
 
@@ -380,7 +397,18 @@ fn client(explorer: &Explorer) -> Driver {
     Driver::spawn(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), None, Some(config)).unwrap().0
 }
 
-async fn connect(
+/// How long a real-socket test waits for any one thing: loopback answers in milliseconds.
+const WITHIN: Duration = Duration::from_secs(10);
+
+/// `future` polled on this thread to its end within [`WITHIN`], waiting for `what`.
+fn wait<F: std::future::Future>(what: &'static str, future: F) -> F::Output {
+    match mailbox::block_on(what, Some(WITHIN), future) {
+        Ok(it) => it,
+        Err(why) => panic!("{why}"),
+    }
+}
+
+fn connect(
     client: &Driver,
     explorer: &Explorer,
     path: &str,
@@ -389,23 +417,55 @@ async fn connect(
     let url = format!("https://127.0.0.1:{}{path}", explorer.port());
     let to = SocketAddr::from((Ipv4Addr::LOCALHOST, explorer.port()));
     let headers: Vec<(&str, &str)> = origin.map(|it| ("origin", it)).into_iter().collect();
-    client.connect(to, &url, &headers).await
+    wait("the explorer's answer to a CONNECT", client.connect(to, &url, &headers))
 }
 
 /// The header and the IPC of the answer to `request`.
-async fn ask(connection: &Connection, request: &str) -> (Value, Vec<u8>) {
-    let (mut send, mut recv) = connection.open_bi().await.unwrap();
-    send.write_all(request.as_bytes()).await.unwrap();
-    send.finish();
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    while let Some(n) = recv.read(&mut chunk).await.unwrap() {
-        bytes.extend_from_slice(&chunk[..n]);
+fn ask(connection: &Connection, request: &str) -> (Value, Vec<u8>) {
+    let bytes = wait("the explorer's answer to a request", async {
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(request.as_bytes()).await.unwrap();
+        send.finish();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Some(n) = recv.read(&mut chunk).await.unwrap() {
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        bytes
+    });
+    let (header, ipc) = answer(&bytes).unwrap();
+    (header, ipc.to_vec())
+}
+
+/// An answer's header and its IPC, which starts 8-aligned: `[u32 header length][header][IPC]`,
+/// the layout of a live frame's body too.
+fn answer(bytes: &[u8]) -> Result<(Value, &[u8]), String> {
+    let Some(len) = bytes.get(..4) else {
+        return Err(format!("an answer of {} bytes has no header length", bytes.len()));
+    };
+    let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+    if (4 + len) % frame::ALIGN != 0 {
+        return Err(format!("an answer's IPC starts at {}, not {}-aligned", 4 + len, frame::ALIGN));
     }
-    let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    assert_eq!((4 + len) % frame::ALIGN, 0, "the IPC starts 8-aligned");
-    let header: Value = serde_json::from_slice(&bytes[4..4 + len]).unwrap();
-    (header, bytes[4 + len..].to_vec())
+    let Some(head) = bytes.get(4..4 + len) else {
+        return Err(format!("an answer of {} bytes is shorter than its header ({len})", bytes.len()));
+    };
+    let header: Value = serde_json::from_slice(head).map_err(|why| format!("an answer's header: {why}"))?;
+    Ok((header, &bytes[4 + len..]))
+}
+
+/// The whole live frames at the front of `bytes` (`[u32 body length][body]`, the body as an
+/// answer's), taken off it into `out`.
+fn frames(bytes: &mut Vec<u8>, out: &mut Vec<(Value, Vec<u8>)>) -> Result<(), String> {
+    // Bounded by `bytes`: each turn takes at least 4 of them, or ends.
+    loop {
+        let Some(len) = bytes.get(..4) else { return Ok(()) };
+        let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+        let Some(body) = bytes.get(4..4 + len) else { return Ok(()) };
+        let (header, ipc) = answer(body)?;
+        out.push((header, ipc.to_vec()));
+        bytes.drain(..4 + len);
+    }
 }
 
 fn token_of(link: &str) -> String {
@@ -425,94 +485,568 @@ fn a_session_is_refused_until_hello_then_answered_and_fed() {
     );
     assert!(link.ends_with(&format!("/{}", explorer.certhash())), "{link}");
     let token = token_of(&link);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    runtime.block_on(async {
-        let client = client(&explorer);
+    let client = client(&explorer);
+    for (path, origin, status) in [
+        (link::PATH, Some("https://evil.example"), 403),
+        (link::PATH, Some(link::DEV_ORIGIN), 403),
+        (link::PATH, None, 403),
+        ("/elsewhere", Some(link::ORIGIN), 404),
+    ] {
+        let refused = connect(&client, &explorer, path, origin).map(|it| it.id());
+        assert_eq!(refused, Err(Closed::Refused { status }), "{path} {origin:?}");
+    }
+
+    let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
+    let (header, ipc) = ask(&connection, r#"{"op":"count","n":3}"#);
+    assert_eq!(header["error"]["kind"], "unauthenticated", "{header}");
+    assert!(ipc.is_empty());
+
+    let (header, _) = ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#));
+    assert_eq!(header["op"], "hello", "{header}");
+    assert_eq!(header["schema"], 3);
+    assert_eq!(header["certhash"], explorer.certhash().as_str());
+    assert_eq!(header["live_every_ms"], 250);
+    assert_eq!(header["source"]["extensions"][0], "test", "{header}");
+    assert_eq!(header["protocol"], PROTOCOL);
+    assert_eq!(header["layers"][0]["name"], "test", "{header}");
+    assert_eq!(header["layers"][0]["version"], 3, "{header}");
+
+    let (header, ipc) = ask(&connection, r#"{"op":"count","n":3}"#);
+    assert_eq!(header["op"], "count", "{header}");
+    assert_eq!(header["rows"], 3);
+    assert!(header["elapsed_ns"].is_u64(), "{header}");
+    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+    let (header, _) = ask(&connection, r#"{"op":"count"}"#);
+    assert_eq!(header["error"]["kind"], "bad_args", "the source's own error: {header}");
+    let (header, _) = ask(&connection, r#"{"op":"frobnicate"}"#);
+    assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
+    assert_eq!(header["error"]["op"], "frobnicate", "{header}");
+
+    let mut live = wait("the explorer's live stream", connection.accept_uni()).unwrap();
+    let (header, ipc) = wait("the live stream's first frame", async {
+        let (mut bytes, mut got, mut chunk) = (Vec::new(), Vec::new(), [0u8; 4096]);
+        while got.is_empty() {
+            let n = live.read(&mut chunk).await.unwrap().unwrap();
+            bytes.extend_from_slice(&chunk[..n]);
+            frames(&mut bytes, &mut got).unwrap();
+        }
+        got.swap_remove(0)
+    });
+    let (op, table) = (header["op"].as_str(), header["table"].as_str());
+    assert_eq!((op, table), (Some("live"), Some("spans")), "{header}");
+    assert_eq!(header["rows"], 2, "{header}");
+    assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+    let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
+    let wrong = if token.starts_with('0') {
+        token.replacen('0', "1", 1)
+    } else {
+        format!("0{}", &token[1..])
+    };
+    let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#));
+    assert_eq!(header["error"]["kind"], "bad_token", "{header}");
+    let closed = wait("bad_token to close the session", other.closed());
+    assert!(matches!(closed, Closed::ByPeer { code: CLOSE_BAD_TOKEN, .. }), "{closed}");
+    let (header, _) = ask(&connection, r#"{"op":"count","n":1}"#);
+    assert_eq!(header["op"], "count", "another session's bad token leaves this one open");
+}
+
+#[test]
+fn a_session_from_the_dev_server_is_taken_only_when_asked() {
+    let explorer = explorer(true);
+    let client = client(&explorer);
+    connect(&client, &explorer, link::PATH, Some(link::DEV_ORIGIN)).unwrap();
+    connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
+}
+
+/// Dropping the explorer closes its sessions with [`CLOSE_STOPPED`] and its thread ends.
+#[test]
+fn dropping_the_explorer_closes_its_sessions() {
+    let explorer = explorer(false);
+    let client = client(&explorer);
+    let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).unwrap();
+    drop(explorer);
+    let closed = wait("the stop to close the session", connection.closed());
+    assert!(matches!(closed, Closed::ByPeer { code: CLOSE_STOPPED, .. }), "{closed}");
+}
+
+// The server's machine under blaze-core's deterministic simulation: the server's [`Loop`]
+// (tags from 0), its [`Serving`] (from `TAGS`), the page's client [`Loop`] (from `2 x TAGS`)
+// and the jobs (from `3 x TAGS`, each a timer whose firing hands its result back after a
+// drawn delay) on one [`Sim`], whose network loses, duplicates and reorders datagrams by the
+// seed. No socket, thread or real clock: every deadline is reached through an armed timer.
+
+const NAME: &str = "test explore";
+const EVERY: Duration = Duration::from_millis(250);
+/// By when on the virtual clock the page's script is done and the server stopped: the late
+/// request alone takes REQUEST_WAIT (10 s), the handshake and the other requests well under a
+/// second, a lost packet's recovery a few probe timeouts more, and the stop SHUTDOWN (1 s).
+const BOUND: Duration = Duration::from_secs(25);
+/// How long past REQUEST_WAIT a late request's answer may take to reach the page.
+const SLACK: Duration = Duration::from_secs(2);
+/// The most turns one run takes: far more than the script needs, so a run not done by then is
+/// one that stalled.
+const TURNS_MOST: usize = 1_000_000;
+const JOB_TAGS: u64 = 3 * h3_driver::TAGS;
+
+fn server_at() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 4433))
+}
+
+/// What the page expects of an answer.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    /// An error of this kind.
+    Error(&'static str),
+    /// `unknown_op`, naming the op.
+    UnknownOp(&'static str),
+    Hello,
+    /// `count`'s answer of this many rows.
+    Rows(usize),
+    /// `bad_args` for a request not whole in REQUEST_WAIT, answered then.
+    Late,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Which {
+    /// The session that says hello and is fed.
+    A,
+    /// The session whose hello has the wrong token.
+    C,
+}
+
+/// The page's requests: A's in groups, each group asked once the one before it is answered
+/// (the last also once C is closed); C's one as it opens.
+const ASKS: [(Which, &[u8], bool, Expect); 8] = [
+    (Which::A, br#"{"op":"count","n":3}"#, true, Expect::Error("unauthenticated")),
+    (Which::A, GOOD, true, Expect::Hello),
+    (Which::A, br#"{"op":"count","n":3}"#, true, Expect::Rows(3)),
+    (Which::A, br#"{"op":"count"}"#, true, Expect::Error("bad_args")),
+    (Which::A, br#"{"op":"frobnicate"}"#, true, Expect::UnknownOp("frobnicate")),
+    // Never finished: answered late.
+    (Which::A, br#"{"op":"cou"#, false, Expect::Late),
+    (Which::A, br#"{"op":"count","n":1}"#, true, Expect::Rows(1)),
+    (Which::C, WRONG, true, Expect::Error("bad_token")),
+];
+const GROUPS: [&[usize]; 5] = [&[0], &[1], &[2], &[3, 4, 5], &[6]];
+
+/// What the page saw of one request.
+#[derive(Default, Debug)]
+struct Seen {
+    opened_at: Option<Duration>,
+    body: Vec<u8>,
+    /// How many times it ended: finished, reset, or its session closed.
+    ends: u32,
+    finished: bool,
+    ended_at: Option<Duration>,
+    /// Something it told after it ended.
+    after_end: bool,
+}
+
+/// The page: four sessions refused, A and C, and A's live stream.
+struct Page {
+    refused: Vec<(SessionId, u16, Option<Closed>)>,
+    a: SessionId,
+    c: SessionId,
+    a_open: bool,
+    a_closed: Option<Closed>,
+    c_closed: Option<Closed>,
+    seen: [Seen; ASKS.len()],
+    streams: BTreeMap<StreamRef, usize>,
+    /// A's next group.
+    group: usize,
+    /// Requests to open, waiting for the server to allow a stream.
+    queued: VecDeque<usize>,
+    live: Option<StreamRef>,
+    live_bytes: Vec<u8>,
+    /// Each live frame: when it came whole, its header and its IPC.
+    live_frames: Vec<(Duration, Value, Vec<u8>)>,
+}
+
+fn connect_to(endpoint: &mut Endpoint, path: &str, origin: Option<&str>) -> Result<SessionId, String> {
+    let url = format!("https://127.0.0.1:{}{path}", server_at().port());
+    let headers: Vec<(&str, &str)> = origin.map(|it| ("origin", it)).into_iter().collect();
+    endpoint.connect(server_at(), &url, &headers).map_err(|it| it.to_string())
+}
+
+impl Page {
+    fn new(endpoint: &mut Endpoint) -> Result<Page, String> {
+        let mut refused = Vec::new();
         for (path, origin, status) in [
             (link::PATH, Some("https://evil.example"), 403),
             (link::PATH, Some(link::DEV_ORIGIN), 403),
             (link::PATH, None, 403),
             ("/elsewhere", Some(link::ORIGIN), 404),
         ] {
-            let refused = connect(&client, &explorer, path, origin).await.map(|it| it.id());
-            assert_eq!(refused, Err(Closed::Refused { status }), "{path} {origin:?}");
+            refused.push((connect_to(endpoint, path, origin)?, status, None));
         }
+        Ok(Page {
+            refused,
+            a: connect_to(endpoint, link::PATH, Some(link::ORIGIN))?,
+            c: connect_to(endpoint, link::PATH, Some(link::ORIGIN))?,
+            a_open: false,
+            a_closed: None,
+            c_closed: None,
+            seen: Default::default(),
+            streams: BTreeMap::new(),
+            group: 0,
+            queued: VecDeque::new(),
+            live: None,
+            live_bytes: Vec::new(),
+            live_frames: Vec::new(),
+        })
+    }
 
-        let connection = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
-        let (header, ipc) = ask(&connection, r#"{"op":"count","n":3}"#).await;
-        assert_eq!(header["error"]["kind"], "unauthenticated", "{header}");
-        assert!(ipc.is_empty());
+    fn session(&self, which: Which) -> SessionId {
+        match which {
+            Which::A => self.a,
+            Which::C => self.c,
+        }
+    }
 
-        let (header, _) = ask(&connection, &format!(r#"{{"op":"hello","token":"{token}"}}"#)).await;
-        assert_eq!(header["op"], "hello", "{header}");
-        assert_eq!(header["schema"], 3);
-        assert_eq!(header["certhash"], explorer.certhash().as_str());
-        assert_eq!(header["live_every_ms"], 250);
-        assert_eq!(header["source"]["extensions"][0], "test", "{header}");
-        assert_eq!(header["protocol"], PROTOCOL);
-        assert_eq!(header["layers"][0]["name"], "test", "{header}");
-        assert_eq!(header["layers"][0]["version"], 3, "{header}");
+    fn seen(&mut self, stream: StreamRef) -> Option<&mut Seen> {
+        let i = *self.streams.get(&stream)?;
+        let seen = &mut self.seen[i];
+        if seen.ends > 0 {
+            seen.after_end = true;
+        }
+        Some(seen)
+    }
 
-        let (header, ipc) = ask(&connection, r#"{"op":"count","n":3}"#).await;
-        assert_eq!(header["op"], "count", "{header}");
-        assert_eq!(header["rows"], 3);
-        assert!(header["elapsed_ns"].is_u64(), "{header}");
-        assert_eq!(decode(&ipc).iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    fn end(seen: &mut Seen, now: Duration, finished: bool) {
+        seen.ends += 1;
+        seen.finished |= finished && seen.ends == 1;
+        seen.ended_at.get_or_insert(now);
+    }
 
-        let (header, _) = ask(&connection, r#"{"op":"count"}"#).await;
-        assert_eq!(header["error"]["kind"], "bad_args", "the source's own error: {header}");
-        let (header, _) = ask(&connection, r#"{"op":"frobnicate"}"#).await;
-        assert_eq!(header["error"]["kind"], "unknown_op", "{header}");
-        assert_eq!(header["error"]["op"], "frobnicate", "{header}");
-
-        let mut live = connection.accept_uni().await.unwrap();
-        let mut first = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let read = async {
-            loop {
-                let n = live.read(&mut chunk).await.unwrap().unwrap();
-                first.extend_from_slice(&chunk[..n]);
-                let len = |it: &[u8]| u32::from_le_bytes(it[..4].try_into().unwrap()) as usize;
-                if first.len() >= 4 && first.len() >= 4 + len(&first) {
-                    break;
-                }
+    /// Queues A's next groups that may be asked.
+    fn advance(&mut self) {
+        // Bounded by GROUPS: each turn queues one, or ends.
+        while self.a_open && self.group < GROUPS.len() {
+            let before_answered = self.group == 0 || GROUPS[self.group - 1].iter().all(|i| self.seen[*i].ends > 0);
+            let last_waits = self.group == GROUPS.len() - 1 && self.c_closed.is_none();
+            if !before_answered || last_waits {
+                return;
             }
-        };
-        tokio::time::timeout(Duration::from_secs(5), read).await.expect("a live frame within 5 s");
-        let body_len = u32::from_le_bytes(first[..4].try_into().unwrap()) as usize;
-        let body = &first[4..4 + body_len];
-        let head_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-        assert_eq!((4 + head_len) % frame::ALIGN, 0, "a live frame's IPC is 8-aligned in its body");
-        let header: Value = serde_json::from_slice(&body[4..4 + head_len]).unwrap();
-        let (op, table) = (header["op"].as_str(), header["table"].as_str());
-        assert_eq!((op, table), (Some("live"), Some("spans")), "{header}");
-        assert_eq!(header["rows"], 2, "{header}");
-        let batches = decode(&body[4 + head_len..]);
-        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+            self.queued.extend(GROUPS[self.group].iter().copied());
+            self.group += 1;
+        }
+    }
 
-        let other = connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
-        let wrong = if token.starts_with('0') {
-            token.replacen('0', "1", 1)
-        } else {
-            format!("0{}", &token[1..])
-        };
-        let (header, _) = ask(&other, &format!(r#"{{"op":"hello","token":"{wrong}"}}"#)).await;
-        assert_eq!(header["error"]["kind"], "bad_token", "{header}");
-        tokio::time::timeout(Duration::from_secs(5), other.closed())
-            .await
-            .expect("bad_token closes the session");
-        let (header, _) = ask(&connection, r#"{"op":"count","n":1}"#).await;
-        assert_eq!(header["op"], "count", "another session's bad token leaves this one open");
-    });
+    fn open(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), String> {
+        while let Some(&i) = self.queued.front() {
+            let (which, request, fin, _) = ASKS[i];
+            let Some(stream) = endpoint.open(self.session(which), Direction::Bi).map_err(|it| it.to_string())? else {
+                return Ok(());
+            };
+            self.queued.pop_front();
+            self.streams.insert(stream, i);
+            self.seen[i].opened_at = Some(now);
+            endpoint.send(stream, request).map_err(|it| it.to_string())?;
+            if fin {
+                endpoint.finish(stream).map_err(|it| it.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn events(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), String> {
+        while let Some(event) = endpoint.next_event() {
+            match event {
+                Event::SessionOpened { session } if session == self.a => {
+                    self.a_open = true;
+                    self.advance();
+                }
+                Event::SessionOpened { session } if session == self.c => self.queued.push_back(7),
+                Event::SessionOpened { session } => return Err(format!("session {session:?}, to be refused, opened")),
+                Event::SessionClosed { session, closed } => {
+                    for (i, (which, ..)) in ASKS.iter().enumerate() {
+                        if self.session(*which) == session && self.seen[i].ends == 0 && self.seen[i].opened_at.is_some() {
+                            Page::end(&mut self.seen[i], now, false);
+                        }
+                    }
+                    if session == self.a {
+                        self.a_closed = Some(closed);
+                    } else if session == self.c {
+                        self.c_closed = Some(closed);
+                        self.advance();
+                    } else if let Some(refused) = self.refused.iter_mut().find(|it| it.0 == session) {
+                        refused.2 = Some(closed);
+                    }
+                }
+                Event::StreamOpened { session, stream } => {
+                    if session != self.a || stream.direction() != Direction::Uni || self.live.is_some() {
+                        return Err(format!("the server opened stream {stream:?} of session {session:?}, which is not A's one live stream"));
+                    }
+                    self.live = Some(stream);
+                }
+                Event::StreamData { stream, bytes } => {
+                    endpoint.consumed(stream, bytes.len());
+                    if self.live == Some(stream) {
+                        self.live_bytes.extend_from_slice(&bytes);
+                        let mut got = Vec::new();
+                        frames(&mut self.live_bytes, &mut got).map_err(|why| format!("a live frame: {why}"))?;
+                        self.live_frames.extend(got.into_iter().map(|(header, ipc)| (now, header, ipc)));
+                    } else if let Some(seen) = self.seen(stream) {
+                        seen.body.extend_from_slice(&bytes);
+                    }
+                }
+                Event::StreamFinished { stream } => {
+                    if let Some(seen) = self.seen(stream) {
+                        Page::end(seen, now, true);
+                    }
+                    self.advance();
+                }
+                Event::StreamReset { stream, .. } => {
+                    if let Some(seen) = self.seen(stream) {
+                        Page::end(seen, now, false);
+                    }
+                    self.advance();
+                }
+                _ => {}
+            }
+        }
+        self.open(endpoint, now)
+    }
+
+    /// Every request asked and ended.
+    fn done(&self) -> bool {
+        self.group == GROUPS.len() && self.queued.is_empty() && self.seen.iter().all(|it| it.ends > 0)
+    }
+
+    /// The oracle, over what the page saw by the end; `stop_at` when the server was stopped.
+    fn check(&self, stop_at: Option<Duration>) -> Result<(), String> {
+        for (session, status, closed) in &self.refused {
+            if *closed != Some(Closed::Refused { status: *status }) {
+                return Err(format!("session {session:?} was to be refused with {status}, and ended {closed:?}"));
+            }
+        }
+        for (i, (_, request, _, expect)) in ASKS.iter().enumerate() {
+            let seen = &self.seen[i];
+            let request = String::from_utf8_lossy(request);
+            if seen.ends != 1 || seen.after_end || !seen.finished {
+                return Err(format!("request {i} ({request}) ended {} times, finished: {}, told after its end: {}", seen.ends, seen.finished, seen.after_end));
+            }
+            let (header, ipc) = answer(&seen.body).map_err(|why| format!("request {i} ({request}): {why}"))?;
+            let rows = || decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>();
+            let right = match *expect {
+                Expect::Error(kind) => header["error"]["kind"] == kind && ipc.is_empty(),
+                Expect::UnknownOp(op) => header["error"]["kind"] == "unknown_op" && header["error"]["op"] == op,
+                Expect::Hello => {
+                    header["op"] == "hello"
+                        && header["live_every_ms"] == EVERY.as_millis() as u64
+                        && header["protocol"] == PROTOCOL
+                        && header["layers"][0]["name"] == "test"
+                }
+                Expect::Rows(n) => header["op"] == "count" && header["rows"] == n && rows() == n,
+                Expect::Late => {
+                    let (opened, ended) = (seen.opened_at.unwrap_or(Duration::ZERO), seen.ended_at.unwrap_or(Duration::MAX));
+                    let took = ended.saturating_sub(opened);
+                    header["error"]["kind"] == "bad_args" && took >= REQUEST_WAIT && took <= REQUEST_WAIT + SLACK
+                }
+            };
+            if !right {
+                let took = seen.ended_at.zip(seen.opened_at).map(|(ended, opened)| ended.saturating_sub(opened));
+                return Err(format!("request {i} ({request}) was to be answered {expect:?}, and was answered {header} in {took:?}"));
+            }
+        }
+        if !matches!(self.c_closed, Some(Closed::ByPeer { code: CLOSE_BAD_TOKEN, .. })) {
+            return Err(format!("the bad token's session was to be closed with {CLOSE_BAD_TOKEN}, and ended {:?}", self.c_closed));
+        }
+        let Some(stop_at) = stop_at else { return Err("the page's script did not end".to_owned()) };
+        if !matches!(self.a_closed, Some(Closed::ByPeer { code: CLOSE_STOPPED, .. })) {
+            return Err(format!("the stop was to close session A with {CLOSE_STOPPED}, and it ended {:?}", self.a_closed));
+        }
+        self.check_live(stop_at)
+    }
+
+    /// Every live frame parses and holds the rows it says; the `spans` table comes a frame a
+    /// tick from the first, at least every other period until the stop; `open` comes once with
+    /// its row and once emptied.
+    fn check_live(&self, stop_at: Duration) -> Result<(), String> {
+        let Some((first_at, first, _)) = self.live_frames.first() else { return Err("no live frame came".to_owned()) };
+        if first["table"] != "spans" || first["rows"] != 2 {
+            return Err(format!("the first live frame was to be `spans` of 2 rows, and is {first}"));
+        }
+        let mut open = Vec::new();
+        let mut spans = 0u64;
+        for (_, header, ipc) in &self.live_frames {
+            let rows = if ipc.is_empty() { 0 } else { decode(ipc).iter().map(RecordBatch::num_rows).sum::<usize>() };
+            if header["op"] != "live" || header["rows"] != rows {
+                return Err(format!("a live frame {header} carries {rows} rows"));
+            }
+            match header["table"].as_str() {
+                Some("spans") => spans += 1,
+                Some("open") => open.push(rows),
+                _ => return Err(format!("a live frame of no table the source has: {header}")),
+            }
+        }
+        if open != [1, 0] {
+            return Err(format!("`open` was to come once with its row and once emptied, and came as {open:?}"));
+        }
+        let periods = (stop_at.saturating_sub(*first_at).as_nanos() / EVERY.as_nanos()) as u64;
+        if spans < 8 || spans < periods / 2 {
+            return Err(format!("{spans} `spans` frames came in {periods} periods of the live stream"));
+        }
+        Ok(())
+    }
 }
 
+/// The network's faults and how long a job may take.
+#[derive(Clone, Copy, Debug)]
+struct Net {
+    lose_one_in: u32,
+    duplicate_one_in: u32,
+    job_most_ms: u64,
+}
+
+/// splitmix64: the jobs' delays, from the seed.
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// One run under `seed`: the page's script, then the stop, driven to their ends, then the
+/// oracle.
+fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
+    let fail = |why: String| format!("seed {seed}, {net:?}, {plant:?}: {why}");
+    let mut sim = Sim::new(seed, Faults { max_latency: Duration::from_millis(1), ..Faults::default() });
+    sim.datagrams(Datagrams { lose_one_in: net.lose_one_in, duplicate_one_in: net.duplicate_one_in, max_delay: Duration::from_millis(5) });
+    let epoch = Instant::now();
+    let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let rotation = Rotation::new(now_s);
+    let cert = Cert::make(rotation.current(), NAME).map_err(|it| it.to_string())?;
+    let identity = cert.identity().map_err(|it| it.to_string())?;
+    let pin = blaze_sha256::digest(&cert.der);
+    let server_config = ServerConfig { identity, transport: Transport::default(), requests: false };
+    let server = Endpoint::new(epoch, Some(server_config), None).map_err(|it| it.to_string())?;
+    let client_config = ClientConfig { trust: Trust::Pinned(vec![pin]), transport: Transport::default() };
+    let client = Endpoint::new(epoch, None, Some(client_config)).map_err(|it| it.to_string())?;
+    let mut server = Loop::new(server, 0, server_at());
+    let mut client = Loop::new(client, 2 * h3_driver::TAGS, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+    let clock = |now: Duration| Clock { now, now_ns: now.as_nanos() as i64, wall_s: now_s + now.as_secs() };
+    let setup = Setup {
+        token: Token::from_bytes(TOKEN),
+        origins: Origins { dev: false },
+        name: NAME,
+        every: EVERY,
+        served: Served { hash: cert.hash, not_after_s: cert.validity.not_after_s },
+        rotation,
+        core: Err("the test serves no core".to_owned()),
+    };
+    let mut serving = Serving::new(setup, serving::TAGS, clock(sim.now()));
+    serving.plant(plant);
+    let mut page = Page::new(client.endpoint())?;
+    let mut rng = seed;
+    let (mut effects, mut done, mut jobs, mut said) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut waiting: BTreeMap<u64, (JobId, Done)> = BTreeMap::new();
+    let mut next_job = 0;
+    let (mut stop_at, mut over) = (None, None);
+    for _ in 0..TURNS_MOST {
+        let now = sim.now();
+        if now > BOUND || (over.is_some() && page.a_closed.is_some()) {
+            break;
+        }
+        server.endpoint().advance_clock(now);
+        client.endpoint().advance_clock(now);
+        serving.step(clock(now), server.endpoint(), &mut effects);
+        serving.take_jobs(&mut jobs);
+        for job in jobs.drain(..) {
+            let now_ns = now.as_nanos() as i64;
+            let result = work_on(job.work, &Test, &move || now_ns);
+            let after = Duration::from_millis(splitmix(&mut rng) % (net.job_most_ms + 1));
+            let tag = JOB_TAGS + next_job;
+            next_job += 1;
+            waiting.insert(tag, (job.id, result));
+            effects.push(Effect::Timer { after, tag: Tag(tag) });
+        }
+        serving.take_said(&mut said);
+        page.events(client.endpoint(), now).map_err(fail)?;
+        if stop_at.is_none() && page.done() {
+            serving.stop(now, format!("{NAME} stopped"));
+            stop_at = Some(now);
+        }
+        if over.is_none() {
+            over = serving.over(server.endpoint());
+        }
+        server.step(now, &mut effects);
+        client.step(now, &mut effects);
+        sim.submit(&mut effects);
+        sim.poll(&mut done, server.deadline().min(client.deadline()).min(serving.deadline()));
+        let now = sim.now();
+        server.endpoint().advance_clock(now);
+        client.endpoint().advance_clock(now);
+        for completion in done.drain(..) {
+            if server.owns(completion.tag) {
+                server.complete(completion);
+            } else if serving.owns(completion.tag) {
+                serving.complete(completion);
+            } else if client.owns(completion.tag) {
+                client.complete(completion);
+            } else if let Some((id, result)) = waiting.remove(&completion.tag.0) {
+                serving.done(id, result);
+            } else {
+                return Err(fail(format!("{:?} is nobody's", completion.tag)));
+            }
+        }
+        if let Some(failed) = server.failed().or(client.failed()) {
+            return Err(fail(format!("a loop's socket failed: {failed}")));
+        }
+    }
+    if !said.is_empty() {
+        return Err(fail(format!("the server said {said:?}")));
+    }
+    page.check(stop_at).map_err(fail)?;
+    if over.is_none() {
+        return Err(fail("the stopped server was never over".to_owned()));
+    }
+    Ok(())
+}
+
+/// The invariant: every request the page opens ends exactly once, finished, with the answer
+/// its rule says (`unauthenticated` before hello, hello, the source's rows, `bad_args`,
+/// `unknown_op` naming the op, a late request's `bad_args` REQUEST_WAIT after it opened, and
+/// `bad_token` closing that session alone, and only after the page has the whole answer and
+/// its FIN: the close waits for the answer's acknowledgement (`Event::StreamAcked`), not for a
+/// margin of time, so it holds however late loss makes the answer); every refused CONNECT gets its status; the live
+/// stream's frames all parse and come at least every other period; and the stop closes every
+/// session with CLOSE_STOPPED and ends the machine: whether the network is clean or loses,
+/// duplicates and reorders datagrams, and whatever each job takes.
+#[hegel::test(test_cases = 16, suppress_health_check = [HealthCheck::TooSlow])]
+fn every_request_is_answered_once_by_its_rule_and_the_live_stream_keeps_its_period(tc: TestCase) {
+    let seed = tc.draw(gs::integers::<u64>());
+    let lossy = tc.draw(gs::booleans());
+    let lose_one_in = if lossy { tc.draw(gs::integers::<u32>().min_value(8).max_value(32)) } else { 0 };
+    let net = Net { lose_one_in, duplicate_one_in: if lossy { 8 } else { 0 }, job_most_ms: tc.draw(gs::integers::<u64>().max_value(100)) };
+    if let Err(why) = run(seed, net, Plant::None) {
+        panic!("{why}");
+    }
+}
+
+const CONTROL_SEEDS: u64 = 4;
+const CLEAN: Net = Net { lose_one_in: 0, duplicate_one_in: 0, job_most_ms: 20 };
+
+/// Control: a job's result dropped (the hello's, a tick's or an answer's, by order of coming
+/// back) leaves its request unanswered or the live stream unfed, and the oracle says so.
 #[test]
-fn a_session_from_the_dev_server_is_taken_only_when_asked() {
-    let explorer = explorer(true);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-    runtime.block_on(async {
-        let client = client(&explorer);
-        connect(&client, &explorer, link::PATH, Some(link::DEV_ORIGIN)).await.unwrap();
-        connect(&client, &explorer, link::PATH, Some(link::ORIGIN)).await.unwrap();
-    });
+fn the_oracle_catches_a_dropped_job_result() {
+    for seed in 0..CONTROL_SEEDS {
+        for nth in 1..=3 {
+            assert!(run(seed, CLEAN, Plant::DropDone { nth }).is_err(), "seed {seed}: the {nth}th job result dropped went unseen");
+        }
+    }
+}
+
+/// Control: with no timer armed the machine reaches its deadlines only when the network steps
+/// it: the live stream ticks far less than its period and the late request is answered late,
+/// and the oracle says so.
+#[test]
+fn the_oracle_catches_a_timer_never_armed() {
+    for seed in 0..CONTROL_SEEDS {
+        assert!(run(seed, CLEAN, Plant::NoRearm).is_err(), "seed {seed}: a timer never armed went unseen");
+    }
 }

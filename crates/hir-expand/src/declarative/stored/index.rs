@@ -20,8 +20,17 @@
 //! names an assoc item by where it is written in its `impl`, and its reader asks this which
 //! id that is in its own file.
 //!
-//! The hashes are of text and of nothing a parse decides (a lazy node or a parsed one, where
-//! the item is in its file), so an outline and a full parse of one text make the same bytes.
+//! The hashes are of tokens ([`tokens`]): each token's kind and text, lexed with no parse, with
+//! whitespace and plain comments left out, so an item moved, reindented or commented the same
+//! is the same row, and nothing a parse decides (a lazy node or a parsed one, where the item is
+//! in its file) is in them: an outline and a full parse of one text make the same bytes. What
+//! is left out is what nothing filed under a row can see: the parser and a token tree see a
+//! token's spacing only as whether a punctuation mark is glued to the next ([`glues`]), which
+//! is fed; whatever reads more of the text (`stringify!`'s and `assert!`'s spacing, a line, a
+//! column, a proc macro's `Span::source_text`) reads the file's text, a read no key of an item
+//! covers (`blaze_item_hash::reads` refuses it by name; [`super::expansion`] keys no such
+//! builtin), and a location macro expands to a placeholder whose value no record holds
+//! (`hir_expand::builtin::PLACE_PLACEHOLDER`; `hir_ty::body_store::mir::location_literals`).
 //!
 //! Last, the positions: a segment of its own, a range a row in the rows' order, where each
 //! item is written in the file ([`FileIndex::range`]). A position is of the file, as the
@@ -30,14 +39,14 @@
 //! it, its line) reads it here, with no parse and no ast id map, and an entry of the item is
 //! not moved by an edit that only moves it.
 //!
-//! The invariant: equal keys are equal bytes; a row is a function of its item's text alone,
+//! The invariant: equal keys are equal bytes; a row is a function of its item's tokens alone,
 //! and a position of the file's text.
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
 use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, TextRange, TextSize};
 use syntax::{
-    NodeOrToken, SyntaxKind, ast,
+    Edition, LexedStr, NodeOrToken, SyntaxKind, ast,
     view::{self, AstNode as _, HasModuleItem as _},
 };
 
@@ -48,16 +57,29 @@ type R<T = ()> = Result<T, String>;
 /// The layout of a file's index: part of its key and its second word. It changes with the
 /// header, a row, which nodes have rows, what any of the three hashes covers, or the pairs.
 /// 2: the pairs of assoc items after the rows, and their count in the header. 3: the
-/// positions after the pairs, a range a row.
-pub const LAYOUT: u32 = 3;
+/// positions after the pairs, a range a row. 4: the three hashes are of tokens ([`tokens`]),
+/// not of text: whitespace and plain comments are in none of them.
+pub const LAYOUT: u32 = 4;
 
 /// The family of a file's index, as the entry store names it.
 pub const FAMILY: &str = "file index";
 
 const INDEX_DOMAIN: &str = "blaze v2 file index";
-const ATTRS_DOMAIN: &str = "blaze v2 item attrs";
-const HEADER_DOMAIN: &str = "blaze v2 item header";
-const BODY_DOMAIN: &str = "blaze v2 item body";
+// Each " 2" since layout 4, the hashes of tokens: no hash of tokens is one of text, so no
+// entry kept under a hash of text is found by one of tokens.
+const ATTRS_DOMAIN: &str = "blaze v2 item attrs 2";
+const HEADER_DOMAIN: &str = "blaze v2 item header 2";
+const BODY_DOMAIN: &str = "blaze v2 item body 2";
+const WHOLE_DOMAIN: &str = "blaze v2 item tokens 1";
+
+/// The edition every text is lexed in for its hashes, whatever the edition of its file: a
+/// hash is a function of the text alone. A later edition only reserves more (a C string, a raw
+/// lifetime, a guarded string are one token there and several before), never splitting what an
+/// earlier one joins, so two texts the same token for token in this edition are the same token
+/// for token in theirs; where this one tells two apart that their own does not, the two hash
+/// apart where they need not, never alike where they must not. A lexer error is fed with its
+/// token ([`Token::feed`]): a prefix this edition reserves is told from the same text spaced.
+const LEX_EDITION: Edition = Edition::LATEST;
 
 /// What an index starts with.
 const MAGIC: [u8; 8] = *b"blzfidx\0";
@@ -70,7 +92,9 @@ const PAIR: usize = 8;
 /// Bytes of a position: where a row's item starts in the file and where it ends.
 const SPAN: usize = 8;
 
-/// In a header's feed, where a body was cut: no piece is this long.
+/// In a header's feed, where a body was cut. A mark's first two bytes are `0xffff` or
+/// `0xfffe`, which no token's kind word is (every kind is below 1024), so a mark is told from a
+/// piece's next token and from its end ([`Feed::piece`]).
 const CUT: u32 = u32::MAX;
 /// Ends the inner attributes after a cut, and the outer attributes of an item.
 const END: u32 = u32::MAX - 1;
@@ -87,10 +111,11 @@ pub struct ItemSource {
     /// The item's own body node (a `fn`'s block, a `const`'s or `static`'s value, a variant's
     /// discriminant), and nothing of its header; `None` for an item with none.
     pub body: Option<u128>,
-    /// Whether the text `attrs` covers has `cfg` in it: only then can what is made of the
-    /// attributes differ with the crate's cfg.
+    /// Whether a token `attrs` covers has `cfg` in it: only then can what is made of the
+    /// attributes differ with the crate's cfg. Of tokens, as the hash is: a plain comment
+    /// that names `cfg` sets it in no row.
     pub attrs_cfg: bool,
-    /// The same of the text `header` covers.
+    /// The same of the tokens `header` covers.
     pub header_cfg: bool,
     /// Of an `impl` or a `trait`: its assoc items are a function of its header and the cfg
     /// alone, with no name looked up. No macro call at assoc position, no inner attribute in
@@ -332,6 +357,24 @@ pub fn source(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> O
 /// kept.
 pub fn range(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate) -> Option<TextRange> {
     of_any(db, file, krate)?.range(ast)
+}
+
+/// The hash of every token of the item `ast` of `file`, nothing cut ([`whole_tokens`]): what a
+/// derive or an attribute macro on the item is given, every body included (an enum's
+/// discriminants, an `impl`'s methods), which its row's `header` and `body` leave out. Read
+/// from where the index places the item and the file's text, with no parse. `None` for a node
+/// with no row.
+pub fn whole(db: &Db, file: EditionedFileId, ast: ErasedFileAstId, krate: Crate) -> Option<u128> {
+    let range = of(db, file, krate).range(ast)?;
+    let text: &str = db.file_text(file.file_id(db)).text(db);
+    Some(whole_tokens(text.get(std::ops::Range::<usize>::from(range))?))
+}
+
+/// The hash of every token of `text` ([`tokens`]), one piece.
+pub fn whole_tokens(text: &str) -> u128 {
+    let mut feed = Feed::new(WHOLE_DOMAIN);
+    feed.piece(text);
+    feed.finish().0
 }
 
 /// The index of the file whose tree is `root` and whose ast ids are `map`, as its entry's
@@ -654,34 +697,188 @@ fn node_source(
         inner_attrs(inner, &mut attrs);
     }
 
+    // The node is lexed once, its tokens dealt out as they come: the header's to the header,
+    // each cut's left out of it but for the cut's mark (the body's to the body). Lexed whole,
+    // a token at the edge of a cut is told whether it is glued to the next across the edge
+    // (`= -1` against `=-1`), which pieces lexed apart could not say.
     let mut header = Feed::new(HEADER_DOMAIN);
     header.kind(node.kind());
-    let text = node.text();
+    let mut own = body.map(|body| {
+        let mut feed = Feed::new(BODY_DOMAIN);
+        feed.kind(body.kind());
+        (body.text_range(), feed)
+    });
     let start = node.text_range().start();
-    let mut at = 0;
-    for cut in cuts {
-        let range = cut.text_range();
-        let (from, to) = (u32::from(range.start() - start) as usize, u32::from(range.end() - start) as usize);
-        header.piece(&text[at..from]);
+    let mut cuts = cuts.iter().copied().peekable();
+    // The range of the cut the walk is in.
+    let mut within: Option<TextRange> = None;
+    /// Ends the header's piece before `cut` and marks the cut, with its inner attributes.
+    fn open(cut: view::Node<'_>, header: &mut Feed) {
+        header.end();
         header.mark(CUT);
         header.kind(cut.kind());
-        inner_attrs(*cut, &mut header);
+        inner_attrs(cut, header);
         header.mark(END);
-        at = to;
     }
-    header.piece(&text[at..]);
+    tokens(node.text(), |at, token| {
+        let at = start + TextSize::from(at as u32);
+        if let Some(range) = within {
+            if at < range.end() {
+                if let Some((body, feed)) = &mut own
+                    && *body == range
+                {
+                    token.feed(feed);
+                }
+                return;
+            }
+            within = None;
+        }
+        while let Some(cut) = cuts.next_if(|cut| cut.text_range().start() <= at) {
+            open(cut, &mut header);
+            let range = cut.text_range();
+            if at < range.end() {
+                within = Some(range);
+                if let Some((body, feed)) = &mut own
+                    && *body == range
+                {
+                    token.feed(feed);
+                }
+                return;
+            }
+        }
+        token.feed(&mut header);
+    });
+    // A cut with no token after the last (none is: a cut is a node, which holds one).
+    for cut in cuts {
+        open(cut, &mut header);
+    }
+    header.end();
 
-    let body = body.map(|body| {
-        let mut hasher = Hasher::new(BODY_DOMAIN);
-        hasher.update(&(body.kind() as u16).to_le_bytes()).update(body.text().as_bytes());
-        hasher.finish().fingerprint().0
+    let body = own.map(|(_, mut feed)| {
+        feed.end();
+        feed.finish().0
     });
     let (attrs, attrs_cfg) = attrs.finish();
     let (header, header_cfg) = header.finish();
     ItemSource { attrs, header, body, attrs_cfg, header_cfg, plain }
 }
 
-/// One hash being fed, and whether any text fed has `cfg` in it.
+/// One token of a text, as [`tokens`] gives it.
+#[derive(Clone, Copy)]
+struct Token<'a> {
+    kind: SyntaxKind,
+    text: &'a str,
+    /// The lexer's error of it, when it has one.
+    error: Option<&'a str>,
+    /// Whether it is glued to the next token in a way the parser or a token tree sees
+    /// ([`glues`]): `false` for any other token, glued or not.
+    glued: bool,
+}
+
+impl Token<'_> {
+    /// Feeds the token: its kind's word, a byte of whether it is glued and whether it has an
+    /// error, its text's length and its text whole (a string's or a raw string's too, every
+    /// space in it), then its error's length and text if it has one. Every part has its length
+    /// or a fixed size, so two runs of tokens feed the same bytes only when they are the same
+    /// tokens: `a b` (two identifiers) is not `ab` (one), and `- -` is not `--` (glued).
+    fn feed(self, feed: &mut Feed) {
+        feed.cfg |= self.text.contains("cfg");
+        let flags = u8::from(self.glued) | u8::from(self.error.is_some()) << 1;
+        feed.hasher
+            .update(&(self.kind as u16).to_le_bytes())
+            .update(&[flags])
+            .update(&(self.text.len() as u32).to_le_bytes())
+            .update(self.text.as_bytes());
+        if let Some(error) = self.error {
+            feed.hasher.update(&(error.len() as u32).to_le_bytes()).update(error.as_bytes());
+        }
+    }
+}
+
+/// Calls `each` with every token of `text` but whitespace and plain comments (`//`, `/* */`),
+/// in order, with where it starts in `text`. Doc comments are tokens that stay: they are
+/// attributes (`#[doc = ".."]`), which a proc macro, `cfg_attr` and rustdoc read, inner
+/// (`//!`, `/*!`) as outer (`///`, `/**`). Lexed with no parse ([`LEX_EDITION`]), so a lazy
+/// body stays unparsed; the lexer lends its columns from the worker's scratch and nothing is
+/// allocated per token: what each token is goes straight to its caller.
+///
+/// The cost against the floor (one pass over the item's bytes to hash them): one more pass to
+/// lex them, and the hash then reads each token's bytes once with a few bytes of kind and
+/// length, which a run of whitespace and comments makes up for.
+fn tokens(text: &str, mut each: impl FnMut(usize, Token<'_>)) {
+    let lexed = LexedStr::new(LEX_EDITION, text);
+    // The last token seen, held until the next says whether it is glued to it.
+    let mut held: Option<(usize, Token<'_>)> = None;
+    let mut gap = false;
+    let mut end = 0;
+    for at in 0..lexed.len() {
+        let start = end;
+        end += lexed.text_len(at);
+        let kind = lexed.kind(at);
+        if kind.is_trivia() {
+            gap = true;
+            continue;
+        }
+        let token = Token { kind, text: &text[start..end], error: lexed.error(at), glued: false };
+        if let Some((held_at, mut last)) = held.take() {
+            last.glued = !gap && glues(last, token);
+            each(held_at, last);
+        }
+        held = Some((start, token));
+        gap = false;
+    }
+    // The last token of the text is glued to nothing: a token tree made of the text ends there.
+    if let Some((held_at, last)) = held {
+        each(held_at, last);
+    }
+}
+
+/// Whether whitespace or a comment between `left` and `right` is something the parser or a
+/// token tree can see, so whether they are glued is fed: the parser joins `-` `>` into `->`,
+/// `&` `&` into `&&` and `.` `.` `=` into `..=` only when they are glued (`at_composite2`), and
+/// a token tree marks a punctuation mark `Joint` only when the next is glued to it and is
+/// punctuation or a lifetime (`syntax_bridge`'s `is_single_token_op`), which a `macro_rules!`
+/// matcher and a proc macro read. Told by the characters at the edge, not by kind, so it holds
+/// for how any edition splits a token (a guarded string that is one token in this edition and
+/// `#` then a string in another). A float's jointness is of its own text (`shortcuts`), and
+/// whether anything else is glued (`f( x )`, `a + b`) is read only off the file's text: by
+/// `stringify!` and `assert!` (`source_joined`), which no row's key covers
+/// ([`super::expansion`] keys neither, and `blaze_item_hash::reads` refuses the read).
+fn glues(left: Token<'_>, right: Token<'_>) -> bool {
+    /// A character that is a punctuation mark of a token tree on its own.
+    fn op(byte: u8) -> bool {
+        matches!(
+            byte,
+            b'=' | b'<'
+                | b'>'
+                | b'!'
+                | b'&'
+                | b'|'
+                | b'~'
+                | b'@'
+                | b'.'
+                | b','
+                | b';'
+                | b':'
+                | b'#'
+                | b'$'
+                | b'?'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'^'
+        )
+    }
+    let doc = |kind: SyntaxKind| matches!(kind, SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT);
+    !doc(left.kind)
+        && !doc(right.kind)
+        && left.text.as_bytes().last().is_some_and(|&it| op(it))
+        && right.text.as_bytes().first().is_some_and(|&it| it == b'\'' || op(it))
+}
+
+/// One hash being fed, and whether any token fed has `cfg` in it.
 struct Feed {
     hasher: Hasher,
     cfg: bool,
@@ -692,13 +889,18 @@ impl Feed {
         Feed { hasher: Hasher::new(domain), cfg: false }
     }
 
-    /// Feeds one piece of text: its length, then its bytes.
+    /// Feeds one piece of text: each of its tokens ([`Token::feed`]), then its end.
     fn piece(&mut self, text: &str) {
-        self.cfg |= text.contains("cfg");
-        self.hasher.update(&(text.len() as u32).to_le_bytes()).update(text.as_bytes());
+        tokens(text, |_, token| token.feed(self));
+        self.end();
     }
 
-    /// Feeds a mark: a word no piece's length is.
+    /// Ends a run of tokens: the word of `EOF`, which no token of a text is.
+    fn end(&mut self) {
+        self.hasher.update(&(SyntaxKind::EOF as u16).to_le_bytes());
+    }
+
+    /// Feeds a mark ([`CUT`]): a word no token's kind starts.
     fn mark(&mut self, mark: u32) {
         self.hasher.update(&mark.to_le_bytes());
     }
@@ -734,8 +936,10 @@ fn inner_attrs(node: view::Node<'_>, feed: &mut Feed) {
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Global;
+
     use span::Edition;
-    use syntax::SourceFile;
+    use syntax::{SourceFile, view::HasModuleItem as _};
 
     use super::*;
 
@@ -953,5 +1157,137 @@ mod tests {
             assert_eq!(items.position(ErasedFileAstId::from_raw(rows[6].0)), Some(2));
             assert_eq!(items.position(ErasedFileAstId::from_raw(rows[11].0)), None);
         }
+    }
+
+    /// Which rows of `a` and `b`, two texts of the same items, differ, from a full parse or an
+    /// outline: (row, attrs, header, body), the file's own row 0.
+    fn differ(a: &str, b: &str, outline: bool) -> Vec<(usize, bool, bool, bool), Global> {
+        let (a, b) = (rows_of(a, outline), rows_of(b, outline));
+        assert_eq!(a.len(), b.len(), "{a:?}\n{b:?}");
+        let mut out = Vec::new_in(Global);
+        for (at, (a, b)) in a.iter().zip(&b).enumerate() {
+            if a.1 != b.1 {
+                out.push((at, a.1.attrs != b.1.attrs, a.1.header != b.1.header, a.1.body != b.1.body));
+            }
+        }
+        out
+    }
+
+    const WRITTEN: &str = "/// Says hi.\n#[inline]\nfn f(x: u8) -> i8 {\n    let y = x + 1; // one more\n    \
+                           -(y as i8)\n}\nconst C: i8 = -1;\nenum E { A = 1, B }\n\
+                           impl S {\n    fn g(&self) -> &Self { self }\n}\n";
+
+    /// The invariant: a row is of its item's tokens, not its text. Reindented, respaced and
+    /// commented with plain comments, and moved down the file, every item is the same row,
+    /// from a full parse and from an outline.
+    #[test]
+    fn a_respaced_commented_or_moved_item_is_the_same_row() {
+        let respaced = "/// Says hi.\n# [ inline ]\nfn f( x : u8 )->i8\n{\n  /* plain */ let y = x+1;\n\n\
+                        \t-( y as i8 )\n}\n// a plain comment\nconst C : i8 = -1 ;\n\
+                        enum E {\n    A = 1,\n    B\n}\n\
+                        impl S\n{\n    // a method\n    fn g( &self )-> &Self{self}\n}\n";
+        let moved = "\n\n// cfg: a comment that names cfg\n/* and a block */\n\n/// Says hi.\n#[inline]\n\
+                     fn f(x: u8) -> i8 {\n    let y = x + 1; // one more\n    -(y as i8)\n}\n\
+                     const C: i8 = -1;\nenum E { A = 1, B }\nimpl S {\n    fn g(&self) -> &Self { self }\n}\n";
+        for outline in [false, true] {
+            assert_eq!(differ(WRITTEN, respaced, outline), [], "respaced, outline {outline}");
+            assert_eq!(differ(WRITTEN, moved, outline), [], "moved, outline {outline}");
+        }
+        // A comment naming `cfg` is no `cfg` of the file.
+        let rows = rows_of(moved, false);
+        assert!(!rows[0].1.attrs_cfg && !rows[1].1.attrs_cfg, "{rows:?}");
+        assert!(rows_of("#[cfg(unix)]\nfn f() {}", false)[1].1.attrs_cfg, "the control");
+    }
+
+    /// The control of the above: each change of a token moves its row, in the part of it
+    /// the token is in. An operator, a literal's text (its spaces too), two tokens made one,
+    /// two punctuation marks glued, a doc comment's text, a doc comment made a plain one.
+    #[test]
+    fn a_changed_token_moves_its_row() {
+        let body = (1, false, false, true);
+        let attrs = (1, true, true, false);
+        let cases: [(&str, &str, (usize, bool, bool, bool)); 12] = [
+            ("fn f() { a + b }", "fn f() { a - b }", body),
+            ("fn f() { a b }", "fn f() { ab }", body),
+            ("fn f() { x - -y }", "fn f() { x --y }", body),
+            ("fn f() { a & &b }", "fn f() { a && b }", body),
+            ("fn f() { x.. =y }", "fn f() { x..=y }", body),
+            ("fn f() { \"a b\" }", "fn f() { \"a  b\" }", body),
+            ("fn f() { r#\"a b\"# }", "fn f() { r#\"a  b\"# }", body),
+            ("fn f() { 'a' }", "fn f() { 'b' }", body),
+            ("/// a\nfn f() {}", "/// b\nfn f() {}", attrs),
+            ("/// a\nfn f() {}", "///  a\nfn f() {}", attrs),
+            ("/// a\nfn f() {}", "// a\nfn f() {}", attrs),
+            ("#[doc = \"a\"]\nfn f() {}", "#[doc = \"b\"]\nfn f() {}", attrs),
+        ];
+        for (a, b, want) in cases {
+            for outline in [false, true] {
+                assert_eq!(differ(a, b, outline), [want], "{a:?} against {b:?}, outline {outline}");
+            }
+        }
+        // A plain comment's text and the spaces between tokens move nothing.
+        for (a, b) in [
+            ("fn f() { 1 // one\n }", "fn f() { 1 // two\n }"),
+            ("fn f() { a + b }", "fn f() {a+b}"),
+            ("fn f() { x - -y }", "fn f() { x -  -y }"),
+        ] {
+            assert_eq!(differ(a, b, false), [], "{a:?} against {b:?}");
+        }
+        // An inner doc comment of a body is an inner attribute, as `#![doc]` is: of the
+        // item's attributes, of its header (what collecting the item reads) and of its body.
+        let inner = differ("fn f() {\n    //! a\n    1\n}", "fn f() {\n    //! b\n    1\n}", false);
+        assert_eq!(inner, [(1, true, true, true)]);
+        let inner = differ("fn f() { #![doc = \"a\"] 1 }", "fn f() { #![doc = \"b\"] 1 }", false);
+        assert_eq!(inner, [(1, true, true, true)]);
+    }
+
+    /// `line!()` and `column!()` expand to a placeholder, never the place
+    /// (`builtin::PLACE_PLACEHOLDER`), and what reads their value reads the file's text, which
+    /// no key of an item covers: so an item that calls one is the same row wherever it is and
+    /// however it is spaced, as any other. The control: which of the two it calls is a token.
+    #[test]
+    fn an_item_that_calls_line_is_the_same_row_where_it_moves() {
+        let item = "fn f() -> u32 { line!() + column!() }\n";
+        let moved = "\n\n\n// above\nfn f() -> u32 {\n        line!() + column!()\n}\n";
+        assert_eq!(differ(item, moved, false), []);
+        let other = "fn f() -> u32 { column!() + line!() }\n";
+        assert_eq!(differ(item, other, false), [(1, false, false, true)]);
+    }
+
+    /// A derive or an attribute macro is given every token of its item; the row's `header`
+    /// and `body` leave out an enum's discriminants and an `impl`'s methods. [`whole_tokens`]
+    /// is of all of them, spaced or not.
+    #[test]
+    fn the_whole_item_is_every_token_of_it() {
+        let (one, two) = ("enum E { A = 1 }", "enum E { A = 2 }");
+        assert_eq!(rows_of(one, false)[1].1.header, rows_of(two, false)[1].1.header);
+        assert_ne!(whole_tokens(one), whole_tokens(two), "a discriminant is of the whole");
+        assert_eq!(whole_tokens(one), whole_tokens("enum E {\n    A = 1 // one\n}"));
+        assert_ne!(whole_tokens("impl S { fn f() { 1 } }"), whole_tokens("impl S { fn f() { 2 } }"));
+    }
+
+    /// The cost: the hashes lex the item and feed each token to the hash, allocating nothing a
+    /// token. An item of 1024 statements allocates what one of 16 does.
+    #[test]
+    fn hashing_an_item_allocates_nothing_a_token() {
+        let used = |statements: usize| {
+            let mut text = Vec::new_in(Global);
+            text.extend_from_slice(b"/// doc\nfn f(x: i8) -> i8 {\n");
+            for _ in 0..statements {
+                text.extend_from_slice(b"    let y = x - -1; // a comment\n");
+            }
+            text.extend_from_slice(b"    x\n}\n");
+            let text = std::str::from_utf8(&text).expect("ASCII");
+            let parse = SourceFile::parse(text, Edition::Edition2021);
+            let file = view::SourceFile::cast(parse.root()).expect("a file");
+            let item = file.items().next().expect("the fn");
+            let warm = item_source(item);
+            let (again, used) = blaze_alloc_count::measure(|| item_source(item));
+            assert_eq!(again, warm, "{statements} statements");
+            used.allocations
+        };
+        let (small, big) = (used(16), used(1024));
+        assert!(small <= 8, "an item of 16 statements: {small} allocations, budget 8");
+        assert_eq!(big, small, "1024 statements against 16");
     }
 }
