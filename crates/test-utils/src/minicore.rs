@@ -61,16 +61,20 @@
 //!     int_wrapping:
 //!     int_overflow: non_zero, from, result, option, iterator
 //!     int_cast: from
+//!     int_methods: int_overflow, int_wrapping
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
 //!     manually_drop: drop
+//!     mem_take: default, option
 //!     matches:
 //!     mul:
 //!     non_null: pat
 //!     non_zero: pat, transmute, option, copy
 //!     option: panic
+//!     option_methods: option, result, default
 //!     ord: eq, option
+//!     ord_methods: ord
 //!     panic: fmt
 //!     panic_location: panic
 //!     pat: panic
@@ -96,6 +100,7 @@
 //!     unary_ops:
 //!     unpin: sized
 //!     unsize: sized
+//!     vec: allocator_api, index, reach, deref_mut, option, default, fn, clone
 //!     write: fmt
 //!     todo: panic
 //!     unimplemented: panic
@@ -565,6 +570,15 @@ pub mod mem {
     }
     // endregion:drop
 
+    // region:mem_take
+    pub const fn swap<T>(x: &mut T, y: &mut T) {
+        loop {}
+    }
+    pub fn take<T: crate::default::Default>(dest: &mut T) -> T {
+        loop {}
+    }
+    // endregion:mem_take
+
     // region:transmute
     #[rustc_intrinsic]
     pub const fn transmute<Src, Dst>(src: Src) -> Dst;
@@ -860,6 +874,7 @@ pub mod ops {
         // endregion:slice
     }
     pub use self::index::{Index, IndexMut};
+    pub use self::index::SliceIndex; // :vec
     // endregion:index
 
     // region:range
@@ -1471,7 +1486,36 @@ pub mod cmp {
 
     pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
         fn cmp(&self, other: &Self) -> Ordering;
+        // region:ord_methods
+        fn max(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn min(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn clamp(self, _min: Self, _max: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        // endregion:ord_methods
     }
+
+    // region:ord_methods
+    pub fn max<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    pub fn min<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    // endregion:ord_methods
 
     pub enum Ordering {
         Less = -1,
@@ -1746,6 +1790,10 @@ pub mod fmt {
 
 // region:slice
 pub mod slice {
+    // region:vec
+    pub use crate::ops::SliceIndex;
+    // endregion:vec
+
     #[lang = "slice"]
     impl<T> [T] {
         #[lang = "slice_len_fn"]
@@ -1762,6 +1810,23 @@ pub mod slice {
             if let [first, ..] = self { Some(first) } else { None }
         }
         // endregion:reach
+
+        // region:vec
+        pub fn get<I>(&self, index: I) -> Option<&I::Output>
+        where
+            I: SliceIndex<Self>,
+        {
+            loop {}
+        }
+
+        pub const fn last(&self) -> Option<&T> {
+            loop {}
+        }
+
+        pub const fn swap(&mut self, a: usize, b: usize) {
+            loop {}
+        }
+        // endregion:vec
 
         // region:iterator
         pub fn iter(&self) -> crate::iter::Iter<'_, T> {
@@ -1799,6 +1864,14 @@ pub mod option {
     // region:copy
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
+
+    // region:mem_take
+    impl<T> crate::default::Default for Option<T> {
+        fn default() -> Option<T> {
+            None
+        }
+    }
+    // endregion:mem_take
 
     // The methods that hand a payload on or panic, which admit a linear one.
     impl<#[blaze::linear] T> Option<T> {
@@ -1849,6 +1922,20 @@ pub mod option {
         pub fn and<U>(self, _optb: Option<U>) -> Option<U> {
             loop {}
         }
+        // region:option_methods
+        pub fn take(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn replace(&mut self, _value: T) -> Option<T> {
+            loop {}
+        }
+        pub fn unwrap_or_default(self) -> T
+        where
+            T: crate::default::Default,
+        {
+            loop {}
+        }
+        // endregion:option_methods
         pub fn unwrap_or(self, default: T) -> T {
             match self {
                 Some(val) => val,
@@ -1903,6 +1990,14 @@ pub mod result {
             }
         }
         // endregion:reach
+        // region:option_methods
+        pub const fn is_err(&self) -> bool {
+            loop {}
+        }
+        pub fn err(self) -> crate::option::Option<E> {
+            loop {}
+        }
+        // endregion:option_methods
         pub const fn or<F>(self, res: Result<T, F>) -> Result<T, F> {
             match self {
                 Ok(v) => Ok(v),
@@ -3093,6 +3188,86 @@ macro_rules! impl_int_abs {
 impl_int_abs! { isize i8 i16 i32 i64 i128 }
 // endregion:int_overflow
 
+// region:int_methods
+// The integer methods `hir-ty-lean` models, as stubs: their bodies are never read.
+macro_rules! impl_int_methods {
+    ($($t:ty, $bytes:literal;)*) => {
+        $(
+            impl $t {
+                pub const BITS: u32 = $bytes * 8;
+                pub const fn leading_zeros(self) -> u32 { loop {} }
+                pub const fn trailing_zeros(self) -> u32 { loop {} }
+                pub const fn count_ones(self) -> u32 { loop {} }
+                pub const fn count_zeros(self) -> u32 { loop {} }
+                pub const fn reverse_bits(self) -> Self { loop {} }
+                pub const fn swap_bytes(self) -> Self { loop {} }
+                pub const fn rotate_left(self, _n: u32) -> Self { loop {} }
+                pub const fn rotate_right(self, _n: u32) -> Self { loop {} }
+                pub const fn saturating_mul(self, _rhs: Self) -> Self { loop {} }
+                pub const fn saturating_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn wrapping_neg(self) -> Self { loop {} }
+                pub const fn wrapping_shl(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_shr(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_div(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_rem(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn checked_div(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_rem(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_pow(self, _exp: u32) -> crate::option::Option<Self> { loop {} }
+                pub const fn overflowing_sub(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn overflowing_mul(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn is_multiple_of(self, _rhs: Self) -> bool { loop {} }
+                pub const fn to_le_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_be_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_ne_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn from_le_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                pub const fn from_be_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // region:!int_impl
+                pub const fn from_ne_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // endregion:!int_impl
+            }
+        )*
+    }
+}
+
+impl_int_methods! {
+    usize, 8; u8, 1; u16, 2; u32, 4; u64, 8; u128, 16;
+    isize, 8; i8, 1; i16, 2; i32, 4; i64, 8; i128, 16;
+}
+
+macro_rules! impl_uint_methods {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn is_power_of_two(self) -> bool { loop {} }
+                pub const fn next_power_of_two(self) -> Self { loop {} }
+                pub const fn div_ceil(self, _rhs: Self) -> Self { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_uint_methods! { usize u8 u16 u32 u64 u128 }
+
+macro_rules! impl_sint_methods {
+    ($($t:ty => $u:ty;)*) => {
+        $(
+            impl $t {
+                pub const fn unsigned_abs(self) -> $u { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> $u { loop {} }
+                pub const fn signum(self) -> Self { loop {} }
+                pub const fn wrapping_abs(self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_sint_methods! {
+    isize => usize; i8 => u8; i16 => u16; i32 => u32; i64 => u64; i128 => u128;
+}
+// endregion:int_methods
+
 // region:int_bounds
 macro_rules! impl_int_bounds {
     ($($t:ty: $min:literal, $max:literal;)*) => {
@@ -3464,8 +3639,152 @@ pub mod alloc {
         }
         // endregion:global_allocator
     }
+
+    // region:vec
+    #[lang = "global_alloc_ty"]
+    pub struct Global;
+    unsafe impl Allocator for Global {
+        fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError> {
+            loop {}
+        }
+        unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {}
+    }
+    // endregion:vec
 }
 // endregion:allocator_api
+
+// region:vec
+pub mod vec {
+    use crate::alloc::{Allocator, Global};
+    use crate::ops::{Deref, DerefMut, Index, IndexMut};
+    use crate::slice::SliceIndex;
+
+    pub struct Vec<T, A: Allocator = Global> {
+        ptr: *mut T,
+        cap: usize,
+        len: usize,
+        alloc: A,
+    }
+
+    impl<T> Vec<T> {
+        pub const fn new() -> Self {
+            loop {}
+        }
+        pub fn with_capacity(capacity: usize) -> Self {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> Vec<T, A> {
+        pub const fn new_in(alloc: A) -> Self {
+            loop {}
+        }
+        pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+            loop {}
+        }
+        pub const fn capacity(&self) -> usize {
+            loop {}
+        }
+        pub fn truncate(&mut self, len: usize) {
+            loop {}
+        }
+        pub const fn as_slice(&self) -> &[T] {
+            loop {}
+        }
+        pub const fn as_mut_slice(&mut self) -> &mut [T] {
+            loop {}
+        }
+        pub fn swap_remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn insert(&mut self, index: usize, element: T) {
+            loop {}
+        }
+        pub fn remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn retain<F>(&mut self, mut f: F)
+        where
+            F: FnMut(&T) -> bool,
+        {
+            loop {}
+        }
+        pub fn push(&mut self, value: T) {
+            loop {}
+        }
+        pub fn pop(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn clear(&mut self) {
+            loop {}
+        }
+        pub const fn len(&self) -> usize {
+            loop {}
+        }
+        pub const fn is_empty(&self) -> bool {
+            loop {}
+        }
+    }
+
+    impl<T: Clone, A: Allocator> Vec<T, A> {
+        pub fn extend_from_slice(&mut self, other: &[T]) {
+            loop {}
+        }
+    }
+
+    pub fn from_elem<T: Clone>(elem: T, n: usize) -> Vec<T> {
+        loop {}
+    }
+
+    impl<T, A: Allocator> Deref for Vec<T, A> {
+        type Target = [T];
+        fn deref(&self) -> &[T] {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> DerefMut for Vec<T, A> {
+        fn deref_mut(&mut self) -> &mut [T] {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> Index<I> for Vec<T, A> {
+        type Output = I::Output;
+        fn index(&self, index: I) -> &Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> IndexMut<I> for Vec<T, A> {
+        fn index_mut(&mut self, index: I) -> &mut Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T> crate::default::Default for Vec<T> {
+        fn default() -> Vec<T> {
+            loop {}
+        }
+    }
+
+    // region:drop
+    impl<T, A: Allocator> Drop for Vec<T, A> {
+        fn drop(&mut self) {}
+    }
+    // endregion:drop
+}
+
+#[macro_export]
+macro_rules! vec {
+    () => (
+        $crate::vec::Vec::new()
+    );
+    ($elem:expr; $n:expr) => (
+        $crate::vec::from_elem($elem, $n)
+    );
+}
+// endregion:vec
 
 pub mod prelude {
     pub mod v1 {
@@ -3508,6 +3827,7 @@ pub mod prelude {
             env, option_env,                              // :env
             cfg,                                          // :cfg
             matches,                                      // :matches
+            vec, vec::Vec,                                // :vec
         };
     }
 

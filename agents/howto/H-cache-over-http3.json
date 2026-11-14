@@ -1,0 +1,9 @@
+{
+ "id": "H-cache-over-http3",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane remote-cache-quic",
+ "task": "Read the public cache over HTTP/3 (QUIC, 0-RTT), or change the HTTP/3 request path",
+ "do": "Setting: `bucket.transport` in remote.json, or BLAZE_CACHE_TRANSPORT (one, never both): \"h1\", the default, or \"h3\". Only anonymous reads go over h3: a GET or HEAD of a public/ object to bucket.public_url. Signed requests always go over HTTP/1.1. There is no fallback: if the host does not serve HTTP/3, each read fails naming the host, how the handshake failed and the setting. \"h3\" is refused until blaze-core's HTTP/3 driver implements `blaze_http::h3::Wire`; that driver then builds `http3::Routed::new(H3Bucket::new(wire, public_url, peer, Trust::Roots(native_roots), &http::load_tickets(dir, now)?)?, HttpBucket)` in `HttpBucket::new`'s place, and calls `http::save_tickets(dir, &bucket.h3().take_tickets())` when tickets came. Tickets are in `<settings dir>/remote-tickets.bin` (mode 0600, at most `http3::TICKETS_KEPT`, none past `TICKET_AGE_MOST_S`). The core: `Endpoint::connect_requests`, `request`/`request_early(conn, Early::get|head(..))`, `cancel`, `consumed_response`, events ResponseHead/ResponseData/RequestEnded/Ticket. Tests: `cargo test -p blaze-http h3` (the DST is h3/tests/requests.rs) and `cargo test -p blaze-remote http3`. Neither touches the network.",
+ "why": "The request path spans the h3 core, a vendored rustls patch (ticket bytes), blaze-remote's bucket and a setting; this is the one place that says how they fit and what is still missing (the driver).",
+ "state": "current"
+}

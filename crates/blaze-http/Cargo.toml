@@ -1,6 +1,6 @@
 [package]
 name = "blaze-http"
-description = "blaze's HTTP: an HTTP/1.1 client and an HTTP/3 WebTransport endpoint, each a sans-IO core (deadlines on an injected clock; TLS through rustls, QUIC through quinn-proto) with a thin tokio driver"
+description = "blaze's HTTP: an HTTP/1.1 client and an HTTP/3 WebTransport endpoint, each a sans-IO core (deadlines on an injected clock; TLS through rustls, QUIC through quinn-proto), driven on blaze-core's effects"
 publish = false
 
 version.workspace = true
@@ -37,13 +37,6 @@ percent-encoding.workspace = true
 rustls-native-certs.workspace = true
 # Addresses and where their redirects lead.
 url.workspace = true
-# The tokio drivers' sockets, DNS, timers and channels, and h3's `select!`.
-tokio = { workspace = true, optional = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
-
-[features]
-default = []
-# `tokio_driver` and `h3::tokio_driver`. Without it the crate is the core alone, with no runtime under it.
-tokio = ["dep:tokio"]
 
 [dev-dependencies]
 # The certificates of the in-memory rustls server the TLS test speaks to and of the h3 pair.

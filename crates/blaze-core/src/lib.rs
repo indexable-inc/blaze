@@ -25,7 +25,7 @@
 //! the simulation with it, is safe Rust.
 
 #![deny(unsafe_code)]
-#![feature(allocator_ext)]
+#![feature(allocator_api, allocator_ext)]
 // `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core`; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -46,6 +46,7 @@ pub mod cores;
 pub mod create_process;
 pub mod decimal;
 mod descriptors;
+pub mod dgram;
 pub mod exit;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the fanotify driver: its system calls and the events it reads")]
@@ -112,6 +113,7 @@ pub mod utf8;
 mod watch;
 pub mod wait;
 pub mod wheel;
+pub mod world;
 
 use std::{fmt, time::Duration};
 
@@ -796,39 +798,57 @@ pub enum Effect {
     Pressure {
         tag: Tag,
     },
-    /// A UDP socket bound at `at` (port 0: one the system picks). Completes with
-    /// [`Done::Bound`] of the socket and the address it is bound at; an address another socket
-    /// has fails, naming it.
+    /// A UDP socket bound at `at` (port 0: one the system picks), v4 or v6 by `at`'s family,
+    /// set up as `options` asks. Completes with [`Done::Bound`] of the socket and the address it
+    /// is bound at; an address another socket has, or an option the system refuses, fails
+    /// naming it.
     Bind {
         at: std::net::SocketAddr,
+        options: dgram::Options,
         tag: Tag,
     },
-    /// `bytes` sent from `sock` to `to` as one datagram. Completes with [`Done::Sent`] of
-    /// `bytes` cleared, its capacity kept, once the system took it: not once it arrived, as a
-    /// datagram may be lost, duplicated or reordered on its way. More than [`DATAGRAM_MOST`]
-    /// bytes, a socket not bound, or a send the system refuses completes with [`Done::Broken`]
-    /// of `bytes` cleared, naming the socket's address and `to`.
+    /// Every datagram of `batch` sent from `sock`, each to its head's peer, in order: on Linux
+    /// one `sendmmsg` per [`dgram::BATCH_MOST`] runs, a run of several datagrams one
+    /// `UDP_SEGMENT` message; on macOS one `sendmsg_x`. Completes with
+    /// [`Done::SentDatagrams`] of `batch` cleared, its capacity kept, once the system took
+    /// every datagram: not once they arrived, as a datagram may be lost, duplicated or
+    /// reordered on its way. A batch [`dgram::Batch::refused`] refuses, a socket not bound, or
+    /// a send the system fails completes with [`Done::DatagramsFailed`] of `batch` as given,
+    /// naming the socket, the peer and the error number; what of it the system took before
+    /// the failure is sent.
     SendTo {
         sock: Dgram,
-        to: std::net::SocketAddr,
-        bytes: Vec<u8>,
+        batch: dgram::Batch,
         tag: Tag,
     },
-    /// The next datagram `sock` receives, and who sent it: completes with
-    /// [`Done::Datagram`], its bytes in `into` (cleared first, its capacity kept, grown once to
-    /// [`DATAGRAM_MOST`]), so an asker that hands each datagram's buffer to its next receive
-    /// allocates nothing once it has grown. Waits for as long as nothing comes; an
-    /// [`Effect::Unbind`] of the socket with it in flight ends it with [`Done::Broken`] of
-    /// `into` as given, naming the socket, as does a receive the system fails.
+    /// The next datagrams `sock` receives, at least one and as many as are there at once up to
+    /// `slots`: completes with [`Done::Datagrams`] of `into`, cleared first, its capacity kept
+    /// (its bytes grown once to `slots.most * slots.size`), so an asker that hands each batch
+    /// to its next receive allocates nothing once it has grown. On Linux one `recvmmsg`; on
+    /// macOS one `recvmsg_x`. Waits for as long as nothing comes; an [`Effect::Unbind`] of the
+    /// socket with it in flight ends it with [`Done::DatagramsFailed`] of `into`, naming the
+    /// socket, as do slots [`dgram::Slots::refused`] refuses and a receive the system fails.
     RecvFrom {
         sock: Dgram,
-        into: Vec<u8>,
+        into: dgram::Batch,
+        slots: dgram::Slots,
         tag: Tag,
     },
     /// `sock` closed: completes with [`Done::Unbound`], and each receive in flight on it ends
     /// as [`Effect::RecvFrom`] says. A socket not bound fails, naming it.
     Unbind {
         sock: Dgram,
+        tag: Tag,
+    },
+    /// The addresses `name` resolves to, each with `port`: completes with [`Done::Resolved`],
+    /// in the order the system gave them, or [`Done::Unresolved`] naming the name and why. A
+    /// name that is an address resolves to itself. Native drivers call `getaddrinfo` on a
+    /// thread of the host's, which fails the resolve once [`dgram::RESOLVE_WAIT`] passes; the
+    /// simulation answers from the names its test gave ([`sim::Sim::name`]). A name longer
+    /// than [`dgram::NAME_MOST`] or holding a NUL is refused naming it.
+    Resolve {
+        name: String,
+        port: u16,
         tag: Tag,
     },
     /// What the process's standard input holds next, at most `most` bytes and at most
@@ -879,7 +899,7 @@ pub enum Effect {
 }
 
 /// The most bytes one datagram of [`Effect::SendTo`] carries: UDP's most over IPv4 (65,535
-/// less its 8-byte header and IPv4's 20-byte one), which a receive's buffer is grown to.
+/// less its 8-byte header and IPv4's 20-byte one), which [`dgram::Slots::ONE`]'s slot is.
 pub const DATAGRAM_MOST: usize = 65_507;
 
 /// The most bytes one [`Effect::Random`] draws.
@@ -968,6 +988,7 @@ impl Effect {
             | Effect::SendTo { tag, .. }
             | Effect::RecvFrom { tag, .. }
             | Effect::Unbind { tag, .. }
+            | Effect::Resolve { tag, .. }
             | Effect::ReadStdin { tag, .. }
             | Effect::WriteOut { tag, .. }
             | Effect::Now { tag }
@@ -1400,13 +1421,23 @@ pub enum Done {
         sock: Dgram,
         local: std::net::SocketAddr,
     },
-    /// Of an [`Effect::RecvFrom`]: who sent the datagram, and its bytes in the receive's buffer.
-    Datagram {
-        from: std::net::SocketAddr,
-        bytes: Vec<u8>,
+    /// Of an [`Effect::RecvFrom`]: at least one datagram, each head saying who sent it.
+    Datagrams(dgram::Batch),
+    /// Of an [`Effect::SendTo`]: its batch, cleared, its capacity kept.
+    SentDatagrams(dgram::Batch),
+    /// An [`Effect::SendTo`] or [`Effect::RecvFrom`] that failed, and its batch back: a send's
+    /// as given, a receive's cleared. The error is boxed so that a completion stays the size
+    /// of a [`Done::Broken`].
+    DatagramsFailed {
+        batch: dgram::Batch,
+        error: Box<dgram::DgramError>,
     },
     /// Of an [`Effect::Unbind`].
     Unbound,
+    /// Of an [`Effect::Resolve`]: at least one address.
+    Resolved(Vec<std::net::SocketAddr>),
+    /// Of an [`Effect::Resolve`]: the name has no address, or the system could not say.
+    Unresolved(dgram::Unresolved),
     /// Of an [`Effect::Now`]: the time since the Unix epoch.
     Wall(Duration),
     /// Of an [`Effect::Random`]: its bytes.
@@ -1425,6 +1456,23 @@ impl Done {
         bytes.clear();
         // alloc: an error path.
         Done::Broken { buffer: bytes, error: IoError(error.to_string()) }
+    }
+
+    /// [`Done::DatagramsFailed`] of `batch` on `sock`, cleared where `clear` (a receive's).
+    pub(crate) fn dgram_failed(
+        mut batch: dgram::Batch,
+        clear: bool,
+        sock: Dgram,
+        local: Option<std::net::SocketAddr>,
+        peer: Option<std::net::SocketAddr>,
+        errno: Option<i32>,
+        why: impl fmt::Display,
+    ) -> Done {
+        if clear {
+            batch.clear();
+        }
+        let error = dgram::DgramError { sock, local, peer, errno, why: why.to_string() };
+        Done::DatagramsFailed { batch, error: Box::new_in(error, std::alloc::Global) }
     }
 
     /// [`Done::Broken`] of a receive's buffer `into`, as it was given.
@@ -1459,8 +1507,9 @@ pub trait Driver {
     /// Moves completions into `out`, waiting until `until` (on [`Driver::now`]'s clock) for
     /// the first if none is ready: [`wait::Deadline::PASSED`] only looks, and
     /// [`wait::Deadline::NEVER`] waits until one comes. An absolute deadline, never a length,
-    /// so no layer between the caller and the kernel restarts it (rule deadline-waits).
-    /// Returns how many it moved.
+    /// so no layer between the caller and the kernel restarts it (rule deadline-waits). With
+    /// nothing in flight it returns at once, unless a waker was handed out: the rule on
+    /// [`Driver::waker`]. Returns how many it moved.
     fn poll(&mut self, out: &mut Vec<Completion>, until: wait::Deadline) -> usize;
     /// How many effects were submitted and have not completed.
     fn in_flight(&self) -> usize;
@@ -1479,6 +1528,14 @@ pub trait Driver {
     /// deadline. `None` says the driver has none (the simulation, which runs no thread; a
     /// driver not yet given one): its caller then bounds its wait by a deadline of its own and
     /// says so in the wait's name.
+    ///
+    /// The rule every driver with a waker keeps, the one place it is stated (the io_uring and
+    /// kqueue drivers point here, and each has a test `a_wake_ends_a_wait_parked_in_the_kernel`):
+    /// once a waker is handed out, a poll with nothing in flight parks until a wake or its
+    /// deadline; and a wake made at any point (before the poll, before it parks, while it is
+    /// parked in the kernel) ends that poll, or the next if none is under way. A driver keeps
+    /// whatever its wake writes to (an eventfd's read, a `kqueue` trigger) armed before every
+    /// wait in the kernel, never only while some other work is out.
     fn waker(&self) -> Option<Waker> {
         None
     }

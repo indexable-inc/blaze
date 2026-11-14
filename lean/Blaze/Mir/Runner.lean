@@ -55,7 +55,7 @@ def parseArg (token : String) : Option Arg :=
   | ["bool", "false"] => some (Arg.value (Value.bool false))
   | [ty, text] =>
     if ty.startsWith "&" then
-      match parseTy (ty.drop 1), parseInts text with
+      match parseTy (ty.drop 1).copy, parseInts text with
       | some scalar, some ints => some (Arg.slice (ints.map (intOf scalar)))
       | _, _ => none
     else
@@ -132,7 +132,7 @@ def answerLines (programs : List (String × Program)) (input output : IO.FS.Stre
     if line.isEmpty then
       pure ()
     else
-      output.putStrLn (answer programs line.trimRight)
+      output.putStrLn (answer programs line.trimAsciiEnd.copy)
       answerLines programs input output lines
 
 /-- The most lines one run answers. -/

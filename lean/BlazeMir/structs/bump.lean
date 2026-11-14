@@ -5,13 +5,23 @@ import Blaze.Mir.Syntax
 open Blaze Blaze.Mir
 
 def structs.bump.mir : Program :=
-  { adts := [{ name := "structs::Counter", discr := ScalarTy.Isize, variants := [(0, [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32])] }],
+  { adts := [{ name := "structs::Counter", discr := ScalarTy.I128, variants := [(0, [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32])] }],
     fns := [
       { name := "structs::bump",
         args := 1,
-        locals := [Ty.unit, Ty.ref true (Ty.adt 0)],
+        locals := [Ty.unit, Ty.ref true (Ty.adt 0), Ty.unit, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 1 [ProjElem.deref, ProjElem.field 0]) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.deref, ProjElem.field 1]))),
+              Statement.storageLive 2,
+              Statement.nop,
+              Statement.storageLive 3,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.copy (Place.mk 1 [ProjElem.deref, ProjElem.field 1]))),
+              Statement.assign (Place.mk 1 [ProjElem.deref, ProjElem.field 0]) (Rvalue.use (Operand.move (Place.mk 3 []))),
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 2,
+              Statement.storageDead 3,
               Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const Const.unit))],
+            terminator := Terminator.drop (Place.mk 1 []) 1 },
+          { stmts := [
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }

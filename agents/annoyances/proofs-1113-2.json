@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-2",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "scripts/src/bin/invariants.rs (`write`, `check`); docs/v2/plan/invariants.md",
+ "what": "`invariants write` exits 1 on main at e6635c9ba7, so docs/v2/plan/invariants.md cannot be regenerated and is stale (its header counts 189 entries, it lists 191, six ids are gone from the tree). It stops at the first statement it cannot place. Four it stopped on in turn: crates/blaze-item-hash/src/tests/classify.rs:1936 `/// The invariant (keys-cover-every-input):`, crates/blaze-vfs/src/image/tests.rs:586 and :708 `(persisted-state-round-trips)`, crates/blaze-keyed/src/memo.rs:42 `(refinement)` (a rule's name where the pattern reads a level), then crates/hir-def/src/item_scope.rs:653, a statement on an `impl` (`the statement is on no fn, struct, enum, trait or type`). I reworded the first four; the fifth needs its owner (its statement belongs on a test with a control) and the generator still fails there.",
+ "cost": "forty minutes; the `(proved: ..)` statements of crates/blaze-core/src/busy.rs are not in invariants.md",
+ "cause": "statements that do not parse landed on main; `invariants check` was not run on the pull requests that added them, or its failure did not hold the merge (not checked which)",
+ "whys": "a statement is free text in a doc comment; whether it parses is known only to the script; the script's failure is not something the author sees while writing; and where the pattern does not match at all (`/// The invariant (rule 26): ..`, any parenthetical with a space) the statement is silently not counted, so a miswritten statement either breaks the list for everyone or vanishes from it",
+ "class": "a generated or checked document that no gate holds to the tree goes stale silently (as proofs-1113-1: the ledger, hir-ty-lean's golden files)",
+ "prevention": "a `blaze::` lint with a fix on every doc comment that opens `/// The invariant`, `/// The refinement` or `/// The reference model`: it must parse as a statement on an item the list accepts, with a known level, or the build says so at the line; then the uncounted ones (a grep finds several hundred) are each counted or reworded. Not built.",
+ "workaround": "none: invariants.md is left as main has it",
+ "state": "open"
+}

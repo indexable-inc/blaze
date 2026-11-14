@@ -406,6 +406,7 @@ fn old_match_attr_flags(
                         // here, each a word attribute under `blaze` as those above.
                         "linear" => attr_flags.insert(AttrFlags::LINEAR),
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
+                        "theorem" => attr_flags.insert(AttrFlags::THEOREM),
                         "holds" => attr_flags.insert(AttrFlags::HOLDS),
                         "memo" => attr_flags.insert(AttrFlags::BLAZE_MEMO),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),

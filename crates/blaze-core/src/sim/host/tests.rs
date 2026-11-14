@@ -12,6 +12,7 @@ use std::{
 use super::{Datagrams, Plant};
 use crate::{
     Completion, DATAGRAM_MOST, Dgram, Done, Driver, Effect, FileName, RANDOM_MOST, Stream, Tag,
+    dgram::{Batch, Ecn, Options, Slots},
     run_until_idle,
     sim::{Faults, Rng, Sim},
     wait::Deadline,
@@ -74,9 +75,10 @@ fn datagrams(seed: u64, plant: Option<Plant>, saw: &mut Saw) -> Result<(), Strin
         sim.plant(plant);
     }
     let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let options = Options::default();
     let mut effects = vec![
-        Effect::Bind { at: loopback, tag: Tag(1) },
-        Effect::Bind { at: loopback, tag: Tag(2) },
+        Effect::Bind { at: loopback, options, tag: Tag(1) },
+        Effect::Bind { at: loopback, options, tag: Tag(2) },
     ];
     let mut bound: [Option<(Dgram, SocketAddr)>; 2] = [None, None];
     let mut sends_done = 0;
@@ -91,48 +93,60 @@ fn datagrams(seed: u64, plant: Option<Plant>, saw: &mut Saw) -> Result<(), Strin
                 bound[n as usize - 1] = Some((sock, local));
                 if let [Some(_), Some((to, at))] = bound {
                     let (from, _) = bound[0].expect("both bound");
-                    effects.push(Effect::RecvFrom { sock: to, into: Vec::new(), tag: RECV });
-                    for n in 0..SENT {
-                        let bytes = n.to_le_bytes().to_vec();
-                        effects.push(Effect::SendTo {
-                            sock: from,
-                            to: at,
-                            bytes,
-                            tag: Tag(FIRST_SEND + n),
-                        });
+                    let slots = Slots { most: 4, size: 64 };
+                    effects.push(Effect::RecvFrom { sock: to, into: Batch::new(), slots, tag: RECV });
+                    // Half one datagram per send, half in batches of four.
+                    for n in 0..SENT / 2 {
+                        let mut batch = Batch::new();
+                        batch.push(at, Ecn::NotEct, &n.to_le_bytes());
+                        effects.push(Effect::SendTo { sock: from, batch, tag: Tag(FIRST_SEND + n) });
+                    }
+                    for n in (SENT / 2..SENT).step_by(4) {
+                        let mut batch = Batch::new();
+                        for it in n..(n + 4).min(SENT) {
+                            batch.push(at, Ecn::NotEct, &it.to_le_bytes());
+                        }
+                        effects.push(Effect::SendTo { sock: from, batch, tag: Tag(FIRST_SEND + n) });
                     }
                 }
             }
-            (Tag(n), Done::Sent(_)) if (FIRST_SEND..FIRST_SEND + SENT).contains(&n) => {
+            (Tag(n), Done::SentDatagrams(_)) if (FIRST_SEND..FIRST_SEND + SENT).contains(&n) => {
                 sends_done += 1;
-                if sends_done == SENT {
+                if sends_done == SENT / 2 + SENT / 8 {
                     effects.push(Effect::Timer { after: Duration::from_millis(100), tag: AFTER });
                 }
             }
-            (RECV, Done::Datagram { from, bytes }) => {
+            (RECV, Done::Datagrams(batch)) => {
                 let (_, sender) = bound[0].expect("bound before anything was sent");
-                if from != sender {
-                    fail(format!("a datagram from {from}, sent from {sender}"));
+                if batch.is_empty() {
+                    fail("a receive told no datagram".to_owned());
                 }
-                let Ok(number) = <[u8; 8]>::try_from(bytes.as_slice()) else {
-                    return fail(format!("a datagram of {} bytes, none was sent", bytes.len()));
-                };
-                let number = u64::from_le_bytes(number);
-                if number >= SENT {
-                    fail(format!("datagram {number} arrived, never sent"));
+                for (head, bytes) in batch.each() {
+                    let from = head.peer;
+                    if from != sender {
+                        fail(format!("a datagram from {from}, sent from {sender}"));
+                    }
+                    let Ok(number) = <[u8; 8]>::try_from(bytes) else {
+                        return fail(format!("a datagram of {} bytes, none was sent", bytes.len()));
+                    };
+                    let number = u64::from_le_bytes(number);
+                    if number >= SENT {
+                        fail(format!("datagram {number} arrived, never sent"));
+                    }
+                    let seen = copies.entry(number).or_default();
+                    *seen += 1;
+                    if *seen > 2 {
+                        fail(format!("datagram {number} arrived {seen} times"));
+                    }
+                    saw.doubled |= *seen == 2;
+                    saw.reordered |= highest.is_some_and(|it| number < it);
+                    highest = highest.max(Some(number));
                 }
-                let seen = copies.entry(number).or_default();
-                *seen += 1;
-                if *seen > 2 {
-                    fail(format!("datagram {number} arrived {seen} times"));
-                }
-                saw.doubled |= *seen == 2;
-                saw.reordered |= highest.is_some_and(|it| number < it);
-                highest = highest.max(Some(number));
                 let (sock, _) = bound[1].expect("bound before it received");
-                effects.push(Effect::RecvFrom { sock, into: bytes, tag: RECV });
+                let slots = Slots { most: 4, size: 64 };
+                effects.push(Effect::RecvFrom { sock, into: batch, slots, tag: RECV });
             }
-            (RECV, Done::Broken { .. }) if unbound => {}
+            (RECV, Done::DatagramsFailed { .. }) if unbound => {}
             (AFTER, Done::Fired) => {
                 unbound = true;
                 for (at, tag) in [(0, Tag(5)), (1, Tag(6))] {
@@ -164,14 +178,19 @@ fn a_datagram_too_long_or_to_a_socket_not_bound_is_refused_naming_it() {
     let mut sim = Sim::new(1, Faults::default());
     let at: SocketAddr = "127.0.0.1:5000".parse().unwrap();
     let mut answers = Vec::new();
-    let mut effects = vec![Effect::Bind { at, tag: Tag(1) }];
+    let options = Options::default();
+    let mut effects = vec![Effect::Bind { at, options, tag: Tag(1) }];
     run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
     let Done::Bound { sock, local } = answers.pop().unwrap().done else { panic!("not bound") };
     assert_eq!(local, at);
+    let mut long = Batch::new();
+    long.push(at, Ecn::NotEct, &vec![0; DATAGRAM_MOST + 1]);
+    let mut one = Batch::new();
+    one.push(at, Ecn::NotEct, &[1]);
     let mut effects = vec![
-        Effect::Bind { at, tag: Tag(2) },
-        Effect::SendTo { sock, to: at, bytes: vec![0; DATAGRAM_MOST + 1], tag: Tag(3) },
-        Effect::SendTo { sock: Dgram(99), to: at, bytes: vec![1], tag: Tag(4) },
+        Effect::Bind { at, options, tag: Tag(2) },
+        Effect::SendTo { sock, batch: long, tag: Tag(3) },
+        Effect::SendTo { sock: Dgram(99), batch: one, tag: Tag(4) },
         Effect::Unbind { sock: Dgram(99), tag: Tag(5) },
     ];
     run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
@@ -179,7 +198,8 @@ fn a_datagram_too_long_or_to_a_socket_not_bound_is_refused_naming_it() {
     let said: Vec<String> = answers
         .into_iter()
         .map(|it| match it.done {
-            Done::Failed(error) | Done::Broken { error, .. } => error.0,
+            Done::Failed(error) => error.0,
+            Done::DatagramsFailed { error, .. } => error.to_string(),
             done => panic!("{:?} completed with {done:?}", it.tag),
         })
         .collect();
@@ -515,6 +535,9 @@ fn each_planted_bug_is_caught() {
                 clock_and_random(seed, Some(plant)).is_err()
             }
             Plant::RemovesFull => dirs(seed, Some(plant)).is_err(),
+            Plant::BarriersNotKept | Plant::RenameFlushesOthers | Plant::PutBackWithBarriers => {
+                unreachable!("{plant:?} is the disk's, caught by its own controls (sim/world.rs)")
+            }
         })
     };
     for plant in [
@@ -528,4 +551,79 @@ fn each_planted_bug_is_caught() {
     ] {
         assert!(caught(plant), "no seed caught {plant:?}");
     }
+}
+
+/// A resolve answers from the test's table, in its order and with the port asked; an address
+/// resolves to itself; a name not in the table fails naming it.
+#[test]
+fn a_name_resolves_from_the_test_s_table_and_one_not_there_is_named() {
+    let mut sim = Sim::new(3, Faults::default());
+    let (a, b): (std::net::IpAddr, std::net::IpAddr) =
+        ("10.0.0.2".parse().unwrap(), "::1".parse().unwrap());
+    sim.name("cache.example", &[a, b]);
+    let mut effects = vec![
+        Effect::Resolve { name: "cache.example".to_owned(), port: 443, tag: Tag(1) },
+        Effect::Resolve { name: "192.0.2.7".to_owned(), port: 80, tag: Tag(2) },
+        Effect::Resolve { name: "missing.example".to_owned(), port: 443, tag: Tag(3) },
+    ];
+    let mut answers = Vec::new();
+    run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
+    answers.sort_by_key(|it| it.tag);
+    let addresses = |done: &Done| match done {
+        Done::Resolved(it) => it.clone(),
+        done => panic!("resolved with {done:?}"),
+    };
+    assert_eq!(addresses(&answers[0].done), [SocketAddr::new(a, 443), SocketAddr::new(b, 443)]);
+    assert_eq!(addresses(&answers[1].done), ["192.0.2.7:80".parse::<SocketAddr>().unwrap()]);
+    match &answers[2].done {
+        Done::Unresolved(it) => {
+            assert_eq!((it.name.as_str(), it.port), ("missing.example", 443));
+            assert!(it.to_string().contains("missing.example"), "{it}");
+        }
+        done => panic!("a name not in the table resolved with {done:?}"),
+    }
+}
+
+/// A datagram to an address the test cut off never arrives, and one after the path heals
+/// does; each keeps its codepoint where both ends asked for codepoints.
+#[test]
+fn a_black_hole_drops_every_datagram_and_codepoints_cross() {
+    let mut sim = Sim::new(9, Faults::default());
+    let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let options = Options { ecn: true, ..Options::default() };
+    let mut answers = Vec::new();
+    let mut effects = vec![
+        Effect::Bind { at: loopback, options, tag: Tag(1) },
+        Effect::Bind { at: loopback, options, tag: Tag(2) },
+    ];
+    run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
+    answers.sort_by_key(|it| it.tag);
+    let bound: Vec<(Dgram, SocketAddr)> = answers
+        .drain(..)
+        .map(|it| match it.done {
+            Done::Bound { sock, local } => (sock, local),
+            done => panic!("bound with {done:?}"),
+        })
+        .collect();
+    let ((from, _), (to, at)) = (bound[0], bound[1]);
+    sim.black_hole(at);
+    let mut lost = Batch::new();
+    lost.push(at, Ecn::Ect0, b"lost");
+    let mut effects = vec![Effect::SendTo { sock: from, batch: lost, tag: Tag(3) }];
+    run_until_idle(&mut sim, &mut effects, |done, _| answers.push(done)).unwrap();
+    sim.clear_black_hole(at);
+    let mut kept = Batch::new();
+    kept.push(at, Ecn::Ect1, b"kept");
+    let mut effects = vec![
+        Effect::RecvFrom { sock: to, into: Batch::new(), slots: Slots::ONE, tag: Tag(4) },
+        Effect::SendTo { sock: from, batch: kept, tag: Tag(5) },
+    ];
+    let mut got = None;
+    drive(&mut sim, &mut effects, |_, Completion { tag, done }, _| {
+        if let (Tag(4), Done::Datagrams(batch)) = (tag, done) {
+            let (head, bytes) = batch.each().next().expect("a receive tells a datagram");
+            got = Some((bytes.to_vec(), head.ecn));
+        }
+    });
+    assert_eq!(got, Some((b"kept".to_vec(), Ecn::Ect1)), "only the datagram after the heal");
 }

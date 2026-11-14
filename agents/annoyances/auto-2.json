@@ -1,0 +1,11 @@
+{
+ "id": "auto-2",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5, lane auto",
+ "where": "lean/Blaze/Auto.lean (blaze_partial, ediv_bounds)",
+ "what": "Two surprises closing generated statements: (1) apply of a lemma concluding with its own match on Result does not unify with a generated statement match on a call that does not compute, even with the discriminant given: the two matchers do not unfold; (2) grind rewrites Int.tdiv/tmod into / and % plus ifs (Init/Grind/Norm.lean:212), so lemmas with tdiv patterns never fire, and core ediv lemmas passed to grind were not instantiated either.",
+ "cost": "four build rounds",
+ "cause": "matchers unfold only on constructor discriminants; grind normalises before e-matching",
+ "workaround": "blaze_partial reads the discriminant and ok-alternative off the matcher and applies Result.partial_cases with the goal abstracted as motive; own lemmas with grind_pattern on a / b and a % b",
+ "state": "worked around"
+}

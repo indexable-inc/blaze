@@ -174,7 +174,7 @@ theorem Hides.next {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l :
 /-! Places. -/
 
 theorem projStep_put {B : FnId → Local → Prop} {g : List (Nat × FnId)} {f l : Nat} {st : State}
-    (h : Hides B g f l st) (sl : Slot) (p : Pointer) (hp : Off f l p) :
+    (_h : Hides B g f l st) (sl : Slot) (p : Pointer) (hp : Off f l p) :
     ∀ (e : ProjElem), elemFine l e = true → projStep (st.put f l sl) p e = projStep st p e
   | ProjElem.deref, _ => Outcome.bind_congr (State.read_put st f l sl p hp) (fun _ _ => rfl)
   | ProjElem.field _, _ => rfl
@@ -309,7 +309,7 @@ theorem evalOperands_put {B : FnId → Local → Prop} {g : List (Nat × FnId)} 
       evalOperands (st.put f l sl) os =
         Outcome.map (keepState (fun s => State.put s f l sl)) (evalOperands st os)
   | [], _, _, _ => rfl
-  | o :: rest, st, h, hfine =>
+  | o :: rest, _, h, hfine =>
     Outcome.bind_commutes_map (evalOperand_put h sl o (and_true_left hfine)) (fun a ha =>
       Outcome.bind_commutes_map
         (evalOperands_put sl rest a.2 (h.operand o a ha) (and_true_right hfine))

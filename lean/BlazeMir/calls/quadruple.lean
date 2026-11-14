@@ -9,18 +9,31 @@ def calls.quadruple.mir : Program :=
     fns := [
       { name := "calls::quadruple",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
         blocks := [
-          { stmts := [],
-            terminator := Terminator.call (Callee.fn 1) [Operand.copy (Place.mk 1 [])] (Place.mk 2 []) (some 1) },
-          { stmts := [],
+          { stmts := [
+              Statement.storageLive 2,
+              Statement.storageLive 3,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+            terminator := Terminator.call (Callee.fn 1) [Operand.move (Place.mk 3 [])] (Place.mk 2 []) (some 1) },
+          { stmts := [
+              Statement.storageDead 3],
             terminator := Terminator.call (Callee.fn 1) [Operand.move (Place.mk 2 [])] (Place.mk 0 []) (some 2) },
-          { stmts := [],
+          { stmts := [
+              Statement.storageDead 2,
+              Statement.storageDead 1],
             terminator := Terminator.ret }] },
       { name := "calls::double",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.checked BinOp.add (Operand.copy (Place.mk 1 [])) (Operand.copy (Place.mk 1 [])))],
+              Statement.storageLive 2,
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.storageLive 3,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.assign (Place.mk 0 []) (Rvalue.checked BinOp.add (Operand.move (Place.mk 2 [])) (Operand.move (Place.mk 3 []))),
+              Statement.storageDead 3,
+              Statement.storageDead 2,
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }

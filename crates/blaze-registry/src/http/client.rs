@@ -1,21 +1,30 @@
 //! [`HyperHttp`]: the [`Http`] blaze asks servers through (the `net` feature), on blaze-http:
 //! its sans-IO HTTP/1.1 client (`blaze_http::Client`: connections kept between requests by
 //! origin, redirects, gzip, TLS through rustls on ring with the machine's roots, every timeout
-//! a deadline) driven by its tokio driver on a runtime of this client's own. Every request goes
-//! through the proxy the environment names for its origin, as curl and cargo read it
-//! (`blaze_http::proxy`), read once as the client is made: a variable that can't be used fails
-//! the client, naming it.
+//! a deadline) driven on blaze-core's effects by `blaze_http::driver`, on a thread of this
+//! client's own. No async runtime is under it: a caller's executor polls the futures
+//! [`Http::get_async`] gives, and the blocking calls park this thread on them
+//! (`blaze_http::mailbox::block_on`, each wait named). Every request goes through the proxy
+//! the environment names for its origin, as curl and cargo read it (`blaze_http::proxy`), read
+//! once as the client is made: a variable that can't be used fails the client, naming it.
 //!
 //! The name is the first client's, kept so that no caller changes; nothing under it is hyper
-//! any more (no hyper, hyper-util, hyper-rustls or tokio-rustls: docs/v2/plan/design/no-tracing.md,
-//! 6.1).
+//! or tokio any more (docs/v2/plan/design/no-tracing.md, 6.1).
 
-use std::{io::Read as _, sync::Arc, time::Duration};
+use std::{
+    alloc::Global,
+    collections::VecDeque,
+    pin::Pin,
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use blaze_http::{
     Client, Config, Event, Kind, Request,
-    tokio_driver::{Answer, Driver},
+    driver::{Answer, Handle},
+    mailbox::{self, Either},
 };
 use http::Method;
 
@@ -23,39 +32,33 @@ use blaze_fetch::{redact, scrub};
 
 use super::{Bounds, Http, Pending, Refused, Response, Sink, Stalled, Transport, Watch};
 
-/// How many requests [`HyperHttp::get_async`] has in flight at once, each on a connection of
-/// its own (HTTP/1), and so the most idle connections the client keeps.
+/// How many requests the driver has in flight at once, each on a connection of its own
+/// (HTTP/1), and so the most idle connections the client keeps; the rest wait their turn in
+/// the driver, in order, their timeouts not yet begun.
 const IN_FLIGHT: usize = 64;
 
 /// The most of a streamed request's error body that is read ([`Http::stream`]): enough for
 /// any server's message, and no more.
 const ERROR_BODY_MOST: u64 = 64 << 10;
 
-/// [`Http`] over blaze-http, with the machine's certificates, on a runtime of its own that any
-/// number of threads ask through at once. Made by its first request, not by [`HyperHttp::new`]:
-/// a daemon that sends nothing never makes a runtime or loads the system's roots (about 90 ms
-/// of a macOS start, `rustls_native_certs::macos::load_native_certs`).
+/// [`Http`] over blaze-http, with the machine's certificates, on a driver thread of its own
+/// that any number of threads ask through at once. Made by its first request, not by
+/// [`HyperHttp::new`]: a daemon that sends nothing never starts the thread or loads the
+/// system's roots (about 90 ms of a macOS start, `rustls_native_certs::macos::load_native_certs`).
 pub struct HyperHttp {
     timeout: Duration,
     #[expect(
         clippy::disallowed_types,
-        reason = "the client's one runtime and connection pool, made once by its first request and shared by every fetch"
+        reason = "the client's one driver and connection pool, made once by its first request and shared by every fetch"
     )]
-    made: std::sync::OnceLock<Result<Made, String>>,
+    made: std::sync::OnceLock<Result<Requests, String>>,
 }
 
-/// What a [`HyperHttp`] runs on, made by its first request ([`HyperHttp::made`]).
-struct Made {
-    runtime: tokio::runtime::Runtime,
-    client: Requests,
-    in_flight: Arc<tokio::sync::Semaphore>,
-}
-
-/// What one request needs, cheap to clone into a task of the runtime.
-#[derive(Clone)]
+/// What one request needs, cheap to clone into any future.
+#[derive(Clone)] // clone: a handle on the one driver, once per range of a download
 struct Requests {
     /// The driver of the process's one client: its connections, shared by every clone.
-    driver: Driver,
+    http: Handle,
 }
 
 impl HyperHttp {
@@ -65,29 +68,23 @@ impl HyperHttp {
         Ok(HyperHttp { timeout, made: Default::default() })
     }
 
-    /// The runtime, the client and its turns, made by the first request; a failure to make
-    /// them is kept and is every request's error, naming what could not be made.
-    fn made(&self) -> anyhow::Result<&Made> {
+    /// The driver and its client, made by the first request; a failure to make them is kept
+    /// and is every request's error, naming what could not be made.
+    fn made(&self) -> anyhow::Result<&Requests> {
         let made = self.made.get_or_init(|| {
             let _span = tracing::info_span!(
                 target: "blaze",
-                "http client: make the runtime and load the system's root certificates"
+                "http client: start the driver and load the system's root certificates"
             )
             .entered();
-            Made::new(self.timeout).map_err(|e| format!("making the HTTP client: {e:#}"))
+            Requests::new(self.timeout).map_err(|e| format!("making the HTTP client: {e:#}"))
         });
         made.as_ref().map_err(|e| anyhow::Error::msg(e.clone())) // clone: an error kept for every request
     }
 }
 
-impl Made {
-    fn new(timeout: Duration) -> anyhow::Result<Made> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("blaze-registry http")
-            .enable_all()
-            .build()
-            .context("making the HTTP client's tokio runtime")?;
+impl Requests {
+    fn new(timeout: Duration) -> anyhow::Result<Requests> {
         // No version: this crate is under every build of blaze, and the release blaze is is told
         // only to the engine (its build.rs), so that a release changes no crate below it.
         let user_agent = "blaze (https://github.com/indexable-inc/blaze)";
@@ -95,14 +92,24 @@ impl Made {
         let proxies = blaze_http::proxy_env::from_env()?;
         let config =
             Config { idle_most: IN_FLIGHT, proxies, ..Config::new(tls, user_agent, timeout) };
-        let driver = Driver::spawn(runtime.handle(), Client::new(config));
-        Ok(Made {
-            runtime,
-            client: Requests { driver },
-            // alloc: the client's one semaphore, made once with it.
-            in_flight: Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT)),
-        })
+        let http = Handle::spawn(Client::new(config), IN_FLIGHT)
+            .context("starting blaze-http's driver thread")?;
+        Ok(Requests { http })
     }
+}
+
+/// Runs `work` to its end on this thread, parked between its steps; `what` names the wait.
+/// Unbounded here: every request ends by its own deadlines (the client's timeouts, the stall
+/// bound), which the driver reaches.
+fn block<T>(what: &'static str, work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    mailbox::block_on(what, None, work).context("waiting for blaze-http's driver")?
+}
+
+/// `headers` as the client takes them.
+fn owned(headers: &[(&str, &str)]) -> Vec<(String, String), Global> {
+    let mut owned = Vec::with_capacity_in(headers.len(), Global);
+    owned.extend(headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
+    owned
 }
 
 impl HyperHttp {
@@ -110,12 +117,14 @@ impl HyperHttp {
     pub fn shared() -> anyhow::Result<Arc<HyperHttp>> {
         #[expect(
             clippy::disallowed_types,
-            reason = "the process's one HTTP client: its runtime and connection pool are shared by every fetch"
+            reason = "the process's one HTTP client: its driver and connection pool are shared by every fetch"
         )]
         static SHARED: std::sync::OnceLock<Result<Arc<HyperHttp>, String>> =
             std::sync::OnceLock::new();
         let shared = SHARED.get_or_init(|| {
-            HyperHttp::new(Duration::from_secs(30)).map(Arc::new).map_err(|e| format!("{e:#}"))
+            HyperHttp::new(Duration::from_secs(30))
+                .map(|it| Arc::new_in(it, Global))
+                .map_err(|e| format!("{e:#}"))
         });
         shared.clone().map_err(anyhow::Error::msg)
     }
@@ -129,7 +138,8 @@ impl HyperHttp {
         body: Vec<u8>,
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
-        made.runtime.block_on(made.client.fetch(method, url, headers, body, Bounds::NONE))
+        let answer = made.ask(method, url, headers, body, Bounds::NONE);
+        block("an HTTP answer", collect(answer, url, Bounds::NONE))
     }
 
     /// [`Http::get`] of `url` held to `bounds`: a body past `bounds.most` stops being read, and
@@ -141,7 +151,8 @@ impl HyperHttp {
         bounds: Bounds,
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
-        made.runtime.block_on(made.client.fetch(Method::GET, url, headers, Vec::new(), bounds))
+        let answer = made.ask(Method::GET, url, headers, Vec::new(), bounds);
+        block("a bounded HTTP answer", collect(answer, url, bounds))
     }
 
     /// `url`'s body from byte `from` into `sink`, in order, each piece with its offset in the
@@ -161,13 +172,13 @@ impl HyperHttp {
         watch: Watch<'_>,
     ) -> anyhow::Result<Response> {
         let made = self.made()?;
-        made.runtime.block_on(made.client.ranged(url, headers, from, bounds, sink, what, watch))
+        block("a download's ranges", made.ranged(url, headers, from, bounds, sink, what, watch))
     }
 }
 
 impl HyperHttp {
-    /// `url`'s body from byte `from`, collected, as a task on this client's runtime for a caller
-    /// in a runtime of its own: [`HyperHttp::stream_watched`]'s ranges, progress (said in
+    /// `url`'s body from byte `from`, collected, as a future any executor polls (its requests
+    /// go as it is first polled): [`HyperHttp::stream_watched`]'s ranges, progress (said in
     /// blaze-fetch's downloads as `what`) and stall bound. The answer's body is the bytes from
     /// `from` on, whether the server kept to the range (206) or sent the whole (200).
     pub fn get_from_async(
@@ -178,20 +189,17 @@ impl HyperHttp {
         what: &str,
     ) -> Pending<anyhow::Result<Response>> {
         let made = match self.made() {
-            Ok(made) => made,
+            Ok(made) => made.clone(), // clone: the driver's handle, moved into the future
             Err(e) => return Box::pin(std::future::ready(Err(e))),
         };
-        let (client, in_flight) = (made.client.clone(), made.in_flight.clone());
-        let (url, what) = (url.to_owned(), what.to_owned()); // alloc: moved into the task
-        let headers: Vec<(String, String)> =
-            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect(); // alloc: as above
-        let task = made.runtime.spawn(async move {
-            let _turn = in_flight.acquire_owned().await?;
-            let headers: Vec<(&str, &str)> =
-                headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect(); // alloc: borrowed views of the above
+        let (url, what) = (url.to_owned(), what.to_owned());
+        let headers = owned(headers);
+        Box::pin(async move {
+            let mut views = Vec::with_capacity_in(headers.len(), Global);
+            views.extend(headers.iter().map(|(name, value)| (name.as_str(), value.as_str())));
             // The body kept, and the offset of its first byte: `from`, or 0 once the server
             // sends the whole.
-            let (mut body, mut base) = (Vec::new(), from); // alloc: the body, for the caller
+            let (mut body, mut base) = (Vec::new_in(Global), from);
             let mut sink = |offset: u64, bytes: &[u8]| -> std::io::Result<()> {
                 if offset != base + body.len() as u64 {
                     if offset != 0 {
@@ -200,21 +208,19 @@ impl HyperHttp {
                             base + body.len() as u64
                         )));
                     }
-                    (body, base) = (Vec::new(), 0); // alloc: as above, begun again
+                    (body, base) = (Vec::new_in(Global), 0);
                 }
                 body.extend_from_slice(bytes);
                 Ok(())
             };
-            let mut answer = client
-                .ranged(&url, &headers, from, Bounds::NONE, &mut sink, &what, &mut |_| {})
-                .await?;
+            let mut answer =
+                made.ranged(&url, &views, from, Bounds::NONE, &mut sink, &what, &mut |_| {}).await?;
             if matches!(answer.status, 200 | 206) {
                 let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX);
                 answer.body = body.split_off(skip.min(body.len()));
             }
             Ok(answer)
-        });
-        Box::pin(async move { task.await.context("a request's task ended")? })
+        })
     }
 }
 
@@ -225,23 +231,21 @@ fn named(url: &str) -> &str {
 }
 
 impl Requests {
-    async fn fetch(
+    /// Asks `method` of `url`: it is sent before this returns; its answer is read from the
+    /// [`Answer`] ([`collect`]). Dropping the answer before its end cancels the request,
+    /// closing its connection.
+    fn ask(
         &self,
         method: Method,
         url: &str,
         headers: &[(&str, &str)],
         body: Vec<u8>,
         bounds: Bounds,
-    ) -> anyhow::Result<Response> {
+    ) -> Answer {
         let request = Request {
             method,
-            // alloc: one per request, handed to the client.
             url: url.to_owned(),
-            // alloc: one per request, its headers handed to the client.
-            headers: headers
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
+            headers: owned(headers),
             body,
             // Asked for as gzip, decoded by the client and held to `most` once decoded. A
             // streamed body is [`Requests::ranged`]'s, asked for as it is kept.
@@ -249,31 +253,34 @@ impl Requests {
             most: bounds.most,
             https_only: bounds.https_only,
         };
-        // Dropping the answer before its end cancels the request, closing its connection.
-        let mut answer = self.driver.ask(request);
-        // `said`, with no userinfo, query or fragment (a redirect's `X-Amz-Signature`), is the
-        // only form of the address that answered any message holds.
-        let (said, status, headers) = match next(&mut answer, url).await? {
-            Event::Head { url, status, headers, .. } => (redact(&url), status, headers),
-            Event::Failed { error, .. } => return Err(failed(error)),
-            Event::Body { .. } | Event::Done { .. } => {
-                anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
-            }
-        };
-        let room = usize::try_from(bounds.most).unwrap_or(usize::MAX);
-        // alloc: one per answer, its body for the caller.
-        let mut bytes = Vec::new();
-        while let Some(piece) = next_piece(&mut answer, &said).await? {
-            if piece.len() > room.saturating_sub(bytes.len()) {
-                // The client holds the body to `most` itself; past it is its bug, said here.
-                let refused =
-                    Refused::TooBig { url: said.clone(), most: bounds.most, said: None, decoded: true };
-                return Err(refused.into());
-            }
-            bytes.extend_from_slice(&piece);
-        }
-        Ok(Response { status, headers, body: bytes })
+        self.http.ask(request)
     }
+}
+
+/// `answer`, read whole: its head and its body, held to `bounds.most`; `url` is the address
+/// asked.
+async fn collect(mut answer: Answer, url: &str, bounds: Bounds) -> anyhow::Result<Response> {
+    // `said`, with no userinfo, query or fragment (a redirect's `X-Amz-Signature`), is the
+    // only form of the address that answered any message holds.
+    let (said, status, headers) = match next(&mut answer, url).await? {
+        Event::Head { url, status, headers, .. } => (redact(&url), status, headers),
+        Event::Failed { error, .. } => return Err(failed(error)),
+        Event::Body { .. } | Event::Done { .. } => {
+            anyhow::bail!("{}: blaze-http's client told of a body before its head", redact(url))
+        }
+    };
+    let room = usize::try_from(bounds.most).unwrap_or(usize::MAX);
+    let mut bytes = Vec::new_in(Global);
+    while let Some(piece) = next_piece(&mut answer, &said).await? {
+        if piece.len() > room.saturating_sub(bytes.len()) {
+            // The client holds the body to `most` itself; past it is its bug, said here.
+            let refused =
+                Refused::TooBig { url: said.clone(), most: bounds.most, said: None, decoded: true };
+            return Err(refused.into());
+        }
+        bytes.extend_from_slice(&piece);
+    }
+    Ok(Response { status, headers, body: bytes })
 }
 
 /// The length of one ranged request of a body ([`HyperHttp::stream_watched`]), and how many
@@ -318,6 +325,40 @@ fn content_range(value: &str) -> Option<(Option<(u64, u64)>, u64)> {
     Some((Some((start.trim().parse().ok()?, end.trim().parse().ok()?)), total))
 }
 
+/// One range of a download in flight: polled with the others ([`front`]) until it has its
+/// bytes. Dropping it cancels its request.
+enum Range {
+    // dyn: one per range of a download (at most `PARALLEL` at once), each a request that costs
+    // far more than its box.
+    Running(Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + Send, Global>>),
+    Done(anyhow::Result<Vec<u8>>),
+}
+
+/// Polls every range in `flying`, so all of them move at once, and gives the front one's
+/// outcome once it has one (`None` when none is in flight): the ranges are handed on in
+/// order.
+fn front(
+    flying: &mut VecDeque<(u64, Range), Global>,
+) -> impl Future<Output = Option<(u64, anyhow::Result<Vec<u8>>)>> + '_ {
+    std::future::poll_fn(move |cx| {
+        for (_, range) in flying.iter_mut() {
+            if let Range::Running(work) = range
+                && let Poll::Ready(done) = work.as_mut().poll(cx)
+            {
+                *range = Range::Done(done);
+            }
+        }
+        match flying.front() {
+            None => Poll::Ready(None),
+            Some((_, Range::Running(_))) => Poll::Pending,
+            Some((_, Range::Done(_))) => match flying.pop_front() {
+                Some((start, Range::Done(done))) => Poll::Ready(Some((start, done))),
+                _ => unreachable!("the front was looked at just above"),
+            },
+        }
+    })
+}
+
 impl Requests {
     /// A GET of `url` asking for bytes `from..=to` (`to` open when `None`), not encoded, held to
     /// `bounds`; with `if_range` (the first answer's `ETag`), a body that changed meanwhile comes
@@ -330,8 +371,8 @@ impl Requests {
         if_range: Option<&str>,
         bounds: Bounds,
     ) -> anyhow::Result<Opened> {
-        // alloc: one per request, its headers handed to the client.
-        let mut asked: Vec<(String, String)> = headers.to_vec();
+        let mut asked = Vec::with_capacity_in(headers.len() + 2, Global);
+        asked.extend_from_slice(headers);
         let range = match to {
             Some(to) => format!("bytes={from}-{to}"),
             None => format!("bytes={from}-"),
@@ -342,14 +383,14 @@ impl Requests {
         }
         let request = Request {
             method: Method::GET,
-            url: url.to_owned(), // alloc: one per request
+            url: url.to_owned(),
             headers: asked,
-            body: Vec::new(),
+            body: Vec::new_in(Global),
             gzip: false,
             most: bounds.most,
             https_only: bounds.https_only,
         };
-        let mut answer = self.driver.ask(request);
+        let mut answer = self.http.ask(request);
         match next(&mut answer, url).await? {
             Event::Head { url, status, headers, .. } => {
                 Ok(Opened { said: redact(&url), status, headers, answer })
@@ -378,8 +419,8 @@ impl Requests {
         counter: blaze_fetch::downloads::Counter<'static>,
     ) -> anyhow::Result<Vec<u8>> {
         let len = usize::try_from(to - from + 1).unwrap_or(usize::MAX);
-        // alloc: one range of a download, at most `PIECE` bytes
-        let mut got = Vec::with_capacity(len);
+        // One range of a download, at most `PIECE` bytes.
+        let mut got = Vec::with_capacity_in(len, Global);
         let mut tries = 0;
         loop {
             let at = from + got.len() as u64;
@@ -462,9 +503,8 @@ impl Requests {
         watch: Watch<'_>,
     ) -> anyhow::Result<Response> {
         let download = blaze_fetch::downloads::Downloads::process().begin(what, url, None);
-        // alloc: one per download, its headers for every range.
-        let owned: Vec<(String, String)> =
-            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+        // The download's headers, for every range.
+        let owned = owned(headers);
         let first_to = from.saturating_add(PIECE - 1);
         let ticked = |download: &blaze_fetch::downloads::Download<'_>,
                       watch: &mut (dyn FnMut(&blaze_fetch::progress::Line) + Send),
@@ -477,11 +517,11 @@ impl Requests {
             }
             Ok(())
         };
-        let mut opened = tick_until(
-            self.open(url, &owned, (from, Some(first_to)), None, bounds),
-            || ticked(&download, watch, url),
-        )
-        .await?;
+        let mut opened = self
+            .tick_until(self.open(url, &owned, (from, Some(first_to)), None, bounds), || {
+                ticked(&download, watch, url)
+            })
+            .await?;
         let length = opened.header("content-length").and_then(|it| it.trim().parse::<u64>().ok());
         let (at, total) = match opened.status {
             200 => (0, length),
@@ -502,13 +542,12 @@ impl Requests {
                 download.resumed(from);
                 download.set_total(Some(from));
                 watch(&download.line());
-                return Ok(Response { status: 206, headers: opened.headers, body: Vec::new() });
+                return Ok(Response { status: 206, headers: opened.headers, body: Vec::new_in(Global) });
             }
             status => {
                 // An error's body, for its message: its first `ERROR_BODY_MOST` bytes.
                 let room = usize::try_from(ERROR_BODY_MOST).unwrap_or(usize::MAX);
-                // alloc: one per error answer
-                let mut body = Vec::new();
+                let mut body = Vec::new_in(Global);
                 while let Some(piece) = next_piece(&mut opened.answer, &opened.said).await? {
                     body.extend_from_slice(&piece[..piece.len().min(room - body.len())]);
                     if body.len() >= room {
@@ -531,9 +570,9 @@ impl Requests {
         // The first answer's body: the whole of a 200, or the first range.
         let mut offset = at;
         loop {
-            let piece =
-                tick_until(next_piece(&mut opened.answer, &said), || ticked(&download, watch, &said))
-                    .await?;
+            let piece = self
+                .tick_until(next_piece(&mut opened.answer, &said), || ticked(&download, watch, &said))
+                .await?;
             let Some(piece) = piece else { break };
             if offset.saturating_add(piece.len() as u64) > bounds.most {
                 let refused = Refused::TooBig { url: said, most: bounds.most, said: None, decoded: false };
@@ -548,66 +587,62 @@ impl Requests {
             (206, Some(total)) => total,
             _ => {
                 watch(&download.line());
-                return Ok(Response { status, headers: head, body: Vec::new() });
+                return Ok(Response { status, headers: head, body: Vec::new_in(Global) });
             }
         };
-        // The rest, `PARALLEL` ranges in flight, handed on in order: memory holds at most
-        // `PARALLEL` ranges.
+        // The rest, `PARALLEL` ranges in flight and polled together, handed on in order:
+        // memory holds at most `PARALLEL` ranges. Returning early drops those in flight, which
+        // cancels their requests.
         let mut next_from = offset;
-        let mut flying = std::collections::VecDeque::new(); // alloc: at most `PARALLEL` ranges in flight
-        let spawn = |start: u64| {
-            let to = start.saturating_add(PIECE - 1).min(total - 1);
-            let task = tokio::spawn(self.clone().piece(
-                url.to_owned(),
-                owned.clone(), // clone: each range asks with the download's headers
-                (start, to),
-                tag.clone(), // clone: as above
-                bounds,
-                download.counter(),
-            ));
-            (start, to, task)
-        };
+        let mut flying = VecDeque::with_capacity_in(PARALLEL, Global);
         while next_from < total || !flying.is_empty() {
             while flying.len() < PARALLEL && next_from < total {
-                let (start, to, task) = spawn(next_from);
+                let to = next_from.saturating_add(PIECE - 1).min(total - 1);
+                let work = self.clone().piece(
+                    url.to_owned(),
+                    owned.clone(), // clone: each range asks with the download's headers
+                    (next_from, to),
+                    tag.clone(), // clone: as above
+                    bounds,
+                    download.counter(),
+                );
+                flying.push_back((next_from, Range::Running(Box::pin(work))));
                 next_from = to + 1;
-                flying.push_back((start, task));
             }
-            let Some((start, mut task)) = flying.pop_front() else { break };
-            let joined = tick_until(async { (&mut task).await.map_err(anyhow::Error::from) }, || {
-                ticked(&download, watch, &said)
-            })
-            .await;
-            let bytes = match joined.and_then(|it| it) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    task.abort();
-                    for (_, other) in flying {
-                        other.abort();
-                    }
-                    return Err(error);
-                }
-            };
+            let joined = self
+                .tick_until(
+                    async {
+                        let front = front(&mut flying).await;
+                        Ok(front)
+                    },
+                    || ticked(&download, watch, &said),
+                )
+                .await?;
+            let Some((start, bytes)) = joined else { break };
+            let bytes = bytes?;
             debug_assert_eq!(start, offset);
             sink(offset, &bytes).with_context(|| format!("keeping the body of {said}"))?;
             offset += bytes.len() as u64;
         }
         watch(&download.line());
-        Ok(Response { status: 206, headers: head, body: Vec::new() })
+        Ok(Response { status: 206, headers: head, body: Vec::new_in(Global) })
     }
-}
 
-/// `work`, with `tick` run every [`TICK`] while it is not done; an error of `tick` (the stall
-/// bound) ends the wait with it.
-async fn tick_until<T>(
-    work: impl Future<Output = anyhow::Result<T>>,
-    mut tick: impl FnMut() -> anyhow::Result<()>,
-) -> anyhow::Result<T> {
-    let mut work = std::pin::pin!(work);
-    loop {
-        match tokio::time::timeout(TICK, &mut work).await {
-            Ok(done) => return done,
-            Err(_) => tick()?,
+    /// `work`, with `tick` run every [`TICK`] (on the driver's timer) while it is not done; an
+    /// error of `tick` (the stall bound) ends the wait with it, dropping `work`.
+    async fn tick_until<T>(
+        &self,
+        work: impl Future<Output = anyhow::Result<T>>,
+        mut tick: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<T> {
+        let mut work = std::pin::pin!(work);
+        // Each pass ends with `work` done or one tick, which ends the wait once the stall bound
+        // passes: no more passes than the stall bound has ticks.
+        loop {
+            match mailbox::race(work.as_mut(), self.http.sleep(TICK)).await {
+                Either::First(done) => return done,
+                Either::Second(()) => tick()?,
+            }
         }
     }
 }
@@ -616,7 +651,7 @@ async fn tick_until<T>(
 async fn next(answer: &mut Answer, url: &str) -> anyhow::Result<Event> {
     answer.next().await.with_context(|| {
         format!(
-            "asking {}: blaze-http's driver ended before the answer did (its runtime shut down, or its loop panicked)",
+            "asking {}: blaze-http's driver ended before the answer did (its thread stopped, or its loop panicked)",
             redact(url)
         )
     })
@@ -665,7 +700,7 @@ fn failed(error: blaze_http::Error) -> anyhow::Error {
 
 impl Http for HyperHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
-        self.send(Method::GET, url, headers, Vec::new())
+        self.send(Method::GET, url, headers, Vec::new_in(Global))
     }
 
     fn stream(
@@ -683,31 +718,21 @@ impl Http for HyperHttp {
             Ok(made) => made,
             Err(e) => return Box::pin(std::future::ready(Err(e))),
         };
-        let (client, in_flight) = (made.client.clone(), made.in_flight.clone());
+        // Sent now: the driver holds it in order behind the `IN_FLIGHT` in flight.
+        let answer = made.ask(Method::GET, url, headers, Vec::new_in(Global), Bounds::NONE);
         let url = url.to_owned();
-        let headers: Vec<(String, String)> =
-            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
-        let task = made.runtime.spawn(async move {
-            let _turn = in_flight.acquire_owned().await?;
-            let headers: Vec<(&str, &str)> =
-                headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-            client.fetch(Method::GET, &url, &headers, Vec::new(), Bounds::NONE).await
-        });
-        Box::pin(async move { task.await.context("a request's task ended")? })
+        Box::pin(async move { collect(answer, &url, Bounds::NONE).await })
     }
 
     fn sleep(&self, duration: Duration) -> Pending<()> {
         // A sleep only ever follows a request's spurious failure, which only a client made can
-        // give: one not made has no runtime to wait on, so the wait holds this thread, as
+        // give: one not made has no driver to wait on, so the wait holds this thread, as
         // [`Http::sleep`]'s does.
         let Ok(made) = self.made() else {
             super::wait_out(duration);
             return Box::pin(std::future::ready(()));
         };
-        let task = made.runtime.spawn(tokio::time::sleep(duration));
-        Box::pin(async move {
-            _ = task.await;
-        })
+        Box::pin(made.http.sleep(duration))
     }
 }
 
@@ -806,56 +831,45 @@ mod tests {
     /// Requests to one origin take turns on one kept-alive connection, so a server that counts
     /// its connections sees one for three requests; a port no one listens on is a [`Transport`]
     /// error (worth another try) naming the host, the port and the step that failed. The one
-    /// test of the tokio driver against real sockets; the client's rules are blaze-http's
-    /// tests, with no IO.
+    /// test of the native driver against real sockets; the client's rules are blaze-http's
+    /// tests, and its driver's are the simulation's, with no IO.
     #[test]
     fn requests_reuse_a_pooled_connection_and_a_refused_one_says_where() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let server = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let listener = server.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&accepted);
         // Answers every request on a connection with a two-byte 200 and keeps it open; it
-        // accepts at most four connections, and stops after a minute either way.
-        let serving = async move {
-            for _ in 0..4 {
-                let Ok((mut stream, _)) = listener.accept().await else { return };
-                counted.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut asked = Vec::new();
-                    let mut piece = [0u8; 1024];
-                    loop {
-                        let end = loop {
-                            if let Some(at) = asked.windows(4).position(|it| it == b"\r\n\r\n") {
-                                break at + 4;
-                            }
-                            match stream.read(&mut piece).await {
-                                Ok(0) | Err(_) => return,
-                                Ok(n) => asked.extend_from_slice(&piece[..n]),
-                            }
-                        };
-                        asked.drain(..end);
-                        if stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                });
-            }
-        };
+        // accepts at most four connections. Each connection's thread ends as its client closes
+        // it, and the process's end ends the rest.
         std::thread::Builder::new()
             .name("a keep-alive server".to_owned())
             .spawn(move || {
-                server.block_on(async move {
-                    _ = tokio::time::timeout(Duration::from_secs(60), serving).await
-                })
+                for _ in 0..4 {
+                    let Ok((mut stream, _)) = listener.accept() else { return };
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::thread::spawn(move || {
+                        let mut asked = Vec::new();
+                        let mut piece = [0u8; 1024];
+                        loop {
+                            let end = loop {
+                                if let Some(at) = asked.windows(4).position(|it| it == b"\r\n\r\n") {
+                                    break at + 4;
+                                }
+                                match stream.read(&mut piece) {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => asked.extend_from_slice(&piece[..n]),
+                                }
+                            };
+                            asked.drain(..end);
+                            if stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
             })
             .unwrap();
 

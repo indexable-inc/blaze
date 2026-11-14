@@ -15,21 +15,26 @@
 //! - [`Source`]: what a program serves: its `hello` fields, its live feed and its ops.
 //! - [`wasm`]: the explorer core a program serves the page ([`CoreWasm`]): `hello`'s `core`
 //!   and the `core` op's bytes.
-//! - [`serve`]: the driver: the transport, the sessions and the live stream, on a thread of its
-//!   own with a one-thread tokio runtime. A source's answers (and its live ticks) run on tokio's
-//!   blocking pool, so a slow one never holds up the live stream or another request.
+//! - [`serving`]: the server as one sans-IO state machine over blaze-http's HTTP/3 core: the
+//!   CONNECT rules, each request stream, each live stream and the certificate's rotation, on
+//!   an injected clock, asking for its timer as an effect and for a source's work as a job.
+//! - [`serve`]: the driver: the machine and blaze-http's HTTP/3 driver loop on one blaze-core
+//!   native driver, on a thread of its own. A source's answers (and its live ticks) run each on
+//!   a thread of its own, so a slow one never holds up the live stream or another request.
 
 pub mod cert;
 pub mod frame;
 pub mod link;
 mod server;
+pub mod serving;
 pub mod session;
 mod source;
 pub mod wasm;
 #[cfg(test)]
 mod tests;
 
-pub use server::{CHECK, Config, Explorer, SHUTDOWN, StartError, serve};
+pub use server::{Config, Explorer, StartError, serve};
+pub use serving::{CHECK, SHUTDOWN};
 pub use source::{
     Answer, Detail, ErrorHeader, Hello, Kind, Layer, Live, LiveTable, OpError, Rule, Source, Stop,
     Table, Tick,

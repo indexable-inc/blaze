@@ -161,11 +161,11 @@ theorem execStmt_absorb {B : FnId → Local → Prop} {g : List (Nat × FnId)} (
       have same : execStmt adts (st.put r.1 r.2.1 r.2.2) s = execStmt adts st s :=
         isOverwrite_exec adts hides r.2.2 fn hfn s hB (and_true_right ha)
       have kept : keepReps top s (r :: rest) = keepReps top s rest :=
-        (keepReps_cons top s r rest).trans (if_pos ha)
+        (keepReps_cons top s r rest).trans (ite_eq_left ha)
       rw [kept]
       exact inner.trans (congrTo (Outcome.map (fun x => puts x (keepReps top s rest))) same)
     · have kept : keepReps top s (r :: rest) = r :: keepReps top s rest :=
-        (keepReps_cons top s r rest).trans (if_neg ha)
+        (keepReps_cons top s r rest).trans (ite_eq_right ha)
       have fits : (st.top = r.1 ∧ stmtFine r.2.1 s = true) ∨ ¬ r.1 = st.top := by
         rw [htop]
         cases And.right (And.right hr) with

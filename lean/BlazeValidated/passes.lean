@@ -8,55 +8,85 @@ open Blaze Blaze.Mir
 namespace BlazeValidated.RemoveStorageMarkers.loops.count
 
 def before : Program :=
-  { adts := [{ name := "(u32, bool)", discr := ScalarTy.Isize, variants := [(0, [Ty.int ScalarTy.U32, Ty.bool])] }],
+  { adts := [{ name := "!", discr := ScalarTy.I128, variants := [] }, { name := "(u32, bool)", discr := ScalarTy.I128, variants := [(0, [Ty.int ScalarTy.U32, Ty.bool])] }],
     fns := [
       { name := "loops::count",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.bool, Ty.adt 0],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.unit, Ty.bool, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.adt 0, Ty.adt 1],
         blocks := [
           { stmts := [
               Statement.storageLive 2,
-              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0))),
+              Statement.nop,
+              Statement.storageLive 3],
             terminator := Terminator.goto 1 },
           { stmts := [
-              Statement.storageLive 3,
-              Statement.assign (Place.mk 3 []) (Rvalue.binary BinOp.lt (Operand.copy (Place.mk 2 [])) (Operand.copy (Place.mk 1 [])))],
-            terminator := Terminator.switchInt (Operand.move (Place.mk 3 [])) [(0, 2)] 3 },
+              Statement.storageLive 4,
+              Statement.storageLive 5,
+              Statement.storageLive 6,
+              Statement.assign (Place.mk 6 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.storageLive 7,
+              Statement.assign (Place.mk 7 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.assign (Place.mk 5 []) (Rvalue.binary BinOp.lt (Operand.move (Place.mk 6 [])) (Operand.move (Place.mk 7 []))),
+              Statement.storageDead 7,
+              Statement.storageDead 6],
+            terminator := Terminator.switchInt (Operand.copy (Place.mk 5 [])) [(1, 2)] 3 },
+          { stmts := [
+              Statement.storageLive 8,
+              Statement.assign (Place.mk 10 []) (Rvalue.withOverflow BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
+            terminator := Terminator.assert (Operand.move (Place.mk 10 [ProjElem.field 1])) false Error.arithmetic 4 },
+          { stmts := [
+              Statement.storageLive 9,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 9,
+              Statement.storageDead 5,
+              Statement.storageDead 4],
+            terminator := Terminator.goto 5 },
+          { stmts := [
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.move (Place.mk 10 [ProjElem.field 0]))),
+              Statement.assign (Place.mk 8 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 8,
+              Statement.assign (Place.mk 4 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 4,
+              Statement.storageDead 5],
+            terminator := Terminator.goto 1 },
           { stmts := [
               Statement.storageDead 3,
               Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
-              Statement.storageDead 2],
-            terminator := Terminator.ret },
-          { stmts := [
-              Statement.storageDead 3,
-              Statement.assign (Place.mk 4 []) (Rvalue.withOverflow BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
-            terminator := Terminator.assert (Operand.move (Place.mk 4 [ProjElem.field 1])) false Error.arithmetic 4 },
-          { stmts := [
-              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.move (Place.mk 4 [ProjElem.field 0])))],
-            terminator := Terminator.goto 1 }] }] }
+              Statement.storageDead 2,
+              Statement.storageDead 1],
+            terminator := Terminator.ret }] }] }
 
 def after : Program :=
-  { adts := [{ name := "(u32, bool)", discr := ScalarTy.Isize, variants := [(0, [Ty.int ScalarTy.U32, Ty.bool])] }],
+  { adts := [{ name := "!", discr := ScalarTy.I128, variants := [] }, { name := "(u32, bool)", discr := ScalarTy.I128, variants := [(0, [Ty.int ScalarTy.U32, Ty.bool])] }],
     fns := [
       { name := "loops::count",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.bool, Ty.adt 0],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.unit, Ty.bool, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.adt 0, Ty.adt 1],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0))),
+              Statement.nop],
             terminator := Terminator.goto 1 },
           { stmts := [
-              Statement.assign (Place.mk 3 []) (Rvalue.binary BinOp.lt (Operand.copy (Place.mk 2 [])) (Operand.copy (Place.mk 1 [])))],
-            terminator := Terminator.switchInt (Operand.move (Place.mk 3 [])) [(0, 2)] 3 },
+              Statement.assign (Place.mk 6 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.assign (Place.mk 7 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.assign (Place.mk 5 []) (Rvalue.binary BinOp.lt (Operand.move (Place.mk 6 [])) (Operand.move (Place.mk 7 [])))],
+            terminator := Terminator.switchInt (Operand.copy (Place.mk 5 [])) [(1, 2)] 3 },
+          { stmts := [
+              Statement.assign (Place.mk 10 []) (Rvalue.withOverflow BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
+            terminator := Terminator.assert (Operand.move (Place.mk 10 [ProjElem.field 1])) false Error.arithmetic 4 },
+          { stmts := [
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.const Const.unit))],
+            terminator := Terminator.goto 5 },
+          { stmts := [
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.move (Place.mk 10 [ProjElem.field 0]))),
+              Statement.assign (Place.mk 8 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.assign (Place.mk 4 []) (Rvalue.use (Operand.const Const.unit))],
+            terminator := Terminator.goto 1 },
           { stmts := [
               Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 [])))],
-            terminator := Terminator.ret },
-          { stmts := [
-              Statement.assign (Place.mk 4 []) (Rvalue.withOverflow BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
-            terminator := Terminator.assert (Operand.move (Place.mk 4 [ProjElem.field 1])) false Error.arithmetic 4 },
-          { stmts := [
-              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.move (Place.mk 4 [ProjElem.field 0])))],
-            terminator := Terminator.goto 1 }] }] }
+            terminator := Terminator.ret }] }] }
 
 /-- `RemoveStorageMarkers` did to `loops::count` what its specification does. -/
 example : after = Opt.removeStorageMarkers before := rfl
@@ -73,12 +103,15 @@ def before : Program :=
         locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [],
-            terminator := Terminator.switchInt (Operand.const (Const.bool true)) [(0, 1)] 2 },
-          { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
-            terminator := Terminator.ret },
+            terminator := Terminator.switchInt (Operand.const (Const.bool true)) [(1, 1)] 2 },
           { stmts := [
               Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }
 
 def after : Program :=
@@ -89,12 +122,15 @@ def after : Program :=
         locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32],
         blocks := [
           { stmts := [],
-            terminator := Terminator.goto 2 },
-          { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
-            terminator := Terminator.ret },
+            terminator := Terminator.goto 1 },
           { stmts := [
               Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.storageDead 1],
             terminator := Terminator.ret }] }] }
 
 /-- `SimplifyConstCondition` did to `consts::pick` what its specification does. -/

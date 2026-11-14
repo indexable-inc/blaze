@@ -150,6 +150,9 @@ impl DefMap {
                         | "linear"
                         | "consumes"
                         | "holds"
+                        // `#[blaze::theorem]`, from `AttrFlags::THEOREM` (`hir-ty-lean`,
+                        // docs/v2/plan/design/proofs-for-sans-io.md).
+                        | "theorem"
                         // `#![blaze::arbitrary_ints]`, from `DefMap::arbitrary_ints`
                         // (docs/v2/plan/design/arbitrary-ints.md).
                         | "arbitrary_ints"
