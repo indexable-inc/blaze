@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far (2026-11-13): the attribute, methods and theorem statements in the translator, `Blaze.Machine`, `blaze_auto`, and two theorem functions of the translator's fixture crate proved; `blaze prove` is written and not yet run; nothing of a real crate is proved. Reviewed from outside the work on 2026-11-13 (its changes are in).
+summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far (2026-11-13): the attribute; methods, integer and Option primitives and theorem statements in the translator; `Blaze.Machine`; `blaze_auto`; the plan of a proof check; `blaze prove` on the first driver (no sandbox yet); and the first proofs of blaze's own code, blaze-core's ETXTBSY retry schedule (two theorems, one sampled test deleted). No world model, no state machine and no simulation test yet. Reviewed from outside the work on 2026-11-13 (its changes are in).
 date: 2026-11-13
 ---
 # Proofs in place of simulation tests
@@ -235,9 +235,9 @@ Not started. The first target is formal-verification.md's (the flight recorder's
 
 ## Order of work
 
-1. The pipeline on one real function with nothing new in the translator:
-   `quiet_turns_after` (blaze-cargo). `#[blaze::theorem]`, `blaze prove`, the first
-   `(proved: ..)` in invariants.md, its table test deleted.
+1. The pipeline on real functions of blaze (done 2026-11-13 for
+   `blaze_core::busy`: two theorems proved, one sampled test deleted; held by the lake gate
+   and a golden test until `blaze prove`'s driver is the gate).
 2. Opaque items, methods and `Duration`: the wait's retry step (`Retry::left`, `Retry::after`
    in `blaze_core::wait::retry`) against a clock world. Its loop `drive` (a closure and a
    trait bound) follows with steps b and c; until then the DST stays.
