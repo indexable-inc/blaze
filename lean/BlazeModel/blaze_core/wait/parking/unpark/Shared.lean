@@ -8,13 +8,13 @@ import BlazeModel.blaze_core.wait.parking.Shared.Futex.wake
 open Blaze
 set_option linter.unusedVariables false
 
+def blaze_core.wait.parking.unpark.Shared.at_1 (kernel : blaze_core.wait.parking.Shared) (word : core.sync.atomic.Atomic .U32) (t0 : U32) : Threads.Prog Unit :=
+  if Scalar.eq t0 (4294967295 : U32) then do
+    let _ ← blaze_core.wait.parking.Shared.Futex.wake kernel word
+    Threads.Prog.done (Result.ok ())
+  else Threads.Prog.done (Result.ok ())
+
 def blaze_core.wait.parking.unpark.Shared (word : core.sync.atomic.Atomic .U32) (kernel : blaze_core.wait.parking.Shared) : Threads.Prog Unit := do
   let t0 ←
     core.sync.atomic.Atomic.swap word (1 : U32) (core.sync.atomic.Ordering.Release : core.sync.atomic.Ordering)
-  let t1 := Scalar.eq t0 (4294967295 : U32)
-  let _ ←
-    if t1 then do
-      let _ ← blaze_core.wait.parking.Shared.Futex.wake kernel word
-      Threads.Prog.done (Result.ok ())
-    else Threads.Prog.done (Result.ok ())
-  Threads.Prog.done (Result.ok ())
+  blaze_core.wait.parking.unpark.Shared.at_1 kernel word t0
