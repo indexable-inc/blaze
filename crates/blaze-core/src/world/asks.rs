@@ -720,6 +720,7 @@ fn synced_append(
 // when its proof (crates/blaze-core/lean/BlazeCore/World/Asks.lean) lands: `#[blaze::theorem]`
 // here, and "(proved: that file)" in the first line above. Until then it is no theorem of
 // `blaze prove`'s, which exits 1 on one that is stated and not proved.
+#[blaze::theorem]
 pub fn a_synced_append_survives_a_crash(
     disk: Disk,
     file: u64,

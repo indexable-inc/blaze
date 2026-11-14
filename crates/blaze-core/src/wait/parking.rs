@@ -242,6 +242,7 @@ fn parks(plant: ParkPlant, schedule: &[Step], now: Duration, deadline: Option<De
 // here, and "(proved: that file)" in the first line above. Until then it is no theorem of
 // `blaze prove`'s, which exits 1 on one that is stated and not proved.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
 pub(crate) fn no_unpark_is_lost(schedule: Vec<Step>, now: Duration, deadline: Option<Duration>) -> bool {
     let deadline = match deadline {
         Some(at) => Some(Deadline::at(at)),
