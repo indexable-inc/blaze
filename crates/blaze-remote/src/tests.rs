@@ -515,7 +515,7 @@ fn a_private_segment_is_never_pushed_to_public() {
     let refused = Push::new(plan(&w, Namespace::PUBLIC, &segs, Vec::new(), true)).err().expect("refused");
     assert!(matches!(refused, Failure::Refused(ref it) if matches!(it.why, Why::Private { .. })), "{refused}");
     assert_eq!(store.borrow().requests, 0);
-    planted(Plant::SkipPrivacy, || push_with(&w, &store, Namespace::PUBLIC, &segs, 1, Faults::default(), true)).expect("pushed with the plant");
+    planted(Plant::SkipPrivacy, || push_with(&w, &store, Namespace::PUBLIC, &segs, &Tape::seeded(1), Faults::default(), true)).expect("pushed with the plant");
     assert!(oracle(&w, &store, Namespace::PUBLIC, &Records::new(), &Records::new()).is_err(), "the planted privacy hole went unseen");
 }
 
@@ -536,7 +536,7 @@ fn a_different_value_under_a_pushed_key_is_refused() {
     let (w, store, recs) = pushed_world(10);
     let first: Records = recs.iter().take(5).map(|(k, v)| (*k, v.clone())).collect();
     let segs = segments_of(Namespace::PUBLIC, &changed(&first), 5);
-    let out = push_with(&w, &store, Namespace::PUBLIC, &segs, 1, Faults::default(), true);
+    let out = push_with(&w, &store, Namespace::PUBLIC, &segs, &Tape::seeded(1), Faults::default(), true);
     assert!(matches!(out, Err(Failure::Refused(ref it)) if matches!(it.why, Why::NotDeterministic { .. }) && it.key.is_some()), "{out:?}");
     oracle(&w, &store, Namespace::PUBLIC, &recs, &Records::new()).expect("the bucket as it was");
 }
