@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-109 theorems: 96 in `lean`, 13 in `lean/analysis`.
+111 theorems: 98 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1050,4 +1050,35 @@ theorem blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof :
 ```lean
 theorem blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof :
     blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.statement
+```
+
+## V17
+
+**`Blaze.Threads.two_ends`** (`Blaze.ThreadsAuto`, `lean`): The induction principle for two threads run by a schedule (Blaze.Threads.two): an invariant over the two threads' remaining programs, the shared world and the schedule steps left, which every step of either thread with any pick of the world's keeps, gives, for every schedule, that the run ends and how each thread stood satisfies what the invariant gives with no step left.
+
+```lean
+theorem two_ends {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop)
+    (first : ∀ n a b w pick, Inv (n + 1) a b w → Advance 1 pick a w (fun a' w' => Inv n a' b w'))
+    (second : ∀ n a b w pick, Inv (n + 1) a b w → Advance 2 pick b w (fun b' w' => Inv n a b' w'))
+    (Post : Ended α → Ended β → World → Prop)
+    (last : ∀ a b w, Inv 0 a b w →
+      ∃ ea eb w', (two [] a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w')
+    (schedule : List Step) (a : Prog α) (b : Prog β) (w : World)
+    (h : Inv schedule.length a b w) :
+    ∃ ea eb w', (two schedule a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w'
+```
+
+**`Blaze.Tests.ThreadsPark.no_unpark_is_lost`** (`Blaze.Tests.ThreadsParkProof`, `lean`): Of a park and an unpark on one word ordered as crates/blaze-core/src/wait/parking.rs orders their atomics, written by hand as programs over Blaze.Threads (a futex wait and wake, a compare-and-swap, a swap): for every schedule of the two threads and every pick of the world's (spurious returns, timeouts), no run ends with the unpark returned and the park asleep with no wake coming; where both returned the token was taken once and the word is empty, or the park left at its timeout before the token came and it is still there; and a park with no time limit returns only with a token.
+
+```lean
+theorem no_unpark_is_lost (timed : Bool) (schedule : List Step) :
+    ∃ fuel parked unparked last,
+      (run park fuel timed schedule).value = .ok (parked, unparked, last) ∧
+      -- the unpark returned: the park is not asleep with no wake coming
+      (unparked = .Done () → parked ≠ .Asleep) ∧
+      -- both returned: the token was taken once, or the park left at its timeout before it came and it is still there
+      (∀ took, parked = .Done took → unparked = .Done () →
+          (took = true ∧ last.val = EMPTY.val) ∨ (took = false ∧ timed = true ∧ last.val = NOTIFIED.val)) ∧
+      -- a park with no time limit returns only with a token
+      (∀ took, parked = .Done took → timed = false → took = true)
 ```
