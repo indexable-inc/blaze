@@ -326,6 +326,7 @@ name = "astlog-core"
 version = "0.0.0"
 dependencies = [
  "ast-merge-langs",
+ "astlog-engine",
  "blaze-hash",
  "edit-applier",
  "ignore",
@@ -333,6 +334,16 @@ dependencies = [
  "snafu",
  "tempfile",
  "tree-sitter",
+]
+
+[[package]]
+name = "astlog-engine"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-sim",
+ "regex",
+ "snafu",
 ]
 
 [[package]]
@@ -481,6 +492,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-astlog"
+version = "0.0.0"
+dependencies = [
+ "astlog-engine",
+ "base-db",
+ "blaze-api",
+ "blaze-hash",
+ "blaze-intent",
+ "blaze-query",
+ "blaze-vfs",
+ "either",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "memchr",
+ "snafu",
+ "syntax",
+]
+
+[[package]]
 name = "blaze-audit"
 version = "0.0.0"
 dependencies = [
@@ -540,6 +571,7 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-api",
+ "blaze-astlog",
  "blaze-audit",
  "blaze-build-script",
  "blaze-cas",
@@ -624,6 +656,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "similar",
  "span",
  "stdx",
  "syntax",

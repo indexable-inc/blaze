@@ -43,6 +43,7 @@ pub mod goal;
 pub mod http;
 pub mod intent;
 pub mod json;
+pub mod query;
 pub mod server;
 pub mod session;
 pub mod units;
@@ -133,7 +134,9 @@ use serde::{Deserialize, Serialize};
 /// name, and for a changed ask which one with its answers then and now.
 /// 61: [`ProofRecord::ModelBroken`]: a theorem whose generated Lean model Lean refuses,
 /// answered as blaze's bug with Lean's first error, proof file or none, never `Open`.
-pub const SCHEMA: u32 = 61;
+/// 62: [`Edit::Rules`], an astlog rules file's rewrites as one edit, and [`Request::Query`] and
+/// [`Response::Rows`] ([`query::Rows`]): its relations and findings, as data, nothing written.
+pub const SCHEMA: u32 = 62;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -381,11 +384,13 @@ pub enum Request {
     Stop,
     /// Edits by meaning, applied in the front end to `base` and committed to `head` as
     /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
-    /// [`Response::Committed`] once durable. The view's proc macros and build scripts' runs,
-    /// which its front end applies before it resolves a name as rustc would, are built first.
+    /// [`Response::Committed`] once durable. With no `head`, a dry run: answered with
+    /// [`Response::Edited`] and `Done`, nothing committed. The view's proc macros and build
+    /// scripts' runs, which its front end applies before it resolves a name as rustc would, are
+    /// built first.
     Edit {
         base: ContentId,
-        head: String,
+        head: Option<String>,
         edits: Vec<Edit>,
     },
     /// Declared intent: the tests `filter` selects in the view will be run soon. What they
@@ -537,6 +542,14 @@ pub enum Request {
         client: String,
         targets: Targets,
         wait_ms: u64,
+    },
+    /// An astlog rules file run over the view's front end and nothing written: every relation
+    /// it derives and every lint's finding, answered with one [`Response::Rows`]
+    /// (docs/v2/plan/design/astlog-sema.md). Builds only the view's proc macros and build
+    /// scripts' runs, applied before the rules read it, as [`Request::Edit`] does.
+    Query {
+        view: ViewRef,
+        rules: String,
     },
     /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
     /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
@@ -1064,6 +1077,8 @@ pub enum Response {
     /// What a test run asked of one test executable, said once per executable: what a client
     /// refusing a run of none names.
     TestsOf(TestsOf),
+    /// [`Request::Query`]'s one answer.
+    Rows(query::Rows),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -2415,6 +2430,104 @@ mod tests {
         assert!(keys.is_sorted(), "{keys:?}: {bytes:02x?}");
         assert!(bytes.ends_with(&[0x67, b'w', b'a', b'i', b't', b'_', b'm', b's', 0x19, 0x4e, 0x20]));
         assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
+    }
+
+    /// `Request::Query`, `Edit::Rules` and `Response::Rows` are written in the codec's key
+    /// order: each one's bytes pinned whole, so a field renamed or reordered is a schema change
+    /// this test names.
+    #[test]
+    fn a_rules_query_and_its_rows_are_written_in_key_order() {
+        let key = |want: &mut Vec<u8>, key: &str| {
+            want.push(0x60 | key.len() as u8);
+            want.extend_from_slice(key.as_bytes());
+        };
+
+        let request =
+            Request::Query { view: ViewRef::Head("/w".to_owned()), rules: "(r)".to_owned() };
+        let bytes = blaze_protocol::cbor::to_vec(&request).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Query");
+        want.push(0xa2);
+        key(&mut want, "view");
+        want.push(0xa1);
+        key(&mut want, "Head");
+        key(&mut want, "/w");
+        key(&mut want, "rules");
+        key(&mut want, "(r)");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
+
+        let edit = Edit::Rules { rules: "(r)".to_owned() };
+        let bytes = blaze_protocol::cbor::to_vec(&edit).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Rules");
+        want.push(0xa1);
+        key(&mut want, "rules");
+        key(&mut want, "(r)");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Edit>(&bytes).unwrap(), edit);
+
+        let code = query::Cell::Code {
+            end: 2,
+            line: Some(1),
+            path: "a".to_owned(),
+            text: "x".to_owned(),
+            start: 1,
+        };
+        let rows = Response::Rows(query::Rows {
+            findings: vec![query::Finding {
+                at: None,
+                message: "m".to_owned(),
+                relation: "r".to_owned(),
+                severity: query::Severity::Warning,
+            }],
+            relations: vec![query::Relation {
+                name: "r".to_owned(),
+                rows: vec![vec![code, query::Cell::Int(-1)]],
+                columns: vec!["e".to_owned(), "n".to_owned()],
+            }],
+        });
+        let bytes = blaze_protocol::cbor::to_vec(&rows).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Rows");
+        want.push(0xa2);
+        key(&mut want, "findings");
+        want.extend_from_slice(&[0x81, 0xa4]);
+        key(&mut want, "at");
+        want.push(0xf6);
+        key(&mut want, "message");
+        key(&mut want, "m");
+        key(&mut want, "relation");
+        key(&mut want, "r");
+        key(&mut want, "severity");
+        key(&mut want, "Warning");
+        key(&mut want, "relations");
+        want.extend_from_slice(&[0x81, 0xa3]);
+        key(&mut want, "name");
+        key(&mut want, "r");
+        key(&mut want, "rows");
+        want.extend_from_slice(&[0x81, 0x82, 0xa1]);
+        key(&mut want, "Code");
+        want.push(0xa5);
+        key(&mut want, "end");
+        want.push(0x02);
+        key(&mut want, "line");
+        want.push(0x01);
+        key(&mut want, "path");
+        key(&mut want, "a");
+        key(&mut want, "text");
+        key(&mut want, "x");
+        key(&mut want, "start");
+        want.push(0x01);
+        want.push(0xa1);
+        key(&mut want, "Int");
+        want.push(0x20);
+        key(&mut want, "columns");
+        want.push(0x82);
+        key(&mut want, "e");
+        key(&mut want, "n");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Response>(&bytes).unwrap(), rows);
     }
 
     /// A run's output is one byte string; JSON shows it as the array of numbers it was.

@@ -330,6 +330,18 @@ pub(crate) fn replace(
     Ok(())
 }
 
+/// The items a def path names, in the type and then the value namespace, read as a replace
+/// reads its `from`: a crate's name, then the item's path in it, of the crate by that name the
+/// view's crates (`view`) are or depend on. astlog's patterns (`blaze-astlog`) name items so.
+///
+/// # Errors
+///
+/// A path that names no item, names a module, a macro or a builtin type, or starts at no one
+/// crate of the build.
+pub fn items_at(db: &Db, view: &[Crate], path: &str) -> Result<Vec<ModuleDef>, String> {
+    Ok(def_of(db, view, path)?.names.into_iter().flatten().collect())
+}
+
 /// The item `path` names: a crate's name (as its `[lib]` is named), then the item's path in
 /// it. Of several crates by that name, the one the view's crates depend on.
 fn def_of(db: &Db, view: &[Crate], path: &str) -> Result<Def, String> {

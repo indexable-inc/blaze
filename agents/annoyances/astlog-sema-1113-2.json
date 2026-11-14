@@ -1,0 +1,14 @@
+{
+ "id": "astlog-sema-1113-2",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, lane astlog-sema-1113",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::lower (takes roots.fronts[root]), stored_kept (the only give-back, after a build)",
+ "what": "A job that lowers a view and builds nothing (Request::Query; Edit and Reach the same way) takes the root kept front end and never gives it back, so each one lowers the view again. Release blaze of 24b499d29c on blaze-vm, a three-file crate: a query repeated before any check takes 4.2 s each time, the same query right after a `blaze check` 0.9 s, and the next one 4.2 s again by the same reasoning (measured on the Mac debug build: 0.59 s then 19 s).",
+ "cost": "about 3.3 s of every query on a tiny crate, more on a large view; the first whole-workspace query on a cold debug daemon did not answer in 46 minutes",
+ "cause": "only a build ends by writer.keep() and store_kept; a read-only job drops the front end it took",
+ "class": "a read-only job that consumes kept state it did not change",
+ "prevention": "a read-only job hands the front end back to its root when it ends, and a serve test counts lowerings across two queries of one unchanged view",
+ "workaround": "none short of running `blaze check` before each query",
+ "fix": "not yet: follow-up branch astlog-daemon-1113",
+ "state": "open"
+}
