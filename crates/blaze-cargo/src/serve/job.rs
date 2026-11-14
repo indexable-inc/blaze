@@ -121,6 +121,11 @@ thread_local! {
     /// written, after the build settled, not as its own build left it, as it did until
     /// 2026-11-14: a file another request placed there meanwhile is named as this answer's.
     pub(super) static PLANT_CERTIFY_SHARED_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the request certificate said of each request that became a job (why it was not
+    /// checked, or why its check missed: `job: ..`) and of each build whose certificate was
+    /// not written (`not written: ..`), in order, each in its own words: what a test whose
+    /// premise is a certificate's answer says when none answered.
+    pub(super) static CERTIFY_WORDS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
     /// its message. What a test reads of a table only the history's thread writes.
     pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -5151,6 +5156,11 @@ impl<S: Steps> Jobs<S> {
         walks: Option<(String, ContentId)>,
     ) {
         let refused = self.refused.take();
+        #[cfg(test)]
+        CERTIFY_WORDS.with_borrow_mut(|it| {
+            let why = refused.as_deref().or(walks.as_ref().map(|it| it.0.as_str()));
+            it.push(format!("job: {}", why.unwrap_or("no word of the certificate"))); // alloc: a test's record
+        });
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job

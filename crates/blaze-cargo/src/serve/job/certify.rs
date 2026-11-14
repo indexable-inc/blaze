@@ -1348,12 +1348,16 @@ impl<S: Steps> Jobs<S> {
                 Ok(walked) => walked,
                 Err(why) => {
                     tracing::info_span!(target: "blaze", "request certificate: not written", root, why = %why).in_scope(|| {});
+                    #[cfg(test)]
+                    super::CERTIFY_WORDS.with_borrow_mut(|it| it.push(format!("not written: {why}")));
                     continue;
                 }
             };
             if let Err(why) = self.certify_write(w, root, shape, walked, &left) {
                 tracing::info_span!(target: "blaze", "request certificate: not written", root, why = %why).in_scope(|| {});
                 tracing::warn!(target: "blaze", root, "{why}");
+                #[cfg(test)]
+                super::CERTIFY_WORDS.with_borrow_mut(|it| it.push(format!("not written: {why}")));
             }
         }
     }

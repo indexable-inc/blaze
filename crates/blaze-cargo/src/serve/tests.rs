@@ -5717,7 +5717,7 @@ fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
 fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
     for seed in 330..336 {
         let steps = shared_path_certified(seed, false, false);
-        for (at, (command, certified, contents, recorded, placed, _)) in steps.iter().enumerate() {
+        for (at, (command, certified, contents, recorded, placed, _, _)) in steps.iter().enumerate() {
             let own = image_of(command);
             let key = ContentId::of("blaze serve tests output", own).0;
             assert_eq!(&contents[..], own, "seed {seed}: step {at} ({command}) answered with another's file at {APP_AT}");
@@ -5733,8 +5733,15 @@ fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
         }
         // The certificate is in play: each command's repeat after its own settled answer is
         // its certificate's.
-        let repeats: Vec<_> = steps.iter().map(|it| it.1).collect();
-        assert!(repeats[5] && repeats[7], "seed {seed}: a repeat was not the certificate's: {repeats:?}");
+        for at in [5, 7] {
+            let (command, certified, .., said) = &steps[at];
+            assert!(
+                *certified,
+                "seed {seed}: step {at} ({command}), a repeat, was not the certificate's; it said, with the step \
+                 before it: {:?} then {said:?}",
+                steps[at - 1].6
+            );
+        }
     }
 }
 
@@ -5746,7 +5753,11 @@ fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
 fn the_oracle_catches_a_certificate_named_by_the_record_at_its_write() {
     let steps = shared_path_certified(330, true, false);
     let caught = steps.iter().any(|(command, _, contents, ..)| &contents[..] != image_of(command));
-    assert!(caught, "the planted bug's answers went unseen: {:?}", steps.iter().map(|it| (it.0, it.1)).collect::<Vec<_>>());
+    assert!(
+        caught,
+        "the planted bug's answers went unseen: {:?}",
+        steps.iter().map(|it| (it.0, it.1, &it.6)).collect::<Vec<_>>()
+    );
 }
 
 /// The invariant: the record's word costs no IO. The run asked after the build placed its
@@ -5757,11 +5768,26 @@ fn a_certificate_whose_outputs_record_holds_another_key_misses_with_no_read_of_i
     let real = shared_path_certified(331, false, false);
     let planted = shared_path_certified(331, false, true);
     assert_eq!(&planted[3].2[..], RUN_APP, "the planted check still ends with the run's own file");
+    // The premise: with the record's word the run's check missed by it, and without it the
+    // check went on to look at the file; each says so in its own words.
+    let placed_by_record = "holds another request's placement by the daemon's record";
+    assert!(
+        real[3].6.iter().any(|it| it.contains(placed_by_record)),
+        "step 3's check did not miss by the record: {:?}",
+        real[3].6
+    );
+    assert!(
+        !planted[3].6.iter().any(|it| it.contains(placed_by_record)),
+        "the planted check still missed by the record: {:?}",
+        planted[3].6
+    );
     assert!(
         planted[3].5 >= real[3].5 + APP.len() as u64,
-        "the record spared no read of {APP_AT}: {} bytes read with it, {} without",
+        "the record spared no read of {APP_AT}: {} bytes read with it ({:?}), {} without ({:?})",
         real[3].5,
-        planted[3].5
+        real[3].6,
+        planted[3].5,
+        planted[3].6
     );
 }
 
@@ -5786,10 +5812,11 @@ fn cargo_asked(command: &str) -> Request {
 }
 
 /// One answer of [`shared_path_certified`]: the cargo command asked, whether its certificate
-/// answered it (no lowering: no job), the file at [`APP_AT`] once it answered, the key the
-/// jobs' record holds for that path then, how many times it placed that path, and the bytes
-/// the driver read for it.
-type Certified = (&'static str, bool, Vec<u8>, Option<[u8; 32]>, usize, u64);
+/// answered it (no job began), the file at [`APP_AT`] once it answered, the key the jobs'
+/// record holds for that path then, how many times it placed that path, the bytes the driver
+/// read for it, and what the certificate said of it and of its settling, in its own words
+/// ([`super::job::CERTIFY_WORDS`]): why it became a job, why no certificate was written.
+type Certified = (&'static str, bool, Vec<u8>, Option<[u8; 32]>, usize, u64, Vec<String>);
 
 /// `run`, `run`, `build`, `run`, `build`, `build`, `run`, `run` of one checkout on one daemon,
 /// a run's image of the program another value than a build's ([`RUN_IMAGE`]). The first run
@@ -5800,7 +5827,7 @@ type Certified = (&'static str, bool, Vec<u8>, Option<[u8; 32]>, usize, u64);
 /// request. `shared`:
 /// [`super::job::PLANT_CERTIFY_SHARED_RECORD`]; `unrecorded`: [`super::job::PLANT_HIT_UNRECORDED`].
 fn shared_path_certified(seed: u64, shared: bool, unrecorded: bool) -> Vec<Certified> {
-    use super::job::{PLACED_PATHS, PLANT_CERTIFY_SHARED_RECORD, PLANT_HIT_UNRECORDED};
+    use super::job::{CERTIFY_WORDS, PLACED_PATHS, PLANT_CERTIFY_SHARED_RECORD, PLANT_HIT_UNRECORDED};
     OUTPUT.set(true);
     RUN_IMAGE.set(true);
     PLANT_CERTIFY_SHARED_RECORD.set(shared);
@@ -5817,16 +5844,18 @@ fn shared_path_certified(seed: u64, shared: bool, unrecorded: bool) -> Vec<Certi
             daemon.driver().hold_syncs(store_dir());
         }
         PLACED_PATHS.with_borrow_mut(Vec::clear);
-        let lowered = || ANEW.get() + INTO_KEPT.get();
-        let (before, lowerings) = (daemon.driver().bytes_read(), lowered());
+        CERTIFY_WORDS.with_borrow_mut(Vec::clear);
+        let before = daemon.driver().bytes_read();
         let id = client.send(&mut daemon, cargo_asked(command));
         let got = client.wait(&mut daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: step {at} ({command}): {got:#?}");
         let read = daemon.driver().bytes_read() - before;
-        // A job lowers its view (a plan kept or not); a certificate's answer is no job.
-        let certified = lowered() == lowerings;
+        // A request that became a job says so as its job begins (`job: ..`, with the
+        // certificate's word of why); a certificate's answer is no job.
+        let certified = !CERTIFY_WORDS.with_borrow(|it| it.iter().any(|it| it.starts_with("job: ")));
         let placed = PLACED_PATHS.with_borrow(|it| it.iter().filter(|it| *it == APP_AT).count());
-        out.push((command, certified, daemon.driver().contents(&app), daemon.placed_key(APP_AT), placed, read));
+        let mut said = CERTIFY_WORDS.with_borrow_mut(std::mem::take);
+        let (contents, recorded) = (daemon.driver().contents(&app), daemon.placed_key(APP_AT));
         if at == 3 {
             daemon.driver().release_held(Duration::ZERO);
         }
@@ -5835,6 +5864,9 @@ fn shared_path_certified(seed: u64, shared: bool, unrecorded: bool) -> Vec<Certi
             settle(&mut daemon, &mut client);
             turn_until(&mut daemon, |it| it.settled());
         }
+        // What its settling said of its certificate (`not written: ..`) is this step's too.
+        said.extend(CERTIFY_WORDS.with_borrow_mut(std::mem::take));
+        out.push((command, certified, contents, recorded, placed, read, said));
     }
     PLANT_HIT_UNRECORDED.set(false);
     PLANT_CERTIFY_SHARED_RECORD.set(false);
