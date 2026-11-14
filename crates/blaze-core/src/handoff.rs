@@ -144,12 +144,13 @@ fn hands(schedule: &[Step], flagged: bool) -> bool {
 /// clear as they begin: where both returned, the driver read the sender's slot after its
 /// drain, or the sender was told to wake the driver ([`hands`]). It is the orderings that
 /// make it so: the two swaps of the flag are one after the other, and the later acquires what
-/// the earlier released. Run on drawn schedules below; not yet proved, and not yet a
-/// `#[blaze::theorem]` (the translator states a theorem in the weak memory once
-/// decision D46's part of it lands). Its control is
+/// the earlier released. Run on drawn schedules below; not yet proved. Its control is
 /// `the_oracle_catches_a_flag_swapped_relaxed`.
+// when its proof (crates/blaze-core/lean/BlazeCore/Handoff.lean) lands: "(proved: that file)" in
+// the first line above. Until then a landing branch drops the attribute below.
 #[cfg(not(blaze_check))]
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
 pub(crate) fn no_hand_back_is_missed(schedule: Vec<Step>, flagged: bool) -> bool {
     hands(&schedule, flagged)
 }
