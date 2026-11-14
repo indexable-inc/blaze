@@ -14,12 +14,15 @@
 //!    `def <fn>.spec.statement : Prop`, the theorem its clauses state. It imports the library
 //!    and the modules of the functions it calls, nothing else. Emitting twice gives the same
 //!    bytes.
-//! 4. [`check`]: the pinned Lean ([`LEAN_VERSION`], from `BLAZE_LEAN_PROVER`) compiles the
-//!    library, the models and the crate's proof file, then a check module that states
-//!    `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof` and prints its axioms. The
-//!    proof file names the statement and never restates it, so a statement that changed is
-//!    an elaboration error naming the theorem. Proved means: Lean accepts it, and its axioms
-//!    are among [`ALLOWED_AXIOMS`] (so no `sorry`, no native evaluation).
+//! 4. [`plan`]: the check of the proofs, a sans-IO core. From a crate's theorems and the text
+//!    of its proof files, the files to write and the runs of the pinned Lean
+//!    ([`LEAN_VERSION`]) to make: the library, the models, the proof files, and for each
+//!    theorem a check module that states `theorem <fn>.spec.checked : <fn>.spec.statement :=
+//!    <fn>.spec.proof` and prints its axioms. The proof file names the statement and never
+//!    restates it, so a statement that changed is an elaboration error naming the theorem.
+//!    Proved means: Lean accepts it, and its axioms are among [`ALLOWED_AXIOMS`] (so no
+//!    `sorry`, no native evaluation). Who runs Lean is the plan's driver (the daemon, for
+//!    `blaze prove`), in blaze's sandbox; nothing in this crate starts a process.
 //!
 //! Beside the functional translation, [`embed_mir`] writes a function's MIR itself as a term
 //! of the deep embedding in `lean/Blaze/Mir` ([`body::embed`]): the executable semantics the
@@ -32,8 +35,8 @@
 //! it allocates on the global heap throughout.
 
 pub mod body;
-mod driver;
 pub mod lean;
+pub mod plan;
 mod spec;
 pub mod structured;
 #[cfg(test)]
@@ -43,13 +46,10 @@ pub mod translate;
 use std::{collections::BTreeMap, fmt};
 
 use base_db::Db;
-use hir_def::{DefWithBodyId, FunctionId};
+use hir_def::{AttrDefId, DefWithBodyId, FunctionId, attrs::AttrFlags};
 use hir_ty::InferenceResult;
 
-pub use driver::{
-    ALLOWED_AXIOMS, Clause, Config, LEAN_VERSION, LeanError, NotProved, ProofFile, ProofKey,
-    Proofs, Proved, Prover, check, check_emitted, proof_key, proved,
-};
+pub use plan::{ALLOWED_AXIOMS, Clause, LEAN_VERSION, NotProved, ProofKey, Prover};
 pub use body::embed::Embedded as EmbeddedMir;
 pub use spec::Spec;
 
@@ -67,7 +67,14 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Scalar", include_str!("../../../lean/Blaze/Scalar.lean")),
     ("Blaze.Slice", include_str!("../../../lean/Blaze/Slice.lean")),
     ("Blaze.Std", include_str!("../../../lean/Blaze/Std.lean")),
+    ("Blaze.Vec", include_str!("../../../lean/Blaze/Vec.lean")),
+    ("Blaze.ScalarOps", include_str!("../../../lean/Blaze/ScalarOps.lean")),
+    ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
+    // What a proof file imports and no model does: the tactic a statement is tried with first.
+    ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
+    // The `@[spec]`s of `Blaze.Vec`'s operations, which `Blaze.Auto` must come before.
+    ("Blaze.VecAuto", include_str!("../../../lean/Blaze/VecAuto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's
@@ -163,7 +170,7 @@ fn accepted(db: &Db, func: FunctionId) -> Result<(), NotTranslated> {
 pub fn embed_mir(db: &Db, func: FunctionId) -> Result<EmbeddedMir, NotTranslated> {
     blaze_query::db::attach(db, || {
         accepted(db, func)?;
-        let term = body::embed::program(db, func, None)?;
+        let term = body::embed::program(db, func, None, None)?;
         Ok(body::embed::module(db, func, term))
     })
 }
@@ -177,7 +184,23 @@ pub fn embed_mir_body<'db>(
 ) -> Result<String, NotTranslated> {
     blaze_query::db::attach(db, || {
         accepted(db, func)?;
-        body::embed::program(db, func, Some(mir))
+        body::embed::program(db, func, Some(mir), None)
+    })
+}
+
+/// As [`embed_mir_body`], with the blocks `layout` reaches, in `layout`'s numbering: the body
+/// after a pass written over the blocks its input reached. The encoder writes the blocks a
+/// body reaches and numbers them as it meets them, so a pass that leaves a block unreachable
+/// would otherwise be compared with its specification over two different sets of blocks.
+pub fn embed_mir_body_as<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    mir: &hir_ty::mir::MirBody<'db>,
+    layout: &hir_ty::mir::MirBody<'db>,
+) -> Result<String, NotTranslated> {
+    blaze_query::db::attach(db, || {
+        accepted(db, func)?;
+        body::embed::program(db, func, Some(mir), Some(layout))
     })
 }
 
@@ -197,7 +220,8 @@ fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emi
         });
     }
     stack.push(func);
-    let mut imports: Vec<Emitted> = Vec::new();
+    // The types it names first, each after those its fields name (`Body::adts`' order).
+    let mut imports: Vec<Emitted> = body.adts.iter().map(type_module).collect();
     let mut shapes = BTreeMap::new();
     for (callee_name, callee) in &lowered.callees {
         let callee = emit_in(db, *callee, stack)?;
@@ -213,28 +237,171 @@ fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emi
     let model = translate::translate(body, &shapes)?;
     let params: Vec<String> = model.params.iter().map(|it| it.name.clone()).collect();
     let spec = spec::lower(db, func, &params)?;
-    Ok(module_of(body, model, spec.as_ref(), imports))
+    let theorem = AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM);
+    let stated = match (theorem, spec.as_ref()) {
+        (false, None) => None,
+        (false, Some(spec)) => Some(Stated::Clauses(spec)),
+        (true, None) => {
+            theorem_shape(body, &model)?;
+            Some(Stated::Theorem)
+        }
+        (true, Some(_)) => {
+            return Err(NotTranslated {
+                function: body.display.clone(),
+                what: "a `#[blaze::theorem]` function with `requires` or `ensures` clauses (a \
+                       theorem states that it returns `true`; what the clauses say is another \
+                       theorem)"
+                    .to_owned(),
+                at: format!("fn {}", body.display),
+            });
+        }
+    };
+    Ok(module_of(body, model, stated, imports))
+}
+
+/// What a function's module states of its model.
+#[derive(Clone, Copy, Debug)]
+pub enum Stated<'a> {
+    /// The function's `requires` and `ensures`.
+    Clauses(&'a Spec),
+    /// The function is marked `#[blaze::theorem]`: it returns `true`.
+    Theorem,
+}
+
+/// What a `#[blaze::theorem]` function is written against.
+const THEOREM: &str = "#[blaze::theorem]";
+
+/// Refused unless `body` can be a theorem: it returns `bool` and gives nothing else back, so
+/// "it returns `true`" is all there is to say of a call.
+fn theorem_shape(body: &body::Body, model: &Model) -> Result<(), NotTranslated> {
+    let refuse = |what: &str| NotTranslated {
+        function: body.display.clone(),
+        what: what.to_owned(),
+        at: format!("fn {}", body.display),
+    };
+    if body.locals[0].ty != body::Ty::Bool {
+        return Err(refuse(&format!(
+            "a `#[blaze::theorem]` function that returns `{}`, not `bool` (a theorem states \
+             that its function returns `true`)",
+            rust_ty(&body.locals[0].ty)
+        )));
+    }
+    if !model.shape.mut_params.is_empty() {
+        return Err(refuse(
+            "a `#[blaze::theorem]` function with a `&mut` parameter (a theorem takes what it \
+             speaks of by value or by shared reference)",
+        ));
+    }
+    Ok(())
+}
+
+/// `ty` as Rust writes it, for a message.
+fn rust_ty(ty: &body::Ty) -> String {
+    use body::Ty;
+    let list = |all: &[Ty]| all.iter().map(rust_ty).collect::<Vec<_>>().join(", ");
+    match ty {
+        Ty::Bool => "bool".to_owned(),
+        Ty::Int(int) => format!("{int:?}").to_lowercase(),
+        Ty::Unit => "()".to_owned(),
+        Ty::Never => "!".to_owned(),
+        Ty::Tuple(all) => format!("({})", list(all)),
+        Ty::Adt(name) => name.replace('.', "::"),
+        Ty::Option(inner) => format!("Option<{}>", rust_ty(inner)),
+        Ty::Result(ok, err) => format!("Result<{}, {}>", rust_ty(ok), rust_ty(err)),
+        Ty::Ref(inner) => format!("&{}", rust_ty(inner)),
+        Ty::RefMut(inner) => format!("&mut {}", rust_ty(inner)),
+        Ty::Slice(inner) => format!("[{}]", rust_ty(inner)),
+        Ty::Vec(inner) => format!("Vec<{}>", rust_ty(inner)),
+        Ty::Array(inner, len) => format!("[{}; {len}]", rust_ty(inner)),
+        Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+    }
+}
+
+/// `def <statement> : Prop` for a theorem function: for all arguments the model gives `true`.
+/// It gives it: a model that fails (a panic) or, for a function with a loop, gives `true` for
+/// no amount of fuel (it never returns) does not meet the statement. A test fails a hang by
+/// its timeout, and the statement that takes the test's place says no less.
+fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
+    let mut args = Vec::new();
+    if model.shape.fuel {
+        args.push(name("fuel"));
+    }
+    args.extend(model.params.iter().map(|it| name(it.name.clone())));
+    let call = app(function, args);
+    let holds = match model.shape.monadic {
+        true => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
+        false => infix(Infix::Eq, call, atom("true")),
+    };
+    let holds = match model.shape.fuel {
+        true => Term::Exists(
+            vec![Binder { name: "fuel".to_owned(), ty: name("Nat") }],
+            Box::new(holds),
+        ),
+        false => holds,
+    };
+    let body = match model.params.is_empty() {
+        true => holds,
+        false => Term::Forall(model.params.clone(), Box::new(holds)),
+    };
+    Decl::Def { name: statement.to_owned(), params: Vec::new(), ty: atom("Prop"), body }
+}
+
+/// The module of the struct or enum `adt`, `BlazeModel.<its path>.type`: its declaration
+/// alone, importing the modules of the types its fields name. A type has one module, so two
+/// functions that use it import one declaration of it; `type` is no Rust identifier, so no
+/// function's module has that name.
+pub fn type_module(adt: &body::AdtDecl) -> Emitted {
+    let module = type_module_name(&adt.name);
+    let display = adt.name.replace('.', "::");
+    let about = vec![
+        format!("Generated by blaze ({TRANSLATOR}) from `{display}`: the type."),
+        "Do not edit: the functions that use it import this module.".to_owned(),
+    ];
+    let mut imports = vec!["Blaze".to_owned()];
+    imports.extend(adt.uses().iter().filter(|it| **it != adt.name).map(|it| lean::ident(&type_module_name(it))));
+    let text = Module { about, imports, decls: vec![translate::type_decl(adt)] }.print();
+    Emitted {
+        function: display,
+        name: adt.name.clone(),
+        module,
+        text,
+        statement: None,
+        clauses: Vec::new(),
+        shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        imports: Vec::new(),
+    }
+}
+
+fn type_module_name(adt: &str) -> String {
+    format!("BlazeModel.{adt}.type")
 }
 
 /// The module of `body`'s `model` and `spec`.
 pub fn module_of(
     body: &body::Body,
     model: Model,
-    spec: Option<&Spec>,
+    stated: Option<Stated<'_>>,
     imports: Vec<Emitted>,
 ) -> Emitted {
     let module = format!("BlazeModel.{}", body.name);
     let mut decls = model.decls.clone();
-    let statement = spec.map(|spec| {
+    let statement = stated.map(|stated| {
         let statement = format!("{}.spec.statement", body.name);
-        decls.push(statement_of(&body.name, &model, spec, &statement));
+        decls.push(match stated {
+            Stated::Clauses(spec) => statement_of(&body.name, &model, spec, &statement),
+            Stated::Theorem => theorem_statement(&body.name, &model, &statement),
+        });
         statement
     });
     let about = vec![
         format!(
             "Generated by blaze ({TRANSLATOR}) from `{}`: its model{}.",
             body.display,
-            if spec.is_some() { " and the statement of its clauses" } else { "" }
+            match stated {
+                None => "",
+                Some(Stated::Clauses(_)) => " and the statement of its clauses",
+                Some(Stated::Theorem) => " and the statement that it returns `true`",
+            }
         ),
         "Do not edit: a proof is written in the crate's `lean/` and names the statement."
             .to_owned(),
@@ -248,7 +415,11 @@ pub fn module_of(
         module,
         text,
         statement,
-        clauses: spec.map(|it| it.clauses.clone()).unwrap_or_default(),
+        clauses: match stated {
+            None => Vec::new(),
+            Some(Stated::Clauses(spec)) => spec.clauses.clone(),
+            Some(Stated::Theorem) => vec![THEOREM.to_owned()],
+        },
         shape: model.shape,
         imports,
     }

@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-4",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "my own probe script for blaze-vm (restartvm.sh in the lane's notes directory); the VM's default home /root/.cache/blaze",
+ "what": "A script meant to run `blaze check`, `blaze stop`, `blaze check` on a home of its own ran them on the VM's default home. It built the remote shell's text by replacing the word BLAZE with the binary's path (`${script//BLAZE/$1}`), which also rewrote `export BLAZE_HOME=...` into `export /root/.../blaze_HOME=...`; bash said `not a valid identifier` and went on (`set -uo pipefail`, no `-e`), so every blaze command ran with BLAZE_HOME unset. It started a daemon there, stopped it, and left a second one that never listened holding /root/.cache/blaze/v2/serve.lock for about four minutes. The default home's serve.log began with `no daemon ran on this state before it`, so no other lane's daemon was stopped. I ended the probe's five processes by pid and removed only what it had made there (v2, build, sources, v2.inspect.sock and its lock, each born 08:16:54 UTC or later).",
+ "cost": "twenty minutes, one misleading result (main's build was run on state the branch's build had written), and for four minutes any lane running blaze on the VM without BLAZE_HOME would have met a lock held by a daemon that did not listen",
+ "cause": "values put into a script by rewriting its text, and a shell that goes on after a failed `export`",
+ "whys": "the remote command is one string, so parameters were spliced in as text; a placeholder that is a common word matched more than the placeholder; the shell reports a failed export and continues; blaze with no BLAZE_HOME quietly means the machine's shared default home, so a lost variable is not an error but another home",
+ "class": "a command meant for a lane's own state runs on shared state because the variable that names the lane's state was lost on the way",
+ "prevention": "built for this lane: the script's values go to the remote shell as its arguments (`bash -c \"$script\" name \"$1\" \"$2\"`), the home is refused unless it is a bare name under the lane's directory, and the binary is checked before the first command. Not built, and the stronger form: on blaze-vm the default home is not usable at all (a daemon started with no BLAZE_HOME by root refuses, naming /root/loop.sh and BLAZE_HOME), so a lost variable fails at once instead of landing in shared state.",
+ "workaround": "none needed after the fix",
+ "state": "open"
+}

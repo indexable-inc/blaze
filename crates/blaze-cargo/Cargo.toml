@@ -35,6 +35,8 @@ hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
 hir-ty-borrowck.workspace = true
+# `blaze prove`: theorem functions translated to Lean and their proofs checked (serve/unit/prove.rs).
+hir-ty-lean.workspace = true
 # `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
 blaze-doc.workspace = true
 # `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.

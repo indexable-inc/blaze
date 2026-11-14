@@ -17,6 +17,8 @@
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
 //! - [`reach`]: `reach`, what the checkout's edits since a root reach, building only what its
 //!   front end applies.
+//! - [`prove`]: `prove`, the theorem functions of the crates selected translated to Lean and
+//!   their proofs checked, building only what the front end applies.
 //! - [`baselines`]: `check --baselines`, a run's lint counts held to the checked-in ones.
 //! - [`fix`]: `check --fix`, the check's machine-applicable suggestions made and checked.
 //! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
@@ -58,6 +60,7 @@ pub mod place;
 #[cfg(feature = "native")]
 pub mod pprof;
 pub mod print;
+pub mod prove;
 pub mod reach;
 pub mod replace;
 pub mod resume;
@@ -131,6 +134,7 @@ Commands:
     explain RULE|PACKAGE|VIEW      A rule's long text, the last failure of PACKAGE with all it blocks, or a history view
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
+    prove [-p PKG] [--emit] [--subset] [--json]   Each `#[blaze::theorem]` translated to Lean and its proof checked (`BLAZE_LEAN_PROVER`)
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
     diagnostics [--since TOKEN] [-p PKG] [--file F] [--json]   What a check says that is new since TOKEN, and the next token
     doctor [--json]                What is wrong with blaze here: its version, agents, daemon, state, toolchain, project, sandbox
@@ -348,6 +352,7 @@ const COMMANDS: &[&str] = &[
     "explain",
     "why",
     "reach",
+    "prove",
     "slow",
     "diagnostics",
     "doctor",
@@ -522,6 +527,7 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
         Asked::Explain(words) => observe::explain(words, auto_color()),
         Asked::Why(words) => observe::why(words, auto_color()),
         Asked::Reach(words) => reach::main(words, auto_color()),
+        Asked::Prove(words) => prove::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
         Asked::Doctor(words) => doctor::main(words, auto_color()),
         Asked::Audit(words) => audit::main(words, auto_color()),

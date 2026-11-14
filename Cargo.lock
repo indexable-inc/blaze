@@ -610,6 +610,7 @@ dependencies = [
  "hir-ty",
  "hir-ty-borrowck",
  "hir-ty-codegen",
+ "hir-ty-lean",
  "hir-ty-pure",
  "hir-ty-ub",
  "intern",

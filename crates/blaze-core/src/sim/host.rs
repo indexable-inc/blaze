@@ -76,6 +76,14 @@ pub(super) enum Plant {
     RandomRepeats,
     /// A directory not empty is removed, and what was under it.
     RemovesFull,
+    /// A crash keeps a change made after a barrier completed without keeping what the barrier
+    /// covers.
+    BarriersNotKept,
+    /// A rename that waits for the drive flushes every file but the one it renames.
+    RenameFlushesOthers,
+    /// A file a crash puts back under its name keeps the barriers, and the epochs, of the
+    /// changes it lost.
+    PutBackWithBarriers,
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.
@@ -279,7 +287,7 @@ impl Sim {
         self.host.plant = Some(plant);
     }
 
-    fn planted(&self, plant: Plant) -> bool {
+    pub(super) fn planted(&self, plant: Plant) -> bool {
         self.host.plant == Some(plant)
     }
 

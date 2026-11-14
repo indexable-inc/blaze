@@ -105,6 +105,7 @@ a build first needs it.
     blaze agents status [--json]
     blaze agents hook claude|codex vN [--strict]
     blaze doctor [--json]
+    blaze prove [-p PKG]... [--workspace] [--emit] [--subset] [--json]
     blaze --version
 
 `blaze help <command>` lists the flags a command takes: cargo's, read as cargo's clap reads them
@@ -1370,6 +1371,60 @@ The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's al
 daemon refuses one another user owns or others may write to;
 [v2/plan/lanes/store.md](v2/plan/design/store.md)).
 
+## blaze prove
+
+`blaze prove` checks the proofs of a crate's theorem functions with Lean
+([v2/plan/design/proofs-for-sans-io.md](v2/plan/design/proofs-for-sans-io.md), section 5;
+`crates/blaze-cargo/src/cli/prove.rs`, `crates/blaze-cargo/src/serve/unit/prove.rs`). It takes
+the package and target flags of `blaze check` and proves the library crates that check would
+check, without `cfg(test)`. Nothing is compiled: the daemon builds only the proc macros and
+build scripts' runs the front end applies, as `blaze reach` does.
+
+For each function marked `#[blaze::theorem]` (a `fn` returning `bool`, in a crate with
+`#![register_tool(blaze)]`), in the order of its path, blaze translates it to Lean
+(`crates/hir-ty-lean`): a model of it and of what it calls, and the statement
+`<name>.spec.statement`, that it returns `true` for every argument. Lean then checks the
+crate's proof of it: `<name>.spec.proof` in the proof file for its module, under `lean/` beside
+the crate's `Cargo.toml` (`blaze_graph::ledger::f` is proved in `lean/BlazeGraph/Ledger.lean`,
+a crate's root module in `Lib`). One proof file may prove many theorems and import the
+crate's other files under `lean/`, the models of its theorems and of what they call, blaze's
+library (`Blaze.Auto` has the tactic to try first, `blaze_auto`) and Lean's own. The models,
+a copy of the proof files and Lean's outputs are written under `lean/` in the workspace's
+build directory, never in the checkout. Each theorem is one line:
+
+- `proved F: THEOREM (axioms: ...)`: Lean's kernel accepted the proof, with no `sorry` and no
+  axiom but Lean's three.
+- `open F: PROOF_FILE`, then Lean's whole message indented: there is no proof file, or Lean
+  refused it. The remaining goals are in the message; edit the proof file and run it again.
+- `refused F: WHAT at `WHERE``: the translator does not take a construct in it.
+
+The last line counts them: `N proved, N open, N refused`. Lean is the executable
+`BLAZE_LEAN_PROVER` names, an absolute path, of the release `lean/lean-toolchain` pins: unset,
+or another version, the command fails, naming the variable and the version, and checks
+nothing.
+
+Lean runs in blaze's sandbox, as a build script does: a proof file's tactics can do IO, so it
+reads its own release and the build directory's `lean/`, writes there alone, and has no
+network (`BLAZE_SANDBOX=off` turns the sandbox off, as for build scripts). It is given a copy
+of the proof files as the daemon read them, never the checkout. One run of Lean a module (the
+library's, each model, each proof file, each theorem's check), those that import nothing of
+each other at once; a run that has not ended in ten minutes is stopped and its theorems are
+open, naming the module. A module Lean accepted is not run again while its text and what it
+imports stay the same: a second `blaze prove` of an unchanged tree runs Lean not at all, and
+after an edit it runs the modules the edit reaches.
+
+- `--emit` translates and writes the models and stops: one `emitted F: STATEMENT (MODEL)` line
+  each, and no Lean is needed.
+- `--subset` also counts every function in a `#![blaze::sans_io]` module of those crates: how
+  many the translator takes, and for the rest each refusal with the number of functions it
+  stopped, most first. A function is counted under the first refusal the translator meets.
+- `--json` prints one object: `records`, each with `outcome` (`Proved`, `Open`, `Emitted`,
+  `Refused`) and the record's fields, `subset`, and `failed` (why no proof was checked, when
+  none could be).
+
+It exits 0 when every theorem is proved (with `--emit`, translated), or there is none (it says
+so), and 1 otherwise. The same tree gives the same output, byte for byte.
+
 ## blaze doctor
 
 `blaze doctor` checks the whole installation without changing anything and without the network
@@ -1501,6 +1556,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 
 | Variable | Meaning | Default |
 |---|---|---|
+| `BLAZE_LEAN_PROVER` | the `lean` executable `blaze prove` checks proofs with, an absolute path, of the Lean `lean/lean-toolchain` pins; read by the client and sent with the request ([blaze prove](#blaze-prove)) | unset: `blaze prove` fails unless `--emit` |
 | `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Files](#files), [Install](#install)) | see there |
 | `BLAZE_TOOLCHAINS` | the directory blaze keeps the Rust it builds with in, shared by every `BLAZE_HOME` ([toolchain.md](toolchain.md)) | `.blaze/toolchains` in the user's home (`HOME`, else the system's record of the user) |
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
@@ -1628,7 +1684,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, lock, clean, cache, gc, store, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach, slow, diagnostics, doctor, agents, pprof and perf
+    help: blaze's commands are build, check, run, test, bench, doc, lock, clean, cache, gc, store, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach, prove, slow, diagnostics, doctor, audit, agents, pprof and perf
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

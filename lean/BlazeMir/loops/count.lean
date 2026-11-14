@@ -5,21 +5,48 @@ import Blaze.Mir.Syntax
 open Blaze Blaze.Mir
 
 def loops.count.mir : Program :=
-  { adts := [],
+  { adts := [{ name := "!", discr := ScalarTy.I128, variants := [] }],
     fns := [
       { name := "loops::count",
         args := 1,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.bool],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.unit, Ty.bool, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.adt 0],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0)))],
+              Statement.storageLive 2,
+              Statement.assign (Place.mk 2 []) (Rvalue.use (Operand.const (Const.int ScalarTy.U32 0))),
+              Statement.nop,
+              Statement.storageLive 3],
             terminator := Terminator.goto 1 },
           { stmts := [
-              Statement.assign (Place.mk 3 []) (Rvalue.binary BinOp.lt (Operand.copy (Place.mk 2 [])) (Operand.copy (Place.mk 1 [])))],
-            terminator := Terminator.switchInt (Operand.move (Place.mk 3 [])) [(0, 2)] 3 },
+              Statement.storageLive 4,
+              Statement.storageLive 5,
+              Statement.storageLive 6,
+              Statement.assign (Place.mk 6 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.storageLive 7,
+              Statement.assign (Place.mk 7 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.assign (Place.mk 5 []) (Rvalue.binary BinOp.lt (Operand.move (Place.mk 6 [])) (Operand.move (Place.mk 7 []))),
+              Statement.storageDead 7,
+              Statement.storageDead 6],
+            terminator := Terminator.switchInt (Operand.copy (Place.mk 5 [])) [(1, 2)] 3 },
           { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 [])))],
-            terminator := Terminator.ret },
+              Statement.storageLive 8,
+              Statement.assign (Place.mk 2 []) (Rvalue.checked BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1))),
+              Statement.assign (Place.mk 8 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 8,
+              Statement.assign (Place.mk 4 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 4,
+              Statement.storageDead 5],
+            terminator := Terminator.goto 1 },
           { stmts := [
-              Statement.assign (Place.mk 2 []) (Rvalue.checked BinOp.add (Operand.copy (Place.mk 2 [])) (Operand.const (Const.int ScalarTy.U32 1)))],
-            terminator := Terminator.goto 1 }] }] }
+              Statement.storageLive 9,
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 9,
+              Statement.storageDead 5,
+              Statement.storageDead 4],
+            terminator := Terminator.goto 4 },
+          { stmts := [
+              Statement.storageDead 3,
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.storageDead 2,
+              Statement.storageDead 1],
+            terminator := Terminator.ret }] }] }

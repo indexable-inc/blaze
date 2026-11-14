@@ -109,7 +109,7 @@ theorem diff_correct (c : ℝ) (env : ℕ → ℝ) (x : ℕ) (e : Expr) (h : Dif
         simp
       have hval : (diff c x (Expr.var i)).eval env = 1 := by
         show (if i = x then Expr.const 1 else Expr.const 0).eval env = 1
-        rw [if_pos hi]
+        rw [ite_eq_left hi]
         rfl
       rw [hfun, hval]
       exact hasDerivAt_id' (env x)
@@ -120,7 +120,7 @@ theorem diff_correct (c : ℝ) (env : ℕ → ℝ) (x : ℕ) (e : Expr) (h : Dif
         simp [hi]
       have hval : (diff c x (Expr.var i)).eval env = 0 := by
         show (if i = x then Expr.const 1 else Expr.const 0).eval env = 0
-        rw [if_neg hi]
+        rw [ite_eq_right hi]
         rfl
       rw [hfun, hval]
       exact hasDerivAt_const (env x) (env i)
