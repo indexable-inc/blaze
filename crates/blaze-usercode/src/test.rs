@@ -38,8 +38,9 @@ pub use wire::Executed;
 /// variable is set and `test::test_main_env_args` otherwise.
 ///
 /// With `record` (a binary with jump-table slots), the server asks the runtime's
-/// `__blaze_exec_slots` once, maps each test's execution record before its fork, has the child
-/// arm it (`__blaze_exec_arm`) and sends what it executed ([`wire::read_region`]); without, it
+/// `__blaze_exec_table` once (the jump table's slot count and identity, [`wire::Table`]), maps
+/// each test's execution record before its fork, has the child arm it (`__blaze_exec_arm`) and
+/// sends what it executed with that table ([`wire::read_region`]); without, it
 /// names neither export, and every end says [`wire::UNRECORDED`]. Both texts are constants:
 /// nothing is made per binary or per test.
 pub fn fork_server(record: bool) -> &'static str {

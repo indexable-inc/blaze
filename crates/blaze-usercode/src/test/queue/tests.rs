@@ -22,6 +22,11 @@ fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
 }
 
+/// A jump table of `slots` slots, of one lineage and generation.
+fn table(slots: u32) -> wire::Table {
+    wire::Table { lineage: [3; 16], generation: 1, slots }
+}
+
 fn config(jobs: usize) -> Config {
     Config {
         root: PathBuf::from("/root"),
@@ -743,7 +748,7 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     let conn = fake.hello(0, &["a", "b", "c"]);
     let runs = fake.runs(conn);
     assert_eq!(indices(&runs), [0, 1, 2]);
-    let hits = || Executed::Hits { slots: 8, hits: vec![1] };
+    let hits = || Executed::Hits { table: table(8), hits: vec![1] };
     fake.end_with(conn, runs[0].0, End::Exited(0), b"a ok", hits());
     fake.end(conn, runs[1].0, End::Exited(101), b"b failed");
     fake.end(conn, runs[2].0, End::Signaled(6), b"");
@@ -1038,7 +1043,7 @@ fn what_a_test_executed_comes_with_its_result() {
     let mut fake = Fake::new(config(2), vec![binary("lib", vec![job("a", 2), job("b", 1)])]);
     let conn = fake.hello(0, &["a", "b"]);
     let runs = fake.runs(conn);
-    let hits = || Executed::Hits { slots: 64, hits: vec![3, 9, 63] };
+    let hits = || Executed::Hits { table: table(64), hits: vec![3, 9, 63] };
     fake.end_with(conn, runs[0].0, End::Exited(0), b"", hits());
     fake.end_with(
         conn,
@@ -1148,7 +1153,7 @@ fn simulated(two_outside: bool) {
                                 "fails" => End::Exited(101),
                                 _ => End::Exited(0),
                             };
-                            let executed = Executed::Hits { slots: 16, hits: vec![index] };
+                            let executed = Executed::Hits { table: table(16), hits: vec![index] };
                             let ended = Frame::Ended {
                                 id,
                                 end,
@@ -1194,7 +1199,7 @@ fn simulated(two_outside: bool) {
                 played[result.binary].tests.iter().position(|it| it == test).unwrap() as u32;
             assert_eq!(
                 result.executed,
-                Executed::Hits { slots: 16, hits: vec![index] },
+                Executed::Hits { table: table(16), hits: vec![index] },
                 "seed {seed}"
             );
         }

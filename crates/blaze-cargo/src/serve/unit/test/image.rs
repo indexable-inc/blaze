@@ -8,7 +8,7 @@ use std::alloc::Global;
 use std::sync::Arc;
 
 use blaze_cas::{Kind, Store};
-use blaze_codegen::{ExecTable, InstanceKey, driver::Built};
+use blaze_codegen::{ExecTable, InstanceKey, JumpTable, driver::Built};
 use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
@@ -17,22 +17,22 @@ use blaze_keyed::{
     store::Put,
 };
 use blaze_testsel::{Bound, FnId, Image, Record, Version, host::Records};
-use blaze_usercode::test::Executed;
+use blaze_usercode::test::{Executed, wire::Table};
 use hir_ty_codegen::v2::RootTest;
 
 use crate::serve::work::RunPuts;
 
 /// The execution table of the test binary `binary`, linked from `built` with the span tables
-/// `spans` (`LinkInputs::spans`): `slots` is how many
-/// slots its jump table has, `slot_of` the slot its link named for a function, `beside` the
-/// content of the code it runs that is in no table (zero for none), and `tests` its harness's
-/// tests in order. An error names the binary: its tests can't be selected, and are never all
-/// run in its place.
+/// `spans` (`LinkInputs::spans`): `jump` is the jump table its link made (its identity, its
+/// capacity and the slots given out), `slot_of` the slot its link named for a function,
+/// `beside` the content of the code it runs that is in no table (zero for none), and `tests`
+/// its harness's tests in order. An error names the binary: its tests can't be selected, and
+/// are never all run in its place.
 pub(crate) fn table(
     binary: &str,
     built: &Built,
     spans: &[(ContentId, Vec<u8>)],
-    slots: u32,
+    jump: JumpTable,
     slot_of: impl Fn(&InstanceKey) -> Option<u32>,
     beside: ContentId,
     tests: &[RootTest],
@@ -40,18 +40,22 @@ pub(crate) fn table(
     // clone: once per test binary linked, the names the table keeps
     let tests = tests.iter().map(|it| (it.name.clone(), it.root));
     // alloc: error path
-    ExecTable::new(built, spans, slots, slot_of, beside, tests)
+    ExecTable::new(built, spans, jump, slot_of, beside, tests)
         .map_err(|why| format!("the execution table of `{binary}`: {}", why.describe(built)))
 }
 
 /// `table` as selection reads it. A slot an incremental link emptied ([`ExecTable::EMPTY`]) is
-/// given as it is: a slot is never dropped, as a record names slots by place.
+/// given as it is: a slot is never dropped, as a record names slots by place. The jump table
+/// it is of is named as the binary's runtime names it ([`Table`]), which a record is read
+/// only against.
 pub(crate) fn image(binary: &str, table: &ExecTable) -> Result<Image, String> {
     let mut fns = Vec::with_capacity_in(table.fns.len(), Global);
     fns.extend(table.fns.iter().map(|(id, bound)| Version { id: FnId(*id), bound: Bound(*bound) }));
     let mut slots = Vec::with_capacity_in(table.slot_fn.len(), Global);
     slots.extend_from_slice(&table.slot_fn);
-    Image::new(fns, slots, table.beside)
+    let jump = &table.jump;
+    let of = Table { lineage: jump.lineage, generation: jump.generation, slots: jump.capacity };
+    Image::new(fns, slots, table.beside, of)
         // alloc: error path
         .map_err(|why| format!("the execution table of `{binary}`: {why}"))
 }
@@ -59,7 +63,7 @@ pub(crate) fn image(binary: &str, table: &ExecTable) -> Result<Image, String> {
 /// What a test's fork server says it executed, as selection keeps it.
 pub(crate) fn record(executed: Executed) -> Record {
     match executed {
-        Executed::Hits { slots, hits } => Record::of_hits(slots, hits),
+        Executed::Hits { table, hits } => Record::of_hits(table, hits),
         Executed::Not(why) => Record::Incomplete { why },
     }
 }

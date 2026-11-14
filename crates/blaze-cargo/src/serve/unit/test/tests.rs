@@ -15,7 +15,7 @@ use blaze_testsel::{
     machine::{By, NotKept, Verdict},
 };
 use blaze_usercode::{
-    test::{Executed, Lines, Trace},
+    test::{Executed, Lines, Trace, wire::Table},
     trace::{self, Inputs, Seen},
 };
 
@@ -218,6 +218,13 @@ fn bound(n: u32, version: u32) -> ContentId {
     ContentId::of("blaze v2 cargo test bound 1", &[n.to_le_bytes(), version.to_le_bytes()].concat())
 }
 
+/// The jump table of [`exec_table`]'s binary: 2 slots given out of a capacity of 64.
+const JUMP: blaze_codegen::JumpTable =
+    blaze_codegen::JumpTable { lineage: [8; 16], generation: 3, capacity: 64, given: 2 };
+
+/// [`JUMP`] as the binary's runtime names it: its capacity is its slot count.
+const NAMED: Table = Table { lineage: [8; 16], generation: 3, slots: 64 };
+
 /// The table of a binary of three functions at `versions`: `0` and `2` in slots 0 and 1, `1`
 /// called directly, and one test `t` that reaches all three.
 fn exec_table(versions: [u32; 3]) -> ExecTable {
@@ -230,6 +237,7 @@ fn exec_table(versions: [u32; 3]) -> ExecTable {
     reached.sort_unstable();
     let (graph, roots) = blaze_codegen::exec::TestGraph::listing(3, &[reached]);
     ExecTable {
+        jump: JUMP,
         fns,
         slot_fn,
         beside: ContentId::default(),
@@ -242,20 +250,21 @@ fn exec_table(versions: [u32; 3]) -> ExecTable {
 /// the table, else not whole, saying why.
 #[test]
 fn what_a_test_executed_is_its_record() {
+    let of = |slots: u32| Table { slots, ..NAMED };
     assert_eq!(
-        record(Executed::Hits { slots: 4, hits: vec![1, 3] }),
-        Record::Complete { slots: 4, hits: vec![1, 3] }
+        record(Executed::Hits { table: of(4), hits: vec![1, 3] }),
+        Record::Complete { table: of(4), hits: vec![1, 3] }
     );
     assert_eq!(
-        record(Executed::Hits { slots: 4, hits: Vec::new() }),
-        Record::Complete { slots: 4, hits: Vec::new() }
+        record(Executed::Hits { table: of(4), hits: Vec::new() }),
+        Record::Complete { table: of(4), hits: Vec::new() }
     );
     assert!(matches!(
-        record(Executed::Hits { slots: 4, hits: vec![3, 1] }),
+        record(Executed::Hits { table: of(4), hits: vec![3, 1] }),
         Record::Incomplete { .. }
     ));
     assert!(matches!(
-        record(Executed::Hits { slots: 2, hits: vec![2] }),
+        record(Executed::Hits { table: of(2), hits: vec![2] }),
         Record::Incomplete { .. }
     ));
     let why = "the child was killed after 60s".to_owned();
@@ -270,6 +279,12 @@ fn a_table_is_its_image_slot_for_slot() {
     let made = image("tests/parse", &table).expect("a table");
     assert_eq!((made.len(), made.slots()), (3, 2));
     assert_eq!(made.bound_of(&FnId(fn_id(1))), Some(Bound(bound(1, 0))));
+    // Named as the runtime names it, by its capacity, not by the slots given out: a record
+    // of the binary (the region the runtime arms is the capacity's) reads, one of the
+    // binary's next link does not.
+    assert_eq!(made.table(), NAMED);
+    assert!(made.executed(NAMED, &[1]).is_ok());
+    assert!(made.executed(Table { generation: 4, ..NAMED }, &[1]).is_err());
 
     let mut emptied = exec_table([0, 0, 0]);
     emptied.slot_fn.insert(1, ExecTable::EMPTY);

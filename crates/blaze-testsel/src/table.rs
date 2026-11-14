@@ -18,7 +18,10 @@ use std::{alloc::Allocator, fmt};
 
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{ask::UNLOGGED, record::Record};
+use crate::{
+    ask::UNLOGGED,
+    record::{Record, Table},
+};
 
 /// A function by what it is across versions: its item and, for an instance, its type
 /// arguments by identity (docs/v2/plan/design/compile-time.md, idea 15). A rename or a move
@@ -54,10 +57,28 @@ pub enum TableError {
     Twice(FnId),
     /// A test reaches a function the table does not have.
     NotInTable(u32),
-    /// A record of another binary: its slot count is not the table's.
-    OtherBinary { record: u32, table: u32 },
-    /// A record hits a slot an incremental relink emptied (codegen's `ExecTable::EMPTY`).
+    /// The table lists more slots than its jump table has: `given`, of `slots`.
+    PastTable { given: u32, slots: u32 },
+    /// A record of another binary: the jump table it names is not this binary's. Never a
+    /// test's doing: blaze ran a binary, or read a region, other than the one it holds the
+    /// table of, so it stops rather than key a pass by another binary's slots.
+    OtherBinary { record: Table, table: Table },
+    /// A record hits a slot that names no function: one an incremental relink emptied
+    /// (codegen's `ExecTable::EMPTY`), or one the link has not given out.
     EmptySlot { slot: u32 },
+}
+
+/// `table` as an error names it: its lineage in hex, its generation and its slot count.
+struct Named<'a>(&'a Table);
+
+impl fmt::Display for Named<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("jump table ")?;
+        for byte in &self.0.lineage {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, " generation {} of {} slots", self.0.generation, self.0.slots)
+    }
 }
 
 impl fmt::Display for TableError {
@@ -78,10 +99,17 @@ impl fmt::Display for TableError {
             TableError::NotInTable(at) => {
                 write!(f, "a test reaches function {at}, which the binary's table does not have")
             }
+            TableError::PastTable { given, slots } => {
+                write!(f, "the binary's table lists {given} slots of a jump table of {slots}")
+            }
             TableError::OtherBinary { record, table } => {
                 write!(
                     f,
-                    "the execution record has {record} slots and the binary {table}: it is of another binary"
+                    "the execution record is of {}, and the binary's table of {}: blaze read the record \
+                     of another binary than the one it ran (rule keys-cover-every-input: a record is \
+                     read only against the table of the binary it is of)",
+                    Named(record),
+                    Named(table)
                 )
             }
             TableError::EmptySlot { slot } => {
@@ -148,8 +176,11 @@ impl Lookup {
 pub struct Image {
     /// By the table's index, codegen's order.
     fns: Vec<Version>,
-    /// Each slot's function: slot `n` is the jump table's `n`.
+    /// Each slot's function: slot `n` is the jump table's `n`. As many as the link gave out,
+    /// at most `table.slots`: a slot past them names no function.
     slot_fn: Vec<u32>,
+    /// The jump table the slots are of: what a record must name to be read here.
+    table: Table,
     /// Whether each function has a slot, by table index.
     logged: Vec<bool>,
     unlogged: ContentId,
@@ -206,13 +237,19 @@ fn by_identity(fns: &[Version]) -> Vec<u32> {
 }
 
 impl Image {
-    /// The table of a binary: its functions, each slot's function, and `beside`, the content
-    /// of the code it runs that is in no table (the premapped dependency image; zero for none).
+    /// The table of a binary: its functions, each slot's function (of the slots its link gave
+    /// out), `beside`, the content of the code it runs that is in no table (the premapped
+    /// dependency image; zero for none), and `table`, the jump table its link made, as the
+    /// binary's runtime names it.
     pub fn new(
         fns: Vec<Version>,
         slot_fn: Vec<u32>,
         beside: ContentId,
+        table: Table,
     ) -> Result<Image, TableError> {
+        if slot_fn.len() as u64 > u64::from(table.slots) {
+            return Err(TableError::PastTable { given: slot_fn.len() as u32, slots: table.slots });
+        }
         // alloc: once per binary
         let mut logged = vec![false; fns.len()];
         for (slot, &function) in slot_fn.iter().enumerate() {
@@ -269,7 +306,7 @@ impl Image {
         }
         hasher.update(&batch[..filled]);
         let state = hasher.finish();
-        Ok(Image { fns, slot_fn, logged, unlogged, state, lookup, order, rank })
+        Ok(Image { fns, slot_fn, table, logged, unlogged, state, lookup, order, rank })
     }
 
     /// How many functions the binary's table has.
@@ -315,8 +352,15 @@ impl Image {
         self.unlogged
     }
 
+    /// How many slots the link gave out: those the table names a function or an emptied slot
+    /// for; the jump table has [`Image::table`]'s count.
     pub fn slots(&self) -> u32 {
         self.slot_fn.len() as u32
+    }
+
+    /// The jump table the slots are of.
+    pub fn table(&self) -> Table {
+        self.table
     }
 
     /// The bound code of the function `id` in this binary; `None` when it has none.
@@ -329,17 +373,24 @@ impl Image {
         self.fns.get(at as usize)
     }
 
-    /// The set a whole record says the test executed.
-    pub fn executed(&self, slots: u32, hits: &[u32]) -> Result<Set, TableError> {
-        if slots != self.slots() {
-            return Err(TableError::OtherBinary { record: slots, table: self.slots() });
+    /// The set a whole record of the slots of `table` says the test executed.
+    ///
+    /// The invariant: a record is read only against the table of the binary it is of, by
+    /// identity: `table` (what the binary's runtime named) is this image's [`Image::table`]
+    /// (what its link made), lineage, generation and slot count alike, or the record is
+    /// refused ([`TableError::OtherBinary`]) before any slot of it is read. A slot count alone
+    /// is no identity: every generation of an image has one capacity, and a count of slots
+    /// given out is not what the runtime knows.
+    pub fn executed(&self, table: Table, hits: &[u32]) -> Result<Set, TableError> {
+        if table != self.table {
+            return Err(TableError::OtherBinary { record: table, table: self.table });
         }
         // alloc: once per kept run
         let mut ranks = Vec::with_capacity(hits.len());
         for &hit in hits {
-            let Some(&function) = self.slot_fn.get(hit as usize) else {
-                return Err(TableError::OtherBinary { record: slots, table: self.slots() });
-            };
+            // A slot past those given out names no function, as an emptied one does (and one
+            // past the table, which no whole record holds: `Record::of_hits`).
+            let function = self.slot_fn.get(hit as usize).copied().unwrap_or(NONE);
             if function == NONE {
                 return Err(TableError::EmptySlot { slot: hit });
             }
@@ -366,7 +417,7 @@ impl Image {
     /// The set a record keys a pass by: what it executed when whole.
     pub fn of_record(&self, record: &Record) -> Option<Result<Set, TableError>> {
         match record {
-            Record::Complete { slots, hits } => Some(self.executed(*slots, hits)),
+            Record::Complete { table, hits } => Some(self.executed(*table, hits)),
             Record::Incomplete { .. } => None,
         }
     }

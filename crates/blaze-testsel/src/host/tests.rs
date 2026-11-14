@@ -30,11 +30,14 @@ use super::{BaseOf, Driver, Drove, Ended, HostError, Out, Program, Records, base
 use crate::{
     PLANT, Plant,
     machine::{NotKept, Selection, Start, Test, Verdict},
-    record::Record,
+    record::{Record, Table},
     table::{Bound, FnId, Image, Version},
 };
 
 const FNS: usize = 6;
+/// The binary's jump table, which every record of the model names: the model edits what its
+/// functions are, never which slot each is in.
+const TABLE: Table = Table { lineage: [6; 16], generation: 1, slots: FNS as u32 };
 const TESTS: usize = 4;
 const FILES: usize = 2;
 
@@ -145,7 +148,7 @@ impl Model {
     /// The binary: every function has a slot, slot `n` holding function `n`.
     fn image(&self) -> Result<Image, Broke> {
         let fns = (0..FNS).map(|at| Version { id: function(at), bound: bound(at, self.versions[at]) }).collect();
-        Image::new(fns, (0..FNS as u32).collect(), ContentId::of("host sim beside", &[]))
+        Image::new(fns, (0..FNS as u32).collect(), ContentId::of("host sim beside", &[]), TABLE)
             .map_err(|why| Broke::Harness(why.to_string()))
     }
 
@@ -216,7 +219,7 @@ fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Re
         let test = test as usize;
         let passed = !model.fails[test];
         let hits: Vec<u32> = model.executes[test].iter().map(|at| *at as u32).collect();
-        let record = Record::Complete { slots: FNS as u32, hits };
+        let record = Record::Complete { table: TABLE, hits };
         let read = file(model.reads[test]);
         let traced = Traced {
             files: vec![(read, Some(content(model.files[model.reads[test]])))],

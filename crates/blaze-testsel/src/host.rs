@@ -91,7 +91,11 @@ pub enum HostError {
     Read { kind: ReadKind, name: Vec<u8, Global>, why: String },
     /// The changes were asked since a program state the host holds no binary of.
     UnknownState { since: ContentId },
-    /// A test's execution record is not of this binary.
+    /// A test's whole execution record does not read against its binary's table: another
+    /// binary's (by the jump table it names), or a slot of no function. Blaze is inconsistent
+    /// here, never the test: a record the trace could not make whole is
+    /// [`Record::Incomplete`] and kept by what the test reaches, or not kept, by name and
+    /// reason (docs/v2/plan/design/test-selection.md, section 2), so this stops the run.
     Table { test: String, why: TableError },
     /// The machine asked more than its tests can: a bug in it.
     Unbounded { steps: u64 },
@@ -270,7 +274,7 @@ impl Driver {
             && ended.traced.is_some_and(|traced| traced.untraceable.is_empty());
         if keepable {
             let set = match ended.record {
-                Record::Complete { slots, hits } => image.executed(*slots, hits),
+                Record::Complete { table, hits } => image.executed(*table, hits),
                 Record::Incomplete { why: said } => {
                     whole = false;
                     why = not_whole(said);

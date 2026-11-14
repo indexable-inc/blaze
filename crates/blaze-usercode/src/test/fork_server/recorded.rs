@@ -2,7 +2,8 @@
 // What each test executed, for a binary built with jump-table slots: the harness text of
 // `blaze_usercode::test::fork_server(true)`, after `fork_server.rs`. The runtime's two exports
 // (the dev runtime's, `blaze_inproc_rt::live::log`, which blaze links into every dev executable,
-// over the jump table) are asked once for the slot count. Each test's child
+// over the jump table) are asked once for the table: its slot count and identity, which every
+// record the server sends carries (`Table`). Each test's child
 // arms a region the server maps before its fork and reads once it has ended; a region read is
 // cleared and kept for the next test, so the server maps only as many as run at once, and a
 // steady stream of tests makes no `mmap`, `munmap` or fresh page of them.
@@ -13,7 +14,7 @@ mod exec {
     use self::std::prelude::rust_2021::*;
     #[allow(unused_imports)]
     use self::std::{eprintln, format, vec};
-    use super::{End, HEADER, header, read_region};
+    use super::{End, HEADER, TABLE_ID, Table, header, read_region};
     use self::std::borrow::Cow;
 
     type Int = ::core::ffi::c_int;
@@ -36,7 +37,7 @@ mod exec {
     const MAP_ANONYMOUS: Int = 0x1000;
 
     unsafe extern "C" {
-        fn __blaze_exec_slots() -> u32;
+        fn __blaze_exec_table(out: *mut u8) -> u32;
         fn __blaze_exec_arm(region: *mut u8, len: usize) -> i32;
         fn mmap(
             at: *mut ::core::ffi::c_void,
@@ -49,10 +50,10 @@ mod exec {
         fn munmap(at: *mut ::core::ffi::c_void, len: usize) -> Int;
     }
 
-    /// The binary's slot count, asked once before the first test, and the regions of tests
+    /// The binary's jump table, asked once before the first test, and the regions of tests
     /// that ended, cleared for the next.
     pub struct Exec {
-        slots: u32,
+        table: Table,
         free: Vec<Region>,
     }
 
@@ -62,14 +63,18 @@ mod exec {
         at: *mut u8,
         /// What was mapped: a multiple of 8.
         len: usize,
-        slots: u32,
+        /// The table whose slots it has a byte for.
+        table: Table,
     }
 
     impl Exec {
         pub fn open() -> Exec {
-            // SAFETY: the runtime's export takes nothing and returns the jump table's slot
-            // count; a binary built with slots has it (codegen picks this text only for one).
-            Exec { slots: unsafe { __blaze_exec_slots() }, free: Vec::new() } // alloc: setup, once per server
+            let mut id = [0u8; TABLE_ID];
+            // SAFETY: the runtime's export writes at most `TABLE_ID` bytes at its argument,
+            // which `id` has, and returns the jump table's slot count; a binary built with
+            // slots has it (codegen picks this text only for one).
+            let slots = unsafe { __blaze_exec_table(id.as_mut_ptr()) };
+            Exec { table: Table::of_id(id, slots), free: Vec::new() } // alloc: setup, once per server
         }
 
         /// What an end of a test that did not start says it executed.
@@ -83,7 +88,8 @@ mod exec {
             if let Some(region) = self.free.pop() {
                 return Ok(region);
             }
-            let len = HEADER + (self.slots as usize).div_ceil(8) * 8;
+            let slots = self.table.slots;
+            let len = HEADER + (slots as usize).div_ceil(8) * 8;
             // SAFETY: a new anonymous mapping (no address asked, no descriptor) touches no
             // memory of ours; the result is checked against `MAP_FAILED` below.
             let at = unsafe {
@@ -92,8 +98,8 @@ mod exec {
             if at as usize == usize::MAX {
                 return Err(format!("mapping the execution record: {}", std::io::Error::last_os_error())); // alloc: error path
             }
-            let region = Region { at: at as *mut u8, len, slots: self.slots };
-            let head = header(self.slots);
+            let region = Region { at: at as *mut u8, len, table: self.table };
+            let head = header(slots);
             // SAFETY: `at` is a fresh mapping of `len >= HEADER` bytes, readable and writable,
             // page aligned, which nothing else uses yet (the child is not forked).
             unsafe { ::core::ptr::copy_nonoverlapping(head.as_ptr(), region.at, HEADER) };
@@ -127,7 +133,7 @@ mod exec {
                     }
                 }
             }
-            let head = header(region.slots);
+            let head = header(region.table.slots);
             for (k, byte) in head.iter().enumerate() {
                 // SAFETY: the header is the first `HEADER` bytes of the live mapping.
                 unsafe { ::core::ptr::write_volatile(region.at.add(k), *byte) };
@@ -142,11 +148,12 @@ mod exec {
             // SAFETY: the region is mapped for `len >= HEADER + slots` bytes, which is what the
             // runtime writes (it checks `HEADER + slots` itself), and stays mapped in the child
             // until it ends: the child never drops it (it leaves by `_exit`).
-            unsafe { __blaze_exec_arm(self.at, HEADER + self.slots as usize) }
+            unsafe { __blaze_exec_arm(self.at, HEADER + self.table.slots as usize) }
         }
 
-        /// What the child executed, once it has ended as `end`, its hits put in `hits`.
-        pub fn read(&self, end: &End, hits: &mut Vec<u8>) -> Result<u32, Cow<'static, str>> {
+        /// What the child executed, once it has ended as `end`, its hits put in `hits`: the
+        /// table they are of, or why the record is not whole.
+        pub fn read(&self, end: &End, hits: &mut Vec<u8>) -> Result<Table, Cow<'static, str>> {
             let ended = match end {
                 End::Exited(_) => Ok(()),
                 End::Signaled(signal) => Err(format!("it was ended by signal {}", signal)), // alloc: error path
@@ -162,12 +169,13 @@ mod exec {
             let head = unsafe { ::core::ptr::read_volatile(self.at as *const [u8; HEADER]) };
             let words = self.len - HEADER;
             let base = self.at as usize + HEADER;
-            read_region(head, self.slots, ended, |n| {
+            read_region(head, self.table.slots, ended, |n| {
                 assert!(8 * n + 8 <= words, "a word past the execution record's region");
                 // SAFETY: the word is inside the mapping (checked above), and 8-aligned: the
                 // mapping is page aligned and `HEADER` is 16.
                 u64::from_le(unsafe { ::core::ptr::read_volatile((base + 8 * n) as *const u64) })
             }, hits)
+            .map(|slots| Table { slots, ..self.table })
             .map_err(Cow::Owned)
         }
     }
