@@ -6416,36 +6416,44 @@ fn the_loop_runs_no_front_end_step_of_the_carry() {
 
 /// The session survives a restart (rule 26): seeded, carried over an edit, the daemon stopped
 /// (its journal marks the session), started again, the file edited again and built. The
-/// restarted daemon opens the marked session and carries it from that root, with the counts
-/// an edit of that shape carries, rather than seeding; and none of it runs on the loop. The
-/// edit after the start is to a text no check answered yet: the edit undone is the first
+/// restarted daemon opens the marked session and carries it from that root, as a daemon that
+/// never stopped carries the same edit, rather than seeding; and none of it runs on the loop.
+/// The edit after the start is to a text no check answered yet: the edit undone is the first
 /// check's view, which that check's certificate answers with no job and so no pass.
 #[test]
 fn a_restarted_daemon_carries_from_its_mark() {
-    CARRY_CRATES.set(carry_crates());
-    let mut sim = Sim::new(34, Faults::default());
-    checkout(&mut sim, "[package]\n");
-    let steps = Arc::new(Fake::default());
-    let mut daemon = start(sim, &steps, 34);
-    let mut client = dial(&mut daemon);
-    check_settled(&mut client, &mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
-    check_settled(&mut client, &mut daemon);
-    let before = crate::serve::front_carry::sim::take_built();
-    assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
-    assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
-
-    let mut daemon = restart(daemon, &steps, 35);
-    assert_eq!(daemon.started().carries, None, "the marked sessions were used");
-    let mut client = dial(&mut daemon);
-    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
-    check_settled(&mut client, &mut daemon);
-    let after = crate::serve::front_carry::sim::take_built();
-    assert_eq!(after.len(), 1, "one pass: {after:?}");
+    // The passes of `/w`'s carry: the seed's and the first edit's, then the second edit's,
+    // the daemon stopped and started before the second edit or not.
+    let passes = |restarts: bool| {
+        CARRY_CRATES.set(carry_crates());
+        let mut sim = Sim::new(34, Faults::default());
+        checkout(&mut sim, "[package]\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, 34);
+        let mut client = dial(&mut daemon);
+        check_settled(&mut client, &mut daemon);
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+        check_settled(&mut client, &mut daemon);
+        let before = crate::serve::front_carry::sim::take_built();
+        assert_eq!(before.len(), 2, "a seed, then a carry: {before:?}");
+        assert!(before[0].files > 0, "the crate's root is in the view's tree: {before:?}");
+        if restarts {
+            daemon = restart(daemon, &steps, 35);
+            assert_eq!(daemon.started().carries, None, "the marked sessions were used");
+            client = dial(&mut daemon);
+        }
+        daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 2; }\n");
+        check_settled(&mut client, &mut daemon);
+        let after = crate::serve::front_carry::sim::take_built();
+        assert_eq!(after.len(), 1, "one pass (restarted: {restarts}): {after:?}");
+        after
+    };
+    let unstopped = passes(false);
+    let after = passes(true);
     assert!(!after[0].first, "the restarted daemon opened the marked session, not a seed");
     assert_eq!(after[0].paths, 1, "carried from the root the marked session is pinned at");
-    assert_eq!(after[0].carried, before[1].carried, "an edit of the same shape carries the same");
-    assert_eq!(after[0].files, before[1].files, "and holds the same roots");
+    assert_eq!(after[0].carried, unstopped[0].carried, "the edit carries what it carries in a daemon that never stopped");
+    assert_eq!(after[0].files, unstopped[0].files, "and holds the same roots");
     assert_eq!(crate::serve::front_carry::sim::reads().0, 0, "no read of the carry's world on the loop");
 }
 
