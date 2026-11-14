@@ -1,0 +1,14 @@
+{
+ "id": "trust-lints-registry-spread",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane secure-by-default (trust lints), int-1113",
+ "where": "crates/blaze-lints/src/blaze.rs (enum, ALL, kind, name, docs_url, help, DENY_BY_DEFAULT), blaze/exempt.rs tag, level.rs Target::blaze, blaze-lint-defs names.rs, lints.rs, tests.rs; crates/hir-ty-pure/src/walk.rs (summary_at, Summary, Witness, How, Instance all pub(crate))",
+ "what": "Adding five lints meant editing eleven hand-kept lists in five files (the registry_spread lint's own finding), and reading the effect walk's per-instance facts needed a new module inside hir-ty-pure because every walk type is pub(crate) and walk.rs was another lane's file. Deny-by-default lints also cannot simply be on in the lint tests, which keep default lints on, so they are gated on a Conf field the driver sets.",
+ "cost": "an hour of list edits that one table row would be, and a coupling of hir-ty-pure's trust module to summary_at's signature",
+ "cause": "a lint's facts (name, kind, level, group, docs anchor, help, exempt tag, registry row) live in parallel lists instead of one row; the walk has no public read API for its summaries",
+ "class": "one concept's facts spread over parallel lists across crates, so each new member touches every list",
+ "prevention": "one const table of lint rows in blaze-lint-defs that blaze-lints derives its enum lists and groups from (reflection over the rows), and a public `walk::read` API of instance summaries",
+ "workaround": "edited every list; hir_ty_pure::trust reads the walk through its pub(crate) items",
+ "fix": "not yet",
+ "state": "open"
+}

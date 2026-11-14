@@ -975,8 +975,9 @@ impl<'db> HirFrontend<'db> {
         // Its template is kept under its template code, which holds no name and no place, when
         // all its positions are its own tables' and its code is its body's alone: none inlined
         // from another body (`inlined`, a unit's inliner; `lang`, the library's bodies, which
-        // `Build::options` always inlines as shipped), no report rows or PGO record naming it
-        // (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
+        // `Build::options` inlines as shipped under a unit that inlines, and are kept under
+        // their code under every unit so one key serves all), no report rows or PGO record
+        // naming it (`Units::names`), and a body of its own (no shim's declaration, no `main`'s start).
         // The template then holds its positions by table and the instance fills its own
         // anchors (docs/v2/plan/design/name-free-identity.md).
         let lang = crate_of(db, &instance.0).is_some_and(|it| it.data(db).origin.is_lang());

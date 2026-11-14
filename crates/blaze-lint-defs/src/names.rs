@@ -85,6 +85,10 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::dead",
             "blaze::test_only",
             "blaze::cfg_only",
+            "blaze::dependency_capability",
+            "blaze::dependency_unsafe",
+            "blaze::trust_grant_unused",
+            "blaze::dependency_capability_unreached",
         ],
     ),
     (
@@ -290,6 +294,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::repeated_field_list",
             "blaze::registry_spread",
             "blaze::same_behaviour",
+            "blaze::workspace_unsafe",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
@@ -313,6 +318,19 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::could_be_sans_io",
             "blaze::could_be_linear",
             "blaze::could_have_invariant",
+        ],
+    ),
+    // What a dependency may do only when the workspace grants it, and a workspace crate's own
+    // `unsafe` (blaze-lints' `blaze::TRUST`), also in `blaze::general` and `blaze::internal`:
+    // one name for all of them, `trust = "deny"`.
+    (
+        "blaze::trust",
+        &[
+            "blaze::dependency_capability",
+            "blaze::dependency_unsafe",
+            "blaze::dependency_capability_unreached",
+            "blaze::trust_grant_unused",
+            "blaze::workspace_unsafe",
         ],
     ),
 ];

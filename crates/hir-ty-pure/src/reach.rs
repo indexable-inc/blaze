@@ -40,21 +40,24 @@
 //! again only when a fact near their premise's terms was added ([`Solver::saturate`]). One
 //! question of a state works out each term's bounds, each sub-question and each linear
 //! residual once ([`Ask`]), so it costs the distinct terms and facts it reaches, not the paths
-//! to them. The walk goes in reverse postorder, so a block with many paths into it is joined
-//! once, and a join works out relations only for the locals still read after it
-//! ([`Solver::live_at`]). So a statement costs `O(log f + k)` per question, `f` the state's
-//! facts and `k` the facts about the terms it asks of, with each linear proof at most
-//! [`LINEAR_FUEL`] steps: linear in the body for bounded `k`, and at most [`work_bound`]
-//! whatever `k` is. What is not linear: a state is a slot per local, copied along each edge,
-//! so straight-line code with `b` blocks and `l` locals copies `b * l / 64` units of slots
-//! ([`State::size`]), and a join of `p` paths scans its `l` slots `p` times.
+//! to them. The walk goes in passes of reverse postorder, so a block with many paths into it
+//! is joined once, and a loop's head again only after its body; a join works out relations
+//! only for the locals still read after it ([`Solver::live_at`]). A state is persistent
+//! ([`Slots`], [`Sorted`]): copying it along an edge is O(1), a write copies the nodes on its
+//! path, and a join or a comparison looks only at what two states do not share, and at the
+//! slots and facts whose marks say they may mention what the join makes again. So a statement
+//! costs `O(log f + k)` per question, `f` the state's facts and `k` the facts about the terms
+//! it asks of, with each linear proof at most [`LINEAR_FUEL`] steps: linear in the body for
+//! bounded `k`, and at most [`work_bound`] whatever `k` is. What is not quite linear: the
+//! first write after a copy moves an index's list of chunks, `f / CHUNK` pointers; liveness is
+//! `l / 64` words a block; and a join of `p` paths asks `p` questions of each joined local.
 
 pub mod models;
 mod obligations;
 
 pub(crate) use obligations::Obligation;
 
-use std::{alloc::Global, cell::Cell};
+use std::{alloc::Global, cell::Cell, rc::Rc};
 
 use base_db::Db;
 use blaze_hash::HashMap;
@@ -237,13 +240,13 @@ struct Work {
 /// ([`Solver::entails`], [`Solver::bounds`]). Only looked up, never walked: no answer depends
 /// on its order.
 struct Ask {
-    bounds: HashMap<TermId, (i128, i128), Global>,
-    by_constants: HashMap<TermId, (i128, i128), Global>,
+    bounds: Memo<TermId, (i128, i128)>,
+    by_constants: Memo<TermId, (i128, i128)>,
     /// `holds` of an atom to a depth.
-    held: HashMap<(Atom, u8), bool, Global>,
+    held: Memo<(Atom, u8), bool>,
     /// Each residual `parts <= limit` a linear proof searched to the end without finding it,
     /// and the depth it searched: it is not found at that depth or less.
-    failed: HashMap<(Vec<(TermId, i128)>, i128), u8, Global>,
+    failed: Memo<(Vec<(TermId, i128)>, i128), u8>,
     /// What is left of the running linear proof's [`LINEAR_FUEL`].
     fuel: u32,
 }
@@ -251,11 +254,44 @@ struct Ask {
 impl Ask {
     fn new() -> Ask {
         Ask {
-            bounds: HashMap::new_in(Global),
-            by_constants: HashMap::new_in(Global),
-            held: HashMap::new_in(Global),
-            failed: HashMap::new_in(Global),
+            bounds: Memo::new(),
+            by_constants: Memo::new(),
+            held: Memo::new(),
+            failed: Memo::new(),
             fuel: LINEAR_FUEL,
+        }
+    }
+}
+
+/// How many entries a [`Memo`] keeps in place.
+const MEMO_INLINE: usize = 8;
+
+/// A map of one question's answers: the first [`MEMO_INLINE`] in place, looked through in
+/// order, the rest in a hash map. Most questions ask a few things, and so allocate nothing.
+struct Memo<K, V> {
+    few: smallvec::SmallVec<[(K, V); MEMO_INLINE]>,
+    many: HashMap<K, V, Global>,
+}
+
+impl<K: Eq + std::hash::Hash, V: Copy> Memo<K, V> {
+    fn new() -> Memo<K, V> {
+        Memo { few: smallvec::SmallVec::new(), many: HashMap::new_in(Global) }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        match self.few.iter().find(|it| it.0 == *key) {
+            Some(it) => Some(it.1),
+            None => self.many.get(key).copied(),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(it) = self.few.iter_mut().find(|it| it.0 == key) {
+            it.1 = value;
+        } else if self.few.len() < MEMO_INLINE {
+            self.few.push((key, value));
+        } else {
+            self.many.insert(key, value);
         }
     }
 }
@@ -316,19 +352,27 @@ type Imp = (Atom, Atom);
 /// hold and the implications between atoms. Sorted, so equal states are equal values; what
 /// a state is is `vals`, `facts` and `imps`, and the rest is indexes of them and what
 /// [`Solver::saturate`] has still to look at.
+///
+/// Persistent: every part is shared between copies ([`Slots`], [`Sorted`]), so a copy (an
+/// edge's state, a block's entry) is O(1), a write copies only the nodes it changes, and a
+/// comparison or a join looks only at what is not shared, which charged writes made.
 #[derive(Clone, Debug)]
 struct State {
-    vals: Vec<TermId>,
-    facts: Vec<Atom>,
-    imps: Vec<Imp>,
+    vals: Slots,
+    facts: Sorted<Atom>,
+    imps: Sorted<Imp>,
     /// Each fact under each term it is about (its sides, and the parts of a side that is a
     /// linear form: [`Solver::fact_keys`]), sorted: what bounds, the one-step walk and the
     /// linear proofs read in place of every fact.
-    about: Vec<(TermId, Atom)>,
+    about: Sorted<(TermId, Atom)>,
     /// Each implication by its conclusion, sorted.
-    concluding: Vec<(Atom, Atom)>,
+    concluding: Sorted<(Atom, Atom)>,
     /// Each implication under each term of its premise ([`Solver::premise_keys`]), sorted.
-    premised: Vec<(TermId, Imp)>,
+    premised: Sorted<(TermId, Imp)>,
+    /// The union of the marks ([`Solver::marks`]) of every term a fact or an implication put
+    /// has: a fact can mention a join's or a statement's unknown only when its bit is here.
+    /// Never narrowed, so it is a superset.
+    marks: u64,
     /// The facts and implications put since the last [`Solver::saturate`].
     fresh: Vec<Atom>,
     fresh_imps: Vec<Imp>,
@@ -344,11 +388,373 @@ impl PartialEq for State {
 
 impl Eq for State {}
 
-/// The entries of a sorted `(key, value)` index whose key is `key`.
-fn keyed<K: Ord + Copy, V: Copy>(index: &[(K, V)], key: K) -> &[(K, V)] {
-    let start = index.partition_point(|it| it.0 < key);
-    let end = start + index[start..].partition_point(|it| it.0 == key);
-    &index[start..end]
+/// The bits of a term's mark ([`Solver::marks`]): one per block modulo 32 for the unknowns
+/// of its join, and one for those its statements make.
+fn join_mark(block: u32) -> u64 {
+    1 << (block % 32)
+}
+
+fn at_mark(block: u32) -> u64 {
+    1 << (32 + block % 32)
+}
+
+/// The bits of a slot's number each level of [`Slots`] reads, and how many entries a node has.
+const FAN_BITS: u32 = 4;
+const FAN: usize = 1 << FAN_BITS;
+const FAN_MASK: usize = FAN - 1;
+
+/// A node of [`Slots`]: [`FAN`] slots, or [`FAN`] nodes a level down, with the union of the
+/// marks of the terms under it.
+#[derive(Clone)]
+enum SlotNode {
+    Leaf { mark: u64, slots: [TermId; FAN] },
+    Branch { mark: u64, kids: [Rc<SlotNode>; FAN] },
+}
+
+impl SlotNode {
+    fn mark(&self) -> u64 {
+        match self {
+            SlotNode::Leaf { mark, .. } | SlotNode::Branch { mark, .. } => *mark,
+        }
+    }
+}
+
+/// A state's slots: a fixed number of term ids in a tree of shared nodes, [`FAN`] wide. A
+/// copy is O(1); a write copies the nodes on its path, O(FAN log l), the first time after a
+/// copy, and none after; two copies differ only under nodes they do not share, which is what
+/// [`Slots::diff`] visits. Each node carries the union of its terms' marks, so the slots that
+/// may mention a join's or a statement's unknown are found without looking at the others
+/// ([`Slots::marked`]).
+#[derive(Clone)]
+struct Slots {
+    len: usize,
+    /// Levels above the leaves.
+    depth: u32,
+    root: Rc<SlotNode>,
+}
+
+impl Slots {
+    fn new(vals: &[TermId], marks: &[u64]) -> Slots {
+        let mut depth = 0;
+        while (FAN << (FAN_BITS * depth)) < vals.len() {
+            depth += 1;
+        }
+        let mut empty = None;
+        let root = Slots::build(vals, marks, depth, 0, &mut empty);
+        Slots { len: vals.len(), depth, root }
+    }
+
+    /// The node at `level` whose first slot is `start`; the leaves past the end are one
+    /// shared empty leaf, `empty`.
+    fn build(
+        vals: &[TermId],
+        marks: &[u64],
+        level: u32,
+        start: usize,
+        empty: &mut Option<Rc<SlotNode>>,
+    ) -> Rc<SlotNode> {
+        if level == 0 {
+            if start >= vals.len() && let Some(leaf) = empty {
+                return leaf.clone(); // clone: one shared empty leaf
+            }
+            let mut slots = [0; FAN];
+            let mut mark = 0;
+            for (at, slot) in slots.iter_mut().enumerate() {
+                if let Some(&value) = vals.get(start + at) {
+                    *slot = value;
+                    mark |= marks.get(value as usize).copied().unwrap_or(0);
+                }
+            }
+            let leaf = Rc::new_in(SlotNode::Leaf { mark, slots }, Global);
+            if start >= vals.len() {
+                *empty = Some(leaf.clone()); // clone: kept for the next past the end
+            }
+            return leaf;
+        }
+        let span = 1usize << (FAN_BITS * level);
+        let kids: [Rc<SlotNode>; FAN] =
+            std::array::from_fn(|at| Slots::build(vals, marks, level - 1, start + at * span, empty));
+        let mark = kids.iter().fold(0, |mark, it| mark | it.mark());
+        Rc::new_in(SlotNode::Branch { mark, kids }, Global)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Puts `value` in slot `at`, copying the nodes on the way that another copy shares.
+    fn set(&mut self, at: usize, value: TermId, marks: &[u64]) {
+        assert!(at < self.len, "slot {at} of a state of {} slots", self.len);
+        if self[at] == value {
+            return;
+        }
+        Slots::set_in(&mut self.root, self.depth, at, value, marks);
+    }
+
+    fn set_in(node: &mut Rc<SlotNode>, level: u32, at: usize, value: TermId, marks: &[u64]) {
+        match Rc::make_mut(node) {
+            SlotNode::Leaf { mark, slots } => {
+                slots[at & FAN_MASK] = value;
+                *mark = slots
+                    .iter()
+                    .fold(0, |mark, &it| mark | marks.get(it as usize).copied().unwrap_or(0));
+            }
+            SlotNode::Branch { mark, kids } => {
+                let kid = (at >> (FAN_BITS * level)) & FAN_MASK;
+                Slots::set_in(&mut kids[kid], level - 1, at, value, marks);
+                *mark = kids.iter().fold(0, |mark, it| mark | it.mark());
+            }
+        }
+    }
+
+    /// Calls `found` with each slot whose value differs between `self` and `other` (two
+    /// states of one proof, of one length), looking only under the nodes they do not share.
+    fn diff(&self, other: &Slots, found: &mut impl FnMut(usize)) {
+        assert_eq!(self.len, other.len, "two states of one proof have one length");
+        Slots::diff_in(&self.root, &other.root, self.depth, 0, self.len, found);
+    }
+
+    fn diff_in(
+        a: &Rc<SlotNode>,
+        b: &Rc<SlotNode>,
+        level: u32,
+        start: usize,
+        len: usize,
+        found: &mut impl FnMut(usize),
+    ) {
+        if Rc::ptr_eq(a, b) || start >= len {
+            return;
+        }
+        match (&**a, &**b) {
+            (SlotNode::Leaf { slots: x, .. }, SlotNode::Leaf { slots: y, .. }) => {
+                for at in 0..FAN {
+                    if start + at < len && x[at] != y[at] {
+                        found(start + at);
+                    }
+                }
+            }
+            (SlotNode::Branch { kids: x, .. }, SlotNode::Branch { kids: y, .. }) => {
+                let span = 1usize << (FAN_BITS * level);
+                for at in 0..FAN {
+                    Slots::diff_in(&x[at], &y[at], level - 1, start + at * span, len, found);
+                }
+            }
+            _ => unreachable!("two slot trees of one length have one shape"),
+        }
+    }
+
+    /// Calls `found` with each slot whose term's mark has a bit of `mark`, looking only under
+    /// the nodes whose mark has one.
+    fn marked(&self, mark: u64, marks: &[u64], found: &mut impl FnMut(usize)) {
+        Slots::marked_in(&self.root, self.depth, 0, self.len, mark, marks, found);
+    }
+
+    fn marked_in(
+        node: &Rc<SlotNode>,
+        level: u32,
+        start: usize,
+        len: usize,
+        mark: u64,
+        marks: &[u64],
+        found: &mut impl FnMut(usize),
+    ) {
+        if node.mark() & mark == 0 || start >= len {
+            return;
+        }
+        match &**node {
+            SlotNode::Leaf { slots, .. } => {
+                for (at, &it) in slots.iter().enumerate() {
+                    let hit = marks.get(it as usize).is_some_and(|&it| it & mark != 0);
+                    if start + at < len && hit {
+                        found(start + at);
+                    }
+                }
+            }
+            SlotNode::Branch { kids, .. } => {
+                let span = 1usize << (FAN_BITS * level);
+                for (at, kid) in kids.iter().enumerate() {
+                    Slots::marked_in(kid, level - 1, start + at * span, len, mark, marks, found);
+                }
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Slots {
+    type Output = TermId;
+
+    fn index(&self, at: usize) -> &TermId {
+        assert!(at < self.len, "slot {at} of a state of {} slots", self.len);
+        let mut node = &*self.root;
+        let mut level = self.depth;
+        loop {
+            match node {
+                SlotNode::Leaf { slots, .. } => return &slots[at & FAN_MASK],
+                SlotNode::Branch { kids, .. } => {
+                    node = &*kids[(at >> (FAN_BITS * level)) & FAN_MASK];
+                    level -= 1;
+                }
+            }
+        }
+    }
+}
+
+impl PartialEq for Slots {
+    fn eq(&self, other: &Slots) -> bool {
+        fn same(a: &Rc<SlotNode>, b: &Rc<SlotNode>) -> bool {
+            Rc::ptr_eq(a, b)
+                || match (&**a, &**b) {
+                    (SlotNode::Leaf { slots: x, .. }, SlotNode::Leaf { slots: y, .. }) => x == y,
+                    (SlotNode::Branch { kids: x, .. }, SlotNode::Branch { kids: y, .. }) => {
+                        x.iter().zip(y.iter()).all(|(a, b)| same(a, b))
+                    }
+                    _ => false,
+                }
+        }
+        // Past the end every tree holds the empty leaf's zeros, so equal shapes compare whole.
+        self.len == other.len && same(&self.root, &other.root)
+    }
+}
+
+impl std::fmt::Debug for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries((0..self.len).map(|at| self[at])).finish()
+    }
+}
+
+/// How many entries a chunk of [`Sorted`] holds at most.
+const CHUNK: usize = 64;
+
+/// A sorted set shared between copies: sorted chunks of at most [`CHUNK`] entries, none
+/// empty, under a shared list of them in order. A copy is O(1); an insert copies the one chunk
+/// it changes and, the first time after a copy, the list ([`CHUNK`] times shorter than the
+/// set): what a state's facts and indexes are.
+#[derive(Clone)]
+struct Sorted<T> {
+    len: usize,
+    chunks: Rc<Vec<Rc<Vec<T>>>>,
+}
+
+impl<T: Ord + Copy> Sorted<T> {
+    fn new() -> Sorted<T> {
+        Sorted { len: 0, chunks: Rc::new_in(Vec::new_in(Global), Global) }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// How many chunks: what the first write after a copy moves of the list.
+    fn chunks(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// The first chunk whose last entry is not below `entry`.
+    fn chunk_at(&self, entry: &T) -> usize {
+        self.chunks.partition_point(|it| it.last().is_some_and(|last| last < entry))
+    }
+
+    fn contains(&self, entry: &T) -> bool {
+        let at = self.chunk_at(entry);
+        self.chunks.get(at).is_some_and(|it| it.binary_search(entry).is_ok())
+    }
+
+    /// Puts `entry` in once: false when it was there.
+    fn insert(&mut self, entry: T) -> bool {
+        let at = self.chunk_at(&entry).min(self.chunks.len().saturating_sub(1));
+        let place = match self.chunks.get(at).map(|it| it.binary_search(&entry)) {
+            Some(Ok(_)) => return false,
+            Some(Err(place)) => place,
+            None => 0,
+        };
+        let chunks = Rc::make_mut(&mut self.chunks);
+        if chunks.is_empty() {
+            let mut chunk = Vec::with_capacity_in(CHUNK, Global);
+            chunk.push(entry);
+            chunks.push(Rc::new_in(chunk, Global));
+            self.len = 1;
+            return true;
+        }
+        let chunk = Rc::make_mut(&mut chunks[at]);
+        chunk.insert(place, entry);
+        if chunk.len() > CHUNK {
+            let mut upper = Vec::with_capacity_in(CHUNK, Global);
+            upper.extend_from_slice(&chunk[CHUNK / 2..]);
+            chunk.truncate(CHUNK / 2);
+            chunks.insert(at + 1, Rc::new_in(upper, Global));
+        }
+        self.len += 1;
+        true
+    }
+
+    /// Keeps the entries `keep` says yes to, each asked once: the chunks it keeps whole stay
+    /// shared. False when it kept all.
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) -> bool {
+        let mut out = Vec::with_capacity_in(self.chunks.len(), Global);
+        let mut changed = false;
+        let mut len = 0;
+        for chunk in self.chunks.iter() {
+            let Some(first) = chunk.iter().position(|it| !keep(it)) else {
+                len += chunk.len();
+                out.push(chunk.clone()); // clone: the chunk, shared
+                continue;
+            };
+            changed = true;
+            let mut kept = Vec::with_capacity_in(chunk.len(), Global);
+            kept.extend_from_slice(&chunk[..first]);
+            for it in &chunk[first + 1..] {
+                if keep(it) {
+                    kept.push(*it);
+                }
+            }
+            if !kept.is_empty() {
+                len += kept.len();
+                out.push(Rc::new_in(kept, Global));
+            }
+        }
+        if changed {
+            self.chunks = Rc::new_in(out, Global);
+            self.len = len;
+        }
+        changed
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        self.chunks.iter().flat_map(|it| it.iter())
+    }
+}
+
+impl<K: Ord + Copy, V: Ord + Copy> Sorted<(K, V)> {
+    /// The entries of a `(key, value)` index whose key is `key`, in order.
+    fn keyed(&self, key: K) -> impl Iterator<Item = &(K, V)> + Clone + '_ {
+        let at = self.chunks.partition_point(|it| it.last().is_some_and(|last| last.0 < key));
+        let start = self.chunks.get(at).map_or(0, |it| it.partition_point(|entry| entry.0 < key));
+        self.chunks[at.min(self.chunks.len())..]
+            .iter()
+            .enumerate()
+            .flat_map(move |(n, chunk)| chunk[if n == 0 { start } else { 0 }..].iter())
+            .take_while(move |entry| entry.0 == key)
+    }
+}
+
+impl<T: Ord + Copy> PartialEq for Sorted<T> {
+    fn eq(&self, other: &Sorted<T>) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        if Rc::ptr_eq(&self.chunks, &other.chunks) {
+            return true;
+        }
+        let aligned = self.chunks.len() == other.chunks.len()
+            && self.chunks.iter().zip(other.chunks.iter()).all(|(a, b)| Rc::ptr_eq(a, b) || a == b);
+        aligned || self.iter().eq(other.iter())
+    }
+}
+
+impl<T: Ord + Copy + std::fmt::Debug> std::fmt::Debug for Sorted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 /// Puts `entry` into the sorted `index` once.
@@ -363,96 +769,99 @@ fn insert_sorted<T: Ord>(index: &mut Vec<T>, entry: T) -> bool {
 }
 
 impl State {
-    fn new(vals: Vec<TermId>) -> State {
+    fn new(vals: Slots) -> State {
         State {
             vals,
-            facts: Vec::new(), // alloc: the state's facts, grown as they are put
-            imps: Vec::new(),
-            about: Vec::new(),
-            concluding: Vec::new(),
-            premised: Vec::new(),
-            fresh: Vec::new(),
-            fresh_imps: Vec::new(),
+            facts: Sorted::new(),
+            imps: Sorted::new(),
+            about: Sorted::new(),
+            concluding: Sorted::new(),
+            premised: Sorted::new(),
+            marks: 0,
+            fresh: Vec::new_in(Global),
+            fresh_imps: Vec::new_in(Global),
             stale: false,
         }
     }
 
     fn has(&self, atom: Atom) -> bool {
-        self.facts.binary_search(&atom).is_ok()
+        self.facts.contains(&atom)
     }
 
     fn has_imp(&self, imp: Imp) -> bool {
-        self.imps.binary_search(&imp).is_ok()
+        self.imps.contains(&imp)
     }
 
-    /// What a copy (or a comparison) of the state costs, in work units of about four cache
-    /// lines moved: a fact or an implication with its index entries is about one line, a
-    /// slot a sixteenth of one.
+    /// What a copy (or a comparison) of the state costs: one unit. A copy shares every
+    /// node; a comparison looks only under the nodes two states do not share, each made by a
+    /// write that was charged when it was made.
     fn size(&self) -> u64 {
-        (self.vals.len() as u64).div_ceil(64) + ((self.facts.len() + self.imps.len()) as u64).div_ceil(4)
+        1
     }
 
     /// The facts about `term` ([`State::about`]'s entries).
-    fn about(&self, term: TermId) -> &[(TermId, Atom)] {
-        keyed(&self.about, term)
+    fn about(&self, term: TermId) -> impl Iterator<Item = &(TermId, Atom)> + Clone + '_ {
+        self.about.keyed(term)
     }
 
     /// The implications whose conclusion is `atom`, as `(conclusion, premise)`.
-    fn concluding(&self, atom: Atom) -> &[(Atom, Atom)] {
-        keyed(&self.concluding, atom)
+    fn concluding(&self, atom: Atom) -> impl Iterator<Item = &(Atom, Atom)> + Clone + '_ {
+        self.concluding.keyed(atom)
     }
 
     /// The implications whose premise is about `term`.
-    fn premised(&self, term: TermId) -> &[(TermId, Imp)] {
-        keyed(&self.premised, term)
+    fn premised(&self, term: TermId) -> impl Iterator<Item = &(TermId, Imp)> + Clone + '_ {
+        self.premised.keyed(term)
+    }
+
+    /// What the first write after a copy moves of the indexes' lists, in units of
+    /// [`CHUNK`] pointers ([`Sorted`]).
+    fn lists(&self) -> u64 {
+        (self.facts.chunks() + self.about.chunks()) as u64 / CHUNK as u64
     }
 
     /// Puts `atom` under the terms `keys`.
     fn insert(&mut self, atom: Atom, keys: &[TermId]) {
-        if !insert_sorted(&mut self.facts, atom) {
+        if !self.facts.insert(atom) {
             return;
         }
         for &key in keys {
-            insert_sorted(&mut self.about, (key, atom));
+            self.about.insert((key, atom));
         }
         self.fresh.push(atom);
     }
 
     /// Puts `imp` under the terms of its premise, `keys`.
     fn insert_imp(&mut self, imp: Imp, keys: &[TermId]) {
-        if !insert_sorted(&mut self.imps, imp) {
+        if !self.imps.insert(imp) {
             return;
         }
-        insert_sorted(&mut self.concluding, (imp.1, imp.0));
+        self.concluding.insert((imp.1, imp.0));
         for &key in keys {
-            insert_sorted(&mut self.premised, (key, imp));
+            self.premised.insert((key, imp));
         }
         self.fresh_imps.push(imp);
     }
 
     /// Keeps the facts `keep` says yes to, and their entries in the indexes.
     fn retain_facts(&mut self, mut keep: impl FnMut(Atom) -> bool) {
-        let before = self.facts.len();
-        self.facts.retain(|&it| keep(it));
-        if self.facts.len() == before {
+        if !self.facts.retain(|&it| keep(it)) {
             return;
         }
         let facts = &self.facts;
-        self.about.retain(|(_, it)| facts.binary_search(it).is_ok());
-        self.fresh.retain(|it| facts.binary_search(it).is_ok());
+        self.about.retain(|(_, it)| facts.contains(it));
+        self.fresh.retain(|it| facts.contains(it));
     }
 
     /// Keeps the implications `keep` says yes to, and their entries in the indexes.
     fn retain_imps(&mut self, mut keep: impl FnMut(Imp) -> bool) {
-        let before = self.imps.len();
-        self.imps.retain(|&it| keep(it));
-        if self.imps.len() == before {
+        if !self.imps.retain(|&it| keep(it)) {
             return;
         }
         let imps = &self.imps;
-        self.concluding.retain(|&(then, premise)| imps.binary_search(&(premise, then)).is_ok());
-        self.premised.retain(|(_, it)| imps.binary_search(it).is_ok());
-        self.fresh_imps.retain(|it| imps.binary_search(it).is_ok());
+        self.concluding.retain(|&(then, premise)| imps.contains(&(premise, then)));
+        self.premised.retain(|(_, it)| imps.contains(it));
+        self.fresh_imps.retain(|it| imps.contains(it));
     }
 }
 
@@ -746,68 +1155,102 @@ fn local_index(local: LocalId) -> usize {
 }
 
 /// Sets the bit of the local in `slot`.
-fn always_live(bits: &mut [u64], slot: usize) {
+fn set_bit(bits: &mut [u64], slot: usize) {
     if let Some(word) = bits.get_mut(slot / 64) {
         *word |= 1 << (slot % 64);
     }
 }
 
-/// The locals `place` reads: the indexes it goes through, and its local unless all of it is
-/// what is written (`whole_write`).
-fn place_reads(place: &StoredPlace, whole_write: bool, bits: &mut [u64]) {
-    let projection = place.projection.as_slice();
-    for elem in projection {
-        if let ProjectionElem::Index(local) = elem {
-            always_live(bits, local_index(*local));
-        }
-    }
-    if !(whole_write && projection.is_empty()) {
-        always_live(bits, local_index(place.local));
+fn clear_bit(bits: &mut [u64], slot: usize) {
+    if let Some(word) = bits.get_mut(slot / 64) {
+        *word &= !(1 << (slot % 64));
     }
 }
 
-fn operand_reads(operand: &Operand, bits: &mut [u64]) {
+/// The locals `place` reads: the indexes it goes through, and its local unless all of it is
+/// what is written (`whole_write`).
+fn place_reads(place: &StoredPlace, whole_write: bool, read: &mut impl FnMut(usize)) {
+    let projection = place.projection.as_slice();
+    for elem in projection {
+        if let ProjectionElem::Index(local) = elem {
+            read(local_index(*local));
+        }
+    }
+    if !(whole_write && projection.is_empty()) {
+        read(local_index(place.local));
+    }
+}
+
+fn operand_reads(operand: &Operand, read: &mut impl FnMut(usize)) {
     if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
-        place_reads(place, false, bits);
+        place_reads(place, false, read);
     }
 }
 
 /// The locals a statement reads, as `hir_ty_mir`'s passes' visitor sees its mentions.
-fn statement_reads(statement: &StatementKind, bits: &mut [u64]) {
+fn statement_reads(statement: &StatementKind, read: &mut impl FnMut(usize)) {
     match statement {
         StatementKind::Assign(to, rvalue) => {
             match rvalue {
                 Rvalue::Ref(_, place)
                 | Rvalue::Len(place)
                 | Rvalue::Discriminant(place)
-                | Rvalue::CopyForDeref(place) => place_reads(place, false, bits),
-                _ => rvalue.for_each_operand(&mut |it| operand_reads(it, bits)),
+                | Rvalue::CopyForDeref(place) => place_reads(place, false, read),
+                _ => rvalue.for_each_operand(&mut |it| operand_reads(it, read)),
             }
-            place_reads(to, true, bits);
+            place_reads(to, true, read);
         }
         StatementKind::FakeRead(place) | StatementKind::Deinit(place) => {
-            place_reads(place, false, bits)
+            place_reads(place, false, read)
         }
+        _ => statement.for_each_operand(&mut |it| operand_reads(it, read)),
+    }
+}
+
+/// The local a statement writes all of, which no read before it in the block sees.
+fn statement_def(statement: &StatementKind) -> Option<usize> {
+    match statement {
+        StatementKind::Assign(to, _) if to.projection.as_slice().is_empty() => {
+            Some(local_index(to.local))
+        }
+        _ => None,
+    }
+}
+
+/// The locals a statement writes, whole or in part.
+fn statement_writes(statement: &StatementKind, write: &mut impl FnMut(usize)) {
+    match statement {
+        StatementKind::Assign(to, _) | StatementKind::Deinit(to) => write(local_index(to.local)),
         _ => {}
     }
 }
 
 /// The locals a terminator reads.
-fn terminator_reads(terminator: &TerminatorKind, bits: &mut [u64]) {
+fn terminator_reads(terminator: &TerminatorKind, read: &mut impl FnMut(usize)) {
     match terminator {
-        TerminatorKind::Drop { place, .. } => place_reads(place, false, bits),
+        TerminatorKind::Drop { place, .. } => place_reads(place, false, read),
         TerminatorKind::DropAndReplace { place, value, .. } => {
-            operand_reads(value, bits);
-            place_reads(place, false, bits);
+            operand_reads(value, read);
+            place_reads(place, false, read);
         }
         TerminatorKind::Call { func, args, destination, .. } => {
-            operand_reads(func, bits);
+            operand_reads(func, read);
             for arg in args.iter() {
-                operand_reads(arg, bits);
+                operand_reads(arg, read);
             }
-            place_reads(destination, true, bits);
+            place_reads(destination, true, read);
         }
-        _ => terminator.for_each_operand(&mut |it| operand_reads(it, bits)),
+        _ => terminator.for_each_operand(&mut |it| operand_reads(it, read)),
+    }
+}
+
+/// The locals a terminator writes, whole or in part (a call's destination is written on the
+/// way back only, so it is never a definition the block's liveness kills at).
+fn terminator_writes(terminator: &TerminatorKind, write: &mut impl FnMut(usize)) {
+    match terminator {
+        TerminatorKind::DropAndReplace { place, .. } => write(local_index(place.local)),
+        TerminatorKind::Call { destination, .. } => write(local_index(destination.local)),
+        _ => {}
     }
 }
 
@@ -1067,6 +1510,10 @@ struct Solver<'a, 'db> {
     ids: HashMap<Term, TermId, Global>,
     /// What each term's type allows, by its number.
     ranges: Vec<(i128, i128)>,
+    /// What each term mentions, by its number, as bits ([`join_mark`], [`at_mark`]): the
+    /// blocks (modulo 32) whose joins' or statements' unknowns are in it, so what a join or a
+    /// statement makes again is found among the slots and facts whose marks have its bit.
+    marks: Vec<u64>,
     /// The first named local each term was put in, for messages.
     names: HashMap<TermId, u32, Global>,
     /// The locals a binding of the source names.
@@ -1077,6 +1524,8 @@ struct Solver<'a, 'db> {
     models: HashMap<hir_def::FunctionId, Option<Model>, Global>,
     /// The locals whose address a `&mut` or a raw pointer took.
     exposed: Vec<bool>,
+    /// The same, as the slots' numbers in order: what [`Self::bump`] visits.
+    exposed_slots: Vec<u32>,
     /// The blocks on a cycle of the graph: only there can a point run again.
     cyclic: Vec<bool>,
     predecessors: Vec<Vec<u32>>,
@@ -1116,6 +1565,11 @@ struct Solver<'a, 'db> {
     /// entry ([`Self::liveness`]). Only these are worth what a join works out of a slot.
     live: Vec<u64>,
     live_words: usize,
+    /// Per block, `live_words` words of bits: the locals it writes ([`Self::liveness`]).
+    written: Vec<u64>,
+    /// Each slot's value at the body's entry ([`Self::entry`]): what a slot no path reads
+    /// any more holds ([`Self::clear_dead`]).
+    entry_vals: Vec<TermId>,
 }
 
 /// The widest range a term's value is kept in.
@@ -1164,12 +1618,14 @@ impl<'a, 'db> Solver<'a, 'db> {
             terms: Vec::new(), // alloc: the body's terms, once per proof
             ids: HashMap::new_in(Global),
             ranges: Vec::new(), // alloc: one range per term
+            marks: Vec::new_in(Global),
             names: HashMap::new_in(Global),
             named: Vec::new(),
             enums: HashMap::new_in(Global),
             variants: Vec::new(), // alloc: the variants the body names, few
             models: HashMap::new_in(Global),
             exposed: Vec::new(),
+            exposed_slots: Vec::new_in(Global),
             cyclic,
             predecessors,
             joined: vec![Vec::new(); count], // alloc: one list per block, once per proof
@@ -1189,8 +1645,12 @@ impl<'a, 'db> Solver<'a, 'db> {
             rpo: Vec::new_in(Global),
             live: Vec::new_in(Global),
             live_words: body.locals.len().div_ceil(64),
+            written: Vec::new_in(Global),
+            entry_vals: Vec::new_in(Global),
         };
         solver.exposed = solver.exposed_locals();
+        solver.exposed_slots =
+            (0..solver.exposed.len() as u32).filter(|&it| solver.exposed[it as usize]).collect();
         let mut named = vec![false; body.locals.len()]; // alloc: one flag per local, once per proof
         for (_, local) in body.binding_locals.iter() {
             named[local_index(*local)] = true;
@@ -1238,21 +1698,21 @@ impl<'a, 'db> Solver<'a, 'db> {
     // Facts, indexed.
 
     /// The terms a fact with side `term` is about: the term, and the parts of a linear form.
-    fn fact_keys(&self, term: TermId, keys: &mut Vec<TermId>) {
+    fn fact_keys(&self, term: TermId, keys: &mut impl Extend<TermId>) {
         match &self.terms[term as usize] {
             Term::Const(_) => {}
             Term::Lin(parts, _) => {
-                keys.push(term);
+                keys.extend([term]);
                 keys.extend(parts.iter().map(|&(it, _)| it));
             }
-            _ => keys.push(term),
+            _ => keys.extend([term]),
         }
     }
 
     /// The terms a premise with side `term` is about: [`Self::fact_keys`], and those of the
     /// sides of a comparison or a `!` it is the value of (`c == 1` holds when the comparison
     /// `c` is does).
-    fn premise_keys(&self, term: TermId, keys: &mut Vec<TermId>) {
+    fn premise_keys(&self, term: TermId, keys: &mut impl Extend<TermId>) {
         self.fact_keys(term, keys);
         match self.terms[term as usize] {
             Term::Cmp(_, a, b) => {
@@ -1293,16 +1753,16 @@ impl<'a, 'db> Solver<'a, 'db> {
             let end = self.lin_bounds.len() as u32;
             self.lins.insert(atom, (start, end));
         }
-        let mut keys = Vec::new(); // alloc: the terms one fact is about, a few
+        // The terms one fact is about, a few: in place, no allocation.
+        let mut keys = smallvec::SmallVec::<[TermId; 8]>::new();
         self.fact_keys(atom.a, &mut keys);
         self.fact_keys(atom.b, &mut keys);
         keys.sort_unstable();
         keys.dedup();
-        // Each key a binary search and a move of half the index on average, at sixteen
-        // entries a unit ([`State::size`]'s four cache lines): the sorted index's insert is
-        // linear in the state, the part of a fact's cost that is not `O(log f)`.
-        let moved = (keys.len() as u64).saturating_mul(state.about.len() as u64) / 32;
-        let _ = self.charge(keys.len() as u64 + 1 + moved);
+        // Each key a binary search and an insert into one chunk of at most [`CHUNK`] entries
+        // ([`Sorted`]), and the lists' share of the first write after a copy.
+        let _ = self.charge(2 * keys.len() as u64 + 2 + state.lists());
+        state.marks |= self.marks[atom.a as usize] | self.marks[atom.b as usize];
         state.insert(atom, &keys);
     }
 
@@ -1311,12 +1771,16 @@ impl<'a, 'db> Solver<'a, 'db> {
         if state.has_imp(imp) {
             return;
         }
-        let mut keys = Vec::new(); // alloc: the terms one premise is about, a few
+        let mut keys = smallvec::SmallVec::<[TermId; 8]>::new();
         self.premise_keys(imp.0.a, &mut keys);
         self.premise_keys(imp.0.b, &mut keys);
         keys.sort_unstable();
         keys.dedup();
-        let _ = self.charge(keys.len() as u64 + 1);
+        let _ = self.charge(2 * keys.len() as u64 + 3 + state.lists());
+        let (premise, then) = imp;
+        state.marks |= [premise.a, premise.b, then.a, then.b]
+            .iter()
+            .fold(0, |mark, &it| mark | self.marks[it as usize]);
         state.insert_imp(imp, &keys);
     }
 
@@ -1339,10 +1803,34 @@ impl<'a, 'db> Solver<'a, 'db> {
             return id;
         }
         let id = self.terms.len() as TermId;
+        let mark = self.mark_of(&term);
         self.terms.push(term.clone()); // clone: the table's copy and the map's key
         self.ranges.push(range);
+        self.marks.push(mark);
         self.ids.insert(term, id);
         id
+    }
+
+    /// The mark of a new term ([`Self::marks`]): its own unknown's bit, or the union of its
+    /// parts' marks, the parts [`Self::mentions`] looks into.
+    fn mark_of(&self, term: &Term) -> u64 {
+        let of = |it: &TermId| self.marks[*it as usize];
+        match term {
+            Term::Const(_) | Term::Unknown(Key::Entry(_)) => 0,
+            Term::Unknown(Key::Join(block, _)) => join_mark(*block),
+            Term::Unknown(Key::At(block, ..)) => at_mark(*block),
+            Term::Len(a)
+            | Term::Discr(a)
+            | Term::Field(a, _)
+            | Term::Payload(a, _, _)
+            | Term::Not(a)
+            | Term::RefTo(a)
+            | Term::Deref(a)
+            | Term::Wrap(a, _) => of(a),
+            Term::Cmp(_, a, b) | Term::DerefAt(a, b) | Term::MutRef(_, a, b) => of(a) | of(b),
+            Term::Agg(_, fields) => fields.iter().fold(0, |mark, it| mark | of(it)),
+            Term::Lin(parts, _) => parts.iter().fold(0, |mark, (it, _)| mark | of(it)),
+        }
     }
 
     fn constant(&mut self, value: i128) -> TermId {
@@ -1552,7 +2040,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                         continue;
                     };
                     let residual = (rest, left);
-                    if ask.failed.get(&residual).is_some_and(|&searched| searched >= depth - 1) {
+                    if ask.failed.get(&residual).is_some_and(|searched| searched >= depth - 1) {
                         continue;
                     }
                     if self.parts_le(state, &residual.0, residual.1, depth - 1, ask) {
@@ -1792,7 +2280,7 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     /// [`Self::bounds`], each term's worked out once per question.
     fn bounds_in(&self, state: &State, term: TermId, ask: &mut Ask) -> (i128, i128) {
-        if let Some(&known) = ask.bounds.get(&term) {
+        if let Some(known) = ask.bounds.get(&term) {
             let _ = self.charge(1);
             return known;
         }
@@ -1887,7 +2375,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if let Some(value) = self.const_of(term) {
             return (value, value);
         }
-        if let Some(&known) = ask.by_constants.get(&term) {
+        if let Some(known) = ask.by_constants.get(&term) {
             let _ = self.charge(1);
             return known;
         }
@@ -1915,10 +2403,12 @@ impl<'a, 'db> Solver<'a, 'db> {
         let (mut low, mut high) = self.ranges[term as usize];
         let about = state.about(term);
         let mut ruled_out = false;
-        for &(_, fact) in about {
+        let mut count = 0;
+        for &(_, fact) in about.clone() { // clone: an iterator over the index, walked again below
             if !self.charge(1) {
                 break;
             }
+            count += 1;
             let (left, right) = (fact.a == term, fact.b == term);
             if !left && !right {
                 continue;
@@ -1942,10 +2432,11 @@ impl<'a, 'db> Solver<'a, 'db> {
             return (low, high);
         }
         // A value ruled out at an end moves the end: at most as many turns as such facts.
-        let mut turns = about.len();
+        let mut turns = count;
         loop {
             let mut moved = false;
-            for &(_, fact) in about {
+            // clone: an iterator over the index, one walk per turn
+            for &(_, fact) in about.clone() {
                 if !self.charge(1) {
                     return (low, high);
                 }
@@ -1981,7 +2472,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         if state.has(atom) {
             return true;
         }
-        if let Some(&known) = ask.held.get(&(atom, depth)) {
+        if let Some(known) = ask.held.get(&(atom, depth)) {
             let _ = self.charge(1);
             return known;
         }
@@ -2053,8 +2544,8 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // One step through a fact: `a <= m` and `m < b`, and the like; `a == m` rewrites. Only
         // a fact about `a` or `b` can be one: those about `a`, then those about `b` alone.
-        let about_b = state.about(b).iter().filter(|(_, it)| it.a != a && it.b != a);
-        for &(_, fact) in state.about(a).iter().chain(about_b) {
+        let about_b = state.about(b).filter(|(_, it)| it.a != a && it.b != a);
+        for &(_, fact) in state.about(a).chain(about_b) {
             if !self.charge(1) {
                 return false;
             }
@@ -2079,7 +2570,6 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         state
             .concluding(atom)
-            .iter()
             .any(|&(_, premise)| self.charge(1) && self.holds(state, premise, depth - 1, ask))
     }
 
@@ -2148,7 +2638,7 @@ impl<'a, 'db> Solver<'a, 'db> {
             // alloc: the implications to ask, few
             let mut asked: Vec<Imp> = Vec::new();
             if every {
-                asked.extend_from_slice(&state.imps);
+                asked.extend(state.imps.iter().copied());
             } else {
                 asked.extend(fresh_imps);
                 // The terms the new facts are about, then those [`REASK_HOPS`] facts away.
@@ -2261,58 +2751,80 @@ impl<'a, 'db> Solver<'a, 'db> {
         post
     }
 
-    /// Fills [`Self::live`]: per block, the locals a statement or terminator of a block it
-    /// reaches (itself too) reads, or writes part of; the parameters, the return place and
-    /// every exposed local everywhere. An over-approximation (a write of all of a local
-    /// before a read does not end it), so a local not in it is never read from the block on,
-    /// and what a join would work out of its slot is never asked. Charged a unit per word
-    /// per block per pass; a pass in postorder carries reads back along every forward edge,
-    /// so the passes are at most one more than the back edges on a path, and never more than
-    /// the blocks.
+    /// Fills [`Self::live`] and [`Self::written`]: per block, the locals that may be read
+    /// from its entry on before a statement writes all of them (a statement or terminator
+    /// reads them, or writes part of them), and the locals the block writes. The parameters,
+    /// the return place and every exposed local are live everywhere. So a local not live at
+    /// a block is not read on any path from it before it is written whole: what a join would
+    /// work out of its slot is never asked, and [`Self::clear_dead`] gives its slot back its
+    /// entry value. A local's reads and whole writes are found once, in one backward scan of
+    /// each block; then each pass, in postorder, charges a unit per word per edge, carries
+    /// reads back along every forward edge, and the passes are at most one more than the back
+    /// edges on a path, and never more than the blocks.
     fn liveness(&mut self, order: &[u32]) {
         let words = self.live_words;
         let count = self.blocks.len();
-        let mut live = vec![0u64; count * words]; // alloc: the bits of every block, once per proof
-        let mut always = vec![0u64; words]; // alloc: one block's bits, once per proof
-        always_live(&mut always, 0);
+        let zeros = |len: usize| {
+            let mut bits = Vec::with_capacity_in(len, Global);
+            bits.resize(len, 0u64);
+            bits
+        };
+        let mut always = zeros(words);
+        set_bit(&mut always, 0);
         for &local in self.body.param_locals.iter() {
-            always_live(&mut always, local_index(local));
+            set_bit(&mut always, local_index(local));
         }
-        for (slot, &exposed) in self.exposed.iter().enumerate() {
-            if exposed {
-                always_live(&mut always, slot);
-            }
+        for &slot in &self.exposed_slots {
+            set_bit(&mut always, slot as usize);
         }
+        // Each block's reads not after a whole write in it, its whole writes, and its writes.
+        let (mut uses, mut defs, mut written) = (zeros(count * words), zeros(count * words), zeros(count * words));
+        let mut scanned = 0u64;
         for (block, data) in self.blocks.iter().enumerate() {
-            let bits = &mut live[block * words..(block + 1) * words];
-            bits.copy_from_slice(&always);
-            for statement in &data.statements {
-                statement_reads(&statement.kind, bits);
-            }
+            let range = block * words..(block + 1) * words;
+            let uses = &mut uses[range.clone()];
+            let defs = &mut defs[range.clone()];
+            let written = &mut written[range];
             if let Some(terminator) = &data.terminator {
-                terminator_reads(&terminator.kind, bits);
+                terminator_reads(&terminator.kind, &mut |slot| set_bit(uses, slot));
+                terminator_writes(&terminator.kind, &mut |slot| set_bit(written, slot));
+            }
+            for statement in data.statements.iter().rev() {
+                scanned += 1;
+                if let Some(def) = statement_def(&statement.kind) {
+                    clear_bit(uses, def);
+                    set_bit(defs, def);
+                }
+                statement_reads(&statement.kind, &mut |slot| set_bit(uses, slot));
+                statement_writes(&statement.kind, &mut |slot| set_bit(written, slot));
             }
         }
-        let _ = self.charge((count * words) as u64);
+        let _ = self.charge(scanned + (count * words) as u64);
+        let mut live = zeros(count * words);
+        for block in 0..count {
+            for at in 0..words {
+                live[block * words + at] = uses[block * words + at] | always[at];
+            }
+        }
+        let mut out = zeros(words);
         for _ in 0..=count {
             let mut changed = false;
             for &block in order.iter().rev() {
                 let block = block as usize;
                 let Some(terminator) = &self.blocks[block].terminator else { continue };
-                let _ = self.charge(words as u64);
+                out.fill(0);
                 for target in terminator.kind.all_successors() {
+                    let _ = self.charge(words as u64);
                     let target = index(target);
-                    if target == block {
-                        continue;
-                    }
-                    let (low, high) = (block.min(target), block.max(target));
-                    let (before, after) = live.split_at_mut(high * words);
-                    let (low_bits, high_bits) = (&mut before[low * words..(low + 1) * words], &mut after[..words]);
-                    let (into, from) = if block < target { (low_bits, &*high_bits) } else { (high_bits, &*low_bits) };
-                    for (word, &add) in into.iter_mut().zip(from) {
-                        changed |= (*word | add) != *word;
+                    for (word, &add) in out.iter_mut().zip(&live[target * words..(target + 1) * words]) {
                         *word |= add;
                     }
+                }
+                for at in 0..words {
+                    let here = block * words + at;
+                    let now = live[here] | uses[here] | (out[at] & !defs[here]) | always[at];
+                    changed |= now != live[here];
+                    live[here] = now;
                 }
             }
             // Out of work, [`Self::solve`] stops before any join reads it.
@@ -2321,10 +2833,35 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
         }
         self.live = live;
+        self.written = written;
     }
 
-    /// Whether the local in `slot` may be read from `block`'s entry on ([`Self::liveness`]).
-    /// The epoch is always.
+    /// Gives back their entry values ([`Self::entry`]) to the slots of an edge's `state` from
+    /// `block` to `target` that are not live at `target` and that the block may have changed
+    /// (live at its entry, or written in it). Nothing on a path from `target` reads them
+    /// before writing all of them, and every state at a block's entry then holds the entry
+    /// value in each slot not live there: paths that meet agree on what none of them reads, so
+    /// a join of many paths sees only what differs that matters. Each slot dies once on a
+    /// path, so this costs the body's writes, and a word per 64 locals per edge.
+    fn clear_dead(&mut self, block: u32, target: u32, state: &mut State) {
+        let words = self.live_words;
+        let _ = self.charge(words as u64);
+        for at in 0..words {
+            let (here, there) = (block as usize * words + at, target as usize * words + at);
+            let mut dead = (self.live[here] | self.written[here]) & !self.live[there];
+            while dead != 0 {
+                let slot = at * 64 + dead.trailing_zeros() as usize;
+                dead &= dead - 1;
+                if let Some(&value) = self.entry_vals.get(slot) {
+                    let _ = self.charge(1);
+                    state.vals.set(slot, value, &self.marks);
+                }
+            }
+        }
+    }
+
+    /// Whether the local in `slot` may be read from `block`'s entry on before it is written
+    /// whole ([`Self::liveness`]). The epoch is always.
     fn live_at(&self, block: u32, slot: usize) -> bool {
         if slot >= self.local_tys.len() {
             return true;
@@ -2335,12 +2872,14 @@ impl<'a, 'db> Solver<'a, 'db> {
 
     fn entry(&mut self) -> State {
         let slots = self.epoch_slot() + 1;
-        let mut vals = Vec::with_capacity(slots); // alloc: one value per slot, the first state
+        let mut vals = Vec::with_capacity_in(slots, Global);
         for slot in 0..slots {
             let ty = self.local_ty(slot);
             vals.push(self.unknown(Key::Entry(slot as u32), ty));
         }
-        State::new(vals)
+        let state = State::new(Slots::new(&vals, &self.marks));
+        self.entry_vals = vals;
+        state
     }
 
     /// Forgets what statement `at` made the last time it ran: the facts that mention it, and
@@ -2350,23 +2889,37 @@ impl<'a, 'db> Solver<'a, 'db> {
             return;
         }
         let of = |key: Key| matches!(key, Key::At(block, stmt, _) if (block, stmt) == at);
-        self.kill(state, &of, |slot| Key::At(at.0, at.1, STALE + slot));
+        self.kill(state, &of, at_mark(at.0), |slot| Key::At(at.0, at.1, STALE + slot));
     }
 
-    /// Forgets every unknown `of` says yes to: the facts that mention one go, and a slot that
-    /// holds one gets the unknown `stale` names for it.
-    fn kill(&mut self, state: &mut State, of: &impl Fn(Key) -> bool, stale: impl Fn(u32) -> Key) {
+    /// Forgets every unknown `of` says yes to, each of a term whose mark has a bit of
+    /// `mark`: the facts that mention one go, and a slot that holds one gets the unknown
+    /// `stale` names for it. Only the facts of a state whose marks have the bit, and the
+    /// slots under nodes whose marks have it, are looked at.
+    fn kill(
+        &mut self,
+        state: &mut State,
+        of: &impl Fn(Key) -> bool,
+        mark: u64,
+        stale: impl Fn(u32) -> Key,
+    ) {
         // Forgetting is never cut short by the work bound: a fact kept past its point would be
         // unsound. It is charged, and the walk stops after it.
-        let _ = self.charge((state.facts.len() + state.imps.len() + state.vals.len()) as u64);
-        state.retain_facts(|fact| !self.mentions(fact.a, of) && !self.mentions(fact.b, of));
-        state.retain_imps(|(premise, then)| {
-            ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
-        });
-        for slot in 0..state.vals.len() {
+        if state.marks & mark != 0 {
+            let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
+            state.retain_facts(|fact| !self.mentions(fact.a, of) && !self.mentions(fact.b, of));
+            state.retain_imps(|(premise, then)| {
+                ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, of))
+            });
+        }
+        let mut hit = smallvec::SmallVec::<[usize; 8]>::new();
+        state.vals.marked(mark, &self.marks, &mut |slot| hit.push(slot));
+        let _ = self.charge(1 + hit.len() as u64);
+        for slot in hit {
             if self.mentions(state.vals[slot], of) {
                 let ty = self.local_ty(slot);
-                state.vals[slot] = self.unknown(stale(slot as u32), ty);
+                let value = self.unknown(stale(slot as u32), ty);
+                state.vals.set(slot, value, &self.marks);
             }
         }
     }
@@ -2376,12 +2929,13 @@ impl<'a, 'db> Solver<'a, 'db> {
     fn bump(&mut self, state: &mut State) {
         let (block, stmt) = self.at;
         let epoch = self.epoch_slot();
-        state.vals[epoch] = self.unknown(Key::At(block, stmt, EPOCH), None);
-        for slot in 0..epoch {
-            if self.exposed[slot] {
-                let ty = self.local_ty(slot);
-                state.vals[slot] = self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty);
-            }
+        let value = self.unknown(Key::At(block, stmt, EPOCH), None);
+        state.vals.set(epoch, value, &self.marks);
+        for at in 0..self.exposed_slots.len() {
+            let slot = self.exposed_slots[at];
+            let ty = self.local_ty(slot as usize);
+            let value = self.unknown(Key::At(block, stmt, HAVOC + slot), ty);
+            state.vals.set(slot as usize, value, &self.marks);
         }
     }
 
@@ -2517,7 +3071,7 @@ impl<'a, 'db> Solver<'a, 'db> {
         let slot = local_index(place.local);
         let projection = place.projection.as_slice();
         if projection.is_empty() {
-            state.vals[slot] = value;
+            state.vals.set(slot, value, &self.marks);
             if self.named[slot] && !self.names.contains_key(&value) {
                 self.names.insert(value, slot as u32);
             }
@@ -2542,13 +3096,14 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
             _ => None,
         };
-        state.vals[slot] = match replaced {
+        let value = match replaced {
             Some(term) => self.term(term, ANY),
             None => {
                 let ty = self.local_ty(slot);
                 self.unknown(Key::At(block, stmt, HAVOC + slot as u32), ty)
             }
         };
+        state.vals.set(slot, value, &self.marks);
     }
 
     fn rvalue(&mut self, state: &mut State, to: &StoredPlace, rvalue: &Rvalue) -> TermId {
@@ -3033,7 +3588,7 @@ impl<'a, 'db> Solver<'a, 'db> {
                             runs = self.assume(&mut returned, goal);
                         }
                         if let Some((local, value)) = call.sets {
-                            returned.vals[local as usize] = value;
+                            returned.vals.set(local as usize, value, &self.marks);
                         }
                         self.write(&mut returned, destination, call.result);
                         for (premise, then) in call.implies {
@@ -3124,24 +3679,46 @@ impl<'a, 'db> Solver<'a, 'db> {
     /// bounds are widened against.
     ///
     /// One path with nothing joined at the block is its state as it is. Otherwise a join
-    /// costs its slots times its paths, and what it works out of a slot (the relations every
-    /// path holds of it, its bounds, what a `bool` meant) only for a slot that may be read
-    /// from the block on ([`Self::live_at`]): a dead slot is one unknown and nothing more.
+    /// looks only at the slots the paths' states do not share ([`Slots::diff`]) and those
+    /// whose marks say they may hold this join's unknowns ([`Slots::marked`]), never at the
+    /// rest; it intersects the facts from the path with the fewest; and what it works out of
+    /// a joined slot (the relations every path holds of it, its bounds, what a `bool` meant)
+    /// only for one that may be read from the block on ([`Self::live_at`]): a dead slot is one
+    /// unknown and nothing more.
     fn join(&mut self, block: u32, incoming: &mut [State], prior: Option<&State>) -> Option<State> {
-        let first = incoming.first()?;
-        let slots = first.vals.len();
+        if incoming.is_empty() {
+            return None;
+        }
         if incoming.len() == 1 && self.joined[block as usize].is_empty() {
-            return Some(std::mem::replace(&mut incoming[0], State::new(Vec::new_in(Global))));
+            let empty = State::new(Slots::new(&[], &[]));
+            return Some(std::mem::replace(&mut incoming[0], empty));
         }
         let before = self.joined[block as usize].len();
+        let mark = join_mark(block);
+        // The slots worth a look: where a path's value differs from the first's, and where the
+        // first's (so, when none differs, every path's) may mention this join's unknowns.
+        let mut looked = Vec::new_in(Global);
+        for other in incoming.iter().skip(1) {
+            incoming[0].vals.diff(&other.vals, &mut |slot| looked.push(slot as u32));
+        }
+        incoming[0].vals.marked(mark, &self.marks, &mut |slot| looked.push(slot as u32));
+        looked.sort_unstable();
+        looked.dedup();
+        let _ = self.charge(incoming.len() as u64 + looked.len() as u64);
         // A slot whose values differ is joined; so is one that holds an unknown this join
         // makes again, until no more are found (each turn adds a slot). `joined` is sorted.
         loop {
-            let _ = self.charge((slots * incoming.len()) as u64);
+            let _ = self.charge((looked.len() * incoming.len()) as u64);
             let mut grew = false;
-            for slot in 0..slots {
-                let whole = slot as u32;
+            for &whole in &looked {
+                let slot = whole as usize;
                 if self.joined[block as usize].binary_search(&whole).is_ok() {
+                    continue;
+                }
+                // A slot nothing reads from here on is one unknown, whatever the paths say.
+                if !self.live_at(block, slot) {
+                    insert_sorted(&mut self.joined[block as usize], whole);
+                    grew = true;
                     continue;
                 }
                 let value = incoming[0].vals[slot];
@@ -3194,13 +3771,25 @@ impl<'a, 'db> Solver<'a, 'db> {
         // every path's own value satisfies it in that path's state. Asked before the states
         // forget what this join makes again: a path round a loop proves it from what held of
         // the last turn's values.
+        // The slots joined whole, in order (a field's key is past every slot's number), and
+        // those with a field joined.
+        let wholes = &joined[..joined.partition_point(|&it| it < FIELD)];
+        let mut by_field: Vec<usize> = Vec::new_in(Global);
+        by_field.extend(
+            joined[wholes.len()..]
+                .iter()
+                .map(|&key| ((key - FIELD) / 64) as usize)
+                .filter(|&slot| slot < FIELD_LOCALS && !is_joined(slot as u32)),
+        );
+        by_field.dedup();
+        let _ = self.charge(joined.len() as u64);
         let mut invariants = Vec::new(); // alloc: the joined slots' relations, few
-        for slot in 0..slots {
-            let whole = slot as u32;
+        for &whole in wholes {
+            let slot = whole as usize;
             let integer = self
                 .local_ty(slot)
                 .is_some_and(|ty| !ty.is_bool() && int_range(ty, self.word).is_some());
-            if !integer || !is_joined(whole) || !self.live_at(block, slot) {
+            if !integer || !self.live_at(block, slot) {
                 continue;
             }
             for at in 0..incoming.len().min(4) {
@@ -3226,17 +3815,29 @@ impl<'a, 'db> Solver<'a, 'db> {
         }
         // What this join makes again is forgotten in each state first. Never cut short by the
         // work bound (a fact kept past what makes it true would be unsound): it is charged.
+        // Only a state whose marks have this join's bit can have one.
         for state in incoming.iter_mut() {
+            if state.marks & mark == 0 {
+                continue;
+            }
             let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
             state.retain_facts(|fact| !self.mentions(fact.a, &made) && !self.mentions(fact.b, &made));
             state.retain_imps(|(premise, then)| {
                 ![premise.a, premise.b, then.a, then.b].iter().any(|&it| self.mentions(it, &made))
             });
         }
-        // clone: the joined state starts from the first
-        let mut state = incoming[0].clone();
+        // The joined state starts from the path with the fewest facts, and keeps what every
+        // other path has: a look-up per fact it has, per other path. Its slots are every
+        // path's where none differs, and the joined slots are made again below.
+        let base = (0..incoming.len())
+            .min_by_key(|&at| incoming[at].facts.len() + incoming[at].imps.len())
+            .unwrap_or(0);
+        let mut state = incoming[base].clone(); // clone: shared, O(1)
         let _ = self.charge(state.size());
-        for other in incoming.iter().skip(1) {
+        for (at, other) in incoming.iter().enumerate() {
+            if at == base {
+                continue;
+            }
             let _ = self.charge((state.facts.len() + state.imps.len()) as u64);
             state.retain_facts(|fact| other.has(fact));
             state.retain_imps(|imp| other.has_imp(imp));
@@ -3248,28 +3849,22 @@ impl<'a, 'db> Solver<'a, 'db> {
         state.stale = true;
         // The joined slots' values, with the bounds every path gives them.
         let mut bounds = Vec::new(); // alloc: the joined slots' bounds, few
-        for slot in 0..slots {
-            let whole = slot as u32;
+        for &whole in wholes {
+            let slot = whole as usize;
             let ty = self.local_ty(slot);
-            if is_joined(whole) {
-                let value = self.unknown(Key::Join(block, whole), ty);
-                if self.live_at(block, slot) {
-                    let (mut low, mut high) = (i128::MAX, i128::MIN);
-                    for it in incoming.iter() {
-                        let (least, most) = self.bounds(it, it.vals[slot]);
-                        (low, high) = (low.min(least), high.max(most));
-                    }
-                    bounds.push((value, low, high));
+            let value = self.unknown(Key::Join(block, whole), ty);
+            if self.live_at(block, slot) {
+                let (mut low, mut high) = (i128::MAX, i128::MIN);
+                for it in incoming.iter() {
+                    let (least, most) = self.bounds(it, it.vals[slot]);
+                    (low, high) = (low.min(least), high.max(most));
                 }
-                state.vals[slot] = value;
-                continue;
+                bounds.push((value, low, high));
             }
-            let low_key = FIELD.wrapping_add(whole.wrapping_mul(64));
-            let any = slot < FIELD_LOCALS
-                && joined.get(joined.partition_point(|&it| it < low_key)).is_some_and(|&it| it - low_key < 64);
-            if !any {
-                continue;
-            }
+            state.vals.set(slot, value, &self.marks);
+        }
+        for &slot in &by_field {
+            let whole = slot as u32;
             let (variant, mut fields) = match &self.terms[state.vals[slot] as usize] {
                 Term::Agg(variant, fields) => (*variant, fields.clone()), // clone: rebuilt with its joined fields
                 _ => continue,
@@ -3283,7 +3878,8 @@ impl<'a, 'db> Solver<'a, 'db> {
                 }
             }
             if changed {
-                state.vals[slot] = self.term(Term::Agg(variant, fields), ANY);
+                let value = self.term(Term::Agg(variant, fields), ANY);
+                state.vals.set(slot, value, &self.marks);
             }
         }
         for (slot, anchor, below) in invariants {
@@ -3319,9 +3915,10 @@ impl<'a, 'db> Solver<'a, 'db> {
         // A joined `bool` keeps what each of its values meant on the paths that gave it (`a &&
         // b` is lowered to a temporary both arms write): what every path that can give the
         // value holds, once its own value is taken to be that, is implied by the value.
-        for slot in 0..slots {
+        for &whole in wholes {
+            let slot = whole as usize;
             let is_bool = self.local_ty(slot).is_some_and(|ty| ty.is_bool());
-            if !is_bool || !is_joined(slot as u32) || !self.live_at(block, slot) {
+            if !is_bool || !self.live_at(block, slot) {
                 continue;
             }
             let value = state.vals[slot];
@@ -3334,8 +3931,13 @@ impl<'a, 'db> Solver<'a, 'db> {
                     if !self.assume(&mut given, Atom::new(Rel::Eq, it.vals[slot], case)) {
                         continue;
                     }
+                    let _ = self.charge(given.facts.len() as u64);
                     common = Some(match common {
-                        None => given.facts,
+                        None => {
+                            let mut all = Vec::with_capacity_in(given.facts.len(), Global);
+                            all.extend(given.facts.iter().copied());
+                            all
+                        }
                         Some(mut have) => {
                             have.retain(|fact| given.has(*fact));
                             have
@@ -3375,11 +3977,18 @@ impl<'a, 'db> Solver<'a, 'db> {
         // alloc: the feasible edges out of each block, once per proof
         let mut edges: Vec<Vec<(u32, State)>> = vec![Vec::new(); count];
         let mut grown = vec![0usize; count]; // alloc: once per proof
-        let mut queued = vec![false; count]; // alloc: once per proof
-        // The worklist, first in reverse postorder ([`Self::rpo`]): a block is walked once
-        // every block before it on an acyclic path has been, so a join with many paths into it
-        // is made once, not once per path that arrives.
-        let mut queue = std::collections::BinaryHeap::with_capacity(count); // alloc: the worklist, once per proof
+        // The pass each block is queued for, `NONE` when it is not.
+        const NONE: u32 = u32::MAX;
+        let mut queued = vec![NONE; count]; // alloc: once per proof
+        // The worklist, in passes, each in reverse postorder ([`Self::rpo`]): a block is
+        // walked once every block before it on an acyclic path has been, so a join with many
+        // paths into it is made once, not once per path that arrives. A back edge (to a block
+        // no later in the order) queues its target for the next pass, so a loop's head is
+        // joined again only after the whole body has been walked with what the head gave it:
+        // each turn of the loop is one pass, and the head's widening sees every path round it.
+        let mut queue = std::collections::BinaryHeap::with_capacity(count); // alloc: this pass's worklist, once per proof
+        let mut next = std::collections::BinaryHeap::with_capacity(count); // alloc: the next pass's, once per proof
+        let mut pass = 0u32;
         let order = self.reverse_postorder();
         let mut rpo = vec![u32::MAX; count]; // alloc: one place per block, once per proof
         for (at, &block) in order.iter().enumerate() {
@@ -3392,11 +4001,23 @@ impl<'a, 'db> Solver<'a, 'db> {
         // neither (docs/v2/plan/design/refined-values.md).
         self.assume_entry(&mut entry);
         queue.push(std::cmp::Reverse((self.rpo[start], start as u32)));
-        queued[start] = true;
+        queued[start] = pass;
         let mut budget = count * 8 + 64;
-        while let Some(std::cmp::Reverse((_, block))) = queue.pop() {
+        loop {
+            let Some(std::cmp::Reverse((_, block))) = queue.pop() else {
+                if next.is_empty() {
+                    break;
+                }
+                std::mem::swap(&mut queue, &mut next);
+                pass += 1;
+                continue;
+            };
             let block = block as usize;
-            queued[block] = false;
+            // An entry left behind when the block was queued for an earlier pass.
+            if queued[block] != pass {
+                continue;
+            }
+            queued[block] = NONE;
             // Out of work: no fixed point is claimed ([`Self::unsettled`] says which bound).
             if budget == 0 || self.spent() {
                 return None;
@@ -3428,10 +4049,13 @@ impl<'a, 'db> Solver<'a, 'db> {
             }
             let _ = self.charge(joined.as_ref().map_or(0, State::size));
             entries[block] = joined.clone(); // clone: kept as the block's entry, walked below
-            let out = match joined {
+            let mut out = match joined {
                 Some(mut state) => self.transfer(block as u32, &mut state).edges,
                 None => Vec::new(),
             };
+            for (target, state) in out.iter_mut() {
+                self.clear_dead(block as u32, *target, state);
+            }
             if self.terms.len() > 1 << 16 || self.spent() {
                 return None;
             }
@@ -3442,10 +4066,20 @@ impl<'a, 'db> Solver<'a, 'db> {
             targets.extend(edges[block].iter().map(|it| it.0));
             edges[block] = out;
             if changed {
+                let here = self.rpo[block];
                 for target in targets {
-                    if !queued[target as usize] {
-                        queued[target as usize] = true;
-                        queue.push(std::cmp::Reverse((self.rpo[target as usize], target)));
+                    let (at, slot) = (self.rpo[target as usize], &mut queued[target as usize]);
+                    let entry = std::cmp::Reverse((at, target));
+                    if at > here {
+                        // Later in this pass. Queued for the next instead, it is walked now,
+                        // and that entry is left behind.
+                        if *slot != pass {
+                            *slot = pass;
+                            queue.push(entry);
+                        }
+                    } else if *slot == NONE {
+                        *slot = pass + 1;
+                        next.push(entry);
                     }
                 }
             }

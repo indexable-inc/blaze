@@ -24,6 +24,7 @@ use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     drop::is_freeze,
+    facts::Proofs,
     next_solver::{GenericArgs, StoredGenericArgs, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
 };
@@ -179,14 +180,21 @@ impl Refusal {
 /// type parameter left.
 pub fn fn_purity(db: &Db, krate: Crate, func: FunctionId, args: StoredGenericArgs) -> &FnPurity {
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
-    checked(db, env, func, args, 0, PURE.refuses.0, false)
+    checked(db, env, func, args, 0, PURE.refuses.0, false, Proofs::Spent)
 }
 
 /// The same of the definition, in its own where-clauses: a call only an instance decides (a
 /// method of a type parameter, its drop) is [`EffectProof::open`], checked at each instance.
+/// A check's: proofs spent.
 pub fn fn_purity_generic(db: &Db, func: FunctionId) -> &FnPurity {
+    fn_purity_generic_at(db, func, Proofs::Spent)
+}
+
+/// [`fn_purity_generic`] made with `proofs`: what a fact a tier asks for reads
+/// (`crate::facts`).
+pub(crate) fn fn_purity_generic_at(db: &Db, func: FunctionId, proofs: Proofs) -> &FnPurity {
     let (env, args) = generic(db, func);
-    checked(db, env, func, args, 0, PURE.refuses.0, true)
+    checked(db, env, func, args, 0, PURE.refuses.0, true, proofs)
 }
 
 /// `effect` of the instance `func<args>`, `krate`'s impls in scope.
@@ -200,22 +208,32 @@ pub fn check(
     let Some(index) = effect_index(effect) else { return Err(unregistered(db, func, effect)) };
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate }.store();
     // clone: a lint's answer, once per function
-    checked(db, env, func, args, index as u8, effect.refuses.0, false)
+    checked(db, env, func, args, index as u8, effect.refuses.0, false, Proofs::Spent)
         .as_result()
         .map(Clone::clone)
         .map_err(Clone::clone)
 }
 
-/// `effect` of the definition `func`, in its own where-clauses.
+/// `effect` of the definition `func`, in its own where-clauses. A check's: proofs spent.
 pub fn check_generic(
     db: &Db,
     func: FunctionId,
     effect: &EffectDef,
 ) -> Result<EffectProof, Refusal> {
+    check_generic_at(db, func, effect, Proofs::Spent)
+}
+
+/// [`check_generic`] made with `proofs`: what a fact a tier asks for reads (`crate::facts`).
+pub(crate) fn check_generic_at(
+    db: &Db,
+    func: FunctionId,
+    effect: &EffectDef,
+    proofs: Proofs,
+) -> Result<EffectProof, Refusal> {
     let Some(index) = effect_index(effect) else { return Err(unregistered(db, func, effect)) };
     let (env, args) = generic(db, func);
     // clone: a lint's answer, once per function
-    checked(db, env, func, args, index as u8, effect.refuses.0, true)
+    checked(db, env, func, args, index as u8, effect.refuses.0, true, proofs)
         .as_result()
         .map(Clone::clone)
         .map_err(Clone::clone)
@@ -280,8 +298,13 @@ fn unregistered(db: &Db, func: FunctionId, effect: &EffectDef) -> Refusal {
 }
 
 /// The check of `EFFECTS[effect]`, refusing the kinds `refuses`, of `func<args>` in `env`;
-/// `generic`: the definition's check, where [`Rule::Open`] is left to each instance.
+/// `generic`: the definition's check, where [`Rule::Open`] is left to each instance. Every
+/// summary it reads is made with `proofs`.
 #[blaze_query::tracked(returns(ref))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a tracked query's arguments are its key: each is an input of the check"
+)]
 fn checked(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -290,11 +313,12 @@ fn checked(
     effect: u8,
     refuses: u32,
     generic: bool,
+    proofs: Proofs,
 ) -> FnPurity {
     let index = usize::from(effect);
     let def = EFFECTS[index];
     let refuses = EffectSet(refuses);
-    let cx = Cx::new(db, env.clone()); // clone: a handle, reference counts
+    let cx = Cx::new(db, env, proofs);
     let root = Instance { def: Def::Body(Body::Fn(func)), args: args.clone() }; // clone: reference counts
     let mut found = Found::default();
     if let Some((reason, door)) = effects::trusted(db, func, def) {
@@ -308,7 +332,7 @@ fn checked(
     {
         return FnPurity::Impure(refusal);
     }
-    let summary = summary(db, env.clone(), root.clone()); // clone: the query's key, reference counts
+    let summary = cx.summary(root.clone()); // clone: the query's key, reference counts
     let mut refused = summary.set(index).intersect(refuses);
     // The root takes a `dyn` nothing answers for, and reaches a call through one (or the drop
     // of one it owns): the object is the caller's, so its code is code the check can't see.
@@ -339,7 +363,7 @@ fn checked(
     if let Some(rule) = shortest {
         return FnPurity::Impure(refusal(&cx, def, index, rule, &root, &summary));
     }
-    let instances = reach(db, &env, &root, def, &mut found);
+    let instances = reach(&cx, &root, def, &mut found);
     FnPurity::Pure(found.proof(instances))
 }
 
@@ -382,21 +406,16 @@ impl Found {
 
 /// Every instance the root reaches for `def`, past none trusted for it (nor, for an effect that
 /// holds of what returns, through one that never does), each trusted one met kept in `found`:
-/// how many instances it reached.
-fn reach(
-    db: &Db,
-    env: &StoredParamEnvAndCrate,
-    root: &Instance,
-    def: &EffectDef,
-    found: &mut Found,
-) -> u32 {
+/// how many instances it reached. Each summary is the check's, made with `cx`'s proofs.
+fn reach(cx: &Cx<'_>, root: &Instance, def: &EffectDef, found: &mut Found) -> u32 {
+    let db = cx.db;
     let mut seen: HashSet<Instance, Global> = HashSet::new_in(Global);
     let mut stack: Vec<Instance> = Vec::new(); // alloc: the walk's frontier, once per check
     seen.insert(root.clone()); // clone: reference counts
     stack.push(root.clone()); // clone: reference counts
     while let Some(instance) = stack.pop() {
         let Def::Body(_) = instance.def else { continue };
-        let summary = summary(db, env.clone(), instance); // clone: the query's key, reference counts
+        let summary = cx.summary(instance);
         for &func in &summary.trusted_calls {
             if let Some((reason, door)) = effects::trusted(db, func, def) {
                 found.trust(db, func, reason, door);
@@ -490,7 +509,7 @@ pub(crate) fn refusal(
                     what = format!("calls {}", instance_path(db, &next)).into(); // alloc: the refusal's text, once
                     break;
                 };
-                let callee = crate::walk::summary(db, cx.stored.clone(), next.clone()); // clone: the query's key
+                let callee = cx.summary(next.clone()); // clone: the query's key, made with the check's proofs
                 at = (next, Some(callee));
             }
         }

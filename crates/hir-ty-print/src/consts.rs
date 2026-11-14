@@ -7,6 +7,8 @@
 //! Ported from `compiler/rustc_middle/src/ty/print/pretty.rs` and
 //! `compiler/rustc_middle/src/ty/consts/int.rs` (MIT or Apache-2.0).
 
+use std::{alloc::Global, hash::BuildHasher as _};
+
 use hir_def::{
     AdtId, VariantId,
     hir::generics::{GenericParams, TypeOrConstParamData},
@@ -78,6 +80,13 @@ impl<'h, 't> Printer<'h, 't> {
     /// value as a diagnostic prints it (`true`, `'a'`, `i8::MIN`), else the number the
     /// constant evaluates to.
     fn print_spelled_const(&mut self, c: Const<'t>) {
+        if let ConstKind::Value(value) = c.kind()
+            && let TyKind::Ref(_, inner, _) = value.ty.kind()
+            && let TyKind::Str = inner.kind()
+            && let ValTreeKind::Branch(consts) = value.value.inner()
+        {
+            return self.print_str_value(*consts);
+        }
         if self.spelling() == Spelling::TypeName
             && let ConstKind::Value(value) = c.kind()
             && let ValTreeKind::Leaf(leaf) = value.value.inner()
@@ -102,12 +111,7 @@ impl<'h, 't> Printer<'h, 't> {
                 TyKind::Slice(elem) if matches!(elem.kind(), TyKind::Uint(UintTy::U8)) => {
                     self.print_byte_str(*consts)
                 }
-                TyKind::Str => {
-                    // alloc: a string constant printed, the edge
-                    let bytes: Vec<u8> = bytes(*consts).collect();
-                    // alloc: none when the bytes are UTF-8; the constant printed, the edge
-                    self.write_fmt(format_args!("{:?}", String::from_utf8_lossy(&bytes)));
-                }
+                TyKind::Str => self.print_str_value(*consts),
                 _ => {
                     self.write_str("&");
                     self.print_valtree(ValueConst { ty: inner, value: value.value });
@@ -152,6 +156,31 @@ impl<'h, 't> Printer<'h, 't> {
                 self.write_str("<ZST>")
             }
             (kind, _) => self.write_fmt(format_args!("{kind:?}")),
+        }
+    }
+
+    /// A `&str` constant (a `&'static str` const argument), quoted. `type_name` prints it
+    /// whole, as rustc's does, since a program reads it. A diagnostic cuts it past
+    /// [`hir_ty::const_valtree::STR_SHOWN`] bytes and says its length. A symbol's or debug
+    /// info's name cuts it there too and adds a hash of all its bytes, so a name stays bounded
+    /// and two long strings that share a prefix keep two names; the instance's link name is
+    /// its instance key, which holds the bytes themselves.
+    fn print_str_value(&mut self, consts: Consts<'t>) {
+        let mut buf = Vec::with_capacity_in(consts.as_slice().len(), Global);
+        buf.extend(bytes(consts));
+        let text = String::from_utf8_lossy(&buf);
+        let (shown, cut) = hir_ty::const_valtree::shown_str(&text);
+        match (self.spelling(), cut) {
+            (Spelling::TypeName, _) | (_, false) => self.write_fmt(format_args!("{text:?}")),
+            (Spelling::Diagnostic, true) => self.write_fmt(format_args!(
+                "\"{}…\" ({} bytes)",
+                shown.escape_debug(),
+                buf.len()
+            )),
+            (Spelling::Symbol | Spelling::Debug, true) => {
+                let hash = blaze_hash::FixedState.hash_one(&buf[..]);
+                self.write_fmt(format_args!("\"{}…\"#{hash:016x}", shown.escape_debug()))
+            }
         }
     }
 

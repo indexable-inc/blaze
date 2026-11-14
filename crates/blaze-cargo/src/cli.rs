@@ -40,6 +40,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod doc;
 pub mod doctor;
+pub mod audit;
 mod duckdb;
 pub mod edits;
 pub mod fetch_url;
@@ -133,6 +134,7 @@ Commands:
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
     diagnostics [--since TOKEN] [-p PKG] [--file F] [--json]   What a check says that is new since TOKEN, and the next token
     doctor [--json]                What is wrong with blaze here: its version, agents, daemon, state, toolchain, project, sandbox
+    audit [pin|fetch] [--json]     Locked packages against RustSec advisories and yanks; every source pinned by a strong digest
     agents install|hook|status|remove [claude|codex|all]   Coding agents told to use blaze, and shown its diagnostics after each edit
     pprof FILE|URL [top|peek|tree|list|flame|diff|export|--http]   Any program's profile (.ixprof or pprof), like `go tool pprof`
     perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
@@ -349,6 +351,7 @@ const COMMANDS: &[&str] = &[
     "slow",
     "diagnostics",
     "doctor",
+    "audit",
     "agents",
     "pprof",
     "perf",
@@ -521,6 +524,7 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
         Asked::Reach(words) => reach::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
         Asked::Doctor(words) => doctor::main(words, auto_color()),
+        Asked::Audit(words) => audit::main(words, auto_color()),
         Asked::Diagnostics(words) => diagnostics::main(words, auto_color()),
         Asked::Agents(words) => agents::main(words, auto_color()),
         #[cfg(feature = "native")]

@@ -16,6 +16,7 @@ fn kept_for_a_code_generator_that_emits_lifetime_markers() {
         inline: false,
         heap_to_stack: false,
         world: None,
+        tier: MirOptions::at(MirOptLevel::Debug).tier,
     };
     let mir = mir(BORROWED, "borrowed", options);
     assert!(mir.contains("StorageLive(") && mir.contains("StorageDead("), "{mir}");

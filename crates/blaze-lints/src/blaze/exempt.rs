@@ -310,7 +310,14 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::RepeatedFieldList
         | Lint::RegistrySpread
         // Held by `#[expect(blaze::same_behaviour, reason = ..)]` and the ratchet baseline.
-        | Lint::SameBehaviour => None,
+        | Lint::SameBehaviour
+        // About a dependency: granted in the root manifest's `[workspace.metadata.blaze.trust]`,
+        // or for a workspace crate's own `unsafe` at its root, never by a comment on a line.
+        | Lint::DependencyCapability
+        | Lint::DependencyUnsafe
+        | Lint::TrustGrantUnused
+        | Lint::DependencyCapabilityUnreached
+        | Lint::WorkspaceUnsafe => None,
     }
 }
 

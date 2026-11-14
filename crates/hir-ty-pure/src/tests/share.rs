@@ -145,7 +145,7 @@ pub(super) fn keys_agree_from(db: &Db, asker: Crate, root: Instance) {
             || format!("{} (home {:?})", name_of(db, &instance), home_of(db, asker, &instance));
         let (through, own) = (
             summary(db, env.clone(), instance.clone()),
-            summary_in(db, env.clone(), instance.clone()),
+            summary_in(db, env.clone(), hir_ty::facts::Proofs::Spent, instance.clone()),
         );
         assert_eq!(through, own, "the summary of {} through its home is not the asker's own", at());
         let (through, own) = (

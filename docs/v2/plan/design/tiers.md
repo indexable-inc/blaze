@@ -62,15 +62,36 @@ written in the workspace or a dependency: true. A tier 0 unit asks for MIR level
 no devirtualization (`hir-ty-codegen/v2/build.rs:86` `Build::of`; test
 `a_tier_zero_unit_builds_no_callee_into_its_bodies`), and `hir-ty-mir`'s `optimize` runs
 `Inline` only with `options.inline` (`optimize.rs:232`) and `SpendFacts` only at `Release`
-(`optimize.rs:249`, `:282`). So **tier 0 does not run the effect-summary pass**, with one
-exception: a body written in core, alloc or std is at level 2 and inlined under every unit
-(`build.rs:130`, `:137`, "as shipped"), so a std generic instantiated at tier 0 was inlined and
-had `SpendFacts` run on its MIR; what it built in and relied on are std's. Its key covers them
-(`refs.rs:344` adds `body.inlined.relied` to what the instance reads; `dev_template_key`,
-`driver.rs:416`, hashes `built_in`). To make the invariant hold without the exception, tier 0
-would compile std's bodies at level 1 too; not done here, since it changes dev code's speed.
-The tier 0 template key also hashes `refs` (the callees' keys it calls, for placement), not
-their bodies.
+(`optimize.rs:249`, `:282`). Until 2026-11-13 a body written in core, alloc or std was at
+level 2 and MIR-inlined under every unit, "as shipped", so a std generic instantiated at tier
+0 was inlined and had `SpendFacts` run on its MIR, which asked the effect summary of every
+callee: a cold hello-world spent 17.6 s of one codegen task in `SpendFacts unwind` under std's
+`__rg_oom`. That exception is gone (below). The tier 0 template key also hashes `refs` (the
+callees' keys it calls, for placement), not their bodies.
+
+**The tier is in the MIR key, and decides the passes** (2026-11-13). `MirOptions::tier`
+(`hir_ty::facts::Tier`) keys every optimized body; `hir-ty-mir`'s `passes_at(tier)` is the one
+declaration of which passes that read past the body may run (each still under its settings),
+`hir_ty::facts::proofs_at(tier)` of whether the facts they read spend proofs, and
+`hir-ty-codegen`'s `Build::tier_of` of which tier a unit builds a body at:
+
+| tier | who | passes past the body | proofs |
+|---|---|---|---|
+| `Zero` | every body of a unit that does not optimize (stencils, Cranelift, LLVM `-O0`), the library's included, and `Build::WALK` | none: no MIR `Inline` (`#[inline(always)]` callees are the code generator's), no `Devirtualize`, no `SpendFacts`, no `Specialize` | none |
+| `Shipped` | the library's bodies under an optimizing unit, the copy the MIR inliner builds in, `shipped_cross_crate_inlinable` | `Inline`, `Specialize` (rustc's own) | none |
+| `Optimizing` | the program's bodies under an optimizing unit, the interpreter at level 2 | `Inline`, `Devirtualize`, `SpendFacts` (unwind edges, repeated calls), `Specialize` | spent |
+
+The library's bodies are MIR-inlined only where the unit MIR-inlines (`Spec::mir_inline`), so
+`WALK` and `WALKS_INLINED` still list what every unit asks for. The checks (`nopanic`, `pure`,
+`noalloc`, `nonblocking`, the role lints, `unreachable`) are no tier: they ask summaries on
+demand with proofs spent. Every summary key holds its proofs (the sealed tables,
+`summary_in`, `fn_facts`). Under `Spent` a function is proved once per definition where its
+instances keep its blocks (`walk.rs` `proof_of`).
+
+The floor (rule 67): optimizing a tier 0 body is a pass over its own statements per pass, and
+nothing that grows with its callees: no summary, no proof, no callee's body is read. Tests:
+`each_tier_runs_the_passes_its_declaration_lists`, `a_tier_zero_body_computes_no_effect_summary`
+(hir-ty-pure), `a_tier_zero_unit_spends_no_proof` (hir-ty-codegen). Not measured on this tree.
 
 **What making tier 0 hold for the library's bodies takes** (read from the code and a profile
 of a new hello-world, 2026-11-12, lane newproj-1111; not built). Changing `Build::options` so a

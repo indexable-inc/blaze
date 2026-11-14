@@ -41,6 +41,7 @@ fn checked(level: MirOptLevel) -> MirOptions {
         inline: false,
         heap_to_stack: false,
         world: None,
+        tier: MirOptions::at(level).tier,
     }
 }
 
@@ -52,6 +53,7 @@ fn unchecked(level: MirOptLevel) -> MirOptions {
         inline: false,
         heap_to_stack: false,
         world: None,
+        tier: MirOptions::at(level).tier,
     }
 }
 

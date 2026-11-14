@@ -146,8 +146,12 @@ pub enum Pin<'a> {
     /// against as it was unpacked.
     Registry(&'a [u8; 32]),
     /// A package of a git source, read from the checkout of the whole commit its lock file
-    /// pins (`<sources>/git/checkouts/<ident>/<commit>`).
-    Git(&'a str),
+    /// pins (`<sources>/git/checkouts/<ident>/<commit>`), whose tree is the digest
+    /// `blaze.lock` pins it by (`PackagePlan::tree`), which the fetcher checked before the
+    /// checkout was mounted. The commit alone is no pin (SHA-1, rule `weak_source_pin`); it
+    /// is kept beside the tree because the checkout's kept repository (`.git/HEAD`, which a
+    /// build script may read) is the commit's, outside the tree's digest.
+    Git { commit: &'a str, tree: &'a str },
 }
 
 impl Pin<'_> {
@@ -158,7 +162,7 @@ impl Pin<'_> {
             // clone: once a pin, a digest's text
             Pin::Shipped(placed) => placed.digest.clone(),
             Pin::Registry(sum) => format!("registry-{}", blaze_format::hex::encode(&sum[..])), // alloc: as above
-            Pin::Git(commit) => format!("git-{commit}"), // alloc: as above
+            Pin::Git { commit, tree } => format!("git-{commit}-{tree}"), // alloc: as above
         }
     }
 
@@ -177,7 +181,8 @@ impl Pin<'_> {
 /// A workspace member never is, but one read through a shipped tree's mount ([`Placed::mounted`]);
 /// then, in order, a package whose manifest is under a shipped tree (its directory or its
 /// mount), one with a registry checksum, one of a git source read from the checkout of a whole
-/// commit. Any other (a path dependency, whatever its origin, a directory source) is not.
+/// commit whose tree `blaze.lock` pins by its digest. Any other (a path dependency, whatever
+/// its origin, a directory source, a git checkout with no tree digest) is not.
 ///
 /// The member that is sealed: the library is loaded as one more workspace (`-Zbuild-std`'s
 /// graph, `blaze_units::stdlib`), so `std`, `sysroot` and `blaze_inproc_rt`, members of
@@ -203,8 +208,11 @@ pub fn pin<'a, 's: 'a, E>(
         return Ok(Some(Pin::Registry(sum)));
     }
     let git = package.source.as_deref().is_some_and(|it| it.contains("://"));
-    if git && let Some(commit) = checkout_commit(sources, dir) {
-        return Ok(Some(Pin::Git(commit)));
+    if git
+        && let Some(commit) = checkout_commit(sources, dir)
+        && let Some(tree) = package.tree.as_deref()
+    {
+        return Ok(Some(Pin::Git { commit, tree }));
     }
     Ok(Placed::sealed_at(shipped()?, dir).map(Pin::Shipped))
 }
