@@ -1000,10 +1000,9 @@ mod tests {
             let mut synced = made.clone();
             synced.sync(name, made.files[at].changes.len());
             let drawn = cut(tape, &synced);
+            // A sync flushes the drive, so no barrier is left to refuse a cut of this disk.
             if synced.allows(&drawn) {
                 tape.reached("a synced file and an allowed cut");
-            } else {
-                tape.reached("a cut the barriers refuse");
             }
             // clone: as above
             holds("a_crash_keeps_a_synced_file", a_crash_keeps_a_synced_file(made.clone(), name, drawn.clone()), &made, &drawn)?;
@@ -1032,6 +1031,9 @@ mod tests {
             ordered.append(later, bytes.clone());
             let drawn = cut(tape, &ordered);
             let appended = ordered.find(later).expect("appended to");
+            if !ordered.allows(&drawn) {
+                tape.reached("a cut the barriers refuse");
+            }
             if ordered.allows(&drawn)
                 && ordered.files[appended].reach(&drawn[appended]) == ordered.files[appended].changes.len()
                 && !made.files[at].changes.is_empty()
