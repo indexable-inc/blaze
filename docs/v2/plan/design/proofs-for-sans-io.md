@@ -66,52 +66,56 @@ input". The function is the same. So:
 
 ### 2. Worlds
 
-A world is what a core's effects go to. Each is a small, pure Rust type with two functions:
+A world is what a core's effects go to. Each is a small, pure Rust type in
+`crates/blaze-core/src/world/`: its state, one function per completion that gives the state
+after it, and a predicate (`allows`) wherever the kernel has a choice. The relation is the
+predicate, so nothing has to show that a script of choices reaches every allowed answer, and
+conformance with a real driver is `allows(observed)` (objective V4).
 
-- `allows(&self, asked: &Effect, answer: &Answer) -> bool`: whether the kernel may answer
-  so, in this state. A crash is an answer that carries the disk it left.
-- `apply(&mut self, asked: &Effect, answer: &Answer)`: the world after it.
+- `clock::Clock` (built 2026-11-14): monotonic time; the next reading is never earlier, and a
+  timer is told fired at a reading not before its deadline.
+- `disk::Disk` (built 2026-11-14): per file its durable bytes and, in order, the changes made
+  since the last sync that covered them; `sync`, `barrier`, `flush`, whole-file writes and
+  renames that wait for the drive and that do not, removal; and the crash rule below.
+- Not built: a full disk, short reads, modes and links; what is asked and not yet answered
+  (today a caller tells the disk each completion and, for a sync, how many changes it
+  covers); locks, the network, processes; `Atomics` (section 8).
 
-The relation is the predicate, so nothing has to show that a script of choices reaches
-every allowed answer, and conformance with a real driver is `allows(observed)` on what the
-kernel did (objective V4). For tests, `pick(&self, asked, choices: &mut Choices) -> Answer`
-draws an answer, with `allows(pick(..))` proved once.
+**A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
+kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
+rename is undone) and is a plain check; `Disk::crash(cut)` is the disk after it. A core's
+crash theorem quantifies over the witness: for every `cut` that `allows` permits of the disk
+the core's own run left, recovery from `crash(cut)` gives a state whose well-formedness and
+durable promises hold. A disk a real power cut left conforms when some allowed cut gives it.
+The rule, which `Sim::crash` followed and the world now states:
 
-- `Clock`: monotonic time; an answer is the next reading, never earlier.
-- `Fs`: per file what is durable and what is only written; `sync`, `rename`; a crash may
-  leave what was synced plus a prefix of the later changes with the last torn at a 512-byte
-  sector, an unsynced rename undone, and the write barriers `Sim` models
-  (`crates/blaze-core/src/sim.rs`, `crash`); `ENOSPC`; the differences between Linux and
-  macOS (what `fsync` makes durable, a rename before its data) as a parameter.
-- `Locks`, `Net`, processes: as `Sim` has them.
-- Later, `Atomics` (section 8).
-
-**What a crash allows**, as `Sim::crash` has it today, which is the rule `Fs::allows` states
-(read 2026-11-13; the world is not written yet):
-
-- A file is its durable bytes and, in order, the changes made since the last sync that
-  covered it. A crash keeps the durable bytes and a prefix of the changes, each file's own;
-  of the first change not kept, any set of its 512-byte sectors may have landed.
-- A barrier (`Effect::Barrier`) orders: if a crash keeps any change, of any file, made after
-  a barrier completed, it keeps every change that barrier covers. That couples files, so
-  `allows` is one predicate over the whole disk: there is a count kept per file such that
-  each is a prefix, the disk is what those prefixes and torn sectors give, and no kept
-  change is newer than a barrier whose changes are not all kept.
+- A crash keeps a file's durable bytes and a prefix of its changes; of the first change not
+  kept, a prefix of an append or of a write at an offset may have landed, or any set of the
+  512-byte sectors of a write from memory.
+- A barrier (`Effect::Barrier`) orders: a crash that keeps any change, whole or in part, of
+  any file, made after a barrier completed keeps every change that barrier covers. That
+  couples files, so `allows` is one predicate over the whole disk.
 - A whole-file write or a rename that waited for no sync may be undone as a whole: the name
-  holds what it held before, a renamed file is back under its old name.
-- A completed whole-file write or rename that did wait is kept whole; one in flight is not
-  there.
+  holds what it held before, as far as that was durable; a renamed file is back under its
+  old name.
 
-A core's crash theorem is then of one shape: for every disk `allows` permits of the world
-the core's own run left, recovery from that disk gives a state whose well-formedness and
-whose durable promises (what was reported durable is there, nothing torn is served) hold.
-The lemmas a proof uses are the consequences of the rule above (what a sync or a barrier
-before a commit record guarantees about the bytes it names), proved once beside the world.
+**One world for Linux and macOS.** The difference between the kernels is in the drivers, not
+in what an effect promises: `Effect::Sync` is `fsync` on Linux and `F_FULLFSYNC` on Apple's
+systems; `Effect::Barrier` is `F_BARRIERFSYNC` there and `fdatasync` on Linux, which is also
+durable. The world states the least both give, and making more durable only removes crashes
+it allows, so a proof against it holds on both.
 
-Worlds are written in the translator's subset as it stands (index loops, `Vec`, sorted
-`Vec` maps), so the first crash proof does not wait for iterators and closures. End state:
-`Sim` is rebuilt on these types, so the kernel's rules have one home
-(`one-concept-one-home`); until then a refinement test holds `Sim` to them.
+**`Sim` is held to the world** by the refinement test `crates/blaze-core/src/sim/world.rs`:
+runs of drawn effects, overlapping, failing and crashing, after each of which the
+simulation's files are the world's change for change, and each cut `Sim` draws is one the
+world allows and leaves the world's disk. `Sim::crash` is split for it into drawing the cut
+and applying it. Writing the world found two places `Sim` left its own rule, fixed with it
+and kept as controls: a rename's flush missed the file it renamed, and a file a crash put
+back kept the barriers of the changes it lost. End state: `Sim` is rebuilt on the world's
+types, so the kernel's rules have one home (`one-concept-one-home`).
+
+Worlds are written in the translator's subset as it stands (index loops, `Vec`), so a crash
+proof does not wait for iterators and closures.
 
 Losing alternatives. A script of choices (`Vec<u64>`) read by a generator: sound only if
 every allowed answer has a script, which no proof checks, so a bound off by one quietly
@@ -264,7 +268,7 @@ Not started. The first target is formal-verification.md's (the flight recorder's
    in `blaze_core::wait::retry`) against a clock world. Its loop `drive` (a closure and a
    trait bound) follows with steps b and c; until then the DST stays.
 3. A refinement against a reference model (a chunked map against a sorted map).
-4. A crash theorem on the `Fs` world: the profile history is exactly-once after any crash.
+4. A crash theorem on the `Disk` world: the profile history is exactly-once after any crash.
 5. Then by class, in lanes, in the order invariants.md's classes are cheapest to prove: pure
    functions, state-machine invariants, refinements, crashes; incremental-equals-clean as one
    theorem about the query engine.

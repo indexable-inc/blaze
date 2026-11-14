@@ -42,5 +42,7 @@ workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
+# The test engine (`blaze_sim::check`): it depends on blaze-rng alone, so nothing circles.
+blaze-sim.workspace = true
 blaze-spin.workspace = true
 hegeltest.workspace = true

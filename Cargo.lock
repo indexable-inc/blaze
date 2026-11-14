@@ -805,6 +805,7 @@ dependencies = [
  "blaze-mem",
  "blaze-radix",
  "blaze-rng",
+ "blaze-sim",
  "blaze-spin",
  "blaze-sys",
  "crossbeam-channel",
