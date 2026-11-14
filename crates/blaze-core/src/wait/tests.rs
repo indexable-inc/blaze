@@ -275,7 +275,7 @@ fn run(tape: &Tape, plan: &Plan, plant: Plant) -> Result<(), String> {
         let deadline = wait.deadline.map(|it| Deadline::after(start, it));
         let event = wait.event.map(|it| start + it);
         let retry = Retry::new("a simulated event", deadline, start).planted(plant);
-        let waited = retry::drive(retry, &clock, |left| call(&now, tape, &faults, event, left));
+        let waited = retry::drive(retry, &mut (&clock, |left| call(&now, tape, &faults, event, left)));
         let end = now.get();
         let waited = waited.map_err(|error| format!("wait {n}: {error}"))?;
         let said = |what: &str| {
