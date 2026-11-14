@@ -162,10 +162,10 @@ fn shares(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> bool {
 }
 
 /// Which runners `nodes` reach ([`Worlds`]): a call of `two` or `two_weak` itself and what its
-/// two closures reach, and what each function they call reaches by its shape in `shapes` (its
-/// callees, closures among them, are emitted before it, so their shapes are known).
-fn worlds(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> Worlds {
-    let reached = |name: &String| shapes.get(name).map_or(Worlds::default(), |it| it.worlds);
+/// two closures reach, and what each function they call reaches, which `reached` says by the
+/// function's name (its callees, closures among them, are emitted before it, so their shapes
+/// are known to the caller's table).
+fn worlds(nodes: &Nodes, reached: &impl Fn(&str) -> Worlds) -> Worlds {
     nodes.iter().fold(Worlds::default(), |all, node| {
         all.join(match node {
             Node::Do(Stmt::Call { callee, .. }) => match callee {
@@ -179,8 +179,8 @@ fn worlds(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> Worlds {
             Node::Do(_) => Worlds::default(),
             Node::Branch { arms, otherwise, .. } => arms
                 .iter()
-                .fold(worlds(otherwise, shapes), |all, (_, arm)| all.join(worlds(arm, shapes))),
-            Node::Block(body) | Node::Loop(body) => worlds(body, shapes),
+                .fold(worlds(otherwise, reached), |all, (_, arm)| all.join(worlds(arm, reached))),
+            Node::Block(body) | Node::Loop(body) => worlds(body, reached),
             Node::Break(_) | Node::Continue(_) | Node::Return | Node::End(_) => Worlds::default(),
         })
     })
@@ -1991,7 +1991,7 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
         .collect();
     // A shared function gives a `Threads.Prog`: it is monadic whatever is left of its body.
     let shared = shares(&body.nodes, shapes);
-    let worlds = worlds(&body.nodes, shapes);
+    let worlds = worlds(&body.nodes, &|name: &str| shapes.get(name).map_or(Worlds::default(), |it| it.worlds));
     translate.prog_level = shared;
     translate.result = translate.types(&translate.returned);
     let live: Set = translate.returned.iter().copied().collect();

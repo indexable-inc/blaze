@@ -117,7 +117,7 @@ mod theorems {
             if let Some(order) = order {
                 tape.reached(order);
             }
-            match no_hand_back_is_missed(schedule.clone(), flagged) {
+            match no_hand_back_is_missed(&schedule, flagged) {
                 true => Ok(()),
                 false => Err(Broke::Oracle(format!(
                     "a hand-back was missed: schedule {schedule:?}, the flag set {flagged}"

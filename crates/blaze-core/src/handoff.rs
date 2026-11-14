@@ -153,8 +153,8 @@ fn hands(schedule: &[Step], flagged: bool) -> bool {
 #[cfg(not(blaze_check))]
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
-pub(crate) fn no_hand_back_is_missed(schedule: Vec<Step>, flagged: bool) -> bool {
-    hands(&schedule, flagged)
+pub(crate) fn no_hand_back_is_missed(schedule: &[Step], flagged: bool) -> bool {
+    hands(schedule, flagged)
 }
 
 #[cfg(test)]
