@@ -1,5 +1,4 @@
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config;
 
 use super::{Fuse8, HEADER};
 use crate::rng::SplitMix64;
@@ -11,20 +10,22 @@ fn random(seed: u64, n: usize) -> Vec<u64> {
 
 /// The model: a filter never hides a key it was built of, at any size, with keys repeated,
 /// and the same after an encoding and decoding.
-#[hegel::test]
-fn a_filter_never_hides_a_key_it_was_built_of(tc: TestCase) {
-    let mut keys: Vec<u64> = tc.draw(gs::vecs(gs::integers()).max_size(3000));
-    let repeated: usize = tc.draw(gs::integers().max_value(keys.len()));
-    keys.extend_from_within(..repeated);
-    let filter = Fuse8::of(keys.clone());
-    let mut bytes = Vec::new();
-    filter.encode(&mut bytes);
-    assert_eq!(bytes.len(), filter.encoded_len());
-    let decoded = Fuse8::decode(&bytes).unwrap();
-    assert_eq!(decoded, filter);
-    for key in keys {
-        assert!(filter.contains(key), "{key:#x} hidden");
-    }
+#[test]
+fn a_filter_never_hides_a_key_it_was_built_of() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut keys: Vec<u64> = tape.vec(0..=3000, "keys", |tape| tape.int("key"));
+        let repeated: usize = tape.int_in(0..=keys.len(), "repeated");
+        keys.extend_from_within(..repeated);
+        let filter = Fuse8::of(keys.clone());
+        let mut bytes = Vec::new();
+        filter.encode(&mut bytes);
+        assert_eq!(bytes.len(), filter.encoded_len());
+        let decoded = Fuse8::decode(&bytes).unwrap();
+        assert_eq!(decoded, filter);
+        for key in keys {
+            assert!(filter.contains(key), "{key:#x} hidden");
+        }
+    });
 }
 
 #[test]

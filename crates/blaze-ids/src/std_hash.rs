@@ -32,8 +32,7 @@ impl Hasher {
 mod tests {
     use std::hash::{Hash, Hasher as _};
 
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use crate::Hasher;
 
@@ -102,25 +101,27 @@ mod tests {
 
     /// Against the reference: the hand-written forwarders `blaze-hashcons`, `hir-ty-share`,
     /// `hir-ty-codegen` and the old query engine each carried, here as the bytes they wrote.
-    #[hegel::test]
-    fn matches_the_reference(tc: TestCase) {
-        let a: u8 = tc.draw(gs::integers());
-        let b: i16 = tc.draw(gs::integers());
-        let c: u32 = tc.draw(gs::integers());
-        let d: i64 = tc.draw(gs::integers());
-        let e: u128 = tc.draw(gs::integers());
-        let f: usize = tc.draw(gs::integers());
-        let g: isize = tc.draw(gs::integers());
-        let s: String = tc.draw(gs::text());
-        let mut want = vec![a];
-        want.extend(b.to_le_bytes());
-        want.extend(c.to_le_bytes());
-        want.extend(d.to_le_bytes());
-        want.extend(e.to_le_bytes());
-        want.extend((f as u64).to_le_bytes());
-        want.extend((g as i64 as u64).to_le_bytes());
-        want.extend(s.as_bytes());
-        want.push(0xff);
-        assert_eq!(bytes(&(a, b, c, d, e, f, g, s.as_str())), want);
+    #[test]
+    fn matches_the_reference() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let a: u8 = tape.int("a");
+            let b: i16 = tape.int("b");
+            let c: u32 = tape.int("c");
+            let d: i64 = tape.int("d");
+            let e: u128 = tape.u128("e");
+            let f: usize = tape.int("f");
+            let g: isize = tape.int("g");
+            let s: String = tape.text(0..=32, "s");
+            let mut want = vec![a];
+            want.extend(b.to_le_bytes());
+            want.extend(c.to_le_bytes());
+            want.extend(d.to_le_bytes());
+            want.extend(e.to_le_bytes());
+            want.extend((f as u64).to_le_bytes());
+            want.extend((g as i64 as u64).to_le_bytes());
+            want.extend(s.as_bytes());
+            want.push(0xff);
+            assert_eq!(bytes(&(a, b, c, d, e, f, g, s.as_str())), want);
+        });
     }
 }
