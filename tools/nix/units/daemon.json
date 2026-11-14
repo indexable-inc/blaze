@@ -1298,6 +1298,22 @@
    },
    {
     "dependencies": [
+     "blaze-cas",
+     "blaze-core",
+     "blaze-format",
+     "blaze-graph",
+     "blaze-ids",
+     "blaze-keyed",
+     "blaze-sim",
+     "blaze-vfs",
+     "crossbeam-queue",
+     "tracing"
+    ],
+    "name": "blaze-host",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
      "base64",
      "blaze-core",
      "blaze-sha256",
@@ -2340,9 +2356,12 @@
      "blaze-api",
      "blaze-cas",
      "blaze-core",
+     "blaze-format",
      "blaze-hash",
      "blaze-ids",
+     "blaze-keyed",
      "blaze-protocol",
+     "blaze-sim",
      "blaze-usercode"
     ],
     "name": "blaze-testsel",
@@ -2398,6 +2417,19 @@
      "serde_json"
     ],
     "name": "blaze-ui",
+    "version": "0.0.0"
+   },
+   {
+    "dependencies": [
+     "blaze-format",
+     "blaze-ids",
+     "blaze-keyed",
+     "blaze-sim",
+     "cfg",
+     "intern",
+     "syntax"
+    ],
+    "name": "blaze-unitkey",
     "version": "0.0.0"
    },
    {
@@ -8389,6 +8421,9 @@
     "blaze-history": {
      "path": "crates/blaze-history"
     },
+    "blaze-host": {
+     "path": "crates/blaze-host"
+    },
     "blaze-http": {
      "default-features": false,
      "path": "crates/blaze-http"
@@ -8590,6 +8625,9 @@
     },
     "blaze-ui": {
      "path": "crates/blaze-ui"
+    },
+    "blaze-unitkey": {
+     "path": "crates/blaze-unitkey"
     },
     "blaze-units": {
      "path": "crates/blaze-units"
@@ -10932,6 +10970,23 @@
    },
    "version": "0.0.0"
   },
+  "blaze-host@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "The host of the keyed driver (docs/v2/plan/design/host.md): one process runs a request to its outcome, performing every effect of blaze-keyed's driver on a real store and a real worker pool, with the front end given as a `Front`; the request's outside reads answered from the disk with a leaf memory of stamps",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-host",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-host",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
   "blaze-http@0.0.0": {
    "authors": "blaze contributors",
    "description": "blaze's HTTP: an HTTP/1.1 client and an HTTP/3 WebTransport endpoint, each a sans-IO core (deadlines on an injected clock; TLS through rustls, QUIC through quinn-proto) with a thin tokio driver",
@@ -11529,7 +11584,7 @@
   },
   "blaze-program@0.0.0": {
    "authors": "blaze contributors",
-   "description": "Code as records and programs as manifests (target decisions 1, 5, 6, 8): the instance code record and its key computed before any lowering, the monomorphization walk as a streaming sans-IO state machine, the program manifest and the `Program` machine that turns a demand or a delta into a placement change of bytes proportional to the edit, and the test-result record",
+   "description": "Code as records and programs as manifests (target decisions 1, 5, 6, 8): the instance code record and its key computed before any lowering, the monomorphization walk as a streaming sans-IO state machine, the program manifest and the `Program` machine that turns a demand or a delta into a placement change of bytes proportional to the edit, and a test's base key and reach",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -12101,6 +12156,23 @@
    "rust_version": "1.101",
    "source": {
     "dir": "crates/blaze-ui",
+    "kind": "path"
+   },
+   "version": "0.0.0"
+  },
+  "blaze-unitkey@0.0.0": {
+   "authors": "blaze contributors",
+   "description": "Task::Key of the keyed driver (D39, docs/v2/plan/design/read-addressed.md): a file's FileImage record from its bytes, and every key of a unit (manifest, surface, each body) from its own text alone, reading nothing of any other unit; sans-IO, reads no file",
+   "homepage": "",
+   "license": "MIT OR Apache-2.0",
+   "license_file": "",
+   "links": null,
+   "name": "blaze-unitkey",
+   "readme": "",
+   "repository": "https://github.com/indexable-inc/blaze",
+   "rust_version": "1.101",
+   "source": {
+    "dir": "crates/blaze-unitkey",
     "kind": "path"
    },
    "version": "0.0.0"
@@ -28063,6 +28135,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
       },
       {
        "name": "blaze_usercode",
@@ -53266,6 +53342,10 @@
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
       },
       {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
+      },
+      {
        "name": "blaze_usercode",
        "unit": "blaze-usercode@0.0.0 lib blaze_usercode build"
       }
@@ -78127,6 +78207,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
       },
       {
        "name": "blaze_usercode",
@@ -103314,6 +103398,10 @@
       {
        "name": "blaze_ids",
        "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
       },
       {
        "name": "blaze_usercode",

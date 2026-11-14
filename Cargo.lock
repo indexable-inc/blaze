@@ -1306,9 +1306,9 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-keyed",
+ "blaze-sim",
  "blaze-vfs",
  "crossbeam-queue",
- "hegeltest",
  "tracing",
 ]
 
@@ -1503,8 +1503,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-format",
  "blaze-ids",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2364,9 +2363,8 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-protocol",
- "blaze-rng",
+ "blaze-sim",
  "blaze-usercode",
- "hegeltest",
 ]
 
 [[package]]
@@ -2428,8 +2426,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-keyed",
+ "blaze-sim",
  "cfg",
- "hegeltest",
  "intern",
  "syntax",
 ]
