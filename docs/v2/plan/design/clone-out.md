@@ -136,6 +136,14 @@ made only of a clone waits for the file to be made, sealed and written back firs
   after the place completed and a `stat` of it (`paths.placed`, in memory), and a daemon that
   starts knows of no placed file, so the next build places again. No hash of the file is
   taken: the check is the recorded length and mtime against a `stat`.
+- **One writer per path** (2026-11-14). An output path is written only by its job's
+  placement (`Jobs::place`, `place_made`, `place_patched`, `place_also`, each under the
+  store's `place` span naming the path). A dev executable's launch (a test binary, `blaze
+  run`) writes nothing: it is started from the placed file with the key the path's record
+  holds (`Jobs::placed_key`, read once the job's placements have ended), and refused naming
+  the path and both keys where that is not its code memory's file
+  (`blaze_inproc::host::StartError::NotPlaced`). So a build after a test run finds the file
+  as placed and places nothing.
 - **The loop thread.** `FICLONE` runs on a thread off the ring with a span `io clone <file>`;
   the ring's eventfd is written only while its thread is parked. Still in line on the ring's
   thread, each one metadata call: mode, seal, times, readlink, flock, truncate, mmap.

@@ -157,6 +157,12 @@ thread_local! {
     /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`], the file its
     /// artifact names ([`app_artifact`]): what the build's answer waits for.
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
+    /// Whether the fakes' tests are a launch of the program at [`APP_AT`] as the code memory's
+    /// host starts it ([`Launches`]), on a memory whose file is this key.
+    static TESTS_LAUNCH: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    /// Each launch [`Launches`] made: the key the job's record held for [`APP_AT`], and the
+    /// refusal, if it was one.
+    static LAUNCHES: RefCell<Vec<(Option<[u8; 32]>, Option<String>)>> = const { RefCell::new(Vec::new()) };
     /// Whether the program's compile also gives [`SIDE`] at [`SIDE_AT`], a file its artifact
     /// does not name (as a program's hashed copy under `deps`): placed after the answer.
     static SIDE_OUTPUT: Cell<bool> = const { Cell::new(false) };
@@ -1079,6 +1085,7 @@ pub(super) enum FakeRuns {
     Over(Over),
     Lost(Lost),
     Keeps(Keeps),
+    Launches(Launches),
 }
 
 impl Runs<Fake> for FakeRuns {
@@ -1086,15 +1093,17 @@ impl Runs<Fake> for FakeRuns {
         &mut self,
         store: &mut Store,
         writer: Option<&mut dyn Asks>,
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         match self {
-            FakeRuns::Script(it) => it.start(store, writer, effects, out),
-            FakeRuns::Slow(it) => it.start(store, writer, effects, out),
-            FakeRuns::Over(it) => it.start(store, writer, effects, out),
-            FakeRuns::Lost(it) => it.start(store, writer, effects, out),
-            FakeRuns::Keeps(it) => it.start(store, writer, effects, out),
+            FakeRuns::Script(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Slow(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Over(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Lost(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Keeps(it) => it.start(store, writer, placed, effects, out),
+            FakeRuns::Launches(it) => it.start(store, writer, placed, effects, out),
         }
     }
 
@@ -1105,6 +1114,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.owns(tag),
             FakeRuns::Lost(it) => it.owns(tag),
             FakeRuns::Keeps(it) => it.owns(tag),
+            FakeRuns::Launches(it) => it.owns(tag),
         }
     }
 
@@ -1122,6 +1132,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Lost(it) => it.complete(completion, store, writer, effects, out),
             FakeRuns::Keeps(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Launches(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -1132,6 +1143,7 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.cancel(effects),
             FakeRuns::Lost(it) => it.cancel(effects),
             FakeRuns::Keeps(it) => it.cancel(effects),
+            FakeRuns::Launches(it) => it.cancel(effects),
         }
     }
 
@@ -1142,7 +1154,64 @@ impl Runs<Fake> for FakeRuns {
             FakeRuns::Over(it) => it.take_puts(),
             FakeRuns::Lost(it) => it.take_puts(),
             FakeRuns::Keeps(it) => it.take_puts(),
+            FakeRuns::Launches(it) => it.take_puts(),
         }
+    }
+}
+
+/// The tests' run as the code memory's host starts a test binary (`TestRun::start` through
+/// `blaze_usercode::test::queue`'s launch): from the file at [`APP_AT`], with the key the
+/// job's record holds there, on a memory whose file is `held`, by the host's own rule
+/// ([`blaze_inproc::host::StartError::check`]). A start is over at once, ok; a refusal ends
+/// it not ok with the refusal as its stderr. Each is kept in [`LAUNCHES`].
+pub(super) struct Launches {
+    held: [u8; 32],
+}
+
+impl Runs<Fake> for Launches {
+    fn start(
+        &mut self,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>,
+        _: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        let key = placed(APP_AT);
+        let refused = blaze_inproc::host::StartError::check(std::path::Path::new(APP_AT), key, self.held)
+            .err()
+            .map(|it| it.to_string());
+        LAUNCHES.with_borrow_mut(|it| it.push((key, refused.clone())));
+        match refused {
+            None => Some(true),
+            Some(why) => {
+                out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: why.into_bytes() });
+                Some(false)
+            }
+        }
+    }
+
+    fn owns(&self, _: Tag) -> bool {
+        false
+    }
+
+    fn complete(
+        &mut self,
+        _: Completion,
+        _: &mut Store,
+        _: Option<&mut dyn Asks>,
+        _: &mut Vec<Effect>,
+        _: &mut Vec<Response>,
+    ) -> Option<bool> {
+        unreachable!("it asked for nothing")
+    }
+
+    fn cancel(&mut self, _: &mut Vec<Effect>) -> Option<bool> {
+        Some(false)
+    }
+
+    fn take_puts(&mut self) -> RunPuts {
+        RunPuts::default()
     }
 }
 
@@ -1154,6 +1223,7 @@ impl Runs<Fake> for Script {
         &mut self,
         _: &mut Store,
         writer: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1198,6 +1268,7 @@ impl Runs<Fake> for Slow {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1241,6 +1312,7 @@ impl Runs<Fake> for Lost {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1302,6 +1374,7 @@ impl Runs<Fake> for Keeps {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1367,6 +1440,7 @@ impl Runs<Fake> for Over {
         &mut self,
         _: &mut Store,
         _: Option<&mut dyn Asks>,
+        _: &dyn Fn(&str) -> Option<[u8; 32]>,
         _: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1546,6 +1620,9 @@ impl Front<Fake> for FakeFront {
         tags: u64,
     ) -> Result<FakeRuns, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
+        if let Some(held) = TESTS_LAUNCH.get() {
+            return Ok(FakeRuns::Launches(Launches { held }));
+        }
         if TESTS_KEEP.get() {
             return Ok(FakeRuns::Keeps(Keeps {
                 tag: Tag(tags),
@@ -5534,6 +5611,161 @@ fn an_output_is_placed_again_once_its_file_is_not_as_placed() {
     build(&mut daemon);
     daemon.driver().change(&app, b"a file longer than the one the build placed\n");
     build(&mut daemon);
+}
+
+/// The invariant: a job whose output's path already holds that output's value places nothing
+/// there (no write, no clone, no rename: the file keeps its inode and times).
+#[test]
+fn a_job_whose_outputs_path_holds_its_value_places_nothing() {
+    let placed = builds_place(false);
+    assert!(
+        !placed.iter().any(|it| it == APP_AT),
+        "a build after the one that placed {APP_AT} placed it again: {placed:?}"
+    );
+}
+
+/// The planted-bug control: an output placed again whatever its path holds, its file not
+/// looked at first, is seen placed by the builds after the first.
+#[test]
+fn the_oracle_catches_an_output_placed_over_its_own_value() {
+    let placed = builds_place(true);
+    assert!(
+        placed.iter().any(|it| it == APP_AT),
+        "the planted bug placed nothing the oracle saw: {placed:?}"
+    );
+}
+
+/// The key the fakes' compile files [`APP`] under: the program's file, as its code memory
+/// holds it.
+fn app_key() -> [u8; 32] {
+    ContentId::of("blaze serve tests output", APP).0
+}
+
+/// The invariant: an output path has one writer, its job's placement. A job that runs tests
+/// whose executable's path holds its value places nothing there, and its launch starts that
+/// file, with the key the job's record holds for the path, which is the program's own: the
+/// code memory's host writes nothing, so nothing is placed again in the build after.
+#[test]
+fn a_test_run_whose_executable_holds_its_value_places_nothing_and_starts_that_file() {
+    for seed in 300..308 {
+        let (placed, launches) = tests_launch(seed, app_key(), false);
+        assert!(
+            !placed.iter().any(|it| it == APP_AT),
+            "seed {seed}: a test run after the one that placed {APP_AT} placed it again: {placed:?}"
+        );
+        assert_eq!(launches.len(), 3, "seed {seed}: one launch a run: {launches:?}");
+        for (key, refused) in &launches {
+            assert_eq!(*key, Some(app_key()), "seed {seed}: launched with the record's key");
+            assert_eq!(*refused, None, "seed {seed}: the placed file starts");
+        }
+    }
+}
+
+/// The planted-bug control: a launch given no record of its path ([`super::job::PLANT_LAUNCH_UNRECORDED`],
+/// as before launches read the job's record, when the host wrote the file in their stead) is
+/// seen by the oracle: refused, naming the path.
+#[test]
+fn the_oracle_catches_a_launch_given_no_record_of_its_path() {
+    let (_, launches) = tests_launch(300, app_key(), true);
+    assert!(
+        launches.iter().any(|(key, refused)| key.is_none() && refused.is_some()),
+        "the planted bug's launches went unseen: {launches:?}"
+    );
+}
+
+/// The invariant: a launch whose path holds another key than its program's, or no record, is
+/// refused, its run not ok, naming the path and both keys (the held one, and the placed one
+/// where there is one); nothing is written there in the build's stead.
+#[test]
+fn a_launch_whose_path_holds_another_key_or_no_record_is_refused_naming_both() {
+    let hex = |key: [u8; 32]| key.iter().map(|it| format!("{it:02x}")).collect::<String>();
+    let other = [0xab; 32];
+    let (placed, launches) = tests_launch(301, other, false);
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    for (key, refused) in &launches {
+        assert_eq!(*key, Some(app_key()));
+        let why = refused.as_deref().expect("a program whose file is another key is refused");
+        assert!(why.contains(APP_AT), "{why}");
+        assert!(why.contains(&hex(app_key())) && why.contains(&hex(other)), "{why}");
+    }
+    assert!(!placed.iter().any(|it| it == APP_AT), "nothing placed it again: {placed:?}");
+    let (_, launches) = tests_launch(302, app_key(), true);
+    for (key, refused) in &launches {
+        assert_eq!(*key, None);
+        let why = refused.as_deref().expect("a launch with no record is refused");
+        assert!(why.contains(APP_AT) && why.contains(&hex(app_key())), "{why}");
+    }
+}
+
+/// Three test runs of a checkout with an executable output at [`APP_AT`], nothing changed
+/// between them, its tests a launch of that file on a memory whose file is `held`
+/// ([`Launches`]): the paths the runs after the first placed a file at, and every launch.
+/// A run ends ok only where its launch started. `plant`: [`super::job::PLANT_LAUNCH_UNRECORDED`].
+fn tests_launch(seed: u64, held: [u8; 32], plant: bool) -> (Vec<String>, Vec<(Option<[u8; 32]>, Option<String>)>) {
+    use super::job::{PLACED_PATHS, PLANT_LAUNCH_UNRECORDED};
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    LAUNCHES.with_borrow_mut(Vec::clear);
+    OUTPUT.set(true);
+    TESTS_LAUNCH.set(Some(held));
+    PLANT_LAUNCH_UNRECORDED.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    for nth in 0..3 {
+        let request = Request::Test {
+            view: ViewRef::Head("/w".into()),
+            targets: agent(),
+            filter: Vec::new(),
+            all: false,
+            args: Vec::new(),
+            ub: None,
+        };
+        let id = client.send(&mut daemon, request);
+        let got = client.wait(&mut daemon, id);
+        let started = LAUNCHES.with_borrow(|it| it.last().is_some_and(|(_, refused)| refused.is_none()));
+        assert_eq!(got.last(), Some(&Response::Done { ok: started }), "seed {seed}: {got:#?}");
+        assert_eq!(daemon.driver().contents(&app), APP, "seed {seed}: the build's file is there");
+        if nth == 0 {
+            PLACED_PATHS.with_borrow_mut(Vec::clear);
+        }
+    }
+    PLANT_LAUNCH_UNRECORDED.set(false);
+    TESTS_LAUNCH.set(None);
+    OUTPUT.set(false);
+    (PLACED_PATHS.with_borrow_mut(std::mem::take), LAUNCHES.with_borrow_mut(std::mem::take))
+}
+
+/// Three builds of a checkout with an executable output, nothing changed between them: the
+/// paths the builds after the first placed a file at. `plant`:
+/// [`super::job::PLANT_PLACE_UNLOOKED`].
+fn builds_place(plant: bool) -> Vec<String> {
+    use super::job::{PLACED_PATHS, PLANT_PLACE_UNLOOKED};
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    let mut sim = Sim::new(13, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 13);
+    OUTPUT.set(true);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let mut build = |daemon: &mut SimDaemon| {
+        let id = client
+            .send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+        assert_eq!(daemon.driver().contents(&app), APP);
+    };
+    build(&mut daemon);
+    PLACED_PATHS.with_borrow_mut(Vec::clear);
+    PLANT_PLACE_UNLOOKED.set(plant);
+    build(&mut daemon);
+    build(&mut daemon);
+    PLANT_PLACE_UNLOOKED.set(false);
+    OUTPUT.set(false);
+    PLACED_PATHS.with_borrow_mut(std::mem::take)
 }
 
 /// What one client asked and how it ended.

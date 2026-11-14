@@ -1,7 +1,9 @@
 //! A dev executable on the daemon's code memory (docs/v2/plan/design/compile-time.md):
 //! linked with the start hook's reservations ([`dev_run`]), committed into a
-//! [`CodeMemory`] instead of a file, written to cargo's path once per content key by
-//! [`Program::command`], and overlaid by the memory before `main`. Each patch is
+//! [`CodeMemory`] instead of a file, started by [`Program::command`] from the file the build
+//! placed at cargo's path (the jobs' placement is that path's one writer: the host writes no
+//! file, and a launch whose path does not hold its memory's file is refused,
+//! [`host::StartError::NotPlaced`]), and overlaid by the memory before `main`. Each patch is
 //! [`Image::commit_into`] the same memory and announced; the run's `blaze-live` asks for its
 //! message over the channel a piece at a time, and says what became of it, answered by
 //! [`serve`] ([`blaze_live::patch::ask`]). What a `run` and a test binary both start through.
@@ -193,9 +195,10 @@ impl DevRuns {
     /// unchanged at their last look (`Jobs::placed_key`; after a start, the placement the
     /// request certificate vouched for by its stamp or hashed), or `None`. A dev executable
     /// whose memory's file is that output is started from the file as it is: the launch writes
-    /// nothing, so the build after it places nothing and its outputs' watch hears nothing
-    /// (`file=placed` on the span). Any other is written from the memory first
-    /// (`file=written`, or `kept` for one this host wrote and nothing changed since).
+    /// nothing, so the build after it places nothing and its outputs' watch hears nothing.
+    /// Any other, or one with nothing placed, is refused naming the path, the key placed and
+    /// the memory's ([`host::StartError::NotPlaced`]): the build is the one writer of `path`,
+    /// and nothing writes it in its stead.
     ///
     /// A dev executable this daemon holds no memory of (it started since the build that
     /// placed it, and nothing since linked or replayed it) is made its memory from the placed
@@ -219,7 +222,6 @@ impl DevRuns {
             "dev run launch",
             path,
             pid,
-            file = tracing::field::Empty,
             adopted = false,
         )
         .entered();
@@ -259,17 +261,7 @@ impl DevRuns {
                 }
             }
         };
-        let (env, wrote) = loaded.launch(path, pid, placed)?;
-        span.record(
-            "file",
-            match wrote {
-                host::Wrote::Placed => "placed",
-                host::Wrote::Kept => "kept",
-                host::Wrote::Cloned => "cloned",
-                host::Wrote::Written => "written",
-            },
-        );
-        Ok(Some(env))
+        Ok(Some(loaded.launch(path, pid, placed)?))
     }
 
     /// The code this daemon's memory holds for the dev executable at `path`, by the key of the
@@ -582,7 +574,7 @@ pub(crate) fn load(
         .commit_into_patch(staged, &mut memory)
         .map_err(|it| format!("committing `{name}` into its code memory: {it}"))?;
     memory.lay_out(format).map_err(|it| format!("laying `{name}`'s code memory out: {it}"))?;
-    let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
+    let file = host::Image { key: file_key(name, image)?.0.0, len };
     let loaded = held(host, name, memory, file, generation, image.lineage())?;
     Ok((loaded, patch))
 }
@@ -614,7 +606,7 @@ fn adopted(host: &Arc<Host>, name: &str, bytes: &[u8], key: Key) -> Result<(Load
     memory
         .lay_out(format)
         .map_err(|it| format!("laying `{name}`'s code memory out from its kept file: {it}"))?;
-    let file = host::Image { key: key.0.0, len, store: None };
+    let file = host::Image { key: key.0.0, len };
     Ok((held(host, name, memory, file, descriptor.generation, descriptor.id)?, written))
 }
 
@@ -820,12 +812,13 @@ struct Served {
 impl Loaded {
     /// `staged`, a later link of `image`, committed into the memory the runs map, and announced
     /// to them; with what it changed of the file, for the store ([`blaze_link::Patch`]: the
-    /// ranges written, never the file's bytes read back out of the memory). A patch of a memory written out since is
-    /// refused when the next run's executable is written ([`Host::write_executable`]), never a
-    /// file that differs from the memory.
+    /// ranges written, never the file's bytes read back out of the memory). The jobs place the
+    /// patched file at the program's path under the new key; a run started before that
+    /// placement has ended is refused, never started from a file that differs from the memory
+    /// ([`host::StartError::NotPlaced`]).
     ///
     /// The memory's image part is then the new file, laid out again, so a run started after
-    /// is written from it and maps it ([`Program::relaid`]). What the runs were told is the
+    /// is started from its placed file and maps it ([`Program::relaid`]). What the runs were told is the
     /// patch's generation, or the restart the linker's message asks for and why (a new
     /// import, a moved thread-local, an address the loader slides in patch code).
     ///
@@ -869,7 +862,7 @@ impl Loaded {
         memory
             .lay_out(format)
             .map_err(|it| format!("laying `{name}`'s code memory out after a patch: {it}"))?;
-        let file = host::Image { key: file_key(name, image)?.0.0, len, store: None };
+        let file = host::Image { key: file_key(name, image)?.0.0, len };
         self.program.relaid(&memory, file).map_err(|it| format!("`{name}`: {it}"))?;
         let told = match &message {
             None => Told::Nothing,
@@ -912,30 +905,33 @@ impl Loaded {
         memory.announce(generation);
     }
 
-    /// The command that runs `command`'s program from the memory: the executable written at
-    /// `command.program` when it is not there yet, and the start hook's variable set. `forks`:
-    /// the process forks children that run the program (a test fork server).
+    /// The command that runs `command`'s program from the memory: the executable the build
+    /// placed at `command.program`, whose job's record holds `placed` for that path, and the
+    /// start hook's variable set. `forks`: the process forks children that run the program (a
+    /// test fork server). Refused, naming the path and both keys, where `placed` is not the
+    /// memory's file's key or is `None` ([`host::StartError::NotPlaced`]): nothing writes the
+    /// file in the build's stead.
     pub(crate) fn command(
         &self,
         command: Command,
         forks: bool,
+        placed: Option<[u8; 32]>,
     ) -> Result<(Command, Started), String> {
-        self.program.command(command, forks).map_err(|it| it.to_string())
+        self.program.command(command, forks, placed).map_err(|it| it.to_string())
     }
 
     /// What `blaze run` adds to the environment of process `pid`, which runs the executable at
     /// `path` once it execs it: the start hook's variable, which names this host's socket and
-    /// a launch waiting for that process. The executable is written there first from the
-    /// memory when it is not the memory's file: the output of `placed`'s key that the build
-    /// placed there is, when that is the memory's file's key ([`Program::command_placed`]).
-    /// The run is the CLI's process, outside any sandbox, as a `run` of a file is. With what
-    /// was done of the file.
+    /// a launch waiting for that process. The file at `path` is the build's: started only
+    /// where `placed`, the key the build's record holds for `path`, is the memory's file's key,
+    /// and refused otherwise ([`Program::command`]). The run is the CLI's process, outside any
+    /// sandbox, as a `run` of a file is.
     pub(crate) fn launch(
         &self,
         path: &str,
         pid: u32,
         placed: Option<[u8; 32]>,
-    ) -> Result<(Vec<(String, String)>, host::Wrote), String> {
+    ) -> Result<Vec<(String, String)>, String> {
         let command = Command {
             program: PathBuf::from(path),
             // alloc: none, empty: the CLI has the arguments, the environment and the directory
@@ -946,8 +942,8 @@ impl Loaded {
             sandbox: blaze_core::Sandbox::Off,
             memory: None,
         };
-        let (command, started, wrote) =
-            self.program.command_placed(command, false, placed).map_err(|it| it.to_string())?;
+        let (command, started) =
+            self.program.command(command, false, placed).map_err(|it| it.to_string())?;
         self.launched.pin().insert(pid, (started, std::time::Instant::now()));
         let env = command
             .env
@@ -957,7 +953,7 @@ impl Loaded {
                 _ => Err(format!("the start hook's variable for `{path}` is not UTF-8")),
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok((env, wrote))
+        Ok(env)
     }
 
     /// The program, for a test queue that starts its binary's processes itself

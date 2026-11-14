@@ -3482,8 +3482,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         }
                     }
                 }
-                // `blaze run` of a dev executable: the programs are the steps' (review: the
-                // file it may write is the launch's, once per run).
+                // `blaze run` of a dev executable: the programs are the steps'. The launch
+                // writes no file: it starts the one the build placed, with the key the jobs'
+                // record holds for its path, or is refused naming the path and both keys.
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
                     let placed = self.jobs.placed_key(&program);
                     let (response, ok) = match self.steps.launch(&program, pid, placed) {
