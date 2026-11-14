@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 
 use blaze_core::{Traced, Untraceable};
 use blaze_usercode::{
+    inputs::Moved,
     test::{Lines, Trace},
     trace::{self, Inputs},
 };
@@ -25,28 +26,29 @@ pub(super) struct Common {
     held: Option<Lines>,
     /// `held`'s shared lines assembled; a result's own spliced in while it is lent.
     traced: Traced,
-    /// Whether something `traced`'s shared part names moved after the run began, asked once
-    /// as it is assembled.
-    moved: bool,
+    /// What `traced`'s shared part names that moved after the run began, asked once as it is
+    /// assembled.
+    moved: Option<Moved>,
     splice: Splice,
 }
 
 impl Common {
     /// `with` called with what `trace` read, hashed as `inputs` has it now, or `None` when not
-    /// known: the same [`Traced`] as [`Trace::traced`]; and whether `moved` says something it
-    /// names changed after the run began, so a hash need not be what the run read. `moved` is
-    /// asked once of the shared part per buffer and once of each result's own part.
+    /// known: the same [`Traced`] as [`Trace::traced`]; and what `moved` says it names that
+    /// changed after the run began, so a hash need not be what the run read (the shared
+    /// part's first, else the result's own). `moved` is asked once of the shared part per
+    /// buffer, and of each result's own part while the shared part's said nothing.
     pub(super) fn traced<I: Inputs, R>(
         &mut self,
         trace: Trace,
         inputs: &mut I,
-        moved: impl Fn(&Traced) -> bool,
-        with: impl FnOnce(Option<&Traced>, bool) -> R,
+        moved: impl Fn(&Traced) -> Option<Moved>,
+        with: impl FnOnce(Option<&Traced>, Option<&Moved>) -> R,
     ) -> Result<R, I::Error> {
         let lines = match trace {
             Trace::Lines(lines) => lines,
-            Trace::Whole(traced) => return Ok(with(Some(&traced), moved(&traced))),
-            Trace::Unknown(_) => return Ok(with(None, false)),
+            Trace::Whole(traced) => return Ok(with(Some(&traced), moved(&traced).as_ref())),
+            Trace::Unknown(_) => return Ok(with(None, None)),
         };
         let shared = lines.common();
         let kept = self.held.as_ref().is_some_and(|it| it.common_is(&lines));
@@ -59,13 +61,20 @@ impl Common {
         if !kept {
             self.held = Some(lines);
         }
-        let own_moved = !self.moved && moved(&own);
-        Ok(self.lend(own, self.moved || own_moved, with))
+        let own_moved = if self.moved.is_none() { moved(&own) } else { None };
+        Ok(self.lend(own, own_moved, with))
     }
 
-    fn lend<R>(&mut self, own: Traced, moved: bool, with: impl FnOnce(Option<&Traced>, bool) -> R) -> R {
+    /// `with` called with the shared part and `own` spliced, and what moved: the shared
+    /// part's, else `own_moved`.
+    fn lend<R>(
+        &mut self,
+        own: Traced,
+        own_moved: Option<Moved>,
+        with: impl FnOnce(Option<&Traced>, Option<&Moved>) -> R,
+    ) -> R {
         self.splice.put(&mut self.traced, own);
-        let out = with(Some(&self.traced), moved);
+        let out = with(Some(&self.traced), self.moved.as_ref().or(own_moved.as_ref()));
         self.splice.undo(&mut self.traced);
         out
     }

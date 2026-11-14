@@ -1474,10 +1474,18 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
 pub trait Runs<S: Steps>: Send + 'static {
     /// Asks for what it runs first; it may end at once (a result the store kept). `store` is
     /// mutable as `complete`'s: a test run reads kept results through it and puts what it learns.
+    ///
+    /// `placed` reads the job's record of a path its build placed an output at: the content
+    /// key of the output whose file is there as placed, or `None` (`Jobs::placed_key`). Asked
+    /// once its job's placements have all ended. A program started from such a path (a test
+    /// binary, a dev run) is started with that key, and refused where it is not the program's
+    /// own (`blaze_inproc::host::StartError::NotPlaced`): the placement is the path's one
+    /// writer, and nothing that starts a program writes its file.
     fn start(
         &mut self,
         store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: the jobs' record read in place, once a run's start
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;

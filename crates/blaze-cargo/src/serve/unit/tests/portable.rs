@@ -174,6 +174,7 @@ impl Checkout {
                 makers: changed.makers,
                 kind: compile::keyed_kind(crate::serve::work::JobKind::Build, &changed.unit),
                 goal: compile::goal_byte(blaze_api::Goal::Edit),
+                build: 0,
                 verified: false,
                 reached: false,
                 pgo: None,

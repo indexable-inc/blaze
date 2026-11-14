@@ -2036,6 +2036,7 @@ impl Runs<Real> for ScriptRun {
         &mut self,
         store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
+        _placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s; a build script is no placed output
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
