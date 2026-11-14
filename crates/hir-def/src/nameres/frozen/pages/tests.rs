@@ -476,16 +476,15 @@ fn agree_under_edits(
 /// of `lib` and of `main`, which names it, as one that resolved `lib` from source, after
 /// each of a run of random edits of `main`; and `lib`, a crate of a source root of its own,
 /// stays read from its pages throughout.
-#[hegel::test]
-fn a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let apart = apart();
-    let pages = written(&apart, &["lib"]).remove(0).1;
-    let edits: usize = tc.draw(gs::integers().max_value(6));
-    let said = agree_under_edits(&apart, pages, edits, || {
-        tc.draw(gs::integers().max_value(EDITS.len() - 1))
-    });
-    assert_eq!(said, Ok(()));
+#[test]
+fn a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let apart = apart();
+        let pages = written(&apart, &["lib"]).remove(0).1;
+        let edits: usize = tape.int_in(0..=6, "edits");
+        let said = agree_under_edits(&apart, pages, edits, || tape.index(EDITS.len(), "edit"));
+        assert_eq!(said, Ok(()));
+    })
 }
 
 /// The control: the cause removed. With `lib` in `main`'s source root, as [`FIXTURE`] has it,

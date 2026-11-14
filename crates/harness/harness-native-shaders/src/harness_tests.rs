@@ -2,15 +2,17 @@
 //! coverage, Ghostty's whole-pixel sprites) and the entry points that use no intrinsic. Every expected
 //! value is a property or a constant worked out from the Slang source, never a printed run.
 use crate::harness::*;
+use blaze_sim::{Config, Tape};
 use gpu::prelude::*;
-use hegel::generators as gs;
 
-fn f(lo: f32, hi: f32) -> gs::FloatGenerator<f32> {
-    gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false)
+/// A finite `f32` in `lo..=hi`.
+fn f(tape: &Tape, lo: f32, hi: f32, label: &'static str) -> f32 {
+    tape.f32_in(lo..=hi, label)
 }
 
-fn i(lo: i32, hi: i32) -> gs::IntegerGenerator<i32> {
-    gs::integers::<i32>().min_value(lo).max_value(hi)
+/// An `i32` in `lo..=hi`.
+fn i(tape: &Tape, lo: i32, hi: i32, label: &'static str) -> i32 {
+    tape.int_in(lo..=hi, label)
 }
 
 fn close(a: f32, b: f32, tol: f32) -> bool {
@@ -33,51 +35,57 @@ fn to_ndc_maps_the_view_corners() {
 /// The squircle's distance along an axis, past the corner region, is how far the point is from the
 /// side (q.y < 0 there, so qp = (k + r, 0) and the corner term is k + r); at the centre it is minus
 /// the smaller half size; and at n = 2 the corner is a circle of radius r about half - r.
-#[hegel::test]
-fn sd_squircle_is_a_distance_on_its_axes_and_round_at_n_2(tc: hegel::TestCase) {
-    let half = vec2(tc.draw(f(1.0, 100.0)), tc.draw(f(1.0, 100.0)));
-    let r = tc.draw(f(0.0, 1.0)) * half.x.min(half.y) * 0.99;
-    let n = tc.draw(f(2.0, 8.0));
-    let k = tc.draw(f(-r, 50.0));
-    let d = sd_squircle(vec2(half.x + k, 0.0), half, r, n);
-    assert!(close(d, k, 1e-3), "on the x axis {k} past the side: {d}");
-    let d = sd_squircle(vec2(0.0, -(half.y + k)), half, r, n);
-    assert!(close(d, k, 1e-3), "on the y axis {k} past the side: {d}");
-    let c = sd_squircle(vec2(0.0, 0.0), half, r, n);
-    assert!(close(c, -half.x.min(half.y), 1e-5), "centre: {c}");
-    let a = tc.draw(f(0.0, core::f32::consts::FRAC_PI_2));
-    let p = half - r + (r + k) * vec2(a.cos(), a.sin());
-    let d = sd_squircle(p, half, r, 2.0);
-    assert!((d - k).abs() <= 1e-3 * (r + k).max(1.0), "n = 2 corner at {a} rad, {k} out: {d}");
+#[test]
+fn sd_squircle_is_a_distance_on_its_axes_and_round_at_n_2() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let half = vec2(f(tape, 1.0, 100.0, "half.x"), f(tape, 1.0, 100.0, "half.y"));
+        let r = f(tape, 0.0, 1.0, "r share") * half.x.min(half.y) * 0.99;
+        let n = f(tape, 2.0, 8.0, "n");
+        let k = f(tape, -r, 50.0, "k");
+        let d = sd_squircle(vec2(half.x + k, 0.0), half, r, n);
+        assert!(close(d, k, 1e-3), "on the x axis {k} past the side: {d}");
+        let d = sd_squircle(vec2(0.0, -(half.y + k)), half, r, n);
+        assert!(close(d, k, 1e-3), "on the y axis {k} past the side: {d}");
+        let c = sd_squircle(vec2(0.0, 0.0), half, r, n);
+        assert!(close(c, -half.x.min(half.y), 1e-5), "centre: {c}");
+        let a = f(tape, 0.0, core::f32::consts::FRAC_PI_2, "a");
+        let p = half - r + (r + k) * vec2(a.cos(), a.sin());
+        let d = sd_squircle(p, half, r, 2.0);
+        assert!((d - k).abs() <= 1e-3 * (r + k).max(1.0), "n = 2 corner at {a} rad, {k} out: {d}");
+    });
 }
 
 /// sd_seg is the distance to the nearest point of the segment; sd_stub is the same, and with no
 /// length (a == b, where sd_seg divides by 0) the distance to the point.
-#[hegel::test]
-fn sd_seg_and_sd_stub_are_the_distance_to_the_segment(tc: hegel::TestCase) {
-    let v = |tc: &hegel::TestCase| vec2(tc.draw(f(-100.0, 100.0)), tc.draw(f(-100.0, 100.0)));
-    let (p, a, b) = (v(&tc), v(&tc), v(&tc));
-    tc.assume(length(b - a) > 1e-2);
-    let d = sd_seg(p, a, b);
-    assert!(close(sd_stub(p, a, b), d, 1e-5));
-    assert!(d <= length(p - a).min(length(p - b)) + 1e-3, "{d} is past an end");
-    // The nearest point is on the segment: some t in 0..1 is that far.
-    let t = saturate(dot(p - a, b - a) / dot(b - a, b - a));
-    assert!(close(d, length(p - lerp(a, b, t)), 1e-4));
-    assert_eq!(sd_stub(p, a, a), length(p - a));
+#[test]
+fn sd_seg_and_sd_stub_are_the_distance_to_the_segment() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let v = |tape: &Tape, x: &'static str, y: &'static str| vec2(f(tape, -100.0, 100.0, x), f(tape, -100.0, 100.0, y));
+        let (p, a, b) = (v(tape, "p.x", "p.y"), v(tape, "a.x", "a.y"), v(tape, "b.x", "b.y"));
+        tape.assume(length(b - a) > 1e-2);
+        let d = sd_seg(p, a, b);
+        assert!(close(sd_stub(p, a, b), d, 1e-5));
+        assert!(d <= length(p - a).min(length(p - b)) + 1e-3, "{d} is past an end");
+        // The nearest point is on the segment: some t in 0..1 is that far.
+        let t = saturate(dot(p - a, b - a) / dot(b - a, b - a));
+        assert!(close(d, length(p - lerp(a, b, t)), 1e-4));
+        assert_eq!(sd_stub(p, a, a), length(p - a));
+    });
 }
 
 /// sd_quad on the unit square: inside, minus the distance to the nearest side; outside, the distance
 /// to the square. Either winding gives the same sign (the crossing test counts parity).
-#[hegel::test]
-fn sd_quad_is_signed_by_inside(tc: hegel::TestCase) {
-    let p = vec2(tc.draw(f(-2.0, 3.0)), tc.draw(f(-2.0, 3.0)));
-    let (v0, v1, v2, v3) = (vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
-    let out = (p - 1.0).max(-p).max(Vec2::splat(0.0));
-    let expect = if out.x > 0.0 || out.y > 0.0 { length(out) } else { -p.x.min(1.0 - p.x).min(p.y.min(1.0 - p.y)) };
-    tc.assume((expect).abs() > 1e-4);
-    assert!(close(sd_quad(p, v0, v1, v2, v3), expect, 1e-4), "ccw at {p:?}");
-    assert!(close(sd_quad(p, v0, v3, v2, v1), expect, 1e-4), "cw at {p:?}");
+#[test]
+fn sd_quad_is_signed_by_inside() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let p = vec2(f(tape, -2.0, 3.0, "p.x"), f(tape, -2.0, 3.0, "p.y"));
+        let (v0, v1, v2, v3) = (vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+        let out = (p - 1.0).max(-p).max(Vec2::splat(0.0));
+        let expect = if out.x > 0.0 || out.y > 0.0 { length(out) } else { -p.x.min(1.0 - p.x).min(p.y.min(1.0 - p.y)) };
+        tape.assume((expect).abs() > 1e-4);
+        assert!(close(sd_quad(p, v0, v1, v2, v3), expect, 1e-4), "ccw at {p:?}");
+        assert!(close(sd_quad(p, v0, v3, v2, v1), expect, 1e-4), "cw at {p:?}");
+    });
 }
 
 /// The powerline triangle is a quad with v3 = v0: that edge has no length and is skipped. At (0.5, 1)
@@ -92,18 +100,20 @@ fn sd_quad_skips_a_degenerate_edge() {
 
 /// The caret is solid for `hold` seconds; after that each cycle is shown at its first quarter and
 /// hidden at its third (the fades are under a quarter of the cycle wide), always between 0 and 1.
-#[hegel::test]
-fn caret_blink_holds_then_blinks(tc: hegel::TestCase) {
-    let hold = tc.draw(f(0.0, 2.0));
-    let period = tc.draw(f(0.2, 2.0));
-    let fade = tc.draw(f(0.01, 0.2));
-    let t = tc.draw(f(0.0, 30.0));
-    let b = caret_blink(t, hold, period, fade);
-    assert!((0.0..=1.0).contains(&b));
-    assert_eq!(caret_blink(hold * tc.draw(f(0.0, 0.999)), hold, period, fade), 1.0);
-    let k = tc.draw(i(0, 10)) as f32;
-    assert_eq!(caret_blink(hold + period * (k + 0.25), hold, period, fade), 1.0);
-    assert_eq!(caret_blink(hold + period * (k + 0.75), hold, period, fade), 0.0);
+#[test]
+fn caret_blink_holds_then_blinks() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let hold = f(tape, 0.0, 2.0, "hold");
+        let period = f(tape, 0.2, 2.0, "period");
+        let fade = f(tape, 0.01, 0.2, "fade");
+        let t = f(tape, 0.0, 30.0, "t");
+        let b = caret_blink(t, hold, period, fade);
+        assert!((0.0..=1.0).contains(&b));
+        assert_eq!(caret_blink(hold * f(tape, 0.0, 0.999, "share of hold"), hold, period, fade), 1.0);
+        let k = i(tape, 0, 10, "cycle") as f32;
+        assert_eq!(caret_blink(hold + period * (k + 0.25), hold, period, fade), 1.0);
+        assert_eq!(caret_blink(hold + period * (k + 0.75), hold, period, fade), 0.0);
+    });
 }
 
 /// pick is the dark colour past 0.5, the light one otherwise.
@@ -115,49 +125,55 @@ fn pick_picks_by_appearance() {
 
 /// in_band: a pixel's coverage of the band, half at an edge (0 * scale + 0.5), whole well inside,
 /// none well outside; a foot of 0 is none; a fade ramps the edge by smoothstep, half at its middle.
-#[hegel::test]
-fn in_band_cuts_at_its_edges(tc: hegel::TestCase) {
-    // A foot of 0 or less is none, so the band sits below 0 to have one.
-    let top = tc.draw(f(0.0, 100.0));
-    let foot = top + tc.draw(f(10.0, 100.0));
-    let scale = tc.draw(f(1.0, 3.0));
-    let hard = vec4(top, foot, 0.0, 0.0);
-    assert_eq!(in_band(top, hard, hard.zw(), scale), 0.5);
-    assert_eq!(in_band(foot, hard, hard.zw(), scale), 0.5);
-    assert_eq!(in_band((top + foot) * 0.5, hard, hard.zw(), scale), 1.0);
-    assert_eq!(in_band(top - 5.0, hard, hard.zw(), scale), 0.0);
-    assert_eq!(in_band(foot + 5.0, hard, hard.zw(), scale), 0.0);
-    let open = vec4(top, 0.0, 0.0, 0.0);
-    assert_eq!(in_band(top + 1e4, open, open.zw(), scale), 1.0);
-    let fade = vec4(top, foot, 8.0, 0.0);
-    assert!((in_band(top + 4.0, fade, fade.zw(), scale) - 0.5).abs() < 1e-5);
+#[test]
+fn in_band_cuts_at_its_edges() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        // A foot of 0 or less is none, so the band sits below 0 to have one.
+        let top = f(tape, 0.0, 100.0, "top");
+        let foot = top + f(tape, 10.0, 100.0, "foot below top");
+        let scale = f(tape, 1.0, 3.0, "scale");
+        let hard = vec4(top, foot, 0.0, 0.0);
+        assert_eq!(in_band(top, hard, hard.zw(), scale), 0.5);
+        assert_eq!(in_band(foot, hard, hard.zw(), scale), 0.5);
+        assert_eq!(in_band((top + foot) * 0.5, hard, hard.zw(), scale), 1.0);
+        assert_eq!(in_band(top - 5.0, hard, hard.zw(), scale), 0.0);
+        assert_eq!(in_band(foot + 5.0, hard, hard.zw(), scale), 0.0);
+        let open = vec4(top, 0.0, 0.0, 0.0);
+        assert_eq!(in_band(top + 1e4, open, open.zw(), scale), 1.0);
+        let fade = vec4(top, foot, 8.0, 0.0);
+        assert!((in_band(top + 4.0, fade, fade.zw(), scale) - 0.5).abs() < 1e-5);
+    });
 }
 
 /// unit2 is length 1, or 0 for a vector under 1e-5 long.
-#[hegel::test]
-fn unit2_is_unit_or_zero(tc: hegel::TestCase) {
-    let v = vec2(tc.draw(f(-100.0, 100.0)), tc.draw(f(-100.0, 100.0)));
-    let u = unit2(v);
-    if length(v) > 1e-5 {
-        assert!(close(length(u), 1.0, 1e-5));
-    } else {
-        assert_eq!(u, vec2(0.0, 0.0));
-    }
-    assert_eq!(unit2(vec2(0.0, 0.0)), vec2(0.0, 0.0));
+#[test]
+fn unit2_is_unit_or_zero() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let v = vec2(f(tape, -100.0, 100.0, "v.x"), f(tape, -100.0, 100.0, "v.y"));
+        let u = unit2(v);
+        if length(v) > 1e-5 {
+            assert!(close(length(u), 1.0, 1e-5));
+        } else {
+            assert_eq!(u, vec2(0.0, 0.0));
+        }
+        assert_eq!(unit2(vec2(0.0, 0.0)), vec2(0.0, 0.0));
+    });
 }
 
 /// sRGB's extended curves invert each other, are odd (extended sRGB carries negatives), and meet the
 /// pinned points: 0, 1, and an encoded 0.5 at 0.214 linear.
-#[hegel::test]
-fn srgb_ext_curves_invert_each_other(tc: hegel::TestCase) {
-    let x = tc.draw(f(-8.0, 8.0));
-    let v = vec3(x, -x, x * 0.5);
-    let back = srgb_encode_ext(srgb_decode_ext(v));
-    assert!(close(back.x, v.x, 1e-5) && close(back.y, v.y, 1e-5) && close(back.z, v.z, 1e-5), "{v:?} -> {back:?}");
-    assert_eq!(srgb_decode_ext(-v), -srgb_decode_ext(v));
-    let pins = srgb_decode_ext(vec3(0.0, 1.0, 0.5));
-    assert_eq!(pins.x, 0.0);
-    assert!((pins.y - 1.0).abs() < 1e-6 && (pins.z - 0.214_041).abs() < 1e-5, "{pins:?}");
+#[test]
+fn srgb_ext_curves_invert_each_other() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let x = f(tape, -8.0, 8.0, "x");
+        let v = vec3(x, -x, x * 0.5);
+        let back = srgb_encode_ext(srgb_decode_ext(v));
+        assert!(close(back.x, v.x, 1e-5) && close(back.y, v.y, 1e-5) && close(back.z, v.z, 1e-5), "{v:?} -> {back:?}");
+        assert_eq!(srgb_decode_ext(-v), -srgb_decode_ext(v));
+        let pins = srgb_decode_ext(vec3(0.0, 1.0, 0.5));
+        assert_eq!(pins.x, 0.0);
+        assert!((pins.y - 1.0).abs() < 1e-6 && (pins.z - 0.214_041).abs() < 1e-5, "{pins:?}");
+    });
 }
 
 /// The frame's headroom is textfx.x, at least 1, and 1 for a reading that isn't finite.
@@ -171,44 +187,48 @@ fn frame_headroom_is_at_least_one() {
 /// tone_map: 0 for nothing, negative or NaN; the identity up to the knee; never past the headroom;
 /// never decreasing; a known peak at or under the headroom only clipped; a known peak over it lands
 /// on it.
-#[hegel::test]
-fn tone_map_rolls_off_into_the_headroom(tc: hegel::TestCase) {
-    let h = tc.draw(f(1.0, 16.0));
-    let peak = if tc.draw(gs::booleans()) { 0.0 } else { tc.draw(f(0.1, 64.0)) };
-    let x = tc.draw(f(0.0, 100.0));
-    let dx = tc.draw(f(0.0, 10.0));
-    let y = tone_map(x, peak, h);
-    assert!(y <= h && y >= 0.0, "{x} -> {y} past {h}");
-    assert!(tone_map(x + dx, peak, h) + 1e-5 >= y, "decreased past {x}");
-    if x <= hdr_knee(h) {
-        assert_eq!(y, x);
-    }
-    if peak > 0.0 && peak <= h {
-        assert_eq!(y, x.min(h));
-    }
-    if peak > h {
-        assert!(close(tone_map(peak, peak, h), h, 1e-4), "peak {peak} lands at {}", tone_map(peak, peak, h));
-    }
-    assert_eq!((tone_map(-x, peak, h), tone_map(f32::NAN, peak, h)), (0.0, 0.0));
-    let rgb = vec3(x, x * 0.5, x * 0.25);
-    let m = tone_map_rgb(rgb, peak, h);
-    if x > 0.0 {
-        assert!(close(m.x, y, 1e-5) && close(m.y, y * 0.5, 1e-5) && close(m.z, y * 0.25, 1e-5), "hue moved: {m:?}");
-    }
-    assert_eq!(tone_map_rgb(vec3(0.0, -1.0, 0.0), peak, h), vec3(0.0, 0.0, 0.0));
+#[test]
+fn tone_map_rolls_off_into_the_headroom() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let h = f(tape, 1.0, 16.0, "h");
+        let peak = if tape.bool("the peak is unknown") { 0.0 } else { f(tape, 0.1, 64.0, "peak") };
+        let x = f(tape, 0.0, 100.0, "x");
+        let dx = f(tape, 0.0, 10.0, "dx");
+        let y = tone_map(x, peak, h);
+        assert!(y <= h && y >= 0.0, "{x} -> {y} past {h}");
+        assert!(tone_map(x + dx, peak, h) + 1e-5 >= y, "decreased past {x}");
+        if x <= hdr_knee(h) {
+            assert_eq!(y, x);
+        }
+        if peak > 0.0 && peak <= h {
+            assert_eq!(y, x.min(h));
+        }
+        if peak > h {
+            assert!(close(tone_map(peak, peak, h), h, 1e-4), "peak {peak} lands at {}", tone_map(peak, peak, h));
+        }
+        assert_eq!((tone_map(-x, peak, h), tone_map(f32::NAN, peak, h)), (0.0, 0.0));
+        let rgb = vec3(x, x * 0.5, x * 0.25);
+        let m = tone_map_rgb(rgb, peak, h);
+        if x > 0.0 {
+            assert!(close(m.x, y, 1e-5) && close(m.y, y * 0.5, 1e-5) && close(m.z, y * 0.25, 1e-5), "hue moved: {m:?}");
+        }
+        assert_eq!(tone_map_rgb(vec3(0.0, -1.0, 0.0), peak, h), vec3(0.0, 0.0, 0.0));
+    });
 }
 
 /// PQ: 0 is black, 1 is 10000 nits (p = 1, so (1 - C1) / (C2 - C3) = 0.1640625 / 0.1640625 = 1), as
 /// a multiple of the 203-nit white; never decreasing between.
-#[hegel::test]
-fn pq_linear_spans_black_to_10000_nits(tc: hegel::TestCase) {
-    let top = pq_linear(Vec3::splat(1.0));
-    assert!(close(top.x, 10000.0 / HDR_WHITE_NITS, 1e-4), "{top:?}");
-    assert_eq!(pq_linear(Vec3::splat(0.0)), Vec3::splat(0.0));
-    let e = tc.draw(f(0.0, 1.0));
-    let de = tc.draw(f(0.0, 0.1));
-    let (lo, hi) = (pq_linear(Vec3::splat(e)).x, pq_linear(Vec3::splat(e + de)).x);
-    assert!(hi >= lo * (1.0 - 1e-6), "{e} gives {lo}, {} gives {hi}", e + de);
+#[test]
+fn pq_linear_spans_black_to_10000_nits() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let top = pq_linear(Vec3::splat(1.0));
+        assert!(close(top.x, 10000.0 / HDR_WHITE_NITS, 1e-4), "{top:?}");
+        assert_eq!(pq_linear(Vec3::splat(0.0)), Vec3::splat(0.0));
+        let e = f(tape, 0.0, 1.0, "e");
+        let de = f(tape, 0.0, 0.1, "de");
+        let (lo, hi) = (pq_linear(Vec3::splat(e)).x, pq_linear(Vec3::splat(e + de)).x);
+        assert!(hi >= lo * (1.0 - 1e-6), "{e} gives {lo}, {} gives {hi}", e + de);
+    });
 }
 
 /// HLG: e^2 / 3 up to 0.5, which is 1/12 there and where the exponential half meets it
@@ -236,42 +256,46 @@ fn bt2020_to_709_keeps_white() {
 /// counts as below): a curve that ends where it began, on one side, crosses twice if its middle is on
 /// the other side and never if not; one that goes from above to below crosses once, its first root;
 /// from below to above once, its second.
-#[hegel::test]
-fn slug_root_code_counts_the_crossings(tc: hegel::TestCase) {
-    let y = |tc: &hegel::TestCase| {
-        let v = tc.draw(f(0.0, 10.0));
-        if tc.draw(gs::booleans()) { -v - f32::MIN_POSITIVE } else { v }
-    };
-    let (y1, y2, y3) = (y(&tc), y(&tc), y(&tc));
-    let below = |v: f32| v.is_sign_negative();
-    let expect = match (below(y1), below(y2), below(y3)) {
-        (a, b, c) if a == c => {
-            if a != b { 0x0101 } else { 0 }
-        }
-        (false, _, true) => 0x0001,
-        _ => 0x0100,
-    };
-    assert_eq!(slug_root_code(y1, y2, y3), expect, "({y1}, {y2}, {y3})");
-    assert_eq!(slug_root_code(-0.0, 1.0, 1.0), 0x0100);
+#[test]
+fn slug_root_code_counts_the_crossings() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let y = |tape: &Tape, label: &'static str| {
+            let v = f(tape, 0.0, 10.0, label);
+            if tape.bool("below the ray") { -v - f32::MIN_POSITIVE } else { v }
+        };
+        let (y1, y2, y3) = (y(tape, "y1"), y(tape, "y2"), y(tape, "y3"));
+        let below = |v: f32| v.is_sign_negative();
+        let expect = match (below(y1), below(y2), below(y3)) {
+            (a, b, c) if a == c => {
+                if a != b { 0x0101 } else { 0 }
+            }
+            (false, _, true) => 0x0001,
+            _ => 0x0100,
+        };
+        assert_eq!(slug_root_code(y1, y2, y3), expect, "({y1}, {y2}, {y3})");
+        assert_eq!(slug_root_code(-0.0, 1.0, 1.0), 0x0100);
+    });
 }
 
 /// For a straight curve (the middle point halfway), the polynomial is linear and both roots are where
 /// the line crosses y = 0; the vertical solver is the horizontal one with x and y swapped, bit for bit.
-#[hegel::test]
-fn slug_solvers_find_the_crossing(tc: hegel::TestCase) {
-    let p1 = vec2(tc.draw(f(-10.0, 10.0)), tc.draw(f(0.1, 10.0)));
-    let p3 = vec2(tc.draw(f(-10.0, 10.0)), -tc.draw(f(0.1, 10.0)));
-    let p2 = (p1 + p3) * 0.5;
-    let r = slug_solve_horiz(vec4(p1.x, p1.y, p2.x, p2.y), p3);
-    let x = p1.x + (p3.x - p1.x) * p1.y / (p1.y - p3.y);
-    assert!((r.x - x).abs() < 1e-3 && r.x == r.y, "{r:?}, crossing at {x}");
-    let q = vec2(tc.draw(f(-10.0, 10.0)), tc.draw(f(-10.0, 10.0)));
-    let p12 = vec4(p1.x, p1.y, q.x, q.y);
-    // By bits, so a NaN made the same way on both is the same too.
-    let bits = |r: Vec2| (r.x.to_bits(), r.y.to_bits());
-    assert_eq!(bits(slug_solve_vert(vec4(p12.y, p12.x, p12.w, p12.z), vec2(p3.y, p3.x))), bits(slug_solve_horiz(p12, p3)));
-    // (-1, 1), (0, -1), (1, 1): y(t) = (2t - 1)^2, a double root at t = 1/2, x = 0.
-    assert_eq!(slug_solve_horiz(vec4(-1.0, 1.0, 0.0, -1.0), vec2(1.0, 1.0)), vec2(0.0, 0.0));
+#[test]
+fn slug_solvers_find_the_crossing() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let p1 = vec2(f(tape, -10.0, 10.0, "p1.x"), f(tape, 0.1, 10.0, "p1.y"));
+        let p3 = vec2(f(tape, -10.0, 10.0, "p3.x"), -f(tape, 0.1, 10.0, "p3.y below"));
+        let p2 = (p1 + p3) * 0.5;
+        let r = slug_solve_horiz(vec4(p1.x, p1.y, p2.x, p2.y), p3);
+        let x = p1.x + (p3.x - p1.x) * p1.y / (p1.y - p3.y);
+        assert!((r.x - x).abs() < 1e-3 && r.x == r.y, "{r:?}, crossing at {x}");
+        let q = vec2(f(tape, -10.0, 10.0, "q.x"), f(tape, -10.0, 10.0, "q.y"));
+        let p12 = vec4(p1.x, p1.y, q.x, q.y);
+        // By bits, so a NaN made the same way on both is the same too.
+        let bits = |r: Vec2| (r.x.to_bits(), r.y.to_bits());
+        assert_eq!(bits(slug_solve_vert(vec4(p12.y, p12.x, p12.w, p12.z), vec2(p3.y, p3.x))), bits(slug_solve_horiz(p12, p3)));
+        // (-1, 1), (0, -1), (1, 1): y(t) = (2t - 1)^2, a double root at t = 1/2, x = 0.
+        assert_eq!(slug_solve_horiz(vec4(-1.0, 1.0, 0.0, -1.0), vec2(1.0, 1.0)), vec2(0.0, 0.0));
+    });
 }
 
 /// The unit square in em space as Slug's buffers hold it: four straight edges counter-clockwise (ink
@@ -298,23 +322,25 @@ fn square() -> ([Vec4; 8], [u32; 12]) {
 /// Inside the square by more than a pixel the coverage is 1; outside by more than one, 0; on its right
 /// edge half (the horizontal ray's root at 0 gives saturate(0.5), weighted fully; worked through in the
 /// Slang by hand), whatever the sample.
-#[hegel::test]
-fn slug_render_covers_the_square(tc: hegel::TestCase) {
-    let (curves, bands) = square();
-    let ppem = vec2(64.0, 64.0);
-    let band_tf = vec4(0.0, 0.0, 0.0, 0.0);
-    let gd = uvec4(0, 0, 0, 0);
-    let p = vec2(tc.draw(f(-1.0, 2.0)), tc.draw(f(-1.0, 2.0)));
-    let margin = 2.0 / 64.0;
-    let inside = p.x.min(1.0 - p.x).min(p.y.min(1.0 - p.y));
-    let cov = slug_render(&curves, &bands, p, band_tf, gd, ppem, 0.0);
-    assert!((0.0..=1.0).contains(&cov));
-    if inside > margin {
-        assert_eq!(cov, 1.0, "inside at {p:?}");
-    } else if inside < -margin {
-        assert_eq!(cov, 0.0, "outside at {p:?}");
-    }
-    assert_eq!(slug_render(&curves, &bands, vec2(1.0, 0.5), band_tf, gd, ppem, 0.0), 0.5);
+#[test]
+fn slug_render_covers_the_square() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (curves, bands) = square();
+        let ppem = vec2(64.0, 64.0);
+        let band_tf = vec4(0.0, 0.0, 0.0, 0.0);
+        let gd = uvec4(0, 0, 0, 0);
+        let p = vec2(f(tape, -1.0, 2.0, "p.x"), f(tape, -1.0, 2.0, "p.y"));
+        let margin = 2.0 / 64.0;
+        let inside = p.x.min(1.0 - p.x).min(p.y.min(1.0 - p.y));
+        let cov = slug_render(&curves, &bands, p, band_tf, gd, ppem, 0.0);
+        assert!((0.0..=1.0).contains(&cov));
+        if inside > margin {
+            assert_eq!(cov, 1.0, "inside at {p:?}");
+        } else if inside < -margin {
+            assert_eq!(cov, 0.0, "outside at {p:?}");
+        }
+        assert_eq!(slug_render(&curves, &bands, vec2(1.0, 0.5), band_tf, gd, ppem, 0.0), 0.5);
+    });
 }
 
 /// sp_box fills the half-open box between its corners, in either order.
@@ -328,13 +354,15 @@ fn sp_box_is_half_open_either_way() {
 
 /// Ghostty's fractions: 0 starts at 0 and 1 ends at the size; a block ending at f and the next
 /// starting at f leave no gap (round(f n) + round((1 - f) n) is n, or n + 1 at a half).
-#[hegel::test]
-fn fractions_leave_no_gap(tc: hegel::TestCase) {
-    let n = tc.draw(i(0, 400));
-    let fr = tc.draw(gs::sampled_from(vec![0.0f32, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0]));
-    assert_eq!((frac_lo(0.0, n), frac_hi(1.0, n)), (0, n));
-    let (lo, hi) = (frac_lo(fr, n), frac_hi(fr, n));
-    assert!(lo <= hi && hi <= lo + 1, "{fr} of {n}: next starts at {lo}, this ends at {hi}");
+#[test]
+fn fractions_leave_no_gap() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let n = i(tape, 0, 400, "n");
+        let fr = *tape.one_of(&[0.0f32, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0], "fraction");
+        assert_eq!((frac_lo(0.0, n), frac_hi(1.0, n)), (0, n));
+        let (lo, hi) = (frac_lo(fr, n), frac_hi(fr, n));
+        assert!(lo <= hi && hi <= lo + 1, "{fr} of {n}: next starts at {lo}, this ends at {hi}");
+    });
 }
 
 fn count(w: i32, h: i32, on: impl Fn(IVec2) -> bool) -> i32 {
@@ -349,79 +377,87 @@ fn count(w: i32, h: i32, on: impl Fn(IVec2) -> bool) -> i32 {
 
 /// A light line across (left and right arms light) is every pixel of the t rows from (H - t) / 2; a
 /// light cross is that and the t columns from (W - t) / 2.
-#[hegel::test]
-fn sp_lines_draws_whole_pixel_light_lines(tc: hegel::TestCase) {
-    let (w, h, t) = (tc.draw(i(4, 40)), tc.draw(i(4, 40)), tc.draw(i(1, 3)));
-    let across = (1 << 2) | (1 << 6);
-    let top = (h - t).max(0) / 2;
-    let left = (w - t).max(0) / 2;
-    for y in 0..h {
-        for x in 0..w {
-            let row = y >= top && y < top + t;
-            let col = x >= left && x < left + t;
-            assert_eq!(sp_lines(ivec2(x, y), w, h, t, across), row, "across at ({x}, {y})");
-            assert_eq!(sp_lines(ivec2(x, y), w, h, t, across | 1 | (1 << 4)), row || col, "cross at ({x}, {y})");
+#[test]
+fn sp_lines_draws_whole_pixel_light_lines() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (w, h, t) = (i(tape, 4, 40, "w"), i(tape, 4, 40, "h"), i(tape, 1, 3, "t"));
+        let across = (1 << 2) | (1 << 6);
+        let top = (h - t).max(0) / 2;
+        let left = (w - t).max(0) / 2;
+        for y in 0..h {
+            for x in 0..w {
+                let row = y >= top && y < top + t;
+                let col = x >= left && x < left + t;
+                assert_eq!(sp_lines(ivec2(x, y), w, h, t, across), row, "across at ({x}, {y})");
+                assert_eq!(sp_lines(ivec2(x, y), w, h, t, across | 1 | (1 << 4)), row || col, "cross at ({x}, {y})");
+            }
         }
-    }
+    });
 }
 
 /// A horizontal dash row of n: n runs on its middle row, with W - n * gap pixels between them, the
 /// runs differing by at most one (spare pixels widen the first).
-#[hegel::test]
-fn sp_dash_makes_n_dashes(tc: hegel::TestCase) {
-    let (w, h, t) = (tc.draw(i(8, 60)), tc.draw(i(4, 40)), tc.draw(i(1, 3)));
-    let n = tc.draw(i(2, 4));
-    let b = (tc.draw(i(0, 2)) as u32) << 2;
-    let want = match b >> 2 {
-        0 => t.max(4),
-        1 => t,
-        _ => 2 * t,
-    };
-    let gap = want.min(w / (2 * n));
-    let y = (h - t).max(0) / 2;
-    let mut runs = Vec::new();
-    let mut prev = false;
-    for x in 0..w {
-        let on = sp_dash(ivec2(x, y), w, h, t, n as u32, b);
-        if on && !prev {
-            runs.push(0);
+#[test]
+fn sp_dash_makes_n_dashes() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (w, h, t) = (i(tape, 8, 60, "w"), i(tape, 4, 40, "h"), i(tape, 1, 3, "t"));
+        let n = i(tape, 2, 4, "n");
+        let b = (i(tape, 0, 2, "gap kind") as u32) << 2;
+        let want = match b >> 2 {
+            0 => t.max(4),
+            1 => t,
+            _ => 2 * t,
+        };
+        let gap = want.min(w / (2 * n));
+        let y = (h - t).max(0) / 2;
+        let mut runs = Vec::new();
+        let mut prev = false;
+        for x in 0..w {
+            let on = sp_dash(ivec2(x, y), w, h, t, n as u32, b);
+            if on && !prev {
+                runs.push(0);
+            }
+            if on {
+                *runs.last_mut().unwrap() += 1;
+            }
+            prev = on;
         }
-        if on {
-            *runs.last_mut().unwrap() += 1;
-        }
-        prev = on;
-    }
-    assert_eq!(runs.len() as i32, n, "{runs:?}");
-    assert_eq!(runs.iter().sum::<i32>(), w - n * gap);
-    assert!(runs.iter().max().unwrap() - runs.iter().min().unwrap() <= 1, "{runs:?}");
+        assert_eq!(runs.len() as i32, n, "{runs:?}");
+        assert_eq!(runs.iter().sum::<i32>(), w - n * gap);
+        assert!(runs.iter().max().unwrap() - runs.iter().min().unwrap() <= 1, "{runs:?}");
+    });
 }
 
 /// Braille: no bits, no pixels; each dot a square of its own, apart from the others, so all eight
 /// cover what the eight alone do together.
-#[hegel::test]
-fn sp_braille_dots_are_disjoint_squares(tc: hegel::TestCase) {
-    let (w, h) = (tc.draw(i(4, 40)), tc.draw(i(8, 60)));
-    assert_eq!(count(w, h, |p| sp_braille(p, w, h, 0)), 0);
-    let each: Vec<i32> = (0..8).map(|b| count(w, h, |p| sp_braille(p, w, h, 1 << b))).collect();
-    let side = (each[0] as f32).sqrt() as i32;
-    assert!(each.iter().all(|&c| c == side * side), "{each:?}");
-    assert_eq!(count(w, h, |p| sp_braille(p, w, h, 0xFF)), each.iter().sum::<i32>());
+#[test]
+fn sp_braille_dots_are_disjoint_squares() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (w, h) = (i(tape, 4, 40, "w"), i(tape, 8, 60, "h"));
+        assert_eq!(count(w, h, |p| sp_braille(p, w, h, 0)), 0);
+        let each: Vec<i32> = (0..8).map(|b| count(w, h, |p| sp_braille(p, w, h, 1 << b))).collect();
+        let side = (each[0] as f32).sqrt() as i32;
+        assert!(each.iter().all(|&c| c == side * side), "{each:?}");
+        assert_eq!(count(w, h, |p| sp_braille(p, w, h, 0xFF)), each.iter().sum::<i32>());
+    });
 }
 
 /// Shades are a / 255 everywhere; a block is round(side * b / 8) whole pixels flush to its side.
-#[hegel::test]
-fn sprite_cov_shades_and_blocks(tc: hegel::TestCase) {
-    let (w, h) = (tc.draw(i(1, 40)), tc.draw(i(1, 60)));
-    let a = tc.draw(i(0, 3)) as u32;
-    let b = tc.draw(i(0, 8)) as u32;
-    let s = |kind, a, b| SpriteInst { rect: ivec4(0, 0, w, h), shape: uvec4(kind, a, b, 1), ..SpriteInst::default() };
-    assert_eq!(sprite_cov(s(SPRITE_SHADE, 51, 0), ivec2(0, 0)), 0.2);
-    let along = |n: i32| ((n as f32) * (b as f32 / 8.0)).round() as i32;
-    let expect = if a < 2 { along(w) * h } else { w * along(h) };
-    let got = count(w, h, |p| sprite_cov(s(SPRITE_BLOCK, a, b), p) == 1.0);
-    assert_eq!(got, expect, "block side {a} share {b}/8");
-    let first = if a == 1 { ivec2(w - 1, 0) } else if a == 3 { ivec2(0, h - 1) } else { ivec2(0, 0) };
-    assert_eq!(sprite_cov(s(SPRITE_BLOCK, a, b), first) == 1.0, b > 0 && expect > 0, "flush to side {a}");
+#[test]
+fn sprite_cov_shades_and_blocks() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (w, h) = (i(tape, 1, 40, "w"), i(tape, 1, 60, "h"));
+        let a = i(tape, 0, 3, "side") as u32;
+        let b = i(tape, 0, 8, "share") as u32;
+        let s = |kind, a, b| SpriteInst { rect: ivec4(0, 0, w, h), shape: uvec4(kind, a, b, 1), ..SpriteInst::default() };
+        assert_eq!(sprite_cov(s(SPRITE_SHADE, 51, 0), ivec2(0, 0)), 0.2);
+        let along = |n: i32| ((n as f32) * (b as f32 / 8.0)).round() as i32;
+        let expect = if a < 2 { along(w) * h } else { w * along(h) };
+        let got = count(w, h, |p| sprite_cov(s(SPRITE_BLOCK, a, b), p) == 1.0);
+        assert_eq!(got, expect, "block side {a} share {b}/8");
+        let first = if a == 1 { ivec2(w - 1, 0) } else if a == 3 { ivec2(0, h - 1) } else { ivec2(0, 0) };
+        assert_eq!(sprite_cov(s(SPRITE_BLOCK, a, b), first) == 1.0, b > 0 && expect > 0, "flush to side {a}");
+    });
 }
 
 /// panel_vs's quad is the rect padded on every side by the shadow and feather's reach, centred on it;

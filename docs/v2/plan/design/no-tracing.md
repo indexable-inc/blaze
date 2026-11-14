@@ -373,7 +373,7 @@ the words relaxed, `fence(Acquire)`, reload `id` and drop the read if it changed
   runner and in an aarch64 ix VM: N threads open, close and remote-free spans in a tight loop
   while M reader threads run the seqlock read and assert that no read returns words from two
   spans (each span writes its id into every word it owns). It runs under `--release`, 10 s,
-  and is the hegel property test of risk 2 with a real memory model.
+  and is the blaze-sim property test of risk 2 with a real memory model.
 
 ### 3.3 Against today
 
@@ -862,7 +862,7 @@ integrator cuts the release and bumps `.github/blaze-version` (7.2).
 1. **Per-op cost on macOS.** Mach-O TLS goes through `_tlv_get_addr`, a call. The owner check
    removes it from close; open and events still pay it. Measure `span_open_close_folded` on the
    macOS arm64 bench machine against Linux aarch64.
-2. **Free lists and the kids split under fiber migration.** A hegel property test: random open,
+2. **Free lists and the kids split under fiber migration.** A blaze-sim property test: random open,
    close, park and resume of fibers over N threads; every slot freed once, no id reused while
    open, kids sums exact, fold decisions equal to a single-threaded model. Plus the aarch64 stress
    test of 3.2.

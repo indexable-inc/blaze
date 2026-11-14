@@ -1,19 +1,12 @@
 //! The sealed layer's core under a simulated machine: two installs of one cover interleaved
-//! under every schedule Hegel draws, the cover's inputs, prebuilt records turned off, and
-//! which crates a home resolves from source once a layer is installed.
+//! under every schedule a case's tape draws, the cover's inputs, prebuilt records turned off,
+//! and which crates a home resolves from source once a layer is installed.
 
 use std::path::{Path, PathBuf};
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::Config;
 
 use super::*;
-
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
 
 fn base(n: usize) -> Base {
     Base::Dir(PathBuf::from(format!("/bases/{n}")))
@@ -111,9 +104,9 @@ fn wrong(has: &[bool], ended: &[Installed; 2], machine: &Machine) -> Option<Stri
 /// `NoPack` only when every base answered `Absent`, naming each.
 #[test]
 fn the_layer_is_installed_once_and_a_second_home_imports_nothing() {
-    run_cases(512, |tc| {
-        let has = tc.draw(gs::vecs(gs::booleans()).min_size(1).max_size(3));
-        let schedule = tc.draw(gs::vecs(gs::booleans()).max_size(24));
+    blaze_sim::check(Config::cases(512), |tape| {
+        let has = tape.vec(1..=3, "has", |tape| tape.bool("holds the pack"));
+        let schedule = tape.vec(0..=24, "schedule", |tape| tape.bool("second moves"));
         let (ended, machine) = interleaved(&has, &schedule, |_| {});
         if let Some(why) = wrong(&has, &ended, &machine) {
             panic!("bases {has:?}, schedule {schedule:?}: {why}");
@@ -137,12 +130,12 @@ fn the_oracle_catches_an_install_that_skips_the_stat() {
 /// a dependency named twice).
 #[test]
 fn a_cover_moves_with_each_input_and_with_nothing_else() {
-    run_cases(256, |tc| {
-        let tree = tc.draw(gs::text().alphabet("abc-").max_size(12));
-        let host = tc.draw(gs::text().alphabet("abc-").max_size(12));
+    blaze_sim::check(Config::cases(256), |tape| {
+        let tree = tape.text_from("abc-", 0..=12, "tree");
+        let host = tape.text_from("abc-", 0..=12, "host");
         let on: Vec<Cover> =
-            tc.draw(gs::vecs(gs::integers::<u8>()).max_size(4)).into_iter().map(|n| Cover(ContentId([n; 32]))).collect();
-        let makers = ContentId([tc.draw(gs::integers::<u8>()); 32]);
+            tape.vec(0..=4, "on", |tape| tape.int::<u8>("cover")).into_iter().map(|n| Cover(ContentId([n; 32]))).collect();
+        let makers = ContentId([tape.int::<u8>("makers"); 32]);
         let of = CoverOf { tree: &tree, on: &on, makers, host: &host };
         let at = cover(&of);
         let mut turned = on.clone();

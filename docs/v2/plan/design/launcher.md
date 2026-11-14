@@ -724,7 +724,7 @@ for every project (std's). Two things remove it, in this order:
 2. **The frontier walk, served by the kept front end.** Built, bottom-up
    (`blaze-codegen/src/driver/near.rs`, `Build::near` and `Build::compile_near`): one
    function made ready to compile from its own describe and those of what it refers to
-   directly, held by a Hegel property to the whole walk's key, unit, places, built-in set
+   directly, held by a blaze-sim property to the whole walk's key, unit, places, built-in set
    and code. The file names each pass of the whole walk the frontier form leaves out
    (which references are direct, the recursion limit, symbols defined twice, the front
    end's closed facts, the least origin of a key, dedupe) and why a launched first call

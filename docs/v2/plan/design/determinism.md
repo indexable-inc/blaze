@@ -249,7 +249,7 @@ provider, and noted as answered, not as untraceable.
 A process's number is its id in the sandbox's PID namespace (the kernel gives them out in
 order, so the same fork order gives the same numbers); in a confined sandbox, which has no
 namespace, its place among those that asked. The state is one count per process
-(`blaze_usercode::provider::Answers`, a sans-IO core with a Hegel property against its model).
+(`blaze_usercode::provider::Answers`, a sans-IO core with a blaze-sim property against its model).
 
 An answered line is no input and is dropped as the trace is assembled; `pure::check` therefore
 passes it. A call that could not be answered is still a refusal (rule no-fallback): `openat2`

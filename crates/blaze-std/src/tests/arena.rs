@@ -5,9 +5,9 @@
 //!
 //! Plant: [`Plant::ArenaUnlimited`], an arena made with no limit of its own.
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, world};
+use super::{check, control, world};
 use crate::{Plant, Stopped};
 
 #[derive(Debug)]
@@ -17,10 +17,10 @@ struct Plan {
     appends: Vec<usize>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let limit = d.int(64, 8192) as usize;
-    let appends = (0..d.int(1, 24)).map(|_| d.int(0, 2048) as usize).collect();
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let limit = tape.int_in(64..=8192u64, "limit") as usize;
+    let appends = (0..tape.int_in(1..=24u64, "appends")).map(|_| tape.int_in(0..=2048u64, "append len") as usize).collect();
     Plan { seed, limit, appends }
 }
 
@@ -54,12 +54,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// bytes in a named arena, its use stays within its limit, an append past it is
 /// `Stopped::OutOfMemory` naming the arena and changes nothing, and the bytes are exactly the
 /// appends that were taken.
-#[hegel::test(test_cases = 200)]
-fn an_arena_never_hands_out_more_than_its_limit(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn an_arena_never_hands_out_more_than_its_limit() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_an_arena_with_no_limit() {
-    control(Plant::ArenaUnlimited, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::ArenaUnlimited, plan, run);
 }

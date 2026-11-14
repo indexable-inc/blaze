@@ -64,35 +64,35 @@ struct WProgram {
     steps: Vec<WStep>,
 }
 
-fn wprogram(tc: &TestCase) -> WProgram {
-    let int = |low: usize, high: usize| tc.draw(gs::integers::<usize>().min_value(low).max_value(high));
-    let inputs = int(1, 4);
-    let nodes = int(1, 8);
+fn wprogram(tape: &Tape) -> WProgram {
+    let int = |low: usize, high: usize, label: &'static str| tape.int_in(low..=high, label);
+    let inputs = int(1, 4, "inputs");
+    let nodes = int(1, 8, "nodes");
     let mut flow = Vec::with_capacity(nodes);
     for at in 0..nodes {
         let op = [FlowOp::Sum, FlowOp::Mod3, FlowOp::Max, FlowOp::Pick, FlowOp::Pick, FlowOp::World]
-            [int(0, 5)];
-        let deps = (0..int(1, 3))
+            [int(0, 5, "op")];
+        let deps = (0..int(1, 3, "reads"))
             .map(|_| {
-                if at > 0 && tc.draw(gs::booleans()) {
-                    Dep::Query(int(0, at - 1))
+                if at > 0 && tape.bool("reads a node") {
+                    Dep::Query(int(0, at - 1, "node read"))
                 } else {
-                    Dep::Input(int(0, inputs - 1))
+                    Dep::Input(int(0, inputs - 1, "input read"))
                 }
             })
             .collect();
         flow.push(FlowNode { op, deps });
     }
     let mut steps = Vec::new();
-    for _ in 0..int(1, 16) {
-        steps.push(match int(0, 10) {
-            0..=2 => WStep::Write(int(0, inputs - 1), tc.draw(gs::integers::<u64>().max_value(6))),
-            3 => WStep::World(tc.draw(gs::integers::<u64>().max_value(3))),
+    for _ in 0..int(1, 16, "steps") {
+        steps.push(match int(0, 10, "step") {
+            0..=2 => WStep::Write(int(0, inputs - 1, "input written"), tape.int_in(0..=6u64, "value written")),
+            3 => WStep::World(tape.int_in(0..=3u64, "world")),
             4 => WStep::Evict,
             5 => WStep::Epoch,
-            6 => WStep::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
+            6 => WStep::Pull((0..int(1, 3, "pulls")).map(|_| int(0, nodes - 1, "node pulled")).collect()),
             7 => WStep::Pack,
-            8 | 9 => WStep::Witness(int(0, nodes - 1)),
+            8 | 9 => WStep::Witness(int(0, nodes - 1, "node witnessed")),
             _ => WStep::Check,
         });
     }
@@ -207,12 +207,14 @@ fn caught_with(program: &WProgram, plant: Plant, set: fn(bool), says: &str) {
 /// from-scratch evaluation. The controls: the changed keys forgetting the fields written
 /// (`Plant::ForgetsWrittenFields`), and a witness that skips every read (`skip_at` 0), each
 /// leave a changed run unnamed.
-#[hegel::test]
-fn a_witnessed_runs_changed_keys_name_every_run_whose_value_is_another(tc: TestCase) {
-    let program = wprogram(&tc);
-    if let Err(why) = simulate(&program, Plant::None) {
-        panic!("{why}\n{program:#?}");
-    }
+#[test]
+fn a_witnessed_runs_changed_keys_name_every_run_whose_value_is_another() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let program = wprogram(tape);
+        if let Err(why) = simulate(&program, Plant::None) {
+            panic!("{why}\n{program:#?}");
+        }
+    })
 }
 
 /// The directed program of the controls: a witness of a node that reads an input field

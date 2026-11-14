@@ -11,7 +11,7 @@
 //! [`Rule::Indirect`], the object's own effects counted where it is made, not at the call),
 //! and an optimizer that makes every [`Spend`], the two MIR does not make yet included.
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use hir_ty::facts::{Callee, Fact, Facts, Plant as SpendPlant, Spend};
 
 use super::{Plant as ProvePlant, UNSEEN, inferred_with};
@@ -346,17 +346,18 @@ fn covered(a: &Program, b: &Program, plants: Plants) -> Result<(), String> {
     Ok(())
 }
 
-fn below(tc: &TestCase, n: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().max_value(n - 1))
+/// Below `n`, at least 1.
+fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+    tape.int_in(0..=n - 1, label)
 }
 
-fn maybe(tc: &TestCase, what: u8) -> Option<u8> {
-    (below(tc, 2) == 0).then_some(what)
+fn maybe(tape: &Tape, what: u8, label: &'static str) -> Option<u8> {
+    (below(tape, 2, label) == 0).then_some(what)
 }
 
-fn drawn_op(tc: &TestCase, at: usize, funcs: usize, objects: &[usize]) -> Op {
-    let small = below(tc, 3) as u8;
-    match below(tc, 6) {
+fn drawn_op(tape: &Tape, at: usize, funcs: usize, objects: &[usize]) -> Op {
+    let small = below(tape, 3, "small") as u8;
+    match below(tape, 6, "op") {
         0 => Op::Print(small),
         1 => Op::PanicIf(small),
         2 => Op::HangIf(small),
@@ -365,30 +366,31 @@ fn drawn_op(tc: &TestCase, at: usize, funcs: usize, objects: &[usize]) -> Op {
             let later: Vec<usize> = (at + 1..funcs).collect();
             let slots: Vec<usize> = (0..objects.len()).filter(|&it| objects[it] > at).collect();
             let target = if kind == 3 && !slots.is_empty() {
-                Target::Object(slots[below(tc, slots.len() as u32) as usize])
+                Target::Object(slots[below(tape, slots.len() as u32, "slot") as usize])
             } else if !later.is_empty() {
-                Target::Direct(later[below(tc, later.len() as u32) as usize])
+                Target::Direct(later[below(tape, later.len() as u32, "callee") as usize])
             } else {
                 return Op::Print(small);
             };
             Op::Call(Call {
                 target,
-                arg: if below(tc, 2) == 0 { Arg::Own } else { Arg::Const(small) },
-                cleanup: maybe(tc, 10 + small),
-                guard: maybe(tc, below(tc, 3) as u8),
-                used: below(tc, 2) == 0,
+                arg: if below(tape, 2, "arg") == 0 { Arg::Own } else { Arg::Const(small) },
+                cleanup: maybe(tape, 10 + small, "cleanup"),
+                guard: maybe(tape, below(tape, 3, "guard value") as u8, "guard"),
+                used: below(tape, 2, "used") == 0,
             })
         }
     }
 }
 
-fn drawn(tc: &TestCase) -> Program {
-    let funcs = 1 + below(tc, 5) as usize;
-    let objects: Vec<usize> = (0..below(tc, 3)).map(|_| below(tc, funcs as u32) as usize).collect();
+fn drawn(tape: &Tape) -> Program {
+    let funcs = 1 + below(tape, 5, "funcs") as usize;
+    let objects: Vec<usize> =
+        (0..below(tape, 3, "objects")).map(|_| below(tape, funcs as u32, "object of") as usize).collect();
     let funcs = (0..funcs)
         .map(|at| Func {
-            ops: (0..below(tc, 5)).map(|_| drawn_op(tc, at, funcs, &objects)).collect(),
-            adds: below(tc, 3) as u8,
+            ops: (0..below(tape, 5, "ops")).map(|_| drawn_op(tape, at, funcs, &objects)).collect(),
+            adds: below(tape, 3, "adds") as u8,
         })
         .collect();
     Program { funcs, objects }
@@ -399,27 +401,31 @@ fn drawn(tc: &TestCase) -> Program {
 /// random small programs (calls by name and through objects, cleanups, guards, panics and
 /// hangs that depend on the argument) and every argument, with every [`Spend`] made wherever
 /// [`Facts::license`] allows it.
-#[hegel::test(test_cases = 2000)]
-fn a_program_optimized_on_facts_behaves_as_written(tc: TestCase) {
-    let program = drawn(&tc);
-    if let Err(what) = refines(&program, NONE) {
-        panic!("{what}");
-    }
+#[test]
+fn a_program_optimized_on_facts_behaves_as_written() {
+    blaze_sim::check(Config::cases(2000), |tape| {
+        let program = drawn(tape);
+        if let Err(what) = refines(&program, NONE) {
+            panic!("{what}");
+        }
+    })
 }
 
 /// The invariant: a body's key covers every fact its passes relied on. For random pairs of
 /// programs that differ in one function, a function with the same code as written and the
 /// same recorded digests in both has the same optimized code in both.
-#[hegel::test(test_cases = 2000)]
-fn one_key_is_one_optimized_code(tc: TestCase) {
-    let a = drawn(&tc);
-    let mut b = a.clone();
-    let changed = below(&tc, a.funcs.len() as u32) as usize;
-    let op = drawn_op(&tc, changed, a.funcs.len(), &a.objects);
-    b.funcs[changed].ops.insert(0, op);
-    if let Err(what) = covered(&a, &b, NONE) {
-        panic!("{what}");
-    }
+#[test]
+fn one_key_is_one_optimized_code() {
+    blaze_sim::check(Config::cases(2000), |tape| {
+        let a = drawn(tape);
+        let mut b = a.clone();
+        let changed = below(tape, a.funcs.len() as u32, "changed") as usize;
+        let op = drawn_op(tape, changed, a.funcs.len(), &a.objects);
+        b.funcs[changed].ops.insert(0, op);
+        if let Err(what) = covered(&a, &b, NONE) {
+            panic!("{what}");
+        }
+    })
 }
 
 fn call(target: Target) -> Call {

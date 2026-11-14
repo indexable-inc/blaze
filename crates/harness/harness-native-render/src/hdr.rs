@@ -194,37 +194,40 @@ pub fn encoded_ceiling(headroom: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blaze_sim::{Config, Tape};
 
-    fn arb(tc: &hegel::TestCase, lo: f32, hi: f32) -> f32 {
-        use hegel::generators as gs;
-        tc.draw(gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false))
+    /// A finite `f32` in `lo..=hi`.
+    fn arb(tape: &Tape, lo: f32, hi: f32, label: &'static str) -> f32 {
+        tape.f32_in(lo..=hi, label)
     }
 
     /// The curve's contract over any light, peak and display: never decreasing, untouched to the knee, never past the
     /// headroom, the peak exactly on it, and pictures within the display's range left alone.
-    #[hegel::test]
-    fn the_tone_map_rolls_off_into_the_headroom_and_keeps_sdr(tc: hegel::TestCase) {
-        let h = arb(&tc, 1.0, 64.0);
-        let peak = arb(&tc, 0.0, 200.0);
-        let x = arb(&tc, 0.0, 400.0);
-        let dx = arb(&tc, 0.0, 50.0);
-        let (y, y2) = (tone_map(x, peak, h), tone_map(x + dx, peak, h));
-        assert!(y2 + 1e-5 * y2.max(1.0) >= y, "decreasing: f({x})={y} > f({})={y2} (peak {peak}, headroom {h})", x + dx);
-        assert!(y <= h * (1.0 + 1e-6), "f({x})={y} past the headroom {h} (peak {peak})");
-        if x <= knee(h) {
-            assert_eq!(y, x, "under the knee {} f({x}) moved (peak {peak}, headroom {h})", knee(h));
-        }
-        if peak > 0.0 && peak <= h {
-            assert_eq!(y, x.min(h), "a picture within the display (peak {peak} <= {h}) was changed at {x}");
-        }
-        if peak > h {
-            let at = tone_map(peak, peak, h);
-            assert!((at - h).abs() <= 1e-4 * h, "the peak {peak} lands at {at}, not the headroom {h}");
-        }
-        // SDR stays SDR wherever the display has a third of a stop to spare.
-        if h >= 1.0 / KNEE && x <= 1.0 {
-            assert_eq!(y, x, "reference white or below moved at {x} on a {h} display");
-        }
+    #[test]
+    fn the_tone_map_rolls_off_into_the_headroom_and_keeps_sdr() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let h = arb(tape, 1.0, 64.0, "h");
+            let peak = arb(tape, 0.0, 200.0, "peak");
+            let x = arb(tape, 0.0, 400.0, "x");
+            let dx = arb(tape, 0.0, 50.0, "dx");
+            let (y, y2) = (tone_map(x, peak, h), tone_map(x + dx, peak, h));
+            assert!(y2 + 1e-5 * y2.max(1.0) >= y, "decreasing: f({x})={y} > f({})={y2} (peak {peak}, headroom {h})", x + dx);
+            assert!(y <= h * (1.0 + 1e-6), "f({x})={y} past the headroom {h} (peak {peak})");
+            if x <= knee(h) {
+                assert_eq!(y, x, "under the knee {} f({x}) moved (peak {peak}, headroom {h})", knee(h));
+            }
+            if peak > 0.0 && peak <= h {
+                assert_eq!(y, x.min(h), "a picture within the display (peak {peak} <= {h}) was changed at {x}");
+            }
+            if peak > h {
+                let at = tone_map(peak, peak, h);
+                assert!((at - h).abs() <= 1e-4 * h, "the peak {peak} lands at {at}, not the headroom {h}");
+            }
+            // SDR stays SDR wherever the display has a third of a stop to spare.
+            if h >= 1.0 / KNEE && x <= 1.0 {
+                assert_eq!(y, x, "reference white or below moved at {x} on a {h} display");
+            }
+        });
     }
 
     /// The decoders agree with what ImageIO measured on this stack: PQ 203 nits is 1.0, 1000 nits 4.93; HLG's full signal

@@ -362,8 +362,8 @@ pub mod http {
 /// Then blaze-core's seeded simulation itself ([`test::Sim`]: a virtual clock, shuffled
 /// completions, failures, crashes), the model checker for lock-free code ([`test::model`], its
 /// shims in [`test::checked`]), and allocation counting ([`test::Counting`], [`test::measure`]).
-/// Hegel stays a direct dev-dependency: its `#[hegel::test]` expands to `::hegel::` paths,
-/// which a re-export cannot satisfy.
+/// A property test over generated inputs is `blaze_sim::check`, a direct dev-dependency
+/// (docs/v2/plan/design/sim.md), not re-exported here: it is blaze's own tests' engine.
 pub mod test {
     pub use blaze_alloc_count::{Counting, Used, assert_at_most, installed, measure};
     pub use blaze_check::{Builder, MAX_THREADS, model};

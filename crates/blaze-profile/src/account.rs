@@ -1197,16 +1197,15 @@ mod tests {
 
     /// A drawn project and its edits, built in sequence under `plant` (in the last build), and
     /// what the oracle found wrong: nothing, when every recompute chains to a change.
-    fn simulate(tc: &hegel::TestCase, plant: Plant) -> Vec<String> {
-        use hegel::generators as gs;
-        let files = 1 + tc.draw(gs::integers::<usize>().max_value(5));
-        let count = 2 + tc.draw(gs::integers::<usize>().max_value(6));
+    fn simulate(tape: &blaze_sim::Tape, plant: Plant) -> Vec<String> {
+        let files = 1 + tape.int_in(0..=5usize, "files");
+        let count = 2 + tape.int_in(0..=6usize, "units");
         let mut units = Vec::new();
         for unit in 0..count {
-            let reads: Vec<usize> = tc.draw(gs::vecs(gs::integers::<usize>().max_value(files - 1)).max_size(3));
+            let reads: Vec<usize> = tape.vec(0..=3, "reads", |tape| tape.index(files, "file read"));
             let deps: Vec<usize> = match unit {
                 0 => Vec::new(),
-                _ => tc.draw(gs::vecs(gs::integers::<usize>().max_value(unit - 1)).max_size(2)),
+                _ => tape.vec(0..=2, "deps", |tape| tape.index(unit, "dep")),
             };
             units.push((reads, deps));
         }
@@ -1219,12 +1218,12 @@ mod tests {
             units[0].0.push(0);
         }
         let mut project = Project { units, built: false };
-        let builds = 2 + tc.draw(gs::integers::<usize>().max_value(4));
+        let builds = 2 + tape.int_in(0..=4usize, "builds");
         let mut wrong = Vec::new();
         for build in 0..builds {
             let edited: BTreeSet<usize> = match build {
                 0 => BTreeSet::new(),
-                _ => tc.draw(gs::vecs(gs::integers::<usize>().max_value(files - 1)).max_size(2)).into_iter().collect(),
+                _ => tape.vec(0..=2, "edited", |tape| tape.index(files, "file edited")).into_iter().collect(),
             };
             let first = !project.built;
             let last = build + 1 == builds;
@@ -1269,24 +1268,30 @@ mod tests {
     /// through the units it reads to a file that changed in that build (the first build's to
     /// "first time"), the units made are exactly those the change reaches, and the stage's
     /// total is the pieces its causes count.
-    #[hegel::test(test_cases = 200)]
-    fn every_recompute_of_a_simulated_build_sequence_chains_to_a_change(tc: hegel::TestCase) {
-        assert_eq!(simulate(&tc, Plant::None), Vec::<String>::new());
+    #[test]
+    fn every_recompute_of_a_simulated_build_sequence_chains_to_a_change() {
+        blaze_sim::check(blaze_sim::Config::cases(200), |tape| {
+            assert_eq!(simulate(tape, Plant::None), Vec::<String>::new());
+        });
     }
 
     /// The control: a recompute started with a cause that is no work of its build fails the
     /// oracle.
-    #[hegel::test(test_cases = 50)]
-    fn the_oracle_catches_a_recompute_started_without_a_cause(tc: hegel::TestCase) {
-        let wrong = simulate(&tc, Plant::Causeless);
-        assert!(wrong.iter().any(|it| it.contains("chain to no change")), "{wrong:?}");
+    #[test]
+    fn the_oracle_catches_a_recompute_started_without_a_cause() {
+        blaze_sim::check(blaze_sim::Config::cases(50), |tape| {
+            let wrong = simulate(tape, Plant::Causeless);
+            assert!(wrong.iter().any(|it| it.contains("chain to no change")), "{wrong:?}");
+        });
     }
 
     /// The control of the stage sum: work the stage counted and no cause was given for.
-    #[hegel::test(test_cases = 50)]
-    fn the_oracle_catches_work_a_stage_counted_and_never_said(tc: hegel::TestCase) {
-        let wrong = simulate(&tc, Plant::Unsaid);
-        assert!(wrong.iter().any(|it| it.contains("StageSum")), "{wrong:?}");
+    #[test]
+    fn the_oracle_catches_work_a_stage_counted_and_never_said() {
+        blaze_sim::check(blaze_sim::Config::cases(50), |tape| {
+            let wrong = simulate(tape, Plant::Unsaid);
+            assert!(wrong.iter().any(|it| it.contains("StageSum")), "{wrong:?}");
+        });
     }
 
     #[test]

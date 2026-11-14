@@ -23,10 +23,14 @@ blaze-keyed.workspace = true
 blaze-usercode.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
+# `Aligned`: the simulated store's records, 16-aligned as the real store's are.
+blaze-format.workspace = true
+blaze-protocol.workspace = true
 blaze-rng.workspace = true
-# The runner host's simulation (`host/tests.rs`) and the detached machine's (`machine/wired_tests.rs`).
+# The machine's simulation (`machine/tests.rs`), the runner host's (`host/tests.rs`) and the
+# detached machine's (`machine/wired_tests.rs`).
 blaze-sim.workspace = true
-hegeltest.workspace = true
 
 [lints]
 workspace = true

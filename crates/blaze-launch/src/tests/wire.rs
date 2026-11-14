@@ -3,8 +3,7 @@
 //! and reads back as the message it was; and what is not a message of this schema is refused.
 
 use blaze_protocol::cbor;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::wire::{
     Arch, Ask, Bind, LONGEST_FRAME, List, Os, ProgramId, RecordId, SCHEMA, StaticDef, Tell,
@@ -155,97 +154,100 @@ impl Owned {
     }
 }
 
-fn pick(tc: &TestCase, max: usize) -> usize {
-    tc.draw(gs::integers::<usize>().max_value(max))
+fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
+    tape.int_in(0..=max, label)
 }
 
 /// A number at the edge of a CBOR head's size, or any.
-fn number(tc: &TestCase) -> u64 {
+fn number(tape: &Tape) -> u64 {
     const EDGES: [u64; 10] =
         [0, 23, 24, 255, 256, 65_535, 65_536, 0xffff_ffff, 0x1_0000_0000, u64::MAX];
-    match pick(tc, 2) {
-        0 => EDGES[pick(tc, EDGES.len() - 1)],
-        1 => pick(tc, 1000) as u64,
-        _ => ((pick(tc, u32::MAX as usize) as u64) << 32) | pick(tc, u32::MAX as usize) as u64,
+    match pick(tape, 2, "number kind") {
+        0 => EDGES[pick(tape, EDGES.len() - 1, "edge")],
+        1 => pick(tape, 1000, "number") as u64,
+        _ => {
+            let high = pick(tape, u32::MAX as usize, "high half") as u64;
+            (high << 32) | pick(tape, u32::MAX as usize, "low half") as u64
+        }
     }
 }
 
-fn small(tc: &TestCase) -> u32 {
-    number(tc) as u32
+fn small(tape: &Tape) -> u32 {
+    number(tape) as u32
 }
 
-fn id(tc: &TestCase) -> [u8; 32] {
-    let seed = number(tc).to_le_bytes();
+fn id(tape: &Tape) -> [u8; 32] {
+    let seed = number(tape).to_le_bytes();
     core::array::from_fn(|at| seed[at % 8] ^ at as u8)
 }
 
-fn text(tc: &TestCase) -> String {
+fn text(tape: &Tape) -> String {
     const TEXTS: [&str; 5] =
         ["", "x", "the record of `main` is not in the store", "λ → 走る", "a\u{0}b"];
-    let text = TEXTS[pick(tc, TEXTS.len() - 1)];
+    let text = TEXTS[pick(tape, TEXTS.len() - 1, "text")];
     // Past the lengths one byte and two bytes of head hold.
-    text.repeat(1 + pick(tc, 2) * 150)
+    text.repeat(1 + pick(tape, 2, "text repeats") * 150)
 }
 
-fn slots(tc: &TestCase) -> Vec<Slot> {
-    (0..pick(tc, 30)).map(|_| Slot(small(tc))).collect()
+fn slots(tape: &Tape) -> Vec<Slot> {
+    (0..pick(tape, 30, "slots")).map(|_| Slot(small(tape))).collect()
 }
 
-fn owned(tc: &TestCase) -> Owned {
-    match pick(tc, 16) {
-        16 => Owned::Image { bytes: (0..pick(tc, 300)).map(|at| at as u8).collect() },
+fn owned(tape: &Tape) -> Owned {
+    match pick(tape, 16, "message") {
+        16 => Owned::Image { bytes: (0..pick(tape, 300, "bytes")).map(|at| at as u8).collect() },
         0 => Owned::Hello {
-            program: id(tc),
-            pid: number(tc),
-            arm: tc.draw(gs::booleans()),
-            mac: tc.draw(gs::booleans()),
-            page: small(tc),
-            holds: tc.draw(gs::booleans()).then(|| id(tc)),
-            running: tc.draw(gs::booleans()),
+            program: id(tape),
+            pid: number(tape),
+            arm: tape.bool("arm"),
+            mac: tape.bool("mac"),
+            page: small(tape),
+            holds: tape.bool("holds").then(|| id(tape)),
+            running: tape.bool("running"),
         },
-        1 => Owned::Need { slot: small(tc), thread: number(tc) },
-        2 => Owned::Applied { txn: number(tc), epoch: number(tc) },
-        3 => Owned::Failed { txn: number(tc), why: text(tc) },
-        4 => Owned::Frames { txn: number(tc), held: slots(tc) },
+        1 => Owned::Need { slot: small(tape), thread: number(tape) },
+        2 => Owned::Applied { txn: number(tape), epoch: number(tape) },
+        3 => Owned::Failed { txn: number(tape), why: text(tape) },
+        4 => Owned::Frames { txn: number(tape), held: slots(tape) },
         5 => Owned::Ended {
-            domain: number(tc),
-            marks: (0..pick(tc, 300)).map(|_| pick(tc, 1) as u8).collect(),
-            needs: tc.draw(gs::booleans()).then(|| text(tc)),
+            domain: number(tape),
+            marks: (0..pick(tape, 300, "marks")).map(|_| pick(tape, 1, "mark") as u8).collect(),
+            needs: tape.bool("needs").then(|| text(tape)),
         },
-        6 => Owned::Restarting { txn: number(tc) },
-        7 => Owned::Welcome { slots: small(tc) },
-        14 => Owned::Unheld { why: text(tc) },
+        6 => Owned::Restarting { txn: number(tape) },
+        7 => Owned::Welcome { slots: small(tape) },
+        14 => Owned::Unheld { why: text(tape) },
         13 => Owned::Start {
-            entry: small(tc),
-            inits: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
+            entry: small(tape),
+            inits: (0..pick(tape, 30, "inits")).map(|_| small(tape)).collect(),
         },
         11 => Owned::Record {
-            id: id(tc),
-            bytes: (0..pick(tc, 300)).map(|at| at as u8).collect(),
+            id: id(tape),
+            bytes: (0..pick(tape, 300, "bytes")).map(|at| at as u8).collect(),
         },
         12 => Owned::Statics {
-            defs: (0..pick(tc, 20)).map(|_| (small(tc), id(tc))).collect(),
-            refs: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
+            defs: (0..pick(tape, 20, "defs")).map(|_| (small(tape), id(tape))).collect(),
+            refs: (0..pick(tape, 30, "refs")).map(|_| small(tape)).collect(),
         },
         8 => Owned::Edit {
-            txn: number(tc),
-            binds: (0..pick(tc, 20))
+            txn: number(tape),
+            binds: (0..pick(tape, 20, "binds"))
                 .map(|_| OwnedBind {
-                    slot: small(tc),
-                    record: id(tc),
-                    code: id(tc),
-                    optimized: tc.draw(gs::booleans()),
-                    len: number(tc),
-                    align: small(tc),
+                    slot: small(tape),
+                    record: id(tape),
+                    code: id(tape),
+                    optimized: tape.bool("optimized"),
+                    len: number(tape),
+                    align: small(tape),
                 })
                 .collect(),
-            refs: (0..pick(tc, 30)).map(|_| small(tc)).collect(),
-            declare: small(tc),
-            together: tc.draw(gs::booleans()),
+            refs: (0..pick(tape, 30, "refs")).map(|_| small(tape)).collect(),
+            declare: small(tape),
+            together: tape.bool("together"),
         },
-        9 => Owned::Refused { slot: small(tc), diagnostic: text(tc) },
-        10 => Owned::Probe { txn: number(tc), slots: slots(tc) },
-        _ => Owned::Restart { txn: number(tc), why: text(tc) },
+        9 => Owned::Refused { slot: small(tape), diagnostic: text(tape) },
+        10 => Owned::Probe { txn: number(tape), slots: slots(tape) },
+        _ => Owned::Restart { txn: number(tape), why: text(tape) },
     }
 }
 
@@ -263,10 +265,14 @@ fn encoded(message: &Message<'_>, id: u64) -> Vec<u8> {
 /// The invariant: every message is written as one frame whose item is in the core
 /// deterministic encoding (so one message has one encoding), and reads back, with its id, as
 /// the message it was; two frames on one stream split where the first ends.
-#[hegel::test(test_cases = 400)]
-fn every_message_is_deterministic_cbor_and_reads_back(tc: TestCase) {
-    let owned = owned(&tc);
-    let id = number(&tc);
+#[test]
+fn every_message_is_deterministic_cbor_and_reads_back() {
+    blaze_sim::check(Config::cases(400), message_reads_back);
+}
+
+fn message_reads_back(tape: &Tape) {
+    let owned = owned(tape);
+    let id = number(tape);
     let lists = owned.lists();
     let message = owned.message(&lists);
     let mut stream = encoded(&message, id);
@@ -290,7 +296,7 @@ fn every_message_is_deterministic_cbor_and_reads_back(tc: TestCase) {
         }
     }
     // Any cut of the item is refused, never read as a shorter message.
-    let cut = pick(&tc, item.len() - 1);
+    let cut = pick(tape, item.len() - 1, "cut");
     assert!(Ask::decode(&item[..cut]).is_err() && Tell::decode(&item[..cut]).is_err());
 }
 

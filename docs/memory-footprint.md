@@ -121,7 +121,7 @@ Built on `kept-memory-1109` (design: [v2/plan/admission-by-footprint.md](v2/plan
 
 - The plane charges the larger of its grants and the footprint plus the grants not yet realized,
   asks a purge before it holds work back or starts a task alone, and fails alone a task that
-  grows past the ceiling (`blaze_graph::footprint`, `TooBig`), proved by a Hegel DST with planted
+  grows past the ceiling (`blaze_graph::footprint`, `TooBig`), proved by a blaze-sim DST with planted
   bugs. The ceiling guard purges on its first look past the ceiling and ends the daemon only if
   the footprint is still past it.
 - A purge reads the footprint only once it took effect. mimalloc 3 keeps freed pages per thread,

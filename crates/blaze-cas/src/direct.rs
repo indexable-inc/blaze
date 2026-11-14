@@ -124,6 +124,9 @@ pub(crate) enum Plant {
     RunEnd,
     /// A chunked value's first chunk is put last.
     ChunkOrder,
+    /// A value made whole in the second round moves only the places that start strictly after
+    /// its own, so a neighbour at the same position keeps pointing at its bytes.
+    StrictlyAfter,
 }
 
 /// The sans-IO core: the reads a batch of records needs, and what came of them.
@@ -815,6 +818,9 @@ impl Direct {
     /// one answer per key, in the order of `keys`, saying where in `into` its value is. The
     /// records are read in file order, neighbours in one read (the module's docs); what was in
     /// `into` before stays as it was.
+    ///
+    /// The invariant: each found answer's place is `[at, at + len)`, the places are in the
+    /// batch's order and do not overlap.
     pub fn read_many<D: Driver, A: Allocator + Clone, B: Allocator>(
         &mut self,
         driver: &mut D,
@@ -897,9 +903,15 @@ impl Direct {
                 into.truncate(end);
             }
             into[at..at + made_len].copy_from_slice(&whole[..made_len]);
-            for place in &mut places[base..] {
+            // The places after this one in the batch's order start at or past its end, and those
+            // before it end at or before its start (`read_many`'s invariant), so the batch's
+            // order, not the position, says which move: a placeholder of no bytes shares its
+            // position with its neighbours. `follows` is in no set order, and the rule needs none.
+            let strictly = self.plant_strictly_after();
+            let after = if strictly { base } else { n + 1 };
+            for place in &mut places[after..] {
                 if let Placed::Found { at: there, .. } = place
-                    && *there > at
+                    && (!strictly || *there > at)
                 {
                     *there = *there - len + made_len;
                 }
@@ -1491,6 +1503,14 @@ impl Direct {
     fn plant_sorted(&self) -> bool {
         #[cfg(test)]
         if self.plant == Plant::SortedOrder {
+            return true;
+        }
+        false
+    }
+
+    fn plant_strictly_after(&self) -> bool {
+        #[cfg(test)]
+        if self.plant == Plant::StrictlyAfter {
             return true;
         }
         false

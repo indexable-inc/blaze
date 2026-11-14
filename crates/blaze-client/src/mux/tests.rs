@@ -8,38 +8,12 @@ use std::time::Duration;
 
 use blaze_api::{Envelope, HotSince, Request, Response, SCHEMA, frames};
 use blaze_core::wait::Deadline;
-use blaze_rng::SplitMix64;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 use super::{Mux, End, Event, Fault, Plant};
 
 /// How many seeded plans a control may take to catch its plant.
-const CONTROL_SEEDS: u64 = 256;
-
-trait Draw {
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for SplitMix64 {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
+const CONTROL_SEEDS: u32 = 256;
 
 /// One request of a plan and what the daemon answers it with.
 #[derive(Clone, Debug)]
@@ -83,14 +57,14 @@ impl Plan {
 
 /// A plan, its fault classes drawn as a swarm: each of a hang-up part way, a frame of another
 /// schema and deadlines is on in about half the plans.
-fn plan(d: &mut impl Draw) -> Plan {
-    let (cuts, schemas, deadlines) = (d.coin(), d.coin(), d.coin());
-    let count = d.int(1, 5) as usize;
+fn plan(tape: &Tape) -> Plan {
+    let (cuts, schemas, deadlines) = (tape.bool("cuts"), tape.bool("other schemas"), tape.bool("deadlines"));
+    let count = tape.int_in(1..=5u64, "requests") as usize;
     let requests: Vec<Asked> = (0..count)
         .map(|_| Asked {
-            responses: d.int(0, 3) as usize,
-            ok: d.coin(),
-            deadline: (deadlines && d.coin()).then(|| d.int(1, 40)),
+            responses: tape.int_in(0..=3u64, "responses") as usize,
+            ok: tape.bool("ok"),
+            deadline: (deadlines && tape.bool("has a deadline")).then(|| tape.int_in(1..=40u64, "deadline")),
         })
         .collect();
     // Each request's tokens in its own order (its send, then each frame of its answer), the
@@ -99,19 +73,20 @@ fn plan(d: &mut impl Draw) -> Plan {
     let mut steps = Vec::new();
     while left.iter().any(|&it| it > 0) {
         let live: Vec<usize> = (0..count).filter(|&it| left[it] > 0).collect();
-        let request = live[d.int(0, live.len() as u64 - 1) as usize];
+        let request = live[tape.int_in(0..=live.len() as u64 - 1, "next request") as usize];
         let first = left[request] == requests[request].responses + 2;
         steps.push(if first { Step::Send(request) } else { Step::Emit(request) });
         left[request] -= 1;
-        if d.int(0, 3) == 0 {
-            steps.push(Step::Pass(d.int(1, 20)));
+        // The clock moves one turn in four; calm, it moves not at all.
+        if tape.int_in(0..=3u64, "clock moves") == 3 {
+            steps.push(Step::Pass(tape.int_in(1..=20u64, "millis")));
         }
     }
-    let chunks = (0..d.int(1, 4)).map(|_| d.int(1, 9) as usize).collect();
-    let cut = cuts.then(|| d.int(0, 200) as usize);
+    let chunks = (0..tape.int_in(1..=4u64, "chunks")).map(|_| tape.int_in(1..=9u64, "chunk") as usize).collect();
+    let cut = cuts.then(|| tape.int_in(0..=200u64, "cut at") as usize);
     let other_schema = schemas.then(|| {
-        let request = d.int(0, count as u64 - 1) as usize;
-        (request, d.int(0, requests[request].responses as u64) as usize)
+        let request = tape.int_in(0..=count as u64 - 1, "other schema request") as usize;
+        (request, tape.int_in(0..=requests[request].responses as u64, "other schema frame") as usize)
     });
     Plan { requests, steps, chunks, cut, other_schema }
 }
@@ -336,38 +311,33 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 }
 
 /// The invariant: whatever the daemon's bytes are cut into and however its answers interleave, every request gets exactly its own responses, in the order the daemon sent them, and then ends exactly once, with its `Done` after its whole answer or with one fault that happened (another schema, a hang-up, its deadline); and the client writes each request's frame whole, once.
-#[hegel::test(test_cases = 300)]
-fn every_request_gets_its_own_responses_in_order_then_one_end(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn every_request_gets_its_own_responses_in_order_then_one_end() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let plan = plan(tape);
+        if let Err(broke) = run(&plan, Plant::None) {
+            panic!("{broke}\nplan {plan:?}");
+        }
+    });
 }
 
-/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans: a response given
-/// to the oldest request under way, not to the one its id names.
+/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] plans: a response given to the
+/// oldest request under way, not to the one its id names. Every finding of the oracle counts,
+/// as before.
 #[test]
 fn the_oracle_catches_responses_matched_by_arrival() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(why) = run(&plan(&mut SplitMix64::new(seed)), Plant::ByArrival) {
-            eprintln!("Plant::ByArrival caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught Plant::ByArrival at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::ByArrival, "", |tape, plant| {
+        run(&plan(tape), plant).map_err(Broke::Oracle)
+    });
 }
 
-/// The same seeded plans pass with nothing planted: what the control catches is the plant.
+/// The same plans pass with nothing planted: what the control catches is the plant.
 #[test]
 fn the_seeded_plans_pass_with_nothing_planted() {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan(&mut SplitMix64::new(seed));
-        if let Err(broke) = run(&plan, Plant::None) {
-            panic!("seed {seed}: {broke}\nplan {plan:?}");
-        }
-    }
+    blaze_sim::check(Config::cases(CONTROL_SEEDS), |tape| {
+        let plan = plan(tape);
+        run(&plan, Plant::None).map_err(|broke| format!("{broke}\nplan {plan:?}"))
+    });
 }
 
 fn frame(id: u64, body: Response) -> Vec<u8> {

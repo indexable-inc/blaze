@@ -63,8 +63,8 @@ toml.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

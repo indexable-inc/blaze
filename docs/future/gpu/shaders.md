@@ -477,7 +477,7 @@ One shader at a time, each on its own switch, with no fallback between them:
    const` arrays become `const`s; `float4` fields stay `Vec4`, so layouts match byte for byte, which
    a test in the shader crate checks against the host's own structs (`harness-native-kip`'s
    `Uniforms` and `model::Vertex` for the mascot).
-2. **Test on the CPU** what is hard to verify: the transfer functions (Hegel round trips and the
+2. **Test on the CPU** what is hard to verify: the transfer functions (blaze-sim round trips and the
    ImageIO-measured values the host's hdr.rs already pins), the vertex math against the host's
    expectations. Derivatives and sampling have no CPU meaning until plan.md's CPU backend runs a
    fragment stage in quads; their host bodies panic naming themselves.
@@ -574,7 +574,7 @@ breath and timing is a bug to trace with the bounded shot above.
 1. **The vocabulary and the ports.** The `gpu` crate (types, traits, `layout`, the math, the
    intrinsics' host bodies), `gpu-macros` (`vertex`, `fragment`, `Varyings`, `Pod`, `entries!`),
    `harness-native-shaders` with mascot.slang ported, its CPU tests and its layout tests against
-   the host. The structurizer in `blaze-shader`, with a Hegel test that runs random reducible
+   the host. The structurizer in `blaze-shader`, with a blaze-sim test that runs random reducible
    graphs and their structured form under the same branch choices and compares the blocks they
    visit. (This lane.)
 2. **MIR to naga for the mascot.** The lowering for what mascot.slang uses (scalars, vectors,

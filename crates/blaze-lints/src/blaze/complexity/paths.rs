@@ -353,40 +353,42 @@ mod tests {
         }
     }
 
-    fn draw_shape(tc: &hegel::TestCase, depth: u32) -> Shape {
-        use hegel::generators as gs;
-        let kind: u8 = tc.draw(gs::integers::<u8>().max_value(if depth == 0 { 0 } else { 3 }));
+    fn draw_shape(tape: &blaze_sim::Tape, depth: u32) -> Shape {
+        let most: u8 = if depth == 0 { 0 } else { 3 };
+        let kind: u8 = tape.int_in(0..=most, "shape");
         match kind {
             0 => Shape::Plain,
-            1 => Shape::If(Box::new(draw_shape(tc, depth - 1)), Box::new(draw_shape(tc, depth - 1))),
-            2 => Shape::While(Box::new(draw_shape(tc, depth - 1))),
-            _ => Shape::Seq(Box::new(draw_shape(tc, depth - 1)), Box::new(draw_shape(tc, depth - 1))),
+            1 => Shape::If(Box::new(draw_shape(tape, depth - 1)), Box::new(draw_shape(tape, depth - 1))),
+            2 => Shape::While(Box::new(draw_shape(tape, depth - 1))),
+            _ => Shape::Seq(Box::new(draw_shape(tape, depth - 1)), Box::new(draw_shape(tape, depth - 1))),
         }
     }
 
     /// The invariant: on a structured program the count is NPATH's, and numbering the blocks
     /// otherwise (the order items or blocks are laid out in) changes nothing.
-    #[hegel::test]
-    fn the_count_is_npath_whatever_the_block_order(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let shape = draw_shape(&tc, 4);
-        let mut edges = vec![Vec::new()];
-        let entry = lower(&shape, 0, &mut edges);
-        // Block 0 is the return; a start block goes to the entry.
-        edges.push(vec![entry]);
-        let start = (edges.len() - 1) as u32;
-        let blocks = edges.len();
-        let order: Vec<u32> = tc.draw(gs::permutations((0..blocks as u32).collect::<Vec<u32>>()));
-        let mut successors = Vec::new_in(Global);
-        successors.resize_with(blocks, || Vec::new_in(Global));
-        for (from, out) in edges.iter().enumerate() {
-            for &to in out {
-                successors[order[from] as usize].push(order[to as usize]);
+    #[test]
+    fn the_count_is_npath_whatever_the_block_order() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let shape = draw_shape(tape, 4);
+            let mut edges = vec![Vec::new()];
+            let entry = lower(&shape, 0, &mut edges);
+            // Block 0 is the return; a start block goes to the entry.
+            edges.push(vec![entry]);
+            let start = (edges.len() - 1) as u32;
+            let blocks = edges.len();
+            let mut order: Vec<u32> = (0..blocks as u32).collect::<Vec<u32>>();
+            tape.shuffle(&mut order, "block order");
+            let mut successors = Vec::new_in(Global);
+            successors.resize_with(blocks, || Vec::new_in(Global));
+            for (from, out) in edges.iter().enumerate() {
+                for &to in out {
+                    successors[order[from] as usize].push(order[to as usize]);
+                }
             }
-        }
-        let mut dead = Vec::new_in(Global);
-        dead.resize(blocks, false);
-        let it = Cfg { successors, dead, start: order[start as usize] };
-        assert_eq!(count(&it), npath(&shape), "{shape:?}");
+            let mut dead = Vec::new_in(Global);
+            dead.resize(blocks, false);
+            let it = Cfg { successors, dead, start: order[start as usize] };
+            assert_eq!(count(&it), npath(&shape), "{shape:?}");
+        });
     }
 }

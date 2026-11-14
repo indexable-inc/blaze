@@ -43,7 +43,7 @@ use blaze_keyed::{
     kind::{Namespace, Tag, Tier},
     store::{ENTRY, FOOTER, HEADER, Located, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, Verifier},
 };
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::{
     core::{Committed, Plain, PlainConfig, Plant, TAGS},
@@ -941,9 +941,9 @@ const HONEST: [Plant; 3] = [Plant::None, Plant::None, Plant::None];
 /// failing: every committed record reads back byte for byte under its namespace or is reported
 /// lost by name; nothing put and not committed is half there; nothing never put is found; no
 /// lookup finds a record of a namespace it did not ask; nothing corrupt is returned.
-#[hegel::test]
-fn two_writers_and_power_cuts_keep_every_committed_record_or_say_so(tc: hegel::TestCase) {
-    two_writers_and_power_cuts(tc);
+#[test]
+fn two_writers_and_power_cuts_keep_every_committed_record_or_say_so() {
+    blaze_sim::check(SimConfig::DEFAULT, two_writers_and_power_cuts);
 }
 
 /// Regression (2026-11-13, round 3): a power cut tore the head's first write (then a whole-file
@@ -951,7 +951,7 @@ fn two_writers_and_power_cuts_keep_every_committed_record_or_say_so(tc: hegel::T
 /// file and stopped. The head is now made at its length and synced at the first open, every
 /// flip writes one slot in place, and a short head is read as far as it goes.
 ///
-/// The history is Hegel's minimal case of then (seed 0, two rounds of one record, a power cut
+/// The history is the property test's shrunk case of then (seed 0, two rounds of one record, a power cut
 /// after 21 completions, no injected failure), written out step by step; the records are now
 /// put under `LOCAL` and `PUBLIC` (keys 0 and 1_000_000), so the history is not the same one
 /// completion for completion, and the test asserts only that the cut lands.
@@ -1005,7 +1005,7 @@ fn a_head_torn_by_a_power_cut_is_read_through_not_refused() {
     assert!(outcome.is_ok(), "{outcome:?}");
 }
 
-/// Regression (2026-11-13, round 4; Hegel blob `AXicY2MAAi5GIMGEQjFCKAZUCgAH4wBO`: seed 2, two
+/// Regression (2026-11-13, round 4; the former engine's case `AXicY2MAAi5GIMGEQjFCKAZUCgAH4wBO`: seed 2, two
 /// rounds of one record, no cut, one effect in 40 failing): a writer failed under the flip lock
 /// and stopped holding it, so every reader's open that had to flip (to name an orphan) waited
 /// on it, asking again every 2 ms, until an injected failure of one ask ended it, 50 times
@@ -1017,7 +1017,7 @@ fn a_store_that_fails_under_the_flip_lock_lets_it_go() {
     assert!(outcome.is_ok(), "{outcome:?}");
 }
 
-/// Regression (2026-11-13, round 5; Hegel blob
+/// Regression (2026-11-13, round 5; the former engine's case
 /// `AXicJcaxCQAACAPBiGghOIf7WLv/HAaSIvcJrpw31yhjuAhhYgUeIBEBNg==`: seed 875559, three rounds
 /// of five records, a power cut after 82 completions, one effect in 40 failing). The oracle
 /// said: "committed record 0 (under LOCAL, generation 1; generation 1 read whole) reads None,
@@ -1079,27 +1079,29 @@ fn a_small_history_cut_at_every_completion_keeps_the_invariant() {
     }
 }
 
-fn two_writers_and_power_cuts(tc: hegel::TestCase) {
-    let seed = tc.draw(gs::integers::<u64>());
-    let rounds = tc.draw(gs::integers::<u32>().min_value(1).max_value(6));
-    let per = tc.draw(gs::integers::<u32>().min_value(1).max_value(24));
-    let cut = tc.draw(gs::integers::<u32>().min_value(0).max_value(1)) == 1;
-    let after = tc.draw(gs::integers::<u32>().min_value(0).max_value(400));
-    let fail = if tc.draw(gs::integers::<u32>().min_value(0).max_value(3)) == 0 { 40 } else { 0 };
+fn two_writers_and_power_cuts(tape: &Tape) {
+    let seed = tape.next_u64("sim seed");
+    let rounds = tape.int_in(1..=6u32, "rounds");
+    let per = tape.int_in(1..=24u32, "records per round");
+    let cut = tape.int_in(0..=1u32, "power cut") == 1;
+    let after = tape.int_in(0..=400u32, "cut after");
+    let fail = if tape.int_in(0..=3u32, "failing effects") == 0 { 40 } else { 0 };
     // The reader's first open fails one effect after its flip's slot lands (when it flips and
     // asks one there): the loss it found must still reach some open's report.
-    let inject = [None, Some(Place::Remove), Some(Place::Map), Some(Place::HeadSync)][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+    let inject = [None, Some(Place::Remove), Some(Place::Map), Some(Place::HeadSync)][tape.index(4, "inject at")];
     let outcome = scenario_traced(seed, rounds, per, cut.then_some(after), fail, HONEST, false, inject, &mut 0, &mut None);
     assert!(outcome.is_ok(), "seed {seed}, {rounds} rounds of {per}, cut {cut} after {after}, fail 1 in {fail}, injected at {inject:?}: {outcome:?}");
 }
 
 /// Durable mode: a power cut loses nothing a completed commit wrote.
-#[hegel::test]
-fn durable_commits_survive_any_power_cut(tc: hegel::TestCase) {
-    let seed = tc.draw(gs::integers::<u64>());
-    let after = tc.draw(gs::integers::<u32>().min_value(0).max_value(400));
-    let outcome = scenario(seed, 4, 8, Some(after), 0, HONEST, true);
-    assert!(outcome.is_ok(), "seed {seed}, cut after {after}: {outcome:?}");
+#[test]
+fn durable_commits_survive_any_power_cut() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let seed = tape.next_u64("sim seed");
+        let after = tape.int_in(0..=400u32, "cut after");
+        let outcome = scenario(seed, 4, 8, Some(after), 0, HONEST, true);
+        assert!(outcome.is_ok(), "seed {seed}, cut after {after}: {outcome:?}");
+    });
 }
 
 /// The oracle fails for some seed of `seeds` with `plants`, and passes for all without.
@@ -1639,16 +1641,20 @@ fn a_previous_layout_is_refused_by_name() {
 /// the records sealed: their namespace and count, each distinct key once with the tag and
 /// payload of its first record given (a later duplicate dropped), no key that was not given,
 /// and the same records sealed twice are the same bytes. Zero records is a valid segment.
-#[hegel::test]
-fn check_segment_accepts_exactly_what_seal_segment_sealed(tc: hegel::TestCase) {
-    let count = tc.draw(gs::integers::<u32>().min_value(0).max_value(60)) as usize;
-    let namespace = writes()[tc.draw(gs::integers::<u32>().min_value(0).max_value(2)) as usize];
+#[test]
+fn check_segment_accepts_exactly_what_seal_segment_sealed() {
+    blaze_sim::check(SimConfig::DEFAULT, check_segment_accepts_exactly_what_seal_segment_sealed_case);
+}
+
+fn check_segment_accepts_exactly_what_seal_segment_sealed_case(tape: &Tape) {
+    let count = tape.int_in(0..=60u32, "records") as usize;
+    let namespace = writes()[tape.int_in(0..=2u32, "namespace") as usize];
     let mut given: Vec<(u32, u16, u32)> = Vec::new_in(Global);
     for _ in 0..count {
         // Keys from a small range, so duplicates happen; each record its own tag and payload.
-        let n = tc.draw(gs::integers::<u32>().min_value(0).max_value(40));
-        let tag = tc.draw(gs::integers::<u16>());
-        let payload = tc.draw(gs::integers::<u32>().min_value(0).max_value(5_000));
+        let n = tape.int_in(0..=40u32, "key");
+        let tag = tape.int::<u16>("tag");
+        let payload = tape.int_in(0..=5_000u32, "payload");
         given.push((n, tag, payload));
     }
     let payloads: Vec<Vec<u8>> = given.iter().map(|it| value(it.2)).collect();

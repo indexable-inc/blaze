@@ -691,7 +691,7 @@ registry can be named in:
 
 ```toml
 [workspace.metadata.blaze.sandbox]
-unsandboxed-build-scripts = ["hegeltest", "flecs_ecs_sys"]   # by package name
+unsandboxed-build-scripts = ["libghostty-vt-sys", "flecs_ecs_sys"]   # by package name
 build-script-link-dirs = ["/opt/vendor/lib", "${OPENSSL_DIR}/lib"]   # rustc-link-search may name
 build-script-env = ["OPENSSL_DIR"]                                   # a ${NAME} above must be listed here
 ```

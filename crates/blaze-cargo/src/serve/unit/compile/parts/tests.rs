@@ -4,9 +4,8 @@
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemKey, kinds};
+use blaze_sim::{Config, Tape};
 use hir_ty::next_solver::goal_store::{FactObject, FactRef};
-use hegel::TestCase;
-use hegel::generators as gs;
 
 use super::{Cover, NARROW_PLANTED, Part, Parts, Quick, Read, Refused, Verdict};
 
@@ -336,25 +335,19 @@ fn hold(unit: &Unit, was: &Below, now: &Below, plant: Plant) -> Result<Verdict, 
     Ok(verdict)
 }
 
-fn drawn_below(tc: &TestCase) -> Below {
-    let functions: Vec<(u8, u8, bool)> = tc.draw(
-        gs::vecs(gs::tuples!(gs::integers().max_value(5), gs::integers().max_value(3), gs::booleans()))
-            .max_size(5),
-    );
+fn drawn_below(tape: &Tape) -> Below {
+    let functions: Vec<(u8, u8, bool)> = tape.vec(0..=5, "functions", |tape| {
+        (tape.int_in(0..=5u8, "name"), tape.int_in(0..=3u8, "signature"), tape.bool("generic"))
+    });
     let mut below = Below::default();
     for (name, signature, generic) in functions {
         if below.named(name).is_none() {
             below.functions.push(Function { name, signature, body: 0, lines: 3, generic });
         }
     }
-    let impls: Vec<(u8, u8, u8)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(1),
-            gs::integers().max_value(1),
-            gs::integers().max_value(2)
-        ))
-        .max_size(3),
-    );
+    let impls: Vec<(u8, u8, u8)> = tape.vec(0..=3, "impls", |tape| {
+        (tape.int_in(0..=1u8, "trait"), tape.int_in(0..=1u8, "type"), tape.int_in(0..=2u8, "which"))
+    });
     for it in impls {
         if !below.impls.contains(&it) {
             below.impls.push(it);
@@ -363,20 +356,17 @@ fn drawn_below(tc: &TestCase) -> Below {
     below
 }
 
-fn drawn_unit(tc: &TestCase) -> Unit {
+fn drawn_unit(tape: &Tape) -> Unit {
     Unit {
-        calls: tc.draw(gs::vecs(gs::integers().max_value(5)).max_size(4)),
-        selects: tc.draw(
-            gs::vecs(gs::tuples!(gs::integers().max_value(1), gs::integers().max_value(1)))
-                .max_size(2),
-        ),
+        calls: tape.vec(0..=4, "calls", |tape| tape.int_in(0..=5u8, "call")),
+        selects: tape.vec(0..=2, "selects", |tape| (tape.int_in(0..=1u8, "trait"), tape.int_in(0..=1u8, "type"))),
     }
 }
 
-fn drawn_edit(tc: &TestCase) -> Edit {
-    let kind: u8 = tc.draw(gs::integers().max_value(5));
-    let at: u8 = tc.draw(gs::integers().max_value(5));
-    let more: u8 = tc.draw(gs::integers().max_value(2));
+fn drawn_edit(tape: &Tape) -> Edit {
+    let kind: u8 = tape.int_in(0..=5u8, "edit");
+    let at: u8 = tape.int_in(0..=5u8, "at");
+    let more: u8 = tape.int_in(0..=2u8, "more");
     match kind {
         0 => Edit::Body(at),
         1 => Edit::Line(at),
@@ -390,20 +380,22 @@ fn drawn_edit(tc: &TestCase) -> Edit {
 /// The invariant: over any crate, any units above it and any sequence of edits, no unit's
 /// record is found after an edit that changes what the unit makes (`hold`), each unit
 /// recorded again after every edit as a build does.
-#[hegel::test]
-fn no_unit_is_found_stale_after_any_edit_of_the_crate_below(tc: TestCase) {
-    let mut below = drawn_below(&tc);
-    let units: Vec<Unit> = (0..3).map(|_| drawn_unit(&tc)).collect();
-    let edits: usize = tc.draw(gs::integers().max_value(6));
-    for _ in 0..edits {
-        let was = below.clone(); // clone: the crate before the edit
-        apply(&mut below, drawn_edit(&tc));
-        for unit in &units {
-            if let Err(found) = hold(unit, &was, &below, Plant::None) {
-                panic!("{found}");
+#[test]
+fn no_unit_is_found_stale_after_any_edit_of_the_crate_below() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut below = drawn_below(tape);
+        let units: Vec<Unit> = (0..3).map(|_| drawn_unit(tape)).collect();
+        let edits: usize = tape.int_in(0..=6usize, "edits");
+        for _ in 0..edits {
+            let was = below.clone(); // clone: the crate before the edit
+            apply(&mut below, drawn_edit(tape));
+            for unit in &units {
+                if let Err(found) = hold(unit, &was, &below, Plant::None) {
+                    panic!("{found}");
+                }
             }
         }
-    }
+    });
 }
 
 fn below() -> Below {

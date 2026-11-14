@@ -9,9 +9,6 @@ licenses/rust-analyzer-LICENSE-APACHE.
 
 syntax-tree started as rowan 0.17.0 (MIT/Apache-2.0); its license texts are in crates/syntax-tree.
 
-Hegel (MIT), copyright Antithesis, LLC: vendor/hegeltest, vendor/hegeltest-macros and
-vendor/hegeltest-c, used only by blaze's tests; the license text is in each of those directories.
-
 The parser's specification clauses (crates/parser/src/grammar/verify.rs) follow Verus's syntax
 (MIT, copyright the Verus contributors) as verus-analyzer's grammar has it (MIT OR Apache-2.0,
 copyright the verus-analyzer and rust-analyzer developers).

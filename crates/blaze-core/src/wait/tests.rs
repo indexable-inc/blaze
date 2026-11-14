@@ -1,9 +1,10 @@
-//! The deadline wait under a simulated kernel (`testing` skill, dst-not-review): one Hegel test
-//! draws a sequence of waits (a deadline or none, and when the awaited event arrives: before,
+//! The deadline wait under a simulated kernel (`testing` skill, dst-not-review): one test draws,
+//! from its case's tape, a sequence of waits (a deadline or none, and when the awaited event arrives: before,
 //! at or after the deadline, or never), and a swarm of kernel faults (an EINTR at random, a
 //! train of them at a fixed period as the profile's sampler sent, spurious wakeups, a timeout
 //! returned early, and each call's latency), runs the real retry loop ([`retry::drive`])
-//! against a kernel on a virtual clock, and checks at every wait:
+//! against a kernel on a virtual clock, which draws which call a fault hits, where, and each
+//! call's latency from the same tape, and checks at every wait:
 //!
 //! - it ends by its deadline: the clock at its return is at most the deadline plus one call's
 //!   latency;
@@ -19,7 +20,7 @@
 //!
 //! The planted bug ([`Plant::SameTimeout`]) gives every call the time left at the first, as
 //! `Ring::enter` did on 0.20261105.0; [`the_oracle_catches_a_retry_with_the_first_timeout`]
-//! must find a seed it breaks. Then [`Sim`] waits through the same loop under its own
+//! must find a case it breaks. Then [`Sim`] waits through the same loop under its own
 //! interruptions ([`a_sim_under_interruption_delivers_everything_by_each_deadline`]).
 //!
 //! The park ([`parking`], a pool worker's idle wait, a futex on its thread's ring on Linux):
@@ -56,7 +57,7 @@ use std::{
     time::Duration,
 };
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 #[cfg(target_os = "linux")]
 use super::direct::{ChildCalls, Direct, FutexCalls};
@@ -69,14 +70,11 @@ use super::{
 };
 use crate::{
     Completion, Done, Driver, Effect, FileName, Tag,
-    sim::{Faults, Rng, Sim},
+    sim::{Faults, Sim},
 };
 
-/// Seeds of [`plan_of`] the control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
-
-/// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
-const REPLAY: (u64, Plant) = (0, Plant::None);
+/// Cases a control searches for one its plant breaks.
+const CONTROL_SEEDS: u32 = 256;
 
 /// Most waits a plan draws.
 const MOST_WAITS: u64 = 24;
@@ -137,39 +135,12 @@ struct Wait {
     event: Option<Duration>,
 }
 
+/// The kernel's choices (which call a fault hits, where, and each call's latency) are drawn
+/// from the case's tape as the run goes.
 #[derive(Debug)]
 struct Plan {
-    /// The kernel's seed: which call a fault hits, where, and each call's latency.
-    seed: u64,
     faults: KernelFaults,
     waits: Vec<Wait>,
-}
-
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
 }
 
 fn us(n: u64) -> Duration {
@@ -177,82 +148,72 @@ fn us(n: u64) -> Duration {
 }
 
 /// A fault's rate: off, or once in 1 to 8 calls.
-fn sometimes(d: &mut impl Draw) -> u64 {
-    match d.coin() {
+fn sometimes(tape: &Tape, label: &'static str) -> u64 {
+    match tape.coin(label) {
         false => 0,
-        true => d.int(1, 8),
+        true => tape.int_in(1..=8u64, label),
     }
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let eintr_one_in = sometimes(d);
-    let spurious_one_in = sometimes(d);
-    let early_one_in = sometimes(d);
+fn plan(tape: &Tape) -> Plan {
+    let eintr_one_in = sometimes(tape, "eintr one in");
+    let spurious_one_in = sometimes(tape, "spurious one in");
+    let early_one_in = sometimes(tape, "early one in");
     // The sampler's shape: a period of 1 to 30 ms against waits of up to 200 ms.
-    let train = match d.coin() {
+    let train = match tape.coin("a train of eintr") {
         false => None,
         true => {
-            let period = us(d.int(1_000, 30_000));
-            Some((period, us(d.int(0, period.as_micros() as u64))))
+            let period = us(tape.int_in(1_000..=30_000u64, "train period us"));
+            Some((period, us(tape.int_in(0..=period.as_micros() as u64, "train phase us"))))
         }
     };
-    let max_latency = match d.coin() {
+    let max_latency = match tape.coin("latency") {
         false => Duration::ZERO,
-        true => us(d.int(0, 2_000)),
+        true => us(tape.int_in(0..=2_000u64, "max latency us")),
     };
     let faults = KernelFaults { eintr_one_in, train, spurious_one_in, early_one_in, max_latency };
-    let n = d.int(1, MOST_WAITS);
+    let n = tape.int_in(1..=MOST_WAITS, "waits");
     let waits = (0..n)
         .map(|_| {
-            let deadline = match d.int(0, 5) {
+            let deadline = match tape.int_in(0..=5u64, "deadline kind") {
                 0 => None,
-                _ => Some(us(d.int(0, 200_000))),
+                _ => Some(us(tape.int_in(0..=200_000u64, "deadline us"))),
             };
             let event = match deadline {
-                None => Some(us(d.int(0, 500_000))),
-                Some(deadline) => match d.int(0, 3) {
-                    0 => Some(us(d.int(0, deadline.as_micros() as u64))),
+                None => Some(us(tape.int_in(0..=500_000u64, "event us"))),
+                Some(deadline) => match tape.int_in(0..=3u64, "event kind") {
+                    0 => Some(us(tape.int_in(0..=deadline.as_micros() as u64, "event us"))),
                     1 => Some(deadline),
-                    2 => Some(deadline + us(d.int(1, 100_000))),
+                    2 => Some(deadline + us(tape.int_in(1..=100_000u64, "event after us"))),
                     _ => None,
                 },
             };
             Wait { deadline, event }
         })
         .collect(); // alloc: a test's plan
-    Plan { seed, faults, waits }
-}
-
-/// The plan of `seed`, for the control and replays.
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
+    Plan { faults, waits }
 }
 
 // --- The simulated kernel ------------------------------------------------------------------
 
-fn one_in(rng: &mut Rng, n: u64) -> bool {
-    n > 0 && rng.below(n) == 0
-}
-
-/// A point drawn in `[from, to)`, or `None` where that is empty.
-fn within(rng: &mut Rng, from: Duration, to: Duration) -> Option<Duration> {
+/// A point drawn from `tape` in `[from, to)`, or `None` (and no draw) where that is empty.
+fn within(tape: &Tape, from: Duration, to: Duration, label: &'static str) -> Option<Duration> {
     let span = to.saturating_sub(from).as_nanos() as u64;
-    (span > 0).then(|| from + Duration::from_nanos(rng.below(span)))
+    (span > 0).then(|| from + Duration::from_nanos(tape.below(span, label)))
 }
 
 /// One blocking call at the clock's now, given `left` (`None`: no limit), for an event at
-/// `event`: it blocks until the event or its timeout, unless a fault ends it first, and
-/// returns a drawn latency after.
+/// `event`: it blocks until the event or its timeout, unless a fault drawn from `tape` ends it
+/// first, and returns a drawn latency after.
 fn call(
     now: &Cell<Duration>,
-    rng: &mut Rng,
+    tape: &Tape,
     faults: &KernelFaults,
     event: Option<Duration>,
     left: Option<Duration>,
 ) -> io::Result<Once<()>> {
     let t0 = now.get();
-    let latency = Duration::from_nanos(1 + rng.below(faults.max_latency.as_nanos() as u64 + 1));
+    let latency = Duration::from_nanos(1 + tape.below(faults.max_latency.as_nanos() as u64 + 1, "latency ns"));
     if event.is_some_and(|it| it <= t0) {
         now.set(t0 + latency);
         return Ok(Once::Ready(()));
@@ -280,19 +241,19 @@ fn call(
             end = (tick, Once::Interrupted);
         }
     }
-    if one_in(rng, faults.eintr_one_in)
-        && let Some(at) = within(rng, t0, end.0)
+    if tape.one_in(faults.eintr_one_in, "eintr")
+        && let Some(at) = within(tape, t0, end.0, "eintr at")
     {
         end = (at, Once::Interrupted);
     }
-    if one_in(rng, faults.spurious_one_in)
-        && let Some(at) = within(rng, t0, end.0)
+    if tape.one_in(faults.spurious_one_in, "spurious")
+        && let Some(at) = within(tape, t0, end.0, "spurious at")
     {
         end = (at, Once::Spurious);
     }
-    if one_in(rng, faults.early_one_in)
+    if tape.one_in(faults.early_one_in, "early timeout")
         && end.1 == Once::TimedOut
-        && let Some(at) = within(rng, t0, end.0)
+        && let Some(at) = within(tape, t0, end.0, "early timeout at")
     {
         end = (at, Once::TimedOut);
     }
@@ -302,11 +263,11 @@ fn call(
 
 // --- A run and its oracle ------------------------------------------------------------------
 
-/// `plan`'s waits one after another on one clock, with `plant`: the first broken rule.
-fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
+/// `plan`'s waits one after another on one clock, with `plant`, the kernel drawing from
+/// `tape`: the first broken rule.
+fn run(tape: &Tape, plan: &Plan, plant: Plant) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
-    let mut rng = Rng::new(plan.seed);
     let faults = plan.faults;
     let bound = faults.latency_bound();
     for (n, wait) in plan.waits.iter().enumerate() {
@@ -314,7 +275,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         let deadline = wait.deadline.map(|it| Deadline::after(start, it));
         let event = wait.event.map(|it| start + it);
         let retry = Retry::new("a simulated event", deadline, start).planted(plant);
-        let waited = retry::drive(retry, &clock, |left| call(&now, &mut rng, &faults, event, left));
+        let waited = retry::drive(retry, &clock, |left| call(&now, tape, &faults, event, left));
         let end = now.get();
         let waited = waited.map_err(|error| format!("wait {n}: {error}"))?;
         let said = |what: &str| {
@@ -346,40 +307,24 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 
 /// The invariant: whatever interrupts it, every wait ends by its deadline, never says it
 /// passed before it did, and is ready whenever its event came first.
-#[hegel::test(test_cases = 400)]
-fn every_wait_ends_by_its_deadline_under_interruption(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn every_wait_ends_by_its_deadline_under_interruption() {
+    blaze_sim::check(Config::cases(400), |tape| drawn_run(tape, Plant::None));
 }
 
-/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a retry with the first relative timeout overruns a deadline under a train
-/// of interruptions.
+/// The case of `tape`: its plan drawn, noted for the report, and run with `plant`.
+fn drawn_run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let plan = plan(tape);
+    tape.note(format_args!("plan {plan:?}"));
+    run(tape, &plan, plant).map_err(Broke::Oracle)
+}
+
+/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] cases (test-the-cause on the
+/// test itself): a retry with the first relative timeout overruns a deadline under a train of
+/// interruptions.
 #[test]
 fn the_oracle_catches_a_retry_with_the_first_timeout() {
-    let plant = Plant::SameTimeout;
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(why) = run(&plan_of(seed), plant) {
-            eprintln!(
-                "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}"
-            );
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
-}
-
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
-    }
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::SameTimeout, "past its deadline", drawn_run);
 }
 
 /// A wait whose clock never moves ends with an error naming it once its fuel is spent, not a
@@ -423,21 +368,24 @@ fn a_passed_deadline_makes_exactly_one_call() {
 
 /// A [`Sim`] whose waits are interrupted delivers every completion, and no poll moves its
 /// clock past the deadline it was given.
-#[hegel::test(test_cases = 100)]
-fn a_sim_under_interruption_delivers_everything_by_each_deadline(tc: TestCase) {
-    let d = &mut Drawn(&tc);
-    let seed = d.int(0, u64::MAX);
+#[test]
+fn a_sim_under_interruption_delivers_everything_by_each_deadline() {
+    blaze_sim::check(Config::cases(100), a_sim_under_interruption);
+}
+
+fn a_sim_under_interruption(tape: &Tape) {
+    let seed = tape.next_u64("sim seed");
     let faults = Faults {
-        interrupt_one_in: d.int(1, 4) as u32,
-        max_latency: us(d.int(0, 50_000)),
+        interrupt_one_in: tape.int_in(1..=4u32, "interrupt one in"),
+        max_latency: us(tape.int_in(0..=50_000u64, "max latency us")),
         ..Faults::default()
     };
     let mut sim = Sim::new(seed, faults);
-    let timers = d.int(1, 16);
-    let writes = d.int(0, 8);
+    let timers = tape.int_in(1..=16u64, "timers");
+    let writes = tape.int_in(0..=8u64, "writes");
     let mut effects = Vec::new(); // alloc: a test's effects
     for n in 0..timers {
-        effects.push(Effect::Timer { after: us(d.int(0, 300_000)), tag: Tag(n) });
+        effects.push(Effect::Timer { after: us(tape.int_in(0..=300_000u64, "timer after us")), tag: Tag(n) });
     }
     for n in 0..writes {
         let file = FileName::new(&format!("f{n}")).unwrap();
@@ -451,9 +399,9 @@ fn a_sim_under_interruption_delivers_everything_by_each_deadline(tc: TestCase) {
         if seen.len() == wanted {
             break;
         }
-        let deadline = match d.coin() {
+        let deadline = match tape.coin("poll with no deadline") {
             true => Deadline::NEVER,
-            false => Deadline::after(sim.now(), us(d.int(0, 100_000))),
+            false => Deadline::after(sim.now(), us(tape.int_in(0..=100_000u64, "poll deadline us"))),
         };
         let before = seen.len();
         let got = sim.poll(&mut seen, deadline);
@@ -492,12 +440,12 @@ impl FutexFaults {
     }
 }
 
-fn futex_faults(d: &mut impl Draw) -> FutexFaults {
+fn futex_faults(tape: &Tape) -> FutexFaults {
     FutexFaults {
-        eintr_one_in: sometimes(d),
-        spurious_one_in: sometimes(d),
-        max_latency: Duration::from_nanos(d.int(0, 20_000)),
-        max_step: Duration::from_nanos(d.int(1, 50_000)),
+        eintr_one_in: sometimes(tape, "eintr one in"),
+        spurious_one_in: sometimes(tape, "spurious one in"),
+        max_latency: Duration::from_nanos(tape.int_in(0..=20_000u64, "max latency ns")),
+        max_step: Duration::from_nanos(tape.int_in(1..=50_000u64, "max step ns")),
     }
 }
 
@@ -510,40 +458,41 @@ struct Round {
     stray: bool,
 }
 
+/// The futex's choices (which call a fault hits, where, each latency and step) are drawn from
+/// the case's tape as the run goes.
 #[derive(Debug)]
 struct ParkPlan {
-    seed: u64,
     faults: FutexFaults,
     rounds: Vec<Round>,
 }
 
-fn park_plan(d: &mut impl Draw) -> ParkPlan {
-    let seed = d.int(0, u64::MAX);
-    let faults = futex_faults(d);
-    let n = d.int(1, MOST_WAITS);
+fn park_plan(tape: &Tape) -> ParkPlan {
+    let faults = futex_faults(tape);
+    let n = tape.int_in(1..=MOST_WAITS, "parks");
     let rounds = (0..n)
         .map(|_| {
-            let deadline = match d.int(0, 4) {
+            let deadline = match tape.int_in(0..=4u64, "deadline kind") {
                 0 => None,
-                _ => Some(us(d.int(0, 50_000))),
+                _ => Some(us(tape.int_in(0..=50_000u64, "deadline us"))),
             };
             // Nanoseconds, dense where the park's steps are; a park with no deadline always
             // gets one, or it would wait forever, as it should.
-            let unpark = match (deadline, d.int(0, 2)) {
+            let unpark = match (deadline, tape.int_in(0..=2u64, "unpark kind")) {
                 (Some(_), 0) => None,
-                _ => Some(Duration::from_nanos(d.int(0, 300_000))),
+                _ => Some(Duration::from_nanos(tape.int_in(0..=300_000u64, "unpark ns"))),
             };
-            Round { deadline, unpark, stray: d.int(0, 5) == 0 }
+            // A stray one in six, never at the calm 0.
+            Round { deadline, unpark, stray: tape.int_in(0..=5u64, "stray") == 5 }
         })
         .collect(); // alloc: a test's plan
-    ParkPlan { seed, faults, rounds }
+    ParkPlan { faults, rounds }
 }
 
 /// A futex on the virtual clock, with the unparks of a plan to run at their times: at a
 /// switch point of the park once their time has come, or while the park waits in it.
 struct FutexSim<'a> {
     now: &'a Cell<Duration>,
-    rng: RefCell<Rng>,
+    tape: &'a Tape,
     faults: FutexFaults,
     word: &'a AtomicU32,
     unparks: RefCell<VecDeque<Duration>>,
@@ -567,8 +516,8 @@ impl FutexSim<'_> {
         self.unparks.borrow().front().copied()
     }
 
-    fn fault_at(&self, rng: &mut Rng, one_in_n: u64, t0: Duration) -> Option<Duration> {
-        one_in(rng, one_in_n).then(|| t0 + Duration::from_nanos(rng.below(100_000)))
+    fn fault_at(&self, one_in_n: u64, t0: Duration, label: &'static str) -> Option<Duration> {
+        self.tape.one_in(one_in_n, label).then(|| t0 + Duration::from_nanos(self.tape.below(100_000, label)))
     }
 
     /// One wait call on `word` for `expected`, given `left`.
@@ -579,14 +528,11 @@ impl FutexSim<'_> {
         left: Option<Duration>,
     ) -> io::Result<Once<()>> {
         let t0 = self.now.get();
-        let (latency, eintr, spurious) = {
-            let mut rng = self.rng.borrow_mut();
-            let latency =
-                Duration::from_nanos(1 + rng.below(self.faults.max_latency.as_nanos() as u64 + 1));
-            let eintr = self.fault_at(&mut rng, self.faults.eintr_one_in, t0);
-            let spurious = self.fault_at(&mut rng, self.faults.spurious_one_in, t0);
-            (latency, eintr, spurious)
-        };
+        let latency = Duration::from_nanos(
+            1 + self.tape.below(self.faults.max_latency.as_nanos() as u64 + 1, "latency ns"),
+        );
+        let eintr = self.fault_at(self.faults.eintr_one_in, t0, "eintr");
+        let spurious = self.fault_at(self.faults.spurious_one_in, t0, "spurious");
         // The kernel's compare: a word that changed is `EAGAIN`, at once.
         if word.load(Ordering::SeqCst) != expected {
             self.now.set(t0 + latency);
@@ -649,10 +595,7 @@ impl Futex for FutexSim<'_> {
         if self.in_unpark.get() {
             return;
         }
-        let step = {
-            let mut rng = self.rng.borrow_mut();
-            Duration::from_nanos(1 + rng.below(self.faults.max_step.as_nanos() as u64))
-        };
+        let step = Duration::from_nanos(1 + self.tape.below(self.faults.max_step.as_nanos() as u64, "step ns"));
         self.now.set(self.now.get() + step);
         while let Some(at) = self.next_unpark() {
             if at > self.now.get() {
@@ -690,19 +633,23 @@ impl FutexCalls for FutexSim<'_> {
     }
 }
 
-/// `plan`'s parks one after another on one word and clock, with `plant`: the first broken rule.
-fn run_parks(plan: &ParkPlan, plant: ParkPlant) -> Result<(), String> {
-    run_parks_through(plan, plant, Through::Core)
+/// A drawn [`ParkPlan`] run with `plant`, the park reaching the simulated futex as `through`
+/// says: the first broken rule, the oracle's.
+fn drawn_parks(tape: &Tape, plant: ParkPlant, through: Through) -> Result<(), Broke> {
+    let plan = park_plan(tape);
+    tape.note(format_args!("plan {plan:?}"));
+    run_parks_through(tape, &plan, plant, through).map_err(Broke::Oracle)
 }
 
-/// [`run_parks`], the park reaching the simulated futex as `through` says.
-fn run_parks_through(plan: &ParkPlan, plant: ParkPlant, through: Through) -> Result<(), String> {
+/// `plan`'s parks one after another on one word and clock, with `plant`, the futex drawing
+/// from `tape`, the park reaching it as `through` says: the first broken rule.
+fn run_parks_through(tape: &Tape, plan: &ParkPlan, plant: ParkPlant, through: Through) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let word = AtomicU32::new(parking::EMPTY);
     let sim = FutexSim {
         now: &now,
-        rng: RefCell::new(Rng::new(plan.seed)),
+        tape,
         faults: plan.faults,
         word: &word,
         unparks: RefCell::new(VecDeque::new()),
@@ -791,27 +738,25 @@ fn run_parks_through(plan: &ParkPlan, plant: ParkPlant, through: Through) -> Res
 
 /// The invariant: whatever interrupts it and whenever its unpark comes, no wakeup is lost and
 /// every park ends by its deadline.
-#[hegel::test(test_cases = 300)]
-fn no_unpark_is_lost_under_interruption(tc: TestCase) {
-    let plan = park_plan(&mut Drawn(&tc));
-    if let Err(broke) = run_parks(&plan, ParkPlant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn no_unpark_is_lost_under_interruption() {
+    blaze_sim::check(Config::cases(300), |tape| drawn_parks(tape, ParkPlant::None, Through::Core));
 }
 
-/// The lost wakeup the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans: a park that
-/// looks for a token and then stores over one that came between.
+/// What the park's oracle says of an unpark or a token lost, whichever way the loss shows: a
+/// park that ends at its deadline after one, a token gone, or a futex wait nothing will wake.
+const LOST: &str = "lost";
+
+/// The lost wakeup the oracle must catch in one of [`CONTROL_SEEDS`] cases: a park that looks
+/// for a token and then stores over one that came between.
 #[test]
 fn the_oracle_catches_a_lost_wakeup() {
-    let plant = ParkPlant::CheckThenStore;
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(why) = run_parks(&park_plan(&mut Rng::new(seed)), plant) {
-            eprintln!("{plant:?} caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught ParkPlant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    blaze_sim::control(
+        Config::cases(CONTROL_SEEDS),
+        ParkPlant::None,
+        ParkPlant::CheckThenStore,
+        LOST,
+        |tape, plant| drawn_parks(tape, plant, Through::Core),
     );
 }
 
@@ -839,45 +784,44 @@ struct Kid {
     deadline: Option<Duration>,
 }
 
+/// The kernel's choices (which call a fault hits, where, each latency) are drawn from the
+/// case's tape as the run goes.
 #[derive(Debug)]
 struct ReapPlan {
-    seed: u64,
     faults: FutexFaults,
     kids: Vec<Kid>,
 }
 
-fn reap_plan(d: &mut impl Draw) -> ReapPlan {
-    let seed = d.int(0, u64::MAX);
-    let faults = futex_faults(d);
-    let n = d.int(1, MOST_WAITS);
+fn reap_plan(tape: &Tape) -> ReapPlan {
+    let faults = futex_faults(tape);
+    let n = tape.int_in(1..=MOST_WAITS, "children");
     let kids = (0..n)
         .map(|_| Kid {
-            exits: match d.int(0, 3) {
+            exits: match tape.int_in(0..=3u64, "exit kind") {
                 0 => Duration::ZERO,
-                _ => us(d.int(0, 100_000)),
+                _ => us(tape.int_in(0..=100_000u64, "exits us")),
             },
-            status: d.int(0, 255) as i32,
-            deadline: match d.int(0, 2) {
+            status: tape.int_in(0..=255i32, "status"),
+            deadline: match tape.int_in(0..=2u64, "deadline kind") {
                 0 => None,
-                _ => Some(us(d.int(0, 150_000))),
+                _ => Some(us(tape.int_in(0..=150_000u64, "deadline us"))),
             },
         })
         .collect(); // alloc: a test's plan
-    ReapPlan { seed, faults, kids }
+    ReapPlan { faults, kids }
 }
 
 /// The kernel's children on the virtual clock.
 struct ChildSim<'a> {
     now: &'a Cell<Duration>,
-    rng: RefCell<Rng>,
+    tape: &'a Tape,
     faults: FutexFaults,
     kids: RefCell<BTreeMap<i32, SimChild>>,
 }
 
 impl ChildSim<'_> {
     fn latency(&self) -> Duration {
-        let mut rng = self.rng.borrow_mut();
-        Duration::from_nanos(1 + rng.below(self.faults.max_latency.as_nanos() as u64 + 1))
+        Duration::from_nanos(1 + self.tape.below(self.faults.max_latency.as_nanos() as u64 + 1, "latency ns"))
     }
 
     /// Children whose exit has come are zombies.
@@ -903,13 +847,10 @@ impl ChildSim<'_> {
     fn call(&self, pid: i32, keep: bool, left: Option<Duration>) -> io::Result<Once<()>> {
         let t0 = self.now.get();
         let latency = self.latency();
-        let (eintr, spurious) = {
-            let mut rng = self.rng.borrow_mut();
-            let at = |rng: &mut Rng, n| {
-                one_in(rng, n).then(|| t0 + Duration::from_nanos(rng.below(100_000)))
-            };
-            (at(&mut rng, self.faults.eintr_one_in), at(&mut rng, self.faults.spurious_one_in))
+        let at = |n: u64, label: &'static str| {
+            self.tape.one_in(n, label).then(|| t0 + Duration::from_nanos(self.tape.below(100_000, label)))
         };
+        let (eintr, spurious) = (at(self.faults.eintr_one_in, "eintr"), at(self.faults.spurious_one_in, "spurious"));
         self.settle();
         let exits = match self.kids.borrow().get(&pid) {
             None => return Err(ChildSim::no_child(pid)),
@@ -1016,18 +957,22 @@ impl ChildCalls for ChildSim<'_> {
     }
 }
 
-/// `plan`'s children reaped one after another on one clock, with `plant`: the first broken rule.
-fn run_reaps(plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
-    run_reaps_through(plan, plant, Through::Core)
+/// A drawn [`ReapPlan`] run with `plant`, the reap reaching the simulated children as `through`
+/// says: the first broken rule, the oracle's.
+fn drawn_reaps(tape: &Tape, plant: ReapPlant, through: Through) -> Result<(), Broke> {
+    let plan = reap_plan(tape);
+    tape.note(format_args!("plan {plan:?}"));
+    run_reaps_through(tape, &plan, plant, through).map_err(Broke::Oracle)
 }
 
-/// [`run_reaps`], the reap reaching the simulated children as `through` says.
-fn run_reaps_through(plan: &ReapPlan, plant: ReapPlant, through: Through) -> Result<(), String> {
+/// `plan`'s children reaped one after another on one clock, with `plant`, the kernel drawing
+/// from `tape`, the reap reaching it as `through` says: the first broken rule.
+fn run_reaps_through(tape: &Tape, plan: &ReapPlan, plant: ReapPlant, through: Through) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let sim = ChildSim {
         now: &now,
-        rng: RefCell::new(Rng::new(plan.seed)),
+        tape,
         faults: plan.faults,
         kids: RefCell::new(BTreeMap::new()),
     };
@@ -1113,27 +1058,24 @@ fn run_reaps_through(plan: &ReapPlan, plant: ReapPlant, through: Through) -> Res
 
 /// The invariant: whatever interrupts the wait and whenever the child exits, every child is
 /// reaped once and its exit reported, by the reap's deadline or after it.
-#[hegel::test(test_cases = 300)]
-fn every_reaped_child_is_reported_under_interruption(tc: TestCase) {
-    let plan = reap_plan(&mut Drawn(&tc));
-    if let Err(broke) = run_reaps(&plan, ReapPlant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn every_reaped_child_is_reported_under_interruption() {
+    blaze_sim::check(Config::cases(300), |tape| drawn_reaps(tape, ReapPlant::None, Through::Core));
 }
 
-/// The unreported child the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans: a wait
-/// that reaps, leaving the reap after it nothing to report.
+/// What the reap's oracle says of a child the wait reaped, whose exit then goes to no one.
+const NEVER_REPORTED: &str = "never reported";
+
+/// The unreported child the oracle must catch in one of [`CONTROL_SEEDS`] cases: a wait that
+/// reaps, leaving the reap after it nothing to report.
 #[test]
 fn the_oracle_catches_a_reaped_child_never_reported() {
-    let plant = ReapPlant::ReapInWait;
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(why) = run_reaps(&reap_plan(&mut Rng::new(seed)), plant) {
-            eprintln!("{plant:?} caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught ReapPlant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    blaze_sim::control(
+        Config::cases(CONTROL_SEEDS),
+        ReapPlant::None,
+        ReapPlant::ReapInWait,
+        NEVER_REPORTED,
+        |tape, plant| drawn_reaps(tape, plant, Through::Core),
     );
 }
 
@@ -1143,29 +1085,22 @@ fn the_oracle_catches_a_reaped_child_never_reported() {
 /// made anew for every call), whatever interrupts it and whenever its unpark comes, no wakeup
 /// is lost and every park ends by its deadline.
 #[cfg(target_os = "linux")]
-#[hegel::test(test_cases = 300)]
-fn no_unpark_is_lost_through_the_direct_driver(tc: TestCase) {
-    let plan = park_plan(&mut Drawn(&tc));
-    if let Err(broke) = run_parks_through(&plan, ParkPlant::None, Through::Direct) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn no_unpark_is_lost_through_the_direct_driver() {
+    blaze_sim::check(Config::cases(300), |tape| drawn_parks(tape, ParkPlant::None, Through::Direct));
 }
 
 /// The lost wakeup, planted in the park the direct driver waits for: caught through it in one
-/// of [`CONTROL_SEEDS`] seeded plans.
+/// of [`CONTROL_SEEDS`] cases.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_oracle_catches_a_lost_wakeup_through_the_direct_driver() {
-    let plant = ParkPlant::CheckThenStore;
-    for seed in 0..CONTROL_SEEDS {
-        let plan = park_plan(&mut Rng::new(seed));
-        if let Err(why) = run_parks_through(&plan, plant, Through::Direct) {
-            eprintln!("{plant:?} caught through the direct driver at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught ParkPlant::{plant:?} through the direct driver at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    blaze_sim::control(
+        Config::cases(CONTROL_SEEDS),
+        ParkPlant::None,
+        ParkPlant::CheckThenStore,
+        LOST,
+        |tape, plant| drawn_parks(tape, plant, Through::Direct),
     );
 }
 
@@ -1173,29 +1108,22 @@ fn the_oracle_catches_a_lost_wakeup_through_the_direct_driver() {
 /// look again, then the reap), whatever interrupts the wait and whenever the child exits, every
 /// child is reaped once and its exit reported, by the reap's deadline or after it.
 #[cfg(target_os = "linux")]
-#[hegel::test(test_cases = 300)]
-fn every_reaped_child_is_reported_through_the_direct_driver(tc: TestCase) {
-    let plan = reap_plan(&mut Drawn(&tc));
-    if let Err(broke) = run_reaps_through(&plan, ReapPlant::None, Through::Direct) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn every_reaped_child_is_reported_through_the_direct_driver() {
+    blaze_sim::check(Config::cases(300), |tape| drawn_reaps(tape, ReapPlant::None, Through::Direct));
 }
 
 /// The unreported child, planted in the reap the direct driver waits for (its `waitid` without
-/// `WNOWAIT`): caught through it in one of [`CONTROL_SEEDS`] seeded plans.
+/// `WNOWAIT`): caught through it in one of [`CONTROL_SEEDS`] cases.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_oracle_catches_a_reaped_child_never_reported_through_the_direct_driver() {
-    let plant = ReapPlant::ReapInWait;
-    for seed in 0..CONTROL_SEEDS {
-        let plan = reap_plan(&mut Rng::new(seed));
-        if let Err(why) = run_reaps_through(&plan, plant, Through::Direct) {
-            eprintln!("{plant:?} caught through the direct driver at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught ReapPlant::{plant:?} through the direct driver at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
+    blaze_sim::control(
+        Config::cases(CONTROL_SEEDS),
+        ReapPlant::None,
+        ReapPlant::ReapInWait,
+        NEVER_REPORTED,
+        |tape, plant| drawn_reaps(tape, plant, Through::Direct),
     );
 }
 

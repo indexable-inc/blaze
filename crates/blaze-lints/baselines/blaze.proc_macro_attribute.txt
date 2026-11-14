@@ -149,9 +149,6 @@ harness-native-ui-view	unmeasured
 harness-proto	unmeasured
 harness-video	unmeasured
 harness-vt	unmeasured
-hegeltest	unmeasured
-hegeltest-c	unmeasured
-hegeltest-macros	unmeasured
 hir	unmeasured
 hir-def	unmeasured
 hir-expand	unmeasured
