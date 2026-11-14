@@ -1604,11 +1604,6 @@ struct KeptTrace {
 /// trace holds every fact its reads stand for even where one read (a source map's
 /// positions) keeps it out of a real store; what is compared here is what the facts see.
 fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
-    step_trace(source, body, Step::Borrowck)
-}
-
-/// `body`'s trace of `step` in `source`, as [`borrowck_trace`] keeps the borrow check's.
-fn step_trace(source: &str, body: &'static str, step: Step) -> KeptTrace {
     let db = super::perturb::db(source);
     let def = body_named(&db, body);
     let identity = crate::identity::early_identity(&db, def)
@@ -1616,7 +1611,7 @@ fn step_trace(source: &str, body: &'static str, step: Step) -> KeptTrace {
     with_steps_run(&db, true, |seen| {
         let mut facts: Vec<(FactRef, Option<ContentId>)> = Vec::new(); // alloc: test
         let mut through: Vec<&'static str> = Vec::new(); // alloc: test
-        for it in seen.iter().filter(|it| it.def == def && it.step == step) {
+        for it in seen.iter().filter(|it| it.def == def && it.step == Step::Borrowck) {
             match it.class {
                 Classified::Fact(fact) | Classified::Scan(fact) => {
                     facts.push((fact, values::value_in(&db, def, fact)));
@@ -1625,7 +1620,7 @@ fn step_trace(source: &str, body: &'static str, step: Step) -> KeptTrace {
                 Classified::Covered | Classified::Refused => {}
             }
         }
-        assert!(!facts.is_empty(), "`{body}`'s {step:?} read no fact: it did not run");
+        assert!(!facts.is_empty(), "`{body}`'s borrow check read no fact: it did not run");
         facts.sort_unstable();
         facts.dedup();
         through.sort_unstable();
@@ -2037,41 +2032,146 @@ const RENOMINALS: [Renominal; 3] = [
     },
 ];
 
-/// The invariant: a caller's stored inference, MIR and borrow check are not served after its
-/// callee's signature comes to name another nominal type of the same shape (a newtype for
-/// another, `PhantomData<A>` for `PhantomData<B>`, a return type with its own impls), though
-/// the caller's text, and so its identity, did not change: some fact its trace lists (the
-/// callee's `Signature`, whose value is its signature hash) tells the two programs apart. And
-/// where rustc rejects the caller after the edit, its inference reports the mismatch: the
-/// fixture says what it is meant to. A stale hit here accepts a program rustc rejects, or
-/// calls the impl of the type the callee no longer returns.
+/// The driver's facts ([`crate::Bodies`]: the real early identity, classification, values and
+/// seals), recording which steps of which bodies ran: the store classifies a step's reads only
+/// when it offers the step's result, which it does only after running it, never on a hit.
+struct Watch {
+    ran: Lock<Vec<(DefWithBodyId, Step)>>,
+}
+
+impl BodyFacts for Watch {
+    fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
+        crate::Bodies.identity(db, def)
+    }
+
+    fn classify(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        step: Step,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
+        name: &'static str,
+    ) -> Classified {
+        self.ran.lock().push((def, step));
+        crate::Bodies.classify(db, def, step, read, kind, name)
+    }
+
+    fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
+        crate::Bodies.value(db, def, fact)
+    }
+
+    fn sealed(
+        &self,
+        db: &Db,
+        def: DefWithBodyId,
+        group: blaze_query::db::SealGroup,
+        facts: &mut Vec<FactRef>,
+    ) -> bool {
+        crate::Bodies.sealed(db, def, group, facts)
+    }
+
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+        crate::Bodies.def_key(db, body, def)
+    }
+
+    fn def_of<'db>(
+        &self,
+        db: &'db Db,
+        body: DefWithBodyId,
+        key: ContentId,
+    ) -> Option<SolverDefId<'db>> {
+        crate::Bodies.def_of(db, body, key)
+    }
+}
+
+/// What one build of `source` over `store` did for `caller`: the steps of it that ran (a step
+/// that did not run was served from the store), whether its inference reports a type mismatch,
+/// and the flush's outcome (under [`Mode::Verify`], `Err` names a stored result that differs
+/// from running the step).
+struct Build {
+    ran: Vec<Step>,
+    mismatched: bool,
+    flushed: Result<(), String>,
+}
+
+/// A build of every body of `source`'s local crate (inference, MIR, borrow check) in a new
+/// database, as a driver makes one: the item store over `store`, the driver's facts.
+fn build_over(source: &str, store: &Arc<Memory>, mode: Mode) -> Build {
+    let db = super::perturb::db(source);
+    let watch = Arc::new(Watch { ran: Lock::new("test.itemhash.ran", Vec::new()) });
+    let installed = body_store::install(&db, store.clone(), watch.clone(), ContentId([7; 32]), mode)
+        .expect("an item store for the test database");
+    let bodies = crate_body_owners(&db, local_crate(&db));
+    for &def in &bodies {
+        let _ = InferenceResult::of(&db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(&db, def);
+    }
+    let caller = body_named(&db, "caller");
+    let mismatched = InferenceResult::of(&db, caller).has_type_mismatches();
+    let flushed = installed.flush().map(|_| ());
+    let mut ran: Vec<Step> = watch // alloc: test
+        .ran
+        .lock()
+        .iter()
+        .filter(|&&(def, _)| def == caller)
+        .map(|&(_, step)| step)
+        .collect();
+    ran.sort_unstable();
+    ran.dedup();
+    drop(installed);
+    Build { ran, mismatched, flushed }
+}
+
+/// The invariant: a caller's inference, MIR and borrow check stored in a build are not served
+/// in a later build after its callee's signature comes to name another nominal type of the
+/// same shape (a newtype for another, `PhantomData<A>` for `PhantomData<B>`, a return type with
+/// its own impl per type), though the caller's text, and so its key, did not change. The store
+/// is the real one, end to end: a first build stores every step; the control, a second build of
+/// the same program over the same store, runs none of `caller`'s steps (each is a hit, so a
+/// row is there to be found); then a build of the edited program under [`Mode::Verify`], where
+/// a hit runs the step as well and a stored result that differs from it fails the flush. A
+/// stale hit is a failed flush, and where rustc rejects the edited caller, its inference must
+/// report the mismatch (a stale answer, made before the edit, has none). A stale hit accepts a
+/// program rustc rejects, or calls the impl of the type the callee no longer returns.
 #[test]
 fn a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller() {
-    let mut stale: Vec<String> = Vec::new(); // alloc: test
     for case in &RENOMINALS {
-        let edited = super::perturb::db(case.after);
-        let caller = body_named(&edited, "caller");
-        assert_eq!(
-            InferenceResult::of(&edited, caller).has_type_mismatches(),
-            case.rejected,
-            "{}: the edited caller's inference does not say what rustc says",
-            case.what,
+        let store = Arc::new(Memory::default());
+        let first = build_over(case.before, &store, Mode::Serve);
+        assert!(first.flushed.is_ok(), "{}: the first build: {:?}", case.what, first.flushed);
+        assert!(
+            first.ran.contains(&Step::Infer),
+            "{}: the first build did not run `caller`'s inference",
+            case.what
         );
-        for step in [Step::Infer, Step::Mir, Step::Borrowck] {
-            let kept = step_trace(case.before, "caller", step);
-            assert_eq!(
-                kept.identity,
-                crate::identity::early_identity(&edited, caller).expect("the caller has a key"),
-                "{}: the caller's text did not change, so neither does its key",
-                case.what,
-            );
-            if reused(&kept, case.after) {
-                stale.push(format!(
-                    "{}: `caller`'s {step:?} served stale; its facts: {:#?}",
-                    case.what, kept.facts
-                )); // alloc: test
-            }
-        }
+        let again = build_over(case.before, &store, Mode::Serve);
+        assert!(again.flushed.is_ok(), "{}: the second build: {:?}", case.what, again.flushed);
+        assert!(
+            !again.ran.contains(&Step::Infer),
+            "{}: the control: the same program over the same store ran `caller`'s inference \
+             again, so nothing of it was stored or found and the edit below proves nothing \
+             (ran: {:?})",
+            case.what,
+            again.ran
+        );
+        let edited = build_over(case.after, &store, Mode::Verify);
+        assert!(
+            edited.flushed.is_ok(),
+            "{}: a stored result of `caller` was served after the edit and differs from \
+             running it: {:?}",
+            case.what,
+            edited.flushed
+        );
+        assert_eq!(
+            edited.mismatched, case.rejected,
+            "{}: the edited caller's inference does not say what rustc says (ran: {:?})",
+            case.what, edited.ran
+        );
     }
-    assert!(stale.is_empty(), "{}", stale.join("\n"));
 }
