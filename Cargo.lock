@@ -481,6 +481,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-audit"
+version = "0.0.0"
+dependencies = [
+ "blaze-fetch",
+ "hegeltest",
+ "semver",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "blaze-bench"
 version = "0.0.0"
 dependencies = [
@@ -528,6 +540,7 @@ dependencies = [
  "base-db",
  "blaze-alloc-count",
  "blaze-api",
+ "blaze-audit",
  "blaze-build-script",
  "blaze-cas",
  "blaze-certify",
@@ -2392,7 +2405,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-audit",
  "blaze-core",
+ "blaze-fetch",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",

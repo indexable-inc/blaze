@@ -192,6 +192,7 @@ fn only_a_crates_io_package_with_a_checksum_has_a_public_origin() {
         is_member,
         default_run: None,
         checksum: None,
+        tree: None,
         tests: blaze_units::query::TestSandbox::default(),
         const_macros: None,
     };

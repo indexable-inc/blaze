@@ -126,6 +126,7 @@ fn package(id: &str, name: &str, dir: &str) -> PackagePlan {
         is_member: true,
         default_run: None,
         checksum: None,
+        tree: None,
         tests: TestSandbox::default(),
         const_macros: None,
     }

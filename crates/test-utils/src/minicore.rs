@@ -248,6 +248,18 @@ pub mod marker {
 
     #[rustc_builtin_macro]
     pub macro ConstParamTy($item:item) {}
+
+    // As library/core/src/marker.rs: the scalars, and (bounded on `unsized_const_params`
+    // there, which hir-ty checks on the parameter's type) `str`, slices and references.
+    macro_rules! const_param_ty_impls {
+        ($($t:ty)*) => { $(impl ConstParamTy_ for $t {})* };
+    }
+    const_param_ty_impls! {
+        usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 bool char () str
+    }
+    impl<T: ConstParamTy_, const N: usize> ConstParamTy_ for [T; N] {}
+    impl<T: ConstParamTy_> ConstParamTy_ for [T] {}
+    impl<T: ConstParamTy_ + ?Sized> ConstParamTy_ for &T {}
     // endregion:const_param_ty
 
     // region:eq

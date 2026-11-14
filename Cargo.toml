@@ -558,6 +558,8 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-expansion = { path = "crates/blaze-expansion" }
 blaze-ext = { path = "crates/blaze-ext" }
 blaze-ext-host = { path = "crates/blaze-ext-host" }
+# `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
+blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }

@@ -67,7 +67,7 @@ pub struct PlainStore<D: Driver = Native> {
 
 impl PlainStore<Native> {
     /// The plain store in `root/plain`, with the namespaces `settings` name.
-    pub fn open(root: &std::path::Path, settings: &Settings) -> Result<PlainStore<Native>, String> {
+    pub fn open(root: &std::path::Path, settings: &Settings) -> Result<PlainStore<Native>, StoreError> {
         Driven::open(root, settings).map(PlainStore::new)
     }
 }
@@ -192,16 +192,15 @@ impl<D: Driver> Store for PlainStore<D> {
                 }
                 Ok(put)
             }
+            // Other bytes under the key: an answer, not a failure.
             Err(PutError::Mismatch(_)) => Ok(Put::Other),
-            Err(PutError::NotWritable { namespace }) => Err(StoreError::NotWritable { namespace }),
-            Err(PutError::TooLong { key: long, len }) => Err(StoreError::TooLong { tag: K::TAG, key: long.0, len }),
-            Err(other) => Err(StoreError::Broken { why: other.to_string() }),
+            Err(refused) => Err(refused.into_store(K::TAG)),
         }
     }
 
     fn commit(&self) -> Result<Generation, StoreError> {
         let mut writer = self.writer.lock();
-        let committed = writer.commit_with(Vec::new_in(Global)).map_err(|why| StoreError::Broken { why })?;
+        let committed = writer.commit_with(Vec::new_in(Global))?;
         self.refresh(&writer);
         Ok(Generation(committed.generation))
     }
@@ -214,13 +213,13 @@ impl<D: Driver> Store for PlainStore<D> {
         let mut writer = self.writer.lock();
         let mut keys = Vec::with_capacity_in(roots.len(), Global);
         keys.extend(roots.iter().map(|it| Key(it.key)));
-        writer.root("compact", &keys).map_err(|why| StoreError::Broken { why: why.to_string() })?;
+        writer.root("compact", &keys)?;
         writer.core_mut().set_cap(cap);
-        writer.commit_with(Vec::new_in(Global)).map_err(|why| StoreError::Broken { why })?;
+        writer.commit_with(Vec::new_in(Global))?;
         // Each slice replaces at least one segment, so one a segment (and one to say there is
         // no more) bounds them.
         let most = writer.core().segments().len() as u32 + 1;
-        let slices = writer.slices(most).map_err(|why| StoreError::Broken { why })?;
+        let slices = writer.slices(most)?;
         self.refresh(&writer);
         let mut out = Compacted::default();
         for it in &slices {

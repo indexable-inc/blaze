@@ -557,6 +557,7 @@ pub(crate) fn units(
                 manifest_path,
                 package.is_member,
                 checksum,
+                git_tree(&resolved.pins, *id),
                 tests,
                 const_macros,
             )),
@@ -1430,14 +1431,28 @@ fn foreign_profiles(
     Ok(profiles)
 }
 
+/// The digest `blaze.lock` pins a git package's tree by, which the load required before it
+/// located the package ([`blaze_audit::source::require_git`]); `None` for any other source.
+fn git_tree(pins: &blaze_audit::pins::SourcePins, id: PackageId) -> Option<String> {
+    let source = id.source_id();
+    if !source.is_git() {
+        return None;
+    }
+    let commit = source.precise_git_fragment()?;
+    pins.git(source.url().as_str(), commit).map(|it| it.tree.to_string())
+}
+
 /// A package as the build names it. `checksum` is the resolve's, in hex: kept only for a
-/// crates.io package, whose `.crate` it is the SHA-256 of.
+/// crates.io package, whose `.crate` it is the SHA-256 of. `tree` is a git package's pinned
+/// tree digest ([`git_tree`]).
+#[allow(clippy::too_many_arguments)] // a package's parts, each once
 fn package_plan(
     id: PackageId,
     manifest: &Manifest,
     manifest_path: &Path,
     is_member: bool,
     checksum: Option<&str>,
+    tree: Option<String>,
     tests: TestSandbox,
     const_macros: Option<String>,
 ) -> PackagePlan {
@@ -1456,6 +1471,7 @@ fn package_plan(
         checksum: checksum
             .filter(|_| id.source_id().is_crates_io())
             .and_then(blaze_format::hex::decode::<32>),
+        tree,
         tests,
         const_macros,
     }

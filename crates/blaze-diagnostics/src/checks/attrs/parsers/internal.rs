@@ -304,6 +304,7 @@ const LANG_ITEMS: &[(&str, &[Policy])] = &[
     ("bitxor", TRAIT),
     ("bitxor_assign", TRAIT),
     // blaze's own, `core::reflect`'s (`#![feature(blaze_comptime)]`): rustc has none of them.
+    ("blaze_described", STRUCT),
     ("blaze_enum", TRAIT),
     ("blaze_field", TRAIT),
     ("blaze_fields", STRUCT),
@@ -313,6 +314,8 @@ const LANG_ITEMS: &[(&str, &[Policy])] = &[
     ("blaze_only_marked", STRUCT),
     ("blaze_only_unmarked", STRUCT),
     ("blaze_struct", TRAIT),
+    ("blaze_type_of", TRAIT),
+    ("blaze_type_of_type", ASSOC_TY),
     ("blaze_unmarked", TRAIT),
     ("blaze_variant", TRAIT),
     ("blaze_variant_of", STRUCT),
@@ -798,8 +801,9 @@ mod tests {
     #[test]
     fn lang_items_are_sorted_by_their_bytes() {
         assert!(LANG_ITEMS.windows(2).all(|it| it[0].0.as_bytes() < it[1].0.as_bytes()));
-        // 231 since f119ec6daa added blaze's `blaze_memo_point` (the `#[blaze::memo]` trait).
-        assert_eq!(LANG_ITEMS.len(), 231);
+        // 234 since `type_of!` added blaze's `blaze_described`, `blaze_type_of` and
+        // `blaze_type_of_type` (docs/v2/plan/design/type-of.md).
+        assert_eq!(LANG_ITEMS.len(), 234);
     }
 
     #[test]
