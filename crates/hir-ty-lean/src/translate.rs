@@ -53,10 +53,33 @@ pub struct Shape {
     /// `blaze_core::world::threads`, or a shared function): it gives a `Threads.Prog`, a program
     /// of operations on that memory. A shared function is monadic.
     pub shared: bool,
+    /// Which of `blaze_core::world::threads`' runners it reaches, which says the memory a
+    /// theorem about it is stated in.
+    pub worlds: Worlds,
     /// Its `&mut` parameters, by position: their final values follow its result.
     pub mut_params: Vec<usize>,
     /// It returns `()`, which the model leaves out when it gives `&mut` values back.
     pub returns_unit: bool,
+}
+
+/// Which of `blaze_core::world::threads`' runners a function reaches, through its own calls
+/// and its callees' (the closures it gives a runner included). `two` runs its threads in the
+/// sequentially consistent world (`Threads.Prog.value`), `two_weak` in the weak one
+/// (`Threads.Prog.valueWeak`); the model of a call is `Threads.two_of` for both, so this is
+/// where the difference is kept (decision D46).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Worlds {
+    /// It reaches `threads::two`.
+    pub two: bool,
+    /// It reaches `threads::two_weak`.
+    pub two_weak: bool,
+}
+
+impl Worlds {
+    /// What either of `self` and `other` reaches.
+    pub fn join(self, other: Worlds) -> Worlds {
+        Worlds { two: self.two || other.two, two_weak: self.two_weak || other.two_weak }
+    }
 }
 
 /// A function's model.
@@ -135,6 +158,31 @@ fn shares(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> bool {
         }
         Node::Block(body) | Node::Loop(body) => shares(body, shapes),
         Node::Break(_) | Node::Continue(_) | Node::Return | Node::End(_) => false,
+    })
+}
+
+/// Which runners `nodes` reach ([`Worlds`]): a call of `two` or `two_weak` itself and what its
+/// two closures reach, and what each function they call reaches by its shape in `shapes` (its
+/// callees, closures among them, are emitted before it, so their shapes are known).
+fn worlds(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> Worlds {
+    let reached = |name: &String| shapes.get(name).map_or(Worlds::default(), |it| it.worlds);
+    nodes.iter().fold(Worlds::default(), |all, node| {
+        all.join(match node {
+            Node::Do(Stmt::Call { callee, .. }) => match callee {
+                Callee::Two { first, second, weak } => {
+                    let own = Worlds { two: !*weak, two_weak: *weak };
+                    own.join(reached(first)).join(reached(second))
+                }
+                Callee::Function { name } => reached(name),
+                Callee::Shared { .. } | Callee::Model { .. } => Worlds::default(),
+            },
+            Node::Do(_) => Worlds::default(),
+            Node::Branch { arms, otherwise, .. } => arms
+                .iter()
+                .fold(worlds(otherwise, shapes), |all, (_, arm)| all.join(worlds(arm, shapes))),
+            Node::Block(body) | Node::Loop(body) => worlds(body, shapes),
+            Node::Break(_) | Node::Continue(_) | Node::Return | Node::End(_) => Worlds::default(),
+        })
     })
 }
 
@@ -1227,9 +1275,18 @@ impl<'a> Translate<'a> {
                 }
                 self.write(dest, Rhs::Prog(app(callee, terms)), lets, at)
             }
-            Stmt::Call { dest, callee: Callee::Two { first, second }, args, at } => {
+            Stmt::Call { dest, callee: Callee::Two { first, second, weak }, args, at } => {
+                // The program is the same for both runners: which memory it runs in is the
+                // statement's ([`Worlds`]).
+                let runner = match weak {
+                    true => "two_weak",
+                    false => "two",
+                };
                 let [schedule, first_env, second_env] = args.as_slice() else {
-                    return Err(self.refuse("a call of `two` not given a schedule and two closures", at));
+                    return Err(self.refuse(
+                        format!("a call of `{runner}` not given a schedule and two closures"),
+                        at,
+                    ));
                 };
                 let schedule = self.operand(schedule, lets, at)?;
                 let shapes: &'a BTreeMap<String, Shape> = self.shapes;
@@ -1241,7 +1298,7 @@ impl<'a> Translate<'a> {
                     if !shape.mut_params.is_empty() {
                         return Err(self.refuse(
                             format!(
-                                "a closure given to `blaze_core::world::threads::two` whose call \
+                                "a closure given to `blaze_core::world::threads::{runner}` whose call \
                                  writes its captures back (`{callee}` takes its closure by `&mut`; a \
                                  thread shares nothing with its caller but the memory; rule \
                                  SharedLend)"
@@ -1934,6 +1991,7 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
         .collect();
     // A shared function gives a `Threads.Prog`: it is monadic whatever is left of its body.
     let shared = shares(&body.nodes, shapes);
+    let worlds = worlds(&body.nodes, shapes);
     translate.prog_level = shared;
     translate.result = translate.types(&translate.returned);
     let live: Set = translate.returned.iter().copied().collect();
@@ -1986,7 +2044,7 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     }
     Ok(Model {
         decls,
-        shape: Shape { fuel: translate.uses_fuel, monadic, shared, mut_params, returns_unit },
+        shape: Shape { fuel: translate.uses_fuel, monadic, shared, worlds, mut_params, returns_unit },
         params,
         result,
     })

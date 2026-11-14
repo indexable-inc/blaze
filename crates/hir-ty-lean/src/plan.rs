@@ -931,7 +931,7 @@ fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::Shape;
+    use crate::translate::{Shape, Worlds};
 
     fn module(function: &str, statement: bool, imports: Vec<Emitted>, body: &str) -> Emitted {
         let name = function.replace("::", ".");
@@ -947,7 +947,7 @@ mod tests {
             name,
             text,
             clauses: Vec::new(),
-            shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+            shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
             imports,
         }
     }

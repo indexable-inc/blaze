@@ -23,8 +23,10 @@ join shows the parent everything its children saw; a later `two` starts fresh).
 a write releases under `Release`, `AcqRel` and `SeqCst`. `SeqCst` means `AcqRel` here and no
 more: that is sound, since `SeqCst` promises at least that, and it loses what only `SeqCst`
 promises (one total order of all `SeqCst` operations: store buffering is shown here even with
-`SeqCst`). A run whose every operation is `SeqCst` is the sequentially consistent world's
-(`Prog.valueAny`). An update that writes reads and writes with its `success` ordering; one that
+`SeqCst`). A theorem states which world it is in by what it runs its threads with:
+`threads::two` the sequentially consistent world (`Prog.value`), `threads::two_weak` this one
+(`Prog.valueWeak`). A run whose every operation is `SeqCst` is still run here as release and
+acquire. An update that writes reads and writes with its `success` ordering; one that
 writes nothing reads with its `failure` ordering.
 
 **The world's pick** (from the schedule's step; 0 for thread 0's own operations) says which
@@ -424,12 +426,5 @@ def valueWeak {α : Type} (p : Prog α) : Result α :=
   | .ok (v, _) => .ok v
   | .fail e => .fail e
   | .div => .div
-
-/-- A run the sequentially consistent world is the meaning of (every operation of the threads
-`SeqCst`, or one cell) is run there; any other is run in the weak world. -/
-def valueAny {α : Type} (p : Prog α) : Result α :=
-  match p.value with
-  | .fail .unmodelled => p.valueWeak
-  | r => r
 
 end Blaze.Threads.Prog

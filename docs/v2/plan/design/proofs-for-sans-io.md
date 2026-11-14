@@ -330,8 +330,8 @@ read joins it, so what was written before a release is seen after the acquire th
 An update is glued to the message it read (nothing goes between) and continues its release
 sequence. A futex look sees at least what the caller of every completed wake had seen. A
 spawn gives a thread its parent's view and a join gives the parent its children's.
-`Prog.valueAny` runs a program in the sequentially consistent world where that world is its
-meaning and in this one where it refuses.
+A program's value in this world is `Prog.valueWeak`, and a theorem says which world it is
+stated in by the runner it calls (decision D46, below).
 
 - It has no promises, so it cannot show load buffering, which ARM allows of plain loads and
   stores. A run that could show it is refused (rule R1: a write that does not release, after
@@ -355,11 +355,17 @@ meaning and in this one where it refuses.
   panic that names the rule; each word holds its newest message's value after every step.
   It is held to the Lean world by that world's 48 litmus runs restated in Rust with the same
   schedules and the same answers.
-- To build: the translator's entry for `two_weak` and the statement's choice; the induction
-  over a schedule for the weak world (`two_exec` over `execWeak`); and the first proof,
-  `handoff::Wake`: a sender's relaxed store of its slot and its `wake`, and the driver's
-  `drain` and relaxed read of the slot, for every schedule and every stale read: the driver
-  saw the slot or the sender was told to wake it. `Prog.valueAny` goes with it.
+- The translator (built 2026-11-14): a call of `two_weak` is `Threads.two_of`, as `two`'s
+  is; each function carries whether it reaches `two` and whether it reaches `two_weak`,
+  through its callees and closures; a theorem that reaches `two_weak` has its statement over
+  `.valueWeak`, and one that reaches both is refused by name. `Prog.valueAny` is gone.
+- The first statement in the weak world (stated and run 2026-11-14, not yet proved):
+  `handoff::no_hand_back_is_missed`, of the real `Wake`: a sender's relaxed store of its slot
+  and its `wake`, the driver's `drain` and its relaxed read of the slot, for every schedule
+  and every stale read: the driver saw the slot or the sender was told to wake it. Its
+  control is the same two threads with the flag's swaps `Relaxed`.
+- To build: the induction over a schedule for the weak world (`two_exec` over `execWeak`,
+  with step lemmas that hold for every pick) and that statement's proof.
 
 **Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
 sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait

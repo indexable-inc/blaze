@@ -55,7 +55,7 @@ pub use spec::Spec;
 
 use lean::{Binder, Decl, Infix, Module, Pat, Term, app, atom, infix, name};
 use body::Instance;
-use translate::{Model, Shape};
+use translate::{Model, Shape, Worlds};
 
 /// The translator's version: part of every proof key. Raised with any change to what is
 /// emitted.
@@ -82,6 +82,8 @@ pub const LIBRARY: &[(&str, &str)] = &[
     // Threads that share atomic words, and `core::sync::atomic` over them.
     ("Blaze.Threads", include_str!("../../../lean/Blaze/Threads.lean")),
     ("Blaze.Atomic", include_str!("../../../lean/Blaze/Atomic.lean")),
+    // The weak world, which a theorem that reaches `threads::two_weak` is stated in.
+    ("Blaze.ThreadsWeak", include_str!("../../../lean/Blaze/ThreadsWeak.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
@@ -269,7 +271,7 @@ fn emit_in<'db>(
     for adt in body.adts.iter().filter(|it| lowered.orders.contains(&it.name)) {
         imports.push(ord_module(adt).map_err(|what| refuse(what))?);
         for function in ORDER_FUNCTIONS {
-            let pure = Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false };
+            let pure = Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false };
             shapes.insert(format!("{}.impl.{function}", adt.name), pure);
         }
     }
@@ -397,6 +399,15 @@ fn theorem_shape(body: &body::Body, model: &Model) -> Result<(), NotTranslated> 
              speaks of by value or by shared reference)",
         ));
     }
+    // Its statement is over one memory, the one the runner it reaches runs in
+    // ([`theorem_statement`]): a schedule's picks mean different things in the two.
+    if model.shape.worlds.two && model.shape.worlds.two_weak {
+        return Err(refuse(&format!(
+            "the `#[blaze::theorem]` `{}`: it reaches both `threads::two` and \
+             `threads::two_weak`: a theorem is stated in one memory (decision D46)",
+            body.display
+        )));
+    }
     Ok(())
 }
 
@@ -442,9 +453,17 @@ fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
     args.extend(model.params.iter().map(|it| name(it.name.clone())));
     let call = app(function, args);
     // A shared function's model is a program of operations on the memory threads share: it is
-    // run alone, from an empty memory (`Threads.Prog.value`), and gives `true`.
+    // run alone, from an empty memory, and gives `true`. The memory is the one the runner it
+    // reaches runs in (decision D46): the weak world (`Threads.Prog.valueWeak`) where it reaches
+    // `threads::two_weak`, else the sequentially consistent one (`Threads.Prog.value`), which a
+    // function that reaches no runner (atomics on one thread) is also stated in.
+    // [`theorem_shape`] refuses a theorem that reaches both.
+    let run = match model.shape.worlds.two_weak {
+        true => "valueWeak",
+        false => "value",
+    };
     let holds = match (model.shape.shared, model.shape.monadic) {
-        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), "value".to_owned()), app("Result.ok", vec![atom("true")])),
+        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), run.to_owned()), app("Result.ok", vec![atom("true")])),
         (false, true) => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
         (false, false) => infix(Infix::Eq, call, atom("true")),
     };
@@ -483,7 +502,7 @@ pub fn type_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -522,7 +541,7 @@ pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -667,7 +686,7 @@ pub fn ord_module(adt: &body::AdtDecl) -> Result<Emitted, String> {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, worlds: Worlds::default(), mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     })
 }
@@ -754,7 +773,7 @@ pub fn opaque_module(opaque: &body::OpaqueFn) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: true, shared: false, mut_params, returns_unit },
+        shape: Shape { fuel: false, monadic: true, shared: false, worlds: Worlds::default(), mut_params, returns_unit },
         imports: Vec::new(),
     }
 }

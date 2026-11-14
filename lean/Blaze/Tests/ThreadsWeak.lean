@@ -140,11 +140,11 @@ example : (spawn [a 0, b]).valueWeak = .ok (5, 9) := by rfl
 example : (spawn [a 1, b]).valueWeak = .ok (5, 9) := by rfl
 example : (spawn [b, a 2]).valueWeak = .ok (5, 9) := by rfl
 
-/-! 8. `valueAny`. -/
+/-! 8. The two worlds, one program. -/
 
 -- Two cells with weaker orderings: the sequentially consistent world refuses, the weak one runs.
 example : (sb .Release .Acquire [a, b, a 1, b 1]).value = .fail .unmodelled := by rfl
-example : (sb .Release .Acquire [a, b, a 1, b 1]).valueAny = .ok (0, 0) := by rfl
+example : (sb .Release .Acquire [a, b, a 1, b 1]).valueWeak = .ok (0, 0) := by rfl
 
 /-- One cell, weaker orderings: the sequentially consistent world's run. -/
 def weak_one (schedule : List Step) : Prog Int := do
@@ -154,8 +154,7 @@ def weak_one (schedule : List Step) : Prog Int := do
   pure last.val
 
 example : (weak_one [a, b]).value = .ok 2 := by rfl
-example : (weak_one [a, b]).valueAny = .ok 2 := by rfl
-example : (weak_one [b, a]).valueAny = .ok 1 := by rfl
+example : (weak_one [b, a]).value = .ok 1 := by rfl
 
 /-! 9. A futex. -/
 
