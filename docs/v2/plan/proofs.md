@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-106 theorems: 93 in `lean`, 13 in `lean/analysis`.
+108 theorems: 95 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1027,4 +1027,20 @@ theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
 
 ```lean
 theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
+```
+
+## V16
+
+**`blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_retry_waits_what_is_left holds of its model: from every state of a blocking wait and every reading of the clock after a call that was not ready, the wait ends exactly when its deadline has passed at that reading, and where it goes on the next call is given what is left of the deadline at that reading, never an earlier timeout; and nothing panics.
+
+```lean
+theorem blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof :
+    blaze_core.wait.retry.a_retry_waits_what_is_left.spec.statement
+```
+
+**`blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_stopped_clock_ends_the_wait holds of its model: from every state of a blocking wait, 65,536 calls in a row that return not ready with the clock at or before the wait's last reading do not all say again: the deadline passes or the wait fails, naming the clock.
+
+```lean
+theorem blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof :
+    blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.statement
 ```
