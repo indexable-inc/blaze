@@ -153,6 +153,30 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 | f | `&mut` inside a value or returned | backward functions, as Aeneas |
 | g | recursion | fuel, as loops |
 
+- **Generics are translated by instance** (step b; methods of non-generic trait impls built
+  2026-11-14, the rest designed here). A theorem function is closed, so everything it reaches
+  is reached at concrete type arguments, as in codegen:
+  - An *instance* is a function with every generic argument concrete. A body is translated
+    at an instance: each type in it is substituted before it is modelled, each callee's
+    generic arguments are substituted and name the callee's instance, and a call of a trait
+    method is resolved to its impl at that instance, with the lookup codegen uses (the one
+    static dispatch already goes through). A generic struct or enum is a Lean structure per
+    instance. Lifetimes are dropped; a const argument is part of the instance.
+  - A Lean name is the function's path and its arguments, written so that two instances
+    never share one (`Wheel.insert` at `u32` and at `Vec<u8>` are two modules); two that
+    would is a refusal, never one replacing the other. Instances are found from the roots,
+    so none is made that no theorem reaches; a chain of instances deeper than a stated bound
+    (a function that calls itself at an ever larger type) is refused by name.
+  - This is also what closures and std's combinators need (step c): a closure is an
+    instance of its body over its captures, and `Option::map` is `library/`'s own source at
+    the instance of its closure.
+  - `blaze prove --subset` counts a generic function by the instances the crate's own
+    functions reach: translated when each translates, refused under the first refusal, and
+    in a line of its own when nothing reaches it.
+  - Losing alternative: Lean polymorphism with a dictionary per trait bound (Aeneas). One
+    proof would cover every `T`, but a statement has to be closed to be a theorem function,
+    bounds with associated types need a second encoding, and codegen already defines what
+    an instance means. It can be added for a theorem over all `T` when one is wanted.
 - **What is translated** is the code of the build being proved: no `cfg(test)` field or
   planted bug is in a model.
 - **Order.** After step a the next step is the one that unlocks the most functions blocked
