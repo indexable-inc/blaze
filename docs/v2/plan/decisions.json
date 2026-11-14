@@ -350,6 +350,14 @@
    "why": "A key hit with no check is unsound for real Rust: `a + b`, `?`, `for`, a deref and auto traits look up what the text does not name, and blaze-unitkey (read 2026-11-13) covers none of them; the simulation could not see it because its model's reads were the key's names. A list of implicit lookups would be a patch per missed case, each a silent stale answer (rules 21, 54). It also removes a copy of every reused record and a re-key of every unit above an interface edit.",
    "recommended": "The test-engine session proposed it and an outside reviewer said adopt with changes; the main agent of the port (claude-fable-5-2) agrees and builds it. The owner has not ruled; it is his to reverse.",
    "state": "Built: blaze-keyed rewritten with its simulation and an audit policy, blaze-host on it, blaze-unitkey keyed from own text; tests pass on blaze-vm (2026-11-14). blaze-front and the command are not on it yet."
+  },
+  {
+   "id": "D40",
+   "date": "2026-11-14",
+   "decision": "blaze carries a patched copy of rustls 0.23.46 (vendor/rustls; vendor/rustls/SOURCE.md lists the change). The patch is additive, two functions: a TLS 1.3 client session ticket written as bytes (`Tls13ClientSessionValue::to_bytes`) and read back under a config (`ClientConfig::tls13_ticket_from_bytes`). With it a blaze process keeps the tickets its cache origin sent in an owner-only file beside the credentials (`remote-tickets.bin`, mode 0600, none older than seven days), and the next process sends its first anonymous reads of the public cache as 0-RTT early data. Only a GET or HEAD of an immutable, content-addressed `public/` object goes as early data; everything signed stays on HTTP/1.1.",
+   "why": "A blaze command is a process that answers and exits, so each one opens its QUIC connection to the cache from cold: without a ticket from an earlier process that is one round trip before the first request leaves. rustls 0.23 cannot hand a ticket to another process (the value's fields are private, its constructor is crate-private, it has no encoding, and it is tied by pointer to the config that received it), so the piece is built where the fields are (rule build-the-missing-piece), as the tree already does for quinn-proto, cranelift and 20 other crates under vendor/.",
+   "recommended": "The main agent (claude-fable-5-2) decided it, after raising it with the owner several times without an answer. A patched TLS library is a thing an owner may not want: the owner has not ruled and it is his to reverse. Reversing is deleting vendor/rustls and its `[patch]` line and blaze-http's `Tickets::add` and `fresh` (crates/blaze-http/src/h3/config.rs) with blaze-remote's tickets file; resumption then works inside one process only.",
+   "state": "Built with the HTTP/3 reads of the remote cache (crates/blaze-http/src/h3, crates/blaze-remote/src/http3.rs); no bucket is configured, so nothing uses it against a real origin yet."
   }
  ]
 }
