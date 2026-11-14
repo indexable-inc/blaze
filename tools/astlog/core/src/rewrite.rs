@@ -31,8 +31,20 @@ pub(crate) fn collect(
             PlannedAction::Source { value, .. } => match **value {},
         }
     }
-    edits.sort();
-    edits.dedup();
+    // `planned` is in rewrite order (the rules file's), then binding, then action order. The
+    // sort is stable and by place alone, so insertions at one offset keep that order rather
+    // than their text's; the same edit from two rules is kept once, at its first place.
+    let place = |edit: &Edit| (edit.file, edit.start, edit.end);
+    edits.sort_by_key(place);
+    let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
+    for edit in edits {
+        // Equal edits share a place, so only the run of that place is looked at.
+        let mut same_place = kept.iter().rev().take_while(|it| place(it) == place(&edit));
+        if !same_place.any(|it| *it == edit) {
+            kept.push(edit);
+        }
+    }
+    let edits = kept;
     let paths: Vec<PathBuf> = corpus.files.iter().map(|file| file.path.clone()).collect();
     edit_applier::check_overlaps(&paths, &edits).map_err(|error| {
         Error::from(

@@ -16,7 +16,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind, TextRange, TextSize, WalkEvent,
-    view::{self as ast, NodeId},
+    view::{self as ast, AstNode as _, NodeId},
 };
 
 use crate::error::{Error, PatternParseSnafu, PatternShapeSnafu};
@@ -92,6 +92,10 @@ pub struct Pattern {
     /// The longest identifier or literal every match spells as written: a file without its
     /// bytes holds no match.
     pub literal: Option<String>,
+    /// The editions that read the pattern's text as other Rust than [`Edition::CURRENT`], the
+    /// one it is parsed in (`async {}` is a struct literal in 2015): code of such an edition
+    /// is refused, never matched against the wrong tree.
+    pub reads_otherwise: Vec<Edition>,
 }
 
 impl fmt::Debug for Pattern {
@@ -227,6 +231,53 @@ fn def_path(path: ast::Node<'_>) -> Option<String> {
     Some(segments.join("::"))
 }
 
+/// The most non-trivia tokens a pattern or a template may have. The front end's parser
+/// recurses with the text's nesting: on a 2 MiB thread (a test thread, a tokio worker) a
+/// debug build overflows on `V<V<..u8..>>` at about 1900 levels, 5700 tokens, while 127000
+/// nested `-` or `{` parse. 2048 tokens of the worst shape stay under 700 levels.
+const MAX_TOKENS: usize = 2048;
+
+/// The deepest a pattern may make the matcher recurse ([`recursion_depth`]). On a 2 MiB
+/// thread a debug build overflows between depth 690 and 710 for each of 28 nesting shapes
+/// measured (parens, calls, blocks, `if`/`else`, generic arguments, refs, closures and
+/// others), so 128 leaves the caller over 1.5 MiB.
+const MAX_DEPTH: usize = 128;
+
+/// The non-trivia tokens `text` lexes as.
+fn token_count(text: &str) -> usize {
+    let lexed = syntax::LexedStr::new(Edition::CURRENT, text);
+    (0..lexed.len()).filter(|&at| !lexed.kind(at).is_trivia()).count()
+}
+
+/// The refusal of a text with more than [`MAX_TOKENS`] tokens.
+pub(crate) fn too_many_tokens(text: &str) -> Option<String> {
+    let tokens = token_count(text);
+    (tokens > MAX_TOKENS).then(|| {
+        format!("has {tokens} tokens, and the parser takes at most {MAX_TOKENS}: split it into smaller rules")
+    })
+}
+
+/// How deep [`Cx::node`] recurses to match the pattern under `root`: one frame pair a level
+/// down the tree, and one more for each run metavariable before a node among its siblings,
+/// since each run backtracks in a frame of its own.
+fn recursion_depth(root: ast::Node<'_>, marks: &HashMap<NodeId, Mark, Global>, vars: &[Var]) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(root, 1)]; // alloc: one pattern's open nodes, once a load
+    while let Some((node, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+        let mut runs = 0;
+        for child in node.children() {
+            stack.push((child, depth + 1 + runs));
+            if let Some(Mark::Var(var)) = marks.get(&child.id())
+                && vars[*var].many
+            {
+                runs += 1;
+            }
+        }
+    }
+    deepest
+}
+
 fn placeholder_in(text: &str) -> bool {
     text.contains(ONE) || text.contains(MANY)
 }
@@ -239,13 +290,16 @@ impl Pattern {
     /// A pattern that is not that form of Rust, holds a stray `$`, or is nothing but one
     /// metavariable.
     pub fn parse(form: Form, text: &str, line: usize) -> Result<Pattern, Error> {
+        let shape = |message: String| -> Error {
+            PatternShapeSnafu { line, form: form.name(), text, message }.build().into()
+        };
+        if let Some(message) = too_many_tokens(text) {
+            return Err(shape(message));
+        }
         let (body, vars) = placeholders(text.trim(), form, line)?;
         let (before, after) = form.wrap();
         let source = format!("{before}{body}{after}");
         let parse = SourceFile::parse(&source, Edition::CURRENT);
-        let shape = |message: String| -> Error {
-            PatternShapeSnafu { line, form: form.name(), text, message }.build().into()
-        };
         if let Some(error) = parse.errors_with_bodies().first() {
             return PatternParseSnafu { line, form: form.name(), text, error: error.to_string() }
                 .fail()
@@ -314,6 +368,29 @@ impl Pattern {
                 }
             }
         }
+        let depth = recursion_depth(root, &marks, &vars);
+        if depth > MAX_DEPTH {
+            return Err(shape(format!(
+                "nests {depth} levels deep, and the matcher takes at most {MAX_DEPTH}: write an inner part \
+                 as `$x` and match `x` with a pattern of its own"
+            )));
+        }
+        let tree = |parse: &Parse<SourceFile>| -> Vec<SyntaxKind> {
+            // alloc: one pattern's kinds, once an edition a load
+            let walk = parse.root().preorder_with_tokens();
+            walk.filter_map(|event| match event {
+                WalkEvent::Enter(element) => Some(element.kind()),
+                WalkEvent::Leave(_) => None,
+            })
+            .collect()
+        };
+        let current = tree(&parse);
+        let reads_otherwise = Edition::iter()
+            .filter(|edition| {
+                let other = SourceFile::parse(&source, *edition);
+                !other.errors_with_bodies().is_empty() || tree(&other) != current
+            })
+            .collect();
         Ok(Pattern {
             form,
             text: text.to_owned(),
@@ -321,6 +398,7 @@ impl Pattern {
             root_kind: root.kind(),
             root: root.id(),
             literal: literal.map(str::to_owned),
+            reads_otherwise,
             parse,
             vars,
             paths,
@@ -427,57 +505,63 @@ impl<'t> Cx<'_, '_, 't> {
         self.seq(target, &want, &have, bound)
     }
 
+    /// `want` against `have`, sibling by sibling. Siblings are a loop and only a run
+    /// metavariable recurses, so the stack grows with the pattern's
+    /// [`recursion_depth`], never with a sibling list's length.
     fn seq(
         &mut self,
         parent: ast::Node<'t>,
-        want: &[ast::Element<'_>],
-        have: &[ast::Element<'t>],
+        mut want: &[ast::Element<'_>],
+        mut have: &[ast::Element<'t>],
         bound: &mut Bindings<'t>,
     ) -> Result<bool, Error> {
-        let Some((first, rest)) = want.split_first() else { return Ok(have.is_empty()) };
-        if let syntax::NodeOrToken::Node(node) = first
-            && let Some(Mark::Var(var)) = self.pattern.marks.get(&node.id()).copied()
-            && self.pattern.vars[var].many
-        {
-            for take in 0..=have.len() {
-                let range = match (have.first(), take) {
-                    (Some(start), 1..) => {
-                        TextRange::new(start.text_range().start(), have[take - 1].text_range().end())
+        loop {
+            let Some((first, rest)) = want.split_first() else { return Ok(have.is_empty()) };
+            if let syntax::NodeOrToken::Node(node) = first
+                && let Some(Mark::Var(var)) = self.pattern.marks.get(&node.id()).copied()
+                && self.pattern.vars[var].many
+            {
+                for take in 0..=have.len() {
+                    let range = match (have.first(), take) {
+                        (Some(start), 1..) => {
+                            TextRange::new(start.text_range().start(), have[take - 1].text_range().end())
+                        }
+                        _ => TextRange::empty(
+                            have.first().map_or(parent.text_range().end(), |it| it.text_range().start()),
+                        ),
+                    };
+                    let mut tried = bound.clone(); // clone: one branch of a run's backtracking
+                    if self.bind(var, Bound::Run(parent, range), &mut tried)
+                        && self.seq(parent, rest, &have[take..], &mut tried)?
+                    {
+                        *bound = tried;
+                        return Ok(true);
                     }
-                    _ => TextRange::empty(
-                        have.first().map_or(parent.text_range().end(), |it| it.text_range().start()),
-                    ),
-                };
-                let mut tried = bound.clone(); // clone: one branch of a run's backtracking
-                if self.bind(var, Bound::Run(parent, range), &mut tried)
-                    && self.seq(parent, rest, &have[take..], &mut tried)?
-                {
-                    *bound = tried;
-                    return Ok(true);
                 }
+                return Ok(false);
             }
-            return Ok(false);
+            let Some((next, left)) = have.split_first() else { return Ok(false) };
+            let matched = match (first, next) {
+                (syntax::NodeOrToken::Node(want), syntax::NodeOrToken::Node(have)) => {
+                    self.node(*want, *have, bound)?
+                }
+                (syntax::NodeOrToken::Token(want), syntax::NodeOrToken::Token(have)) => {
+                    want.kind() == have.kind() && want.text() == have.text()
+                }
+                _ => false,
+            };
+            if !matched {
+                return Ok(false);
+            }
+            (want, have) = (rest, left);
         }
-        let Some((next, left)) = have.split_first() else { return Ok(false) };
-        let matched = match (first, next) {
-            (syntax::NodeOrToken::Node(want), syntax::NodeOrToken::Node(have)) => {
-                self.node(*want, *have, bound)?
-            }
-            (syntax::NodeOrToken::Token(want), syntax::NodeOrToken::Token(have)) => {
-                want.kind() == have.kind() && want.text() == have.text()
-            }
-            _ => false,
-        };
-        if !matched {
-            return Ok(false);
-        }
-        self.seq(parent, rest, left, bound)
     }
 }
 
 /// A type pattern for `type-matches`: `_`, `$name`, a def path with generic arguments
 /// (`core::result::Result<_, $e>`), a single name with or without them (`Vec<$a>`, `u32`,
-/// `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, a slice or an array. A single name the std
+/// `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, a slice or an array whose length is a number
+/// or `_` (any length). A single name the std
 /// prelude names is that item, resolved; a builtin type's name is that type; any other single
 /// name matches a type of that name, by text.
 pub struct TypePattern {
@@ -510,7 +594,34 @@ pub enum TypeShape<'p> {
     Ref { mutable: bool, inner: ast::Node<'p> },
     Tuple(Vec<ast::Node<'p>>),
     Slice(ast::Node<'p>),
-    Array(ast::Node<'p>),
+    Array(ast::Node<'p>, Length),
+}
+
+/// What an array pattern asks of the array's length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Length {
+    /// `_`: any length, one the front end evaluates or not (`[T; N]` in a generic fn).
+    Any,
+    /// A number: that length, evaluated.
+    Is(u128),
+}
+
+/// The length an array pattern's `; N` asks for: `_` or an integer literal.
+fn length(arg: ast::Node<'_>) -> Option<Length> {
+    let expr = match arg.kind() {
+        SyntaxKind::CONST_ARG => arg.children().next()?,
+        _ => arg,
+    };
+    if expr.kind() == SyntaxKind::UNDERSCORE_EXPR {
+        return Some(Length::Any);
+    }
+    match ast::Literal::cast(expr)?.kind() {
+        ast::LiteralKind::IntNumber(number) => match number.value() {
+            Ok(value) => Some(Length::Is(value)),
+            Err(_) => None,
+        },
+        _ => None,
+    }
 }
 
 impl TypePattern {
@@ -543,7 +654,7 @@ impl TypePattern {
                 Ok(TypeShape::Def(_, args) | TypeShape::Named { args, .. } | TypeShape::Tuple(args)) => {
                     stack.extend(args);
                 }
-                Ok(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner)) => {
+                Ok(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner, _)) => {
                     stack.push(inner);
                 }
                 Ok(TypeShape::Wild | TypeShape::Var(_) | TypeShape::Builtin(_) | TypeShape::Never) => {}
@@ -598,10 +709,20 @@ impl TypePattern {
                 Some(inner) => Ok(TypeShape::Slice(inner)),
                 None => Err(format!("`{text}` has no element type: write `[T]`")),
             },
-            SyntaxKind::ARRAY_TYPE => match node.children().next() {
-                Some(inner) => Ok(TypeShape::Array(inner)),
-                None => Err(format!("`{text}` has no element type: write `[T; N]`")),
-            },
+            SyntaxKind::ARRAY_TYPE => {
+                let mut children = node.children();
+                let (Some(inner), Some(len)) = (children.next(), children.next()) else {
+                    return Err(format!("`{text}` has no element type or no length: write `[T; 4]` or `[T; _]`"));
+                };
+                match length(len) {
+                    Some(length) => Ok(TypeShape::Array(inner, length)),
+                    None => Err(format!(
+                        "`{}` in `{text}` is a length `type-matches` does not evaluate: write the \
+                         length as a number or `_`",
+                        len.text()
+                    )),
+                }
+            }
             SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::DYN_TRAIT_TYPE => Err(format!(
                 "`{text}` names a trait, not one type: match the type with `$t` and add \
                  `(implements t \"krate::Trait\")`"
