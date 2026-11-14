@@ -6,5 +6,5 @@ import BlazeModel.closures.add_k.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.add_k.closure0.call (t1 : closures.add_k.closure0) (x : U32) : Result U32 :=
-  Scalar.add x t1.c0
+def closures.add_k.closure0.call (t0 : closures.add_k.closure0) (x : U32) : Result U32 :=
+  Scalar.add x t0.c0

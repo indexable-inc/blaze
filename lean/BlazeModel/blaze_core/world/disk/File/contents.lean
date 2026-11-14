@@ -18,8 +18,8 @@ def blaze_core.world.disk.File.contents.loop_0 (fuel : Nat) (self : blaze_core.w
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.changes) then do
-      let t21 ← Slice.index self.changes i
-      let bytes ← blaze_core.world.disk.Change.apply fuel t21.change bytes
+      let t0 ← Slice.index self.changes i
+      let bytes ← blaze_core.world.disk.Change.apply fuel t0.change bytes
       let i ← Scalar.add i (1 : Usize)
       blaze_core.world.disk.File.contents.loop_0 fuel self bytes i
     else Result.ok bytes

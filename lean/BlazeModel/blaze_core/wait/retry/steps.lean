@@ -25,25 +25,25 @@ def blaze_core.wait.retry.steps (retry : blaze_core.wait.retry.Retry) (deadline 
   let passed :=
     match deadline with
     | Option.some v0 =>
-      let deadline_8 := v0
-      blaze_core.wait.retry.Deadline.passed deadline_8 now
+      let deadline_1 := v0
+      blaze_core.wait.retry.Deadline.passed deadline_1 now
     | Option.none => false
-  let (t11, retry) ← blaze_core.wait.retry.Retry.after retry now
-  match t11 with
+  let (t0, retry) ← blaze_core.wait.retry.Retry.after retry now
+  match t0 with
   | core.result.Result.Ok v1 =>
     match v1 with
     | blaze_core.wait.retry.Next.Deadline => Result.ok passed
     | blaze_core.wait.retry.Next.Again =>
-      let t15 := !passed
-      let t14 := if t15 then Scalar.lt retry.still (65536 : U32) else t15
-      if t14 then
-        let (t19, retry) := blaze_core.wait.retry.Retry.left retry
-        Result.ok (blaze_core.wait.retry.left_at t19 deadline now)
-      else Result.ok t14
+      let t1 := !passed
+      let t2 := if t1 then Scalar.lt retry.still (65536 : U32) else t1
+      if t2 then
+        let (t3, retry) := blaze_core.wait.retry.Retry.left retry
+        Result.ok (blaze_core.wait.retry.left_at t3 deadline now)
+      else Result.ok t2
   | core.result.Result.Err v2 =>
-    let t24 := !passed
-    let t23 := if t24 then core.time.Duration.le now «at» else t24
-    if t23 then do
-      let t28 ← Scalar.add still (1 : U32)
-      Result.ok (Scalar.ge t28 (65536 : U32))
-    else Result.ok t23
+    let t4 := !passed
+    let t5 := if t4 then core.time.Duration.le now «at» else t4
+    if t5 then do
+      let t6 ← Scalar.add still (1 : U32)
+      Result.ok (Scalar.ge t6 (65536 : U32))
+    else Result.ok t5

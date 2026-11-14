@@ -9,9 +9,9 @@ def blaze_core.world.disk.extend.loop_0 (fuel : Nat) (bytes : Vec U8) (more : Sl
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t7 := Scalar.lt i count
-    let t6 := if t7 then Scalar.lt i (Slice.len more) else t7
-    if t6 then do
+    let t0 := Scalar.lt i count
+    let t1 := if t0 then Scalar.lt i (Slice.len more) else t0
+    if t1 then do
       let x0 ← Slice.index more i
       let bytes ← Vec.push bytes x0
       let i ← Scalar.add i (1 : Usize)

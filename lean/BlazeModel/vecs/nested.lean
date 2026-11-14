@@ -6,18 +6,18 @@ open Blaze
 set_option linter.unusedVariables false
 
 def vecs.nested (rows : Vec (Vec U32)) (i : Usize) (x : U32) (spare : Option (Vec U32)) : Result (Usize × Vec (Vec U32)) := do
-  let t21 := i
-  let t10 := x
-  let x0 ← Slice.index rows t21
-  let x1 ← Vec.push x0 t10
-  let x2 ← Slice.update rows t21 x1
+  let t0 := i
+  let t1 := x
+  let x0 ← Slice.index rows t0
+  let x1 ← Vec.push x0 t1
+  let x2 ← Slice.update rows t0 x1
   let rows := x2
-  let t15 ← Slice.index rows i
-  let n := Slice.len t15
+  let t2 ← Slice.index rows i
+  let n := Slice.len t2
   let ret ←
     match spare with
-    | Option.some v3 =>
-      let v := v3
+    | Option.some v0 =>
+      let v := v0
       Scalar.add n (Slice.len v)
     | Option.none => Result.ok n
   Result.ok (ret, rows)

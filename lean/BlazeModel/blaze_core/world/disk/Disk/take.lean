@@ -13,11 +13,11 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.take (fuel : Nat) (self : blaze_core.world.disk.Disk) (name : U64) : Result (Option blaze_core.world.disk.File × blaze_core.world.disk.Disk) := do
-  let t3 ← blaze_core.world.disk.Disk.find fuel self name
-  match t3 with
+  let t0 ← blaze_core.world.disk.Disk.find fuel self name
+  match t0 with
   | Option.some v0 => do
     let «at» := v0
-    let (t8, x1) ← Vec.remove self.files «at»
-    let self := { self with files := x1 }
-    Result.ok ((Option.some t8 : Option blaze_core.world.disk.File), self)
+    let (t1, x0) ← Vec.remove self.files «at»
+    let self := { self with files := x0 }
+    Result.ok ((Option.some t1 : Option blaze_core.world.disk.File), self)
   | Option.none => Result.ok ((Option.none : Option blaze_core.world.disk.File), self)

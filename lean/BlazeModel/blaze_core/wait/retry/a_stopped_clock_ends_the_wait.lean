@@ -18,9 +18,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.wait.retry.a_stopped_clock_ends_the_wait (fuel : Nat) (deadline : Option blaze_core.wait.retry.Deadline) («at» : core.time.Duration) (still : U32) (now : core.time.Duration) : Result Bool :=
-  let t7 := Scalar.ge still (65536 : U32)
-  let t6 := if t7 then t7 else core.time.Duration.gt now «at»
-  if t6 then Result.ok true
+  let t0 := Scalar.ge still (65536 : U32)
+  let t1 := if t0 then t0 else core.time.Duration.gt now «at»
+  if t1 then Result.ok true
   else
     let retry :=
       blaze_core.wait.retry.Retry.new (Str.ofBytes [97, 32, 119, 97, 105, 116]) deadline «at»

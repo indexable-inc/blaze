@@ -6,34 +6,34 @@ open Blaze
 set_option linter.unusedVariables false
 
 def vecs.reading (v : Vec Usize) (i : Usize) : Result Usize := do
-  let t6 ← Slice.index v i
-  let total := t6
-  let t8 := Slice.get v i
+  let t0 ← Slice.index v i
+  let total := t0
+  let t1 := Slice.get v i
   let total ←
-    match t8 with
+    match t1 with
     | Option.some v0 =>
       let x := v0
       Scalar.add total x
     | Option.none => Result.ok total
-  let t17 := Slice.first v
+  let t2 := Slice.first v
   let total ←
-    match t17 with
+    match t2 with
     | Option.some v1 =>
-      let x_21 := v1
-      Scalar.add total x_21
+      let x_1 := v1
+      Scalar.add total x_1
     | Option.none => Result.ok total
-  let t24 := Slice.last v
+  let t3 := Slice.last v
   let total ←
-    match t24 with
+    match t3 with
     | Option.some v2 =>
-      let x_28 := v2
-      Scalar.add total x_28
+      let x_2 := v2
+      Scalar.add total x_2
     | Option.none => Result.ok total
-  let t31 := Slice.is_empty v
-  let total ← if t31 then Scalar.add total (1 : Usize) else Result.ok total
+  let t4 := Slice.is_empty v
+  let total ← if t4 then Scalar.add total (1 : Usize) else Result.ok total
   let s := v
   let t := v
-  let t43 ← Scalar.add total (Slice.len v)
-  let t42 ← Scalar.add t43 (Slice.len s)
-  let t41 ← Scalar.add t42 (Slice.len t)
-  Scalar.add t41 (Slice.len v)
+  let t5 ← Scalar.add total (Slice.len v)
+  let t6 ← Scalar.add t5 (Slice.len s)
+  let t7 ← Scalar.add t6 (Slice.len t)
+  Scalar.add t7 (Slice.len v)

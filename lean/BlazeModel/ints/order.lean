@@ -6,8 +6,8 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.order (x : U64) (lo : U64) (hi : U64) : Result U64 := do
-  let t6 := Scalar.min (Scalar.max x lo) hi
-  let t11 ← Scalar.ord_clamp x lo hi
-  let t5 ← Scalar.add t6 t11
-  let t4 ← Scalar.add t5 (Scalar.max x lo)
-  Scalar.add t4 (Scalar.min x hi)
+  let t0 := Scalar.min (Scalar.max x lo) hi
+  let t1 ← Scalar.ord_clamp x lo hi
+  let t2 ← Scalar.add t0 t1
+  let t3 ← Scalar.add t2 (Scalar.max x lo)
+  Scalar.add t3 (Scalar.min x hi)

@@ -6,6 +6,6 @@ import BlazeModel.closures.nested.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.nested.closure0.call (t1 : closures.nested.closure0) : Result closures.nested.closure0 := do
-  let x0 ← Scalar.add t1.c0 (1 : U32)
-  Result.ok { t1 with c0 := x0 }
+def closures.nested.closure0.call (t0 : closures.nested.closure0) : Result closures.nested.closure0 := do
+  let x0 ← Scalar.add t0.c0 (1 : U32)
+  Result.ok { t0 with c0 := x0 }

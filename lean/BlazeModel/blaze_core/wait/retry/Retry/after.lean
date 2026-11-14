@@ -18,12 +18,12 @@ def blaze_core.wait.retry.Retry.after (self : blaze_core.wait.retry.Retry) (now 
   if core.option.Option.Deadline.is_some_and.closure0_wait_retry_Retry_after self.deadline ({ c0 := now } : blaze_core.wait.retry.Retry.after.closure0) then
     Result.ok ((core.result.Result.Ok (blaze_core.wait.retry.Next.Deadline : blaze_core.wait.retry.Next) : core.result.Result blaze_core.wait.retry.Next blaze_core.wait.retry.WaitError), self)
   else do
-    let t13 := core.time.Duration.gt now self.«at»
-    let t16 := true == t13
-    let t12 ←
-      if t16 then Result.ok (0 : U32)
-      else if false == t13 then Scalar.add self.still (1 : U32) else Result.fail Error.unreachable
-    let self := { self with still := t12 }
+    let t0 := core.time.Duration.gt now self.«at»
+    let t1 := true == t0
+    let t2 ←
+      if t1 then Result.ok (0 : U32)
+      else if false == t0 then Scalar.add self.still (1 : U32) else Result.fail Error.unreachable
+    let self := { self with still := t2 }
     if Scalar.ge self.still (65536 : U32) then
       Result.ok ((core.result.Result.Err ({ what := self.what, why := (blaze_core.wait.retry.Why.Stuck self.still now : blaze_core.wait.retry.Why) } : blaze_core.wait.retry.WaitError) : core.result.Result blaze_core.wait.retry.Next blaze_core.wait.retry.WaitError), self)
     else

@@ -11,6 +11,6 @@ def core.option.Option.u32.map.u32_closure0_option_methods (self : Option U32) (
   match self with
   | Option.some v0 => do
     let x := v0
-    let t5 ← closures.option_methods.closure0.call f x
-    Result.ok (Option.some t5 : Option U32)
+    let t0 ← closures.option_methods.closure0.call f x
+    Result.ok (Option.some t0 : Option U32)
   | Option.none => Result.ok (Option.none : Option U32)

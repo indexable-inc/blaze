@@ -17,7 +17,7 @@ def ints.convert (x : U8) (b : Bool) (w : U64) : Result U64 := do
     | core.result.Result.Err v1 => (0 : U64)
   match Scalar.try_from .U8 w with
   | core.result.Result.Ok v2 => do
-    let v_19 := v2
-    let t20 ← Scalar.add c d
-    Scalar.add t20 (Scalar.cast .U64 v_19)
+    let v_1 := v2
+    let t0 ← Scalar.add c d
+    Scalar.add t0 (Scalar.cast .U64 v_1)
   | core.result.Result.Err v3 => Scalar.add c d

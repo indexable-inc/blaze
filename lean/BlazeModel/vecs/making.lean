@@ -12,8 +12,8 @@ def vecs.making (n : Usize) : Result Usize := do
   let d := (Vec.new : Vec U32)
   let e := (Vec.new : Vec U32)
   let f := Vec.from_elem (7 : U8) n
-  let t16 ← Scalar.add (Slice.len a) (Slice.len b)
-  let t15 ← Scalar.add t16 (Slice.len c)
-  let t14 ← Scalar.add t15 (Slice.len d)
-  let t13 ← Scalar.add t14 (Slice.len e)
-  Scalar.add t13 (Slice.len f)
+  let t0 ← Scalar.add (Slice.len a) (Slice.len b)
+  let t1 ← Scalar.add t0 (Slice.len c)
+  let t2 ← Scalar.add t1 (Slice.len d)
+  let t3 ← Scalar.add t2 (Slice.len e)
+  Scalar.add t3 (Slice.len f)

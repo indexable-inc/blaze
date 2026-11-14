@@ -1508,10 +1508,196 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     // The types are not declared here: each has a module of its own, which this one imports.
     let mut decls = std::mem::take(&mut translate.loops);
     decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, monadic) });
+    let mut params = params;
+    renumber(&mut decls, &mut params, &generated_names(body, &translate.names, &translate.temps));
     Ok(Model {
         decls,
         shape: Shape { fuel: translate.uses_fuel, monadic, mut_params, returns_unit },
         params,
         result,
     })
+}
+
+/// What a generated variable's new name is made of: its kind's prefix and a number.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Generated {
+    /// A temporary (`t`): a local with no binding.
+    Temp,
+    /// A local whose binding's name another local, a library root or the crate already has
+    /// (`<binding>_`).
+    Suffixed(String),
+    /// A variable of the translation's own ([`Translate::fresh`]): `x` for a part read or
+    /// written, `v` for a field a `match` arm binds.
+    Fresh(String),
+}
+
+/// The variables of `body`'s model whose names [`local_names`] and [`Translate::fresh`] made
+/// from MIR's numbering (a local's number, a counter), each with its kind; the binding names
+/// and `ret` are not among them.
+fn generated_names(body: &Body, names: &[String], temps: &BTreeSet<String>) -> BTreeMap<String, Generated> {
+    let mut out = BTreeMap::new();
+    for (at, (local, named)) in body.locals.iter().zip(names).enumerate() {
+        let kind = match &local.name {
+            Some(binding) if binding == named => continue,
+            Some(binding) => Generated::Suffixed(binding.clone()),
+            None if at == 0 && named == "ret" => continue,
+            None if at == 0 => Generated::Suffixed("ret".to_owned()),
+            None => Generated::Temp,
+        };
+        out.insert(named.clone(), kind);
+    }
+    for fresh in temps {
+        if !out.contains_key(fresh) && !names.contains(fresh) {
+            let prefix = fresh.trim_end_matches(|it: char| it.is_ascii_digit()).to_owned();
+            out.insert(fresh.clone(), Generated::Fresh(prefix));
+        }
+    }
+    out
+}
+
+/// Renames the `generated` variables of a model (its declarations, the function's last, and
+/// its parameters) by the order each is first bound in the model as printed: temporaries
+/// `t0`, `t1`, .., a suffixed binding `<binding>_1`, `<binding>_2`, .. per binding, and the
+/// translation's own `x0`, .. and `v0`, .. per prefix. So the model of one function is the
+/// same text whatever MIR numbered its locals (the standard library's MIR may have one more
+/// temporary than the fixture's `core`). Each variable is renamed everywhere it occurs, to a
+/// name no other variable or name of the model has: the model is alpha-equivalent to the one
+/// before, shadowing included.
+fn renumber(decls: &mut [Decl], params: &mut [Binder], generated: &BTreeMap<String, Generated>) {
+    if generated.is_empty() {
+        return;
+    }
+    // Every name that stays: a candidate equal to one is skipped.
+    let mut taken: BTreeSet<String> = GLOBAL_ROOTS.iter().map(|it| (*it).to_owned()).collect();
+    taken.insert("fuel".to_owned());
+    for decl in decls.iter_mut() {
+        visit_decl(decl, &mut |it: &mut String| {
+            if !generated.contains_key(it.as_str()) {
+                taken.insert(it.clone());
+            }
+        });
+    }
+    let mut renamed: BTreeMap<String, String> = BTreeMap::new();
+    let mut counters: BTreeMap<Generated, usize> = BTreeMap::new();
+    let mut rename = |it: &mut String| {
+        let Some(kind) = generated.get(it.as_str()) else { return };
+        if let Some(new) = renamed.get(it.as_str()) {
+            *it = new.clone();
+            return;
+        }
+        let counter = counters.entry(kind.clone()).or_insert(match kind {
+            Generated::Suffixed(_) => 1,
+            Generated::Temp | Generated::Fresh(_) => 0,
+        });
+        let new = loop {
+            let candidate = match kind {
+                Generated::Temp => format!("t{counter}"),
+                Generated::Suffixed(binding) => format!("{binding}_{counter}"),
+                Generated::Fresh(prefix) => format!("{prefix}{counter}"),
+            };
+            *counter += 1;
+            if !taken.contains(&candidate) {
+                break candidate;
+            }
+        };
+        taken.insert(new.clone());
+        renamed.insert(std::mem::replace(it, new.clone()), new);
+    };
+    for decl in decls.iter_mut() {
+        visit_decl(decl, &mut rename);
+    }
+    for param in params.iter_mut() {
+        rename(&mut param.name);
+    }
+}
+
+/// Calls `f` on each variable name of `decl` (a binder's, a pattern's, a name's), in the order
+/// the printer writes them; constructors, fields and declarations' own names are not variables.
+fn visit_decl(decl: &mut Decl, f: &mut impl FnMut(&mut String)) {
+    match decl {
+        Decl::Def { params, ty, body, .. } => {
+            visit_binders(params, f);
+            visit_term(ty, f);
+            visit_term(body, f);
+        }
+        Decl::Structure { .. }
+        | Decl::Inductive { .. }
+        | Decl::Theorem { .. }
+        | Decl::PrintAxioms(_)
+        | Decl::DeriveDecidableEq(_)
+        | Decl::Opaque { .. } => {}
+    }
+}
+
+fn visit_binders(binders: &mut [Binder], f: &mut impl FnMut(&mut String)) {
+    for binder in binders {
+        f(&mut binder.name);
+        visit_term(&mut binder.ty, f);
+    }
+}
+
+fn visit_pat(pat: &mut Pat, f: &mut impl FnMut(&mut String)) {
+    match pat {
+        Pat::Name(it) => f(it),
+        Pat::Tuple(all) | Pat::Ctor(_, all) => all.iter_mut().for_each(|it| visit_pat(it, f)),
+        Pat::Wild | Pat::Atom(_) => {}
+    }
+}
+
+fn visit_term(term: &mut Term, f: &mut impl FnMut(&mut String)) {
+    match term {
+        Term::Name(it) => f(it),
+        Term::Atom(_) => {}
+        Term::App(head, args) => {
+            visit_term(head, f);
+            args.iter_mut().for_each(|it| visit_term(it, f));
+        }
+        Term::Proj(of, _) | Term::BoolNot(of) | Term::Not(of) => visit_term(of, f),
+        Term::Tuple(all) | Term::List(all) => all.iter_mut().for_each(|it| visit_term(it, f)),
+        Term::Typed(of, ty) => {
+            visit_term(of, f);
+            visit_term(ty, f);
+        }
+        Term::Update(of, fields) => {
+            visit_term(of, f);
+            fields.iter_mut().for_each(|(_, it)| visit_term(it, f));
+        }
+        Term::Structure(fields) => fields.iter_mut().for_each(|(_, it)| visit_term(it, f)),
+        Term::Infix(_, left, right) => {
+            visit_term(left, f);
+            visit_term(right, f);
+        }
+        Term::If(test, then, otherwise) => {
+            visit_term(test, f);
+            visit_term(then, f);
+            visit_term(otherwise, f);
+        }
+        Term::Match(on, arms) => {
+            visit_term(on, f);
+            for (pat, arm) in arms {
+                visit_pat(pat, f);
+                visit_term(arm, f);
+            }
+        }
+        Term::Let(pat, value, rest) => {
+            visit_pat(pat, f);
+            visit_term(value, f);
+            visit_term(rest, f);
+        }
+        Term::Do(elems) => {
+            for elem in elems {
+                match elem {
+                    DoElem::Bind(pat, value) | DoElem::Let(pat, value) => {
+                        visit_pat(pat, f);
+                        visit_term(value, f);
+                    }
+                    DoElem::Term(it) => visit_term(it, f),
+                }
+            }
+        }
+        Term::Forall(binders, of) | Term::Exists(binders, of) => {
+            visit_binders(binders, f);
+            visit_term(of, f);
+        }
+    }
 }

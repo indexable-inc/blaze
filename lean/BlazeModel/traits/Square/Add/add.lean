@@ -7,5 +7,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def traits.Square.Add.add (self : traits.Square) (other : traits.Square) : Result traits.Square := do
-  let t3 ← Scalar.add self.side other.side
-  Result.ok ({ side := t3 } : traits.Square)
+  let t0 ← Scalar.add self.side other.side
+  Result.ok ({ side := t0 } : traits.Square)

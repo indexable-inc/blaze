@@ -20,20 +20,20 @@ def blaze_core.world.disk.write.loop_1 (fuel : Nat) (bytes : Vec U8) («at» : U
   | fuel + 1 =>
     if Scalar.lt i to then do
       let x0 ← Slice.index more i
-      let t27 := x0
-      let t30 := «at»
-      let t31 ← Scalar.sub i «from»
-      let t29 ← Scalar.add t30 t31
-      let x1 ← Slice.update bytes t29 t27
+      let t0 := x0
+      let t1 := «at»
+      let t2 ← Scalar.sub i «from»
+      let t3 ← Scalar.add t1 t2
+      let x1 ← Slice.update bytes t3 t0
       let bytes := x1
       let i ← Scalar.add i (1 : Usize)
       blaze_core.world.disk.write.loop_1 fuel bytes «at» more «from» to i
     else Result.ok bytes
 
 def blaze_core.world.disk.write (fuel : Nat) (bytes : Vec U8) («at» : Usize) (more : Slice U8) («from» : Usize) (to : Usize) : Result (Vec U8) := do
-  let t7 := «at»
-  let t8 ← Scalar.sub to «from»
-  let «end» ← Scalar.add t7 t8
+  let t4 := «at»
+  let t5 ← Scalar.sub to «from»
+  let «end» ← Scalar.add t4 t5
   let bytes ← blaze_core.world.disk.write.loop_0 fuel bytes «end»
   let i := «from»
   blaze_core.world.disk.write.loop_1 fuel bytes «at» more «from» to i

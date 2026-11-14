@@ -14,8 +14,8 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.File.reach (self : blaze_core.world.disk.File) (kept : blaze_core.world.disk.Kept) : Result Usize :=
   let all := Slice.len self.changes
-  let t6 := Scalar.lt kept.whole all
-  let whole := if t6 then kept.whole else all
+  let t0 := Scalar.lt kept.whole all
+  let whole := if t0 then kept.whole else all
   match kept.torn with
   | blaze_core.world.disk.Torn.Nothing => Result.ok whole
   | _ => if Scalar.lt whole all then Scalar.add whole (1 : Usize) else Result.ok whole

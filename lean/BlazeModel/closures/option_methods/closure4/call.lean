@@ -6,9 +6,9 @@ import BlazeModel.closures.option_methods.closure4.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.option_methods.closure4.call (t1 : closures.option_methods.closure4) (v : U32) : Result (Option U32) :=
-  let t3 := t1.c0
-  if Scalar.gt v t3 then do
-    let t8 ← Scalar.sub v t3
-    Result.ok (Option.some t8 : Option U32)
+def closures.option_methods.closure4.call (t0 : closures.option_methods.closure4) (v : U32) : Result (Option U32) :=
+  let t1 := t0.c0
+  if Scalar.gt v t1 then do
+    let t2 ← Scalar.sub v t1
+    Result.ok (Option.some t2 : Option U32)
   else Result.ok (Option.none : Option U32)

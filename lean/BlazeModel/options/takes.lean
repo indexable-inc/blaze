@@ -6,8 +6,8 @@ open Blaze
 set_option linter.unusedVariables false
 
 def options.takes (a : Option U32) : Option U32 × Option U32 × Option U32 :=
-  let a_2 := a
-  let (was, a_2) := core.option.Option.take a_2
+  let a_1 := a
+  let (was, a_1) := core.option.Option.take a_1
   let b := was
   let (old, b) := core.option.Option.replace b (5 : U32)
-  (a_2, b, old)
+  (a_1, b, old)
