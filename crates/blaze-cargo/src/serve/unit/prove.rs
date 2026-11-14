@@ -1004,34 +1004,12 @@ mod tests {
         sim::{self, Faults, Sim},
         wait::Deadline,
     };
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Broke, Config, Tape};
     use hir_ty_lean::translate::Shape;
 
     use super::*;
 
     const LEAN: &str = "/lean/bin/lean";
-
-    trait Draw {
-        /// In `0..n`.
-        fn below(&mut self, n: u64) -> u64;
-    }
-
-    struct Drawn<'a>(&'a TestCase);
-
-    impl Draw for Drawn<'_> {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0.draw(gs::integers::<u64>().min_value(0).max_value(n - 1))
-        }
-    }
-
-    /// For the controls' seeded worlds.
-    struct Seeded(sim::Rng);
-
-    impl Draw for Seeded {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0.below(n)
-        }
-    }
 
     /// What Lean does with a module.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1088,18 +1066,20 @@ mod tests {
     }
 
     impl World {
-        fn draw(d: &mut impl Draw) -> World {
+        /// A world from the tape. The calm one is one crate with one theorem, proved in one
+        /// file that imports its model alone, every module accepted and no power cut.
+        fn draw(tape: &Tape) -> World {
             let mut crates = Vec::new();
             let mut does = BTreeMap::new();
-            for name in ["k", "j"].iter().take(1 + d.below(2) as usize) {
+            for name in ["k", "j"].iter().take(1 + tape.below(2, "a second crate") as usize) {
                 let upper = name.to_uppercase();
                 let mut theorems = Vec::new();
                 let mut proofs: BTreeMap<String, String> = BTreeMap::new();
-                for at in 0..1 + d.below(3) {
-                    let part = d.below(2);
-                    let helper = match d.below(3) {
-                        0 => vec![module(&format!("{name}::helper"), false, Vec::new())],
-                        _ => Vec::new(),
+                for at in 0..1 + tape.below(3, "more theorems") {
+                    let part = tape.below(2, "the theorem's Rust module");
+                    let helper = match tape.coin("it calls a helper") {
+                        true => vec![module(&format!("{name}::helper"), false, Vec::new())],
+                        false => Vec::new(),
                     };
                     let theorem = module(&format!("{name}::m{part}::t{at}"), true, helper);
                     // The proof file of its Rust module, which imports its model.
@@ -1107,9 +1087,9 @@ mod tests {
                     file.push_str(&format!("import {}\n", theorem.module));
                     theorems.push(theorem);
                 }
-                let lemmas = d.below(2) == 0;
+                let lemmas = tape.coin("a file of lemmas");
                 for (file, text) in proofs.iter_mut() {
-                    if d.below(2) == 0 {
+                    if tape.coin("the proof file imports Blaze.Auto") {
                         text.push_str("import Blaze.Auto\n");
                     }
                     if lemmas && file.ends_with("M0") {
@@ -1119,27 +1099,33 @@ mod tests {
                 if lemmas {
                     proofs.insert(format!("{upper}.Lemmas"), "import Blaze\n".to_owned());
                 }
-                // One theorem in eight has no proof file at all.
-                if d.below(8) == 0 {
+                if tape.one_in(8, "a proof file is missing") {
                     proofs.remove(&format!("{upper}.M1"));
                 }
                 let krate = Krate { name: (*name).to_owned(), theorems, proofs };
                 for step in &plan_of(&krate).steps {
-                    let does_it = match (step.kind, d.below(match step.kind {
+                    // The library's modules are every crate's: what the first crate drew.
+                    if does.contains_key(&step.module) {
+                        continue;
+                    }
+                    let outcomes = match step.kind {
                         plan::Kind::Library => 60,
                         _ => 9,
-                    })) {
-                        (_, 0) => Does::Refuse,
-                        (_, 1) => Does::Late,
-                        (plan::Kind::Check, 2) => Does::Sorry,
+                    };
+                    let does_it = match (step.kind, tape.below(outcomes, "what Lean does with the module")) {
+                        (_, 1) => Does::Refuse,
+                        (_, 2) => Does::Late,
+                        (plan::Kind::Check, 3) => Does::Sorry,
                         _ => Does::Accept,
                     };
-                    // The library's modules are every crate's: what the first crate drew.
-                    does.entry(step.module.clone()).or_insert(does_it);
+                    // clone: a test's names
+                    does.insert(step.module.clone(), does_it);
                 }
                 crates.push(krate);
             }
-            World { crates, does, seed: d.below(1 << 32), crash: d.below(3) == 0 }
+            // The simulated machine is seeded: its order of completions is not yet the tape's.
+            let seed = tape.next_u64("the machine's seed");
+            World { crates, does, seed, crash: tape.one_in(3, "the power is cut between the checks") }
         }
 
         fn does(&self, module: &str) -> Does {
@@ -1165,8 +1151,8 @@ mod tests {
             ran
         }
 
-        /// What a check must answer: whether no proof could be checked, else each theorem
-        /// with what was found of it; and the modules Lean accepts on the way.
+        /// What a check must answer: nothing where no proof could be checked, else each
+        /// theorem with what was found of it; and the modules Lean accepts on the way.
         fn expected(&self) -> (Option<Vec<(String, String)>>, BTreeSet<String>) {
             let mut found = Vec::new();
             let mut accepted = BTreeSet::new();
@@ -1175,6 +1161,7 @@ mod tests {
                 let ran = self.reference(&plan);
                 for (step, ran) in plan.steps.iter().zip(&ran) {
                     if matches!(ran, Ran::Accepted(_)) {
+                        // clone: a test's names
                         accepted.insert(step.module.clone());
                     }
                 }
@@ -1233,6 +1220,10 @@ mod tests {
         }
     }
 
+    fn oracle(why: String) -> Broke {
+        Broke::Oracle(why)
+    }
+
     /// One check of `world` on `sim`, watched: its answer and the modules it gave Lean, in
     /// order. `earlier` are the modules an earlier check accepted, whose verdicts it may find.
     fn check(
@@ -1240,7 +1231,7 @@ mod tests {
         world: &World,
         plant: Plant,
         earlier: &BTreeSet<String>,
-    ) -> Result<(Proven, Vec<String>), String> {
+    ) -> Result<(Proven, Vec<String>), Broke> {
         // Each module's imports that are steps, for the watch below.
         let mut needs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut crates = Vec::new();
@@ -1252,6 +1243,7 @@ mod tests {
                 needs.insert(step.module.clone(), of);
             }
             crates.push(Asked {
+                // clone: a test's names
                 name: krate.name.clone(),
                 proofs: PathBuf::from(format!("/w/{}/lean", krate.name)),
                 ran: plan.steps.iter().map(|_| None).collect(),
@@ -1278,7 +1270,7 @@ mod tests {
         while ended.is_none() {
             turns += 1;
             if turns > 200_000 {
-                return Err("the check has not ended in 200,000 turns".to_owned());
+                return Err(oracle("the check has not ended in 200,000 turns".to_owned()));
             }
             for effect in &effects {
                 let Effect::Spawn { command, tag } = effect else { continue };
@@ -1288,11 +1280,13 @@ mod tests {
                 }
                 let module = last.trim_end_matches(".lean").replace('/', ".");
                 if given.contains(&module) {
-                    return Err(format!("`{module}` was given to Lean twice in one check"));
+                    return Err(oracle(format!("`{module}` was given to Lean twice in one check")));
                 }
                 for need in needs.get(&module).into_iter().flatten() {
                     if !accepted.contains(need) && !earlier.contains(need) {
-                        return Err(format!("`{module}` was given to Lean before `{need}`, which it imports, was accepted"));
+                        return Err(oracle(format!(
+                            "`{module}` was given to Lean before `{need}`, which it imports, was accepted"
+                        )));
                     }
                 }
                 // clone: a test's names
@@ -1301,7 +1295,7 @@ mod tests {
             }
             sim.submit(&mut effects);
             if sim.poll(&mut done, Deadline::NEVER) == 0 {
-                return Err("the check waits with nothing in flight".to_owned());
+                return Err(oracle("the check waits with nothing in flight".to_owned()));
             }
             for completion in done.drain(..) {
                 if let (Some(module), Done::Exited(exit)) = (running.remove(&completion.tag.0), &completion.done)
@@ -1321,12 +1315,15 @@ mod tests {
             done.clear();
         }
         if ended != Some(true) {
-            return Err(format!("the check ended {ended:?}, where it always answers"));
+            return Err(oracle(format!("the check ended {ended:?}, where it always answers")));
         }
         match out.as_slice() {
             // clone: the answer, once
             [Response::Proven(proven)] => Ok((proven.clone(), given)),
-            other => Err(format!("the check answered {} responses, where it gives one `Proven`", other.len())),
+            other => Err(oracle(format!(
+                "the check answered {} responses, where it gives one `Proven`",
+                other.len()
+            ))),
         }
     }
 
@@ -1357,23 +1354,26 @@ mod tests {
         }
     }
 
-    fn holds(world: &World, plant: Plant) -> Result<(), String> {
+    fn holds(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let world = World::draw(tape);
         let mut sim = Sim::new(world.seed, Faults::default());
         // clone: the simulated Lean's own copy of what each module does
         sim.program(LEAN, lean(Rc::new(world.does.clone())));
         let (expected, accepted) = world.expected();
-        let (first, _) = check(&mut sim, world, plant, &BTreeSet::new())?;
-        same(&first, &expected).map_err(|broke| format!("the first check: {broke}"))?;
+        let (first, _) = check(&mut sim, &world, plant, &BTreeSet::new())?;
+        same(&first, &expected).map_err(|broke| oracle(format!("the first check: {broke}")))?;
         if world.crash {
             sim.crash();
         }
-        let (second, given) = check(&mut sim, world, plant, &accepted)?;
-        same(&second, &expected).map_err(|broke| format!("the second check: {broke}"))?;
+        let (second, given) = check(&mut sim, &world, plant, &accepted)?;
+        same(&second, &expected).map_err(|broke| oracle(format!("the second check: {broke}")))?;
         if !world.crash
             && expected.is_some()
             && let Some(again) = given.iter().find(|it| accepted.contains(*it))
         {
-            return Err(format!("the first check accepted `{again}` and the second gave it to Lean again"));
+            return Err(oracle(format!(
+                "the first check accepted `{again}` and the second gave it to Lean again"
+            )));
         }
         Ok(())
     }
@@ -1385,38 +1385,25 @@ mod tests {
     /// with no power cut between, gives Lean no module the first accepted. Its controls are
     /// `the_oracle_catches_a_step_started_before_what_it_imports` and
     /// `the_oracle_catches_a_refused_step_kept_as_accepted`.
-    #[hegel::test(test_cases = 200)]
-    fn a_check_answers_as_its_plan_run_in_order_and_runs_nothing_twice(tc: TestCase) {
-        let world = World::draw(&mut Drawn(&tc));
-        if let Err(broke) = holds(&world, Plant::None) {
-            panic!("{broke}\n{world:#?}");
-        }
-    }
-
-    const CONTROL_SEEDS: u64 = 300;
-
-    fn seeded(seed: u64) -> World {
-        World::draw(&mut Seeded(sim::Rng::new(seed)))
-    }
-
     #[test]
-    fn the_seeded_worlds_hold_unplanted() {
-        for seed in 0..CONTROL_SEEDS {
-            let world = seeded(seed);
-            if let Err(broke) = holds(&world, Plant::None) {
-                panic!("seed {seed}: {broke}\n{world:#?}");
-            }
-        }
+    fn a_check_answers_as_its_plan_run_in_order_and_runs_nothing_twice() {
+        blaze_sim::check(Config::cases(300), |tape| holds(tape, Plant::None));
     }
 
     #[test]
     fn the_oracle_catches_a_step_started_before_what_it_imports() {
-        assert!((0..CONTROL_SEEDS).any(|seed| holds(&seeded(seed), Plant::BeforeNeeds).is_err()));
+        blaze_sim::control(
+            Config::cases(300),
+            Plant::None,
+            Plant::BeforeNeeds,
+            "which it imports, was accepted",
+            holds,
+        );
     }
 
     #[test]
     fn the_oracle_catches_a_refused_step_kept_as_accepted() {
-        assert!((0..CONTROL_SEEDS).any(|seed| holds(&seeded(seed), Plant::KeepRefused).is_err()));
+        blaze_sim::control(Config::cases(300), Plant::None, Plant::KeepRefused, "the second check", holds);
     }
 
     /// A verdict is taken only where it is this key's and whole: one of another key, one cut

@@ -590,6 +590,7 @@ dependencies = [
  "blaze-serde",
  "blaze-sha256",
  "blaze-shader",
+ "blaze-sim",
  "blaze-source",
  "blaze-store-check",
  "blaze-testsel",
