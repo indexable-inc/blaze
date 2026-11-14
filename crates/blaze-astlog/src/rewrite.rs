@@ -12,6 +12,7 @@
 use std::alloc::Global;
 
 use std::cmp::Ordering;
+use std::ops::Range;
 
 use astlog_engine::{Facts as _, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
 use base_db::Db;
@@ -319,18 +320,31 @@ fn literal_paths<'p, F: Files>(
         let mut found: Vec<(String, ModuleDef)> = Vec::new();
         for action in &rewrite.actions {
             let astlog_engine::Action::Text(text) = action else { continue };
+            // The template as one text, each metavariable a name, so a string or a comment
+            // that spans one lexes whole; a path is the template's only when it is all in
+            // one literal piece.
+            let mut joined = String::new();
+            let mut literal: Vec<Range<usize>> = Vec::new();
             for segment in &text.template.segments {
-                let Segment::Lit(lit) = segment else { continue };
-                for path in def_paths(lit) {
-                    if found.iter().any(|(it, _)| *it == path) {
-                        continue;
+                match segment {
+                    Segment::Lit(lit) => {
+                        literal.push(joined.len()..joined.len() + lit.len());
+                        joined.push_str(lit);
                     }
-                    // An absolute path starts at a crate: one that names nothing is a typo the
-                    // rule would write into the code.
-                    let defs = facts.items_at(&path, text.line)?;
-                    if let Some(def) = defs.first() {
-                        found.push((path, *def));
-                    }
+                    Segment::Var(_) => joined.push_str("__astlog_var"),
+                }
+            }
+            for (at, path) in def_paths(&joined) {
+                if !literal.iter().any(|it| it.start <= at.start && at.end <= it.end)
+                    || found.iter().any(|(it, _)| it == path)
+                {
+                    continue;
+                }
+                // An absolute path starts at a crate: one that names nothing is a typo the
+                // rule would write into the code.
+                let defs = facts.items_at(path, text.line)?;
+                if let Some(def) = defs.first() {
+                    found.push((path.to_owned(), *def));
                 }
             }
         }
@@ -340,14 +354,28 @@ fn literal_paths<'p, F: Files>(
     Ok(out)
 }
 
-/// The absolute `::a::b(::c)*` paths of `text`, leading `::` included. One after a name or a
-/// `>` (`Vec::<u8>::new`) continues that path and is none.
-fn def_paths(text: &str) -> Vec<String> {
+/// The absolute `::a::b(::c)*` paths written as code in `text`, leading `::` included, each
+/// with its byte range. One after a name or a `>` (`Vec::<u8>::new`) continues that path and is
+/// none, and so is one in a comment or a string, char or byte literal: that is text, not code.
+fn def_paths(text: &str) -> Vec<(Range<usize>, &str)> {
+    let lexed = syntax::LexedStr::new(syntax::Edition::CURRENT, text);
+    let not_code: Vec<Range<usize>> = (0..lexed.len())
+        .filter(|&i| {
+            let kind = lexed.kind(i);
+            kind == SyntaxKind::COMMENT
+                || (kind.is_literal() && !matches!(kind, SyntaxKind::INT_NUMBER | SyntaxKind::FLOAT_NUMBER))
+        })
+        .map(|i| lexed.text_range(i))
+        .collect();
     let bytes = text.as_bytes();
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut out = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
+        if let Some(skip) = not_code.iter().find(|it| it.contains(&at)) {
+            at = skip.end;
+            continue;
+        }
         let starts = bytes[at..].starts_with(b"::")
             && bytes.get(at + 2).is_some_and(|b| ident(*b) && !b.is_ascii_digit())
             && (at == 0 || !(ident(bytes[at - 1]) || matches!(bytes[at - 1], b':' | b'>' | b'.')));
@@ -373,7 +401,7 @@ fn def_paths(text: &str) -> Vec<String> {
             }
         }
         if segments >= 2 {
-            out.push(text[at..end].to_owned());
+            out.push((at..end, &text[at..end]));
         }
         at = end.max(at + 1);
     }
@@ -390,17 +418,15 @@ fn with_paths<'a, F: Files>(
     written: &str,
     paths: &[(String, ModuleDef)],
 ) -> Res<String> {
-    let found = def_paths(written);
-    if paths.is_empty() || found.is_empty() {
+    if paths.is_empty() {
         return Ok(written.to_owned());
     }
     let mut out = written.to_owned();
-    for (literal, def) in paths {
-        if !found.iter().any(|it| it == literal) {
-            continue;
-        }
+    // Last first, so each earlier range still holds the text it was found at.
+    for (at, found) in def_paths(written).into_iter().rev() {
+        let Some((literal, def)) = paths.iter().find(|(it, _)| it == found) else { continue };
         let named = named_at(facts, by, node, path, range, *def, literal)?;
-        out = replace_path(&out, literal, &named);
+        out.replace_range(at, &named);
     }
     Ok(out)
 }
@@ -432,28 +458,6 @@ fn named_at<'a, F: Files>(
         ));
     };
     Ok(named.display(facts.db, scope.krate().edition(facts.db)).to_string())
-}
-
-/// `text` with every whole occurrence of the path `from` replaced by `to`.
-fn replace_path(text: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    let mut before: Option<char> = None;
-    while let Some(at) = rest.find(from) {
-        let prior = rest[..at].chars().next_back().or(before);
-        let after = rest[at + from.len()..].chars().next();
-        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == ':';
-        out.push_str(&rest[..at]);
-        if prior.is_some_and(ident) || after.is_some_and(|c| c.is_alphanumeric() || c == '_') {
-            out.push_str(from);
-        } else {
-            out.push_str(to);
-        }
-        before = from.chars().next_back();
-        rest = &rest[at + from.len()..];
-    }
-    out.push_str(rest);
-    out
 }
 
 fn source_edit<'p, F: Files>(

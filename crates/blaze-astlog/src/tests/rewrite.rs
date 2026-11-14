@@ -157,6 +157,21 @@ fn a_template_path_from_a_crate_that_names_nothing_is_an_error() {
 }
 
 #[test]
+fn a_template_path_inside_a_string_or_a_comment_is_left_as_written() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `::lib::nwe` names nothing: as code it would be refused, as text it is only text.
+    let rules = r#"
+        (rule (call e x) (expr e "lib::old($x)"))
+        (rewrite to-new (call e x) (not (in-macro-expansion e))
+          (replace e "{ let _ = \"::lib::nwe\"; ::lib::new($x) /* was ::lib::new */ }"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(r#"{ { let _ = "::lib::nwe"; new(1) /* was ::lib::new */ } }"#), "{text}");
+    assert!(text.contains(r#"{ { let _ = "::lib::nwe"; crate::new(2) /* was ::lib::new */ } }"#), "{text}");
+}
+
+#[test]
 fn rename_goes_through_the_front_ends_references() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);
     let rules = r#"
