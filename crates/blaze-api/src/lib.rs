@@ -29,6 +29,8 @@
 
 #![deny(unsafe_code)]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
+// `frames::identity` counts the variants it generated against the enum's own count.
+#![cfg_attr(test, feature(variant_count))]
 #![register_tool(blaze)]
 // The field order promised above, held by `blaze::cbor_field_order`.
 #![blaze::canonical_cbor]

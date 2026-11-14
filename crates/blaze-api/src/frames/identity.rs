@@ -3,7 +3,7 @@
 //! by both, the same answer from both for the bytes changed, and nothing of the API's own
 //! types put in order on the way out.
 
-use std::fmt::Debug;
+use std::{collections::HashSet, fmt::Debug, mem};
 
 use blaze_ids::{ContentId, Fingerprint, rng::SplitMix64};
 use blaze_protocol::cbor::{self, reference};
@@ -22,10 +22,34 @@ use crate::{
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 39;
-const RESPONSES: usize = 48;
-
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
+
+/// One variant of an enum, each variant that can be made here as likely, made by its arm.
+///
+/// An arm is a variant's name and what follows it in a constructor (`{ fields }`, `(values)`
+/// or nothing), then optionally `if` the condition under which it can be made. The list of arms
+/// is all the bookkeeping there is: a variant's position and the count are the list's, so two
+/// changes that each add an arm merge without renumbering, and a variant of the enum the list
+/// leaves out does not compile ("patterns `&Request::New { .. }` not covered").
+macro_rules! one_of {
+    ($g:expr, $enum:path {
+        $($variant:ident $({ $($fields:tt)* })? $(( $($values:tt)* ))? $(if $can:expr)?),+ $(,)?
+    }) => {{
+        type This = $enum;
+        #[derive(Clone, Copy)]
+        enum Kind {
+            $($variant),+
+        }
+        // Every variant of `This` has an arm: the check that one added gets a generator.
+        const _: fn(&This) = |it| match it {
+            $(This::$variant { .. } => {})+
+        };
+        let kinds = [$((Kind::$variant, true $(&& $can)?)),+];
+        match $g.pick(&kinds) {
+            $(Kind::$variant => This::$variant $({ $($fields)* })? $(( $($values)* ))?,)+
+        }
+    }};
+}
 
 /// Values of the API from a seed, the same in every run. `plain` leaves out what holds a map
 /// of another crate's type whose fields are not declared in their keys' order (`Op`,
@@ -46,6 +70,19 @@ impl Gen {
 
     fn yes(&mut self) -> bool {
         self.next() & 1 == 1
+    }
+
+    /// One of the `kinds` marked `true`, each as likely: what [`one_of!`] draws with.
+    fn pick<K: Copy>(&mut self, kinds: &[(K, bool)]) -> K {
+        let can = kinds.iter().filter(|(_, can)| *can).count();
+        let at = self.rng.index(can);
+        let mut can = kinds.iter().filter(|(_, can)| *can).map(|&(kind, _)| kind);
+        can.nth(at).expect("one_of! with no arm that can be made here")
+    }
+
+    /// One of a type's own list of its values (`Goal::ALL`), each as likely.
+    fn one<T: Copy>(&mut self, all: &[T]) -> T {
+        all[self.rng.index(all.len())]
     }
 
     /// A number of each width a head has.
@@ -103,11 +140,7 @@ impl Gen {
     }
 
     fn outcome(&mut self) -> TestOutcome {
-        match self.below(3) {
-            0 => TestOutcome::Passed,
-            1 => TestOutcome::Failed,
-            _ => TestOutcome::Ignored,
-        }
+        one_of!(self, TestOutcome { Passed, Failed, Ignored })
     }
 
     fn pairs(&mut self, depth: u32) -> Vec<(String, String)> {
@@ -136,25 +169,16 @@ impl Gen {
     }
 
     fn op(&mut self) -> Op {
-        match self.below(4) {
-            0 => Op::Write {
+        one_of!(self, Op {
+            Write {
                 path: self.text(),
                 bytes: self.bytes(),
-                mode: match self.below(3) {
-                    0 => Mode::Regular,
-                    1 => Mode::Executable,
-                    _ => Mode::Symlink,
-                },
+                mode: one_of!(self, Mode { Regular, Executable, Symlink }),
             },
-            1 => Op::Edit {
-                path: self.text(),
-                at: self.wide(),
-                len: self.wide(),
-                bytes: self.bytes(),
-            },
-            2 => Op::Delete { path: self.text() },
-            _ => Op::Rename { from: self.text(), to: self.text() },
-        }
+            Edit { path: self.text(), at: self.wide(), len: self.wide(), bytes: self.bytes() },
+            Delete { path: self.text() },
+            Rename { from: self.text(), to: self.text() },
+        })
     }
 
     fn ops(&mut self, depth: u32) -> Vec<Op> {
@@ -170,11 +194,7 @@ impl Gen {
         }
         self.many(depth, |g| Change {
             path: g.text(),
-            kind: match g.below(3) {
-                0 => ChangeKind::Added,
-                1 => ChangeKind::Removed,
-                _ => ChangeKind::Modified,
-            },
+            kind: one_of!(g, ChangeKind { Added, Removed, Modified }),
         })
     }
 
@@ -193,21 +213,24 @@ impl Gen {
                 was: g.fingerprint(),
                 now: g.fingerprint(),
             }),
-            input: self.maybe(|g| match g.below(3) {
-                0 => Input::File(g.text()),
-                1 => Input::Dir(g.text()),
-                _ => Input::Config,
-            }),
+            input: self.maybe(|g| one_of!(g, Input {
+                File(g.text()),
+                Dir(g.text()),
+                Config,
+                FileAt { root: g.id(), path: g.text() },
+                DirAt { root: g.id(), path: g.text() },
+            })),
         }
     }
 
     fn view(&mut self, depth: u32) -> ViewRef {
-        let kinds = if self.plain || depth > 2 { 2 } else { 3 };
-        match self.below(kinds) {
-            0 => ViewRef::Head(self.text()),
-            1 => ViewRef::Root(View { root: self.id() }),
-            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) }, // alloc: test and fuzz reference only
-        }
+        one_of!(self, ViewRef {
+            Head(self.text()),
+            Root(View { root: self.id() }),
+            // Holds ops, which `plain` leaves out, and a view: only near the top, so it ends.
+            WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) } // alloc: test and fuzz reference only
+                if !self.plain && depth <= 2,
+        })
     }
 
     fn cargo(&mut self) -> Cargo {
@@ -240,15 +263,19 @@ impl Gen {
     }
 
     fn goal(&mut self) -> Goal {
-        Goal::ALL[(self.next() % Goal::ALL.len() as u64) as usize]
+        self.one(&Goal::ALL)
+    }
+
+    fn hot_since(&mut self) -> crate::HotSince {
+        one_of!(self, crate::HotSince { LastBuild, Start })
     }
 
     fn request(&mut self) -> Request {
-        match self.below(REQUESTS as u64) {
-            0 => Request::Commit { ops: self.ops(0), base: self.id(), head: self.text() },
-            1 => Request::Check { view: self.view(0), targets: self.targets() },
-            2 => Request::Build { view: self.view(0), targets: self.targets() },
-            3 => Request::Test {
+        one_of!(self, Request {
+            Commit { ops: self.ops(0), base: self.id(), head: self.text() },
+            Check { view: self.view(0), targets: self.targets() },
+            Build { view: self.view(0), targets: self.targets() },
+            Test {
                 ub: self.maybe(|g| Ub { seed: g.maybe(Gen::wide), schedules: g.maybe(Gen::u32) }),
                 all: self.yes(),
                 args: self.texts(0),
@@ -256,76 +283,67 @@ impl Gen {
                 filter: self.texts(0),
                 targets: self.targets(),
             },
-            4 => Request::Run {
+            Run {
                 bin: self.maybe(Gen::text),
                 args: self.texts(0),
                 view: self.view(0),
                 targets: self.targets(),
             },
-            5 => Request::Diff { to: self.view(0), from: self.view(0) },
-            6 => Request::Why { view: self.view(0), query: self.key() },
-            7 => Request::Status,
-            8 => Request::Cancel { id: self.wide() },
-            9 => Request::Open { view: self.view(0) },
-            10 => Request::Close { root: self.id() },
-            11 => Request::Reach { to: self.view(0), from: self.view(0), targets: self.targets() },
-            12 => Request::BestOf {
+            Diff { to: self.view(0), from: self.view(0) },
+            Why { view: self.view(0), query: self.key() },
+            Status,
+            Cancel { id: self.wide() },
+            Open { view: self.view(0) },
+            Close { root: self.id() },
+            Reach { to: self.view(0), from: self.view(0), targets: self.targets() },
+            BestOf {
                 base: self.view(0),
                 test: self.yes(),
                 filter: self.texts(0),
                 targets: self.targets(),
                 candidates: self.many(0, |g| g.ops(1)),
             },
-            13 => Request::Verify { view: self.view(0), targets: self.targets() },
-            14 => Request::Snapshot,
-            15 => Request::CodegenInputs { view: self.view(0), targets: self.targets() },
-            16 => Request::Trace { view: self.view(0), targets: self.targets() },
-            17 => Request::Tables { view: self.view(0) },
-            18 => {
-                Request::Edit {
-                    base: self.id(),
-                    head: self.maybe(Gen::text),
-                    edits: self.many(0, Gen::edit),
-                }
-            }
-            19 => Request::WillTest {
+            Verify { view: self.view(0), targets: self.targets() },
+            Snapshot,
+            CodegenInputs { view: self.view(0), targets: self.targets() },
+            Trace { view: self.view(0), targets: self.targets() },
+            Tables { view: self.view(0) },
+            Edit { base: self.id(), head: self.maybe(Gen::text), edits: self.many(0, Gen::edit) },
+            WillTest {
                 view: self.view(0),
                 filter: self.texts(0),
                 targets: self.targets(),
                 wait_ms: self.wide(),
             },
-            20 => Request::WillSave {
+            WillSave {
                 ops: self.ops(0),
                 head: self.text(),
                 test: self.yes(),
                 targets: self.targets(),
                 wait_ms: self.wide(),
             },
-            21 => Request::Memory,
-            22 => Request::Doc {
+            Memory,
+            Doc {
                 view: self.view(0),
                 no_deps: self.yes(),
                 private: self.yes(),
                 targets: self.targets(),
             },
-            23 => Request::Explore { dev: self.yes() },
-            24 => Request::Profile { seconds: self.u32() },
-            25 => Request::Live,
-            26 => Request::Flush,
-            27 => Request::Hot {
-                top: self.u32(),
-                since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
-            },
-            28 => Request::Gc { dry_run: self.yes(), unkept: self.yes() },
-            29 => Request::Rebuilt {
+            Explore { dev: self.yes() },
+            Profile { seconds: self.u32() },
+            Live,
+            Flush,
+            Hot { top: self.u32(), since: self.hot_since() },
+            Gc { dry_run: self.yes(), unkept: self.yes() },
+            Rebuilt {
                 all: self.yes(),
                 cwd: self.maybe_text(),
                 item: self.maybe_text(),
                 build: if self.yes() { Some(self.wide()) } else { None },
                 unexplained: self.yes(),
             },
-            30 => Request::Launch { program: self.text(), pid: self.u32() },
-            31 => Request::FetchUrl {
+            Launch { program: self.text(), pid: self.u32() },
+            FetchUrl {
                 url: self.maybe_text(),
                 repo: self.maybe_text(),
                 rev: self.maybe_text(),
@@ -333,7 +351,7 @@ impl Gen {
                 most_bytes: if self.yes() { Some(self.wide()) } else { None },
                 out: self.maybe_text(),
             },
-            32 => Request::ClientRows {
+            ClientRows {
                 build: self.wide(),
                 events: self.bytes(),
                 folded: self.bytes(),
@@ -349,25 +367,25 @@ impl Gen {
                     })
                     .collect(),
             },
-            33 => Request::Lock { view: self.view(0), targets: self.targets() },
-            35 => Request::Store { words: self.texts(0) },
-            36 => Request::Diagnostics {
+            Lock { view: self.view(0), targets: self.targets() },
+            Stop,
+            Store { words: self.texts(0) },
+            Diagnostics {
                 view: self.view(0),
                 since: self.maybe_id(),
                 client: self.text(),
                 targets: self.targets(),
                 wait_ms: self.wide(),
             },
-            37 => Request::Prove {
+            Prove {
                 emit: self.yes(),
                 lean: self.maybe_text(),
                 view: self.view(0),
                 subset: self.yes(),
                 targets: self.targets(),
             },
-            38 => Request::Query { view: self.view(0), rules: self.text() },
-            _ => Request::Stop,
-        }
+            Query { view: self.view(0), rules: self.text() },
+        })
     }
 
     fn target(&mut self) -> Target {
@@ -375,38 +393,26 @@ impl Gen {
     }
 
     fn edit(&mut self) -> Edit {
-        match self.below(11) {
-            0 => Edit::ReplaceBody { body: self.text(), item: self.target() },
-            1 => Edit::ReplaceSignature { item: self.target(), signature: self.text() },
-            2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
-            3 => Edit::AddField { field: self.text(), strukt: self.target() },
-            4 => Edit::RemoveField { field: self.text(), strukt: self.target() },
-            5 => {
-                Edit::AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() }
-            }
-            6 => Edit::RemoveItem { item: self.target() },
-            7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
-            8 => Edit::Rename { to: self.text(), item: self.target() },
-            9 => Edit::Rules { rules: self.text() },
-            _ => Edit::Replace { to: self.text(), from: self.text() },
-        }
+        one_of!(self, Edit {
+            ReplaceBody { body: self.text(), item: self.target() },
+            ReplaceSignature { item: self.target(), signature: self.text() },
+            ReplaceItem { item: self.target(), text: self.text() },
+            AddField { field: self.text(), strukt: self.target() },
+            RemoveField { field: self.text(), strukt: self.target() },
+            AddItem { file: self.text(), into: self.maybe(Gen::text), text: self.text() },
+            RemoveItem { item: self.target() },
+            AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
+            Rename { to: self.text(), item: self.target() },
+            Rules { rules: self.text() },
+            Replace { to: self.text(), from: self.text() },
+        })
     }
 
     fn edited(&mut self, depth: u32) -> Edited {
-        const HOWS: [How; 8] = [
-            How::Body,
-            How::Signature,
-            How::Fields,
-            How::Whole,
-            How::Added,
-            How::Removed,
-            How::Renamed,
-            How::Scope,
-        ];
         Edited {
             ops: self.ops(depth),
             items: self.many(depth, |g| EditedItem {
-                how: HOWS[g.below(HOWS.len() as u64) as usize],
+                how: one_of!(g, How { Body, Signature, Fields, Whole, Added, Removed, Renamed, Scope }),
                 key: g.maybe(Gen::id),
                 file: g.text(),
                 path: g.text(),
@@ -426,46 +432,20 @@ impl Gen {
             byte_start: self.u32(),
             end_column: self.u32(),
             replacement: self.maybe(Gen::text),
-            applicability: self.maybe(|g| {
-                const SURE: [Applicability; 4] = [
-                    Applicability::MachineApplicable,
-                    Applicability::MaybeIncorrect,
-                    Applicability::HasPlaceholders,
-                    Applicability::Unspecified,
-                ];
-                SURE[g.below(SURE.len() as u64) as usize]
-            }),
+            applicability: self.maybe(|g| g.one(&Applicability::ALL)),
         }
     }
 
     fn unit_target(&mut self) -> UnitTarget {
-        const KINDS: [TargetKind; 6] = [
-            TargetKind::Lib,
-            TargetKind::Bin,
-            TargetKind::Test,
-            TargetKind::Bench,
-            TargetKind::Example,
-            TargetKind::CustomBuild,
-        ];
-        const TYPES: [CrateType; 8] = [
-            CrateType::Bin,
-            CrateType::Lib,
-            CrateType::Rlib,
-            CrateType::Dylib,
-            CrateType::Cdylib,
-            CrateType::Staticlib,
-            CrateType::ProcMacro,
-            CrateType::Sdylib,
-        ];
         UnitTarget {
             doc: self.yes(),
-            kind: KINDS[self.below(KINDS.len() as u64) as usize],
+            kind: self.one(&TargetKind::ALL),
             name: self.text(),
             test: self.yes(),
             doctest: self.yes(),
             edition: self.text(),
             src_path: self.text(),
-            crate_types: self.many(1, |g| TYPES[g.below(TYPES.len() as u64) as usize]),
+            crate_types: self.many(1, |g| g.one(&CrateType::ALL)),
         }
     }
 
@@ -486,13 +466,7 @@ impl Gen {
             code: self.maybe(Gen::text),
             unit: self.maybe(Gen::unit_of),
             facts: self.many(1, Gen::fact),
-            level: match self.below(5) {
-                0 => Level::Error,
-                1 => Level::Warning,
-                2 => Level::Note,
-                3 => Level::Help,
-                _ => Level::FailureNote,
-            },
+            level: one_of!(self, Level { Error, Warning, Note, Help, FailureNote }),
             spans: self.many(1, Gen::span),
             message: self.text(),
             children: match depth < 2 {
@@ -511,10 +485,8 @@ impl Gen {
             help: self.texts(1),
             span: self.maybe(Gen::span),
             fixes: self.many(1, Gen::span),
-            level: match self.below(2) {
-                0 => Level::Error,
-                _ => Level::Warning,
-            },
+            // A found is an error or a warning, never another level.
+            level: if self.yes() { Level::Error } else { Level::Warning },
             message: self.text(),
             package: self.maybe(Gen::text),
             primary: self.yes(),
@@ -523,19 +495,9 @@ impl Gen {
     }
 
     fn artifact(&mut self) -> Artifact {
-        const KINDS: [ArtifactKind; 8] = [
-            ArtifactKind::Bin,
-            ArtifactKind::Lib,
-            ArtifactKind::Test,
-            ArtifactKind::Example,
-            ArtifactKind::Bench,
-            ArtifactKind::ProcMacro,
-            ArtifactKind::CustomBuild,
-            ArtifactKind::Doctest,
-        ];
         Artifact {
             env: self.pairs(1),
-            kind: KINDS[self.below(KINDS.len() as u64) as usize],
+            kind: self.one(&ArtifactKind::ALL),
             path: self.text(),
             fresh: self.yes(),
             runner: self.texts(1),
@@ -557,38 +519,26 @@ impl Gen {
         }
     }
 
-    /// A response; [`Response::Of`], the last, only at a `depth` under 2.
     fn response(&mut self, depth: u32) -> Response {
-        let kinds = if depth > 1 { RESPONSES - 1 } else { RESPONSES };
-        match self.below(kinds as u64) {
-            0 => Response::Committed { root: self.id(), rebased: self.yes() },
-            1 => Response::Diagnostic(self.diagnostic(0)),
-            2 => Response::Built {
+        one_of!(self, Response {
+            Committed { root: self.id(), rebased: self.yes() },
+            Diagnostic(self.diagnostic(0)),
+            Built {
                 members: self.u32(),
                 profile: self.text(),
                 artifacts: self.many(depth, Gen::artifact),
             },
-            3 => Response::Unit(UnitStarted {
+            Unit(UnitStarted {
                 name: self.text(),
-                verb: match self.below(3) {
-                    0 => Verb::Compiling,
-                    1 => Verb::Checking,
-                    _ => Verb::Fresh,
-                },
+                verb: one_of!(self, Verb { Compiling, Checking, Fresh }),
                 source: self.maybe(Gen::text),
                 package: self.u32(),
                 version: self.text(),
                 package_id: self.text(),
             }),
-            4 => Response::UnitEnded(self.unit_of()),
-            5 => Response::Fetched {
-                verb: match self.yes() {
-                    true => FetchVerb::Updating,
-                    false => FetchVerb::Downloaded,
-                },
-                what: self.text(),
-            },
-            6 => Response::BuildScript(BuildScriptRan {
+            UnitEnded(self.unit_of()),
+            Fetched { verb: one_of!(self, FetchVerb { Updating, Downloaded }), what: self.text() },
+            BuildScript(BuildScriptRan {
                 env: self.pairs(depth),
                 cfgs: self.texts(depth),
                 out_dir: self.text(),
@@ -596,36 +546,26 @@ impl Gen {
                 linked_libs: self.texts(depth),
                 linked_paths: self.texts(depth),
             }),
-            7 => Response::Work(Worked {
+            Work(Worked {
                 why: self.maybe(|g| g.many(depth, |g| g.report(depth + 1))),
-                link: match self.yes() {
-                    true => LinkKind::Patched,
-                    false => LinkKind::Placed,
-                },
+                link: one_of!(self, LinkKind { Patched, Placed }),
                 found: self.wide(),
                 green: self.wide(),
                 links: self.many(depth, |g| Linked {
-                    how: match g.below(4) {
-                        0 => LinkHow::First,
-                        1 => LinkHow::Spliced,
-                        2 => LinkHow::Unchanged,
-                        _ => LinkHow::Full { why: g.texts(depth) },
-                    },
+                    how: one_of!(g, LinkHow { First, Spliced, Unchanged, Full { why: g.texts(depth) } }),
                     path: g.text(),
                 }),
                 reran: self.wide(),
                 misses: self.wide(),
                 served: self.many(depth, |g| ServedCrate {
                     why: g.maybe(Gen::text),
-                    bodies: ServedPart::ALL[(g.next() % 3) as usize],
-                    outcome: ServedPart::ALL[(g.next() % 3) as usize],
+                    bodies: g.one(&ServedPart::ALL),
+                    outcome: g.one(&ServedPart::ALL),
                     package: g.text(),
                 }),
                 build_id: self.maybe(Gen::wide),
                 compiled: self.wide(),
-                steps_us: self.many(depth, |g| {
-                    (NodeKind::ALL[(g.next() % NodeKind::ALL.len() as u64) as usize], g.wide())
-                }),
+                steps_us: self.many(depth, |g| (g.one(&NodeKind::ALL), g.wide())),
                 critical_path_us: self.wide(),
                 placed: crate::PlacedBytes {
                     cloned: self.wide(),
@@ -648,7 +588,7 @@ impl Gen {
                     warning: g.maybe_text(),
                 }),
             }),
-            8 => Response::TestResult(TestResult {
+            TestResult(TestResult {
                 ran: self.maybe(|g| RanWhy {
                     ask: g.maybe_text(),
                     now: g.maybe_text(),
@@ -659,10 +599,7 @@ impl Gen {
                 name: self.text(),
                 binary: self.text(),
                 cached: self.maybe(|g| Cached {
-                    basis: match g.yes() {
-                        true => Basis::Executed,
-                        false => Basis::Reached { why: g.text() },
-                    },
+                    basis: one_of!(g, Basis { Executed, Reached { why: g.text() } }),
                     millis: g.wide(),
                     outcome: g.outcome(),
                 }),
@@ -673,15 +610,15 @@ impl Gen {
                 executable: self.u32(),
                 not_kept: self.maybe(|g| NotKept { no: g.text(), why: g.text() }),
             }),
-            9 => Response::Ran {
+            Ran {
                 code: self.maybe(|g| g.next() as i32),
                 stderr: self.bytes(),
                 stdout: self.bytes(),
             },
-            10 => Response::Diff { changes: self.changes(depth) },
-            11 if self.plain => Response::Done { ok: self.yes() },
-            11 => Response::Why(self.why()),
-            12 => Response::Status(Status {
+            Diff { changes: self.changes(depth) },
+            // Holds maps of another crate's types, which `plain` leaves out.
+            Why(self.why()) if !self.plain,
+            Status(Status {
                 pid: self.u32(),
                 views: self.u32(),
                 history: self.maybe(Gen::text),
@@ -726,17 +663,17 @@ impl Gen {
                     thread: g.maybe(Gen::text),
                 }),
             }),
-            13 => Response::Done { ok: self.yes() },
-            14 => Response::Error(ApiError::from(self.report(depth))),
-            15 => Response::Opened { root: self.id() },
-            16 => Response::Reached(Reach {
+            Done { ok: self.yes() },
+            Error(ApiError::from(self.report(depth))),
+            Opened { root: self.id() },
+            Reached(Reach {
                 items: self
                     .many(depth, |g| ReachedItem { path: g.text(), facts: g.many(1, Gen::fact) }),
                 tests: self.texts(depth),
                 changes: self.changes(depth),
                 compiled: self.texts(depth),
             }),
-            17 => Response::Ranked(self.many(depth, |g| Ranked {
+            Ranked(self.many(depth, |g| Ranked {
                 ok: g.yes(),
                 root: g.id(),
                 errors: g.u32(),
@@ -745,7 +682,7 @@ impl Gen {
                 warnings: g.u32(),
                 candidate: g.u32(),
             })),
-            18 => Response::Verified {
+            Verified {
                 mismatches: self.many(depth, |g| Mismatch {
                     fact: g.maybe(Gen::fact),
                     query: g.key(),
@@ -753,22 +690,22 @@ impl Gen {
                     incremental: g.fingerprint(),
                 }),
             },
-            19 => Response::Snapshotted { heads: self.many(depth, |g| (g.text(), g.id())) },
-            20 => Response::CodegenInputs(self.many(depth, |g| (g.id(), g.id()))),
-            21 => Response::Trace(self.many(depth, |g| Traced {
+            Snapshotted { heads: self.many(depth, |g| (g.text(), g.id())) },
+            CodegenInputs(self.many(depth, |g| (g.id(), g.id()))),
+            Trace(self.many(depth, |g| Traced {
                 key: g.key(),
                 ran: g.yes(),
                 edges: g.edges(1),
                 fingerprint: g.fingerprint(),
             })),
-            22 => Response::Tables(self.many(depth, |g| Table {
+            Tables(self.many(depth, |g| Table {
                 name: g.text(),
                 bytes: g.wide(),
                 elements: g.wide(),
             })),
-            23 => Response::Edited(self.edited(depth)),
-            24 => Response::Announced { root: self.id() },
-            25 => Response::Memory(Memory {
+            Edited(self.edited(depth)),
+            Announced { root: self.id() },
+            Memory(Memory {
                 tags: self.many(depth, |g| TagMemory {
                     tag: g.text(),
                     live: g.wide(),
@@ -781,8 +718,8 @@ impl Gen {
                 committed: self.wide(),
                 committed_high_water: self.wide(),
             }),
-            26 => Response::DocPage { page: self.bytes(), path: self.text() },
-            27 => Response::Documented(Documented {
+            DocPage { page: self.bytes(), path: self.text() },
+            Documented(Documented {
                 dir: self.text(),
                 pages: self.wide(),
                 crates: self.many(depth, |g| DocumentedCrate {
@@ -792,9 +729,9 @@ impl Gen {
                 }),
                 source_pages: self.wide(),
             }),
-            28 => Response::Explored { link: self.text() },
-            29 => Response::Profiled { trace: self.bytes() },
-            30 => Response::Live(LiveFrame {
+            Explored { link: self.text() },
+            Profiled { trace: self.bytes() },
+            Live(LiveFrame {
                 lost: self.wide(),
                 open: self.bytes(),
                 at_ns: self.wide() as i64,
@@ -802,30 +739,19 @@ impl Gen {
                 skipped: self.wide(),
                 counters: self.bytes(),
             }),
-            31 => Response::Flushed { seq: self.wide() },
-            32 => Response::Hot(crate::Hot {
+            Flushed { seq: self.wide() },
+            Hot(crate::Hot {
                 keys: self.many(depth, |g| crate::HotKey {
                     span: g.text(),
-                    function: match g.below(3) {
-                        0 => crate::HotFunction::None,
-                        1 => crate::HotFunction::Named(g.text()),
-                        _ => crate::HotFunction::Forgotten(g.u32()),
-                    },
+                    function: one_of!(g, crate::HotFunction { None, Named(g.text()), Forgotten(g.u32()) }),
                     lower_ns: g.wide(),
                     upper_ns: g.wide(),
                 }),
                 torn: self.wide(),
-                since: if self.yes() { crate::HotSince::LastBuild } else { crate::HotSince::Start },
+                since: self.hot_since(),
                 spans: self.wide(),
                 waits: self.many(depth, |g| crate::HotWait {
-                    kind: match g.below(6) {
-                        0 => crate::HotWaitKind::Key,
-                        1 => crate::HotWaitKind::Lock,
-                        2 => crate::HotWaitKind::Channel,
-                        3 => crate::HotWaitKind::Io,
-                        4 => crate::HotWaitKind::Child,
-                        _ => crate::HotWaitKind::Scope,
-                    },
+                    kind: one_of!(g, crate::HotWaitKind { Key, Lock, Channel, Io, Child, Scope }),
                     count: g.wide(),
                     max_ns: g.wide(),
                     p50_ns: g.wide(),
@@ -835,17 +761,13 @@ impl Gen {
                 error_ns: self.wide(),
                 total_ns: self.wide(),
             }),
-            33 => Response::Collected { report: self.text() },
-            34 => Response::UnitBegan(self.unit_of()),
-            35 => Response::TestReady(self.artifact()),
-            36 => Response::Rebuilt(self.rebuilt(depth)),
-            37 => Response::Launched {
-                live: self.yes(),
-                env: self.many(depth, |g| (g.text(), g.text())),
-            },
-            38 => Response::Stopping { doing: self.text() },
-            40 => Response::Stored { path: self.maybe_text(), blake3: self.text() },
-            39 => Response::Unchecked(Unchecked {
+            Collected { report: self.text() },
+            UnitBegan(self.unit_of()),
+            TestReady(self.artifact()),
+            Rebuilt(self.rebuilt(depth)),
+            Launched { live: self.yes(), env: self.many(depth, |g| (g.text(), g.text())) },
+            Stopping { doing: self.text() },
+            Unchecked(Unchecked {
                 open: self
                     .many(depth, |g| OpenFailure { unit: g.text(), checked: g.texts(depth + 1) }),
                 behind: self.many(depth, |g| Behind {
@@ -861,24 +783,20 @@ impl Gen {
                 }),
                 stopped: self.yes(),
             }),
-            41 => Response::Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
-            42 => Response::Doing(crate::Doing {
+            Stored { path: self.maybe_text(), blake3: self.text() },
+            Report { unit: self.maybe(Gen::unit_of), report: self.report(depth) },
+            Doing(crate::Doing {
                 on: self.maybe_text(),
                 now: blaze_protocol::now::Now::default(),
                 busy: self.u32(),
                 idle: self.u32(),
-                units: self
-                    .many(depth, |g| crate::UnitDoing { id: g.u32(), doing: g.text() }),
+                units: self.many(depth, |g| crate::UnitDoing { id: g.u32(), doing: g.text() }),
                 for_ms: self.wide(),
                 running: self.maybe_text(),
             }),
-            43 => Response::Diagnostics(crate::Seen {
+            Diagnostics(crate::Seen {
                 new: self.many(depth, Gen::found),
-                base: match self.below(3) {
-                    0 => crate::Base::First,
-                    1 => crate::Base::Held,
-                    _ => crate::Base::Unknown,
-                },
+                base: one_of!(self, crate::Base { First, Held, Unknown }),
                 root: self.id(),
                 build: if self.yes() { Some(self.wide()) } else { None },
                 ended: self.yes(),
@@ -887,67 +805,64 @@ impl Gen {
                 failed: self.maybe(|g| ApiError::from(g.report(depth))),
                 unchanged: self.many(depth, Gen::found),
             }),
-            44 => Response::Proven(crate::Proven {
+            Proven(crate::Proven {
                 failed: self.maybe(|g| g.text()),
                 subset: self.maybe(|g| crate::Subset {
                     generic: g.u32(),
                     refused: g.many(depth, |g| crate::SubsetRefusal { what: g.text(), count: g.u32() }),
                     outcomes: g.many(depth, |g| crate::SubsetFunction {
                         path: g.text(),
-                        outcome: match g.below(3) {
-                            0 => crate::SubsetOutcome::Translated,
-                            1 => crate::SubsetOutcome::Generic,
-                            _ => crate::SubsetOutcome::Refused { what: g.text() },
-                        },
+                        outcome: one_of!(g, crate::SubsetOutcome {
+                            Translated,
+                            Generic,
+                            Refused { what: g.text() },
+                        }),
                     }),
                     functions: g.u32(),
                     translated: g.u32(),
                 }),
-                records: self.many(depth, |g| match g.below(5) {
-                    0 => crate::ProofRecord::Open {
+                records: self.many(depth, |g| one_of!(g, crate::ProofRecord {
+                    Open {
                         why: g.text(),
                         function: g.text(),
                         statement: g.text(),
                         proof_file: g.text(),
                     },
-                    1 => crate::ProofRecord::Proved {
+                    Proved {
                         key: g.id(),
                         model: g.text(),
                         axioms: g.texts(depth),
                         theorem: g.text(),
                         function: g.text(),
                     },
-                    2 => crate::ProofRecord::Emitted {
+                    Emitted {
                         path: g.text(),
                         module: g.text(),
                         function: g.text(),
                         statement: g.text(),
                     },
-                    3 => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
-                    _ => crate::ProofRecord::ModelBroken {
+                    Refused { at: g.text(), what: g.text(), function: g.text() },
+                    ModelBroken {
                         at: g.text(),
                         error: g.text(),
                         module: g.text(),
                         function: g.text(),
                     },
-                }),
+                })),
             }),
-            45 => Response::TestsOf(crate::TestsOf {
+            TestsOf(crate::TestsOf {
                 tests: self.u32(),
                 binary: self.text(),
                 nearest: self.many(depth, |g| crate::Near { name: g.text(), distance: g.u32() }),
                 executable: self.u32(),
                 filtered_out: self.u32(),
             }),
-            46 => Response::Rows(crate::query::Rows {
+            Rows(crate::query::Rows {
                 findings: self.many(depth, |g| crate::query::Finding {
                     at: g.maybe(Gen::cell),
                     message: g.text(),
                     relation: g.text(),
-                    severity: match g.yes() {
-                        true => crate::query::Severity::Error,
-                        false => crate::query::Severity::Warning,
-                    },
+                    severity: one_of!(g, crate::query::Severity { Error, Warning }),
                 }),
                 relations: self.many(depth, |g| crate::query::Relation {
                     name: g.text(),
@@ -955,10 +870,10 @@ impl Gen {
                     columns: g.texts(depth + 1),
                 }),
             }),
-            _ => {
-                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
-            }
-        }
+            // Holds a response: only near the top, so a value ends.
+            Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
+                if depth < 2,
+        })
     }
 
     /// A report: its causes only near the top.
@@ -983,46 +898,41 @@ impl Gen {
                 _ => Vec::new(),
             },
             headline: self.report_text(),
-            severity: match self.below(3) {
-                0 => crate::Severity::Error,
-                1 => crate::Severity::Warning,
-                _ => crate::Severity::Note,
-            },
+            severity: one_of!(self, crate::Severity { Error, Warning, Note }),
         }
     }
 
     fn report_text(&mut self) -> crate::Text {
-        crate::Text(self.many(1, |g| match g.below(11) {
-            0 => crate::ReportSpan::Plain(g.text()),
-            1 => crate::ReportSpan::Code(g.text()),
-            2 => crate::ReportSpan::Path(g.text()),
-            3 => crate::ReportSpan::Package { name: g.text(), version: g.maybe(Gen::text) },
-            4 => crate::ReportSpan::Version(g.text()),
-            5 => crate::ReportSpan::Hash(g.text()),
-            6 => crate::ReportSpan::Var(g.text()),
-            7 => crate::ReportSpan::Count(g.wide()),
-            8 => crate::ReportSpan::Took(g.wide()),
-            9 => crate::ReportSpan::Command(g.text()),
-            _ => crate::ReportSpan::Strong(g.text()),
-        }))
+        crate::Text(self.many(1, |g| one_of!(g, crate::ReportSpan {
+            Plain(g.text()),
+            Code(g.text()),
+            Path(g.text()),
+            Package { name: g.text(), version: g.maybe(Gen::text) },
+            Version(g.text()),
+            Hash(g.text()),
+            Var(g.text()),
+            Count(g.wide()),
+            Took(g.wide()),
+            Command(g.text()),
+            Strong(g.text()),
+        })))
     }
 
     fn cell(&mut self) -> crate::query::Cell {
-        use crate::query::Cell;
-        match self.below(6) {
-            0 => Cell::Code {
+        one_of!(self, crate::query::Cell {
+            Code {
                 end: self.u32(),
                 line: self.maybe(Gen::u32),
                 path: self.text(),
                 text: self.text(),
                 start: self.u32(),
             },
-            1 => Cell::Expanded { call: self.text(), text: self.text() },
-            2 => Cell::Def { path: self.text() },
-            3 => Cell::Type { text: self.text() },
-            4 => Cell::Text(self.text()),
-            _ => Cell::Int(self.next() as i64),
-        }
+            Expanded { call: self.text(), text: self.text() },
+            Def { path: self.text() },
+            Type { text: self.text() },
+            Text(self.text()),
+            Int(self.next() as i64),
+        })
     }
 
     fn maybe_id(&mut self) -> Option<ContentId> {
@@ -1060,49 +970,39 @@ impl Gen {
     }
 
     fn reason(&mut self) -> crate::Reason {
-        use crate::{EvictedBy, Reason};
-        match self.below(7) {
-            0 => Reason::InputChanged { file: self.yes(), input: self.text(), trivia: self.yes() },
-            1 => Reason::FirstTime,
-            2 => Reason::Evicted {
-                by: match self.below(3) {
-                    0 => EvictedBy::Memory,
-                    1 => EvictedBy::Age,
-                    _ => EvictedBy::Cap,
-                },
+        one_of!(self, crate::Reason {
+            InputChanged { file: self.yes(), input: self.text(), trivia: self.yes() },
+            FirstTime,
+            Evicted {
+                by: one_of!(self, crate::EvictedBy { Memory, Age, Cap }),
                 when: self.wide(),
             },
-            3 => Reason::PreviousFailed { since: self.wide() },
-            4 => Reason::Forced { how: self.text() },
-            5 => Reason::KeyUnstable { part: self.text() },
-            _ => Reason::Unexplained { what: self.text() },
-        }
+            PreviousFailed { since: self.wide() },
+            Forced { how: self.text() },
+            KeyUnstable { part: self.text() },
+            Unexplained { what: self.text() },
+        })
     }
 
     fn rebuild_cause(&mut self, depth: u32) -> crate::RebuildCause {
-        use crate::{PartChanged, RebuildCause};
-        match self.below(15) {
-            0 => RebuildCause::First,
-            1 => RebuildCause::Parts {
+        one_of!(self, crate::RebuildCause {
+            First,
+            Parts {
                 parts: self.u32(),
                 since: self.wide(),
-                changed: self.many(depth, |g| PartChanged {
+                changed: self.many(depth, |g| crate::PartChanged {
                     now: g.maybe_id(),
                     was: g.maybe_id(),
-                    kind: match g.below(3) {
-                        0 => crate::PartIs::Input,
-                        1 => crate::PartIs::File,
-                        _ => crate::PartIs::Result,
-                    },
+                    kind: one_of!(g, crate::PartIs { Input, File, Result }),
                     part: g.text(),
                     names: g.maybe_text(),
                     trivia: g.yes(),
                 }),
             },
-            2 => RebuildCause::Lost { since: self.wide() },
-            3 => RebuildCause::Beyond { what: self.text(), since: self.wide() },
-            4 => RebuildCause::Unnamed { since: self.wide() },
-            5 => RebuildCause::Read {
+            Lost { since: self.wide() },
+            Beyond { what: self.text(), since: self.wide() },
+            Unnamed { since: self.wide() },
+            Read {
                 now: self.maybe_id(),
                 was: self.maybe_id(),
                 read: self.text(),
@@ -1111,16 +1011,16 @@ impl Gen {
                 since: if self.yes() { Some(self.wide()) } else { None },
                 changed: self.u32(),
             },
-            6 => RebuildCause::Unrecorded,
-            7 => RebuildCause::Collected,
-            8 => RebuildCause::Unshaped,
-            9 => RebuildCause::Twice { count: self.u32() },
-            10 => RebuildCause::Always { why: self.text() },
-            11 => RebuildCause::NotExplained { what: self.text() },
-            12 => RebuildCause::Unfinished { since: self.wide() },
-            13 => RebuildCause::Dropped { since: self.wide() },
-            _ => RebuildCause::Failed { why: self.text() },
-        }
+            Unrecorded,
+            Collected,
+            Unshaped,
+            Twice { count: self.u32() },
+            Always { why: self.text() },
+            NotExplained { what: self.text() },
+            Unfinished { since: self.wide() },
+            Dropped { since: self.wide() },
+            Failed { why: self.text() },
+        })
     }
 
     /// A few bytes flipped, replaced, cut, put in or swapped.
@@ -1147,105 +1047,6 @@ impl Gen {
                 _ => bytes.push(0),
             }
         }
-    }
-}
-
-/// Which of [`Gen::request`]'s a request is; a variant added is a variant to generate.
-fn request_index(request: &Request) -> usize {
-    match request {
-        Request::Commit { .. } => 0,
-        Request::Check { .. } => 1,
-        Request::Build { .. } => 2,
-        Request::Test { .. } => 3,
-        Request::Run { .. } => 4,
-        Request::Diff { .. } => 5,
-        Request::Why { .. } => 6,
-        Request::Status => 7,
-        Request::Cancel { .. } => 8,
-        Request::Open { .. } => 9,
-        Request::Close { .. } => 10,
-        Request::Reach { .. } => 11,
-        Request::BestOf { .. } => 12,
-        Request::Verify { .. } => 13,
-        Request::Snapshot => 14,
-        Request::CodegenInputs { .. } => 15,
-        Request::Trace { .. } => 16,
-        Request::Tables { .. } => 17,
-        Request::Edit { .. } => 18,
-        Request::WillTest { .. } => 19,
-        Request::WillSave { .. } => 20,
-        Request::Memory => 21,
-        Request::Doc { .. } => 22,
-        Request::Explore { .. } => 23,
-        Request::Profile { .. } => 24,
-        Request::Live => 25,
-        Request::Flush => 26,
-        Request::Hot { .. } => 27,
-        Request::Gc { .. } => 28,
-        Request::Rebuilt { .. } => 29,
-        Request::Launch { .. } => 30,
-        Request::FetchUrl { .. } => 31,
-        Request::ClientRows { .. } => 32,
-        Request::Lock { .. } => 33,
-        Request::Stop => 34,
-        Request::Store { .. } => 35,
-        Request::Diagnostics { .. } => 36,
-        Request::Prove { .. } => 37,
-        Request::Query { .. } => 38,
-    }
-}
-
-/// Which of [`Gen::response`]'s a response is; a variant added is a variant to generate.
-fn response_index(response: &Response) -> usize {
-    match response {
-        Response::Committed { .. } => 0,
-        Response::Diagnostic(_) => 1,
-        Response::Built { .. } => 2,
-        Response::Unit(_) => 3,
-        Response::UnitEnded(_) => 4,
-        Response::Fetched { .. } => 5,
-        Response::BuildScript(_) => 6,
-        Response::Work(_) => 7,
-        Response::TestResult(_) => 8,
-        Response::Ran { .. } => 9,
-        Response::Diff { .. } => 10,
-        Response::Why(_) => 11,
-        Response::Status(_) => 12,
-        Response::Done { .. } => 13,
-        Response::Error(_) => 14,
-        Response::Opened { .. } => 15,
-        Response::Reached(_) => 16,
-        Response::Ranked(_) => 17,
-        Response::Verified { .. } => 18,
-        Response::Snapshotted { .. } => 19,
-        Response::CodegenInputs(_) => 20,
-        Response::Trace(_) => 21,
-        Response::Tables(_) => 22,
-        Response::Edited(_) => 23,
-        Response::Announced { .. } => 24,
-        Response::Memory(_) => 25,
-        Response::DocPage { .. } => 26,
-        Response::Documented(_) => 27,
-        Response::Explored { .. } => 28,
-        Response::Profiled { .. } => 29,
-        Response::Live(_) => 30,
-        Response::Flushed { .. } => 31,
-        Response::Hot(_) => 32,
-        Response::Collected { .. } => 33,
-        Response::UnitBegan(_) => 34,
-        Response::TestReady(_) => 35,
-        Response::Rebuilt(_) => 36,
-        Response::Launched { .. } => 37,
-        Response::Stopping { .. } => 38,
-        Response::Unchecked(_) => 39,
-        Response::Stored { .. } => 40,
-        Response::Report { .. } => 41,
-        Response::Doing(_) => 42,
-        Response::Diagnostics(_) => 43,
-        Response::Proven(_) => 44,
-        Response::TestsOf(_) => 45,
-        Response::Rows(_) => 46,
-        Response::Of { .. } => 47,
     }
 }
 
@@ -1312,11 +1113,11 @@ fn same_lent(bytes: &[u8]) {
 fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
     let mut g = Gen { rng: SplitMix64::new(0x2545_f491_4f6c_dd1d), plain: false };
     let mut writer = cbor::Writer::new();
-    let (mut requests, mut responses) = ([false; REQUESTS], [false; RESPONSES]);
+    let (mut requests, mut responses) = (HashSet::new(), HashSet::new()); // alloc: test and fuzz reference only
     for round in 0..3000 {
         g.plain = round % 2 == 0;
         let envelope = Envelope::new(g.wide(), g.request());
-        requests[request_index(&envelope.body)] = true;
+        requests.insert(mem::discriminant(&envelope.body));
         let in_order = same(&mut writer, &envelope);
         assert!(
             in_order || !g.plain,
@@ -1324,7 +1125,7 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
              first, then bytewise): {envelope:?}"
         );
         let envelope = Envelope::new(g.wide(), g.response(0));
-        responses[response_index(&envelope.body)] = true;
+        responses.insert(mem::discriminant(&envelope.body));
         same_lent(&cbor::to_vec(&envelope).unwrap());
         let in_order = same(&mut writer, &envelope);
         assert!(
@@ -1333,8 +1134,10 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
              first, then bytewise): {envelope:?}"
         );
     }
-    assert!(requests.iter().all(|&seen| seen), "requests generated: {requests:?}");
-    assert!(responses.iter().all(|&seen| seen), "responses generated: {responses:?}");
+    // `one_of!` makes every variant have an arm; this holds that each arm's condition lets it
+    // be drawn.
+    assert_eq!(requests.len(), mem::variant_count::<Request>(), "kinds of request generated");
+    assert_eq!(responses.len(), mem::variant_count::<Response>(), "kinds of response generated");
 }
 
 #[test]
