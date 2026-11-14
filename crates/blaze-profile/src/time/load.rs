@@ -262,7 +262,13 @@ pub fn pick(source: &Source<'_>, build: Option<u64>) -> Result<Pick, TimeError> 
         }
     }
     // A build asked for by name with no `builds` row is read by its tagged rows alone.
-    build.map(|build| Pick { build, row: None, died: None }).ok_or(TimeError::NoBuild)
+    if let Some(build) = build {
+        return Ok(Pick { build, row: None, died: None });
+    }
+    // No build to answer about: never an empty report of "the last build". The manifest says
+    // whether the cap retired builds, so the error says why there is none.
+    let manifest = history::read_manifest(source.history).map_err(TimeError::History)?;
+    Err(TimeError::NoBuild { capped: manifest.capped() })
 }
 
 /// The time of the last row the process `pid` wrote from `since` on: a span's end, a switch, a

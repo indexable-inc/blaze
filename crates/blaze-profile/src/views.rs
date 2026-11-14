@@ -71,15 +71,74 @@ impl ArgType {
 /// does after its answer (storing what it left) is recorded under the id after its own, which
 /// is no build: with that as the default, `blaze explain edit_work` after any build said
 /// `build 4 counted no work in any stage` and `writes` said `0 rows` (2026-11-12).
-const BUILD: Arg =
-    Arg { name: "build", ty: ArgType::U64, default: Some("(SELECT max(build_id) FROM builds)") };
+///
+/// With no build in the table the default is an error that says why ([`NO_BUILD`]), never NULL:
+/// until 2026-11-14 a NULL build read as a build with no rows, and every view answered "0
+/// rows" about a build that was not there.
+const BUILD: Arg = Arg {
+    name: "build",
+    ty: ArgType::U64,
+    default: Some("coalesce((SELECT max(build_id) FROM builds), error($no_build))"),
+};
 /// A build for a view over its wall time: by default the last to end, as one still running has
 /// only its start's `builds` row, with no end to bound it.
 const ENDED_BUILD: Arg = Arg {
     name: "build",
     ty: ArgType::U64,
-    default: Some("(SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL)"),
+    default: Some(
+        "coalesce((SELECT max(build_id) FROM builds WHERE dur_ns IS NOT NULL), error($no_build))",
+    ),
 };
+
+/// Where a default says why it has no build to name: replaced, as it is put in, by an SQL
+/// string saying why ([`NoBuild`]) with the count of `builds` rows in it. The count is there so
+/// the argument is no constant: DuckDB would fold `error` of a constant as it plans, and fail a
+/// query that never reaches it.
+const NO_BUILD: &str = "$no_build";
+
+/// Why a view has no build to read, as far as the caller knows: [`render`] knows nothing of the
+/// history; [`prelude`] reads it from the manifest it is given ([`Manifest::capped`]).
+#[derive(Clone, Copy, Debug)]
+enum NoBuild {
+    Unknown,
+    Capped(crate::history::manifest::CappedBuilds),
+    NoneRan,
+}
+
+impl NoBuild {
+    fn of(manifest: &Manifest) -> NoBuild {
+        manifest.capped().map_or(NoBuild::NoneRan, NoBuild::Capped)
+    }
+
+    /// The SQL expression of the message ([`NO_BUILD`]).
+    fn sql(self, out: &mut String) {
+        out.push_str("concat(");
+        match self {
+            NoBuild::Unknown => quote(
+                "the profile history holds no build for this view: none has run here, or its cap \
+                 retired every one; name one with build=N",
+                out,
+            ),
+            NoBuild::Capped(capped) => quote(
+                &format!(
+                    "the profile history holds no build for this view: its cap retired builds \
+                     through build {} (at flush {}), and those it keeps (every running build and \
+                     the last {} finished) hold none for it; name one with build=N",
+                    capped.through,
+                    capped.flush,
+                    crate::history::KEEP_BUILDS,
+                ),
+                out,
+            ),
+            NoBuild::NoneRan => quote(
+                "the profile history holds no build for this view: none has run here (its cap \
+                 retired none); name one with build=N",
+                out,
+            ),
+        }
+        out.push_str(", ' (rows in builds: ', CAST((SELECT count(*) FROM builds) AS VARCHAR), ')')");
+    }
+}
 const LIMIT: Arg = Arg { name: "limit", ty: ArgType::U64, default: Some("20") };
 /// One build, or none: a view over the last builds (`problems`) reads them all unless one is
 /// named.
@@ -424,6 +483,15 @@ fn scan(
 /// An argument it does not take, one it needs and is not given, and one of the wrong type are
 /// errors.
 pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewError> {
+    render_saying(view, args, NoBuild::Unknown)
+}
+
+/// [`render`], a default build that finds none failing with `no_build` as its reason.
+fn render_saying(
+    view: &View,
+    args: &Map<String, Value>,
+    no_build: NoBuild,
+) -> Result<String, ViewError> {
     if let Some(arg) = args.keys().find(|key| !view.args.iter().any(|it| it.name == key.as_str())) {
         // alloc: an error, once a request
         return Err(ViewError::UnknownArg { view: view.name, arg: arg.to_owned() });
@@ -440,7 +508,7 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
             return Err(ViewError::Undeclared { view: view.name, name: it.name.to_owned() });
         };
         out.push_str(&view.sql[copied..it.at]);
-        literal(view, arg, args.get(arg.name), &mut out)?;
+        literal(view, arg, args.get(arg.name), no_build, &mut out)?;
         copied = it.end;
         Ok(())
     })?;
@@ -452,6 +520,7 @@ fn literal(
     view: &View,
     arg: &Arg,
     value: Option<&Value>,
+    no_build: NoBuild,
     out: &mut String,
 ) -> Result<(), ViewError> {
     let bad = |got: &Value| ViewError::BadArg {
@@ -464,7 +533,14 @@ fn literal(
     let Some(value) = value else {
         let default =
             arg.default.ok_or(ViewError::MissingArg { view: view.name, arg: arg.name })?;
-        out.push_str(default);
+        match default.split_once(NO_BUILD) {
+            Some((before, after)) => {
+                out.push_str(before);
+                no_build.sql(out);
+                out.push_str(after);
+            }
+            None => out.push_str(default),
+        }
         return Ok(());
     };
     // Writing to a `String` does not fail.
@@ -560,7 +636,7 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
             out,
             "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n",
             view.name,
-            render(view, &Map::new())?
+            render_saying(view, &Map::new(), NoBuild::of(manifest))?
         );
     }
     crate::span::views(&mut out);
@@ -664,9 +740,10 @@ mod tests {
         let view = find("slowest_queries").unwrap();
         let sql = render(view, &args(json!({}))).unwrap();
         assert!(
-            sql.contains("build_id = (SELECT max(build_id) FROM builds)"),
-            "a missing argument takes its default: {sql}"
+            sql.contains("build_id = coalesce((SELECT max(build_id) FROM builds), error(concat('"),
+            "a missing argument takes its default, which says why when there is no build: {sql}"
         );
+        assert!(!sql.contains(NO_BUILD), "the reason is put in: {sql}");
         assert!(sql.ends_with("LIMIT 20"), "{sql}");
         let sql = render(view, &args(json!({"build": 41}))).unwrap();
         assert!(sql.contains("build_id = 41"), "{sql}");
@@ -869,6 +946,7 @@ mod tests {
         "floor",
         "nullif",
         "split_part",
+        "error",
     ];
 
     /// The identifiers of `sql` outside comments, strings, numbers and `$`/`@` names, each with
