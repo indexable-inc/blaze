@@ -51,11 +51,13 @@ impl Default for Clock {
     }
 }
 
-/// The invariant: a timer the clock allows fired did not fire early, and the clock after it
-/// has not run back: for every clock, wait and reading, if a timer set now for `after` may be
-/// told fired at `reading`, then `reading` is at least `after` past now (or the sum did not
-/// fit and the reading is the last one there is), and after the reading the clock allows no
-/// reading before it.
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Clock.lean): a timer the
+/// clock allows fired did not fire early, and the clock after it has not run back: for every
+/// clock, wait and reading, if a timer set now for `after` may be told fired at `reading`,
+/// then `reading` is at least `after` past now (or the sum did not fit and the reading is the
+/// last one there is), and after the reading the clock allows no reading before it; and no
+/// arithmetic of the clock's overflows or panics. Its control is
+/// `the_oracle_catches_a_timer_fired_before_its_deadline`.
 #[blaze::theorem]
 pub fn a_timer_never_fires_early(now: u64, after: u64, reading: u64, later: u64) -> bool {
     let mut clock = Clock { now };

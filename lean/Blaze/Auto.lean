@@ -185,6 +185,28 @@ range (it is not, for `MIN / -1`). -/
 @[simp, grind =] theorem ne_true_eq (a b : Scalar ty) : (ne a b = true) = (a.val ≠ b.val) := by
   simp [ne]
 
+/-! A comparison that is `false`, as arithmetic: what a branch not taken, and the condition of a
+Rust `&&` or `||` once `simp` has opened it, say. -/
+
+/-- `a < b` is false when `b ≤ a`. -/
+@[simp, grind =] theorem lt_eq_false (a b : Scalar ty) : (lt a b = false) = (b.val ≤ a.val) := by
+  simp [lt]
+/-- `a <= b` is false when `b < a`. -/
+@[simp, grind =] theorem le_eq_false (a b : Scalar ty) : (le a b = false) = (b.val < a.val) := by
+  simp [le]
+/-- `a > b` is false when `a ≤ b`. -/
+@[simp, grind =] theorem gt_eq_false (a b : Scalar ty) : (gt a b = false) = (a.val ≤ b.val) := by
+  simp [gt]
+/-- `a >= b` is false when `a < b`. -/
+@[simp, grind =] theorem ge_eq_false (a b : Scalar ty) : (ge a b = false) = (a.val < b.val) := by
+  simp [ge]
+/-- `a == b` is false when the values differ. -/
+@[simp, grind =] theorem eq_false_eq (a b : Scalar ty) : (eq a b = false) = (a.val ≠ b.val) := by
+  simp [eq]
+/-- `a != b` is false when the values are equal. -/
+@[simp, grind =] theorem ne_false_eq (a b : Scalar ty) : (ne a b = false) = (a.val = b.val) := by
+  simp [ne]
+
 /-- Every integer is at least its type's minimum; `grind` learns it from each value it sees. -/
 theorem min_le_val (x : Scalar ty) : ty.min ≤ x.val := x.hmin
 /-- Every integer is at most its type's maximum. -/
@@ -295,7 +317,9 @@ elab_rules : tactic
 partial-correctness `match`, or total correctness (`f args = .ok v`, `∃ r, f args = .ok r ∧ Q r`,
 or `∃ r, f args = .ok r`). It turns the statement into a triple, generates its verification
 conditions with `vcgen` (unfolding `defs`, using the `@[spec]`s and any triple given in `defs`,
-such as an induction hypothesis or a loop's invariant lemma), unfolds `defs` in what is left, and
+such as an induction hypothesis or a loop's invariant lemma), unfolds `defs` in what is left,
+opens what Rust's `&&`, `||` and `!` became (an `if` whose value is a `Bool`, a comparison that
+is `false`) into propositions about the integers' values, and
 closes each goal with `grind` over the integers' bounds (and `ediv_bounds`, `emod_bounds`). A statement that is not about a `Result`
 (a total function, or that an operation fails) is unfolded and given to `grind` directly. It
 fails, naming each goal it left open, when it cannot close them all. -/
@@ -315,6 +339,12 @@ macro_rules
       | skip
     blaze_vcs [$ls,*]
     all_goals try simp only [$ls,*] at *
+    all_goals try (set_option linter.unusedSimpArgs false in
+      simp only [Bool.not_eq_true', Bool.not_eq_false', Bool.not_eq_true, Bool.not_eq_false,
+        Bool.ite_eq_true_distrib, Bool.ite_eq_false_distrib, Scalar.lt_eq, Scalar.le_eq,
+        Scalar.gt_eq, Scalar.ge_eq, Scalar.eq_true_eq, Scalar.ne_true_eq, Scalar.lt_eq_false,
+        Scalar.le_eq_false, Scalar.gt_eq_false, Scalar.ge_eq_false, Scalar.eq_false_eq,
+        Scalar.ne_false_eq, $ls,*] at *)
     all_goals try
       grind [ScalarTy.min, ScalarTy.max, ScalarTy.bits, Scalar.ofNat_val, Scalar.add, Scalar.sub, Scalar.mul,
         Scalar.checked, List.length_pos_iff, List.head?_eq_getElem?]

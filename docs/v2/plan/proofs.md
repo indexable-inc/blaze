@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-97 theorems: 84 in `lean`, 13 in `lean/analysis`.
+98 theorems: 85 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -925,6 +925,15 @@ theorem blaze_core.busy.next_is_bounded.spec.proof :
 ```lean
 theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
     blaze_core.busy.next_is_the_doubling_schedule.spec.statement
+```
+
+## V14
+
+**`blaze_core.world.clock.a_timer_never_fires_early.spec.proof`** (`BlazeCore.World.Clock`, `lean`): The statement blaze generates from blaze-core's theorem function a_timer_never_fires_early holds of its model: for every clock, wait and reading, a timer the clock world allows fired waited at least its time (or its deadline did not fit a u64 and the reading is the last there is), the clock after the reading allows none before it, and nothing overflows or panics.
+
+```lean
+theorem blaze_core.world.clock.a_timer_never_fires_early.spec.proof :
+    blaze_core.world.clock.a_timer_never_fires_early.spec.statement
 ```
 
 ## V15
