@@ -18,6 +18,38 @@ fn refused(words: &[&str]) -> String {
 }
 
 #[test]
+fn query_rules_and_replace_refuse_each_build_selection_flag_by_name() {
+    let unhonored = |words: &[&str]| super::refused(&cargo(words));
+    let modes: [&[&str]; 3] = [&["--query", "q"], &["--rules", "r", "--dry-run"], &["--replace", "a::B=c::D"]];
+    let selections: [(&str, &[&str]); 14] = [
+        ("--package", &["-p", "a"]),
+        ("--workspace", &["--workspace"]),
+        ("--exclude", &["--workspace", "--exclude", "a"]),
+        ("--features", &["--features", "x"]),
+        ("--all-features", &["--all-features"]),
+        ("--no-default-features", &["--no-default-features"]),
+        ("--release", &["--release"]),
+        ("--profile", &["--profile", "dev"]),
+        ("--target", &["--target", "x86_64-unknown-linux-gnu"]),
+        ("--lib", &["--lib"]),
+        ("--bin", &["--bin", "b"]),
+        ("--tests", &["--tests"]),
+        ("--all-targets", &["--all-targets"]),
+        ("--timings", &["--timings"]),
+    ];
+    for mode in modes {
+        assert_eq!(unhonored(&[&["check"], mode].concat()), None, "{mode:?} alone");
+        for (flag, words) in selections {
+            let line = [&["check"], mode, words].concat();
+            let said = unhonored(&line).unwrap_or_else(|| panic!("{line:?} is accepted"));
+            assert!(said.contains(&format!("`{flag}`")), "{line:?}: {said}");
+        }
+    }
+    // What the client reads to show the answer stays allowed.
+    assert_eq!(unhonored(&["check", "--query", "q", "--message-format", "json", "-v"]), None);
+}
+
+#[test]
 fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load() {
     let asked = cargo(&[
         "check",

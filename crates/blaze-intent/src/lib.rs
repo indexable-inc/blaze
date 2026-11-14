@@ -253,6 +253,19 @@ impl<F: Files> Edits<'_, F> {
                 let bytes = &file.base().file().text().as_bytes()[..usize::from(offset)];
                 memchr::memchr_iter(b'\n', bytes).count() + 1
             };
+            // A file broken before the edits could hide a new error behind one they mend, and
+            // no count or list of errors maps through edits that move them: refuse it whole.
+            if let Some(first) = file.base.errors_with_bodies().first() {
+                let place = format!("{}:{}", edit.path, line(first.range().start()));
+                return Err(ApiError::new(
+                    format!(
+                        "{place}: the file already has a syntax error, so {} would edit a file no \
+                         reparse can check: {first}",
+                        edit.by
+                    ),
+                    Some(place),
+                ));
+            }
             let place = format!("{}:{}", edit.path, line(edit.range.start()));
             let now = file.to_now(edit.range).ok_or_else(|| {
                 ApiError::new(
@@ -276,11 +289,8 @@ impl<F: Files> Edits<'_, F> {
         }
         for at in changed {
             let file = &self.working[at as usize];
-            let before = file.base.errors_with_bodies().len();
-            let after = file.parse.errors_with_bodies();
-            if after.len() > before
-                && let Some(first) = after.first()
-            {
+            // The file parsed clean before the edits (refused above otherwise).
+            if let Some(first) = file.parse.errors_with_bodies().first() {
                 let offset = usize::from(first.range().start());
                 let line = memchr::memchr_iter(b'\n', &file.text().as_bytes()[..offset]).count() + 1;
                 let place = format!("{}:{line}", file.path);

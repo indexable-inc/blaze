@@ -183,6 +183,12 @@ impl astlog_engine::Language for Blaze {
         if args.len() != arity {
             return BuiltinAritySnafu { line, name: head, expected: arity, got: args.len() }.fail();
         }
+        if head == "def-path"
+            && let [_, Sexpr::Str { text, .. }] = args
+            && names_an_impl(text)
+        {
+            return Err(impl_has_no_path(text, line));
+        }
         Ok(Some(Parsed { value, args: astlog_engine::terms(args)?, needs }))
     }
 
@@ -211,6 +217,24 @@ fn term_and_literal<'a>(head: &str, args: &'a [Sexpr], line: usize) -> Result<(T
     };
     let term = astlog_engine::terms(std::slice::from_ref(first))?.remove(0);
     Ok((term, text))
+}
+
+/// Whether `path` ends in an impl's segment (`lib::<impl Trait for Type>`), the text
+/// `def-path` gives an impl: it names the impl to a reader and resolves to nothing.
+pub(crate) fn names_an_impl(path: &str) -> bool {
+    path.trim().starts_with("<impl ") || path.contains("::<impl ")
+}
+
+/// The error for a def path that names an impl, which no path resolves to.
+pub(crate) fn impl_has_no_path(path: &str, line: usize) -> Error {
+    SourceError::DefPath {
+        line,
+        path: path.to_owned(),
+        message: "an impl has no path that names it back: bind it from its syntax, \
+                  (syntax n \"IMPL\") (defines n d), or from code in it, (enclosing-impl n d)"
+            .to_owned(),
+    }
+    .into()
 }
 
 /// The syntax kind named `name` as the parser spells it (`METHOD_CALL_EXPR`).

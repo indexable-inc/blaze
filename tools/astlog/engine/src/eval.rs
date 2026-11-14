@@ -11,16 +11,21 @@
 
 use std::alloc::Global;
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::Hash;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
 use snafu::ResultExt as _;
 
-use crate::error::{BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, RegexSnafu};
+use crate::error::{
+    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, RegexSnafu,
+    TooManyBindingsSnafu, TooManyRowsSnafu, TooManySourceRowsSnafu,
+};
 use crate::program::{AppAtom, BodyAtom, Language, Program, Term};
 
 /// One value in a relation row.
@@ -220,9 +225,14 @@ enum Step<'p, A, N> {
     Not { relation: usize, args: Vec<Arg<N>>, index: Option<usize> },
     Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
     Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>>, regex: Option<regex::Regex> },
-    Source { atom: &'p A, line: usize, args: Vec<Arg<N>> },
-    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>> },
+    /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
+    /// text, so two occurrences never share answers they might not agree on.
+    Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
+    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
 }
+
+/// A source atom occurrence and the inputs it was asked with.
+type Asked<N> = (usize, Vec<Option<Value<N>>>);
 
 /// A body compiled to steps over variable slots.
 struct Body<'p, A, N> {
@@ -240,15 +250,44 @@ struct CompiledRule<'p, A, N> {
     relation: usize,
     head: Vec<usize>,
     body: Body<'p, A, N>,
+    line: usize,
+}
+
+/// The most rows one run holds at once by default ([`Limits::DEFAULT`]). A rule's join can
+/// grow as the product of what it joins, and a request names the rules, so the run stops
+/// with [`Error::TooManyRows`] before it takes the daemon's memory.
+///
+/// [`Error::TooManyRows`]: crate::Error::TooManyRows
+pub const MAX_ROWS: usize = 10_000_000;
+
+/// How much one run may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Rows held at once: every derived row, the source rows kept for the run
+    /// ([`Evaluator`] asks a source atom each input once), and the rows a rule or a rewrite's
+    /// body has made and not yet stored.
+    pub rows: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self { rows: MAX_ROWS };
 }
 
 /// The program compiled against one fact source, ready to run.
 pub struct Evaluator<'p, F: Facts> {
     program: &'p Program<F::Lang>,
     facts: &'p F,
+    limits: Limits,
+    /// Rows stored: derived, and kept in `asked`.
+    held: Cell<usize>,
     names: Vec<String>,
     rules: Vec<CompiledRule<'p, <F::Lang as Language>::Atom, F::Node>>,
     relations: Vec<Relation<F::Node>>,
+    /// Each source atom's rows by the inputs it was asked with, for the run: a recursive rule
+    /// asks again every round, and a join asks once per row to its left.
+    asked: RefCell<HashMap<Asked<F::Node>, Rc<Vec<Row<F::Node>>>, Global>>,
+    /// The next source atom occurrence [`Self::compile`] numbers.
+    occurrences: usize,
 }
 
 type Env<N> = Vec<Option<Value<N>>>;
@@ -259,12 +298,16 @@ struct Window {
 }
 
 impl<'p, F: Facts> Evaluator<'p, F> {
-    /// Compile `program` against `facts`.
+    /// Compile `program` against `facts`, to run within `limits`.
     ///
     /// # Errors
     ///
     /// An invalid `text-match` regex.
-    pub fn new(program: &'p Program<F::Lang>, facts: &'p F) -> Result<Self, FError<F>> {
+    pub fn new(
+        program: &'p Program<F::Lang>,
+        facts: &'p F,
+        limits: Limits,
+    ) -> Result<Self, FError<F>> {
         let mut names: Vec<String> = Vec::new();
         let mut relations = Vec::new();
         for rule in &program.rules {
@@ -273,7 +316,17 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 relations.push(Relation::new(rule.head_vars.clone()));
             }
         }
-        let mut this = Self { program, facts, names, rules: Vec::new(), relations };
+        let mut this = Self {
+            program,
+            facts,
+            limits,
+            held: Cell::new(0),
+            names,
+            rules: Vec::new(),
+            relations,
+            asked: RefCell::new(HashMap::new_in(Global)),
+            occurrences: 0,
+        };
         for rule in &program.rules {
             let relation = this.relation(&rule.name)?;
             let body = this.compile(&rule.body)?;
@@ -286,7 +339,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            this.rules.push(CompiledRule { relation, head, body });
+            this.rules.push(CompiledRule { relation, head, body, line: rule.line });
         }
         Ok(this)
     }
@@ -309,11 +362,13 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     atom: &source.value,
                     line: source.line,
                     args: args(&mut names, &source.args, true),
+                    occurrence: self.occurrence(),
                 },
                 BodyAtom::NegatedSource(source) => Step::NotSource {
                     atom: &source.value,
                     line: source.line,
                     args: args(&mut names, &source.args, false),
+                    occurrence: self.occurrence(),
                 },
                 BodyAtom::App(app) => match Builtin::of(&app.name) {
                     Some(builtin) => {
@@ -365,6 +420,36 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         Ok(Body { steps, names })
     }
 
+    fn occurrence(&mut self) -> usize {
+        self.occurrences += 1;
+        self.occurrences - 1
+    }
+
+    /// The rows of a source atom occurrence for `inputs`: asked of the source the first time,
+    /// then the same rows for the rest of the run.
+    fn source_rows(
+        &self,
+        occurrence: usize,
+        atom: &<F::Lang as Language>::Atom,
+        line: usize,
+        inputs: Vec<Option<Value<F::Node>>>,
+    ) -> Result<Rc<Vec<Row<F::Node>>>, FError<F>> {
+        let key = (occurrence, inputs);
+        if let Some(rows) = self.asked.borrow().get(&key) {
+            return Ok(Rc::clone(rows));
+        }
+        let mut rows = Vec::new();
+        self.facts.solve(atom, line, &key.1, &mut rows)?;
+        let held = self.held.get() + rows.len();
+        if held > self.limits.rows {
+            return TooManySourceRowsSnafu { line, cap: self.limits.rows }.fail();
+        }
+        self.held.set(held);
+        let rows = Rc::new(rows);
+        self.asked.borrow_mut().insert(key, Rc::clone(&rows));
+        Ok(rows)
+    }
+
     fn index_of(&mut self, relation: usize, args: &[Arg<F::Node>]) -> Option<usize> {
         let columns: Vec<usize> =
             args.iter().enumerate().filter(|(_, arg)| arg.is_input()).map(|(at, _)| at).collect();
@@ -402,7 +487,10 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let delta_from = before.clone();
             let mut grew = false;
             for (relation, row) in staged.drain(..) {
-                grew |= self.relations[relation].insert(row);
+                if self.relations[relation].insert(row) {
+                    grew = true;
+                    self.held.set(self.held.get() + 1);
+                }
             }
             if !grew {
                 return Ok(());
@@ -440,7 +528,17 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         self.solve(&compiled.body, 0, &windows, &mut env, &mut |env| {
             let row = compiled.head.iter().map(|&slot| env[slot].clone()).collect::<Option<_>>();
             match row {
+                // A row the relation has already costs nothing to make again.
+                Some(row) if self.relations[compiled.relation].seen.contains(&row) => Ok(()),
                 Some(row) => {
+                    if self.held.get() + staged.len() >= self.limits.rows {
+                        return TooManyRowsSnafu {
+                            relation: self.names[compiled.relation].clone(),
+                            line: compiled.line,
+                            cap: self.limits.rows,
+                        }
+                        .fail();
+                    }
                     staged.push((compiled.relation, row));
                     Ok(())
                 }
@@ -509,23 +607,20 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     clear(env, &set);
                 }
             }
-            Step::Source { atom, line, args } => {
-                let inputs: Vec<Option<Value<F::Node>>> =
-                    args.iter().map(|arg| input(arg, env)).collect();
-                let mut rows = Vec::new();
-                self.facts.solve(atom, *line, &inputs, &mut rows)?;
-                for row in &rows {
+            Step::Source { atom, line, args, occurrence } => {
+                let inputs = args.iter().map(|arg| input(arg, env)).collect();
+                let rows = self.source_rows(*occurrence, atom, *line, inputs)?;
+                for row in rows.iter() {
                     if let Some(set) = unify(args, row, env) {
                         self.solve(body, at + 1, windows, env, emit)?;
                         clear(env, &set);
                     }
                 }
             }
-            Step::NotSource { atom, line, args } => {
+            Step::NotSource { atom, line, args, occurrence } => {
                 let inputs: Vec<Option<Value<F::Node>>> =
                     args.iter().map(|arg| input(arg, env)).collect();
-                let mut rows = Vec::new();
-                self.facts.solve(atom, *line, &inputs, &mut rows)?;
+                let rows = self.source_rows(*occurrence, atom, *line, inputs.clone())?; // clone: the key keeps one
                 let any = rows.iter().any(|row| {
                     row.iter().zip(&inputs).all(|(value, input)| input.as_ref().is_none_or(|it| it == value))
                 });
@@ -678,17 +773,23 @@ impl<'p, F: Facts> Evaluator<'p, F> {
     ///
     /// # Errors
     ///
-    /// Same conditions as rule bodies during [`Self::fixpoint`].
+    /// Same conditions as rule bodies during [`Self::fixpoint`], and
+    /// [`Error::TooManyBindings`] naming `line`, the rewrite's.
     pub fn bindings(
         &mut self,
         atoms: &'p [BodyAtom<<F::Lang as Language>::Atom>],
+        line: usize,
     ) -> Result<Vec<Binding<F::Node>>, FError<F>> {
         let body = self.compile(atoms)?;
         let mut out = Vec::new();
         let ends: Vec<usize> = self.relations.iter().map(|r| r.rows.len()).collect();
         let windows = Windows { delta: None, from: &ends, to: &ends };
         let mut env: Env<F::Node> = vec![None; body.names.len()];
+        let (held, cap) = (self.held.get(), self.limits.rows);
         self.solve(&body, 0, &windows, &mut env, &mut |env| {
+            if held + out.len() >= cap {
+                return TooManyBindingsSnafu { line, cap }.fail();
+            }
             let binding = body
                 .names
                 .iter()

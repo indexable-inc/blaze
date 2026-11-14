@@ -65,6 +65,17 @@ fn a_single_name_no_prelude_names_matches_a_type_of_that_name_with_its_arguments
 }
 
 #[test]
+fn an_array_pattern_matches_its_own_length_and_underscore_any_length() {
+    let lib = "//- /lib.rs crate:lib edition:2021\n\
+               pub fn four(_: [u8; 4]) {}\n\
+               pub fn eight(_: [u8; 8]) {}\n\
+               pub fn sized<const N: usize>(_: [u8; N]) {}\n";
+    assert_eq!(params(lib, 0, "[u8; 4]", &[]), [["lib::four"]]);
+    assert_eq!(params(lib, 0, "[u8; 0x8]", &[]), [["lib::eight"]]);
+    assert_eq!(params(lib, 0, "[u8; _]", &[]), [["lib::eight"], ["lib::four"], ["lib::sized"]]);
+}
+
+#[test]
 fn peel_refs_strips_every_leading_reference_and_keeps_a_type_with_none() {
     let (db, files) = view(OWN, 0, &["lib.rs"]);
     let rules = r#"(rule (peeled p u) (syntax s "FN") (defines s d) (fn-param d 0 t) (peel-refs t u) (def-path d p))"#;
@@ -174,6 +185,8 @@ fn a_refused_type_pattern_says_what_to_write_instead() {
         ("impl Fn()", "add `(implements t"),
         ("*const u8", "match it whole with `$t` or `_`"),
         ("lib::Wrapper<N = u8>", "write a type, `_` or `$name` for each type argument"),
+        ("[u8; N]", "write the length as a number or `_`"),
+        ("[u8; $n]", "write the length as a number or `_`"),
     ];
     for (pattern, advice) in cases {
         let said = refusal(pattern);

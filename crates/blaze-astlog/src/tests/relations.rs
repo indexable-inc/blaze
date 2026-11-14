@@ -68,6 +68,20 @@ fn references_are_the_names_that_resolve_to_the_def_and_not_its_namesakes() {
 }
 
 #[test]
+fn references_to_a_tuple_field_are_its_numbered_accesses() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct Pair(pub u32, pub u32);\n\
+                   pub fn first(p: &Pair) -> u32 { p.0 }\n\
+                   pub fn second(p: &Pair) -> u32 { p.1 + 10 }\n\
+                   pub fn again(p: &Pair) -> u32 { p.0 + 20 }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (refs n) (expr e "$p.0") (resolves e d) (references d n))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    // `p.1` is the other field, and the `0` of `10` and `20` is no name.
+    assert_eq!(lines(&outcome, "refs"), [2, 4], "{:?}", texts(&outcome, "refs"));
+}
+
+#[test]
 fn in_unsafe_holds_inside_an_unsafe_block_only() {
     let (db, files) = lib();
     let rules = r#"(rule (deref e) (syntax e "PREFIX_EXPR") (in-unsafe e))"#;
@@ -84,11 +98,48 @@ fn in_test_holds_inside_a_test_fn_only() {
 }
 
 #[test]
+fn in_test_reads_a_test_attributes_path_apart_from_its_arguments() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   #[tokio::test(flavor = \"multi_thread\")]\n\
+                   async fn threaded() { let _ = 1 + 2; }\n\
+                   #[cfg(test)]\n\
+                   mod tests { fn helper() { let _ = 3 + 4; } }\n\
+                   #[testing::other(test)]\n\
+                   fn lookalike() { let _ = 5 + 6; }\n\
+                   #[cfg(not(test))]\n\
+                   fn shipped() { let _ = 7 + 8; }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (tested e) (syntax e "BIN_EXPR") (in-test e))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "tested"), [["1 + 2"], ["3 + 4"]], "`test` as an argument names no test");
+}
+
+#[test]
 fn cfg_off_holds_inside_an_item_its_cfg_removes_only() {
     let (db, files) = lib();
     let rules = r#"(rule (off e) (syntax e "BIN_EXPR") (cfg-off e))"#;
     let outcome = query(&db, &files, rules).unwrap();
     assert_eq!(texts(&outcome, "off"), [["5 + 6"]], "the #[test] fn's `1 + 2` is compiled");
+}
+
+#[test]
+fn cfg_off_holds_inside_a_variant_or_a_field_its_cfg_removes() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub enum E { On = 1 + 2, #[cfg(any())] Off = 3 + 4 }\n\
+                   pub struct Named { pub on: [u8; 5 + 6], #[cfg(any())] pub off: [u8; 7 + 8] }\n\
+                   pub struct Tuple(pub [u8; 9 + 1], #[cfg(any())] pub [u8; 2 + 3]);\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (off e) (syntax e "BIN_EXPR") (cfg-off e))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "off"), [["3 + 4"], ["7 + 8"], ["2 + 3"]], "the compiled ones are no cfg-off");
+    // A statement's cfg has no def to tell whether it is on: refused, not guessed.
+    let fixture = "//- /lib.rs crate:lib edition:2021\npub fn f() { #[cfg(any())] let _ = 4 + 5; }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let error = match query(&db, &files, rules) {
+        Ok(outcome) => panic!("a statement's cfg was read: {:?}", texts(&outcome, "off")),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("rules:1") && error.contains("`#[cfg(any())]` at lib.rs:1"), "{error}");
 }
 
 #[test]
@@ -103,6 +154,21 @@ fn in_macro_input_holds_for_an_expansions_nodes_from_the_input_only() {
     // A node the macro made has no text in the file: its cell carries the expansion's own.
     assert!(texts(&made, "made").contains(&vec!["7+8".to_owned()]), "make!'s sum is the macro's own");
     assert!(!found.contains(&vec!["7+8".to_owned()]), "{found:?}");
+}
+
+#[test]
+fn a_pattern_finds_a_match_whose_literal_only_a_macro_expansion_holds() {
+    let fixture = "//- /dep.rs crate:dep edition:2021\n\
+                   #[macro_export]\n\
+                   macro_rules! answer { () => { 40 + 2 }; }\n\
+                   //- /lib.rs crate:lib deps:dep edition:2021\n\
+                   pub fn asked() -> u32 { dep::answer!() }\n";
+    let (db, files) = view(fixture, 1, &["lib.rs"]);
+    let outcome = query(&db, &files, r#"(rule (sum e) (expr e "40 + 2"))"#).unwrap();
+    let found = texts(&outcome, "sum");
+    // lib.rs never spells `40`: only the expansion of `answer!()` does.
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0][0].replace(' ', ""), "40+2", "{found:?}");
 }
 
 #[test]
@@ -128,6 +194,20 @@ fn attribute_holds_for_the_item_that_carries_it_only() {
     let rules = r#"(rule (cfgd n) (syntax n "FN") (attribute n "cfg"))"#;
     let outcome = query(&db, &files, rules).unwrap();
     assert_eq!(lines(&outcome, "cfgd"), [line("#[cfg(any())]")], "the #[test] fn is no cfg");
+}
+
+#[test]
+fn defines_maps_a_macro_rules_to_its_macro_and_back() {
+    let (db, files) = lib();
+    let rules = r#"
+        (rule (macros d k) (syntax n "MACRO_RULES") (defines n d) (def-kind d k))
+        (rule (back n) (syntax m "MACRO_RULES") (defines m d) (defines n d))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut found = texts(&outcome, "macros");
+    found.sort();
+    assert_eq!(found, [["lib::make", "macro"], ["lib::twice", "macro"]]);
+    assert_eq!(lines(&outcome, "back"), [line("macro_rules! twice"), line("macro_rules! make")]);
 }
 
 #[test]
@@ -159,6 +239,31 @@ fn def_kind_names_what_each_def_is() {
 }
 
 #[test]
+fn each_impl_has_a_path_of_its_own_that_names_no_def_back() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct S;\n\
+                   pub trait T {}\n\
+                   pub trait G<X> {}\n\
+                   impl S { pub fn f() {} }\n\
+                   impl T for S {}\n\
+                   impl G<u8> for S {}\n\
+                   impl G<u16> for S {}\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (impls p) (syntax n "IMPL") (defines n d) (def-path d p))"#;
+    let mut found = texts(&query(&db, &files, rules).unwrap(), "impls");
+    found.sort();
+    assert_eq!(found, [["lib::<impl G<u16> for S>"], ["lib::<impl G<u8> for S>"], ["lib::<impl S>"], ["lib::<impl T for S>"]]);
+    let refused = |rules: &str| match query(&db, &files, rules) {
+        Ok(_) => panic!("an impl's path named a def: {rules}"),
+        Err(error) => error.to_string(),
+    };
+    let error = refused(r#"(rule (named d) (def-path d "lib::<impl S>"))"#);
+    assert!(error.contains("rules:1") && error.contains("an impl has no path"), "{error}");
+    let error = refused(r#"(rule (named d) (syntax n "IMPL") (defines n e) (def-path e p) (def-path d p))"#);
+    assert!(error.contains("rules:1") && error.contains("an impl has no path"), "{error}");
+}
+
+#[test]
 fn crate_of_names_a_defs_crate_and_a_nodes_own() {
     let (db, files) = lib();
     let rules = r#"
@@ -168,6 +273,17 @@ fn crate_of_names_a_defs_crate_and_a_nodes_own() {
     let outcome = query(&db, &files, rules).unwrap();
     assert_eq!(texts(&outcome, "home"), [["dep"]]);
     assert_eq!(texts(&outcome, "here"), [["lib"]], "the call is written in lib");
+}
+
+#[test]
+fn callee_sees_through_parentheses_around_the_called_path() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn foo() {}\n\
+                   pub fn bar() { (foo)(); ((foo))(); }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (called e d) (syntax e "CALL_EXPR") (callee e d))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "called"), [["(foo)()", "lib::foo"], ["((foo))()", "lib::foo"]]);
 }
 
 #[test]
@@ -185,6 +301,26 @@ fn enclosing_module_is_the_innermost_module() {
     let outcome = query(&db, &files, rules).unwrap();
     let found = texts(&outcome, "in-mod");
     assert_eq!(found, [["target()", "lib"], ["target()", "lib"], ["target()", "lib::lookalike"]]);
+}
+
+#[test]
+fn def_path_names_a_field_from_its_def_and_its_def_from_the_path() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct S { pub field: u32 }\n\
+                   pub enum E { V { inner: u8 } }\n\
+                   pub struct P(pub u8);\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (paths p) (syntax f "RECORD_FIELD") (defines f d) (def-path d p))
+        (rule (named k p) (def-path d "lib::S::field") (def-kind d k) (def-path d p))
+        (rule (named k p) (def-path d "lib::E::V::inner") (def-kind d k) (def-path d p))
+        (rule (named k p) (def-path d "lib::P::0") (def-kind d k) (def-path d p))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "paths"), [["lib::E::V::inner"], ["lib::S::field"]], "a variant's field is under its enum");
+    let mut named = texts(&outcome, "named");
+    named.sort();
+    assert_eq!(named, [["field", "lib::E::V::inner"], ["field", "lib::P::0"], ["field", "lib::S::field"]]);
 }
 
 const NOT_A_TEST: &str = r#"(rule (stmt-of s) (stmt s "let _ = 3 + 4;"))"#;
