@@ -3,7 +3,7 @@
 //! by both, the same answer from both for the bytes changed, and nothing of the API's own
 //! types put in order on the way out.
 
-use std::{collections::HashSet, fmt::Debug, mem};
+use std::{any::TypeId, collections::HashSet, fmt::Debug};
 
 use blaze_ids::{ContentId, Fingerprint, rng::SplitMix64};
 use blaze_protocol::cbor::{self, reference};
@@ -1109,6 +1109,35 @@ fn same_lent(bytes: &[u8]) {
     }
 }
 
+/// The names of an enum's variants in declaration order, read by reflection.
+macro_rules! variant_names {
+    ($enum:ty) => {{
+        const COUNT: usize = TypeId::of::<$enum>().variants();
+        const NAMES: [&str; COUNT] = {
+            let mut names = [""; COUNT];
+            let mut at = 0;
+            while at < COUNT {
+                names[at] = TypeId::of::<$enum>().variant(at).name();
+                at += 1;
+            }
+            names
+        };
+        NAMES
+    }};
+}
+
+/// The variant `value` is: the name its derived `Debug` writes first.
+fn variant_name(value: &impl Debug) -> String {
+    let written = format!("{value:?}"); // alloc: test and fuzz reference only
+    let mut words = written.split(|c: char| !c.is_alphanumeric() && c != '_');
+    words.next().expect("split yields at least one piece").to_owned()
+}
+
+/// Of `names`, those not in `seen`.
+fn never<'a>(names: &[&'a str], seen: &HashSet<String>) -> Vec<&'a str> {
+    names.iter().copied().filter(|name| !seen.contains(*name)).collect() // alloc: test and fuzz reference only
+}
+
 #[test]
 fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
     let mut g = Gen { rng: SplitMix64::new(0x2545_f491_4f6c_dd1d), plain: false };
@@ -1117,7 +1146,7 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
     for round in 0..3000 {
         g.plain = round % 2 == 0;
         let envelope = Envelope::new(g.wide(), g.request());
-        requests.insert(mem::discriminant(&envelope.body));
+        requests.insert(variant_name(&envelope.body));
         let in_order = same(&mut writer, &envelope);
         assert!(
             in_order || !g.plain,
@@ -1125,7 +1154,7 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
              first, then bytewise): {envelope:?}"
         );
         let envelope = Envelope::new(g.wide(), g.response(0));
-        responses.insert(mem::discriminant(&envelope.body));
+        responses.insert(variant_name(&envelope.body));
         same_lent(&cbor::to_vec(&envelope).unwrap());
         let in_order = same(&mut writer, &envelope);
         assert!(
@@ -1136,8 +1165,10 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
     }
     // `one_of!` makes every variant have an arm; this holds that each arm's condition lets it
     // be drawn.
-    assert_eq!(requests.len(), mem::variant_count::<Request>(), "kinds of request generated");
-    assert_eq!(responses.len(), mem::variant_count::<Response>(), "kinds of response generated");
+    let unseen = never(&variant_names!(Request), &requests);
+    assert!(unseen.is_empty(), "requests never generated: {unseen:?}");
+    let unseen = never(&variant_names!(Response), &responses);
+    assert!(unseen.is_empty(), "responses never generated: {unseen:?}");
 }
 
 #[test]
