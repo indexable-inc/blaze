@@ -8,7 +8,7 @@ use alloc::alloc::Global;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use blaze_sql::desc::{Storage, ValueRef};
-use blaze_sim::{Config, Tape};
+use blaze_sim::Tape;
 
 use crate::codec::{self, EncodeError, ValueError};
 use crate::proto::{base64_18, put_base64};
@@ -482,7 +482,7 @@ fn scram_refuses_a_server_first_message_by_name() {
 
 #[test]
 fn base64_is_the_crate_s() {
-    blaze_sim::check(Config::cases(100), |tape| {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
         let bytes = tape.bytes(0..=70, "bytes");
         let mut ours = Vec::new();
         put_base64(&mut ours, &bytes);
@@ -499,7 +499,7 @@ fn base64_is_the_crate_s() {
 /// The refinement: decoding what `encode` wrote gives the value back, for every storage.
 #[test]
 fn a_value_round_trips() {
-    blaze_sim::check(Config::cases(100), |tape| {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
         let storage = storage(tape);
         let value = value(tape, storage, true);
         let mut bytes = Vec::new();
@@ -514,7 +514,7 @@ fn a_value_round_trips() {
 /// The refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
 #[test]
 fn an_array_round_trips() {
-    blaze_sim::check(Config::cases(100), |tape| {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
         let storage = storage(tape);
         let items: Vec<Owned> = tape.vec(0..=6, "items", |tape| value(tape, storage, true));
         let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
