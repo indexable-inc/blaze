@@ -415,3 +415,24 @@ fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
     assert!(stray.is_err(), "`$5` is no variable");
     Ok(())
 }
+
+#[test]
+fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (path a b) (edge a b))
+         (rule (path a c) (path a b) (path b c))",
+    )?;
+    let edges = Edges(vec![(1, 2), (2, 3), (3, 4), (4, 5)]);
+    let run = |rows: usize| crate::run_with(&program, &edges, crate::Limits { rows });
+    // 4 `edge` answers kept and 10 `path` rows.
+    let (db, _) = run(20)?;
+    assert_eq!(db.relations["path"].rows().len(), 10);
+    let error = run(10).err().expect("10 rows hold the edges and the first 6 paths only");
+    assert!(
+        matches!(error, Error::TooManyRows { ref relation, line: 2, cap: 10 } if relation == "path"),
+        "{error}"
+    );
+    let error = run(3).err().expect("the 4 `edge` answers alone are past 3");
+    assert!(matches!(error, Error::TooManySourceRows { line: 1, cap: 3 }), "{error}");
+    Ok(())
+}

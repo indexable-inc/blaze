@@ -11,7 +11,7 @@
 
 use std::alloc::Global;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::Hash;
@@ -22,7 +22,10 @@ use std::sync::Arc;
 use blaze_hash::{HashMap, HashSet};
 use snafu::ResultExt as _;
 
-use crate::error::{BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, RegexSnafu};
+use crate::error::{
+    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, RegexSnafu,
+    TooManyBindingsSnafu, TooManyRowsSnafu, TooManySourceRowsSnafu,
+};
 use crate::program::{AppAtom, BodyAtom, Language, Program, Term};
 
 /// One value in a relation row.
@@ -247,12 +250,36 @@ struct CompiledRule<'p, A, N> {
     relation: usize,
     head: Vec<usize>,
     body: Body<'p, A, N>,
+    line: usize,
+}
+
+/// The most rows one run holds at once by default ([`Limits::DEFAULT`]). A rule's join can
+/// grow as the product of what it joins, and a request names the rules, so the run stops
+/// with [`Error::TooManyRows`] before it takes the daemon's memory.
+///
+/// [`Error::TooManyRows`]: crate::Error::TooManyRows
+pub const MAX_ROWS: usize = 10_000_000;
+
+/// How much one run may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Rows held at once: every derived row, the source rows kept for the run
+    /// ([`Evaluator`] asks a source atom each input once), and the rows a rule or a rewrite's
+    /// body has made and not yet stored.
+    pub rows: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self { rows: MAX_ROWS };
 }
 
 /// The program compiled against one fact source, ready to run.
 pub struct Evaluator<'p, F: Facts> {
     program: &'p Program<F::Lang>,
     facts: &'p F,
+    limits: Limits,
+    /// Rows stored: derived, and kept in `asked`.
+    held: Cell<usize>,
     names: Vec<String>,
     rules: Vec<CompiledRule<'p, <F::Lang as Language>::Atom, F::Node>>,
     relations: Vec<Relation<F::Node>>,
@@ -271,12 +298,16 @@ struct Window {
 }
 
 impl<'p, F: Facts> Evaluator<'p, F> {
-    /// Compile `program` against `facts`.
+    /// Compile `program` against `facts`, to run within `limits`.
     ///
     /// # Errors
     ///
     /// An invalid `text-match` regex.
-    pub fn new(program: &'p Program<F::Lang>, facts: &'p F) -> Result<Self, FError<F>> {
+    pub fn new(
+        program: &'p Program<F::Lang>,
+        facts: &'p F,
+        limits: Limits,
+    ) -> Result<Self, FError<F>> {
         let mut names: Vec<String> = Vec::new();
         let mut relations = Vec::new();
         for rule in &program.rules {
@@ -288,6 +319,8 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         let mut this = Self {
             program,
             facts,
+            limits,
+            held: Cell::new(0),
             names,
             rules: Vec::new(),
             relations,
@@ -306,7 +339,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            this.rules.push(CompiledRule { relation, head, body });
+            this.rules.push(CompiledRule { relation, head, body, line: rule.line });
         }
         Ok(this)
     }
@@ -407,6 +440,11 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         }
         let mut rows = Vec::new();
         self.facts.solve(atom, line, &key.1, &mut rows)?;
+        let held = self.held.get() + rows.len();
+        if held > self.limits.rows {
+            return TooManySourceRowsSnafu { line, cap: self.limits.rows }.fail();
+        }
+        self.held.set(held);
         let rows = Rc::new(rows);
         self.asked.borrow_mut().insert(key, Rc::clone(&rows));
         Ok(rows)
@@ -449,7 +487,10 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             let delta_from = before.clone();
             let mut grew = false;
             for (relation, row) in staged.drain(..) {
-                grew |= self.relations[relation].insert(row);
+                if self.relations[relation].insert(row) {
+                    grew = true;
+                    self.held.set(self.held.get() + 1);
+                }
             }
             if !grew {
                 return Ok(());
@@ -487,7 +528,17 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         self.solve(&compiled.body, 0, &windows, &mut env, &mut |env| {
             let row = compiled.head.iter().map(|&slot| env[slot].clone()).collect::<Option<_>>();
             match row {
+                // A row the relation has already costs nothing to make again.
+                Some(row) if self.relations[compiled.relation].seen.contains(&row) => Ok(()),
                 Some(row) => {
+                    if self.held.get() + staged.len() >= self.limits.rows {
+                        return TooManyRowsSnafu {
+                            relation: self.names[compiled.relation].clone(),
+                            line: compiled.line,
+                            cap: self.limits.rows,
+                        }
+                        .fail();
+                    }
                     staged.push((compiled.relation, row));
                     Ok(())
                 }
@@ -722,17 +773,23 @@ impl<'p, F: Facts> Evaluator<'p, F> {
     ///
     /// # Errors
     ///
-    /// Same conditions as rule bodies during [`Self::fixpoint`].
+    /// Same conditions as rule bodies during [`Self::fixpoint`], and
+    /// [`Error::TooManyBindings`] naming `line`, the rewrite's.
     pub fn bindings(
         &mut self,
         atoms: &'p [BodyAtom<<F::Lang as Language>::Atom>],
+        line: usize,
     ) -> Result<Vec<Binding<F::Node>>, FError<F>> {
         let body = self.compile(atoms)?;
         let mut out = Vec::new();
         let ends: Vec<usize> = self.relations.iter().map(|r| r.rows.len()).collect();
         let windows = Windows { delta: None, from: &ends, to: &ends };
         let mut env: Env<F::Node> = vec![None; body.names.len()];
+        let (held, cap) = (self.held.get(), self.limits.rows);
         self.solve(&body, 0, &windows, &mut env, &mut |env| {
+            if held + out.len() >= cap {
+                return TooManyBindingsSnafu { line, cap }.fail();
+            }
             let binding = body
                 .names
                 .iter()
