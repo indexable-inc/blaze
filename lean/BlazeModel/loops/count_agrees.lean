@@ -245,14 +245,14 @@ theorem model_loop (n : U32) :
       omega
     have hin : i = n := Scalar.ext (by omega)
     rw [loops.count.loop_0]
-    rw [if_neg hlt, hin]
+    rw [ite_eq_right hlt, hin]
   | succ k ih =>
     intro i hk
     have hlt : Scalar.lt i n = true := (Scalar.lt_iff _ _).mpr (by omega)
     have hin := in_range n i hlt
     have h1 := one_val
     rw [loops.count.loop_0]
-    rw [if_pos hlt]
+    rw [ite_eq_left hlt]
     simp only [Scalar.add_ok i (1 : U32) hin, Result.bind_ok]
     exact ih ⟨i.val + (1 : U32).val, hin.1, hin.2⟩ (by
       show i.val + (1 : U32).val + (k : Int) = n.val

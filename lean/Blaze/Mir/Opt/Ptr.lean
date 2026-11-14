@@ -61,9 +61,9 @@ theorem found_ok (missing : Undefined) :
 theorem ite_ok {α : Type} {c : Prop} [Decidable c] {a w : α} {why : Undefined}
     (h : (if c then Outcome.ok a else Outcome.undefined why) = Outcome.ok w) : a = w := by
   by_cases hc : c
-  · rw [if_pos hc] at h
+  · rw [ite_eq_left hc] at h
     exact Outcome.ok.inj h
-  · rw [if_neg hc] at h
+  · rw [ite_eq_right hc] at h
     cases h
 
 /-! Lists. -/
@@ -93,11 +93,11 @@ theorem findFrame_mem :
   | [], _, _, h => none_eq_some_elim h
   | a :: l, id, fr, h => by
     by_cases hc : a.id = id
-    · have e : findFrame (a :: l) id = some a := (findFrame_cons a l id).trans (if_pos hc)
+    · have e : findFrame (a :: l) id = some a := (findFrame_cons a l id).trans (ite_eq_left hc)
       have e2 : a = fr := Option.some.inj (e.symm.trans h)
       exact List.mem_cons.mpr (Or.inl e2.symm)
     · have e : findFrame (a :: l) id = findFrame l id :=
-        (findFrame_cons a l id).trans (if_neg hc)
+        (findFrame_cons a l id).trans (ite_eq_right hc)
       exact List.mem_cons.mpr (Or.inr (findFrame_mem l id fr (e.symm.trans h)))
 
 /-! Reads. -/
@@ -139,12 +139,12 @@ theorem Value.checkLive_ok (v w : Value) (h : v.checkLive = Outcome.ok w) : v = 
 theorem State.slots?_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) (f : Nat)
     (slots : List Slot) (h : st.slots? f = some slots) : SlotsOk P slots := by
   by_cases hf : f = 0
-  · have e : st.slots? f = some st.base := (State.slots?_def st f).trans (if_pos hf)
+  · have e : st.slots? f = some st.base := (State.slots?_def st f).trans (ite_eq_left hf)
     have e2 : st.base = slots := Option.some.inj (e.symm.trans h)
     rw [← e2]
     exact And.left hm
   · have e : st.slots? f = (findFrame st.stack f).map (fun fr => fr.locals) :=
-      (State.slots?_def st f).trans (if_neg hf)
+      (State.slots?_def st f).trans (ite_eq_right hf)
     have h2 : (findFrame st.stack f).map (fun fr => fr.locals) = some slots := e.symm.trans h
     cases hfr : findFrame st.stack f with
     | none =>
@@ -265,7 +265,7 @@ theorem setFrame_ok (Q : List Slot → Prop) (id : Nat) (slots : List Slot) (hq 
   | a :: l, hl, fr, h => by
     by_cases hc : a.id = id
     · have e : setFrame (a :: l) id slots = a.withLocals slots :: l :=
-        (setFrame_cons a l id slots).trans (if_pos hc)
+        (setFrame_cons a l id slots).trans (ite_eq_left hc)
       rw [e] at h
       cases List.mem_cons.mp h with
       | inl here =>
@@ -273,7 +273,7 @@ theorem setFrame_ok (Q : List Slot → Prop) (id : Nat) (slots : List Slot) (hq 
         exact hq
       | inr there => exact hl fr (List.mem_cons.mpr (Or.inr there))
     · have e : setFrame (a :: l) id slots = a :: setFrame l id slots :=
-        (setFrame_cons a l id slots).trans (if_neg hc)
+        (setFrame_cons a l id slots).trans (ite_eq_right hc)
       rw [e] at h
       cases List.mem_cons.mp h with
       | inl here =>
@@ -287,12 +287,12 @@ theorem State.setSlots_ok {P : Pointer → Prop} {st : State} (hm : MemOk P st) 
     (slots : List Slot) (hs : SlotsOk P slots) : MemOk P (st.setSlots f slots) := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     rw [e]
     exact And.intro hs (And.right hm)
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     rw [e]
     exact And.intro (And.left hm) (setFrame_ok (SlotsOk P) f slots hs st.stack (And.right hm))
 

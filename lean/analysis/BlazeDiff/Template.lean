@@ -190,15 +190,15 @@ def Cx.eval (cx : Cx) (env : ℕ → ℝ) : RCx where
 theorem eval_powiDown (env : ℕ → ℝ) (cx : Cx) :
     cx.powiDown.eval env = (cx.eval env).powiDown := by
   by_cases h : cx.exponent.val = Blaze.ScalarTy.min .I32
-  · have e1 : cx.powiDown = Expr.bin .div cx.out cx.a0 := if_pos h
-    have e2 : (cx.eval env).powiDown = (cx.eval env).out / (cx.eval env).a0 := if_pos h
+  · have e1 : cx.powiDown = Expr.bin .div cx.out cx.a0 := ite_eq_left h
+    have e2 : (cx.eval env).powiDown = (cx.eval env).out / (cx.eval env).a0 := ite_eq_left h
     rw [e1, e2]
     rfl
   · have e1 : cx.powiDown = Expr.powi (Blaze.Scalar.wrap .I32 (cx.exponent.val - 1)) cx.a0 :=
-      if_neg h
+      ite_eq_right h
     have e2 : (cx.eval env).powiDown =
         (cx.eval env).a0 ^ (Blaze.Scalar.wrap .I32 ((cx.eval env).exponent.val - 1)).val :=
-      if_neg h
+      ite_eq_right h
     rw [e1, e2]
     rfl
 

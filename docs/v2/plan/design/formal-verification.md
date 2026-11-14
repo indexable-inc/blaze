@@ -419,7 +419,7 @@ out of fuel is allowed, so a function with a loop gets partial correctness.
   `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof`, which fails to elaborate, naming
   the theorem, when the proof is of anything else.
 
-**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.20.0
+**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.35.0
 (`lean/lean-toolchain`), named by `BLAZE_LEAN_PROVER` (an absolute path to `lean`; no `PATH`,
 no elan; `BLAZE_LEAN` was taken by the code generator), and refused when `--version` says
 another. Proved means Lean accepts the check module and `#print axioms` lists only `propext`,
@@ -980,8 +980,8 @@ generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of
   (`lake build` in `lean/`).
 - `lean/analysis` (package `blazeAnalysis`, library `BlazeDiff`) is for proofs that need real
   analysis. Its `lean-toolchain` equals `lean/`'s. It requires Mathlib at commit
-  `c211948581bde9846a99e32d97a03f0d5307c31e`, which is what Mathlib's tag `v4.20.0` names (the
-  Mathlib built for Lean 4.20.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
+  `56a005855ea17e0b0958f73ec801ae140b0a1679`, which is what Mathlib's tag `v4.35.0` names (the
+  Mathlib built for Lean 4.35.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
   does not copy it: a `powi` exponent is `Blaze.I32`, Rust's `i32` as `Blaze.Scalar` models it.
   Build: in `lean/analysis`, `lake exe cache get` (Mathlib's prebuilt files; Mathlib is never
   compiled here), then `lake build`. `lake-manifest.json` is checked in, so what Mathlib itself

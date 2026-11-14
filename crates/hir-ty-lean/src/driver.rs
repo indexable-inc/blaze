@@ -28,7 +28,7 @@ use crate::{
 
 /// The Lean release blaze proves with: `lean/lean-toolchain` pins the same. Part of every
 /// [`ProofKey`].
-pub const LEAN_VERSION: &str = "4.20.0";
+pub const LEAN_VERSION: &str = "4.35.0";
 
 /// The axioms a proof may rest on: Lean's three. `sorryAx` (a `sorry`) and
 /// `Lean.ofReduceBool` (native evaluation: `native_decide`, `bv_decide`) are not among them.

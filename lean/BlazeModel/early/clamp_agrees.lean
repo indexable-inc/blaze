@@ -112,14 +112,14 @@ theorem agrees (x limit : U32) (extra : Nat) :
     run P (extra + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
       Outcome.ok (Value.int ScalarTy.U32 (early.clamp x limit)) := by
   by_cases hgt : Scalar.gt x limit = true
-  · have hm : early.clamp x limit = limit := if_pos hgt
+  · have hm : early.clamp x limit = limit := ite_eq_left hgt
     rw [run_step P (extra + 1) _ _ (step0_true Slot.uninit Slot.uninit x limit hgt), hm]
     exact run_done P extra _ _ (step2 Slot.moved x limit)
   · have hf : Scalar.gt x limit = false := by
       cases hb : Scalar.gt x limit with
       | true => exact absurd hb hgt
       | false => rfl
-    have hm : early.clamp x limit = x := if_neg hgt
+    have hm : early.clamp x limit = x := ite_eq_right hgt
     rw [run_step P (extra + 1) _ _ (step0_false Slot.uninit Slot.uninit x limit hf), hm]
     exact run_done P extra _ _ (step1 Slot.moved x limit)
 
