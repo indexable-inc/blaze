@@ -1,4 +1,9 @@
-use super::*;
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
+use super::{Problem, TextError, parse, print, print_runs};
 use crate::{Broke, Config, Tape};
 
 /// A bug a control plants in `print`.
@@ -27,7 +32,9 @@ fn round_trips(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let kept = values.iter().rposition(|&value| value != 0).map_or(0, |last| last + 1);
     let back = parse(&text);
     if back.as_deref() != Ok(&values[..kept]) {
-        return Err(Broke::Oracle(format!("{values:?} printed as `{text}` parsed back as {back:?}")));
+        return Err(Broke::Oracle(format!(
+            "{values:?} printed as `{text}` parsed back as {back:?}"
+        )));
     }
     Ok(())
 }
@@ -76,5 +83,8 @@ fn each_problem_is_refused_where_it_starts() {
     assert_eq!(refused("1 0*1048576"), (2, Problem::TooLong));
     assert_eq!(refused("0*99999999999999999999999"), (0, Problem::TooLong));
     let error = TextError { at: 2, problem: Problem::BadRun };
-    assert_eq!(error.to_string(), "the tape's text at byte 2: a run is written `0*n`, with n of 2 or more");
+    assert_eq!(
+        error.to_string(),
+        "the tape's text at byte 2: a run is written `0*n`, with n of 2 or more"
+    );
 }

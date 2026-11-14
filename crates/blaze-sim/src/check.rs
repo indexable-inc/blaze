@@ -15,10 +15,12 @@ use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe, Location, PanicHookInfo};
 use std::sync::Once;
 
-use crate::control::Broke;
 #[cfg(test)]
 use crate::search::Plant;
-use crate::search::{Config, Ended, Failed, Failure, Given, Next, Origin, SEED, SEEDS, Search, TAPE, Verdict};
+use crate::search::{
+    Broke, Config, Ended, Failed, Failure, Given, GivenError, Next, Origin, SEED, SEEDS, Search,
+    TAPE, Verdict,
+};
 use crate::tape::{Record, Tail, Tape};
 use crate::text;
 
@@ -31,12 +33,20 @@ pub trait Outcome {
 }
 
 impl Outcome for () {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn ended(self) -> Ended {
         Ended::Passed
     }
 }
 
 impl Outcome for Result<(), Broke> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn ended(self) -> Ended {
         match self {
             Ok(()) => Ended::Passed,
@@ -47,6 +57,10 @@ impl Outcome for Result<(), Broke> {
 }
 
 impl Outcome for Result<(), String> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn ended(self) -> Ended {
         match self {
             Ok(()) => Ended::Passed,
@@ -64,7 +78,8 @@ struct Kept {
 /// The thread-locals the panic hook and `search` share.
 mod local {
     #![expect(
-        blaze::process_static,
+        blaze::global_state,
+        blaze::std_use,
         reason = "the panic hook is process-wide and finds the search it serves through the panicking thread: how deep in searches the thread is, and the panic it kept"
     )]
 
@@ -83,31 +98,55 @@ mod local {
 use local::{DEPTH, KEPT};
 
 /// Installs the hook once for the process.
+#[expect(
+    blaze::std_use,
+    reason = "a panic hook is one per process: the process's one `Once` says whether it is installed"
+)]
 fn install_hook() {
     #[expect(
-        blaze::process_static,
+        blaze::global_state,
+        blaze::std_use,
         reason = "a panic hook is one per process: it is installed once, over the hook that was there before"
     )]
     static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        let before = panic::take_hook();
-        let hook = Box::new_in(
-            move |info: &PanicHookInfo<'_>| {
-                // At thread teardown the depth is gone, and so is any search on the thread.
-                let inside = DEPTH.try_with(Cell::get).unwrap_or(0) > 0;
-                if inside {
-                    keep(info);
-                } else {
-                    before(info);
-                }
-            },
-            Global,
-        );
-        panic::set_hook(hook);
-    });
+    INSTALL.call_once(replace_hook);
+}
+
+/// Puts blaze-sim's hook over the one the process had, which it keeps to hand panics on to.
+#[expect(
+    blaze::effect_breadth,
+    reason = "std's `take_hook` alone brings IO, blocking, locking, allocating and panicking: a function that takes the hook there was has all five, however it is split"
+)]
+fn replace_hook() {
+    let before = panic::take_hook();
+    let hook = Box::new_in(move |info: &PanicHookInfo<'_>| on_panic(&before, info), Global);
+    panic::set_hook(hook);
+}
+
+/// What the hook does with a panic: keeps it when this thread is inside a search, else hands it
+/// to `before`, the hook that was there before.
+#[expect(
+    blaze::std_use,
+    reason = "the hook is process-wide and finds the search it serves through the panicking thread's depth"
+)]
+#[expect(
+    blaze::dropped_error,
+    reason = "the hook can run while a thread is torn down, when its thread-locals are gone and so is any search on it: no depth to read is depth 0"
+)]
+fn on_panic(before: &(dyn Fn(&PanicHookInfo<'_>) + Sync + Send), info: &PanicHookInfo<'_>) {
+    let inside = DEPTH.try_with(Cell::get).unwrap_or(0) > 0;
+    if inside {
+        keep(info);
+    } else {
+        before(info);
+    }
 }
 
 /// Keeps a panic's place and message for the search on this thread.
+#[expect(
+    blaze::std_use,
+    reason = "the hook hands a panic to the search on its thread through that thread's kept panic"
+)]
 fn keep(info: &PanicHookInfo<'_>) {
     let at = match info.location() {
         Some(at) => format!("{}:{}:{}", at.file(), at.line(), at.column()),
@@ -121,20 +160,34 @@ fn keep(info: &PanicHookInfo<'_>) {
     let _gone = KEPT.try_with(|kept| kept.set(Some(Kept { at, message })));
 }
 
-/// Raises this thread's depth while a search runs; lowers it when dropped, a panic out of the
+/// Raises this thread's depth while a search runs; puts it back when dropped, a panic out of the
 /// search among the ways.
-struct Inside;
+struct Inside {
+    /// The thread's depth outside this search, which the drop puts back.
+    outer: u32,
+}
 
 impl Inside {
+    #[expect(
+        blaze::std_use,
+        reason = "the depth is the thread's, so the process-wide hook can tell a panic inside a search from one outside"
+    )]
     fn enter() -> Inside {
-        DEPTH.set(DEPTH.get() + 1);
-        Inside
+        let outer = DEPTH.get();
+        DEPTH.set(outer + 1);
+        Inside { outer }
     }
 }
 
 impl Drop for Inside {
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    #[expect(
+        blaze::std_use,
+        reason = "the depth is the thread's, so the process-wide hook can tell a panic inside a search from one outside"
+    )]
     fn drop(&mut self) {
-        DEPTH.set(DEPTH.get() - 1);
+        DEPTH.set(self.outer);
     }
 }
 
@@ -145,11 +198,19 @@ pub fn search<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) -> Verdi
 
 /// `search` with a bug planted in the search, for a control.
 #[cfg(test)]
-pub(crate) fn search_planted<O: Outcome>(config: Config, plant: Plant, body: impl FnMut(&Tape) -> O) -> Verdict {
+pub(crate) fn search_planted<O: Outcome>(
+    config: Config,
+    plant: Plant,
+    body: impl FnMut(&Tape) -> O,
+) -> Verdict {
     drive(Search::planted(config, plant), body)
 }
 
 /// Runs `search`'s proposals on one tape and one record, kept across cases.
+#[expect(
+    blaze::std_use,
+    reason = "the hook hands a body's panic to its search through this thread's kept panic: emptied before each run, taken after it"
+)]
 fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Verdict {
     install_hook();
     let _inside = Inside::enter();
@@ -158,7 +219,15 @@ fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Ve
     let most_runs = search.most_runs();
     for _ in 0..=most_runs {
         let proposal = match search.next() {
-            Next::Done(verdict) => return verdict.clone(),
+            Next::Done(
+                verdict @ (Verdict::Passed(_)
+                | Verdict::Failed(_)
+                | Verdict::NotAFunction { .. }
+                | Verdict::DrewNothing { .. }
+                | Verdict::AllDiscarded { .. }
+                | Verdict::Unreached { .. }
+                | Verdict::Misfit { .. }),
+            ) => return verdict.clone(),
             Next::Run(proposal) => proposal,
         };
         tape.reset(proposal.prefix, proposal.tail);
@@ -169,11 +238,17 @@ fn drive<O: Outcome>(mut search: Search, mut body: impl FnMut(&Tape) -> O) -> Ve
         let ended = decide(&record, result, kept);
         search.ran(&record, ended);
     }
-    panic!("blaze-sim: the search proposed more than its {most_runs} runs (its cases, shrink runs and final run)")
+    panic!(
+        "blaze-sim: the search proposed more than its {most_runs} runs (its cases, shrink runs and final run)"
+    )
 }
 
 /// How a case ended: discarded, then overran, then a panic, then what the body returned.
-fn decide<O: Outcome>(record: &Record, result: std::thread::Result<O>, kept: Option<Kept>) -> Ended {
+fn decide<O: Outcome>(
+    record: &Record,
+    result: std::thread::Result<O>,
+    kept: Option<Kept>,
+) -> Ended {
     if record.discarded {
         return Ended::Discarded;
     }
@@ -191,11 +266,12 @@ fn decide<O: Outcome>(record: &Record, result: std::thread::Result<O>, kept: Opt
                 Some(kept) => (kept.at, kept.message),
                 // Another hook took over after blaze-sim's was installed: the payload is all there is.
                 None => {
-                    let text = match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
-                        (Some(text), _) => (*text).to_owned(),
-                        (None, Some(text)) => text.clone(),
-                        (None, None) => "a panic whose payload is not text".to_owned(),
-                    };
+                    let text =
+                        match (payload.downcast_ref::<&str>(), payload.downcast_ref::<String>()) {
+                            (Some(text), _) => (*text).to_owned(),
+                            (None, Some(text)) => text.clone(),
+                            (None, None) => "a panic whose payload is not text".to_owned(),
+                        };
                     ("a place unknown: another panic hook replaced blaze-sim's".to_owned(), text)
                 }
             };
@@ -222,18 +298,54 @@ pub fn check<O: Outcome>(config: Config, body: impl FnMut(&Tape) -> O) {
 pub fn check_given<O: Outcome>(config: Config, given: Given, body: impl FnMut(&Tape) -> O) {
     let at = Location::caller();
     let verdict = search(config.given(given), body);
-    let thread = std::thread::current();
-    let test = thread.name().filter(|name| *name != "main");
     match &verdict {
-        Verdict::Passed(passed) => say_passed(&place(at, test), passed.cases, passed.choices),
-        _ => panic!("{}", report(&verdict, at, test)),
+        Verdict::Passed(passed) => {
+            say_passed(&with_test_name(|test| place(at, test)), passed.cases, passed.choices);
+        }
+        Verdict::Failed(_)
+        | Verdict::NotAFunction { .. }
+        | Verdict::DrewNothing { .. }
+        | Verdict::AllDiscarded { .. }
+        | Verdict::Unreached { .. }
+        | Verdict::Misfit { .. } => panic!("{}", report_here(&verdict, at)),
     }
+}
+
+/// The name Rust's runtime gives the main thread: a thread's name, but no test's.
+const MAIN_THREAD: &str = "main";
+
+/// Runs `then` with the name of the test on this thread: the thread's name, unless the thread
+/// has none or is the main thread.
+#[expect(
+    blaze::std_use,
+    reason = "the test harness names the thread it runs a test on after the test: the thread's name is the one place the test's name is"
+)]
+fn with_test_name<R>(then: impl FnOnce(Option<&str>) -> R) -> R {
+    let thread = std::thread::current();
+    then(thread.name().filter(|name| *name != MAIN_THREAD))
+}
+
+/// `report` of `verdict`, from the check at `at`, named after the test on this thread.
+pub(crate) fn report_here(verdict: &Verdict, at: &Location<'_>) -> String {
+    with_test_name(|test| report(verdict, at, test))
 }
 
 /// The three settings, read once, as a `Given`; a refused one panics with why.
 #[expect(
     clippy::disallowed_methods,
     reason = "the driver is the entry point: the one place blaze-sim reads what the person gave"
+)]
+#[expect(
+    blaze::env_read,
+    reason = "the driver is the entry point: the three settings are read here once, as a `Given`, and handed to `check_given`"
+)]
+#[expect(
+    blaze::std_use,
+    reason = "the driver is the entry point: the one place blaze-sim reads what the person gave, from the test process's environment"
+)]
+#[expect(
+    blaze::error_debug,
+    reason = "a setting that is not Unicode has no `Display`: `Debug`'s escaped form is the one that shows its bytes as they are"
 )]
 fn given_by_the_person() -> Given {
     let read = |setting: &'static str| match std::env::var(setting) {
@@ -246,11 +358,26 @@ fn given_by_the_person() -> Given {
     let (seed, seeds, tape) = (read(SEED), read(SEEDS), read(TAPE));
     match Given::parse(seed.as_deref(), seeds.as_deref(), tape.as_deref()) {
         Ok(given) => given,
-        Err(error) => panic!("blaze-sim: {error}"),
+        Err(
+            error @ (GivenError::NotANumber { .. }
+            | GivenError::Tape { .. }
+            | GivenError::TapeWith { .. }
+            | GivenError::ZeroSeeds
+            | GivenError::SeedWithSeeds),
+        ) => panic!("blaze-sim: {error}"),
     }
 }
 
+/// Prints a check's pass line.
 #[expect(clippy::print_stdout, reason = "a check's pass line goes to the test's own output")]
+#[expect(
+    blaze::std_use,
+    reason = "a check's pass line goes to the test's own output, which the test harness captures through `println!` alone"
+)]
+#[expect(
+    blaze::effect_breadth,
+    reason = "one `println!`: std's `_print` brings IO, blocking, locking and allocating and its arguments' formatting panicking, so any function that prints a line has all five"
+)]
 fn say_passed(place: &str, cases: u32, choices: u64) {
     println!("blaze-sim: {place}: {cases} cases, {choices} choices");
 }
@@ -264,52 +391,78 @@ fn place(at: &Location<'_>, test: Option<&str>) -> String {
 }
 
 /// What a verdict says to a person. `test` is the test's name when known.
+#[blaze::pure]
+#[blaze::nonblocking]
 pub fn report(verdict: &Verdict, at: &Location<'_>, test: Option<&str>) -> String {
     let place = place(at, test);
     match verdict {
         Verdict::Failed(failed) => report_failed(failed, &place),
-        Verdict::Passed(passed) => format!(
-            "blaze-sim: `{place}` passed: {} cases ({} discarded), {} choices",
-            passed.cases, passed.discarded, passed.choices
-        ),
-        Verdict::NotAFunction { seed, tape, first, again } => {
-            let tape = text::print(tape);
-            let found = match seed {
-                Some(seed) => format!(" (the case as found: {SEED}={seed})"),
-                None => String::new(),
-            };
+        Verdict::Passed(passed) => {
             format!(
-                "blaze-sim: `{place}` is not a function of its tape: its least tape failed with `{}` ({}), and run once more it {}\n\
-                 it reads something outside its tape (a counter, a clock, a global); the tape: {TAPE}='{tape}'{found}",
-                first.text,
-                origin(&first.origin),
-                ended(again),
+                "blaze-sim: `{place}` passed: {} cases ({} discarded), {} choices",
+                passed.cases, passed.discarded, passed.choices
             )
         }
+        Verdict::NotAFunction {
+            seed,
+            tape,
+            first,
+            again: again @ (Ended::Passed | Ended::Failed(_) | Ended::Discarded),
+        } => report_not_a_function(&place, *seed, tape, first, again),
         Verdict::DrewNothing { cases } => format!(
             "blaze-sim: `{place}`: its {cases} cases drew no choice, so it is no property test: draw what varies from the tape"
         ),
         Verdict::AllDiscarded { cases } => format!(
             "blaze-sim: `{place}`: all {cases} cases were discarded, so nothing was tested: discard less, or draw what the case assumes"
         ),
-        Verdict::Unreached { cases, missing } => {
-            let mut points = String::new();
-            for (index, point) in missing.iter().enumerate() {
-                if index > 0 {
-                    points.push_str(", ");
-                }
-                points.push('`');
-                points.push_str(point);
-                points.push('`');
-            }
-            format!("blaze-sim: `{place}`: in {cases} cases no passing case reached {points}")
-        }
-        Verdict::Misfit { clamped, unused, ended: how } => format!(
+        Verdict::Unreached { cases, missing } => report_unreached(&place, *cases, missing),
+        Verdict::Misfit {
+            clamped,
+            unused,
+            ended: how @ (Ended::Passed | Ended::Failed(_) | Ended::Discarded),
+        } => format!(
             "blaze-sim: `{place}`: the given tape does not fit the case: {clamped} values lowered to fit their draws, {unused} never drawn; the case {}\n\
              a tape replays only the case it was recorded from: give the one the failure printed",
             ended(how)
         ),
     }
+}
+
+/// The report of a body that is not a function of its tape: its least tape failed with `first`,
+/// and run once more it ended `again`.
+fn report_not_a_function(
+    place: &str,
+    seed: Option<u64>,
+    tape: &[u64],
+    first: &Failure,
+    again: &Ended,
+) -> String {
+    let tape = text::print(tape);
+    let found = match seed {
+        Some(seed) => format!(" {}", as_found(seed)),
+        None => String::new(),
+    };
+    format!(
+        "blaze-sim: `{place}` is not a function of its tape: its least tape failed with `{}` ({}), and run once more it {}\n\
+         it reads something outside its tape (a counter, a clock, a global); the tape: {TAPE}='{tape}'{found}",
+        first.text,
+        origin(&first.origin),
+        ended(again),
+    )
+}
+
+/// The report of a search whose passing cases never reached the points `missing`.
+fn report_unreached(place: &str, cases: u32, missing: &[&'static str]) -> String {
+    let mut points = String::new();
+    for (index, point) in missing.iter().enumerate() {
+        if index > 0 {
+            points.push_str(", ");
+        }
+        points.push('`');
+        points.push_str(point);
+        points.push('`');
+    }
+    format!("blaze-sim: `{place}`: in {cases} cases no passing case reached {points}")
 }
 
 /// The report of a failure: what failed, the least tape, its choices that are not calm, the
@@ -318,6 +471,17 @@ fn report_failed(failed: &Failed, place: &str) -> String {
     let mut values = Vec::new_in(Global);
     failed.least.values_into(&mut values);
     let tape = text::print(&values);
+    let mut out = failed_what(failed, place);
+    failed_tape(&mut out, failed, &tape);
+    failed_not_calm(&mut out, &failed.least);
+    failed_notes(&mut out, &failed.least);
+    failed_replay(&mut out, &tape, failed.seed);
+    out
+}
+
+/// The report's first two lines: what failed, at which seed or on the given tape, and where the
+/// failure came from.
+fn failed_what(failed: &Failed, place: &str) -> String {
     let mut out = match failed.seed {
         Some(seed) => format!(
             "blaze-sim: `{place}` failed at seed {seed} (case {} of {}): {}\n",
@@ -327,8 +491,16 @@ fn report_failed(failed: &Failed, place: &str) -> String {
     };
     match &failed.failure.origin {
         Origin::Panic { at } => out.push_str(&format!("  at {at}\n")),
-        other => out.push_str(&format!("  from {}\n", origin(other))),
+        other @ (Origin::Oracle | Origin::Harness | Origin::Error | Origin::Overran) => {
+            out.push_str(&format!("  from {}\n", origin(other)));
+        }
     }
+    out
+}
+
+/// The report's tape lines: how many choices the least tape has, how it was found, and the tape
+/// as text.
+fn failed_tape(out: &mut String, failed: &Failed, tape: &str) {
     match failed.seed {
         Some(_) => out.push_str(&format!(
             "least tape: {} choices, from {}, in {} shrink runs\n",
@@ -342,9 +514,13 @@ fn report_failed(failed: &Failed, place: &str) -> String {
         true => out.push_str("  (empty: every choice calm)\n"),
         false => out.push_str(&format!("  {tape}\n")),
     }
+}
+
+/// The report's line of the least tape's choices that are not calm, at most `NOT_CALM_SHOWN`.
+fn failed_not_calm(out: &mut String, least: &Record) {
     out.push_str("not calm:");
     let mut shown = 0;
-    for choice in failed.least.choices.iter().filter(|choice| choice.value != 0) {
+    for choice in least.choices.iter().filter(|choice| choice.value != 0) {
         if shown == NOT_CALM_SHOWN {
             out.push_str(" | ..");
             break;
@@ -360,17 +536,30 @@ fn report_failed(failed: &Failed, place: &str) -> String {
         out.push_str(" none");
     }
     out.push('\n');
-    if !failed.least.notes.is_empty() {
+}
+
+/// The report's notes of the least tape, when it has any.
+fn failed_notes(out: &mut String, least: &Record) {
+    if !least.notes.is_empty() {
         out.push_str("notes:\n");
-        for note in &failed.least.notes {
+        for note in &least.notes {
             out.push_str(&format!("  [{}] {}\n", note.at, note.text));
         }
     }
+}
+
+/// The report's last line: the setting that replays the least tape, and the seed it was found at.
+fn failed_replay(out: &mut String, tape: &str, seed: Option<u64>) {
     out.push_str(&format!("replay: {TAPE}='{tape}'"));
-    if let Some(seed) = failed.seed {
-        out.push_str(&format!("   (the case as found: {SEED}={seed})"));
+    if let Some(seed) = seed {
+        out.push_str("   ");
+        out.push_str(&as_found(seed));
     }
-    out
+}
+
+/// The words that give the seed a failing case was found at, as the setting that finds it again.
+fn as_found(seed: u64) -> String {
+    format!("(the case as found: {SEED}={seed})")
 }
 
 /// The most choices that are not calm a report lists.
@@ -387,12 +576,17 @@ fn origin(origin: &Origin) -> String {
     }
 }
 
+/// The word that says a case passed, following "it".
+const SAID_PASSED: &str = "passed";
+
 /// How a case ended, in words that follow "it".
 fn ended(ended: &Ended) -> String {
     match ended {
-        Ended::Passed => "passed".to_owned(),
+        Ended::Passed => SAID_PASSED.to_owned(),
         Ended::Discarded => "was discarded".to_owned(),
-        Ended::Failed(failure) => format!("failed with `{}` ({})", failure.text, origin(&failure.origin)),
+        Ended::Failed(failure) => {
+            format!("failed with `{}` ({})", failure.text, origin(&failure.origin))
+        }
     }
 }
 

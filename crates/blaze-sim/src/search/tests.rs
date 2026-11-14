@@ -1,15 +1,23 @@
 //! The search and the shrinker, tested with the engine itself: a test draws its parameters with
 //! `crate::check`, runs `crate::search` over an inner body and judges the verdict.
 
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
 use std::cell::Cell;
 use std::collections::BTreeSet;
 
 use blaze_rng::SplitMix64;
 
-use super::*;
+use super::{
+    Config, Ended, Failure, Given, GivenError, Next, Origin, Passed, Phase, Plant, SEED, SEEDS,
+    Search, TAPE, Verdict,
+};
 use crate::check::{search, search_planted};
 use crate::shrink::{Shrinker, simpler};
-use crate::tape::Tape;
+use crate::tape::{Record, Tail, Tape};
 
 /// Family (a): 20 draws below 100; fails when one is at least `t`. Its least failing tape is
 /// the single value `t`.
@@ -69,12 +77,18 @@ fn least_of(verdict: &Verdict) -> Result<Vec<u64>, String> {
 }
 
 /// Whether a search (with `plant`) over `body` ends on exactly `least`.
-fn ends_on(plant: Plant, body: impl FnMut(&Tape) -> Result<(), String>, least: &[u64]) -> Result<(), String> {
+fn ends_on(
+    plant: Plant,
+    body: impl FnMut(&Tape) -> Result<(), String>,
+    least: &[u64],
+) -> Result<(), String> {
     let verdict = search_planted(Config::DEFAULT, plant, body);
     let values = least_of(&verdict)?;
     match values == least {
         true => Ok(()),
-        false => Err(format!("the search ended on {values:?}, not the least failing tape {least:?}")),
+        false => {
+            Err(format!("the search ended on {values:?}, not the least failing tape {least:?}"))
+        }
     }
 }
 
@@ -83,8 +97,8 @@ fn ends_on(plant: Plant, body: impl FnMut(&Tape) -> Result<(), String>, least: &
 fn a_search_ends_on_the_least_failing_tape() {
     crate::check(Config::cases(12), |tape| {
         let t = tape.range(1..100, "t");
-        let k = tape.range(1..6, "k") as usize;
-        let m = tape.range(1..7, "m") as usize;
+        let k = usize::try_from(tape.range(1..6, "k")).expect("k is drawn below 6");
+        let m = usize::try_from(tape.range(1..7, "m")).expect("m is drawn below 7");
         ends_on(Plant::None, |inner| at_least(inner, t), &[t])?;
         ends_on(Plant::None, |inner| nonzero_items(inner, k), &vec![1u64; 2 * k])?;
         ends_on(Plant::None, |inner| unsorted(inner, m), &least_unsorted(m))
@@ -94,23 +108,32 @@ fn a_search_ends_on_the_least_failing_tape() {
 #[test]
 fn the_oracle_catches_a_shrinker_that_keeps_a_passing_candidate() {
     let caught = ends_on(Plant::KeepsPassing, |inner| at_least(inner, 10), &[10]);
-    assert!(caught.is_err(), "a shrinker that keeps passing candidates still ended on the least tape");
+    assert!(
+        caught.is_err(),
+        "a shrinker that keeps passing candidates still ended on the least tape"
+    );
 }
 
 #[test]
 fn the_oracle_catches_a_shrinker_that_keeps_a_record_that_is_not_simpler() {
     let caught = ends_on(Plant::KeepsNotSimpler, |inner| at_least(inner, 10), &[10]);
-    assert!(caught.is_err(), "a shrinker that keeps records that are not simpler still ended on the least tape");
+    assert!(
+        caught.is_err(),
+        "a shrinker that keeps records that are not simpler still ended on the least tape"
+    );
 }
 
 /// Whether `config` over `body` gives one verdict, run twice.
-fn same_twice<O: crate::Outcome>(config: Config, mut body: impl FnMut(&Tape) -> O) -> Result<(), String> {
+fn same_twice<O: crate::Outcome>(
+    config: Config,
+    mut body: impl FnMut(&Tape) -> O,
+) -> Result<(), String> {
     let first = search(config.clone(), &mut body);
     let again = search(config, &mut body);
-    match first == again {
-        true => Ok(()),
-        false => Err(format!("one config gave two verdicts:\n{first:?}\n{again:?}")),
+    if first != again {
+        return Err(format!("one config gave two verdicts:\n{first:?}\n{again:?}"));
     }
+    Ok(())
 }
 
 /// The invariant: one configuration gives one verdict (the same search twice gives equal
@@ -138,7 +161,10 @@ fn the_oracle_catches_a_verdict_that_depends_on_a_counter() {
             false => Ok(()),
         }
     };
-    assert!(same_twice(Config::DEFAULT, body).is_err(), "a verdict that depends on a counter was given twice");
+    assert!(
+        same_twice(Config::DEFAULT, body).is_err(),
+        "a verdict that depends on a counter was given twice"
+    );
 }
 
 /// Whether the least tape of a search (with `plant`) over family (a), given back as a tape,
@@ -149,13 +175,16 @@ fn replays_exactly(plant: Plant, t: u64) -> Result<(), String> {
         return Err(format!("the search did not end `Failed`: {found:?}"));
     };
     let values = least_of(&found)?;
-    let config = Config::DEFAULT.given(Given { tape: Some(values), ..Given::NOTHING });
+    let config = Config::DEFAULT.given(Given { seed: None, seeds: None, tape: Some(values) });
     let replay = search(config, |inner| at_least(inner, t));
     let Verdict::Failed(again) = &replay else {
         return Err(format!("the least tape, given back, did not fail: {replay:?}"));
     };
     if again.failure.origin != failed.failure.origin {
-        return Err(format!("the replay failed from {:?}, not {:?}", again.failure.origin, failed.failure.origin));
+        return Err(format!(
+            "the replay failed from {:?}, not {:?}",
+            again.failure.origin, failed.failure.origin
+        ));
     }
     match again.least == failed.least {
         true => Ok(()),
@@ -172,10 +201,14 @@ fn the_least_tape_replays_exactly() {
 
 #[test]
 fn the_oracle_catches_a_search_that_reports_the_candidate_as_proposed() {
-    assert!(replays_exactly(Plant::ReportsProposed, 10).is_err(), "a least tape reported as proposed replayed exactly");
+    assert!(
+        replays_exactly(Plant::ReportsProposed, 10).is_err(),
+        "a least tape reported as proposed replayed exactly"
+    );
 }
 
-/// Whether a body whose failure depends on a flag outside its tape ends `NotAFunction`.
+/// Whether a body whose failure depends on a flag outside its tape ends
+/// `Verdict::NotAFunction`.
 fn reports_outside_reads(plant: Plant) -> Result<(), String> {
     let failed_once = Cell::new(false);
     let verdict = search_planted(Config::DEFAULT, plant, |tape: &Tape| -> Result<(), String> {
@@ -190,12 +223,20 @@ fn reports_outside_reads(plant: Plant) -> Result<(), String> {
     });
     match verdict {
         Verdict::NotAFunction { seed: Some(_), again: Ended::Passed, .. } => Ok(()),
-        other => Err(format!("a body that reads outside its tape ended {other:?}")),
+        other @ (Verdict::Passed(..)
+        | Verdict::Failed(..)
+        | Verdict::NotAFunction { .. }
+        | Verdict::DrewNothing { .. }
+        | Verdict::AllDiscarded { .. }
+        | Verdict::Unreached { .. }
+        | Verdict::Misfit { .. }) => {
+            Err(format!("a body that reads outside its tape ended {other:?}"))
+        }
     }
 }
 
 /// The invariant: a body whose failure depends on something outside its tape ends
-/// `NotAFunction`.
+/// `Verdict::NotAFunction`.
 #[test]
 fn a_body_that_reads_outside_its_tape_is_not_a_function() {
     reports_outside_reads(Plant::None).unwrap();
@@ -203,7 +244,10 @@ fn a_body_that_reads_outside_its_tape_is_not_a_function() {
 
 #[test]
 fn the_oracle_catches_a_search_that_skips_the_final_run() {
-    assert!(reports_outside_reads(Plant::SkipsFinalRun).is_err(), "a search with no final run still said `NotAFunction`");
+    assert!(
+        reports_outside_reads(Plant::SkipsFinalRun).is_err(),
+        "a search with no final run still said `NotAFunction`"
+    );
 }
 
 #[test]
@@ -235,13 +279,24 @@ fn a_missing_reach_point_ends_unreached_and_a_reached_one_passes() {
 }
 
 /// Runs a search with a body that returns, noting each proposal's phase.
-fn phases(mut search: Search, mut body: impl FnMut(&Tape) -> Result<(), String>) -> (Verdict, Vec<Phase>) {
+fn phases(
+    mut search: Search,
+    mut body: impl FnMut(&Tape) -> Result<(), String>,
+) -> (Verdict, Vec<Phase>) {
     let tape = Tape::new(&[], Tail::Calm, Tape::MOST_CHOICES);
     let mut record = Record::new();
     let mut phases = Vec::new();
     for _ in 0..10_000 {
         let proposal = match search.next() {
-            Next::Done(verdict) => return (verdict.clone(), phases),
+            Next::Done(
+                verdict @ (Verdict::Passed(..)
+                | Verdict::Failed(..)
+                | Verdict::NotAFunction { .. }
+                | Verdict::DrewNothing { .. }
+                | Verdict::AllDiscarded { .. }
+                | Verdict::Unreached { .. }
+                | Verdict::Misfit { .. }),
+            ) => return (verdict.clone(), phases),
             Next::Run(proposal) => proposal,
         };
         phases.push(proposal.phase);
@@ -258,7 +313,7 @@ fn phases(mut search: Search, mut body: impl FnMut(&Tape) -> Result<(), String>)
 
 #[test]
 fn a_given_seed_runs_alone_and_is_shrunk() {
-    let config = Config::DEFAULT.given(Given { seed: Some(7), ..Given::NOTHING });
+    let config = Config::DEFAULT.given(Given { seed: Some(7), seeds: None, tape: None });
     let (verdict, phases) = phases(Search::new(config), |tape| at_least(tape, 1));
     assert_eq!(phases.iter().filter(|&&phase| phase == Phase::Generate).count(), 1, "{phases:?}");
     assert_eq!(phases[0], Phase::Generate);
@@ -271,7 +326,7 @@ fn a_given_seed_runs_alone_and_is_shrunk() {
 
 #[test]
 fn a_given_tape_runs_alone_with_no_shrinking() {
-    let config = Config::DEFAULT.given(Given { tape: Some(vec![0, 5]), ..Given::NOTHING });
+    let config = Config::DEFAULT.given(Given { seed: None, seeds: None, tape: Some(vec![0, 5]) });
     let (verdict, phases) = phases(Search::new(config), |tape| at_least(tape, 1));
     assert_eq!(phases, vec![Phase::Given]);
     let Verdict::Failed(failed) = &verdict else { panic!("{verdict:?}") };
@@ -281,10 +336,15 @@ fn a_given_tape_runs_alone_with_no_shrinking() {
 
 #[test]
 fn a_given_tape_that_does_not_fit_ends_misfit() {
-    let too_large = Config::DEFAULT.given(Given { tape: Some(vec![0, 150]), ..Given::NOTHING });
+    let too_large =
+        Config::DEFAULT.given(Given { seed: None, seeds: None, tape: Some(vec![0, 150]) });
     let verdict = search(too_large, |tape| at_least(tape, 1));
-    assert!(matches!(verdict, Verdict::Misfit { clamped: 1, unused: 0, ended: Ended::Failed(_) }), "{verdict:?}");
-    let never_drawn = Config::DEFAULT.given(Given { tape: Some(vec![3, 1, 2]), ..Given::NOTHING });
+    assert!(
+        matches!(verdict, Verdict::Misfit { clamped: 1, unused: 0, ended: Ended::Failed(_) }),
+        "{verdict:?}"
+    );
+    let never_drawn =
+        Config::DEFAULT.given(Given { seed: None, seeds: None, tape: Some(vec![3, 1, 2]) });
     let verdict = search(never_drawn, |tape: &Tape| {
         tape.below(10, "x");
     });
@@ -321,7 +381,11 @@ fn the_shrinker_never_proposes_a_tape_twice_nor_runs_past_its_budget() {
                 break;
             };
             let candidate = candidate.to_vec();
-            assert!(simpler(&candidate, shrinker.best()), "{candidate:?} is not simpler than {:?}", shrinker.best());
+            assert!(
+                simpler(&candidate, shrinker.best()),
+                "{candidate:?} is not simpler than {:?}",
+                shrinker.best()
+            );
             assert!(proposed.insert(candidate.clone()), "{candidate:?} was proposed twice");
             let tape = Tape::replay(&candidate);
             let same = at_least(&tape, 10).is_err();
@@ -335,7 +399,12 @@ fn the_shrinker_never_proposes_a_tape_twice_nor_runs_past_its_budget() {
 }
 
 /// Whether `simpler` is a strict order on `a`, `b` and `c` that does not see trailing zeros.
-fn simpler_is_strict(simpler: fn(&[u64], &[u64]) -> bool, a: &[u64], b: &[u64], c: &[u64]) -> Result<(), String> {
+fn simpler_is_strict(
+    simpler: fn(&[u64], &[u64]) -> bool,
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+) -> Result<(), String> {
     let tapes = [a, b, c];
     for x in tapes {
         if simpler(x, x) {
@@ -343,11 +412,15 @@ fn simpler_is_strict(simpler: fn(&[u64], &[u64]) -> bool, a: &[u64], b: &[u64], 
         }
         let padded: Vec<u64> = x.iter().copied().chain([0, 0]).collect();
         if simpler(&padded, x) || simpler(x, &padded) {
-            return Err(format!("{x:?} and {padded:?} differ only in trailing zeros, yet one is simpler"));
+            return Err(format!(
+                "{x:?} and {padded:?} differ only in trailing zeros, yet one is simpler"
+            ));
         }
         for y in tapes {
             if simpler(&padded, y) != simpler(x, y) {
-                return Err(format!("trailing zeros on {x:?} changed whether it is simpler than {y:?}"));
+                return Err(format!(
+                    "trailing zeros on {x:?} changed whether it is simpler than {y:?}"
+                ));
             }
             for z in tapes {
                 if simpler(x, y) && simpler(y, z) && !simpler(x, z) {
@@ -375,21 +448,49 @@ fn the_oracle_catches_a_simpler_that_counts_trailing_zeros() {
     fn by_raw_length(a: &[u64], b: &[u64]) -> bool {
         a.len() < b.len() || (a.len() == b.len() && a < b)
     }
+    assert!(
+        simpler_is_strict(simpler, &[1], &[2], &[3]).is_ok(),
+        "the oracle refused `simpler` itself on [1], [2], [3]"
+    );
     assert!(simpler_is_strict(by_raw_length, &[1], &[2], &[3]).is_err());
 }
 
 #[test]
 fn given_parse_accepts_and_refuses_naming_the_setting() {
     assert_eq!(Given::parse(None, None, None), Ok(Given::NOTHING));
-    assert_eq!(Given::parse(Some("41"), None, None), Ok(Given { seed: Some(41), ..Given::NOTHING }));
-    assert_eq!(Given::parse(None, Some("1000"), None), Ok(Given { seeds: Some(1000), ..Given::NOTHING }));
-    assert_eq!(Given::parse(None, None, Some("3 0*2 1")), Ok(Given { tape: Some(vec![3, 0, 0, 1]), ..Given::NOTHING }));
-    assert_eq!(Given::parse(None, None, Some("")), Ok(Given { tape: Some(Vec::new()), ..Given::NOTHING }));
+    assert_eq!(
+        Given::parse(Some("41"), None, None),
+        Ok(Given { seed: Some(41), seeds: None, tape: None })
+    );
+    assert_eq!(
+        Given::parse(None, Some("1000"), None),
+        Ok(Given { seed: None, seeds: Some(1000), tape: None })
+    );
+    assert_eq!(
+        Given::parse(None, None, Some("3 0*2 1")),
+        Ok(Given { seed: None, seeds: None, tape: Some(vec![3, 0, 0, 1]) })
+    );
+    assert_eq!(
+        Given::parse(None, None, Some("")),
+        Ok(Given { seed: None, seeds: None, tape: Some(Vec::new()) })
+    );
 
     let refusals = [
-        (Given::parse(Some("x41"), None, None), GivenError::NotANumber { setting: SEED, value: "x41".to_owned() }, SEED),
-        (Given::parse(Some("+4"), None, None), GivenError::NotANumber { setting: SEED, value: "+4".to_owned() }, SEED),
-        (Given::parse(None, Some("-1"), None), GivenError::NotANumber { setting: SEEDS, value: "-1".to_owned() }, SEEDS),
+        (
+            Given::parse(Some("x41"), None, None),
+            GivenError::NotANumber { setting: SEED, value: "x41".to_owned() },
+            SEED,
+        ),
+        (
+            Given::parse(Some("+4"), None, None),
+            GivenError::NotANumber { setting: SEED, value: "+4".to_owned() },
+            SEED,
+        ),
+        (
+            Given::parse(None, Some("-1"), None),
+            GivenError::NotANumber { setting: SEEDS, value: "-1".to_owned() },
+            SEEDS,
+        ),
         (
             Given::parse(None, Some("4294967296"), None),
             GivenError::NotANumber { setting: SEEDS, value: "4294967296".to_owned() },

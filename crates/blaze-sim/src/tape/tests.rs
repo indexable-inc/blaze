@@ -1,9 +1,14 @@
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use blaze_rng::SplitMix64;
 
-use super::*;
+use super::{Choice, Int, Note, Plant, Record, Span, Tail, Tape};
 use crate::{Broke, Config};
 
 /// One call of a method `Tape` and `SplitMix64` share, with its arguments.
@@ -58,7 +63,8 @@ fn call(tape: &Tape) -> Call {
         0 => Call::NextU64,
         1 => Call::NextU32,
         2 => Call::Below(bound(tape)),
-        3 => Call::Index(bound(tape) as usize),
+        // On the 64-bit hosts tests run on, every bound is a `usize`.
+        3 => Call::Index(usize::try_from(bound(tape)).unwrap_or(usize::MAX)),
         4 => {
             let start = bound(tape);
             Call::Range(start, bound(tape))
@@ -78,6 +84,7 @@ fn on_tape(call: Call, tape: &Tape) -> Out {
         Call::NextU64 => Out::Number(tape.next_u64("next_u64")),
         Call::NextU32 => Out::Number(u64::from(tape.next_u32("next_u32"))),
         Call::Below(n) => Out::Number(tape.below(n, "below")),
+        #[expect(blaze::as_cast, reason = "an index below a `usize` length, widened to compare")]
         Call::Index(len) => Out::Number(tape.index(len, "index") as u64),
         Call::Range(start, end) => Out::Number(tape.range(start..end, "range")),
         Call::OneIn(n) => Out::Flag(tape.one_in(n, "one_in")),
@@ -106,6 +113,7 @@ fn on_rng(call: Call, rng: &mut SplitMix64) -> Out {
         Call::NextU64 => Out::Number(rng.next_u64()),
         Call::NextU32 => Out::Number(u64::from(rng.next_u32())),
         Call::Below(n) => Out::Number(rng.below(n)),
+        #[expect(blaze::as_cast, reason = "an index below a `usize` length, widened to compare")]
         Call::Index(len) => Out::Number(rng.index(len) as u64),
         Call::Range(start, end) => Out::Number(rng.range(start..end)),
         Call::OneIn(n) => Out::Flag(rng.one_in(n)),
@@ -134,14 +142,18 @@ fn recorded(seed: u64, plant: Plant) -> Tape {
     let tail = Tail::Seeded(SplitMix64::new(seed));
     match plant {
         Plant::None => Tape::new(&[], tail, Tape::MOST_CHOICES),
-        plant => Tape::planted(&[], tail, Tape::MOST_CHOICES, plant),
+        plant @ (Plant::OneInDrawsAtZero
+        | Plant::ShuffleFromFront
+        | Plant::ReplayFlipsFlags
+        | Plant::ShuffleSwapsWithValue) => Tape::planted(&[], tail, Tape::MOST_CHOICES, plant),
     }
 }
 
 fn refines(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let seed = tape.next_u64("seed");
     let calls = tape.vec(0..=40, "calls", call);
-    let subjects = [("Tape::seeded", Tape::seeded(seed)), ("a recorded Tape::new", recorded(seed, plant))];
+    let subjects =
+        [("Tape::seeded", Tape::seeded(seed)), ("a recorded Tape::new", recorded(seed, plant))];
     for (name, subject) in &subjects {
         let mut rng = SplitMix64::new(seed);
         for (at, &call) in calls.iter().enumerate() {
@@ -172,12 +184,24 @@ fn a_seeded_tape_is_splitmix64() {
 
 #[test]
 fn the_oracle_catches_a_one_in_that_draws_at_zero() {
-    crate::control(Config::cases(200), Plant::None, Plant::OneInDrawsAtZero, "the tape gave", refines);
+    crate::control(
+        Config::cases(200),
+        Plant::None,
+        Plant::OneInDrawsAtZero,
+        "the tape gave",
+        refines,
+    );
 }
 
 #[test]
 fn the_oracle_catches_a_shuffle_that_walks_from_the_front() {
-    crate::control(Config::cases(200), Plant::None, Plant::ShuffleFromFront, "the tape gave", refines);
+    crate::control(
+        Config::cases(200),
+        Plant::None,
+        Plant::ShuffleFromFront,
+        "the tape gave",
+        refines,
+    );
 }
 
 fn replays(tape: &Tape, plant: Plant) -> Result<(), Broke> {
@@ -190,7 +214,12 @@ fn replays(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let values: Vec<u64> = was.choices.iter().map(|choice| choice.value).collect();
     let again = match plant {
         Plant::None => Tape::replay(&values),
-        plant => Tape::planted(&values, Tail::Calm, Tape::MOST_CHOICES, plant),
+        plant @ (Plant::OneInDrawsAtZero
+        | Plant::ShuffleFromFront
+        | Plant::ReplayFlipsFlags
+        | Plant::ShuffleSwapsWithValue) => {
+            Tape::planted(&values, Tail::Calm, Tape::MOST_CHOICES, plant)
+        }
     };
     let agains: Vec<Out> = calls.iter().map(|&call| on_tape(call, &again)).collect();
     let mut is = Record::new();
@@ -291,14 +320,28 @@ fn calm_out(call: Call) -> Out {
 /// `None` when `quiet` answers calm on `subject`, else what it gave.
 fn not_calm(quiet: Quiet, subject: &Tape) -> Option<String> {
     let calm = match quiet {
-        Quiet::Call(call) => {
+        Quiet::Call(
+            call @ (Call::NextU64
+            | Call::NextU32
+            | Call::Below(..)
+            | Call::Index(..)
+            | Call::Range(..)
+            | Call::OneIn(..)
+            | Call::Chance(..)
+            | Call::Coin
+            | Call::Unit
+            | Call::Pick(..)
+            | Call::Fill(..)
+            | Call::Shuffle(..)),
+        ) => {
             let got = on_tape(call, subject);
             return (got != calm_out(call)).then(|| format!("{got:?}"));
         }
         Quiet::More(k) => !subject.more(k, "more"),
         Quiet::List(min, max) => {
             let list = subject.vec(min..=max, "list", |t| t.below(5, "element"));
-            return (list.len() != min || list.iter().any(|&x| x != 0)).then(|| format!("{list:?}"));
+            return (list.len() != min || list.iter().any(|&x| x != 0))
+                .then(|| format!("{list:?}"));
         }
         Quiet::IntU8 => subject.int::<u8>("int") == 0,
         Quiet::IntU64 => subject.int::<u64>("int") == 0,
@@ -310,13 +353,18 @@ fn not_calm(quiet: Quiet, subject: &Tape) -> Option<String> {
         Quiet::IntInI32(lo, hi) => subject.int_in(lo..=hi, "int_in") == lo,
         Quiet::IntInI8(lo, hi) => subject.int_in(lo..=hi, "int_in") == lo,
     };
-    (!calm).then(|| "not its calm value".to_string())
+    (!calm).then(|| "not its calm value".to_owned())
 }
 
 fn is_calm(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let subject = match plant {
         Plant::None => Tape::calm(),
-        plant => Tape::planted(&[], Tail::Calm, Tape::MOST_CHOICES, plant),
+        plant @ (Plant::OneInDrawsAtZero
+        | Plant::ShuffleFromFront
+        | Plant::ReplayFlipsFlags
+        | Plant::ShuffleSwapsWithValue) => {
+            Tape::planted(&[], Tail::Calm, Tape::MOST_CHOICES, plant)
+        }
     };
     let steps = tape.vec(1..=30, "steps", quiet);
     for (at, &step) in steps.iter().enumerate() {
@@ -336,7 +384,13 @@ fn the_calm_tape_is_calm_everywhere() {
 
 #[test]
 fn the_oracle_catches_a_shuffle_that_swaps_with_its_value() {
-    crate::control(Config::cases(200), Plant::None, Plant::ShuffleSwapsWithValue, "the calm tape gave", is_calm);
+    crate::control(
+        Config::cases(200),
+        Plant::None,
+        Plant::ShuffleSwapsWithValue,
+        "the calm tape gave",
+        is_calm,
+    );
 }
 
 fn finished(tape: &Tape) -> Record {
@@ -454,7 +508,9 @@ fn int_u8_reaches_its_ends_and_its_small_values() {
     assert!(seen[..8].iter().all(|&seen| seen), "every value below 8: {:?}", &seen[..8]);
 }
 
-fn stays_in_and_reaches_both_ends<T: Int + PartialOrd + core::fmt::Debug>(range: core::ops::RangeInclusive<T>) {
+fn stays_in_and_reaches_both_ends<T: Int + PartialOrd + core::fmt::Debug>(
+    range: core::ops::RangeInclusive<T>,
+) {
     let tape = Tape::seeded(7);
     let (lo, hi) = (*range.start(), *range.end());
     let (mut low, mut high) = (false, false);
@@ -490,7 +546,7 @@ fn reached_keeps_each_point_once_in_order() {
     tape.reached("b");
     let record = finished(&tape);
     assert_eq!(record.reached, ["b", "a"]);
-    assert_eq!(record.notes, [Note { at: 1, text: "after 1 draw".to_string() }]);
+    assert_eq!(record.notes, [Note { at: 1, text: "after 1 draw".to_owned() }]);
 }
 
 #[test]

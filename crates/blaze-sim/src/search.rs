@@ -53,6 +53,10 @@ impl Config {
     };
 
     /// [`Config::DEFAULT`] with `cases` cases.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn cases(cases: u32) -> Config {
         let mut config = Config::DEFAULT;
         config.cases = cases;
@@ -60,30 +64,49 @@ impl Config {
     }
 
     /// The first seed of the run.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn first(mut self, seed: u64) -> Config {
         self.first = seed;
         self
     }
 
     /// The runs the shrinker may spend.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn shrink_runs(mut self, runs: u32) -> Config {
         self.shrink_runs = runs;
         self
     }
 
     /// The most choices one case may draw.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn most_choices(mut self, most: u32) -> Config {
         self.most_choices = most;
         self
     }
 
     /// Points some passing case has to reach.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub const fn must_reach(mut self, points: &'static [&'static str]) -> Config {
         self.must_reach = points;
         self
     }
 
     /// What the person gave from outside, in place of what this config had.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::nonblocking]
     pub fn given(mut self, given: Given) -> Config {
         self.given = given;
         self
@@ -107,7 +130,13 @@ impl Given {
     /// From the three settings' texts (`BLAZE_SIM_SEED`, `BLAZE_SIM_SEEDS`, `BLAZE_SIM_TAPE`).
     /// A number is decimal digits only; a count of 0 is refused, as is a tape with a seed or a
     /// count, and a seed with a count (the seed runs alone, so the count would mean nothing).
-    pub fn parse(seed: Option<&str>, seeds: Option<&str>, tape: Option<&str>) -> Result<Given, GivenError> {
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    pub fn parse(
+        seed: Option<&str>,
+        seeds: Option<&str>,
+        tape: Option<&str>,
+    ) -> Result<Given, GivenError> {
         let seed = match seed {
             Some(value) => Some(number::<u64>(SEED, value)?),
             None => None,
@@ -139,6 +168,10 @@ impl Given {
 }
 
 /// A setting's value as a decimal number: digits only, no sign, no space.
+#[expect(
+    blaze::dropped_error,
+    reason = "the value is checked to be decimal digits first, so the parse can only fail by being out of the type's range, which `GivenError::NotANumber` says"
+)]
 fn number<N: core::str::FromStr>(setting: &'static str, value: &str) -> Result<N, GivenError> {
     let refused = || GivenError::NotANumber { setting, value: value.to_owned() };
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -174,7 +207,10 @@ impl core::fmt::Display for GivenError {
             }
             GivenError::ZeroSeeds => write!(f, "`{SEEDS}` is 0: a check of no cases tests nothing"),
             GivenError::SeedWithSeeds => {
-                write!(f, "`{SEED}` runs one seed alone, so it excludes `{SEEDS}`: give one of them")
+                write!(
+                    f,
+                    "`{SEED}` runs one seed alone, so it excludes `{SEEDS}`: give one of them"
+                )
             }
         }
     }
@@ -196,6 +232,26 @@ pub struct Failure {
     pub origin: Origin,
     pub text: String,
 }
+
+/// What broke a case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Broke {
+    /// The oracle saw the invariant broken: a finding.
+    Oracle(String),
+    /// The test itself went wrong (a model out of step, a bound of the harness's own).
+    Harness(String),
+}
+
+impl core::fmt::Display for Broke {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Broke::Oracle(why) => write!(f, "the oracle: {why}"),
+            Broke::Harness(why) => write!(f, "the harness: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for Broke {}
 
 /// Where a failure came from: two failures are the same when their origins are equal.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,11 +279,13 @@ pub enum Phase {
 
 /// The case to run next.
 pub struct Proposal<'s> {
+    #[expect(
+        blaze::write_only_field,
+        reason = "the phase is how a test sees the order of a search's stages; the driver runs every proposal the same way"
+    )]
     pub phase: Phase,
     pub prefix: &'s [u64],
     pub tail: Tail,
-    /// The seed of the tail, for a generated case.
-    pub seed: Option<u64>,
 }
 
 /// What a search wants next: a case run, or nothing, since it is done.
@@ -267,14 +325,30 @@ pub enum Verdict {
     Failed(Failed),
     /// The least tape, run once more, did not fail the same way: the case reads something
     /// outside its tape.
-    NotAFunction { seed: Option<u64>, tape: Vec<u64>, first: Failure, again: Ended },
+    NotAFunction {
+        seed: Option<u64>,
+        tape: Vec<u64>,
+        first: Failure,
+        again: Ended,
+    },
     /// No case drew a choice: it is no property test.
-    DrewNothing { cases: u32 },
-    AllDiscarded { cases: u32 },
+    DrewNothing {
+        cases: u32,
+    },
+    AllDiscarded {
+        cases: u32,
+    },
     /// Points of `Config::must_reach` no passing case reached.
-    Unreached { cases: u32, missing: Vec<&'static str> },
+    Unreached {
+        cases: u32,
+        missing: Vec<&'static str>,
+    },
     /// A given tape that did not fit the case: values lowered, or never drawn.
-    Misfit { clamped: u32, unused: u32, ended: Ended },
+    Misfit {
+        clamped: u32,
+        unused: u32,
+        ended: Ended,
+    },
 }
 
 /// A bug a control plants in the search or its shrinker, for a test's oracle to catch (rule
@@ -342,12 +416,24 @@ pub struct Search {
 impl Search {
     /// A search of `config`. A `Given` with a tape and a seed or a count (which `Given::parse`
     /// refuses) panics, naming both.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn new(config: Config) -> Search {
         let given = &config.given;
-        assert!(
-            given.tape.is_none() || (given.seed.is_none() && given.seeds.is_none()),
-            "blaze-sim: a given tape excludes a given seed or count, and this `Given` has both: {given:?}"
-        );
+        if let Some(tape) = &given.tape {
+            if let Some(seed) = given.seed {
+                panic!(
+                    "blaze-sim: a given tape excludes a given seed, and this `Given` has both: a tape of {} values and seed {seed}",
+                    tape.len()
+                );
+            }
+            if let Some(seeds) = given.seeds {
+                panic!(
+                    "blaze-sim: a given tape excludes a given count, and this `Given` has both: a tape of {} values and a count of {seeds}",
+                    tape.len()
+                );
+            }
+        }
         let (stage, first_seed, count) = match (&given.tape, given.seed) {
             (Some(_), _) => (Stage::Given, 0, 1),
             (None, Some(seed)) => (Stage::Generate, seed, 1),
@@ -372,7 +458,7 @@ impl Search {
             plant: Plant::None,
         };
         if search.stage == Stage::Generate && search.count == 0 {
-            search.finish(true);
+            search.finish(Reach::Asked);
         }
         search
     }
@@ -386,25 +472,39 @@ impl Search {
     }
 
     /// The most choices a case of this search may draw.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn most_choices(&self) -> u32 {
         self.config.most_choices
     }
 
     /// The most cases this search proposes: its cases, its shrink runs and the final run.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub(crate) fn most_runs(&self) -> u64 {
         u64::from(self.count) + u64::from(self.config.shrink_runs) + 1
     }
 
     /// The case to run next, or the verdict once the search is done. Called again before `ran`,
     /// it proposes the same case.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn next(&mut self) -> Next<'_> {
         if self.stage == Stage::Shrink {
             self.step_shrink();
         }
         match self.stage {
             Stage::Given => {
-                let prefix = self.config.given.tape.as_deref().expect("a search of a given tape holds the tape");
-                Next::Run(Proposal { phase: Phase::Given, prefix, tail: Tail::Calm, seed: None })
+                let prefix = self
+                    .config
+                    .given
+                    .tape
+                    .as_deref()
+                    .expect("a search of a given tape holds the tape");
+                Next::Run(Proposal { phase: Phase::Given, prefix, tail: Tail::Calm })
             }
             Stage::Generate => {
                 let seed = self.seed_of(self.ran);
@@ -412,37 +512,54 @@ impl Search {
                     phase: Phase::Generate,
                     prefix: &[],
                     tail: Tail::Seeded(SplitMix64::new(seed)),
-                    seed: Some(seed),
                 })
             }
             Stage::Shrink => {
-                let shrinker = self.shrinker.as_ref().expect("a search that shrinks holds its shrinker");
+                let shrinker =
+                    self.shrinker.as_ref().expect("a search that shrinks holds its shrinker");
                 #[cfg(test)]
                 let tail = match self.plant {
-                    Plant::KeepsNotSimpler => Tail::Seeded(SplitMix64::new(u64::from(shrinker.runs()))),
-                    _ => Tail::Calm,
+                    Plant::KeepsNotSimpler => {
+                        Tail::Seeded(SplitMix64::new(u64::from(shrinker.runs())))
+                    }
+                    Plant::None
+                    | Plant::KeepsPassing
+                    | Plant::ReportsProposed
+                    | Plant::SkipsFinalRun => Tail::Calm,
                 };
                 #[cfg(not(test))]
                 let tail = Tail::Calm;
-                Next::Run(Proposal { phase: Phase::Shrink, prefix: shrinker.candidate(), tail, seed: None })
+                Next::Run(Proposal { phase: Phase::Shrink, prefix: shrinker.candidate(), tail })
             }
-            Stage::Final => Next::Run(Proposal { phase: Phase::Final, prefix: &self.least, tail: Tail::Calm, seed: None }),
-            Stage::Done => Next::Done(self.verdict.as_ref().expect("a done search holds its verdict")),
+            Stage::Final => {
+                Next::Run(Proposal { phase: Phase::Final, prefix: &self.least, tail: Tail::Calm })
+            }
+            Stage::Done => {
+                Next::Done(self.verdict.as_ref().expect("a done search holds its verdict"))
+            }
         }
     }
 
     /// What the case `next` proposed drew, and how it ended.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn ran(&mut self, record: &Record, ended: Ended) {
         match self.stage {
             Stage::Given => self.ran_given(record, ended),
             Stage::Generate => self.ran_case(record, ended),
             Stage::Shrink => {
-                let found = self.found.as_ref().expect("a search that shrinks holds its first failure");
+                let found =
+                    self.found.as_ref().expect("a search that shrinks holds its first failure");
                 let same = matches!(&ended, Ended::Failed(failure) if failure.origin == found.failure.origin);
-                self.shrinker.as_mut().expect("a search that shrinks holds its shrinker").ran(record, same);
+                self.shrinker
+                    .as_mut()
+                    .expect("a search that shrinks holds its shrinker")
+                    .ran(record, same);
             }
             Stage::Final => self.ran_final(record, ended),
-            Stage::Done => panic!("blaze-sim: `Search::ran` after the search was done: no case was proposed"),
+            Stage::Done => {
+                panic!("blaze-sim: `Search::ran` after the search was done: no case was proposed")
+            }
         }
     }
 
@@ -498,12 +615,11 @@ impl Search {
             })),
             Ended::Passed => {
                 self.passed += 1;
-                // One replayed case is not a run, so reach points are not asked of it.
-                self.finish(false);
+                self.finish(Reach::Waived);
             }
             Ended::Discarded => {
                 self.discarded += 1;
-                self.finish(false);
+                self.finish(Reach::Waived);
             }
         }
     }
@@ -550,7 +666,7 @@ impl Search {
             }
         }
         if self.ran == self.count {
-            self.finish(true);
+            self.finish(Reach::Asked);
         }
     }
 
@@ -579,7 +695,14 @@ impl Search {
                     shrink_runs,
                 })
             }
-            again => Verdict::NotAFunction { seed: found.seed, tape: self.least.clone(), first: found.failure, again },
+            again @ (Ended::Passed | Ended::Failed(..) | Ended::Discarded) => {
+                Verdict::NotAFunction {
+                    seed: found.seed,
+                    tape: self.least.clone(),
+                    first: found.failure,
+                    again,
+                }
+            }
         };
         self.done(verdict);
     }
@@ -587,27 +710,25 @@ impl Search {
     /// Counts a case of the run, whatever its end.
     fn count_case(&mut self, record: &Record) {
         self.ran += 1;
-        self.choices += record.choices.len() as u64;
+        #[expect(
+            blaze::as_cast,
+            reason = "a record's length, a `usize`, widens exactly to `u64` on every target"
+        )]
+        let drawn = record.choices.len() as u64;
+        self.choices += drawn;
         self.drew |= !record.choices.is_empty();
     }
 
     /// The verdict of a run with no failure, in this order: nothing drawn, nothing passed, a
     /// point missed (when `reach` asks), passed.
-    fn finish(&mut self, reach: bool) {
+    fn finish(&mut self, reach: Reach) {
         let cases = self.count;
         let verdict = if !self.drew {
             Verdict::DrewNothing { cases }
         } else if self.passed == 0 {
             Verdict::AllDiscarded { cases }
         } else {
-            let mut missing = Vec::new_in(Global);
-            if reach {
-                for point in self.config.must_reach {
-                    if !self.reached.contains(point) && !missing.contains(point) {
-                        missing.push(*point);
-                    }
-                }
-            }
+            let missing = self.missing(reach);
             if missing.is_empty() {
                 Verdict::Passed(Passed { cases, discarded: self.discarded, choices: self.choices })
             } else {
@@ -617,13 +738,43 @@ impl Search {
         self.done(verdict);
     }
 
+    /// The points of `Config::must_reach` no passing case reached, each once, in their order;
+    /// none when `reach` waives them.
+    fn missing(&self, reach: Reach) -> Vec<&'static str, Global> {
+        let mut missing = Vec::new_in(Global);
+        match reach {
+            Reach::Asked => {
+                for point in self.config.must_reach {
+                    if !self.reached.contains(point) && !missing.contains(point) {
+                        missing.push(*point);
+                    }
+                }
+            }
+            Reach::Waived => {}
+        }
+        missing
+    }
+
     fn done(&mut self, verdict: Verdict) {
         self.verdict = Some(verdict);
         self.stage = Stage::Done;
     }
 }
 
+/// Whether a run's verdict asks for the points of `Config::must_reach`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    /// A run of cases: a point no passing case reached fails it.
+    Asked,
+    /// One replayed case, which is not a run: the points are not asked of it.
+    Waived,
+}
+
 /// The choices a record holds; a case draws at most `u32::MAX` (its bound is a `u32`).
+#[expect(
+    blaze::dropped_error,
+    reason = "a case draws at most `Config::most_choices`, a `u32`, so the conversion cannot fail; `u32::MAX` is that bound"
+)]
 fn choices_of(record: &Record) -> u32 {
     u32::try_from(record.choices.len()).unwrap_or(u32::MAX)
 }

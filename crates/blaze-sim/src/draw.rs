@@ -34,6 +34,39 @@ const SCALAR_COUNT: u64 = 0x11_0000 - SURROGATE_COUNT;
 /// How many draws in a row may give a key a map already holds before `btree_map` refuses.
 const SAME_KEYS: u32 = 64;
 
+/// The kinds `option` picks among: kind 0 (the calm one) is `None` and the other three are
+/// `Some`, so a seeded `option` is `Some` three times in four, enough to reach the inner draw
+/// often while `None` still turns up in every few cases.
+const OPTION_KINDS: u64 = 4;
+
+/// The kinds `f64_in` and `f32_in` pick among: the start (the calm one), the end, and two kinds
+/// uniform between them, so each end turns up once in four, where an off-by-one at a bound hides.
+const IN_RANGE_KINDS: u64 = 4;
+
+/// How many values a byte has: `bytes` draws each byte uniform below this.
+const BYTE_VALUES: u64 = 1 << u8::BITS;
+
+/// The eighths `char` splits its kinds into: five for printable ASCII (`0..=4`), two for the rest
+/// of the basic plane (`5 | 6`) and one for any scalar value, so most characters are readable
+/// and a multi-byte or astral one still turns up in every few draws.
+const CHAR_KINDS: u64 = 8;
+
+/// The kinds `f64` and `f32` pick among, the calm one first: a small whole number, a small
+/// integer over a power of two, uniform in `[0, 1)` of either sign, any bit pattern, and one of
+/// the special values.
+const FLOAT_KINDS: u64 = 5;
+
+/// The base of `f64`'s exponent: a whole number times a power of it is exact while it fits the
+/// significand, so the second float kind gives exact fractions.
+const BINARY_BASE_F64: f64 = 2.0;
+
+/// [`BINARY_BASE_F64`] as an `f32`.
+const BINARY_BASE_F32: f32 = 2.0;
+
+/// The most elements `Any for Vec<T>` and characters `Any for String` draw: the most a contract
+/// test's argument needs to show a case, while each case stays small to run and to read.
+const ANY_LONGEST: usize = 16;
+
 /// The whole numbers a float's first kind draws, as zigzag offsets: magnitudes up to 2^53 (2^24
 /// for `f32`), where every whole number is exact.
 const WHOLE_F64: u64 = 1 << 54;
@@ -74,12 +107,62 @@ const SPECIAL_F32: [f32; 12] = [
 
 /// 0, -1, 1, -2, 2, ..: small canonical values are small magnitudes of either sign.
 fn zigzag_64(u: u64) -> i64 {
-    ((u >> 1) as i64) ^ -((u & 1) as i64)
+    (u >> 1).cast_signed() ^ -(u & 1).cast_signed()
 }
 
 /// [`zigzag_64`] over 128 bits.
 fn zigzag_128(u: u128) -> i128 {
-    ((u >> 1) as i128) ^ -((u & 1) as i128)
+    (u >> 1).cast_signed() ^ -(u & 1).cast_signed()
+}
+
+/// A zigzag whole number of magnitude at most 2^53, as the `f64` of that value: the first float
+/// kind, and the numerator of the second.
+#[expect(
+    blaze::as_cast,
+    reason = "the cast is the operation: an integer of magnitude at most 2^53 made into the `f64` of the same value, which is exact"
+)]
+fn whole_f64(tape: &Tape, label: &'static str) -> f64 {
+    zigzag_64(tape.int_in::<u64>(0..=WHOLE_F64, label)) as f64
+}
+
+/// [`whole_f64`] for `f32`: magnitude at most 2^24.
+#[expect(
+    blaze::as_cast,
+    reason = "the cast is the operation: an integer of magnitude at most 2^24 made into the `f32` of the same value, which is exact"
+)]
+fn whole_f32(tape: &Tape, label: &'static str) -> f32 {
+    zigzag_64(tape.int_in::<u64>(0..=WHOLE_F32, label)) as f32
+}
+
+/// How many times the second float kind halves its whole number: from 1 to `fraction_bits`
+/// (the float's fraction width), so the result keeps every bit of a small numerator.
+#[expect(
+    blaze::as_cast,
+    reason = "a draw below a fraction width (52 or 23) made into the `i32` exponent `powi` takes; every such value fits"
+)]
+fn halvings(tape: &Tape, fraction_bits: u32, label: &'static str) -> i32 {
+    1 + tape.below(u64::from(fraction_bits), label) as i32
+}
+
+/// Where a float lies for `f64_finite` and `f32_finite`: finite, or past one end of the finite
+/// values (a NaN counts as past the top).
+enum Reach {
+    Finite,
+    AboveMax,
+    BelowMin,
+}
+
+impl Reach {
+    /// Where `x` lies; an `f32` is asked as its `f64`, which keeps its finiteness and sign.
+    fn of(x: f64) -> Reach {
+        if x.is_finite() {
+            Reach::Finite
+        } else if x.is_nan() || x > 0.0 {
+            Reach::AboveMax
+        } else {
+            Reach::BelowMin
+        }
+    }
 }
 
 /// A count of non-surrogate code points from 0, as the code point it names.
@@ -98,7 +181,7 @@ impl Tape {
 
     /// Calm is `None`; seeded, `Some` three times in four. `some`'s draws are one span.
     pub fn option<T>(&self, label: &'static str, some: impl FnOnce(&Tape) -> T) -> Option<T> {
-        match self.below(4, label) {
+        match self.below(OPTION_KINDS, label) {
             0 => None,
             _ => Some(self.span(label, some)),
         }
@@ -113,25 +196,36 @@ impl Tape {
     }
 
     /// `N` elements, each one's draws a span.
-    pub fn array<T, const N: usize>(&self, label: &'static str, mut element: impl FnMut(&Tape) -> T) -> [T; N] {
+    pub fn array<T, const N: usize>(
+        &self,
+        label: &'static str,
+        mut element: impl FnMut(&Tape) -> T,
+    ) -> [T; N] {
         core::array::from_fn(|_| self.span(label, &mut element))
     }
 
     /// `sizes` bytes, each uniform and its own span; calm is the least size of zeros.
+    #[expect(
+        blaze::as_cast,
+        reason = "the cast is the operation: a draw below 256 taken as the byte of the same value, which every such draw is"
+    )]
     pub fn bytes(&self, sizes: RangeInclusive<usize>, label: &'static str) -> Vec<u8> {
-        self.vec(sizes, label, |tape| tape.below(256, label) as u8)
+        self.vec(sizes, label, |tape| tape.below(BYTE_VALUES, label) as u8)
     }
 
     /// Any character: printable ASCII most often (five times in eight), then the rest of the
     /// basic plane (twice in eight), then any scalar value; calm is a space. Never a surrogate:
     /// the draw counts scalar values only.
     pub fn char(&self, label: &'static str) -> char {
-        let code = match self.below(8, label) {
+        let code = match self.below(CHAR_KINDS, label) {
             0..=4 => PRINTABLE_FROM + self.below(PRINTABLE_COUNT, label),
             5 | 6 => past_surrogates(self.below(BASIC_COUNT, label)),
             _ => past_surrogates(self.below(SCALAR_COUNT, label)),
         };
-        char::from_u32(code as u32).expect("a count of scalar values mapped past the surrogates is a scalar value")
+        u32::try_from(code)
+            .ok()
+            .and_then(char::from_u32)
+            .expect("a count of scalar values mapped past the surrogates is a scalar value")
     }
 
     /// `sizes` characters of `char`, each its own span; calm is the least size of spaces.
@@ -145,9 +239,17 @@ impl Tape {
 
     /// `sizes` characters, each one of `alphabet`'s and its own span; calm is its first. An
     /// empty alphabet panics, naming the label.
-    pub fn text_from(&self, alphabet: &str, sizes: RangeInclusive<usize>, label: &'static str) -> String {
+    pub fn text_from(
+        &self,
+        alphabet: &str,
+        sizes: RangeInclusive<usize>,
+        label: &'static str,
+    ) -> String {
         let count = alphabet.chars().count();
-        assert!(count > 0, "`{label}`: text_from with an empty alphabet: there is no character to draw");
+        assert!(
+            count > 0,
+            "`{label}`: text_from with an empty alphabet: there is no character to draw"
+        );
         let mut out = String::new();
         // As in `text`: `vec` decides the length and the spans; the characters go straight in.
         let _drawn: Vec<()> = self.vec(sizes, label, |tape| {
@@ -161,12 +263,12 @@ impl Tape {
     /// first: a small whole number; a small integer over a power of two; uniform in `[0, 1)` of
     /// either sign; any bit pattern; one of the special values.
     pub fn f64(&self, label: &'static str) -> f64 {
-        match self.below(5, label) {
-            0 => zigzag_64(self.int_in::<u64>(0..=WHOLE_F64, label)) as f64,
+        match self.below(FLOAT_KINDS, label) {
+            0 => whole_f64(self, label),
             1 => {
-                let whole = zigzag_64(self.int_in::<u64>(0..=WHOLE_F64, label)) as f64;
-                let power = 1 + self.below(52, label) as i32;
-                whole * 2f64.powi(-power)
+                let whole = whole_f64(self, label);
+                let power = halvings(self, f64::MANTISSA_DIGITS - 1, label);
+                whole * BINARY_BASE_F64.powi(-power)
             }
             2 => {
                 let negative = self.coin(label);
@@ -185,10 +287,10 @@ impl Tape {
     /// `MAX` of the result's sign (a NaN counts as positive).
     pub fn f64_finite(&self, label: &'static str) -> f64 {
         let x = self.f64(label);
-        match (x.is_finite(), x.is_nan() || x > 0.0) {
-            (true, _) => x,
-            (false, true) => f64::MAX,
-            (false, false) => f64::MIN,
+        match Reach::of(x) {
+            Reach::Finite => x,
+            Reach::AboveMax => f64::MAX,
+            Reach::BelowMin => f64::MIN,
         }
     }
 
@@ -198,10 +300,10 @@ impl Tape {
         let (lo, hi) = range.into_inner();
         assert!(
             lo.is_finite() && hi.is_finite(),
-            "`{label}`: f64_in over {lo:?}..={hi:?}: an end is NaN or infinite, and the draw is of finite values"
+            "`{label}`: f64_in over {lo}..={hi}: an end is NaN or infinite, and the draw is of finite values"
         );
-        assert!(lo <= hi, "`{label}`: f64_in over {lo:?}..={hi:?}: the range is empty");
-        match self.below(4, label) {
+        assert!(lo <= hi, "`{label}`: f64_in over {lo}..={hi}: the range is empty");
+        match self.below(IN_RANGE_KINDS, label) {
             0 => lo,
             1 => hi,
             _ => {
@@ -216,12 +318,12 @@ impl Tape {
     /// Any `f32`, NaN and the infinities among them; calm is 0.0. `f64`'s kinds, drawn as `f32`
     /// (never an `f64` narrowed, which would miss `f32`'s own subnormals and bit patterns).
     pub fn f32(&self, label: &'static str) -> f32 {
-        match self.below(5, label) {
-            0 => zigzag_64(self.int_in::<u64>(0..=WHOLE_F32, label)) as f32,
+        match self.below(FLOAT_KINDS, label) {
+            0 => whole_f32(self, label),
             1 => {
-                let whole = zigzag_64(self.int_in::<u64>(0..=WHOLE_F32, label)) as f32;
-                let power = 1 + self.below(23, label) as i32;
-                whole * 2f32.powi(-power)
+                let whole = whole_f32(self, label);
+                let power = halvings(self, f32::MANTISSA_DIGITS - 1, label);
+                whole * BINARY_BASE_F32.powi(-power)
             }
             2 => {
                 let negative = self.coin(label);
@@ -239,10 +341,10 @@ impl Tape {
     /// Any finite `f32`; calm is 0.0. As `f64_finite`.
     pub fn f32_finite(&self, label: &'static str) -> f32 {
         let x = self.f32(label);
-        match (x.is_finite(), x.is_nan() || x > 0.0) {
-            (true, _) => x,
-            (false, true) => f32::MAX,
-            (false, false) => f32::MIN,
+        match Reach::of(f64::from(x)) {
+            Reach::Finite => x,
+            Reach::AboveMax => f32::MAX,
+            Reach::BelowMin => f32::MIN,
         }
     }
 
@@ -251,10 +353,10 @@ impl Tape {
         let (lo, hi) = range.into_inner();
         assert!(
             lo.is_finite() && hi.is_finite(),
-            "`{label}`: f32_in over {lo:?}..={hi:?}: an end is NaN or infinite, and the draw is of finite values"
+            "`{label}`: f32_in over {lo}..={hi}: an end is NaN or infinite, and the draw is of finite values"
         );
-        assert!(lo <= hi, "`{label}`: f32_in over {lo:?}..={hi:?}: the range is empty");
-        match self.below(4, label) {
+        assert!(lo <= hi, "`{label}`: f32_in over {lo}..={hi}: the range is empty");
+        match self.below(IN_RANGE_KINDS, label) {
             0 => lo,
             1 => hi,
             _ => {
@@ -269,7 +371,7 @@ impl Tape {
     pub fn u128(&self, label: &'static str) -> u128 {
         let high = self.int::<u64>(label);
         let low = self.int::<u64>(label);
-        (u128::from(high) << 64) | u128::from(low)
+        (u128::from(high) << u64::BITS) | u128::from(low)
     }
 
     /// `u128`, zigzag-decoded (0, -1, 1, -2, ..); calm is 0.
@@ -281,7 +383,10 @@ impl Tape {
     /// with a weight above 0, and an alternative of weight 0 is never the result. No weights, or
     /// all 0, panics naming the label.
     pub fn weighted(&self, weights: &[u32], label: &'static str) -> usize {
-        assert!(!weights.is_empty(), "`{label}`: weighted with no weights: there is no alternative to pick");
+        assert!(
+            !weights.is_empty(),
+            "`{label}`: weighted with no weights: there is no alternative to pick"
+        );
         let total: u64 = weights.iter().map(|&weight| u64::from(weight)).sum();
         assert!(
             total > 0,
@@ -334,14 +439,22 @@ impl Tape {
     }
 
     /// A `T` by its own rule.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn any<T: Any>(&self, label: &'static str) -> T {
         T::any(self, label)
     }
 }
 
 /// Uniform in `[0, 1)` on `f32`'s 24-bit grid; calm is 0.0.
+#[expect(
+    blaze::as_cast,
+    reason = "the cast is the operation: a draw below 2^24 and 2^24 itself made into the `f32`s of the same values, which are exact"
+)]
 fn unit_f32(tape: &Tape, label: &'static str) -> f32 {
-    tape.below(1 << 24, label) as f32 * (1.0 / (1u32 << 24) as f32)
+    tape.below(1 << f32::MANTISSA_DIGITS, label) as f32
+        * (1.0 / (1u32 << f32::MANTISSA_DIGITS) as f32)
 }
 
 /// A type with a draw of its own: what `#[blaze::contract_test]` draws a function's arguments
@@ -402,6 +515,9 @@ impl Any for f64 {
 }
 
 impl Any for () {
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn any(_tape: &Tape, _label: &'static str) {}
 }
 
@@ -435,21 +551,22 @@ impl<T: Any> Any for Option<T> {
     }
 }
 
-/// Up to 16 elements, the most a contract test's argument needs to show a case.
+/// Up to [`ANY_LONGEST`] elements.
 impl<T: Any> Any for Vec<T> {
     fn any(tape: &Tape, label: &'static str) -> Vec<T> {
-        tape.vec(0..=16, label, |tape| T::any(tape, label))
+        tape.vec(0..=ANY_LONGEST, label, |tape| T::any(tape, label))
     }
 }
 
-/// Up to 16 characters of `Tape::char`.
+/// Up to [`ANY_LONGEST`] characters of `Tape::char`.
 impl Any for String {
     fn any(tape: &Tape, label: &'static str) -> String {
-        tape.text(0..=16, label)
+        tape.text(0..=ANY_LONGEST, label)
     }
 }
 
 impl<T: Any> Any for Box<T> {
+    #[blaze::nonblocking]
     fn any(tape: &Tape, label: &'static str) -> Box<T> {
         Box::new_in(T::any(tape, label), Global)
     }
