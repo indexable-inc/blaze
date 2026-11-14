@@ -2165,7 +2165,7 @@ impl Lint {
                 "add a test that hands it a bad input and asserts which error comes back (`assert_eq!(f(bad), Err(..))`)"
             }
             Lint::PropertyOverExamples => {
-                "add a property test (Hegel) that draws a value and asserts the inverse gives it back"
+                "add a property test over generated inputs that draws a value and asserts the inverse gives it back (blaze's own form: `blaze_sim::check(Config::cases(200), |tape| ..)`)"
             }
             Lint::CouldBeNarrower => {
                 "return the narrower type (callers widen with `.into()` where they need to); or say why with `#[expect(blaze::could_be_narrower, reason = \"..\")]`"
