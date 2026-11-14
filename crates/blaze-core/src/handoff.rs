@@ -7,6 +7,11 @@
 //! Safe code: what they promise is the memory ordering the unsafe code beside them relies on.
 
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(blaze_check))]
+use crate::{
+    atomic::AtomicU32,
+    world::threads::{self, Ended, Step},
+};
 
 /// `chunks` pieces of one job, each claimed by exactly one thread, and the job completed by
 /// exactly one: the thread whose [`Claims::finish`] counts the last chunk. Every finish is a
@@ -103,6 +108,50 @@ impl Default for Wake {
     fn default() -> Wake {
         Wake::new()
     }
+}
+
+/// Whether a sender's hand-back and the driver's drain, run as two threads by `schedule` in
+/// the weak memory ([`threads::two_weak`]: a read may see any value its ordering allows),
+/// miss nothing: the sender hands back (a relaxed store of its slot, which only [`Wake`]
+/// orders) and calls [`Wake::wake`]; the driver calls [`Wake::drain`] and reads the slot; and
+/// where both returned, the driver saw the slot or the sender was told to wake it. `flagged`:
+/// the flag as the run begins (a wake-up already on its way to the driver).
+///
+/// A schedule that ends before a thread does says nothing.
+#[cfg(not(blaze_check))]
+fn hands(schedule: &[Step], flagged: bool) -> bool {
+    let wake = Wake { woken: AtomicBool::new(flagged) };
+    let slot = AtomicU32::new(0);
+    let (sent, drained) = threads::two_weak(
+        schedule,
+        || {
+            slot.store(1, Ordering::Relaxed);
+            wake.wake()
+        },
+        || {
+            wake.drain();
+            slot.load(Ordering::Relaxed)
+        },
+    );
+    match (sent, drained) {
+        (Ended::Done(must), Ended::Done(seen)) => seen == 1 || must,
+        (Ended::Done(_) | Ended::Running | Ended::Asleep, Ended::Done(_) | Ended::Running | Ended::Asleep) => true,
+    }
+}
+
+/// The invariant: no hand-back is missed, in the weak memory. For every schedule of a sender
+/// and the driver, every value each read may see under its ordering, and the flag set or
+/// clear as they begin: where both returned, the driver read the sender's slot after its
+/// drain, or the sender was told to wake the driver ([`hands`]). It is the orderings that
+/// make it so: the two swaps of the flag are one after the other, and the later acquires what
+/// the earlier released. Run on drawn schedules below; not yet proved, and not yet a
+/// `#[blaze::theorem]` (the translator states a theorem in the weak memory once
+/// decision D46's part of it lands). Its control is
+/// `the_oracle_catches_a_flag_swapped_relaxed`.
+#[cfg(not(blaze_check))]
+#[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+pub(crate) fn no_hand_back_is_missed(schedule: Vec<Step>, flagged: bool) -> bool {
+    hands(&schedule, flagged)
 }
 
 #[cfg(test)]
