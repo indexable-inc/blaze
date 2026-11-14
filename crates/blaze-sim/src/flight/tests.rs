@@ -1,13 +1,18 @@
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
 use std::collections::{BTreeSet, VecDeque};
 
-use super::*;
+use super::{Flight, Nanos, Plant};
 use crate::{Broke, Config, Record, Tape};
 
 fn in_order(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let calm = Tape::calm();
     let mut flight = match plant {
         Plant::None => Flight::new(),
-        plant => Flight::planted(plant),
+        plant @ Plant::SwapRemove => Flight::planted(plant),
     };
     let mut asked = VecDeque::new();
     let steps = tape.vec(0..=60, "steps", |t| t.below(3, "step"));
@@ -17,7 +22,9 @@ fn in_order(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             let want = asked.pop_front();
             let got = flight.deliver(&calm, Nanos(u64::MAX));
             if got != want {
-                return Err(Broke::Oracle(format!("step {at}: delivered {got:?}, asked first {want:?}")));
+                return Err(Broke::Oracle(format!(
+                    "step {at}: delivered {got:?}, asked first {want:?}"
+                )));
             }
         } else {
             flight.ask_at(Nanos(u64::from(next % 5)), next);
@@ -28,7 +35,9 @@ fn in_order(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     while let Some(want) = asked.pop_front() {
         let got = flight.deliver(&calm, Nanos(u64::MAX));
         if got != Some(want) {
-            return Err(Broke::Oracle(format!("at the end: delivered {got:?}, asked first {want}")));
+            return Err(Broke::Oracle(format!(
+                "at the end: delivered {got:?}, asked first {want}"
+            )));
         }
     }
     Ok(())
@@ -54,11 +63,13 @@ fn every_order_of_three_is_delivered_by_some_seed_below_64() {
         for answer in ['a', 'b', 'c'] {
             flight.ask(answer);
         }
-        let order: String = (0..3).map(|_| flight.deliver(&tape, Nanos(0)).expect("three are due")).collect();
+        let order: String =
+            (0..3).map(|_| flight.deliver(&tape, Nanos(0)).expect("three are due")).collect();
         assert!(flight.is_empty());
         orders.insert(order);
     }
-    let all: BTreeSet<String> = ["abc", "acb", "bac", "bca", "cab", "cba"].into_iter().map(String::from).collect();
+    let all: BTreeSet<String> =
+        ["abc", "acb", "bac", "bca", "cab", "cba"].into_iter().map(String::from).collect();
     assert_eq!(orders, all);
 }
 
