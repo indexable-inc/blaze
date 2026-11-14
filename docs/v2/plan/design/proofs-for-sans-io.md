@@ -377,3 +377,9 @@ unpark's swap and its wake.
 Ledger rows V13 to V17 (objectives.json): the first proved invariant with its test deleted;
 the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
 the count of invariants at `proved`; atomics.
+
+The models under `lean/BlazeModel/blaze_core` are what the proofs in the tree were checked
+against, so they must be what `blaze prove` emits from the source today:
+`harness/v2/lean_gate.py '{"command": "models", "emitted": "<target>/lean/lib"}'` compares
+every model a run emitted with the checked-in one, byte for byte. It needs a built blaze and
+is run by hand after `blaze prove -p blaze-core` until the release train runs it.
