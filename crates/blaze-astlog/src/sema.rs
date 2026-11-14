@@ -24,8 +24,8 @@ use syntax::{
     view::{self as ast, AstNode as _, NodeId},
 };
 
-use crate::error::{DefPathSnafu, Error, WrongValueSnafu};
-use crate::pattern::{Bound, Pattern, TypePattern, TypeShape, node_at};
+use crate::error::{CfgUnreadSnafu, DefPathSnafu, Error, PatternEditionSnafu, WrongValueSnafu};
+use crate::pattern::{Bound, Length, Pattern, TypePattern, TypeShape, node_at};
 use crate::program::{Atom, Blaze, Enclosing, Filter};
 
 /// A value of blaze's rules.
@@ -199,19 +199,19 @@ impl<'a, F: Files> Sema<'a, F> {
         Some(self.types.borrow()[at as usize])
     }
 
-    /// The trees the patterns search: each view file holding `literal` (or every one), then
-    /// the macro expansions in it, depth first.
+    /// The trees the patterns search: each view file and the macro expansions in it, depth
+    /// first, each that holds `literal` (or every one). A file without the literal is still
+    /// expanded: a macro defined elsewhere can write it.
     fn searched(&self, literal: Option<&str>) -> Vec<u32> {
         let finder = literal.map(|it| Finder::new(it.as_bytes()));
         let mut out = Vec::new(); // alloc: the trees one atom searches
         for &tree in &self.targets {
-            let root = self.tree_at(tree).root;
-            if finder.as_ref().is_some_and(|it| it.find(root.text().as_bytes()).is_none()) {
-                continue;
-            }
             let mut stack = vec![tree];
             while let Some(tree) = stack.pop() {
-                out.push(tree);
+                let root = self.tree_at(tree).root;
+                if finder.as_ref().is_none_or(|it| it.find(root.text().as_bytes()).is_some()) {
+                    out.push(tree);
+                }
                 let inner = self.expansions_of(tree);
                 stack.extend(inner.iter().rev());
             }
@@ -352,8 +352,41 @@ impl<'a, F: Files> Sema<'a, F> {
                 AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
             })
             .collect();
+        // `lib::E::V`, the path `def_path` gives a variant.
+        if let ModuleDef::Adt(hir::Adt::Enum(it)) = owner {
+            out.extend(it.variants(db).into_iter().map(ModuleDef::EnumVariant));
+        }
         out.dedup();
         out
+    }
+
+    /// The defs a def path names: [`Sema::items_at`]'s, or else the field of that name of the
+    /// struct, union or variant the rest of the path names (`lib::S::field`, `lib::P::0`).
+    fn defs_at(&self, path: &str, line: usize) -> Res<Vec<Def>> {
+        let missed = match self.items_at(path, line) {
+            Ok(items) => return Ok(items.into_iter().map(Def::Item).collect()),
+            Err(missed) => missed,
+        };
+        let Some((owner, name)) = path.trim().trim_start_matches("::").rsplit_once("::") else {
+            return Err(missed);
+        };
+        let Ok(owners) = self.items_at(owner, line) else { return Err(missed) };
+        let db = self.db;
+        let fields: Vec<Def> = owners
+            .into_iter()
+            .flat_map(|owner| match owner {
+                ModuleDef::Adt(hir::Adt::Struct(it)) => it.fields(db),
+                ModuleDef::Adt(hir::Adt::Union(it)) => it.fields(db),
+                ModuleDef::EnumVariant(it) => it.fields(db),
+                _ => Vec::new(),
+            })
+            .filter(|it| it.name(db).as_str() == name)
+            .map(Def::Field)
+            .collect();
+        match fields.is_empty() {
+            true => Err(missed),
+            false => Ok(fields),
+        }
     }
 
     /// The def a path, name, method call or field names.
@@ -392,7 +425,11 @@ impl<'a, F: Files> Sema<'a, F> {
         match node.kind() {
             SyntaxKind::METHOD_CALL_EXPR => self.resolve(node),
             SyntaxKind::CALL_EXPR => {
-                let callee = node.children().next()?;
+                let mut callee = node.children().next()?;
+                // `(foo)()` calls `foo`.
+                while callee.kind() == SyntaxKind::PAREN_EXPR {
+                    callee = callee.children().next()?;
+                }
                 match self.resolve(callee)? {
                     def @ Def::Item(ModuleDef::Function(_)) => Some(def),
                     _ => None,
@@ -404,23 +441,35 @@ impl<'a, F: Files> Sema<'a, F> {
 
     /// The def an item's syntax declares.
     pub fn defines(&self, node: ast::Node<'a>) -> Option<Def> {
+        self.declaration(node).flatten()
+    }
+
+    /// `None` for a node of a kind that declares nothing, `Some(None)` for a declaration the
+    /// front end has no def of (a `#[cfg]` removed it), and `Some(Some(def))` for one it has.
+    /// The one list of the kinds that declare, so `defines` and `cfg-off` read the same.
+    fn declaration(&self, node: ast::Node<'a>) -> Option<Option<Def>> {
         let sema = &self.sema;
-        let item = |def: ModuleDef| Some(Def::Item(def));
-        match node.kind() {
-            SyntaxKind::FN => item(sema.to_fn_def(ast::Fn::cast(node)?)?.into()),
-            SyntaxKind::STRUCT => item(ModuleDef::Adt(sema.to_def(ast::Struct::cast(node)?)?.into())),
-            SyntaxKind::ENUM => item(ModuleDef::Adt(sema.to_def(ast::Enum::cast(node)?)?.into())),
-            SyntaxKind::UNION => item(ModuleDef::Adt(sema.to_def(ast::Union::cast(node)?)?.into())),
-            SyntaxKind::TRAIT => item(sema.to_def(ast::Trait::cast(node)?)?.into()),
-            SyntaxKind::CONST => item(sema.to_def(ast::Const::cast(node)?)?.into()),
-            SyntaxKind::STATIC => item(sema.to_def(ast::Static::cast(node)?)?.into()),
-            SyntaxKind::TYPE_ALIAS => item(sema.to_def(ast::TypeAlias::cast(node)?)?.into()),
-            SyntaxKind::MODULE => item(sema.to_def(ast::Module::cast(node)?)?.into()),
-            SyntaxKind::VARIANT => item(sema.to_def(ast::Variant::cast(node)?)?.into()),
-            SyntaxKind::RECORD_FIELD => Some(Def::Field(sema.to_def(ast::RecordField::cast(node)?)?)),
-            SyntaxKind::IMPL => Some(Def::Impl(sema.to_impl_def(ast::Impl::cast(node)?)?)),
-            _ => None,
-        }
+        let item = |def: Option<ModuleDef>| def.map(Def::Item);
+        // Each cast is of the kind its arm matched, so its `?` never returns.
+        Some(match node.kind() {
+            SyntaxKind::FN => item(sema.to_fn_def(ast::Fn::cast(node)?).map(Into::into)),
+            SyntaxKind::STRUCT => item(sema.to_def(ast::Struct::cast(node)?).map(|it| ModuleDef::Adt(it.into()))),
+            SyntaxKind::ENUM => item(sema.to_def(ast::Enum::cast(node)?).map(|it| ModuleDef::Adt(it.into()))),
+            SyntaxKind::UNION => item(sema.to_def(ast::Union::cast(node)?).map(|it| ModuleDef::Adt(it.into()))),
+            SyntaxKind::TRAIT => item(sema.to_def(ast::Trait::cast(node)?).map(Into::into)),
+            SyntaxKind::CONST => item(sema.to_def(ast::Const::cast(node)?).map(Into::into)),
+            SyntaxKind::STATIC => item(sema.to_def(ast::Static::cast(node)?).map(Into::into)),
+            SyntaxKind::TYPE_ALIAS => item(sema.to_def(ast::TypeAlias::cast(node)?).map(Into::into)),
+            SyntaxKind::MODULE => item(sema.to_def(ast::Module::cast(node)?).map(Into::into)),
+            SyntaxKind::VARIANT => item(sema.to_def(ast::Variant::cast(node)?).map(Into::into)),
+            SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
+                item(sema.to_macro_def(ast::Macro::cast(node)?).map(ModuleDef::Macro))
+            }
+            SyntaxKind::RECORD_FIELD => sema.to_def(ast::RecordField::cast(node)?).map(Def::Field),
+            SyntaxKind::TUPLE_FIELD => sema.to_def(ast::TupleField::cast(node)?).map(Def::Field),
+            SyntaxKind::IMPL => sema.to_impl_def(ast::Impl::cast(node)?).map(Def::Impl),
+            _ => return None,
+        })
     }
 
     /// The syntax that declares a def, if the front end has it.
@@ -482,8 +531,23 @@ impl<'a, F: Files> Sema<'a, F> {
             }
             None => {}
         }
+        // A variant is under its enum, and a field under its struct, union or variant.
+        let variant = match def {
+            Def::Item(ModuleDef::EnumVariant(it)) => Some(it),
+            Def::Field(field) => match field.parent_def(db) {
+                hir::Variant::EnumVariant(it) => Some(it),
+                hir::Variant::Struct(_) | hir::Variant::Union(_) => None,
+            },
+            _ => None,
+        };
+        if let Some(variant) = variant {
+            segments.push(variant.parent_enum(db).name(db).as_str().to_owned());
+        }
         if let Def::Field(field) = def {
-            segments.push(hir::Variant::from(field.parent_def(db)).name(db).as_str().to_owned());
+            segments.push(field.parent_def(db).name(db).as_str().to_owned());
+        }
+        if let Def::Impl(it) = def {
+            segments.push(self.impl_segment(it));
         }
         // A module's own name is the last of its path's segments already.
         if let Some(name) = self.name_of(def)
@@ -492,6 +556,17 @@ impl<'a, F: Files> Sema<'a, F> {
             segments.push(name);
         }
         Some(segments.join("::"))
+    }
+
+    /// An impl's last segment, as rustc's paths show one: `<impl Type>` or
+    /// `<impl Trait<Args> for Type>`. It names the impl and resolves to nothing
+    /// ([`crate::program::names_an_impl`]).
+    fn impl_segment(&self, it: hir::Impl) -> String {
+        let ty = self.display(it.self_ty(self.db));
+        match it.trait_ref(self.db) {
+            Some(by) => format!("<impl {} for {ty}>", by.display(self.db, self.target)),
+            None => format!("<impl {ty}>"),
+        }
     }
 
     fn display(&self, ty: Type<'a>) -> String {
@@ -564,9 +639,16 @@ impl<'a, F: Files> Sema<'a, F> {
                 Some(elem) => self.type_matches(pattern, inner, elem, out)?,
                 None => false,
             },
-            TypeShape::Array(inner) => match ty.as_array(db) {
-                Some((elem, _)) => self.type_matches(pattern, inner, elem, out)?,
+            TypeShape::Array(inner, Length::Any) => match ty.as_array_element(db) {
+                Some(elem) => self.type_matches(pattern, inner, elem, out)?,
                 None => false,
+            },
+            // A length the front end cannot evaluate (`[T; N]`) is no length a number names.
+            TypeShape::Array(inner, Length::Is(want)) => match ty.as_array(db) {
+                Some((elem, len)) if u128::try_from(len).is_ok_and(|len| len == want) => {
+                    self.type_matches(pattern, inner, elem, out)?
+                }
+                _ => false,
             },
         })
     }
@@ -605,17 +687,28 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
-    /// Whether `item` carries `#[cfg(test)]` or a `#[test]`-like attribute (`test`, `tokio::test`).
+    /// Whether `item` carries `#[cfg(test)]` or an attribute whose path's last segment is
+    /// `test` (`#[test]`, `#[tokio::test(flavor = "multi_thread")]`): the path is read apart
+    /// from the arguments, so `#[other(test)]` is no test.
     fn test_item(item: ast::Node<'_>) -> bool {
         item.children().filter(|it| it.kind() == SyntaxKind::ATTR).any(|attr| {
-            let text: String = attr.text().chars().filter(|c| !c.is_whitespace()).collect();
-            text == "#[test]" || text.ends_with("::test]") || text == "#[cfg(test)]"
+            let Some(meta) = attr.children().next() else { return false };
+            if meta.kind() == SyntaxKind::CFG_META {
+                let text: String = meta.text().chars().filter(|c| !c.is_whitespace()).collect();
+                return text == "cfg(test)";
+            }
+            let last = meta
+                .children()
+                .find(|it| it.kind() == SyntaxKind::PATH)
+                .and_then(|path| path.children().find(|it| it.kind() == SyntaxKind::PATH_SEGMENT))
+                .and_then(|segment| segment.children().find(|it| it.kind() == SyntaxKind::NAME_REF));
+            last.is_some_and(|it| it.text() == "test")
         })
     }
 
-    fn filter(&self, filter: Filter, node: ast::Node<'a>) -> bool {
+    fn filter(&self, filter: Filter, node: ast::Node<'a>, line: usize) -> Res<bool> {
         let tree = self.tree_at(self.tree(node));
-        match filter {
+        Ok(match filter {
             // The two split an expansion's nodes: those whose text is the call's input, which
             // an edit can reach, and those the macro made, which it can't.
             Filter::InMacroExpansion => tree.call.is_some() && self.sema.original_range_opt(node).is_none(),
@@ -625,27 +718,38 @@ impl<'a, F: Files> Sema<'a, F> {
                     && it.child_token(SyntaxKind::UNSAFE_KW).is_some()
             }),
             Filter::InTest => self.ancestors_out(node).into_iter().any(Self::test_item),
-            Filter::CfgOff => self.ancestors_out(node).into_iter().any(|it| {
-                Self::has_attribute(it, "cfg") && self.defines(it).is_none() && Self::declares(it)
-            }),
-        }
+            Filter::CfgOff => {
+                for it in self.ancestors_out(node) {
+                    if !Self::has_attribute(it, "cfg") {
+                        continue;
+                    }
+                    match self.declaration(it) {
+                        Some(None) => return Ok(true),
+                        Some(Some(_)) => {}
+                        // A cfg the front end lowers to no def it could miss: say so.
+                        None => {
+                            let attr = it
+                                .children()
+                                .find(|it| it.kind() == SyntaxKind::ATTR)
+                                .map_or("#[cfg]", |it| it.text());
+                            return CfgUnreadSnafu { line, place: self.place(it), attr, kind: format!("{:?}", it.kind()) }
+                                .fail()
+                                .map_err(Error::from);
+                        }
+                    }
+                }
+                false
+            }
+        })
     }
 
-    /// Whether `node` is an item [`Sema::defines`] knows how to map.
-    fn declares(node: ast::Node<'_>) -> bool {
-        matches!(
-            node.kind(),
-            SyntaxKind::FN
-                | SyntaxKind::STRUCT
-                | SyntaxKind::ENUM
-                | SyntaxKind::UNION
-                | SyntaxKind::TRAIT
-                | SyntaxKind::CONST
-                | SyntaxKind::STATIC
-                | SyntaxKind::TYPE_ALIAS
-                | SyntaxKind::MODULE
-                | SyntaxKind::IMPL
-        )
+    /// `path:line` of a syntax node, the path saying when the tree is a macro's expansion.
+    fn place(&self, node: ast::Node<'a>) -> String {
+        let tree = self.tree(node);
+        let root = self.tree_at(tree).root;
+        let before = &root.text().as_bytes()[..usize::from(node.text_range().start())];
+        let line = memchr::memchr_iter(b'\n', before).count() + 1;
+        format!("{}:{line}", self.path(tree as usize))
     }
 
     fn enclosing(&self, kind: Enclosing, node: ast::Node<'a>) -> Option<Def> {
@@ -723,7 +827,8 @@ impl<'a, F: Files> Sema<'a, F> {
             for start in finder.find_iter(text) {
                 let at = syntax::TextSize::from(u32::try_from(start).expect("a file under 4 GiB"));
                 let Some(token) = root.token_at_offset(at).right_biased() else { continue };
-                if token.kind() != SyntaxKind::IDENT || token.text() != name {
+                // A tuple field's name is a number: `value.0` names field `0` by an INT_NUMBER.
+                if !matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::INT_NUMBER) || token.text() != name {
                     continue;
                 }
                 for mapped in self.sema.descend_into_macros_exact(token) {
@@ -792,10 +897,28 @@ impl<'a, F: Files> Sema<'a, F> {
         inputs: &[Option<Value<Node>>],
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
+        let trees = match &inputs[0] {
+            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", pattern.line)?)],
+            None => self.searched(pattern.literal.as_deref()),
+        };
+        for &tree in &trees {
+            let edition = self.tree_at(tree).file.edition(self.db);
+            if pattern.reads_otherwise.contains(&edition) {
+                return PatternEditionSnafu {
+                    line: pattern.line,
+                    form: pattern.form.name(),
+                    text: &pattern.text,
+                    parsed: syntax::Edition::CURRENT.number(),
+                    edition: edition.number(),
+                    place: self.path(tree as usize),
+                }
+                .fail()
+                .map_err(Error::from);
+            }
+        }
         let candidates: Vec<ast::Node<'a>> = match &inputs[0] {
             Some(_) => vec![self.need_syn(&inputs[0], "a pattern", pattern.line)?],
-            None => self
-                .searched(pattern.literal.as_deref())
+            None => trees
                 .into_iter()
                 .flat_map(|tree| {
                     let root = self.tree_at(tree).root;
@@ -881,8 +1004,11 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     }
                 }
                 (None, Some(Value::Text(path))) => {
-                    for def in self.items_at(path, line)? {
-                        out.push(vec![node(self.def(Def::Item(def))), text(path)]);
+                    if crate::program::names_an_impl(path) {
+                        return Err(crate::program::impl_has_no_path(path, line));
+                    }
+                    for def in self.defs_at(path, line)? {
+                        out.push(vec![node(self.def(def)), text(path)]);
                     }
                 }
                 (None, other) => {
@@ -1037,7 +1163,7 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
             }
             Atom::Filter(filter) => {
                 let at = self.need_syn(&inputs[0], "a filter", line)?;
-                if self.filter(*filter, at) {
+                if self.filter(*filter, at, line)? {
                     out.push(vec![node(self.syn(at))]);
                 }
             }

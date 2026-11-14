@@ -103,6 +103,26 @@ fn rewrite_splices_template() -> TestResult {
 }
 
 #[test]
+fn insertions_at_one_offset_keep_rule_then_action_order_whatever_their_text() -> TestResult {
+    let inserted = |first: &str, second: &str, third: &str| -> Result<String, Box<dyn std::error::Error>> {
+        let rules = format!(
+            "(rule (item f) (match rust \"(function_item) @f\"))
+             (rewrite first (item f) (insert-before f \"// {first}\\n\") (insert-before f \"// {second}\\n\"))
+             (rewrite then (item f) (insert-before f \"// {third}\\n\"))"
+        );
+        let dir = tempfile::tempdir()?;
+        write_sample(&dir, "sample.rs", "fn x() {}\n")?;
+        let analysis = analyze(&rules, &[dir.path().to_path_buf()])?;
+        let [rewritten] = analysis.rewritten().try_into().map_err(|_| "one file rewritten")?;
+        Ok(rewritten.content)
+    };
+    assert_eq!(inserted("b", "a", "0")?, "// b\n// a\n// 0\nfn x() {}\n");
+    assert_eq!(inserted("a", "b", "0")?, "// a\n// b\n// 0\nfn x() {}\n", "swapped text, same order");
+    assert_eq!(inserted("y", "z", "a")?, "// y\n// z\n// a\nfn x() {}\n", "the later rule's last");
+    Ok(())
+}
+
+#[test]
 fn value_join_on_same_text() -> TestResult {
     let source = r#"
 fn main() {
@@ -743,5 +763,18 @@ applied = [100000, true]
         ],
         "the misgrouped exponent and the array's literal fire; the canonical exponent and the array do not"
     );
+    Ok(())
+}
+
+#[test]
+fn a_negated_match_filters_rows_it_holds_for() -> TestResult {
+    let rules = r#"
+(rule (item f) (match rust "(function_item) @f"))
+(rule (calls-nothing f)
+  (item f)
+  (not (match rust "(function_item body: (block (expression_statement (call_expression)))) @f")))
+"#;
+    let text = only_node_text("sample.rs", "fn a() { b(); }\nfn b() {}\n", rules, "calls-nothing")?;
+    assert_eq!(text, "fn b() {}");
     Ok(())
 }
