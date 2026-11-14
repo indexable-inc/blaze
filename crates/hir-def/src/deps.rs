@@ -52,7 +52,7 @@ pub use crate::deps::{
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     serve::{
         ImageStore, KEPT_DOMAIN, PAGES_DOMAIN, ReadThrough, Refused, Served, Stored, StoredOf,
-        Which, filing_keys, front_keys, kept_key, pages_key, serve, store,
+        Which, filing_keys, front_keys, kept_key, pages_key, serve, store, whole_pages,
     },
 };
 pub use crate::nameres::frozen::Mode;

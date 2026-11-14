@@ -564,11 +564,19 @@ def ratchet_dir(manifest: str) -> str | None:
     return found
 
 
-def ratchet_off(base: Mapping[str, Mapping[str, int | None]], now: Mapping[str, Mapping[str, int | None]]) -> list[str]:
+def ratchet_off(base: Mapping[str, Mapping[str, int | None]], now: Mapping[str, Mapping[str, int | None]],
+                first: frozenset[str] = frozenset()) -> list[str]:
     """Each way `now`'s baselines, by file name, hold more than `base`'s: a crate the file did not
-    list there, a count over the base's, a count turned back to `unmeasured`."""
+    list there, a count over the base's, a count turned back to `unmeasured`.
+
+    `first` names the lints the base's registry did not have (`new_lints`). Such a lint's baseline
+    is its first: every crate it lists is where the lint begins, so nothing is compared. Without
+    this a new lint could only enter with every finding in the tree fixed in the same change, and
+    was left at `warn` with no baseline at all, which holds nothing (three lints, 2026-11-14)."""
     off: list[str] = []
     for name in sorted(now):
+        if name not in base and name.removeprefix("blaze.").removesuffix(".txt") in first:
+            continue
         was = base.get(name, {})
         for krate, held in now[name].items():
             if krate not in was:
@@ -604,6 +612,24 @@ def baselines_at(rev: str | None) -> tuple[str | None, dict[str, Baseline]]:
     return found, {name: read_baseline(f"{found}/{name}", text) for name, text in files.items()}
 
 
+LINT_NAMES = "crates/blaze-lint-defs/src/names.rs"
+
+
+def lint_names(text: str) -> frozenset[str]:
+    """The lints a registry names: each `"blaze::<name>"` in blaze-lint-defs' names.rs."""
+    found: set[str] = set()
+    for part in text.split('"blaze::')[1:]:
+        name = part.split('"', 1)[0]
+        if name and all(it.islower() or it.isdigit() or it == "_" for it in name):
+            found.add(name)
+    return frozenset(found)
+
+
+def new_lints(base: str) -> frozenset[str]:
+    """The lints the tree's registry names that `base`'s does not: their baselines are their first."""
+    return lint_names((ROOT / LINT_NAMES).read_text()) - lint_names(git("show", f"{base}:{LINT_NAMES}"))
+
+
 def ratchet(base: str) -> list[str]:
     """What the tree's baselines hold that `base`'s did not; empty when the ratchet held."""
     found, now = baselines_at(None)
@@ -616,7 +642,12 @@ def ratchet(base: str) -> list[str]:
         print(f"{SCRIPT}: the base {base} has no ratchet: it begins here, with "
               f"{sum(len(it) for it in now.values())} crates held at `warn` over {len(now)} lints")
         return []
-    return ratchet_off(was, now)
+    first = new_lints(base)
+    for lint in sorted(first):
+        if f"blaze.{lint}.txt" in now:
+            print(f"{SCRIPT}: `{lint}` is new since {base}: its baseline begins here, "
+                  f"{len(now[f'blaze.{lint}.txt'])} crates held at `warn`")
+    return ratchet_off(was, now, first)
 
 
 def empty(lint: str) -> list[str]:
@@ -823,7 +854,14 @@ def ratchet_selftest() -> None:
     added = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 3, "b": 1}})
     expect(len(added) == 1 and "`b` is held at `warn` and was not" in added[0], f"a new crate is refused: {added}")
     new_file = ratchet_off(base, {**base, "blaze.dead.txt": {"a": None}})
-    expect(len(new_file) == 1 and new_file[0].startswith("blaze.dead.txt"), f"a new lint's file is refused: {new_file}")
+    expect(len(new_file) == 1 and new_file[0].startswith("blaze.dead.txt"),
+           f"a file for a lint the base's registry had (held at `deny` everywhere there) is refused: {new_file}")
+    begun = ratchet_off(base, {**base, "blaze.dead.txt": {"a": None}}, frozenset({"dead"}))
+    expect(begun == [], f"the first baseline of a lint the base's registry did not have passes: {begun}")
+    grown = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 3, "b": 1}}, frozenset({"wall_clock"}))
+    expect(len(grown) == 1, f"a lint named new whose file the base has is still held to it: {grown}")
+    expect(lint_names('["blaze::a_b", "blaze::c2", "clippy::x", "blaze::"]') == frozenset({"a_b", "c2"}),
+           "the registry's names read")
     rose = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": 4}})
     expect(rose == ["blaze.wall_clock.txt: `a` holds 4, over the base's 3"], f"a count that rose is refused: {rose}")
     again = ratchet_off(base, {**base, "blaze.wall_clock.txt": {"a": None}})
