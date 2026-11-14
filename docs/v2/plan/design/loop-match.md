@@ -66,4 +66,5 @@ blaze can't resolve is an error naming it, never a plain `break` in its place.
   jump in plain-break order; a jump to `x @ 1..=3` and to `x` binds the new value; one test per
   refusal with rustc's message.
 - `harness/v2/frontend/cases/mir/` case `loop-match-jumps-into-the-arm`: a state machine run
-  under blaze prints what the pinned nightly prints.
+  under blaze prints what the plain loop prints. Its `dropping()` counts two drops of the old
+  state, which the pinned nightly does not make, so the nightly fails that case on purpose.
