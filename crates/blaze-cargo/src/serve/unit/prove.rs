@@ -16,7 +16,9 @@
 //! own release and that directory, writes that directory alone, and has no network
 //! (`sandbox-everything`); a step that has not ended by [`DEADLINE`] is killed and its
 //! theorems are open, naming it (`bounded-progress`). Lean never reads the checkout: the
-//! proof files are written from the texts the plan keyed. A step Lean accepted leaves its
+//! proof files are written from the texts the plan keyed. Every theorem's model is compiled,
+//! proof file or none ([`plan::wanted`]): a model Lean refuses is answered as blaze's bug
+//! ([`ProofRecord::ModelBroken`]), never `Open`. A step Lean accepted leaves its
 //! output beside its module under the step's key (its verdict), and a step whose key is found
 //! there is not run again: an unchanged tree runs Lean not at all. A verdict is written only
 //! after the compiled module it vouches for is ordered before it on the disk
@@ -348,7 +350,8 @@ fn function_of(record: &ProofRecord) -> &str {
         ProofRecord::Open { function, .. }
         | ProofRecord::Proved { function, .. }
         | ProofRecord::Emitted { function, .. }
-        | ProofRecord::Refused { function, .. } => function,
+        | ProofRecord::Refused { function, .. }
+        | ProofRecord::ModelBroken { function, .. } => function,
     }
 }
 
@@ -599,6 +602,14 @@ impl Checking {
                         .join(format!("{}.lean", proof_module.replace('.', "/")))
                         .display()
                         .to_string(),
+                },
+                // Lean's place, under the directory the models are written in: a path a
+                // person opens.
+                Verdict::ModelBroken { function, module, at, error } => ProofRecord::ModelBroken {
+                    at: lib.join(at).display().to_string(),
+                    error,
+                    module,
+                    function,
                 },
             });
         }
@@ -1230,6 +1241,7 @@ mod tests {
                     found.push(match verdict {
                         Verdict::Proved { function, axioms, .. } => (function, format!("proved on {axioms:?}")),
                         Verdict::Open { function, why, .. } => (function, format!("open: {why}")),
+                        Verdict::ModelBroken { function, module, .. } => (function, format!("model broken: {module}")),
                     });
                 }
             }
@@ -1404,6 +1416,9 @@ mod tests {
                 // clone: a test's names
                 ProofRecord::Proved { function, axioms, .. } => (function.clone(), format!("proved on {axioms:?}")),
                 ProofRecord::Open { function, why, .. } => (function.clone(), format!("open: {why}")),
+                ProofRecord::ModelBroken { function, module, .. } => {
+                    (function.clone(), format!("model broken: {module}"))
+                }
                 other => return Err(format!("a record that is no verdict: {other:?}")),
             });
         }
@@ -1464,6 +1479,42 @@ mod tests {
     #[test]
     fn the_oracle_catches_a_refused_step_kept_as_accepted() {
         blaze_sim::control(Config::cases(300), Plant::None, Plant::KeepRefused, "the second check", holds);
+    }
+
+    /// A theorem with no proof file has its model compiled all the same, once: the first check
+    /// gives Lean both models and answers the one Lean accepts open for want of its proof file
+    /// and the one it refuses as blaze's bug, at Lean's place; the second check of the same
+    /// tree answers the same and gives Lean the accepted model zero times. (The refused one is
+    /// run again: a refusal leaves no verdict, `the_oracle_catches_a_refused_step_kept_as_accepted`.)
+    #[test]
+    fn a_model_without_a_proof_file_is_compiled_once_and_its_verdict_found_after() {
+        let (good, bad) = ("BlazeModel.k.m.t0", "BlazeModel.k.m.t1");
+        let theorems = vec![module("k::m::t0", true, Vec::new()), module("k::m::t1", true, Vec::new())];
+        let krate = Krate { name: "k".to_owned(), theorems, proofs: BTreeMap::new() };
+        let does = BTreeMap::from([(bad.to_owned(), Does::Refuse)]);
+        let world = World { crates: vec![krate], does, seed: 7, crash: false };
+        let mut sim = Sim::new(world.seed, Faults::default());
+        // clone: the simulated Lean's own copy of what each module does
+        sim.program(LEAN, lean(Rc::new(world.does.clone())));
+        let (_, accepted) = world.expected();
+        let (first, given) = check(&mut sim, &world, Plant::None, &BTreeSet::new()).unwrap_or_else(|it| panic!("{it:?}"));
+        for model in [good, bad] {
+            assert_eq!(given.iter().filter(|it| *it == model).count(), 1, "{model} in {given:?}");
+        }
+        assert_eq!(first.failed, None);
+        match first.records.as_slice() {
+            [ProofRecord::Open { function, why, .. }, ProofRecord::ModelBroken { function: broken, module, at, error }] => {
+                assert_eq!((function.as_str(), broken.as_str(), module.as_str()), ("k::m::t0", "k::m::t1", bad));
+                assert!(why.starts_with("there is no proof file"), "{why}");
+                assert_eq!((at.as_str(), error.as_str()), ("/b/lean/lib/BlazeModel/k/m/t1.lean:1:0", "error: refused"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(accepted.contains(good) && !accepted.contains(bad), "{accepted:?}");
+        let (second, given) = check(&mut sim, &world, Plant::None, &accepted).unwrap_or_else(|it| panic!("{it:?}"));
+        assert_eq!(second, first);
+        assert_eq!(given.iter().filter(|it| *it == good).count(), 0, "{given:?}");
+        assert!(given.iter().all(|it| !accepted.contains(it)), "{given:?}");
     }
 
     /// A verdict is taken only where it is this key's and whole: one of another key, one cut

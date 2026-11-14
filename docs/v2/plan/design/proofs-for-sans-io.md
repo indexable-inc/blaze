@@ -234,6 +234,11 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 Proved means what formal-verification.md says: the kernel accepts it, no `sorry`, only
 Lean's three axioms.
 
+Every theorem's model is compiled, proof file or none, before anything is said of it: `Open`
+for want of a proof file means the model builds. A model Lean refuses is `ModelBroken`, never
+`Open`: blaze's translator's bug, which no proof can fix, with Lean's first error at its file
+and line; like `Open`, it makes the command fail.
+
 **How Lean is run.** The check has a sans-IO core and a driver, as everything does
 (`sans-io-cores`):
 

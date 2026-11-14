@@ -83,6 +83,9 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
     // The `@[spec]`s of `Blaze.Vec`'s operations, which `Blaze.Auto` must come before.
     ("Blaze.VecAuto", include_str!("../../../lean/Blaze/VecAuto.lean")),
+    // What a proof about two threads is written with: the induction over a schedule and the
+    // world's step on each operation.
+    ("Blaze.ThreadsAuto", include_str!("../../../lean/Blaze/ThreadsAuto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's

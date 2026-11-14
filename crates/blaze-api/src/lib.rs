@@ -131,7 +131,9 @@ use serde::{Deserialize, Serialize};
 /// many the filter left out, and the nearest names to a filter that matched none.
 /// 60: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
 /// name, and for a changed ask which one with its answers then and now.
-pub const SCHEMA: u32 = 60;
+/// 61: [`ProofRecord::ModelBroken`]: a theorem whose generated Lean model Lean refuses,
+/// answered as blaze's bug with Lean's first error, proof file or none, never `Open`.
+pub const SCHEMA: u32 = 61;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -2166,6 +2168,11 @@ pub enum ProofRecord {
     Emitted { path: String, module: String, function: String, statement: String },
     /// The translator refused it: what construct, and where (`hir_ty_lean::NotTranslated`).
     Refused { at: String, what: String, function: String },
+    /// Lean refused the generated model of the theorem (`module`: its own, or one it
+    /// imports): a bug in blaze's translator, which no proof file can fix. Given whether or
+    /// not there is a proof file. `at` is where Lean's first error is (`<file>:<line>:<column>`,
+    /// the file absolute) and `error` the rest of it as Lean printed it (`error(<code>): ...`).
+    ModelBroken { at: String, error: String, module: String, function: String },
 }
 
 /// What the translator takes of every function in a `#![blaze::sans_io]` module of the crates

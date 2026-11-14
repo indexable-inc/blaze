@@ -1,6 +1,7 @@
--- Hand-written, not generated: the proof of the `derives` fixture's statement.
+-- Hand-written, not generated: the proofs of the `derives` fixture's statements.
 import Blaze
 import BlazeModel.derives.clone_is_equal
+import BlazeModel.derives.waited_eq_is_the_values
 
 /-!
 Derived `Clone` and `PartialEq` proved through their models (crates/hir-ty-lean/src/tests.rs,
@@ -14,3 +15,13 @@ open Blaze
 theorem derives.clone_is_equal.spec.proof : derives.clone_is_equal.spec.statement := by
   intro p s
   simp [derives.clone_is_equal, core.cmp.PartialEq.ne]
+
+/-- The same at instances of a generic enum: `Waited<()>`, `Waited<u32>` and `Waited<Point>`
+each have their own type and `DecidableEq`, so `==` and `!=` are equality of the values and
+`clone` the value itself, whatever `x` is. -/
+theorem derives.waited_eq_is_the_values.spec.proof :
+    derives.waited_eq_is_the_values.spec.statement := by
+  intro x
+  simp [derives.waited_eq_is_the_values, derives.is_ready, derives.waited_differ,
+    derives.copy_waited, derives.ready_or, core.cmp.PartialEq.ne, core.cmp.PartialEq.eq]
+  rfl

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-115 theorems: 102 in `lean`, 13 in `lean/analysis`.
+120 theorems: 107 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1036,6 +1036,25 @@ theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
 theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
 ```
 
+**`derives.waited_eq_is_the_values.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function waited_eq_is_the_values holds of its model: the derived ==, != and clone of a generic enum at its instances (Waited<()>, Waited<u32>, Waited<Point>) are the values' own.
+
+```lean
+theorem derives.waited_eq_is_the_values.spec.proof :
+    derives.waited_eq_is_the_values.spec.statement
+```
+
+**`blaze_shapes.hunts_find_the_hit.spec.proof`** (`BlazeModel.blaze_shapes.proved`, `lean`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names.
+
+```lean
+theorem blaze_shapes.hunts_find_the_hit.spec.proof : blaze_shapes.hunts_find_the_hit.spec.statement
+```
+
+**`traits.provided_agree.spec.proof`** (`BlazeModel.traits.proved`, `lean`): The statement blaze generates from the fixture's theorem function provided_agree holds of its model: a trait's provided methods at two implementors, one overriding one of them, give the Rust's values.
+
+```lean
+theorem traits.provided_agree.spec.proof : traits.provided_agree.spec.statement
+```
+
 ## V16
 
 **`blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_retry_waits_what_is_left holds of its model: from every state of a blocking wait and every reading of the clock after a call that was not ready, the wait ends exactly when its deadline has passed at that reading, and where it goes on the next call is given what is left of the deadline at that reading, never an earlier timeout; and nothing panics.
@@ -1108,4 +1127,16 @@ theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
 
 ```lean
 theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
+```
+
+**`atomics.adds_until_done.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function adds_until_done holds of its model, a program over shared cells: a compare-exchange loop that returns its Ok value returns what the cell held and leaves the sum.
+
+```lean
+theorem atomics.adds_until_done.spec.proof : atomics.adds_until_done.spec.statement
+```
+
+**`atomics.pokes_count.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function pokes_count holds of its model: a trait's provided methods, translated at their implementor, on a shared word: two pokes of a zeroed word return 1 and leave 2.
+
+```lean
+theorem atomics.pokes_count.spec.proof : atomics.pokes_count.spec.statement
 ```

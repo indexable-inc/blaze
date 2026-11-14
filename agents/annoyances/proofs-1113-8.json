@@ -15,6 +15,6 @@
  "class": "an answer that is reached before the check that would contradict it has run: a status that skips a step and does not say so",
  "prevention": "blaze prove compiles a theorem`s model whether or not a proof file exists, and answers `the generated model does not build: a bug in blaze`s translator` with Lean`s error in place of Open; not built (the translator lane holds plan.rs today). Until then: `leanvm.sh <wt> <lane> 4.35.0 build BlazeModel` on copied models before committing them (added to H-proof-loop`s recipe in words here)",
  "workaround": "run `lake build BlazeModel` on the models copied from a run before checking them in",
- "fix": "",
- "state": "open"
+ "fix": "blaze prove compiles every theorem`s model whether or not a proof file exists and answers `model broken` (ProofRecord::ModelBroken, schema 61) with Lean`s first error where it does not build; by the lane provemodel (claude-opus-5-5), 2026-11-14",
+ "state": "fixed"
 }

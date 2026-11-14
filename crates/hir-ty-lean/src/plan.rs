@@ -206,6 +206,9 @@ pub struct Planned {
     pub proof_module: String,
     /// Its model's file under [`Root::Out`].
     pub model: String,
+    /// The step that compiles its model: run whether or not there is a proof file, so no
+    /// answer is given of a theorem whose model Lean has not seen ([`wanted`]).
+    pub model_step: usize,
     /// The step that checks it, or why no run of Lean can.
     pub check: Result<usize, Why>,
 }
@@ -233,7 +236,8 @@ pub enum PlanError {
     Import { module: String, imported: String },
     /// Lean refused a module of blaze's library, or did not finish it.
     Library { module: String, output: String },
-    /// The driver gave no outcome for a check though every step it needs was accepted.
+    /// The driver gave no outcome for a model or a check though every step it needs was
+    /// accepted.
     NotRun { module: String },
 }
 
@@ -265,7 +269,8 @@ impl fmt::Display for PlanError {
             PlanError::NotRun { module } => write!(
                 f,
                 "`{module}` was not run though Lean accepted every module it imports: the \
-                 proof check's driver runs every step a check needs (`plan::wanted`)"
+                 proof check's driver runs every step a theorem needs, its model whether or not \
+                 it has a proof file and its check where it has one (`plan::wanted`)"
             ),
         }
     }
@@ -436,6 +441,9 @@ pub(crate) enum Plant {
     None,
     /// A step's key leaves out the keys of the steps it needs.
     KeyWithoutNeeds,
+    /// A theorem's model is compiled only when its check needs it (the plan before
+    /// 2026-11-14): a theorem with no proof file is answered before Lean saw its model.
+    NoModelCompile,
 }
 
 struct Planner<'a> {
@@ -607,6 +615,7 @@ fn plan_with(ask: Ask<'_>, #[cfg(test)] plant: Plant) -> Result<Plan, PlanError>
             theorem,
             proof_module,
             model: emitted.path(),
+            model_step: model,
             check,
         });
     }
@@ -671,14 +680,90 @@ pub enum Verdict {
         proof_module: String,
         why: Why,
     },
+    /// Lean refused the theorem's generated model, or a model it imports: blaze's translator
+    /// emitted Lean that does not build, which no proof file can mend. Given whether or not
+    /// there is a proof file.
+    ModelBroken {
+        function: String,
+        /// The module Lean refused.
+        module: String,
+        /// Where Lean's first error is, `<file>:<line>:<column>` with the file under
+        /// [`Root::Out`] as Lean printed it; the module's file where Lean printed no error
+        /// with a place.
+        at: String,
+        /// Lean's first error after its place, as Lean printed it (`error: ...`,
+        /// `error(<code>): ...`), with the lines that belong to it.
+        error: String,
+    },
 }
 
-/// The steps a driver runs, in order: those some theorem's check needs, each after what it
-/// needs. A step no check needs (the model of a theorem with no proof file) is not run.
+/// Lean's first error in `output`: where (`<file>:<line>:<column>`) and the rest of it as Lean
+/// printed it (`error(lean.redundantMatchAlt): Redundant alternative: ...`, the lines under it
+/// up to the next message Lean printed). `None` where no line is an error with a place.
+pub fn first_error(output: &str) -> Option<(String, String)> {
+    // `<file>.lean:<line>:<column>: <severity>[(<code>)]: <message>`: where, severity, and the
+    // rest after the place.
+    fn located(line: &str) -> Option<(&str, &str, &str)> {
+        let (file, rest) = line.split_once(".lean:")?;
+        if file.is_empty() || file.contains(char::is_whitespace) {
+            return None;
+        }
+        let (row, rest) = rest.split_once(':')?;
+        let (column, rest) = rest.split_once(": ")?;
+        if !row.bytes().all(|it| it.is_ascii_digit()) || !column.bytes().all(|it| it.is_ascii_digit()) {
+            return None;
+        }
+        let severity = rest.split(':').next().unwrap_or("");
+        let severity = severity.split('(').next().unwrap_or("");
+        Some((&line[..file.len() + ".lean:".len() + row.len() + 1 + column.len()], severity, rest))
+    }
+    let mut lines = output.lines();
+    let (at, message) = lines.find_map(|line| match located(line) {
+        Some((at, "error", rest)) => Some((at, rest)),
+        _ => None,
+    })?;
+    let mut error = message.to_owned();
+    for line in lines.take_while(|line| located(line).is_none()) {
+        error.push('\n');
+        error.push_str(line);
+    }
+    Some((at.to_owned(), error.trim().to_owned()))
+}
+
+impl Verdict {
+    /// What a [`Verdict::ModelBroken`] says, in one place for every client: the function, that
+    /// its model does not build, whose bug that is, and Lean's first error.
+    pub fn model_broken_said(function: &str, module: &str, at: &str, error: &str) -> String {
+        format!(
+            "the generated Lean model of `{function}` does not build: Lean {LEAN_VERSION} refused \
+             `{module}`, a bug in blaze's translator (hir-ty-lean) that no proof file can fix:\n\
+             {at}: {error}"
+        )
+    }
+}
+
+/// The steps a driver runs, in order: every theorem's model and its check, where it has one,
+/// each after what it needs. A theorem with no proof file has its model compiled all the
+/// same: its answer says the model builds. A library module none of them imports is not run.
 pub fn wanted(plan: &Plan) -> Vec<usize> {
+    wanted_with(
+        plan,
+        #[cfg(test)]
+        Plant::None,
+    )
+}
+
+fn wanted_with(plan: &Plan, #[cfg(test)] plant: Plant) -> Vec<usize> {
     let mut wanted = BTreeSet::new();
-    let mut stack: Vec<usize> =
-        plan.theorems.iter().filter_map(|it| it.check.as_ref().ok().copied()).collect();
+    #[cfg(test)]
+    let models = plant != Plant::NoModelCompile;
+    #[cfg(not(test))]
+    let models = true;
+    let mut stack: Vec<usize> = plan
+        .theorems
+        .iter()
+        .flat_map(|it| it.check.as_ref().ok().copied().into_iter().chain(models.then_some(it.model_step)))
+        .collect();
     while let Some(step) = stack.pop() {
         if wanted.insert(step) {
             stack.extend(plan.steps[step].needs.iter().copied());
@@ -687,13 +772,40 @@ pub fn wanted(plan: &Plan) -> Vec<usize> {
     wanted.into_iter().collect()
 }
 
+/// The steps `from` needs, itself among them, in the plan's order.
+fn closure(plan: &Plan, from: usize) -> BTreeSet<usize> {
+    let mut needed = BTreeSet::new();
+    let mut stack = vec![from];
+    while let Some(step) = stack.pop() {
+        if needed.insert(step) {
+            stack.extend(plan.steps[step].needs.iter().copied());
+        }
+    }
+    needed
+}
+
 /// Each theorem's verdict, from what each step of `plan` came to (`ran[i]` for step `i`).
-/// Proved means: Lean accepted every module the check needs and the check, and the axioms it
-/// printed for the theorem are among [`ALLOWED_AXIOMS`].
+/// First its model: Lean must have accepted it and every model it imports, or the answer is
+/// [`Verdict::ModelBroken`] (or open for a deadline), proof file or none. Then proved means:
+/// Lean accepted every module the check needs and the check, and the axioms it printed for
+/// the theorem are among [`ALLOWED_AXIOMS`].
 pub fn conclude(plan: &Plan, ran: &[Ran]) -> Result<Vec<Verdict>, PlanError> {
+    conclude_with(
+        plan,
+        ran,
+        #[cfg(test)]
+        Plant::None,
+    )
+}
+
+fn conclude_with(plan: &Plan, ran: &[Ran], #[cfg(test)] plant: Plant) -> Result<Vec<Verdict>, PlanError> {
     assert_eq!(ran.len(), plan.steps.len(), "one outcome for each step of the plan");
+    #[cfg(test)]
+    let models = plant != Plant::NoModelCompile;
+    #[cfg(not(test))]
+    let models = true;
     let mut verdicts = Vec::with_capacity(plan.theorems.len());
-    for theorem in &plan.theorems {
+    'theorems: for theorem in &plan.theorems {
         let open = |why: Why| Verdict::Open {
             // clone: the verdict owns its names
             function: theorem.function.clone(),
@@ -701,6 +813,48 @@ pub fn conclude(plan: &Plan, ran: &[Ran]) -> Result<Vec<Verdict>, PlanError> {
             proof_module: theorem.proof_module.clone(),
             why,
         };
+        // The model, before anything else is said of the theorem: no answer is given before
+        // Lean has seen it (agents/annoyances/proofs-1113-8.json).
+        if models {
+            for at in closure(plan, theorem.model_step) {
+                let step = &plan.steps[at];
+                match &ran[at] {
+                    Ran::Accepted(_) => {}
+                    // clone: error path, once
+                    Ran::Rejected(output) if step.kind == Kind::Library => {
+                        return Err(PlanError::Library { module: step.module.clone(), output: output.clone() });
+                    }
+                    Ran::TimedOut if step.kind == Kind::Library => {
+                        return Err(PlanError::Library {
+                            module: step.module.clone(),
+                            output: "Lean did not finish it by its deadline".to_owned(),
+                        });
+                    }
+                    Ran::Rejected(output) => {
+                        let (at, error) = first_error(output)
+                            .unwrap_or_else(|| (step.file(), output.trim_end().to_owned()));
+                        verdicts.push(Verdict::ModelBroken {
+                            // clone: the verdict owns its names
+                            function: theorem.function.clone(),
+                            module: step.module.clone(),
+                            at,
+                            error,
+                        });
+                        continue 'theorems;
+                    }
+                    Ran::TimedOut => {
+                        // clone: the verdict owns its names
+                        verdicts.push(open(Why::TimedOut { kind: step.kind, module: step.module.clone() }));
+                        continue 'theorems;
+                    }
+                    // Every step before it in the closure was accepted (a refusal ended the
+                    // walk), so a model not run is the driver's bug, named: never an answer
+                    // given without it.
+                    // clone: error path, once
+                    Ran::NotRun => return Err(PlanError::NotRun { module: step.module.clone() }),
+                }
+            }
+        }
         let check = match &theorem.check {
             Ok(check) => *check,
             Err(why) => {
@@ -710,13 +864,7 @@ pub fn conclude(plan: &Plan, ran: &[Ran]) -> Result<Vec<Verdict>, PlanError> {
             }
         };
         // The first step it needs, in the plan's order, that Lean did not accept.
-        let mut needed = BTreeSet::new();
-        let mut stack = vec![check];
-        while let Some(step) = stack.pop() {
-            if needed.insert(step) {
-                stack.extend(plan.steps[step].needs.iter().copied());
-            }
-        }
+        let needed = closure(plan, check);
         let mut held_up = None;
         for &at in &needed {
             let step = &plan.steps[at];
@@ -958,8 +1106,13 @@ mod tests {
         assert_eq!(plan.theorems[1].check, Err(unknown));
         assert_eq!(plan.theorems[2].check, Err(Why::NoProofFile));
         assert_eq!(plan.theorems[2].proof_module, "K.Other");
-        // Nothing has a check, so nothing is run.
-        assert_eq!(wanted(&plan), [] as [usize; 0]);
+        // Nothing has a check, so what is run is the models (and the library they import):
+        // no proof file and no check.
+        let run = wanted(&plan);
+        for theorem in &plan.theorems {
+            assert!(run.contains(&theorem.model_step), "{} is not run", theorem.model);
+        }
+        assert!(run.iter().all(|it| matches!(plan.steps[*it].kind, Kind::Library | Kind::Model)), "{run:?}");
         proofs.insert("K.Lemmas".to_owned(), "import K.M\n".to_owned());
         let plan = planned(&theorems, &proofs, Plant::None);
         assert_eq!(plan.theorems[0].check, Err(Why::Cycle { module: "K.M".to_owned() }));
@@ -1023,5 +1176,109 @@ mod tests {
         assert!(matches!(&verdicts[0], Verdict::Open { why: Why::TimedOut { kind: Kind::Model, .. }, .. }));
         ran[0] = Ran::Rejected("Blaze/Result.lean:1:0: error".to_owned());
         assert!(matches!(conclude(&plan, &ran), Err(PlanError::Library { module, .. }) if module == LIBRARY[0].0));
+    }
+    /// A stand-in for Lean over `wanted`, in order: a step whose needs were not all accepted
+    /// is not run; `refused` is refused with `output`; a check prints its theorem's axioms.
+    fn lean_over(plan: &Plan, wanted: &[usize], refused: Option<(&str, &str)>) -> Vec<Ran> {
+        let mut ran = vec![Ran::NotRun; plan.steps.len()];
+        for &at in wanted {
+            let step = &plan.steps[at];
+            if step.needs.iter().any(|need| !matches!(ran[*need], Ran::Accepted(_))) {
+                continue;
+            }
+            ran[at] = match (refused, step.module.strip_prefix("BlazeCheck.")) {
+                (Some((module, output)), _) if module == step.module => Ran::Rejected(output.to_owned()),
+                (_, Some(name)) => Ran::Accepted(format!("'{name}.spec.checked' depends on axioms: [propext]\n")),
+                (_, None) => Ran::Accepted(String::new()),
+            };
+        }
+        ran
+    }
+
+    /// `two`'s theorems and `k::other::c`, which has no proof file.
+    fn three() -> (Vec<Emitted>, BTreeMap<String, String>) {
+        let (theorems, proofs) = two("def k.m.a := true\n");
+        let c = module("k::other::c", true, Vec::new(), "def k.other.c : Nat := match (0 : Nat) with\n  | _ => 0\n  | 0 => 1\n");
+        ([theorems, vec![c]].concat(), proofs)
+    }
+
+    /// What Lean printed of c's model, as the stand-in says it: an error, a line under it and
+    /// a warning after.
+    const REFUSED_C: &str = "BlazeModel/k/other/c.lean:5:4: error: Redundant alternative\n  | 0 => 1\n\
+                             BlazeModel/k/other/c.lean:6:0: warning: unused\n";
+
+    /// The verdicts of [`three`] with c's model refused, the safeguard `plant` removed.
+    fn c_refused(plant: Plant) -> Result<Vec<Verdict>, PlanError> {
+        let (theorems, proofs) = three();
+        let plan = planned(&theorems, &proofs, plant);
+        let ran = lean_over(&plan, &wanted_with(&plan, plant), Some(("BlazeModel.k.other.c", REFUSED_C)));
+        conclude_with(&plan, &ran, plant)
+    }
+
+    /// The oracle of a theorem with no proof file whose model Lean refuses: it is answered
+    /// [`Verdict::ModelBroken`], naming the function and the module, with Lean's first error
+    /// and where it is, never `Open`.
+    fn c_is_said_broken(verdicts: &[Verdict]) -> Result<(), String> {
+        match &verdicts[2] {
+            Verdict::ModelBroken { function, module, at, error } => {
+                assert_eq!((function.as_str(), module.as_str()), ("k::other::c", "BlazeModel.k.other.c"));
+                assert_eq!((at.as_str(), error.as_str()), ("BlazeModel/k/other/c.lean:5:4", "error: Redundant alternative\n  | 0 => 1"));
+                Ok(())
+            }
+            other => Err(format!("a model Lean refuses was answered {other:?}")),
+        }
+    }
+
+    /// The invariant: no theorem is answered before Lean has compiled its model. With no
+    /// proof file, a model Lean refuses is [`Verdict::ModelBroken`] (blaze's bug, Lean's first
+    /// error and its place) and a model it accepts is open for want of the file; with a proof
+    /// file, a refused model is the same `ModelBroken`, and the theorems whose proof file
+    /// imports it are open naming it, as before. Its control is
+    /// `the_oracle_catches_an_answer_given_before_the_model_was_compiled`.
+    #[test]
+    fn a_plan_compiles_every_model_and_a_refused_one_is_blazes_bug() {
+        let verdicts = c_refused(Plant::None).unwrap_or_else(|err| panic!("{err}"));
+        c_is_said_broken(&verdicts).unwrap_or_else(|err| panic!("{err}"));
+        let Verdict::ModelBroken { function, module, at, error } = &verdicts[2] else { unreachable!() };
+        let said = Verdict::model_broken_said(function, module, at, error);
+        for words in ["`k::other::c`", "does not build", "bug in blaze's translator", "no proof file can fix", "c.lean:5:4: error: Redundant alternative"] {
+            assert!(said.contains(words), "{said}");
+        }
+        // The theorems with a proof file are unchanged by it.
+        assert!(matches!(&verdicts[0], Verdict::Proved { .. }) && matches!(&verdicts[1], Verdict::Proved { .. }), "{verdicts:?}");
+        // The same theorem with a model Lean accepts: open, there being no proof file.
+        let (theorems, proofs) = three();
+        let plan = planned(&theorems, &proofs, Plant::None);
+        let ran = lean_over(&plan, &wanted(&plan), None);
+        assert!(matches!(ran[plan.theorems[2].model_step], Ran::Accepted(_)), "its model was compiled");
+        let verdicts = conclude(&plan, &ran).unwrap();
+        assert!(matches!(&verdicts[2], Verdict::Open { why: Why::NoProofFile, .. }), "{verdicts:?}");
+        // With a proof file: a's model refused is a's `ModelBroken`; b, whose proof file
+        // imports a's model, is open naming it.
+        let ran = lean_over(&plan, &wanted(&plan), Some(("BlazeModel.k.m.a", "BlazeModel/k/m/a.lean:3:0: error: unknown constant\n")));
+        let verdicts = conclude(&plan, &ran).unwrap();
+        assert!(matches!(&verdicts[0], Verdict::ModelBroken { function, at, .. } if function == "k::m::a" && at == "BlazeModel/k/m/a.lean:3:0"), "{verdicts:?}");
+        assert!(matches!(&verdicts[1], Verdict::Open { why: Why::Rejected { kind: Kind::Model, module, .. }, .. } if module == "BlazeModel.k.m.a"), "{verdicts:?}");
+        // Lean's first error, with the lines under it; none where no line has a place.
+        assert_eq!(first_error("BlazeModel/W/lands.lean:37:6: error: Unknown constant `x`\n"), Some(("BlazeModel/W/lands.lean:37:6".to_owned(), "error: Unknown constant `x`".to_owned())));
+        assert_eq!(first_error("a.lean:1:0: warning: w\nLean was ended by signal 9\n"), None);
+        // Lean 4.35 names the kind of error in parentheses.
+        let coded = "x.lean:2:0: warning(lean.unused): w\nM.lean:21:4: error(lean.redundantMatchAlt): Redundant alternative: Any\n  0\nwill match\n";
+        assert_eq!(first_error(coded), Some(("M.lean:21:4".to_owned(), "error(lean.redundantMatchAlt): Redundant alternative: Any\n  0\nwill match".to_owned())));
+        // A model the driver did not run is no answer either: named as the driver's bug.
+        let (theorems, proofs) = three();
+        let plan = planned(&theorems, &proofs, Plant::None);
+        let ran = lean_over(&plan, &wanted_with(&plan, Plant::NoModelCompile), None);
+        assert_eq!(conclude(&plan, &ran), Err(PlanError::NotRun { module: "BlazeModel.k.other.c".to_owned() }));
+    }
+
+    #[test]
+    fn the_oracle_catches_an_answer_given_before_the_model_was_compiled() {
+        // With the plant c's model is not compiled, and c is open for want of a proof file:
+        // the answer of 2026-11-14 (agents/annoyances/proofs-1113-8.json).
+        let verdicts = c_refused(Plant::NoModelCompile).unwrap_or_else(|err| panic!("{err}"));
+        assert!(matches!(&verdicts[2], Verdict::Open { why: Why::NoProofFile, .. }), "{verdicts:?}");
+        let caught = c_is_said_broken(&verdicts).unwrap_err();
+        assert!(caught.contains("a model Lean refuses was answered Open"), "{caught}");
     }
 }
