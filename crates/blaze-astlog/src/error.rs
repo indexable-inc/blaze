@@ -34,6 +34,9 @@ pub enum SourceError {
 
     #[snafu(display("{what}"))]
     Edit { what: String, at: Option<String> },
+
+    #[snafu(display("{place}: the view's file has no text at the range {start}..{end} the front end gives a node"))]
+    ViewText { place: String, start: u32, end: u32 },
 }
 
 /// `error` as the API reports it: its words, and its place in the view when it has one (an
@@ -42,7 +45,9 @@ pub enum SourceError {
 pub fn api_error(error: &Error) -> blaze_api::ApiError {
     let at = match error {
         astlog_engine::Error::Source { source } => match source {
-            SourceError::Unplaceable { place, .. } | SourceError::Overlap { place, .. } => {
+            SourceError::Unplaceable { place, .. }
+            | SourceError::Overlap { place, .. }
+            | SourceError::ViewText { place, .. } => {
                 Some(place.clone())
             }
             SourceError::Edit { at, .. } => at.clone(),

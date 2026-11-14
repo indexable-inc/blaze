@@ -40,7 +40,10 @@ pub struct Planned<'p, N, X> {
 
 #[derive(Debug)]
 pub enum PlannedAction<'p, N, X> {
-    Text { kind: TextKind, node: N, text: String },
+    /// `text` is the template with each variable's text spliced in as it is. A source whose
+    /// language has precedence renders again from `template` and `binding` (blaze's
+    /// parenthesizes a spliced expression where its new place would read it otherwise).
+    Text { kind: TextKind, node: N, text: String, template: &'p Template, binding: Binding<N> },
     Source { name: &'p str, value: &'p X, args: Vec<Value<N>> },
 }
 
@@ -93,6 +96,8 @@ fn plan<'p, F: Facts>(
                 kind: text.kind,
                 node: *node,
                 text: render(facts, &text.template, binding)?,
+                template: &text.template,
+                binding: binding.clone(), // clone: one binding per planned action
             }
         }
         Action::Source(source) => {

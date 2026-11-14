@@ -19,7 +19,7 @@ pub(crate) fn collect(
     let mut edits = Vec::new();
     for plan in planned {
         match &plan.action {
-            PlannedAction::Text { kind, node, text } => {
+            PlannedAction::Text { kind, node, text, .. } => {
                 let info = corpus.node_info(*node);
                 let (start, end) = match kind {
                     TextKind::Replace | TextKind::Delete => (info.start, info.end),

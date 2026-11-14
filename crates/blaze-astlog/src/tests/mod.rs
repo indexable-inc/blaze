@@ -2,6 +2,7 @@
 //! given as blaze-intent's [`Files`].
 
 mod query;
+mod relations;
 mod rewrite;
 
 use base_db::{Db, FileId};

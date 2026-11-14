@@ -257,6 +257,10 @@ impl<'a, F: Files> Sema<'a, F> {
         }
         let found = match blaze_intent::replace::items_at(self.db, &self.view, path) {
             Ok(found) => found,
+            // blaze-intent names items to replace, never a module; a rule may ask for one.
+            Err(_) if self.module_at(path).is_some() => {
+                self.module_at(path).into_iter().map(ModuleDef::Module).collect()
+            }
             Err(why) => {
                 let assoc = path.rsplit_once("::").and_then(|(owner, name)| {
                     let owners = blaze_intent::replace::items_at(self.db, &self.view, owner).ok()?;
@@ -274,6 +278,29 @@ impl<'a, F: Files> Sema<'a, F> {
         };
         self.paths.borrow_mut().insert(path.to_owned(), found.clone()); // clone: a few defs
         Ok(found)
+    }
+
+    /// The module at `path`, from a view crate's name or a name a view crate gives a
+    /// dependency, through each segment's child module.
+    fn module_at(&self, path: &str) -> Option<hir::Module> {
+        let db = self.db;
+        let mut segments = path.split("::");
+        let first = segments.next()?;
+        let own = self.view.iter().copied().find(|it| {
+            it.base().rust_name(db).is_ok_and(|name| name.as_str() == first)
+        });
+        let krate = own.or_else(|| {
+            self.view
+                .iter()
+                .flat_map(|it| it.dependencies_iter(db))
+                .find(|dep| dep.name.as_str() == first)
+                .map(|dep| dep.krate)
+        })?;
+        let mut module = krate.root_module(db);
+        for segment in segments {
+            module = module.children(db).find(|it| it.name(db).is_some_and(|it| it.as_str() == segment))?;
+        }
+        Some(module)
     }
 
     fn assoc_items(&self, owner: ModuleDef) -> Vec<ModuleDef> {
@@ -430,7 +457,10 @@ impl<'a, F: Files> Sema<'a, F> {
         if let Def::Field(field) = def {
             segments.push(hir::Variant::from(field.parent_def(db)).name(db).as_str().to_owned());
         }
-        if let Some(name) = self.name_of(def) {
+        // A module's own name is the last of its path's segments already.
+        if let Some(name) = self.name_of(def)
+            && !matches!(def, Def::Item(ModuleDef::Module(_)))
+        {
             segments.push(name);
         }
         Some(segments.join("::"))
@@ -520,12 +550,16 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
-    /// Whether any attribute of `item` is `name` (its path's first segment).
+    /// Whether any attribute of `item` is `name` (its path's first segment). Read from the
+    /// attribute's text: `#[cfg(...)]` parses as a cfg predicate with no path node.
     fn has_attribute(item: ast::Node<'_>, name: &str) -> bool {
         item.children().filter(|it| it.kind() == SyntaxKind::ATTR).any(|attr| {
-            attr.descendants()
-                .find(|it| it.kind() == SyntaxKind::PATH_SEGMENT)
-                .is_some_and(|segment| segment.text() == name)
+            let text: String = attr.text().chars().filter(|c| !c.is_whitespace()).collect();
+            let Some(inner) = text.strip_prefix("#![").or_else(|| text.strip_prefix("#[")) else {
+                return false;
+            };
+            let first = inner.split(|c: char| !(c.is_alphanumeric() || c == '_')).next();
+            first == Some(name)
         })
     }
 

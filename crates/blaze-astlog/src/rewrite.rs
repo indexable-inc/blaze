@@ -25,9 +25,10 @@ use syntax::{
     view::{self as ast, AstNode as _},
 };
 
-use crate::error::{Error, OverlapSnafu, SourceError, UnplaceableSnafu};
+use crate::error::{Error, OverlapSnafu, SourceError, UnplaceableSnafu, ViewTextSnafu};
 use crate::program::{Action, Program};
 use crate::sema::{Node, Sema};
+use crate::splice::{self, Parens};
 
 type Res<T> = Result<T, Error>;
 
@@ -48,8 +49,8 @@ pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
         let mut rows: Vec<Vec<Cell>> = relation
             .rows()
             .iter()
-            .map(|row| row.iter().map(|value| cell(&facts, value)).collect())
-            .collect();
+            .map(|row| row.iter().map(|value| cell(&facts, value)).collect::<Res<Vec<Cell>>>())
+            .collect::<Res<_>>()?;
         rows.sort_by(|a, b| by_place(a, b));
         relations.push(Relation {
             name: name.clone(),
@@ -63,9 +64,14 @@ pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
         for row in relation.rows() {
             let binding = row_binding(&relation.columns, row);
             let message = astlog_engine::render(&facts, &lint.message, &binding)?;
-            let at = row.iter().map(|value| cell(&facts, value)).find(|it| {
-                matches!(it, Cell::Code { .. } | Cell::Expanded { .. })
-            });
+            let mut at = None;
+            for value in row {
+                let it = cell(&facts, value)?;
+                if matches!(it, Cell::Code { .. } | Cell::Expanded { .. }) {
+                    at = Some(it);
+                    break;
+                }
+            }
             findings.push(Finding {
                 at,
                 message,
@@ -119,6 +125,17 @@ fn place_key(cell: &Cell) -> (u8, &str, u32, u32, &str, i64) {
 /// A query's errors; an action that can't be placed or that overlaps another rule's, naming
 /// both and the place; the edits' own failure, a file left unparsable among them.
 pub fn edit<F: Files>(db: &Db, files: &F, rules: &str, edits: &[Edit]) -> Res<Applied> {
+    edit_with(db, files, rules, edits, Parens::ByPrecedence)
+}
+
+/// [`edit`], with templates parenthesized by precedence or, for a test's control, not.
+pub(crate) fn edit_with<F: Files>(
+    db: &Db,
+    files: &F,
+    rules: &str,
+    edits: &[Edit],
+    parens: Parens,
+) -> Res<Applied> {
     let program = Program::parse(rules)?;
     let facts = Sema::new(db, files)?;
     blaze_query::db::attach(db, || {
@@ -129,9 +146,10 @@ pub fn edit<F: Files>(db: &Db, files: &F, rules: &str, edits: &[Edit]) -> Res<Ap
         for planned in planned {
             let by = Origin { rule: planned.rule, line: planned.line };
             match planned.action {
-                PlannedAction::Text { kind, node, text: written } => {
+                PlannedAction::Text { kind, node, template, binding, .. } => {
                     let paths = literal.get(planned.rule).map_or(&[][..], Vec::as_slice);
-                    let edit = text_edit(&facts, by, kind, node, &written, paths)?;
+                    let written = Written { template, binding: &binding, parens };
+                    let edit = text_edit(&facts, by, kind, node, written, paths)?;
                     text.push(Made { edit, by });
                 }
                 PlannedAction::Source { value, args, .. } => {
@@ -193,18 +211,36 @@ fn place<F: Files>(files: &F, path: &str, at: TextSize) -> String {
     }
 }
 
-fn cell<F: Files>(facts: &Sema<'_, F>, value: &Value<Node>) -> Cell {
-    match value {
+/// The file's own text at `range`: a node of an expansion, mapped to the input it came from,
+/// has the expansion's spacing, not the file's.
+fn file_text<F: Files>(files: &F, path: &str, range: TextRange) -> Res<String> {
+    let bytes = files
+        .file(path)
+        .and_then(|(_, bytes)| bytes.get(usize::from(range.start())..usize::from(range.end())));
+    match bytes.map(std::str::from_utf8) {
+        Some(Ok(text)) => Ok(text.to_owned()),
+        Some(Err(_)) | None => ViewTextSnafu {
+            place: place(files, path, range.start()),
+            start: u32::from(range.start()),
+            end: u32::from(range.end()),
+        }
+        .fail()
+        .map_err(Error::from),
+    }
+}
+
+fn cell<F: Files>(facts: &Sema<'_, F>, value: &Value<Node>) -> Res<Cell> {
+    Ok(match value {
         Value::Text(text) => Cell::Text(text.to_string()),
         Value::Int(int) => Cell::Int(*int),
         Value::Node(node @ Node::Def(_)) => Cell::Def { path: facts.text(*node).into_owned() },
         Value::Node(node @ Node::Ty(_)) => Cell::Type { text: facts.text(*node).into_owned() },
         Value::Node(Node::Syn { tree, id }) => {
             let view = facts.syn_at(*tree, *id);
-            let text = view.text().to_owned();
             match locate(facts, view) {
                 Ok((path, range)) => {
                     let line = line_of(facts.files, &path, range.start());
+                    let text = file_text(facts.files, &path, range)?;
                     Cell::Code {
                         end: u32::from(range.end()),
                         line,
@@ -213,14 +249,22 @@ fn cell<F: Files>(facts: &Sema<'_, F>, value: &Value<Node>) -> Cell {
                         start: u32::from(range.start()),
                     }
                 }
-                Err(call) => Cell::Expanded { call, text },
+                Err(call) => Cell::Expanded { call, text: view.text().to_owned() },
             }
         }
-    }
+    })
 }
 
 fn unplaceable(by: Origin<'_>, place: String, message: impl Into<String>) -> Error {
     UnplaceableSnafu { place, rule: by.rule, line: by.line, message: message.into() }.build().into()
+}
+
+/// What a text action writes: its template, the binding it renders, and how.
+#[derive(Clone, Copy)]
+struct Written<'w> {
+    template: &'w astlog_engine::Template,
+    binding: &'w astlog_engine::Binding<Node>,
+    parens: Parens,
 }
 
 fn text_edit<F: Files>(
@@ -228,7 +272,7 @@ fn text_edit<F: Files>(
     by: Origin<'_>,
     kind: TextKind,
     node: Node,
-    written: &str,
+    written: Written<'_>,
     paths: &[(String, ModuleDef)],
 ) -> Res<TextEdit> {
     let Some(view) = facts.view_of(node) else {
@@ -245,7 +289,12 @@ fn text_edit<F: Files>(
             ),
         )
     })?;
-    let text = with_paths(facts, by, view, &path, range, written, paths)?;
+    let at = || place(facts.files, &path, range.start());
+    let Written { template, binding, parens } = written;
+    let rendered = splice::render(facts, template, binding, kind, view, parens)
+        .map_err(|message| unplaceable(by, at(), message))?;
+    let text = with_paths(facts, by, view, &path, range, &rendered, paths)?;
+    let text = splice::in_place(kind, view, text, parens).map_err(|message| unplaceable(by, at(), message))?;
     let (range, text) = match kind {
         TextKind::Replace => (range, text),
         TextKind::Delete => (range, String::new()),

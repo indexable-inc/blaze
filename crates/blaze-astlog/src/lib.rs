@@ -12,6 +12,7 @@ pub mod pattern;
 pub mod program;
 pub mod rewrite;
 pub mod sema;
+mod splice;
 
 #[cfg(test)]
 mod tests;

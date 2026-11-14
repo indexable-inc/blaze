@@ -47,7 +47,13 @@ A refactor written once, run by a person or an agent:
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
   item, imported when needed) and `(add-use n "krate::path")` (n any node of the file). Templates
-  splice `$var`; `$$` is a literal `$`. An absolute path in a template (`::core::mem::take`) is a
+  splice `$var`; `$$` is a literal `$`. A template is parsed with each metavariable as a hole,
+  as the form of what it edits (an expression it replaces, or statements it replaces or sits
+  beside in a body), and a bound expression is parenthesized only where its hole's precedence
+  needs it (`syntax::view::prec`); then the replacement is, where the edited expression's
+  parent needs it: `$a * $b` with `$a` = `x + y` writes `(x + y) * b`, and `$a + $b` over the
+  `f(a, b)` of `f(a, b).len()` writes `(a + b).len()`. A template that is not that form is
+  refused, naming the rule. An absolute path in a template (`::core::mem::take`) is a
   def path, respelled as the edited node's module names that item (`Module::find_path`:
   `crate::new`, `new`, `std::mem::take`); no `use` is added. A template path that names nothing
   is an error naming the rule. A rewrite may hold several actions; the same edit from two rules
@@ -83,7 +89,7 @@ argument.
 | `(expr n "pat")` and the other pattern forms | nothing | every matching node and its metavariables |
 | `(syntax n "KIND")` | nothing | every node of that `SyntaxKind` |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
-| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path |
+| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |
 | `(implements t "krate::Trait")` | `t` | holds when the type implements the trait |
@@ -138,5 +144,8 @@ cycle. The old naive evaluator stays as the reference model for a property test 
 - Prelude resolution of single-segment pattern names; they match by text.
 - A `use` added for a template path `find_path` can only spell through an import; it is written
   as `find_path` spells it.
+- Precedence outside expressions. A metavariable spliced as a type (`&dyn A + B`), a pattern
+  (`&a | b`), a path segment or an item is written as its text, and so is a template that
+  replaces any node that is not an expression or a body's statement.
 - A query's cost report. `Response::Rows` carries no per-relation timing; `blaze trace` does
   not see the rules' evaluation.
