@@ -4,7 +4,8 @@
 //! The invariant: no byte is used unverified; after any crash the bucket is readable at its
 //! last root and a later push completes it; what is pulled is what was pushed, byte for byte;
 //! nothing of an organisation's namespace is under public; no client checks one object twice.
-//! Each planted bug ([`Plant`]) is caught by the oracle that states it.
+//! Each planted bug ([`Plant`]) is caught by the oracle that states it. Every choice of a case
+//! (its records, every client's latencies and faults, whose turn it is) is drawn from one tape.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,8 +15,7 @@ use blaze_keyed::{
     kind::{ActionResult, Kind, Origin, Tag, ToolId},
     store::{Located, Refused, Source, StoreError, Verifier, WireError},
 };
-use blaze_rng::SplitMix64;
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
     PLANT, Plant,
@@ -70,14 +70,21 @@ impl World {
 /// Records by key: each one's kind (its tag) and payload.
 type Records = BTreeMap<[u8; 32], (Tag, Vec<u8>)>;
 
-fn records(rng: &mut SplitMix64, n: usize) -> Records {
+fn records(tape: &Tape, n: usize) -> Records {
     let mut out = Records::new();
-    while out.len() < n {
+    for _ in 0..n {
         let mut key = [0u8; 32];
-        rng.fill(&mut key);
-        let mut payload = vec![0u8; 1 + rng.index(200)];
-        rng.fill(&mut payload);
-        out.insert(key, (Tag(rng.index(64) as u16), payload));
+        tape.fill(&mut key, "key");
+        // A calm tape draws every key alike: count up past the keys taken, so there are `n`.
+        // (A seeded one never repeats a key, so its records are its stream's.)
+        while out.contains_key(&key) {
+            let mut low = [0u8; 8];
+            low.copy_from_slice(&key[..8]);
+            key[..8].copy_from_slice(&u64::from_le_bytes(low).wrapping_add(1).to_le_bytes());
+        }
+        let mut payload = vec![0u8; 1 + tape.index(200, "payload len")];
+        tape.fill(&mut payload, "payload");
+        out.insert(key, (Tag(tape.index(64, "tag") as u16), payload));
     }
     out
 }
@@ -111,24 +118,25 @@ fn plan<'a>(w: &'a World, namespace: Namespace, segs: &'a [Vec<u8>], bundles: Ve
 }
 
 /// One push by a fresh client; its checks are held to once each.
-fn push_with(w: &World, store: &Shared, namespace: Namespace, segs: &[Vec<u8>], seed: u64, faults: Faults, cas: bool) -> Result<push::Report, Failure> {
+fn push_with(w: &World, store: &Shared, namespace: Namespace, segs: &[Vec<u8>], tape: &Tape, faults: Faults, cas: bool) -> Result<push::Report, Failure> {
     trust::reset_checks();
     let mut machine = Push::new(plan(w, namespace, segs, Vec::new(), cas))?;
-    let mut bucket = Fake::new(store, seed, faults);
+    let mut bucket = Fake::new(store, tape, faults);
     let out = drive(&mut machine, &mut bucket, &mut |()| Ok(()));
     assert_eq!(trust::checks().twice, 0, "a pusher checked one object twice: {:?}", trust::checks());
     out
 }
 
 fn push_clean(w: &World, store: &Shared, namespace: Namespace, segs: &[Vec<u8>]) -> push::Report {
-    push_with(w, store, namespace, segs, 1, Faults::default(), true).unwrap_or_else(|it| panic!("a clean push failed: {it}"))
+    // No faults: the client draws nothing.
+    push_with(w, store, namespace, segs, &Tape::seeded(1), Faults::default(), true).unwrap_or_else(|it| panic!("a clean push failed: {it}"))
 }
 
 /// What a fresh client pulls of `keys` in `namespace`: every record of every segment handed to
 /// it, read through the proof. A client that checks an object twice is an error.
 fn pull_all(w: &World, store: &Shared, namespace: Namespace, keys: &[[u8; 32]]) -> Result<Records, String> {
     trust::reset_checks();
-    let mut bucket = Fake::new(store, 7, Faults::default());
+    let mut bucket = Fake::new(store, &Tape::seeded(7), Faults::default());
     let mut remote = Remote::new(&mut bucket, "main", w.trusted());
     let mut got = Records::new();
     let pulled = remote.pull(namespace, keys.to_vec(), &mut |proven: Proven| {
@@ -184,11 +192,10 @@ fn union(a: &Records, b: &Records) -> Records {
 // ---- crashes, faults, concurrency ----
 
 /// A push crashed after each number of requests that took effect, then pushed again.
-fn crash_at_every_step(seed: u64) -> Result<(), String> {
+fn crash_at_every_step(tape: &Tape) -> Result<(), String> {
     let w = World::new(1);
-    let mut rng = SplitMix64::new(seed);
-    let base_recs = records(&mut rng, 40);
-    let next_recs = records(&mut rng, 60);
+    let base_recs = records(tape, 40);
+    let next_recs = records(tape, 60);
     let base = fake::shared();
     push_clean(&w, &base, Namespace::PUBLIC, &segments_of(Namespace::PUBLIC, &base_recs, 16));
     let next = segments_of(Namespace::PUBLIC, &next_recs, 16);
@@ -199,10 +206,10 @@ fn crash_at_every_step(seed: u64) -> Result<(), String> {
     for k in 0..=steps {
         let store = fake::fork(&base);
         // Answers out of order, so a crash can fall between any two of one batch of puts.
-        let crashed = push_with(&w, &store, Namespace::PUBLIC, &next, seed ^ k, Faults { crash_after: Some(k), latency_ms: 30, ..Faults::default() }, true);
+        let crashed = push_with(&w, &store, Namespace::PUBLIC, &next, tape, Faults { crash_after: Some(k), latency_ms: 30, ..Faults::default() }, true);
         let committed = if crashed.is_ok() { union(&base_recs, &next_recs) } else { base_recs.clone() };
         oracle(&w, &store, Namespace::PUBLIC, &committed, &next_recs).map_err(|it| format!("crash after {k} of {steps}: {it}"))?;
-        push_with(&w, &store, Namespace::PUBLIC, &next, seed, Faults::default(), true).map_err(|it| format!("crash after {k}: the push after it failed: {it}"))?;
+        push_with(&w, &store, Namespace::PUBLIC, &next, tape, Faults::default(), true).map_err(|it| format!("crash after {k}: the push after it failed: {it}"))?;
         oracle(&w, &store, Namespace::PUBLIC, &union(&base_recs, &next_recs), &Records::new()).map_err(|it| format!("crash after {k}, pushed again: {it}"))?;
     }
     Ok(())
@@ -212,15 +219,15 @@ fn crash_at_every_step(seed: u64) -> Result<(), String> {
 /// next push completes it.
 #[test]
 fn a_crash_at_any_step_leaves_the_bucket_readable() {
-    for seed in 0..4 {
-        crash_at_every_step(seed).unwrap_or_else(|it| panic!("seed {seed}: {it}"));
-    }
+    blaze_sim::check(Config::cases(4), crash_at_every_step);
 }
 
 #[test]
 fn the_oracle_catches_a_root_put_before_its_shards() {
-    let caught = planted(Plant::RootBeforeShards, || (0..4).any(|seed| crash_at_every_step(seed).is_err()));
-    assert!(caught, "the planted root-before-shards bug went unseen");
+    // Every error of `crash_at_every_step` names the crash it follows.
+    blaze_sim::control(Config::cases(4), Plant::None, Plant::RootBeforeShards, "crash after", |tape, plant| {
+        planted(plant, || crash_at_every_step(tape)).map_err(Broke::Oracle)
+    });
 }
 
 /// The invariant: under slow, failing, ambiguous and timed-out requests, a push ends (never
@@ -228,20 +235,21 @@ fn the_oracle_catches_a_root_put_before_its_shards() {
 #[test]
 fn slow_and_failing_requests_never_break_the_bucket() {
     let w = World::new(1);
-    for seed in 0..48u64 {
-        let mut rng = SplitMix64::new(seed);
-        let base_recs = records(&mut rng, 30);
-        let next_recs = records(&mut rng, 50);
+    blaze_sim::check(Config::cases(48), |tape| {
+        let base_recs = records(tape, 30);
+        let next_recs = records(tape, 50);
+        // Calm: with compare-and-swap.
+        let cas = !tape.coin("without compare-and-swap");
         let store = fake::shared();
         push_clean(&w, &store, Namespace::PUBLIC, &segments_of(Namespace::PUBLIC, &base_recs, 8));
         let next = segments_of(Namespace::PUBLIC, &next_recs, 8);
         let faults = Faults { latency_ms: 20_000, fail_one_in: 9, ambiguous_one_in: 9, timeout_one_in: 13, crash_after: None };
-        let out = push_with(&w, &store, Namespace::PUBLIC, &next, seed, faults, seed % 2 == 0);
+        let out = push_with(&w, &store, Namespace::PUBLIC, &next, tape, faults, cas);
         let committed = if out.is_ok() { union(&base_recs, &next_recs) } else { base_recs.clone() };
-        oracle(&w, &store, Namespace::PUBLIC, &committed, &next_recs).unwrap_or_else(|it| panic!("seed {seed}, after a faulty push ({out:?}): {it}"));
-        push_with(&w, &store, Namespace::PUBLIC, &next, seed, Faults::default(), seed % 2 == 0).unwrap_or_else(|it| panic!("seed {seed}: the clean push after: {it}"));
-        oracle(&w, &store, Namespace::PUBLIC, &union(&base_recs, &next_recs), &Records::new()).unwrap_or_else(|it| panic!("seed {seed}, pushed again: {it}"));
-    }
+        oracle(&w, &store, Namespace::PUBLIC, &committed, &next_recs).unwrap_or_else(|it| panic!("after a faulty push ({out:?}): {it}"));
+        push_with(&w, &store, Namespace::PUBLIC, &next, tape, Faults::default(), cas).unwrap_or_else(|it| panic!("the clean push after: {it}"));
+        oracle(&w, &store, Namespace::PUBLIC, &union(&base_recs, &next_recs), &Records::new()).unwrap_or_else(|it| panic!("pushed again: {it}"));
+    });
 }
 
 /// A push machine stepped one round trip at a time, as `drive` steps it, with its own checks:
@@ -254,12 +262,12 @@ struct Runner<'a> {
     checks: ClientChecks,
 }
 
-fn runner<'a>(w: &'a World, store: &Shared, segs: &'a [Vec<u8>], seed: u64, cas: bool) -> Runner<'a> {
+fn runner<'a>(w: &'a World, store: &Shared, segs: &'a [Vec<u8>], tape: &Tape, cas: bool) -> Runner<'a> {
     // `Push::new` checks the plan's segments: those checks are this client's.
     let outer = trust::swap_checks(ClientChecks::default());
     let machine = Push::new(plan(w, Namespace::PUBLIC, segs, Vec::new(), cas)).expect("a plan");
     let checks = trust::swap_checks(outer);
-    Runner { machine, bucket: Fake::new(store, seed, Faults { latency_ms: 40, ..Faults::default() }), replies: Vec::new(), done: None, checks }
+    Runner { machine, bucket: Fake::new(store, tape, Faults { latency_ms: 40, ..Faults::default() }), replies: Vec::new(), done: None, checks }
 }
 
 impl Runner<'_> {
@@ -295,21 +303,29 @@ impl Runner<'_> {
 }
 
 /// Two pushers at once on one bucket; the records each pushed that the bucket must hold.
-fn two_pushers(seed: u64, cas: bool) -> Result<(), String> {
+fn two_pushers(tape: &Tape, cas: bool) -> Result<(), String> {
     let w = World::new(1);
-    let mut rng = SplitMix64::new(seed);
-    let base_recs = records(&mut rng, 30);
-    let (a_recs, b_recs) = (records(&mut rng, 40), records(&mut rng, 40));
+    let base_recs = records(tape, 30);
+    let (a_recs, b_recs) = (records(tape, 40), records(tape, 40));
     let store = fake::shared();
     push_clean(&w, &store, Namespace::PUBLIC, &segments_of(Namespace::PUBLIC, &base_recs, 8));
     let (a_segs, b_segs) = (segments_of(Namespace::PUBLIC, &a_recs, 8), segments_of(Namespace::PUBLIC, &b_recs, 8));
-    let (mut a, mut b) = (runner(&w, &store, &a_segs, seed, cas), runner(&w, &store, &b_segs, seed + 1, cas));
-    let mut turns = SplitMix64::new(seed ^ 0x5eed);
+    let (mut a, mut b) = (runner(&w, &store, &a_segs, tape, cas), runner(&w, &store, &b_segs, tape, cas));
     for _ in 0..1_000_000 {
-        if a.done.is_some() && b.done.is_some() {
-            break;
+        // Whose turn is a choice only while both are running; calm runs the first to its end,
+        // then the second.
+        match (a.done.is_some(), b.done.is_some()) {
+            (true, true) => break,
+            (false, true) => a.tick(),
+            (true, false) => b.tick(),
+            (false, false) => {
+                if tape.coin("the second pusher's turn") {
+                    b.tick();
+                } else {
+                    a.tick();
+                }
+            }
         }
-        if turns.coin() { a.tick() } else { b.tick() }
     }
     let (Some(a_out), Some(b_out)) = (a.done.take(), b.done.take()) else { return Err("two pushers did not end".to_owned()) };
     for (who, it) in [("the first", &a), ("the second", &b)] {
@@ -340,23 +356,26 @@ fn two_pushers(seed: u64, cas: bool) -> Result<(), String> {
 /// whose root lost says so (never success with its run unindexed).
 #[test]
 fn two_pushers_at_once_both_land_or_say_they_lost() {
-    for seed in 0..32 {
-        two_pushers(seed, true).unwrap_or_else(|it| panic!("seed {seed}, with compare-and-swap: {it}"));
-        two_pushers(seed, false).unwrap_or_else(|it| panic!("seed {seed}, without: {it}"));
-    }
+    blaze_sim::check(Config::cases(32), |tape| -> Result<(), String> {
+        two_pushers(tape, true).map_err(|it| format!("with compare-and-swap: {it}"))?;
+        two_pushers(tape, false).map_err(|it| format!("without: {it}"))
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_root_put_without_its_compare_and_swap() {
-    let caught = planted(Plant::IgnoreCas, || (0..32).any(|seed| two_pushers(seed, true).is_err()));
-    assert!(caught, "the planted unconditional root put went unseen");
+    // The unconditional root put shows as a lost write or an unreadable bucket, by the oracle,
+    // or as a pusher failing: any error of `two_pushers` is the plant seen, as before the port.
+    blaze_sim::control(Config::cases(32), Plant::None, Plant::IgnoreCas, "", |tape, plant| {
+        planted(plant, || two_pushers(tape, true)).map_err(Broke::Oracle)
+    });
 }
 
 // ---- forgeries ----
 
 fn pushed_world(seed: u64) -> (World, Shared, Records) {
     let w = World::new(1);
-    let recs = records(&mut SplitMix64::new(seed), 50);
+    let recs = records(&Tape::seeded(seed), 50);
     let store = fake::shared();
     push_clean(&w, &store, Namespace::PUBLIC, &segments_of(Namespace::PUBLIC, &recs, 12));
     (w, store, recs)
@@ -383,14 +402,14 @@ fn a_flipped_byte_in_any_object_is_refused() {
     let (w, store, recs) = pushed_world(3);
     let keys: Vec<[u8; 32]> = recs.keys().copied().collect();
     let names: Vec<String> = store.borrow().objects.keys().cloned().collect();
-    let mut rng = SplitMix64::new(11);
+    let tape = Tape::seeded(11);
     for name in names {
         let forged = fake::fork(&store);
         {
             let mut it = forged.borrow_mut();
             let bytes = &mut it.objects.get_mut(&name).expect("listed").bytes;
-            let at = rng.index(bytes.len());
-            bytes[at] ^= 1 << rng.below(8);
+            let at = tape.index(bytes.len(), "flipped byte");
+            bytes[at] ^= 1 << tape.below(8, "flipped bit");
         }
         match uses_only_verified(&w, &forged, Namespace::PUBLIC, &recs, &keys) {
             Ok(Some(_)) => {}
@@ -468,7 +487,7 @@ fn a_signature_not_by_its_named_signer_is_refused() {
 #[test]
 fn an_organisations_objects_moved_to_public_are_refused() {
     let (w, store, public_recs) = pushed_world(7);
-    let private = records(&mut SplitMix64::new(77), 30);
+    let private = records(&Tape::seeded(77), 30);
     let theirs = fake::shared();
     push_clean(&w, &theirs, org(), &segments_of(org(), &private, 10));
     let prefix = name::space(org()).expect("an organisation's namespace");
@@ -490,7 +509,7 @@ fn an_organisations_objects_moved_to_public_are_refused() {
 #[test]
 fn a_private_segment_is_never_pushed_to_public() {
     let w = World::new(1);
-    let private = records(&mut SplitMix64::new(8), 20);
+    let private = records(&Tape::seeded(8), 20);
     let segs = segments_of(org(), &private, 10);
     let store = fake::shared();
     let refused = Push::new(plan(&w, Namespace::PUBLIC, &segs, Vec::new(), true)).err().expect("refused");
@@ -503,7 +522,7 @@ fn a_private_segment_is_never_pushed_to_public() {
 #[test]
 fn the_fast_tier_never_goes_to_public() {
     let w = World::new(1);
-    let segs = segments_of(Namespace::PUBLIC, &records(&mut SplitMix64::new(9), 4), 4);
+    let segs = segments_of(Namespace::PUBLIC, &records(&Tape::seeded(9), 4), 4);
     let mut it = plan(&w, Namespace::PUBLIC, &segs, Vec::new(), true);
     it.tier = Tier::Fast;
     let refused = Push::new(it).err().expect("refused");
@@ -551,7 +570,7 @@ fn nothing_past_a_limit_can_be_built() {
     assert_eq!(SegmentLen::new(SEGMENT_MOST).map(SegmentLen::get), Ok(SEGMENT_MOST));
     assert!(SegmentLen::new(SegmentLen::LEAST - 1).is_err());
     let zero = SegmentId(ContentId([0; 32]));
-    // Hegel's minimal case of round 1: every field zero, or the length one past the limit.
+    // The minimal case of round 1's property failure: every field zero, or the length one past the limit.
     assert!(SegmentRef::new(zero, 0, 0, 0).is_err());
     assert!(SegmentRef::new(zero, SEGMENT_MOST + 1, SEGMENT_MOST + 1 - (ENTRY + FOOTER) as u64, 1).is_err());
     // An index not aligned, or inside the header, or not ending at the footer.
@@ -619,17 +638,17 @@ fn a_stale_key_list_is_refused() {
 #[test]
 fn a_bundle_is_pulled_whole_and_checked_once() {
     let w = World::new(1);
-    let recs = records(&mut SplitMix64::new(13), 60);
+    let recs = records(&Tape::seeded(13), 60);
     let segs = segments_of(Namespace::PUBLIC, &recs, 15);
     let id = BundleId::new(TOOLCHAIN, "aarch64-apple-darwin", "std").expect("a bundle id");
     let digests: Vec<SegmentId> = segs.iter().map(|it| segment::read(it).expect("a segment").segment.digest()).collect();
     let store = fake::shared();
     trust::reset_checks();
     let mut machine = Push::new(plan(&w, Namespace::PUBLIC, &segs, vec![BundleOut { id: id.clone(), segments: digests }], true)).expect("a plan");
-    drive(&mut machine, &mut Fake::new(&store, 1, Faults::default()), &mut |()| Ok(())).expect("pushed");
+    drive(&mut machine, &mut Fake::new(&store, &Tape::seeded(1), Faults::default()), &mut |()| Ok(())).expect("pushed");
 
     trust::reset_checks();
-    let mut bucket = Fake::new(&store, 2, Faults::default());
+    let mut bucket = Fake::new(&store, &Tape::seeded(2), Faults::default());
     let mut remote = Remote::new(&mut bucket, "main", w.trusted());
     let mut got = Records::new();
     let bundle = remote
@@ -648,7 +667,7 @@ fn a_bundle_is_pulled_whole_and_checked_once() {
     assert_eq!(requests, 2 + 2 * segs.len() as u64, "{requests} requests");
 
     trust::reset_checks();
-    let mut bucket = Fake::new(&store, 3, Faults::default());
+    let mut bucket = Fake::new(&store, &Tape::seeded(3), Faults::default());
     let mut remote = Remote::new(&mut bucket, "main", w.trusted());
     let (_, wanted) = remote.bundle_ahead(Namespace::PUBLIC, &id).expect("ahead");
     let trusted = remote.trusted().clone();
@@ -679,7 +698,7 @@ fn bucket_requests(remote: &Remote<'_>) -> u64 {
 fn the_store_takes_the_segments_this_crate_hands_on() {
     let w = World::new(1);
     let dir = std::env::temp_dir().join(format!("blaze-remote-test-{}", std::process::id()));
-    let recs = records(&mut SplitMix64::new(14), 20);
+    let recs = records(&Tape::seeded(14), 20);
     let mut trusted = w.trusted();
     trusted.take_list("keys", Namespace::PUBLIC, &w.key_list(Namespace::PUBLIC)).expect("the world's list");
     for bytes in segments_of(Namespace::PUBLIC, &recs, 7) {
@@ -720,7 +739,7 @@ fn a_verifier_bound_to_one_namespace_refuses_another() {
     let mut trusted = w.trusted();
     trusted.take_list("keys", Namespace::PUBLIC, &w.key_list(Namespace::PUBLIC)).expect("the world's list");
     trusted.take_list("keys", org(), &w.key_list(org())).expect("the world's list");
-    let bytes = segment_of(org(), &records(&mut SplitMix64::new(17), 5).into_iter().collect::<Vec<_>>());
+    let bytes = segment_of(org(), &records(&Tape::seeded(17), 5).into_iter().collect::<Vec<_>>());
     let segment = segment::read(&bytes).expect("ours").segment;
     let statement = signed_statement(&w, org(), &segment);
     trust::reset_checks();
@@ -747,15 +766,15 @@ fn a_verifier_bound_to_one_namespace_refuses_another() {
 #[test]
 fn a_find_never_answers_from_a_namespace_not_asked() {
     let w = World::new(1);
-    let private = records(&mut SplitMix64::new(18), 30);
+    let private = records(&Tape::seeded(18), 30);
     let store = fake::shared();
     push_clean(&w, &store, org(), &segments_of(org(), &private, 10));
-    let public = records(&mut SplitMix64::new(19), 10);
+    let public = records(&Tape::seeded(19), 10);
     push_clean(&w, &store, Namespace::PUBLIC, &segments_of(Namespace::PUBLIC, &public, 10));
     let keys: Vec<RecordRef> = private.iter().map(|(key, (tag, _))| RecordRef { tag: *tag, key: ContentId(*key) }).collect();
 
     trust::reset_checks();
-    let mut bucket = Fake::new(&store, 4, Faults::default());
+    let mut bucket = Fake::new(&store, &Tape::seeded(4), Faults::default());
     let mut remote = Remote::new(&mut bucket, "main", w.trusted());
     let mut found: Vec<Option<Located>> = vec![None; keys.len()];
     remote.find(Namespace::PUBLIC, &keys, &mut found).expect("the public index read");
@@ -798,7 +817,7 @@ fn no_cache_or_a_disabled_one_contacts_nothing() {
         for words in [&["pull", TOOLCHAIN, "aarch64-apple-darwin", "std"][..], &["push", r#"{"toolchain": "nightly-2026-11-13"}"#]] {
             let out = crate::cmd::run(&dir, &no_env, words, 0, &mut |_| {
                 made += 1;
-                Ok(Box::new(Fake::new(&store, 1, Faults::default())) as Box<dyn Bucket>)
+                Ok(Box::new(Fake::new(&store, &Tape::seeded(1), Faults::default())) as Box<dyn Bucket>)
             });
             assert!(out.is_err_and(|it| it.contains("nothing was contacted")), "{words:?}");
         }
@@ -834,7 +853,7 @@ fn a_push_from_a_machine_that_is_not_a_trusted_writer_sends_nothing() {
     let mut made = 0;
     let out = crate::cmd::run(&dir, &env, &["push", r#"{"toolchain": "nightly-2026-11-13"}"#], 0, &mut |_| {
         made += 1;
-        Ok(Box::new(Fake::new(&store, 1, Faults::default())) as Box<dyn Bucket>)
+        Ok(Box::new(Fake::new(&store, &Tape::seeded(1), Faults::default())) as Box<dyn Bucket>)
     });
     let why = out.expect_err("refused");
     assert!(why.contains("`trusted_writer` is off") && why.contains("nothing pushed"), "{why}");
@@ -845,9 +864,8 @@ fn a_push_from_a_machine_that_is_not_a_trusted_writer_sends_nothing() {
 
 #[test]
 fn settings_never_show_a_secret() {
-    let mut rng = SplitMix64::new(15);
     let mut seed = [0u8; 32];
-    rng.fill(&mut seed);
+    Tape::seeded(15).fill(&mut seed, "seed");
     let (seed_hex, secret_hex) = (blaze_format::hex::encode(&seed), blaze_format::hex::encode(&seed[..16]));
     let env = |name: &str| -> Option<std::ffi::OsString> {
         match name {
@@ -957,13 +975,13 @@ fn sigv4_signs_as_the_algorithm_defines() {
 #[test]
 fn a_large_segment_goes_up_in_parts() {
     let w = World::new(1);
-    let recs = records(&mut SplitMix64::new(16), 40);
+    let recs = records(&Tape::seeded(16), 40);
     let segs = segments_of(Namespace::PUBLIC, &recs, 20);
     let largest = segs.iter().map(Vec::len).max().expect("segments");
     let store = fake::shared();
     trust::reset_checks();
     let mut machine = Push::new(plan(&w, Namespace::PUBLIC, &segs, Vec::new(), true)).expect("a plan").with_parts(1024, 700);
-    drive(&mut machine, &mut Fake::new(&store, 1, Faults { latency_ms: 30, ..Faults::default() }), &mut |()| Ok(())).expect("pushed");
+    drive(&mut machine, &mut Fake::new(&store, &Tape::seeded(1), Faults { latency_ms: 30, ..Faults::default() }), &mut |()| Ok(())).expect("pushed");
     let (parts, multipart) = (store.borrow().parts, store.borrow().multipart);
     assert!(largest > 1024 && multipart as usize == segs.iter().filter(|it| it.len() > 1024).count(), "{multipart} multipart uploads for segments of up to {largest} bytes");
     assert_eq!(parts as usize, segs.iter().filter(|it| it.len() > 1024).map(|it| it.len().div_ceil(700)).sum::<usize>());
@@ -1076,189 +1094,219 @@ fn a_remote_action_is_byte_identical_to_a_local_one() {
 
 // ---- the encoders, by property ----
 
-fn id(tc: &hegel::TestCase) -> ContentId {
+fn id(tape: &Tape) -> ContentId {
     let mut out = [0u8; 32];
-    out[..8].copy_from_slice(&tc.draw(gs::integers::<u64>()).to_le_bytes());
-    out[8] = tc.draw(gs::integers::<u8>());
+    out[..8].copy_from_slice(&tape.int::<u64>("id").to_le_bytes());
+    out[8] = tape.int::<u8>("id byte");
     ContentId(out)
 }
 
 /// A segment's length, drawn over its whole range, both ends included.
-fn segment_len(tc: &hegel::TestCase) -> SegmentLen {
-    SegmentLen::new(tc.draw(gs::integers::<u64>().min_value(SegmentLen::LEAST).max_value(SEGMENT_MOST))).expect("drawn within")
+fn segment_len(tape: &Tape) -> SegmentLen {
+    SegmentLen::new(tape.int_in(SegmentLen::LEAST..=SEGMENT_MOST, "segment len")).expect("drawn within")
 }
 
 /// A reference to a segment of any shape the store writes: up to a million records, its index
 /// anywhere aligned past the header, its length up to [`SEGMENT_MOST`].
-fn segment_ref(tc: &hegel::TestCase) -> SegmentRef {
-    let count = tc.draw(gs::integers::<u32>().max_value(1 << 20));
+fn segment_ref(tape: &Tape) -> SegmentRef {
+    let count = tape.int_in(0u32..=1 << 20, "record count");
     let tail = u64::from(count) * ENTRY as u64 + FOOTER as u64;
     let slots = (SEGMENT_MOST - tail - HEADER as u64) / 16;
-    let index_at = HEADER as u64 + 16 * tc.draw(gs::integers::<u64>().max_value(slots));
-    SegmentRef::new(SegmentId(id(tc)), index_at + tail, index_at, count).expect("drawn in shape")
+    let index_at = HEADER as u64 + 16 * tape.int_in(0u64..=slots, "index slot");
+    SegmentRef::new(SegmentId(id(tape)), index_at + tail, index_at, count).expect("drawn in shape")
 }
 
-fn tag(tc: &hegel::TestCase) -> Tag {
-    Tag(tc.draw(gs::integers::<u16>()))
+fn tag(tape: &Tape) -> Tag {
+    Tag(tape.int::<u16>("tag"))
 }
 
 /// The invariant: a statement signed as a push signs it decodes to itself by the one layout and
 /// is taken by its namespace's verifier; a byte flipped anywhere in it is refused, by the layout
 /// or by the verifier (every byte of it is bound).
-#[hegel::test(test_cases = 200)]
-fn statements_round_trip(tc: hegel::TestCase) {
-    let w = World::new(tc.draw(gs::integers::<u8>()));
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let segment = segment_ref(&tc);
-    let mut it = Statement {
-        namespace: ns,
-        segment: segment.digest(),
-        len: segment.segment_len(),
-        toolchain: w.toolchain.digest(),
-        records: tc.draw(gs::integers::<u32>()),
-        tier: if tc.draw(gs::booleans()) { Tier::Top } else { Tier::Fast },
-        issued: tc.draw(gs::integers::<u64>()),
-        signer: [0; 32],
-        signature: [0; 64],
-    };
-    w.builder.sign_statement(&mut it);
-    let bytes = it.encode();
-    assert_eq!(Statement::decode(&bytes), Ok(it));
-    let mut trusted = Trusted::new(w.toolchain.clone());
-    trusted.anchor(ns, vec![w.anchor.public()]);
-    trusted.take_list("keys", ns, &w.key_list(ns)).expect("the world's list");
-    assert_eq!(trusted.verifier(ns).verify(&it, &segment), Ok(()));
-    // Signed over another length: refused as not the segment's, by the shared length type.
-    let other = segment_len(&tc);
-    if other != segment.segment_len() {
-        let mut wrong = Statement { len: other, ..it };
-        w.builder.sign_statement(&mut wrong);
-        assert_eq!(trusted.verifier(ns).verify(&wrong, &segment), Err(Refused::Length { found: other, wanted: segment.segment_len() }));
-    }
-    let mut flipped = bytes;
-    let at = tc.draw(gs::integers::<usize>().max_value(Statement::LEN - 1));
-    flipped[at] ^= 1;
-    let refused = match Statement::decode(&flipped) {
-        Err(_) => true,
-        Ok(back) => trusted.verifier(ns).verify(&back, &segment).is_err(),
-    };
-    assert!(refused, "byte {at} flipped and taken");
+#[test]
+fn statements_round_trip() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let w = World::new(tape.int::<u8>("world"));
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let segment = segment_ref(tape);
+        let mut it = Statement {
+            namespace: ns,
+            segment: segment.digest(),
+            len: segment.segment_len(),
+            toolchain: w.toolchain.digest(),
+            records: tape.int::<u32>("records"),
+            tier: if tape.bool("top tier") { Tier::Top } else { Tier::Fast },
+            issued: tape.int::<u64>("issued"),
+            signer: [0; 32],
+            signature: [0; 64],
+        };
+        w.builder.sign_statement(&mut it);
+        let bytes = it.encode();
+        assert_eq!(Statement::decode(&bytes), Ok(it));
+        let mut trusted = Trusted::new(w.toolchain.clone());
+        trusted.anchor(ns, vec![w.anchor.public()]);
+        trusted.take_list("keys", ns, &w.key_list(ns)).expect("the world's list");
+        assert_eq!(trusted.verifier(ns).verify(&it, &segment), Ok(()));
+        // Signed over another length: refused as not the segment's, by the shared length type.
+        let other = segment_len(tape);
+        if other != segment.segment_len() {
+            let mut wrong = Statement { len: other, ..it };
+            w.builder.sign_statement(&mut wrong);
+            assert_eq!(trusted.verifier(ns).verify(&wrong, &segment), Err(Refused::Length { found: other, wanted: segment.segment_len() }));
+        }
+        let mut flipped = bytes;
+        let at = tape.int_in(0usize..=Statement::LEN - 1, "flipped byte");
+        flipped[at] ^= 1;
+        let refused = match Statement::decode(&flipped) {
+            Err(_) => true,
+            Ok(back) => trusted.verifier(ns).verify(&back, &segment).is_err(),
+        };
+        assert!(refused, "byte {at} flipped and taken");
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn key_lists_round_trip(tc: hegel::TestCase) {
-    let anchor = Signer::from_seed(&[tc.draw(gs::integers::<u8>()); 32]);
-    let n = tc.draw(gs::integers::<usize>().max_value(20));
-    let keys = (0..n)
-        .map(|_| KeyEntry { key: PublicKey(id(&tc).0), roles: Roles(tc.draw(gs::integers::<u32>().max_value(3))), revoked: tc.draw(gs::booleans()), from: tc.draw(gs::integers::<u64>()), until: tc.draw(gs::integers::<u64>()) })
-        .collect();
-    let keys = Bounded::new(keys).expect("drawn within");
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let it = KeyList { namespace: ns, serial: tc.draw(gs::integers::<u64>()), issued: tc.draw(gs::integers::<u64>()), keys };
-    let bytes = it.encode(&anchor);
-    assert_eq!(KeyList::decode("k", &bytes, ns, &[anchor.public()]).expect("decodes"), it);
-    assert!(KeyList::decode("k", &bytes, ns, &[]).is_err());
+#[test]
+fn key_lists_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let anchor = Signer::from_seed(&[tape.int::<u8>("anchor seed"); 32]);
+        let n = tape.int_in(0usize..=20, "keys");
+        let keys = (0..n)
+            .map(|_| KeyEntry {
+                key: PublicKey(id(tape).0),
+                roles: Roles(tape.int_in(0u32..=3, "roles")),
+                revoked: tape.bool("revoked"),
+                from: tape.int::<u64>("from"),
+                until: tape.int::<u64>("until"),
+            })
+            .collect();
+        let keys = Bounded::new(keys).expect("drawn within");
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let it = KeyList { namespace: ns, serial: tape.int::<u64>("serial"), issued: tape.int::<u64>("issued"), keys };
+        let bytes = it.encode(&anchor);
+        assert_eq!(KeyList::decode("k", &bytes, ns, &[anchor.public()]).expect("decodes"), it);
+        assert!(KeyList::decode("k", &bytes, ns, &[]).is_err());
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn roots_round_trip(tc: hegel::TestCase) {
-    let signer = Signer::from_seed(&[tc.draw(gs::integers::<u8>()); 32]);
-    let runs_n = tc.draw(gs::integers::<usize>().max_value(4));
-    let mut runs = Vec::new();
-    for g in 0..runs_n {
-        let n = 1 + tc.draw(gs::integers::<usize>().max_value(5));
-        let firsts: BTreeSet<[u8; 32]> = (0..n).map(|_| id(&tc).0).collect();
-        let shards = firsts.into_iter().map(|first| ShardRef { first, digest: id(&tc), count: 1 + tc.draw(gs::integers::<u32>().max_value(shard::SHARD_MOST as u32 - 1)) }).collect();
-        runs.push(Run::new(g as u64, shards).expect("drawn sorted, each within"));
-    }
-    let runs = Bounded::new(runs).expect("drawn within");
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let it = Root { namespace: ns, generation: tc.draw(gs::integers::<u64>()), keys_serial: tc.draw(gs::integers::<u64>()), issued: tc.draw(gs::integers::<u64>()), previous: id(&tc), runs };
-    let (back, by) = Root::decode("r", &it.encode(&signer), ns).expect("decodes");
-    assert_eq!((back, by), (it, signer.public()));
+#[test]
+fn roots_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let signer = Signer::from_seed(&[tape.int::<u8>("signer seed"); 32]);
+        let runs_n = tape.int_in(0usize..=4, "runs");
+        let mut runs = Vec::new();
+        for g in 0..runs_n {
+            let n = 1 + tape.int_in(0usize..=5, "shards");
+            let firsts: BTreeSet<[u8; 32]> = (0..n).map(|_| id(tape).0).collect();
+            let shards = firsts
+                .into_iter()
+                .map(|first| ShardRef { first, digest: id(tape), count: 1 + tape.int_in(0u32..=shard::SHARD_MOST as u32 - 1, "shard count") })
+                .collect();
+            runs.push(Run::new(g as u64, shards).expect("drawn sorted, each within"));
+        }
+        let runs = Bounded::new(runs).expect("drawn within");
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let it = Root {
+            namespace: ns,
+            generation: tape.int::<u64>("generation"),
+            keys_serial: tape.int::<u64>("keys serial"),
+            issued: tape.int::<u64>("issued"),
+            previous: id(tape),
+            runs,
+        };
+        let (back, by) = Root::decode("r", &it.encode(&signer), ns).expect("decodes");
+        assert_eq!((back, by), (it, signer.public()));
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn bundles_round_trip(tc: hegel::TestCase) {
-    let signer = Signer::from_seed(&[tc.draw(gs::integers::<u8>()); 32]);
-    let id_ = BundleId::new(TOOLCHAIN, "x86_64-unknown-linux-gnu", if tc.draw(gs::booleans()) { "std" } else { "blaze-std.release" }).expect("an id");
-    let n = tc.draw(gs::integers::<usize>().max_value(30));
-    // Drawn through `SegmentRef::new`, so a reference past a limit is never drawn (round 1's
-    // failure was one drawn as raw fields: a length of 4 GiB + 1 encoded, then refused).
-    let segments = Bounded::new((0..n).map(|_| segment_ref(&tc)).collect()).expect("drawn within");
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let it = Bundle { namespace: ns, id: id_.clone(), issued: tc.draw(gs::integers::<u64>()), keys_serial: tc.draw(gs::integers::<u64>()), segments };
-    let bytes = it.encode(&signer);
-    let (back, by) = Bundle::decode("b", &bytes, ns, &id_).expect("decodes");
-    assert_eq!((back, by), (it, signer.public()));
-    // A manifest is only ever the one its name asks for.
-    let other = BundleId::new(TOOLCHAIN, "x86_64-unknown-linux-gnu", "other").expect("an id");
-    assert!(Bundle::decode("b", &bytes, ns, &other).is_err());
+#[test]
+fn bundles_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let signer = Signer::from_seed(&[tape.int::<u8>("signer seed"); 32]);
+        let id_ = BundleId::new(TOOLCHAIN, "x86_64-unknown-linux-gnu", if tape.bool("std") { "std" } else { "blaze-std.release" }).expect("an id");
+        let n = tape.int_in(0usize..=30, "segments");
+        // Drawn through `SegmentRef::new`, so a reference past a limit is never drawn (round 1's
+        // failure was one drawn as raw fields: a length of 4 GiB + 1 encoded, then refused).
+        let segments = Bounded::new((0..n).map(|_| segment_ref(tape)).collect()).expect("drawn within");
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let it = Bundle { namespace: ns, id: id_.clone(), issued: tape.int::<u64>("issued"), keys_serial: tape.int::<u64>("keys serial"), segments };
+        let bytes = it.encode(&signer);
+        let (back, by) = Bundle::decode("b", &bytes, ns, &id_).expect("decodes");
+        assert_eq!((back, by), (it, signer.public()));
+        // A manifest is only ever the one its name asks for.
+        let other = BundleId::new(TOOLCHAIN, "x86_64-unknown-linux-gnu", "other").expect("an id");
+        assert!(Bundle::decode("b", &bytes, ns, &other).is_err());
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn segments_round_trip(tc: hegel::TestCase) {
-    let n = tc.draw(gs::integers::<usize>().max_value(20));
-    let mut recs = Records::new();
-    for _ in 0..n {
-        recs.insert(id(&tc).0, (tag(&tc), tc.draw(gs::binary().max_size(100))));
-    }
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let all: Vec<([u8; 32], (Tag, Vec<u8>))> = recs.iter().map(|(k, v)| (*k, v.clone())).collect();
-    let bytes = segment_of(ns, &all);
-    trust::reset_checks();
-    let read = segment::read(&bytes).expect("reads");
-    assert_eq!(read.namespace, ns);
-    assert_eq!((read.segment.size(), read.segment.count() as usize), (bytes.len() as u64, recs.len()));
-    assert_eq!(SegmentRef::decode(&read.segment.encode()), Ok(read.segment));
-    assert_eq!(read.records.len(), recs.len());
-    for (rec, (key, (tag, payload))) in read.records.iter().zip(&recs) {
-        assert_eq!((rec.key, rec.tag), (*key, *tag));
-        assert_eq!(&bytes[rec.at as usize..rec.at as usize + rec.len as usize], payload.as_slice());
-        assert_eq!(rec.value, segment::value_digest(*tag, payload));
-    }
+#[test]
+fn segments_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let n = tape.int_in(0usize..=20, "records");
+        let mut recs = Records::new();
+        for _ in 0..n {
+            recs.insert(id(tape).0, (tag(tape), tape.bytes(0..=100, "payload")));
+        }
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let all: Vec<([u8; 32], (Tag, Vec<u8>))> = recs.iter().map(|(k, v)| (*k, v.clone())).collect();
+        let bytes = segment_of(ns, &all);
+        trust::reset_checks();
+        let read = segment::read(&bytes).expect("reads");
+        assert_eq!(read.namespace, ns);
+        assert_eq!((read.segment.size(), read.segment.count() as usize), (bytes.len() as u64, recs.len()));
+        assert_eq!(SegmentRef::decode(&read.segment.encode()), Ok(read.segment));
+        assert_eq!(read.records.len(), recs.len());
+        for (rec, (key, (tag, payload))) in read.records.iter().zip(&recs) {
+            assert_eq!((rec.key, rec.tag), (*key, *tag));
+            assert_eq!(&bytes[rec.at as usize..rec.at as usize + rec.len as usize], payload.as_slice());
+            assert_eq!(rec.value, segment::value_digest(*tag, payload));
+        }
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn shards_round_trip(tc: hegel::TestCase) {
-    let n = 1 + tc.draw(gs::integers::<usize>().max_value(600));
-    let keys: BTreeSet<[u8; 32]> = (0..n).map(|_| id(&tc).0).collect();
-    let entries: Vec<Entry> = keys
-        .into_iter()
-        .map(|key| {
-            let segment = segment_ref(&tc);
-            let room = segment.index_at() - HEADER as u64;
-            let at = HEADER as u64 + tc.draw(gs::integers::<u64>().max_value(room));
-            let len = tc.draw(gs::integers::<u64>().max_value((segment.index_at() - at).min(u64::from(u32::MAX)))) as u32;
-            Entry::new(key, id(&tc), segment, at, len).expect("drawn inside")
-        })
-        .collect();
-    let ns = Namespace(tc.draw(gs::integers::<u64>()));
-    let (digest, bytes) = shard::encode(ns, 3, &entries);
-    let shard_ref = ShardRef { first: entries[0].key, digest, count: entries.len() as u32 };
-    trust::reset_checks();
-    assert_eq!(shard::decode_whole("s", &bytes, &shard_ref, ns, &mut Cache::default()).expect("decodes"), entries);
-    assert_eq!(trust::checks().twice, 0);
+#[test]
+fn shards_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let n = 1 + tape.int_in(0usize..=600, "entries");
+        let keys: BTreeSet<[u8; 32]> = (0..n).map(|_| id(tape).0).collect();
+        let entries: Vec<Entry> = keys
+            .into_iter()
+            .map(|key| {
+                let segment = segment_ref(tape);
+                let room = segment.index_at() - HEADER as u64;
+                let at = HEADER as u64 + tape.int_in(0u64..=room, "entry at");
+                let len = tape.int_in(0u64..=(segment.index_at() - at).min(u64::from(u32::MAX)), "entry len") as u32;
+                Entry::new(key, id(tape), segment, at, len).expect("drawn inside")
+            })
+            .collect();
+        let ns = Namespace(tape.int::<u64>("namespace"));
+        let (digest, bytes) = shard::encode(ns, 3, &entries);
+        let shard_ref = ShardRef { first: entries[0].key, digest, count: entries.len() as u32 };
+        trust::reset_checks();
+        assert_eq!(shard::decode_whole("s", &bytes, &shard_ref, ns, &mut Cache::default()).expect("decodes"), entries);
+        assert_eq!(trust::checks().twice, 0);
+    });
 }
 
-#[hegel::test(test_cases = 100)]
-fn batches_and_outcomes_round_trip(tc: hegel::TestCase) {
-    let n = tc.draw(gs::integers::<usize>().max_value(10));
-    let actions: Vec<Sent> = (0..n)
-        .map(|_| {
-            let inputs = (0..tc.draw(gs::integers::<usize>().max_value(5))).map(|_| RecordRef { tag: Tag(tc.draw(gs::integers::<u16>())), key: id(&tc) }).collect();
-            Sent { made: RecordRef { tag: Tag(tc.draw(gs::integers::<u16>())), key: id(&tc) }, inputs: Bounded::new(inputs).expect("drawn within") }
-        })
-        .collect();
-    let batch = Batch::new(Namespace(tc.draw(gs::integers::<u64>())), id(&tc), actions).expect("drawn within");
-    assert_eq!(Batch::decode(&batch.encode()).expect("decodes"), batch);
-    let made = RecordRef { tag: Tag(1), key: id(&tc) };
-    let status = match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => Status::Made(Bounded::new((0..tc.draw(gs::integers::<usize>().max_value(4))).map(|_| segment_ref(&tc)).collect()).expect("drawn within")),
-        1 => Status::NotAnInput(blaze_keyed::exec::NotAnInput { asked: RecordRef { tag: Tag(tc.draw(gs::integers::<u16>())), key: id(&tc) }, action: made }),
-        _ => Status::Failed,
-    };
-    let logs = Bounded::new(tc.draw(gs::binary().max_size(64))).expect("drawn within");
-    let outcome = Outcome { action: made.key, status, logs, usage: Usage { cpu_ns: tc.draw(gs::integers::<u64>()), peak_bytes: tc.draw(gs::integers::<u64>()) } };
-    assert_eq!(Outcome::decode(&outcome.encode(), made).expect("decodes"), outcome);
+#[test]
+fn batches_and_outcomes_round_trip() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let n = tape.int_in(0usize..=10, "actions");
+        let actions: Vec<Sent> = (0..n)
+            .map(|_| {
+                let inputs = (0..tape.int_in(0usize..=5, "inputs")).map(|_| RecordRef { tag: Tag(tape.int::<u16>("input tag")), key: id(tape) }).collect();
+                Sent { made: RecordRef { tag: Tag(tape.int::<u16>("made tag")), key: id(tape) }, inputs: Bounded::new(inputs).expect("drawn within") }
+            })
+            .collect();
+        let batch = Batch::new(Namespace(tape.int::<u64>("namespace")), id(tape), actions).expect("drawn within");
+        assert_eq!(Batch::decode(&batch.encode()).expect("decodes"), batch);
+        let made = RecordRef { tag: Tag(1), key: id(tape) };
+        let status = match tape.int_in(0u8..=2, "status") {
+            0 => Status::Made(Bounded::new((0..tape.int_in(0usize..=4, "segments")).map(|_| segment_ref(tape)).collect()).expect("drawn within")),
+            1 => Status::NotAnInput(blaze_keyed::exec::NotAnInput { asked: RecordRef { tag: Tag(tape.int::<u16>("asked tag")), key: id(tape) }, action: made }),
+            _ => Status::Failed,
+        };
+        let logs = Bounded::new(tape.bytes(0..=64, "logs")).expect("drawn within");
+        let outcome = Outcome { action: made.key, status, logs, usage: Usage { cpu_ns: tape.int::<u64>("cpu ns"), peak_bytes: tape.int::<u64>("peak bytes") } };
+        assert_eq!(Outcome::decode(&outcome.encode(), made).expect("decodes"), outcome);
+    });
 }

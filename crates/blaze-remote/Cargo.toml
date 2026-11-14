@@ -35,10 +35,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
-blaze-rng.workspace = true
 # An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).
 blaze-sha256.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true
