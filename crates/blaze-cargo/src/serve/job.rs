@@ -9951,14 +9951,16 @@ impl<S: Steps> Jobs<S> {
                 // to no one: the error names the unit, and says how to see them.
                 Some((unit, why)) => {
                     let named = match ready.input.units.graph.units.get(*unit) {
-                        Some(unit) => format!("`{}` of {}", unit.target.name, unit.pkg_id),
+                        Some(unit) => format!("{} of {}", unit.target.name, unit.pkg_id),
                         None => format!("unit {unit}"),
                     };
+                    // A `blaze check` of the unit's package prints what its end only counts.
                     match why {
-                        Some(why) => format!("did not all build: {named} did not build: {why}"),
+                        Some(why) => format!(
+                            "did not all build: {named} did not build: {why}; `blaze check` of its package prints its errors"
+                        ),
                         None => format!(
-                            "did not all build: {named} did not build (`blaze check -p {}` prints its errors)",
-                            ready.input.units.graph.units.get(*unit).map_or("<its package>", |it| it.target.name.as_str()),
+                            "did not all build: {named} did not build; `blaze check` of its package prints its errors"
                         ),
                     }
                 }
