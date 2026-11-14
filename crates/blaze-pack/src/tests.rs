@@ -1,6 +1,6 @@
 //! The cores under simulation: a model store that crashes, bodies that are cut and flipped,
 //! sources that fail, stall and lie, each run under many seeds on a generator of its own
-//! (the crate has no dependency, so not Hegel's; a failing seed is printed and replays).
+//! (the crate has no dependency, so not blaze-sim's tape; a failing seed is printed and replays).
 //! Every invariant test has a control that plants the bug its oracle is there to catch.
 
 use std::collections::BTreeSet;
