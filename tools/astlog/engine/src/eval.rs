@@ -11,10 +11,12 @@
 
 use std::alloc::Global;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::Hash;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
@@ -220,9 +222,14 @@ enum Step<'p, A, N> {
     Not { relation: usize, args: Vec<Arg<N>>, index: Option<usize> },
     Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
     Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>>, regex: Option<regex::Regex> },
-    Source { atom: &'p A, line: usize, args: Vec<Arg<N>> },
-    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>> },
+    /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
+    /// text, so two occurrences never share answers they might not agree on.
+    Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
+    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
 }
+
+/// A source atom occurrence and the inputs it was asked with.
+type Asked<N> = (usize, Vec<Option<Value<N>>>);
 
 /// A body compiled to steps over variable slots.
 struct Body<'p, A, N> {
@@ -249,6 +256,11 @@ pub struct Evaluator<'p, F: Facts> {
     names: Vec<String>,
     rules: Vec<CompiledRule<'p, <F::Lang as Language>::Atom, F::Node>>,
     relations: Vec<Relation<F::Node>>,
+    /// Each source atom's rows by the inputs it was asked with, for the run: a recursive rule
+    /// asks again every round, and a join asks once per row to its left.
+    asked: RefCell<HashMap<Asked<F::Node>, Rc<Vec<Row<F::Node>>>, Global>>,
+    /// The next source atom occurrence [`Self::compile`] numbers.
+    occurrences: usize,
 }
 
 type Env<N> = Vec<Option<Value<N>>>;
@@ -273,7 +285,15 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 relations.push(Relation::new(rule.head_vars.clone()));
             }
         }
-        let mut this = Self { program, facts, names, rules: Vec::new(), relations };
+        let mut this = Self {
+            program,
+            facts,
+            names,
+            rules: Vec::new(),
+            relations,
+            asked: RefCell::new(HashMap::new_in(Global)),
+            occurrences: 0,
+        };
         for rule in &program.rules {
             let relation = this.relation(&rule.name)?;
             let body = this.compile(&rule.body)?;
@@ -309,11 +329,13 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     atom: &source.value,
                     line: source.line,
                     args: args(&mut names, &source.args, true),
+                    occurrence: self.occurrence(),
                 },
                 BodyAtom::NegatedSource(source) => Step::NotSource {
                     atom: &source.value,
                     line: source.line,
                     args: args(&mut names, &source.args, false),
+                    occurrence: self.occurrence(),
                 },
                 BodyAtom::App(app) => match Builtin::of(&app.name) {
                     Some(builtin) => {
@@ -363,6 +385,31 @@ impl<'p, F: Facts> Evaluator<'p, F> {
             steps.push(step);
         }
         Ok(Body { steps, names })
+    }
+
+    fn occurrence(&mut self) -> usize {
+        self.occurrences += 1;
+        self.occurrences - 1
+    }
+
+    /// The rows of a source atom occurrence for `inputs`: asked of the source the first time,
+    /// then the same rows for the rest of the run.
+    fn source_rows(
+        &self,
+        occurrence: usize,
+        atom: &<F::Lang as Language>::Atom,
+        line: usize,
+        inputs: Vec<Option<Value<F::Node>>>,
+    ) -> Result<Rc<Vec<Row<F::Node>>>, FError<F>> {
+        let key = (occurrence, inputs);
+        if let Some(rows) = self.asked.borrow().get(&key) {
+            return Ok(Rc::clone(rows));
+        }
+        let mut rows = Vec::new();
+        self.facts.solve(atom, line, &key.1, &mut rows)?;
+        let rows = Rc::new(rows);
+        self.asked.borrow_mut().insert(key, Rc::clone(&rows));
+        Ok(rows)
     }
 
     fn index_of(&mut self, relation: usize, args: &[Arg<F::Node>]) -> Option<usize> {
@@ -509,23 +556,20 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     clear(env, &set);
                 }
             }
-            Step::Source { atom, line, args } => {
-                let inputs: Vec<Option<Value<F::Node>>> =
-                    args.iter().map(|arg| input(arg, env)).collect();
-                let mut rows = Vec::new();
-                self.facts.solve(atom, *line, &inputs, &mut rows)?;
-                for row in &rows {
+            Step::Source { atom, line, args, occurrence } => {
+                let inputs = args.iter().map(|arg| input(arg, env)).collect();
+                let rows = self.source_rows(*occurrence, atom, *line, inputs)?;
+                for row in rows.iter() {
                     if let Some(set) = unify(args, row, env) {
                         self.solve(body, at + 1, windows, env, emit)?;
                         clear(env, &set);
                     }
                 }
             }
-            Step::NotSource { atom, line, args } => {
+            Step::NotSource { atom, line, args, occurrence } => {
                 let inputs: Vec<Option<Value<F::Node>>> =
                     args.iter().map(|arg| input(arg, env)).collect();
-                let mut rows = Vec::new();
-                self.facts.solve(atom, *line, &inputs, &mut rows)?;
+                let rows = self.source_rows(*occurrence, atom, *line, inputs.clone())?; // clone: the key keeps one
                 let any = rows.iter().any(|row| {
                     row.iter().zip(&inputs).all(|(value, input)| input.as_ref().is_none_or(|it| it == value))
                 });

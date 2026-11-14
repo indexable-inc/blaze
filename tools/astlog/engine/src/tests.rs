@@ -2,6 +2,7 @@
 //! whose `(succ a b)` is demand-driven on `a`.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -335,8 +336,69 @@ fn demanded_argument_must_be_bound_on_the_left() {
     assert!(program.is_ok(), "bound on the left is fine");
 }
 
+/// [`Edges`] that counts its `succ` calls.
+struct Counted {
+    edges: Edges,
+    succ_calls: Cell<usize>,
+}
+
+impl Facts for Counted {
+    type Lang = Graph;
+    type Node = u32;
+
+    fn solve(
+        &self,
+        atom: &GraphAtom,
+        line: usize,
+        inputs: &[Option<Value<u32>>],
+        out: &mut Vec<Row<u32>>,
+    ) -> Result<(), Error<GraphError>> {
+        if matches!(atom, GraphAtom::Succ) {
+            self.succ_calls.set(self.succ_calls.get() + 1);
+        }
+        self.edges.solve(atom, line, inputs, out)
+    }
+
+    fn parent(&self, node: u32) -> Option<u32> {
+        self.edges.parent(node)
+    }
+
+    fn kind(&self, node: u32) -> Cow<'_, str> {
+        self.edges.kind(node)
+    }
+
+    fn text(&self, node: u32) -> Cow<'_, str> {
+        self.edges.text(node)
+    }
+
+    fn span(&self, node: u32) -> Option<(usize, Range<usize>)> {
+        self.edges.span(node)
+    }
+
+    fn path(&self, file: usize) -> Cow<'_, str> {
+        self.edges.path(file)
+    }
+}
+
 #[test]
-fn dollar_templates_splice_and_escape() -> Result<(), Error<GraphError>> {
+fn a_source_atom_asked_the_same_inputs_twice_is_called_once() -> Result<(), Error<GraphError>> {
+    // `next` asks `succ` with `a` = 1, 1, 2, 2, 3: three distinct inputs in five asks.
+    // `skip` asks the negated `succ` with (1, 3), (1, 4), (1, 4), (2, 4): three in four.
+    let program = Program::<Graph>::parse(
+        "(rule (next a b) (edge a x) (succ a b))
+         (rule (skip a c) (edge a b) (edge b c) (not (succ a c)))",
+    )?;
+    let edges = Edges(vec![(1, 2), (1, 3), (2, 3), (2, 4), (3, 4)]);
+    let facts = Counted { edges, succ_calls: Cell::new(0) };
+    let (db, _) = crate::run(&program, &facts)?;
+    assert_eq!(db.relations["next"].rows().len(), 3);
+    assert_eq!(db.relations["skip"].rows().len(), 3);
+    assert_eq!(facts.succ_calls.get(), 3 + 3, "one call per (atom occurrence, inputs)");
+    Ok(())
+}
+
+#[test]
+fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
     let template =
         parse_template::<GraphError>(TemplateSyntax::Dollar, "$a + ${b}c $$ $$$args", 1)?;
     assert_eq!(
