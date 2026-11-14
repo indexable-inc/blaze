@@ -16,7 +16,7 @@
 use std::{alloc::Global, ffi::OsStr, ffi::OsString};
 
 use blaze_hash::HashMap;
-use blaze_ids::Hasher;
+use blaze_ids::{ContentId, Hasher};
 
 use crate::{RunKey, RunKind};
 
@@ -92,6 +92,22 @@ impl Provider {
         Ok(Provider { seed, wall })
     }
 
+    /// The provider of the processes of a sandboxed test binary of `suite`: what every test of
+    /// the binary has in its base key (blaze-testsel's `host::suite`: the toolchain, the
+    /// suite's settings and the environment blaze gives its tests). The wall clock is the
+    /// system's, as [`Provider::of`] says for a test: a test that reads it is not kept.
+    ///
+    /// The seed adds no input to a test's key: it is a hash of `suite`, which is made of
+    /// inputs every test's base key already covers, so two runs of one base have one seed.
+    /// Each test is answered from a stream of its own scope ([`Answers::marked`]), derived
+    /// from this seed and its libtest name, which its base key covers too.
+    pub fn of_suite(suite: &ContentId) -> Provider {
+        let mut hasher = Hasher::new(Provider::DOMAIN);
+        hasher.update(&[RunKind::Test.byte()]);
+        hasher.update(&suite.0);
+        Provider { seed: hasher.finish().0, wall: Wall::System }
+    }
+
     /// The variable the run's processes are started with: its name and its value.
     pub fn entry(&self) -> (OsString, OsString) {
         let mut value = [0; derive::VALUE_MOST];
@@ -138,20 +154,39 @@ pub const DEVICE_OPENS_MOST: u64 = 1 << 24;
 /// What the sandbox answers the processes of one run that ask the kernel for randomness: a
 /// state machine, with no IO and no clock.
 ///
-/// Each process has a stream of its own, a function of the seed and of the process's number
-/// alone, and is given the stream's next bytes each time it asks. What a process is given
-/// therefore does not depend on when another process asked, in which order the supervisor
-/// saw them, or how the process cut its reads.
+/// Each process has a stream of its own and is given the stream's next bytes each time it
+/// asks. Which stream:
 ///
-/// The reference model: [`Answers::model`], which says what the `n`th byte a process is given
-/// is with no state at all.
+/// - a process of no scope (a build script's, a test binary's fork server before any test):
+///   the stream of its number in the run, a function of the run's seed and that number;
+/// - a process of a scope (a test of a fork server, whose child took the scope's mark with
+///   the test's libtest name, and every process it starts): a stream of the scope, a
+///   function of the seed, the scope's name and the process's place in the scope: the
+///   process that took the mark is the first ([`Answers::marked`]), the others are numbered
+///   in the order they first ask. The process's number in the run is not used: it follows
+///   the order the server forked its tests in, which which tests were asked and in what
+///   order decide, so by it a test's bytes would differ between a full run and a rerun of it
+///   alone.
+///
+/// What a process is given therefore does not depend on when another process asked, in which
+/// order the supervisor saw them, how the process cut its reads, or, in a scope, how many
+/// tests ran before its test and which.
+///
+/// The reference model: [`Answers::model`] and [`Answers::model_in`], which say what the
+/// `n`th byte a process is given is with no state at all.
 #[derive(Debug)]
 pub struct Answers {
     seed: Seed,
-    /// How many bytes of its `getrandom` stream each process has been given.
-    taken: HashMap<u64, u64, Global>,
-    /// How many opens of a random device each process has been answered.
-    opened: HashMap<u64, u64, Global>,
+    /// How many bytes of its `getrandom` stream each stream has given, by its seed (the run's
+    /// or a scope's) and its number under it.
+    taken: HashMap<(Seed, u64), u64, Global>,
+    /// How many opens of a random device each stream has answered, keyed as `taken` is.
+    opened: HashMap<(Seed, u64), u64, Global>,
+    /// The place of each process of a scope in it, by the scope's seed and the process's id
+    /// as the supervisor sees it.
+    places: HashMap<(Seed, u64), u64, Global>,
+    /// How many processes of each scope have a place, by the scope's seed.
+    placed: HashMap<Seed, u64, Global>,
     /// Test-only: the bug to plant.
     plant: Plant,
 }
@@ -163,7 +198,26 @@ pub enum Plant {
     Nothing,
     /// One count for all processes: what a process is given depends on who asked before it.
     SharedCount,
+    /// A process of a scope is given the stream of its number in the run, as a process of no
+    /// scope is: what a test is given depends on the order its server forked.
+    ByNumber,
 }
+
+/// A process that asks, as the supervisor sees it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Asker<'a> {
+    /// The scope the asking thread runs in (the libtest name its process's mark gave), empty
+    /// for none.
+    pub scope: &'a str,
+    /// Its process's id as the supervisor sees it: what [`Answers::marked`] is told.
+    pub id: u64,
+    /// Its process's number in the run (its id in the sandbox's PID namespace): the stream of
+    /// a process of no scope.
+    pub number: u64,
+}
+
+/// The domain of a scope's seed.
+const SCOPE_DOMAIN: &str = "blaze v2 provider scope 1";
 
 impl Answers {
     pub fn new(provider: &Provider) -> Answers {
@@ -176,42 +230,89 @@ impl Answers {
             seed: provider.seed,
             taken: HashMap::new_in(Global),
             opened: HashMap::new_in(Global),
+            places: HashMap::new_in(Global),
+            placed: HashMap::new_in(Global),
             plant,
         }
     }
 
-    /// Answers a `getrandom` of `process` (its number in the run: its process id in the
-    /// sandbox's namespace): the next `into.len()` bytes of its stream.
-    pub fn random(&mut self, process: u64, into: &mut [u8]) {
+    /// The seed of the scope `scope` under the run's `seed`: a function of the two alone.
+    pub fn scope_seed(seed: &Seed, scope: &str) -> Seed {
+        let mut hasher = Hasher::new(SCOPE_DOMAIN);
+        hasher.update(seed).part(scope.as_bytes());
+        hasher.finish().0
+    }
+
+    /// The process `id` took the mark of `scope` (a fork server's child, about to run the
+    /// test of that name): it is the first of the scope, and the scope's streams start over,
+    /// so a test run again in the same server (a retry) is given what its first run was. An
+    /// empty scope (a mark that leaves its scope) changes nothing.
+    pub fn marked(&mut self, scope: &str, id: u64) {
+        if scope.is_empty() {
+            return;
+        }
+        let seed = Answers::scope_seed(&self.seed, scope);
+        self.places.retain(|key, _| key.0 != seed);
+        self.taken.retain(|key, _| key.0 != seed);
+        self.opened.retain(|key, _| key.0 != seed);
+        self.places.insert((seed, id), 0);
+        self.placed.insert(seed, 1);
+    }
+
+    /// The stream `asker` is given: its seed and its number under it.
+    fn stream(&mut self, asker: Asker<'_>) -> (Seed, u64) {
+        if asker.scope.is_empty() || self.plant == Plant::ByNumber {
+            return (self.seed, asker.number);
+        }
+        let seed = Answers::scope_seed(&self.seed, asker.scope);
+        if let Some(&place) = self.places.get(&(seed, asker.id)) {
+            return (seed, place);
+        }
+        let placed = self.placed.entry(seed).or_insert(0);
+        let place = *placed;
+        *placed += 1;
+        self.places.insert((seed, asker.id), place);
+        (seed, place)
+    }
+
+    /// Answers a `getrandom` of `asker`: the next `into.len()` bytes of its stream.
+    pub fn random(&mut self, asker: Asker<'_>, into: &mut [u8]) {
+        let (seed, stream) = self.stream(asker);
         let counted = match self.plant {
-            Plant::Nothing => process,
-            Plant::SharedCount => 0,
+            Plant::Nothing | Plant::ByNumber => (seed, stream),
+            Plant::SharedCount => (self.seed, 0),
         };
-        // alloc: one entry per process that asks, for the run
         let taken = self.taken.entry(counted).or_insert(0);
-        derive::fill(&self.seed, derive::SYSTEM, process, *taken, into);
+        derive::fill(&seed, derive::SYSTEM, stream, *taken, into);
         *taken = taken.wrapping_add(into.len() as u64);
     }
 
-    /// Answers an open of `/dev/urandom` or `/dev/random` by `process`: the bytes the file it
-    /// is handed holds, `into.len()` of them, another stream for each open. `None` once the
-    /// process has opened [`DEVICE_OPENS_MOST`]: then the open is not answered.
-    pub fn device(&mut self, process: u64, into: &mut [u8]) -> Option<()> {
-        // alloc: one entry per process that opens one, for the run
-        let opened = self.opened.entry(process).or_insert(0);
+    /// Answers an open of `/dev/urandom` or `/dev/random` by `asker`: the bytes the file it
+    /// is handed holds, `into.len()` of them, another stream for each open. `None` once its
+    /// stream has opened [`DEVICE_OPENS_MOST`]: then the open is not answered.
+    pub fn device(&mut self, asker: Asker<'_>, into: &mut [u8]) -> Option<()> {
+        let (seed, stream) = self.stream(asker);
+        let opened = self.opened.entry((seed, stream)).or_insert(0);
         if *opened >= DEVICE_OPENS_MOST {
             return None;
         }
-        let stream = process.wrapping_mul(DEVICE_OPENS_MOST).wrapping_add(*opened);
+        let device = stream.wrapping_mul(DEVICE_OPENS_MOST).wrapping_add(*opened);
         *opened += 1;
-        derive::fill(&self.seed, derive::DEVICE, stream, 0, into);
+        derive::fill(&seed, derive::DEVICE, device, 0, into);
         Some(())
     }
 
-    /// The reference model: the byte at `offset` of what `process` is given by `getrandom`,
-    /// whatever anyone asked before.
+    /// The reference model: the byte at `offset` of what the process numbered `process` in
+    /// the run, of no scope, is given by `getrandom`, whatever anyone asked before.
     pub fn model(seed: &Seed, process: u64, offset: u64) -> u8 {
         derive::word(seed, derive::SYSTEM, process, offset / 8).to_le_bytes()[(offset % 8) as usize]
+    }
+
+    /// The reference model in a scope: the byte at `offset` of what the process at `place` in
+    /// `scope` (0: the one that took its mark) is given by `getrandom` since the mark,
+    /// whatever anyone asked before and whichever tests ran before it.
+    pub fn model_in(seed: &Seed, scope: &str, place: u64, offset: u64) -> u8 {
+        Answers::model(&Answers::scope_seed(seed, scope), place, offset)
     }
 }
 
@@ -319,7 +420,7 @@ mod tests {
         let mut given: std::collections::BTreeMap<u64, Vec<u8>> = std::collections::BTreeMap::new();
         for &(process, len) in asks {
             let mut bytes = vec![0; usize::from(len)];
-            answers.random(u64::from(process), &mut bytes);
+            answers.random(unscoped(u64::from(process)), &mut bytes);
             given.entry(u64::from(process)).or_default().extend(bytes);
         }
         for (process, bytes) in &given {
@@ -363,9 +464,9 @@ mod tests {
         let run = || {
             let mut answers = Answers::new(&provider(6));
             let mut opens = [[0u8; 32]; 3];
-            answers.device(1, &mut opens[0]).unwrap();
-            answers.device(1, &mut opens[1]).unwrap();
-            answers.device(2, &mut opens[2]).unwrap();
+            answers.device(unscoped(1), &mut opens[0]).unwrap();
+            answers.device(unscoped(1), &mut opens[1]).unwrap();
+            answers.device(unscoped(2), &mut opens[2]).unwrap();
             opens
         };
         let opens = run();
@@ -373,5 +474,130 @@ mod tests {
         assert_ne!(opens[0], opens[1]);
         assert_ne!(opens[0], opens[2]);
         assert_ne!(opens[1], opens[2]);
+    }
+
+    /// A process of no scope, numbered `number` in the run, and the same as its id.
+    fn unscoped(number: u64) -> Asker<'static> {
+        Asker { scope: "", id: number, number }
+    }
+
+    /// The tests of the simulated binary, by their libtest names.
+    const TESTS: [&str; 5] = ["tests::adds", "tests::muls", "tests::both", "a::b", "a::c"];
+
+    /// A fork server of [`TESTS`] run as the tape says, through `Answers` as the supervisor
+    /// drives it: the server (number 2 in the sandbox's PID namespace, id 102 as the
+    /// supervisor sees it) asks first, as std's start would without a provider; then the
+    /// tests the tape picks, in the order it picks, each in a child forked in turn (the next
+    /// number and id: so a test's number is its place in the fork order), which takes its mark
+    /// and asks a few times, cutting its reads as the tape says; some run a second process
+    /// that asks too. What each test's first process was given, by test.
+    fn serve(tape: &Tape, plant: Plant) -> Vec<(&'static str, Vec<u8>)> {
+        let mut answers = Answers::planted(&Provider::of_suite(&ContentId([7; 32])), plant);
+        let mut start = [0u8; 16];
+        answers.random(Asker { scope: "", id: 102, number: 2 }, &mut start);
+        let mut order: Vec<usize> = (0..TESTS.len()).collect();
+        let mut picked = Vec::new();
+        while !order.is_empty() && tape.bool("another test") {
+            let at = usize::from(tape.int::<u8>("which")) % order.len();
+            picked.push(order.remove(at));
+        }
+        let mut given = Vec::new();
+        for (forked, &test) in picked.iter().enumerate() {
+            let number = 3 + 2 * forked as u64;
+            let (id, scope) = (100 + number, TESTS[test]);
+            answers.marked(scope, id);
+            let mut bytes = Vec::new();
+            for _ in 0..1 + tape.int::<u8>("asks") % 3 {
+                let mut cut = vec![0u8; 1 + usize::from(tape.int::<u8>("len") % 24)];
+                answers.random(Asker { scope, id, number }, &mut cut);
+                bytes.extend(cut);
+                if tape.bool("a child of the test asks") {
+                    let mut theirs = [0u8; 8];
+                    answers.random(Asker { scope, id: id + 1, number: number + 1 }, &mut theirs);
+                }
+            }
+            given.push((scope, bytes));
+        }
+        given
+    }
+
+    /// Whether what each test was given is what the model says its own stream is: its scope's
+    /// first, from its start.
+    fn tests_are_given_their_own_streams(given: &[(&str, Vec<u8>)]) -> Result<(), String> {
+        let seed = Provider::of_suite(&ContentId([7; 32])).seed;
+        for (scope, bytes) in given {
+            for (offset, byte) in bytes.iter().enumerate() {
+                let model = Answers::model_in(&seed, scope, 0, offset as u64);
+                if *byte != model {
+                    return Err(format!(
+                        "test `{scope}` was given {byte:#04x} as byte {offset} of its randomness, and its own stream has {model:#04x}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The invariant: what a test of a fork server is given by `getrandom` is a function of
+    /// the suite's seed (made of what every test's base key covers) and the test's name
+    /// alone: the same whichever tests ran before it, in whatever order, with the server's
+    /// own start before them and the test's own children asking in between. So a pass kept
+    /// of a full run is a pass on the bytes a rerun of the test alone is given.
+    #[test]
+    fn a_test_is_given_the_stream_of_its_name_whatever_ran_before_it() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            tests_are_given_their_own_streams(&serve(tape, Plant::Nothing))
+        });
+    }
+
+    /// The control: by its number in the run (its place in the fork order) a test is given
+    /// other bytes when another test ran before it, which the oracle catches.
+    #[test]
+    fn the_oracle_catches_a_test_given_the_stream_of_its_fork_order() {
+        let mut answers =
+            Answers::planted(&Provider::of_suite(&ContentId([7; 32])), Plant::ByNumber);
+        let mut first = [0u8; 8];
+        answers.marked("tests::adds", 103);
+        answers.random(Asker { scope: "tests::adds", id: 103, number: 3 }, &mut [0u8; 8]);
+        answers.marked("tests::muls", 105);
+        answers.random(Asker { scope: "tests::muls", id: 105, number: 5 }, &mut first);
+        let caught = tests_are_given_their_own_streams(&[("tests::muls", first.to_vec())]);
+        assert!(caught.is_err_and(|why| why.contains("tests::muls")));
+    }
+
+    /// The same test alone and after others, and twice in one server (a retry), is given the
+    /// same bytes; two tests are given different ones; and the stream of a scope is not that
+    /// of the run's number the process has.
+    #[test]
+    fn a_test_alone_after_others_and_retried_is_given_the_same_bytes() {
+        let provider = Provider::of_suite(&ContentId([7; 32]));
+        let of = |answers: &mut Answers, scope: &'static str, number: u64| {
+            answers.marked(scope, 100 + number);
+            let mut bytes = [0u8; 32];
+            answers.random(Asker { scope, id: 100 + number, number }, &mut bytes);
+            bytes
+        };
+        let mut alone = Answers::new(&provider);
+        let muls = of(&mut alone, "tests::muls", 3);
+        let mut full = Answers::new(&provider);
+        let adds = of(&mut full, "tests::adds", 3);
+        assert_eq!(of(&mut full, "tests::muls", 4), muls);
+        assert_eq!(of(&mut full, "tests::muls", 5), muls, "a retry starts over");
+        assert_ne!(adds, muls);
+        let mut by_number = [0u8; 32];
+        Answers::new(&provider).random(unscoped(3), &mut by_number);
+        assert_ne!(by_number, muls);
+    }
+
+    /// A suite's provider is a function of the suite alone: another suite has another seed,
+    /// the wall clock is the system's, and it is read back from its variable.
+    #[test]
+    fn a_suites_provider_is_its_suites_and_tells_the_systems_time() {
+        let one = Provider::of_suite(&ContentId([1; 32]));
+        assert_eq!(one, Provider::of_suite(&ContentId([1; 32])));
+        assert_ne!(one.seed, Provider::of_suite(&ContentId([2; 32])).seed);
+        assert_eq!(one.wall, Wall::System);
+        let (_, value) = one.entry();
+        assert_eq!(Provider::parse(value.as_encoded_bytes()), Some(one));
     }
 }

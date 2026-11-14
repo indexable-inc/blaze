@@ -887,7 +887,9 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
 
 /// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
 /// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
-/// with no such line, which names nobody.
+/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
+/// the `host` tests of `linux` below are.
+#[cfg(feature = "host")]
 #[test]
 fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
     let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";

@@ -58,12 +58,13 @@ fn binary(name: &str, jobs: Vec<Job>) -> Binary {
         jobs,
         loaded: None,
         sandboxed: true,
+        provider: Some(Provider::of_suite(&ContentId::of("blaze v2 test binary 1", name.as_bytes()))),
     }
 }
 
 /// `binary` outside the sandbox.
 fn outside(name: &str, jobs: Vec<Job>) -> Binary {
-    Binary { sandboxed: false, ..binary(name, jobs) }
+    Binary { sandboxed: false, provider: None, ..binary(name, jobs) }
 }
 
 fn not_known() -> Trace {
@@ -361,6 +362,9 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
     assert!(command.env.contains(&(confine::LIVE.into(), "/root/req/1/r0".into())));
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
+    // Its processes are given the suite's provider, in their environment but not the plan's.
+    let given = binary("lib", Vec::new()).provider.unwrap().entry();
+    assert!(command.env.contains(&given), "{:?}", command.env);
     assert!(command.args.is_empty());
     let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else {
         panic!("{command:?}")
@@ -636,6 +640,20 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
     assert_eq!(fake.queue.take_unsandboxable(), None, "said once");
 }
 
+/// The invariant: every sandboxed binary's processes are given a provider. The control is a
+/// sandboxed binary with none: refused before anything is spawned, naming it, its tests lost
+/// with why, never started with the kernel's randomness.
+#[test]
+fn a_sandboxed_binary_given_no_provider_is_refused_naming_it() {
+    let mut fake =
+        Fake::new(config(4), vec![Binary { provider: None, ..binary("lib", vec![job("a", 0)]) }]);
+    assert!(fake.spawns.is_empty(), "nothing is spawned: {:?}", fake.spawns);
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("a").outcome else {
+        panic!("{:?}", fake.results)
+    };
+    assert!(why.contains("/bin/lib is to run sandboxed and was given no provider"), "{why}");
+}
+
 /// The invariant: a dev executable's launch adds nothing writable to a test's sandbox, so no
 /// path of the daemon's home is a test's to write; what it adds to read (its program, the
 /// code-memory host's socket, which a readable entry lets it connect to by that path alone) is
@@ -720,6 +738,7 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     assert_eq!(command.sandbox, Sandbox::Off);
     assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
     assert!(!command.env.iter().any(|it| it.0 == confine::LIVE), "{:?}", command.env);
+    assert!(!command.env.iter().any(|it| it.0 == crate::provider::VAR), "{:?}", command.env);
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     let conn = fake.hello(0, &["a", "b", "c"]);
     let runs = fake.runs(conn);

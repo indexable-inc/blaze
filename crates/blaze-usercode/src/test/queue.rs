@@ -64,6 +64,7 @@ use blaze_inproc::host::{Program, Started};
 use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
     confine,
+    provider::Provider,
     trace::{self, BadRecord, Inputs, Seen},
 };
 
@@ -129,6 +130,15 @@ pub struct Binary {
     /// No binary goes outside but by this field: one sandboxed whose sandbox can't be made
     /// loses its tests, saying why, and stops the run ([`Queue::take_unsandboxable`]).
     pub sandboxed: bool,
+    /// What its processes' randomness comes from when it is sandboxed: its suite's
+    /// ([`Provider::of_suite`]), named to them by [`crate::provider::VAR`] in their
+    /// environment (not in `env`, which a test's base key is made of: the provider is a
+    /// function of that key's inputs and adds none). std reads its hash maps' keys and its
+    /// `fill_bytes` from it with no system call, and the sandbox answers from it what a
+    /// process asks the kernel, each test from a stream of its own name. A sandboxed binary
+    /// with none is refused as it starts, naming it: without one, std's start reads the
+    /// kernel's randomness, which no test can be kept on. Unused outside the sandbox.
+    pub provider: Option<Provider>,
 }
 
 /// A binary blaze holds in memory. Two are the same when they are one program.
@@ -1176,6 +1186,9 @@ impl Queue {
         let sandbox = match plan.sandboxed {
             true => {
                 env.push((confine::LIVE.into(), record_path.into()));
+                if let Some(provider) = &plan.provider {
+                    env.push(provider.entry());
+                }
                 let mut read = plan.read.clone(); // clone: setup, once per server: the driver's command owns its parts
                 read.push(PathBuf::from(socket_path));
                 Sandbox::On {
@@ -1980,6 +1993,10 @@ impl Queue {
             args.push("--include-ignored".into());
         }
         args.extend(given.iter().cloned());
+        let mut env = plan.env.clone(); // clone: setup, once per binary run whole: the driver's command owns its parts
+        if let (true, Some(provider)) = (plan.sandboxed, &plan.provider) {
+            env.push(provider.entry());
+        }
         let sandbox = match plan.sandboxed {
             true => Sandbox::On {
                 read: plan.read.clone(),
@@ -1993,7 +2010,7 @@ impl Queue {
         let command = Command {
             program: plan.program.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             args,
-            env: plan.env.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
+            env,
             dir: plan.dir.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             stdin: Vec::new(),     // alloc: empty, allocates nothing
             sandbox,
@@ -2269,6 +2286,13 @@ fn launch(
     command: Command,
     forks: bool,
 ) -> Result<(Command, Option<Started>), String> {
+    if plan.sandboxed && plan.provider.is_none() {
+        return Err(format!(
+            "{} is to run sandboxed and was given no provider (`Binary::provider`): its \
+             start would read the kernel's randomness, on which none of its tests can be kept",
+            plan.program.display()
+        ));
+    }
     let Some(loaded) = &plan.loaded else { return Ok((command, None)) };
     let (command, started) = loaded.0.command(command, forks).map_err(|error| {
         format!("{} could not be made ready to start: {error}", plan.program.display())

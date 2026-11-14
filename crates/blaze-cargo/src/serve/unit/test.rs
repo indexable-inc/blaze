@@ -51,6 +51,7 @@ use blaze_testsel::{
     machine::{NotKept, SelectError, Selection as Selecting, Start, Test as Asked, Verdict},
 };
 use blaze_units::schema::{Mode, Unit};
+use blaze_usercode::provider::Provider;
 use blaze_usercode::test::{
     self, Attrs, Binary, Config, Filter, Finished, Ignored, Job as TestJob, Mode as TestMode,
     Outcome, Queue, Reported, ShouldPanic, Suite, Wanted, select,
@@ -1034,8 +1035,10 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         jobs: Vec::new(),
         loaded: loaded.clone(),
         sandboxed,
+        // Given below, once its suite's key is known: to the sandboxed binary alone.
+        provider: None,
     };
-    let binary = make(sandboxed);
+    let mut binary = make(sandboxed);
     let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
     let tests = &made.tests;
     // alloc: once per binary, a place per test
@@ -1051,6 +1054,12 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         namespace: Namespace::LOCAL,
     };
     let given = suite.given();
+    // The sandboxed binary's provider, made of what every test's base key has (`host::suite`
+    // over the tool, `given` and the environment `begin` keys each test by), so it adds no
+    // input to any key; each test is answered from its own name's stream of it.
+    if binary.sandboxed {
+        binary.provider = Some(Provider::of_suite(&host::suite(&tool, given, &binary.env)));
+    }
     let taken = job
         .shared
         .selectors

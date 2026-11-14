@@ -396,18 +396,45 @@ pub const ITEM_DOMAIN: &str = "blaze-testsel test item 1";
 /// The domain of a test's name and attributes in its base key.
 pub const ATTRS_DOMAIN: &str = "blaze-testsel test attrs 1";
 
+/// The domain of [`suite`].
+pub const SUITE_DOMAIN: &str = "blaze-testsel test suite 1";
+
+/// The digest of a test's declared environment in its base key: the variables sorted by
+/// name, each a name and a value.
+fn env_set(env: &[(OsString, OsString)]) -> ContentId {
+    let mut order: Vec<u32, Global> = Vec::with_capacity_in(env.len(), Global);
+    order.extend(0..env.len() as u32);
+    order.sort_unstable_by(|a, b| env[*a as usize].0.cmp(&env[*b as usize].0));
+    let mut hasher = Hasher::new(ENV_SET_DOMAIN);
+    hasher.update(&(env.len() as u64).to_le_bytes());
+    for at in order {
+        let (name, value) = &env[at as usize];
+        hasher.part(name.as_bytes()).part(value.as_bytes());
+    }
+    hasher.finish()
+}
+
+/// What every test of a suite has in its base key ([`base`]): `tool`, the suite's `settings`
+/// and the `env` blaze gives its tests, and nothing a test alone has (its name, its
+/// attributes). Two tests of one suite have one; a change to any of it is a change to every
+/// test's base. It is what the suite's provider is made of
+/// (`blaze_usercode::provider::Provider::of_suite`), so that provider adds no input to any
+/// test's key.
+pub fn suite(tool: &ToolId, settings: ContentId, env: &[(OsString, OsString)]) -> ContentId {
+    let mut hasher = Hasher::new(SUITE_DOMAIN);
+    hasher
+        .id(&tool.tool)
+        .id(&tool.target)
+        .update(&tool.namespace.0.to_le_bytes())
+        .id(&settings)
+        .id(&env_set(env));
+    hasher.finish()
+}
+
 /// A test's base key: the core's [`TestRun`] rule over its identity. Nothing its code is: what
 /// it executes and reads are its asks.
 pub fn base(of: &BaseOf<'_>) -> Key<TestRun> {
-    let mut order: Vec<u32, Global> = Vec::with_capacity_in(of.env.len(), Global);
-    order.extend(0..of.env.len() as u32);
-    order.sort_unstable_by(|a, b| of.env[*a as usize].0.cmp(&of.env[*b as usize].0));
-    let mut env = Hasher::new(ENV_SET_DOMAIN);
-    env.update(&(of.env.len() as u64).to_le_bytes());
-    for at in order {
-        let (name, value) = &of.env[at as usize];
-        env.part(name.as_bytes()).part(value.as_bytes());
-    }
+    let env = env_set(of.env);
     let mut item = Hasher::new(ITEM_DOMAIN);
     item.part(of.name.as_bytes());
     let mut attrs = Hasher::new(ATTRS_DOMAIN);
@@ -415,7 +442,7 @@ pub fn base(of: &BaseOf<'_>) -> Key<TestRun> {
     TestRun::key(&TestInputs {
         tool: of.tool,
         settings: Settings(of.settings),
-        env: env.finish(),
+        env,
         item: item.finish(),
         entry_args: ABSENT,
         attrs: attrs.finish(),
