@@ -213,6 +213,23 @@ C-variadic one, whose callers are outside Rust; a removed parameter the body sti
 removed pattern parameter (`(a, b): (u8, u8)`); an index past the list, a name the fn has not,
 and a reorder that does not name every parameter once.
 
+## Computed renames
+
+```lisp
+;; every fn named `legacy_*` loses the prefix, and every reference with it
+(rule (legacy d new)
+  (syntax n "FN")
+  (defines n d)
+  (def-name d name)
+  (text-capture name "^legacy_(.+)$" new))
+(rewrite drop-legacy-prefix (legacy d new)
+  (rename d new))
+```
+
+An action's text argument is taken as written: `(rename d "$new")` would name the text `$new`,
+so a `$name` in one is a load error that says to pass the variable bare. The text builtins
+compute it instead: `(text-replace name "^legacy_" "" short)` then `(case short "pascal" t)`.
+
 ## The evaluator
 
 Semi-naive per stratum: each round evaluates each recursive rule once per body position that

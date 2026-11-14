@@ -230,8 +230,36 @@ impl astlog_engine::Language for Blaze {
             }
             .fail();
         }
+        // An action's text is the name, path or code itself, no template: `(rename d "$t")`
+        // would rename to the text `$t`. A variable is passed bare.
+        for arg in args {
+            if let Sexpr::Str { text, .. } = arg
+                && let Some(var) = dollar_var(text)
+            {
+                return DslSnafu {
+                    line,
+                    message: format!(
+                        "`{head}` takes its text as written, and `\"{text}\"` is no template: pass \
+                         the variable itself, `{var}` without quotes, and compute new text with \
+                         text-replace or case"
+                    ),
+                }
+                .fail();
+            }
+        }
         Ok(Some(Parsed { value, args: astlog_engine::terms(args)?, needs: Needs::Nothing }))
     }
+}
+
+/// The first `$name` or `${name}` in `text`, as a template would read it.
+fn dollar_var(text: &str) -> Option<&str> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    text.match_indices('$').find_map(|(at, _)| {
+        let rest = &text[at + 1..];
+        let inner = rest.strip_prefix('{').unwrap_or(rest);
+        let end = inner.find(|c: char| !ident(c)).unwrap_or(inner.len());
+        (end > 0).then(|| &inner[..end])
+    })
 }
 
 /// `(head term "literal")`: the term, and the literal the atom is compiled from.

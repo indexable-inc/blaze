@@ -66,6 +66,49 @@ fn the_docs_connect_timeout_adds_a_parameter_and_its_default_at_every_call() {
 }
 
 #[test]
+fn the_docs_drop_legacy_prefix_renames_each_matching_fn_and_every_reference() {
+    let rules = example(3);
+    assert!(rules.contains("(rewrite drop-legacy-prefix"), "{rules}");
+    let lib = "pub fn legacy_parse(x: u8) -> u8 { x }\n\
+        pub fn not_legacy_load() -> u8 { 1 }\n\
+        pub struct S;\n\
+        impl S { pub fn legacy_make() -> S { S } }\n\
+        macro_rules! id { ($($t:tt)*) => { $($t)* }; }\n\
+        pub mod inner { pub use crate::legacy_parse as parse_old; }\n\
+        pub fn uses() -> u8 { legacy_parse(1) + inner::parse_old(2) + id!(crate::legacy_parse(3)) }\n\
+        pub fn made() -> S { S::legacy_make() }\n";
+    let fixture = format!("//- /lib.rs crate:lib edition:2021\n{lib}");
+    let text = rewritten(&fixture, 0, rules);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "pub fn parse(x: u8) -> u8 { x }",
+            "pub fn not_legacy_load() -> u8 { 1 }",
+            "pub struct S;",
+            "impl S { pub fn make() -> S { S } }",
+            "macro_rules! id { ($($t:tt)*) => { $($t)* }; }",
+            "pub mod inner { pub use crate::parse as parse_old; }",
+            "pub fn uses() -> u8 { parse(1) + inner::parse_old(2) + id!(crate::parse(3)) }",
+            "pub fn made() -> S { S::make() }",
+        ],
+    );
+}
+
+#[test]
+fn a_dollar_variable_in_an_action_text_is_refused_saying_to_pass_the_variable() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\npub fn legacy_parse() {}\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = example(3).replace("(rename d new)", "(rename d \"$new\")");
+    let Err(error) = edit(&db, &files, &rules, &[]) else { panic!("`\"$new\"` loaded") };
+    let message = error.to_string();
+    assert!(
+        message.contains("`\"$new\"` is no template") && message.contains("`new` without quotes"),
+        "{message}"
+    );
+}
+
+#[test]
 fn the_docs_is_empty_rewrites_vec_and_string_lengths_through_references_and_not_a_user_type() {
     let rules = example(1);
     assert!(rules.contains("(rewrite is-empty"), "{rules}");
