@@ -9,5 +9,5 @@ import BlazeModel.blaze_core.wait.retry.Deadline.left
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.wait.retry.Retry.left.closure0.call (t1 : blaze_core.wait.retry.Retry.left.closure0) (it : blaze_core.wait.retry.Deadline) : core.time.Duration :=
-  blaze_core.wait.retry.Deadline.left it t1.c0
+def blaze_core.wait.retry.Retry.left.closure0.call (t0 : blaze_core.wait.retry.Retry.left.closure0) (it : blaze_core.wait.retry.Deadline) : core.time.Duration :=
+  blaze_core.wait.retry.Deadline.left it t0.c0

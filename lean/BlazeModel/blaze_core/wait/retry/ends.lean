@@ -20,8 +20,8 @@ def blaze_core.wait.retry.ends.loop_0 (fuel : Nat) (retry : blaze_core.wait.retr
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt calls (65536 : U32) then do
-      let (t10, retry) ← blaze_core.wait.retry.Retry.after retry now
-      match t10 with
+      let (t0, retry) ← blaze_core.wait.retry.Retry.after retry now
+      match t0 with
       | core.result.Result.Ok v0 =>
         match v0 with
         | blaze_core.wait.retry.Next.Again => do

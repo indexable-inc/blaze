@@ -8,5 +8,5 @@ import BlazeModel.blaze_core.wait.retry.Deadline.passed
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.wait.retry.Retry.after.closure0.call (t1 : blaze_core.wait.retry.Retry.after.closure0) (it : blaze_core.wait.retry.Deadline) : Bool :=
-  blaze_core.wait.retry.Deadline.passed it t1.c0
+def blaze_core.wait.retry.Retry.after.closure0.call (t0 : blaze_core.wait.retry.Retry.after.closure0) (it : blaze_core.wait.retry.Deadline) : Bool :=
+  blaze_core.wait.retry.Deadline.passed it t0.c0
