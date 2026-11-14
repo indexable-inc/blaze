@@ -3479,8 +3479,8 @@ impl<'db> Cx<'db> {
     }
 
     /// A call of a function of `blaze_core::world::threads` ([`THREADS`]), by its name, never
-    /// its body (which runs real threads): `wait` and `wake` are `Threads.wait` and
-    /// `Threads.wake`; `two(schedule, first, second)` runs its two closures as the threads of
+    /// its body (which runs real threads): `wait`, `wake`, `clock`, `now`, `time` and
+    /// `wait_until` are `Threads.<name>`; `two(schedule, first, second)` runs its two closures as the threads of
     /// `Threads.two_of`. A closure given to `two` must not lend (hold a capture by `&mut`): two
     /// threads never share a place but through the memory. Any other function is refused by
     /// name.
@@ -3496,7 +3496,9 @@ impl<'db> Cx<'db> {
         out: &mut Vec<Stmt>,
     ) -> Refused<Exit<Cond>> {
         match name {
-            "wait" | "wake" => {
+            // The futex, and the world's clock (its script of readings, a reading, the clock as
+            // it stands, a wait with a deadline on it): each is the Lean definition of its name.
+            "wait" | "wake" | "clock" | "now" | "time" | "wait_until" => {
                 let callee = Callee::Shared { name: format!("Threads.{name}") };
                 self.call_with(callee, args, destination, target, at, out)
             }
