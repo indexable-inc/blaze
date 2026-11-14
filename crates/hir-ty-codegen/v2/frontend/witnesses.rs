@@ -390,7 +390,7 @@ pub(super) fn of_in(slot: &mut Option<Arc<Witnesses>>, db: &Db) -> Arc<Witnesses
 
 #[cfg(test)]
 mod tests {
-    use hegel::{Hegel, Settings, TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::{Plant, Table};
 
@@ -486,22 +486,22 @@ mod tests {
         Ok(())
     }
 
-    fn steps(tc: &TestCase) -> Vec<Step> {
-        let count: usize = tc.draw(gs::integers().min_value(1).max_value(24));
-        let read = || tc.draw(gs::integers::<u64>().max_value(40));
+    fn steps(tape: &Tape) -> Vec<Step> {
+        let count: usize = tape.int_in(1..=24, "steps");
+        let read = || tape.int_in(0..=40u64, "read");
         (0..count)
-            .map(|_| match tc.draw(gs::integers::<u8>().max_value(2)) {
+            .map(|_| match tape.int_in(0..=2u8, "step") {
                 0 => {
-                    let changed = tc.draw(gs::integers::<u8>().max_value(3));
+                    let changed = tape.int_in(0..=3u8, "changed");
                     Step::Change((0..changed).map(|_| read()).collect())
                 }
                 _ => {
-                    let reads = tc.draw(gs::integers::<u8>().max_value(5));
+                    let reads = tape.int_in(0..=5u8, "reads");
                     Step::Note {
-                        key: tc.draw(gs::integers::<u32>().max_value(7)),
+                        key: tape.int_in(0..=7u32, "key"),
                         reads: (0..reads).map(|_| read()).collect(),
-                        complete: tc.draw(gs::integers::<u8>().max_value(4)) != 0,
-                        value: tc.draw(gs::integers::<u8>().max_value(2)),
+                        complete: tape.int_in(0..=4u8, "complete") != 0,
+                        value: tape.int_in(0..=2u8, "value"),
                     }
                 }
             })
@@ -522,15 +522,7 @@ mod tests {
     /// the read changed).
     #[test]
     fn no_changed_read_is_held_or_left_unnamed() {
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(300);
-        Hegel::new(|tc: TestCase| {
-            if let Err(why) = check(&steps(&tc), Plant::None) {
-                panic!("{why}");
-            }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        blaze_sim::check(Config::cases(300), |tape| check(&steps(tape), Plant::None));
 
         let read = of_first_shard();
         let rerun = [

@@ -101,6 +101,9 @@ blaze-codegen-code.workspace = true
 
 [dev-dependencies]
 # tests/revisions/oracle.rs: the drawn sequences of the real driver's oracle.
+blaze-sim.workspace = true
+# tests/repro.rs: the fixture `#[blaze::contract_test]` generates Hegel calls for, until the
+# generated code draws from blaze-sim (docs/v2/plan/design/sim.md, row V12).
 hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 # as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.

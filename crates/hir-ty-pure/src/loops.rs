@@ -713,7 +713,7 @@ impl Bounding for Counted<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -806,28 +806,29 @@ mod tests {
         unbounded(graph, &Facts(facts.to_vec())).is_some() || !runs_for_ever(graph, facts)
     }
 
-    fn below(tc: &TestCase, n: u32) -> u32 {
-        tc.draw(gs::integers::<u32>().max_value(n - 1))
+    /// Below `n`, at least 1.
+    fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+        tape.int_in(0..=n - 1, label)
     }
 
-    fn drawn(tc: &TestCase) -> (Graph, Vec<Fact>) {
-        let blocks = 1 + below(tc, 6);
+    fn drawn(tape: &Tape) -> (Graph, Vec<Fact>) {
+        let blocks = 1 + below(tape, 6, "blocks");
         let mut graph = Graph::new(blocks as usize);
         for from in 0..blocks {
-            for _ in 0..below(tc, 3) {
-                graph.edge(from, below(tc, blocks));
+            for _ in 0..below(tape, 3, "edges") {
+                graph.edge(from, below(tape, blocks, "to"));
             }
         }
         let mut facts: Vec<Fact> = Vec::new();
-        for _ in 0..below(tc, 4) {
-            let block = below(tc, blocks);
+        for _ in 0..below(tape, 4, "facts") {
+            let block = below(tape, blocks, "block");
             let targets = graph.successors(block);
             if targets.is_empty() || facts.iter().any(|it| it.block == block) {
                 continue;
             }
-            let exit = targets[below(tc, targets.len() as u32) as usize];
-            let resets = (0..blocks).filter(|&it| it != block && below(tc, 4) == 0).collect();
-            facts.push(Fact { block, exit, resets, bound: 1 + below(tc, 2) });
+            let exit = targets[below(tape, targets.len() as u32, "exit") as usize];
+            let resets = (0..blocks).filter(|&it| it != block && below(tape, 4, "resets") == 0).collect();
+            facts.push(Fact { block, exit, resets, bound: 1 + below(tape, 2, "bound") });
         }
         (graph, facts)
     }
@@ -836,10 +837,12 @@ mod tests {
     /// small graphs with random bounding facts, every accepted graph, each fact's block forced
     /// through its exit once its bound is used up, has only finite paths (checked by brute
     /// force over every state).
-    #[hegel::test]
-    fn an_accepted_graph_has_no_infinite_path(tc: TestCase) {
-        let (graph, facts) = drawn(&tc);
-        assert!(holds(&graph, &facts), "accepted, but runs for ever: {facts:?}");
+    #[test]
+    fn an_accepted_graph_has_no_infinite_path() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let (graph, facts) = drawn(tape);
+            assert!(holds(&graph, &facts), "accepted, but runs for ever: {facts:?}");
+        })
     }
 
     /// The analysis accepts what ends and refuses what does not, on the shapes the rule is
