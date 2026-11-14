@@ -1,0 +1,14 @@
+{
+ "id": "allows-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane allows (V14) under proofs-1113",
+ "where": "lean/Blaze/Auto.lean (blaze_auto) used from crates/blaze-core/lean/BlazeCore/World/DiskAllows.lean",
+ "what": "blaze_auto failed with `Failed to construct rule SpecProof.global ...eq_1` and `failed to synthesize Std.WP.Assertion Prop` because the file had only `open Blaze`; it needs `open Blaze Std.WP Lean.Order` (scoped instances) like Busy.lean and Clock.lean. The message names neither the missing open nor the scope.",
+ "cost": "one build round and some misdirected debugging",
+ "cause": "the instances vcgen needs are scoped to Std.WP / Lean.Order, and blaze_auto does not open them itself",
+ "whys": "blaze_auto expands to vcgen inside the caller scope; the caller scope decides which scoped instances exist; nothing checks that before vcgen runs",
+ "class": "a tactic whose correctness depends on the caller opening namespaces (hidden precondition)",
+ "prevention": "make blaze_auto open Std.WP and Lean.Order in its own expansion (`open Std.WP Lean.Order in vcgen ...`), so no proof file has to",
+ "workaround": "start every proof file with `open Blaze Std.WP Lean.Order`",
+ "state": "open"
+}

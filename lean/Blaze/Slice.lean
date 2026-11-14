@@ -52,7 +52,7 @@ def index (s : Slice α) (i : Usize) : Result α :=
 theorem index_ok (s : Slice α) (i : Usize) (h : i.val.toNat < s.val.length) :
     index s i = Result.ok (s.val.get ⟨i.val.toNat, h⟩) := by
   unfold index
-  rw [dif_pos h]
+  rw [dite_eq_left h]
 
 /-- `s[i] = v`. -/
 def update (s : Slice α) (i : Usize) (v : α) : Result (Slice α) :=

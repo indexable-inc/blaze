@@ -214,7 +214,7 @@ theorem top_ptr (B : FnId → Local → Prop) (b : Local) :
   | { base := _, stack := [], next := _ }, _ => Or.inl rfl
   | { base := _, stack := fr :: rest, next := _ }, hb => by
     have found : fnOfIds ((fr.id, fr.fn) :: rest.map idFnOf) fr.id = some fr.fn :=
-      (fnOfIds_cons (fr.id, fr.fn) (rest.map idFnOf) fr.id).trans (if_pos rfl)
+      (fnOfIds_cons (fr.id, fr.fn) (rest.map idFnOf) fr.id).trans (ite_eq_left rfl)
     have has : FrameHas B b (fnOfIds ((fr.id, fr.fn) :: rest.map idFnOf) fr.id) := by
       rw [found]
       exact hb

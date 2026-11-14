@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-5",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": ".github/scripts/land.py (its check of the smoke quote), the blaze installed on the Mac",
+ "what": "land.py checks a smoke quote by running `blaze run -q -p scripts --bin smoke -- '{\"verify\": ..}'` with whatever `blaze` is on PATH. On the Mac that is ~/.cargo/bin/blaze, `blaze 0.0.0-dev (f396732)` of 2026-11-12, which refuses a checkout of main in 0.6 s: `[workspace.metadata.blaze.lints-ratchet] in .../Cargo.toml: not_latest_edition is no lint or group of blaze's`. So on this Mac no quote can be checked and land.py can open no pull request, for a reason that has nothing to do with the quote.",
+ "cost": "fifteen minutes while main could move past a smoked head (it had, twice that night, each costing a merge, a release build and a smoke)",
+ "cause": "the manifest names a lint added after the installed blaze was built (commit 3d1f288ebf), and nothing updates the installed blaze or says which one land.py needs",
+ "whys": "the gate's own checker is built by an ambient binary; the tree it must build moves every hour and the binary does not; the checker's result is `could not run`, which land.py reports as a refusal of the quote; the script that only reads one text needs a whole build of the workspace's manifest first",
+ "class": "a gate that depends on an ambient tool nobody pins or updates fails for reasons unrelated to what it checks (as proofs-1113-1 and proofs-1113-2: generators that no gate holds to the tree)",
+ "prevention": "the quote's check needs no build: `smoke verify` reads one text and one tree hash, so land.py can do it with the tree's own Python (the format's one home moves to a small module both read), or run the checker from a pinned release named in the tree (`harness/toolchain`-style) and say which when it is missing. Not built.",
+ "workaround": "a stand-in named `blaze` first on PATH for exactly `run -q -p scripts --bin smoke -- <json>`, which runs the checkout's own smoke.rs built by cargo with the pinned nightly (/Volumes/Projects/blaze-proofs-1113-notes/shim/blaze); it prints `ok` for a quote of the tree and refuses one of another tree, as smoke.rs does",
+ "state": "open"
+}

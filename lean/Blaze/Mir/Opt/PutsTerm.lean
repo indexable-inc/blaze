@@ -419,16 +419,16 @@ theorem assertOn_puts (expected : Bool) (kind : Error) (target : BlockId) (reps 
     by_cases h : b = expected
     · have left : assertOn (puts st reps) expected kind target (Value.bool b) =
           (puts st reps).jump target :=
-        (assertOn_bool (puts st reps) expected kind target b).trans (if_pos h)
+        (assertOn_bool (puts st reps) expected kind target b).trans (ite_eq_left h)
       have right : assertOn st expected kind target (Value.bool b) = st.jump target :=
-        (assertOn_bool st expected kind target b).trans (if_pos h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_left h)
       exact left.trans ((jump_puts target reps st).trans
         (congrTo (Outcome.map (Next.map (fun s => puts s reps))) right).symm)
     · have left : assertOn (puts st reps) expected kind target (Value.bool b) =
           Outcome.panic kind :=
-        (assertOn_bool (puts st reps) expected kind target b).trans (if_neg h)
+        (assertOn_bool (puts st reps) expected kind target b).trans (ite_eq_right h)
       have right : assertOn st expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool st expected kind target b).trans (if_neg h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_right h)
       exact left.trans (congrTo (Outcome.map (Next.map (fun s => puts s reps))) right).symm
   | Value.unit => rfl
   | Value.int _ _ => rfl
@@ -457,14 +457,14 @@ theorem mem_dropAt (q : Pointer) :
   | [], _, m => mem_nil_elim m
   | x :: rest, r, m => by
     by_cases ha : atPtr q x = true
-    · have kept : dropAt q (x :: rest) = dropAt q rest := (dropAt_cons q x rest).trans (if_pos ha)
+    · have kept : dropAt q (x :: rest) = dropAt q rest := (dropAt_cons q x rest).trans (ite_eq_left ha)
       have m' : r ∈ dropAt q rest := by
         rw [kept] at m
         exact m
       have ih := mem_dropAt q rest r m'
       exact And.intro (List.mem_cons.mpr (Or.inr (And.left ih))) (And.right ih)
     · have kept : dropAt q (x :: rest) = x :: dropAt q rest :=
-        (dropAt_cons q x rest).trans (if_neg ha)
+        (dropAt_cons q x rest).trans (ite_eq_right ha)
       have m' : r ∈ x :: dropAt q rest := by
         rw [kept] at m
         exact m
@@ -496,11 +496,11 @@ theorem write_puts (q : Pointer) (v : Value) :
       have same : (st.put r.1 r.2.1 r.2.2).write q v = st.write q v :=
         (congrTo (fun p => State.write (st.put r.1 r.2.1 r.2.2) p v) eq).trans
           (whole.trans (congrTo (fun p => State.write st p v) eq).symm)
-      have kept : dropAt q (r :: rest) = dropAt q rest := (dropAt_cons q r rest).trans (if_pos ha)
+      have kept : dropAt q (r :: rest) = dropAt q rest := (dropAt_cons q r rest).trans (ite_eq_left ha)
       rw [kept]
       exact inner.trans (congrTo (Outcome.map (fun x => puts x (dropAt q rest))) same)
     · have kept : dropAt q (r :: rest) = r :: dropAt q rest :=
-        (dropAt_cons q r rest).trans (if_neg ha)
+        (dropAt_cons q r rest).trans (ite_eq_right ha)
       have off : Off r.1 r.2.1 q :=
         (h r (List.mem_cons.mpr (Or.inl rfl))).elim (fun a => absurd a ha) (fun o => o)
       have single : (st.put r.1 r.2.1 r.2.2).write q v =
@@ -541,19 +541,19 @@ theorem enterState_slots? (st : State) (id : FnId) (sig : FnSig) (args : List Va
     (enterState st id sig args dest target).slots? f = st.slots? f := by
   by_cases h0 : f = 0
   · have left : (enterState st id sig args dest target).slots? f = some st.base :=
-      (State.slots?_def (enterState st id sig args dest target) f).trans (if_pos h0)
-    have right : st.slots? f = some st.base := (State.slots?_def st f).trans (if_pos h0)
+      (State.slots?_def (enterState st id sig args dest target) f).trans (ite_eq_left h0)
+    have right : st.slots? f = some st.base := (State.slots?_def st f).trans (ite_eq_left h0)
     exact left.trans right.symm
   · have hne : ¬ (newFrame st id sig args dest target).id = f := fun e => hf e.symm
     have found : findFrame (newFrame st id sig args dest target :: st.stack) f =
         findFrame st.stack f :=
-      (findFrame_cons (newFrame st id sig args dest target) st.stack f).trans (if_neg hne)
+      (findFrame_cons (newFrame st id sig args dest target) st.stack f).trans (ite_eq_right hne)
     have left : (enterState st id sig args dest target).slots? f =
         (findFrame st.stack f).map (fun fr => fr.locals) :=
-      ((State.slots?_def (enterState st id sig args dest target) f).trans (if_neg h0)).trans
+      ((State.slots?_def (enterState st id sig args dest target) f).trans (ite_eq_right h0)).trans
         (congrTo (Option.map (fun (fr : Frame) => fr.locals)) found)
     have right : st.slots? f = (findFrame st.stack f).map (fun fr => fr.locals) :=
-      (State.slots?_def st f).trans (if_neg h0)
+      (State.slots?_def st f).trans (ite_eq_right h0)
     exact left.trans right.symm
 
 theorem enterState_setSlots (st : State) (id : FnId) (sig : FnSig) (args : List Value)
@@ -572,7 +572,7 @@ theorem enterState_setSlots (st : State) (id : FnId) (sig : FnSig) (args : List 
   · have hne : ¬ (newFrame st id sig args dest target).id = f := fun e => hf e.symm
     have e1 : setFrame (newFrame st id sig args dest target :: st.stack) f slots =
         newFrame st id sig args dest target :: setFrame st.stack f slots :=
-      (setFrame_cons (newFrame st id sig args dest target) st.stack f slots).trans (if_neg hne)
+      (setFrame_cons (newFrame st id sig args dest target) st.stack f slots).trans (ite_eq_right hne)
     have left : (enterState st id sig args dest target).setSlots f slots =
         State.mk st.base (newFrame st id sig args dest target :: setFrame st.stack f slots)
           (st.next + 1) :=
@@ -640,10 +640,10 @@ theorem enter_puts (id : FnId) (sig : FnSig) (args : List Value) (dest : Pointer
   by_cases hl : args.length = sig.args
   · have left : (puts st reps).enter id sig args dest target =
         Outcome.ok (Next.state (enterState (puts st reps) id sig args dest target)) :=
-      (State.enter_eq (puts st reps) id sig args dest target).trans (if_pos hl)
+      (State.enter_eq (puts st reps) id sig args dest target).trans (ite_eq_left hl)
     have right : st.enter id sig args dest target =
         Outcome.ok (Next.state (enterState st id sig args dest target)) :=
-      (State.enter_eq st id sig args dest target).trans (if_pos hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_left hl)
     have mid : Outcome.ok (Next.state (enterState (puts st reps) id sig args dest target)) =
         Outcome.map (Next.map (fun s => puts s reps))
           (Outcome.ok (Next.state (enterState st id sig args dest target))) :=
@@ -652,9 +652,9 @@ theorem enter_puts (id : FnId) (sig : FnSig) (args : List Value) (dest : Pointer
     exact left.trans (mid.trans (congrTo (Outcome.map (Next.map (fun s => puts s reps))) right).symm)
   · have left : (puts st reps).enter id sig args dest target =
         Outcome.undefined Undefined.illFormed :=
-      (State.enter_eq (puts st reps) id sig args dest target).trans (if_neg hl)
+      (State.enter_eq (puts st reps) id sig args dest target).trans (ite_eq_right hl)
     have right : st.enter id sig args dest target = Outcome.undefined Undefined.illFormed :=
-      (State.enter_eq st id sig args dest target).trans (if_neg hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_right hl)
     exact left.trans (congrTo (Outcome.map (Next.map (fun s => puts s reps))) right).symm
 
 /-- An intrinsic depends on the state only through the reads at the pointers its arguments
@@ -765,9 +765,9 @@ theorem State.ret_cons (base : List Slot) (fr : Frame) (stack : List Frame) (nex
         slot.load.bind (fun v =>
           retVia v (State.mk base stack next) (bare fr :: stack.map bare))) := by
   have found : findFrame (fr :: stack) fr.id = some fr :=
-    (findFrame_cons fr stack fr.id).trans (if_pos rfl)
+    (findFrame_cons fr stack fr.id).trans (ite_eq_left rfl)
   have a : State.slots? (State.mk base (fr :: stack) next) fr.id = some fr.locals :=
-    ((State.slots?_def (State.mk base (fr :: stack) next) fr.id).trans (if_neg hpos)).trans
+    ((State.slots?_def (State.mk base (fr :: stack) next) fr.id).trans (ite_eq_right hpos)).trans
       (congrTo (Option.map (fun (x : Frame) => x.locals)) found)
   have hs : State.slot (State.mk base (fr :: stack) next)
       { frame := fr.id, slot := 0, path := [] } = slotOf (nth? fr.locals 0) :=
@@ -803,20 +803,20 @@ theorem findFrame_none_of (id : Nat) :
     ∀ (l : List Frame), (∀ (x : Frame), x ∈ l → ¬ x.id = id) → findFrame l id = none
   | [], _ => rfl
   | fr :: rest, h =>
-    ((findFrame_cons fr rest id).trans (if_neg (h fr (List.mem_cons.mpr (Or.inl rfl))))).trans
+    ((findFrame_cons fr rest id).trans (ite_eq_right (h fr (List.mem_cons.mpr (Or.inl rfl))))).trans
       (findFrame_none_of id rest (fun x m => h x (List.mem_cons.mpr (Or.inr m))))
 
 /-- Popping the running frame commutes with a replacement, when no frame under it has its
 id: a replacement in the popped frame is then none. -/
 theorem State.pop_put_cons (base : List Slot) (c : Frame) (rest : List Frame) (next : Nat)
-    (hpos : ¬ c.id = 0) (hu : findFrame rest c.id = none) (f l : Nat) (sl : Slot) :
+    (_hpos : ¬ c.id = 0) (hu : findFrame rest c.id = none) (f l : Nat) (sl : Slot) :
     (State.put (State.mk base (c :: rest) next) f l sl).pop =
       (State.mk base rest next).put f l sl := by
   by_cases h0 : f = 0
   · have sa : State.slots? (State.mk base (c :: rest) next) f = some base :=
-      (State.slots?_def (State.mk base (c :: rest) next) f).trans (if_pos h0)
+      (State.slots?_def (State.mk base (c :: rest) next) f).trans (ite_eq_left h0)
     have sb : State.slots? (State.mk base rest next) f = some base :=
-      (State.slots?_def (State.mk base rest next) f).trans (if_pos h0)
+      (State.slots?_def (State.mk base rest next) f).trans (ite_eq_left h0)
     have a : State.put (State.mk base (c :: rest) next) f l sl =
         State.mk (setNth base l sl) (c :: rest) next :=
       (State.setSlot_some (State.mk base (c :: rest) next) { frame := f, slot := l, path := [] }
@@ -832,13 +832,13 @@ theorem State.pop_put_cons (base : List Slot) (c : Frame) (rest : List Frame) (n
     exact pa.trans b.symm
   · by_cases hc : c.id = f
     · have found : findFrame (c :: rest) f = some c :=
-        (findFrame_cons c rest f).trans (if_pos hc)
+        (findFrame_cons c rest f).trans (ite_eq_left hc)
       have sa : State.slots? (State.mk base (c :: rest) next) f = some c.locals :=
-        ((State.slots?_def (State.mk base (c :: rest) next) f).trans (if_neg h0)).trans
+        ((State.slots?_def (State.mk base (c :: rest) next) f).trans (ite_eq_right h0)).trans
           (congrTo (Option.map (fun (x : Frame) => x.locals)) found)
       have set : setFrame (c :: rest) f (setNth c.locals l sl) =
           c.withLocals (setNth c.locals l sl) :: rest :=
-        (setFrame_cons c rest f (setNth c.locals l sl)).trans (if_pos hc)
+        (setFrame_cons c rest f (setNth c.locals l sl)).trans (ite_eq_left hc)
       have a : State.put (State.mk base (c :: rest) next) f l sl =
           State.mk base (c.withLocals (setNth c.locals l sl) :: rest) next :=
         ((State.setSlot_some (State.mk base (c :: rest) next)
@@ -848,7 +848,7 @@ theorem State.pop_put_cons (base : List Slot) (c : Frame) (rest : List Frame) (n
           (congrTo (fun s => State.mk base s next) set)
       have hf : findFrame rest f = none := (congrTo (findFrame rest) hc.symm).trans hu
       have sb : State.slots? (State.mk base rest next) f = none :=
-        ((State.slots?_def (State.mk base rest next) f).trans (if_neg h0)).trans
+        ((State.slots?_def (State.mk base rest next) f).trans (ite_eq_right h0)).trans
           (congrTo (Option.map (fun (x : Frame) => x.locals)) hf)
       have b : State.put (State.mk base rest next) f l sl = State.mk base rest next :=
         State.setSlot_none (State.mk base rest next) { frame := f, slot := l, path := [] } sl sb
@@ -856,12 +856,12 @@ theorem State.pop_put_cons (base : List Slot) (c : Frame) (rest : List Frame) (n
           State.mk base rest next := congrTo State.pop a
       exact pa.trans b.symm
     · have found : findFrame (c :: rest) f = findFrame rest f :=
-        (findFrame_cons c rest f).trans (if_neg hc)
+        (findFrame_cons c rest f).trans (ite_eq_right hc)
       have sa : State.slots? (State.mk base (c :: rest) next) f =
           State.slots? (State.mk base rest next) f :=
-        ((State.slots?_def (State.mk base (c :: rest) next) f).trans (if_neg h0)).trans
+        ((State.slots?_def (State.mk base (c :: rest) next) f).trans (ite_eq_right h0)).trans
           ((congrTo (Option.map (fun (x : Frame) => x.locals)) found).trans
-            ((State.slots?_def (State.mk base rest next) f).trans (if_neg h0)).symm)
+            ((State.slots?_def (State.mk base rest next) f).trans (ite_eq_right h0)).symm)
       cases hs : State.slots? (State.mk base rest next) f with
       | none =>
         have a : State.put (State.mk base (c :: rest) next) f l sl =
@@ -876,7 +876,7 @@ theorem State.pop_put_cons (base : List Slot) (c : Frame) (rest : List Frame) (n
       | some slots =>
         have set : setFrame (c :: rest) f (setNth slots l sl) =
             c :: setFrame rest f (setNth slots l sl) :=
-          (setFrame_cons c rest f (setNth slots l sl)).trans (if_neg hc)
+          (setFrame_cons c rest f (setNth slots l sl)).trans (ite_eq_right hc)
         have a : State.put (State.mk base (c :: rest) next) f l sl =
             State.mk base (c :: setFrame rest f (setNth slots l sl)) next :=
           ((State.setSlot_some (State.mk base (c :: rest) next)

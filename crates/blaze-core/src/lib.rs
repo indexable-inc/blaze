@@ -112,6 +112,7 @@ pub mod utf8;
 mod watch;
 pub mod wait;
 pub mod wheel;
+pub mod world;
 
 use std::{fmt, time::Duration};
 

@@ -1,0 +1,14 @@
+{
+ "id": "vecs-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane vecs (V15) under proofs-1113",
+ "where": "/Volumes/Projects/blaze-proofs-1113-notes/cargovm.sh (the tar pipe into the VM source copy)",
+ "what": "After sending `crates Cargo.toml Cargo.lock`, hir-def kept failing with `cannot find value blaze_implied_bounds in module sym` though the VM copy of crates/intern/src/symbol/symbols.rs had the symbol: tar restores each file's Mac mtime, which was older than the intern rlib built from the previous (older) copy, so cargo judged intern fresh and linked the stale rlib. Touching the changed files on the VM fixed it; every new send undoes the touch.",
+ "cost": "about an hour and three whole-tree sends on a loaded VM",
+ "cause": "cargo decides freshness by mtime, and `tar -x` writes files with an older mtime than the artifact built from their previous content",
+ "whys": "the VM copy is updated by tar rather than by git; tar preserves mtimes by default; cargo trusts mtimes; a file replaced by older-dated new content is invisible to it",
+ "class": "a build cache keyed by timestamps instead of content gives stale output when files are copied (keys-cover-every-input)",
+ "prevention": "extract with `tar -xmf -` (mtime = now) in cargovm.sh and leanvm.sh, or sync with git so changed files get a fresh mtime; not done: the script is shared and not this lane's",
+ "workaround": "on the VM, touch every file `git status --porcelain` lists, then send only the paths being edited",
+ "state": "open"
+}

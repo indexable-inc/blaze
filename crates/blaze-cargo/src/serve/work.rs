@@ -773,6 +773,15 @@ pub trait Steps: Sized + Send + Sync + 'static {
     type Linked: Kept;
     /// User code of a job run through the loop's driver ([`Runs`]).
     type Runs: Runs<Self>;
+    /// What a `blaze prove`'s worker found ([`Front::prove`]): its theorems translated and the
+    /// plan of their check, which [`Steps::check_proofs`] makes a run of the loop.
+    type Proving: Send + 'static;
+
+    /// On the loop, once [`Front::prove`] has answered: its check as a run of the loop, the
+    /// Lean at `lean` over what the worker found, in the sandbox as all user code is, with the
+    /// tags `tags..tags + 2^32`. It ends with a [`Response::Proven`] whatever it found: what
+    /// is proved, what is open, and where no proof could be checked, why.
+    fn check_proofs(proving: Self::Proving, lean: Option<&str>, tags: u64) -> Self::Runs;
 
     /// On an IO thread: the source `fetch` names, fetched and checked (a `.crate`'s sha256 and
     /// its paths kept inside it, a git tree at its commit, an index file as served).
@@ -1421,6 +1430,14 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// run that has not been asked for; the view's proc macros and build scripts' runs were
     /// built and applied before it is posted (`Jobs::next`).
     fn ahead(&self, reader: S::Reader, filter: &[String]) -> Result<Vec<u32>, Failed>;
+    /// On a worker, for `blaze prove` ([`blaze_api::Request::Prove`]): every theorem function
+    /// of the view's primary library crates translated to Lean and, unless `emit`, the plan
+    /// of their proofs' check made from the crates' proof files; with `subset`, the
+    /// translator's count over the sans-IO cores. It writes nothing and runs no Lean: the
+    /// loop does, with what this gives ([`Steps::check_proofs`]). Building nothing more: the
+    /// view's proc macros and build scripts' runs were built and applied before it is posted
+    /// (`Jobs::next`).
+    fn prove(&self, reader: S::Reader, emit: bool, subset: bool) -> Result<S::Proving, Failed>;
     /// On a worker: each codegen unit's inputs and output of the view's last build, as
     /// [`Response::CodegenInputs`] lists them.
     fn codegen_inputs(&self, reader: S::Reader) -> Result<Vec<(ContentId, ContentId)>, Failed>;
