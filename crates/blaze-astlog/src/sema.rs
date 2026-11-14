@@ -352,8 +352,41 @@ impl<'a, F: Files> Sema<'a, F> {
                 AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
             })
             .collect();
+        // `lib::E::V`, the path `def_path` gives a variant.
+        if let ModuleDef::Adt(hir::Adt::Enum(it)) = owner {
+            out.extend(it.variants(db).into_iter().map(ModuleDef::EnumVariant));
+        }
         out.dedup();
         out
+    }
+
+    /// The defs a def path names: [`Sema::items_at`]'s, or else the field of that name of the
+    /// struct, union or variant the rest of the path names (`lib::S::field`, `lib::P::0`).
+    fn defs_at(&self, path: &str, line: usize) -> Res<Vec<Def>> {
+        let missed = match self.items_at(path, line) {
+            Ok(items) => return Ok(items.into_iter().map(Def::Item).collect()),
+            Err(missed) => missed,
+        };
+        let Some((owner, name)) = path.trim().trim_start_matches("::").rsplit_once("::") else {
+            return Err(missed);
+        };
+        let Ok(owners) = self.items_at(owner, line) else { return Err(missed) };
+        let db = self.db;
+        let fields: Vec<Def> = owners
+            .into_iter()
+            .flat_map(|owner| match owner {
+                ModuleDef::Adt(hir::Adt::Struct(it)) => it.fields(db),
+                ModuleDef::Adt(hir::Adt::Union(it)) => it.fields(db),
+                ModuleDef::EnumVariant(it) => it.fields(db),
+                _ => Vec::new(),
+            })
+            .filter(|it| it.name(db).as_str() == name)
+            .map(Def::Field)
+            .collect();
+        match fields.is_empty() {
+            true => Err(missed),
+            false => Ok(fields),
+        }
     }
 
     /// The def a path, name, method call or field names.
@@ -498,8 +531,23 @@ impl<'a, F: Files> Sema<'a, F> {
             }
             None => {}
         }
+        // A variant is under its enum, and a field under its struct, union or variant.
+        let variant = match def {
+            Def::Item(ModuleDef::EnumVariant(it)) => Some(it),
+            Def::Field(field) => match field.parent_def(db) {
+                hir::Variant::EnumVariant(it) => Some(it),
+                hir::Variant::Struct(_) | hir::Variant::Union(_) => None,
+            },
+            _ => None,
+        };
+        if let Some(variant) = variant {
+            segments.push(variant.parent_enum(db).name(db).as_str().to_owned());
+        }
         if let Def::Field(field) = def {
-            segments.push(hir::Variant::from(field.parent_def(db)).name(db).as_str().to_owned());
+            segments.push(field.parent_def(db).name(db).as_str().to_owned());
+        }
+        if let Def::Impl(it) = def {
+            segments.push(self.impl_segment(it));
         }
         // A module's own name is the last of its path's segments already.
         if let Some(name) = self.name_of(def)
@@ -508,6 +556,17 @@ impl<'a, F: Files> Sema<'a, F> {
             segments.push(name);
         }
         Some(segments.join("::"))
+    }
+
+    /// An impl's last segment, as rustc's paths show one: `<impl Type>` or
+    /// `<impl Trait<Args> for Type>`. It names the impl and resolves to nothing
+    /// ([`crate::program::names_an_impl`]).
+    fn impl_segment(&self, it: hir::Impl) -> String {
+        let ty = self.display(it.self_ty(self.db));
+        match it.trait_ref(self.db) {
+            Some(by) => format!("<impl {} for {ty}>", by.display(self.db, self.target)),
+            None => format!("<impl {ty}>"),
+        }
     }
 
     fn display(&self, ty: Type<'a>) -> String {
@@ -920,8 +979,11 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     }
                 }
                 (None, Some(Value::Text(path))) => {
-                    for def in self.items_at(path, line)? {
-                        out.push(vec![node(self.def(Def::Item(def))), text(path)]);
+                    if crate::program::names_an_impl(path) {
+                        return Err(crate::program::impl_has_no_path(path, line));
+                    }
+                    for def in self.defs_at(path, line)? {
+                        out.push(vec![node(self.def(def)), text(path)]);
                     }
                 }
                 (None, other) => {

@@ -224,6 +224,31 @@ fn def_kind_names_what_each_def_is() {
 }
 
 #[test]
+fn each_impl_has_a_path_of_its_own_that_names_no_def_back() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct S;\n\
+                   pub trait T {}\n\
+                   pub trait G<X> {}\n\
+                   impl S { pub fn f() {} }\n\
+                   impl T for S {}\n\
+                   impl G<u8> for S {}\n\
+                   impl G<u16> for S {}\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (impls p) (syntax n "IMPL") (defines n d) (def-path d p))"#;
+    let mut found = texts(&query(&db, &files, rules).unwrap(), "impls");
+    found.sort();
+    assert_eq!(found, [["lib::<impl G<u16> for S>"], ["lib::<impl G<u8> for S>"], ["lib::<impl S>"], ["lib::<impl T for S>"]]);
+    let refused = |rules: &str| match query(&db, &files, rules) {
+        Ok(_) => panic!("an impl's path named a def: {rules}"),
+        Err(error) => error.to_string(),
+    };
+    let error = refused(r#"(rule (named d) (def-path d "lib::<impl S>"))"#);
+    assert!(error.contains("rules:1") && error.contains("an impl has no path"), "{error}");
+    let error = refused(r#"(rule (named d) (syntax n "IMPL") (defines n e) (def-path e p) (def-path d p))"#);
+    assert!(error.contains("rules:1") && error.contains("an impl has no path"), "{error}");
+}
+
+#[test]
 fn crate_of_names_a_defs_crate_and_a_nodes_own() {
     let (db, files) = lib();
     let rules = r#"
@@ -261,6 +286,26 @@ fn enclosing_module_is_the_innermost_module() {
     let outcome = query(&db, &files, rules).unwrap();
     let found = texts(&outcome, "in-mod");
     assert_eq!(found, [["target()", "lib"], ["target()", "lib"], ["target()", "lib::lookalike"]]);
+}
+
+#[test]
+fn def_path_names_a_field_from_its_def_and_its_def_from_the_path() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct S { pub field: u32 }\n\
+                   pub enum E { V { inner: u8 } }\n\
+                   pub struct P(pub u8);\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (paths p) (syntax f "RECORD_FIELD") (defines f d) (def-path d p))
+        (rule (named k p) (def-path d "lib::S::field") (def-kind d k) (def-path d p))
+        (rule (named k p) (def-path d "lib::E::V::inner") (def-kind d k) (def-path d p))
+        (rule (named k p) (def-path d "lib::P::0") (def-kind d k) (def-path d p))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "paths"), [["lib::E::V::inner"], ["lib::S::field"]], "a variant's field is under its enum");
+    let mut named = texts(&outcome, "named");
+    named.sort();
+    assert_eq!(named, [["field", "lib::E::V::inner"], ["field", "lib::P::0"], ["field", "lib::S::field"]]);
 }
 
 const NOT_A_TEST: &str = r#"(rule (stmt-of s) (stmt s "let _ = 3 + 4;"))"#;
