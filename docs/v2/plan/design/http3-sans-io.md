@@ -223,3 +223,72 @@ One change, whole port (rule 23):
 - **The browser**, by hand: the probe page in Chrome and Firefox (bidirectional echo,
   unidirectional echo, datagrams), then `blaze explore` with the real page on ix.dev. This is
   the one check no test here can make.
+
+## 8. Requests and the remote cache
+
+The owner (2026-11-13): "remote cache should be quic (sans io with state machine, think we
+already have crates for this)". The same core makes plain requests, and blaze-remote reads
+public objects with them.
+
+**The core** (`h3/request.rs`, `h3/endpoint/requests.rs`). On a connection opened with
+`Endpoint::connect_requests`, `request(conn, Request)` sends one GET or HEAD:
+`:method`, `:scheme`, `:authority`, `:path`, `range` and `user-agent: blaze`, encoded with
+static-table QPACK, and FIN. The answer comes back as `Event::ResponseHead` (status,
+content-length, content-range, etag), `Event::ResponseData` (read only as far as the asker's
+`consumed_response` opens the window), and one `Event::RequestEnded`. The body is held to
+the asked `Length`: past it, or short of a stated content-length, the request ends `Failed`,
+naming the object. A cancel is STOP_SENDING and RESET_STREAM with H3_REQUEST_CANCELLED. Each
+request carries a deadline, and the core ends it `TimedOut` there. A GOAWAY, a close or a lost
+connection gives each open request exactly one outcome, saying whether the server started it:
+`NotStarted` for one at or above the GOAWAY's ID, or one never sent, and `Lost` otherwise. A
+server made with `ServerConfig::requests` gets `Event::Request` and answers with `respond`; that
+is enough for the simulation.
+
+**Tickets and 0-RTT.** Tickets go into the core as bytes, with their server name, issue time
+and lifetime (`add_ticket`), and come out as `Event::Ticket`. That needs the vendored rustls
+(`vendor/rustls`): it adds a serializer for TLS 1.3 client sessions, which upstream rustls
+lacks. Only an `Early` may go as early data, and only `Early::get` and `Early::head` make
+one. Asked before the handshake on a connection that resumes, its HEADERS leave in 0-RTT
+packets. If the server refuses early data, each such request is sent again exactly once, at
+handshake completion. That is QUIC's rule (RFC 9001, 4.6.2: 0-RTT data the server rejected was
+not processed), not a retry.
+
+**Floor and cost** (rule 67; computed from the code, not measured):
+
+| Operation | Floor | This design |
+|---|---|---|
+| Round trips to the first byte, with a ticket | 1 | 1 (0-RTT) |
+| Without a ticket | 2 (keys need one round trip) | 2 |
+| Server refused the early data | 2 | 2, plus the HEADERS sent twice |
+| Request framing | The path, range and authority bytes | Those plus about 20 bytes (frame and QPACK prefixes, static indices, `user-agent`) |
+| Response framing, per 16 KiB `DATA_FRAME` | 0 | 3 or 4 bytes (under 0.03%) |
+
+HTTP/1.1 over TLS 1.3 needs 3 round trips to the first byte cold, and 2 with TLS resumption,
+because TCP's handshake comes first.
+
+**The bucket** (`crates/blaze-remote/src/http3.rs`). `H3Bucket` is a `Bucket` that runs an
+`Endpoint` itself, on `blaze_http::h3::Wire` (`epoch`, `now`, `send`, and `wait(until)`). That is
+the one thing a driver gives it. It sends anonymous reads only: a GET or HEAD of a `public/`
+object, every read as `Early`. It keeps one connection to the origin, opened again only after
+it closes. Each ask's deadline becomes the request's. A connect that fails is `Reply::Failed`
+naming the object, the host, the way the handshake failed (timed out, version negotiation,
+ALPN refused) and `bucket.transport`. There is no fallback to HTTP/1.1. `Routed` sends
+anonymous reads to it and everything signed to the HTTP/1.1 bucket. The setting is
+`bucket.transport` (`BLAZE_CACHE_TRANSPORT`), `"h1"` by default. `"h3"` is refused until
+blaze-core's HTTP/3 driver implements `Wire`. Tickets live in
+`<settings dir>/remote-tickets.bin`, mode 0600, at most 4 of them and none past 7 days
+(`http::load_tickets`, `save_tickets`; the format is `http3::encode_tickets`).
+
+Nothing assumes that R2's public custom domain or its S3 endpoint serves HTTP/3. Whether it
+does is not known. With `"h3"` against a host that doesn't, every read fails, naming the
+setting.
+
+**Proof.** `h3/tests/requests.rs` runs the client core against the server core over a seeded
+network that drops, duplicates, reorders and delays datagrams. Its workload is ranged GETs,
+HEADs, missing objects, cancels, and a second process resuming with the first's tickets. The
+oracle checks three things: a completed read has exactly the asked bytes; each request has
+exactly one outcome by its deadline; only GET and HEAD come early. Three planted bugs are
+caught: a body past its length, no outcome on close, and a POST sent early. Two more tests
+check that a resumed GET's bytes are in a 0-RTT packet before any server datagram arrives,
+and that refused early requests are sent again exactly once. `blaze-remote`'s
+`http3_tests.rs` runs the bucket against an in-process server on a simulated `Wire`.

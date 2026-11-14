@@ -2,13 +2,16 @@
 //! reads the settings once ([`Settings::read`]); with no cache configured, or the cache
 //! disabled, no bucket is made and nothing is contacted (the tests count it).
 //!
-//! - `blaze cache status`: what can leave this machine, said plainly; which settings are set
+//! - `blaze cache status`: what can leave this machine, said plainly; which namespaces the store
+//!   reads and writes (from its settings, `<root>/store.json`, alone); which settings are set
 //!   and where from (never a value of a secret). Contacts nothing.
 //! - `blaze cache pull <toolchain> <target> <cfg> [<namespace>]`: the bundle of that toolchain,
 //!   target and cfg set (std, blaze-std) into the plain store, ahead of a first build. Each
 //!   segment is checked once, by the store as it adopts it.
 //! - `blaze cache push '<json>'`: the plain store's segments of a namespace, with their
-//!   statements, index and root (and a bundle naming them all, when asked). The JSON is
+//!   statements, index and root (and a bundle naming them all, when asked). Only on a trusted
+//!   writer (`trusted_writer` in the store's settings), and only a namespace its store writes
+//!   other than local: elsewhere the store holds nothing but local, by construction. The JSON is
 //!   `{"toolchain": "<name>", "namespace": "public", "tier": "top", "bundle": {"target":
 //!   "<triple>", "cfg": "<name>"}}`; `namespace` defaults to `public`, `tier` to `top`, and
 //!   `bundle` is optional. Every setting it lacks is named at once, before anything is sent.
@@ -20,7 +23,7 @@
 
 use std::path::Path;
 
-use blaze_cas::plain::{Driven, Namespace};
+use blaze_cas::plain::{Driven, Namespace, Settings as StoreSettings};
 use serde::Deserialize;
 
 use crate::{
@@ -29,8 +32,9 @@ use crate::{
     name::{self, Toolchain},
     pull::Remote,
     push::{BundleOut, Plan, Push},
+    segment::SegmentId,
     settings::{Env, Leaves, Settings},
-    trust::{KeyEntry, KeyList, PublicKey, Roles, Signer, Tier, Trusted},
+    trust::{KeyEntry, KeyList, PublicKey, Roles, Signer, Trusted, tier_named},
 };
 
 /// The words this module answers after `blaze cache`.
@@ -51,7 +55,11 @@ pub fn main(root: &Path, env: Env<'_>, words: &[&str], now_s: u64) -> Result<Str
 /// a bucket and the command needs one).
 pub fn run(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Connect<'_>) -> Result<String, String> {
     match words {
-        ["status"] => Settings::read(root, env).map(|it| status(&it)),
+        ["status"] => {
+            let settings = Settings::read(root, env)?;
+            let store = StoreSettings::read(root)?;
+            Ok(format!("{}{}", store_status(&store), status(&settings)))
+        }
         ["pull", toolchain, target, cfg] => pull(root, env, toolchain, target, cfg, "public", connect),
         ["pull", toolchain, target, cfg, namespace] => pull(root, env, toolchain, target, cfg, namespace, connect),
         ["push", json] => push(root, env, json, now_s, connect),
@@ -61,7 +69,34 @@ pub fn run(root: &Path, env: Env<'_>, words: &[&str], now_s: u64, connect: Conne
     }
 }
 
-/// What `status` says.
+/// A namespace as `status` says it.
+fn space_said(namespace: Namespace) -> String {
+    if namespace == Namespace::LOCAL {
+        return "local".to_owned();
+    }
+    name::space(namespace).unwrap_or_else(|_| format!("{:016x}", namespace.0))
+}
+
+/// What `status` says of the store's namespaces, from its settings alone (`<root>/store.json`):
+/// which it reads and which it writes, and, when no organisation is set and `trusted_writer` is
+/// off, that nothing it writes leaves this machine. Contacts nothing.
+pub fn store_status(store: &StoreSettings) -> String {
+    let list = |it: Vec<Namespace>| it.into_iter().map(space_said).collect::<Vec<_>>().join(", ");
+    let mut out = format!("the store reads namespaces {}; it writes {}\n", list(store.reads()), list(store.writes()));
+    if let Some(org) = &store.org {
+        out.push_str(&format!("organisation {org:?}: namespace {}\n", space_said(Namespace::named(org))));
+    }
+    if store.trusted_writer {
+        out.push_str("trusted_writer is on: what this machine builds of public or organisation code is filed in those namespaces, and `blaze cache push` may send it\n");
+    } else if store.org.is_none() {
+        out.push_str("no organisation is set and trusted_writer is off: everything this machine writes is namespace local, and nothing of it leaves this machine\n");
+    } else {
+        out.push_str("trusted_writer is off: everything this machine writes is namespace local, and nothing of it leaves this machine; the organisation's namespace is only read\n");
+    }
+    out
+}
+
+/// What `status` says of the shared cache's settings.
 pub fn status(settings: &Settings) -> String {
     let mut out = String::new();
     match settings.leaves() {
@@ -117,15 +152,22 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
     let id = BundleId::new(toolchain, target, cfg).map_err(|it| it.to_string())?;
     let ns = name::namespace_named(namespace).map_err(|it| it.to_string())?;
     let trusted = trusted(&settings, id.toolchain.clone(), ns)?;
-    let store_settings = blaze_cas::plain::Settings::read(root)?;
-    let mut driven = Driven::open(root, &store_settings)?;
+    let store_settings = StoreSettings::read(root)?;
+    if !store_settings.reads().contains(&ns) {
+        return Err(format!(
+            "namespace {namespace} is not one this store reads ({}); nothing was contacted. An organisation's namespace is read once `org` names it in the store's settings",
+            store_settings.reads().into_iter().map(space_said).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
     let mut bucket = connect(&settings).map_err(|it| it.to_string())?;
     let mut remote = Remote::new(&mut *bucket, &settings.root, trusted);
     let (bundle, segments) = remote.bundle_ahead(ns, &id).map_err(|it| it.to_string())?;
     // The trust as it stands after the manifest (the key list taken once); the store checks
-    // each segment's statement under it, and its bytes, once each.
-    let verifier = remote.trusted().clone();
-    let ids = driven.pull(&mut remote, &verifier, ns, segments)?;
+    // each segment's statement under the verifier of this namespace, and its bytes, once each.
+    let trusted = remote.trusted().clone();
+    let verifier = trusted.verifier(ns);
+    let ids = driven.pull(&mut remote, &verifier, ns, &segments).map_err(|it| it.to_string())?;
     let counts = remote.report.counts;
     Ok(format!(
         "pulled bundle {}/{}/{}: {} segment(s) adopted, {} requests, {} bytes received\n",
@@ -144,8 +186,9 @@ struct PushInput {
     toolchain: String,
     #[serde(default = "public")]
     namespace: String,
+    /// `top` or `fast` ([`tier_named`]).
     #[serde(default = "top")]
-    tier: Tier,
+    tier: String,
     bundle: Option<BundleInput>,
 }
 
@@ -153,8 +196,8 @@ fn public() -> String {
     "public".to_owned()
 }
 
-fn top() -> Tier {
-    Tier::Top
+fn top() -> String {
+    "top".to_owned()
 }
 
 #[derive(Deserialize)]
@@ -190,14 +233,35 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     if !missing.is_empty() {
         return Err(Failure::NotConfigured { missing }.to_string());
     }
+    let tier = tier_named(&input.tier)?;
     let toolchain = Toolchain::new(&input.toolchain).map_err(|it| it.to_string())?;
     let ns = name::namespace_named(&input.namespace).map_err(|it| it.to_string())?;
+    let store_settings = StoreSettings::read(root)?;
+    let store_file = root.join(blaze_cas::plain::settings::FILE);
+    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
+    if !store_settings.trusted_writer {
+        // By construction: a machine that is not a trusted writer files everything in
+        // namespace local, so its store holds nothing of a namespace that can be pushed.
+        return Err(format!(
+            "the store holds no segment of namespace {} ({} segment(s) stay here); nothing pushed. `trusted_writer` is off in {}: this machine writes namespace local alone, which never leaves it",
+            input.namespace,
+            driven.core().segments().len(),
+            store_file.display()
+        ));
+    }
+    let pushable: Vec<Namespace> = store_settings.writes().into_iter().filter(|it| *it != Namespace::LOCAL).collect();
+    if !pushable.contains(&ns) {
+        return Err(format!(
+            "namespace {} is not one this store writes ({}, set in {}); nothing pushed",
+            input.namespace,
+            store_settings.writes().into_iter().map(space_said).collect::<Vec<_>>().join(", "),
+            store_file.display()
+        ));
+    }
     let trusted = trusted(&settings, toolchain.clone(), ns)?;
     let key_list_path = settings.key_list.as_ref().expect("checked");
     let key_list = std::fs::read(key_list_path).map_err(|e| format!("{}: {e}", key_list_path.display()))?;
 
-    let store_settings = blaze_cas::plain::Settings::read(root)?;
-    let mut driven = Driven::open(root, &store_settings)?;
     let mut ids = Vec::new();
     let mut other = 0usize;
     let mut segments: Vec<&[u8]> = Vec::new();
@@ -210,14 +274,11 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
         }
         let bytes = bytes.ok_or_else(|| format!("segment {id} ({}): not mapped by this store, so its bytes cannot be pushed", blaze_format::hex::encode(&seg.digest.0)))?;
         ids.push(id);
-        digests.push(seg.digest);
+        digests.push(SegmentId(seg.digest));
         segments.push(bytes);
     }
     if segments.is_empty() {
-        return Err(format!(
-            "the store holds no segment of namespace {} ({other} of other namespaces stay here); nothing pushed. The plain store writes namespace local until it is given the namespace to write",
-            input.namespace
-        ));
+        return Err(format!("the store holds no segment of namespace {} ({other} of other namespaces stay here); nothing pushed", input.namespace));
     }
     let bundles = match &input.bundle {
         None => Vec::new(),
@@ -227,7 +288,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let plan = Plan {
         namespace: ns,
         root_name: settings.root.clone(),
-        tier: input.tier,
+        tier,
         signer,
         key_list,
         trusted,
@@ -243,7 +304,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let report = drive(&mut machine, &mut *bucket, &mut |()| Ok(())).map_err(|it| it.to_string())?;
     let counts = bucket.counts();
     drop(machine);
-    driven.publish(ids)?;
+    driven.publish(ids).map_err(|it| it.to_string())?;
     Ok(format!(
         "pushed {} records in {} segment(s) to {} ({} put, {} already there, {} bytes); {} shard(s), {} merge(s), root generation {} after {} attempt(s), {} key(s) sampled against the bucket; {} requests, {} bytes sent; {other} segment(s) of other namespaces stay here\n",
         report.records,
@@ -316,9 +377,6 @@ fn keys_sign(env: Env<'_>, json: &str) -> Result<String, String> {
         return Err(Failure::NotConfigured { missing: vec!["the anchor seed (BLAZE_CACHE_ANCHOR_SEED)".to_owned()] }.to_string());
     };
     let namespace = name::namespace_named(&input.namespace).map_err(|it| it.to_string())?;
-    if input.keys.len() > crate::trust::KEYS_MOST {
-        return Err(format!("{} keys: a key list names at most {}", input.keys.len(), crate::trust::KEYS_MOST));
-    }
     let mut keys = Vec::with_capacity(input.keys.len());
     for it in &input.keys {
         let key = PublicKey::from_hex(&it.key).ok_or_else(|| format!("key {:?}: not 64 hex digits (an Ed25519 public key)", it.key))?;
@@ -338,6 +396,7 @@ fn keys_sign(env: Env<'_>, json: &str) -> Result<String, String> {
         }
         keys.push(KeyEntry { key, roles, revoked: it.revoked, from: it.from, until: it.until });
     }
+    let keys = crate::wire::Bounded::new(keys).map_err(|why| format!("the key list of namespace {}: {why}", input.namespace))?;
     let list = KeyList { namespace, serial: input.serial, issued: input.issued, keys };
     let bytes = list.encode(&anchor);
     std::fs::write(&input.out, &bytes).map_err(|e| format!("{}: {e}", input.out.display()))?;

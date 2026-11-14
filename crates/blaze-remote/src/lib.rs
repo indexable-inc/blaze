@@ -2,7 +2,11 @@
 //! S3), and anyone can pull it, the public namespace without a login. Remote workers can later
 //! fill the same bucket the same way (target decisions 9 and 12-17 of 2026-11-13).
 //!
-//! The plain store's segment is the wire format: a segment file is an object, unchanged. The
+//! The plain store's segment is the wire format: a segment file is an object, unchanged, read
+//! and written only by the store's own layout code (`blaze_cas::plain::check_segment` and
+//! `seal_segment`; [`segment`] holds no second reader). The vocabulary around it (the segment
+//! reference, its length, the statement, the namespace, [`Source`](blaze_keyed::store::Source)
+//! and [`Verifier`](blaze_keyed::store::Verifier)) is blaze-keyed's store, declared once. The
 //! bucket adds four things around segments: a signed statement per segment, index shards that
 //! find a key among very many segments, a signed root per namespace and toolchain, and bundles
 //! that name the segments to fetch before a first build.
@@ -55,7 +59,8 @@
 //! # Verify once
 //!
 //! Decision 18: each check has one place and a proof. A segment is checked once, either by the
-//! plain store as it pulls from [`pull::Remote`] or by [`Trusted::prove`], which alone makes a
+//! plain store as it pulls from [`pull::Remote`] (its statement by [`Trusted::verifier`] of the
+//! namespace pulled, its bytes by the store) or by [`Trusted::prove`], which alone makes a
 //! [`pull::Proven`]. A shard head or block is checked once per client and cached by digest. A
 //! root is checked once per digest of its bytes. A key list is checked once a process. Counters
 //! ([`trust::checks`]) count every signature and digest checked, and every second check of one
@@ -88,7 +93,7 @@
 //! requests). An organisation's namespace is opt-in, by naming it.
 
 #![deny(unsafe_code)]
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 // `#![blaze::sans_io]` in each core module; inert under rustc.
 #![register_tool(blaze)]
 
@@ -99,6 +104,7 @@ pub mod exec;
 pub mod expire;
 pub mod find;
 pub mod http;
+pub mod http3;
 pub mod name;
 pub mod privacy;
 pub mod pull;
@@ -113,16 +119,20 @@ mod wire;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+mod http3_tests;
+#[cfg(test)]
 mod tests;
 
 pub use bucket::{Bucket, Failure, Machine, Step, drive};
 pub use trust::{PublicKey, Refusal, Signer, Trusted, Why};
+pub use wire::Bounded;
 
 /// A bug planted by a test, to show the oracle catches it: only ever in this crate's tests.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Plant {
     None,
-    /// A fetched segment is handed on without checking its digest.
+    /// A fetched segment is handed on with only its header and footer read (the store's
+    /// `describe`), not the store's whole check (`check_segment`): its digest unchecked.
     SkipSegmentDigest,
     /// A statement is taken without checking its signature.
     SkipSignature,

@@ -42,7 +42,7 @@ pub fn turn(m: &std::sync::Mutex<u32>) {
     );
     let found = findings(&out, "bounded_turn");
     assert_eq!(found.len(), 1, "{out}");
-    assert!(found[0].contains("`drain`"), "{out}");
+    assert!(found[0].contains("`main::drain`"), "{out}");
     assert!(found[0].contains("std::sync::Mutex::lock"), "{out}");
 }
 
@@ -134,7 +134,7 @@ pub fn answer(fd: i32) -> i32 {
     );
     let found = findings(&out, "answers_request");
     assert_eq!(found.len(), 1, "{out}");
-    assert!(found[0].contains("`persist`"), "{out}");
+    assert!(found[0].contains("`main::persist`"), "{out}");
     assert!(found[0].contains("`fsync`"), "{out}");
 }
 

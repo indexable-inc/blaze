@@ -60,8 +60,9 @@ fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
         PureAttr::Trusted(_) => None,
         PureAttr::Malformed(text) => {
             let name = hir_def::signatures::FunctionSignature::of(db, func).name.symbol().as_str();
+            // The text is the attribute's token tree, its delimiters with it.
             let message = format!(
-                "`#[blaze::{}({})]` on `{name}`: the attribute takes nothing, or `trusted = \"why\"`",
+                "`#[blaze::{}{}]` on `{name}`: the attribute takes nothing, or `trusted = \"why\"`",
                 effect.name,
                 text.as_str()
             ); // alloc: a message

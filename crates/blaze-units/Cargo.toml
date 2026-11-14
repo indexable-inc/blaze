@@ -15,6 +15,11 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+# `blaze.lock`'s `[git]` and `[advisories]` tables, and the rule the load refuses an unpinned
+# git package by (`weak_source_pin`).
+blaze-audit.workspace = true
+# A git package's tree digest (`Digest`), which its fetch is pinned by.
+blaze-fetch.workspace = true
 blaze-format.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true

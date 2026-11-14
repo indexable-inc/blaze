@@ -53,8 +53,20 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
     // 151 before the 17 suspicious-code lints (`blaze::skipped_pair` .. `blaze::doc_names_nothing`)
-    // and the 2 magic-literal lints (`blaze::magic_number`, `blaze::magic_string`).
-    assert_eq!(blaze_lints().len(), 170);
+    // and the 5 magic-literal lints (`blaze::magic_number` .. `blaze::string_near_miss_across_crates`),
+    // and the 10 lints of code that carries no weight (`blaze::swapped_arguments` ..
+    // `blaze::swappable_parameters`), and the 12 complexity lints (`blaze::function_weight` ..
+    // `blaze::module_cycle`), and the 10 correct-by-construction lints (`blaze::proof_forgotten`
+    // .. `blaze::validated_but_raw`), and the 6 claim lints (`blaze::claim_contradicts_facts` ..
+    // `blaze::comment_claims`), and the 11 duplicate-code lints (`blaze::same_fn` ..
+    // `blaze::duplicate_across_crates`), and the 7 test-strength lints
+    // (`blaze::result_part_unobserved` .. `blaze::property_over_examples`), and the 4 suggestion
+    // lints (`blaze::could_be_narrower` .. `blaze::could_have_invariant`), and the 10 structural
+    // lints (`blaze::hand_written_derivable` .. `blaze::registry_spread`), and
+    // `blaze::same_behaviour`, and the 5 trust lints (`blaze::dependency_capability` ..
+    // `blaze::workspace_unsafe`).
+    // (The refinement gate, `blaze::refinement`, is the one more.)
+    assert_eq!(blaze_lints().len(), 250);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -67,6 +79,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let internal = group("blaze::internal").expect("blaze's internal group");
     let pedantic = group("blaze::pedantic_perf").expect("blaze's pedantic_perf group");
     let edition = group("blaze::edition").expect("blaze's edition group");
+    let suggest = group("blaze::suggest").expect("blaze's suggest group");
     // The edition lints whose advice this blaze already has warn by default (`ready`): a
     // function-like proc macro's replacement, `const fn`, needs nothing new; the rest wait for
     // their switch.
@@ -88,10 +101,8 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         ("blaze::unmarked_nonblocking", false),
         ("blaze::mut_ref", false),
         // `program_lifetime` is `deny` where it fires (below); the two that say where it would
-        // pay wait for the group.
+        // pay are `blaze::suggest`'s.
         ("blaze::program_lifetime", false),
-        ("blaze::could_be_program_lifetime", false),
-        ("blaze::could_be_ref32", false),
     ];
     for it in edition.lints.iter() {
         assert!(warns.iter().any(|(name, _)| *name == it.name), "`{}` says when it warns", it.name);
@@ -112,18 +123,23 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::unfulfilled_effect",
         "blaze::program_lifetime",
         "blaze::unreachable",
+        "blaze::refinement",
+        // A dependency doing what the workspace did not grant it.
+        "blaze::dependency_capability",
+        "blaze::dependency_unsafe",
     ];
     for it in &blaze_lints()[1..] {
         let in_ = |g: &Group| g.lints.iter().any(|m| m.name == it.name);
-        let (in_general, in_internal, in_pedantic, in_edition) =
-            (in_(general), in_(internal), in_(pedantic), in_(edition));
+        let (in_general, in_internal, in_pedantic, in_edition, in_suggest) =
+            (in_(general), in_(internal), in_(pedantic), in_(edition), in_(suggest));
         assert_eq!(
             usize::from(in_general)
                 + usize::from(in_internal)
                 + usize::from(in_pedantic)
-                + usize::from(in_edition),
+                + usize::from(in_edition)
+                + usize::from(in_suggest),
             1,
-            "`{}` is general, internal, pedantic_perf or edition, once",
+            "`{}` is general, internal, pedantic_perf, edition or suggest, once",
             it.name
         );
         let level = if deny.contains(&it.name) {
@@ -135,7 +151,7 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         };
         assert_eq!(
             it.default_level, level,
-            "`{}`: a general lint warns, an internal, pedantic_perf or edition one waits, but \
+            "`{}`: a general lint warns, an internal, pedantic_perf, edition or suggest one waits, but \
              for an edition lint whose advice is ready",
             it.name
         );
@@ -267,6 +283,8 @@ fn counts_are_rustcs() {
             "blaze::internal",
             "blaze::reach",
             "blaze::proc_macro",
+            "blaze::suggest",
+            "blaze::trust",
         ]
     );
     // With `repeated_reprs`, since Rust 1.100.

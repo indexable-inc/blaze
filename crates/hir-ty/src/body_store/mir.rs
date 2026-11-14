@@ -146,7 +146,40 @@ pub fn place_call(
     owner: ExpressionStoreOwnerId,
     expr: ExprId,
 ) -> Option<(hir_expand::MacroCallId, bool)> {
-    let store = ExpressionStore::of(db, owner);
+    place_call_in(db, owner, ExpressionStore::of(db, owner), expr)
+}
+
+/// Whether the literal `expr` of `store` stands for a `line!()` or `column!()`, for a caller
+/// that holds the store the expression is in. That store is `owner`'s own, or one lowered apart
+/// from it (a type read on its own, as an editor's query does: its ids are not the owner's).
+///
+/// The invariant: an expression is only ever read from the store it is in. For a store lowered
+/// apart, the owner's source map does not hold its expressions, so which literal a place macro
+/// wrote can't be told; where such a store calls a place macro at all, every integer literal of
+/// it is answered `true`, and its const is made as an anon const, which is right for both.
+pub fn is_place(db: &Db, owner: ExpressionStoreOwnerId, store: &ExpressionStore, expr: ExprId) -> bool {
+    if !matches!(store.expr(expr), Expr::Literal(hir_def::hir::Literal::Uint(..)))
+        || !calls_place_macro(db, store)
+    {
+        return false;
+    }
+    if !core::ptr::eq(store, ExpressionStore::of(db, owner)) {
+        return true;
+    }
+    place_call_in(db, owner, store, expr).is_some()
+}
+
+#[expect(
+    blaze::reads_positions,
+    reason = "which expansion a literal came from is read off the unmoved source map, whose ids \
+              hold no line: the answer is the call, never where it is"
+)]
+fn place_call_in(
+    db: &Db,
+    owner: ExpressionStoreOwnerId,
+    store: &ExpressionStore,
+    expr: ExprId,
+) -> Option<(hir_expand::MacroCallId, bool)> {
     if !matches!(store.expr(expr), Expr::Literal(hir_def::hir::Literal::Uint(..)))
         || !calls_place_macro(db, store)
     {

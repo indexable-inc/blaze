@@ -10,12 +10,14 @@
 //! subject is no edge. No fix.
 
 use base_db::Db;
-use cfg::{CfgAtom, CfgExpr};
 use hir::HasAttrs as _;
 use hir_def::hir::Expr;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 
-use super::{super::{Lint, std_mistakes::report}, test_asserts_nothing::is_test_fn};
+use super::{
+    super::{Lint, std_mistakes::report, test_code::names_test},
+    test_asserts_nothing::is_test_fn,
+};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::TestMissesItsSubject;
@@ -117,13 +119,3 @@ fn in_test_module(db: &Db, module: hir::Module) -> bool {
     false
 }
 
-/// clippy's `is_cfg_test`, as `test_code` reads a module's `cfg`: the `cfg`'s list has the word
-/// `test`.
-fn names_test(cfg: &CfgExpr) -> bool {
-    let is_test =
-        |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
-    match cfg {
-        CfgExpr::All(items) => items.iter().any(is_test),
-        it => is_test(it),
-    }
-}

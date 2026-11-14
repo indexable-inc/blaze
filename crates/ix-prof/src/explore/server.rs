@@ -229,7 +229,11 @@ fn unix_now_s() -> Result<u64, StartError> {
 }
 
 fn server_config(identity: Identity) -> ServerConfig {
-    ServerConfig { identity, transport: Transport { idle: IDLE, keep_alive: Some(KEEP_ALIVE) } }
+    ServerConfig {
+        identity,
+        transport: Transport { idle: IDLE, keep_alive: Some(KEEP_ALIVE) },
+        requests: false,
+    }
 }
 
 async fn run(

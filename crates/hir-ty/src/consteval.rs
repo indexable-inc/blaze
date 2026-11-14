@@ -404,7 +404,7 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
     // (`body_store::placed_literal`): an anon const, whose MIR makes the value. Told by the
     // call alone (`body_store::place_call`), so no line is read here.
     if let Expr::Literal(_) = expr
-        && crate::body_store::place_call(interner.db, owner, path_expr).is_some()
+        && crate::body_store::is_place(interner.db, owner, store, path_expr)
     {
         return Err(CreateConstError::NeedsAnonConst);
     }

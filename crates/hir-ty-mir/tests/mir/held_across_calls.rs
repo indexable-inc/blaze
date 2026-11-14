@@ -1,5 +1,6 @@
 //! `MirBody::held_across_calls_in`: what a call that may suspend keeps alive, by the analyses
-//! `held_locals_in` runs across a yield.
+//! `held_locals_in` runs across a yield; and `MirBody::live_after_calls_in`, what a lock's guard
+//! is held across.
 
 use hir_expand::fixture;
 use hir_ty::{db::HirDatabase, mir::TerminatorKind, next_solver::TyKind};
@@ -49,5 +50,38 @@ fn a_call_holds_what_is_used_after_it_or_borrowed_before_it() {
                 .collect()
         });
         assert_eq!(held, ["u8", "u16", "u64"]);
+    });
+}
+
+/// `MirBody::live_after_calls_in`, what a lock's guard is held across: live after `park()` are
+/// the parameter and `kept` alone. `r`, borrowed before it and never used after, is not, the
+/// one difference from what the call holds for a coroutine's layout.
+///
+/// The invariant: a local is live after a call exactly when some path from the call's return
+/// uses or drops it.
+#[test]
+fn a_call_has_live_after_it_only_what_is_used_after_it() {
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
+    blaze_query::db::attach(&db, || {
+        let body = db.mir_body(function(&db, "work").into()).expect("the body");
+        let calls: Vec<_> = (body.basic_blocks.iter())
+            .filter(|(_, block)| {
+                matches!(&block.terminator, Some(it) if matches!(it.kind, TerminatorKind::Call { .. }))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let [call] = calls[..] else { panic!("{} calls", calls.len()) };
+        let live: Vec<String> = blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+            let live = body.live_after_calls_in(frame, &[call]);
+            (live[0].iter())
+                .map(|&local| match body.locals[local].ty.as_ref().kind() {
+                    TyKind::Uint(it) => format!("{it:?}"),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        });
+        assert_eq!(live, ["u8", "u16"]);
     });
 }

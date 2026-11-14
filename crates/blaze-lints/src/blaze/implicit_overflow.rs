@@ -8,7 +8,7 @@
 //! What it judges, of a function's body and its closures, test code left out: integer `+`,
 //! `-`, `*`, `<<` and `>>`, their compound forms, unary `-` of a signed integer, an `as` that
 //! can lose an integer's value (to a narrower integer, between signed and unsigned, `usize`
-//! and `isize` taken as narrow as 32 bits on the target side, as `lossy_as` takes them), and a
+//! and `isize` taken as narrow as 32 bits on the target side, as `as_cast` takes them), and a
 //! call whose overflow is the profile's or a panic (`pow`, `abs`, `next_power_of_two`,
 //! `Iterator::sum` and `product` of integers, `strict_*`). The forms that say what overflow
 //! means are not found, being calls the prover does not need: `checked_*`, `wrapping_*` and
@@ -23,6 +23,9 @@
 //! subtraction that `len_minus` reports (`v.len() - n` with no check before it) is left to
 //! `len_minus` when that lint is on, so the place is found once, with the advice for a length.
 //!
+//! A cast it reports is its finding alone: `as_cast` gives way there ([`reported_casts`]), so
+//! one cast has one finding, the one the prover stands behind.
+//!
 //! There is no fallback: a body that does not lower, or whose proof does not settle, has each
 //! of its operations found, saying so. The fix, machine-applicable, is offered in a function
 //! returning `Option` (outside closures): `a + b` becomes `a.checked_add(b)?`, `x as u8`
@@ -34,16 +37,18 @@ use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId,
     expr_store::Body,
     hir::{ArithOp, BinaryOp, Expr, ExprId, Literal, UnaryOp},
+    resolver::ValueNs,
 };
 use hir_ty::{
+    consteval::{allocation_as_isize, allocation_as_usize},
     db::HirDatabase as _,
-    next_solver::{Ty, TyKind},
+    next_solver::{GenericArgs, Ty, TyKind},
 };
 use hir_ty_pure::reach::{Missing, OpKind, Overflow};
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{NodeOrToken, TextRange};
 
-use super::{Lint, facts, lossy_as};
+use super::{Lint, as_cast, facts, general_facts};
 use crate::{check::Cx, diag::Applicability};
 
 const LINT: Lint = Lint::ImplicitOverflow;
@@ -57,10 +62,26 @@ struct Found {
     message: String,
     note: &'static str,
     fix: Option<(TextRange, String)>,
+    /// Of an `as`: the place `as_cast` gives way at.
+    cast: bool,
+}
+
+/// Whether the lint judges the walked body.
+fn judging(cx: &Cx<'_, '_>) -> bool {
+    cx.on_blaze(LINT) && !cx.is_in_test(cx.root())
+}
+
+/// The ranges of the casts this lint reports in the walked body, where `as_cast` gives way:
+/// one cast, one finding, the one with the prover behind it. Empty where it is off.
+pub(super) fn reported_casts(cx: &Cx<'_, '_>) -> Vec<TextRange> {
+    if !judging(cx) {
+        return Vec::new();
+    }
+    find(cx).into_iter().filter(|it| it.cast).map(|it| it.range).collect() // alloc: one body's cast places
 }
 
 pub(super) fn check(cx: &mut Cx<'_, '_>) {
-    if !cx.on_blaze(LINT) || cx.is_in_test(cx.root()) {
+    if !judging(cx) {
         return;
     }
     let found = find(cx);
@@ -175,7 +196,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
                         shown(ty)
                     ),
                 };
-                found.push(Found { range, message, note: CALL_NOTE, fix: None });
+                found.push(Found { range, message, note: CALL_NOTE, fix: None, cast: false });
                 continue;
             }
         };
@@ -186,7 +207,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
                 quote(id).unwrap_or_else(|| "this `as`".to_owned()), // alloc: a message's part
                 shown(ty)
             );
-            found.push(Found { range, message, note: FLOAT_NOTE, fix: None });
+            found.push(Found { range, message, note: FLOAT_NOTE, fix: None, cast: true });
             continue;
         }
         let overflow = *overflow.get_or_insert_with(|| hir_ty_pure::reach::overflow_of_body(db, def));
@@ -218,7 +239,8 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Found> {
         let in_file = at.file_id == file && cx.in_file();
         let fix = if in_file { fixes.fix(cx, analysis, &parents, id, &site, ty, &shown) } else { None };
         let fix = fix.map(|text| (range, text));
-        found.push(Found { range, message, note: NOTE, fix });
+        let cast = matches!(site, Site::Cast { .. });
+        found.push(Found { range, message, note: NOTE, fix, cast });
     }
     found
 }
@@ -237,10 +259,10 @@ fn written_bin(root: syntax::view::Node<'_>, range: TextRange) -> Option<syntax:
 }
 
 /// What `expr` is, when the lint judges it.
-fn site(
-    cx: &Cx<'_, '_>,
+fn site<'q>(
+    cx: &Cx<'_, 'q>,
     body: &Body,
-    infer: &hir_ty::InferenceResult<'_>,
+    infer: &hir_ty::InferenceResult<'q>,
     id: ExprId,
     expr: Expr<'_>,
 ) -> Option<Site> {
@@ -259,17 +281,23 @@ fn site(
         {
             Site::Neg { operand }
         }
+        // What an `as` can lose is `as_cast`'s classification, the one home of it.
         Expr::Cast { expr: operand, .. } => {
             let (from_ty, to_ty) = (infer.expr_ty(operand), infer.expr_ty(id));
-            let (from, to) = (lossy_as::Kind::of(from_ty)?, lossy_as::Kind::of(to_ty)?);
-            if from_ty == to_ty || !lossy_as::loss(from, to)?.of_value() {
+            if from_ty == to_ty {
                 return None;
             }
-            let Ok(def) = DefWithBodyId::try_from(cx.analysis()?.def()) else { return None };
-            if lossy_as::known(cx, def, body, operand, from).is_some_and(|it| lossy_as::fits(it, to)) {
+            let analysis = cx.analysis()?;
+            let from = as_cast::Kind::of(&analysis.ty(from_ty));
+            let to = as_cast::Kind::of(&analysis.ty(to_ty));
+            if !as_cast::loss(from, to)?.of_value() {
                 return None;
             }
-            Site::Cast { operand, float: matches!(from, lossy_as::Kind::Float(_)) }
+            let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return None };
+            if known(cx, def, body, operand, from).is_some_and(|it| fits(it, to)) {
+                return None;
+            }
+            Site::Cast { operand, float: matches!(from, as_cast::Kind::Float(_)) }
         }
         Expr::MethodCall { .. } => {
             let (func, _) = infer.method_resolution(id)?;
@@ -277,6 +305,64 @@ fn site(
         }
         _ => return None,
     })
+}
+
+/// The value of the integer `operand`, of kind `from`, when it is known without running the
+/// code: an integer literal, maybe negated, or a `const` with no generics that evaluates.
+fn known(cx: &Cx<'_, '_>, def: DefWithBodyId, body: &Body, operand: ExprId, from: as_cast::Kind) -> Option<i128> {
+    let as_cast::Kind::Int(as_cast::Int { signed, .. }) = from else { return None };
+    match body.expr(operand) {
+        Expr::Literal(literal) => literal_value(literal),
+        Expr::UnaryOp { expr, op: UnaryOp::Neg } => match body.expr(expr) {
+            Expr::Literal(literal) => literal_value(literal)?.checked_neg(),
+            _ => None,
+        },
+        Expr::Path(_) => {
+            let db = cx.db();
+            let ValueNs::ConstId(konst) = general_facts::value_of(db, def, body, operand)? else {
+                return None;
+            };
+            if hir_ty::generics::generics(db, konst.into()).iter(true).next().is_some() {
+                return None;
+            }
+            let value = db.const_eval(konst, GenericArgs::empty(), None).ok()?;
+            match signed {
+                true => Some(allocation_as_isize(value)),
+                false => i128::try_from(allocation_as_usize(value)).ok(),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The value of an integer literal, if `i128` holds it.
+fn literal_value(literal: &Literal) -> Option<i128> {
+    match *literal {
+        Literal::Int(value, _) => Some(value),
+        Literal::Uint(value, _) => i128::try_from(value).ok(),
+        _ => None,
+    }
+}
+
+/// Whether `value` survives a cast to `to`, on every pointer width.
+fn fits(value: i128, to: as_cast::Kind) -> bool {
+    match to {
+        as_cast::Kind::Int(as_cast::Int { signed, width }) => {
+            let bits = width.least();
+            if bits >= 128 {
+                return signed || value >= 0;
+            }
+            match signed {
+                true => {
+                    let half = 1i128 << (bits - 1);
+                    (-half..half).contains(&value)
+                }
+                false => (0..(1i128 << bits)).contains(&value),
+            }
+        }
+        as_cast::Kind::Float(bits) => value.unsigned_abs() <= 1u128 << as_cast::mantissa(bits),
+        _ => false,
+    }
 }
 
 fn arith(op: ArithOp) -> bool {

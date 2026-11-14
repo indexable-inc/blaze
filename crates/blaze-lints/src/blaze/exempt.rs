@@ -62,7 +62,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ManyBools
         | Lint::DefaultPolicy
         // Kept with `#[expect(..)]`: a core and a key are choices of the item, not of one line
-        // (`key_ignores_field`'s `// not in key: <why>` names one field, through [`commented`]).
+        // (`key_ignores_field`'s `// left out: <why>` names one field, through [`commented`]).
         | Lint::SansIoCore
         | Lint::KeyIgnoresField
         // Kept with `#[expect(blaze::wildcard_arm, reason = ..)]` on the arm, the `match` or
@@ -168,6 +168,12 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::ProgramLifetime
         | Lint::CouldBeProgramLifetime
         | Lint::CouldBeRef32
+        // Suggestions and the refinement gate: advice is taken or left, never kept by a comment.
+        | Lint::CouldBeNarrower
+        | Lint::CouldBeSansIo
+        | Lint::CouldBeLinear
+        | Lint::CouldHaveInvariant
+        | Lint::Refinement
         // Kept with `#[expect(..)]` on the function: where a setting is read is the item's
         // choice, and the allowed modules are named in `clippy.toml`.
         | Lint::EnvRead
@@ -227,7 +233,91 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::IgnoredWithoutReason
         | Lint::DocNamesNothing
         | Lint::MagicNumber
-        | Lint::MagicString => None,
+        | Lint::MagicString
+        | Lint::RepeatedFormat
+        | Lint::StringSharedAcrossCrates
+        | Lint::StringNearMissAcrossCrates
+        | Lint::SwappedArguments
+        | Lint::WriteOnlyField
+        | Lint::OnlyUsedInTests
+        | Lint::SingleImplTrait
+        | Lint::ForwardingFn
+        | Lint::ConstantArgument
+        | Lint::AlwaysSameResult
+        | Lint::NeverConstructed
+        | Lint::NeverMatched
+        | Lint::SwappableParameters
+        // Held by the per-item baseline (`baselines/items.tsv`), never by a comment.
+        | Lint::FunctionWeight
+        | Lint::PathCount
+        | Lint::LiveState
+        | Lint::EffectBreadth
+        | Lint::Exits
+        | Lint::LongFunction
+        | Lint::LongFile
+        | Lint::ManyParams
+        | Lint::WideType
+        | Lint::DeepNesting
+        | Lint::FanOut
+        | Lint::ModuleCycle
+        | Lint::ProofForgotten
+        | Lint::UnitMismatch
+        | Lint::PrimitiveMeaning
+        | Lint::SentinelValue
+        | Lint::StateInFlags
+        | Lint::BoolPairState
+        | Lint::OutParameter
+        | Lint::ParallelCollections
+        | Lint::UntypedIndex
+        | Lint::ValidatedButRaw
+        | Lint::ClaimContradictsFacts
+        | Lint::ClaimIsDerivable
+        | Lint::ClaimWithoutEvidence
+        | Lint::EvidenceIsStale
+        | Lint::SafetyWithoutInvariant
+        | Lint::CommentClaims
+        // Held by `#[expect(blaze::<lint>, reason = ..)]` and the ratchet baselines.
+        | Lint::SameFn
+        | Lint::SameImplFn
+        | Lint::SameBlock
+        | Lint::NearDuplicate
+        | Lint::PasteMismatch
+        | Lint::SameType
+        | Lint::SameConst
+        | Lint::ExtractableDuplicate
+        | Lint::TestsDifferByLiteral
+        | Lint::ImplsDifferByType
+        | Lint::DuplicateAcrossCrates
+        // Held by `#[expect(blaze::<lint>, reason = ..)]` on the function or the test.
+        | Lint::ResultPartUnobserved
+        | Lint::WeakAssertion
+        | Lint::MirrorAssertion
+        | Lint::PseudoTested
+        | Lint::UnreachedByTests
+        | Lint::ErrorPathUntested
+        | Lint::PropertyOverExamples
+        // Kept with `#[expect(..)]` on the impl, the enum or the list: a field left out of a
+        // field-wise body says so with `// left out: <why>` on its `field: _`, through
+        // [`commented`], not by a tag.
+        | Lint::HandWrittenDerivable
+        | Lint::ImplMissesField
+        | Lint::HandKeptVariantList
+        | Lint::VariantListDrift
+        | Lint::HandWrittenCodec
+        | Lint::FieldWiseConversion
+        | Lint::ConversionMissesField
+        | Lint::HandWrittenVisitor
+        | Lint::RepeatedFieldList
+        | Lint::RegistrySpread
+        // Held by `#[expect(blaze::same_behaviour, reason = ..)]` and the ratchet baseline.
+        | Lint::SameBehaviour
+        // About a dependency: granted in the root manifest's `[workspace.metadata.blaze.trust]`,
+        // or for a workspace crate's own `unsafe` at its root, never by a comment on a line.
+        | Lint::DependencyCapability
+        | Lint::DependencyUnsafe
+        | Lint::TrustGrantUnused
+        | Lint::DependencyCapabilityUnreached
+        | Lint::WorkspaceUnsafe => None,
     }
 }
 
@@ -302,7 +392,9 @@ mod tests {
         assert!(!exempt(text, at(text, "z.clone()"), Lint::HotClone));
         assert!(exempt(text, at(text, "z.clone()"), Lint::HotDyn));
         assert!(!exempt(text, at(text, "z.clone()"), Lint::DefaultHasher));
-        assert!(!exempt(text, at(text, "z.clone()"), Lint::HotDyn));
+        // No comment stands in for an allocator (rule bump-allocate): `// alloc:` keeps nothing.
+        let text = "// alloc: why\nlet v = Vec::new();\n";
+        assert!(!exempt(text, at(text, "Vec::new()"), Lint::HotAlloc));
     }
 
     #[test]

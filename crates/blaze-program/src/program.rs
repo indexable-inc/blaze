@@ -48,15 +48,15 @@
 #![deny(blaze::sans_io_core)]
 
 use std::alloc::Global;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::Plant;
 use crate::change::{Import, LineWrite, PlacementChange, Section, Write};
-use crate::key::{InstanceKey, ItemId, Node, Settings, Symbol, Tier};
+use crate::key::{InstanceKey, ItemId, Node, PlanKey, Settings, Symbol, Tier};
 use crate::record::{InstanceCode, RelocError, RelocKind, StaticValue, Target, ValueKey};
 use crate::codec::{CodecError, Digest, In, Out, Payload};
-use crate::walk::{Front, Prior, Seed, Span, Walked};
+use crate::walk::{Front, Prior, Seed, Span, Stale, Walked};
 
 /// The instruction set (hosts: macOS arm64, Linux arm64 and x86_64).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -107,7 +107,11 @@ pub struct FnRow {
     pub statics: Vec<Symbol, Global>,
     /// The fields of its code that point at functions and statics, by relocation index.
     pub out: Vec<(Node, u32), Global>,
-    pub inlined: Vec<Symbol, Global>,
+    /// Its plan key: with [`FnRow::inlined`], the tier-free identity of the code a test runs
+    /// through this row ([`crate::reach`]).
+    pub plan: PlanKey,
+    /// Every instance it took in at any depth, sorted by symbol, each once, with its plan key.
+    pub inlined: Vec<(Symbol, PlanKey), Global>,
     /// The item each of its locations is in, in order.
     pub loc_items: Vec<ItemId, Global>,
 }
@@ -156,6 +160,20 @@ pub struct Delta {
     /// Workspace instances to make again at the top tier, their bodies unchanged
     /// ([`Program::tier_ups`]).
     pub tier_up: Vec<Symbol, Global>,
+}
+
+impl Delta {
+    /// The tier a workspace node new to the program is made at in this delta's walk
+    /// ([`crate::walk::WalkConfig::new_at`]): `Release` when the delta only tiers up (a
+    /// background walk: what it reaches first is made once, at the tier the program is moving
+    /// to), `Edit` when it carries any edit (nothing an edit needs waits on the top tier).
+    pub fn new_at(&self) -> Tier {
+        let edits = !self.edited.is_empty() || !self.gone.is_empty() || !self.statics.is_empty() || !self.moved.is_empty();
+        match edits || self.tier_up.is_empty() {
+            true => Tier::Edit,
+            false => Tier::Release,
+        }
+    }
 }
 
 /// The code records a program reads, by instance key.
@@ -415,13 +433,13 @@ impl Program {
         out
     }
 
-    /// The nodes an edit walk starts from: every placed instance of an edited item
-    /// ([`Seed::Edited`]); every function that calls one or a gone one, and every instance that
-    /// took any of those in at any depth ([`Seed::Revisit`]: its inline decisions or inlinees
-    /// may have changed, its tier is kept); every changed static; every root not yet placed;
-    /// and the tier-ups ([`Seed::TierUp`] or [`Seed::Promote`]). On an empty program with
-    /// [`Program::top_tier`] of another as `delta.tier_up`, a whole build that holds the same
-    /// rows at the same tiers.
+    /// The stale nodes of a delta, each seeded by the crate's row rule ([`Seed::Walk`] or
+    /// [`Seed::IfReached`]): every placed instance of an edited item ([`Stale::Edited`]); every
+    /// function that calls one or a gone one, and every instance that took any of those in at
+    /// any depth ([`Stale::Revisit`]: its inline decisions or inlinees may have changed, its
+    /// tier is kept); every changed static; every root not yet placed; and the tier-ups
+    /// ([`Stale::TierUp`]). On an empty program with [`Program::top_tier`] of another as
+    /// `delta.tier_up`, a whole build that holds the same rows at the same tiers.
     pub fn seeds(&self, delta: &Delta) -> Vec<(Node, Seed), Global> {
         // The placed instances of edited items, and of gone ones (whose callers must look).
         let mut edited = BTreeSet::new_in(Global);
@@ -475,57 +493,96 @@ impl Program {
                 revisit.insert(*inliner);
             }
         }
-        let mut seeds = BTreeMap::new_in(Global);
+        // The stale nodes, each with how it is walked. An edit wins over a revisit, and both
+        // over a tier-up (a changed body starts again at the fast tier; a revisit keeps its
+        // tier); a root not placed yet is stale as an edit, or as a tier-up when it is one.
+        let mut stale = BTreeMap::new_in(Global);
         for symbol in revisit {
             if !touched.contains(&symbol) || edited.contains(&symbol) {
-                seeds.insert(Node::Function(symbol), Seed::Revisit);
+                stale.insert(Node::Function(symbol), Stale::Revisit);
             }
         }
-        // An edit wins over a revisit and a tier-up: a changed body starts again at the fast
-        // tier.
         for symbol in &edited {
-            seeds.insert(Node::Function(*symbol), Seed::Edited);
+            stale.insert(Node::Function(*symbol), Stale::Edited);
         }
         for symbol in &delta.statics {
-            seeds.insert(Node::Static(*symbol), Seed::Edited);
+            stale.insert(Node::Static(*symbol), Stale::Edited);
         }
-        for root in &self.roots {
-            if !self.holds(root) {
-                seeds.insert(*root, Seed::Edited);
-            }
-        }
-        // Tier-ups, decided last, against everything else this walk starts from. Whether a
-        // node has a row is the walk's one rule, the same for a whole build and a delta: a
-        // node has one when it is a root or a node the program holds after the walk refers to
-        // it. A tier-up some node outside the walk still refers to (a static or an instance not
-        // walked again) keeps its row whatever the walked callers inline: it is walked
-        // ([`Seed::TierUp`]). One referred to only by nodes this walk walks, or that tier up
-        // too, has a row exactly when the walk reaches it: it is only promoted
-        // ([`Seed::Promote`]). An edit and a revisit win over a tier-up (a changed body starts
-        // again at the fast tier; a revisit keeps its tier); a root not placed yet tiers up.
         let mut tiering = BTreeSet::new_in(Global);
         tiering.extend(delta.tier_up.iter().copied());
-        for symbol in &delta.tier_up {
-            let target = Node::Function(*symbol);
-            match seeds.get(&target) {
-                Some(Seed::Edited) if !edited.contains(symbol) && self.roots.contains(&target) => {}
-                Some(_) => continue,
-                None => {}
+        for root in &self.roots {
+            if !self.holds(root) {
+                let tiers = matches!(root, Node::Function(symbol) if tiering.contains(symbol));
+                stale.insert(*root, if tiers { Stale::TierUp } else { Stale::Edited });
             }
-            let mut needed = self.roots.contains(&target);
-            for ((at, referrer, _), _) in self.sites.range((target, LEAST_NODE, 0u32)..) {
-                if *at != target {
+        }
+        for symbol in &delta.tier_up {
+            stale.entry(Node::Function(*symbol)).or_insert(Stale::TierUp);
+        }
+        // The row rule: a stale node a root or an unstale path from an unstale root holds is in
+        // the new set whatever the walk does, and is walked for its own sake; every other one
+        // is in it exactly when the walk reaches it.
+        // A stale node not held that way is reached, if at all, from a walked node: directly,
+        // or through kept rows that are its unstale ancestors (its gates, [`Seed::Gate`]),
+        // which forward to what they call when the walk passes them.
+        let mut live = BTreeSet::new_in(Global);
+        let mut gates = BTreeSet::new_in(Global);
+        let mut out = Vec::with_capacity_in(stale.len(), Global);
+        for (node, how) in &stale {
+            let anchored = self.roots.contains(node) || self.kept_reaches(node, &stale, &mut live, &mut gates);
+            out.push((*node, if anchored { Seed::Walk(*how) } else { Seed::IfReached(*how) }));
+        }
+        for gate in gates {
+            out.push((gate, Seed::Gate));
+        }
+        out
+    }
+
+    /// Whether an unstale root reaches `node` through unstale rows only (none of them in
+    /// `stale`): nothing on such a path is walked again, so its edges are the new program's
+    /// and `node` has a row whatever the walk does. Searched upward from `node` over the sites
+    /// table, so it reads the edit's ancestors, not the program. When none does, every unstale
+    /// ancestor it saw is added to `gates`: the walk reaches `node` through them, if at all.
+    /// `live` keeps, across the calls of one [`Program::seeds`], unstale nodes known to reach
+    /// such a root (every node on a path found).
+    fn kept_reaches(
+        &self,
+        node: &Node,
+        stale: &BTreeMap<Node, Stale, Global>,
+        live: &mut BTreeSet<Node, Global>,
+        gates: &mut BTreeSet<Node, Global>,
+    ) -> bool {
+        let mut visited = BTreeSet::new_in(Global);
+        // Each visited ancestor's node below it on the path from `node`.
+        let mut below = BTreeMap::new_in(Global);
+        let mut queue = VecDeque::new_in(Global);
+        queue.push_back(*node);
+        while let Some(at) = queue.pop_front() {
+            for ((target, referrer, _), _) in self.sites.range((at, LEAST_NODE, 0u32)..) {
+                if *target != at {
                     break;
                 }
-                let walked = seeds.contains_key(referrer)
-                    || matches!(referrer, Node::Function(caller) if tiering.contains(caller));
-                needed |= !walked;
+                if stale.contains_key(referrer) || !visited.insert(*referrer) {
+                    continue;
+                }
+                below.insert(*referrer, at);
+                if live.contains(referrer) || self.roots.contains(referrer) {
+                    let mut on = *referrer;
+                    live.insert(on);
+                    while let Some(next) = below.get(&on).copied() {
+                        if next == *node {
+                            break;
+                        }
+                        live.insert(next);
+                        on = next;
+                    }
+                    return true;
+                }
+                queue.push_back(*referrer);
             }
-            seeds.insert(target, if needed { Seed::TierUp } else { Seed::Promote });
         }
-        let mut out = Vec::new_in(Global);
-        out.extend(seeds);
-        out
+        gates.extend(visited);
+        false
     }
 
     /// Every function the program holds at the top tier: with [`Delta::tier_up`], what a whole
@@ -540,7 +597,9 @@ impl Program {
         out
     }
 
-    /// Places what a walk gave, and the span moves of `moved`, giving the change to apply.
+    /// Places what a walk gave ([`crate::walk::Ended`]: what it walked, and the stale nodes it
+    /// never reached, which have no row now and are retired with every node only they
+    /// reached), and the span moves of `moved`, giving the change to apply.
     /// Refused before anything changes when a record, a value or a span is missing, a field
     /// points at a node the program would not hold, or a reserve would be outgrown. A field
     /// whose distance does not fit ([`ProgramError::Reloc`], only past a reserve of 64 MiB on
@@ -549,6 +608,7 @@ impl Program {
     pub fn place(
         &mut self,
         walked: &[Walked],
+        unreached: &[Node],
         moved: &[ItemId],
         front: &impl Front,
         records: &impl Records,
@@ -648,7 +708,8 @@ impl Program {
 
         // Pass one: every changed node's place and import slots.
         let mut changed = BTreeSet::new_in(Global);
-        let mut lost_edge = false;
+        // A held node the walk never reached has left the set of rows: the mark runs.
+        let mut lost_edge = unreached.iter().any(|node| self.holds(node));
         let mut moved_targets = Vec::new_in(Global);
         for node in &loaded {
             match node {
@@ -709,6 +770,7 @@ impl Program {
                             calls: walked.calls.clone(),
                             statics: walked.statics.clone(),
                             out: Vec::new_in(Global),
+                            plan: walked.plan,
                             inlined: walked.inlined.clone(),
                             loc_items,
                         },
@@ -858,6 +920,7 @@ impl Program {
                 node: Node::Function(*symbol),
                 key: row.key.0,
                 tier: row.tier,
+                plan: row.plan,
                 calls: row.calls.clone(),
                 statics: row.statics.clone(),
                 inlined: row.inlined.clone(),
@@ -868,13 +931,14 @@ impl Program {
                 node: Node::Static(*symbol),
                 key: row.key.0,
                 tier: Tier::Release,
+                plan: PlanKey::default(),
                 calls: row.calls.clone(),
                 statics: row.statics.clone(),
                 inlined: Vec::new_in(Global),
             });
         }
         let mut program = Program::new(machine, self.settings, &self.roots, self.plant);
-        let change = program.place(&walked, &[], front, records)?;
+        let change = program.place(&walked, &[], &[], front, records)?;
         // Keep each row's build, so tier-up choices survive a relayout.
         for (symbol, row) in &self.fns {
             if let Some(new) = program.fns.get_mut(symbol) {
@@ -973,7 +1037,7 @@ impl Program {
         for (index, item) in previous.loc_items.iter().enumerate() {
             self.loc_items.remove(&(*item, *symbol, index as u32));
         }
-        for inlinee in &previous.inlined {
+        for (inlinee, _) in &previous.inlined {
             self.inliners.remove(&(*inlinee, *symbol));
         }
     }
@@ -996,7 +1060,7 @@ impl Program {
         };
         let (code_place, locs_place) = (row.code, row.locs);
         let mut inlined = Vec::with_capacity_in(row.inlined.len(), Global);
-        inlined.extend_from_slice(&row.inlined);
+        inlined.extend(row.inlined.iter().map(|(inlinee, _)| *inlinee));
         let base = self.machine.base(Section::Text) + code_place.offset;
         let mut bytes = Vec::with_capacity_in(code.placed_len() as usize, Global);
         bytes.extend_from_slice(code.code());
@@ -1267,7 +1331,8 @@ impl Program {
                 encode_symbols(&row.calls, out);
                 encode_symbols(&row.statics, out);
                 encode_out(&row.out, out);
-                encode_symbols(&row.inlined, out);
+                out.digest(&row.plan.0);
+                encode_planned(&row.inlined, out);
                 out.count(row.loc_items.len());
                 for item in &row.loc_items {
                     out.digest(&item.0);
@@ -1351,13 +1416,14 @@ impl Program {
                 let calls = decode_symbols(input)?;
                 let statics = decode_symbols(input)?;
                 let out = decode_out(input)?;
-                let inlined = decode_symbols(input)?;
+                let plan = PlanKey(input.digest()?);
+                let inlined = decode_planned(input)?;
                 let count = input.count(32)?;
                 let mut loc_items = Vec::with_capacity_in(count, Global);
                 for _ in 0..count {
                     loc_items.push(ItemId(input.digest()?));
                 }
-                self.fns.insert(symbol, FnRow { key, tier, code, locs, since, calls, statics, out, inlined, loc_items });
+                self.fns.insert(symbol, FnRow { key, tier, code, locs, since, calls, statics, out, plan, inlined, loc_items });
             }
             1 => {
                 let symbol = Symbol::decode(input)?;
@@ -1456,6 +1522,23 @@ impl Prior for Program {
     fn tier(&self, symbol: &Symbol) -> Option<Tier> {
         self.fns.get(symbol).map(|row| row.tier)
     }
+
+    fn targets(&self, node: &Node) -> Vec<Node, Global> {
+        let mut out = Vec::new_in(Global);
+        let (calls, statics) = match node {
+            Node::Function(symbol) => match self.fns.get(symbol) {
+                Some(row) => (&row.calls, &row.statics),
+                None => return out,
+            },
+            Node::Static(symbol) => match self.statics.get(symbol) {
+                Some(row) => (&row.calls, &row.statics),
+                None => return out,
+            },
+        };
+        out.extend(calls.iter().map(|callee| Node::Function(*callee)));
+        out.extend(statics.iter().map(|target| Node::Static(*target)));
+        out
+    }
 }
 
 fn decode_tier(input: &mut In<'_>) -> Result<Tier, CodecError> {
@@ -1488,6 +1571,24 @@ fn decode_symbols(input: &mut In<'_>) -> Result<Vec<Symbol, Global>, CodecError>
     let mut out = Vec::with_capacity_in(count, Global);
     for _ in 0..count {
         out.push(Symbol::decode(input)?);
+    }
+    Ok(out)
+}
+
+fn encode_planned(planned: &[(Symbol, PlanKey)], out: &mut Out) {
+    out.count(planned.len());
+    for (symbol, plan) in planned {
+        symbol.encode(out);
+        out.digest(&plan.0);
+    }
+}
+
+fn decode_planned(input: &mut In<'_>) -> Result<Vec<(Symbol, PlanKey), Global>, CodecError> {
+    let count = input.count(96)?;
+    let mut out = Vec::with_capacity_in(count, Global);
+    for _ in 0..count {
+        let symbol = Symbol::decode(input)?;
+        out.push((symbol, PlanKey(input.digest()?)));
     }
     Ok(out)
 }

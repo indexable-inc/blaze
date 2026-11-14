@@ -1762,9 +1762,10 @@ fn a_file_name_cloned_into_effects_allocates_nothing() {
 fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
     let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let made = || name("made");
+    let options = crate::dgram::Options::default();
     let mut effects = vec![
-        Effect::Bind { at: loopback, tag: Tag(1) },
-        Effect::Bind { at: loopback, tag: Tag(2) },
+        Effect::Bind { at: loopback, options, tag: Tag(1) },
+        Effect::Bind { at: loopback, options, tag: Tag(2) },
         Effect::Now { tag: Tag(7) },
         Effect::Random { len: 32, tag: Tag(8) },
         Effect::Random { len: crate::RANDOM_MOST + 1, tag: Tag(9) },
@@ -1788,11 +1789,16 @@ fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
                     bound[tag.0 as usize - 1] = Some((sock, local));
                     "bound".to_owned()
                 }
-                Done::Datagram { from, bytes } => format!(
-                    "{} from the first: {}",
-                    String::from_utf8_lossy(&bytes),
-                    bound[0].is_some_and(|(_, at)| at == from)
-                ),
+                Done::Datagrams(batch) => match batch.each().next() {
+                    Some((head, bytes)) => format!(
+                        "{} from the first: {}",
+                        String::from_utf8_lossy(bytes),
+                        bound[0].is_some_and(|(_, at)| at == head.peer)
+                    ),
+                    None => "no datagram".to_owned(),
+                },
+                Done::SentDatagrams(batch) => format!("sent, {} left", batch.bytes.len()),
+                Done::DatagramsFailed { .. } => "broken".to_owned(),
                 Done::Wall(wall) => {
                     let near = match real {
                         true => {
@@ -1819,13 +1825,15 @@ fn host(driver: &mut impl Driver, real: bool) -> BTreeMap<u64, String> {
             match tag.0 {
                 1 | 2 => {
                     if let [Some((from, _)), Some((to, at))] = bound {
-                        effects.push(Effect::RecvFrom { sock: to, into: Vec::new(), tag: Tag(4) });
-                        effects.push(Effect::SendTo {
-                            sock: from,
-                            to: at,
-                            bytes: b"ping".to_vec(),
-                            tag: Tag(3),
+                        effects.push(Effect::RecvFrom {
+                            sock: to,
+                            into: crate::dgram::Batch::new(),
+                            slots: crate::dgram::Slots::ONE,
+                            tag: Tag(4),
                         });
+                        let mut batch = crate::dgram::Batch::new();
+                        batch.push(at, crate::dgram::Ecn::NotEct, b"ping");
+                        effects.push(Effect::SendTo { sock: from, batch, tag: Tag(3) });
                     }
                 }
                 4 => {
@@ -1918,7 +1926,8 @@ fn a_host_effect_that_fails_names_what_it_is_about() {
     let mut driver = crate::native(root.path(), 1).unwrap();
     let loopback: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut answers = Vec::new();
-    let mut effects = vec![Effect::Bind { at: loopback, tag: Tag(1) }];
+    let options = crate::dgram::Options::default();
+    let mut effects = vec![Effect::Bind { at: loopback, options, tag: Tag(1) }];
     run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
     let local = match answers.pop() {
         Some(Done::Bound { local, .. }) => local,
@@ -1928,7 +1937,7 @@ fn a_host_effect_that_fails_names_what_it_is_about() {
         }
         other => panic!("a bind at {loopback} ended {other:?}"),
     };
-    let mut effects = vec![Effect::Bind { at: local, tag: Tag(2) }];
+    let mut effects = vec![Effect::Bind { at: local, options, tag: Tag(2) }];
     run_until_idle(&mut driver, &mut effects, |it, _| answers.push(it.done)).unwrap();
     match answers.pop() {
         Some(Done::Failed(error)) => assert!(error.0.contains(&local.to_string()), "{error:?}"),

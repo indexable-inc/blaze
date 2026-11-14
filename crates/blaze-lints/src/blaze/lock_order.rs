@@ -13,11 +13,19 @@
 //!   waits as long. A fiber's park is `held_across_wait`'s, IO and allocation
 //!   `lock_held_across_slow`'s.
 //!
+//! Each reports only what it can show: a cycle with both chains, a guard across a named call.
 //! A summary with more classes or edges than it keeps, or that reaches a body that does not
-//! lower, is `wide`: refused at the function where it starts, never taken as having no edge.
+//! lower, is `wide`: what it misses is unknown, never taken as clean, and refused only at a
+//! function that asked for its locks to be proved ([`asked`]): one marked
+//! `#[blaze::lock_checked]` (itself or a module around it, `#![blaze::lock_checked]`) or with a
+//! role (`#[blaze::bounded_turn]`, `#[blaze::answers_request]`). Elsewhere an unknown is silent:
+//! most code reaches a body that does not lower, and a refusal of each would bury the findings.
 
 use base_db::Db;
-use hir_def::{DefWithBodyId, FunctionId, HasModule as _};
+use hir_def::{
+    AttrDefId, DefWithBodyId, FunctionId, HasModule as _,
+    attrs::{AttrFlags, PureAttr, RoleWord},
+};
 use hir_ty_pure::{
     Step,
     locks::{held_across, held_while_taking, lock_facts},
@@ -61,6 +69,28 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
             diagnostic.span_note(diag::of_file(file, range), text);
         }
     }
+}
+
+/// Whether `func` asked for its locks to be proved: `#[blaze::lock_checked]` on it or
+/// `#![blaze::lock_checked]` on a module around it, or a checked role attribute on it (a
+/// `trusted` one asks for nothing).
+fn asked(db: &Db, func: FunctionId) -> bool {
+    if AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::LOCK_CHECKED) {
+        return true;
+    }
+    if RoleWord::ALL.into_iter().any(|role| {
+        matches!(AttrFlags::role_attr(db, AttrDefId::FunctionId(func), role), Some(PureAttr::Checked))
+    }) {
+        return true;
+    }
+    let mut module = Some(hir::Function::from(func).module(db));
+    while let Some(it) = module {
+        if AttrFlags::query(db, AttrDefId::ModuleId(it.into())).contains(AttrFlags::LOCK_CHECKED) {
+            return true;
+        }
+        module = it.parent(db);
+    }
+    false
 }
 
 /// An edge of the crate's graph: the classes, the function of the crate whose summary has it,
@@ -220,9 +250,9 @@ fn find_order(
 ) {
     let facts = lock_facts(db, func);
     let krate = func.krate(db);
-    if facts.wide_here {
+    if facts.wide && asked(db, func) {
         let message = format!(
-            "`{}` takes locks the check can't all name: it reaches more lock classes or lock-order edges than a summary keeps, or a body that does not lower, so a cycle through it can't be ruled out: {RULE}",
+            "`{}` asked for its locks to be proved, but the check cannot show the absence of a lock-order cycle through it: it reaches more lock classes or lock-order edges than a summary keeps, or a body that does not lower: {RULE}",
             facts.function
         ); // alloc: a message
         found.push((Finding { lint: Lint::LockOrder, range: whole, message, note: None }, Vec::new()));
@@ -288,6 +318,14 @@ fn find_across(
     found: &mut Vec<(Finding, Vec<StepNote>)>,
 ) {
     let krate = func.krate(db);
+    let facts = lock_facts(db, func);
+    if facts.wide && asked(db, func) {
+        let message = format!(
+            "`{}` asked for its locks to be proved, but the check cannot show that no guard is held across a call that blocks under it: it reaches more locks or holds than a summary keeps, or a body that does not lower: {RULE}",
+            facts.function
+        ); // alloc: a message
+        found.push((Finding { lint: Lint::LockAcrossWait, range: whole, message, note: None }, Vec::new()));
+    }
     for hold in held_across(db, func).iter() {
         let message = format!(
             "the lock `{}`{} is held across {}, which {}: every thread that wants the lock waits as long; drop the guard before the call: {RULE}",

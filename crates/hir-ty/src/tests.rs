@@ -9,6 +9,7 @@ mod comptime_solver;
 mod const_args;
 mod const_bounds;
 mod const_param_ty;
+mod const_str;
 mod consteval_inference;
 mod default_binding_modes;
 mod elided_lifetime_args;

@@ -19,15 +19,15 @@
 use base_db::Db;
 use blaze_items::{ItemId, item_key};
 use hir_def::{AdtId, FunctionId, ItemContainerId, signatures::FunctionSignature};
-use hir_ty::facts::{Fact, FactItem, FactSet, Facts, Provider};
+use hir_ty::facts::{Fact, FactItem, FactSet, Facts, Proofs, Provider};
 use hir_ty_mir::mir::dispatch::Body;
 
 use crate::{
     effect_attrs::{NOALLOC, NONBLOCKING, NOPANIC, TERMINATES},
     effects::{EffectDef, EffectSet, Rule},
-    function::{FnPurity, check_generic, fn_purity_generic, generic},
+    function::{FnPurity, check_generic_at, fn_purity_generic_at, generic},
     program_lifetime,
-    walk::{Def, Instance, summary},
+    walk::{Def, Instance, summary_at},
 };
 
 #[cfg(test)]
@@ -43,9 +43,10 @@ inventory::submit! {
 /// is in the object the registration above is in.
 pub fn linked_here() {}
 
-fn facts_of(db: &Db, item: FactItem) -> &Facts {
+fn facts_of(db: &Db, item: FactItem, proofs: Proofs) -> &Facts {
     match item {
-        FactItem::Fn(func) => fn_facts(db, func),
+        FactItem::Fn(func) => fn_facts(db, func, proofs),
+        // A type's facts are read off its declaration: no proof is asked.
         FactItem::Adt(adt) => adt_facts(db, adt),
     }
 }
@@ -113,23 +114,26 @@ const CHECKED: [(Fact, &EffectDef); 4] = [
     (Fact::Returns, &TERMINATES),
 ];
 
-/// Every fact of the function `func` as defined. A function with no body of its own to walk
-/// (a foreign function, a trait's method without a default) has none.
+/// Every fact of the function `func` as defined, every summary and check under it made with
+/// `proofs` (the asking body's, `hir_ty::facts::proofs_at` of its tier): the record of one
+/// mode is a row of its own and never read for the other's. A function with no body of its
+/// own to walk (a foreign function, a trait's method without a default) has none.
 #[blaze_query::tracked(returns(ref))]
-fn fn_facts(db: &Db, func: FunctionId) -> Facts {
+fn fn_facts(db: &Db, func: FunctionId, proofs: Proofs) -> Facts {
     let mut facts = Facts::none(item_key(db, ItemId::Function(func)).0.0);
     let foreign = matches!(func.loc(db).container, ItemContainerId::ExternBlockId(_));
     if foreign || !FunctionSignature::of(db, func).has_body() {
         return facts;
     }
     let (env, args) = generic(db, func);
-    let kinds = summary(db, env, Instance { def: Def::Body(Body::Fn(func)), args }).kinds;
+    let kinds =
+        summary_at(db, proofs, env, Instance { def: Def::Body(Body::Fn(func)), args }).kinds;
     facts.inferred = inferred_of(kinds);
     for (fact, effect) in CHECKED {
         if facts.inferred.has(fact) || !kinds.intersect(UNSEEN).is_empty() {
             continue;
         }
-        if let Ok(proof) = check_generic(db, func, effect)
+        if let Ok(proof) = check_generic_at(db, func, effect, proofs)
             && !proof.open
             && !proof.trusted.is_empty()
         {
@@ -137,7 +141,7 @@ fn fn_facts(db: &Db, func: FunctionId) -> Facts {
         }
     }
     if kinds.intersect(UNSEEN).is_empty()
-        && let FnPurity::Pure(proof) = fn_purity_generic(db, func)
+        && let FnPurity::Pure(proof) = fn_purity_generic_at(db, func, proofs)
         && !proof.open
     {
         if proof.trusted.is_empty() {

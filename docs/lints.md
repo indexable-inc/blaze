@@ -60,8 +60,8 @@ ratchet denies `std_use` now ([the ratchet](#workspace-levels-and-the-ratchet)).
 The group also holds what the edition removes or respells (`async_fn`, `global_state`,
 `lossy_as`, `mut_ref`), what it writes at a crate's border (`unmarked_pure`,
 `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking`) and the type facts
-(`program_lifetime`, which is `deny` where it fires, `could_be_program_lifetime`,
-`could_be_ref32`). None of these has a switch: each is allowed unless a workspace or crate
+(`program_lifetime`, which is `deny` where it fires; `could_be_program_lifetime` and
+`could_be_ref32` are [`blaze::suggest`](#suggestions)'s). None of these has a switch: each is allowed unless a workspace or crate
 turns it, or the group, on. Of them only `mut_ref` and the four `unmarked_*` lints have a fix.
 The three `unmarked_*` effect lints still write the old spellings (`#[blaze::nopanic]`, ..),
 which [`negative_effect`](#undeclared_effect-unfulfilled_effect-negative_effect) then asks to
@@ -867,30 +867,30 @@ found.
 
 **Allowing it.** `#[expect(blaze::jagged_vec, reason = "..")]` on the struct.
 
-## `lossy_as`
+## `as_cast`
 
-In `blaze::edition`, allowed by default.
+In `blaze::edition`, allowed by default; its old name `lossy_as` still works.
 
-**What it catches.** An `as` cast that can lose value or sign, or that goes between a pointer
-and an integer, by the types the front end inferred: an integer to a narrower one
-(`u64 as u32`), between signed and unsigned (`i32 as u32`, `u32 as i32`), a float to an
-integer (drops the fraction, saturates), an integer to a float whose mantissa can't hold it
-(`u64 as f64`), a float to a narrower float, a `char` to an integer narrower than 21 bits, a
-pointer to an integer (drops provenance) and an integer to a pointer. `usize` and `isize` count
-as 32 to 64 bits, so `usize as u32` and `u64 as usize` are both found. The message names the
-two types and what can be lost; the note names the conversion that says it (`T::try_from`,
-`cast_signed`, `cast_unsigned`, `wrapping_*`, `ptr.addr()`, `ptr::with_exposed_provenance`).
+**What it catches.** Every `as` written in a body. The message names the two inferred types
+and what the cast can lose: high bits, a sign, a fraction, precision, a code point, or a
+pointer's provenance. `usize` and `isize` count as 32 to 64 bits.
 
-**Why it matters.** `as` silently truncates, wraps, rounds or saturates, and the cast looks
-the same whether it can lose or not. The blaze edition removes the lossy forms.
+**Why it matters.** `as` is one keyword for a dozen operations, and the reader can't tell
+which without the types. The blaze edition removes it.
 
-**How to fix it.** `From` where nothing can be lost (`u64::from(x)`), `T::try_from(x)` where
-it can, or the method that names the loss.
+**How to fix it.** The machine-applicable fix writes the operation by name, with the same
+behaviour: `T::from(x)`, `x.truncate::<T>()`, `cast_signed`, `cast_unsigned`, blaze-cast's
+helpers, `p.cast::<U>()` or `core::ptr::from_ref(r)`. A fix that keeps wrapping is what
+`truncating_cast` then lists.
 
-**Not found.** A cast that can't lose (`u8 as u32`, `bool as u8`, `f32 as f64`), a cast to its
-own type, and a cast of a literal or a `const` whose value fits the target.
+**One cast, one finding.** With `implicit_overflow` on, a cast that can lose an integer's value,
+which its prover can't show keeps that value, is reported by `implicit_overflow` alone, with
+its `try_from` fix. `as_cast` gives way there. `truncating_cast` lists the calls the fix
+writes, never an `as`.
 
-**Allowing it.** `#[expect(blaze::lossy_as, reason = "..")]`.
+**Not found.** A cast a macro writes, and one in a type (an array type's length).
+
+**Allowing it.** `#[expect(blaze::as_cast, reason = "..")]`.
 
 ## `many_bools`
 
@@ -1106,17 +1106,26 @@ for the disk makes every request as slow as the slowest sync.
 
 ## `lock_order`, `lock_across_wait`
 
-**What they catch.** Over every function, through any call, with a lock named by its receiver
-(`Type.field`, a static's path, else the lock's type):
+In the group `blaze::internal`, allowed unless a workspace turns them on: two locks the class
+can't tell apart share one, so a cycle between them may be false.
+
+**What they catch.** Over every function, through any call, with a lock classed by where it is
+declared: `Type.field` (through an `Arc` or a `Box`, `Type.field[]` for an element), a static's
+path, the name a `blaze_core::lock` lock is made with in the same body (`"store.kept"`), the
+accessor's path for a guard a function returns of a lock it knows only by type, else
+`type` and the lock's type (a lock handed in as a parameter, or read out of a collection).
 
 - `lock_order`: the crate's functions take two locks in both orders, A then B and B then A. The
-  finding prints both chains. A function whose locks are more than a summary keeps is refused
-  where that starts.
+  finding prints both chains.
 - `lock_across_wait`: a guard held across a call that blocks the thread (a condvar it is not
   handed, a channel, a sleep, a join, a blocking syscall). A fiber's park is
   `held_across_wait`'s, IO and allocation `lock_held_across_slow`'s.
 
-They are `deny` by default: a cycle is a deadlock and a guard across a wait a convoy.
+Each reports only what it can show. Where the check can't see everything (a callee whose body
+does not lower, more locks than a summary keeps) it says nothing, except at a function that
+asked for its locks to be proved: `#[blaze::lock_checked]` on it, `#![blaze::lock_checked]` on
+a module around it, or a role (`#[blaze::bounded_turn]`, `#[blaze::answers_request]`). There
+it refuses: the check cannot show the absence of a cycle through it.
 
 **How to fix it.** Take the locks in one order everywhere; drop the guard before the call.
 
@@ -2233,7 +2242,8 @@ constructor:
 
 `Global` is named as it resolves at the site: `Global` where it is in scope, the path to it
 where something else is, and where nothing is, the fix adds `use std::alloc::Global;` (by name
-resolution) before the first item of the innermost module. Many findings in one file each want
+resolution) before the first statement of the function the call is in (a fix of a body writes
+in that body's own tree, so not at the module's items). Many findings in one function each want
 that import; `--fix` applies one of them and the rest on its next pass (it runs up to four).
 
 **What a type change costs.** `Vec<T>` and `Vec<T, Global>` are one type, and so are `Box<T>`,
@@ -2814,9 +2824,12 @@ Code that compiles and reads as right but leaves something implicit, which the n
 person, or an LLM editing it) has to reconstruct and gets wrong: an early exit that skips the
 second half of a pair, a value left half changed by a `?`, a conversion whose target only
 inference knows, a fallback that hides the failure it answers, a test that checks nothing. Each
-lint is in `blaze::internal` (crates/blaze-lints/src/blaze/suspicious/, one module each): denied
-in blaze's workspace by the ratchet, with a crate held at `warn` only by the lint's baseline
-(`half_done` warns outright), and allowed in other workspaces until they turn it on. Each is
+lint is in `blaze::internal` (crates/blaze-lints/src/blaze/suspicious/, one module each) and
+allowed in other workspaces until they turn it on. In blaze's workspace each is at `warn` in
+`lints-ratchet` until it has a baseline (the tree cannot yet run `blaze check` on itself to make
+one, and `deny` with none would fail the first run); once baselined each goes to `deny`, except
+`half_done`, `option_question_mark_hides` and `shadow_changes_meaning`, which stay at `warn`
+because many of their findings are a judgement, not a bug. Each is
 found by name resolution, inferred types or the MIR's control flow, never by text.
 
 An `#[allow]` with no reason, and any `#[allow]` where `#[expect]` would say when it stops
@@ -2873,12 +2886,13 @@ are left alone, and test code.
 name starting with `_` included: the underscore only quiets rustc's `unused_variables`. Read
 from the HIR with macro expansions (a parameter named only in `format!` is read), closures
 included; a write is not a read, a compound assignment is. Left alone: `self`, a trait's method
-or an impl of one, a function with an ABI, a callback (named as a value in its own file), a
-function under `#[cfg(..)]` (a twin of another target's), a body whose value diverges, a
-signature a macro wrote.
+or an impl of one, a function with an ABI, a function under `#[cfg(..)]` (a twin of another
+target's), a body that diverges, a signature a macro wrote. A callback is reported: that a
+function is passed as a `fn` pointer is a fact of other bodies, and each body's lint reads only
+its own.
 
 **The right form.** Read it again where the body lost its use, or remove it with its argument
-at every call in one change; a signature fixed for a reason says it with
+at every call in one change; a signature fixed for a reason (a callback's) says it with
 `#[expect(blaze::unused_parameter, reason = "..")]`. No fix.
 
 ## `versioned_name`
@@ -2917,3 +2931,1207 @@ names starting with `_`, bindings a macro made, `match` arm and closure bindings
 
 **The right form.** A name for each value (`header_len`, `body_len`), or a block that ends the
 first one's scope. No fix.
+
+## `fallback`
+
+**What it catches.** A `Result`'s failure answered by computing the same result another way
+without looking at the error, so the second route runs on every failure, not the one it was
+for (AGENTS.md rule 3): an `Err(_)`, `Err(..)` or `Err(_name)` arm whose value is a call with
+arguments (or a method call other than `clone`, `to_owned`, `to_string`, `into`, `cloned`,
+`copied`); `.unwrap_or_else(|_| route(..))`; `.or_else(|_| ..)`; and `if let Err(_) = r`, a unit
+`Err(_)` arm, `if r.is_err()` or `if !r.is_ok()` whose branch assigns a call's value to a place.
+Left alone: arms that return, break or panic, an `Err(e)` that reads `e`, a constant default
+(`Err(_) => 0`, which is `dropped_error`'s), test code. Where both are on, a place is
+`fallback`'s and `dropped_error` passes it over.
+
+**The right form.** Hand the error on with `?`, or match the one failure the second route is
+for (`Err(e) if e.kind() == NotFound => route(..)`) and hand on the rest. No fix.
+
+## `unseen_target`
+
+**What it catches.** `Into::into`, `TryInto::try_into`, `str::parse`, `Iterator::collect`,
+`Iterator::sum` and `Iterator::product` with no turbofish, and `Default::default()`, whose
+value initializes a `let` with no type written (through parentheses, `?`, `.unwrap()` or
+`.expect(..)`): the type is fixed only by a later use. Left alone: the value as an argument, a
+return, a struct field or an assignment to a typed place, where the type is one step away.
+
+**The right form.** The type written where the value is made. The fix writes a turbofish for
+`parse`, `collect`, `sum` and `product` (`.parse::<u32>()`) and the `let`'s type for the others
+(`let w: Wide = n.into();`): machine-applicable when the type's text has no `::`, maybe-incorrect
+when it does, none when it has a lifetime, a closure or an `impl`.
+
+## `question_mark_converts`
+
+**What it catches.** A `?` whose operand's error `E` is not the function's error `F` and is
+converted by a `From` no one sees, when (a) `E` is a std error that names no subject (`io::Error`,
+`fmt::Error`, `ParseIntError`, `ParseFloatError`, `ParseBoolError`, `ParseCharError`,
+`Utf8Error`, `FromUtf8Error`, `FromUtf16Error`, `TryFromIntError`, `TryFromSliceError`,
+`AddrParseError`, `VarError`): "no such file" arrives without the path; or (b) `F` is erased
+(`Box<dyn Error>`, `String`, `anyhow::Error`, `eyre::Report`): `E`'s type is gone. Left alone:
+an operand already of type `F`, test code, `async` and `try` blocks.
+
+**The right form.** `.map_err(|source| Error::Read { path, source })?`: a variant that carries
+the subject. No fix.
+
+## `option_question_mark_hides`
+
+**What it catches.** In a function or closure returning `Option`, a `?` on a lookup's `None`
+(`get`, `find`, `find_map`, `first`, `last`, `nth`, `position`, `strip_prefix`, `split_once`,
+`parent` and the like) after an earlier lookup's `?` in the same body. The first `None` means
+"not there"; a later one means a broken invariant, and the caller cannot tell them apart. The
+message names the first lookup. Left alone: the first lookup, `.ok()?` (`dropped_error`'s), test
+code.
+
+**The right form.** Return a `Result` and answer the later miss with
+`.ok_or(Error::Dangling { key })?`, or `.expect("why it cannot miss")`. No fix.
+
+## `placeholder_body`
+
+**What it catches.** A function whose whole body is a constant success (`Ok(())`, `Ok` or `Some`
+of a constant, `None`, `true`, `0`, `()`, a no-argument `new()`, `default()` or `empty()`) while
+it has inputs it ignores (parameters, or a `self` with fields) or its doc promises an effect
+(writes, sends, saves, removes). It reports success for work it did not do. Left alone: a
+trait's default body and test code; a trait impl's method only when it repeats the trait's
+default body, and then the fix (machine-applicable) deletes the override.
+
+**The right form.** Do the work, or make the hole loud: `todo!()` or a typed error naming what
+is not built.
+
+## `test_asserts_nothing`
+
+**What it catches.** A `#[test]` with no way to fail: no call that never returns (`panic!`,
+`assert!` and what is built on them), no `unwrap`/`expect` of an `Option` or `Result`, no `?` or
+`return` in a test returning `Result`, no `#[should_panic]`, and no helper of the crate that has
+one (looked into one level deep). It passes whatever the code does.
+
+**The right form.** `assert_eq!(got, want)`, a returned `Result`, or
+`#[should_panic(expected = "..")]`. No fix.
+
+## `assertion_cannot_fail`
+
+**What it catches.** In any body: `assert!(true)` or `assert!(CONST)`, `assert_eq!` with one
+place on both sides (`x`, `self.len`), `assert_eq!` or `assert_ne!` of two literals, and an
+assertion after a statement of type `!` in its block (never reached). `assert!(false)` is left
+alone.
+
+**The right form.** Assert what the code computes against what it must be, or delete the
+assertion. No fix.
+
+## `test_misses_its_subject`
+
+**What it catches.** A `#[test]` that calls, builds or names nothing of its crate's non-test
+code (test helpers followed one level; for a `tests/` target, any workspace crate it depends on
+is its subject). It checks a copy, a mock or std, and stays green whatever the crate does.
+
+**The right form.** Call the real code the test is named for, or delete the test. No fix.
+
+## `ignored_without_reason`
+
+**What it catches.** `#[ignore]` or `#[ignore = ""]` on a test (inside `cfg_attr` too): no one
+can tell whether it is slow, broken or forgotten.
+
+**The right form.** `#[ignore = "why, and what would let it run"]`. No fix.
+
+## `doc_names_nothing`
+
+**What it catches.** A path in single backticks in a doc comment (`a::b`, or one `CamelCase`
+name) that resolves to nothing, resolved as rustdoc resolves an intra-doc link from the item's
+scope, with no visibility asked (a private item of another module, a test in `mod tests`, is
+named all the same). Left alone: lowercase words, macros, generic parameters, primitives, link text, code
+blocks, and a bare name a dependency exports. A doc that names a renamed or deleted item sends
+the reader (and an LLM) to look for it.
+
+**The right form.** The path of an item that exists, or plain words for what is not an item.
+When exactly one item of the crate has the name, the fix (maybe-incorrect) writes its path.
+
+## `magic_number`
+
+**What it catches.** A number in code (an argument, an operand, a returned or bound value, a
+range bound, an array repeat count) that is neither derived from what it depends on nor a named
+`const`. Read on the typed tree, by the literal's token, value and type; four findings, the
+strongest first:
+
+- *Disagreeing*: a slice of 3 bytes read as a `u32` (`from_le_bytes`), or an array indexed by
+  an enum whose length is not the enum's variant count.
+- *Derivable*: the length of the fixed array a `for` range or a bound walks (`0..4` over `[T;
+  4]`, the fix `a.len()`, machine-applicable), an enum's variant count where the array is
+  indexed by it (`core::mem::variant_count::<E>()`, machine-applicable where the crate has
+  `variant_count` on, else maybe-incorrect), the size of the integer bytes are read into
+  (`size_of::<u32>()`), or the value of the one `const` passed at the same parameter elsewhere
+  in the crate (the fix writes its name, maybe-incorrect).
+- *Repeated*: the same value and type at the same callee parameter or compared with the same
+  field, static or method in two or more bodies; the message lists the bodies and proposes a
+  name from the parameter (`const CAPACITY: usize = 4096;`).
+- *Plain*: any other; a `Duration::from_*` argument is told "name this duration".
+
+Left alone, with why:
+
+- `const`, `static`, enum discriminant and inline `const { }` initializers: that is the name.
+- `0`, `1`, `-1`, `0.0` and `1.0`: identities, which no name explains better.
+- `2` as an operand of `*`, `/`, `%`, a shift or `pow`: doubling and halving say themselves.
+- A tuple index, an array index or slice bound a fixed array's length proves in range, and
+  `0..`: the type already states the bound.
+- Literals in patterns (`0x7f =>`, `b'0'..=b'9'`): a pattern is a case of the data's format,
+  named by the arm; a closed set of string patterns is `magic_string`'s.
+- Byte, char and string literals: strings are `magic_string`'s; a byte or char spells itself.
+- Test code (a `#[test]`, a `cfg(test)` module, a test, bench or example target): fixture
+  data.
+- Attribute and macro arguments, and anything a macro wrote: the macro owns the number (a gap
+  for `vec![0; 4096]`, named below).
+
+Not yet seen: array lengths written in types and signatures (`[u8; 24]` in a field), literals
+inside macro arguments, and a `const` initializer that repeats another `const`'s value.
+`retry` reports retry bounds of its own; `many_bools` and `bool_param` are the boolean
+siblings.
+
+**The right form.** Derive the number from what it depends on, else a `const` whose doc
+comment says why the value is what it is, else a field of the typed settings. In
+`blaze::internal`; denied in blaze's workspace through its `internal = "deny"` ratchet
+(`baselines/blaze.magic_number.txt`).
+
+## `magic_string`
+
+**What it catches.** A string literal that names something the program branches on or looks up
+by, which is a fact with one home: an enum where the set is closed, else a named `const`, else
+a field of the typed settings. Its findings, the strongest first:
+
+- *Whole set*: a `match` with one string arm per variant of a fieldless enum, or an array
+  holding the name of every variant (of at least the set floor): with `blaze_comptime` on,
+  derive the names with `for const` over the variants; otherwise keep one `const` table
+  beside the enum, indexed by its discriminant. Its members are not reported one by one.
+- *Named already*: a literal whose text a `const` of this crate already holds, or, for a
+  key-like literal (or a const named after its own value, `const BLAZE_HOME: &str =
+  "BLAZE_HOME"`), a `const` of a local dependency: "`dep::STORE_VAR` already names this; use
+  it", with a machine-applicable fix when the const is nameable from here, and "make it
+  `pub`" when it is not.
+- *Item name*: a literal that spells a variant, field, function, the enclosing type's or the
+  crate's name (`env!("CARGO_PKG_NAME")`) where a rename would not follow it
+  (`Kind::Lib => "lib"`, `"dep-info"` for `DepInfo`): derive it by reflection,
+  `core::any::type_name` or `env!`. The message says the case convention the literal is in
+  (lower, snake, kebab, screaming snake, camel, Pascal). An environment variable's or a
+  path's name is never the enclosing function's, type's or crate's: it is fixed outside the
+  program and they are named after it (`fn home() { env::var("HOME") }` is a lookup).
+- *Near miss*: two literals in the same role (the same callee parameter or compared place) in
+  different bodies that differ only by case, `-` against `_`, a plural `s`, or one non-digit
+  character when both are 6 characters or longer (`"dep-info"`, `"dep_info"`); both sites are
+  reported. Shorter words one letter apart (`"get"`, `"set"`) and numbered names
+  (`"worker1"`, `"worker2"`) are two names, not a typo.
+- *Repeated*: the same trimmed literal in two or more places in the crate outside tests, other
+  than message text; the message lists the bodies.
+- *Closed set*: a place matched against string patterns, or compared with `==` against two or
+  more literals in one body: "make it an enum with these variants", listing them; its members
+  are not reported again one by one.
+- *Lookup*: a literal compared with a value, used as a `HashMap`, `HashSet`, `BTreeMap` or
+  `BTreeSet` key, read as an environment variable (`std::env::var`), or joined to a path.
+
+Left alone, with why: message text for people (formatting and diagnostic macro arguments,
+`expect`, `context`, doc strings), a literal with whitespace or no letter or digit (prose,
+punctuation the code writes), the empty string, a literal in a `const` or `static`
+initializer (that is the name), and test code. Near misses are compared across bodies only.
+
+`string_key` sits beside it: that lint is about a map keyed by an identifier's text
+(`String` where a `Symbol` or an id belongs); `magic_string` is about the literal. A large
+string `match` is also `fixed_key_lookup`'s, for its speed.
+
+**The right form.** An enum where the set is closed (a newtype over an interned name where it
+is open), else a `const`, else a field of the typed settings. A fix only for *named
+already*: use the `const`. In `blaze::internal`; denied in blaze's workspace through
+`baselines/blaze.magic_string.txt`. Whole sets overlap the derive-by-reflection lints
+(hand-written `Display` or name tables); where those report a set, they own it.
+
+## `repeated_format`
+
+**What it catches.** One sentence written as a format template in two or more places of a
+crate outside tests: the template of `format!`, `write!`, `panic!`, `anyhow!`-style and
+blaze's error macros, read from the `format_args!` the macro expands to, with each
+placeholder made one (`"{}: cannot read {path}"` and `"{0}: cannot read {1:?}"` are the same).
+Only templates of at least `TEMPLATE_WORDS_FLOOR` (3) words outside placeholders count; below
+that a template is a label or a layout (`"{} ms"`, `"{}: {}"`), so a two-word sentence is a
+miss, not a false finding.
+
+**The right form.** One owner for the sentence: a variant of a typed error whose `Display`
+writes it, naming the error type when every site sits inside `Err(..)` of one type, else one
+function that formats it. No fix.
+
+**Gaps.** A template built with `concat!` or held in a `const`, and macros that format
+without `format_args!` (tracing's field syntax), are not read. In `blaze::internal`; baseline
+`baselines/blaze.repeated_format.txt`.
+
+## `string_shared_across_crates`, `string_near_miss_across_crates`
+
+**What they catch.** A key-like string (a const's value, a compared, matched, map-key,
+environment or path literal) spelled in two or more crates of the workspace
+(`string_shared_across_crates`), or spelled in two crates differently but equal after
+lower-casing, dropping `-` and `_` and a plural `s`, or one character apart
+(`string_near_miss_across_crates`). A near miss whose one side writes (`insert`, `set_var`,
+`create`) and other side reads (`get`, `var`, `open`) says which crate writes and which
+reads: the reader never finds what the writer wrote. Prose and a string in one crate only are
+not reported.
+
+**The right form.** One `const` in the crate that owns what the string names (or one both
+depend on), used by the others.
+
+**How it runs.** Each crate exports its sorted rows (`magic::shared::string_rows`); the
+workspace pass k-way merges them (`merge_strings`). The caller is `crates/blaze-findings`,
+not wired yet, so `blaze check` does not emit these today. A literal passed only as a plain
+argument (a span or counter name) is not a row yet.
+
+## Code that carries no weight
+
+The shapes code written in a hurry, by an agent most of all, leaves behind: a field nothing
+reads, a helper only tests call, a trait with one impl, a function that only forwards, a
+parameter every caller passes the same constant, and two same-typed arguments passed in each
+other's place. Each is found by name resolution and inferred types, never by text
+(`crates/blaze-lints/src/blaze/weight/`).
+
+The lints about how an item is used read the whole workspace. Each body gives use rows
+(a field read or written, a variant constructed or matched, a function called or named as a
+value, the constant each argument is, an impl of a trait); each crate folds its bodies' rows;
+an item's facts are the sum over the crates that can name it: every configuration of its own
+crate (its lib and its tests) and every workspace crate that depends on one. Items are joined
+across configurations by where they are written, not by definition id. A body is production
+code, test code (a test, bench or example target, `#[test]`, `#[cfg(test)]`), or a serde impl
+(where a value reaches disk or the wire). The built-in derives have no bodies, so what only
+`Debug`, `Clone` or `PartialEq` reads is never read.
+
+All ten are in `blaze::internal`: allowed by default, denied in blaze's workspace through
+`baselines/blaze.<lint>.txt`. They add to `blaze::dead` and `blaze::test_only`, which judge a
+private item within its crate; these judge what another crate could use, across the workspace.
+
+## `swapped_arguments`
+
+**The mistake.** `copy(dst_path, src_path)` into `fn copy(src_path: &Path, dst_path: &Path)`:
+both arguments have the parameters' one type, so the call compiles, and the copy runs
+backwards.
+
+Found as Google Error Prone's `ArgumentSelectionDefectChecker` finds it (Rice et al.,
+"Detecting argument selection defects", OOPSLA 2017): each argument's name (a local, a path's
+last segment, a field, a getter) and each parameter's are split into words; a pair is
+reported when the swap is a strict improvement for both (each argument shares more of its
+words with the other's parameter than with its own, and at least half), and the two
+parameters and the two arguments have one type. Names under three letters and `arg0`-like
+names say nothing and are left out.
+
+**The right form.** The arguments in the order the names say; better, a newtype per role or a
+struct of named fields, so the swap no longer compiles. The fix swaps the two
+(`MaybeIncorrect`: the names may be what is wrong).
+
+## `write_only_field`
+
+**The mistake.** A field the workspace writes and production code never reads: only a
+derived `Debug`, `Clone` or `PartialEq`, a test, or nothing reads it. Every value carries its
+bytes and every constructor an argument for nothing. A field only a serde impl reads is
+"stored and never used": it reaches disk or the wire and nothing reads it back.
+
+Found for a field another crate could read, and for a private field whose only reader is a
+comparison derive or a serde impl (`dead` counts those as reads; a private field nothing reads
+is `dead`'s). Left alone: `_` fields, `PhantomData`, `#[repr(..)]` ADTs, ADTs deriving `Hash`,
+`Ord` or `PartialOrd` (a key's fields are used by being hashed and compared), test code.
+
+**The right form.** Delete the field and its writes (with a format change, for a stored one),
+or read it where it was meant to be used. No fix.
+
+## `only_used_in_tests`
+
+**The mistake.** An exported function production code never calls or names, that tests do: a
+helper written for its test and kept public. The test proves a function nothing runs.
+
+Left alone: a trait's function or an impl's of one, `main`, `extern` and test functions, a
+function with an attribute (a `#[no_mangle]`, a registration), one nothing uses at all.
+
+**The right form.** Move it into the tests' module, or call it from the code it was written
+for. No fix.
+
+## `single_impl_trait`
+
+**The mistake.** A trait the whole workspace implements once. An abstraction with one user:
+readers go through the trait to find the one body, a change edits two signatures, and a
+generic or `dyn` over it buys nothing.
+
+Impls are counted across every crate that can name the trait, each once by where it is
+written, so a test's mock is a second. Counted as more than one: a blanket impl, an impl for a
+type of another crate (an extension trait), an impl for a simulation's type (the sim side of a
+sans-IO core), and a trait that bounds an ADT's type parameter (a strategy chosen by type,
+rule 78). Left alone: `unsafe`, `auto` and generic traits, traits with supertraits, test code.
+
+**The right form.** The type with inherent methods; the trait comes when a second
+implementation does. No fix.
+
+## `forwarding_fn`
+
+**The mistake.** `fn load(p: &Path) -> Config { read_config(p) }`: a body that calls another
+function with its own parameters, in order, unchanged. A second name for one function, which
+readers follow two hops through and which drifts from the first.
+
+Found when the one expression is a call by path or a method call on `self`, every argument is
+the next parameter by path with no conversion, there is no turbofish, and the callee is
+neither a trait's, generic nor the function itself. Left alone: an exported function, a
+trait's or an impl's, one with an attribute (`#[inline]`, `#[track_caller]`, a `cfg`), an
+`unsafe`, `async`, `const` or `extern` one, one named as a value (a callback), delegation to a
+field (`self.inner.f(x)`), test code.
+
+**The right form.** Call the function it forwards to, and delete this one. No fix: the
+callers change, in other files.
+
+## `constant_argument`
+
+**The mistake.** A parameter every call in the workspace passes the same constant (a literal,
+a `const`, a unit variant or struct), with two calls or more: a choice nobody makes, repeated
+at every call.
+
+Left alone: a function named as a value or called by a serde impl
+(`#[serde(default = "..")]`), a trait's or an impl's function, `extern` and test functions, a
+`_` parameter.
+
+**The right form.** The value inside the function, as a `const` or a local, and the parameter
+gone. No fix yet: inlining it edits every call, which may be in other files.
+
+## `always_same_result`
+
+**The mistake.** A function whose every return gives the same answer: the same constant, a
+`Result` that is never `Err`, an `Option` that is never `None`. Every caller handles an error
+or an absence that cannot happen. Its results are the tail (through blocks, `if` and `match`)
+and every `return` outside closures; a `?` returns the residual, so it varies.
+
+Left alone: exported, trait and impl functions, `async` ones, one named as a value or called
+by a serde impl, test code.
+
+**The right form.** Return the value: a `const` for a constant, `T` for the `Option<T>` or
+`Result<T, E>`. No fix: every caller changes.
+
+## `never_constructed`, `never_matched`
+
+**The mistake.**
+
+- `never_constructed`: a variant of an exported enum no production code of the workspace
+  constructs (or a serde impl reads in). An error variant nothing returns is the usual one:
+  every `match` handles a case that cannot happen. A variant only tests make is said so.
+- `never_matched`: a variant production code constructs that no pattern of the workspace
+  names, of an enum other variants of which are matched, never compared with `==` or cast with
+  `as`: every `match` sends it to a `_` arm or a binding, so it means what that arm means.
+
+Left alone: a `#[default]` variant, test code.
+
+**The right form.** Delete the variant, construct it where its case happens, handle it by name
+where it differs, or merge it into the variant it means the same as. No fix.
+
+## `swappable_parameters`
+
+**The mistake.** Two adjacent parameters of one primitive or string type
+(`fn copy(src: &str, dst: &str)`, `fn resize(width: u32, height: u32)`): a call that passes
+them in each other's place compiles. `swapped_arguments` catches it at a call whose arguments
+have names; this is the declaration that lets it happen. Integers, floats, `char`, `str` and
+`String` behind any references; a `bool` pair is `bool_param`'s. One finding per function.
+
+Left alone: a private function with one call site, a trait's or an impl's function, `extern`,
+`main` and test functions, `_` parameters.
+
+**The right form.** A newtype per parameter, or one struct of named fields the caller writes
+by name, so a swap is a type error. No fix.
+
+## Complexity
+
+How hard a function, a type, a file or a crate's modules are to hold in one's head, by the
+measures that best predict defects and the effort to change code. Each lint measures one
+thing on the typed tree or the MIR and refuses an item over its bound. The message names the
+measure, the value and the bound, and gives one concrete way down: the part to move out, by
+its lines and its share of the value. These are what a reader, a person or an agent with a
+short context, has to keep in mind at once. Code: `crates/blaze-lints/src/blaze/complexity/`.
+Test code (`#[test]`, `#[cfg(test)]`) is not measured.
+
+All twelve are in `blaze::internal`. They are allowed by default and at `warn` in blaze's
+workspace until `crates/blaze-lints/baselines/items.tsv` holds every existing item at its
+value. That takes a bless, which needs the tree to check itself. Once baselined they go to
+`deny`: new code meets the bound, and existing code may only shrink.
+
+**Held values.** `items.tsv` has one line per item over its bound when it was first blessed,
+sorted: `measure<TAB>path<TAB>fingerprint<TAB>value`. `path` is the item as the finding names
+it (`blaze_lints::blaze::complexity::check`; a file by its module; a cycle by its modules,
+space-separated). `fingerprint` is 16 hex digits hashing the item's tokens with trivia and
+its own name left out. An item matches a line by both; by path alone after an edit; by
+fingerprint alone after a rename or move with no edit. An item over its bound is a finding
+when no line matches it, or when its value is over the line's. Each finding's note is its
+line (`item baseline line: ..`). A bless runs with no file loaded and keeps, of the lines
+found, only the items the old file held, each at the lower of its old and new value, so a
+value never rises and no item is added after the first bless
+(`crates/blaze-lints/src/baseline/items.rs`). The gate's comparison lists each item that is
+new, grew, shrank or is gone, and can print the ten worst by value over bound.
+
+| key | lint | default | where the default comes from |
+| --- | --- | --- | --- |
+| `function-weight-threshold` | `function_weight` | 15 | SonarSource S3776 default |
+| `path-count-threshold` | `path_count` | 200 | Nejmeh's NPATH threshold, PMD's default |
+| `live-state-threshold` | `live_state` | 6 | working memory: 4 ± 1 chunks (Cowan 2001), 7 ± 2 (Miller 1956); estimate |
+| `effect-breadth-threshold` | `effect_breadth` | 4 | of 6 kinds; estimate |
+| `exits-threshold` | `exits` | 5 | estimate |
+| `function-lines-threshold` | `long_function` | 100 | SonarSource S138 default |
+| `function-statements-threshold` | `long_function` | 400 | about 4 MIR statements per line at the line bound; estimate |
+| `file-lines-threshold` | `long_file` | 1000 | SonarSource S104 default; this tree's 90th percentile is 1066 |
+| `params-threshold` | `many_params` | 7 | clippy `too_many_arguments`, SonarSource S107 |
+| `struct-fields-threshold` | `wide_type` | 20 | estimate |
+| `enum-variants-threshold` | `wide_type` | 50 | estimate |
+| `nesting-threshold` | `deep_nesting` | 4 | this tree's 95th percentile; SonarSource S134 uses 3 |
+| `fan-out-threshold` | `fan_out` | 30 | estimate |
+| `module-cycle-threshold` | `module_cycle` | 1 | no cycle |
+
+A value at its bound is not a finding. Lines are lines of code: not blank, and not only a
+`//` comment. The estimates are rough cuts from a text-level pass over this tree (52,299
+functions; 3,984 files, generated and vendored ones excluded): function lines p50 8, p95 57,
+p99 121; nesting p95 4, p99 5; parameters p95 5, p99 7. Revisit them once the lints have
+measured the tree for real.
+
+## `function_weight`
+
+**The measure.** Cognitive complexity, by G. Ann Campbell's rules ("Cognitive Complexity: a new
+way of measuring understandability", SonarSource, 2017, rev. 2018). These rules track how hard
+code is to read better than McCabe's cyclomatic number does, because they charge for nesting
+and not for a `match`'s arms. +1 for each `if`, `else if`, `else`, `match`, loop, `let .. else`,
+labelled `break`/`continue`, and each run of like boolean operators (`a && b || c` is 2). The
+`if`, `match`, loop and `let .. else` each also add the nesting they sit at. Closures nest
+without adding. A function that calls itself gets +1. `?`, `return` and macros add nothing.
+Read on the syntax as written, not on desugared HIR.
+
+**The way down.** The help names the smallest `if`, `match`, arm, loop or closure that brings
+the weight to the bound when moved into its own function, with its lines and share. If no
+part is enough alone, it names the largest.
+
+## `path_count`
+
+**The measure.** The acyclic paths through the function's MIR, each loop taken once: as
+many tests as a full path cover needs. This is NPATH (Nejmeh, CACM 31(2), 1988) computed on
+the control-flow graph, as Ball and Larus count paths (MICRO 1996). Each back edge is cut, a
+loop's latches are joined to its exits, and paths from the entry are summed (saturating).
+Unwind blocks and `Unreachable` are left out.
+
+**The way down.** Branches multiply the paths after them, so splitting off the most
+branching `if`, `match` or loop divides the count.
+
+## `live_state`
+
+**The measure.** The most mutable places (a `mut` or `ref mut` binding, a `&mut` local) the
+runtime MIR holds live across one call: what a reader of the call must keep in mind, since
+the call may depend on any of them or change them. The bound is set by working memory.
+
+**The way down.** The help points at the call. Finish what is done before it, or move each
+piece of state, with the code that changes it, into a function that returns its result.
+
+## `effect_breadth`
+
+**The measure.** How many of six kinds of effect (IO, blocking, syncing to disk, locking,
+allocating, panicking) the function's own calls into other crates bring, by hir-ty-pure's
+effect summaries. A function that both does IO and takes locks is two kinds of work to
+reason about.
+
+**The way down.** Move the calls of the kind fewest calls bring into a function of this
+crate.
+
+## `exits`
+
+**The measure.** The early exits (`return`, `?`, a call or macro that never returns) of a
+function that holds a value whose own `Drop` finishes something. Types from `core`,
+`alloc`, `smallvec`, `thin_vec` and `arrayvec` only free memory and do not count. Each exit
+is a place the reader has to check the value is left right.
+
+**The way down.** Return from one place while the value is held, or finish it explicitly in
+one place.
+
+## `long_function`
+
+**The measure.** Lines of code from `fn` to the closing brace, and MIR statements (what
+macros and generic calls expand to counts there). Size is the strongest single predictor of
+defects; it confounds most other measures (El Emam et al., IEEE TSE 27(7), 2001).
+
+**The way down.** The help names the smallest control-flow part that brings the lines to
+the bound. Straight-line code is split where it moves from one step to the next.
+
+## `long_file`
+
+**The measure.** A file's lines of code, its `#[cfg(test)]` items left out.
+
+**The way down.** The help names the smallest top-level item that brings the file to the
+bound when moved into a module of its own.
+
+## `many_params`
+
+**The measure.** Parameters, `self` not counted.
+
+**The way down.** Group the parameters that travel together into a struct, or make the
+function a method of the type most of them describe.
+
+## `wide_type`
+
+**The measure.** A struct's fields; an enum's variants when at least one has data (a
+fieldless enum is a list of names, read one at a time).
+
+**The way down.** When three or more fields share a prefix (`cache_hits`, `cache_misses`, ..),
+the help names them as a struct of their own.
+
+## `deep_nesting`
+
+**The measure.** The most `if`/`match`/loop/`let .. else` bodies one point of the function is
+inside. An `else if` chain is one level, and a closure adds none.
+
+**The way down.** The help points at the deepest body. Return early from the conditions
+around it, or move it out.
+
+## `fan_out`
+
+**The measure.** Distinct functions called, the standard library's not counted (efferent
+coupling at the function level; Henry and Kafura, IEEE TSE 7(5), 1981).
+
+**The way down.** Move the calls of one concern, with the code between them, into a
+function.
+
+## `module_cycle`
+
+**The measure.** Modules of one crate that import from each other: none can be read, moved
+or tested without the rest (the acyclic dependencies principle; Lakos, "Large-Scale C++
+Software Design", 1996). An edge is a name one module's scope holds of an item another
+defines, `use` included. Edges between a module and its ancestors are nesting and are left
+out. Every other edge is lifted to the children of the two modules' nearest common ancestor.
+Each strongly connected group of two or more modules is one finding at the crate root,
+listing its edges with their names.
+
+**The way down.** Cut the edge of fewest names: move what it uses into the module that uses
+it, or both into a module neither depends on.
+
+## Hotspots
+
+`scripts/src/bin/hotspots.rs` ranks files by how often they change times how complex they
+are: change frequency from `git log --numstat`, complexity from the `function_weight` lines
+of `items.tsv` summed per file (Tornhill, "Your Code as a Crime Scene", 2015). It also lists
+pairs of files that change together but sit in different modules. It is for deciding where
+refactoring pays off, not a gate.
+
+## Correct by construction
+
+The lints of `crates/blaze-lints/src/blaze/construct/`: a check at run time, a convention or a
+name standing in for a type (AGENTS.md: type, then lint, then rule). Each finding says what it
+found, the type that would carry it ("carry it in a type: ..."), and what that type removes.
+All are decided on the typed tree (HIR, inference, name resolution, the crate's field facts,
+`hir_ty_pure::reach`'s proof), never on text: a name is the one a binding, field or method has,
+and is read only where its type agrees. None looks at test code or at what a macro wrote. All
+are in `blaze::internal` (allowed by default) and held at `warn` in blaze's ratchet until a
+baseline holds what the tree has today; `unit_mismatch` is a bug wherever it fires and goes to
+`deny` then. Another project opts in at the `suggest` step.
+
+## `proof_forgotten`
+
+An `unwrap` or `expect` of std's `Option` or `Result`, or an index, that the body's proof
+(`hir_ty_pure::reach`) discharges, of a local that an `if` condition or `match` scrutinee
+written before it reads: `if x.is_some() { x.unwrap() }`, `if x.is_none() { return } x.unwrap()`,
+`if i < v.len() { v[i] }`. The check's answer was a proof, dropped and asked again with a panic
+site. A site discharged by what it is (`Some(3).unwrap()`) has no such check and is left alone.
+
+**Fix** (`MaybeIncorrect`): for `if x.is_some()` (`is_ok`) of a local holding an owned `Option`
+(`Result`), every site in the `then` branch, the condition becomes `let Some(x) = x` (`let Ok(x)
+= x`) and each site `x`. It moves `x`; a use after the `if` needs `&x`.
+
+## `unit_mismatch`, `primitive_meaning`
+
+- `unit_mismatch`: `+`, `-`, `+=`, `-=` or a comparison of two numbers whose names (a local's,
+  a field's, a method's such as `as_millis`, through casts and borrows) carry different units:
+  `elapsed_ms > limit_secs`, `head_bytes + body_kib`. The type is `Duration`, or a newtype per
+  size unit; a sum of two units is then a type error.
+- `primitive_meaning`: a parameter or field of a bare integer or float whose name carries a
+  unit of time (`timeout_ms: u64`) or an identity (`node_id: u32`: a last word `id`, `idx` or
+  `index` after another). The type is `Duration`, or a typed id (a newtype per thing,
+  `la_arena::Idx<T>`). A trait impl's method and a `#[repr]` struct are left alone.
+
+## `sentinel_value`
+
+An `==` or `!=` of an integer with `-1`, with std's `MAX` (resolved, not read), or with `0`
+where the other side's name ends in `id`, `idx` or `index`: a value of the range standing in for
+"none". The type is `Option<T>`, with a niche (`Option<NonZero<T>>`, a `NonMax` newtype) where
+the size matters.
+
+## `state_in_flags`, `bool_pair_state`
+
+- `state_in_flags`: a struct with two or more `bool` fields named for states of one life
+  (`started`, `running`, `closed`, `done`, `failed`, ...). The type is an enum of the states,
+  or one type per state.
+- `bool_pair_state`: a field, parameter or return type that is a tuple of two or more `bool`s
+  or an `Option<bool>`, and a `match` on a tuple of `bool`s. The type is an enum naming each
+  state that occurs.
+
+## `out_parameter`
+
+A `&mut` parameter, bound by a plain name, every use of which is the place of `*name = ..`,
+in a function returning `bool` or `()` (not a trait impl's method). The type is the return
+value: `Option<T>`, `T`, or `Result<T, E>`.
+
+## `parallel_collections`
+
+Two distinct `Vec` fields of the same local pushed in two consecutive statements, or indexed
+by the same local in one body: two collections kept the same length by convention. The type is
+one `Vec` of a struct, or a struct-of-arrays type with one `push`.
+
+## `untyped_index`
+
+An integer field of a non-test struct that the crate's bodies use as an index into one
+collection (from `goose_fields`, the crate's field facts) and do not iterate or measure. The
+type is a typed index made only by that collection (`la_arena::Idx<T>`, or a newtype with
+`Index<ThatIdx>`). A private `usize` or `u64` read only as an index is `wide_index`'s.
+
+## `validated_but_raw`
+
+A function whose body starts with `if` guards that diverge (`return`, a panic), one of which
+reads a parameter of a bare number or string type, and whose value is that parameter, raw or
+as `Ok(p)` or `Some(p)`. The check's result is thrown away. The type is a newtype whose one
+constructor is the check (`impl TryFrom<T> for Valid`); with ranged integers (`Int<LO, HI>`) or
+`#[blaze::invariant]` the check becomes the type's, proved at compile time.
+
+## Claims
+
+The lints of `crates/blaze-lints/src/blaze/claims/` (design: docs/v2/plan/design/claims.md): a
+promise a doc comment makes is derived by the compiler, checked by an attribute, or points at
+what proves it; never only asserted. A reader, an agent above all, takes a doc's word; these
+make the word one the tree holds. The one written form of a held claim is a rustdoc section:
+
+```rust
+/// # Guarantees
+///
+/// - The result is sorted by key. Evidence: [`tests::sorted_by_key`]
+/// - A step of the model is deterministic. Evidence: Lean `Blaze.Mir.step_deterministic`
+/// - A lookup probes at most twice. Unverified: no test counts the probes yet.
+```
+
+`# Guarantees` holds a function's promises, `# Invariants` a type's. Each item ends in
+`Evidence:` with intra-doc links to tests or oracles (rustdoc renders and checks them) or
+``Lean `Name` `` (a theorem of `lean/theorems.json`), or in `Unverified:` with a reason. `#
+Safety` is the caller's obligation and asks for none. `scripts/src/bin/invariants.rs`'s ledger
+lists every claim with how it is held and its level.
+
+An effect stated in prose is read only in the narrow form: a clause that opens with the phrase
+(after `It`, `This`, `This function`), `Never panics.`, `It cannot panic or allocate.`,
+`Allocates nothing.`, `is pure`, or a later phrase of a clause that opens with the item's verb
+(`Allocates nothing, takes no lock and never panics`), followed by the clause's end; never one a
+word narrows (`allocates nothing once warm`, `never blocks without end`, `a warm read
+allocates nothing`). The effect walk (`hir_ty_pure::check_generic`) decides it; `nopanic` only
+in a crate built with overflow checks.
+
+All six are in `blaze::internal`, so another project opts in, at the adoption ladder's
+`suggest` step. blaze's ratchet: `claim_contradicts_facts` deny; `claim_without_evidence`,
+`evidence_is_stale` and `safety_without_invariant` deny, held at each crate's count by their
+baselines; `claim_is_derivable` warn; `comment_claims` allow.
+
+## `claim_contradicts_facts`
+
+The doc says the function never panics, does not allocate, never blocks or is pure, and the
+effect walk finds otherwise: a reachable panic, an allocation, a blocking call, IO. The finding
+quotes the walk and places each step of its chain (`first` calls `pick` here, `pick` indexes
+here). Also a `# Panics` section on a function the walk proves never panics with overflow
+checks on. A function already marked with the attribute is the attribute's lint's. Not built:
+`# Errors` against the error set (error sets are not inferred yet), and complexity claims,
+which no analysis decides exactly; both are `Evidence:` or `Unverified:` items.
+
+## `claim_is_derivable`
+
+The doc says an effect the walk proves through every call. **Fix** (`MachineApplicable`):
+write `#[blaze::nopanic]` (`noalloc`, `nonblocking`, `pure`) where `unmarked_*` writes it,
+and delete the sentence when it says nothing else. On a function already marked, the sentence
+repeats the attribute and the fix deletes it. The suggestions lane's lints (`could_be_pure`,
+the `unmarked_*` edition lints) say the same of a function whose doc says nothing.
+
+## `claim_without_evidence`
+
+A claim held by nothing: an effect sentence the walk can't decide (a call it can't follow),
+an item of `# Guarantees` or `# Invariants` with no marker, `Unverified:` with no reason,
+`Evidence:` naming nothing. A marker spelled another way (`Tested by`, `Proof:`,
+`evidence:`) is one too; **fix** (`MaybeIncorrect`): the one marker.
+
+## `evidence_is_stale`
+
+An `Evidence:` pointer that resolves to nothing from the item (a pointer names a declaration:
+modules from the item's module, `crate`, `self` or `super` first, then the item; visibility is
+not asked and every configuration of the crate is searched, so a private test in a
+`#[cfg(test)]` module is found from the lib; a `use` is not followed), that is not a test (a `#[test]` or a function of `cfg(test)` code: an oracle, a
+simulation), or a test none of whose calls, two levels into the crate's own code, calls the
+function or makes a value of the type. What part of a result a test observes is the
+test-observation lane's; a theorem's name is checked by the ledger.
+
+## `safety_without_invariant`
+
+A `// SAFETY:` comment above an `unsafe` block or `unsafe impl` that names no invariant by a
+backticked path that resolves from the item it is in, or names one and does not say where it is
+upheld: `upheld by` a path, `upheld above` (the code just before), or in an `unsafe fn`
+`upheld by the caller`.
+
+```rust
+// SAFETY: `Ring::cap` is a power of two (the `# Invariants` of [`Ring`]); upheld by `Ring::new`.
+unsafe { *self.slots.get_unchecked(i & (self.cap - 1)) }
+```
+
+With no `SAFETY:` comment it says nothing: that is clippy's `undocumented_unsafe_blocks`.
+
+## `comment_claims`
+
+Advice: a body comment that states what the code can't do where nothing checks it (`cannot
+overflow`, `unreachable`, `can't be None`, `can't fail`, `always in bounds`, `can't be zero`).
+The finding names the checked form: `strict_add` or `#[blaze::nopanic]`, `blaze::unreachable!()`
+(which blaze proves), `let Some(x) = .. else { blaze::unreachable!() }`, an `assert!` the bounds
+checks fold into, `NonZero<T>`. A comment on or above code that already checks it (`assert`,
+`expect(`, `unreachable!`, `strict_`, `checked_`, `NonZero`) is left alone. The comment is never
+rewritten.
+
+## Duplicates
+
+Code written twice, and the copy that was not finished. An agent with a short context writes a
+helper that exists already, or pastes a block and misses one rename; these lints find both with
+the compiler's own view of code: the parsed tree, with each local renumbered by first use
+(Baker's parameterized matching, as in NiCad and Deckard), so `fn f(a: u32)` and `fn g(b: u32)`
+with the same body are one shape, and a literal or a path that differs is a different one. Each
+message names every copy, with a note at each. Code: `crates/blaze-lints/src/blaze/dup/`.
+
+All are in `blaze::internal`, allowed by default. In blaze's workspace `same_fn`, `same_block`,
+`paste_mismatch`, `same_type` and `same_const` deny, each held at its crate's count by a
+baseline (`unmeasured` until the tree checks itself), and the rest warn. Cost: one pass over the
+crate's bodies, a query per crate (`dup_index`) that sorts their hashes, and its dependencies'
+whole-item hashes merged in, so a copy of a dependency's function is found too. About 200 bytes
+a function: two 8-byte hashes, the block and row hashes, a 32-word MinHash sketch past the near
+floor. Output is sorted by position. Test code is not measured but by `tests_differ_by_literal`.
+
+The precision column is an estimate; nothing has measured it on a tree yet.
+
+| lint | technique | floor | precision (estimate) |
+| --- | --- | --- | --- |
+| `same_fn` | the whole body and signature by shape | 12 tokens | near 1: equal shapes are one function |
+| `same_impl_fn` | `same_fn` where every copy is a trait method | 12 tokens | high; often a default method waiting |
+| `same_block` | a block or a run of statements by shape, the outermost only | 64 tokens | high; short blocks are under the floor |
+| `near_duplicate` | 6-token shingles, MinHash (32 hashes, 8 bands of 4), then exact Jaccard | 80 tokens, 85% | medium: tables and match arms look alike |
+| `paste_mismatch` | CP-Miner: a block by structure whose renaming is consistent but in one place; rows of a run of rows | 30 tokens; 3 renamed places to one kept; 3 rows | medium-high |
+| `same_type` | fields (names, types) or unit variants, in order | 3 fields, 4 variants | medium |
+| `same_const` | type and value by shape | 8 tokens or a 12-byte string | high |
+| `extractable_duplicate` | anti-unification (Plotkin's least general generalisation) of a near pair or a pair of one structure | at most 4 holes, each of one type both sides | high |
+| `tests_differ_by_literal` | a test's hash with each literal erased to its kind | 12 tokens, 2 tests | high |
+| `impls_differ_by_type` | anti-unification where every hole is a type | at most 4 holes | high |
+| `duplicate_across_crates` | a k-way merge of each crate's whole-item hashes (`dup::index::merge_siblings`) | as `same_fn` | as `same_fn` |
+
+## `same_fn`, `same_impl_fn`
+
+"`second` is the same function as `first`, up to the names of its locals". Where the copy is
+exported and plain (no generics, `async`, `unsafe` or ABI; simple parameters) the fix makes it
+call the other, `{ first(values, cap) }`, as `MaybeIncorrect`: two that must stay apart say why
+with `#[expect(blaze::same_fn, reason = ..)]`. `same_impl_fn` names the trait methods and
+suggests a default method or a blanket impl.
+
+## `same_block`
+
+"this code (64 tokens) is written 2 times". The note lists the block's free locals: the
+parameters of the function it becomes. A block inside a reported block is not reported again.
+
+## `near_duplicate`
+
+"`b` is a near copy of `a`: 91% of their runs of 6 tokens agree", with the lines that differ.
+A pair `extractable_duplicate` or `impls_differ_by_type` explains is reported there instead,
+one finding per pair.
+
+## `paste_mismatch`
+
+Two forms. A pasted block where `left` became `right` at three or more places and stayed `left`
+at one: "`left` is left as it was in a copy that renames `left` to `right` everywhere else";
+the fix renames it (`MaybeIncorrect`). And a run of three or more rows of one structure
+(`x.a = y.a; x.b = y.b; x.b = y.c;`) where one row repeats the row above in a place every row
+has its own: the fix writes the row's own name. A deliberate one says why with
+`#[expect(blaze::paste_mismatch, reason = ..)]`.
+
+## `same_type`, `same_const`
+
+A struct or enum with the fields or variants of another, and a constant with the value of
+another: one fact with two homes. The fix is by hand: keep one and `use` or alias it.
+
+## `extractable_duplicate`
+
+"`small` and `large` are one function with 2 parameters: the limit (`64` / `256`, u32, in 2
+places) and the callee (`read_head` / `read_tail`)". The two bodies are anti-unified: walked
+side by side, locals matched by a bijection, each differing subtree a hole, a hole whose pair
+of texts repeats counted once. It fires at most at 4 holes, each a literal, path, field or
+expression, of the same inferred type on both sides; a statements hole over 20% of the body
+or swapped statements is no generalisation. The help writes the signature; there is no
+machine fix.
+
+## `tests_differ_by_literal`
+
+"these 3 tests are one test over a table of 3 rows of 2 values": tests whose bodies are equal
+with each literal replaced by its kind, found by that hash, reported once at the first. Help:
+one test over a table, or a Hegel property where the expected value can be computed.
+
+## `impls_differ_by_type`
+
+"`sum64` is `sum32` with other types: the type (`u32` / `u64`, in 3 places)". Help: one
+generic function or a blanket impl, or `for const` reflection over a closed list of types.
+
+## `duplicate_across_crates`
+
+"the same fn is written in crates `a` and `b`; its home is their nearest common dependency".
+The workspace pass (`crates/blaze-findings`) runs it over every crate's whole-item hashes; it
+is registered here and not wired yet.
+
+**Clippy's copy-paste lints.** `eq_op`, `ifs_same_cond` and `self_assignment` are in clippy's
+`correctness`, denied in blaze's table; `if_same_then_else` is denied and `match_same_arms`
+warns. `blaze check` does not implement them yet.
+
+## Suggestions
+
+The group `blaze::suggest` (`crates/blaze-lints/src/blaze/suggest/`): where a plain Rust
+project gains from a blaze feature or a tighter type, each finding saying what adopting it
+buys. It is the second step of the adoption ladder, one setting in the workspace manifest:
+
+```toml
+[workspace.metadata.blaze.lints]
+step = "suggest"   # rust (the default), suggest, edition, strict
+```
+
+`rust` is `blaze::general` at warn; `suggest` adds `blaze::suggest`; `edition` adds
+`blaze::edition`; `strict` is blaze's own table (every group at deny, held by the ratchet's
+baselines). Taking a step baselines what the new step shows, per lint and crate, so a crate
+never gets worse and each fix lowers its count; the report of the next step gives its findings
+by lint, how many fix themselves, and the crates by least work by hand
+(`blaze_findings::ladder`; the manifest reader and a command that prints it are not wired yet).
+Group and lint lines in the same table apply on top of the step. Nothing in a step changes what
+the program means: a lint only reports.
+
+Members besides the four below: `could_be_program_lifetime` and `could_be_ref32`. `suggest` is
+a kind, like `general` or `edition`: every blaze lint is of exactly one, so no suggestion is in
+`blaze::edition`, and each is off by default.
+
+Each lint's class in the findings scheduler (`crates/blaze-findings`, not yet driving `blaze
+check`) says when it arrives: with the answer, right after it (cheap), or in the background
+(deferred). Any lint at `deny` runs before the answer whatever its class.
+
+## `could_be_narrower`
+
+"`fn level` returns `u64`, but every value it returns is in 1..=300: `NonZero<u16>` holds
+them". Every result of a non-exported function (the tail through blocks, `if` and `match`,
+and each `return`) is an integer literal, at least two distinct ones, needing fewer bits than
+the declared type; the rule is `blaze_findings::fold::Narrow`. Not found: a trait's function or
+an impl of one, `async`, test code, an `isize`/`usize` whose values need more than 16 bits, one
+that is narrower only by sign or by never being zero. Class: cheap. No fix (every caller's
+arithmetic changes). Parameters and fields (every call's argument, every construction) are the
+same join over a workspace fold of per-body rows, deferred; designed, not built.
+
+## `could_be_sans_io`
+
+"the module `app::machine` reaches no ambient effect in its 2 functions: mark it a sans-IO
+core". Found at the highest such module (the crate root, or one whose parent's code reaches
+the clock, a file, a thread, a socket, a process, the environment, stdio, OS randomness, an
+async runtime or a syscall), by `sans_io_core`'s walk. Not found: a test, bench or example
+target, a module already in a core, one with no function, a file of only `mod` items, a module
+over 4096 functions. Class: cheap. **Fix** (`MaybeIncorrect`): `#![blaze::sans_io]` after the
+file's inner attributes and `//!` docs (under rustc the crate root also needs
+`#![feature(register_tool, custom_inner_attributes)]` and `#![register_tool(blaze)]`).
+
+## `could_be_linear`
+
+"`Drop::drop` of `Writer` calls `flush_pending`, as `Writer::finish` does: a `Writer` dropped
+instead of finished by `finish` does that work where no caller sees it fail". A type of the
+crate, not `#[blaze::linear]`, with an inherent method in its module that takes `self` by value,
+whose `drop` calls a function of the crate that method calls too, or can panic. Help: the type
+`#[blaze::linear]` and the method `#[blaze::consumes]` (docs/v2/plan/design/linear.md). Class:
+cheap. No fix.
+
+## `could_have_invariant`
+
+"`new`, `set` each start with `assert!(lo <= hi)`: that is an invariant of `Span`". Two or more
+functions of one inherent impl, at least one a constructor (no `self`, returns `Self`), the
+rest `&mut self` methods, whose first statement is the same `assert!` or `debug_assert!` by
+tokens. Not found: a struct with a `pub` field, one with a `#[blaze::invariant]`, test code.
+Help: `#[blaze::invariant(..)]` on the struct, in terms of its fields (proved where a value is
+built or written, assumed where read), or a ranged integer (`Int<LO, HI>`) for a field's range.
+Class: cheap. No fix.
+
+Not here, by design: a never-written `&mut` parameter is clippy's `needless_pass_by_ref_mut`;
+a `Vec` that never grows is clippy's `useless_vec`. `could_derive_from` (a hand-written impl
+that a derive or reflection gives) is not built yet.
+
+## Test strength
+
+**The rule.** A test is as strong as what it looks at. These seven lints say, before anything
+runs, which parts of a function's result no test observes: the static counterpart of mutation
+testing (`blaze-mutants` is the dynamic one). They live in
+`crates/blaze-lints/src/blaze/test_strength/`, warn in blaze's workspace and are allowed
+elsewhere.
+
+**The analysis.** Each test body, its closures and its helpers are lowered from MIR into a small
+IR (`lower.rs`). A sans-IO, flow-insensitive fixpoint (`flow.rs`) then follows each value a
+workspace call returns, or writes through a `&mut` argument, to the places that can fail the
+test. A part is a path of fields, variants and elements ending in the value itself, its
+discriminant or its length. A part is observed when it reaches:
+
+- an `assert!` or `assert_eq!`, which is a branch to a block from which no path returns;
+- a checking `unwrap` or `expect`;
+- a `PartialEq`: derived impls observe every field, hand-written ones are walked;
+- a helper that does one of these (summaries go 3 calls deep);
+- a dependency's function, such as a snapshot or property runner.
+
+Printing a value, or dropping it, observes nothing. Wherever the analysis cannot see, it counts
+the value as observed, so a finding is meant to be true. A per-crate index (`strength_index`)
+merges every test's reads by function path. Each function's lints read only its own row (the
+interned `StrengthKey`), so an edit to one test re-lints only the functions whose rows changed.
+Doc tests are not read yet.
+
+| lint | fires on | message names |
+|---|---|---|
+| `result_part_unobserved` | a function some test calls whose result has a part no test observes | the function, the parts, the tests |
+| `weak_assertion` | an assert on only `is_some`, `is_ok`, `is_err`, `len` or `contains` of a value with a payload | the call, the predicate |
+| `mirror_assertion` | an `assert_eq!` whose expected side runs the same code as the side under test | both sides |
+| `pseudo_tested` | a function tests call but observe nothing of: its result and `&mut` writes are never checked | the function, the tests |
+| `unreached_by_tests` | a public or crate function no test reaches, in a crate that has tests | the function |
+| `error_path_untested` | a function returning `Result` whose tests never check which `Err` comes back | the function, its error sites |
+| `property_over_examples` | a function with an inverse beside it (`encode`/`decode`, `to_bytes`/`from_bytes`, ...) tested only by examples | the pair |
+
+None has a machine fix; each finding's help says what to assert.
+
+## `result_part_unobserved`
+
+"`parse` is tested by `parses_header` and 2 more, but no test looks at `Header.flags` or
+`Header.len` of what it returns". A part counts as observed when any test observes it. Help:
+assert on the whole value, or on the part named.
+
+## `weak_assertion`
+
+"`assert!(find(..).is_some())` checks only that `find` returned a `Some`, not which value".
+Quiet where there is no payload to check (`Result<(), E>`, `Option<()>`), and on `is_none` and
+`is_empty`, which pin the whole value when they hold. The polarity of a check is not followed, so
+`!v.is_empty()` is missed. Help: compare with the expected value.
+
+## `mirror_assertion`
+
+"both sides of this `assert_eq!` run `encode`: the test checks `encode` against itself". Fires
+when both sides call the same function with the same arguments, or one side calls the other
+within 2 levels.
+
+## `pseudo_tested`
+
+"`apply` is called by 3 tests, but none observes anything it returns or writes": any body for
+`apply` would pass them. Help: assert on what it returns or writes.
+
+## `unreached_by_tests`
+
+"no test reaches `orphan`". Reach is a walk from every test's calls, through every function they
+call, plus trait methods that are dispatched and const and static bodies. Fires only in a crate
+that has tests.
+
+## `error_path_untested`
+
+"`load`'s tests check whether it fails, never which error it returns (it returns one at 3
+places)". Matching only `Ok`, or `is_err`, does not count; `assert_eq!(f(bad), Err(..))` or a
+`match` on the `Err`'s variant does.
+
+## `property_over_examples`
+
+"`encode` and its inverse `decode` are tested only by examples". Quiet once a test draws a
+value (Hegel, proptest, quickcheck) and passes it through either function.
+
+## Structural
+
+**The rule.** Code that the type's structure gives is not written by hand (AGENTS.md rules 56,
+reflection-first, and 30, one concept in one home). A body that does the same thing to every
+field is the field list written again, and a field added later is an edit there that nothing
+asks for. The one that does it to every field but one is usually a bug. These ten lints live in
+`crates/blaze-lints/src/blaze/structural/`. They are in `blaze::internal`, so another workspace
+turns them on itself, as advice it adopts at the adoption ladder's `suggest` step.
+
+**The analysis** (`structural/uniform.rs`) asks one question of each body: is it uniform over
+the type's fields or variants? It runs once per file. The body is split at its combinator:
+
+- its statements;
+- one operator throughout (`&&`, `||`, `+`, `*`, `^`, `|`, `&`);
+- a method chain (`.field(..)` links between a head and `finish`, `.then(..)` and
+  `.then_with(..)` links);
+- the fields of a record or tuple constructor (`Ok(..)` and `Some(..)` looked through).
+
+Each piece is a **term**. A term's **template** is its tokens with each read of a field written
+`#`. The reads that count are `self.f`, `other.f`, a parameter's `.f`, a local bound by
+destructuring `let Self { f, .. } = self`, and the string `"f"`. The template is normalized, so
+`self.f.clone()`, `Clone::clone(&self.f)` and `self.f` match, and the default forms
+(`Default::default()`, `T::default()`, `0`, `false`, `None`, `""`, and `String::new()`,
+`Vec::new()` and the other std collections' `new()`) are one. Each term
+falls in one of four classes:
+
+- **clean**: it reads one field, or fills the field it reads;
+- **crossed**: it fills one field from another;
+- **odd**: it reads two fields;
+- **frame**: it reads none, such as `f.debug_struct("T")`.
+
+The template most clean terms share is the body's; a tie means none. The verdict:
+
+- **uniform**: every field is covered by that template once, and nothing is odd, crossed or
+  missing;
+- **almost uniform**: something is wrong, but two fields or more are covered, and more are
+  covered than are odd or crossed;
+- **not uniform**: anything else.
+
+A field left out on purpose is written `field: _, // left out: <why>` in a destructuring `let`.
+This is the one marker, shared with `key_ignores_field`. A property test checks the analysis
+(`structural/tests.rs`). A uniform body stays uniform under any order of its terms. Deleting one
+term gives almost uniform, naming that field.
+
+**Levels.** In blaze's workspace (`lints-ratchet`):
+
+- `impl_misses_field`, `variant_list_drift` and `conversion_misses_field` are the bug forms,
+  meant to be `deny`. Each is held at `warn` until it has a baseline.
+- `hand_written_derivable` warns.
+- The other six are advice, `allow`.
+
+**Already covered elsewhere.** These clippy lints overlap and are on in the table, but
+`blaze check` does not implement them yet: `derivable_impls`, `derived_hash_with_manual_eq`,
+`derive_ord_xor_partial_ord`, `non_canonical_clone_impl` and `non_canonical_partial_ord_impl`.
+`key_ignores_field` checks a single `Hash`, `Eq` or `Ord` impl, or key builder, that leaves a
+field out. `impl_misses_field` does not check those, and adds the checks across two bodies.
+
+**The end state** for every one of these is reflection: `for const f in fields_of::<T>()` over
+a struct's fields, and `variants_of::<E>()` with `Variant::NAME` and `Variant::INDEX` over an
+enum's variants (docs/v2/plan/design/comptime.md). Until then the fix is a derive, a declarative
+macro or a table.
+
+| lint | fires on | fix |
+|---|---|---|
+| `hand_written_derivable` | an impl whose body is exactly what the derive writes | the derive, impls removed (machine) |
+| `impl_misses_field` | a field-wise body almost uniform with a field missing; two bodies of one type that disagree | none |
+| `hand_kept_variant_list` | `ALL`, `COUNT`, `fn name`, `fn index` or a names table derivable from the enum | none yet |
+| `variant_list_drift` | such a list that misses, repeats, miscounts, misspells or misorders, or a `_` arm for one variant | the list regenerated (maybe-incorrect) |
+| `hand_written_codec` | an encoder or decoder of three fields or more, the same call on each | none |
+| `field_wise_conversion` | a `From` or `to_*` copying three fields or more into their namesakes | none |
+| `conversion_misses_field` | such a conversion that crosses two fields or drops one | none |
+| `hand_written_visitor` | one walk (`visit*`, `walk*`, `fold*`) uniform over the fields of three or more types | none |
+| `repeated_field_list` | a struct of three fields or more written out in three uniform methods | none |
+| `registry_spread` | an enum with five lists or more in a file, two of them facts no rule derives | none |
+
+## `hand_written_derivable`
+
+"`impl Clone for Pair` is what `#[derive(Clone)]` writes: by hand, it must be edited with every
+field `Pair` gains". The lint checks exact forms:
+
+- `Clone`: each field `.clone()`d into `Self { .. }`, or `*self` where `Copy` is derived;
+- `Debug`: `debug_struct("Name")`, a `.field("f", &self.f)` per field in order, then `finish()`;
+- `Default`: every field its default;
+- `PartialEq`: `self.f == other.f` joined by `&&`;
+- `Hash`: `self.f.hash(state)` per field, in order;
+- `Ord`: `self.f.cmp(&other.f)` joined by `.then(..)` in order;
+- `PartialOrd`: `Some(self.cmp(other))`.
+
+Generic types are left alone, since the derive's bounds differ. So is `Eq`, whose derive also
+asserts every field is `Eq`. A pair is derived together or not at all: `Hash` with `PartialEq`,
+and `Ord` with `PartialOrd`. The fix removes the impls and adds the names to the struct's
+derive. It is maybe-incorrect when a removed impl holds a comment.
+
+## `impl_misses_field`
+
+Fires on one body: "`encode` of `impl Encode for Row` covers `a`, `b`, `c` and `d` the same way
+but leaves out `e`". Only bodies meant to cover every field are checked: `clone_from`, the
+codec methods, `merge`, `reset`, `validate`, walks, and a std `Debug`'s `fmt` unless it ends in
+`finish_non_exhaustive()`.
+
+Fires on two bodies of one type:
+
+- "`PartialEq` of `Loose` ignores `c`, which its `Hash` covers": two values equal by `==` can
+  hash differently. A `Hash` coarser than `Eq` is legal and is not reported.
+- `Ord` against `PartialEq`, and `Ord` against `PartialOrd`, in either direction.
+- An encoder against its decoder (`encode`/`decode`, `write_to`/`read_from`,
+  `to_bytes`/`from_bytes`, `persist`/`restore`, `serialize`/`deserialize`, `save`/`load`).
+
+A derived side covers every field.
+
+## `hand_kept_variant_list`, `variant_list_drift`
+
+An enum's variants listed again by hand. The lint reads these lists:
+
+- in the enum's impls: an `ALL` array, a count (`COUNT`, `LEN`, `N`, ...), and a `match self`
+  that gives a string, an integer or a fact per variant;
+- a parse that matches strings to variants;
+- anywhere in the file, of an enum of any crate: a `const` or `static` string array whose length
+  is `E::COUNT`, written out or made by the file's `macro_rules!`.
+
+A names list follows one rule: the variant's own name, snake, lower, kebab or screaming case,
+with any shared prefix stripped.
+
+`variant_list_drift` is the bug form. It fires on:
+
+- a list that misses or repeats a variant;
+- a count that is wrong;
+- a name off the rule that is another variant's or within two edits;
+- a table out of declaration order;
+- a parse that disagrees with `fn name`;
+- a `match self` whose `_` arm stands for exactly one variant: "`fn name` of `Tag` names 22 of
+  its 23 variants and leaves `W` to `_`". A variant added later takes that arm silently.
+
+A `_` over two variants or more is a grouping and is left alone.
+
+`hand_kept_variant_list` is the advice: a list that is right today, reported once per enum.
+
+## `hand_written_codec`
+
+An `encode`, `decode`, `persist`, `write_to`, ... (or any method of a trait named `Encode`,
+`Persist`, `Serialize`, ...) that covers three fields or more with one call each. The record's
+layout belongs in one place (`blaze_format::record!`, or one generic codec over `fields_of`), so
+the encoder and the decoder cannot disagree.
+
+## `field_wise_conversion`, `conversion_misses_field`
+
+The conversions read are `impl From<A> for B` and an inherent `to_*`, `into_*` or `as_*` that
+takes `self`.
+
+- `conversion_misses_field` fires on a crossed field: "`from` of `impl From<Wire> for Point`
+  fills `x` from `w.y`". `x: w.y` counts as crossed only where the source has its own `x` and the
+  target its own `y`. It also fires on a field both types have that is never read.
+- `field_wise_conversion` is the advice: three fields or more copied straight across.
+
+## `hand_written_visitor`
+
+The same walk method, uniform over its type's fields, written by hand for three types or more
+in one file. Reported once, at the first.
+
+## `repeated_field_list`
+
+A struct of three fields or more whose whole field list is written out in three uniform methods
+or more of the file. Each is the declaration again.
+
+## `registry_spread`
+
+An enum of this file with five lists or more, two of them facts no rule derives (`fn kind`,
+`fn help`). Each variant's facts then live at its position in every list. The form that replaces
+them is one row per variant in one table, from which every list is derived.
+
+## `same_behaviour`
+
+**The mistake.** A function written again in another style under another name: `if` where the
+first has `match`, an early `return` where it has `else`, `b + a` for `a + b`, one more `let`.
+The syntax lints (`same_fn`, `near_duplicate`) miss it because the text differs; the compiled
+behaviour does not.
+
+Left alone: two homes for one rule, which drift the first time one is fixed.
+
+**The right form.** Keep the original and call it. Where the two must stay apart, say why with
+`#[expect(blaze::same_behaviour, reason = "..")]`. Internal, allowed by default.
+
+The canonical form (`crates/blaze-lints/src/blaze/dup/semantic.rs`, `CANON_VERSION` 1). A body's
+runtime MIR is lowered to a small graph and the steps below are repeated to their fixpoint (at
+most 8 rounds; one that does not settle is not compared):
+
+1. Thread jumps: a chain of empty `goto` blocks becomes its end; a jump to an empty end block
+   (`return`, `unreachable`) becomes that end.
+2. Number: blocks in reverse postorder from the entry, unreachable blocks dropped; the return
+   place and the parameters keep their slots, other locals are numbered by first appearance.
+3. Fold `bool`s: `!` of a constant, `== true`, `!= false`; a switch on `!x` becomes a switch on
+   `x` with its arms swapped.
+4. Copy-propagate a temporary written once and read once in its block; forward an operation
+   whose temporary is only copied whole by a later assignment of its block (`_t = a * k;
+   y = _t` is `y = a * k`); drop stores never read. Nothing between may write what it reads.
+5. Simplify switches: arms to the `otherwise` target and arms to `unreachable` go; a switch
+   with one target left is a `goto`.
+6. Sort the operands of operations that commute on their type (integer and `bool` `+`, `*`,
+   `&`, `|`, `^`, `==`, `!=` and the overflow-checked `+` and `*`; float `+` and `*`, whose
+   NaN payload Rust leaves unspecified; never `-`, `/`, a shift or a float comparison).
+
+Types, callees and constants are hashed by path and value, not by local name. Compared: free
+functions, inherent and trait-impl methods and trait default bodies of the crate and its
+local (workspace) dependencies, from 6 to 256 statements and terminators; test code, macro
+written bodies, `const fn`s that are one constant, and bodies with closures, coroutines,
+inline `asm` or a constant the lowering cannot read are not. A pair that `same_fn` already
+reports (equal shape) is left to it. Where the lowering cannot tell, it reports nothing.
+
+Not built: `reimplements_library_fn`. A hand-written `is_none` is equal to `Option::is_none` only
+once the callee is inlined; that needs a per-instance query in the front end for MIR with small
+callees inlined and overflow checks normalised (core builds without them), and an enumeration
+of library items by path.

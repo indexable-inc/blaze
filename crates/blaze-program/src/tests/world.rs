@@ -135,7 +135,8 @@ pub(super) fn settings() -> Settings {
 }
 
 /// One walk, driven to its end over `shards` shards with completions in an order drawn from
-/// `rng`. Gives what was walked and the code records made, in order.
+/// `rng`, making nodes new to the program at `new_at`. Gives what was walked, the stale nodes
+/// never reached, and the code records made, in order.
 pub(super) fn walk(
     front: &ModelFront,
     store: &mut Store,
@@ -143,11 +144,12 @@ pub(super) fn walk(
     prior: &impl Prior,
     shards: u32,
     plant: Plant,
+    new_at: Tier,
     rng: &mut Rng,
-) -> Result<(Vec<Walked>, Vec<InstanceKey>), String> {
+) -> Result<(Vec<Walked>, Vec<Node>, Vec<InstanceKey>), String> {
     let mut walks = Vec::new();
     for shard in 0..shards {
-        walks.push(Walk::new(WalkConfig { settings: front.settings, shard, shards, fuel: 200_000, plant }));
+        walks.push(Walk::new(WalkConfig { settings: front.settings, shard, shards, fuel: 200_000, plant, new_at }));
     }
     for (node, seed) in seeds {
         walks[shard_of(&node.symbol(), shards) as usize].reach(*node, *seed, prior);
@@ -204,10 +206,14 @@ pub(super) fn walk(
         if pending.is_empty() {
             if walks.iter().all(Walk::is_idle) {
                 let mut walked = Vec::new();
+                let mut unreached = Vec::new();
                 for walk in walks {
-                    walked.extend(walk.end().map_err(|error| error.to_string())?);
+                    let ended = walk.end().map_err(|error| error.to_string())?;
+                    walked.extend(ended.walked);
+                    unreached.extend(ended.unreached);
                 }
-                return Ok((walked, makes));
+                unreached.sort_unstable();
+                return Ok((walked, unreached, makes));
             }
             if !asked {
                 return Err("a walk is not idle, yet asks nothing and waits for nothing".to_string());
@@ -242,8 +248,9 @@ pub(super) fn fresh(
     for _ in 0..8 {
         let mut program = Program::new(machine, front.settings, &roots(&front.model), plant);
         let seeds = program.seeds(&delta);
-        let (walked, _) = walk(front, &mut store, &seeds, &Fresh, shards, plant, rng)?;
-        match program.place(&walked, &[], front, &store) {
+        // A whole build: every node is new, and only `top` is made at the top tier.
+        let (walked, unreached, _) = walk(front, &mut store, &seeds, &Fresh, shards, plant, Tier::Edit, rng)?;
+        match program.place(&walked, &unreached, &[], front, &store) {
             Ok(change) => {
                 let mut image = FileImage::new(machine.page);
                 apply(&change, &mut image);
@@ -411,7 +418,7 @@ fn row_of(program: &Program, front: &ModelFront, node: &Node) -> String {
                 row.key,
                 row.tier,
                 names(front, &row.calls),
-                names(front, &row.inlined)
+                names(front, &row.inlined.iter().map(|(inlinee, _)| *inlinee).collect::<Vec<_>>())
             ),
             None => "no row".to_string(),
         },
@@ -612,9 +619,11 @@ fn run(program: &Program, image: &FileImage, front: &ModelFront, arch: Arch, add
     }
 }
 
-/// What a test can observe of the model: every instance it can call (by its body key, its type
-/// arguments and the tier it is held at), every static it can read, every span its panics print.
-fn model_reach(front: &ModelFront, program: &Program, entry: usize) -> Digest {
+/// What a test can observe of the model: every instance it can call (by its body key and its
+/// type arguments), every static it can read, every span its panics print. From the model
+/// alone, never the program: not the tier an instance is held at, nor whether it is placed or
+/// taken in, as neither changes what the test observes.
+fn model_reach(front: &ModelFront, entry: usize) -> Digest {
     let model = &front.model;
     let mut seen = BTreeSet::new();
     let mut statics = BTreeSet::new();
@@ -645,8 +654,6 @@ fn model_reach(front: &ModelFront, program: &Program, entry: usize) -> Digest {
         let (index, _) = front.instance(symbol);
         let body = front.body_key(&item(index)).map(|key| key.0).unwrap_or_default();
         hasher.id(&symbol.item.0).id(&symbol.args.0).id(&body);
-        let tier = program.functions().get(symbol).map_or(9, |row| row.tier as u8);
-        hasher.update(&[tier]);
         if model.fns[index].panics > 0 {
             let span = front.span(&item(index)).map(|span| (span.file, span.line)).unwrap_or_default();
             hasher.part(&span.0).update(&span.1.to_le_bytes());
@@ -696,6 +703,10 @@ pub(super) enum Edit {
     Text,
     /// A body edit that adds a panic: the function's code grows by 16 bytes.
     Panic,
+    /// A body edit that marks the function `#[inline(always)]`: every caller takes it in.
+    Always,
+    /// An edit of the type with this index (its content key moves).
+    Retype(u8),
 }
 
 impl World {
@@ -744,6 +755,11 @@ impl World {
                 model.fns[pick].text += 1;
                 model.fns[pick].panics += 1;
             }
+            Edit::Always => {
+                model.fns[pick].text += 1;
+                model.fns[pick].attr = crate::inline::InlineAttr::Always;
+            }
+            Edit::Retype(ty) => model.types[ty as usize] += 1,
             Edit::Body => {
                 let function = &mut model.fns[pick];
                 function.text += 1;
@@ -833,20 +849,21 @@ impl World {
     }
 
     fn model_reaches(&self) -> Vec<Digest> {
-        self.model.tests.iter().map(|test| model_reach(&self.front, &self.program, *test)).collect()
+        self.model.tests.iter().map(|test| model_reach(&self.front, *test)).collect()
     }
 
     /// Places `walked`; on an outgrown reserve, builds the revision whole at twice the reserve.
-    fn place(&mut self, walked: &[Walked], moved: &[ItemId], makes: &mut Vec<InstanceKey>) -> Result<(), String> {
-        match self.program.place(walked, moved, &self.front, &self.store) {
+    fn place(&mut self, walked: &[Walked], unreached: &[Node], moved: &[ItemId], makes: &mut Vec<InstanceKey>) -> Result<(), String> {
+        match self.program.place(walked, unreached, moved, &self.front, &self.store) {
             Ok(change) => self.apply(&change),
             Err(ProgramError::Outgrown { .. }) => {
                 let machine = self.program.machine().doubled();
                 let mut program = Program::new(machine, self.front.settings, &roots(&self.model), self.plant);
                 let seeds = program.seeds(&Delta::default());
-                let (walked, more) = walk(&self.front, &mut self.store, &seeds, &Fresh, self.shards, self.plant, &mut self.rng)?;
+                let (walked, unreached, more) =
+                    walk(&self.front, &mut self.store, &seeds, &Fresh, self.shards, self.plant, Tier::Edit, &mut self.rng)?;
                 makes.extend(more);
-                let change = program.place(&walked, &[], &self.front, &self.store).map_err(|error| error.to_string())?;
+                let change = program.place(&walked, &unreached, &[], &self.front, &self.store).map_err(|error| error.to_string())?;
                 self.program = program;
                 self.rebuilt = true;
                 self.apply(&change)
@@ -883,9 +900,10 @@ impl World {
         let program = self.program.clone();
         self.rebuilt = false;
         self.written = 0;
-        let (walked, mut makes) = walk(&self.front, &mut self.store, &seeds, &program, self.shards, self.plant, &mut self.rng)?;
+        let (walked, unreached, mut makes) =
+            walk(&self.front, &mut self.store, &seeds, &program, self.shards, self.plant, delta.new_at(), &mut self.rng)?;
         let first_walk: BTreeSet<InstanceKey> = makes.iter().copied().collect();
-        self.place(&walked, &delta.moved, &mut makes)?;
+        self.place(&walked, &unreached, &delta.moved, &mut makes)?;
 
         // The makes are exactly the held keys the store did not have (and, when the reserve
         // was outgrown, what the abandoned edit walk made before the whole walk).
@@ -925,7 +943,8 @@ impl World {
         self.last_delta = delta;
         self.last_makes = makes;
 
-        // A test's key moved exactly when what it reaches changed.
+        // A test's key moved exactly when what it reaches changed; a tier-up changes nothing a
+        // test observes, so it moves no key.
         let tests_after = self.test_keys();
         let reaches_after = self.model_reaches();
         for index in 0..tests_after.len() {
@@ -1012,6 +1031,13 @@ pub(super) fn run_seed(seed: u64, steps: usize, plant: Plant) -> Result<(), Stri
 }
 
 /// The oracles hold over many seeds and edit sequences.
+///
+/// The invariant: after every edit, the patched program equals a fresh build of the same
+/// revision holding the same functions at the top tier (every node, its key and its content),
+/// and runs the same; and a test's key moves exactly when what the test can observe moved (the
+/// body keys and type arguments of every instance it can run, the values of the statics it can
+/// read, the spans its panics print), which a tier never changes: a tier-up, of any instance a
+/// test runs placed or taken in, never moves a test's key, so it never runs a test again.
 #[test]
 fn patched_programs_equal_fresh_builds() {
     for seed in 0..64 {
@@ -1054,17 +1080,33 @@ fn edits_cost_their_floor() {
         if seed % 2 == 0 {
             world.step(Edit::MoveSpan).unwrap_or_else(|why| panic!("seed {seed}, span move: {why}"));
             world.step(Edit::TierUp).unwrap_or_else(|why| panic!("seed {seed}, tier-up: {why}"));
-            assert!(
-                world.rebuilt || world.program.functions().values().all(|row| row.tier == Tier::Release),
-                "seed {seed}: a tier-up left a row at the fast tier"
-            );
+            if !world.rebuilt {
+                let fast: Vec<String> = world
+                    .program
+                    .functions()
+                    .iter()
+                    .filter(|(_, row)| row.tier == Tier::Edit)
+                    .map(|(symbol, row)| {
+                        let node = Node::Function(*symbol);
+                        format!(
+                            "{} ({}; since build {} of {}; referred to by [{}])",
+                            name(&world.front, &node),
+                            row_of(&world.program, &world.front, &node),
+                            row.since,
+                            world.program.generation(),
+                            referrers(&world.program, &world.front, &node)
+                        )
+                    })
+                    .collect();
+                assert!(fast.is_empty(), "seed {seed}: a tier-up left rows at the fast tier: {}", fast.join("; "));
+            }
         }
         let live: Vec<usize> = (0..world.model.fns.len()).filter(|index| world.model.fns[*index].alive).collect();
         let target = live[(seed as usize) % live.len()];
         let target_item = item(target);
         let mut expected = BTreeSet::new();
         for (symbol, row) in world.program.functions() {
-            let inlines_it = row.inlined.iter().any(|inlinee| inlinee.item == target_item);
+            let inlines_it = row.inlined.iter().any(|(inlinee, _)| inlinee.item == target_item);
             if symbol.item == target_item || inlines_it {
                 expected.insert(*symbol);
             }
@@ -1239,37 +1281,103 @@ fn a_static_pointing_at_a_moved_function_reads_the_same() {
     }
 }
 
-/// The core's framing: every record kind this crate files opens under its key and gives back
-/// the value, and refuses another key.
+/// Regression (seed 0, step 7 of `patched_programs_equal_fresh_builds`): an edit that makes a
+/// function `#[inline(always)]` makes its callers take it in, so its own instance leaves the
+/// set of rows. It was seeded as an edit and made for its own sake, then retired: a record
+/// made to be thrown away. By the row rule it is stale with only walked referrers, so walked
+/// only if reached, and never reached.
+#[test]
+fn an_instance_its_callers_now_take_in_is_not_made() {
+    for arch in [Arch::Arm64, Arch::X86_64] {
+        let model = main_calls_three(crate::inline::InlineAttr::None, 40);
+        let mut world = World::of(model, Rng::new(4), arch, 1, 1 << 16, Plant::None)
+            .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
+        world.pick = Some(3);
+        world.step(Edit::Always).unwrap_or_else(|why| panic!("{arch:?}, function 3 made inline(always): {why}"));
+        assert!(
+            !world.program.functions().keys().any(|symbol| symbol.item == item(3)),
+            "{arch:?}: function 3 kept a row though `main` takes it in"
+        );
+        let main = fn_symbol(&world.model, 0, &[]);
+        assert_eq!(world.last_makes, vec![world.program.functions()[&main].key], "{arch:?}: the edit makes `main`, and only it");
+    }
+}
+
+/// Regression (`every_edit_kind_holds`, "the model has no instance"): a type edit moves the
+/// symbol of every instance at that type. `main` names type 0, so it is edited and calls
+/// `3<0>` at the new type. `3<0>` passes its parameter on to `4<0>`, so its body is unchanged;
+/// 4 names type 0 itself (it calls `3<0>` back at a concrete type 0), so the old `4<0>` is an
+/// instance of an edited item. The old `4<0>` is reached only through the old `3<0>`, which
+/// only `main` called: it is not in the new set of rows and must be neither walked (its symbol
+/// is no instance of the new revision) nor kept.
+#[test]
+fn an_edited_instance_at_a_retyped_argument_is_not_walked() {
+    use super::model::{Arg, Call};
+    for arch in [Arch::Arm64, Arch::X86_64] {
+        let none = crate::inline::InlineAttr::None;
+        let mut model = main_calls_three(none, 40);
+        model.fns[0].calls = vec![Call { callee: 3, args: vec![Arg::Concrete(0)] }];
+        model.fns[3].generics = 1;
+        model.fns[3].calls = vec![Call { callee: 4, args: vec![Arg::Param(0)] }];
+        let mut four = written(4, none, 40, &[5]);
+        four.generics = 1;
+        four.calls.push(Call { callee: 3, args: vec![Arg::Concrete(0)] });
+        model.fns.push(four);
+        model.fns.push(written(5, none, 40, &[]));
+        let mut world = World::of(model, Rng::new(5), arch, 1, 1 << 16, Plant::None)
+            .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
+        let old_four = fn_symbol(&world.model, 4, &[0]);
+        assert!(world.program.functions().contains_key(&old_four), "{arch:?}: 4<0> is not placed, so the case is not tested");
+        world.step(Edit::Retype(0)).unwrap_or_else(|why| panic!("{arch:?}, type 0 edited: {why}"));
+        assert!(
+            !world.program.functions().contains_key(&old_four),
+            "{arch:?}: the old 4<0> kept a row after its type moved"
+        );
+    }
+}
+
+/// The core's framing: every record kind this crate files is proved the record of its key by
+/// the core's one check ([`blaze_keyed::proof::hit`]), gives back the value through the one
+/// payload reader, and is refused under another key.
 #[test]
 fn records_round_trip_through_the_core_framing() {
     use blaze_format::Aligned;
+    use blaze_keyed::proof;
 
     use crate::keyed;
     use crate::record::{OutsideRead, TestRecord};
 
     let world = World::new(3, Plant::None).unwrap_or_else(|why| panic!("{why}"));
-    for (symbol, row) in world.program.functions() {
-        let Some(code) = world.store.code(&row.key) else { panic!("no record of {symbol}") };
-        let filed = Aligned::copy_from(&keyed::write_code(&row.key, &code));
-        assert_eq!(keyed::read_code(&filed, &row.key), Ok(code.clone()));
-        assert_eq!(keyed::read_code_head(&filed, &row.key), Ok(code.head()));
-        let other = InstanceKey(Digest::of("blaze program test other key 1", &row.key.0.0));
-        assert!(keyed::read_code(&filed, &other).is_err(), "a code record opened under another key");
-    }
-    for (key, bytes) in &world.store.plans {
-        let plan = Plan::decode(bytes).unwrap_or_else(|error| panic!("{error}"));
-        let filed = Aligned::copy_from(&keyed::write_plan(key, &plan));
-        assert_eq!(keyed::read_plan(&filed, key), Ok(plan));
-    }
-    let (head_key, head, chunks) = keyed::write_program(&world.program);
-    let head = Aligned::copy_from(&head);
-    let mut filed = BTreeMap::new();
-    for (key, bytes) in chunks {
-        filed.insert(key.id(), Aligned::copy_from(&bytes));
-    }
-    let read = keyed::read_program(&head, &head_key, |key| filed.get(&key.id()).map(|bytes| &bytes[..]));
-    assert_eq!(read, Ok(world.program.clone()));
+    proof::scope(|snap| {
+        for (symbol, row) in world.program.functions() {
+            let Some(code) = world.store.code(&row.key) else { panic!("no record of {symbol}") };
+            let filed = Aligned::copy_from(&keyed::write_code(&row.key, &code));
+            let holds = proof::hit(snap, keyed::code_key(&row.key), &filed).unwrap_or_else(|error| panic!("{error}")).holds();
+            assert_eq!(keyed::read_code(&holds, &filed), Ok(code.clone()));
+            assert_eq!(keyed::read_code_head(&holds, &filed), Ok(code.head()));
+            let other = InstanceKey(Digest::of("blaze program test other key 1", &row.key.0.0));
+            assert!(proof::hit(snap, keyed::code_key(&other), &filed).is_err(), "a code record proved under another key");
+        }
+        for (key, bytes) in &world.store.plans {
+            let plan = Plan::decode(bytes).unwrap_or_else(|error| panic!("{error}"));
+            let filed = Aligned::copy_from(&keyed::write_plan(key, &plan));
+            let holds = proof::hit(snap, keyed::plan_key(key), &filed).unwrap_or_else(|error| panic!("{error}")).holds();
+            assert_eq!(keyed::read_plan(&holds, &filed), Ok(plan));
+        }
+        let (head_key, head, chunks) = keyed::write_program(&world.program);
+        let head = Aligned::copy_from(&head);
+        let mut filed = BTreeMap::new();
+        for (key, bytes) in chunks {
+            filed.insert(key.id(), (key, Aligned::copy_from(&bytes)));
+        }
+        let holds = proof::hit(snap, head_key, &head).unwrap_or_else(|error| panic!("{error}")).holds();
+        let read = keyed::read_program(&holds, &head, |key| {
+            let (filed_key, bytes) = filed.get(&key.id())?;
+            let chunk = proof::hit(snap, *filed_key, bytes).unwrap_or_else(|error| panic!("{error}")).holds();
+            Some((chunk, &bytes[..]))
+        });
+        assert_eq!(read, Ok(world.program.clone()));
+    });
     let result = TestRecord {
         key: TestKey(Digest::of("blaze program test result key 1", b"t")),
         passed: true,
@@ -1280,5 +1388,8 @@ fn records_round_trip_through_the_core_framing() {
         ],
     };
     let filed = Aligned::copy_from(&keyed::write_test(&result));
-    assert_eq!(keyed::read_test(&filed, &result.key), Ok(result));
+    proof::scope(|snap| {
+        let holds = proof::hit(snap, keyed::test_key(&result.key), &filed).unwrap_or_else(|error| panic!("{error}")).holds();
+        assert_eq!(keyed::read_test(&holds, &filed), Ok(result));
+    });
 }

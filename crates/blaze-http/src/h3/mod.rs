@@ -12,7 +12,13 @@
 //! the session's bidirectional and unidirectional streams, its datagrams, and its close
 //! capsule. It speaks both WebTransport drafts Chrome ships (02 and 07) with the settings
 //! wtransport 0.7.2 sent. A request that is not a WebTransport CONNECT is answered 400 or 501
-//! and reported ([`Event::Refused`]); an HTTP/3 page server is not this core's job.
+//! and reported ([`Event::Refused`]), unless the server was made to take requests
+//! ([`ServerConfig::requests`]).
+//!
+//! It also makes plain requests (GET, HEAD, with a range) and answers them, with session
+//! resumption and 0-RTT early data for the requests that may be replayed: the [`request`]
+//! module says what, and the floor each is held to. That is what the remote cache reads public
+//! objects with (`blaze-remote`'s `http3`).
 //!
 //! # The driver contract
 //!
@@ -32,12 +38,23 @@
 //!    [`Endpoint::reset`], [`Endpoint::stop`], [`Endpoint::send_datagram`],
 //!    [`Endpoint::close`], [`Endpoint::set_identity`] and [`Endpoint::close_all`] as the
 //!    asker wants; [`Endpoint::consumed`] as the asker takes each [`Event::StreamData`] (the
-//!    core reads no stream more than [`WINDOW`] bytes ahead of its asker).
-//! 5. **Events.** Drain [`Endpoint::next_event`] and hand each to the asker of its session
-//!    or stream.
-//! 6. **Waits.** Sleep until the next datagram, ask or [`Endpoint::next_deadline`], whichever
-//!    is first. Every connection ends by its idle timeout ([`Transport::idle`]), and a session
-//!    whose peer sends no SETTINGS fails at [`SETTINGS_WAIT`], so no wait is open.
+//!    core reads no stream more than [`WINDOW`] bytes ahead of its asker). For requests:
+//!    [`Endpoint::connect_requests`], [`Endpoint::request`], [`Endpoint::request_early`],
+//!    [`Endpoint::cancel`], and [`Endpoint::consumed_response`] as each
+//!    [`Event::ResponseData`] is taken; a server [`Endpoint::respond`]s to each
+//!    [`Event::Request`] and may [`Endpoint::go_away`].
+//! 5. **Events.** Drain [`Endpoint::next_event`] and hand each to the asker of its session,
+//!    stream or request.
+//! 6. **Tickets.** Before connecting, [`Endpoint::add_ticket`] each ticket kept from an
+//!    earlier process; keep each [`Event::Ticket`] (its bytes are a secret: owner-only, as
+//!    credentials are).
+//! 7. **Waits.** Sleep until the next datagram, ask or [`Endpoint::next_deadline`], whichever
+//!    is first. Every connection ends by its idle timeout ([`Transport::idle`]), a session
+//!    whose peer sends no SETTINGS fails at [`SETTINGS_WAIT`], and a request ends by its own
+//!    deadline ([`Request::deadline`]), so no wait is open.
+//!
+//! A caller that runs the core inside its own state machine needs only datagrams and a clock
+//! from its driver: the [`Wire`] trait is that seam, and the caller does the steps above.
 //!
 //! The waits a driver does open no span yet: blaze-trace is not in the graph
 //! (docs/v2/plan/design/no-tracing.md). When it lands, the driver opens one per wait, named
@@ -52,7 +69,8 @@
 //! [`check_pinned`] takes the time as an argument; the client's verifier reads rustls's clock
 //! to give it one.
 
-// Each core module (`endpoint`, `frame`, `qpack`, `huffman`, `varint`, `config`) is marked
+// Each core module (`endpoint` and its `requests`, `request`, `frame`, `qpack`, `huffman`,
+// `varint`, `config`) is marked
 // `#![blaze::sans_io]` itself: this module is not, since its children are part of a marked module
 // and `tokio_driver` is the driver.
 
@@ -61,6 +79,7 @@ mod endpoint;
 mod frame;
 mod huffman;
 mod qpack;
+pub mod request;
 #[cfg(feature = "tokio")]
 pub mod tokio_driver;
 mod varint;
@@ -71,13 +90,18 @@ mod tests;
 use std::net::SocketAddr;
 
 pub use config::{
-    ALPN, ClientConfig, Identity, MOST_VALID, ServerConfig, Transport, check_pinned, server_tls,
+    ALPN, ClientConfig, Identity, MOST_TICKET_SERVERS, MOST_TICKETS_PER_SERVER, MOST_VALID,
+    ServerConfig, Ticket, Transport, Trust, check_pinned, server_tls,
 };
 pub use endpoint::{
     Closed, ConnId, Direction, Endpoint, Event, LINGER, MOST_HELD, SETTINGS_WAIT, SessionId,
     SessionRequest, StreamRef, Transmit, WINDOW,
 };
 pub use frame::Settings;
+pub use request::{
+    DATA_FRAME, Early, Length, Range, Request, RequestEnd, RequestId, ResponseHead, Served,
+    USER_AGENT,
+};
 
 /// A step of an endpoint's work: what an [`Error`] was about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +120,8 @@ pub enum Step {
     Stream,
     /// A datagram.
     Datagram,
+    /// A plain request and its answer.
+    Request,
 }
 
 impl std::fmt::Display for Step {
@@ -108,6 +134,7 @@ impl std::fmt::Display for Step {
             Step::Session => "the WebTransport session",
             Step::Stream => "a WebTransport stream",
             Step::Datagram => "a WebTransport datagram",
+            Step::Request => "an HTTP/3 request",
         })
     }
 }
@@ -131,3 +158,39 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// What a wait on a [`Wire`] ended with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waited {
+    /// At least one datagram came, and each was handed over.
+    Received,
+    /// The wait's deadline came first.
+    Deadline,
+}
+
+/// The network and the clock, and nothing else: what a caller that runs an [`Endpoint`] in
+/// its own state machine (blaze-remote's HTTP/3 bucket) needs from a driver. A driver
+/// implements it over its UDP socket and monotonic clock; a test implements it over a
+/// simulated network and a virtual clock, with the peer endpoint inside.
+///
+/// The caller does the rest of the driver contract itself: it feeds [`Wire::wait`]'s datagrams
+/// to [`Endpoint::received`], moves [`Endpoint::next_transmit`] onto [`Wire::send`], and calls
+/// [`Endpoint::advance_clock`] with [`Wire::now`].
+pub trait Wire {
+    /// The instant the clock counts from: what the caller's [`Endpoint::new`] is given.
+    fn epoch(&self) -> std::time::Instant;
+    /// The time since [`Wire::epoch`], monotonic.
+    fn now(&mut self) -> std::time::Duration;
+    /// Sends one datagram. One that cannot be sent is dropped, as the network may drop it:
+    /// QUIC sends it again.
+    fn send(&mut self, transmit: Transmit);
+    /// Waits until a datagram comes or the clock reaches `until`, whichever is first, and
+    /// hands each datagram that came (its sender and bytes) to `received`. `until` is the
+    /// wait's bound: a wire never waits past it. (A driver opens a span naming the wait's
+    /// peer for it, every-wait-says-what.)
+    fn wait(
+        &mut self,
+        until: std::time::Duration,
+        received: &mut dyn FnMut(SocketAddr, &[u8]),
+    ) -> Waited;
+}

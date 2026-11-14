@@ -29,6 +29,8 @@ one code path sized by the machine.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
 - Remote execution is the same driver with another executor.
+- A lint finding is a record too: errors before the answer, advice after, analyses in the
+  background.
 
 ## Scope
 
@@ -43,6 +45,7 @@ In scope:
 - Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
 - Code that stays for the long term is sans-IO. New crates move to bstd once blaze builds blaze.
+- A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
 - `blaze watch`, or building on save: edits come in transactions whose middle states are invalid.
@@ -87,6 +90,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **65. granular-caching**: Every cache is keyed per item by a key from text, computed before the work; never per crate.
 - **71. item-relative-positions**: Keys and records hold item-relative positions; `file:line:col` exists only when printed.
 - **74. verify-once**: A check happens once and returns a proof type that later code takes; nothing is verified twice.
+- **81. findings-are-records**: A lint finding is a record keyed like its check, with no level and an item-relative range.
 
 ### Runtime code (skill `runtime-code`)
 - **3. no-fallback**: No fallback, no retry, nothing quietly ignored: stop with an error naming what and where.
@@ -147,7 +151,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
 - **47. every-agent-has-a-task**: Every agent starts on one task with its outcome and check; people follow tasks, not agents.
-- **48. agents-are-a-cost**: Start each independent large piece now in its own lane, four writing at most; nothing small.
+- **48. agents-are-a-cost**: Start each independent large piece now in its own lane; four at most share files; nothing small.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
 

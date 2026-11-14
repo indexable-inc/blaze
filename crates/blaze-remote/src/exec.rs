@@ -8,8 +8,11 @@
 //!    the task with an [`Inputs`] reader holding those records and nothing else. A read of
 //!    anything else is the core's [`NotAnInput`], and the action fails with it.
 //! 3. The worker writes all results of the batch as segments of the batch's namespace, each
-//!    with a statement signed by its builder key (role build), as a push does, and answers an
-//!    [`Outcome`] per action: the segments holding its records, its logs and its usage.
+//!    with a statement signed by its builder key (role build), as a push does: each record made
+//!    is filed under its own kind and key (the action's `made`). It answers an [`Outcome`] per
+//!    action: the segments holding its records, its logs and its usage. The outcome is a record
+//!    of the core's `ActionResult` kind, keyed by the toolchain, the record made and the inputs
+//!    ([`Outcome::record`]).
 //! 4. The results must be byte-identical to a local run of the same action (rule
 //!    deterministic-output). The simulation checks it, and a push's determinism check compares
 //!    them to what a second builder made.
@@ -33,12 +36,18 @@ use std::collections::BTreeMap;
 use blaze_cas::plain::Namespace;
 use blaze_ids::ContentId;
 pub use blaze_keyed::exec::{Action, NotAnInput, RecordRef};
-use blaze_keyed::kind::Tag;
+use blaze_keyed::{
+    kind::{ActionInputs, ActionResult, Kind, Tag, ToolId},
+    store::StoreError,
+};
 
 use crate::{
-    bundle::SegmentRef,
-    wire::{id_at, put_u32, put_u64, u32_at, u64_at},
+    bundle::SEGMENTS_MOST,
+    segment::SegmentRef,
+    wire::{Bounded, id_at, put_u32, put_u64, u32_at, u64_at},
 };
+
+const ROW: usize = SegmentRef::ROW;
 
 /// The most actions a batch holds.
 pub const ACTIONS_MOST: usize = 4096;
@@ -47,26 +56,33 @@ pub const INPUTS_MOST: usize = 1 << 16;
 /// The most bytes a batch may be.
 pub const BATCH_MOST: u64 = 64 << 20;
 /// The most bytes an action's log may be.
-pub const LOG_MOST: u32 = 1 << 20;
+pub const LOG_MOST: usize = 1 << 20;
 
-/// An action as owned and sent.
+/// An action as owned and sent: at most [`INPUTS_MOST`] inputs, by construction.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Sent {
     pub made: RecordRef,
-    pub inputs: Vec<RecordRef>,
+    pub inputs: Bounded<RecordRef, INPUTS_MOST>,
 }
 
 impl Sent {
     pub fn as_action(&self) -> Action<'_> {
         Action { made: self.made, inputs: &self.inputs }
     }
+
+    /// Its bytes on the wire: made (36), inputs u32, inputs (36 each).
+    fn wire_len(&self) -> u64 {
+        40 + 36 * self.inputs.len() as u64
+    }
 }
 
+/// A batch: at most [`ACTIONS_MOST`] actions and [`BATCH_MOST`] bytes encoded. Made only by
+/// [`Batch::new`], so every batch that exists decodes back to itself.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Batch {
-    pub namespace: Namespace,
-    pub toolchain: ContentId,
-    pub actions: Vec<Sent>,
+    namespace: Namespace,
+    toolchain: ContentId,
+    actions: Vec<Sent>,
 }
 
 fn put_ref(out: &mut Vec<u8>, it: &RecordRef) {
@@ -81,6 +97,30 @@ fn ref_at(bytes: &[u8], at: usize) -> Option<RecordRef> {
 }
 
 impl Batch {
+    /// The batch, or why not: more actions than [`ACTIONS_MOST`] or more bytes encoded than
+    /// [`BATCH_MOST`], the bounds its decoder holds it to.
+    pub fn new(namespace: Namespace, toolchain: ContentId, actions: Vec<Sent>) -> Result<Batch, &'static str> {
+        if actions.len() > ACTIONS_MOST {
+            return Err("a batch of more actions than a batch holds");
+        }
+        if 56 + actions.iter().map(Sent::wire_len).sum::<u64>() > BATCH_MOST {
+            return Err("a batch larger than a batch may be");
+        }
+        Ok(Batch { namespace, toolchain, actions })
+    }
+
+    pub fn namespace(&self) -> Namespace {
+        self.namespace
+    }
+
+    pub fn toolchain(&self) -> ContentId {
+        self.toolchain
+    }
+
+    pub fn actions(&self) -> &[Sent] {
+        &self.actions
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"BLRA");
@@ -116,8 +156,8 @@ impl Batch {
         for _ in 0..count {
             let made = ref_at(bytes, at).ok_or("a batch cut short")?;
             let n = bytes.get(at + 36..at + 40).map(|it| u32_at(it, 0) as usize).ok_or("a batch cut short")?;
-            if n > INPUTS_MOST {
-                return Err("an action of more inputs than an action names");
+            if n > INPUTS_MOST || n > (bytes.len() - at - 40) / 36 {
+                return Err("an action of more inputs than an action names or the batch holds");
             }
             at += 40;
             let mut inputs = Vec::with_capacity(n);
@@ -125,12 +165,13 @@ impl Batch {
                 inputs.push(ref_at(bytes, at).ok_or("a batch cut short")?);
                 at += 36;
             }
+            let inputs = Bounded::new(inputs).map_err(|_| "an action of more inputs than an action names")?;
             actions.push(Sent { made, inputs });
         }
         if at != bytes.len() {
             return Err("a batch with bytes past its last action");
         }
-        Ok(Batch { namespace: Namespace(u64_at(bytes, 8)), toolchain: id_at(bytes, 16), actions })
+        Batch::new(Namespace(u64_at(bytes, 8)), id_at(bytes, 16), actions)
     }
 }
 
@@ -144,16 +185,17 @@ pub struct Usage {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Status {
     /// Its records are in these segments.
-    Made(Vec<SegmentRef>),
+    Made(Bounded<SegmentRef, SEGMENTS_MOST>),
     NotAnInput(NotAnInput),
     Failed,
 }
 
+/// An action's outcome; every bounded field is bounded by its type, so it decodes back.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Outcome {
     pub action: ContentId,
     pub status: Status,
-    pub logs: Vec<u8>,
+    pub logs: Bounded<u8, LOG_MOST>,
     pub usage: Usage,
 }
 
@@ -175,11 +217,7 @@ impl Outcome {
         put_u64(&mut out, self.usage.cpu_ns);
         put_u64(&mut out, self.usage.peak_bytes);
         for it in segments {
-            out.extend_from_slice(&it.digest.0);
-            put_u64(&mut out, it.len);
-            put_u64(&mut out, it.index_at);
-            put_u32(&mut out, it.count);
-            put_u32(&mut out, 0);
+            out.extend_from_slice(&it.encode());
         }
         out.extend_from_slice(&self.logs);
         if let Status::NotAnInput(it) = &self.status {
@@ -196,19 +234,24 @@ impl Outcome {
         if id_at(bytes, 8) != action.key {
             return Err("an outcome for another action");
         }
-        let (status, segments, log) = (u32_at(bytes, 40), u32_at(bytes, 44) as usize, u32_at(bytes, 48));
-        if log > LOG_MOST || segments > crate::bundle::SEGMENTS_MOST {
+        let (status, segments, log) = (u32_at(bytes, 40), u32_at(bytes, 44) as usize, u32_at(bytes, 48) as usize);
+        if log > LOG_MOST || segments > SEGMENTS_MOST || u32_at(bytes, 52) != 0 {
             return Err("an outcome past its bounds");
+        }
+        if status != 0 && segments != 0 {
+            return Err("an outcome naming segments for an action that made nothing");
         }
         let mut at = 72;
         let mut refs = Vec::with_capacity(segments);
         for _ in 0..segments {
-            let row = bytes.get(at..at + 56).ok_or("an outcome cut short")?;
-            refs.push(SegmentRef { digest: id_at(row, 0), len: u64_at(row, 32), index_at: u64_at(row, 40), count: u32_at(row, 48) });
-            at += 56;
+            let row = bytes.get(at..at + ROW).ok_or("an outcome cut short")?;
+            refs.push(SegmentRef::decode(row).map_err(|_| "an outcome naming a malformed segment")?);
+            at += ROW;
         }
-        let logs = bytes.get(at..at + log as usize).ok_or("an outcome cut short")?.to_vec();
-        at += log as usize;
+        let logs = bytes.get(at..at + log).ok_or("an outcome cut short")?.to_vec();
+        let logs = Bounded::new(logs).map_err(|_| "an outcome past its bounds")?;
+        at += log;
+        let refs = Bounded::new(refs).map_err(|_| "an outcome past its bounds")?;
         let status = match status {
             0 => Status::Made(refs),
             1 => {
@@ -223,6 +266,15 @@ impl Outcome {
             return Err("an outcome with bytes past its end");
         }
         Ok(Outcome { action: action.key, status, logs, usage: Usage { cpu_ns: u64_at(bytes, 56), peak_bytes: u64_at(bytes, 64) } })
+    }
+
+    /// The outcome as the record the store files it under: of the core's `ActionResult` kind,
+    /// keyed by `tool`, the record `sent` makes and its inputs; its bytes this outcome's
+    /// encoding. Filed once its segments are known (the outcome names them, so it is never in
+    /// the segment of the records it names).
+    pub fn record(&self, tool: ToolId, sent: &Sent) -> (RecordRef, Vec<u8>) {
+        let key = <ActionResult as Kind>::key(&ActionInputs { tool, made: sent.made, inputs: &sent.inputs });
+        (RecordRef::of(&key), self.encode())
     }
 }
 
@@ -250,24 +302,25 @@ impl<'a> Inputs<'a> {
 /// A task: an action's records made from its inputs.
 pub type Task<'t> = &'t dyn Fn(&Inputs<'_>) -> Result<Vec<u8>, NotAnInput>;
 
-/// Runs a batch's actions with `task`, each over its own inputs. The records made (key, kind
-/// byte, bytes) go into one segment of the batch's namespace. With the segment it answers an
-/// outcome per action, the segment's place left for the caller to fill once it is written.
-/// The same code a local run uses.
-pub fn run(batch: &Batch, records: &BTreeMap<RecordRef, Vec<u8>>, task: Task<'_>) -> (Vec<u8>, Vec<Outcome>) {
+/// Runs a batch's actions with `task`, each over its own inputs. Each record made is filed under
+/// its own kind and key (the action's `made`), all in one segment of the batch's namespace,
+/// written by the store's own writer. With the segment it answers an outcome per action, the
+/// segment's place left for the caller to fill once it is written. The same code a local run
+/// uses. Why not, as the store's writer says it.
+pub fn run(batch: &Batch, records: &BTreeMap<RecordRef, Vec<u8>>, task: Task<'_>) -> Result<(Vec<u8>, Vec<Outcome>), StoreError> {
     let mut made = Vec::new();
     let mut outcomes = Vec::with_capacity(batch.actions.len());
     for sent in &batch.actions {
         let inputs = Inputs::new(sent.as_action(), records);
         let status = match task(&inputs) {
             Ok(bytes) => {
-                made.push((sent.made.key.0, sent.made.tag.0 as u8, bytes));
-                Status::Made(Vec::new())
+                made.push((sent.made, bytes));
+                Status::Made(Bounded::empty())
             }
             Err(not) => Status::NotAnInput(not),
         };
-        outcomes.push(Outcome { action: sent.made.key, status, logs: Vec::new(), usage: Usage::default() });
+        outcomes.push(Outcome { action: sent.made.key, status, logs: Bounded::empty(), usage: Usage::default() });
     }
-    let segment = crate::segment::make(batch.namespace, &made);
-    (segment, outcomes)
+    let segment = crate::segment::make(batch.namespace, &made)?;
+    Ok((segment, outcomes))
 }

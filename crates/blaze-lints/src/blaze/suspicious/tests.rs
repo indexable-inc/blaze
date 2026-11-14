@@ -5,7 +5,8 @@
 //!
 //! minicore has no `assert_eq!`, no `String`, no `Vec` and no `io`: the fixture's `std` gives
 //! them by the paths the real ones have, as `macro_rules` and plain structs, enough for the
-//! lints' name resolution and inference.
+//! lints' name resolution and inference. `assert_eq!` is in the prelude, as std's is, so a
+//! fixture's call of it resolves to std's macro; it fails through a `-> !` function of std.
 
 mod errors;
 mod flow;
@@ -24,25 +25,26 @@ use crate::{
     tests::{lint, main_crate},
 };
 
-pub(super) const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, try, from, drop, default, iterator, iterators, slice, index, range, deref, eq, ord, fmt, panic, assert, builtin_impls, str\n";
+pub(super) const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, try, from, drop, default, iterator, iterators, slice, index, range, deref, eq, ord, fmt, panic, assert, builtin_impls, str, reach\n";
 
 /// The `std` every fixture here builds on.
 pub(super) const STD: &str = r#"
 //- /std/lib.rs crate:std
 pub mod prelude {
-    pub mod rust_2015 { pub use core::prelude::rust_2015::*; pub use crate::{string::String, vec::Vec, boxed::Box}; }
-    pub mod rust_2018 { pub use core::prelude::rust_2018::*; pub use crate::{string::String, vec::Vec, boxed::Box}; }
-    pub mod rust_2021 { pub use core::prelude::rust_2021::*; pub use crate::{string::String, vec::Vec, boxed::Box}; }
-    pub mod rust_2024 { pub use core::prelude::rust_2024::*; pub use crate::{string::String, vec::Vec, boxed::Box}; }
+    pub mod rust_2015 { pub use core::prelude::rust_2015::*; pub use crate::{string::String, vec::Vec, boxed::Box, assert_eq}; }
+    pub mod rust_2018 { pub use core::prelude::rust_2018::*; pub use crate::{string::String, vec::Vec, boxed::Box, assert_eq}; }
+    pub mod rust_2021 { pub use core::prelude::rust_2021::*; pub use crate::{string::String, vec::Vec, boxed::Box, assert_eq}; }
+    pub mod rust_2024 { pub use core::prelude::rust_2024::*; pub use crate::{string::String, vec::Vec, boxed::Box, assert_eq}; }
 }
 pub use core::{option, result, convert, default, iter, ops, fmt, cmp, marker, mem};
+pub fn assert_failed() -> ! { loop {} }
 #[macro_export]
 macro_rules! assert_eq {
     ($left:expr, $right:expr $(,)?) => {
         match (&$left, &$right) {
             (left, right) => {
                 if !(*left == *right) {
-                    ::core::panic!("assertion failed");
+                    $crate::assert_failed()
                 }
             }
         }
@@ -51,7 +53,7 @@ macro_rules! assert_eq {
         match (&$left, &$right) {
             (left, right) => {
                 if !(*left == *right) {
-                    ::core::panic!($($arg)+);
+                    $crate::assert_failed()
                 }
             }
         }

@@ -105,11 +105,16 @@ covered by no span, are bugs; the profile test fails on them.
 ## bounded-progress (rule 18)
 
 Bounded by construction: every resource and every wait has a bound written in the code, not hoped
-for. Memory is workers times a small frame (`one-memory-measure`); a wait has a deadline
-(`deadline-waits`); a retry, where a protocol allows one at all (`no-fallback`), has a count; a
-table, queue or cache has a cap, with what happens at the cap stated; an agent's command has a
-timeout (`every-command-has-a-timeout`). How: when you add a loop, a collection that grows with
-input, or a wait, write its bound in the same line and a test that reaching it gives the typed
+for. A bound on each loop is not a bound on the work: bounded loops nested in each other multiply.
+So anything on the answer path that searches (a solver, a prover, a fixpoint) charges one budget
+that is a function of its input's size, counted in steps and never in time (the result is then the
+same on every machine and run, `deterministic-output`), and ends in a typed outcome when the budget
+runs out; a test holds the work used to that bound and to near-linear growth (work at twice the size
+within a stated factor).Memory is workers times a small frame (`one-memory-measure`); a wait has a
+deadline (`deadline-waits`); a retry, where a protocol allows one at all (`no-fallback`), has a
+count; a table, queue or cache has a cap, with what happens at the cap stated; an agent's command
+has a timeout (`every-command-has-a-timeout`). How: when you add a loop, a collection that grows
+with input, or a wait, write its bound in the same line and a test that reaching it gives the typed
 outcome. Every loop that waits for progress (a solver, a fixpoint, a readiness probe, a retry, a
 build's rounds) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed
 outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never an

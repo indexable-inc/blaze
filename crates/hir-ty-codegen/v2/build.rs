@@ -16,6 +16,9 @@ use blaze_codegen::{
     Backend,
     settings::{Panic, Spec},
 };
+#[cfg(doc)]
+use hir_ty::facts::proofs_at;
+use hir_ty::facts::Tier;
 use hir_ty_mir::mir::{MirOptLevel, MirOptions, devirt::DevirtWorld};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -101,9 +104,9 @@ impl Build {
 
     /// What a body of `written` is optimized with, `per_user` where it is an instance each crate
     /// that uses it compiles (`Instance::compiled_by_user`: a generic, a closure, an `#[inline]`
-    /// function), by rustc's rules: the library's crates' MIR at level 2 and inlined, as
-    /// shipped, and every other at the unit's level, inlined where the unit inlines
-    /// ([`Self::inlines`]). The code generator always gives lifetimes. Allocations move to the
+    /// function), by rustc's rules: the library's crates' MIR at level 2, and every other at
+    /// the unit's level, each inlined where the unit inlines ([`Self::inlines`]) and at the
+    /// tier [`Self::tier_of`] gives. The code generator always gives lifetimes. Allocations move to the
     /// stack in every crate but the library's, whose bodies are one for every program.
     ///
     /// UB checks (`CheckAlignment`, `CheckNull`) are `sess.ub_checks()` of the crate whose MIR
@@ -134,12 +137,48 @@ impl Build {
             false => self.debug_assertions && !lang,
             true => crate::debug_assertions(db, written),
         };
-        let inline = lang || self.inlines;
+        // The library's bodies are MIR-inlined, as shipped, only where the unit MIR-inlines:
+        // a tier 0 unit inlines nothing at the MIR level (its `#[inline(always)]` callees are
+        // the code generator's, [`Self::built_in`]), and a unit that optimizes without the
+        // inliner (`opt-level` 1, `s`, `z`, a build that patches) builds them as `WALK`
+        // walks them, so `WALK` and `WALKS_INLINED` still list what every unit asks for.
+        let inline = self.inlines;
         let heap_to_stack = self.heap_to_stack && !lang;
         // Devirtualized only where `hir-ty-mir` runs `Devirtualize` (level 2, inlined), and
         // never in the library's bodies, which are one for every program.
         let world = self.world.filter(|_| level == MirOptLevel::Release && inline && !lang);
-        MirOptions { level, ub_checks, lifetime_markers: true, inline, heap_to_stack, world }
+        MirOptions {
+            level,
+            ub_checks,
+            lifetime_markers: true,
+            inline,
+            heap_to_stack,
+            world,
+            tier: self.tier_of(lang),
+        }
+    }
+
+    /// The tier the unit compiles its code at: optimizing where its backend optimizes
+    /// ([`Self::optimized`]), else tier 0.
+    pub(crate) fn tier(self) -> Tier {
+        match self.optimized {
+            true => Tier::Optimizing,
+            false => Tier::Zero,
+        }
+    }
+
+    /// The tier a body is built at under this unit, `lang` where it is the library's: the
+    /// unit's, but the library's bodies at an optimizing unit are as shipped
+    /// ([`Tier::Shipped`]: rustc's pipeline, no pass on facts, one body for every optimizing
+    /// unit and the same as the copy `hir-ty-mir`'s inliner builds in). The one place a body's
+    /// tier, so its passes ([`hir_ty_mir::mir::passes_at`]) and proofs ([`proofs_at`]), is
+    /// decided.
+    pub(crate) fn tier_of(self, lang: bool) -> Tier {
+        match (self.tier(), lang) {
+            (Tier::Zero, _) => Tier::Zero,
+            (_, true) => Tier::Shipped,
+            (tier, false) => tier,
+        }
     }
 }
 

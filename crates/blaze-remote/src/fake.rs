@@ -36,6 +36,9 @@ pub(crate) struct Store {
     next_upload: u64,
     /// Requests asked of the bucket by every client.
     pub(crate) requests: u64,
+    /// Parts of multipart uploads taken, and uploads finished into an object.
+    pub(crate) parts: u64,
+    pub(crate) multipart: u64,
 }
 
 impl Store {
@@ -90,6 +93,7 @@ impl Store {
             Op::Part { name, upload, number, bytes } => match self.uploads.get_mut(upload) {
                 Some((for_name, parts)) if for_name == name => {
                     parts.insert(*number, bytes.clone());
+                    self.parts += 1;
                     Reply::Done { etag: format!("\"p{number}-{}\"", bytes.len()) }
                 }
                 _ => Reply::Failed { why: format!("{name}: no such upload") },
@@ -105,6 +109,7 @@ impl Store {
                 }
                 let (_, held) = self.uploads.remove(upload).expect("just seen");
                 let bytes = held.into_values().flatten().collect();
+                self.multipart += 1;
                 let version = self.version();
                 let object = Object { bytes, version };
                 let etag = object.etag();

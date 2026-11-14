@@ -1,0 +1,14 @@
+{
+ "id": "limit-checked-on-decode-only",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-remote, fix-hello-1113, round 2",
+ "where": "crates/blaze-remote/src/bundle.rs, segment.rs, shard.rs, trust.rs, exec.rs (every wire type with a limit)",
+ "what": "A bundle's segment length was a bare u64 bounded only by its decoder, so an encoder could write a bundle its own decoder refused (Hegel: a length of 4 GiB + 1); the same shape held for key lists, manifests, roots, outcomes and batches.",
+ "cost": "one failing property test found by the main agent; every limited field was a latent producer of objects no reader takes",
+ "cause": "a limit written as a check in the decoder, not as the type of the field, so the encoder and every builder were free of it",
+ "class": "a wire limit enforced on one side of a round trip only",
+ "prevention": "every limited field has a type that cannot hold a value past the limit, built through one checked constructor used by the decoder too: SegmentLen, SegmentRef::new, Run::new, Entry::new, Batch::new, and Bounded<T, MOST> for every list; generators draw through the same constructors",
+ "workaround": "none needed",
+ "fix": "segment.rs SegmentLen and SegmentRef (moved from bundle.rs), wire.rs Bounded, shard.rs Run::new and Entry::new, exec.rs Batch::new; tests.rs nothing_past_a_limit_can_be_built (uncompiled at the time of writing)",
+ "state": "fixed, unverified until the main agent runs the tests"
+}

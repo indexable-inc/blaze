@@ -1,0 +1,14 @@
+{
+ "id": "doc-claims-unchecked-prose",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane claims lints, fix-hello-1113",
+ "where": "doc comments across crates/ (\"never panics\", \"allocates nothing\", \"is thread-safe\", \"guarantees\"); crates/blaze-lints/src/blaze/claims/; scripts/src/bin/invariants.rs",
+ "what": "Doc comments state promises (effects, ordering, bounds) that nothing ties to a proof: a reader, an agent above all, takes them as fact. A keyword search for promise words found about 21 whole-item promises in 40 sampled lines (53%); the rest were qualified (\"a warm read allocates nothing\") or about something else, so a lint keyed on words alone is wrong half the time.",
+ "cost": "a stale or false promise is believed until someone reads the code under it; an effect sentence the effect walk would prove is a sentence nobody checks",
+ "cause": "rustdoc gives a promise no form a tool can read, so a held claim and a hope look the same",
+ "class": "a statement of fact in prose with no pointer to what makes it true",
+ "prevention": "one form per held claim (an attribute the build checks, or a `# Guarantees` / `# Invariants` item ending in `Evidence:` or `Unverified:`), the six claim lints, and the ledger in invariants.rs that counts open claims per crate and refuses a level going down",
+ "workaround": "read an effect sentence only in the narrow form (a clause that opens with the phrase and ends with it); write any other promise as a `# Guarantees` item",
+ "fix": "crates/blaze-lints/src/blaze/claims/ (not yet compiled when written)",
+ "state": "open"
+}

@@ -36,8 +36,32 @@ pub struct Cache {
 }
 
 impl Cache {
-    fn keep_block(&mut self, shard: ContentId, i: usize, entries: Vec<Entry>) {
+    pub(crate) fn keep_block(&mut self, shard: ContentId, i: usize, entries: Vec<Entry>) {
         self.blocks.insert((shard, i), entries);
+    }
+
+    /// Keeps a block a merge checked, while fewer than [`BLOCKS_CACHED`] are held: a merge
+    /// walks whole runs, and past the bound a block is let go (and, if needed again, checked
+    /// again, counted), never held without limit.
+    pub(crate) fn keep_merged_block(&mut self, shard: ContentId, i: usize, entries: Vec<Entry>) {
+        if self.blocks.len() < BLOCKS_CACHED {
+            self.blocks.insert((shard, i), entries);
+        }
+    }
+
+    pub(crate) fn keep_head(&mut self, shard: ContentId, head: Head) {
+        self.heads.insert(shard, head);
+    }
+
+    /// Every entry of `shard`, when its head and every block of it are held (each checked once,
+    /// when it was kept): a merge that needs the shard again takes them without a fetch.
+    pub(crate) fn whole(&self, shard: &ShardRef) -> Option<Vec<Entry>> {
+        let head = self.heads.get(&shard.digest)?;
+        let mut out = Vec::with_capacity(shard.count as usize);
+        for i in 0..head.blocks.len() {
+            out.extend_from_slice(self.blocks.get(&(shard.digest, i))?);
+        }
+        Some(out)
     }
 
     pub(crate) fn head(&self, shard: &ContentId) -> Option<&Head> {
@@ -152,7 +176,7 @@ impl Find {
                         }
                     };
                     for run in &seen.root.runs {
-                        for shard in &run.shards {
+                        for shard in run.shards() {
                             self.generation_of.insert(shard.digest, run.generation);
                         }
                     }
@@ -249,7 +273,7 @@ impl Find {
                     for key in self.open_keys(seen) {
                         for run in &seen.root.runs {
                             if let Some(i) = run.shard_of(&key) {
-                                let shard = run.shards[i];
+                                let shard = run.shards()[i];
                                 if !self.cache.heads.contains_key(&shard.digest) {
                                     wanted.insert(shard.digest, shard);
                                 }
@@ -271,7 +295,7 @@ impl Find {
                     for key in self.open_keys(seen) {
                         for run in &seen.root.runs {
                             let Some(i) = run.shard_of(&key) else { continue };
-                            let shard = run.shards[i];
+                            let shard = run.shards()[i];
                             let head = &self.cache.heads[&shard.digest];
                             let Some(b) = head.block_of(&key) else { continue };
                             if !self.cache.blocks.contains_key(&(shard.digest, b)) {
@@ -318,7 +342,7 @@ impl Find {
             let mut hit = None;
             for run in &seen.root.runs {
                 let Some(i) = run.shard_of(&key) else { continue };
-                let shard = run.shards[i];
+                let shard = run.shards()[i];
                 let Some(b) = self.cache.heads.get(&shard.digest).and_then(|head| head.block_of(&key)) else { continue };
                 if let Some(entries) = self.cache.blocks.get(&(shard.digest, b))
                     && let Ok(at) = entries.binary_search_by(|it| it.key.cmp(&key))

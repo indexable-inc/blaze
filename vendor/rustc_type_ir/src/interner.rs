@@ -524,6 +524,16 @@ pub trait Interner:
     /// an existing variant `v`: `VariantOf<E, v>`. `None` for any other type.
     fn reflect_variant_view(self, member: Self::Ty) -> Option<Self::Ty>;
 
+    /// blaze: the description `D` of `ty` when `ty` is `core::reflect::Described<'a, D, Args>`,
+    /// for the solver to normalize before [`Interner::reflect_type_of`] reads it. `None` for
+    /// any other type.
+    fn reflect_described_desc(self, ty: Self::Ty) -> Option<Const<Self>>;
+
+    /// blaze: `<Described<'a, D, Args> as core::reflect::TypeOf>::Type` of `ty`, with `desc`
+    /// for `D`, normalized (`type_of!`).
+    fn reflect_type_of(self, ty: Self::Ty, desc: Const<Self>)
+    -> crate::reflect::TypeOfAnswer<Self>;
+
     /// blaze: whether `ty` is an enum (`core::reflect::Enum`).
     fn reflect_is_enum(self, ty: Self::Ty) -> bool;
 

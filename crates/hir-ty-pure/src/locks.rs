@@ -3,13 +3,24 @@
 //! taking B" of its body and its callees, and the guards its body holds across a call that
 //! blocks the thread.
 //!
-//! A lock's name is a run-time string (`Lock::new("x", ..)`), so the class of an acquire is
-//! read from its receiver, as lockdep classes a lock by where it is declared:
+//! The class of an acquire is read from its receiver, as lockdep classes a lock by where it is
+//! declared, followed back through borrows, moves and the toolchain's calls that hand a lock on
+//! (`Arc`'s and `Box`'s `deref`, `Arc::new`, `Arc::clone`):
 //!
-//! - `Type.field` where the receiver is a borrow of a field of an ADT (`&self.state`);
-//! - the static's path where it is a static (`&STATE`);
-//! - else the lock's own type, shown (`std::sync::Mutex<u32>`), which is coarser: two locks of
-//!   one type share it.
+//! - `Type.field` where it is a field of an ADT (`&self.state`, an `Arc<Lock<_>>` or `Box`
+//!   field), `Type.field[]` for an element of one (`self.shards[i]`);
+//! - the static's path where it is a static (`&STATE`, `STATES[i]`);
+//! - the name it is made with, quoted (`"store.kept"`), where `blaze_core::lock`'s
+//!   `Lock::new("store.kept", ..)` is called in the same body with a literal name;
+//! - the accessor's path (`State::jobs()`) for a guard a function returns of a lock it knows
+//!   only by type;
+//! - else the lock's own type (`type std::sync::Mutex<u32>`).
+//!
+//! What still collapses: a lock handed in as a parameter (`fn f(a: &Lock<X>, b: &Lock<X>)`) or
+//! read out of a map or a `Vec` of locks, which is its type; the elements of one array or field
+//! of locks, which are one class, and an edge from a class to itself is not kept, so two
+//! elements taken in both orders are not seen; and a field's lock reached both directly and
+//! through an accessor, which are two classes, so a cycle through both is missed.
 //!
 //! An acquire is a call of a row that takes a lock ([`Rule::Lock`]: std's, `lock_api`'s,
 //! `blaze_core::lock`'s). Its destination holds the class, and the class follows a guard through
@@ -17,8 +28,10 @@
 //! `Result::expect`). A function whose return slot holds a classed guard says so
 //! ([`Locks::returns`]), so an accessor `fn state(&self) -> Guard` gives its class to its caller.
 //!
-//! What is live across a call is the MIR's ([`MirBody::held_across_calls_in`]): a guard dropped
-//! or moved into the call is not held. A guard lent to the call (`signal.wait(&mut guard)`) is
+//! A guard is held across a call exactly while it is live after it, used or dropped later
+//! ([`MirBody::live_after_calls_in`]), one decision for a site's call and a foreign function's:
+//! a guard dropped, moved into the call or done before it is not held, and a borrow of it
+//! taken earlier keeps nothing (the coroutine layout's `held_across_calls_in` does). A guard lent to the call (`signal.wait(&mut guard)`) is
 //! not held across it for [`Locks::across`]: the call releases it while it waits.
 //!
 //! Every set is sorted and holds at most [`MOST`] entries; past that the summary is
@@ -28,7 +41,7 @@ use std::sync::Arc;
 
 use base_db::{CrateOrigin, Db};
 use hir_def::{AdtId, FunctionId, HasModule as _, ModuleDefId, VariantId};
-use hir_ty::{next_solver::TyKind, traits::StoredParamEnvAndCrate};
+use hir_ty::{facts::Proofs, next_solver::TyKind, traits::StoredParamEnvAndCrate};
 use hir_ty_mir::mir::{
     BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
     Rvalue, StatementKind, StoredPlace, TerminatorKind, dispatch::Body, return_slot,
@@ -96,8 +109,16 @@ pub(crate) struct Across {
     pub(crate) class: Box<str>,
     /// The site of the guard's acquire.
     pub(crate) held_at: u32,
-    /// The site of the call that blocks.
-    pub(crate) call: u32,
+    /// The call that blocks.
+    pub(crate) call: Blocker,
+}
+
+/// The call a guard is held across: a site of the body, or a foreign function, which is no
+/// site (nothing below it is walked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Blocker {
+    Site(u32),
+    Foreign { link: Box<str>, span: Option<MirSpan> },
 }
 
 /// A site of the body as this pass reads it: what it reaches, the block whose call it is, and
@@ -106,6 +127,14 @@ pub(crate) struct LockSite<'a> {
     pub(crate) instance: &'a Instance,
     pub(crate) call: Option<BasicBlockId>,
     pub(crate) given: bool,
+}
+
+/// A call of the body to a foreign function that may block the thread, not trusted
+/// `nonblocking`: its block, its link name and where it is written.
+pub(crate) struct ForeignBlock {
+    pub(crate) call: BasicBlockId,
+    pub(crate) link: Box<str>,
+    pub(crate) span: Option<MirSpan>,
 }
 
 /// The function an instance is of, when it is one.
@@ -179,17 +208,46 @@ fn defined<'b>(body: &'b MirBody<'_>, block: BasicBlockId, local: LocalId) -> Op
     body.basic_blocks.iter().find_map(|(_, data)| assigns(&data.statements).next())
 }
 
-/// The class of a lock borrowed at `place`: `Type.field` for a field of an ADT, the static's
-/// path for a static.
+/// What a coarse class (a lock known only by its type) starts with: [`Locks::returns`] of
+/// one is replaced at the caller by the accessor's path, which tells two accessors apart.
+const BY_TYPE: &str = "type ";
+
+/// Whether `class` is a lock known only by its type.
+fn coarse(class: &str) -> bool {
+    class.starts_with(BY_TYPE)
+}
+
+/// A projection that stays inside one declared lock, or one of a collection of them: through a
+/// pointer, or to an element (every element of an array of locks is one class).
+fn within(elem: &ProjectionElem<LocalId>) -> bool {
+    matches!(
+        elem,
+        ProjectionElem::Deref
+            | ProjectionElem::Index(_)
+            | ProjectionElem::ConstantIndex { .. }
+            | ProjectionElem::Subslice { .. }
+    )
+}
+
+/// `[]` when `elems` index into a collection of locks.
+fn indexed(elems: &[ProjectionElem<LocalId>]) -> &'static str {
+    if elems.iter().any(|it| !matches!(it, ProjectionElem::Deref)) { "[]" } else { "" }
+}
+
+/// The class of a lock borrowed at `place`: `Type.field` for a field of an ADT (through a
+/// `Box` or to an element of it: `Type.field[]`), the static's path for a static.
 fn place_class(cx: &Cx<'_>, body: &MirBody<'_>, block: BasicBlockId, place: &StoredPlace) -> Option<Box<str>> {
     let db = cx.db;
     let place = place.as_ref();
     let elems = place.projection.as_slice();
-    if let [prefix @ .., ProjectionElem::Field(field)] = elems {
+    if let Some(at) = elems.iter().rposition(|it| matches!(it, ProjectionElem::Field(_)))
+        && elems[at + 1..].iter().all(within)
+        && let ProjectionElem::Field(field) = &elems[at]
+    {
         let parent = PlaceTy::from_ty(body.locals[place.local].ty.as_ref()).multi_projection_ty(
             &cx.infcx,
             cx.env.param_env,
-            prefix,
+            &elems[..at],
         );
         let TyKind::Adt(adt, _) = parent.ty.kind() else { return None };
         let adt = adt.def_id();
@@ -203,39 +261,136 @@ fn place_class(cx: &Cx<'_>, body: &MirBody<'_>, block: BasicBlockId, place: &Sto
         let (_, data) = fields.iter().nth(field.0 as usize)?;
         // alloc: a class, once per acquire of a summary
         return Some(
-            format!("{}.{}", item_path(db, ModuleDefId::AdtId(adt)), data.name.as_str()).into(),
+            format!(
+                "{}.{}{}",
+                item_path(db, ModuleDefId::AdtId(adt)),
+                data.name.as_str(),
+                indexed(&elems[at + 1..])
+            )
+            .into(),
         );
     }
-    if matches!(elems, [] | [ProjectionElem::Deref])
+    if elems.iter().all(within)
         && let Some(Rvalue::Use(Operand { kind: OperandKind::Static(id), .. })) =
             defined(body, block, place.local)
     {
-        return Some(item_path(db, ModuleDefId::StaticId(*id)).into()); // alloc: a class
+        // alloc: a class
+        return Some(format!("{}{}", item_path(db, ModuleDefId::StaticId(*id)), indexed(elems)).into());
     }
     None
 }
 
-/// The class of the lock the call ending `block` takes, from its receiver `arg`: its place's,
-/// else its type, shown.
+/// The site whose call makes `local` whole, with the block the call ends.
+fn made_by<'s, 'i>(
+    body: &MirBody<'_>,
+    sites: &'s [LockSite<'i>],
+    local: LocalId,
+) -> Option<(BasicBlockId, &'s LockSite<'i>)> {
+    sites.iter().find_map(|site| {
+        let block = site.call?;
+        let Some(TerminatorKind::Call { destination, .. }) =
+            body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind)
+        else {
+            return None;
+        };
+        (destination.local == local && destination.as_ref().projection.as_slice().is_empty())
+            .then_some((block, site))
+    })
+}
+
+/// Whether `func` makes a named lock of `blaze_core::lock` (`Lock::new("name", ..)`, its
+/// `unrecorded` and `probed`, and `ReadLock`'s), whose first argument is the lock's name.
+fn names_lock(db: &Db, func: FunctionId) -> bool {
+    let path = crate::walk::fn_item_path(db, func);
+    let mut segments = path.split("::");
+    let first = segments.next();
+    let mut rest: smallvec::SmallVec<[&str; 4]> = segments.collect();
+    let (Some(name), Some(ty)) = (rest.pop(), rest.pop()) else { return false };
+    first == Some("blaze_core")
+        && matches!(ty, "Lock" | "ReadLock")
+        && matches!(name, "new" | "unrecorded" | "probed")
+}
+
+/// The name a lock is made with by the call ending `block`, when that call is one
+/// [`names_lock`] knows and its name is a string literal written in this body (not inlined into
+/// it): `"store.kept"`, quoted, as the class.
+fn constructor_name(cx: &Cx<'_>, body: &MirBody<'_>, block: BasicBlockId) -> Option<Box<str>> {
+    let terminator = body.basic_blocks[block].terminator.as_ref()?;
+    let (span, inlined) = hir_ty_mir::mir::checks::source_span(body, terminator.span);
+    let (false, MirSpan::ExprId(call), hir_ty::InferBodyId::DefWithBodyId(owner)) =
+        (inlined, span, body.owner)
+    else {
+        return None;
+    };
+    let source = hir_def::expr_store::Body::of(cx.db, owner);
+    let hir_def::hir::Expr::Call { args, .. } = source.expr(call) else { return None };
+    let hir_def::hir::Expr::Literal(hir_def::hir::Literal::String(name)) = source.expr(*args.first()?)
+    else {
+        return None;
+    };
+    Some(format!("\"{}\"", name.as_str()).into()) // alloc: a class, once per named lock
+}
+
+/// Whether a call of `instance` hands on the lock it is given, so the lock's class is its
+/// argument's: a toolchain function that takes no lock (`Deref::deref` of an `Arc` or a `Box`,
+/// `Arc::new`, `Arc::clone`, `as_ref`).
+fn hands_on(db: &Db, instance: &Instance) -> bool {
+    func_of(instance).is_some_and(|func| {
+        matches!(func.krate(db).data(db).origin, CrateOrigin::Lang(_)) && !acquires(db, instance)
+    })
+}
+
+/// The class of the lock the call ending `block` takes, from its receiver `arg`, followed back
+/// through borrows, moves and the toolchain's calls that hand it on ([`hands_on`]): the place
+/// it is declared at ([`place_class`]), else the name it is made with where that call is in
+/// this body ([`constructor_name`]), else its type, shown ([`BY_TYPE`]).
 fn receiver_class<'db>(
     cx: &Cx<'db>,
     body: &MirBody<'db>,
     block: BasicBlockId,
     arg: &Operand,
+    sites: &[LockSite<'_>],
 ) -> Box<str> {
     let mut local = whole_local(arg);
-    for _ in 0..4 {
+    let mut block = block;
+    for _ in 0..8 {
         let Some(at) = local else { break };
         match defined(body, block, at) {
-            Some(Rvalue::Ref(_, place)) => match place_class(cx, body, block, place) {
-                Some(class) => return class,
-                None => break,
-            },
+            Some(Rvalue::Ref(_, place)) => {
+                if let Some(class) = place_class(cx, body, block, place) {
+                    return class;
+                }
+                // `&lock` of a local, or `&*r` of a reference to one (a method call's reborrow
+                // of what an overloaded `deref` returned): what made the local.
+                if !place.as_ref().projection.as_slice().iter().all(|it| matches!(it, ProjectionElem::Deref)) {
+                    break;
+                }
+                local = Some(place.local);
+            }
             Some(Rvalue::Use(Operand { kind: OperandKind::Static(id), .. })) => {
                 return item_path(cx.db, ModuleDefId::StaticId(*id)).into(); // alloc: a class
             }
             Some(Rvalue::Use(operand)) => local = whole_local(operand),
-            _ => break,
+            Some(_) => break,
+            None => {
+                let Some((made_in, site)) = made_by(body, sites, at) else { break };
+                if func_of(site.instance).is_some_and(|func| names_lock(cx.db, func)) {
+                    match constructor_name(cx, body, made_in) {
+                        Some(name) => return name,
+                        None => break,
+                    }
+                }
+                if !hands_on(cx.db, site.instance) {
+                    break;
+                }
+                let Some(TerminatorKind::Call { args, .. }) =
+                    body.basic_blocks[made_in].terminator.as_ref().map(|it| &it.kind)
+                else {
+                    break;
+                };
+                local = args.first().and_then(whole_local);
+                block = made_in;
+            }
         }
     }
     let mut ty = match &arg.kind {
@@ -250,7 +405,26 @@ fn receiver_class<'db>(
     while let TyKind::Ref(_, inner, _) = ty.kind() {
         ty = inner;
     }
-    format!("{}", cx.shown(ty)).into() // alloc: a class, once per acquire of a summary
+    format!("{BY_TYPE}{}", cx.shown(ty)).into() // alloc: a class, once per acquire of a summary
+}
+
+/// The class `class`, taken under a call of `instance` whose summary is `summary`, has at the
+/// caller: the one it returns a guard of is [`returned_class`], every other is as it is.
+fn seen_class(db: &Db, instance: &Instance, summary: &Summary, class: &str) -> Box<str> {
+    match summary.locks.returns.as_deref() {
+        Some(returned) if returned == class => returned_class(db, instance, class),
+        _ => class.into(), // alloc: a class
+    }
+}
+
+/// The class a guard `instance` returns gets at its caller: the callee's, or for one known only
+/// by its type the accessor's path (`daemon::State::jobs()`), so two accessors of locks of one
+/// type are two classes.
+fn returned_class(db: &Db, instance: &Instance, class: &str) -> Box<str> {
+    match func_of(instance) {
+        Some(func) if coarse(class) => format!("{}()", crate::walk::fn_item_path(db, func)).into(), // alloc: a class
+        _ => class.into(),
+    }
 }
 
 /// Adds `class` taken through `site` at `depth`, keeping the fewest calls; false past [`MOST`].
@@ -290,12 +464,13 @@ fn add_edge(order: &mut Vec<Edge>, held: &str, taken: &str, how: EdgeHow) -> boo
     }
 }
 
-/// The locks of `body`, whose sites are `sites` and whose body callees' summaries `callee`
-/// gives (`None` for a leaf).
+/// The locks of `body`, whose sites are `sites`, whose blocking foreign calls are `foreign` and
+/// whose body callees' summaries `callee` gives (`None` for a leaf).
 pub(crate) fn of<'db>(
     cx: &Cx<'db>,
     body: &MirBody<'db>,
     sites: &[LockSite<'_>],
+    foreign: &[ForeignBlock],
     callee: &dyn Fn(&Instance) -> Option<Arc<Summary>>,
 ) -> Locks {
     let db = cx.db;
@@ -319,7 +494,8 @@ pub(crate) fn of<'db>(
         if let Some(summary) = summary {
             fits &= !summary.locks.wide;
             for it in summary.locks.taken.iter() {
-                fits &= add_taken(&mut taken, &it.class, it.depth.saturating_add(1), at);
+                let class = seen_class(db, site.instance, summary, &it.class);
+                fits &= add_taken(&mut taken, &class, it.depth.saturating_add(1), at);
             }
             for it in summary.locks.order.iter() {
                 fits &= add_edge(&mut order, &it.held, &it.taken, EdgeHow::Site(at));
@@ -333,13 +509,15 @@ pub(crate) fn of<'db>(
         };
         let found = if acquires(db, site.instance) {
             let found = match args.first() {
-                Some(arg) => receiver_class(cx, body, block, arg),
+                Some(arg) => receiver_class(cx, body, block, arg, sites),
                 None => "a lock taken with no receiver".into(),
             };
             fits &= add_taken(&mut taken, &found, 1, at);
             Some(found)
         } else {
-            summary.and_then(|it| it.locks.returns.clone()) // clone: a class, few
+            summary
+                .and_then(|it| it.locks.returns.as_deref())
+                .map(|class| returned_class(db, site.instance, class))
         };
         if let Some(found) = found
             && destination.as_ref().projection.as_slice().is_empty()
@@ -361,10 +539,30 @@ pub(crate) fn of<'db>(
             .filter(|(_, site)| !site.given)
             .filter_map(|(at, site)| Some((at as u32, site.call?)))
             .collect();
-        let blocks: Vec<BasicBlockId> = points.iter().map(|it| it.1).collect(); // alloc: as above
+        // The sites' blocks, then the foreign calls': no site is made of a foreign function.
+        let blocks: Vec<BasicBlockId> =
+            points.iter().map(|it| it.1).chain(foreign.iter().map(|it| it.call)).collect(); // alloc: as above
         blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
-            let held = body.held_across_calls_in(frame, &blocks);
-            for (&(at, block), locals) in points.iter().zip(held.iter()) {
+            let held = body.live_after_calls_in(frame, &blocks);
+            let (at_sites, at_foreign) = held.split_at(points.len());
+            for (call, locals) in foreign.iter().zip(at_foreign.iter()) {
+                for &local in locals.iter() {
+                    let Some((held_class, held_at)) = &class[slot(local)] else { continue };
+                    if lent(body, call.call, local) {
+                        continue;
+                    }
+                    if across.len() < MOST {
+                        across.push(Across {
+                            class: held_class.clone(), // clone: a class
+                            held_at: *held_at,
+                            call: Blocker::Foreign { link: call.link.clone(), span: call.span }, // clone: a name
+                        });
+                    } else {
+                        fits = false;
+                    }
+                }
+            }
+            for (&(at, block), locals) in points.iter().zip(at_sites.iter()) {
                 let site = &sites[at as usize];
                 let summary = summaries[at as usize].as_deref();
                 let acquire = acquires(db, site.instance).then(|| {
@@ -390,14 +588,19 @@ pub(crate) fn of<'db>(
                     }
                     if let Some(summary) = summary {
                         for it in summary.locks.taken.iter() {
-                            if it.class != *held_class {
-                                fits &= add_edge(&mut order, held_class, &it.class, own(at));
+                            let class = seen_class(db, site.instance, summary, &it.class);
+                            if class != *held_class {
+                                fits &= add_edge(&mut order, held_class, &class, own(at));
                             }
                         }
                     }
                     if !lent(body, block, local) && blocks_thread(db, site.instance, summary) {
                         if across.len() < MOST {
-                            across.push(Across { class: held_class.clone(), held_at: *held_at, call: at }); // clone: a class
+                            across.push(Across {
+                                class: held_class.clone(), // clone: a class
+                                held_at: *held_at,
+                                call: Blocker::Site(at),
+                            });
                         } else {
                             fits = false;
                         }
@@ -543,8 +746,6 @@ pub struct LockFacts {
     pub taken: Box<[Box<str>]>,
     /// More than the summary keeps: what is missing is unknown.
     pub wide: bool,
-    /// Wide here, and through no callee that is wide: where a finding says so once.
-    pub wide_here: bool,
 }
 
 /// The root instance of `func` as defined, with its environment.
@@ -556,16 +757,9 @@ fn root_of(db: &Db, func: FunctionId) -> (StoredParamEnvAndCrate, Instance) {
 /// What `func`'s summary says of locks, without places: for a crate's graph.
 pub fn lock_facts(db: &Db, func: FunctionId) -> LockFacts {
     let (env, root) = root_of(db, func);
-    let summary = summary(db, env.clone(), root.clone()); // clone: the query's key, reference counts
+    let summary = summary(db, env, root.clone()); // clone: the query's key, reference counts
     let locks = &summary.locks;
-    let wide_here = locks.wide
-        && !summary.sites.iter().any(|site| {
-            !site.given
-                && matches!(site.instance.def, Def::Body(_))
-                && summary_of(db, &env, &site.instance).locks.wide
-        });
     LockFacts {
-        wide_here,
         function: instance_path(db, &root),
         order: locks
             .order
@@ -584,7 +778,8 @@ pub fn lock_facts(db: &Db, func: FunctionId) -> LockFacts {
 /// The edges of `func`'s own body with their places and chains.
 pub fn held_while_taking(db: &Db, func: FunctionId) -> Box<[HeldWhileTaking]> {
     let (env, root) = root_of(db, func);
-    let cx = Cx::new(db, env.clone()); // clone: a handle, reference counts
+    // A lint's: proofs spent, as [`summary`]'s.
+    let cx = Cx::new(db, env.clone(), Proofs::Spent); // clone: a handle, reference counts
     let summary = summary(db, env, root.clone()); // clone: the query's key, reference counts
     summary
         .locks
@@ -609,7 +804,8 @@ pub fn held_while_taking(db: &Db, func: FunctionId) -> Box<[HeldWhileTaking]> {
 )]
 pub fn held_across(db: &Db, func: FunctionId) -> Box<[HeldAcross]> {
     let (env, root) = root_of(db, func);
-    let cx = Cx::new(db, env.clone()); // clone: a handle, reference counts
+    // A lint's: proofs spent, as [`summary`]'s.
+    let cx = Cx::new(db, env.clone(), Proofs::Spent); // clone: a handle, reference counts
     let summary = summary(db, env.clone(), root.clone()); // clone: the query's key
     let Some(index) = effect_index(&NONBLOCKING) else { return Box::default() };
     summary
@@ -617,7 +813,22 @@ pub fn held_across(db: &Db, func: FunctionId) -> Box<[HeldAcross]> {
         .across
         .iter()
         .filter_map(|it| {
-            let site = summary.sites.get(it.call as usize)?;
+            let site = match &it.call {
+                Blocker::Site(at) => summary.sites.get(*at as usize)?,
+                Blocker::Foreign { link, span } => {
+                    let first = Step {
+                        name: instance_path(db, &root),
+                        at: (*span).and_then(|span| place(&cx, &root, span)),
+                    };
+                    return Some(HeldAcross {
+                        class: it.class.clone(), // clone: a class
+                        held_at: site_place(&cx, &root, &summary, it.held_at),
+                        chain: Box::new([first]),
+                        what: format!("calls the foreign function `{link}`, which may block the thread")
+                            .into(), // alloc: a lint's answer
+                    });
+                }
+            };
             let first = Step {
                 name: instance_path(db, &root),
                 at: site.span.and_then(|span| place(&cx, &root, span)),
@@ -677,6 +888,7 @@ fn taken_chain(
     class: &str,
 ) -> Box<[Step]> {
     let db = cx.db;
+    let mut class: Box<str> = class.into(); // alloc: a class, once per chain
     let mut chain: Vec<Step> = Vec::new(); // alloc: a lint's answer
     let mut instance = root.clone(); // clone: reference counts
     let mut current = Arc::clone(start);
@@ -694,7 +906,13 @@ fn taken_chain(
         }
         let Def::Body(_) = next.def else { break };
         let below = summary(db, cx.stored.clone(), next.clone()); // clone: the query's key
-        site_at = below.locks.taken.iter().find(|it| &*it.class == class).map(|it| it.site);
+        // An accessor's class is its own returned coarse class beneath it.
+        if let Some(inner) = below.locks.returns.as_deref()
+            && *seen_class(db, &next, &below, inner) == *class
+        {
+            class = inner.into(); // alloc: a class, once per accessor step
+        }
+        site_at = below.locks.taken.iter().find(|it| it.class == class).map(|it| it.site);
         instance = next;
         current = below;
     }

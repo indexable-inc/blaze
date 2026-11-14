@@ -17,7 +17,7 @@ use blaze_keyed::{
 use blaze_rng::SplitMix64;
 use hegel::TestCase;
 
-use super::support::{Broke, Draw, Drawn, MemStore, control, filing, tool};
+use super::support::{Broke, Draw, Drawn, MemStore, NAMESPACE, control, filing, tool};
 use crate::{
     Digest, NOTHING, Subject, What,
     machine::{Found, file, lookup, payload, settle},
@@ -232,7 +232,7 @@ fn build(
                 .encode();
                 let put = settle(&subject, key, reads, value, &mut answers, &mut checks).map_err(harness)?;
                 let filer = missed.filer(put.settled, put.list.shape()).map_err(harness)?;
-                file(store, &subject, filer, &put, &mut checks, Global).map_err(filing)?;
+                file(store, &subject, NAMESPACE, filer, &put, &mut checks, Global).map_err(filing)?;
                 true
             }
         };

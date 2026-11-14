@@ -19,7 +19,7 @@
 //! `Default::default()`, which take none, the `let`'s type (`let n: u64 = m.into();`). A type
 //! with a lifetime, a closure or an `impl` in it, or one inference left unknown, gets no fix.
 
-use hir::AsAssocItem as _;
+use hir::{AsAssocItem as _, HirDisplay as _};
 use syntax::{
     SyntaxKind, TextRange,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _},

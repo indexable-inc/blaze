@@ -13,7 +13,7 @@ use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
 use blaze_http::h3::{
-    ClientConfig, Closed, Transport,
+    ClientConfig, Closed, Transport, Trust,
     tokio_driver::{Driver, Session as Connection},
 };
 use serde_json::Value;
@@ -376,7 +376,7 @@ fn explorer(dev_origin: bool) -> Explorer {
 fn client(explorer: &Explorer) -> Driver {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
     let config =
-        ClientConfig { pins: vec![raw.try_into().unwrap()], transport: Transport::default() };
+        ClientConfig { trust: Trust::Pinned(vec![raw.try_into().unwrap()]), transport: Transport::default() };
     let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
     Driver::spawn(&tokio::runtime::Handle::current(), socket, None, Some(config)).unwrap().0
 }

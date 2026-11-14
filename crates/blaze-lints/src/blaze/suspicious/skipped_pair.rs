@@ -18,14 +18,14 @@
 //! on purpose, or the first hands back what ends it); a first that returns a value with drop
 //! glue, a guard, which is the right form already; test code.
 //!
-//! `#[blaze::pairs_with(..)]` is read from the first function's own attributes when it is
-//! written in the file linted; a mark on a function of another file needs the attribute in
-//! hir-def's attribute flags, which it is not yet.
+//! `#[blaze::pairs_with(..)]` is read from the first function's own attributes, from its source
+//! wherever in the crate it is written (a mark on a function of another crate is not read).
 //!
 //! The right form is a type: a guard whose `Drop` does the second (`let _scope =
 //! self.scopes.enter(s);`), or a `#[blaze::linear]` value the second consumes, so no exit can
 //! leave without it and the compiler, not a reader, checks every path.
 
+use hir::view::HasSourceView as _;
 use hir_def::{DefWithBodyId, hir::Expr};
 use hir_ty::mir::{
     BasicBlockId, MirBody, MirSpan, OperandKind, ProjectionElem, Rvalue, StatementKind,
@@ -84,7 +84,6 @@ pub(super) fn check_body(cx: &mut Cx<'_, '_>) {
         let Some(analysis) = cx.analysis() else { return };
         let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return };
         let db = cx.db();
-        let mut marked: Option<Vec<(hir::Function, String)>> = None;
         for body in guards::bodies(db, analysis, def) {
             let mir = body.mir;
             let calls = calls_of(cx, analysis, mir);
@@ -93,7 +92,7 @@ pub(super) fn check_body(cx: &mut Cx<'_, '_>) {
                 if first.guard {
                     continue;
                 }
-                let Some(second) = partner(cx, first.function, &mut marked) else { continue };
+                let Some(second) = partner(cx, first.function) else { continue };
                 let first_home = home(cx, first.function);
                 // alloc: the blocks that call the second, a few
                 let seconds: Vec<BasicBlockId> = calls
@@ -196,11 +195,7 @@ fn borrowed(mir: &MirBody<'_>, block: BasicBlockId, place: &StoredPlace) -> Stor
 }
 
 /// The second of `f`'s pair, by its name or by its mark.
-fn partner(
-    cx: &Cx<'_, '_>,
-    f: hir::Function,
-    marked: &mut Option<Vec<(hir::Function, String)>>,
-) -> Option<String> {
+fn partner(cx: &Cx<'_, '_>, f: hir::Function) -> Option<String> {
     let db = cx.db();
     let name = f.name(db);
     if let Some((_, second)) = PAIRS.iter().find(|(first, _)| *first == name.as_str()) {
@@ -209,33 +204,27 @@ fn partner(
     if f.module(db).krate(db) != cx.krate() {
         return None;
     }
-    let marked = marked.get_or_insert_with(|| marks(cx));
-    marked.iter().find(|(it, _)| *it == f).map(|(_, second)| second.clone())
+    mark_of(cx, f)
 }
 
-/// The functions of the file linted marked `#[blaze::pairs_with(second)]`, with their second.
-fn marks(cx: &Cx<'_, '_>) -> Vec<(hir::Function, String)> {
+/// The second `f` names in its own `#[blaze::pairs_with(second)]`, read from `f`'s own source
+/// (wherever in the crate it is written): a body's walk sees only its own item, so the mark is
+/// looked up on the callee, not found by scanning the linted file.
+fn mark_of(cx: &Cx<'_, '_>, f: hir::Function) -> Option<String> {
     let db = cx.db();
     let cfg = cx.krate().cfg(db);
-    let file = cx.root().ancestors().last().unwrap_or(cx.root());
-    // alloc: the marked functions of one file, almost always none
-    let mut out = Vec::new();
-    for node in file.descendants() {
-        let Some(item) = ast::Fn::cast(node) else { continue };
-        for (meta, _) in hir_expand::attrs::cfg_attrs_view(item.attrs(), cfg) {
-            let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
-            if !meta.path().is_some_and(|it| it.syntax().text() == MARK) {
-                continue;
-            }
-            let Some(tt) = meta.token_tree() else { continue };
-            let text = tt.syntax().text();
-            let second = text.strip_prefix('(').and_then(|it| it.strip_suffix(')')).unwrap_or(text).trim();
-            if let Some(f) = cx.fn_def(item) {
-                out.push((f, second.to_owned())); // alloc: the second's name
-            }
+    let item = f.source_view(db)?.value;
+    for (meta, _) in hir_expand::attrs::cfg_attrs_view(item.attrs(), cfg) {
+        let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
+        if !meta.path().is_some_and(|it| it.syntax().text() == MARK) {
+            continue;
         }
+        let Some(tt) = meta.token_tree() else { continue };
+        let text = tt.syntax().text();
+        let second = text.strip_prefix('(').and_then(|it| it.strip_suffix(')')).unwrap_or(text).trim();
+        return Some(second.to_owned()); // alloc: the second's name
     }
-    out
+    None
 }
 
 fn home(cx: &Cx<'_, '_>, f: hir::Function) -> Home {

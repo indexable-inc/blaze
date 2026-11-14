@@ -367,14 +367,21 @@ merges, by `land.py` or by an admin, until a release blaze built from the exact 
 branch merged into the main it joins) has run the hello-world smoke on blaze-vm (a cold run, a
 no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
 program's own line) and the result is quoted in the pull request; a compile check is not evidence
-that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). A change that
-builds no binary says so instead. Once the branch's work is committed, the local gate passed
-([What a change needs](#what-a-change-needs)) and the smoke quoted, run
+that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
+quote, merge origin/main into the branch, build a release blaze of that commit on blaze-vm and run
+`blaze run -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+(`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
+whose first line is `blaze-smoke 1`, goes in the pull request's body, and `land.py` puts it there
+from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
+does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
+main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is
+committed, the local gate passed ([What a change needs](#what-a-change-needs)) and the smoke run,
+run
 
-    python3 .github/scripts/land.py "what the branch does"
+    python3 .github/scripts/land.py '{"what": "what the branch does", "smoke": "smoke.txt"}'
 
-It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
-on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
+It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") with the
+quote in its body, and starts the waiting that merges it. The pull request's own run is the merge gate, the build and the unit tests on
 Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
 astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
 with the check's link. The gate also holds the budget smoke's guards with the blaze the change
@@ -382,15 +389,17 @@ built ([harness.md](harness.md#the-smokes-guards)): what a warm no-op build, a c
 body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
 merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
 runs green and merges going around it, every build had been lowering its program anew for days.
-A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it passes, GitHub merges the branch with a merge commit, as
-`git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
-main: two changes that each pass but break together are caught on main by the release train.
-`land.py` waits for the merge and prints the commit, or says why the pull request did not
-merge; then fix the branch and run it again. The waiting runs in a process of
-its own that outlives `land.py`, its terminal and a tool that ends its process group, writing to
-`.git/land/pr-N.log` in the main checkout; `land.py --wait` (or `--wait N`) follows it again, as
-does running `land.py` again on the branch, so nobody polls GitHub by hand. A branch that conflicts with main
-gets `git merge origin/main` first. Once it has merged, GitHub deletes the branch on origin;
+A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it
+passes, the waiting asks `smoke` again about the body's quote and the head GitHub has, and merges
+the branch with a merge commit pinned to that head, as `git merge --no-ff` would. The branch
+must contain main, since the quote is of the tree that becomes main: when main has moved past
+the head, the waiting refuses, and the branch gets `git merge origin/main`, a new build and a new
+smoke. There is no merge queue. `land.py` waits for the merge and prints the commit, or says why
+the pull request did not merge; then fix the branch and run it again. The waiting runs in a
+process of its own that outlives `land.py`, its terminal and a tool that ends its process group,
+writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}'` (or
+`'{"follow": N}'`) follows it again, as does running `land.py` again on the branch, so nobody
+polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
 remove the worktree and the local branch
 (`git worktree remove <dir> && git branch -D <branch>`).
 

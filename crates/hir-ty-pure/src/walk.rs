@@ -15,6 +15,25 @@
 //! foreign functions, inline assembly, intrinsics not known to be pure, state that changes
 //! (`static mut`, thread-locals, foreign statics, statics with interior mutability), bodies
 //! that do not lower, code pointers made of bytes, and instances past [`LONGEST`].
+//!
+//! Proofs are an input of a summary ([`Proofs`], in every key: the sealed tables',
+//! `summary_in`, `summary_within`, `summarized`). Under [`Proofs::None`] no site is
+//! discharged by the reachability prover and the prover never runs; under [`Proofs::Spent`]
+//! it does ([`proof_of`]). Who asks for which is decided once, `hir_ty::facts::proofs_at` of
+//! the asking body's tier: a tier 0 body and the library's as shipped ask for no summary at
+//! all (`SpendFacts` is not in their pass list, `hir_ty_mir::mir::passes_at`); the optimizing
+//! tier and the checks (`nopanic`, `pure`, `noalloc`, `nonblocking`, the role lints,
+//! `unreachable`, `proved_unreachable`) ask `Spent`.
+//!
+//! The floor (rule 67). A summary of an instance is one pass over its body's sites and calls,
+//! plus a read of each callee's summary: an oracle redoing only what an edit changed walks
+//! exactly the edited bodies and re-reads their callers' rows, so the walk is at the floor
+//! per body (one scan, no fixpoint outside a call cycle). Under `None` that is all of it: at
+//! tier 0 the floor of a fact is zero prover work, and the walk spends zero. Under `Spent` the
+//! prover's own floor is one proof per body as written, which [`proof_of`] reaches for a
+//! function with no `for const` loop (one `reach::of_body` row per definition, shared by
+//! every instance); a closure, a coroutine and a `for const` body are proved once per
+//! instance, which is above the floor by the number of instances of each. Not measured.
 
 use std::{cmp::Ordering, sync::Arc};
 
@@ -42,6 +61,7 @@ use hir_ty::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     display::{DisplayTarget, HirDisplay as _},
     drop::is_freeze,
+    facts::Proofs,
     intrinsic::{Intrinsic, SimdOp},
     next_solver::{
         AllocationData, ConstKind, DbInterner, GenericArg, GenericArgs, ParamEnv,
@@ -68,7 +88,7 @@ use smallvec::SmallVec;
 use std::alloc::Global;
 use syntax::{SyntaxKind, TextRange};
 
-pub(crate) use crate::sealed::summary;
+pub(crate) use crate::sealed::{summary, summary_at};
 #[cfg(test)]
 pub(crate) use crate::sealed::summary_in;
 use crate::{
@@ -290,7 +310,8 @@ pub fn script_purity(db: &Db, main: FunctionId) -> &Purity {
 #[blaze_query::tracked(returns(ref))]
 pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
-    let cx = Cx::new(db, stored);
+    // A build script's purity is a check: it spends proofs.
+    let cx = Cx::new(db, stored, Proofs::Spent);
     let mut roots: SmallVec<[(Instance, String); 2]> = SmallVec::new();
     let empty = GenericArgs::new_from_slice(&[]).store();
     roots.push((Instance { def: Def::Body(Body::Fn(main)), args: empty }, "`main`".to_owned())); // alloc: once per script
@@ -562,15 +583,19 @@ pub(crate) fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
 /// What the instance does, in `env`: the body of both [`crate::sealed::summary_in`] (a workspace
 /// home's row)
 /// and the task-scoped summary of a sealed home (`crate::sealed`), run under the witnessing frame of
-/// `within`, the [`Sealed`] of the home's crate, which its callees are asked through.
+/// `within`, the [`Sealed`] of the home's crate, which its callees are asked through. Made
+/// with `proofs`, which its callees are asked with too.
 pub(crate) fn summarized(
     db: &Db,
     within: Option<&Sealed>,
+    proofs: Proofs,
     env: StoredParamEnvAndCrate,
     instance: &Instance,
 ) -> Arc<Summary> {
     let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
-    let cx = Cx::within(db, env, within.cloned()); // clone: two reference counts
+    #[cfg(test)]
+    plant::count_summary();
+    let cx = Cx::within(db, env, proofs, within.cloned()); // clone: two reference counts
     // The body is read here once and only the summary is kept: made for this run and dropped
     // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
     // monomorphized body an instance the walk reaches until the build lets every MIR go.
@@ -603,10 +628,36 @@ pub(crate) mod plant {
 
     thread_local! {
         static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+        /// How many proofs summaries on this thread asked for ([`super::proof_of`]).
+        static PROOFS_ASKED: Cell<u64> = const { Cell::new(0) };
+        /// How many summaries were made on this thread ([`super::summarized`]).
+        static SUMMARIES_MADE: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn keeps_bodies() -> bool {
         KEEPS_BODIES.with(Cell::get)
+    }
+
+    pub(super) fn count_proof() {
+        PROOFS_ASKED.with(|it| it.set(it.get() + 1));
+    }
+
+    pub(super) fn count_summary() {
+        SUMMARIES_MADE.with(|it| it.set(it.get() + 1));
+    }
+
+    /// What `work` gives, and how many summaries it made on this thread.
+    pub(crate) fn counting_summaries<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = SUMMARIES_MADE.with(Cell::get);
+        let made = work();
+        (made, SUMMARIES_MADE.with(Cell::get) - before)
+    }
+
+    /// What `work` gives, and how many proofs the summaries it made on this thread asked for.
+    pub(crate) fn counting_proofs<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = PROOFS_ASKED.with(Cell::get);
+        let made = work();
+        (made, PROOFS_ASKED.with(Cell::get) - before)
     }
 
     /// `work` with every summary made on this thread reading its body from the memo that
@@ -751,30 +802,35 @@ pub(crate) struct Cx<'db> {
     /// The sealed crate whose covered run this is ([`Cx::within`]): its callees' summaries are
     /// found through it, never by a read of `crate::sealed::sealed` under the frame.
     sealed: Option<Sealed>,
+    /// Whether the summaries made and asked from here spend proofs: part of every summary's
+    /// key ([`crate::sealed::Key`]), so a callee is asked with the caller's.
+    pub(crate) proofs: Proofs,
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate) -> Cx<'db> {
-        Cx::within(db, stored, None)
+    /// The context of a summary or check asked in `stored`, made with `proofs`.
+    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate, proofs: Proofs) -> Cx<'db> {
+        Cx::within(db, stored, proofs, None)
     }
 
     /// [`Cx::new`] for a run under the witnessing frame of `sealed` (`None`: no such run).
     pub(crate) fn within(
         db: &'db Db,
         stored: StoredParamEnvAndCrate,
+        proofs: Proofs,
         sealed: Option<Sealed>,
     ) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), sealed }
+        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), sealed, proofs }
     }
 
-    /// The summary of `instance` asked from this environment: through the sealed crate this run
-    /// is under, if it is one.
+    /// The summary of `instance` asked from this environment, with this context's proofs:
+    /// through the sealed crate this run is under, if it is one.
     pub(crate) fn summary(&self, instance: Instance) -> Arc<Summary> {
         // clone: the query's key, reference counts
-        summary_within(self.db, self.sealed.as_ref(), self.stored.clone(), instance)
+        summary_within(self.db, self.sealed.as_ref(), self.proofs, self.stored.clone(), instance)
     }
 
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -852,6 +908,8 @@ struct Walk<'a, 'db> {
     workspace: bool,
     /// Functions trusted for some effect called with no site (Summary::trusted_calls).
     trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// The calls of foreign functions that may block the thread ([`crate::locks::ForeignBlock`]).
+    foreign: Vec<crate::locks::ForeignBlock>,
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
@@ -865,10 +923,9 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
     // What is proved dead or unable to fail is not a panic of this body
-    // (docs/v2/plan/design/proved-unreachable.md): asked only of a body with a branch or a check.
-    let reach = crate::reach::worth(body)
-        .then(|| crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[]));
-    let reach = reach.as_ref();
+    // (docs/v2/plan/design/proved-unreachable.md): asked only where proofs are spent.
+    let proof = proof_of(cx, body, def);
+    let reach = proof.as_deref();
     walk.gather(body, reach);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.
@@ -973,7 +1030,7 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
             crate::locks::LockSite { instance, call: site.call, given: site.given }
         })
         .collect(); // alloc: a view of the body's sites, once per instance
-    let locks = crate::locks::of(cx, body, &lock_sites, &|instance| match instance.def {
+    let locks = crate::locks::of(cx, body, &lock_sites, &walk.foreign, &|instance| match instance.def {
         // clone: the query's key, reference counts
         Def::Body(_) => Some(cx.summary(instance.clone())),
         Def::Leaf(..) => None,
@@ -988,6 +1045,53 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
         trusted_calls: walk.trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
         ..out.finish(ret, callees.into_boxed_slice())
     }
+}
+
+/// The proof the walk reads of `body`, `def`'s instance, under `cx.proofs`.
+///
+/// - Under [`Proofs::None`] there is none: tier 0 runs no prover, by construction, and every
+///   site counts as reached.
+/// - Under [`Proofs::Spent`], for a function whose generic body has no `for const` loop, the
+///   definition's proof ([`crate::reach::of_body`], one row per definition): monomorphization
+///   folds types into a clone of the generic body (`monomorphization::monomorphized`), so its
+///   blocks keep their ids and the definition's verdict per block is the instance's. A
+///   `for const` loop is expanded per instance (`comptime::expand` adds blocks), and closures
+///   and coroutines are not definitions `of_body` takes: those are proved per instance.
+///
+/// What the definition's proof loses against an instance's: a discharge that needs a value
+/// only the instance has (a const generic `N`, `size_of::<T>()`, an associated const, the
+/// concrete integer type behind a normalized alias); the prover takes those as unknown.
+fn proof_of<'db>(
+    cx: &Cx<'db>,
+    body: &MirBody<'db>,
+    def: Def,
+) -> Option<std::borrow::Cow<'db, crate::reach::Reach>> {
+    if cx.proofs == Proofs::None || !crate::reach::worth(body) {
+        return None;
+    }
+    #[cfg(test)]
+    plant::count_proof();
+    let db = cx.db;
+    if let Def::Body(Body::Fn(func)) = def
+        && let Ok(generic) =
+            db.runtime_mir_body(InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)))
+        && !generic.has_comptime_loop()
+    {
+        // The invariant the definition's proof rests on: the instance is the generic body
+        // with types folded in, block for block. A body that breaks it is refused loudly,
+        // never read against another body's block ids.
+        assert_eq!(
+            generic.basic_blocks.len(),
+            body.basic_blocks.len(),
+            "the instance of {func:?} does not keep its definition's blocks, so the \
+             definition's proof (reach::of_body) cannot be read for it",
+        );
+        return Some(std::borrow::Cow::Borrowed(crate::reach::of_body(
+            db,
+            DefWithBodyId::FunctionId(func),
+        )));
+    }
+    Some(std::borrow::Cow::Owned(crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[])))
 }
 
 /// The effects of a body as its sites are taken in: per effect, each kind once with its
@@ -1089,24 +1193,17 @@ impl Fold {
             Body::Fn(func) => Some(func),
             Body::Closure(_) | Body::Coroutine(_) | Body::CoroutineByMove(_) => None,
         };
-        if let Some(func) = func
-            && let Some(rule) = effect_attrs::allocator_rule(db, func, args)
-        {
-            // The allocator's own body is not walked: its kind is the call's.
-            return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
-                format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
-            });
-        }
-        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) =
-            match func.and_then(|it| effect_row(db, it)) {
-                Some(modeled) if !modeled.from_workspace || workspace => {
-                    (modeled.kinds, modeled.covers, Some(modeled.does))
-                }
-                _ => match func.and_then(|it| effect_attrs::row_of(db, it)) {
-                    Some(row) => (row.kinds(), row.kinds(), Some(row.says)),
-                    None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
-                },
-            };
+        let found = func.and_then(|func| Some((func, call_row(db, func, args, workspace)?)));
+        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) = match found {
+            Some((func, CallRow::Allocator(rule))) => {
+                // The allocator's own body is not walked: its kind is the call's.
+                return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
+                    format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
+                });
+            }
+            Some((_, CallRow::Row { kinds, covers, does })) => (kinds, covers, Some(does)),
+            None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
+        };
         self.kinds = self.kinds.union(row).union(callee.kinds);
         let trusted = self.trusted_for(db, def_crate(db, Def::Body(def)));
         // The toolchain's `unsafe` precondition checks (`Rule::Precondition`): what the check
@@ -1177,6 +1274,43 @@ impl Fold {
     fn finish(mut self) -> (EffectSet, Sets, Box<[Witness]>) {
         self.witnesses.sort_by_key(|it| (it.effect, it.rule));
         (self.kinds, self.sets, self.witnesses.into_boxed_slice())
+    }
+}
+
+/// What a call of `func` adds at its site beside what its body does ([`call_row`]).
+#[derive(Clone, Copy)]
+pub(crate) enum CallRow {
+    /// A method of an allocator: its kind is the call's, and its body is not walked.
+    Allocator(Rule),
+    /// A row of a toolchain table ([`crate::effects::MODELS`]) or of an effect attribute: the
+    /// kinds it adds, the kinds of the body it answers for, and what it says the call does.
+    Row { kinds: EffectSet, covers: EffectSet, does: &'static str },
+}
+
+/// The one lookup of what a call of `func<args>` adds at its site, from a body of a workspace
+/// crate when `workspace`: an allocator's kind first, then the toolchain table's row (one
+/// counted only from a workspace crate's body is skipped otherwise), then an effect attribute's
+/// row; `None` when nothing is added beside the body.
+pub(crate) fn call_row<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+    workspace: bool,
+) -> Option<CallRow> {
+    if let Some(rule) = effect_attrs::allocator_rule(db, func, args) {
+        return Some(CallRow::Allocator(rule));
+    }
+    match effect_row(db, func) {
+        Some(modeled) if !modeled.from_workspace || workspace => Some(CallRow::Row {
+            kinds: modeled.kinds,
+            covers: modeled.covers,
+            does: modeled.does,
+        }),
+        _ => effect_attrs::row_of(db, func).map(|row| CallRow::Row {
+            kinds: row.kinds(),
+            covers: row.kinds(),
+            does: row.says,
+        }),
     }
 }
 
@@ -1491,6 +1625,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             calls: vec![CallKind::Sites; body.map_or(0, |it| it.basic_blocks.len())],
             workspace: body.is_some_and(|it| effects::workspace(cx.db, it.owner.krate(cx.db))),
             trusted_calls: SmallVec::new(),
+            foreign: Vec::new_in(Global),
             dropped: HashSet::new_in(Global),
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
@@ -1987,6 +2122,21 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             let except = self.trusted_call(g);
             self.observe_except(kinds, &what, except);
+            // No site is made of a foreign function: the lock pass sees a guard held across one
+            // that may block only through this list.
+            let nonblocking =
+                effects::effect_index(&effect_attrs::NONBLOCKING).map_or(0, |it| 1 << it);
+            if let Some(call) = at
+                && !self.giving
+                && kinds.has(Rule::Block)
+                && (except | self.kinds.base) & nonblocking == 0
+            {
+                self.foreign.push(crate::locks::ForeignBlock {
+                    call,
+                    link: link.as_str().into(), // alloc: a name, once per blocking foreign call
+                    span: self.span,
+                });
+            }
             // A build script may call none: its sandbox is the proof.
             if self.own.is_none() && !self.giving {
                 self.own = Some(what);

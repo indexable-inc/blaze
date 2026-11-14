@@ -21,19 +21,21 @@ use crate::{
 };
 
 /// core as the pinned nightly has it for the fixes, and a blaze-cast of the functions used.
+/// Each has the body blaze-cast's has, the `as` it stands for: the fixed `WORDS` is evaluated,
+/// and a `loop {}` there never ends (const eval's step bound refuses it).
 const CRATES: &str = r#"
 //- minicore: sized, copy, clone, fn, from, int_cast, coerce_unsized, unsize
 //- /blaze_cast/lib.rs crate:blaze_cast
-pub const fn usize_from_u32(_: u32) -> usize { loop {} }
-pub const fn u64_from_usize(_: usize) -> u64 { loop {} }
-pub const fn u32_truncated_from_usize(_: usize) -> u32 { loop {} }
-pub const fn usize_truncated_from_u64(_: u64) -> usize { loop {} }
-pub const fn u8_from_bool(_: bool) -> u8 { loop {} }
-pub const fn f64_from_f32(_: f32) -> f64 { loop {} }
-pub const fn f64_rounded_from_u64(_: u64) -> f64 { loop {} }
-pub const fn f32_rounded_from_f64(_: f64) -> f32 { loop {} }
-pub const fn i32_saturated_from_f64(_: f64) -> i32 { loop {} }
-pub const fn u8_saturated_from_f32(_: f32) -> u8 { loop {} }
+pub const fn usize_from_u32(x: u32) -> usize { x as usize }
+pub const fn u64_from_usize(x: usize) -> u64 { x as u64 }
+pub const fn u32_truncated_from_usize(x: usize) -> u32 { x as u32 }
+pub const fn usize_truncated_from_u64(x: u64) -> usize { x as usize }
+pub const fn u8_from_bool(x: bool) -> u8 { x as u8 }
+pub const fn f64_from_f32(x: f32) -> f64 { x as f64 }
+pub const fn f64_rounded_from_u64(x: u64) -> f64 { x as f64 }
+pub const fn f32_rounded_from_f64(x: f64) -> f32 { x as f32 }
+pub const fn i32_saturated_from_f64(x: f64) -> i32 { x as i32 }
+pub const fn u8_saturated_from_f32(x: f32) -> u8 { x as u8 }
 "#;
 
 const MAIN: &str = "//- /src/lib.rs crate:main deps:blaze_cast\n#![feature(integer_widen_truncate)]\n";

@@ -349,9 +349,13 @@ pub fn plan(scope: &Scope<'_>, universe: &Universe<'_>, config: &Config, plant: 
                 run.push(extra);
             }
         }
+        // The reaching tests' keys, sorted, each once: the verdict key's list (the plant leaves
+        // it out).
         let mut keys = Vec::with_capacity_in(reaching.len(), Global);
-        for test in &reaching {
-            keys.push(universe.tests[*test as usize].key);
+        if plant != Plant::VerdictKeyWithoutTests {
+            for test in &reaching {
+                keys.push(universe.tests[*test as usize].key.0);
+            }
         }
         keys.sort_unstable();
         keys.dedup();
@@ -370,13 +374,7 @@ pub fn plan(scope: &Scope<'_>, universe: &Universe<'_>, config: &Config, plant: 
         for (local, &(priority, site, mutation)) in picked.iter().enumerate() {
             bytes.clear();
             mutation.encode(&mut bytes);
-            let key = MutantVerdict::key(&VerdictInputs {
-                body: function.body,
-                site,
-                mutation: &bytes,
-                tests: &keys,
-                plant,
-            });
+            let key = MutantVerdict::key(&VerdictInputs { body: function.body.0, site, mutation: &bytes, tests: &keys });
             let candidate = Candidate {
                 at: MutantRef { item: *item, body: function.body, site, mutation },
                 priority,
@@ -430,8 +428,9 @@ fn pick(
             let best = real
                 .iter()
                 .enumerate()
-                .filter(|(index, it)| !taken.contains(index) && line_of(it) == line)
-                .max_by(|(_, a), (_, b)| {
+                .filter(|&(index, it)| !taken.contains(&index) && line_of(it) == line)
+                .max_by(|x, y| {
+                    let (a, b) = (x.1, y.1);
                     (operator_of(a).telling(), tie_of(b)).cmp(&(operator_of(b).telling(), tie_of(a)))
                 });
             let Some((index, it)) = best else { break };

@@ -2641,6 +2641,7 @@ impl Driver for Uring {
                 | Effect::SendTo { .. }
                 | Effect::RecvFrom { .. }
                 | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }
                 | Effect::Now { .. }

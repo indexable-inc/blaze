@@ -25,6 +25,8 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+pub mod items;
+
 /// A lint's counts, by crate (the package's name).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Baseline {
@@ -260,7 +262,7 @@ pub const ALLOC_SITES_FILE: &str = "alloc-sites.txt";
 
 /// Whether `name`, a file of a baselines directory, is one that is not a lint's baseline.
 fn not_a_baseline(name: &std::ffi::OsStr) -> bool {
-    name == TARGET_FILE || name == ALLOC_SITES_FILE
+    name == TARGET_FILE || name == ALLOC_SITES_FILE || name == items::FILE
 }
 
 /// The target the baselines in `dir` count, from its [`TARGET_FILE`]; none when it has none.

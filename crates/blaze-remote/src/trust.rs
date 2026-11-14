@@ -9,25 +9,32 @@
 //!   revoked, which refuses every object it signed, old ones included. A client keeps the
 //!   highest serial it has seen per namespace and refuses a lower one ([`Why::StaleKeyList`]),
 //!   so a revocation cannot be rolled back by serving an old list.
-//! - A statement binds (namespace, toolchain, tier, segment digest, length, record count,
-//!   issued, builder) and is signed by the builder. The segment digest covers every byte of
-//!   the segment, so it binds every key in the segment to its value.
+//! - A statement ([`Statement`], blaze-keyed's, the one layout) binds (namespace, toolchain,
+//!   tier, segment id, length, record count, issued, signer) and is signed by the builder. The
+//!   segment id is the digest over every byte of the segment, so it binds every key in the
+//!   segment to its value. Its check is a [`Verifier`] bound to one namespace
+//!   ([`Trusted::verifier`]); the digest of the fetched bytes is the store's.
 //!
-//! A signed message is `domain || 0x00 || body`, with a domain per object kind, so a signature
-//! over one kind of object is never valid for another.
+//! A signed message of this crate's own objects is `domain || 0x00 || body`, with a domain per
+//! object kind, so a signature over one kind of object is never valid for another. A statement
+//! is signed over [`Statement::body`] as it is: its magic `BLRT` and format are its domain, and
+//! no domain here starts with `B`, so no message of one kind is a message of the other.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
 use std::{collections::BTreeMap, fmt};
 
-use blaze_cas::plain::{Namespace, Verifier};
+use blaze_cas::plain::Namespace;
 use blaze_ids::ContentId;
+pub use blaze_keyed::kind::Tier;
+use blaze_keyed::store::{Refused, SegmentRef, StoreError, Verifier, WireError};
+pub use blaze_keyed::store::Statement;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 
 use crate::{
     name::Toolchain,
-    wire::{hex, id_at, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
+    wire::{Bounded, hex, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
 };
 
 /// An Ed25519 public key.
@@ -89,6 +96,22 @@ impl Signer {
         message.extend_from_slice(body);
         self.pair.sign(&message).as_ref().try_into().expect("64 bytes")
     }
+
+    /// Signs `statement` as this builder: its signer becomes this key, its signature the one over
+    /// [`Statement::body`].
+    pub fn sign_statement(&self, statement: &mut Statement) {
+        statement.signer = self.public.0;
+        statement.signature = self.pair.sign(&statement.body()).as_ref().try_into().expect("64 bytes");
+    }
+}
+
+/// Whether `statement`'s signature holds over its body under the key it names. Counted once.
+fn statement_holds(statement: &Statement) -> bool {
+    note(Check::Signature, statement.signature[..32].try_into().expect("32 bytes"));
+    if crate::planted(crate::Plant::SkipSignature) {
+        return true;
+    }
+    UnparsedPublicKey::new(&ED25519, &statement.signer).verify(&statement.body(), &statement.signature).is_ok()
 }
 
 pub(crate) fn verify_sig(key: &PublicKey, domain: &str, body: &[u8], signature: &[u8; 64]) -> bool {
@@ -149,6 +172,28 @@ pub fn reset_checks() {
     CHECKED.with_borrow_mut(std::collections::BTreeSet::clear);
 }
 
+/// One client's checks, set aside while another client runs on this thread (two clients
+/// stepped in turn on one thread, as the simulation steps two pushers): each is held to once
+/// per object on its own.
+#[derive(Clone, Default, Debug)]
+pub struct ClientChecks {
+    checks: Checks,
+    checked: std::collections::BTreeSet<(Check, [u8; 32])>,
+}
+
+impl ClientChecks {
+    pub fn checks(&self) -> Checks {
+        self.checks
+    }
+}
+
+/// Makes `client` this thread's count, and hands back the one it replaces.
+pub fn swap_checks(client: ClientChecks) -> ClientChecks {
+    let checks = CHECKS.replace(client.checks);
+    let checked = CHECKED.replace(client.checked);
+    ClientChecks { checks, checked }
+}
+
 /// Why an object was refused.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Why {
@@ -170,6 +215,14 @@ pub enum Why {
     Digest,
     /// It is larger than anything of its kind may be.
     TooLarge { len: u64, most: u64 },
+    /// It holds more items than its kind may ([`crate::Bounded`]).
+    TooMany { count: u64, most: u64 },
+    /// The plain store's own check of a segment refuses it: what the store says.
+    Segment(StoreError),
+    /// A segment's statement is refused by the verifier of its namespace.
+    Statement(Refused),
+    /// Bytes on the wire (a statement, a segment reference) are not of their form.
+    Wire(WireError),
     /// Its length is not the one named for it.
     Length { len: u64, wanted: u64 },
     /// It is not well formed: what is wrong.
@@ -208,24 +261,34 @@ impl fmt::Display for Refusal {
         if let Some(key) = &self.key {
             write!(f, " (key {key})")?;
         }
-        match &self.why {
-            Why::Signature => write!(f, ": its signature does not verify"),
-            Why::UnknownSigner => write!(f, ": its signer is not trusted for this namespace"),
-            Why::Revoked => write!(f, ": its signer is revoked"),
-            Why::NotValid { from, until, at } => write!(f, ": its signer is valid {from}..{until} (unix s), not at {at}"),
-            Why::Role { wanted } => write!(f, ": its signer may not sign a {wanted}"),
-            Why::Namespace { found, wanted } => write!(f, ": it is of namespace {found:016x}, not {wanted:016x}"),
-            Why::Toolchain => write!(f, ": it is of another toolchain"),
-            Why::Digest => write!(f, ": its bytes are not the ones its digest names (forged, torn or cut short)"),
-            Why::TooLarge { len, most } => write!(f, ": it is {len} bytes, at most {most} may be read"),
-            Why::Length { len, wanted } => write!(f, ": it is {len} bytes, {wanted} named"),
-            Why::Malformed(what) => write!(f, ": {what}"),
-            Why::OutsideSegment => write!(f, ": an index entry places a record outside its segment"),
-            Why::StaleKeyList { serial, seen } => write!(f, ": key list serial {serial} is older than serial {seen} already seen"),
-            Why::NotDeterministic { ours, theirs } => write!(f, ": two builders made different values under one key (digest {} here, {} in the bucket); rule deterministic-output", hex(ours), hex(theirs)),
-            Why::Private { segment, wanted } => write!(f, ": a segment of namespace {segment:016x} may not go to namespace {wanted:016x}"),
-            Why::Tier => write!(f, ": only the top tier is shared in a public namespace"),
-            Why::Name(why) => write!(f, ": {why}"),
+        write!(f, ": {}", self.why)
+    }
+}
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Why::Signature => write!(f, "its signature does not verify"),
+            Why::UnknownSigner => write!(f, "its signer is not trusted for this namespace"),
+            Why::Revoked => write!(f, "its signer is revoked"),
+            Why::NotValid { from, until, at } => write!(f, "its signer is valid {from}..{until} (unix s), not at {at}"),
+            Why::Role { wanted } => write!(f, "its signer may not sign a {wanted}"),
+            Why::Namespace { found, wanted } => write!(f, "it is of namespace {found:016x}, not {wanted:016x}"),
+            Why::Toolchain => write!(f, "it is of another toolchain"),
+            Why::Digest => write!(f, "its bytes are not the ones its digest names (forged, torn or cut short)"),
+            Why::TooLarge { len, most } => write!(f, "it is {len} bytes, at most {most} may be read"),
+            Why::TooMany { count, most } => write!(f, "it holds {count} items, at most {most} may be"),
+            Why::Segment(what) => write!(f, "the plain store refuses it as a segment: {what}"),
+            Why::Statement(why) => write!(f, "{why}"),
+            Why::Wire(why) => write!(f, "{why}"),
+            Why::Length { len, wanted } => write!(f, "it is {len} bytes, {wanted} named"),
+            Why::Malformed(what) => write!(f, "{what}"),
+            Why::OutsideSegment => write!(f, "an index entry places a record outside its segment"),
+            Why::StaleKeyList { serial, seen } => write!(f, "key list serial {serial} is older than serial {seen} already seen"),
+            Why::NotDeterministic { ours, theirs } => write!(f, "two builders made different values under one key (digest {} here, {} in the bucket); rule deterministic-output", hex(ours), hex(theirs)),
+            Why::Private { segment, wanted } => write!(f, "a segment of namespace {segment:016x} may not go to namespace {wanted:016x}"),
+            Why::Tier => write!(f, "only the top tier is shared in a public namespace"),
+            Why::Name(why) => write!(f, "{why}"),
         }
     }
 }
@@ -264,7 +327,7 @@ pub struct KeyList {
     pub namespace: Namespace,
     pub serial: u64,
     pub issued: u64,
-    pub keys: Vec<KeyEntry>,
+    pub keys: Bounded<KeyEntry, KEYS_MOST>,
 }
 
 const KEYS_DOMAIN: &str = "blaze-remote key list 1";
@@ -335,107 +398,88 @@ impl KeyList {
             };
             keys.push(KeyEntry { key: PublicKey(key_at(bytes, at)), roles: Roles(u32_at(bytes, at + 32)), revoked, from: u64_at(bytes, at + 40), until: u64_at(bytes, at + 48) });
         }
-        Ok(KeyList { namespace, serial: u64_at(bytes, 16), issued: u64_at(bytes, 24), keys })
+        Ok(KeyList { namespace, serial: u64_at(bytes, 16), issued: u64_at(bytes, 24), keys: Bounded::new(keys).map_err(refuse)? })
     }
 
     /// Whether `key` may sign an object needing `role` issued at `at`.
     pub fn allows(&self, object: &str, key: &PublicKey, role: Roles, at: u64) -> Result<(), Refusal> {
-        let refuse = |why| Err(Refusal::new(object, Some(key.to_string()), why));
-        let Some(entry) = self.keys.iter().find(|it| it.key == *key) else { return refuse(Why::UnknownSigner) };
+        self.entry_allows(key, role, at).map_err(|why| Refusal::new(object, Some(key.to_string()), why))
+    }
+
+    /// Whether `key` may sign an object needing `role` issued at `at`, and why not.
+    fn entry_allows(&self, key: &PublicKey, role: Roles, at: u64) -> Result<(), Why> {
+        let Some(entry) = self.keys.iter().find(|it| it.key == *key) else { return Err(Why::UnknownSigner) };
         if entry.revoked {
-            return refuse(Why::Revoked);
+            return Err(Why::Revoked);
         }
         if !entry.roles.has(role) {
-            return refuse(Why::Role { wanted: if role == Roles::ROOT { "root" } else { "statement or bundle" } });
+            return Err(Why::Role { wanted: if role == Roles::ROOT { "root" } else { "statement or bundle" } });
         }
         if at < entry.from || at > entry.until {
-            return refuse(Why::NotValid { from: entry.from, until: entry.until, at });
+            return Err(Why::NotValid { from: entry.from, until: entry.until, at });
         }
         Ok(())
     }
 }
 
-/// The tier of the code a segment holds. What is shared publicly is the top tier only (the
-/// owner, 2026-11-13: everything pulled is maximally optimized; the fast tier is never pushed
-/// for dependencies).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Tier {
-    /// No code, or code at the top tier.
-    Top,
-    /// Code by the fast backend: a workspace's own, never public.
-    Fast,
-}
-
-/// A builder's signed statement about one segment, 200 bytes.
-///
-/// Layout: `BLRT`, format u32, namespace u64, segment digest 32, length u64, toolchain digest
-/// 32, records u32, tier u8 (0 top, 1 fast), zero 3, issued u64, builder key 32 (136 bytes
-/// signed), signature 64.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Statement {
-    pub namespace: Namespace,
-    pub segment: ContentId,
-    pub len: u64,
-    pub toolchain: ContentId,
-    pub records: u32,
-    pub tier: Tier,
-    pub issued: u64,
-    pub builder: PublicKey,
-}
-
-const STATEMENT_DOMAIN: &str = "blaze-remote statement 1";
-/// A statement's length.
-pub const STATEMENT_LEN: usize = 200;
-const STATEMENT_BODY: usize = 136;
-
-impl Statement {
-    pub fn encode(&self, signer: &Signer) -> Vec<u8> {
-        let mut out = Vec::with_capacity(STATEMENT_LEN);
-        out.extend_from_slice(b"BLRT");
-        put_u32(&mut out, 1);
-        put_u64(&mut out, self.namespace.0);
-        out.extend_from_slice(&self.segment.0);
-        put_u64(&mut out, self.len);
-        out.extend_from_slice(&self.toolchain.0);
-        put_u32(&mut out, self.records);
-        out.extend_from_slice(&[if self.tier == Tier::Fast { 1 } else { 0 }, 0, 0, 0]);
-        put_u64(&mut out, self.issued);
-        out.extend_from_slice(&signer.public().0);
-        let signature = signer.sign(STATEMENT_DOMAIN, &out);
-        out.extend_from_slice(&signature);
-        out
+/// The tier named `name` (`top` or `fast`), as `blaze cache push` takes it. What is shared
+/// publicly is the top tier only (the owner, 2026-11-13: everything pulled is maximally
+/// optimized; the fast tier is never pushed for dependencies): [`Why::Tier`].
+pub fn tier_named(name: &str) -> Result<Tier, String> {
+    match name {
+        "top" => Ok(Tier::Top),
+        "fast" => Ok(Tier::Fast),
+        other => Err(format!("tier {other:?} is not `top` or `fast`")),
     }
+}
 
-    /// The statement in `bytes`, its signature checked under the key it names (whether that
-    /// key is trusted is [`Trusted::statement`]'s).
-    pub fn decode(object: &str, bytes: &[u8]) -> Result<Statement, Refusal> {
-        let refuse = |why| Refusal::new(object, None, why);
-        if bytes.len() != STATEMENT_LEN {
-            return Err(refuse(Why::Length { len: bytes.len() as u64, wanted: STATEMENT_LEN as u64 }));
+/// The verifier of one namespace's statements, under what a [`Trusted`] holds: what the store
+/// calls before a byte of a fetched segment is read ([`Verifier`]). Made by
+/// [`Trusted::verifier`].
+#[derive(Clone, Copy, Debug)]
+pub struct Bound<'a> {
+    trusted: &'a Trusted,
+    namespace: Namespace,
+}
+
+impl Bound<'_> {
+    pub fn namespace(&self) -> Namespace {
+        self.namespace
+    }
+}
+
+impl Verifier for Bound<'_> {
+    /// In order: the namespace is the one bound; the toolchain the one this machine reads; the
+    /// segment and its length are `segment`'s; the signer is a builder of the namespace's key
+    /// list (not revoked, with the build role) valid when the statement was issued; and the
+    /// signature holds over [`Statement::body`]. A revoked key or one without the build role is
+    /// [`Refused::Untrusted`] (the shared `Refused` has no finer variant), one outside its window
+    /// [`Refused::Expired`].
+    fn verify(&self, statement: &Statement, segment: &SegmentRef) -> Result<(), Refused> {
+        if statement.namespace != self.namespace && !crate::planted(crate::Plant::SkipNamespace) {
+            return Err(Refused::Namespace { found: statement.namespace, wanted: self.namespace });
         }
-        if bytes[0..4] != *b"BLRT" || u32_at(bytes, 4) != 1 || bytes[93..96] != [0, 0, 0] {
-            return Err(refuse(Why::Malformed("not a statement of format 1")));
+        let toolchain = self.trusted.toolchain.digest();
+        if statement.toolchain != toolchain {
+            return Err(Refused::Toolchain { found: statement.toolchain, wanted: toolchain });
         }
-        let builder = PublicKey(key_at(bytes, 104));
-        if !verify_sig(&builder, STATEMENT_DOMAIN, &bytes[..STATEMENT_BODY], &sig_at(bytes, STATEMENT_BODY)) {
-            return Err(Refusal::new(object, Some(builder.to_string()), Why::Signature));
+        if statement.segment != segment.digest() {
+            return Err(Refused::Segment { found: statement.segment, wanted: segment.digest() });
         }
-        let tier = match bytes[92] {
-            0 => Tier::Top,
-            1 => Tier::Fast,
-            _ => return Err(refuse(Why::Malformed("a statement's tier is neither 0 nor 1"))),
-        };
-        Ok(Statement {
-            namespace: Namespace(u64_at(bytes, 8)),
-            segment: id_at(bytes, 16),
-            len: u64_at(bytes, 48),
-            toolchain: id_at(bytes, 56),
-            records: u32_at(bytes, 88),
-            tier,
-            issued: u64_at(bytes, 96),
-            builder,
-        })
+        if statement.len != segment.segment_len() {
+            return Err(Refused::Length { found: statement.len, wanted: segment.segment_len() });
+        }
+        let signer = statement.signer;
+        let Some(list) = self.trusted.list(self.namespace) else { return Err(Refused::Untrusted { signer }) };
+        match list.entry_allows(&PublicKey(signer), Roles::BUILD, statement.issued) {
+            Ok(()) => {}
+            Err(Why::NotValid { .. }) => return Err(Refused::Expired { signer, issued: statement.issued }),
+            Err(_) => return Err(Refused::Untrusted { signer }),
+        }
+        if !statement_holds(statement) {
+            return Err(Refused::Signature { signer });
+        }
+        Ok(())
     }
 }
 
@@ -489,32 +533,17 @@ impl Trusted {
         Ok(self.lists.get(&namespace.0).expect("just put"))
     }
 
-    /// Checks a statement for the segment `digest` of `len` bytes in `namespace`: its
-    /// signature, its namespace, toolchain, digest and length, and its builder in the key list.
-    pub fn statement(&self, object: &str, namespace: Namespace, digest: &ContentId, len: u64, bytes: &[u8]) -> Result<Statement, Refusal> {
-        let statement = Statement::decode(object, bytes)?;
-        let refuse = |why| Refusal::new(object, Some(statement.builder.to_string()), why);
-        if statement.namespace != namespace && !crate::planted(crate::Plant::SkipNamespace) {
-            return Err(refuse(Why::Namespace { found: statement.namespace.0, wanted: namespace.0 }));
-        }
-        if statement.toolchain != self.toolchain.digest() {
-            return Err(refuse(Why::Toolchain));
-        }
-        if statement.segment != *digest {
-            return Err(refuse(Why::Digest));
-        }
-        if statement.len != len {
-            return Err(refuse(Why::Length { len, wanted: statement.len }));
-        }
-        let Some(list) = self.list(namespace) else { return Err(refuse(Why::UnknownSigner)) };
-        list.allows(object, &statement.builder, Roles::BUILD, statement.issued)?;
-        Ok(statement)
+    /// The verifier of `namespace`'s statements under what this holds now (its key list for
+    /// `namespace`, taken before).
+    pub fn verifier(&self, namespace: Namespace) -> Bound<'_> {
+        Bound { trusted: self, namespace }
     }
-}
 
-impl Verifier for Trusted {
-    fn verify(&self, namespace: Namespace, digest: &ContentId, len: u64, statement: &[u8]) -> Result<(), String> {
-        let object = crate::name::statement(namespace, &self.toolchain, digest).map_err(|it| it.to_string())?;
-        self.statement(&object, namespace, digest, len, statement).map(|_| ()).map_err(|it| it.to_string())
+    /// The statement in `bytes` (the object `object`) for `segment` in `namespace`: decoded by
+    /// the one layout ([`Statement::decode`]) and checked by `namespace`'s verifier.
+    pub fn statement(&self, object: &str, namespace: Namespace, segment: &SegmentRef, bytes: &[u8]) -> Result<Statement, Refusal> {
+        let statement = Statement::decode(bytes).map_err(|why| Refusal::new(object, None, Why::Wire(why)))?;
+        self.verifier(namespace).verify(&statement, segment).map_err(|why| Refusal::new(object, Some(PublicKey(statement.signer).to_string()), Why::Statement(why)))?;
+        Ok(statement)
     }
 }

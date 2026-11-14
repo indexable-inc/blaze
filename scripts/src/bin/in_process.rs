@@ -61,15 +61,15 @@ failed run (status not 0) stops the script, naming the operation and its log.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::File,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
 use blaze_script::{
-    TempDir, expect, fail, git,
+    TempDir,
+    child::{self, Ended, Measured},
+    expect, fail, git,
     input::{self, Fields, Input, InputError},
     run,
 };
@@ -80,8 +80,6 @@ const SCRIPT: &str = "in_process";
 const OPS: [&str; 5] = ["cold", "noop", "comment", "body", "restart_body"];
 /// The hosts, as `[serve] host` names them (`blaze_thin::host::Host::word`).
 const HOSTS: [&str; 2] = ["daemon", "process"];
-/// How often a running child is asked whether it ended: the wall time's resolution.
-const POLL: Duration = Duration::from_millis(1);
 
 struct Edit {
     file: String,
@@ -184,86 +182,14 @@ fn floors(value: &Value, at: &str) -> Result<BTreeMap<String, f64>, InputError> 
         .collect()
 }
 
-/// The kernel's account of a reaped child (`struct rusage`, the same layout on 64-bit macOS
-/// and Linux: two `timeval`s of 16 bytes, then 14 `long`s, `ru_maxrss` first).
-#[repr(C)]
-struct Rusage {
-    utime: [i64; 2],
-    stime: [i64; 2],
-    maxrss: i64,
-    rest: [i64; 13],
-}
-
-const WNOHANG: i32 = 1;
-const SIGKILL: i32 = 9;
-
-unsafe extern "C" {
-    fn wait4(pid: i32, status: *mut i32, options: i32, rusage: *mut Rusage) -> i32;
-    fn kill(pid: i32, signal: i32) -> i32;
-}
-
-/// `ru_maxrss` in bytes: macOS counts bytes, Linux kibibytes.
-fn rss_bytes(maxrss: i64) -> u64 {
-    let it = u64::try_from(maxrss).unwrap_or(0);
-    if cfg!(target_os = "macos") { it } else { it * 1024 }
-}
-
-/// One run that ended.
-struct Measured {
-    wall_ns: u64,
-    rss_bytes: u64,
-    cpu_ns: u64,
-    status: i32,
-}
-
-/// Runs `argv` in `cwd` with exactly `env`, its outputs to `<log>.out` and `<log>.err`, reaped
-/// with `wait4` so the kernel's peak RSS of it comes back. Bounded by `limit`: past it the child
-/// is killed and this is `Err`.
+/// Runs `argv` in `cwd` with exactly `env`, its outputs to `<log>.out` and `<log>.err`, the
+/// kernel's peak RSS of it coming back ([`child::run_logged`]). Bounded by `limit`: past it the
+/// child's process group is killed and this is `Err`.
 fn measure(argv: &[String], cwd: &Path, env: &[(&str, &Path)], log: &Path, limit: Duration) -> Result<Measured, String> {
-    let (program, args) = argv.split_first().ok_or("no program to run")?;
-    let file = |ext: &str| {
-        let path = log.with_extension(ext);
-        File::create(&path).map_err(|e| format!("{} could not be made: {e}", path.display()))
-    };
-    #[allow(clippy::disallowed_methods, reason = "the one place this script starts a measured program; its environment and `cwd` are given whole")]
-    let mut command = Command::new(program);
-    command.env_clear().args(args).current_dir(cwd).stdin(Stdio::null()).stdout(file("out")?).stderr(file("err")?);
-    for (name, value) in env {
-        command.env(name, value);
+    match child::run_logged(argv, cwd, env, log, limit)? {
+        Ended::Exited(it) => Ok(it),
+        Ended::TimedOut { after } => Err(format!("killed at its bound of {} s (log {})", after.as_secs(), log.display())),
     }
-    let began = Instant::now();
-    let child = command.spawn().map_err(|e| format!("{program} did not start in {}: {e}", cwd.display()))?;
-    let pid = i32::try_from(child.id()).map_err(|_| format!("pid {} is not a pid_t", child.id()))?;
-    let deadline = began + limit;
-    let mut status = 0i32;
-    let mut usage = Rusage { utime: [0; 2], stime: [0; 2], maxrss: 0, rest: [0; 13] };
-    // Bounded: it ends at the deadline at the latest, asking every `POLL`.
-    loop {
-        // SAFETY: `pid` is this process's unreaped child (`Child` never waits on drop); both
-        // pointers are to locals that live across the call.
-        let got = unsafe { wait4(pid, &mut status, WNOHANG, &mut usage) };
-        match got {
-            0 if Instant::now() >= deadline => {
-                // SAFETY: as above; the child is not reaped yet, so the pid is still its own.
-                unsafe {
-                    kill(pid, SIGKILL);
-                    wait4(pid, &mut status, 0, &mut usage);
-                }
-                return Err(format!("killed at its bound of {} s (log {})", limit.as_secs(), log.display()));
-            }
-            0 => {
-                #[allow(clippy::disallowed_methods, reason = "a script polls its child; it is on no pool")]
-                std::thread::sleep(POLL);
-            }
-            it if it == pid => break,
-            _ => return Err(format!("wait4({pid}): {}", std::io::Error::last_os_error())),
-        }
-    }
-    let wall_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    let tv_ns = |tv: [i64; 2]| u64::try_from(tv[0]).unwrap_or(0) * 1_000_000_000 + u64::try_from(tv[1] & 0xffff_ffff).unwrap_or(0) * 1_000;
-    // `WIFEXITED`/`WEXITSTATUS`, the same on both: a signal's end is -1.
-    let status = if status & 0x7f == 0 { (status >> 8) & 0xff } else { -1 };
-    Ok(Measured { wall_ns, rss_bytes: rss_bytes(usage.maxrss), cpu_ns: tv_ns(usage.utime) + tv_ns(usage.stime), status })
 }
 
 /// Bytes on disk under `root`: allocated blocks, each inode once, links not followed; 0 when
@@ -342,8 +268,8 @@ impl Bench<'_> {
         let Some((pid, _)) = self.daemon(home) else { return Ok(()) };
         self.blaze(home, &["stop"])?;
         let deadline = Instant::now() + self.limit;
-        // Bounded: the run's bound. SAFETY: signal 0 only asks whether `pid` is alive.
-        while unsafe { kill(pid, 0) } == 0 {
+        // Bounded: the run's bound.
+        while child::alive(pid) {
             if Instant::now() >= deadline {
                 return Err(format!("the daemon of {} (pid {pid}) outlived `blaze stop` by {} s", home.display(), self.limit.as_secs()));
             }
@@ -600,7 +526,6 @@ fn print_table(it: &Args, summary: &[Value], named: &Value) {
 
 fn selftest() {
     let dir = TempDir::new("in-process-selftest-").unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
-    expect(SCRIPT, std::mem::size_of::<Rusage>() == 144, "struct rusage is 144 bytes on 64-bit macOS and Linux");
     expect(SCRIPT, spread(&[3.0, 1.0, 2.0]) == Some((2.0, 1.0, 3.0)), "the median of three is the middle one");
     expect(SCRIPT, spread(&[4.0, 1.0, 2.0, 3.0]) == Some((2.5, 1.0, 4.0)), "the median of four is the mean of the middle two");
     expect(SCRIPT, spread(&[]).is_none(), "no values have no median");

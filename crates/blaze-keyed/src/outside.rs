@@ -87,11 +87,6 @@ pub fn shape_of<'b, K: Kind<Root = Traced>>(record: &'b [u8], slot: &Key<K>) -> 
     record::open::<K>(record, slot)?.payload.follow(record).map_err(RecordError::Format)
 }
 
-/// The payload of a value record found by [`Lookup`] (its proof's key is the address).
-pub fn payload_of<'b, K: Kind<Root = Traced>>(record: &'b [u8], holds: &Holds<'_, K>) -> Result<&'b [u8], RecordError> {
-    record::open::<K>(record, &holds.key())?.payload.follow(record).map_err(RecordError::Format)
-}
-
 /// Why an outside lookup or filing stopped, naming the key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum OutsideError {

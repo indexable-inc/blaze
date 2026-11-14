@@ -40,6 +40,7 @@
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
 //!     error_union: error, from, clone, hash
+//!     expect: option, fmt
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
 //!     fn: sized, tuple
@@ -247,6 +248,18 @@ pub mod marker {
 
     #[rustc_builtin_macro]
     pub macro ConstParamTy($item:item) {}
+
+    // As library/core/src/marker.rs: the scalars, and (bounded on `unsized_const_params`
+    // there, which hir-ty checks on the parameter's type) `str`, slices and references.
+    macro_rules! const_param_ty_impls {
+        ($($t:ty)*) => { $(impl ConstParamTy_ for $t {})* };
+    }
+    const_param_ty_impls! {
+        usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 bool char () str
+    }
+    impl<T: ConstParamTy_, const N: usize> ConstParamTy_ for [T; N] {}
+    impl<T: ConstParamTy_> ConstParamTy_ for [T] {}
+    impl<T: ConstParamTy_ + ?Sized> ConstParamTy_ for &T {}
     // endregion:const_param_ty
 
     // region:eq
@@ -1807,6 +1820,15 @@ pub mod option {
             }
         }
 
+        // region:expect
+        pub const fn expect(self, _msg: &str) -> T {
+            match self {
+                Some(val) => val,
+                None => panic!("called `Option::expect()` on a `None` value"),
+            }
+        }
+        // endregion:expect
+
         pub const fn as_ref(&self) -> Option<&T> {
             match self {
                 Some(x) => Some(x),
@@ -1954,6 +1976,19 @@ pub mod result {
                 Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
             }
         }
+
+        // region:expect
+        #[track_caller]
+        pub fn expect(self, _msg: &str) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::expect()` on an `Err` value"),
+            }
+        }
+        // endregion:expect
         // endregion:fmt
 
         // region:option

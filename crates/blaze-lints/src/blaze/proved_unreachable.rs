@@ -97,7 +97,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let explained = hir_ty_pure::reach::explain(db, def, &blocks);
     for site in unproved {
         let Some(range) = analysis.expr_range(site) else { continue };
-        let why = match reach.refused {
+        let why = match reach.refusal() {
             // alloc: a message's part
             Some(why) => format!("`{name}` can't be checked: {why}"),
             None => reach

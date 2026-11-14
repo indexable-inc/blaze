@@ -3,23 +3,16 @@
 //! fixed file lints clean and fixes to itself.
 //!
 //! minicore's `core` has no float `PartialOrd`, no `str` methods past `as_bytes` and no
-//! `RefCell`: the fixture's `std` gives the floats their comparison, `str` its `split_at`,
-//! `find`, `get` and `len` (as `#[rustc_allow_incoherent_impl]` methods, as `alloc` does for
-//! the real `str`), `ManuallyDrop` its `into_inner`, and `RefCell` its diagnostic item.
+//! `RefCell`: the fixture's `std` gives the floats their comparison, `to_bits`, `from_bits`
+//! and `total_cmp`, `u32` its `to_ne_bytes`, `str` its `split_at`, `find`, `get` and `len` (as
+//! `#[rustc_allow_incoherent_impl]` methods, as `alloc` does for the real `str`),
+//! `ManuallyDrop` its `into_inner`, and `RefCell` its diagnostic item. `from` gives `Result` its
+//! `Try` (a fix that writes `?` type-checks), `int_cast` the `From` and `cast_signed` the
+//! `transmute` fixes write, and `expect` the `expect` of `Option` and `Result`.
 
-use base_db::FileId;
-use hir_expand::fixture;
-use syntax::{TextRange, TextSize};
+use crate::{conf::Conf, tests::lint};
 
-use crate::{
-    check::{Setup, check},
-    conf::Conf,
-    fix::fix,
-    level::CommandLine,
-    tests::{lint, main_crate},
-};
-
-const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, iterator, iterators, iterators_more, slice, index, range, deref, drop, manually_drop, transmute, ord, eq, builtin_impls, try, str, fmt, panic, assert\n";
+const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, fn, iterator, iterators, iterators_more, slice, index, range, deref, drop, manually_drop, transmute, ord, eq, builtin_impls, try, from, int_cast, expect, str, fmt, panic, assert\n";
 
 const CRATES: &str = r#"
 //- /alloc/lib.rs crate:alloc
@@ -104,6 +97,24 @@ pub mod floats {
     }
     impl core::cmp::PartialOrd for f64 {
         fn partial_cmp(&self, other: &f64) -> Option<core::cmp::Ordering> { None }
+    }
+    impl f32 {
+        #[rustc_allow_incoherent_impl]
+        pub const fn to_bits(self) -> u32 { loop {} }
+        #[rustc_allow_incoherent_impl]
+        pub const fn from_bits(v: u32) -> f32 { loop {} }
+    }
+    impl f64 {
+        #[rustc_allow_incoherent_impl]
+        pub const fn to_bits(self) -> u64 { loop {} }
+        #[rustc_allow_incoherent_impl]
+        pub const fn from_bits(v: u64) -> f64 { loop {} }
+        #[rustc_allow_incoherent_impl]
+        pub fn total_cmp(&self, other: &f64) -> core::cmp::Ordering { loop {} }
+    }
+    impl u32 {
+        #[rustc_allow_incoherent_impl]
+        pub const fn to_ne_bytes(self) -> [u8; 4] { loop {} }
     }
 }
 pub mod io {
@@ -243,63 +254,7 @@ fn found_in_bin(lint_name: &str, main: &str) -> String {
 /// checking that the fix changed it, that linting it again finds nothing, and that fixing it
 /// again changes nothing.
 fn fixed(lint_name: &str, main: &str) -> String {
-    let fx = fixture::db(&fixture_of(main));
-    let file = *fx.files().last().expect("src/lib.rs");
-    let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
-    let file = file.file_id(&db);
-    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
-    let flags: Vec<String> = flags(lint_name).split_whitespace().map(str::to_owned).collect();
-    let setup = Setup {
-        command_line: CommandLine::parse(&flags).expect("the flags read"),
-        conf: Conf::default(),
-    };
-    let before = db.file_text(file).text(&db).to_string();
-    let made = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
-    let after = db.file_text(file).text(&db).to_string();
-    assert_ne!(after, before, "the fix of `{lint_name}` changed the file");
-    assert!(made.applied > 0, "the fix of `{lint_name}` made a suggestion");
-    blaze_query::db::attach(&db, || {
-        let found = check(&db, krate, &setup, &name_of).expect("the file is named");
-        let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
-        assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");
-    });
-    let again = fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
-    let twice = db.file_text(file).text(&db).to_string();
-    assert_eq!(again.applied, 0, "the fixed file has nothing left to fix:\n{twice}");
-    assert_eq!(twice, after, "fixing the fixed file changes nothing");
-    after
-}
-
-/// The findings of `blaze::<lint_name>` alone in `main` (`src/lib.rs`), with the text and the
-/// first substitution of each finding's first suggestion, whatever its applicability.
-fn suggested(lint_name: &str, main: &str) -> (String, Vec<String>, Vec<(TextRange, String)>) {
-    let fx = fixture::db(&fixture_of(main));
-    let file = *fx.files().last().expect("src/lib.rs");
-    let db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
-    let file = file.file_id(&db);
-    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
-    let flags: Vec<String> = flags(lint_name).split_whitespace().map(str::to_owned).collect();
-    let setup = Setup {
-        command_line: CommandLine::parse(&flags).expect("the flags read"),
-        conf: Conf::default(),
-    };
-    let text = db.file_text(file).text(&db).to_string();
-    let found = blaze_query::db::attach(&db, || {
-        check(&db, krate, &setup, &name_of).expect("the file is named")
-    });
-    let messages = found.iter().map(|it| it.diagnostic.message.clone()).collect();
-    let mut parts: Vec<(TextRange, String)> = found
-        .iter()
-        .filter_map(|it| it.diagnostic.suggestions.first()?.substitutions.first())
-        .flatten()
-        .map(|(span, text)| {
-            (TextRange::new(TextSize::new(span.lo), TextSize::new(span.hi)), text.clone())
-        })
-        .collect();
-    parts.sort_by_key(|(range, _)| (range.start(), range.end()));
-    (text, messages, parts)
+    crate::tests::fixed_in(&fixture_of(main), &flags(lint_name))
 }
 
 /// `main` after every suggestion `blaze::<lint_name>` offers is made, a `MaybeIncorrect` one
@@ -307,17 +262,7 @@ fn suggested(lint_name: &str, main: &str) -> (String, Vec<String>, Vec<(TextRang
 /// changed it, that linting it again finds nothing, and that it offers nothing more, so
 /// making the suggestions again changes nothing.
 fn offered(lint_name: &str, main: &str) -> String {
-    let (before, _, parts) = suggested(lint_name, main);
-    assert!(!parts.is_empty(), "`{lint_name}` offers a fix of:\n{before}");
-    let mut after = before.clone();
-    for (range, text) in parts.iter().rev() {
-        after.replace_range(std::ops::Range::<usize>::from(*range), text);
-    }
-    assert_ne!(after, before, "the suggestions of `{lint_name}` changed the file");
-    let (_, left, more) = suggested(lint_name, &after);
-    assert!(left.is_empty(), "the file the suggestions made lints clean:\n{after}\n{left:#?}");
-    assert!(more.is_empty(), "the file the suggestions made has nothing left to offer");
-    after
+    crate::tests::offered_in(&fixture_of(""), main.trim_start_matches('\n'), &flags(lint_name))
 }
 
 #[test]

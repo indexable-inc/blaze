@@ -14,8 +14,10 @@ use quinn_proto::{DatagramEvent, EndpointConfig};
 
 use super::{
     ClientConfig, Closed, Direction, Endpoint, Event, Identity, SETTINGS_WAIT, ServerConfig,
-    SessionId, Step, StreamRef, Transport, config, frame,
+    SessionId, Step, StreamRef, Transport, Trust, config, frame,
 };
+
+mod requests;
 
 const SERVER: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4433);
@@ -45,7 +47,7 @@ fn server(epoch: Instant) -> (Endpoint, [u8; 32]) {
     let (identity, hash) = identity();
     let server = Endpoint::new(
         epoch,
-        Some(ServerConfig { identity, transport: Transport::default() }),
+        Some(ServerConfig { identity, transport: Transport::default(), requests: false }),
         None,
     )
     .unwrap();
@@ -91,9 +93,12 @@ struct Mute {
 
 impl Mute {
     fn new(epoch: Instant, pin: [u8; 32]) -> Mute {
-        let client =
-            config::client(&ClientConfig { pins: vec![pin], transport: Transport::default() })
-                .unwrap();
+        let client = config::client(&ClientConfig {
+            trust: Trust::Pinned(vec![pin]),
+            transport: Transport::default(),
+        })
+        .unwrap()
+        .quic;
         let mut endpoint =
             quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = endpoint.connect(epoch, client, SERVER, "localhost").unwrap();
@@ -211,7 +216,7 @@ impl Pair<Endpoint> {
         let client = Endpoint::new(
             epoch,
             None,
-            Some(ClientConfig { pins: vec![pin], transport: Transport::default() }),
+            Some(ClientConfig { trust: Trust::Pinned(vec![pin]), transport: Transport::default() }),
         )
         .unwrap();
         Pair {
@@ -425,7 +430,7 @@ fn a_certificate_not_pinned_fails_the_handshake_naming_the_server() {
     let client = Endpoint::new(
         epoch,
         None,
-        Some(ClientConfig { pins: vec![[7; 32]], transport: Transport::default() }),
+        Some(ClientConfig { trust: Trust::Pinned(vec![[7; 32]]), transport: Transport::default() }),
     )
     .unwrap();
     let mut pair = Pair {

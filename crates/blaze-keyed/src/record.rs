@@ -99,18 +99,27 @@ blaze_format::record! {
     }
 }
 
-blaze_format::record! {
-    #[derive(Clone, Copy, Debug)]
-    pub struct ProgramRoot: 1 {
-        pub head: RecordHead,
-        pub image: ContentId,
-        pub instances: Slice<ContentId>,
-    }
-}
-
 /// A root: a record whose first field is its [`RecordHead`].
 pub trait Headed: Record {
     fn head(&self) -> &RecordHead;
+}
+
+/// A root that carries a payload: [`Opaque`] and [`Traced`]. What [`crate::proof::payload`]
+/// reads by proof.
+pub trait HasPayload: Headed {
+    fn payload(&self) -> &Slice<u8>;
+}
+
+impl HasPayload for Opaque {
+    fn payload(&self) -> &Slice<u8> {
+        &self.payload
+    }
+}
+
+impl HasPayload for Traced {
+    fn payload(&self) -> &Slice<u8> {
+        &self.payload
+    }
 }
 
 macro_rules! headed {
@@ -124,7 +133,7 @@ macro_rules! headed {
     )*};
 }
 
-headed!(Traced, Opaque, Sections, ManifestRoot, ProgramRoot);
+headed!(Traced, Opaque, Sections, ManifestRoot);
 
 /// What an item is across edits: the hash of its path and its kind. Never a position, never a
 /// dense id.

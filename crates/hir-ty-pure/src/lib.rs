@@ -39,8 +39,10 @@ mod memory;
 pub mod models;
 pub mod program_lifetime;
 pub mod reach;
+pub mod refined;
 pub mod roles;
 mod sealed;
+pub mod trust;
 mod values;
 mod walk;
 
@@ -56,8 +58,8 @@ use intern::Symbol;
 
 pub use effects::{EFFECTS, EffectDef, EffectSet, PURE, Rule};
 pub use function::{
-    EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, check, check_generic,
-    derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
+    EffectProof, FnPurity, Place, PureProof, Refusal, Step, Trusted, call_effects, check,
+    check_generic, derived_pure, fn_memory, fn_purity, fn_purity_generic, instance_effects,
 };
 pub use memory::{Access, MemoryEffects};
 pub use walk::{ScriptProof, main_of, script_proof, script_purity};

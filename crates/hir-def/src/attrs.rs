@@ -783,6 +783,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::nonblocking)) => AttrFlags::NONBLOCKING,
                 (Some(Word::blaze), Some(Word::bounded_turn)) => AttrFlags::BOUNDED_TURN,
                 (Some(Word::blaze), Some(Word::answers_request)) => AttrFlags::ANSWERS_REQUEST,
+                (Some(Word::blaze), Some(Word::lock_checked)) => AttrFlags::LOCK_CHECKED,
                 (Some(Word::blaze), Some(Word::norefcount)) => AttrFlags::NOREFCOUNT,
                 (Some(Word::blaze), Some(Word::expect)) => AttrFlags::EXPECT,
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
@@ -994,6 +995,7 @@ name_set! {
     link_ordinal,
     link_section,
     linkage,
+    lock_checked,
     macro_export,
     macro_style,
     marker,
@@ -1274,6 +1276,12 @@ bitflags::bitflags! {
         /// [`AttrFlags::NOPANIC`], for an answer path that never syncs a file to the disk
         /// (`blaze::sync_on_answer_path`).
         const ANSWERS_REQUEST = 1 << 116;
+        /// `#[blaze::lock_checked]` on a function, or `#![blaze::lock_checked]` on a module
+        /// (for every function in it and its children): the function asked for its locks to be
+        /// proved, so `blaze::lock_order` and `blaze::lock_across_wait` refuse what they can't
+        /// see under it, where elsewhere an unknown is silent
+        /// (docs/v2/plan/design/effect-summary.md).
+        const LOCK_CHECKED = 1 << 117;
         /// `#[blaze::memo]`, a word, on a function: a blaze extension (inert under rustc with
         /// `#![register_tool(blaze)]`), the function is a memo point of `bstd::eval`
         /// (docs/v2/plan/design/std.md, "Eval"). It is held pure as if written
@@ -2745,6 +2753,34 @@ impl AttrFlags {
                 };
                 ControlFlow::Break(read)
             })
+        }
+    }
+
+    /// The conditions the `#[blaze::invariant(..)]` attributes on `owner` state, each as written
+    /// between its parentheses, in source order; empty without one. A blaze extension (inert
+    /// under rustc with `#![register_tool(blaze)]`), read and refused by
+    /// `hir_ty_pure::refined` (docs/v2/plan/design/refined-values.md). Every bit of
+    /// [`AttrFlags`] is taken, so this is a query of its own, asked only of a struct a body
+    /// builds, writes or takes.
+    pub fn blaze_invariants(db: &Db, owner: AttrDefId) -> &[Box<str>] {
+        return blaze_invariants(db, owner);
+
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+        fn blaze_invariants(db: &Db, owner: AttrDefId) -> Box<[Box<str>]> {
+            // alloc: the invariants of one type, few; the query's value
+            let mut found: Vec<Box<str>> = Vec::new();
+            collect_attrs::<Infallible>(db, owner, |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && is_blaze_word(attr.path(), "invariant")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let text = tt.syntax().text().to_string(); // alloc: the condition's text, once per attribute
+                    let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or("");
+                    found.push(Box::from(inner.trim())); // alloc: as above
+                }
+                ControlFlow::Continue(())
+            });
+            found.into_boxed_slice()
         }
     }
 

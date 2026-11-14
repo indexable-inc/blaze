@@ -40,7 +40,7 @@ use std::{
 
 use blaze_hash::{ByHash, HashMap};
 use blaze_keyed::{
-    kind::{Key, Kind},
+    kind::{Key, Kind, Namespace},
     outside::{self, Filer, Lookup, MAX_SHAPES, OutsideError, Settled, Want},
     proof::{self, Checks, Holds, Snapshot},
     record::{RecordError, Traced},
@@ -180,7 +180,7 @@ pub fn payload<'r, K: Kind<Root = Traced>>(
     holds: &Holds<'_, K>,
     record: &'r [u8],
 ) -> Result<&'r [u8], Refusal> {
-    outside::payload_of(record, holds).map_err(record_error(subject, holds.key()))
+    proof::payload(holds, record).map_err(record_error(subject, holds.key()))
 }
 
 /// Looks for a valid value of `key` in the snapshot `snap`: the core's [`Lookup`], its reads
@@ -308,6 +308,7 @@ pub fn settle<K: Kind, A: Answers>(
 pub fn file<K: Kind<Root = Traced>, S: Store, F: Allocator + Copy>(
     store: &S,
     subject: &Subject,
+    namespace: Namespace,
     mut filer: Filer<K>,
     put: &Put<K>,
     checks: &mut Checks,
@@ -323,12 +324,12 @@ pub fn file<K: Kind<Root = Traced>, S: Store, F: Allocator + Copy>(
             }
             Want::PutShape(at) => {
                 let filed =
-                    store.put::<K>(&at, &outside::write_shape(&at, shape)).map_err(store_error(subject, at))?;
+                    store.put::<K>(&at, namespace, &outside::write_shape(&at, shape)).map_err(store_error(subject, at))?;
                 filer.put(filed).map_err(outside_error(subject))?;
             }
             Want::PutValue(address) => {
                 let record = outside::write_value(&address, &put.list.facts(), &put.value);
-                let filed = store.put::<K>(&address, &record).map_err(store_error(subject, address))?;
+                let filed = store.put::<K>(&address, namespace, &record).map_err(store_error(subject, address))?;
                 filer.put(filed).map_err(outside_error(subject))?;
             }
             Want::Done => return Ok(()),

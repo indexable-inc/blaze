@@ -15,6 +15,7 @@ use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::Funct
 use hir_expand::fixture;
 use hir_ty::{
     ParamEnvAndCrate,
+    facts::Tier,
     mir::{MirOptLevel, MirOptions},
     next_solver::{GenericArgs, ParamEnv},
     traits::StoredParamEnvAndCrate,
@@ -74,6 +75,7 @@ const DEBUG: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A debug unit of a program whose allocations are unobserved: `HeapToStack` moves `boxed`'s
@@ -85,6 +87,7 @@ const MOVED: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: true,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A release unit: level 2 with the inliner on.
@@ -95,6 +98,7 @@ const RELEASE: Compiled = Compiled::every(MirOptions {
     inline: true,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Optimizing,
 });
 
 /// The model's functions with no generic parameter, each a root, by name.

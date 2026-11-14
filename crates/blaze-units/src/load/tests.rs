@@ -1078,10 +1078,12 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
     let source = format!("git+https://github.com/o/r?rev={commit}#{commit}");
     let ident = blaze_resolve::SourceId::from_url(&source).unwrap().git_ident();
     let at = format!("{SOURCES}/git/checkouts/{ident}/{commit}");
+    let tree = format!("blake3:{}", "ab".repeat(32));
+    let blaze_lock = format!("version = 1\n\n[git.\"https://github.com/o/r\"]\n{commit} = \"{tree}\"\n");
     let fetch = Fetch {
         what: "git repository `https://github.com/o/r`".to_owned(),
         url: "https://github.com/o/r".to_owned(),
-        kind: FetchKind::Git { commit: commit.to_owned() },
+        kind: FetchKind::Git { commit: commit.to_owned(), tree },
         at: at.clone(),
     };
     let manifest =
@@ -1092,9 +1094,25 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
          [[package]]\nname = \"r-sys\"\nversion = \"0.1.0\"\nsource = \"{source}\"\n"
     );
     let fixture = Fixture::new();
+    // Without its tree pinned in `blaze.lock`, the git package is refused before its
+    // checkout is asked for: the commit (SHA-1) pins nothing.
+    let unpinned = [
+        ("ws/Cargo.toml", manifest.as_str()),
+        ("ws/Cargo.lock", lock.as_str()),
+        ("ws/src/lib.rs", ""),
+    ];
+    let Planned::Failed(error) = fixture.plan(fixture.open(&ask(&unpinned))) else {
+        panic!("an unpinned git package was located");
+    };
+    assert!(
+        error.what.contains("weak_source_pin") && error.what.contains("blaze audit pin") && error.what.contains(commit),
+        "{}",
+        error.what
+    );
     let files = [
         ("ws/Cargo.toml", manifest.as_str()),
         ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
         ("ws/src/lib.rs", ""),
     ];
     assert_eq!(fixture.plan(fixture.open(&ask(&files))), Planned::Needs(vec![fetch]));
@@ -1108,6 +1126,7 @@ fn two_packages_of_one_git_repository_ask_for_its_checkout_once() {
     let fetched = [
         ("ws/Cargo.toml", manifest.as_str()),
         ("ws/Cargo.lock", lock.as_str()),
+        ("ws/blaze.lock", blaze_lock.as_str()),
         ("ws/src/lib.rs", ""),
         ("co/Cargo.toml", root),
         ("co/crates/r/Cargo.toml", r),

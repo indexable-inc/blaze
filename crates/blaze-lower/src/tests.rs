@@ -161,6 +161,7 @@ fn package(
         is_member,
         default_run: None,
         checksum: None,
+        tree: None,
         tests: TestSandbox::default(),
         const_macros: None,
     }

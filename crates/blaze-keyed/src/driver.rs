@@ -33,7 +33,7 @@ use blaze_ids::ContentId;
 use crate::{
     Plant,
     exec::{Executor, LOCAL_TASKS},
-    kind::{Body, Certificate, Key, Kind, Layout, Surface, Tag, UnitManifest},
+    kind::{Body, Certificate, Key, Kind, Layout, Namespace, Surface, Tag, UnitManifest},
     memo::{Arena, Memo},
     outside::{self, Filer, Found, Lookup, OutsideError, Want},
     planted,
@@ -50,12 +50,18 @@ use crate::{
 pub struct UnitPlan<'p> {
     pub deps: &'p [u32],
     pub last: Option<Key<UnitManifest>>,
+    /// The namespace the unit's records are filed in: [`crate::kind::namespace_of`] of its
+    /// package, computed once per package by the host.
+    pub namespace: Namespace,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Plan<'p> {
     /// The request's base: the key its certificate's shapes are filed under.
     pub certificate: Key<Certificate>,
+    /// The namespace the certificate is filed in: what the request's own machine reads
+    /// ([`Namespace::LOCAL`] unless the machine is a trusted writer).
+    pub namespace: Namespace,
     pub units: &'p [UnitPlan<'p>],
 }
 
@@ -148,7 +154,8 @@ pub enum Effect<'d> {
     /// Run `task`: on the local pool, or, when `remote`, through the executor's
     /// [`RemoteService`](crate::exec::RemoteService) as an action over its inputs.
     Run { ticket: Ticket, task: Task, remote: bool },
-    Put { ticket: Ticket, tag: Tag, key: ContentId, bytes: &'d [u8] },
+    /// File `bytes` under `tag`, `key` in `namespace` ([`crate::store::Store::put`]).
+    Put { ticket: Ticket, tag: Tag, key: ContentId, namespace: Namespace, bytes: &'d [u8] },
     /// Give the request's outside reads: [`Input::Reads`].
     Reads { ticket: Ticket },
 }
@@ -272,6 +279,7 @@ struct Unit<'s, A: Allocator> {
     open: u32,
     last_entries: Vec<Entry, A>,
     manifest_bytes: Option<Aligned>,
+    namespace: Namespace,
 }
 
 enum Phase {
@@ -326,6 +334,7 @@ pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> {
     ended: bool,
     alloc: A,
     certificate: Key<Certificate>,
+    namespace: Namespace,
     lookup: Lookup<'s, Certificate>,
     certified: Option<Certified<'s>>,
     filer: Option<Filer<Certificate>>,
@@ -417,6 +426,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 open: 0,
                 last_entries: Vec::new_in(alloc.clone()),
                 manifest_bytes: None,
+                namespace: unit.namespace,
             });
         }
         let mut manifests = Vec::with_capacity_in(count, alloc.clone());
@@ -441,6 +451,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
             ended: false,
             alloc,
             certificate: plan.certificate,
+            namespace: plan.namespace,
             lookup: Lookup::new(snap, plan.certificate),
             certified: None,
             filer: None,
@@ -682,12 +693,14 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                         ticket,
                         tag: Certificate::TAG,
                         key: at.id(),
+                        namespace: self.namespace,
                         bytes: self.cert_shape_record.as_deref().unwrap_or(&[]),
                     },
                     Want::PutValue(at) => Effect::Put {
                         ticket,
                         tag: Certificate::TAG,
                         key: at.id(),
+                        namespace: self.namespace,
                         bytes: self.cert_value.as_deref().unwrap_or(&[]),
                     },
                     _ => cert_get(Key::from_id(none)),
@@ -722,9 +735,10 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                 Effect::Run { ticket, task, remote: X::REMOTE && !stays_local(&task, queued) }
             }
             Work::Put(unit, at) => {
+                let namespace = self.units[unit as usize].namespace;
                 let slot = slot(unit, at);
                 let bytes = slot.held.as_deref().expect("a record is held while it is put");
-                Effect::Put { ticket, tag: slot.tag, key: slot.key, bytes }
+                Effect::Put { ticket, tag: slot.tag, key: slot.key, namespace, bytes }
             }
             Work::PutManifest(unit) => {
                 let unit = &self.units[unit as usize];
@@ -732,6 +746,7 @@ impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A>
                     ticket,
                     tag: UnitManifest::TAG,
                     key: unit.manifest.map_or(none, |key| key.id()),
+                    namespace: unit.namespace,
                     bytes: unit.manifest_bytes.as_deref().expect("a manifest is held while it is put"),
                 }
             }

@@ -28,7 +28,8 @@ use tokio::sync::mpsc;
 use crate::{
     bucket::{Asked, Bucket, Cond, Counts, Failure, Op, Reply, Ticket},
     s3,
-    settings::{Credentials, Settings},
+    http3,
+    settings::{Credentials, Settings, TRANSPORT_SETTING, Transport},
 };
 
 /// The most bytes an S3 answer that is not an object may be (XML of a multipart upload).
@@ -62,10 +63,16 @@ fn cond_header(cond: &Cond) -> Vec<(&'static str, String)> {
     }
 }
 
+/// Whether `op` is an anonymous read: a GET or HEAD of a public object, sent unsigned to the
+/// public address (over HTTP/3 when `bucket.transport` says so, [`crate::http3`]).
+pub fn anonymous(op: &Op) -> bool {
+    matches!(op, Op::Get { .. } | Op::Head { .. }) && op.name().starts_with("public/")
+}
+
 /// The request for `op` at `unix_s`, and how to read its answer. Why not, naming the setting
 /// missing.
 pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), String> {
-    let anonymous = matches!(op, Op::Get { .. } | Op::Head { .. }) && op.name().starts_with("public/");
+    let anonymous = anonymous(&op);
     if anonymous && let Some(public_url) = &access.public_url {
         let url = s3::public(public_url, op.name());
         let (method, want, most, headers) = match op {
@@ -178,6 +185,14 @@ impl HttpBucket {
         let Some(bucket) = settings.contacts() else {
             return Err(Failure::NotConfigured { missing: vec!["the cache is not configured or is disabled (remote.json)".to_owned()] });
         };
+        if bucket.transport == Transport::H3 {
+            // The HTTP/3 reads ([`crate::http3::Routed`] over this bucket) need a driver that
+            // gives them a `Wire`; none is in this tree yet (the HTTP/3 driver on blaze-core's
+            // effects). Refused, never read over HTTP/1.1 instead.
+            return Err(Failure::NotConfigured {
+                missing: vec![format!("{TRANSPORT_SETTING} is \"h3\", and this blaze has no HTTP/3 driver to read with yet: set it to \"h1\"")],
+            });
+        }
         let access = Access { endpoint: bucket.endpoint.clone(), bucket: bucket.name.clone(), public_url: bucket.public_url.clone(), credentials: settings.credentials.clone() };
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("blaze-remote http").enable_all().build().map_err(|e| Failure::Misused(format!("making the cache's HTTP runtime: {e}")))?;
         let tls = blaze_http::roots::native().map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
@@ -232,19 +247,67 @@ impl Bucket for HttpBucket {
         // cannot come; it is read as nothing answered.
         let first = self.runtime.block_on(self.from_tasks.recv());
         let mut out: Vec<(Ticket, Reply)> = first.into_iter().collect();
-        while let Ok(it) = self.from_tasks.try_recv() {
-            out.push(it);
-        }
-        self.in_flight -= out.len();
-        for (_, reply) in &out {
-            if let Reply::Got { bytes, .. } = reply {
-                self.counts.received += bytes.len() as u64;
-            }
-        }
+        self.taken(&mut out);
         out
     }
 
     fn counts(&self) -> Counts {
         self.counts
     }
+}
+
+impl HttpBucket {
+    /// Adds every answer ready to `out`, and counts what `out` holds as taken.
+    fn taken(&mut self, out: &mut Vec<(Ticket, Reply)>) {
+        while let Ok(it) = self.from_tasks.try_recv() {
+            out.push(it);
+        }
+        self.in_flight -= out.len();
+        for (_, reply) in out.iter() {
+            if let Reply::Got { bytes, .. } = reply {
+                self.counts.received += bytes.len() as u64;
+            }
+        }
+    }
+}
+
+impl http3::Ready for HttpBucket {
+    fn ready(&mut self) -> Vec<(Ticket, Reply)> {
+        let mut out = Vec::new_in(std::alloc::Global);
+        self.taken(&mut out);
+        out
+    }
+}
+
+/// The HTTP/3 tickets kept in `dir` ([`http3::TICKETS_FILE`]) usable at `now_unix_s`; none
+/// when there is no file yet. A file anyone but its owner can read is refused, as the
+/// credentials file is: its tickets resume sessions as this client.
+pub fn load_tickets(dir: &std::path::Path, now_unix_s: u64) -> Result<Vec<blaze_http::h3::Ticket, std::alloc::Global>, String> {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+    let path = dir.join(http3::TICKETS_FILE);
+    let file = match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new_in(std::alloc::Global)),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(file) => file,
+    };
+    let mode = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!("{}: its mode is {:o}: a file of tickets is read only when no one but its owner can read it (chmod 600)", path.display(), mode & 0o777));
+    }
+    let mut bytes = Vec::new_in(std::alloc::Global);
+    // One byte past the bound, so a file past it is seen to be.
+    file.take(http3::TICKETS_FILE_MOST as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    http3::decode_tickets(&bytes, now_unix_s)
+}
+
+/// Writes `tickets` to `dir`'s tickets file, owner-only, replacing it whole (written aside,
+/// synced, then renamed over it).
+pub fn save_tickets(dir: &std::path::Path, tickets: &[blaze_http::h3::Ticket]) -> Result<(), String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let path = dir.join(http3::TICKETS_FILE);
+    let aside = dir.join(format!("{}.new", http3::TICKETS_FILE));
+    let bytes = http3::encode_tickets(tickets);
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&aside).map_err(|e| format!("{}: {e}", aside.display()))?;
+    file.write_all(&bytes).and_then(|()| file.sync_all()).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, &path).map_err(|e| format!("{}: {e}", path.display()))
 }

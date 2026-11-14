@@ -12,7 +12,7 @@ use blaze_query::db::{Database as _, Durability};
 use hir_def::FunctionId;
 use hir_ty::{
     ParamEnvAndCrate,
-    facts::{FactItem, Facts, facts_of},
+    facts::{FactItem, Facts, Proofs, facts_of},
     next_solver::{GenericArgs, ParamEnv},
 };
 use hir_ty_mir::mir::dispatch::Body;
@@ -62,7 +62,7 @@ fn rows_after_the_facts(instances: usize, all_rows: bool) -> u64 {
     let facts = || {
         blaze_query::db::attach(&db, || {
             for name in ["leaf", "root"] {
-                _ = facts_of(&db, FactItem::Fn(fn_named(&db, ladder, name)));
+                _ = facts_of(&db, FactItem::Fn(fn_named(&db, ladder, name)), Proofs::Spent);
             }
         });
     };
@@ -117,7 +117,8 @@ fn facts(db: &Db) -> Vec<(&'static str, Facts)> {
             .iter()
             .map(|&(krate, name)| {
                 let func = fn_named(db, crate_named(db, krate), name);
-                (name, facts_of(db, FactItem::Fn(func)).clone()) // clone: a test's answer
+                // clone: a test's answer
+                (name, facts_of(db, FactItem::Fn(func), Proofs::Spent).clone())
             })
             .collect() // alloc: a test's answer
     })
@@ -412,90 +413,4 @@ fn a_summary_of_high_reads_beside_them_is_still_no_row() {
     with_inputs(&mut db, SHORT);
     let (_, counted) = said_of(&db, "sealed_only");
     assert_eq!((summary_rows(&db), counted), (0, 0), "`summary_in` rows and `base`'s count");
-}
-
-/// How deep [`chain`] is in the chain tests.
-const DEPTH: usize = 12;
-
-/// A library crate, `chain`, in a library root at `/lib`: `f0` calls `f1`, each `f{k}` calls
-/// `f{k+1}`, and `f{depth-1}` calls `leaf`, which includes the file a process variable names
-/// (`BASE_DATA`, as [`READS`]' `by_variable`): every run down the chain reads below `HIGH`,
-/// through its leaf alone.
-fn chain(depth: usize) -> String {
-    let mut fns = String::new();
-    for k in 0..depth {
-        let next = if k + 1 == depth { "leaf".to_owned() } else { format!("f{}", k + 1) }; // alloc: a test's fixture text
-        fns.push_str(&format!("pub fn f{k}(x: u32) -> u32 {{\n    {next}(x) ^ {k}\n}}\n")); // alloc: as above
-    }
-    // alloc: a test's fixture text
-    format!(
-        "\n//- /lib/chain.rs crate:chain deps:std new_source_root:library\n\
-         #[rustc_builtin_macro]\n\
-         macro_rules! env {{}}\n\
-         #[rustc_builtin_macro]\n\
-         macro_rules! include_bytes {{\n    ($file:expr $(,)?) => {{{{ /* compiler built-in */ }}}};\n}}\n\
-         pub trait Pick {{\n    fn pick(&self) -> u32;\n}}\n\
-         impl Pick for [u8; 2] {{\n    fn pick(&self) -> u32 {{ 2 }}\n}}\n\
-         pub fn leaf(x: u32) -> u32 {{\n    include_bytes!(env!(\"BASE_DATA\")).pick() ^ x\n}}\n\
-         {fns}\
-         //- /lib/short.txt\n\
-         ab\n\
-         //- /kernel.rs crate:kernel deps:std,chain new_source_root:local\n\
-         pub fn run() -> u32 {{\n    chain::f0(1)\n}}\n"
-    )
-}
-
-/// `chain::f0`'s summary, asked from `chain` in a fresh database of [`chain`]`(depth)`, and how
-/// many times each instance's summary ran on the way (`plant::counting_runs`), by name.
-fn runs_down_the_chain(depth: usize) -> Vec<(String, u32)> {
-    let mut db = db_with(&chain(depth));
-    with_inputs(&mut db, SHORT);
-    let krate = crate_named(&db, "chain");
-    let f0 = fn_named(&db, krate, "f0");
-    blaze_query::db::attach(&db, || {
-        assert!(crate::sealed::sealed(&db, krate).is_some(), "`chain`, in a library root, is sealed");
-        let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
-        plant::counting_runs(|| _ = summary(&db, env, body_instance(f0))).1
-    })
-}
-
-/// The invariant: down a chain [`DEPTH`] deep in a sealed crate whose leaf reads below `HIGH`,
-/// each instance's summary runs at most twice (once in the run that read below `HIGH` and was
-/// discarded, once as its row), so the chain costs at most twice its length in runs, not a run
-/// of every depth below each asker (quadratic) nor one per path (exponential). The walk
-/// reaches every function of the chain, or the count proves nothing.
-#[test]
-fn a_chain_whose_leaf_reads_below_high_runs_each_instance_at_most_twice() {
-    let runs = runs_down_the_chain(DEPTH);
-    let of_chain: Vec<&(String, u32)> = runs.iter().filter(|it| it.0.contains("chain::")).collect(); // alloc: a test's answer
-    for k in 0..DEPTH {
-        let name = format!("`chain::f{k}`"); // alloc: a test's message
-        assert!(of_chain.iter().any(|it| it.0 == name), "the walk reaches {name}: {runs:?}");
-    }
-    assert!(of_chain.iter().any(|it| it.0 == "`chain::leaf`"), "the walk reaches the leaf: {runs:?}");
-    let most = of_chain.iter().map(|it| it.1).max().unwrap_or(0);
-    let total: u32 = of_chain.iter().map(|it| it.1).sum();
-    assert!(most <= 2, "an instance of the chain ran {most} times: {runs:?}");
-    // The chain's functions, its leaf and the `Pick` impl the leaf calls, each at most twice.
-    assert!(total as usize <= 2 * (DEPTH + 2), "the chain of {} ran {total} times: {runs:?}", DEPTH + 2);
-}
-
-/// The planted bug: a run that read below `HIGH` routes its outer instance alone to its row
-/// (`plant::routing_the_root_only`), as before the fix, so `f0`'s row asks `f1` again on a
-/// witness of its own, which runs the chain below it again. The bound refuses it at once: a
-/// [`crate::sealed::Reattempted`] naming `chain::f1`, which `f0`'s discarded run had asked,
-/// and the read below `HIGH` that made the run low. (Without the bound, the old routing runs
-/// `f{k}` `k + 2` times: once in the run of each asker above it and itself, once as its row.)
-#[test]
-fn the_bound_catches_a_discarded_run_asked_again() {
-    let caught = std::panic::catch_unwind(|| {
-        plant::routing_the_root_only(|| runs_down_the_chain(DEPTH))
-    })
-    .expect_err("the old routing ran the chain again and the bound let it");
-    let refused = caught
-        .downcast::<crate::sealed::Reattempted>()
-        .unwrap_or_else(|other| std::panic::resume_unwind(other));
-    assert_eq!(refused.instance, "`chain::f1`", "{refused}");
-    assert!(refused.routed <= refused.started, "{refused}");
-    assert!(!refused.cause.is_empty(), "the error names the read: {refused}");
 }

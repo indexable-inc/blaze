@@ -537,7 +537,12 @@ impl Model {
                     }
                 }
             }
-            Effect::Put { ticket, tag, key, bytes } => {
+            Effect::Put { ticket, tag, key, namespace, bytes } => {
+                // The simulated machine is no trusted writer: everything is filed in its own
+                // namespace, as the plan named it.
+                if namespace != Namespace::LOCAL {
+                    return Err(format!("a put of kind {} key {key:?} in namespace {:016x}, on a machine that is no trusted writer", tag.0, namespace.0));
+                }
                 if tag != Certificate::TAG {
                     self.check_meaning(tag, key, bytes, "a put")?;
                 }
@@ -583,7 +588,7 @@ impl Model {
         self.in_flight = 0;
         self.seen = Seen { unchanged: (0..3).map(|c| self.unchanged(c, &fresh)).collect(), ..Seen::default() };
         let plans: Vec<UnitPlan<'static>> =
-            (0..3).map(|c| UnitPlan { deps: DEPS[c], last: self.disk.last.get(c).copied() }).collect();
+            (0..3).map(|c| UnitPlan { deps: DEPS[c], last: self.disk.last.get(c).copied(), namespace: Namespace::LOCAL }).collect();
         let outcome = proof::scope(|snap| self.drive(snap, memo, rng, kill, &fresh, &plans))?;
         if let Some(outcome) = &outcome {
             self.check_end(outcome, &fresh)?;
@@ -603,7 +608,7 @@ impl Model {
         fresh: &[FreshUnit],
         plans: &[UnitPlan<'_>],
     ) -> Result<Option<Outcome>, String> {
-        let plan = Plan { certificate: certificate(), units: plans };
+        let plan = Plan { certificate: certificate(), namespace: Namespace::LOCAL, units: plans };
         let mut driver = Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| format!("{error:?}"))?;
         let mut queue: Vec<Answer> = Vec::new();
         let mut performed = 0u32;
@@ -981,4 +986,119 @@ fn a_cycle_is_one_component() {
     let (a2, _) = closures(b"fn b2");
     assert_eq!(a1, b1);
     assert_ne!(a1, a2);
+}
+
+fn drawn_id(tc: &hegel::TestCase) -> ContentId {
+    let mut id = [0u8; 32];
+    for chunk in id.chunks_mut(8) {
+        chunk.copy_from_slice(&tc.draw(gs::integers::<u64>()).to_le_bytes());
+    }
+    ContentId(id)
+}
+
+/// The invariant: a segment reference [`crate::store::SegmentRef::new`] made decodes from its
+/// row to itself; a row of another length, with its padding not zero, or naming an index off
+/// [`crate::store::ALIGN`], is refused.
+#[hegel::test(test_cases = 200)]
+fn a_segment_ref_round_trips(tc: hegel::TestCase) {
+    use crate::store::{ALIGN, ENTRY, FOOTER, HEADER, SegmentId, SegmentRef, WireError};
+
+    let digest = SegmentId(drawn_id(&tc));
+    let index_at = tc.draw(gs::integers::<u64>().min_value(HEADER as u64 / ALIGN).max_value(1 << 24)) * ALIGN;
+    let count = tc.draw(gs::integers::<u32>().max_value(1 << 20));
+    let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+    let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
+    let row = made.encode();
+    assert_eq!(SegmentRef::decode(&row), Ok(made));
+    assert_eq!((made.digest(), made.size(), made.index_at(), made.count()), (digest, len, index_at, count));
+    assert!(matches!(SegmentRef::decode(&row[..SegmentRef::ROW - 1]), Err(WireError::Length { .. })));
+    let mut padded = row;
+    padded[SegmentRef::ROW - 1] = 1;
+    assert_eq!(SegmentRef::decode(&padded), Err(WireError::Padding { at: 52 }));
+    assert!(matches!(SegmentRef::new(digest, len + 1, index_at + 1, count), Err(WireError::Index { .. })));
+    assert!(matches!(SegmentRef::new(digest, len + 1, index_at, count), Err(WireError::Index { .. })));
+    assert!(SegmentRef::new(digest, len, HEADER as u64 - ALIGN, count).is_err(), "an index inside the header");
+}
+
+/// A segment length is taken at both ends of its range and refused one past each.
+#[test]
+fn a_segment_len_is_bounded_at_both_ends() {
+    use crate::store::{SEGMENT_MOST, SegmentLen, WireError};
+
+    assert_eq!(SegmentLen::new(SegmentLen::LEAST).map(SegmentLen::get), Ok(SegmentLen::LEAST));
+    assert_eq!(SegmentLen::new(SEGMENT_MOST).map(SegmentLen::get), Ok(SEGMENT_MOST));
+    assert_eq!(SegmentLen::new(SegmentLen::LEAST - 1), Err(WireError::SegmentLen { len: SegmentLen::LEAST - 1 }));
+    assert_eq!(SegmentLen::new(SEGMENT_MOST + 1), Err(WireError::SegmentLen { len: SEGMENT_MOST + 1 }));
+}
+
+/// The invariant: a statement decodes from its 200 bytes to itself; bytes cut short or
+/// extended, a tier byte that names no tier, or padding not zero, are refused.
+#[hegel::test(test_cases = 200)]
+fn a_statement_round_trips(tc: hegel::TestCase) {
+    use crate::kind::Tier;
+    use crate::store::{SegmentId, SegmentLen, Statement, WireError};
+
+    let len = tc.draw(gs::integers::<u64>().min_value(SegmentLen::LEAST).max_value(SegmentLen::MOST));
+    let mut signature = [0u8; 64];
+    signature[..32].copy_from_slice(&drawn_id(&tc).0);
+    signature[32..].copy_from_slice(&drawn_id(&tc).0);
+    let statement = Statement {
+        namespace: Namespace(tc.draw(gs::integers::<u64>())),
+        segment: SegmentId(drawn_id(&tc)),
+        len: SegmentLen::new(len).unwrap_or_else(|why| panic!("{why}")),
+        toolchain: drawn_id(&tc),
+        records: tc.draw(gs::integers::<u32>()),
+        tier: if tc.draw(gs::integers::<u8>().max_value(1)) == 1 { Tier::Fast } else { Tier::Top },
+        issued: tc.draw(gs::integers::<u64>()),
+        signer: drawn_id(&tc).0,
+        signature,
+    };
+    let bytes = statement.encode();
+    assert_eq!(&bytes[..Statement::BODY], &statement.body()[..]);
+    assert_eq!(Statement::decode(&bytes), Ok(statement));
+    let cut = usize::from(tc.draw(gs::integers::<u16>().max_value(Statement::LEN as u16 - 1)));
+    assert_eq!(Statement::decode(&bytes[..cut]), Err(WireError::Length { len: cut, wanted: Statement::LEN }));
+    let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
+    extended.extend_from_slice(&bytes);
+    extended.push(0);
+    assert_eq!(Statement::decode(&extended), Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN }));
+    let mut tier = bytes;
+    tier[92] = 2;
+    assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
+    let mut padded = bytes;
+    padded[94] = 1;
+    assert_eq!(Statement::decode(&padded), Err(WireError::Padding { at: 94 }));
+}
+
+/// The invariant: on a machine that is no trusted writer every package is filed in the
+/// machine's own namespace, whatever its origin: a fully local private build names no shared
+/// namespace. On a trusted writer, registry and toolchain packages are public and the rest the
+/// organisation's.
+#[hegel::test(test_cases = 200)]
+fn an_untrusted_machine_files_everything_locally(tc: hegel::TestCase) {
+    use crate::kind::{Origin, namespace_of};
+
+    let origin = match tc.draw(gs::integers::<u8>().max_value(2)) {
+        0 => Origin::Registry { checksum: drawn_id(&tc) },
+        1 => Origin::Toolchain,
+        _ => Origin::Private,
+    };
+    let org = Namespace(tc.draw(gs::integers::<u64>()));
+    assert_eq!(namespace_of(origin, org, false), Namespace::LOCAL);
+    let trusted = namespace_of(origin, org, true);
+    match origin {
+        Origin::Registry { .. } | Origin::Toolchain => assert_eq!(trusted, Namespace::PUBLIC),
+        Origin::Private => assert_eq!(trusted, org),
+    }
+}
+
+/// `TAGS` names every kind once: no tag twice, no name twice, each kind at its own tag.
+#[test]
+fn tags_has_no_duplicate() {
+    use crate::kind::TAGS;
+
+    let tags: BTreeSet<u16> = TAGS.iter().map(|(tag, _)| tag.0).collect();
+    let names: BTreeSet<&str> = TAGS.iter().map(|(_, name)| *name).collect();
+    assert_eq!((tags.len(), names.len()), (TAGS.len(), TAGS.len()), "a tag or a name listed twice in `TAGS`");
+    assert!(!tags.contains(&0), "no kind is at tag 0");
 }

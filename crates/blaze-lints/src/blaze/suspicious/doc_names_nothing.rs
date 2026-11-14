@@ -8,8 +8,9 @@
 //! Single lowercase words (`len`, `true`), macros (`foo!`), generic parameters (`T::Item`),
 //! primitives (`u32::MAX`), explicit links (`` [`x`](..) ``), code blocks and spans of two or
 //! more backticks are left alone. Each path is resolved the way rustdoc resolves an
-//! intra-doc link, by `hir::resolve_doc_path_on` in the item's own scope (a module's inner doc
-//! in the module's), never by matching text.
+//! intra-doc link, in the item's own scope (a module's inner doc in the module's), never by
+//! matching text, and as rustdoc with no visibility asked: a doc that names a private item of
+//! another module (`tests::a_test`) names it ([`resolves`]).
 //!
 //! A path that does not resolve is reported when it names nothing at all, or when its first
 //! segment resolves and the rest does not (`crate::gone`, `Self::removed`). A single name that
@@ -38,9 +39,10 @@ const PRIMITIVES: &[&str] = &[
     "i128", "isize", "f16", "f32", "f64", "f128",
 ];
 
-/// What a doc comment is on, the scope its paths resolve in.
+/// What a doc comment is on, the scope its paths resolve in. `claims` resolves its evidence
+/// pointers from the same owner, so the two read a doc's paths one way.
 #[derive(Clone, Copy)]
-enum Owner {
+pub(in crate::blaze) enum Owner {
     Def(hir::ModuleDef),
     Impl(hir::Impl),
 }
@@ -80,7 +82,10 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
             continue;
         }
         let base = range.start() + TextSize::of(&text[..text.len() - line.len()]);
-        for (start, span) in spans(line) {
+        // An evidence pointer (`Evidence: [`path`]`) is `evidence_is_stale`'s, which says more
+        // of it than that it resolves (what it is, and whether it reaches the item).
+        let evidence = line.find("Evidence:").unwrap_or(line.len());
+        for (start, span) in spans(line).into_iter().filter(|(start, _)| *start < evidence) {
             let Some(path) = path_like(span) else { continue };
             let Some(finding) = judge(cx, owner, path, is_inner) else { continue };
             let at = TextRange::at(base + TextSize::of(&line[..start]), TextSize::of(path));
@@ -113,7 +118,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 }
 
 /// What the doc comment `node`, a child of `parent`, documents.
-fn owner_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, parent: ast::Node<'t>, inner: bool) -> Option<Owner> {
+pub(in crate::blaze) fn owner_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, parent: ast::Node<'t>, inner: bool) -> Option<Owner> {
     if inner {
         return test_code::module_of(cx, node).map(|it| Owner::Def(hir::ModuleDef::Module(it)));
     }
@@ -141,7 +146,7 @@ fn owner_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>, parent: ast::Node<'t>, inn
 }
 
 /// The item a message names: `` `name` `` or "this impl".
-fn owner_name(cx: &Cx<'_, '_>, owner: Owner) -> String {
+pub(in crate::blaze) fn owner_name(cx: &Cx<'_, '_>, owner: Owner) -> String {
     let db = cx.db();
     match owner {
         Owner::Def(def) => match def.name(db) {
@@ -152,12 +157,118 @@ fn owner_name(cx: &Cx<'_, '_>, owner: Owner) -> String {
     }
 }
 
-/// Whether `link` resolves from `owner`'s scope as rustdoc would resolve it.
-fn resolves(cx: &Cx<'_, '_>, owner: Owner, link: &str, inner: hir::IsInnerDoc) -> bool {
+/// Whether `link` resolves from `owner`'s scope as rustdoc would resolve it: rustdoc asks no
+/// visibility (a doc names a private item of another module, a test in `mod tests`, all the
+/// same) and reads a `#[cfg(test)]` module from every configuration of the crate.
+///
+/// The doc-path resolution of hir ([`resolve`]) follows `use`s, `Self` and associated items but
+/// drops a segment the owner cannot see (`nameres::path_resolution` filters each segment by
+/// visibility), and [`declared`] walks declarations with no visibility but follows no `use`:
+/// a link resolves when either finds it. The end state is one visibility-free mode of hir's
+/// own doc-path resolution, which makes [`declared`] go.
+pub(in crate::blaze) fn resolves(cx: &Cx<'_, '_>, owner: Owner, link: &str, inner: hir::IsInnerDoc) -> bool {
+    resolve(cx, owner, link, inner).is_some() || declared(cx.db(), owner, inner, link).is_some()
+}
+
+/// What the doc path `text` of `owner`'s doc names, by where it is declared: each segment but
+/// the last a module (`crate`, `self`, `super`, or a child module's name) walked from the
+/// owner's module, the last an item declared in the module reached.
+///
+/// The rule differs from a `use` path's in the two ways rustdoc's differs: visibility is not
+/// asked (a test is private to its module, and a doc names it all the same), and a
+/// `#[cfg(test)]` module is reached from a configuration without `test`, through each
+/// configuration of the owner's crate (its lib, its tests: the local crates of its root file),
+/// the owner's own first. A `use` is not followed: this names the declaration, which is what an
+/// evidence pointer (`claims`) means.
+pub(in crate::blaze) fn declared(
+    db: &base_db::Db,
+    owner: Owner,
+    inner: hir::IsInnerDoc,
+    text: &str,
+) -> Option<hir::ModuleDef> {
+    let home = match owner {
+        Owner::Def(hir::ModuleDef::Module(it)) if inner.yes() => it,
+        // An outer doc of a module is read from its parent, as rustdoc reads it.
+        Owner::Def(def) => def.module(db)?,
+        Owner::Impl(imp) => imp.module(db),
+    };
+    let home_crate = home.krate(db);
+    // The owner's module from its crate's root: the names to find it by in another
+    // configuration, `None` under a block (whose module has no name), which only its own has.
+    let chain = home.path_to_root(db);
+    let named = chain.iter().rev().skip(1).all(|it| it.name(db).is_some());
+    let (path, last) = text.rsplit_once("::").unwrap_or(("", text));
+    for krate in configurations(db, home_crate) {
+        let start = if krate == home_crate {
+            Some(home)
+        } else if named {
+            chain.iter().rev().skip(1).try_fold(krate.root_module(db), |at, it| {
+                let name = it.name(db)?;
+                child(db, at, name.as_str())
+            })
+        } else {
+            None
+        };
+        let Some(start) = start else { continue };
+        if let Some(found) = walk(db, start, path, last) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The item `last` declared in the module `path` (segments of `::`) leads to from `start`: a
+/// function first, as evidence is one, where a module of the name is declared beside it.
+fn walk(db: &base_db::Db, start: hir::Module, path: &str, last: &str) -> Option<hir::ModuleDef> {
+    let mut at = start;
+    for (place, segment) in path.split("::").filter(|it| !it.is_empty()).enumerate() {
+        at = match segment {
+            "crate" if place == 0 => at.krate(db).root_module(db),
+            "self" if place == 0 => at,
+            "super" => at.parent(db)?,
+            name => child(db, at, name)?,
+        };
+    }
+    let mut found = None;
+    for def in at.declarations_iter(db) {
+        if !def.name(db).is_some_and(|it| it.as_str() == last) {
+            continue;
+        }
+        if matches!(def, hir::ModuleDef::Function(_)) {
+            return Some(def);
+        }
+        found = found.or(Some(def));
+    }
+    found
+}
+
+/// The child module of `module` named `name`.
+fn child(db: &base_db::Db, module: hir::Module, name: &str) -> Option<hir::Module> {
+    module.children(db).find(|it| it.name(db).is_some_and(|it| it.as_str() == name))
+}
+
+/// Every configuration of `home`: `home` first, then each other local crate of its root file
+/// (its tests', with `cfg(test)`), in the crate graph's order.
+fn configurations(db: &base_db::Db, home: hir::Crate) -> impl Iterator<Item = hir::Crate> {
+    let root = home.root_file(db);
+    std::iter::once(home).chain(
+        hir::Crate::all(db)
+            .into_iter()
+            .filter(move |it| *it != home && it.origin(db).is_local() && it.root_file(db) == root),
+    )
+}
+
+/// What `link` resolves to from `owner`'s scope, as rustdoc would resolve it.
+pub(in crate::blaze) fn resolve(
+    cx: &Cx<'_, '_>,
+    owner: Owner,
+    link: &str,
+    inner: hir::IsInnerDoc,
+) -> Option<hir::DocLinkDef> {
     let db = cx.db();
     match owner {
-        Owner::Def(def) => hir::resolve_doc_path_on(db, def, link, None, inner).is_some(),
-        Owner::Impl(imp) => hir::resolve_doc_path_on(db, imp, link, None, inner).is_some(),
+        Owner::Def(def) => hir::resolve_doc_path_on(db, def, link, None, inner),
+        Owner::Impl(imp) => hir::resolve_doc_path_on(db, imp, link, None, inner),
     }
 }
 
@@ -231,7 +342,7 @@ fn exported_by_a_dependency(cx: &Cx<'_, '_>, name: &str) -> bool {
 
 /// The single-backtick spans of `line`, each with the byte offset of its text: a span right
 /// before `](` or `][` is a link's text, whose target is elsewhere, and is left out.
-fn spans(line: &str) -> Vec<(usize, &str)> {
+pub(in crate::blaze) fn spans(line: &str) -> Vec<(usize, &str)> {
     let bytes = line.as_bytes();
     // alloc: one line's spans, a few
     let mut found = Vec::new();
@@ -270,7 +381,7 @@ fn spans(line: &str) -> Vec<(usize, &str)> {
 
 /// The path `text` is, when it is one this lint resolves: its identifiers, without a trailing
 /// `()` or generic arguments.
-fn path_like(text: &str) -> Option<&str> {
+pub(in crate::blaze) fn path_like(text: &str) -> Option<&str> {
     let text = text.strip_suffix("()").unwrap_or(text);
     let text = text.split('<').next()?;
     if text.is_empty() || text.ends_with('!') {

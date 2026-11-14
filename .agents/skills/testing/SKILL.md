@@ -20,7 +20,7 @@ image while it exists; what a persisted value is, is `outputs-are-records`) has 
 it and checks the result equals a fresh build byte for byte, and a budget for a fresh process to
 first answer. A file that another version of blaze can find (in the state directory, in a home, in
 `/tmp`) also has a test that a file of its previous layout is handled: an old home after an upgrade
-is detected, reported by name and rebuilt, and nothing is migrated (scope decision D35); a file
+is detected, reported by name and rebuilt, and nothing is migrated (scope decision D36); a file
 outside a home is refused by name with what to do, or left alone under a name that carries its
 layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
 silently starts empty is a failure blaze reports, naming why. A format that is written while blaze
@@ -57,7 +57,11 @@ them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants
 collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
 gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
 or regenerating code, read the invariants its crate states: they are what the new code is judged
-against.
+against. A promise in a doc comment is either derived (an effect attribute the build checks) or a `#
+Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``, ``Evidence: Lean `Name` `` or
+`Unverified: why`; never prose alone. The `claims` lints refuse a doc the effect walk refutes, a
+promise held by nothing and a stale pointer; the ledger refuses a crate's count of open claims
+growing or any claim's level dropping (docs/v2/plan/design/claims.md).
 
 See [docs/v2/plan.md#11-proof-by-check-not-by-review](../../../docs/v2/plan.md#11-proof-by-check-not-by-review).
 

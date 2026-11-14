@@ -14,7 +14,7 @@
 //! - a struct pattern of the type (or one of its variants) with `..`, naming what it leaves out;
 //! - a body that reads some fields of `self` (`self.a`, or `other.a` of the same type) but not
 //!   all, when nothing of the type is handed on whole (a call taking `self` may read the rest);
-//! - `field: _` (or `_` in a tuple struct's pattern) with no `// not in key: <why>` on its line
+//! - `field: _` (or `_` in a tuple struct's pattern) with no `// left out: <why>` on its line
 //!   or the line above.
 //!
 //! The fix: destructure every field, `let Self { a, b, cache: _ } = self;`, with the comment
@@ -43,10 +43,11 @@ use crate::check::Cx;
 
 /// The rule every message ends with.
 const RULE: &str = "a key covers every input its value depends on (AGENTS.md rule 21): name every field, and \
-                    mark one left out on purpose `field: _` with `// not in key: <why>`";
+                    mark one left out on purpose `field: _` with `// left out: <why>`";
 
-/// The tag of the comment that says why a field is left out.
-const TAG: &str = "not in key";
+/// The tag of the comment that says why a field is left out: the structural lints' one marker
+/// of a field a field-wise body leaves out on purpose.
+const TAG: &str = super::structural::LEFT_OUT;
 
 /// What builds the key a body is checked for.
 enum Kind {
@@ -374,7 +375,7 @@ impl Hash for Named {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let Named {
             a,
-            b: _, // not in key: a cache of `a`
+            b: _, // left out: a cache of `a`
         } = self;
         a.hash(state);
     }

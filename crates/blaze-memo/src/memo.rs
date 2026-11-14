@@ -117,6 +117,13 @@ impl Memo {
 
     /// The arena `id`.
     ///
+    /// The generation compare here is the one compare a hit makes, and it is of the id, not of
+    /// any entry: an id stays valid across `Memo::next` exactly when its arena is carried, and
+    /// values carried in arenas hold ids of earlier snapshots by design, so which ids are dead
+    /// is the edit's (dynamic) closure, not a lifetime. A brand per snapshot
+    /// (`blaze_keyed::proof::Snapshot`) would refuse every carried id; the compare refuses only
+    /// the dead ones, loudly.
+    ///
     /// # Panics
     ///
     /// Where this snapshot has no arena at `id`'s index, or has one of another generation: an

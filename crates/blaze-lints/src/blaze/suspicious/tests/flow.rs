@@ -45,7 +45,7 @@ impl Scope {
 "#,
     );
     assert_eq!(out.matches("is not undone by its `pop` on every path").count(), 2, "{out}");
-    assert!(out.contains("index.html#skipped_pair"), "{out}");
+    assert!(out.contains("docs/lints.md#skipped_pair"), "{out}");
     assert!(out.contains("`check(x)?`"), "{out}");
     assert!(out.contains("`return 0`"), "{out}");
 }
@@ -129,7 +129,7 @@ impl Pool {
     );
     assert_eq!(out.matches("half changed").count(), 1, "{out}");
     assert!(out.contains("`self.len += 1` wrote it before"), "{out}");
-    assert!(out.contains("index.html#half_done"), "{out}");
+    assert!(out.contains("docs/lints.md#half_done"), "{out}");
 }
 
 #[test]
@@ -167,5 +167,5 @@ pub fn f(x: u32) -> Result<u32, ()> {
     assert_eq!(out.matches("leaves the function it is called in").count(), 2, "{out}");
     assert!(out.contains("`check!` leaves the function it is called in: its expansion holds a `return`"), "{out}");
     assert!(out.contains("`open!` leaves the function it is called in: its expansion holds a `?`"), "{out}");
-    assert!(out.contains("index.html#hidden_exit"), "{out}");
+    assert!(out.contains("docs/lints.md#hidden_exit"), "{out}");
 }

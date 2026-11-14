@@ -16,8 +16,10 @@ use core::{cmp::Ordering, fmt, hash, marker::PhantomData};
 use blaze_ids::{ContentId, Hasher};
 
 use crate::{
-    Plant, planted,
-    record::{Headed, ManifestRoot, Opaque, ProgramRoot, Sections, Traced},
+    Plant,
+    exec::RecordRef,
+    planted,
+    record::{Headed, ManifestRoot, Opaque, Sections, StableId, Traced},
     text::NameHash,
 };
 
@@ -176,7 +178,7 @@ impl KeyHasher {
     }
 
     pub fn toolchain(&mut self, tool: &ToolId) -> &mut KeyHasher {
-        self.0.id(&tool.namespace.0).id(&tool.tool).id(&tool.target);
+        self.0.update(&tool.namespace.0.to_le_bytes()).id(&tool.tool).id(&tool.target);
         self
     }
 
@@ -234,14 +236,34 @@ impl KeyHasher {
     }
 }
 
-/// Where a record may be shared: the public namespace (std, a registry package at a version),
-/// readable by all, or one organisation's, under its own credentials. Read lists and names never
+/// Which readers a record is for: every segment, statement and wire object is of exactly one,
+/// and a lookup names the namespaces it asks, no other searched. Read lists and names never
 /// leave their namespace.
+///
+/// - [`Namespace::PUBLIC`]: std, registry packages at a version: what every reader may read.
+/// - [`Namespace::LOCAL`]: what a machine built for itself; it never leaves the machine.
+/// - An organisation's: [`Namespace::named`].
+///
+/// Eight bytes, not a content id: every wire object carries it in eight bytes and a bucket's
+/// prefixes are its 16 hex digits. Trust comes from a namespace's anchors and the signed
+/// namespace field of each statement, not from the id being unguessable.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Namespace(pub ContentId);
+pub struct Namespace(pub u64);
 
 impl Namespace {
-    pub const PUBLIC: Namespace = Namespace(ContentId([0; 32]));
+    pub const PUBLIC: Namespace = Namespace(0);
+    pub const LOCAL: Namespace = Namespace(1);
+
+    /// An organisation's: the first eight bytes (little-endian) of a domain-separated hash of
+    /// its name, never 0 or 1.
+    pub fn named(name: &str) -> Namespace {
+        let mut hasher = Hasher::new("blaze plain store namespace 1");
+        hasher.update(name.as_bytes());
+        let id: ContentId = hasher.finish();
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&id.0[0..8]);
+        Namespace(u64::from_le_bytes(first).max(2))
+    }
 }
 
 /// Where a package's source came from: what decides its namespace.
@@ -255,10 +277,19 @@ pub enum Origin {
     Private,
 }
 
-/// The namespace of a package's records: public only for a registry archive known by its
-/// checksum or the toolchain's crates; everything else, private code included, under `org`. So
-/// private code never lands in the public namespace, whatever it is called.
-pub fn namespace_of(origin: Origin, org: Namespace) -> Namespace {
+/// The namespace of a package's records.
+///
+/// - On a machine that is not a trusted writer (every developer's machine): [`Namespace::LOCAL`]
+///   for everything, so a build is fully local and private (the owner: "we need fully local
+///   private builds"); what it reads of the shared cache it reads, and nothing it writes leaves.
+/// - On a trusted writer (the owner's CI, later its remote workers): public only for a registry
+///   archive known by its checksum or the toolchain's crates; everything else, private code
+///   included, under `org`. So private code never lands in the public namespace, whatever it is
+///   called.
+pub fn namespace_of(origin: Origin, org: Namespace, trusted_writer: bool) -> Namespace {
+    if !trusted_writer {
+        return Namespace::LOCAL;
+    }
     match origin {
         Origin::Registry { .. } | Origin::Toolchain => Namespace::PUBLIC,
         Origin::Private => org,
@@ -335,6 +366,11 @@ macro_rules! kind {
                 inputs.key()
             }
         }
+
+        const _: () = assert!(
+            listed($name::TAG, $name::NAME),
+            ::core::concat!(::core::stringify!($name), " is not in `TAGS` at its tag: list it in `tags!`")
+        );
     };
 }
 
@@ -464,33 +500,76 @@ impl BodyInputs<'_> {
 }
 
 kind! {
-    /// One instance's code: a body at its type arguments, compiled.
+    /// An instance's plan: its calls in MIR order and its own facts, made before any backend
+    /// runs, so one plan serves both tiers (blaze-program's `Plan` is the payload).
+    InstancePlan {
+        tag: 12, version: 1, layout: Flat, grain: Instance, trace: Key, keep: DiskAndResident,
+        root: Opaque, inputs: PlanInputs,
+    }
+}
+
+/// A plan's key: the instance's symbol (its item and type arguments), the body's key, and the
+/// digest of the code settings but the tier (target, target features, code generator, panic
+/// strategy, debug info, overflow checks). The toolchain and target come in through `settings`.
+pub struct PlanInputs<'a> {
+    pub item: ContentId,
+    pub args: ContentId,
+    pub body: ContentId,
+    pub settings: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl PlanInputs<'_> {
+    fn key(&self) -> Key<InstancePlan> {
+        KeyHasher::of::<InstancePlan>().id(&self.item).id(&self.body).id(&self.args).id(&self.settings).finish()
+    }
+}
+
+kind! {
+    /// One instance's code: a body at its type arguments, compiled at a tier (blaze-program's
+    /// `InstanceCode` is the payload).
     Instance {
-        tag: 5, version: 1, layout: Flat, grain: Instance, trace: Key, keep: Disk, root: Opaque,
+        tag: 5, version: 2, layout: Flat, grain: Instance, trace: Key, keep: Disk, root: Opaque,
         inputs: InstanceInputs,
     }
 }
 
-/// An instance's key, computed once its body is checked: the digest of the body's result (not
-/// its key, so a body reused under a moved key keeps its code), the type arguments' keys, the
-/// codegen settings and the keys of the instances it inlines.
+/// The tier code is made at. A tier never changes behaviour: both compile one body from one
+/// plan; the tier is in the instance key only. Its number is its byte on the wire (a statement's
+/// tier, [`crate::store::Statement`]).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Tier {
+    /// No code, or code at the top tier (the release backend): what is shared publicly.
+    Top = 0,
+    /// Code by the fast backend (the edit loop's): a workspace's own, never public.
+    Fast = 1,
+}
+
+/// One instance an instance inlines: the callee's symbol and its instance key at the same tier.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct Inlinee {
+    pub item: ContentId,
+    pub args: ContentId,
+    pub code: Key<Instance>,
+}
+
+/// An instance's key, computed before any lowering: its plan's key, the tier, and its direct
+/// inlinees with their instance keys, sorted by symbol, each once (two lists of one set give one
+/// key). A body reused under a moved key keeps its plan key, so its code is reused too.
 pub struct InstanceInputs<'a> {
-    pub tool: ToolId,
-    pub settings: Settings,
-    pub body: ContentId,
-    pub args: &'a [ContentId],
-    pub inlinees: &'a [Key<Instance>],
+    pub plan: Key<InstancePlan>,
+    pub tier: Tier,
+    pub inlinees: &'a [Inlinee],
 }
 
 impl InstanceInputs<'_> {
     fn key(&self) -> Key<Instance> {
-        KeyHasher::of::<Instance>()
-            .toolchain(&self.tool)
-            .id(&self.settings.0)
-            .id(&self.body)
-            .ids(self.args)
-            .keys(self.inlinees)
-            .finish()
+        let mut hasher = KeyHasher::of::<Instance>();
+        hasher.id(&self.plan.id()).u64(self.tier as u64).u64(self.inlinees.len() as u64);
+        for inlinee in self.inlinees {
+            hasher.id(&inlinee.item).id(&inlinee.args).id(&inlinee.code.id());
+        }
+        hasher.finish()
     }
 }
 
@@ -611,7 +690,7 @@ pub struct CodeKey(pub ContentId);
 impl CodeKey {
     pub fn of(tool: &ToolId, unit: Key<UnitManifest>, deps: &[CodeKey]) -> CodeKey {
         let mut hasher = Hasher::new("blaze-keyed code key 1");
-        hasher.id(&tool.namespace.0).id(&tool.tool).id(&tool.target).id(&unit.id());
+        hasher.update(&tool.namespace.0.to_le_bytes()).id(&tool.tool).id(&tool.target).id(&unit.id());
         hasher.update(&(deps.len() as u64).to_le_bytes());
         deps.iter().for_each(|dep| {
             hasher.id(&dep.0);
@@ -666,23 +745,20 @@ kind! {
     }
 }
 
-/// A test's key: what its program reaches from the test's entry (the digest of the reachable
-/// instances' keys), the test's path, and the run's settings.
+/// A test's key: its entry's symbol (item and type arguments), the digest of what its program
+/// reaches from the entry (every reachable function's and static's symbol and instance key, and
+/// the spans a panic message can name: blaze-program's `reach_digest`), and the arguments it is
+/// run with. The instance keys carry the toolchain, target and settings.
 pub struct TestInputs<'a> {
-    pub tool: ToolId,
+    pub item: ContentId,
+    pub entry_args: ContentId,
     pub reach: ContentId,
-    pub test: &'a [u8],
-    pub settings: Settings,
+    pub args: &'a [u8],
 }
 
 impl TestInputs<'_> {
     fn key(&self) -> Key<TestRun> {
-        KeyHasher::of::<TestRun>()
-            .toolchain(&self.tool)
-            .id(&self.reach)
-            .bytes(self.test)
-            .id(&self.settings.0)
-            .finish()
+        KeyHasher::of::<TestRun>().id(&self.item).id(&self.entry_args).id(&self.reach).bytes(self.args).finish()
     }
 }
 
@@ -720,41 +796,277 @@ impl UnitInputs<'_> {
 }
 
 kind! {
-    /// One program: the instances it is made of, by key, and its image's digest.
+    /// A program's manifest head: its header (machine, settings, roots, section lengths, the
+    /// generation) and the directory of its content-defined chunks ([`ProgramChunk`]). A
+    /// manifest is patched, not relinked, and changes with every edit, so it is filed by content;
+    /// which manifest is a program's current one is a root the driver keeps, never a record
+    /// overwritten.
     ProgramManifest {
-        tag: 10, version: 1, layout: Flat, grain: Program, trace: Key, keep: Disk,
-        root: ProgramRoot, inputs: ProgramInputs,
+        tag: 10, version: 2, layout: Flat, grain: Program, trace: Key, keep: Disk,
+        root: Opaque, inputs: ProgramInputs,
     }
 }
 
-/// A program's key: the link settings and its instances' keys, sorted and deduplicated.
+/// A manifest head's key, by its content: the program's own key, its header's bytes and its
+/// chunk directory, so a manifest's bytes are one value under one key.
 pub struct ProgramInputs<'a> {
-    pub tool: ToolId,
-    pub link: ContentId,
-    pub instances: &'a [Key<Instance>],
+    pub program: ContentId,
+    pub header: &'a [u8],
+    pub chunks: &'a [ContentId],
 }
 
 impl ProgramInputs<'_> {
     fn key(&self) -> Key<ProgramManifest> {
-        KeyHasher::of::<ProgramManifest>()
-            .toolchain(&self.tool)
-            .id(&self.link)
-            .keys(self.instances)
+        KeyHasher::of::<ProgramManifest>().id(&self.program).bytes(self.header).ids(self.chunks).finish()
+    }
+}
+
+kind! {
+    /// One content-defined chunk of a program's manifest. A chunk an earlier manifest filed is
+    /// the same bytes again ([`crate::store::Put::Same`]).
+    ProgramChunk {
+        tag: 13, version: 1, layout: Flat, grain: Program, trace: Key, keep: Disk, root: Opaque,
+        inputs: ChunkInputs,
+    }
+}
+
+/// A chunk's key: the digest of its bytes (blaze-program's chunk domain).
+pub struct ChunkInputs<'a> {
+    pub content: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl ChunkInputs<'_> {
+    fn key(&self) -> Key<ProgramChunk> {
+        KeyHasher::of::<ProgramChunk>().id(&self.content).finish()
+    }
+}
+
+kind! {
+    /// One mutant's final verdict (blaze-mutants): killed by which test and how, or survived
+    /// with the tests that ran. An equal key is the verdict with no other check, so an unchanged
+    /// function with unchanged tests is never mutated again.
+    MutantVerdict {
+        tag: 14, version: 1, layout: Flat, grain: Run, trace: Key, keep: Disk, root: Opaque,
+        inputs: VerdictInputs,
+    }
+}
+
+/// A verdict's key, all known before anything runs: the function's body key, the site's index in
+/// that body, the mutation's bytes, and the keys of every test whose reach includes the function,
+/// sorted, each once. The kind's version is the operators' version.
+pub struct VerdictInputs<'a> {
+    pub body: ContentId,
+    pub site: u32,
+    pub mutation: &'a [u8],
+    pub tests: &'a [ContentId],
+}
+
+impl VerdictInputs<'_> {
+    fn key(&self) -> Key<MutantVerdict> {
+        KeyHasher::of::<MutantVerdict>()
+            .id(&self.body)
+            .u64(u64::from(self.site))
+            .bytes(self.mutation)
+            .ids(self.tests)
             .finish()
     }
 }
 
-/// Every kind's tag, for a host that dispatches an untyped ask to `Store::read::<K>`.
-pub const TAGS: [(Tag, &str); 11] = [
-    (Certificate::TAG, Certificate::NAME),
-    (FileImage::TAG, FileImage::NAME),
-    (Surface::TAG, Surface::NAME),
-    (Body::TAG, Body::NAME),
-    (Instance::TAG, Instance::NAME),
-    (Expansion::TAG, Expansion::NAME),
-    (ScriptRun::TAG, ScriptRun::NAME),
-    (TestRun::TAG, TestRun::NAME),
-    (UnitManifest::TAG, UnitManifest::NAME),
-    (ProgramManifest::TAG, ProgramManifest::NAME),
-    (ExpanderModule::TAG, ExpanderModule::NAME),
+kind! {
+    /// The outcome of one remote action: its status, its log, its usage and the segments that
+    /// hold what it made. The record it made is filed under that record's own kind; this is what
+    /// the executor answered for it.
+    ActionResult {
+        tag: 15, version: 1, layout: Flat, grain: Run, trace: Key, keep: Disk, root: Opaque,
+        inputs: ActionInputs,
+    }
+}
+
+/// An action result's key: the toolchain, the record the action makes and every record it may
+/// read, sorted ([`crate::exec::Action`]).
+pub struct ActionInputs<'a> {
+    pub tool: ToolId,
+    pub made: RecordRef,
+    pub inputs: &'a [RecordRef],
+}
+
+impl ActionInputs<'_> {
+    fn key(&self) -> Key<ActionResult> {
+        let mut hasher = KeyHasher::of::<ActionResult>();
+        hasher.toolchain(&self.tool).u64(u64::from(self.made.tag.0)).id(&self.made.key);
+        hasher.u64(self.inputs.len() as u64);
+        for input in self.inputs {
+            hasher.u64(u64::from(input.tag.0)).id(&input.key);
+        }
+        hasher.finish()
+    }
+}
+
+/// A lint pass as a findings key names it (blaze-findings' `PassRef`): its name's hash and the
+/// version of what it computes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Pass {
+    pub id: u64,
+    pub version: u16,
+}
+
+impl KeyHasher {
+    fn pass(&mut self, pass: Pass) -> &mut KeyHasher {
+        self.u64(pass.id).u64(u64::from(pass.version))
+    }
+}
+
+kind! {
+    /// One body's findings of one lint pass (blaze-findings): the body check's sibling. Its key
+    /// is the body's key and the keys of the summaries of other items the pass reads, so an
+    /// equal key is the finding with no other check; a key miss with an unchanged read list
+    /// files the old record under the new key, byte for byte. The version is blaze-findings'
+    /// payload format.
+    BodyFindings {
+        tag: 16, version: 1, layout: Flat, grain: Item, trace: Reuse, keep: Disk, root: Traced,
+        inputs: PerBody,
+    }
+}
+
+kind! {
+    /// One item's rows for the folds of one pass: (subject, value) facts the item contributes,
+    /// such as "this function calls `f` with argument 0 in `0..=3`".
+    ItemRows {
+        tag: 17, version: 1, layout: Flat, grain: Item, trace: Reuse, keep: Disk, root: Traced,
+        inputs: PerBody,
+    }
+}
+
+/// What a per-body findings record's key ([`BodyFindings`], [`ItemRows`]) is made of: all known
+/// once the body's own check is held.
+#[derive(Clone, Copy, Debug)]
+pub struct PerBody<'a> {
+    pub tool: ToolId,
+    pub body: Key<Body>,
+    pub pass: Pass,
+    /// The keys of other items' records the pass reads (a callee's effect summary), sorted.
+    pub beyond: &'a [ContentId],
+}
+
+impl PerBody<'_> {
+    fn key<K: Kind>(&self) -> Key<K> {
+        let mut hasher = KeyHasher::of::<K>();
+        hasher.toolchain(&self.tool).id(&self.body.id());
+        hasher.pass(self.pass).ids(self.beyond).finish()
+    }
+}
+
+/// The leaf a fold's root record is filed at ([`FoldInputs::leaf`]).
+pub const ROOT_LEAF: u32 = u32::MAX;
+
+kind! {
+    /// One leaf of a workspace fold of lint rows (its rows and findings), or its root (the leaf
+    /// digests).
+    FoldFindings {
+        tag: 18, version: 1, layout: Flat, grain: Surface, trace: Key, keep: Disk, root: Opaque,
+        inputs: FoldInputs,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FoldInputs<'a> {
+    pub tool: ToolId,
+    pub pass: Pass,
+    /// What the fold is over (a workspace, by the digest of its member list).
+    pub scope: ContentId,
+    /// The leaf, or [`ROOT_LEAF`].
+    pub leaf: u32,
+    /// A leaf: the digest of its rows; the root: the digest of the leaf digests.
+    pub digest: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl FoldInputs<'_> {
+    fn key(&self) -> Key<FoldFindings> {
+        let mut hasher = KeyHasher::of::<FoldFindings>();
+        hasher.toolchain(&self.tool);
+        hasher.pass(self.pass).id(&self.scope).u64(u64::from(self.leaf)).id(&self.digest).finish()
+    }
+}
+
+kind! {
+    /// One expensive lint analysis of one item, keyed by everything it reads.
+    DeferredFindings {
+        tag: 19, version: 1, layout: Flat, grain: Item, trace: Key, keep: Disk, root: Opaque,
+        inputs: DeferredInputs,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeferredInputs<'a> {
+    pub tool: ToolId,
+    pub pass: Pass,
+    pub item: StableId,
+    /// The keys of every record the analysis reads (the item's rows, its callers' rows, a fold's
+    /// leaves), sorted: known before it runs, so its key is too.
+    pub reads: &'a [ContentId],
+}
+
+impl DeferredInputs<'_> {
+    fn key(&self) -> Key<DeferredFindings> {
+        let mut hasher = KeyHasher::of::<DeferredFindings>();
+        hasher.toolchain(&self.tool);
+        hasher.pass(self.pass).id(&self.item.0).ids(self.reads).finish()
+    }
+}
+
+/// Every kind, once: [`TAGS`] and the compile-time check that each kind declared here is listed
+/// under its own tag.
+macro_rules! tags {
+    ($($kind:ident),* $(,)?) => {
+        /// Every kind's tag and name, in tag order, tags 1 to `TAGS.len()` each once: for a host
+        /// that dispatches an untyped ask to `Store::read::<K>`, and the store's index.
+        pub const TAGS: [(Tag, &str); [$(::core::stringify!($kind)),*].len()] = [$(($kind::TAG, $kind::NAME)),*];
+    };
+}
+
+tags![
+    Certificate,
+    FileImage,
+    Surface,
+    Body,
+    Instance,
+    Expansion,
+    ScriptRun,
+    TestRun,
+    UnitManifest,
+    ProgramManifest,
+    ExpanderModule,
+    InstancePlan,
+    ProgramChunk,
+    MutantVerdict,
+    ActionResult,
+    BodyFindings,
+    ItemRows,
+    FoldFindings,
+    DeferredFindings,
 ];
+
+const fn same_name(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < a.len() {
+        if a[at] != b[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+/// Whether kind `name` of `tag` is listed in [`TAGS`] at its tag's place: what every `kind!`
+/// asserts at compile time, so a kind declared and not listed, or two kinds of one tag, does not
+/// compile.
+const fn listed(tag: Tag, name: &str) -> bool {
+    let at = tag.0 as usize;
+    at >= 1 && at <= TAGS.len() && TAGS[at - 1].0.0 == tag.0 && same_name(TAGS[at - 1].1, name)
+}

@@ -82,6 +82,8 @@ blaze-protocol.workspace = true
 proc-macro-api.workspace = true
 blaze-ui.workspace = true
 blaze-units.workspace = true
+# `blaze audit`, and the git fetcher's check of a tree against its pin (`weak_source_pin`).
+blaze-audit.workspace = true
 blaze-registry.workspace = true
 blaze-report.workspace = true
 # `blaze cache push | pull | status | keys`: the shared cache in an object bucket.

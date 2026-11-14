@@ -25,10 +25,41 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use blaze_core::{FileName, Mapping};
+use std::alloc::Global;
 
-use super::format::{self, ENTRY, Entry, Segment, record_crc};
+use blaze_core::{FileName, Mapping};
+use blaze_keyed::store::{ENTRY, Generation, SegmentId, SegmentProof, StoreError};
+
+use super::format::{self, Entry, Segment, record_crc};
 use crate::{Corrupt, Key};
+
+/// What a read returns as its segment's proof ([`blaze_keyed::store::SegmentProof`]): the
+/// segment and the generation the reading process mapped, made only from a [`Verified`]
+/// ([`Verified::proof`]). A `Verified` itself cannot be `Copy` (it holds the mapping), so the
+/// trait's proof is this brand of it: two words, no pointer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Proof {
+    segment: SegmentId,
+    generation: Generation,
+}
+
+impl Proof {
+    /// The proof of a record this process put and has not committed: its segment is this
+    /// process's own, not yet written (the zero id names none), trusted as written.
+    pub(crate) fn own(generation: Generation) -> Proof {
+        Proof { segment: SegmentId(blaze_ids::ContentId([0; 32])), generation }
+    }
+}
+
+impl SegmentProof for Proof {
+    fn segment(&self) -> SegmentId {
+        self.segment
+    }
+
+    fn generation(&self) -> Generation {
+        self.generation
+    }
+}
 
 /// The boot this process runs in (a hash of the kernel's boot id): what a proof holds for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,10 +79,6 @@ impl Unverified {
 
     pub(crate) fn seg(&self) -> &Segment {
         &self.seg
-    }
-
-    pub(crate) fn file(&self) -> &FileName {
-        &self.file
     }
 
     /// Its length on the disk (from the mapping, not a byte of it): what its row names, or the
@@ -95,22 +122,34 @@ impl Verified {
     /// The one full check of a segment of an earlier boot: its length, layout and the digest of
     /// every byte, and that it is the segment its row names. Consumes it: a proved segment is
     /// never checked again. `Err` names what failed, with the segment and file.
-    pub(crate) fn check(it: Unverified, boot: Boot, checks: &mut Checks) -> Result<Verified, (Segment, FileName, String)> {
+    pub(crate) fn check(it: Unverified, boot: Boot, checks: &mut Checks) -> Result<Verified, (Segment, FileName, StoreError)> {
         let len = it.len();
+        let segment = SegmentId(it.seg.digest);
         if len != it.seg.file_len() {
-            // alloc: a report
-            return Err((it.seg, it.file, format!("it is {len} bytes and its generation names {}", it.seg.file_len())));
+            return Err((it.seg, it.file, StoreError::Layout { segment, what: "its file's length is not the one its generation names", at: len }));
         }
         checks.full += 1;
         let checked = format::check_segment(it.map.bytes()).and_then(|described| {
             (described.digest == it.seg.digest && described.namespace == it.seg.namespace && described.count == it.seg.count)
                 .then_some(())
-                .ok_or_else(|| "it is a whole segment, but not the one its generation names".to_owned()) // alloc: a report
+                .ok_or(StoreError::Layout { segment, what: "it is a whole segment, but not the one its generation names", at: 0 })
         });
         match checked {
             Ok(()) => Ok(Verified { seg: it.seg, file: it.file, map: it.map, boot }),
-            Err(what) => Err((it.seg, it.file, what)),
+            Err(why) => Err((it.seg, it.file, why)),
         }
+    }
+
+    /// Its proof as a read returns it: this segment, branded with the generation the reading
+    /// process mapped.
+    pub(crate) fn proof(&self, generation: Generation) -> Proof {
+        Proof { segment: SegmentId(self.seg.digest), generation }
+    }
+
+    /// The mapping, for a reader that keeps it alive beside the proof (the store handle's
+    /// table, never unmapped while the process runs).
+    pub(crate) fn mapping(&self) -> &Mapping {
+        &self.map
     }
 
     /// The planted bug of `super::tests` (`Plant::TrustBoot`): a segment of an earlier boot
@@ -152,22 +191,21 @@ impl Verified {
     /// bytes as they lie now, naming each that changed on the disk after its proof was made.
     pub(crate) fn scrub(&self) -> Vec<Corrupt> {
         let run = self.run();
-        // alloc: a scrub's findings, usually none
-        let mut out = Vec::new();
+        // A scrub's findings, usually none: the global heap, as they outlive the scrub.
+        let mut out = Vec::new_in(Global);
         for i in 0..self.seg.count as usize {
             let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
                 Ok(entry) => entry,
                 Err(what) => {
-                    out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what });
+                    out.push(Corrupt { key: Key(blaze_ids::ContentId(run[i * ENTRY..i * ENTRY + 32].try_into().expect("32 bytes"))), pack: self.file.clone(), what: what.to_owned() });
                     continue;
                 }
             };
             let end = entry.at + u64::from(entry.len);
-            if end > self.seg.index_at || record_crc(&entry.key, entry.kind, self.payload(&entry)) != entry.crc {
+            if end > self.seg.index_at || record_crc(&entry.key, entry.tag, self.payload(&entry)) != entry.crc {
                 out.push(Corrupt {
-                    key: entry.key,
+                    key: Key(entry.key),
                     pack: self.file.clone(),
-                    // alloc: a finding
                     what: format!("its {} bytes at {} fail their CRC-32C {:08x}: changed on the disk after the segment was proved", entry.len, entry.at, entry.crc),
                 });
             }
