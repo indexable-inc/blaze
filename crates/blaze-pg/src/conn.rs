@@ -33,10 +33,14 @@
 
 #![blaze::sans_io]
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
+use core::ops::Range;
+
+use blaze_cast::{u64_from_usize, usize_from_u32};
 
 use blaze_sql::desc::{Storage, ValueRef};
 
@@ -46,8 +50,8 @@ use crate::error::{
     State, StatementId, Text, What,
 };
 use crate::proto::{
-    self, MESSAGE_MOST, PROTOCOL_3_0, Reader, STARTUP_MESSAGE_MOST, base64_18, put_cstr, put_i32,
-    put_u16, put_u32,
+    self, DECIMAL, INT32_BYTES, MESSAGE_MOST, NONCE_BYTES, NONCE_CHARS, PROTOCOL_3_0, Reader,
+    STARTUP_MESSAGE_MOST, base64_18, put_cstr, put_i32, put_u16, put_u32,
 };
 use crate::scram;
 
@@ -59,10 +63,66 @@ pub const PIPELINE_MOST: usize = 1024;
 /// connection here instead of growing it without end.
 pub const HELD_MOST: usize = 64 << 20;
 
-const INBOX_MOST: usize = MESSAGE_MOST + 5 + HELD_MOST;
+/// A message's type byte and its `int32` length: where its body starts.
+const HEADER_BYTES: usize = 1 + INT32_BYTES;
+
+const INBOX_MOST: usize = MESSAGE_MOST + HEADER_BYTES + HELD_MOST;
 
 /// A buffer above this capacity, holding under a quarter of it, gives the rest back.
 const SHRINK_ABOVE: usize = 64 << 10;
+
+/// The fraction of its capacity below which a buffer shrinks: a quarter.
+const SHRINK_BELOW: usize = 4;
+
+/// A shrunk buffer keeps twice what it holds, so the next bytes in do not grow it at once.
+const SHRINK_KEEPS: usize = 2;
+
+/// The outbox's first room: the startup message and each SCRAM message fit.
+const OUTBOX_START: usize = 128;
+
+/// A `DataRow`'s value count, an `int16`, before its values.
+const COUNT_BYTES: usize = size_of::<u16>();
+
+/// The secret of protocol 3.0's `BackendKeyData`.
+const SECRET_BYTES: usize = 4;
+
+/// A `BackendKeyData` body: the process id, an `int32`, and the secret.
+const KEY_BYTES: usize = size_of::<u32>() + SECRET_BYTES;
+
+/// The most digits of a `CommandComplete` count read: every number of 19 digits is below
+/// `u64::MAX`, so the sum cannot overflow.
+const COUNT_DIGITS_MOST: usize = 19;
+
+/// What every statement's server-side name starts with.
+const NAME_PREFIX: &[u8] = b"blaze_";
+
+/// The most digits of a statement id in decimal: `u64::MAX` has 20.
+const ID_DIGITS_MOST: usize = 20;
+
+/// The longest server-side statement name.
+const SERVER_NAME_MOST: usize = NAME_PREFIX.len() + ID_DIGITS_MOST;
+
+/// The client-first-message-bare's head, before the nonce: the user is empty (the server
+/// takes the startup message's).
+const BARE_HEAD: &[u8] = b"n=,r=";
+
+/// The client-first-message-bare: its head and the nonce.
+const BARE_LEN: usize = BARE_HEAD.len() + NONCE_CHARS;
+
+/// The config's field the startup message names `user`, written once for both.
+const USER: &str = "user";
+
+/// The config's field the startup message names `database`, written once for both.
+const DATABASE: &str = "database";
+
+/// The field a row's value is read as, in errors.
+const VALUE: &str = "value";
+
+/// The `Bind` message's name, in errors.
+const BIND: &str = "Bind";
+
+/// The `Close` message's name, in errors.
+const CLOSE: &str = "Close";
 
 /// What a connection is made with.
 #[derive(Clone, Copy, Debug)]
@@ -88,10 +148,26 @@ pub enum ParamType {
 
 impl ParamType {
     /// The type's OID, as `Parse` names it and `ParameterDescription` describes it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn oid(self) -> u32 {
         match self {
-            ParamType::Scalar(storage) => codec::scalar_oid(storage),
-            ParamType::Array(storage) => codec::array_oid(storage),
+            ParamType::Scalar(
+                storage @ (Storage::Boolean
+                | Storage::Integer
+                | Storage::Real
+                | Storage::Text
+                | Storage::Blob),
+            ) => codec::scalar_oid(storage),
+            ParamType::Array(
+                storage @ (Storage::Boolean
+                | Storage::Integer
+                | Storage::Real
+                | Storage::Text
+                | Storage::Blob),
+            ) => codec::array_oid(storage),
         }
     }
 }
@@ -118,7 +194,7 @@ pub enum Expect<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendKey {
     pub pid: u32,
-    pub secret: [u8; 4],
+    pub secret: [u8; SECRET_BYTES],
 }
 
 /// What the connection tells its user. Each event borrows the connection until the next call.
@@ -154,32 +230,54 @@ pub struct Columns<'a> {
 }
 
 impl<'a> Columns<'a> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn len(&self) -> usize {
         self.storages.len()
     }
 
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.storages.is_empty()
     }
 
     /// The values in column order.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn iter(&self) -> Values<'a> {
         Values { rest: self.body, storages: self.storages.iter() }
     }
 
-    pub fn get(&self, index: usize) -> Option<ValueRef<'a>> {
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn get(&self, index: usize) -> Option<Result<ValueRef<'a>, ValueError>> {
         self.iter().nth(index)
     }
 }
 
 impl fmt::Debug for Columns<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
+        let mut list = f.debug_list();
+        for value in self.iter() {
+            match value {
+                Ok(value) => list.entry(&value),
+                Err(error) => list.entry(&error),
+            };
+        }
+        list.finish()
     }
 }
 
 /// The values of a row in column order. The row was checked against its columns when it
-/// arrived, so every value decodes.
+/// arrived, so every value decodes; were one not to, its error is the last item.
 #[derive(Clone, Debug)]
 pub struct Values<'a> {
     rest: &'a [u8],
@@ -187,16 +285,30 @@ pub struct Values<'a> {
 }
 
 impl<'a> Iterator for Values<'a> {
-    type Item = ValueRef<'a>;
+    type Item = Result<ValueRef<'a>, ValueError>;
 
-    fn next(&mut self) -> Option<ValueRef<'a>> {
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn next(&mut self) -> Option<Result<ValueRef<'a>, ValueError>> {
         let storage = *self.storages.next()?;
-        let value = codec::split_value(&mut self.rest, "value").ok()?;
-        codec::decode(storage, value).ok()
+        let value = codec::split_value(&mut self.rest, VALUE)
+            .and_then(|value| codec::decode(storage, value));
+        if value.is_err() {
+            // An error ends the row: nothing after it is read.
+            let none: &[Storage] = &[];
+            self.storages = none.iter();
+            self.rest = &[];
+        }
+        Some(value)
     }
 
+    /// One item per column left: an error, which ends the row, empties what is left.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.storages.len()))
+        (self.storages.len(), Some(self.storages.len()))
     }
 }
 
@@ -204,7 +316,7 @@ impl<'a> Iterator for Values<'a> {
 #[derive(Clone, Copy, Debug)]
 struct Span {
     at: u64,
-    len: u32,
+    len: usize,
 }
 
 /// The three fields of an `ErrorResponse` or `NoticeResponse`.
@@ -305,20 +417,24 @@ struct Statement<A: Allocator> {
     /// `close_statement` was called: nothing more may use it, and the id may be prepared again.
     closing: bool,
     /// Each parameter's type.
-    params: Vec<ParamType, A>,
+    params: Box<[ParamType], A>,
+    /// How many parameters: `params`' length, checked to fit the protocol's `int16`.
+    param_count: u16,
     /// Whether it returns rows (else a count).
     rows: bool,
-    storages: Vec<Storage, A>,
+    storages: Box<[Storage], A>,
+    /// How many columns: `storages`' length, checked to fit the protocol's `int16`.
+    column_count: u16,
     /// The expected columns' names, joined; `name_ends` says where each ends.
-    names: Vec<u8, A>,
-    name_ends: Vec<u32, A>,
+    names: Box<[u8], A>,
+    name_ends: Box<[usize], A>,
 }
 
 impl<A: Allocator> Statement<A> {
     fn name(&self, index: usize) -> &[u8] {
-        let end = self.name_ends.get(index).map_or(0, |&end| end as usize);
+        let end = self.name_ends.get(index).copied().unwrap_or(0);
         let start = match index.checked_sub(1) {
-            Some(before) => self.name_ends.get(before).map_or(0, |&end| end as usize),
+            Some(before) => self.name_ends.get(before).copied().unwrap_or(0),
             None => 0,
         };
         self.names.get(start..end).unwrap_or(&[])
@@ -361,6 +477,10 @@ enum Fail {
 }
 
 impl From<What> for Fail {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn from(what: What) -> Fail {
         Fail::Protocol(what)
     }
@@ -372,9 +492,9 @@ pub struct Connection<A: Allocator + Copy> {
     now: u64,
     phase: Phase,
     startup_deadline: u64,
-    password: Vec<u8, A>,
-    /// Base64 of the caller's 18 random bytes: SCRAM's client nonce.
-    nonce: [u8; 24],
+    password: Box<[u8], A>,
+    /// Base64 of the caller's [`NONCE_BYTES`] random bytes: SCRAM's client nonce.
+    nonce: [u8; NONCE_CHARS],
     /// The server's stream from offset `base`, read to `parsed`.
     inbox: Vec<u8, A>,
     base: u64,
@@ -394,9 +514,9 @@ pub struct Connection<A: Allocator + Copy> {
     plant: Option<Plant>,
 }
 
-/// The body of the message at `start..end` of `inbox`.
-fn body_of(inbox: &[u8], start: usize, end: usize) -> &[u8] {
-    inbox.get(start..end).unwrap_or(&[])
+/// The body of the message at `body` of `inbox`.
+fn body_of(inbox: &[u8], body: Range<usize>) -> &[u8] {
+    inbox.get(body).unwrap_or(&[])
 }
 
 /// A `ReadyForQuery` body: one byte of transaction status.
@@ -412,49 +532,57 @@ fn ready_status(body: &[u8]) -> Result<(), What> {
 /// `MERGE n`, `FETCH n`, `MOVE n`, `COPY n`; `None` for a command with no count.
 fn changed_of(tag: &[u8]) -> Result<Option<u64>, What> {
     let mut words = tag.split(|&b| b == b' ');
-    let words_wanted = match words.next() {
-        Some(b"INSERT") => 3,
-        Some(b"UPDATE" | b"DELETE" | b"SELECT" | b"MERGE" | b"FETCH" | b"MOVE" | b"COPY") => 2,
+    // The words before the count: `INSERT`'s object id (always 0 now).
+    let skip = match words.next() {
+        Some(b"INSERT") => 1,
+        Some(b"UPDATE" | b"DELETE" | b"SELECT" | b"MERGE" | b"FETCH" | b"MOVE" | b"COPY") => 0,
         _ => return Ok(None),
     };
-    let rest: [Option<&[u8]>; 3] = [words.next(), words.next(), words.next()];
-    let count = match (words_wanted, rest) {
-        (3, [Some(_), Some(count), None]) | (2, [Some(count), None, None]) => count,
-        _ => return Err(What::Tag),
+    // The count is the last word.
+    let (Some(count), None) = (words.nth(skip), words.next()) else {
+        return Err(What::Tag);
     };
-    if count.is_empty() || count.len() > 19 || !count.iter().all(u8::is_ascii_digit) {
+    if count.is_empty() || count.len() > COUNT_DIGITS_MOST || !count.iter().all(u8::is_ascii_digit)
+    {
         return Err(What::Tag);
     }
-    // At most 19 digits: below `u64::MAX`.
-    Ok(Some(count.iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0'))))
+    // At most `COUNT_DIGITS_MOST` digits: below `u64::MAX`.
+    Ok(Some(count.iter().fold(0u64, |n, d| n * DECIMAL + u64::from(d - b'0'))))
 }
 
-/// The statement's name on the server: `blaze_` and the id in decimal, at most 26 bytes.
-fn server_name(statement: StatementId) -> ([u8; 26], usize) {
-    let mut name = [0u8; 26];
-    name[..6].copy_from_slice(b"blaze_");
-    let mut digits = [0u8; 20];
+/// The statement's name on the server: [`NAME_PREFIX`] and the id in decimal, at most
+/// [`SERVER_NAME_MOST`] bytes.
+fn server_name(statement: StatementId) -> ([u8; SERVER_NAME_MOST], usize) {
+    let mut name = [0u8; SERVER_NAME_MOST];
+    let (prefix, id) = name.split_at_mut(NAME_PREFIX.len());
+    prefix.copy_from_slice(NAME_PREFIX);
+    let mut digits = [0u8; ID_DIGITS_MOST];
     let mut n = statement.0;
     let mut count = 0;
-    // At most 20 turns: `u64::MAX` has 20 digits.
+    // At most `ID_DIGITS_MOST` turns: `u64::MAX` has that many digits.
     loop {
-        digits[count] = b'0' + (n % 10) as u8;
+        // Below 10: the low byte is the whole digit.
+        let [digit, ..] = (n % DECIMAL).to_le_bytes();
+        digits[count] = b'0' + digit;
         count += 1;
-        n /= 10;
+        n /= DECIMAL;
         if n == 0 || count == digits.len() {
             break;
         }
     }
-    for (slot, digit) in name[6..6 + count].iter_mut().zip(digits[..count].iter().rev()) {
+    for (slot, digit) in id.iter_mut().zip(digits[..count].iter().rev()) {
         *slot = *digit;
     }
-    (name, 6 + count)
+    (name, NAME_PREFIX.len() + count)
 }
 
 impl<A: Allocator + Copy> Connection<A> {
     /// A connection that has written its startup message. `nonce` is the caller's randomness,
     /// SCRAM's client nonce: 18 bytes from the system's random source, new for each connection.
-    pub fn new(config: Config<'_>, nonce: [u8; 18], alloc: A) -> Connection<A> {
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn new(config: Config<'_>, nonce: [u8; NONCE_BYTES], alloc: A) -> Connection<A> {
         let mut password = Vec::with_capacity_in(config.password.len(), alloc);
         password.extend_from_slice(config.password.as_bytes());
         let mut connection = Connection {
@@ -462,12 +590,12 @@ impl<A: Allocator + Copy> Connection<A> {
             now: 0,
             phase: Phase::Auth(Auth::Request),
             startup_deadline: config.startup_deadline,
-            password,
+            password: password.into_boxed_slice(),
             nonce: base64_18(&nonce),
             inbox: Vec::new_in(alloc),
             base: 0,
             parsed: 0,
-            outbox: Vec::with_capacity_in(128, alloc),
+            outbox: Vec::with_capacity_in(OUTBOX_START, alloc),
             sent: 0,
             rounds: VecDeque::new_in(alloc),
             answering: 0,
@@ -479,9 +607,9 @@ impl<A: Allocator + Copy> Connection<A> {
             plant: None,
         };
         let refused = if config.user.as_bytes().contains(&0) {
-            Some(StoredFatal::Nul { field: "user" })
+            Some(StoredFatal::Nul { field: USER })
         } else if config.database.as_bytes().contains(&0) {
-            Some(StoredFatal::Nul { field: "database" })
+            Some(StoredFatal::Nul { field: DATABASE })
         } else {
             connection.write_startup(config).err()
         };
@@ -502,34 +630,41 @@ impl<A: Allocator + Copy> Connection<A> {
         put_u32(out, 0);
         put_u32(out, PROTOCOL_3_0);
         for (name, value) in
-            [("user", config.user), ("database", config.database), ("client_encoding", "UTF8")]
+            [(USER, config.user), (DATABASE, config.database), ("client_encoding", "UTF8")]
         {
             put_cstr(out, name.as_bytes());
             put_cstr(out, value.as_bytes());
         }
         out.push(0);
-        let len = out.len() - at;
+        let len = out.len().saturating_sub(at);
         if len > STARTUP_MESSAGE_MOST {
             out.truncate(at);
             return Err(StoredFatal::StartupTooLong { len });
         }
-        // At most `STARTUP_MESSAGE_MOST`.
-        let field = (len as u32).to_be_bytes();
-        if let Some(slot) = out.get_mut(at..at + 4) {
-            slot.copy_from_slice(&field);
+        // At most `STARTUP_MESSAGE_MOST`, so this refuses nothing more.
+        let Ok(field) = u32::try_from(len) else {
+            out.truncate(at);
+            return Err(StoredFatal::StartupTooLong { len });
+        };
+        if let Some(slot) = out.get_mut(at..at + INT32_BYTES) {
+            slot.copy_from_slice(&field.to_be_bytes());
         }
         Ok(())
     }
 
     /// The time, in nanoseconds since the driver started, from a monotonic clock. A time before
     /// the last is a driver's bug; the later stays.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn advance_clock(&mut self, now: u64) {
         self.now = self.now.max(now);
         let now = self.now;
         let here = self.read_to();
         match self.phase {
             Phase::Closed => {}
-            Phase::Auth(_) | Phase::Starting => {
+            Phase::Auth(Auth::Request | Auth::ScramContinue | Auth::ScramFinal(_) | Auth::Ok)
+            | Phase::Starting => {
                 if now >= self.startup_deadline {
                     let deadline = self.startup_deadline;
                     self.close(here, StoredFatal::StartupDeadline { deadline, now });
@@ -577,6 +712,9 @@ impl<A: Allocator + Copy> Connection<A> {
     }
 
     /// The peer closed the connection, or the socket broke.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn closed(&mut self) {
         if matches!(self.phase, Phase::Closed) {
             return;
@@ -587,6 +725,10 @@ impl<A: Allocator + Copy> Connection<A> {
     }
 
     /// The bytes to write next, if any; say how many were written with [`Connection::sent`].
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn next_send(&mut self) -> Option<&[u8]> {
         if matches!(self.phase, Phase::Closed) {
             return None;
@@ -598,6 +740,9 @@ impl<A: Allocator + Copy> Connection<A> {
     }
 
     /// `len` bytes of [`Connection::next_send`]'s were written.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn sent(&mut self, len: usize) {
         if matches!(self.phase, Phase::Closed) {
             return;
@@ -621,10 +766,13 @@ impl<A: Allocator + Copy> Connection<A> {
 
     /// The earliest deadline: startup's until [`Event::Ready`], then the earliest of the
     /// prepares and queries not ended. `None` when nothing waits on the clock.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn next_deadline(&self) -> Option<u64> {
         match self.phase {
             Phase::Closed => None,
-            Phase::Auth(_) | Phase::Starting => Some(self.startup_deadline),
+            Phase::Auth(Auth::Request | Auth::ScramContinue | Auth::ScramFinal(_) | Auth::Ok)
+            | Phase::Starting => Some(self.startup_deadline),
             Phase::Ready => {
                 self.rounds.iter().filter(|r| !r.ended).filter_map(|r| r.deadline).min()
             }
@@ -632,11 +780,17 @@ impl<A: Allocator + Copy> Connection<A> {
     }
 
     /// The process and secret to cancel with, once the server sent them.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn backend_key(&self) -> Option<BackendKey> {
         self.key
     }
 
     /// The next event. What it borrows lives until the next call into the connection.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn next_event(&mut self) -> Option<Event<'_>> {
         self.settle();
         let pending = self.events.pop_front()?;
@@ -645,7 +799,7 @@ impl<A: Allocator + Copy> Connection<A> {
             Kind::Prepared { statement, .. } | Kind::PrepareFailed { statement, .. } => {
                 Some(Round::Prepare(statement))
             }
-            _ => None,
+            Kind::Ready | Kind::Notice(..) | Kind::Row { .. } | Kind::Close(..) => None,
         };
         if let Some(round) = round
             && let Some(flight) = self.rounds.iter_mut().find(|r| r.round == round && !r.told)
@@ -660,7 +814,10 @@ impl<A: Allocator + Copy> Connection<A> {
         match self.phase {
             Phase::Ready => {}
             Phase::Closed => return Err(Refused::Closed),
-            Phase::Auth(_) | Phase::Starting => return Err(Refused::NotReady),
+            Phase::Auth(Auth::Request | Auth::ScramContinue | Auth::ScramFinal(_) | Auth::Ok)
+            | Phase::Starting => {
+                return Err(Refused::NotReady);
+            }
         }
         if self.rounds.len() >= PIPELINE_MOST {
             return Err(Refused::PipelineFull { most: PIPELINE_MOST });
@@ -691,6 +848,9 @@ impl<A: Allocator + Copy> Connection<A> {
     /// [`Event::PrepareFailed`]. Refused, with nothing sent, before [`Event::Ready`], after
     /// [`Event::Close`], when the connection holds `statement` already, or when it cannot be
     /// written.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn prepare(
         &mut self,
         statement: StatementId,
@@ -717,9 +877,9 @@ impl<A: Allocator + Copy> Connection<A> {
             Expect::Rows(columns) => columns,
             Expect::Count => &[],
         };
-        if columns.len() > usize::from(u16::MAX) {
+        let Ok(column_count) = u16::try_from(columns.len()) else {
             return Err(Refused::TooManyColumns { count: columns.len() });
-        }
+        };
         let names_len =
             columns.iter().fold(0usize, |sum, (name, _)| sum.saturating_add(name.len()));
         if names_len > MESSAGE_MOST {
@@ -740,8 +900,7 @@ impl<A: Allocator + Copy> Connection<A> {
         for (name, storage) in columns {
             storages.push(*storage);
             names.extend_from_slice(name.as_bytes());
-            // At most `MESSAGE_MOST` in all, checked above.
-            name_ends.push(names.len() as u32);
+            name_ends.push(names.len());
         }
         let key = self.next_key;
         self.next_key += 1;
@@ -755,11 +914,13 @@ impl<A: Allocator + Copy> Connection<A> {
                 key,
                 prepare: Prepare::Preparing,
                 closing: false,
-                params: types,
+                params: types.into_boxed_slice(),
+                param_count,
                 rows: matches!(returns, Expect::Rows(_)),
-                storages,
-                names,
-                name_ends,
+                storages: storages.into_boxed_slice(),
+                column_count,
+                names: names.into_boxed_slice(),
+                name_ends: name_ends.into_boxed_slice(),
             },
         );
         self.rounds.push_back(InFlight {
@@ -779,6 +940,9 @@ impl<A: Allocator + Copy> Connection<A> {
     /// nothing sent, before [`Event::Ready`], after [`Event::Close`], for a statement not
     /// prepared (or preparing, or failed, or closing), or when the values are not the
     /// statement's.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn query(
         &mut self,
         id: QueryId,
@@ -830,6 +994,9 @@ impl<A: Allocator + Copy> Connection<A> {
     /// Closes `statement` on the server (`Close`, `Sync`). Queries sent before still run; one
     /// sent after is refused, and the id may be prepared again at once. Nobody awaits a close,
     /// so it has no deadline and no event; an `ErrorResponse` to it closes the connection.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn close_statement(&mut self, statement: StatementId) -> Result<(), Refused> {
         self.settle();
         self.can_send()?;
@@ -860,7 +1027,7 @@ impl<A: Allocator + Copy> Connection<A> {
 
     /// Where the stream has been read to.
     fn read_to(&self) -> u64 {
-        self.base + self.parsed as u64
+        self.base + u64_from_usize(self.parsed)
     }
 
     fn push(&mut self, from: u64, kind: Kind) {
@@ -885,10 +1052,12 @@ impl<A: Allocator + Copy> Connection<A> {
             self.answering = self.answering.saturating_sub(1);
         }
         let keep = self.events.front().map_or(self.read_to(), |pending| pending.from);
-        let drop = usize::try_from(keep.saturating_sub(self.base)).unwrap_or(0).min(self.parsed);
-        if drop > 0 && drop >= self.inbox.len() - drop {
+        // Past `usize` is past the inbox: nothing to drop.
+        let Ok(ahead) = usize::try_from(keep.saturating_sub(self.base)) else { return };
+        let drop = ahead.min(self.parsed);
+        if drop > 0 && drop >= self.inbox.len().saturating_sub(drop) {
             drop_prefix(&mut self.inbox, drop);
-            self.base += drop as u64;
+            self.base += u64_from_usize(drop);
             self.parsed -= drop;
             shrink(&mut self.inbox);
         }
@@ -956,17 +1125,18 @@ impl<A: Allocator + Copy> Connection<A> {
         while !matches!(self.phase, Phase::Closed) {
             let avail = self.inbox.get(self.parsed..).unwrap_or(&[]);
             let Some((&tag, rest)) = avail.split_first() else { break };
-            let Some(len) = rest.first_chunk::<4>() else { break };
+            let Some(len) = rest.first_chunk::<INT32_BYTES>() else { break };
             let len = u32::from_be_bytes(*len);
+            let size = usize_from_u32(len);
             let from = self.read_to();
             let most = if matches!(self.phase, Phase::Ready) {
                 MESSAGE_MOST
             } else {
                 STARTUP_MESSAGE_MOST
             };
-            let what = if len < 4 {
+            let what = if size < INT32_BYTES {
                 Some(What::Length { len })
-            } else if len as usize > most {
+            } else if size > most {
                 Some(What::TooLong { len, most })
             } else {
                 None
@@ -976,35 +1146,63 @@ impl<A: Allocator + Copy> Connection<A> {
                 self.close(from, StoredFatal::Protocol(error));
                 break;
             }
-            let total = 1 + len as usize;
+            // The type byte, then what the length counts.
+            let total = 1 + size;
             if avail.len() < total {
                 break;
             }
-            let start = self.parsed + 5;
+            let start = self.parsed + HEADER_BYTES;
             let end = self.parsed + total;
             self.parsed = end;
             let state = self.state();
             let handled = match self.phase {
-                Phase::Auth(auth) => self.on_auth(tag, from, start, end, auth),
+                Phase::Auth(
+                    auth @ (Auth::Request | Auth::ScramContinue | Auth::ScramFinal(_) | Auth::Ok),
+                ) => self.on_auth(tag, from, start, end, auth),
                 Phase::Starting => self.on_starting(tag, from, start, end),
                 Phase::Ready => self.on_ready(tag, from, start, end),
                 Phase::Closed => Ok(()),
             };
             match handled {
                 Ok(()) => {}
-                Err(Fail::Protocol(what)) => {
+                Err(Fail::Protocol(
+                    what @ (What::NotAllowed
+                    | What::Length { .. }
+                    | What::TooLong { .. }
+                    | What::Truncated { .. }
+                    | What::Unterminated { .. }
+                    | What::Trailing { .. }
+                    | What::NotUtf8 { .. }
+                    | What::MissingField { .. }
+                    | What::ReadyStatus { .. }
+                    | What::Tag
+                    | What::AuthCode { .. }
+                    | What::KeyLength { .. }
+                    | What::Encoding),
+                )) => {
                     let error = ProtocolError { message: tag, state, what };
                     self.close(from, StoredFatal::Protocol(error));
                 }
-                Err(Fail::Fatal(why)) => self.close(from, why),
+                Err(Fail::Fatal(
+                    why @ (StoredFatal::Deadline { .. }
+                    | StoredFatal::StartupDeadline { .. }
+                    | StoredFatal::PeerClosed { .. }
+                    | StoredFatal::Protocol(..)
+                    | StoredFatal::Auth(..)
+                    | StoredFatal::Server(..)
+                    | StoredFatal::Nul { .. }
+                    | StoredFatal::StartupTooLong { .. }
+                    | StoredFatal::NotDrained { .. }
+                    | StoredFatal::SentTooMuch { .. }),
+                )) => self.close(from, why),
             }
         }
     }
 
-    /// The three required fields of the `ErrorResponse` or `NoticeResponse` at `start..end`,
-    /// each checked to be UTF-8.
-    fn fields(&self, from: u64, start: usize, end: usize) -> Result<Fields, What> {
-        let mut reader = Reader::new(body_of(&self.inbox, start, end));
+    /// The three required fields of the `ErrorResponse` or `NoticeResponse` whose body is at
+    /// `body`, each checked to be UTF-8.
+    fn fields(&self, from: u64, body: Range<usize>) -> Result<Fields, What> {
+        let mut reader = Reader::new(body_of(&self.inbox, body));
         let (mut severity, mut code, mut message) = (None, None, None);
         // Each turn reads at least the field's type byte: it ends with the body.
         loop {
@@ -1017,8 +1215,7 @@ impl<A: Allocator + Copy> Connection<A> {
             if core::str::from_utf8(value).is_err() {
                 return Err(What::NotUtf8 { field: "field value" });
             }
-            // A message is at most `MESSAGE_MOST` bytes, so its fields' lengths fit.
-            let span = Span { at: from + 5 + at as u64, len: value.len() as u32 };
+            let span = Span { at: from + u64_from_usize(HEADER_BYTES + at), len: value.len() };
             match field {
                 b'S' => severity = Some(span),
                 b'C' => code = Some(span),
@@ -1035,8 +1232,8 @@ impl<A: Allocator + Copy> Connection<A> {
         })
     }
 
-    fn parameter_status(&self, start: usize, end: usize) -> Result<(), What> {
-        let mut reader = Reader::new(body_of(&self.inbox, start, end));
+    fn parameter_status(&self, body: Range<usize>) -> Result<(), What> {
+        let mut reader = Reader::new(body_of(&self.inbox, body));
         let name = reader.cstr("parameter name")?;
         let value = reader.cstr("parameter value")?;
         reader.end()?;
@@ -1059,17 +1256,17 @@ impl<A: Allocator + Copy> Connection<A> {
         match tag {
             b'R' => {}
             b'E' => {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 return Err(Fail::Fatal(StoredFatal::Server(fields)));
             }
             b'N' => {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 self.push(from, Kind::Notice(fields));
                 return Ok(());
             }
             _ => return Err(What::NotAllowed.into()),
         }
-        let body = body_of(&self.inbox, start, end);
+        let body = body_of(&self.inbox, start..end);
         let mut reader = Reader::new(body);
         let code = reader.u32("authentication code")?;
         let refuse = |method: &'static str| {
@@ -1082,14 +1279,8 @@ impl<A: Allocator + Copy> Connection<A> {
             }
             (Auth::Request, 3) => {
                 reader.end()?;
-                if let Some(at) = scram::unprintable(&self.password) {
-                    return Err(Fail::Fatal(StoredFatal::Auth(AuthError::PasswordNotPrintable {
-                        at,
-                    })));
-                }
+                let (mark, at) = self.begin_password()?;
                 let out = &mut self.outbox;
-                let mark = out.len();
-                let at = proto::begin(out, b'p');
                 put_cstr(out, &self.password);
                 if let Err(len) = proto::finish(out, at) {
                     out.truncate(mark);
@@ -1115,22 +1306,20 @@ impl<A: Allocator + Copy> Connection<A> {
                         if plus { AuthError::ChannelBindingOnly } else { AuthError::NoScram };
                     return Err(Fail::Fatal(StoredFatal::Auth(error)));
                 }
-                if let Some(at) = scram::unprintable(&self.password) {
-                    return Err(Fail::Fatal(StoredFatal::Auth(AuthError::PasswordNotPrintable {
-                        at,
-                    })));
-                }
+                let (mark, at) = self.begin_password()?;
                 let out = &mut self.outbox;
-                let mark = out.len();
-                let at = proto::begin(out, b'p');
                 put_cstr(out, b"SCRAM-SHA-256");
                 let length_at = out.len();
                 put_i32(out, 0);
                 scram::client_first(b"", &self.nonce, out);
-                // A few dozen bytes.
-                let len = (out.len() - length_at - 4) as i32;
-                if let Some(slot) = out.get_mut(length_at..length_at + 4) {
-                    slot.copy_from_slice(&len.to_be_bytes());
+                // A few dozen bytes, so this refuses nothing.
+                let len = out.len().saturating_sub(length_at + INT32_BYTES);
+                let Ok(field) = i32::try_from(len) else {
+                    out.truncate(mark);
+                    return Err(Fail::Fatal(StoredFatal::StartupTooLong { len }));
+                };
+                if let Some(slot) = out.get_mut(length_at..length_at + INT32_BYTES) {
+                    slot.copy_from_slice(&field.to_be_bytes());
                 }
                 if let Err(len) = proto::finish(out, at) {
                     out.truncate(mark);
@@ -1140,26 +1329,19 @@ impl<A: Allocator + Copy> Connection<A> {
             }
             (Auth::ScramContinue, 11) => {
                 let server_first = reader.rest();
-                let mut bare = [0u8; 29];
-                let (head, tail) = bare.split_at_mut(5);
-                head.copy_from_slice(b"n=,r=");
+                let mut bare = [0u8; BARE_LEN];
+                let (head, tail) = bare.split_at_mut(BARE_HEAD.len());
+                head.copy_from_slice(BARE_HEAD);
                 tail.copy_from_slice(&self.nonce);
                 let out = &mut self.outbox;
                 let mark = out.len();
                 let at = proto::begin(out, b'p');
-                let signature = match scram::client_final(
-                    &self.password,
-                    &bare,
-                    server_first,
-                    &self.nonce,
-                    out,
-                ) {
-                    Ok(signature) => signature,
-                    Err(error) => {
-                        out.truncate(mark);
-                        return Err(Fail::Fatal(StoredFatal::Auth(error)));
-                    }
-                };
+                let written =
+                    scram::client_final(&self.password, &bare, server_first, &self.nonce, out);
+                if written.is_err() {
+                    out.truncate(mark);
+                }
+                let signature = written.map_err(|error| Fail::Fatal(StoredFatal::Auth(error)))?;
                 if let Err(len) = proto::finish(out, at) {
                     out.truncate(mark);
                     return Err(Fail::Fatal(StoredFatal::StartupTooLong { len }));
@@ -1173,43 +1355,57 @@ impl<A: Allocator + Copy> Connection<A> {
                 }
                 self.phase = Phase::Auth(Auth::Ok);
             }
-            (_, 2) => return refuse("Kerberos V5"),
-            (_, 5) => return refuse("MD5"),
-            (_, 6) => return refuse("SCM credential"),
-            (_, 7 | 8) => return refuse("GSSAPI"),
-            (_, 9) => return refuse("SSPI"),
-            (_, 0 | 3 | 10 | 11 | 12) => return Err(What::AuthCode { code }.into()),
-            (_, code) => {
-                return Err(Fail::Fatal(StoredFatal::Auth(AuthError::UnknownMethod { code })));
+            // Whatever the state: a method refused by name, a code this state does not take,
+            // or one the protocol does not have.
+            (Auth::Request | Auth::ScramContinue | Auth::ScramFinal(_) | Auth::Ok, code) => {
+                return match code {
+                    2 => refuse("Kerberos V5"),
+                    5 => refuse("MD5"),
+                    6 => refuse("SCM credential"),
+                    7 | 8 => refuse("GSSAPI"),
+                    9 => refuse("SSPI"),
+                    0 | 3 | 10 | 11 | 12 => Err(What::AuthCode { code }.into()),
+                    code => Err(Fail::Fatal(StoredFatal::Auth(AuthError::UnknownMethod { code }))),
+                };
             }
         }
         Ok(())
     }
 
+    /// Checks the password is printable ASCII, as cleartext and SCRAM both need, and starts a
+    /// `PasswordMessage`: where the outbox was, to drop back to, and where its length is.
+    fn begin_password(&mut self) -> Result<(usize, usize), Fail> {
+        if let Some(at) = scram::unprintable(&self.password) {
+            return Err(Fail::Fatal(StoredFatal::Auth(AuthError::PasswordNotPrintable { at })));
+        }
+        let mark = self.outbox.len();
+        Ok((mark, proto::begin(&mut self.outbox, b'p')))
+    }
+
     fn on_starting(&mut self, tag: u8, from: u64, start: usize, end: usize) -> Result<(), Fail> {
         match tag {
-            b'S' => self.parameter_status(start, end)?,
+            b'S' => self.parameter_status(start..end)?,
             b'K' => {
-                let body = body_of(&self.inbox, start, end);
-                if body.len() != 8 {
+                let body = body_of(&self.inbox, start..end);
+                if body.len() != KEY_BYTES {
                     return Err(What::KeyLength { len: body.len() }.into());
                 }
                 let mut reader = Reader::new(body);
                 let pid = reader.u32("process id")?;
-                let secret = reader.array::<4>("secret key")?;
+                let secret = reader.array::<SECRET_BYTES>("secret key")?;
                 self.key = Some(BackendKey { pid, secret });
             }
             b'Z' => {
-                ready_status(body_of(&self.inbox, start, end))?;
+                ready_status(body_of(&self.inbox, start..end))?;
                 self.phase = Phase::Ready;
                 self.push(from, Kind::Ready);
             }
             b'E' => {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 return Err(Fail::Fatal(StoredFatal::Server(fields)));
             }
             b'N' => {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 self.push(from, Kind::Notice(fields));
             }
             _ => return Err(What::NotAllowed.into()),
@@ -1220,23 +1416,23 @@ impl<A: Allocator + Copy> Connection<A> {
     fn on_ready(&mut self, tag: u8, from: u64, start: usize, end: usize) -> Result<(), Fail> {
         match tag {
             b'N' => {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 self.push(from, Kind::Notice(fields));
                 return Ok(());
             }
-            b'S' => return Ok(self.parameter_status(start, end)?),
+            b'S' => return Ok(self.parameter_status(start..end)?),
             _ => {}
         }
         let index = self.answering;
         let Some(&InFlight { round, key, stage, .. }) = self.rounds.get(index) else {
             // No round is being answered: an error here is the server ending the session.
             if tag == b'E' {
-                let fields = self.fields(from, start, end)?;
+                let fields = self.fields(from, start..end)?;
                 return Err(Fail::Fatal(StoredFatal::Server(fields)));
             }
             return Err(What::NotAllowed.into());
         };
-        let body = body_of(&self.inbox, start, end);
+        let body = body_of(&self.inbox, start..end);
         match (stage, tag) {
             (Stage::Skipping, b'Z') => {
                 ready_status(body)?;
@@ -1267,8 +1463,18 @@ impl<A: Allocator + Copy> Connection<A> {
                     self.answered(index);
                     Ok(())
                 }
-                (_, b'E') => {
-                    let fields = self.fields(from, start, end)?;
+                (
+                    Stage::ParseComplete
+                    | Stage::ParameterDescription
+                    | Stage::RowDescription
+                    | Stage::BindComplete
+                    | Stage::CloseComplete
+                    | Stage::Rows
+                    | Stage::ReadyForQuery
+                    | Stage::Skipping,
+                    b'E',
+                ) => {
+                    let fields = self.fields(from, start..end)?;
                     Err(Fail::Fatal(StoredFatal::Server(fields)))
                 }
                 _ => Err(What::NotAllowed.into()),
@@ -1288,11 +1494,21 @@ impl<A: Allocator + Copy> Connection<A> {
         start: usize,
         end: usize,
     ) -> Result<(), Fail> {
-        let body = body_of(&self.inbox, start, end);
+        let body = body_of(&self.inbox, start..end);
         let Some(held) = self.statement(key) else { return Err(What::NotAllowed.into()) };
         match (stage, tag) {
-            (_, b'E') => {
-                let fields = self.fields(from, start, end)?;
+            (
+                Stage::ParseComplete
+                | Stage::ParameterDescription
+                | Stage::RowDescription
+                | Stage::BindComplete
+                | Stage::CloseComplete
+                | Stage::Rows
+                | Stage::ReadyForQuery
+                | Stage::Skipping,
+                b'E',
+            ) => {
+                let fields = self.fields(from, start..end)?;
                 self.fail(index, from, Stored::Server(fields));
             }
             (Stage::ParseComplete, b'1') => {
@@ -1300,24 +1516,23 @@ impl<A: Allocator + Copy> Connection<A> {
                 self.set_stage(index, Stage::ParameterDescription);
             }
             (Stage::ParameterDescription, b't') => {
-                let mismatch = parameter_description(held, body)?;
-                match mismatch {
-                    Some(error) => self.fail(index, from, error),
-                    None => self.set_stage(index, Stage::RowDescription),
+                if let Some(error) = parameter_description(held, body)? {
+                    self.fail(index, from, error);
+                } else {
+                    self.set_stage(index, Stage::RowDescription);
                 }
             }
             (Stage::RowDescription, b'T') => {
-                let mismatch = row_description(held, from, body)?;
-                match mismatch {
-                    Some(error) => self.fail(index, from, error),
-                    None => self.set_stage(index, Stage::ReadyForQuery),
+                if let Some(error) = row_description(held, from, body)? {
+                    self.fail(index, from, error);
+                } else {
+                    self.set_stage(index, Stage::ReadyForQuery);
                 }
             }
             (Stage::RowDescription, b'n') => {
                 Reader::new(body).end()?;
                 if held.rows {
-                    // At most `u16::MAX`, checked when it was prepared.
-                    let columns = held.storages.len() as u16;
+                    let columns = held.column_count;
                     let error =
                         Stored::Returns { expected: Returns::Rows(columns), got: Returns::Count };
                     self.fail(index, from, error);
@@ -1353,25 +1568,39 @@ impl<A: Allocator + Copy> Connection<A> {
         start: usize,
         end: usize,
     ) -> Result<(), Fail> {
-        let body = body_of(&self.inbox, start, end);
+        let body = body_of(&self.inbox, start..end);
         let Some(held) = self.statement(key) else { return Err(What::NotAllowed.into()) };
         match (stage, tag) {
-            (_, b'E') => {
-                let fields = self.fields(from, start, end)?;
+            (
+                Stage::ParseComplete
+                | Stage::ParameterDescription
+                | Stage::RowDescription
+                | Stage::BindComplete
+                | Stage::CloseComplete
+                | Stage::Rows
+                | Stage::ReadyForQuery
+                | Stage::Skipping,
+                b'E',
+            ) => {
+                let fields = self.fields(from, start..end)?;
                 self.fail(index, from, Stored::Server(fields));
             }
             (Stage::BindComplete, b'2') => {
                 Reader::new(body).end()?;
                 self.set_stage(index, Stage::Rows);
             }
-            (Stage::Rows, b'D') => match data_row(held, body)? {
-                Some(error) => self.fail(index, from, error),
-                None => {
-                    // The values after the count; a message's length fits `u32`.
-                    let span = Span { at: from + 7, len: body.len().saturating_sub(2) as u32 };
+            (Stage::Rows, b'D') => {
+                if let Some(error) = data_row(held, body)? {
+                    self.fail(index, from, error);
+                } else {
+                    // The values after the count.
+                    let span = Span {
+                        at: from + u64_from_usize(HEADER_BYTES + COUNT_BYTES),
+                        len: body.len().saturating_sub(COUNT_BYTES),
+                    };
                     self.push(from, Kind::Row { id, key, body: span });
                 }
-            },
+            }
             (Stage::Rows, b'C') => {
                 let mut reader = Reader::new(body);
                 let command = reader.cstr("command tag")?;
@@ -1429,8 +1658,9 @@ impl<A: Allocator + Copy> Connection<A> {
     }
 
     fn span(&self, span: Span) -> &[u8] {
-        let start = usize::try_from(span.at.saturating_sub(self.base)).unwrap_or(usize::MAX);
-        let end = start.saturating_add(span.len as usize);
+        // Past `usize` is past the inbox: no bytes.
+        let Ok(start) = usize::try_from(span.at.saturating_sub(self.base)) else { return &[] };
+        let end = start.saturating_add(span.len);
         self.inbox.get(start..end).unwrap_or(&[])
     }
 
@@ -1447,16 +1677,55 @@ impl<A: Allocator + Copy> Connection<A> {
             Kind::Ready => Event::Ready,
             Kind::Notice(fields) => Event::Notice(self.server_error(fields)),
             Kind::Prepared { statement, .. } => Event::Prepared { statement },
-            Kind::PrepareFailed { statement, key, error } => {
-                Event::PrepareFailed { statement, error: self.error(key, error) }
-            }
+            Kind::PrepareFailed {
+                statement,
+                key,
+                error:
+                    error @ (Stored::Server(..)
+                    | Stored::ParamCount { .. }
+                    | Stored::ParamType { .. }
+                    | Stored::Returns { .. }
+                    | Stored::ColumnCount { .. }
+                    | Stored::ColumnName { .. }
+                    | Stored::ColumnType { .. }
+                    | Stored::RowWidth { .. }
+                    | Stored::Value { .. }
+                    | Stored::Deadline { .. }
+                    | Stored::Closed(..)),
+            } => Event::PrepareFailed { statement, error: self.error(key, error) },
             Kind::Row { id, key, body } => {
                 let storages = self.statement(key).map_or(&[][..], |s| &s.storages[..]);
                 Event::Row { id, columns: Columns { body: self.span(body), storages } }
             }
             Kind::Done { id, changed } => Event::Done { id, changed },
-            Kind::Failed { id, key, error } => Event::Failed { id, error: self.error(key, error) },
-            Kind::Close(why) => Event::Close { why: self.fatal(why) },
+            Kind::Failed {
+                id,
+                key,
+                error:
+                    error @ (Stored::Server(..)
+                    | Stored::ParamCount { .. }
+                    | Stored::ParamType { .. }
+                    | Stored::Returns { .. }
+                    | Stored::ColumnCount { .. }
+                    | Stored::ColumnName { .. }
+                    | Stored::ColumnType { .. }
+                    | Stored::RowWidth { .. }
+                    | Stored::Value { .. }
+                    | Stored::Deadline { .. }
+                    | Stored::Closed(..)),
+            } => Event::Failed { id, error: self.error(key, error) },
+            Kind::Close(
+                why @ (StoredFatal::Deadline { .. }
+                | StoredFatal::StartupDeadline { .. }
+                | StoredFatal::PeerClosed { .. }
+                | StoredFatal::Protocol(..)
+                | StoredFatal::Auth(..)
+                | StoredFatal::Server(..)
+                | StoredFatal::Nul { .. }
+                | StoredFatal::StartupTooLong { .. }
+                | StoredFatal::NotDrained { .. }
+                | StoredFatal::SentTooMuch { .. }),
+            ) => Event::Close { why: self.fatal(why) },
         }
     }
 
@@ -1467,7 +1736,10 @@ impl<A: Allocator + Copy> Connection<A> {
             Stored::Server(fields) => Error::Server(self.server_error(fields)),
             Stored::ParamCount { expected, got } => Error::ParamCount { expected, got },
             Stored::ParamType { index, expected, got } => Error::ParamType { index, expected, got },
-            Stored::Returns { expected, got } => Error::Returns { expected, got },
+            Stored::Returns {
+                expected: expected @ (Returns::Rows(..) | Returns::Count),
+                got: got @ (Returns::Rows(..) | Returns::Count),
+            } => Error::Returns { expected, got },
             Stored::ColumnCount { expected, got } => Error::ColumnCount { expected, got },
             Stored::ColumnName { index, got } => {
                 Error::ColumnName { index, expected: name(index), got: Text(self.span(got)) }
@@ -1476,23 +1748,63 @@ impl<A: Allocator + Copy> Connection<A> {
                 Error::ColumnType { index, name: name(index), expected, got }
             }
             Stored::RowWidth { expected, got } => Error::RowWidth { expected, got },
-            Stored::Value { index, error } => Error::Value { index, name: name(index), error },
+            Stored::Value {
+                index,
+                error:
+                    error @ (ValueError::Length { .. }
+                    | ValueError::Boolean { .. }
+                    | ValueError::NotUtf8 { .. }
+                    | ValueError::NegativeLength { .. }
+                    | ValueError::Dimensions { .. }
+                    | ValueError::NullFlag { .. }
+                    | ValueError::NullNotFlagged { .. }
+                    | ValueError::ElementOid { .. }
+                    | ValueError::LowerBound { .. }
+                    | ValueError::ArrayLength { .. }
+                    | ValueError::Truncated { .. }
+                    | ValueError::Trailing { .. }),
+            } => Error::Value { index, name: name(index), error },
             Stored::Deadline { deadline, now } => Error::Deadline { deadline, now },
-            Stored::Closed(why) => Error::Closed(self.fatal(why)),
+            Stored::Closed(
+                why @ (StoredFatal::Deadline { .. }
+                | StoredFatal::StartupDeadline { .. }
+                | StoredFatal::PeerClosed { .. }
+                | StoredFatal::Protocol(..)
+                | StoredFatal::Auth(..)
+                | StoredFatal::Server(..)
+                | StoredFatal::Nul { .. }
+                | StoredFatal::StartupTooLong { .. }
+                | StoredFatal::NotDrained { .. }
+                | StoredFatal::SentTooMuch { .. }),
+            ) => Error::Closed(self.fatal(why)),
         }
     }
 
     fn fatal(&self, why: StoredFatal) -> Fatal<'_> {
         match why {
-            StoredFatal::Deadline { round, deadline, now } => {
-                Fatal::Deadline { round, deadline, now }
-            }
+            StoredFatal::Deadline {
+                round: round @ (Round::Prepare(..) | Round::Query(..) | Round::Close(..)),
+                deadline,
+                now,
+            } => Fatal::Deadline { round, deadline, now },
             StoredFatal::StartupDeadline { deadline, now } => {
                 Fatal::StartupDeadline { deadline, now }
             }
             StoredFatal::PeerClosed { buffered } => Fatal::PeerClosed { buffered },
             StoredFatal::Protocol(error) => Fatal::Protocol(error),
-            StoredFatal::Auth(error) => Fatal::Auth(error),
+            StoredFatal::Auth(
+                error @ (AuthError::Method { .. }
+                | AuthError::UnknownMethod { .. }
+                | AuthError::NoScram
+                | AuthError::ChannelBindingOnly
+                | AuthError::PasswordNotPrintable { .. }
+                | AuthError::ServerFirst { .. }
+                | AuthError::Nonce
+                | AuthError::Iterations { .. }
+                | AuthError::ServerFinal { .. }
+                | AuthError::ServerRefused
+                | AuthError::Signature),
+            ) => Fatal::Auth(error),
             StoredFatal::Server(fields) => Fatal::Server(self.server_error(fields)),
             StoredFatal::Nul { field } => Fatal::Nul { field },
             StoredFatal::StartupTooLong { len } => Fatal::StartupTooLong { len },
@@ -1504,8 +1816,8 @@ impl<A: Allocator + Copy> Connection<A> {
 
 /// Gives back most of a buffer's room once it holds under a quarter of it.
 fn shrink<A: Allocator>(buffer: &mut Vec<u8, A>) {
-    if buffer.capacity() > SHRINK_ABOVE && buffer.len() < buffer.capacity() / 4 {
-        buffer.shrink_to(buffer.len().saturating_mul(2).max(SHRINK_ABOVE));
+    if buffer.capacity() > SHRINK_ABOVE && buffer.len() < buffer.capacity() / SHRINK_BELOW {
+        buffer.shrink_to(buffer.len().saturating_mul(SHRINK_KEEPS).max(SHRINK_ABOVE));
     }
 }
 
@@ -1567,25 +1879,54 @@ fn write_query<A: Allocator>(
     // One format code for every parameter: binary.
     put_u16(out, 1);
     put_u16(out, 1);
-    // At most `u16::MAX`: as many as the statement's parameters, checked when it was prepared.
-    put_u16(out, params.len() as u16);
+    // As many as the statement's parameters, checked when it was prepared, so this refuses
+    // nothing more.
+    let Ok(count) = u16::try_from(params.len()) else {
+        return Err(Refused::TooManyParams { count: params.len() });
+    };
+    put_u16(out, count);
     for (index, (&param, &value)) in params.iter().zip(values).enumerate() {
         let written = match (param, value) {
-            (_, Bound::Value(ValueRef::Null)) => {
+            (ParamType::Scalar(..) | ParamType::Array(..), Bound::Value(ValueRef::Null)) => {
                 put_i32(out, -1);
                 Ok(())
             }
-            (ParamType::Scalar(storage), Bound::Value(value))
-                if value.storage() == Some(storage) =>
-            {
-                codec::encode(value, out)
-            }
-            (ParamType::Array(storage), Bound::Array(items)) => {
-                codec::encode_array(storage, items, out)
-            }
-            (_, value) => {
+            (
+                ParamType::Scalar(
+                    storage @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+                ),
+                Bound::Value(
+                    value @ (ValueRef::Boolean(..)
+                    | ValueRef::Integer(..)
+                    | ValueRef::Real(..)
+                    | ValueRef::Text(..)
+                    | ValueRef::Blob(..)),
+                ),
+            ) if value.storage() == Some(storage) => codec::encode(value, out),
+            (
+                ParamType::Array(
+                    storage @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+                ),
+                Bound::Array(items),
+            ) => codec::encode_array(storage, items, out),
+            (ParamType::Scalar(..) | ParamType::Array(..), Bound::Value(..) | Bound::Array(..)) => {
                 let got = match value {
-                    Bound::Value(value) => value.storage().map_or(0, codec::scalar_oid),
+                    Bound::Value(
+                        value @ (ValueRef::Null
+                        | ValueRef::Boolean(..)
+                        | ValueRef::Integer(..)
+                        | ValueRef::Real(..)
+                        | ValueRef::Text(..)
+                        | ValueRef::Blob(..)),
+                    ) => value.storage().map_or(0, codec::scalar_oid),
                     Bound::Array(items) => {
                         items.iter().find_map(ValueRef::storage).map_or(0, codec::array_oid)
                     }
@@ -1594,15 +1935,15 @@ fn write_query<A: Allocator>(
             }
         };
         written.map_err(|why| Refused::Param { index, why })?;
-        let len = out.len() - at;
+        let len = out.len().saturating_sub(at);
         if len > MESSAGE_MOST {
-            return Err(Refused::TooLong { message: "Bind", len });
+            return Err(Refused::TooLong { message: BIND, len });
         }
     }
     // One format code for every result column: binary.
     put_u16(out, 1);
     put_u16(out, 1);
-    proto::finish(out, at).map_err(too_long("Bind"))?;
+    proto::finish(out, at).map_err(too_long(BIND))?;
 
     let at = proto::begin(out, b'E');
     put_cstr(out, b"");
@@ -1616,7 +1957,7 @@ fn write_close<A: Allocator>(out: &mut Vec<u8, A>, name: &[u8]) -> Result<(), Re
     let at = proto::begin(out, b'C');
     out.push(b'S');
     put_cstr(out, name);
-    proto::finish(out, at).map_err(too_long("Close"))?;
+    proto::finish(out, at).map_err(too_long(CLOSE))?;
     write_sync(out)
 }
 
@@ -1639,8 +1980,7 @@ fn parameter_description<A: Allocator>(
         }
     }
     reader.end()?;
-    // At most `u16::MAX`, checked when it was prepared.
-    let expected = held.params.len() as u16;
+    let expected = held.param_count;
     if count != expected {
         mismatch = Some(Stored::ParamCount { expected, got: count });
     }
@@ -1657,8 +1997,7 @@ fn row_description<A: Allocator>(
     let mut reader = Reader::new(body);
     let count = reader.u16("column count")?;
     let mut mismatch = None;
-    // At most `u16::MAX`, checked when it was prepared.
-    let expected = held.storages.len() as u16;
+    let expected = held.column_count;
     if !held.rows {
         mismatch = Some(Stored::Returns { expected: Returns::Count, got: Returns::Rows(count) });
     } else if count != expected {
@@ -1682,8 +2021,7 @@ fn row_description<A: Allocator>(
         }
         let i = usize::from(index);
         if name != held.name(i) {
-            // A message's length fits `u32`.
-            let got = Span { at: from + 5 + at as u64, len: name.len() as u32 };
+            let got = Span { at: from + u64_from_usize(HEADER_BYTES + at), len: name.len() };
             mismatch = Some(Stored::ColumnName { index, got });
         } else if let Some(&storage) = held.storages.get(i)
             && codec::scalar_oid(storage) != oid
@@ -1702,16 +2040,13 @@ fn data_row<A: Allocator>(held: &Statement<A>, body: &[u8]) -> Result<Option<Sto
     let mut reader = Reader::new(body);
     let count = reader.u16("value count")?;
     let mut rest = reader.rest();
-    // At most `u16::MAX`, checked when it was prepared.
-    let expected = held.storages.len() as u16;
+    let expected = held.column_count;
     if count != expected {
         return Ok(Some(Stored::RowWidth { expected, got: count }));
     }
-    for (index, &storage) in held.storages.iter().enumerate() {
-        // Below `u16::MAX`: there are `count` columns.
-        let index = index as u16;
+    for (index, &storage) in (0..count).zip(held.storages.iter()) {
         let checked =
-            codec::split_value(&mut rest, "value").and_then(|value| codec::decode(storage, value));
+            codec::split_value(&mut rest, VALUE).and_then(|value| codec::decode(storage, value));
         if let Err(error) = checked {
             return Ok(Some(Stored::Value { index, error }));
         }

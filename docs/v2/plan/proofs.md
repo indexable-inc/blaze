@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-130 theorems: 117 in `lean`, 13 in `lean/analysis`.
+132 theorems: 119 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1203,4 +1203,18 @@ theorem atomics.adds_until_done.spec.proof : atomics.adds_until_done.spec.statem
 
 ```lean
 theorem atomics.pokes_count.spec.proof : atomics.pokes_count.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.proof`** (`BlazeCore.Wait.ParkingTime`, `lean`): The statement blaze generates from the theorem function a_park_left_alone_returns_or_sleeps holds of the models of the real park and unpark on the kernel whose wait has a deadline and the world's clock: after every schedule of the two over one word (empty or holding a token), every script of clock readings, every choice of the kernel's and every deadline or none, eight more steps of the park alone with the kernel quiet leave it returned or asleep, never running (31 reachable states; the longest run alone is six steps).
+
+```lean
+theorem blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.proof :
+    blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof`** (`BlazeCore.Wait.ParkingDeadline`, `lean`): The statement blaze generates from the theorem function a_park_keeps_its_deadline holds of the models of the real park and unpark on the kernel whose wait has a deadline and the world's clock: for every schedule, every script of clock readings, every choice of the kernel's and every deadline or none, a park that says its deadline passed has one and the clock when the schedule ends is at or past it, and a park asleep when the schedule ends has a deadline the clock has not reached.
+
+```lean
+theorem blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof :
+    blaze_core.wait.parking.a_park_keeps_its_deadline.spec.statement
 ```

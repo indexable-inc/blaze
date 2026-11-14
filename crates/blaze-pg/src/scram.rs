@@ -16,7 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use blaze_sha256::{Sha256, digest};
 
 use crate::error::AuthError;
-use crate::proto::put_base64;
+use crate::proto::{DECIMAL, put_base64};
 
 /// The most PBKDF2 iterations a server may ask for. Postgres asks 4096 by default
 /// (`scram_iterations`); each is two SHA-256 compressions, so this bounds the work a server
@@ -25,6 +25,33 @@ pub const ITERATIONS_MOST: u32 = 1 << 20;
 
 /// The longest salt read, in bytes. Postgres's are 16.
 pub const SALT_MOST: usize = 128;
+
+/// SHA-256's block: HMAC pads its key to one (RFC 2104).
+const BLOCK: usize = 64;
+
+/// SHA-256's digest: a MAC, a salted password, a signature.
+const DIGEST_BYTES: usize = 32;
+
+/// HMAC's inner pad byte (RFC 2104).
+const IPAD: u8 = 0x36;
+
+/// HMAC's outer pad byte (RFC 2104).
+const OPAD: u8 = 0x5c;
+
+/// The first printable ASCII byte, the space: a password of printable ASCII is one SASLprep
+/// leaves as it is.
+const PRINTABLE_FIRST: u8 = 0x20;
+
+/// The last printable ASCII byte, `~`, for the password and the nonce.
+const PRINTABLE_LAST: u8 = 0x7e;
+
+/// The first byte a nonce may hold: printable ASCII but the space (RFC 5802's `printable`
+/// also leaves out `,`, which ends the attribute before this is checked).
+const NONCE_FIRST: u8 = 0x21;
+
+/// The most digits an iteration count is read with: `u32::MAX` has 10, and
+/// [`ITERATIONS_MOST`] fewer, so a longer count is refused before it is summed.
+const COUNT_DIGITS_MOST: usize = 10;
 
 /// HMAC-SHA-256 with its key's inner and outer pads hashed once, so each MAC is the message's
 /// blocks plus two.
@@ -36,18 +63,18 @@ pub struct Hmac {
 
 impl Hmac {
     pub fn new(key: &[u8]) -> Hmac {
-        let mut block = [0u8; 64];
+        let mut block = [0u8; BLOCK];
         if key.len() > block.len() {
             let hashed = digest(key);
             block[..hashed.len()].copy_from_slice(&hashed);
         } else {
             block[..key.len()].copy_from_slice(key);
         }
-        let mut inner_pad = [0u8; 64];
-        let mut outer_pad = [0u8; 64];
+        let mut inner_pad = [0u8; BLOCK];
+        let mut outer_pad = [0u8; BLOCK];
         for ((byte, inner), outer) in block.iter().zip(&mut inner_pad).zip(&mut outer_pad) {
-            *inner = byte ^ 0x36;
-            *outer = byte ^ 0x5c;
+            *inner = byte ^ IPAD;
+            *outer = byte ^ OPAD;
         }
         let mut inner = Sha256::new();
         inner.update(&inner_pad);
@@ -91,18 +118,27 @@ pub fn pbkdf2(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
 
 /// Whether `password` is printable ASCII, the passwords SASLprep leaves as they are: the byte
 /// that is not, if one is not.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn unprintable(password: &[u8]) -> Option<usize> {
-    password.iter().position(|b| !(0x20..=0x7e).contains(b))
+    password.iter().position(|b| !(PRINTABLE_FIRST..=PRINTABLE_LAST).contains(b))
 }
 
 /// Writes the client-first-message, `n,,n=<user>,r=<nonce>`, with `=` and `,` in the user
 /// escaped (`=3D`, `=2C`). Its bare part (after `n,,`) is what [`client_final`] takes.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn client_first<A: Allocator>(user: &[u8], nonce: &[u8], out: &mut Vec<u8, A>) {
     out.extend_from_slice(b"n,,");
     put_bare(user, nonce, out);
 }
 
 /// The client-first-message-bare: `n=<user>,r=<nonce>`.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn put_bare<A: Allocator>(user: &[u8], nonce: &[u8], out: &mut Vec<u8, A>) {
     out.extend_from_slice(b"n=");
     for &byte in user {
@@ -128,6 +164,9 @@ pub struct ServerFirst<'a> {
 
 /// Reads `r=<nonce>,s=<salt>,i=<iterations>`. A mandatory extension (`m=`) or any attribute
 /// after the count is refused: none is spoken here, and none is ignored.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn server_first<'a>(
     message: &'a [u8],
     client_nonce: &[u8],
@@ -148,7 +187,7 @@ pub fn server_first<'a>(
     if nonce.len() <= client_nonce.len() || !nonce.starts_with(client_nonce) {
         return Err(AuthError::Nonce);
     }
-    if nonce.iter().any(|b| !(0x21..=0x7e).contains(b)) {
+    if nonce.iter().any(|b| !(NONCE_FIRST..=PRINTABLE_LAST).contains(b)) {
         return Err(AuthError::ServerFirst { what: "has a nonce that is not printable ASCII" });
     }
     let mut salt = [0u8; SALT_MOST];
@@ -161,15 +200,19 @@ pub fn server_first<'a>(
             });
         }
     };
-    if count.is_empty() || count.len() > 10 || !count.iter().all(u8::is_ascii_digit) {
+    if count.is_empty() || count.len() > COUNT_DIGITS_MOST || !count.iter().all(u8::is_ascii_digit)
+    {
         return Err(AuthError::ServerFirst { what: "has an iteration count that is not a number" });
     }
-    let iterations = count.iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0'));
+    let iterations = count.iter().fold(0u64, |n, d| n * DECIMAL + u64::from(d - b'0'));
     if iterations == 0 || iterations > u64::from(ITERATIONS_MOST) {
         return Err(AuthError::Iterations { iterations });
     }
-    // At most `ITERATIONS_MOST`, checked above.
-    Ok(ServerFirst { nonce, salt, salt_len, iterations: iterations as u32 })
+    // At most `ITERATIONS_MOST`, checked above, so this refuses nothing more.
+    let Ok(iterations) = u32::try_from(iterations) else {
+        return Err(AuthError::Iterations { iterations });
+    };
+    Ok(ServerFirst { nonce, salt, salt_len, iterations })
 }
 
 /// Writes the client-final-message, `c=biws,r=<nonce>,p=<proof>`, for `password` (already
@@ -210,6 +253,9 @@ pub fn client_final<A: Allocator>(
 
 /// Checks the server-final-message, `v=<signature>`, against the signature [`client_final`]
 /// returned.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn server_final(message: &[u8], expected: &[u8; 32]) -> Result<(), AuthError> {
     let signature = match message {
         [b'e', b'=', ..] => return Err(AuthError::ServerRefused),
@@ -220,9 +266,9 @@ pub fn server_final(message: &[u8], expected: &[u8; 32]) -> Result<(), AuthError
     if signature.contains(&b',') {
         return Err(AuthError::ServerFinal { what: "has an attribute after its verifier" });
     }
-    let mut got = [0u8; 32];
+    let mut got = [0u8; DIGEST_BYTES];
     match STANDARD.decode_slice(signature, &mut got) {
-        Ok(32) => {}
+        Ok(DIGEST_BYTES) => {}
         _ => {
             return Err(AuthError::ServerFinal {
                 what: "has a verifier that is not base64 of 32 bytes",

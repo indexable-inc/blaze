@@ -15,14 +15,17 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use crate::ast::{
-    CallArgs, ChainOp, CompareOp, Expr, ExprKind, JoinKind, Name, ResultColumn, SqlType, Statement,
+    CallArgs, ChainOp, CompareOp, Expr, ExprKind, JoinKind, Name, ResultColumn, Statement,
     TableRef, UnaryOp,
 };
-use crate::lex::keyword;
+use crate::desc::Storage;
+use crate::lex::{BLOB_OPEN, Keyword, keyword, keyword_text};
 use crate::parse::MAX_DEPTH;
 
 /// Writes `statement` as text of the subset, which [`crate::parse::parse`] reads back to a tree
 /// [`crate::same::same`] to it.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn print<A: Allocator>(statement: &Statement<'_, A>, out: &mut impl fmt::Write) -> fmt::Result {
     Printer { out, parentheses: true }.statement(statement)
 }
@@ -86,45 +89,32 @@ fn quotes_doubled(text: &str) -> bool {
     true
 }
 
-fn chain_operator(op: ChainOp) -> &'static str {
-    match op {
-        ChainOp::Or => "or",
-        ChainOp::And => "and",
-        ChainOp::Add => "+",
-        ChainOp::Sub => "-",
-        ChainOp::Mul => "*",
-        ChainOp::Div => "/",
-        ChainOp::Rem => "%",
-        ChainOp::Concat => "||",
-    }
-}
-
-fn compare_operator(op: CompareOp) -> &'static str {
-    match op {
-        CompareOp::Eq => "=",
-        CompareOp::Ne => "<>",
-        CompareOp::Lt => "<",
-        CompareOp::Le => "<=",
-        CompareOp::Gt => ">",
-        CompareOp::Ge => ">=",
-        CompareOp::Is => "is",
-        CompareOp::IsNot => "is not",
-    }
-}
-
-fn type_name(to: SqlType) -> &'static str {
-    match to {
-        SqlType::Boolean => "boolean",
-        SqlType::Integer => "integer",
-        SqlType::Real => "real",
-        SqlType::Text => "text",
-        SqlType::Blob => "blob",
-    }
-}
-
 impl<W: fmt::Write> Printer<'_, W> {
     fn str(&mut self, text: &str) -> fmt::Result {
         self.out.write_str(text)
+    }
+
+    /// `keyword`, in the spelling the lexer reads ([`keyword_text`]).
+    fn word(&mut self, keyword: Keyword) -> fmt::Result {
+        self.str(keyword_text(keyword).ok_or(fmt::Error)?)
+    }
+
+    /// `keyword` and the space after it.
+    fn lead(&mut self, keyword: Keyword) -> fmt::Result {
+        self.word(keyword)?;
+        self.str(" ")
+    }
+
+    /// The space before `keyword`, and `keyword`.
+    fn tail(&mut self, keyword: Keyword) -> fmt::Result {
+        self.str(" ")?;
+        self.word(keyword)
+    }
+
+    /// `keyword` with a space either side.
+    fn pad(&mut self, keyword: Keyword) -> fmt::Result {
+        self.tail(keyword)?;
+        self.str(" ")
     }
 
     fn name(&mut self, name: &Name<'_>) -> fmt::Result {
@@ -158,39 +148,46 @@ impl<W: fmt::Write> Printer<'_, W> {
                 if select.offset.is_some() && select.limit.is_none() {
                     return Err(fmt::Error);
                 }
-                self.str("select ")?;
+                self.lead(Keyword::Select)?;
                 if select.distinct {
-                    self.str("distinct ")?;
+                    self.lead(Keyword::Distinct)?;
                 }
                 self.result_columns(&select.columns)?;
                 if let Some(from) = &select.from {
-                    self.str(" from ")?;
+                    self.pad(Keyword::From)?;
                     self.table_ref(&from.first)?;
                     for join in &from.joins {
-                        self.str(match join.kind {
-                            JoinKind::Inner => " join ",
-                            JoinKind::Left => " left join ",
-                        })?;
+                        match join.kind {
+                            JoinKind::Inner => {}
+                            JoinKind::Left => self.tail(Keyword::Left)?,
+                        }
+                        self.pad(Keyword::Join)?;
                         self.table_ref(&join.table)?;
-                        self.str(" on ")?;
+                        self.pad(Keyword::On)?;
                         self.top(&join.on)?;
                     }
                 }
-                self.clause(" where ", select.filter.as_ref())?;
+                self.clause(Keyword::Where, select.filter.as_ref())?;
                 if !select.group_by.is_empty() {
-                    self.str(" group by ")?;
+                    self.tail(Keyword::Group)?;
+                    self.pad(Keyword::By)?;
                     self.list(&select.group_by)?;
                 }
-                self.clause(" having ", select.having.as_ref())?;
+                self.clause(Keyword::Having, select.having.as_ref())?;
                 for (at, term) in select.order_by.iter().enumerate() {
-                    self.str(if at == 0 { " order by " } else { ", " })?;
+                    if at == 0 {
+                        self.tail(Keyword::Order)?;
+                        self.pad(Keyword::By)?;
+                    } else {
+                        self.str(", ")?;
+                    }
                     self.top(&term.expr)?;
                     if term.descending {
-                        self.str(" desc")?;
+                        self.tail(Keyword::Desc)?;
                     }
                 }
-                self.clause(" limit ", select.limit.as_ref())?;
-                self.clause(" offset ", select.offset.as_ref())
+                self.clause(Keyword::Limit, select.limit.as_ref())?;
+                self.clause(Keyword::Offset, select.offset.as_ref())
             }
             Statement::Insert(insert) => {
                 // An `insert` names one column or more and has one row or more, none empty.
@@ -200,7 +197,8 @@ impl<W: fmt::Write> Printer<'_, W> {
                 {
                     return Err(fmt::Error);
                 }
-                self.str("insert into ")?;
+                self.lead(Keyword::Insert)?;
+                self.lead(Keyword::Into)?;
                 self.name(&insert.table)?;
                 self.str(" (")?;
                 for (at, column) in insert.columns.iter().enumerate() {
@@ -209,7 +207,8 @@ impl<W: fmt::Write> Printer<'_, W> {
                     }
                     self.name(column)?;
                 }
-                self.str(") values ")?;
+                self.str(") ")?;
+                self.lead(Keyword::Values)?;
                 for (at, row) in insert.rows.iter().enumerate() {
                     if at > 0 {
                         self.str(", ")?;
@@ -224,9 +223,9 @@ impl<W: fmt::Write> Printer<'_, W> {
                 if update.sets.is_empty() {
                     return Err(fmt::Error);
                 }
-                self.str("update ")?;
+                self.lead(Keyword::Update)?;
                 self.name(&update.table)?;
-                self.str(" set ")?;
+                self.pad(Keyword::Set)?;
                 for (at, set) in update.sets.iter().enumerate() {
                     if at > 0 {
                         self.str(", ")?;
@@ -235,22 +234,28 @@ impl<W: fmt::Write> Printer<'_, W> {
                     self.str(" = ")?;
                     self.top(&set.value)?;
                 }
-                self.clause(" where ", update.filter.as_ref())?;
+                self.clause(Keyword::Where, update.filter.as_ref())?;
                 self.returning(&update.returning)
             }
             Statement::Delete(delete) => {
-                self.str("delete from ")?;
+                self.lead(Keyword::Delete)?;
+                self.lead(Keyword::From)?;
                 self.name(&delete.table)?;
-                self.clause(" where ", delete.filter.as_ref())?;
+                self.clause(Keyword::Where, delete.filter.as_ref())?;
                 self.returning(&delete.returning)
             }
         }
     }
 
-    fn clause<A: Allocator>(&mut self, keyword: &str, expr: Option<&Expr<'_, A>>) -> fmt::Result {
+    /// ` keyword expr`, if there is an `expr`.
+    fn clause<A: Allocator>(
+        &mut self,
+        keyword: Keyword,
+        expr: Option<&Expr<'_, A>>,
+    ) -> fmt::Result {
         match expr {
             Some(expr) => {
-                self.str(keyword)?;
+                self.pad(keyword)?;
                 self.top(expr)
             }
             None => Ok(()),
@@ -261,7 +266,7 @@ impl<W: fmt::Write> Printer<'_, W> {
         if columns.is_empty() {
             return Ok(());
         }
-        self.str(" returning ")?;
+        self.pad(Keyword::Returning)?;
         self.result_columns(columns)
     }
 
@@ -283,7 +288,7 @@ impl<W: fmt::Write> Printer<'_, W> {
                 ResultColumn::Expr { expr, alias } => {
                     self.top(expr)?;
                     if let Some(alias) = alias {
-                        self.str(" as ")?;
+                        self.pad(Keyword::As)?;
                         self.name(alias)?;
                     }
                 }
@@ -295,7 +300,7 @@ impl<W: fmt::Write> Printer<'_, W> {
     fn table_ref(&mut self, table: &TableRef<'_>) -> fmt::Result {
         self.name(&table.table)?;
         if let Some(alias) = &table.alias {
-            self.str(" as ")?;
+            self.pad(Keyword::As)?;
             self.name(alias)?;
         }
         Ok(())
@@ -336,8 +341,33 @@ impl<W: fmt::Write> Printer<'_, W> {
         }
     }
 
-    fn not(&mut self, negated: bool) -> fmt::Result {
-        if negated { self.str(" not") } else { Ok(()) }
+    fn chain_op(&mut self, op: ChainOp) -> fmt::Result {
+        match op {
+            ChainOp::Or => self.word(Keyword::Or),
+            ChainOp::And => self.word(Keyword::And),
+            ChainOp::Add => self.str("+"),
+            ChainOp::Sub => self.str("-"),
+            ChainOp::Mul => self.str("*"),
+            ChainOp::Div => self.str("/"),
+            ChainOp::Rem => self.str("%"),
+            ChainOp::Concat => self.str("||"),
+        }
+    }
+
+    fn compare_op(&mut self, op: CompareOp) -> fmt::Result {
+        match op {
+            CompareOp::Eq => self.str("="),
+            CompareOp::Ne => self.str("<>"),
+            CompareOp::Lt => self.str("<"),
+            CompareOp::Le => self.str("<="),
+            CompareOp::Gt => self.str(">"),
+            CompareOp::Ge => self.str(">="),
+            CompareOp::Is => self.word(Keyword::Is),
+            CompareOp::IsNot => {
+                self.word(Keyword::Is)?;
+                self.tail(Keyword::Not)
+            }
+        }
     }
 
     /// `expr`, `depth` levels down its statement's expression (the top is 1).
@@ -349,8 +379,10 @@ impl<W: fmt::Write> Printer<'_, W> {
         }
         let below = depth + 1;
         match &expr.kind {
-            ExprKind::Null => self.str("null"),
-            ExprKind::Boolean(value) => self.str(if *value { "true" } else { "false" }),
+            ExprKind::Null => self.word(Keyword::Null),
+            ExprKind::Boolean(value) => {
+                self.word(if *value { Keyword::True } else { Keyword::False })
+            }
             ExprKind::Integer(value) => write!(self.out, "{value}"),
             ExprKind::Real(value) => {
                 if !value.is_finite() || value.is_sign_negative() {
@@ -370,7 +402,7 @@ impl<W: fmt::Write> Printer<'_, W> {
                 if digits.len() % 2 != 0 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                     return Err(fmt::Error);
                 }
-                self.str("x'")?;
+                self.str(BLOB_OPEN)?;
                 self.str(digits)?;
                 self.str("'")
             }
@@ -382,11 +414,12 @@ impl<W: fmt::Write> Printer<'_, W> {
                 self.name(column)
             }
             ExprKind::Param(name) => self.param(name),
-            ExprKind::Unary { op, operand } => {
-                self.str(match op {
-                    UnaryOp::Neg => "-",
-                    UnaryOp::Not => "not ",
-                })?;
+            ExprKind::Unary { op: UnaryOp::Neg, operand } => {
+                self.str("-")?;
+                self.operand(operand, below)
+            }
+            ExprKind::Unary { op: UnaryOp::Not, operand } => {
+                self.lead(Keyword::Not)?;
                 self.operand(operand, below)
             }
             ExprKind::Chain { first, rest } => {
@@ -402,28 +435,46 @@ impl<W: fmt::Write> Printer<'_, W> {
                 self.operand(first, below)?;
                 for link in rest.iter() {
                     self.str(" ")?;
-                    self.str(chain_operator(link.op))?;
+                    self.chain_op(link.op)?;
                     self.str(" ")?;
                     self.operand(&link.operand, below)?;
                 }
                 Ok(())
             }
-            ExprKind::Compare { op, left, right } => {
+            ExprKind::Compare {
+                op:
+                    op @ (CompareOp::Eq
+                    | CompareOp::Ne
+                    | CompareOp::Lt
+                    | CompareOp::Le
+                    | CompareOp::Gt
+                    | CompareOp::Ge
+                    | CompareOp::Is
+                    | CompareOp::IsNot),
+                left,
+                right,
+            } => {
                 self.operand(left, below)?;
                 self.str(" ")?;
-                self.str(compare_operator(*op))?;
+                self.compare_op(*op)?;
                 self.str(" ")?;
                 // `a is (null)`: bare, `a is null` would read back as `IsNull`.
                 let is = matches!(op, CompareOp::Is | CompareOp::IsNot);
                 if is && matches!(right.kind, ExprKind::Null) {
-                    self.str("(null)")
+                    self.str("(")?;
+                    self.word(Keyword::Null)?;
+                    self.str(")")
                 } else {
                     self.operand(right, below)
                 }
             }
             ExprKind::IsNull { operand, negated } => {
                 self.operand(operand, below)?;
-                self.str(if *negated { " is not null" } else { " is null" })
+                self.tail(Keyword::Is)?;
+                if *negated {
+                    self.tail(Keyword::Not)?;
+                }
+                self.tail(Keyword::Null)
             }
             ExprKind::InList { operand, list, negated } => {
                 // An `in` list has at least one entry; `in ()` is not text of the subset.
@@ -431,74 +482,93 @@ impl<W: fmt::Write> Printer<'_, W> {
                     return Err(fmt::Error);
                 }
                 self.operand(operand, below)?;
-                self.not(*negated)?;
-                self.str(" in (")?;
+                if *negated {
+                    self.tail(Keyword::Not)?;
+                }
+                self.pad(Keyword::In)?;
+                self.str("(")?;
                 self.list_at(list, below)?;
                 self.str(")")
             }
             ExprKind::InParam { operand, list, negated } => {
                 self.operand(operand, below)?;
-                self.not(*negated)?;
-                self.str(" in ")?;
+                if *negated {
+                    self.tail(Keyword::Not)?;
+                }
+                self.pad(Keyword::In)?;
                 self.param(list)
             }
             ExprKind::Between { operand, low, high, negated } => {
                 self.operand(operand, below)?;
-                self.not(*negated)?;
-                self.str(" between ")?;
+                if *negated {
+                    self.tail(Keyword::Not)?;
+                }
+                self.pad(Keyword::Between)?;
                 self.operand(low, below)?;
-                self.str(" and ")?;
+                self.pad(Keyword::And)?;
                 self.operand(high, below)
             }
             ExprKind::Like { operand, pattern, negated } => {
                 self.operand(operand, below)?;
-                self.not(*negated)?;
-                self.str(" like ")?;
+                if *negated {
+                    self.tail(Keyword::Not)?;
+                }
+                self.pad(Keyword::Like)?;
                 self.operand(pattern, below)
             }
             ExprKind::Case { operand, arms, otherwise } => {
                 if arms.is_empty() {
                     return Err(fmt::Error);
                 }
-                self.str("case")?;
+                self.word(Keyword::Case)?;
                 if let Some(operand) = operand {
                     self.str(" ")?;
                     self.expr(operand, below)?;
                 }
                 for arm in arms {
-                    self.str(" when ")?;
+                    self.pad(Keyword::When)?;
                     self.expr(&arm.when, below)?;
-                    self.str(" then ")?;
+                    self.pad(Keyword::Then)?;
                     self.expr(&arm.then, below)?;
                 }
                 if let Some(otherwise) = otherwise {
-                    self.str(" else ")?;
+                    self.pad(Keyword::Else)?;
                     self.expr(otherwise, below)?;
                 }
-                self.str(" end")
+                self.tail(Keyword::End)
             }
-            ExprKind::Cast { operand, to } => {
-                self.str("cast(")?;
+            ExprKind::Cast {
+                operand,
+                to:
+                    to @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+            } => {
+                self.word(Keyword::Cast)?;
+                self.str("(")?;
                 self.expr(operand, below)?;
-                self.str(" as ")?;
-                self.str(type_name(*to))?;
+                self.pad(Keyword::As)?;
+                self.str(to.name().ok_or(fmt::Error)?)?;
                 self.str(")")
             }
-            ExprKind::Call { function, args } => {
+            ExprKind::Call { function, args: CallArgs::Star } => {
                 self.name(function)?;
                 self.str("(")?;
-                match args {
-                    CallArgs::Star => self.str("*")?,
-                    CallArgs::List { distinct, args } => {
-                        if *distinct {
-                            if args.is_empty() {
-                                return Err(fmt::Error);
-                            }
-                            self.str("distinct ")?;
-                        }
-                        self.list_at(args, below)?;
+                self.str("*")?;
+                self.str(")")
+            }
+            ExprKind::Call { function, args: CallArgs::List { distinct, args } } => {
+                self.name(function)?;
+                self.str("(")?;
+                if *distinct {
+                    if args.is_empty() {
+                        return Err(fmt::Error);
                     }
+                    self.lead(Keyword::Distinct)?;
                 }
+                self.list_at(args, below)?;
                 self.str(")")
             }
         }
