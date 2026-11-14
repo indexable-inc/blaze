@@ -1604,6 +1604,11 @@ struct KeptTrace {
 /// trace holds every fact its reads stand for even where one read (a source map's
 /// positions) keeps it out of a real store; what is compared here is what the facts see.
 fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
+    step_trace(source, body, Step::Borrowck)
+}
+
+/// `body`'s trace of `step` in `source`, as [`borrowck_trace`] keeps the borrow check's.
+fn step_trace(source: &str, body: &'static str, step: Step) -> KeptTrace {
     let db = super::perturb::db(source);
     let def = body_named(&db, body);
     let identity = crate::identity::early_identity(&db, def)
@@ -1611,7 +1616,7 @@ fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
     with_steps_run(&db, true, |seen| {
         let mut facts: Vec<(FactRef, Option<ContentId>)> = Vec::new(); // alloc: test
         let mut through: Vec<&'static str> = Vec::new(); // alloc: test
-        for it in seen.iter().filter(|it| it.def == def && it.step == Step::Borrowck) {
+        for it in seen.iter().filter(|it| it.def == def && it.step == step) {
             match it.class {
                 Classified::Fact(fact) | Classified::Scan(fact) => {
                     facts.push((fact, values::value_in(&db, def, fact)));
@@ -1620,7 +1625,7 @@ fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
                 Classified::Covered | Classified::Refused => {}
             }
         }
-        assert!(!facts.is_empty(), "`{body}`'s borrow check read no fact: it did not run");
+        assert!(!facts.is_empty(), "`{body}`'s {step:?} read no fact: it did not run");
         facts.sort_unstable();
         facts.dedup();
         through.sort_unstable();
@@ -1976,4 +1981,97 @@ fn a_sealed_library_row_is_its_crates_fact_and_changes_with_it() {
     // alloc: test facts, once.
     let mut none = Vec::new();
     assert!(!reads::sealed(&db, def, stray, &mut none), "a stray group stood for {none:?}");
+}
+
+/// A callee's signature edited to name another nominal type of the same shape, and a caller
+/// whose text does not change: the caller, the fixture before and after.
+struct Renominal {
+    what: &'static str,
+    before: &'static str,
+    after: &'static str,
+    /// Whether rustc rejects the caller after the edit.
+    rejected: bool,
+}
+
+const RENOMINALS: [Renominal; 3] = [
+    // A parameter: `f(Meters(1))` against `f(_: Feet)` is a type mismatch.
+    Renominal {
+        what: "a parameter that becomes another newtype of the same shape",
+        before: "//- minicore: sized, copy\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 pub fn f(_x: Meters) {}\npub fn caller() { f(Meters(1)) }\n",
+        after: "//- minicore: sized, copy\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                pub fn f(_x: Feet) {}\npub fn caller() { f(Meters(1)) }\n",
+        rejected: true,
+    },
+    // A type-level marker: `PhantomData<A>` against `PhantomData<B>`.
+    Renominal {
+        what: "a parameter whose marker type becomes another unit struct",
+        before: "//- minicore: sized, copy, phantom_data\n\
+                 use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                 pub fn f(_x: PhantomData<A>) {}\npub fn caller() { f(PhantomData::<A>) }\n",
+        after: "//- minicore: sized, copy, phantom_data\n\
+                use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                pub fn f(_x: PhantomData<B>) {}\npub fn caller() { f(PhantomData::<A>) }\n",
+        rejected: true,
+    },
+    // A return type, with an impl of the trait for each type: rustc accepts both programs, and
+    // the caller's `.m()` must select `Feet`'s impl after the edit. A stale answer selects
+    // `Meters`'s and returns 1 where the program returns 2: a silent miscompile.
+    Renominal {
+        what: "a return type that becomes another newtype, each with its own impl",
+        before: "//- minicore: sized, copy\n\
+                 pub trait Tr { fn m(&self) -> u32; }\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                 impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                 pub fn f() -> Meters { Meters(1) }\npub fn caller() -> u32 { f().m() }\n",
+        after: "//- minicore: sized, copy\n\
+                pub trait Tr { fn m(&self) -> u32; }\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                pub fn f() -> Feet { Feet(1) }\npub fn caller() -> u32 { f().m() }\n",
+        rejected: false,
+    },
+];
+
+/// The invariant: a caller's stored inference, MIR and borrow check are not served after its
+/// callee's signature comes to name another nominal type of the same shape (a newtype for
+/// another, `PhantomData<A>` for `PhantomData<B>`, a return type with its own impls), though
+/// the caller's text, and so its identity, did not change: some fact its trace lists (the
+/// callee's `Signature`, whose value is its signature hash) tells the two programs apart. And
+/// where rustc rejects the caller after the edit, its inference reports the mismatch: the
+/// fixture says what it is meant to. A stale hit here accepts a program rustc rejects, or
+/// calls the impl of the type the callee no longer returns.
+#[test]
+fn a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller() {
+    let mut stale: Vec<String> = Vec::new(); // alloc: test
+    for case in &RENOMINALS {
+        let edited = super::perturb::db(case.after);
+        let caller = body_named(&edited, "caller");
+        assert_eq!(
+            InferenceResult::of(&edited, caller).has_type_mismatches(),
+            case.rejected,
+            "{}: the edited caller's inference does not say what rustc says",
+            case.what,
+        );
+        for step in [Step::Infer, Step::Mir, Step::Borrowck] {
+            let kept = step_trace(case.before, "caller", step);
+            assert_eq!(
+                kept.identity,
+                crate::identity::early_identity(&edited, caller).expect("the caller has a key"),
+                "{}: the caller's text did not change, so neither does its key",
+                case.what,
+            );
+            if reused(&kept, case.after) {
+                stale.push(format!(
+                    "{}: `caller`'s {step:?} served stale; its facts: {:#?}",
+                    case.what, kept.facts
+                )); // alloc: test
+            }
+        }
+    }
+    assert!(stale.is_empty(), "{}", stale.join("\n"));
 }

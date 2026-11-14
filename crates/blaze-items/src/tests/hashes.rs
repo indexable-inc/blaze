@@ -168,6 +168,57 @@ fn g() -> u32 { f(1) }
     assert_ne!(of(&db, "g").code, g.code);
 }
 
+/// The invariant: a signature that names another nominal type of the same shape (a newtype for
+/// another, a unit marker for another) moves its signature and interface hashes, as it changes
+/// what every caller of it type-checks against: `f(Meters(1))` is accepted with `f(_: Meters)`
+/// and rejected with `f(_: Feet)`. A body's stored inference, MIR and borrow check are checked
+/// by the callee's `Signature` fact, whose value is the signature hash
+/// (`facts::value`, `Fact::Signature`), so a signature hash that spells `Meters` and `Feet`
+/// alike serves a caller's stale result. The control: the two types' layouts are equal, which
+/// is right (a layout does not depend on a name), so codegen may share what depends only on it.
+#[test]
+fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() {
+    let cases = [
+        (
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f(_x: Meters) {}\n",
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f(_x: Feet) {}\n",
+        ),
+        (
+            "pub struct A;\npub struct B;\npub fn f(_x: &A) {}\n",
+            "pub struct A;\npub struct B;\npub fn f(_x: &B) {}\n",
+        ),
+        (
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f() -> Meters { Meters(1) }\n",
+            "pub struct Meters(pub u32);\npub struct Feet(pub u32);\npub fn f() -> Feet { Feet(1) }\n",
+        ),
+    ];
+    for (before, after) in cases {
+        let (mut db, file) = single(before);
+        let f = item(&db, "f");
+        let (signature, interface) = (signature_hash(&db, f).unwrap(), of(&db, "f").interface);
+        edit(&mut db, file, after);
+        let f = item(&db, "f");
+        assert_ne!(
+            signature_hash(&db, f).unwrap(),
+            signature,
+            "`f`'s signature hash did not move when the type it names became another of the \
+             same shape:\n{before}---\n{after}"
+        );
+        assert_ne!(
+            of(&db, "f").interface,
+            interface,
+            "`f`'s interface hash did not move:\n{before}---\n{after}"
+        );
+    }
+    // The control: equal shapes, equal layouts.
+    let (db, _) = single(cases[0].0);
+    assert_eq!(
+        layout_hash(&db, adt(&db, "Meters")).unwrap(),
+        layout_hash(&db, adt(&db, "Feet")).unwrap(),
+        "two types of one shape have one layout"
+    );
+}
+
 #[test]
 fn a_body_edit_executes_no_interface_form_of_another_item() {
     let (mut db, file) = single(
