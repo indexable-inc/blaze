@@ -45,7 +45,8 @@ impl<'a> TreeFacts<'a> {
         let rule_atoms = program.rules.iter().flat_map(|rule| &rule.body);
         let rewrite_atoms = program.rewrites.iter().flat_map(|rewrite| &rewrite.body);
         for atom in rule_atoms.chain(rewrite_atoms) {
-            let BodyAtom::Source(source) = atom else {
+            // A negated `match` is asked for its rows the same way, to filter by them.
+            let (BodyAtom::Source(source) | BodyAtom::NegatedSource(source)) = atom else {
                 continue;
             };
             let Atom::Match(m) = &source.value else {

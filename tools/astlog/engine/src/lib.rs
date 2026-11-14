@@ -19,7 +19,9 @@ mod tests;
 use std::alloc::Global;
 
 pub use crate::error::*;
-pub use crate::eval::{Binding, Database, Evaluator, Facts, Relation, Row, Value};
+pub use crate::eval::{
+    Binding, Database, Evaluator, Facts, Limits, MAX_ROWS, Relation, Row, Value,
+};
 pub use crate::program::{
     Action, AppAtom, BodyAtom, CountAtom, Language, Lint, Needs, Parsed, Program, Rewrite, Rule,
     Segment, Severity, SourceAction, SourceAtom, Template, TemplateSyntax, Term, TextAction,
@@ -47,24 +49,38 @@ pub enum PlannedAction<'p, N, X> {
     Source { name: &'p str, value: &'p X, args: Vec<Value<N>> },
 }
 
-/// Run `program` against `facts`: the derived relations and every rewrite action, in rewrite
-/// order and then binding order.
+/// The two results of one run: the derived relations and every rewrite action.
+type Ran<'p, F> = (
+    Database<<F as Facts>::Node>,
+    Vec<Planned<'p, <F as Facts>::Node, <<F as Facts>::Lang as Language>::Action>>,
+);
+
+/// Run `program` against `facts` within [`Limits::DEFAULT`]: the derived relations and every
+/// rewrite action, in rewrite order and then binding order.
 ///
 /// # Errors
 ///
-/// A source's failure, a builtin given the wrong kind of value, or a rewrite target bound to
-/// something other than a node.
-#[expect(clippy::type_complexity, reason = "the two results of one run, named by the signature")]
-pub fn run<'p, F: Facts>(
+/// A source's failure, a builtin given the wrong kind of value, a rewrite target bound to
+/// something other than a node, or a run past [`MAX_ROWS`] rows.
+pub fn run<'p, F: Facts>(program: &'p Program<F::Lang>, facts: &'p F) -> Result<Ran<'p, F>, FError<F>> {
+    run_with(program, facts, Limits::DEFAULT)
+}
+
+/// [`run`] within `limits`.
+///
+/// # Errors
+///
+/// As [`run`], with `limits.rows` for the cap.
+pub fn run_with<'p, F: Facts>(
     program: &'p Program<F::Lang>,
     facts: &'p F,
-) -> Result<(Database<F::Node>, Vec<Planned<'p, F::Node, <F::Lang as Language>::Action>>), FError<F>>
-{
-    let mut evaluator = Evaluator::new(program, facts)?;
+    limits: Limits,
+) -> Result<Ran<'p, F>, FError<F>> {
+    let mut evaluator = Evaluator::new(program, facts, limits)?;
     evaluator.fixpoint()?;
     let mut planned = Vec::new();
     for rewrite in &program.rewrites {
-        for binding in evaluator.bindings(&rewrite.body)? {
+        for binding in evaluator.bindings(&rewrite.body, rewrite.line)? {
             for action in &rewrite.actions {
                 planned.push(plan(facts, rewrite, action, &binding)?);
             }
