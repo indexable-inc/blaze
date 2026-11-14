@@ -24,7 +24,7 @@
 //! (under rustc the crate root needs `#![feature(register_tool, custom_inner_attributes)]` and
 //! `#![register_tool(blaze)]`; under blaze it is accepted as written).
 
-use base_db::Db;
+use base_db::{Db, TargetKind};
 use hir_def::{AttrDefId, DefWithBodyId, FunctionId, HasModule as _, attrs::AttrFlags, expr_store::Body, hir::Expr};
 use hir_ty::{InferenceResult, ParamEnvAndCrate, db::HirDatabase as _};
 use syntax::{
@@ -62,7 +62,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, file: ast::Node<'t>) {
         return;
     }
     let db = cx.db();
-    if test_code::is_test_target(db, cx.krate()) {
+    if matches!(cx.krate().target_kind(db), TargetKind::Test | TargetKind::Bench | TargetKind::Example) {
         return;
     }
     let Some((module, first)) = module_of_file(cx, file) else { return };

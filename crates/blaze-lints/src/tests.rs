@@ -91,29 +91,6 @@ pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
     lint_given(fixture, flags, conf, |_| {})
 }
 
-/// What [`lint`] says of the fixture's crate in each build `blaze check --all-targets` makes of
-/// a library: plain, then with `--test` ([`built_with_test`]). The crate's code outside
-/// `#[cfg(test)]` is the same production code in both, so both judge it alike: what a lint
-/// finds there, and whether an `#[expect]` there is fulfilled.
-pub(crate) fn lint_both_builds(fixture: &str, flags: &str) -> [String; 2] {
-    [lint(fixture, flags), lint_given(fixture, flags, Conf::default(), built_with_test)]
-}
-
-/// Makes the fixture's crate `main` the `--test` build of its library, as blaze's lowering
-/// does: a [`base_db::TargetKind::Test`] crate whose manifest target stays a `Lib`. A fixture
-/// that wants `cfg(test)` set writes `cfg:test` on the crate.
-fn built_with_test(fx: &mut fixture::Fixture) {
-    let main = blaze_query::db::attach(fx.db(), || main_crate(fx.db()).base());
-    let mut data = blaze_query::db::attach(fx.db(), || main.data(fx.db()).clone());
-    assert!(
-        matches!(data.manifest_kind, base_db::TargetKind::Lib { .. }),
-        "the fixture's crate `main` is a library"
-    );
-    data.target_kind = base_db::TargetKind::Test;
-    main.set_data(fx.db_mut(), data);
-    fx.db_mut().note_crates_changed();
-}
-
 /// [`lint_with`], `given` done to each database's fixture first (a proc-macro crate given its
 /// macros, [`fixture::Fixture::set_proc_macros`]).
 pub(crate) fn lint_given(

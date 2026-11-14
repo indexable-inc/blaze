@@ -54,7 +54,7 @@ use super::{
     Finding, Lint,
     alloc::written_callee,
     facts::{self, Parents},
-    open_wait_loop, test_code, unbounded_wait,
+    open_wait_loop, unbounded_wait,
 };
 use crate::check::Cx;
 
@@ -75,7 +75,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 /// ([`Cx::is_in_test`]), or of an integration test's crate, whose every body only the test
 /// harness runs.
 pub(super) fn in_test(cx: &Cx<'_, '_>) -> bool {
-    cx.is_in_test(cx.root()) || matches!(test_code::target_of(cx.db(), cx.krate()), TargetKind::Test)
+    cx.is_in_test(cx.root()) || matches!(cx.krate().target_kind(cx.db()), TargetKind::Test)
 }
 
 fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {

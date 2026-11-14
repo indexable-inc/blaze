@@ -33,7 +33,7 @@ use hir_def::{
 };
 use std::alloc::Global;
 
-use super::{Finding, Lint, facts, general_facts, test_code};
+use super::{Finding, Lint, facts, general_facts};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::DosHasherOnInput;
@@ -65,7 +65,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     // alloc: the findings of one body, reported at the edge
     let mut found = Vec::new();
     let db = cx.db();
-    if !matches!(test_code::target_of(db, cx.krate()), TargetKind::Lib { is_proc_macro: false }) {
+    if !matches!(cx.krate().target_kind(db), TargetKind::Lib { is_proc_macro: false }) {
         return found;
     }
     let Some(analysis) = cx.analysis() else { return found };

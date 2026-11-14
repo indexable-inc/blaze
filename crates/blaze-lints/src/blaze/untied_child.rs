@@ -41,7 +41,7 @@ use hir_def::{
 };
 use syntax::TextRange;
 
-use super::{Finding, Lint, alloc::written_callee, facts, test_code};
+use super::{Finding, Lint, alloc::written_callee, facts};
 use crate::{check::Cx, diag::Applicability};
 
 const LINT: Lint = Lint::UntiedChild;
@@ -108,7 +108,7 @@ fn find(cx: &Cx<'_, '_>) -> Found {
     let Some(analysis) = cx.analysis() else { return found };
     let Ok(def) = DefWithBodyId::try_from(analysis.def()) else { return found };
     let db = cx.db();
-    let integration = matches!(test_code::target_of(db, cx.krate()), TargetKind::Test);
+    let integration = matches!(cx.krate().target_kind(db), TargetKind::Test);
     if !integration && !cx.is_in_test(cx.root()) {
         return found;
     }

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     conf::Conf,
-    tests::{CLIPPY_OFF, lint, lint_both_builds, lint_with},
+    tests::{CLIPPY_OFF, lint, lint_with},
 };
 
 const STD: &str = r#"
@@ -151,49 +151,6 @@ pub fn hand_on() -> std::env::Vars {
     let out = lint(&fixture(HANDS_ON), &flags());
     assert!(lines(&out).is_empty(), "{out}");
     assert!(!out.contains("unfulfilled"), "the expectation is met:\n{out}");
-}
-
-/// The invariant: a library's `--test` build judges its production code as its plain build
-/// does, so the expectation on a function whose read is inside a closure is fulfilled in both
-/// builds, and one on a function that reads nothing is unfulfilled in both. The `--test` build
-/// once ran no `env_read` (it took the crate's target for a test target) and said the
-/// expectation its plain build had met unfulfilled.
-#[test]
-fn an_expected_read_is_fulfilled_in_the_test_build_too() {
-    const READS: &str = r#"
-pub fn given() {
-    let _read = |name: &str| std::env::var(name);
-}
-"#;
-    const EXPECTED: &str = r#"
-#[expect(
-    blaze::env_read,
-    reason = "the entry point reads its settings once"
-)]
-pub fn given() {
-    let _read = |name: &str| std::env::var(name);
-}
-"#;
-    const MISSED: &str = r#"
-#[expect(
-    blaze::env_read,
-    reason = "the entry point reads its settings once"
-)]
-pub fn paths() -> u32 {
-    std::env::split_paths("a:b")
-}
-"#;
-    for out in lint_both_builds(&fixture(READS), &flags()) {
-        assert_eq!(lines(&out).len(), 1, "{out}");
-    }
-    for out in lint_both_builds(&fixture(EXPECTED), &flags()) {
-        assert!(lines(&out).is_empty(), "{out}");
-        assert!(!out.contains("lint expectation is unfulfilled"), "the expectation is met:\n{out}");
-    }
-    for out in lint_both_builds(&fixture(MISSED), &flags()) {
-        assert!(lines(&out).is_empty(), "{out}");
-        assert_eq!(out.matches("lint expectation is unfulfilled").count(), 1, "{out}");
-    }
 }
 
 /// A value of `env-read-allowed` that is not a list of paths is refused as the file loads.

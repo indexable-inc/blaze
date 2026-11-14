@@ -3,8 +3,6 @@
 //! `#[cfg(test)]` ([`Cx::is_in_test`]), in a module whose own attributes say `cfg(test)` (a
 //! `#[cfg(test)] mod tests;` brought in from its own file, which a walk of that file outside a
 //! body cannot see in its tree), or anywhere in a test, bench or example target.
-//!
-//! What kind of target code is in is [`target_of`]'s, the one home of that question.
 
 use base_db::TargetKind;
 use cfg::{CfgAtom, CfgExpr};
@@ -13,27 +11,9 @@ use syntax::view::{self as ast, AstNode as _};
 
 use crate::check::Cx;
 
-/// The kind of the manifest's target `krate` is built from: what its code is, however it is
-/// built. A library, binary or example built with `--test` is a [`TargetKind::Test`] crate
-/// ([`hir::Crate::target_kind`]) of a `Lib`, `Bin` or `Example` target, and its code outside
-/// `#[cfg(test)]` is the production code its plain build has. A lint that asks what code is
-/// (test code, library code, an integration test's) asks this, so both builds of one target
-/// judge that code alike: a lint that asked `target_kind` judged nothing of a library in its
-/// test build, and an `#[expect]` of it on production code, fulfilled in the plain build, was
-/// reported unfulfilled in the test build. `target_kind` says only how the crate is built
-/// (whether it has a test harness).
-pub(super) fn target_of(db: &base_db::Db, krate: hir::Crate) -> TargetKind {
-    krate.base().data(db).manifest_kind
-}
-
-/// Whether `krate`'s code is all test code: a test, bench or example target ([`target_of`]).
-pub(super) fn is_test_target(db: &base_db::Db, krate: hir::Crate) -> bool {
-    matches!(target_of(db, krate), TargetKind::Test | TargetKind::Bench | TargetKind::Example)
-}
-
 pub(super) fn is_test_code<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> bool {
     let db = cx.db();
-    if is_test_target(db, cx.krate()) {
+    if matches!(cx.krate().target_kind(db), TargetKind::Test | TargetKind::Bench | TargetKind::Example) {
         return true;
     }
     if cx.is_in_test(node) {
@@ -56,7 +36,9 @@ pub(super) fn is_test_code<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> bool {
 pub(super) fn is_test_def(db: &base_db::Db, def: hir_def::DefWithBodyId) -> bool {
     let body = hir::DefWithBody::from(def);
     let mut module = Some(body.module(db));
-    if module.is_some_and(|it| is_test_target(db, it.krate(db))) {
+    if module.is_some_and(|it| {
+        matches!(it.krate(db).target_kind(db), TargetKind::Test | TargetKind::Bench | TargetKind::Example)
+    }) {
         return true;
     }
     if let hir::DefWithBody::Function(it) = body

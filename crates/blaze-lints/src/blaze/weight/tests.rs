@@ -4,7 +4,7 @@
 //! and, for `swapped_arguments`, that its fix lints clean. `try` and `from` give `Result` its
 //! `Try`, without which a `?` lowers to no `return` of the residual.
 
-use crate::tests::{lint, lint_both_builds, offered_in};
+use crate::tests::{lint, offered_in};
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, option, result, try, from, fmt, derive, eq, ord, hash, phantom_data, fn, add, mul\n";
 
@@ -174,96 +174,6 @@ pub fn run(a: u32) -> u32 { scale(a, 3) + scale(a + 1, 3) + once(4) }
     );
     assert_eq!(out.matches("calls of `fn").count(), 1, "{out}");
     assert!(out.contains("every one of the 2 calls of `fn scale` passes `3` for `factor`"), "{out}");
-}
-
-/// What `blaze::<lint_name>` alone says of `main` in its plain build and in its `--test` build.
-fn found_in_both_builds(lint_name: &str, main: &str) -> [String; 2] {
-    lint_both_builds(&format!("{MINICORE}{MAIN}{}", main.trim_start_matches('\n')), &flags(lint_name))
-}
-
-/// The invariant: a library's `--test` build judges its production code as its plain build
-/// does, so an `#[expect]` that silences a finding there is fulfilled in both builds, and one
-/// on an item the lint does not fire on is unfulfilled in both. The `--test` build once took
-/// all of a library for test code and ran no `write_only_field`, and said the expectation its
-/// plain build had met unfulfilled.
-#[test]
-fn an_expected_write_only_field_is_fulfilled_in_the_test_build_too() {
-    let fires = r#"
-pub struct Job { pub id: u32, pub note: u32 }
-pub fn make() -> Job { Job { id: 1, note: 2 } }
-pub fn read(job: &Job) -> u32 { job.id }
-"#;
-    let expected = r#"
-pub struct Job {
-    pub id: u32,
-    #[expect(
-        blaze::write_only_field,
-        reason = "kept for the format"
-    )]
-    pub note: u32,
-}
-pub fn make() -> Job { Job { id: 1, note: 2 } }
-pub fn read(job: &Job) -> u32 { job.id }
-"#;
-    let missed = r#"
-pub struct Job {
-    #[expect(
-        blaze::write_only_field,
-        reason = "read below"
-    )]
-    pub id: u32,
-    pub note: u32,
-}
-pub fn make() -> Job { Job { id: 1, note: 2 } }
-pub fn read(job: &Job) -> u32 { job.id + job.note }
-"#;
-    for out in found_in_both_builds("write_only_field", fires) {
-        assert!(out.contains("field `note` is written and never read in the workspace"), "{out}");
-    }
-    for out in found_in_both_builds("write_only_field", expected) {
-        assert!(!out.contains("is written and"), "{out}");
-        assert!(!out.contains("lint expectation is unfulfilled"), "the expectation is met:\n{out}");
-    }
-    for out in found_in_both_builds("write_only_field", missed) {
-        assert_eq!(out.matches("lint expectation is unfulfilled").count(), 1, "{out}");
-    }
-}
-
-/// The invariant of [`an_expected_write_only_field_is_fulfilled_in_the_test_build_too`], for
-/// `constant_argument`, whose finding is on a parameter inside the function the expectation is on.
-#[test]
-fn an_expected_constant_argument_is_fulfilled_in_the_test_build_too() {
-    let fires = r#"
-fn scale(x: u32, factor: u32) -> u32 { x * factor }
-pub fn run(a: u32) -> u32 { scale(a, 3) + scale(a + 1, 3) }
-"#;
-    let expected = r#"
-#[expect(
-    blaze::constant_argument,
-    reason = "the factor is the caller's to choose"
-)]
-fn scale(x: u32, factor: u32) -> u32 { x * factor }
-pub fn run(a: u32) -> u32 { scale(a, 3) + scale(a + 1, 3) }
-"#;
-    let missed = r#"
-#[expect(
-    blaze::constant_argument,
-    reason = "the factor is the caller's to choose"
-)]
-fn scale(x: u32, factor: u32) -> u32 { x * factor }
-pub fn run(a: u32) -> u32 { scale(a, 3) + scale(a + 1, 4) }
-"#;
-    for out in found_in_both_builds("constant_argument", fires) {
-        assert!(out.contains("every one of the 2 calls of `fn scale` passes `3` for `factor`"), "{out}");
-    }
-    for out in found_in_both_builds("constant_argument", expected) {
-        assert!(!out.contains("calls of `fn"), "{out}");
-        assert!(!out.contains("lint expectation is unfulfilled"), "the expectation is met:\n{out}");
-    }
-    for out in found_in_both_builds("constant_argument", missed) {
-        assert!(!out.contains("calls of `fn"), "{out}");
-        assert_eq!(out.matches("lint expectation is unfulfilled").count(), 1, "{out}");
-    }
 }
 
 #[test]

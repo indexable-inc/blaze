@@ -25,7 +25,7 @@
 use base_db::TargetKind;
 use syntax::{NodeOrToken, TextRange};
 
-use super::{Lint, std_use, test_code};
+use super::{Lint, std_use};
 use crate::check::Cx;
 
 const LINT: Lint = Lint::EnvRead;
@@ -66,7 +66,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
         return;
     }
     let db = cx.db();
-    if matches!(test_code::target_of(db, cx.krate()), TargetKind::BuildScript | TargetKind::Test | TargetKind::Bench) {
+    if matches!(cx.krate().target_kind(db), TargetKind::BuildScript | TargetKind::Test | TargetKind::Bench) {
         return;
     }
     let (mut found, module) = {
