@@ -277,6 +277,7 @@ diagnostics![AnyDiagnostic<'db> ->
     ReturnOutsideFunction,
     TailCallRefused,
     TailCallTrackCaller,
+    LoopMatchRefused,
     UnsafeBinderCastOfNonBinder<'db>,
     InvalidConstArg,
     NotAStructPath<'db>,
@@ -893,6 +894,8 @@ pub enum Unplaced {
     ConstCheck { code: &'static str, message: String },
     /// `check_tail_calls`'s, its message.
     TailCall(&'static str),
+    /// The `#[loop_match]` checks', its message.
+    LoopMatch(&'static str),
     /// Type lowering's (a signature's, a field's, a type alias's), which its node in the store's
     /// source map could not place: the lowering diagnostic as hir-ty has it.
     Lowering(String),
@@ -2123,6 +2126,15 @@ pub struct TailCallRefused {
     /// The `become` expression.
     pub become_expr: InFile<ExprOrPatPtr>,
     pub kind: TailCallErrorKind<InFile<ExprOrPatPtr>>,
+}
+
+pub use hir_ty_mir::mir::loop_match::{LoopMatchErrorKind, NotEarlyWhy as LoopMatchNotEarly};
+
+/// A `#[loop_match]` loop or `#[const_continue]` break rustc refuses:
+/// `hir_ty_mir::mir::loop_match::LoopMatchError` at its syntax.
+#[derive(Debug)]
+pub struct LoopMatchRefused {
+    pub kind: LoopMatchErrorKind<InFile<ExprOrPatPtr>>,
 }
 
 /// A tail call of a `#[track_caller]` function: the lint `tail_call_track_caller`.
@@ -3552,6 +3564,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         if hir_ty_tailck::has_become(body) {
             self.collect_tail_calls(def, placing.get());
         }
+        if body.has_loop_match() {
+            self.collect_loop_match(def, placing.get());
+        }
 
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
             self.acc.extend(AnyDiagnostic::body_validation_diagnostic(
@@ -3613,6 +3628,25 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             // A lint at code with no syntax is not given: rustc's is at the call it writes.
             if let Ok(it) = placed {
                 self.acc.push(it.into());
+            }
+        }
+    }
+
+    /// What rustc refuses of the body's `#[loop_match]` loops and `#[const_continue]` breaks.
+    fn collect_loop_match(&mut self, def: DefWithBodyId, source_map: &ExpressionStoreSourceMap) {
+        let check = hir_ty_mir::mir::loop_match::loop_match_check(self.db, def);
+        for error in check.errors() {
+            // clone: the refusal's type, once per refusal
+            let placed = (error.kind.clone()).try_map(|expr| source_map.expr_syntax(expr));
+            match placed {
+                Ok(kind) => self.acc.push(LoopMatchRefused { kind }.into()),
+                Err(SyntheticSyntax) => self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::LoopMatch(error.kind.message()),
+                    }
+                    .into(),
+                ),
             }
         }
     }

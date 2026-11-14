@@ -34,6 +34,7 @@ pub(crate) mod invalid_const_arg;
 pub(crate) mod invalid_derive_target;
 pub(crate) mod invalid_visibility;
 pub(crate) mod late_bound_lifetime_args;
+pub(crate) mod loop_match;
 pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
@@ -375,6 +376,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
         AnyDiagnostic::TailCallRefused(d) => tail_call::lower(cx, &d),
         AnyDiagnostic::TailCallTrackCaller(d) => tail_call::lower_track_caller(cx, &d),
+        AnyDiagnostic::LoopMatchRefused(d) => loop_match::lower(cx, &d),
         AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnlabeledJumpInLabeledBlock(d) => unlabeled_jump_in_labeled_block::lower(cx, &d),

@@ -98,6 +98,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::pod_serialized_by_field",
             "blaze::packable",
             "blaze::soa_candidate",
+            "blaze::loop_match_candidate",
             "blaze::vecreport",
         ],
     ),

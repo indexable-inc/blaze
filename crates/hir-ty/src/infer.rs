@@ -988,7 +988,7 @@ fn trait_item_struct_path_def(db: &Db, trait_: TraitId, name: &Name) -> Option<S
 impl InferenceDiagnostic {
     /// Whether this is an error that leaves the body tainted by errors, like rustc's
     /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
-    pub(crate) fn taints_body(&self) -> bool {
+    pub fn taints_body(&self) -> bool {
         let is_lint = |diag: &PathLoweringDiagnostic| {
             matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
         };
