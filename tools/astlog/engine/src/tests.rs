@@ -309,6 +309,23 @@ fn count_local_variable_cannot_escape() {
 }
 
 #[test]
+fn a_count_whose_result_it_also_counts_over_is_refused_naming_the_variable() {
+    let error = Program::<Graph>::parse(
+        "(rule (out a b) (edge a b))
+         (rule (bad a x) (edge a y) (count x (out a x)))",
+    )
+    .expect_err("x is the count and a column it counts over: it derives nothing");
+    let message = error.to_string();
+    assert!(message.starts_with("rules:2: ") && message.contains("`x`"), "{message}");
+    // A result bound before the count compares the count with it, which is meaningful.
+    let compared = Program::<Graph>::parse(
+        "(rule (out a b) (edge a b))
+         (rule (two a) (edge a n) (count n (out a b)))",
+    );
+    assert!(compared.is_ok(), "{compared:?}");
+}
+
+#[test]
 fn demanded_argument_must_be_bound_on_the_left() {
     let error = Program::<Graph>::parse("(rule (next a b) (succ a b) (edge a b))")
         .expect_err("succ is demand-driven on a");

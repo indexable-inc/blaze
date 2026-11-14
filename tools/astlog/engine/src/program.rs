@@ -651,6 +651,19 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     }
                 }
                 if let Term::Var(var) = &count.result {
+                    // Unbound, it would be both the number and a column counted over. The
+                    // column is local to the count and unset once the rows are counted, so the
+                    // result has nothing to equal and the rule derives nothing.
+                    if !bound.contains(var.as_str()) && vars(&count.inner.args).any(|it| it == var) {
+                        return DslSnafu {
+                            line: count.line,
+                            message: format!(
+                                "`{var}` is the (count ...)'s result and an argument it counts over; \
+                                 name the counted column apart"
+                            ),
+                        }
+                        .fail();
+                    }
                     bound.insert(var);
                 }
             }
