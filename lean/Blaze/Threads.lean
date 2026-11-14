@@ -11,8 +11,9 @@ Everything between two operations is a thread's own and is not a step.
 
 The world (`World`) is what is shared: the cells, and who sleeps in a futex wait of which.
 `World.step` is one operation by one thread, with the world's free choice at that step (`pick`:
-whether a weak compare-and-swap fails for nothing, whether a sleeper wakes for nothing or its
-time runs out, which sleeper a wake takes). `Prog.exec` runs a program alone.
+1 fails a weak compare-and-swap for nothing and wakes a sleeper for nothing, 2 tells a sleeper
+with a time limit that it ran out, and a wake takes the sleeper of that number, the first
+where there is none). `Prog.exec` runs a program alone.
 
 `two` runs two programs as two threads, one operation at a time in the order a schedule gives,
 and is itself a program: so a theorem's function is an ordinary one that takes the schedule as
@@ -193,7 +194,7 @@ def step (who pick : Nat) (o : Op) (w : World) : Option (Got × World) :=
     | some old =>
       let w := w.touched who cell [success, failure]
       if !w.fits then none
-      else if weak && pick % 2 == 1 then some (⟨old, false⟩, w)
+      else if weak && pick == 1 then some (⟨old, false⟩, w)
       else
         match change old with
         | some new => some (⟨old, true⟩, { w with cells := w.cells.set cell new })
@@ -220,7 +221,7 @@ def step (who pick : Nat) (o : Op) (w : World) : Option (Got × World) :=
       let sleepers := w.asleep.filter (fun it => it.2 == cell)
       if !w.fits then none
       else
-        match sleepers[pick % sleepers.length]? with
+        match sleepers[pick]? <|> sleepers.head? with
         | none => some (⟨0, false⟩, w)
         | some one =>
           if all then
@@ -247,9 +248,9 @@ def Op.sleeps (o : Op) (got : Got) : Bool :=
 
 namespace Prog
 
-/-- A program run alone, from `w`: its value and the world after. A wait that sleeps with no
-other thread to wake it never returns (`div`); a step the world refuses is
-`Error.unmodelled`. -/
+/-- A program run alone, from `w`: its value and the world after. A wait of its own (thread
+0, not one `two` gave a thread) that sleeps has no other thread to wake it and never returns
+(`div`); a step the world refuses is `Error.unmodelled`. -/
 def exec {α : Type} : Prog α → World → Result (α × World)
   | done (.ok v), w => .ok (v, w)
   | done (.fail e), _ => .fail e
@@ -257,7 +258,7 @@ def exec {α : Type} : Prog α → World → Result (α × World)
   | op who pick o next, w =>
     match w.step who pick o with
     | none => .fail .unmodelled
-    | some (got, w') => if o.sleeps got then .div else exec (next got) w'
+    | some (got, w') => if who == 0 && o.sleeps got then .div else exec (next got) w'
 
 /-- What a program run alone in a world with nothing shared returns: the left side of a
 theorem's statement. -/

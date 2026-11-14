@@ -10,3 +10,4 @@ import Blaze.Str
 import Blaze.Machine
 import Blaze.Opaque
 import Blaze.Threads
+import Blaze.Atomic
