@@ -1831,24 +1831,31 @@ fn a_clean_bodys_borrow_check_reads_no_refused_row() {
 /// name (its answer is no context), and is refused by its own name where a `macro` 2.0 wrote
 /// it (its answer is a context, which no fact spells). The control is the refusal: a rule that
 /// answered every read with the `Fields` fact would keep the `macro` body too.
+///
+/// The path: a method's lookup reads its items' keys inside tracked queries
+/// (`trait_value_item`, `impl_value_item`, `lookup_impl_method`), which a body does not read
+/// through; normalizing `<S as Tr>::Out` reads the impl item's key in the body's own step, in
+/// the solver's `fetch_eligible_assoc_item` (`hir_def::nameres::implements`). Refused reads
+/// are answered as covered (`with_steps_run`'s `answer_refused`), so the walk, which stops at
+/// the first refusal, reaches every read; `seen` still records each one's own class.
 #[test]
 fn an_assoc_items_hygiene_key_is_its_containers_fields_or_refused() {
     let db = db_of(
         r#"
 //- minicore: sized
 #![feature(decl_macro)]
-pub trait Tr { fn m(&self) -> u8; }
+pub trait Tr { type Out; fn m(&self) -> Self::Out; }
 pub struct S;
 pub struct T;
-macro_rules! by_rules { ($t:ty) => { impl Tr for $t { fn m(&self) -> u8 { 1 } } } }
+macro_rules! by_rules { ($t:ty) => { impl Tr for $t { type Out = u8; fn m(&self) -> u8 { 1 } } } }
 by_rules!(S);
-macro by_macro($t:ty) { impl Tr for $t { fn m(&self) -> u8 { 2 } } }
+macro by_macro($t:ty) { impl Tr for $t { type Out = u8; fn m(&self) -> u8 { 2 } } }
 by_macro!(T);
 pub fn rules(s: S) -> u8 { s.m() }
 pub fn macros(t: T) -> u8 { t.m() }
 "#,
     );
-    with_steps_run(&db, false, |seen| {
+    with_steps_run(&db, true, |seen| {
         let reads = |name: &str| -> Vec<Classified> {
             let def = body_named(&db, name);
             seen.iter()
@@ -1870,6 +1877,76 @@ pub fn macros(t: T) -> u8 { t.m() }
             "`macros`: a `macro` 2.0 name's key was not refused: {macros:?}"
         );
     });
+}
+
+/// The invariant (granular caching): what a body's steps read of another crate is a fact of
+/// what they read there (a signature, fields, the impls of one trait for one type), never that
+/// crate's `Crate` fact, whose value is every file of the crate and of the crates below it
+/// (`blaze_items::facts::crate_inputs`): with one, a private body's edit anywhere below
+/// misses every body that read it (blaze-cargo's
+/// `a_dependencys_function_that_names_another_type_of_the_same_shape_reaches_the_dependent`,
+/// its control). The bodies are that test's three callers. A failure names each read and the
+/// step it was read in: the read whose rule falls back to the whole crate.
+#[test]
+fn a_bodys_steps_read_no_whole_crate_fact_of_another_crate() {
+    let db = super::perturb::db(
+        r#"
+//- minicore: sized, phantom_data
+//- /main.rs crate:main deps:dep
+use dep::Tr;
+pub fn param() { dep::f(dep::Meters(1)) }
+pub fn marker() { dep::g(core::marker::PhantomData::<dep::A>) }
+pub fn ret() -> u32 { dep::h().m() }
+//- /dep.rs crate:dep
+pub struct Meters(pub u32);
+pub struct A;
+pub fn f(_x: Meters) {}
+pub fn g(_x: core::marker::PhantomData<A>) {}
+pub trait Tr { fn m(&self) -> u32; }
+impl Tr for Meters { fn m(&self) -> u32 { 1 } }
+pub fn h() -> Meters { Meters(1) }
+fn private() -> u32 { 1 }
+"#,
+    );
+    let main = super::perturb::body(&db, "param").module(&db).krate(&db);
+    let own = key::crate_key(&db, main);
+    let bodies = crate_body_owners(&db, main);
+    let probe = Arc::new(Probe::new(true));
+    let installed = body_store::install(
+        &db,
+        Arc::new(Memory::default()),
+        probe.clone(),
+        ContentId([7; 32]),
+        Mode::Serve,
+    )
+    .expect("an item store for the test database");
+    for &def in &bodies {
+        let _ = InferenceResult::of(&db, def);
+    }
+    for &def in &bodies {
+        let _ = db.mir_body(InferBodyId::DefWithBodyId(def));
+    }
+    for &def in &bodies {
+        let _ = hir_ty_borrowck::checked(&db, def);
+    }
+    installed.flush().expect("the test store flushes");
+    let seen = std::mem::take(&mut *probe.seen.lock());
+    drop(installed);
+    let mut whole: Vec<(Step, &'static str)> = Vec::new(); // alloc: test
+    for it in seen.iter().filter(|it| bodies.contains(&it.def)) {
+        if let Classified::Fact(fact) | Classified::Scan(fact) = it.class
+            && fact.kind == blaze_items::kinds::CRATE
+            && fact.subject != own
+        {
+            whole.push((it.step, it.name));
+        }
+    }
+    whole.sort_unstable_by_key(|&(step, name)| (step as u8, name));
+    whole.dedup();
+    assert!(
+        whole.is_empty(),
+        "reads of `main`'s bodies kept under another crate's whole `Crate` fact (step, query): {whole:?}"
+    );
 }
 
 /// The invariant: a borrow-check trace kept under its solver queries' facts is not reused
