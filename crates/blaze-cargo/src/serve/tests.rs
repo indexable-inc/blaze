@@ -141,6 +141,8 @@ thread_local! {
     /// The checkout whose kept front end leaves nothing for the store: a job that puts
     /// nothing new, and may still have read what another job put.
     static PUTS_NOTHING: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Whether storing a kept front end fails (`Steps::store_kept`), as a full disk does.
+    static FAILS_STORE: Cell<bool> = const { Cell::new(false) };
     /// The tests' run keeps how it ran in the store ([`Keeps`]).
     static TESTS_KEEP: Cell<bool> = const { Cell::new(false) };
     /// ... and hands the put's ticket to no one: a put no caller told the loop of.
@@ -787,6 +789,9 @@ impl Steps for Fake {
     }
 
     fn store_kept(&self, kept: &mut FakeInputs) -> Result<Vec<KeptPut>, ApiError> {
+        if FAILS_STORE.get() {
+            return Err(ApiError::new("the fakes' store failed", None));
+        }
         // The second store, before an idle front end is let go or at a stop: the workspace
         // members' pages, as a real front end's second store writes them (`Stored::Sealed`).
         if kept.stored {
@@ -5799,6 +5804,158 @@ fn a_second_query_of_an_unchanged_view_lowers_nothing_anew_over_many_seeds() {
 fn the_oracle_catches_a_query_that_drops_its_front_end() {
     let (_, second) = two_queries(3, true);
     assert_eq!(second, (1, 0), "the planted bug's second query lowered into a kept front end");
+}
+
+/// Two queries of one unchanged checkout under `seed`, the second sent the turn the first
+/// answered, the planted skip of the store wait set or not: the second's lowerings, as (anew,
+/// into the kept front end), and whether its lowering met the first's store under way.
+fn second_query_meets_the_store(seed: u64, plant: bool) -> ((usize, usize), bool) {
+    use super::job::{LOWERINGS_MET_STORE, PLANT_LOWERING_SKIPS_STORE_WAIT};
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    // The first's store held on the runner, as a large front end's runs on a worker (21.7 s on
+    // the demo crate), so the second meets it under way.
+    daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, true);
+    query_ok(&mut client, &mut daemon);
+    assert_eq!(daemon.storing(), 1, "seed {seed}: the first's front end is still being stored");
+    PLANT_LOWERING_SKIPS_STORE_WAIT.set(plant);
+    let (before, met_before) = (lowerings_now(), LOWERINGS_MET_STORE.get());
+    let id = client
+        .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+    // Let go in the turn its lowering meets the store: with both waiting, nothing else is in
+    // flight, and the clock would jump to the stall's timer.
+    turn_until(&mut daemon, |daemon| {
+        client.take(daemon);
+        LOWERINGS_MET_STORE.get() > met_before || client.done(id)
+    });
+    let met = LOWERINGS_MET_STORE.get() > met_before;
+    daemon.hold_tasks_for_test(blaze_graph::admission::kinds::STORE_KEPT, false);
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+    let second = lowerings_since(before);
+    PLANT_LOWERING_SKIPS_STORE_WAIT.set(false);
+    settle(&mut daemon, &mut client);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (second, met)
+}
+
+/// The invariant: a query sent while the root's kept front end is away being stored waits for
+/// the store and lowers into the front end it gives back, lowering nothing anew
+/// (`Jobs::lower_or_wait`). The first's store is held, so every seed meets it. The control:
+/// [`the_oracle_catches_a_lowering_that_does_not_wait_for_the_store`].
+#[test]
+fn a_query_sent_while_the_front_end_is_stored_lowers_nothing_anew_over_many_seeds() {
+    for seed in 0..32 {
+        let (second, met) = second_query_meets_the_store(seed, false);
+        assert!(met, "seed {seed}: the second query never met the first's store under way");
+        assert_eq!(second, (0, 1), "seed {seed}: the second lowers into the first's front end");
+    }
+}
+
+/// The control of [`a_query_sent_while_the_front_end_is_stored_lowers_nothing_anew_over_many_seeds`]:
+/// a lowering that meets the store and lowers anew beside it
+/// (`job::PLANT_LOWERING_SKIPS_STORE_WAIT`) is seen in each seed that met the store.
+#[test]
+fn the_oracle_catches_a_lowering_that_does_not_wait_for_the_store() {
+    for seed in 0..8 {
+        let (second, met) = second_query_meets_the_store(seed, true);
+        assert!(met, "seed {seed}: the second query never met the first's store under way");
+        assert_eq!(second, (1, 0), "seed {seed}: the planted skip lowered into a kept front end");
+    }
+}
+
+/// A query, then a second while the first's store is under way and never ends
+/// (`job::STORE_NEVER_ENDS`), the bound of the wait planted away or not: whether the second
+/// answered ok within the turns, and its lowerings.
+fn second_query_past_a_store_that_never_ends(seed: u64, plant: bool) -> (bool, (usize, usize)) {
+    use super::job::{PLANT_STORE_WAIT_UNBOUNDED, STORE_NEVER_ENDS, STORE_WAIT_WITHIN};
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    STORE_NEVER_ENDS.set(true);
+    query_ok(&mut client, &mut daemon);
+    STORE_NEVER_ENDS.set(false);
+    assert_eq!(daemon.storing(), 0, "seed {seed}: the never-ending store has no task");
+    PLANT_STORE_WAIT_UNBOUNDED.set(plant);
+    let before = lowerings_now();
+    let id = client
+        .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+    turns(&mut daemon, &mut client, 50);
+    assert_eq!(dones(&client, id), 0, "seed {seed}: the second answered before the bound");
+    daemon.driver().advance(STORE_WAIT_WITHIN);
+    let mut answered = false;
+    for _ in 0..TURNS {
+        daemon.turn();
+        client.take(&mut daemon);
+        if client.done(id) {
+            answered = true;
+            break;
+        }
+    }
+    PLANT_STORE_WAIT_UNBOUNDED.set(false);
+    let ok = answered && client.of(id).last() == Some(&Response::Done { ok: true });
+    if answered && !ok {
+        eprintln!("seed {seed}: the second query failed: {:#?}", client.of(id));
+    }
+    (ok, lowerings_since(before))
+}
+
+/// A store of the kept front end that never ends does not hang the query after it: its
+/// lowering waits [`super::job::STORE_WAIT_WITHIN`] and then lowers anew, said as a warning.
+/// The control: [`the_oracle_catches_a_store_wait_with_no_bound`].
+#[test]
+fn a_store_that_never_ends_does_not_hang_the_next_query() {
+    for seed in 0..8 {
+        let (ok, second) = second_query_past_a_store_that_never_ends(seed, false);
+        assert!(ok, "seed {seed}: the second query did not answer ok past a store that never ends");
+        assert_eq!(second, (1, 0), "seed {seed}: it lowered anew at the bound");
+    }
+}
+
+/// The control of [`a_store_that_never_ends_does_not_hang_the_next_query`]: with the bound
+/// planted away (`job::PLANT_STORE_WAIT_UNBOUNDED`, the code before 2026-11-14) the second
+/// query lowers nothing and only the stall watch ends it, as a failure.
+#[test]
+fn the_oracle_catches_a_store_wait_with_no_bound() {
+    let (ok, second) = second_query_past_a_store_that_never_ends(1, true);
+    assert!(!ok, "the planted unbounded wait answered ok");
+    assert_eq!(second, (0, 0), "the planted unbounded wait lowered");
+}
+
+/// A store of the kept front end that fails does not hang the query waiting for it: the
+/// failure is a loss said beside the first query's answer, and the second lowers anew.
+#[test]
+fn a_store_that_fails_does_not_hang_the_next_query_over_many_seeds() {
+    for seed in 0..16 {
+        let mut sim = Sim::new(seed, Faults::default());
+        checkout(&mut sim, "[package]\nname = \"app\"\n");
+        let steps = Arc::new(Fake::default());
+        let mut daemon = start(sim, &steps, seed);
+        let mut client = dial(&mut daemon);
+        FAILS_STORE.set(true);
+        // Each query's failed store is a loss, which `blaze status` shows as a bug: two.
+        let (second, reported) = stdx::assert::reported::expecting("settling", || {
+            query_ok(&mut client, &mut daemon);
+            let before = lowerings_now();
+            query_ok(&mut client, &mut daemon);
+            let second = lowerings_since(before);
+            settle(&mut daemon, &mut client);
+            second
+        });
+        FAILS_STORE.set(false);
+        assert_eq!(reported, 2, "seed {seed}: each failed store is one loss said");
+        assert_eq!(second, (1, 0), "seed {seed}: no front end came back, so it lowers anew");
+        let lost = daemon.lost();
+        assert!(
+            !lost.is_empty() && lost.iter().all(|it| it.what.contains("the fakes' store failed")),
+            "seed {seed}: {lost:#?}"
+        );
+    }
 }
 
 /// A query, an edit of the view's `src/main.rs`, and a query, under `seed`, the planted stale

@@ -74,6 +74,18 @@ thread_local! {
     /// lowered as it answers ([`Jobs::keep_queried`] does nothing), as before 2026-11-14, so
     /// every query of a root lowers it anew.
     pub(super) static PLANT_QUERY_DROPS_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' store-wait controls: a lowering that meets its
+    /// root's front end being stored lowers anew beside the store ([`Jobs::lower_or_wait`]).
+    pub(super) static PLANT_LOWERING_SKIPS_STORE_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the bounded store wait's control: a lowering waits for its root's
+    /// store with no bound ([`Jobs::lower_overdue`] lowers nothing).
+    pub(super) static PLANT_STORE_WAIT_UNBOUNDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's store that never ends: [`Jobs::store_kept`] counts the store under way and
+    /// posts no task for it, so nothing ever ends it.
+    pub(super) static STORE_NEVER_ENDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many lowerings met their root's front end being stored ([`Jobs::lower_or_wait`]),
+    /// whether they then waited or not.
+    pub(super) static LOWERINGS_MET_STORE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -3833,8 +3845,19 @@ struct Lowering {
     checkout: String,
     /// The node of the store it waits on, when one was found.
     on: Option<NodeId>,
+    /// When it began to wait, on the injected clock ([`World::now`]): it lowers anew once
+    /// [`STORE_WAIT_WITHIN`] has gone by ([`Jobs::lower_overdue`]).
+    since: Duration,
     span: tracing::Span,
 }
+
+/// How long a lowering waits for its root's kept front end to be stored before it lowers anew
+/// beside the store (bounded-progress). The store is one plane task that says no progress, so
+/// the bound is on the whole wait. It is there for a store that is wedged or never ends, not to
+/// race a slow one: lowering anew beside a running store holds two front ends at once and costs a
+/// whole lowering, so the bound sits well above a store's measured time (the demo crate's:
+/// 21.7 s, 2026-11-14) and at the durability wait's [`DURABLE_WITHIN`].
+pub(super) const STORE_WAIT_WITHIN: Duration = DURABLE_WITHIN;
 
 /// The jobs a client waits on, each with its stage and what it waits on there
 /// ([`Jobs::waited_on`]): what a stall names when no plane task of the build runs.
@@ -7556,10 +7579,19 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let job_idle = job.idle;
+        #[cfg(test)]
+        let waits = {
+            if root.is_some_and(|root| self.roots.storing[root as usize] > 0) {
+                LOWERINGS_MET_STORE.set(LOWERINGS_MET_STORE.get() + 1);
+            }
+            !PLANT_LOWERING_SKIPS_STORE_WAIT.get()
+        };
+        #[cfg(not(test))]
+        let waits = true;
         match root {
             // The root's front end is being stored: the lowering waits for it rather than
             // lowering anew beside it.
-            Some(root) if self.roots.storing[root as usize] > 0 => {
+            Some(root) if waits && self.roots.storing[root as usize] > 0 => {
                 let mut on = None;
                 // The store is its job's, or of what its job left to settle after its answer.
                 let storings = self
@@ -7588,9 +7620,10 @@ impl<S: Steps> Jobs<S> {
                     checkout = %checkout,
                     root,
                     store_node = on.map(|it| it.0),
+                    bound_s = STORE_WAIT_WITHIN.as_secs(),
                 );
-                self.lowering.push(Lowering { id, input, root, name, checkout, on, span });
-            }
+                let since = w.now;
+                self.lowering.push(Lowering { id, input, root, name, checkout, on, since, span });            }
             root => self.lower(w, id, input, root, &name, checkout),
         }
     }
@@ -7644,6 +7677,15 @@ impl<S: Steps> Jobs<S> {
     ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let request = w.plane.open(w.now, false, true);
+        #[cfg(test)]
+        if STORE_NEVER_ENDS.get() {
+            // Under way and never ended: the front end is held by no task, and no store of the
+            // root ever ends.
+            drop(kept);
+            w.plane.close(w.now, request);
+            self.roots.storing[root as usize] += 1;
+            return;
+        }
         let name = named("storing the kept front end of ", &checkout);
         let fresh = lone_learned(
             w.plane,
@@ -11058,14 +11100,18 @@ impl<S: Steps> Jobs<S> {
     /// snapshot's, or that of what an answered job left to settle. The loop calls
     /// [`Jobs::expire`] then, if nothing woke it before.
     pub fn next_deadline(&self) -> Option<Duration> {
-        let since = self
+        let durable = self
             .jobs
             .values()
             .filter_map(|it| it.durable_since)
             .chain(self.settling.iter().filter_map(|it| it.since))
-            .min()?;
-        let bound = since.max(self.store_heard) + DURABLE_WITHIN;
-        Some(self.recheck.map_or(bound, |at| at.min(bound)))
+            .min()
+            .map(|since| {
+                let bound = since.max(self.store_heard) + DURABLE_WITHIN;
+                self.recheck.map_or(bound, |at| at.min(bound))
+            });
+        let lowering = self.lowering.iter().map(|it| it.since + STORE_WAIT_WITHIN).min();
+        durable.into_iter().chain(lowering).min()
     }
 
     /// The store took a completion of its own at `now` on the injected clock, its commit
@@ -11082,7 +11128,40 @@ impl<S: Steps> Jobs<S> {
     /// is past it fails, naming what it waited for, and each such wait of what an answered job
     /// left to settle is given up as a loss.
     pub fn expire(&mut self, w: &mut World<'_, S>) {
+        self.lower_overdue(w);
         self.wind_up_judging(w, true);
+    }
+
+    /// Each lowering that waited [`STORE_WAIT_WITHIN`] for its root's kept front end to be
+    /// stored lowers anew beside the store, said as a warning naming the store it gave up on.
+    /// Lowering anew from nothing is always right; it only costs a lowering the store would
+    /// have saved. The store, when it ends, still gives its front end back to the root.
+    fn lower_overdue(&mut self, w: &mut World<'_, S>) {
+        #[cfg(test)]
+        if PLANT_STORE_WAIT_UNBOUNDED.get() {
+            return;
+        }
+        let now = w.now;
+        while let Some(at) =
+            self.lowering.iter().position(|it| it.since + STORE_WAIT_WITHIN <= now)
+        {
+            let Lowering { id, input, root, name, checkout, on, since, span } =
+                self.lowering.remove(at);
+            tracing::warn!(
+                target: "blaze",
+                parent: &span,
+                checkout = %checkout,
+                root,
+                store_node = on.map(|it| it.0),
+                waited_s = now.saturating_sub(since).as_secs(),
+                "the kept front end's store did not end within {}s, so the lowering waiting for it lowers anew beside it",
+                STORE_WAIT_WITHIN.as_secs()
+            );
+            drop(span);
+            if self.jobs.get(key_of(id)).is_some_and(|it| it.over.is_none()) {
+                self.lower(w, id, input, Some(root), &name, checkout);
+            }
+        }
     }
 
     /// The VFS's tickets that are durable: a snapshot waits for its own.
