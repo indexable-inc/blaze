@@ -392,7 +392,11 @@ impl<'a, F: Files> Sema<'a, F> {
         match node.kind() {
             SyntaxKind::METHOD_CALL_EXPR => self.resolve(node),
             SyntaxKind::CALL_EXPR => {
-                let callee = node.children().next()?;
+                let mut callee = node.children().next()?;
+                // `(foo)()` calls `foo`.
+                while callee.kind() == SyntaxKind::PAREN_EXPR {
+                    callee = callee.children().next()?;
+                }
                 match self.resolve(callee)? {
                     def @ Def::Item(ModuleDef::Function(_)) => Some(def),
                     _ => None,

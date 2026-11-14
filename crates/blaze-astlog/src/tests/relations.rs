@@ -171,6 +171,17 @@ fn crate_of_names_a_defs_crate_and_a_nodes_own() {
 }
 
 #[test]
+fn callee_sees_through_parentheses_around_the_called_path() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub fn foo() {}\n\
+                   pub fn bar() { (foo)(); ((foo))(); }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (called e d) (syntax e "CALL_EXPR") (callee e d))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "called"), [["(foo)()", "lib::foo"], ["((foo))()", "lib::foo"]]);
+}
+
+#[test]
 fn enclosing_impl_holds_for_code_in_an_impl_only() {
     let (db, files) = lib();
     let rules = r#"(rule (in-impl e) (syntax e "PATH_EXPR") (enclosing-impl e i))"#;
