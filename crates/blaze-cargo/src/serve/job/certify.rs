@@ -1111,6 +1111,11 @@ impl<S: Steps> Jobs<S> {
     fn certify_hit(&mut self, w: &mut World<'_, S>, checking: Checking, answer: certificate::Answer) {
         let Checking { id, span, root, shape, late, base, drawn, told, ref env, ref work, .. } = checking;
         self.certify_verified(root, shape);
+        #[cfg(test)]
+        super::CERTIFY_WORDS.with_borrow_mut(|it| {
+            let named = answer.outputs.iter().map(|it| format!("{} {}: {:x}", it.base, it.path, it.content)); // alloc: a test's record
+            it.push(format!("hit: the answer names {:?}", named.collect::<Vec<_>>())); // alloc: a test's record
+        });
         let asked = match work {
             Some(work) => slot_asked(work),
             None => self.jobs.get(key_of(id)).and_then(|job| slot_asked(&job.work)),
@@ -1486,6 +1491,11 @@ impl<S: Steps> Jobs<S> {
             },
             |holder, path| w.steps.held_code(holder, path),
         )?;
+        #[cfg(test)]
+        super::CERTIFY_WORDS.with_borrow_mut(|it| {
+            let named = outputs.iter().map(|(it, _)| format!("{} {}: {:x}", it.base, it.path, it.content)); // alloc: a test's record
+            it.push(format!("writing: it left {left:x?} and names {:?}", named.collect::<Vec<_>>())); // alloc: a test's record
+        });
         let said = blaze_protocol::cbor::to_vec(&walked.said)
             .map_err(|error| format!("no request certificate is written: what the build said does not encode: {error}"))?;
         let tool = tool_of(&mut self.certify.tool).map_err(|why| format!("no request certificate is written: {why}"))?;
