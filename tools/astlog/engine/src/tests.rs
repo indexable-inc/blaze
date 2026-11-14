@@ -266,6 +266,25 @@ fn unstratifiable_program_names_its_cycle() {
     assert!(!message.contains("`s`"), "s is on no cycle: {message}");
 }
 
+/// `nested(n)` is `n` lists, each holding the next, around one atom.
+fn nested(depth: usize) -> String {
+    format!("{}x{}", "(".repeat(depth), ")".repeat(depth))
+}
+
+#[test]
+fn a_rules_file_nested_past_the_depth_cap_is_refused_naming_its_line() {
+    let max = crate::sexpr::MAX_DEPTH;
+    let at_cap = crate::sexpr::parse::<GraphError>(&nested(max));
+    assert!(at_cap.is_ok(), "{max} levels read: {at_cap:?}");
+    let text = format!("(rule (r a) (edge a b))\n{}", nested(max + 1));
+    let past = Program::<Graph>::parse(&text).expect_err("one level past the cap");
+    assert!(matches!(past, Error::TooDeep { line: 2, .. }), "{past}");
+    assert!(past.to_string().starts_with("rules:2: ") && past.to_string().contains("nested"));
+    // Far past the cap is refused the same way, not by the reader overflowing its stack.
+    let far = crate::sexpr::parse::<GraphError>(&nested(1_000_000)).expect_err("far past the cap");
+    assert!(matches!(far, Error::TooDeep { line: 1, .. }), "{far}");
+}
+
 #[test]
 fn count_counts_rows_per_bound_key() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(

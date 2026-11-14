@@ -13,6 +13,11 @@ pub enum Error<S: std::error::Error + 'static> {
     #[snafu(display("rules:{line}: {message}"))]
     Dsl { line: usize, message: String },
 
+    #[snafu(display(
+        "rules:{line}: this `(` is nested past {max} lists, the deepest a rules file may nest"
+    ))]
+    TooDeep { line: usize, max: usize },
+
     #[snafu(display("rules:{line}: invalid regex `{pattern}` in text-match"))]
     Regex { line: usize, pattern: String, source: regex::Error },
 

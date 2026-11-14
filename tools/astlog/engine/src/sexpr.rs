@@ -5,7 +5,12 @@
 //! `;` comments run to end of line. Every form remembers the 1-based line it
 //! started on so later passes can report positions.
 
-use crate::error::{DslSnafu, Error};
+use crate::error::{DslSnafu, Error, TooDeepSnafu};
+
+/// The deepest a list may nest. The reader, and every pass over what it read, recurses once a
+/// level, so request text nested without bound would overflow the stack; a real rule nests a
+/// handful of levels.
+pub(crate) const MAX_DEPTH: usize = 64;
 
 /// One form as read: a fact source parses its own atoms from these.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +108,11 @@ impl Reader<'_> {
         Sexpr::Atom { text, line }
     }
 
-    fn read_form<S: std::error::Error + 'static>(&mut self) -> Result<Option<Sexpr>, Error<S>> {
+    /// The next form, itself inside `depth` lists.
+    fn read_form<S: std::error::Error + 'static>(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<Sexpr>, Error<S>> {
         self.skip_trivia();
         let Some(&c) = self.chars.peek() else {
             return Ok(None);
@@ -111,6 +120,9 @@ impl Reader<'_> {
         match c {
             '(' => {
                 let line = self.line;
+                if depth == MAX_DEPTH {
+                    return TooDeepSnafu { line, max: MAX_DEPTH }.fail();
+                }
                 self.bump();
                 let mut items = Vec::new();
                 loop {
@@ -119,7 +131,7 @@ impl Reader<'_> {
                         self.bump();
                         return Ok(Some(Sexpr::List { items, line }));
                     }
-                    let Some(item) = self.read_form()? else {
+                    let Some(item) = self.read_form(depth + 1)? else {
                         return DslSnafu { line, message: "unclosed `(`".to_owned() }.fail();
                     };
                     items.push(item);
@@ -137,11 +149,11 @@ impl Reader<'_> {
 /// # Errors
 ///
 /// Returns [`Error::Dsl`] on unbalanced parentheses, unterminated strings, or
-/// unknown string escapes.
+/// unknown string escapes, and [`Error::TooDeep`] on lists nested past [`MAX_DEPTH`].
 pub(crate) fn parse<S: std::error::Error + 'static>(src: &str) -> Result<Vec<Sexpr>, Error<S>> {
     let mut reader = Reader { chars: src.chars().peekable(), line: 1 };
     let mut forms = Vec::new();
-    while let Some(form) = reader.read_form()? {
+    while let Some(form) = reader.read_form(0)? {
         forms.push(form);
     }
     Ok(forms)
