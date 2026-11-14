@@ -10,5 +10,5 @@
  "class": "a theorem hypothesis that misses a bound a model operation needs (push overflow on an unbounded Vec)",
  "prevention": "File::small checks barriers.len() <= MOST_CHANGES; or the Vec model bounds length by isize::MAX / size_of::<T>() for sized non-ZST T, which makes every push on a Vec under the bound provably safe",
  "workaround": "none in the proof: the statement must change",
- "state": "open"
+ "state": "fixed in a45e087f2d: File::small holds a file to 2^16 barriers; the theorem is proved (crates/blaze-core/lean/BlazeCore/World/Disk.lean)"
 }

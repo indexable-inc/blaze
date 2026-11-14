@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-103 theorems: 90 in `lean`, 13 in `lean/analysis`.
+104 theorems: 91 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -986,6 +986,13 @@ theorem sync_all (fuel : Nat) (f : File) (covers : Usize) (hs : Small f)
     (hall : (f.changes.val.length : Int) ≤ covers.val) (hfuel : 73786976294838206464 ≤ fuel) :
     ∃ r v, File.sync fuel f covers = Result.ok r ∧ File.contents fuel f = Result.ok v ∧
       r.changes.val = [] ∧ r.undo = none ∧ r.name = f.name ∧ r.durable.val = v.val
+```
+
+**`blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_keeps_what_a_barrier_ordered holds of its model: from every well-formed disk within the bounds, after a barrier of a file that covers all its changes and then an append to any file, a cut a crash is allowed to make that keeps any part of that append keeps whole every change the barrier covered; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof :
+    blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.statement
 ```
 
 ## V15

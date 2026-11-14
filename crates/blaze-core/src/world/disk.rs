@@ -869,7 +869,8 @@ pub fn a_crash_cuts_an_appended_file_to_a_prefix(disk: Disk, file: u64, cut: Vec
     cut_to_a_prefix(&durable, &read, &disk.contents(file))
 }
 
-/// The invariant: a barrier orders. From every well-formed disk within the bounds, once a
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a barrier
+/// orders. From every well-formed disk within the bounds, once a
 /// barrier of `file` that covers all its changes has completed and `bytes` were then appended
 /// to `later` (any file, `file` itself too), a cut a crash is allowed to make that keeps any
 /// part of that append keeps whole every change the barrier covered. So a commit record
