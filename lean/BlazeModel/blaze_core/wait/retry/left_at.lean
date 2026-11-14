@@ -8,16 +8,16 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.wait.retry.left_at (left : Option core.time.Duration) (deadline : Option blaze_core.wait.retry.Deadline) (now : core.time.Duration) : Bool :=
-  let t4 := (left, deadline)
-  match t4.1 with
+  let t0 := (left, deadline)
+  match t0.1 with
   | Option.none =>
-    match t4.2 with
+    match t0.2 with
     | Option.none => true
     | Option.some v0 => false
   | Option.some v1 =>
-    match t4.2 with
+    match t0.2 with
     | Option.some v2 =>
-      let left_8 := v1
-      let deadline_9 := v2
-      core.cmp.PartialEq.eq left_8 (blaze_core.wait.retry.Deadline.left deadline_9 now)
+      let left_1 := v1
+      let deadline_1 := v2
+      core.cmp.PartialEq.eq left_1 (blaze_core.wait.retry.Deadline.left deadline_1 now)
     | Option.none => false

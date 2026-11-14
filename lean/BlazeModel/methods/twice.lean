@@ -11,6 +11,6 @@ set_option linter.unusedVariables false
 
 def methods.twice (limit : U32) : Result U32 := do
   let counter := methods.Counter.new limit
-  let (t4, counter) ← methods.Counter.bump counter
-  let (t6, counter) ← methods.Counter.bump counter
+  let (t0, counter) ← methods.Counter.bump counter
+  let (t1, counter) ← methods.Counter.bump counter
   Result.ok (methods.Counter.hits_fn counter)

@@ -10,6 +10,6 @@ set_option linter.unusedVariables false
 def generics.first_or (p : Option generics.Pair.u32) (d : U32) : U32 :=
   match p with
   | Option.some v0 =>
-    let p_4 := v0
-    generics.Pair.u32.first p_4
+    let p_1 := v0
+    generics.Pair.u32.first p_1
   | Option.none => d

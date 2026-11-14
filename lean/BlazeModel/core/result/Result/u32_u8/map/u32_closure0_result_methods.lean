@@ -11,8 +11,8 @@ def core.result.Result.u32_u8.map.u32_closure0_result_methods (self : core.resul
   match self with
   | core.result.Result.Ok v0 => do
     let t := v0
-    let t5 ← closures.result_methods.closure0.call op t
-    Result.ok (core.result.Result.Ok t5 : core.result.Result U32 U8)
+    let t0 ← closures.result_methods.closure0.call op t
+    Result.ok (core.result.Result.Ok t0 : core.result.Result U32 U8)
   | core.result.Result.Err v1 =>
     let e := v1
     Result.ok (core.result.Result.Err e : core.result.Result U32 U8)

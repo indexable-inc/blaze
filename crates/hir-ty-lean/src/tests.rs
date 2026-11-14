@@ -3052,7 +3052,7 @@ fn opaque_items_are_carried_and_never_looked_inside() {
 #[test]
 fn what_opaque_items_leave_out_is_refused_by_name() {
     let uses = "use core::{fmt, io, panic::Location, string::String};\n";
-    let cases: [(&str, &str, &str); 10] = [
+    let cases: [(&str, &str, &str); 9] = [
         (
             "",
             "pub fn f(a: &String, b: &String) -> bool { a == b }\n",
@@ -3111,13 +3111,6 @@ fn what_opaque_items_leave_out_is_refused_by_name() {
             "a call of the standard library's `new_display`, which has no model and is not in the list \
              of opaque functions (rule NoModel)",
         ),
-        (
-            ", try, from",
-            "pub fn f(r: Result<u32, io::Error>) -> Result<u32, io::Error> { let x = r?; Ok(x) }\n",
-            // `?` is `Try::branch`, which has no model yet: refused at it.
-            "a call of the standard library's `branch`, which has no model and is not in the list of \
-             opaque functions (rule NoModel)",
-        ),
     ];
     let mut wrong = Vec::new();
     for (extra, source, what) in cases {
@@ -3129,3 +3122,171 @@ fn what_opaque_items_leave_out_is_refused_by_name() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+// ---- `?` (docs/v2/plan/design/proofs-for-sans-io.md, section 3, step b). ----
+
+/// What the `questions` fixture enables: `Option`, `Result`, the `Try` and `FromResidual`
+/// impls of both with core's own bodies, `From` and its identity impl, and slices.
+const QUESTION_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, option, result, try, try_bodies, from, infallible, index, slice, io_error";
+
+const QUESTIONS: &str = "use core::{convert::Infallible, io};
+pub struct Small { pub v: u8 }
+pub struct Big { pub v: u32 }
+impl From<Small> for Big { fn from(s: Small) -> Big { Big { v: s.v as u32 } } }
+pub fn add_one(r: Result<u32, u8>) -> Result<u32, u8> {
+    let x = r?;
+    Ok(x + 1)
+}
+pub fn sum_two(a: Result<u32, u8>, b: Result<u32, u8>) -> Result<u32, u8> {
+    Ok(a? + b?)
+}
+pub fn widen(r: Result<u32, Small>) -> Result<u32, Big> {
+    let x = r?;
+    Ok(x)
+}
+pub fn half(a: Option<u32>) -> Option<u32> {
+    let x = a?;
+    Some(x / 2)
+}
+pub fn sum_opts(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    Some(a? + b?)
+}
+pub fn pass_io(r: Result<u32, io::Error>) -> Result<u32, io::Error> {
+    let x = r?;
+    Ok(x)
+}
+pub fn never_fails(r: Result<u32, Infallible>) -> u32 {
+    match r { Ok(x) => x, Err(e) => match e {} }
+}
+fn check(x: u32, limit: u32) -> Result<u32, u8> { if x > limit { Err(1) } else { Ok(x) } }
+pub fn total(xs: &[u32], limit: u32) -> Result<u32, u8> {
+    let mut i = 0;
+    let mut t = 0u32;
+    while i < xs.len() {
+        t += check(xs[i], limit)?;
+        i += 1;
+    }
+    Ok(t)
+}
+#[blaze::theorem]
+pub fn sum_two_adds_or_gives_the_first_err(a: u32, b: u32, e: u8, f: u8) -> bool {
+    if a > 1000 || b > 1000 {
+        return true;
+    }
+    let both = match sum_two(Ok(a), Ok(b)) { Ok(s) => s == a + b, Err(_) => false };
+    let first = match sum_two(Err(e), Err(f)) { Ok(_) => false, Err(x) => x == e };
+    let second = match sum_two(Ok(a), Err(f)) { Ok(_) => false, Err(x) => x == f };
+    both && first && second
+}
+#[blaze::theorem]
+pub fn sum_opts_adds_or_is_none(a: u32, b: u32) -> bool {
+    if a > 1000 || b > 1000 {
+        return true;
+    }
+    let both = match sum_opts(Some(a), Some(b)) { Some(s) => s == a + b, None => false };
+    let first = match sum_opts(None, Some(b)) { Some(_) => false, None => true };
+    let second = match sum_opts(Some(a), None) { Some(_) => false, None => true };
+    both && first && second
+}
+#[blaze::theorem]
+pub fn widen_keeps_ok_and_converts_err(x: u32, v: u8) -> bool {
+    let kept = match widen(Ok(x)) { Ok(y) => y == x, Err(_) => false };
+    let converted = match widen(Err(Small { v })) { Ok(_) => false, Err(b) => b.v == v as u32 };
+    kept && converted
+}
+";
+
+/// `x?` is MIR's call of `Try::branch(x)`, a match on the `ControlFlow` it gives, and in the
+/// `Break` arm a call of `FromResidual::from_residual(residual)` returned: each is core's own
+/// impl for `Option` or `Result`, translated at its instance, `ControlFlow` a type per
+/// instance as any generic enum, and the error converted by the `From` impl at the instance
+/// (the identity `impl<T> From<T> for T`, or the crate's own).
+#[test]
+fn question_mark_is_core_try_at_the_instance() {
+    let cases: [(&str, &[&str], &[&str]); 8] = [
+        ("add_one", &["core.result.Result.u32_u8.Try.branch r"], &[]),
+        ("sum_two", &[], &[]),
+        ("widen", &[], &["BlazeModel.questions.Big.From.Small.from"]),
+        ("half", &["core.option.Option.u32.Try.branch a"], &[]),
+        ("sum_opts", &[], &[]),
+        ("total", &[], &[]),
+        ("pass_io", &[], &["BlazeModel.core.io.error.Error.From.from"]),
+        // `Infallible` is `!`, `Unit` in the model; its empty match is `unreachable`.
+        ("never_fails", &["Result.fail Error.unreachable"], &[]),
+    ];
+    for (name, calls, modules) in cases {
+        let out = golden(QUESTION_FLAGS, "questions", name, QUESTIONS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules.iter() {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    for name in [
+        "sum_two_adds_or_gives_the_first_err",
+        "sum_opts_adds_or_is_none",
+        "widen_keeps_ok_and_converts_err",
+    ] {
+        let out = golden(QUESTION_FLAGS, "questions", name, QUESTIONS);
+        assert_eq!(out.statement.as_deref(), Some(format!("questions.{name}.spec.statement").as_str()));
+    }
+}
+
+/// What `?` leaves out is refused by name: a `try` block (`Try::from_output`), a type of the
+/// crate's own with an impl of `Try` (both unstable), `?` on a `Result<_, Infallible>`
+/// (`Infallible` is `!`, whose identity `From` has no Lean name), and an error conversion that
+/// is the standard library's impl with no model.
+#[test]
+fn what_question_marks_leave_out_is_refused_by_name() {
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "",
+            "pub fn f(a: Option<u32>) -> Option<u32> { let r: Option<u32> = try { a? + 1 }; r }\n",
+            "a `try` block (`residual_into_try_type`; `try` blocks are unstable, rule UnstableTry)",
+        ),
+        (
+            "",
+            "use core::ops::{ControlFlow, FromResidual, Try};\n\
+             pub struct Mine(pub u32);\n\
+             impl FromResidual<Mine> for Mine { fn from_residual(r: Mine) -> Mine { r } }\n\
+             impl Try for Mine {\n\
+                 type Output = u32;\n\
+                 type Residual = Mine;\n\
+                 fn from_output(o: u32) -> Mine { Mine(o) }\n\
+                 fn branch(self) -> ControlFlow<Mine, u32> {\n\
+                     if self.0 == 0 { ControlFlow::Break(self) } else { ControlFlow::Continue(self.0) }\n\
+                 }\n\
+             }\n\
+             pub fn f(m: Mine) -> Mine { let x = m?; Mine(x + 1) }\n",
+            "`?` on `main::Mine`, a type with its own impl of `Try` or `FromResidual` (the traits are \
+             unstable, `try_trait_v2`; only core's impls are translated; rule UnstableTry)",
+        ),
+        (
+            "",
+            // `Infallible` is `!`, in core and in minicore: core's identity `From` at `!`.
+            "use core::convert::Infallible;\n\
+             pub fn f(r: Result<u32, Infallible>) -> Result<u32, Infallible> { let x = r?; Ok(x) }\n",
+            "a call of `from`, a method of a trait impl of `From` for a type that is not a struct, \
+             an enum, an integer or `bool`",
+        ),
+        (
+            ", option_from",
+            "pub fn f(r: Result<u32, u8>) -> Result<u32, Option<u8>> { let x = r?; Ok(x) }\n",
+            "a call of `From::from` from `u8` into `Option<u8>`, the standard library's impl, which \
+             has no model and is not in the list of opaque functions (rule NoModel)",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (extra, source, what) in cases {
+        let flags = format!("{QUESTION_FLAGS}{extra}");
+        let err = refused(&flags, "f", source);
+        if !err.what.contains(what) {
+            wrong.push(format!("`{source}` is refused for {what}: {err}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+

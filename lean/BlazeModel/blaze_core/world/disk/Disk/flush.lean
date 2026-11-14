@@ -21,17 +21,17 @@ def blaze_core.world.disk.Disk.flush.loop_0 (fuel : Nat) (self : blaze_core.worl
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.files) then do
-      let t14 ← Slice.index self.files i
-      let t9 := !(Slice.is_empty t14.barriers)
+      let t0 ← Slice.index self.files i
+      let t1 := !(Slice.is_empty t0.barriers)
       let self ←
-        if t9 then do
-          let t19 ← Slice.index self.files i
-          let covered ← blaze_core.world.disk.File.ordered fuel t19
-          let t28 := i
-          let t25 := covered
-          let x0 ← Slice.index self.files t28
-          let x1 ← blaze_core.world.disk.File.sync fuel x0 t25
-          let x2 ← Slice.update self.files t28 x1
+        if t1 then do
+          let t2 ← Slice.index self.files i
+          let covered ← blaze_core.world.disk.File.ordered fuel t2
+          let t3 := i
+          let t4 := covered
+          let x0 ← Slice.index self.files t3
+          let x1 ← blaze_core.world.disk.File.sync fuel x0 t4
+          let x2 ← Slice.update self.files t3 x1
           Result.ok { self with files := x2 }
         else Result.ok self
       let i ← Scalar.add i (1 : Usize)

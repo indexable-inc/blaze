@@ -10,9 +10,9 @@ set_option linter.unusedVariables false
 
 def closures.count_over (a : Option U32) (k : U32) : Result U32 := do
   let seen := (0 : U32)
-  let (doubled, t6) ←
+  let (doubled, t0) ←
     core.option.Option.u32.map.u32_closure0_count_over a ({ c0 := seen } : closures.count_over.closure0)
-  let seen := t6.c0
+  let seen := t0.c0
   match doubled with
   | Option.some v0 => if Scalar.gt v0 k then Scalar.add seen (1 : U32) else Result.ok seen
   | Option.none => Result.ok seen

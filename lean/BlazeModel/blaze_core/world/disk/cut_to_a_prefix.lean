@@ -10,6 +10,6 @@ def blaze_core.world.disk.cut_to_a_prefix (fuel : Nat) (durable : Slice U8) (rea
   match after with
   | Option.some v0 => do
     let bytes := v0
-    let t6 ← blaze_core.world.disk.starts_with fuel bytes durable
-    if t6 then blaze_core.world.disk.starts_with fuel read bytes else Result.ok t6
+    let t0 ← blaze_core.world.disk.starts_with fuel bytes durable
+    if t0 then blaze_core.world.disk.starts_with fuel read bytes else Result.ok t0
   | Option.none => Result.ok false

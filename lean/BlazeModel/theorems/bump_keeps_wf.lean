@@ -11,9 +11,9 @@ set_option linter.unusedVariables false
 def theorems.bump_keeps_wf (counter : theorems.Counter) : Result Bool :=
   if !(theorems.Counter.wf counter) then Result.ok true
   else do
-    let counter_8 := counter
-    let (t9, counter_8) ← theorems.Counter.bump counter_8
-    Result.ok (theorems.Counter.wf counter_8)
+    let counter_1 := counter
+    let (t0, counter_1) ← theorems.Counter.bump counter_1
+    Result.ok (theorems.Counter.wf counter_1)
 
 def theorems.bump_keeps_wf.spec.statement : Prop :=
   ∀ (counter : theorems.Counter), theorems.bump_keeps_wf counter = Result.ok true

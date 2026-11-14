@@ -8,8 +8,8 @@ set_option linter.unusedVariables false
 
 def generics.largest_is_at_least_both (a : U32) (b : U32) : Bool :=
   let m := generics.largest.u32 a b
-  let t6 := Scalar.ge m a
-  if t6 then Scalar.ge m b else t6
+  let t0 := Scalar.ge m a
+  if t0 then Scalar.ge m b else t0
 
 def generics.largest_is_at_least_both.spec.statement : Prop :=
   ∀ (a : U32) (b : U32), generics.largest_is_at_least_both a b = true

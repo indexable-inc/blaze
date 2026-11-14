@@ -6,5 +6,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.ordered_first (reach : Usize) (last : Usize) (whole : Usize) (covers : Usize) : Bool :=
-  let t5 := Scalar.le reach last
-  if t5 then t5 else Scalar.ge whole covers
+  let t0 := Scalar.le reach last
+  if t0 then t0 else Scalar.ge whole covers

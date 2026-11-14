@@ -7,17 +7,17 @@ open Blaze
 set_option linter.unusedVariables false
 
 def opaques.pass_keeps_ok (x : U32) (e : core.io.error.Error) : Bool :=
-  let t4 := opaques.pass (core.result.Result.Ok x : core.result.Result U32 core.io.error.Error)
+  let t0 := opaques.pass (core.result.Result.Ok x : core.result.Result U32 core.io.error.Error)
   let kept :=
-    match t4 with
+    match t0 with
     | core.result.Result.Ok v0 =>
       let y := v0
       Scalar.eq y x
     | core.result.Result.Err v1 => false
-  let t11 := kept
-  if t11 then
+  let t1 := kept
+  if t1 then
     core.result.Result.is_err (opaques.pass (core.result.Result.Err e : core.result.Result U32 core.io.error.Error))
-  else t11
+  else t1
 
 def opaques.pass_keeps_ok.spec.statement : Prop :=
   ∀ (x : U32) (e : core.io.error.Error), opaques.pass_keeps_ok x e = true

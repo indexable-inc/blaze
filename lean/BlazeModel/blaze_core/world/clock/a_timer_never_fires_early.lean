@@ -17,12 +17,12 @@ def blaze_core.world.clock.a_timer_never_fires_early (now : U64) (after : U64) (
   else do
     let waited ← Scalar.sub reading now
     let clock := blaze_core.world.clock.Clock.read clock reading
-    let t25 := Scalar.ge waited after
-    let t24 := if t25 then t25 else Scalar.eq reading (18446744073709551615 : U64)
-    if t24 then
-      let t30 := !(blaze_core.world.clock.Clock.allows clock later)
-      if t30 then Result.ok t30 else Result.ok (Scalar.ge later reading)
-    else Result.ok t24
+    let t0 := Scalar.ge waited after
+    let t1 := if t0 then t0 else Scalar.eq reading (18446744073709551615 : U64)
+    if t1 then
+      let t2 := !(blaze_core.world.clock.Clock.allows clock later)
+      if t2 then Result.ok t2 else Result.ok (Scalar.ge later reading)
+    else Result.ok t1
 
 def blaze_core.world.clock.a_timer_never_fires_early.spec.statement : Prop :=
   ∀ (now : U64) (after : U64) (reading : U64) (later : U64),

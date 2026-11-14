@@ -19,15 +19,15 @@ def blaze_core.world.disk.Disk.newest.loop_0 (fuel : Nat) (self : blaze_core.wor
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t9 := Scalar.lt i (Slice.len self.files)
-    let t8 := if t9 then Scalar.lt i (Slice.len cut) else t9
-    if t8 then do
-      let t22 ← Slice.index self.files i
-      let t19 := t22
+    let t0 := Scalar.lt i (Slice.len self.files)
+    let t1 := if t0 then Scalar.lt i (Slice.len cut) else t0
+    if t1 then do
+      let t2 ← Slice.index self.files i
+      let t3 := t2
       let x0 ← Slice.index cut i
-      let t18 ← blaze_core.world.disk.File.newest fuel t19 x0 none newest
-      let still := t18.1
-      let epoch := t18.2
+      let t4 ← blaze_core.world.disk.File.newest fuel t3 x0 none newest
+      let still := t4.1
+      let epoch := t4.2
       let none := still
       let newest := epoch
       let i ← Scalar.add i (1 : Usize)

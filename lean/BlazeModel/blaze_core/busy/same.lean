@@ -12,9 +12,9 @@ def blaze_core.busy.same (wait : Option U64) (reference : Option U64) : Bool :=
     | Option.none => true
     | Option.some v0 => false
   | Option.some v1 =>
-    let wait_4 := v1
+    let wait_1 := v1
     match reference with
     | Option.some v2 =>
-      let reference_5 := v2
-      Scalar.eq wait_4 reference_5
+      let reference_1 := v2
+      Scalar.eq wait_1 reference_1
     | Option.none => false

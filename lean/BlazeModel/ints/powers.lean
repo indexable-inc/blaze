@@ -6,21 +6,21 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.powers (x : U64) (y : U64) (e : U32) : Result U64 := do
-  let t6 := Scalar.is_power_of_two x
-  let t5 := if t6 then Scalar.is_multiple_of x y else t6
-  let flag := if t5 then (1 : U64) else (0 : U64)
-  let t19 ← Scalar.pow x e
-  let t22 ← Scalar.next_power_of_two x
-  let t18 ← Scalar.add t19 t22
-  let t24 ← Scalar.div_ceil x y
-  let t17 ← Scalar.add t18 t24
-  let t16 ← Scalar.add t17 (Scalar.saturating_mul x y)
-  let t15 ← Scalar.add t16 (Scalar.saturating_pow x e)
-  let t14 ← Scalar.add t15 (Scalar.wrapping_neg x)
-  let t13 ← Scalar.add t14 (Scalar.wrapping_shl x e)
-  let t12 ← Scalar.add t13 (Scalar.wrapping_shr x e)
-  let t41 ← Scalar.wrapping_div x y
-  let t11 ← Scalar.add t12 t41
-  let t44 ← Scalar.wrapping_rem x y
-  let t10 ← Scalar.add t11 t44
-  Scalar.add t10 flag
+  let t0 := Scalar.is_power_of_two x
+  let t1 := if t0 then Scalar.is_multiple_of x y else t0
+  let flag := if t1 then (1 : U64) else (0 : U64)
+  let t2 ← Scalar.pow x e
+  let t3 ← Scalar.next_power_of_two x
+  let t4 ← Scalar.add t2 t3
+  let t5 ← Scalar.div_ceil x y
+  let t6 ← Scalar.add t4 t5
+  let t7 ← Scalar.add t6 (Scalar.saturating_mul x y)
+  let t8 ← Scalar.add t7 (Scalar.saturating_pow x e)
+  let t9 ← Scalar.add t8 (Scalar.wrapping_neg x)
+  let t10 ← Scalar.add t9 (Scalar.wrapping_shl x e)
+  let t11 ← Scalar.add t10 (Scalar.wrapping_shr x e)
+  let t12 ← Scalar.wrapping_div x y
+  let t13 ← Scalar.add t11 t12
+  let t14 ← Scalar.wrapping_rem x y
+  let t15 ← Scalar.add t13 t14
+  Scalar.add t15 flag

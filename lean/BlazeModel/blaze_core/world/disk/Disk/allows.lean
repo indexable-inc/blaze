@@ -24,11 +24,11 @@ def blaze_core.world.disk.Disk.allows.loop_1 (fuel : Nat) (self : blaze_core.wor
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len cut) then do
-      let t54 ← Slice.index self.files i
-      let t51 := t54
-      let x2 ← Slice.index cut i
-      let t50 ← blaze_core.world.disk.File.keeps_ordered fuel t51 x2.whole newest
-      if !t50 then Result.ok false
+      let t0 ← Slice.index self.files i
+      let t1 := t0
+      let x0 ← Slice.index cut i
+      let t2 ← blaze_core.world.disk.File.keeps_ordered fuel t1 x0.whole newest
+      if !t2 then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.Disk.allows.loop_1 fuel self cut i newest
@@ -39,19 +39,19 @@ def blaze_core.world.disk.Disk.allows.loop_0 (fuel : Nat) (self : blaze_core.wor
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len cut) then do
-      let t24 ← Slice.index self.files i
-      let t21 := t24
-      let x0 ← Slice.index cut i
-      let t20 ← blaze_core.world.disk.File.fits t21 x0
-      if !t20 then Result.ok false
+      let t3 ← Slice.index self.files i
+      let t4 := t3
+      let x1 ← Slice.index cut i
+      let t5 ← blaze_core.world.disk.File.fits t4 x1
+      if !t5 then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.Disk.allows.loop_0 fuel self cut i
     else do
-      let t33 ← blaze_core.world.disk.Disk.newest fuel self cut
-      match t33 with
-      | Option.some v1 =>
-        let newest := v1
+      let t6 ← blaze_core.world.disk.Disk.newest fuel self cut
+      match t6 with
+      | Option.some v0 =>
+        let newest := v0
         let i := (0 : Usize)
         blaze_core.world.disk.Disk.allows.loop_1 fuel self cut i newest
       | Option.none => Result.ok true

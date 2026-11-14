@@ -6,11 +6,11 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.rebase.clash (a0 : U64) (a1 : U64) (b0 : U64) (b1 : U64) : Bool :=
-  let t6 := Scalar.eq a0 a1
-  let t5 := if t6 then t6 else Scalar.eq b0 b1
-  if t5 then
-    let t11 := Scalar.le a0 b1
-    if t11 then Scalar.le b0 a1 else t11
+  let t0 := Scalar.eq a0 a1
+  let t1 := if t0 then t0 else Scalar.eq b0 b1
+  if t1 then
+    let t2 := Scalar.le a0 b1
+    if t2 then Scalar.le b0 a1 else t2
   else
-    let t16 := Scalar.lt a0 b1
-    if t16 then Scalar.lt b0 a1 else t16
+    let t3 := Scalar.lt a0 b1
+    if t3 then Scalar.lt b0 a1 else t3

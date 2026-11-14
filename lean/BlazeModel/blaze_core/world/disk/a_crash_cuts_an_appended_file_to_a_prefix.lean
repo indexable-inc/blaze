@@ -45,42 +45,42 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix (fuel : Nat) (disk : blaze_core.world.disk.Disk) (file : U64) (cut : Vec blaze_core.world.disk.Kept) : Result Bool := do
-  let disk_4 := disk
-  let t8 ← blaze_core.world.disk.Disk.wf fuel disk_4
-  let t7 := !t8
-  let t6 ←
-    if t7 then Result.ok t7
+  let disk_1 := disk
+  let t0 ← blaze_core.world.disk.Disk.wf fuel disk_1
+  let t1 := !t0
+  let t2 ←
+    if t1 then Result.ok t1
     else do
-      let t10 ← blaze_core.world.disk.Disk.small fuel disk_4
-      Result.ok (!t10)
-  if t6 then Result.ok true
+      let t3 ← blaze_core.world.disk.Disk.small fuel disk_1
+      Result.ok (!t3)
+  if t2 then Result.ok true
   else do
-    let t15 ← blaze_core.world.disk.Disk.find fuel disk_4 file
-    match t15 with
+    let t4 ← blaze_core.world.disk.Disk.find fuel disk_1 file
+    match t4 with
     | Option.some v0 => do
       let «at» := v0
-      let t28 ← Slice.index disk_4.files «at»
-      let t24 ← blaze_core.world.disk.File.only_appended fuel t28
-      let t23 := !t24
-      let t22 ←
-        if t23 then Result.ok t23
+      let t5 ← Slice.index disk_1.files «at»
+      let t6 ← blaze_core.world.disk.File.only_appended fuel t5
+      let t7 := !t6
+      let t8 ←
+        if t7 then Result.ok t7
         else do
-          let t32 ← Slice.index disk_4.files «at»
-          Result.ok (core.option.Option.is_some t32.undo)
-      if t22 then Result.ok true
+          let t9 ← Slice.index disk_1.files «at»
+          Result.ok (core.option.Option.is_some t9.undo)
+      if t8 then Result.ok true
       else do
-        let t39 ← Slice.index disk_4.files «at»
-        let read ← blaze_core.world.disk.File.contents fuel t39
-        let t45 ← Slice.index disk_4.files «at»
-        let durable ← blaze_core.world.disk.copy t45.durable
-        let t50 ← blaze_core.world.disk.Disk.allows fuel disk_4 cut
-        if !t50 then Result.ok true
+        let t10 ← Slice.index disk_1.files «at»
+        let read ← blaze_core.world.disk.File.contents fuel t10
+        let t11 ← Slice.index disk_1.files «at»
+        let durable ← blaze_core.world.disk.copy t11.durable
+        let t12 ← blaze_core.world.disk.Disk.allows fuel disk_1 cut
+        if !t12 then Result.ok true
         else do
-          let disk_4 ← blaze_core.world.disk.Disk.crash fuel disk_4 cut
-          let t64 := durable
-          let t68 := read
-          let t74 ← blaze_core.world.disk.Disk.contents fuel disk_4 file
-          blaze_core.world.disk.cut_to_a_prefix fuel t64 t68 t74
+          let disk_1 ← blaze_core.world.disk.Disk.crash fuel disk_1 cut
+          let t13 := durable
+          let t14 := read
+          let t15 ← blaze_core.world.disk.Disk.contents fuel disk_1 file
+          blaze_core.world.disk.cut_to_a_prefix fuel t13 t14 t15
     | Option.none => Result.ok true
 
 def blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.statement : Prop :=

@@ -6,5 +6,5 @@ import BlazeModel.closures.result_methods.closure7.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.result_methods.closure7.call (t1 : closures.result_methods.closure7) (v : U32) : U32 :=
+def closures.result_methods.closure7.call (t0 : closures.result_methods.closure7) (v : U32) : U32 :=
   v

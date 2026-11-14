@@ -6,7 +6,7 @@ import BlazeModel.closures.ticks.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.ticks.closure0.call (t1 : closures.ticks.closure0) : Result (U32 × closures.ticks.closure0) := do
-  let x0 ← Scalar.add t1.c0 (1 : U32)
-  let t1 := { t1 with c0 := x0 }
-  Result.ok (t1.c0, t1)
+def closures.ticks.closure0.call (t0 : closures.ticks.closure0) : Result (U32 × closures.ticks.closure0) := do
+  let x0 ← Scalar.add t0.c0 (1 : U32)
+  let t0 := { t0 with c0 := x0 }
+  Result.ok (t0.c0, t0)
