@@ -642,10 +642,10 @@ impl Daemon {
         if let Some(mut recording) = recording {
             // And the paths the steps read, as they say once the walk ended: the header, and
             // the build script's `OUT_DIR`, under the directory of outputs, stamped now.
-            let files = [PathBuf::from(HEADER), PathBuf::from(world.out_dir_path())];
+            let reads = [PathBuf::from(HEADER), PathBuf::from(world.out_dir_path())];
             let listed: &[PathBuf] = &[];
             let read = match world.names {
-                true => Ok((files.as_slice(), listed)),
+                true => Ok((reads.as_slice(), listed)),
                 false => Err("a build script's run was not found kept"),
             };
             recording.vouch_reads(read, &self.disk);
