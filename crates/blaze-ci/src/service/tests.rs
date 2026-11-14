@@ -331,7 +331,8 @@ fn a_failed_request_lists_errors_with_their_place_facts_and_test_output() {
     let out = sim.step(Input::Ended { job, run: test_run, ok: false });
     let summary = &sim.posted[&test_run].summary;
     assert_eq!(sim.status(test_run), CheckStatus::Failure);
-    assert!(summary.contains("0 passed, 1 failed"), "{summary}");
+    // No pass is a kept one: the counts alone, with no cached clause.
+    assert!(summary.starts_with("0 errors, 0 warnings; tests: 0 passed, 1 failed, 0 ignored."), "{summary}");
     assert!(summary.contains("test blaze_ci `t` failed"), "{summary}");
     assert!(summary.contains("line 99") && !summary.contains("line 69\n"), "{summary}");
     assert!(summary.contains("the test binary crashed (at blaze_ci)"), "{summary}");
@@ -1011,10 +1012,11 @@ impl OldReport {
         );
         match kind {
             CheckKind::Test => {
-                text += &format!(
-                    "; tests: {} passed ({} cached: their kept passes stand), {} failed, {} ignored",
-                    self.passed, self.cached, self.failed, self.ignored
-                )
+                text += &format!("; tests: {} passed", self.passed);
+                if self.cached > 0 {
+                    text += &format!(" ({} cached: their kept passes stand)", self.cached);
+                }
+                text += &format!(", {} failed, {} ignored", self.failed, self.ignored);
             }
             CheckKind::Build => text += &format!("; {} artifacts built", self.artifacts),
             CheckKind::Check => {}

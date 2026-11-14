@@ -608,7 +608,10 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
                 view,
                 targets,
                 filter: asked.filter.iter().cloned().collect(),
-                all: flags.run_all,
+                // `--ub` runs every test it selects: its runs are in the MIR evaluator, which
+                // compiles nothing, so no test's reach is known and no kept pass is asked of
+                // (`serve::unit::test::ub_tests` refuses a `--ub` request that is not `all`).
+                all: flags.run_all || flags.ub,
                 args,
                 ub,
             }

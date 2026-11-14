@@ -334,6 +334,19 @@ fn tests_built() -> Vec<Response> {
     ]
 }
 
+/// What a `blaze test --doc` build answers: as [`tests_built`], its artifacts the doc tests
+/// alone, as cargo's `--doc` builds no test executable.
+fn docs_built() -> Vec<Response> {
+    let mut responses = tests_built();
+    for response in &mut responses {
+        if let Response::Built { artifacts, .. } = response {
+            artifacts.retain(|it| it.kind == blaze_api::ArtifactKind::Doctest);
+            assert_eq!(artifacts.len(), 1, "the fixture has one doc test target");
+        }
+    }
+    responses
+}
+
 fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, String, String) {
     let asked = invocation(self::words(os(words)));
     let request = request_of(&asked);
@@ -444,16 +457,19 @@ fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
     let nothing = blaze_screen::Tally { filtered_out: 6, ..blaze_screen::Tally::default() };
     let mut programs = Fake { counts: Some(nothing), names: vec!["tests::parses"], ..Fake::default() };
     let (then, out, err) =
-        driven(&mut FakeApi::answering(tests_built()), &["blaze", "test", "--doc", "parsse"], &mut programs);
+        driven(&mut FakeApi::answering(docs_built()), &["blaze", "test", "--doc", "parsse"], &mut programs);
     assert_eq!(then, Then::Exit(Exit::NoTests.code()));
     assert_eq!(out, "");
+    // The doc tests alone ran, and nothing lists a doc test's names: no nearest is said (the
+    // daemon's runs below name the nearest, from what it said of each executable).
     assert!(
         err.contains(
             "error: no test ran: `blaze test --doc parsse` matched none of the 6 tests in 1 test executable\n\
-             note: the nearest that exist: tests::parses\n"
+             note: a run of no test is refused"
         ),
         "{err}"
     );
+    assert!(!err.contains("     Running "), "under `--doc` no test executable runs: {err}");
     assert!(
         err.lines().last().unwrap().starts_with("blaze: tests failed selected=0 ran=0 passed=0 failed=0 "),
         "{err}"
@@ -462,7 +478,7 @@ fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
 
     let mut programs = Fake { counts: Some(nothing), ..Fake::default() };
     let words = ["blaze", "test", "--doc", "parsse", "--no-tests", "pass"];
-    let (then, _, err) = driven(&mut FakeApi::answering(tests_built()), &words, &mut programs);
+    let (then, _, err) = driven(&mut FakeApi::answering(docs_built()), &words, &mut programs);
     assert_eq!(then, Then::Exit(0), "{err}");
     assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=0 ran=0 "), "{err}");
 

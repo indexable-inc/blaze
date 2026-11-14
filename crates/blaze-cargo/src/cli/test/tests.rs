@@ -902,7 +902,9 @@ fn the_daemons_results_are_counted_by_outcome_and_executable() {
     );
     assert_eq!(tally_of(&[], &[]), Tally::default());
     // An executable whose every test the filter left out has no result: what the daemon said
-    // of it counts it, and what it left out.
+    // of it counts it, and what it left out. The daemon says it of every executable of the
+    // run, under the index its results carry (`foo` is 3, `x` is 1): one with results and a
+    // `TestsOf` is one executable, and `e2`, all of whose 5 tests were left out, is the third.
     let of = |executable: u32, filtered_out: u32| blaze_api::TestsOf {
         tests: filtered_out,
         binary: format!("/w/target/debug/deps/e{executable}"),
@@ -911,7 +913,7 @@ fn the_daemons_results_are_counted_by_outcome_and_executable() {
         filtered_out,
     };
     assert_eq!(
-        tally_of(&results, &[of(0, 3), of(1, 0), of(2, 5)]),
+        tally_of(&results, &[of(3, 3), of(1, 0), of(2, 5)]),
         Tally { binaries: 3, passed: 2, failed: 1, ignored: 1, cached: 1, filtered_out: 8, ..Tally::default() }
     );
 }

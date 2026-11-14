@@ -1100,11 +1100,13 @@ impl Report {
         );
         match kind {
             CheckKind::Test => {
-                let _ = write!(
-                    text,
-                    "; tests: {} passed ({} cached: their kept passes stand), {} failed, {} ignored",
-                    self.passed, self.cached, self.failed, self.ignored
-                );
+                // The cached clause only when some pass is a kept one: a run that kept none
+                // reads as libtest's counts alone.
+                let _ = write!(text, "; tests: {} passed", self.passed);
+                if self.cached > 0 {
+                    let _ = write!(text, " ({} cached: their kept passes stand)", self.cached);
+                }
+                let _ = write!(text, ", {} failed, {} ignored", self.failed, self.ignored);
             }
             CheckKind::Build => {
                 let _ = write!(text, "; {} artifacts built", self.artifacts);
