@@ -6,4 +6,6 @@ import BlazeModel.derives.Waited.unit.type
 open Blaze
 set_option linter.unusedVariables false
 
+namespace derives.Waited.unit
 deriving instance DecidableEq for derives.Waited.unit
+end derives.Waited.unit

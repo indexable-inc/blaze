@@ -111,3 +111,21 @@ theorem expect_eq_ok (r : Blaze.core.result.Result T E) (v : T) :
   unwrap_eq_ok r v
 
 end Blaze.core.result.Result
+
+namespace Blaze.core.marker
+
+/-- `core::marker::PhantomData<T>` (library/core/src/marker.rs:811,
+`pub struct PhantomData<T: PointeeSized>;`): a unit struct, zero-sized, with no field. Its `T` is
+no value at run time (it speaks to variance, the drop check and auto traits only), so one Lean
+type stands for every `PhantomData<T>`: the structure with no field, which has one value. It is
+built as `PhantomData.mk`; a copy or a clone is the value (marker.rs:844, `impl Copy`); `==` is
+always `true` (marker.rs:821: `fn eq(&self, _other: &PhantomData<T>) -> bool { true }`), which is
+Lean's `=` of a type with one value. Nothing looks inside it: there is nothing. -/
+structure PhantomData : Type where
+  deriving DecidableEq, Repr
+
+/-- Every two `PhantomData`s are one. -/
+theorem PhantomData.eq_all (a b : PhantomData) : a = b := by
+  cases a; cases b; rfl
+
+end Blaze.core.marker

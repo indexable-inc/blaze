@@ -150,8 +150,12 @@ pub enum Decl {
     Theorem { name: String, statement: String, proof: String },
     /// `#print axioms name`.
     PrintAxioms(String),
-    /// `deriving instance DecidableEq for name`: Lean's `=` of the type decided, the model of
-    /// its derived `==`.
+    /// `deriving instance DecidableEq for name` inside `namespace name`: Lean's `=` of the
+    /// type decided, the model of its derived `==`. In the type's own namespace the instance
+    /// and its auxiliary definitions are named by the whole type (`name.instDecidableEq..`):
+    /// at the top level Lean names them by the last segment alone, and two impl modules of
+    /// types alike in it (`derives.Point`, `derives.Tagged.Point`) that do not import each
+    /// other then declare one name twice, so no module can import both.
     DeriveDecidableEq(String),
     /// `opaque name (params) : ty`: a constant of that type with no definition the kernel
     /// unfolds ([`crate::opaque_module`]).
@@ -480,7 +484,9 @@ impl Printer {
             ),
             Decl::PrintAxioms(name) => self.line(0, &format!("#print axioms {}", ident(name))),
             Decl::DeriveDecidableEq(name) => {
-                self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)))
+                self.line(0, &format!("namespace {}", ident(name)));
+                self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)));
+                self.line(0, &format!("end {}", ident(name)))
             }
             Decl::Opaque { name, params, ty } => {
                 let params = binders(params);

@@ -8,4 +8,6 @@ import BlazeModel.derives.Shape.impl
 open Blaze
 set_option linter.unusedVariables false
 
+namespace derives.Path
 deriving instance DecidableEq for derives.Path
+end derives.Path

@@ -86,6 +86,7 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Vec(elem) => app("Vec", vec![lean_ty(elem)]),
         Ty::Array(elem, len) => app("Arr", vec![lean_ty(elem), atom(len.to_string())]),
         Ty::TryFromIntError => name("core.num.TryFromIntError"),
+        Ty::PhantomData => name("core.marker.PhantomData"),
         Ty::Duration => name("core.time.Duration"),
         Ty::Ordering => name("core.cmp.Ordering"),
         Ty::Str => name("Str"),
@@ -280,24 +281,46 @@ fn substitute(term: &mut Term, x: &str, with: &Term) {
     }
 }
 
-/// How often `x` is read in `m`, up to where it is bound again.
-fn reads(m: &M, x: &str) -> usize {
+/// How often `x` is read in `m`, up to where it is bound again. A tail several arms go on to
+/// ([`Translate::joins`]) reads, where it is called, what it reads itself: it is written in the
+/// scope of the code that calls it, so a binding it reads is live at each call.
+fn reads(m: &M, x: &str, joins: &[M]) -> usize {
+    reads_through(m, x, joins, &mut Vec::new())
+}
+
+/// [`reads`], `open` the tails whose reads are being counted (a tail that calls one of them
+/// adds nothing more).
+fn reads_through(m: &M, x: &str, joins: &[M], open: &mut Vec<usize>) -> usize {
+    let mut term_reads = |term: &Term, open: &mut Vec<usize>| {
+        occurs(term, x)
+            + match join_of(term) {
+                Some(id) if !open.contains(&id) => {
+                    open.push(id);
+                    let tail = joins.get(id).map_or(0, |tail| reads_through(tail, x, joins, open));
+                    open.pop();
+                    tail
+                }
+                _ => 0,
+            }
+    };
     match m {
-        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => occurs(term, x),
+        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => term_reads(term, open),
         M::Fail(_) => 0,
         M::Let { pat, value, body } => {
             let value = match value {
-                Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term) => occurs(term, x),
-                Rhs::Sub(sub) => reads(sub, x),
+                Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term) => term_reads(term, open),
+                Rhs::Sub(sub) => reads_through(sub, x, joins, open),
             };
-            value + if binds(pat, x) { 0 } else { reads(body, x) }
+            value + if binds(pat, x) { 0 } else { reads_through(body, x, joins, open) }
         }
-        M::If { cond, then, otherwise } => occurs(cond, x) + reads(then, x) + reads(otherwise, x),
+        M::If { cond, then, otherwise } => {
+            occurs(cond, x) + reads_through(then, x, joins, open) + reads_through(otherwise, x, joins, open)
+        }
         M::Match { on, arms, .. } => {
             occurs(on, x)
                 + arms
                     .iter()
-                    .map(|(pat, arm)| if binds(pat, x) { 0 } else { reads(arm, x) })
+                    .map(|(pat, arm)| if binds(pat, x) { 0 } else { reads_through(arm, x, joins, open) })
                     .sum::<usize>()
         }
     }
@@ -355,13 +378,14 @@ fn replace_end(m: M, end: M) -> M {
     }
 }
 
-/// The simplifications the module names; `temps` are the variables that hold no binding.
-fn simplify(m: M, temps: &BTreeSet<String>) -> M {
+/// The simplifications the module names; `temps` are the variables that hold no binding,
+/// `joins` the tails the code's placeholders stand for ([`Translate::joins`]).
+fn simplify(m: M, temps: &BTreeSet<String>, joins: &[M]) -> M {
     match m {
         M::Let { pat, value, body } => {
-            let mut body = simplify(*body, temps);
+            let mut body = simplify(*body, temps, joins);
             let value = match value {
-                Rhs::Sub(sub) => match simplify(*sub, temps) {
+                Rhs::Sub(sub) => match simplify(*sub, temps, joins) {
                     M::Ret(term) => Rhs::Pure(term),
                     M::Tail(term) => Rhs::Act(term),
                     M::ProgTail(term) => Rhs::Prog(term),
@@ -378,7 +402,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                 return body;
             }
             if let (Pat::Name(x), Rhs::Pure(term)) = (&pat, &value) {
-                let count = reads(&body, x);
+                let count = reads(&body, x, joins);
                 if count == 0 {
                     return body;
                 }
@@ -416,12 +440,12 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
         }
         M::If { cond, then, otherwise } => M::If {
             cond,
-            then: Box::new(simplify(*then, temps)),
-            otherwise: Box::new(simplify(*otherwise, temps)),
+            then: Box::new(simplify(*then, temps, joins)),
+            otherwise: Box::new(simplify(*otherwise, temps, joins)),
         },
         M::Match { on, arms, of } => {
             let mut arms: Vec<(Pat, M)> =
-                arms.into_iter().map(|(pat, arm)| (pat, simplify(arm, temps))).collect();
+                arms.into_iter().map(|(pat, arm)| (pat, simplify(arm, temps, joins))).collect();
             // `match x with | A => a | _ => match x with | B => b | A => c` is
             // `match x with | A => a | B => b`: the `_` arm binds nothing, so the inner `x` is
             // the outer one, and an inner arm for a constructor an outer arm took is dead there.
@@ -452,7 +476,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                     let M::Match { arms: inner, .. } = *sub else { unreachable!("matched above") };
                     for (pat, arm) in inner.into_iter().filter(|(pat, _)| live(&heads, pat)) {
                         let rest = M::Let { pat: bound.clone(), value: Rhs::Sub(Box::new(arm)), body: body.clone() };
-                        arms.push((pat, simplify(rest, temps)));
+                        arms.push((pat, simplify(rest, temps, joins)));
                     }
                 }
                 _ => {}
@@ -617,8 +641,11 @@ struct Translate<'a> {
     /// `Threads.Prog`: its program points are named, and a tail several arms go on to is
     /// written once.
     prog_level: bool,
-    /// The tails several arms go on to, each written once ([`Then::Join`]), by number.
-    joins: Vec<Option<M>>,
+    /// The tails several arms go on to, each written once ([`Then::Join`]), by number. The
+    /// table only grows: a number is taken only with its tail, never given back or reused, and
+    /// an entry is only ever replaced by a fuller tail ([`push`]), so every [`join_call`] made
+    /// from a number finds its tail, whatever order the code around it is written in.
+    joins: Vec<M>,
     /// The tails a loop's program points went on to ([`Points::join`]).
     reached: BTreeSet<usize>,
 }
@@ -960,6 +987,7 @@ impl<'a> Translate<'a> {
             Operand::Int(ty, bits) => int_lit(*ty, *bits),
             Operand::Bool(value) => atom(if *value { "true" } else { "false" }),
             Operand::Unit => atom("()"),
+            Operand::PhantomData => name("core.marker.PhantomData.mk"),
             Operand::Str(bytes) => app(
                 "Str.ofBytes",
                 vec![Term::List(bytes.iter().map(|it| atom(it.to_string())).collect())],
@@ -1578,26 +1606,24 @@ impl<'a> Translate<'a> {
         }
         // The tail first: a loop in an arm whose way out goes on to it makes its program points
         // when the loop is written, from the tail.
-        let before = (self.loops.len(), self.loop_count, self.prog_loops.clone(), self.joins.len());
+        let before = (self.loops.len(), self.loop_count, self.prog_loops.clone());
         let rest = self.seq(after, then, live);
         (self.bound, self.narrowed) = (bound.clone(), narrowed.clone());
-        let rest = simplify(rest?, &self.temps);
+        let rest = simplify(rest?, &self.temps, &self.joins);
         let id = self.joins.len();
-        self.joins.push(Some(rest.clone()));
+        self.joins.push(rest.clone());
         let m = self.inside(node, &Then::Join { id }, live_after)?;
         let calls = joins_in(&m, id);
         if calls == 0 && !self.reached.contains(&id) {
             // Nothing goes on: the tail is not part of the model, and the branch is written
-            // again without it, its loops numbered as if the tail had never been written.
-            let (loops, loop_count, prog_loops, joins) = before;
+            // the plain way ([`Then::Seq`]), its loops numbered as if the tail had never been
+            // written. The tail stays in the table under its own number, which nothing calls.
+            let (loops, loop_count, prog_loops) = before;
             self.loops.truncate(loops);
             self.loop_count = loop_count;
             self.prog_loops = prog_loops;
-            self.joins.truncate(joins);
             (self.bound, self.narrowed) = (bound, narrowed);
-            let id = self.joins.len();
-            self.joins.push(None);
-            return self.inside(node, &Then::Join { id }, live_after).map(Some);
+            return Ok(None);
         }
         // Only a loop in an arm goes on to it: the loop has the tail's point.
         if calls == 0 {
@@ -1637,12 +1663,12 @@ impl<'a> Translate<'a> {
             loops.insert(it.clone(), (binder, ty.clone()));
         }
         let m = prepass(m, &mut self.joins);
-        let m = simplify(m, &self.temps);
+        let m = simplify(m, &self.temps, &self.joins);
         known.extend(loops.values().map(|(binder, _)| binder.clone()));
         let mut points = Points {
             known,
             loops: loops.clone(),
-            joins: &mut self.joins,
+            joins: &self.joins,
             reached: &mut self.reached,
             joined: BTreeMap::new(),
             made: Vec::new(),
@@ -1707,7 +1733,7 @@ impl<'a> Translate<'a> {
         self.bound = outer_bound;
         self.narrowed = outer_narrowed;
         self.prog_level = outer_level;
-        let m = simplify(m?, &self.temps);
+        let m = simplify(m?, &self.temps, &self.joins);
         let m = match shared {
             true => {
                 // The loops a point of this one goes on with are those still being written
@@ -1883,7 +1909,7 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     translate.result = translate.types(&translate.returned);
     let live: Set = translate.returned.iter().copied().collect();
     let m = translate.seq(&body.nodes, &Then::Return, &live)?;
-    let m = simplify(m, &translate.temps);
+    let m = simplify(m, &translate.temps, &translate.joins);
     let (m, points) = match shared {
         true => translate.points(m, &body.name, &BTreeSet::new())?,
         false => (m, Vec::new()),
@@ -2298,17 +2324,15 @@ fn ends(m: &M) -> usize {
 }
 
 /// `m`, whose value `pat` binds, then `rest`: `rest` at each end of `m`.
-fn push(m: M, pat: &Pat, rest: &M, joins: &mut Vec<Option<M>>, pushed: &mut BTreeSet<usize>) -> M {
+fn push(m: M, pat: &Pat, rest: &M, joins: &mut Vec<M>, pushed: &mut BTreeSet<usize>) -> M {
     let then = |value: Rhs| M::Let { pat: pat.clone(), value, body: Box::new(rest.clone()) };
     match m {
         // A tail the arms share takes what follows once, where it is written.
         M::ProgTail(term) if let Some(id) = join_of(&term) => {
             if pushed.insert(id) {
-                let Some(tail) = joins.get_mut(id).and_then(Option::take) else {
-                    unreachable!("a tail is called only from the definition it was written for")
-                };
-                let tail = push(tail, pat, rest, joins, pushed);
-                joins[id] = Some(prepass(tail, joins));
+                // The tail stays in the table while what follows is pushed into it.
+                let tail = push(joins[id].clone(), pat, rest, joins, pushed);
+                joins[id] = prepass(tail, joins);
             }
             M::ProgTail(term)
         }
@@ -2338,7 +2362,7 @@ fn push(m: M, pat: &Pat, rest: &M, joins: &mut Vec<Option<M>>, pushed: &mut BTre
 /// no name), and a tail its arms share takes it once. What follows is copied where it is one
 /// term or only one arm reaches it, and is otherwise a tail the arms call
 /// ([`Translate::joins`]).
-fn prepass(m: M, joins: &mut Vec<Option<M>>) -> M {
+fn prepass(m: M, joins: &mut Vec<M>) -> M {
     match m {
         M::Let { pat, value: Rhs::Sub(sub), body } if in_prog(&sub) => bind_sub(*sub, &pat, *body, joins),
         M::Let { pat, value: Rhs::Prog(term), body } if join_of(&term).is_some() => {
@@ -2360,13 +2384,13 @@ fn prepass(m: M, joins: &mut Vec<Option<M>>) -> M {
 }
 
 /// `let pat ← sub; body`, `body` pushed into `sub`'s ends ([`prepass`]).
-fn bind_sub(sub: M, pat: &Pat, body: M, joins: &mut Vec<Option<M>>) -> M {
+fn bind_sub(sub: M, pat: &Pat, body: M, joins: &mut Vec<M>) -> M {
     let body = prepass(body, joins);
     let rest = match single(&body) || ends(&sub) <= 1 {
         true => body,
         false => {
             let id = joins.len();
-            joins.push(Some(body));
+            joins.push(body);
             join_call(id)
         }
     };
@@ -2569,7 +2593,7 @@ struct Points<'j> {
     known: BTreeSet<String>,
     /// Each loop a point takes as a parameter: the parameter's name and type.
     loops: BTreeMap<String, (String, Term)>,
-    joins: &'j mut Vec<Option<M>>,
+    joins: &'j [M],
     /// The tails these points go on to, recorded for [`Translate::shared_tail`].
     reached: &'j mut BTreeSet<usize>,
     /// The call of each tail made a point.
@@ -2612,10 +2636,7 @@ impl Points<'_> {
         }
         self.reached.insert(id);
         // A loop in an arm that goes on to the tail has its own copy of the tail's point.
-        let Some(Some(m)) = self.joins.get(id).cloned() else {
-            unreachable!("a tail is written before the code that calls it")
-        };
-        let m = self.cut(m);
+        let m = self.cut(self.joins[id].clone());
         let call = if single(&m) { m } else { self.point(m, &Pat::Wild) };
         self.joined.insert(id, call.clone());
         call
