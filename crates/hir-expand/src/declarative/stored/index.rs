@@ -312,8 +312,9 @@ pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
 /// database keeps entries, with no expansion; made from the expansion's parse and kept where
 /// it is not found. `None` for an expansion with no key, whose items are made from it.
 ///
-/// A row is a function of its item's text, as a file's is; the positions are of the
-/// expansion's text, which the key determines.
+/// A row is a function of its item's tokens, as a file's is; the positions are of the
+/// expansion's text, which the key determines (an expansion's text is made from its tokens
+/// and their spacing, never from the spaces of the text its call or definition is in).
 #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
 pub fn of_expansion(db: &Db, call: MacroCallId, krate: Crate) -> Option<FileIndex> {
     let set = super::expansion::key(db, call)?;
@@ -831,6 +832,13 @@ fn tokens(text: &str, mut each: impl FnMut(usize, Token<'_>)) {
     if let Some((held_at, last)) = held {
         each(held_at, last);
     }
+}
+
+/// Calls `each` with where each token [`tokens`] gives of `text` starts and its length, in
+/// order: the tokens a row hashes, so what a kept value says by them (`super::Squeeze`) is a
+/// function of the row's hash, as its key is.
+pub(super) fn token_ranges(text: &str, mut each: impl FnMut(u32, u32)) {
+    tokens(text, |at, token| each(at as u32, token.text.len() as u32));
 }
 
 /// Whether whitespace or a comment between `left` and `right` is something the parser or a
