@@ -22,7 +22,6 @@ impl App {
         let before = p.query.text.clone(); // alloc: short search query, compared only on an input event
         f(&mut p.query);
         if p.query.text.contains(['\n', '\r', '\t']) { p.query.text = p.query.text.replace(['\n', '\r', '\t'], " "); }
-        p.query_since = self.time;
         if before != p.query.text {
             p.at = 0;
             p.changed = self.time;
@@ -59,9 +58,7 @@ impl App {
         if let Some(hint) = field.part("hint_at").and_then(|h| h.part("hint")) {
             hint.text(if shown.is_empty() { placeholder } else { "" });
         }
-        let old = text.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-        let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused: self.focused, blink: true, since: p.query_since, ..old };
-        if next != old { text.set(next); }
+        self.sync_draft_caret(text, [caret, anchor, lo, hi], self.focused);
         // A long query stays on one line. Follow the caret horizontally without a distracting visible scroller.
         if let (Some(area), Some(caret)) = (field.entity().try_cloned::<&Laid>(), words_caret(&mut self.paint.borrow_mut(), text.entity())) {
             let shown = field.entity().try_cloned::<&ScrollState>().unwrap_or_default();
@@ -89,14 +86,13 @@ impl App {
         if p.query.marked.is_some() { return; }
         if self.mods.shift && clicks == 1 { p.query.caret = at; }
         else { let span = p.query.press(at, unit); p.query_drag = Some((unit, span)); }
-        p.query_since = self.time;
         self.poke();
     }
 
     pub(in crate::app) fn palette_pointer_drag(&mut self) {
         let Some((unit, span)) = self.palette.as_ref().and_then(|p| p.query_drag) else { return };
         let Some(at) = self.palette_index(self.pointer.x, self.pointer.y) else { return };
-        if let Some(p) = self.palette.as_mut() { p.query.drag_to(at, unit, span); p.query_since = self.time; }
+        if let Some(p) = self.palette.as_mut() { p.query.drag_to(at, unit, span); }
         self.poke();
     }
 }

@@ -153,7 +153,6 @@ struct Pick {
 struct Palette {
     mode: Mode,
     query: chat::Draft,
-    query_since: f32,
     query_drag: Option<(crate::pane::Unit, (usize, usize))>,
     at: usize,
     /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
@@ -167,11 +166,10 @@ impl Palette {
         Self {
             mode: Mode::Commands,
             query: chat::Draft::default(),
-            query_since: now,
             query_drag: None,
             at: 0,
             searched: String::new(),
-            changed: 0.0,
+            changed: now,
         }
     }
 }
@@ -1019,8 +1017,8 @@ impl App {
             let model::Row { e, depth } = r;
             let o = w.entity_from_id(e);
             me.sync_agent_emotion(row, o);
-            let status = me.status_of(e);
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
+            let status = row_status(me.status_of(e), o.has(model::ChatMode::id()), code);
             // Ended by an interrupt or a terminate (128 + SIGINT, 128 + SIGTERM): stopped on purpose, not a failure.
             let stopped = matches!(code, Some(130 | 143));
             let failed = status == "killed" || (code.is_some() && !stopped);
@@ -1030,7 +1028,7 @@ impl App {
             let sleeps = me.run_of(e).is_none() && depth > 0 && status == "running" && !o.has(model::Busy::id());
             let look = if selected {
                 "on"
-            } else if status == "running" && !sleeps {
+            } else if matches!(status, "running" | "ready") && !sleeps {
                 "rest"
             } else {
                 "done"
@@ -1100,6 +1098,7 @@ impl App {
                     n => n.to_string(),
                 };
                 let (meta, why) = match (status, code) {
+                    ("ready", _) => (String::new(), format!("{folder} · Ready to resume · conversation saved")),
                     ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
                     (_, Some(c)) if stopped => ("stopped".to_owned(), format!("{folder} \u{b7} stopped (exit {c}) {when} ago")),
                     (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
@@ -2318,6 +2317,7 @@ impl App {
             || paint.shimmering
             || paint.blocks_live
             || paint.lantern_live
+            || paint.caret_blinking
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
@@ -2765,7 +2765,6 @@ impl App {
         if let Some(p) = self.palette.as_mut() {
             p.query = chat::Draft { text: q.to_owned(), caret: q.len(), anchor: q.len(), ..chat::Draft::default() };
             p.changed = time;
-            p.query_since = time;
         }
         self.poke();
     }
@@ -2790,6 +2789,11 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
         _ if code.is_some() => "fail",
         _ => "",
     }
+}
+
+/// Process loss does not lose a durable chat. Preserve actual failures and lost terminals/runs; an idle chat resumes on send.
+fn row_status(status: &'static str, chat: bool, code: Option<i32>) -> &'static str {
+    if chat && status == "lost" && code.is_none() { "ready" } else { status }
 }
 
 /// The share of its work the running step of transcript `t` says it has done ("\u{2026} \u{b7} 132/388" in its words: a
@@ -3106,6 +3110,18 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon restart loses a provider process, not the saved conversation. Real exits and lost non-chat work remain visible.
+    #[test]
+    fn restored_chat_rows_are_ready_and_actual_failures_stay_failures() {
+        let ready = row_status("lost", true, None);
+        assert_eq!(ready, "ready");
+        assert_eq!(done_mark(ready, None, 1), "", "a resumable child chat has no failure mark");
+        assert_eq!(row_status("lost", false, None), "lost");
+        assert_eq!(row_status("lost", true, Some(1)), "lost");
+        assert_eq!(row_status("killed", true, None), "killed");
+        assert_eq!(row_status("exited", true, Some(1)), "exited");
+    }
 
     /// The tree as the daemon's `list` and `runs` tell it, at change `n` (the title and the newest run move each time).
     fn tree(n: usize) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
