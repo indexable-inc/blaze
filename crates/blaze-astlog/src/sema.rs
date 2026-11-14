@@ -561,6 +561,47 @@ impl<'a, F: Files> Sema<'a, F> {
         Some(segments.join("::"))
     }
 
+    /// A type's shape, for `type-kind`. `other` is a shape no row names otherwise: a coroutine,
+    /// a foreign type, an unnormalized projection.
+    fn type_kind(&self, ty: Type<'a>) -> &'static str {
+        if let Some(adt) = ty.as_adt() {
+            return match adt {
+                hir::Adt::Struct(_) => "struct",
+                hir::Adt::Enum(_) => "enum",
+                hir::Adt::Union(_) => "union",
+            };
+        }
+        if let Some(builtin) = ty.as_builtin() {
+            return match () {
+                () if builtin.is_int() => "int",
+                () if builtin.is_uint() => "uint",
+                () if builtin.is_float() => "float",
+                () if builtin.is_bool() => "bool",
+                () if builtin.is_char() => "char",
+                () if builtin.is_str() => "str",
+                () => "other",
+            };
+        }
+        let shapes: [(bool, &'static str); 11] = [
+            (ty.is_unknown(), "unknown"),
+            (ty.is_never(), "never"),
+            (ty.is_reference(), "ref"),
+            (ty.is_raw_ptr(), "ptr"),
+            (ty.is_slice(), "slice"),
+            (ty.is_array(), "array"),
+            (ty.is_tuple(), "tuple"),
+            (ty.as_dyn_trait().is_some(), "dyn"),
+            (ty.as_type_param(self.db).is_some(), "param"),
+            (ty.is_closure(), "closure"),
+            (ty.is_fn(), "fn"),
+        ];
+        match shapes.iter().find(|(is, _)| *is) {
+            Some((_, kind)) => kind,
+            None if ty.as_impl_traits(self.db).is_some() => "impl",
+            None => "other",
+        }
+    }
+
     /// The def that owns `def`: a variant's enum, a field's struct, union or variant, an
     /// associated item's impl or trait, an impl's or an item's module, a module's parent.
     /// `None` for a crate's root.
@@ -1346,6 +1387,26 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     out.push(vec![node(self.def(def)), Value::Int(count)]);
                 }
             }
+            Atom::TypeDef | Atom::TypeKind => {
+                let name = if matches!(atom, Atom::TypeDef) { "type-def" } else { "type-kind" };
+                let Some(Value::Node(at)) = inputs[0] else {
+                    return Err(not_a_type(line, name, inputs[0].as_ref().map_or("unbound", Value::what)));
+                };
+                let Some(ty) = self.ty_at(at) else { return Err(not_a_type(line, name, "a syntax node or a def")) };
+                match atom {
+                    Atom::TypeKind => out.push(vec![node(at), text(self.type_kind(ty))]),
+                    _ => {
+                        let def = match (ty.as_adt(), ty.as_dyn_trait()) {
+                            (Some(adt), _) => Some(ModuleDef::Adt(adt)),
+                            (None, Some(it)) => Some(ModuleDef::Trait(it)),
+                            (None, None) => None,
+                        };
+                        if let Some(def) = def {
+                            out.push(vec![node(at), node(self.def(Def::Item(def)))]);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1390,6 +1451,11 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
             (None, _) => Cow::Borrowed("(outside the view)"),
         }
     }
+}
+
+/// The error of a type relation given `what` where its type goes.
+fn not_a_type(line: usize, name: &'static str, what: &'static str) -> Error {
+    WrongValueSnafu { line, name, needs: "a type", arg: "its first argument", what }.build().into()
 }
 
 /// The integer `node` means: an integer literal, or one negated in an expression (`-7`) or a

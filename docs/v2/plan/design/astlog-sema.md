@@ -134,6 +134,8 @@ argument.
 | `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`) |
 | `(def-parent d p)` | `d` or `p` | the def that owns `d`: a variant's enum, a field's struct, union or variant, an associated item's impl or trait, an item's or an impl's module, a module's parent (a crate's root has none); or each def `p` owns |
 | `(variant-count e n)` | `e` | how many variants the enum has; any other def has no row |
+| `(type-kind t k)` | `t` | the type's shape as text: `struct`, `enum`, `union`, `ref`, `ptr`, `slice`, `array`, `tuple`, `str`, `bool`, `char`, `int` (signed), `uint`, `float`, `dyn`, `param`, `closure`, `fn`, `impl`, `never`, `unknown`, else `other` |
+| `(type-def t d)` | `t` | the ADT the type is, or the trait of a `dyn Trait`; a reference is not peeled, so `(peel-refs t u)` first |
 | `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field); an impl has none, so no row |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |

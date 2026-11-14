@@ -74,6 +74,10 @@ pub enum Atom {
     DefParent,
     /// `(variant-count e n)`: how many variants the enum `e` has.
     VariantCount,
+    /// `(type-def t d)`: the ADT a type is, or the trait of a `dyn Trait`.
+    TypeDef,
+    /// `(type-kind t k)`: the type's shape, as text (`struct`, `ref`, `int`, ...).
+    TypeKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +140,8 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "str-value" => (Atom::StrValue, 2, all0),
         "def-parent" => (Atom::DefParent, 2, Needs::Any(&[0, 1])),
         "variant-count" => (Atom::VariantCount, 2, all0),
+        "type-def" => (Atom::TypeDef, 2, all0),
+        "type-kind" => (Atom::TypeKind, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

@@ -538,3 +538,38 @@ fn def_parent_joins_a_def_and_its_owner_both_ways_and_variant_count_counts_an_en
     assert_eq!(down, want);
     assert_eq!(texts(&outcome, "variants"), [["lib::E", "3"]]);
 }
+
+/// `type-kind` names a type's shape, and `type-def` the ADT or the `dyn` trait it is; a
+/// reference is its own kind until `peel-refs` strips it.
+#[test]
+fn type_kind_names_a_types_shape_and_type_def_its_adt_or_trait() {
+    let fixture = r#"
+//- /lib.rs crate:lib edition:2021
+pub struct S;
+pub enum E { A }
+pub union U { a: u8 }
+pub trait T {}
+pub fn f(s: S, e: E, uu: U, r: &S, p: *const u8, sl: &[u8], a: [u8; 2], t: (u8, i8), st: &str, b: bool, c: char, i: i32, u: usize, fl: f64, d: &dyn T) {}
+"#;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (param p t) (syntax n "PARAM") (child n p) (kind p "IDENT_PAT") (type-of p t))
+        (rule (kinds p k) (param p t) (type-kind t k))
+        (rule (peeled p k) (param p t) (peel-refs t u) (type-kind u k))
+        (rule (defs p d) (param p t) (type-def t d))
+        (rule (peeled-defs p d) (param p t) (peel-refs t u) (type-def u d))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let kinds = [
+        "struct", "enum", "union", "ref", "ptr", "ref", "array", "tuple", "ref", "bool", "char", "int",
+        "uint", "float", "ref",
+    ];
+    let found: Vec<String> = texts(&outcome, "kinds").into_iter().map(|it| it[1].clone()).collect();
+    assert_eq!(found, kinds);
+    let peeled = texts(&outcome, "peeled");
+    let of = |name: &str| peeled.iter().find(|it| it[0] == name).map(|it| it[1].clone());
+    assert_eq!([of("sl"), of("st"), of("d")], [Some("slice".to_owned()), Some("str".to_owned()), Some("dyn".to_owned())]);
+    assert_eq!(texts(&outcome, "defs"), [["s", "lib::S"], ["e", "lib::E"], ["uu", "lib::U"]]);
+    let peeled = [["s", "lib::S"], ["e", "lib::E"], ["uu", "lib::U"], ["r", "lib::S"], ["d", "lib::T"]];
+    assert_eq!(texts(&outcome, "peeled-defs"), peeled);
+}
