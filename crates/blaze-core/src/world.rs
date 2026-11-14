@@ -8,7 +8,9 @@
 //! which answers the kernel may give where it has a choice. [`asks`] lays over the disk what
 //! has been asked of it and not answered yet, and which answers the kernel may give to each
 //! (a sync covers at least what it owes, a failed write lands what it may), and what a crash
-//! does to what is in flight.
+//! does to what is in flight. [`blocking`] is one call that waits: the kernel may end it early,
+//! for a signal or for nothing, and never says ready before the event or anything else after
+//! it.
 //!
 //! Three things read the one text. A proof: `blaze prove` translates a world's functions as it
 //! does a core's, so a core's theorem quantifies over every answer the world allows and needs
@@ -19,7 +21,13 @@
 //!
 //! The worlds are written in the subset `hir-ty-lean` translates today (structs, enums, `Vec`,
 //! index loops; no closures, iterators or generics), so a proof against one waits for nothing.
+//!
+//! A core that loops is proved against a world by running it: the theorem's function gives
+//! the real loop a kernel that answers from a list, each answer one the world allows, and
+//! says what holds when the loop ends; proved for every list, that is every run
+//! (`wait/retry.rs`, `a_wait_ends_by_its_deadline`).
 
 pub mod asks;
+pub mod blocking;
 pub mod clock;
 pub mod disk;

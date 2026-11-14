@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-108 theorems: 95 in `lean`, 13 in `lean/analysis`.
+109 theorems: 96 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1043,4 +1043,11 @@ theorem blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof :
 ```lean
 theorem blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof :
     blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.statement
+```
+
+**`blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_wait_ends_by_its_deadline holds of its model: for every start, deadline or none, event or none, lateness and list of answers, the real retry loop (drive), its calls answered from the list, each answer one the blocking call's world allows (interrupted, woken for nothing or timed out early at any moment before the event, read up to the lateness after), does not fail or panic, ends at most the lateness past its deadline, says the deadline passed only at a reading that has passed it and never where the event came the lateness or more before it, and with no deadline ends only ready.
+
+```lean
+theorem blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof :
+    blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.statement
 ```

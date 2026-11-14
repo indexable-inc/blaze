@@ -374,6 +374,22 @@
    "why": "A blaze command is a process that answers and exits, so each one opens its QUIC connection to the cache from cold: without a ticket from an earlier process that is one round trip before the first request leaves. rustls 0.23 cannot hand a ticket to another process (the value's fields are private, its constructor is crate-private, it has no encoding, and it is tied by pointer to the config that received it), so the piece is built where the fields are (rule build-the-missing-piece), as the tree already does for quinn-proto, cranelift and 20 other crates under vendor/.",
    "recommended": "The main agent (claude-fable-5-2) decided it, after raising it with the owner several times without an answer. A patched TLS library is a thing an owner may not want: the owner has not ruled and it is his to reverse. Reversing is deleting vendor/rustls and its `[patch]` line and blaze-http's `Tickets::add` and `fresh` (crates/blaze-http/src/h3/config.rs) with blaze-remote's tickets file; resumption then works inside one process only.",
    "state": "Built with the HTTP/3 reads of the remote cache (crates/blaze-http/src/h3, crates/blaze-remote/src/http3.rs); no bucket is configured, so nothing uses it against a real origin yet."
+  },
+  {
+   "id": "D43",
+   "date": "2026-11-14",
+   "decision": "A sans-IO loop takes its world as one value, and is proved by running it: the retry loop of every blocking wait (`blaze_core::wait::retry::drive`) takes a `Kernel` (its calls and its clock; a clock and a closure are one), a theorem's function gives the real loop a kernel that answers from a list of answers the world (`crates/blaze-core/src/world/blocking.rs`) allows, and its statement for every list is every run. The loop's simulation test and that test's hand-written kernel are deleted (wait/tests.rs), `a_wait_ends_by_its_deadline` being proved in Lean.",
+   "why": "The loop read its clock through `&self` beside a closure that moved it, which only a `Cell` can share; the translator has no model of interior mutability and a functional model should not need one. One value needs none, callers of `until` do not change, and the loop the theorem runs is the loop production runs. The world is at least as liberal as the deleted test's kernel (each of its behaviours is an answer the world allows) and allows more: a timeout early with the event still to come, a call that starts after the clock was read.",
+   "recommended": "The main agent (claude-fable-5-2) decided it under the owner's 2026-11-13 request that proofs replace simulation tests. Reversing is restoring wait/tests.rs's deleted section from git and keeping both.",
+   "state": "on proofs-1113: built and proved (Lean 4.35.0, the three allowed axioms)"
+  },
+  {
+   "id": "D44",
+   "date": "2026-11-14",
+   "decision": "Threads that share atomics are modelled as programs over one world (`lean/Blaze/Threads.lean`): a function that reaches an atomic operation is a tree of operations, `blaze_core::world::threads::two(schedule, first, second)` runs two closures one operation at a time in the schedule's order, and a theorem for every schedule is every interleaving. The world's memory is sequentially consistent and it refuses, never approximates, a run it is not the meaning of: orderings weaker than `SeqCst` are accepted only where the run's threads touch one cell (where every memory model is sequentially consistent); weaker orderings over two or more cells are `Error.unmodelled` until the world has views, and `Relaxed` there until it has promises.",
+   "why": "The park's simulation test ran an unpark whole between two of the park's atomics, so it never tried a park's step between the unpark's swap and its wake; an exhaustive statement needs both threads as steppable programs. Treating a weaker ordering as `SeqCst` would be a proof about a program blaze does not compile (rule no-fallback); the single-cell rule makes the first slice sound on real code (a park, a once, a flag, a lock word) without the weak world.",
+   "recommended": "The main agent (claude-fable-5-2) decided it. The weak world (views, then promises) is objective V17's remainder.",
+   "state": "on proofs-1113: the Lean library and its tests by evaluation are built; the translator's support, the Rust `two` and the park's proof are in lanes"
   }
  ]
 }
