@@ -3992,6 +3992,18 @@ pub fn parks_real(schedule: &[Step], deadline: Option<u32>) -> bool {
         Ended::Done(Err(_)) => !both || last == NOTIFIED,
     }
 }
+pub fn or_pattern_tail(word: &AtomicU32, parked: Ended<Result<Waited, WaitError>>, deadline: Option<u32>) -> bool {
+    let end = word.load(Ordering::SeqCst);
+    let passed = match deadline {
+        Some(at) => end >= at,
+        None => false,
+    };
+    match parked {
+        Ended::Asleep => !passed,
+        Ended::Done(Ok(Waited::Deadline)) => passed,
+        Ended::Done(Ok(Waited::Ready(()))) | Ended::Done(Err(_)) | Ended::Running => true,
+    }
+}
 pub fn unpark(word: &AtomicU32) {
     if word.swap(NOTIFIED, Ordering::Release) == PARKED {
         _ = threads::wake(word);
@@ -4090,6 +4102,14 @@ fn atomics_are_programs_over_shared_memory() {
     );
     let out = golden_from(&fixture, "atomics", "bump_and_wake");
     assert!(out.text.contains("Threads.wake word"), "{}", out.text);
+    // An or-pattern's three alternatives, tested at three depths, go on to one arm, and MIR
+    // tests them again at the start of that arm, to bind. The `match` touches no shared memory:
+    // it is a plain value, each alternative goes on to the arm in place, and there what the
+    // tests before it narrowed `parked` to decides the second test, which leaves nothing.
+    let out = emitted_from(&fixture, "atomics", "or_pattern_tail");
+    assert!(!out.text.contains('\u{0}'), "a placeholder is left in the model:\n{}", out.text);
+    assert!(!out.text.contains("let _ ←"), "the arm's second test is left in the model:\n{}", out.text);
+    golden_from(&fixture, "atomics", "or_pattern_tail");
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     for name in ["two_adds_make_two", "adds_until_done", "pokes_count", "parks_once"] {
         let theorem = emitted_from(&fixture, "atomics", name);
@@ -4104,6 +4124,29 @@ fn atomics_are_programs_over_shared_memory() {
     for module in ["BlazeModel.atomics.Real.Kernel.prepare", "BlazeModel.atomics.Real.Kernel.poke", "BlazeModel.atomics.Real.Kernel.kind"] {
         assert!(modules.contains(&module), "`poke_twice` imports {module}: {modules:?}");
     }
+}
+
+/// The check that ends every translation finds a placeholder of the translator's own (a tail's
+/// call, `\0join<n>`; a program point's, `\0point<n>`) wherever a model still holds one, and
+/// names it; a model with none passes. No body reaches the refusal it guards (every
+/// placeholder is replaced), so the check is tested on models built here.
+#[test]
+fn a_placeholder_left_in_a_model_is_found() {
+    let def = |body: lean::Term| lean::Decl::Def {
+        name: "f".to_owned(),
+        params: Vec::new(),
+        ty: lean::Term::Name("Bool".to_owned()),
+        body,
+    };
+    let call = |head: &str| {
+        lean::Term::App(Box::new(lean::Term::Name(head.to_owned())), vec![lean::Term::Name("x".to_owned())])
+    };
+    let mut joined = [def(lean::Term::Name("x".to_owned())), def(call("\u{0}join3"))];
+    assert_eq!(crate::translate::placeholder_left(&mut joined), Some("join3".to_owned()));
+    let mut pointed = [lean::Decl::Mutual(vec![def(call("\u{0}point0"))])];
+    assert_eq!(crate::translate::placeholder_left(&mut pointed), Some("point0".to_owned()));
+    let mut clean = [def(call("f.at_1"))];
+    assert_eq!(crate::translate::placeholder_left(&mut clean), None);
 }
 
 /// A `Step` built from its fields, `Step { second: false, pick: 0 }`, is a value of the Lean

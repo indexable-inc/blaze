@@ -289,6 +289,7 @@ fn sealed_or_row(
     match reads.first() {
         Some(&read) => {
             sealed.below_high.pin().insert(key);
+            let of = ReadCrate { db, read };
             let read = Witness::read_text(db, read);
             let _span = tracing::info_span!(
                 target: "blaze",
@@ -296,6 +297,7 @@ fn sealed_or_row(
                 krate = %krate,
                 instance = %name,
                 read = %read,
+                of = %of,
                 count = sealed.below_high.len(),
             )
             .entered();
@@ -314,6 +316,31 @@ fn sealed_or_row(
             .entered();
             summary_in(db, home, proofs, instance)
         }
+    }
+}
+
+/// The crate a read is of, where the read is a field of a crate's input: its name and its
+/// origin, which says why its data is below `HIGH` (a workspace crate's is, a library's is
+/// not). Nothing for any other read. Read unrecorded: a span's text is no input of a summary.
+struct ReadCrate<'a> {
+    db: &'a Db,
+    read: u64,
+}
+
+impl std::fmt::Display for ReadCrate<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let db = self.db;
+        blaze_query::db::unrecorded(db, || {
+            let id = Witness::read_id(self.read);
+            let Some(krate) = <Crate as blaze_query::db::FromIdIn>::from_id_in(blaze_query::db::Database::storage(db), id) else {
+                return Ok(());
+            };
+            match &krate.extra_data(db).display_name {
+                Some(name) => f.write_str(name.crate_name().as_str())?,
+                None => write!(f, "{krate:?}")?,
+            }
+            write!(f, " ({:?})", krate.data(db).origin)
+        })
     }
 }
 

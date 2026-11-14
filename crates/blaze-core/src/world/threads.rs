@@ -49,6 +49,17 @@
 //! operation of the run's threads is `SeqCst`, or they touch one word. Any other run is
 //! refused: [`two`] panics saying the run is not one this world models, naming the rule.
 //!
+//! [`two_weak`] is the same scheduler over the weak world ([`super::weak`], whose model is
+//! `lean/Blaze/ThreadsWeak.lean`; decision D46): which memory a theorem is stated in is said by
+//! which of the two its code calls. In a weak run every operation of a scheduled atomic, and
+//! every [`wait`], [`wait_until`], [`wake`], [`now`] and [`time`], on a run's thread is a step
+//! of that pure world, not an operation on the real word: a word is a cell found by its
+//! address, made where a run's thread first touches it with one message holding the word's
+//! value then, which every thread's view names (as if thread 0 made it before the run), and
+//! after each step the real word holds the value of its cell's newest message, which is what
+//! the thread that called [`two_weak`] reads after the run. What the weak world refuses (rule
+//! R1) ends the run as a refusal of [`two`] does.
+//!
 //! The baton: a run is one [`Lock`] (`threads.two.baton`) over the world and whose turn it is,
 //! and one [`Signal`]. A thread that reaches an operation arrives: it records that it stands
 //! there (and whether at a wait), gives the turn back if it held it, and waits on the signal
@@ -65,8 +76,8 @@
 //! the Rust body of [`two`] is how a theorem's function runs where it is stated, and what a
 //! proof reads of it is its model, `Blaze.Threads.two`, which a translated core's function
 //! calls in place of this body. Outside blaze-core's own test build, [`crate::atomic`]'s types
-//! are std's, which no schedule can order, so there [`two`], [`wait`], [`wait_until`],
-//! [`wake`], [`clock`], [`now`] and [`time`] refuse to run at all.
+//! are std's, which no schedule can order, so there [`two`], [`two_weak`], [`wait`],
+//! [`wait_until`], [`wake`], [`clock`], [`now`] and [`time`] refuse to run at all.
 
 use std::{
     alloc::Global,
@@ -78,6 +89,7 @@ use std::{
     time::Duration,
 };
 
+use super::weak;
 use crate::lock::{Lock, LockGuard, Signal};
 
 /// One step of a run: which thread goes, and the world's pick at the step. The model is
@@ -200,13 +212,74 @@ enum Ask {
     Look,
 }
 
-/// An operation the world refused: after it, the run's threads had used an ordering weaker
-/// than `SeqCst` and touched more than one word.
+/// An operation the world refused: by thread `who`, on the word at address `cell`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Refused {
     who: Who,
     cell: usize,
-    cells: usize,
+    why: Why,
+}
+
+/// The rule that refused an operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Why {
+    /// [`two`]'s `World.fits`: after it, the run's threads had used an ordering weaker than
+    /// `SeqCst` and touched `cells` words.
+    Unfit { cells: usize },
+    /// [`two_weak`]'s rule R1: a write that does not release, after the thread's relaxed read
+    /// of the word at address `read`.
+    R1 { read: usize },
+    /// The weak world has no such cell or message: a rule of this runner is broken.
+    Lost,
+    /// In a run of [`two_weak`], the word holds `real` but its cell's newest message `newest`:
+    /// something wrote it that is not a step of the run.
+    Outside { real: u64, newest: u64 },
+}
+
+/// The weak world of a run of [`two_weak`], and the word each of its cells is.
+struct Weakly {
+    world: weak::World,
+    /// The address of each cell's word; a cell's number is its place.
+    words: Vec<usize, Global>,
+}
+
+impl Weakly {
+    /// One step of thread `who` on `word` in the weak world: the word's cell (made where the
+    /// run first sees it, holding the word's value), `op` on it, and the word then made to
+    /// hold its cell's newest message's value.
+    fn step<T>(
+        &mut self,
+        who: Who,
+        word: &dyn Real,
+        op: impl FnOnce(&mut weak::World, Who, usize) -> Result<T, weak::Refusal>,
+    ) -> Result<T, Why> {
+        let (address, real) = (word.address(), word.read());
+        let cell = match self.words.iter().position(|it| *it == address) {
+            Some(cell) => {
+                let newest = self.world.newest(cell).ok_or(Why::Lost)?;
+                if newest != real {
+                    return Err(Why::Outside { real, newest });
+                }
+                cell
+            }
+            None => {
+                self.words.push(address);
+                self.world.seen(real)
+            }
+        };
+        let out = op(&mut self.world, who, cell).map_err(|refusal| match refusal {
+            weak::Refusal::R1 { read } => match self.words.get(read) {
+                Some(read) => Why::R1 { read: *read },
+                None => Why::Lost,
+            },
+            weak::Refusal::NotACell | weak::Refusal::NoMessage => Why::Lost,
+        })?;
+        let newest = self.world.newest(cell).ok_or(Why::Lost)?;
+        if newest != real {
+            word.write(newest);
+        }
+        Ok(out)
+    }
 }
 
 /// The world of a run and whose turn it is, under the baton's lock.
@@ -235,6 +308,18 @@ struct Baton {
     /// The readings [`now`] has still to take, in nanoseconds, the next one last (taken by
     /// `pop`).
     script: Vec<u128, Global>,
+    /// A run of [`two_weak`]: its world, which holds the sleepers, the woken, the clock and
+    /// its script in place of the fields above; `None`: a run of [`two`].
+    weakly: Option<Weakly>,
+}
+
+/// Which memory a run's atomics are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Memory {
+    /// [`two`]'s: each operation the real one, refused where that is not the run's meaning.
+    Sequential,
+    /// [`two_weak`]'s: each operation a step of [`weak::World`].
+    Weak,
 }
 
 impl Baton {
@@ -298,8 +383,16 @@ fn here() -> Option<Member> {
 }
 
 impl Run {
-    /// A run whose clock starts at 0 with `script` (the next reading last).
-    fn new(script: Vec<u128, Global>) -> Run {
+    /// A run of `memory` whose clock starts at 0 with `script` (the next reading last).
+    fn new(script: Vec<u128, Global>, memory: Memory) -> Run {
+        let (script, weakly) = match memory {
+            Memory::Sequential => (script, None),
+            Memory::Weak => {
+                let mut world = weak::World::new();
+                world.readings = script;
+                (Vec::new_in(Global), Some(Weakly { world, words: Vec::new_in(Global) }))
+            }
+        };
         Run {
             baton: Lock::new(
                 "threads.two.baton",
@@ -316,6 +409,7 @@ impl Run {
                     refused: None,
                     clock: 0,
                     script,
+                    weakly,
                 },
             ),
             signal: Signal::new("threads.two.baton"),
@@ -348,10 +442,10 @@ impl Run {
         baton
     }
 
-    /// Thread `who`'s operation refused (`World.fits` is false after it): the run ends there,
-    /// and the thread stops without making it.
-    fn refuse(&self, mut baton: LockGuard<'_, Baton>, who: Who, cell: usize) -> ! {
-        baton.refused = Some(Refused { who, cell, cells: baton.used.len() });
+    /// An operation refused (`World.fits` is false after it, or the weak world refuses it):
+    /// the run ends there, and the thread stops without making it.
+    fn refuse(&self, mut baton: LockGuard<'_, Baton>, refused: Refused) -> ! {
+        baton.refused = Some(refused);
         baton.turn = None;
         self.signal.notify_all();
         drop(baton);
@@ -360,24 +454,91 @@ impl Run {
 }
 
 impl Member {
-    /// One operation on the word at `cell`, with `orders`, at this thread's next step: `act`
-    /// is the operation itself, given the world's pick, made under the baton.
-    fn op<R>(&self, cell: usize, orders: &[Ordering], act: impl FnOnce(u8) -> R) -> R {
-        let mut baton = self.run.arrive(self.who, Pending::Op);
+    /// One operation on `word`, with `orders`, at this thread's next step. In a run of [`two`],
+    /// `act` is the operation itself, given the world's pick, made under the baton; in a run
+    /// of [`two_weak`], `access` is the operation as a step of the weak world, and `answer`
+    /// reads its result.
+    fn op<R>(
+        &self,
+        word: &dyn Real,
+        orders: &[Ordering],
+        access: Access<'_>,
+        act: impl FnOnce(u8) -> R,
+        answer: impl FnOnce(weak::Got) -> R,
+    ) -> R {
+        let (who, cell) = (self.who, word.address());
+        let mut baton = self.run.arrive(who, Pending::Op);
         let Ask::Go(pick) = baton.ask else {
             drop(baton);
             panic!(
                 "blaze_core::world::threads::two: {} was asked to look at a wait while it stands \
                  at an operation that is not one",
-                named(self.who)
+                named(who)
             );
         };
-        if !baton.touch(cell, orders) {
-            self.run.refuse(baton, self.who, cell);
+        let weakly = baton.weakly.as_mut().map(|weakly| {
+            weakly.step(who, word, |world, who, cell| {
+                let pick = usize::from(pick);
+                match access {
+                    Access::Load(order) => world.load(who, pick, cell, order),
+                    Access::Store(value, order) => world.store(who, pick, cell, value, order),
+                    Access::Update { change, weak, success, failure } => {
+                        world.update(who, pick, cell, change, weak, success, failure)
+                    }
+                }
+            })
+        });
+        match weakly {
+            Some(Ok(got)) => {
+                drop(baton);
+                answer(got)
+            }
+            Some(Err(why)) => self.run.refuse(baton, Refused { who, cell, why }),
+            None => {
+                if !baton.touch(cell, orders) {
+                    let cells = baton.used.len();
+                    self.run.refuse(baton, Refused { who, cell, why: Why::Unfit { cells } });
+                }
+                let out = act(pick);
+                drop(baton);
+                out
+            }
         }
-        let out = act(pick);
-        drop(baton);
-        out
+    }
+
+    /// One pass of a wait of `word` for `expected` in the weak world, ended also as `limit`
+    /// says: `Some` where the wait returns; `None` where the step is used up and the thread
+    /// sleeps still, or it was asked to look (its answer is in `looked`).
+    fn wait_weakly(&self, baton: &mut Baton, word: &dyn Real, expected: u32, limit: Limit) -> Result<Option<Woke>, Why> {
+        let who = self.who;
+        let Baton { ask, looked, weakly, .. } = baton;
+        let Some(weakly) = weakly.as_mut() else {
+            return Err(Why::Lost);
+        };
+        let expected = u64::from(expected);
+        match *ask {
+            // `ended`'s look, with pick 0.
+            Ask::Look => {
+                let asleep = weakly.step(who, word, |world, who, cell| match limit {
+                    Limit::At(deadline) => world.asleep_until(who, 0, cell, expected, Some(deadline)),
+                    Limit::Never | Limit::Kernel => world.asleep(who, 0, cell, expected),
+                })?;
+                looked[slot(who)] = Some(asleep);
+                Ok(None)
+            }
+            Ask::Go(pick) => {
+                let pick = usize::from(pick);
+                let waited = weakly.step(who, word, |world, who, cell| match limit {
+                    Limit::Never => world.wait(who, pick, cell, expected, false),
+                    Limit::Kernel => world.wait(who, pick, cell, expected, true),
+                    Limit::At(deadline) => world.wait_until(who, pick, cell, expected, Some(deadline)),
+                })?;
+                Ok(match waited {
+                    weak::Waited::Returned(woke) => Some(woke),
+                    weak::Waited::Asleep => None,
+                })
+            }
+        }
     }
 
     /// A wait of `word` while it holds `expected` (`World.step`'s `.wait`), ended also as
@@ -388,6 +549,13 @@ impl Member {
         let me = (who, cell);
         loop {
             let mut baton = self.run.arrive(who, Pending::Wait);
+            if baton.weakly.is_some() {
+                match self.wait_weakly(&mut baton, word, expected, limit) {
+                    Ok(Some(woke)) => return woke,
+                    Ok(None) => continue,
+                    Err(why) => self.run.refuse(baton, Refused { who, cell, why }),
+                }
+            }
             // Whether the clock has reached the deadline: such a wait never sleeps.
             let due = matches!(limit, Limit::At(deadline) if baton.clock >= deadline);
             let pick = match baton.ask {
@@ -401,7 +569,8 @@ impl Member {
                 Ask::Go(pick) => pick,
             };
             if !baton.touch(cell, &[]) {
-                self.run.refuse(baton, who, cell);
+                let cells = baton.used.len();
+                self.run.refuse(baton, Refused { who, cell, why: Why::Unfit { cells } });
             }
             if let Some(at) = baton.woken.iter().position(|it| *it == me) {
                 baton.woken.remove(at);
@@ -451,40 +620,53 @@ impl Member {
     /// A wake of one sleeper of `word` (`World.step`'s `.wake`, not `all`): the one of number
     /// `pick` among the word's sleepers, the first where there is none of that number.
     fn wake(&self, word: &std::sync::atomic::AtomicU32) -> bool {
-        let cell = word.as_ptr().addr();
+        let (who, cell) = (self.who, word.as_ptr().addr());
         self.op_with_world(Some(cell), |baton, pick| {
+            if let Some(weakly) = baton.weakly.as_mut() {
+                let woke = weakly.step(who, word, |world, who, cell| world.wake(who, usize::from(pick), cell, false))?;
+                return Ok(woke > 0);
+            }
             let mut sleepers =
                 baton.asleep.iter().enumerate().filter(|(_, it)| it.1 == cell).map(|(at, _)| at);
             let first = sleepers.clone().next();
             let Some(at) = sleepers.nth(usize::from(pick)).or(first) else {
-                return false;
+                return Ok(false);
             };
             let one = baton.asleep.remove(at);
             baton.woken.insert(0, one);
-            true
+            Ok(true)
         })
     }
 
     /// An operation on the world's own record, with no ordering: a wake, which touches its
-    /// `cell`, or a reading of the clock, which touches none (`None`).
-    fn op_with_world<R>(&self, cell: Option<usize>, act: impl FnOnce(&mut Baton, u8) -> R) -> R {
-        let mut baton = self.run.arrive(self.who, Pending::Op);
+    /// `cell`, or a reading of the clock, which touches none (`None`). `act` may refuse it (a
+    /// step the weak world refuses), which ends the run.
+    fn op_with_world<R>(&self, cell: Option<usize>, act: impl FnOnce(&mut Baton, u8) -> Result<R, Why>) -> R {
+        let who = self.who;
+        let mut baton = self.run.arrive(who, Pending::Op);
         let Ask::Go(pick) = baton.ask else {
             drop(baton);
             panic!(
                 "blaze_core::world::threads::two: {} was asked to look at a wait while it stands \
                  at a wake or a reading of the clock",
-                named(self.who)
+                named(who)
             );
         };
+        // A run of `two_weak` asks nothing of `World.fits`.
         if let Some(cell) = cell
+            && baton.weakly.is_none()
             && !baton.touch(cell, &[])
         {
-            self.run.refuse(baton, self.who, cell);
+            let cells = baton.used.len();
+            self.run.refuse(baton, Refused { who, cell, why: Why::Unfit { cells } });
         }
-        let out = act(&mut baton, pick);
-        drop(baton);
-        out
+        match act(&mut baton, pick) {
+            Ok(out) => {
+                drop(baton);
+                out
+            }
+            Err(why) => self.run.refuse(baton, Refused { who, cell: cell.unwrap_or(0), why }),
+        }
     }
 
     /// The top of a run's thread: `body` run as this member, its end told to the scheduler.
@@ -613,6 +795,9 @@ fn drive(run: &Run, schedule: &[Step]) -> Standing {
                 baton.looked[slot(who)] = None;
                 run.signal.notify_all();
                 run.signal.wait_while_for(&mut baton, |it| it.turn.is_some(), SCHEDULER_BOUND);
+                if let Some(refused) = baton.refused {
+                    return Standing::Refused(refused);
+                }
                 match baton.looked[slot(who)] {
                     Some(true) => Stood::Asleep,
                     Some(false) => Stood::Running,
@@ -662,14 +847,11 @@ fn ended<T>(exit: Exit<T>, stood: Stood, who: Who) -> Ended<T> {
 ///
 /// Panics: where a run's threads used an ordering weaker than `SeqCst` and touched more than
 /// one word (not a run this world models; docs/v2/plan/design/proofs-for-sans-io.md, section
-/// 8); with a thread's own panic, resumed here (the first thread's where both panicked) once
-/// the schedule is done; where a thread does not come back to the scheduler within 10 s (it
-/// blocks on something that is not a scheduled operation); called from one of a run's
-/// threads; and in any build but blaze-core's tests, where the atomics are std's.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "the run's two threads borrow the caller's closures: they are scoped, and are the world's, not parallel work for the pool"
-)]
+/// 8: state such a run with [`two_weak`]); with a thread's own panic, resumed here (the first
+/// thread's where both panicked) once the schedule is done; where a thread does not come back
+/// to the scheduler within 10 s (it blocks on something that is not a scheduled operation);
+/// called from one of a run's threads; and in any build but blaze-core's tests, where the
+/// atomics are std's.
 pub fn two<A: Send, B: Send>(
     schedule: &[Step],
     first: impl FnOnce() -> A + Send,
@@ -684,9 +866,67 @@ pub fn two<A: Send, B: Send>(
              inside a run is not modelled (`Blaze.Threads.turn` refuses it)"
         );
     }
+    run_threads(Memory::Sequential, schedule, first, second)
+}
+
+/// Runs `first` and `second` as threads 1 and 2 in the weak world, one operation at a time in
+/// the order `schedule` gives, and says how each stood at its end: [`two`] with the memory of
+/// `lean/Blaze/ThreadsWeak.lean` (`Prog.valueWeak`; decision D46), where an atomic's orderings
+/// say what a thread sees, and a load may read a stale value.
+///
+/// Which thread goes, a returned thread's steps, a sleeper's steps, the clock and its script,
+/// and the stopping of every thread not returned when the schedule ends are [`two`]'s. What a
+/// step's pick means is the weak world's ([`super::weak`]): for a load, which message it reads,
+/// counted back from the newest (0 the newest), never older than what the thread has seen of
+/// the word; for a store, after which message its own goes, counted the same way, never before
+/// what the thread has seen; for an update (a swap, a `fetch_*`, a compare-and-swap), which
+/// message it reads as a load's pick does, and for a `compare_exchange_weak`, pick 2k reads k
+/// back and pick 2k+1 fails for nothing having read k back; for a wait, which message its look
+/// reads, never older than what the caller of a completed wake had seen, and, asleep, 1 returns
+/// for nothing and 2 says its time ran out; for a wake, which sleeper it takes. `SeqCst` is
+/// `AcqRel` here, so store buffering is shown even with `SeqCst`. Each word the run's threads
+/// touch is followed by its address; after every step it holds the value of its newest
+/// message, which is what this thread reads after the run.
+///
+/// Panics: where the weak world refuses an operation (rule R1: a write that does not release,
+/// by a thread that has read another word relaxed, since this world cannot show load
+/// buffering), naming the rule and the word; where a word holds a value that no step wrote (it
+/// was written outside the schedule, or is a new word at a dropped one's address); and as
+/// [`two`] does otherwise.
+pub fn two_weak<A: Send, B: Send>(
+    schedule: &[Step],
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B + Send,
+) -> (Ended<A>, Ended<B>) {
+    if cfg!(not(test)) {
+        panic!(
+            "blaze_core::world::threads::two_weak: {NOT_SCHEDULED} (in the weak world, \
+             `Prog.valueWeak` of lean/Blaze/ThreadsWeak.lean)"
+        );
+    }
+    if ROLE.with_borrow(Option::is_some) {
+        panic!(
+            "blaze_core::world::threads::two_weak: called from a thread of a run: a run inside a \
+             run is not modelled (`Blaze.Threads.turn` refuses it)"
+        );
+    }
+    run_threads(Memory::Weak, schedule, first, second)
+}
+
+/// The run of [`two`] or [`two_weak`], by `memory`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the run's two threads borrow the caller's closures: they are scoped, and are the world's, not parallel work for the pool"
+)]
+fn run_threads<A: Send, B: Send>(
+    memory: Memory,
+    schedule: &[Step],
+    first: impl FnOnce() -> A + Send,
+    second: impl FnOnce() -> B + Send,
+) -> (Ended<A>, Ended<B>) {
     // The script `clock` installed for this run, consumed by it; none: an empty one.
     let script = SCRIPT.take().unwrap_or_else(|| Vec::new_in(Global));
-    let run = Arc::new_in(Run::new(script), Global);
+    let run = Arc::new_in(Run::new(script, memory), Global);
     let (standing, one, other) = std::thread::scope(|scope| {
         // Made first and dropped last, also as the scheduler unwinds: every thread is stopped
         // before the scope waits for it.
@@ -701,22 +941,54 @@ pub fn two<A: Send, B: Send>(
     });
     // The clock as the run left it, for `time` on this thread, kept before a refusal or a
     // thread's panic is resumed here.
-    let left = run.baton.lock().clock;
+    let left = {
+        let baton = run.baton.lock();
+        match &baton.weakly {
+            Some(weakly) => weakly.world.clock,
+            None => baton.clock,
+        }
+    };
     LEFT.set(left);
     let stood = match standing {
         Standing::Stood(stood) => stood,
-        Standing::Refused(Refused { who, cell, cells }) => panic!(
-            "blaze_core::world::threads::two: {} touched the word at {cell:#x}, after which the \
-             run's threads had touched {cells} words and used an ordering weaker than `SeqCst`: \
-             this is not a run the world of threads models (its memory is sequentially \
-             consistent only where every operation is `SeqCst` or the threads touch one word: \
-             `World.fits`, docs/v2/plan/design/proofs-for-sans-io.md, section 8)",
-            named(who)
-        ),
+        Standing::Refused(refused) => refuse(refused),
     };
     let first = ended(one, stood[0], 1);
     let second = ended(other, stood[1], 2);
     (first, second)
+}
+
+/// The panic of a refused run, naming the thread, the word and the rule.
+fn refuse(Refused { who, cell, why }: Refused) -> ! {
+    let who = named(who);
+    match why {
+        Why::Unfit { cells } => panic!(
+            "blaze_core::world::threads::two: {who} touched the word at {cell:#x}, after which the \
+             run's threads had touched {cells} words and used an ordering weaker than `SeqCst`: \
+             this is not a run the world of threads models (its memory is sequentially \
+             consistent only where every operation is `SeqCst` or the threads touch one word: \
+             `World.fits`, docs/v2/plan/design/proofs-for-sans-io.md, section 8); a run with \
+             orderings weaker than `SeqCst` over more than one word is stated with `two_weak`, \
+             the weak world (lean/Blaze/ThreadsWeak.lean)"
+        ),
+        Why::R1 { read } => panic!(
+            "blaze_core::world::threads::two_weak: {who} wrote the word at {cell:#x} with an \
+             ordering that does not release, after its relaxed read of the word at {read:#x}: \
+             rule R1 of the weak world refuses it (that world has no promises, so a run that \
+             could show load buffering is refused, not approximated; lean/Blaze/ThreadsWeak.lean)"
+        ),
+        Why::Lost => panic!(
+            "blaze_core::world::threads::two_weak: {who}'s step on the word at {cell:#x} found no \
+             cell or message for it in the weak world: a rule of the runner is broken"
+        ),
+        Why::Outside { real, newest } => panic!(
+            "blaze_core::world::threads::two_weak: {who} found the word at {cell:#x} holding \
+             {real}, but the newest message of its cell in the weak world holds {newest}: it was \
+             written by something that is not a step of the run (`get_mut`, or std's operation \
+             in a destructor of a thread that unwinds), or it is a new word at the address of one \
+             dropped during the run; the weak world follows a word by its address for the whole run"
+        ),
+    }
 }
 
 /// A futex wait as the world of threads has it: sleeps while `word` holds `expected`, until a
@@ -809,11 +1081,15 @@ pub fn now() -> Duration {
              run, `time` reads where it was left"
         );
     };
+    let who = member.who;
     let clock = member.op_with_world(None, |baton, _| {
+        if let Some(weakly) = baton.weakly.as_mut() {
+            return Ok(weakly.world.now(who, true));
+        }
         if let Some(reading) = baton.script.pop() {
             baton.clock = baton.clock.max(reading);
         }
-        baton.clock
+        Ok(baton.clock)
     });
     duration(clock)
 }
@@ -829,7 +1105,15 @@ pub fn time() -> Duration {
         panic!("blaze_core::world::threads::time: {NOT_SCHEDULED}");
     }
     let clock = match here() {
-        Some(member) => member.op_with_world(None, |baton, _| baton.clock),
+        Some(member) => {
+            let who = member.who;
+            member.op_with_world(None, |baton, _| {
+                Ok(match baton.weakly.as_mut() {
+                    Some(weakly) => weakly.world.now(who, false),
+                    None => baton.clock,
+                })
+            })
+        }
         None if ROLE.with_borrow(Option::is_some) => panic!(
             "blaze_core::world::threads::time: called on a thread of a run of `two` while it \
              unwinds: the model has no steps after a thread ends"
@@ -878,6 +1162,109 @@ impl Word for scheduled::AtomicU32 {
     }
 }
 
+/// What a scheduled atomic's operation is as a step of the weak world.
+enum Access<'a> {
+    Load(Ordering),
+    /// The value stored, as the weak world holds it.
+    Store(u64, Ordering),
+    /// A read-modify-write (`Op.update`): `change` of what it read is what it writes, or
+    /// `None` for nothing; `weak`: a `compare_exchange_weak`.
+    Update { change: &'a dyn Fn(u64) -> Option<u64>, weak: bool, success: Ordering, failure: Ordering },
+}
+
+/// A value of a scheduled atomic as the weak world holds it: a `u64`, a `bool` 0 or 1.
+trait Value: Copy {
+    fn to_world(self) -> u64;
+    /// The value a message holds, which an operation of this type wrote (or the word held
+    /// when the run first saw it), so it fits.
+    fn of_world(value: u64) -> Self;
+}
+
+impl Value for u32 {
+    fn to_world(self) -> u64 {
+        u64::from(self)
+    }
+
+    fn of_world(value: u64) -> u32 {
+        u32::try_from(value).unwrap_or_else(|_| {
+            panic!(
+                "blaze_core::world::threads::two_weak: a message of a `u32` word holds {value}, \
+                 which no operation of a `u32` writes"
+            )
+        })
+    }
+}
+
+impl Value for u64 {
+    fn to_world(self) -> u64 {
+        self
+    }
+
+    fn of_world(value: u64) -> u64 {
+        value
+    }
+}
+
+impl Value for usize {
+    fn to_world(self) -> u64 {
+        u64::try_from(self).unwrap_or_else(|_| {
+            panic!(
+                "blaze_core::world::threads::two_weak: a `usize` word holds {self}, which the weak \
+                 world's `u64` messages cannot"
+            )
+        })
+    }
+
+    fn of_world(value: u64) -> usize {
+        usize::try_from(value).unwrap_or_else(|_| {
+            panic!(
+                "blaze_core::world::threads::two_weak: a message of a `usize` word holds {value}, \
+                 which no operation of a `usize` writes"
+            )
+        })
+    }
+}
+
+impl Value for bool {
+    fn to_world(self) -> u64 {
+        u64::from(self)
+    }
+
+    fn of_world(value: u64) -> bool {
+        value != 0
+    }
+}
+
+/// A real word as a run of [`two_weak`] follows it: its address (its cell), its value, and
+/// the write that makes it hold its cell's newest message.
+trait Real {
+    fn address(&self) -> usize;
+    fn read(&self) -> u64;
+    fn write(&self, value: u64);
+}
+
+macro_rules! real {
+    ($($atomic:ident: $int:ty),*) => {
+        $(
+            impl Real for std::sync::atomic::$atomic {
+                fn address(&self) -> usize {
+                    self.as_ptr().addr()
+                }
+
+                fn read(&self) -> u64 {
+                    self.load(Ordering::SeqCst).to_world()
+                }
+
+                fn write(&self, value: u64) {
+                    self.store(<$int>::of_world(value), Ordering::SeqCst);
+                }
+            }
+        )*
+    };
+}
+
+real!(AtomicU32: u32, AtomicU64: u64, AtomicUsize: usize, AtomicBool: bool);
+
 /// Whether `order` is one a load takes (`Ordering.loads`): a load, and a failed compare,
 /// panic on `Release` and `AcqRel`.
 fn loads(order: Ordering) -> bool {
@@ -890,22 +1277,25 @@ fn stores(order: Ordering) -> bool {
     !matches!(order, Ordering::Acquire | Ordering::AcqRel)
 }
 
-/// The scheduled atomics: std's, each method call one operation of a run of [`two`].
+/// The scheduled atomics: std's, each method call one operation of a run of [`two`] or
+/// [`two_weak`].
 ///
 /// Each type is `#[repr(transparent)]` over std's, with its constructor and the methods a
 /// core uses, of the same signatures. On a thread that is not one of a run's, a method is
 /// std's and nothing more (one thread-local read finds that out). On a run's thread, a call is
-/// one operation: the thread stops before it until the schedule gives it the step, then makes
-/// the real std operation with its real ordering. An ordering std refuses (a load with
-/// `Release`, a store with `Acquire`, a compare failing with `Release`) panics as std does,
-/// before the step, as `Ordering.loads` and `Ordering.stores` have it.
+/// one operation: the thread stops before it until the schedule gives it the step, then, in a
+/// run of [`two`], makes the real std operation with its real ordering, and in a run of
+/// [`two_weak`], takes the step of the weak world that the operation is (a load, a store, or an
+/// update whose change is the method's), and answers what that step read. An ordering std
+/// refuses (a load with `Release`, a store with `Acquire`, a compare failing with `Release`)
+/// panics as std does, before the step, as `Ordering.loads` and `Ordering.stores` have it.
 ///
 /// `Debug`, `get_mut` and `into_inner` are std's and never a step: the first reads the word
 /// outside the schedule, and the other two have the word to themselves.
 pub mod scheduled {
     use std::{fmt, sync::atomic::Ordering};
 
-    use super::{here, loads, stores};
+    use super::{Access, Value, here, loads, stores};
 
     macro_rules! scheduled_int {
         ($(#[$doc:meta])* $name:ident, $int:ty) => {
@@ -930,32 +1320,46 @@ pub mod scheduled {
                     self.0.into_inner()
                 }
 
-                /// The word's address: its identity in the world.
-                fn cell(&self) -> usize {
-                    self.0.as_ptr().addr()
-                }
-
                 pub fn load(&self, order: Ordering) -> $int {
                     match here() {
-                        Some(member) if loads(order) => {
-                            member.op(self.cell(), &[order], |_| self.0.load(order))
-                        }
+                        Some(member) if loads(order) => member.op(
+                            &self.0,
+                            &[order],
+                            Access::Load(order),
+                            |_| self.0.load(order),
+                            |got| <$int>::of_world(got.value),
+                        ),
                         _ => self.0.load(order),
                     }
                 }
 
                 pub fn store(&self, value: $int, order: Ordering) {
                     match here() {
-                        Some(member) if stores(order) => {
-                            member.op(self.cell(), &[order], |_| self.0.store(value, order))
-                        }
+                        Some(member) if stores(order) => member.op(
+                            &self.0,
+                            &[order],
+                            Access::Store(value.to_world(), order),
+                            |_| self.0.store(value, order),
+                            |_| (),
+                        ),
                         _ => self.0.store(value, order),
                     }
                 }
 
                 pub fn swap(&self, value: $int, order: Ordering) -> $int {
                     match here() {
-                        Some(member) => member.op(self.cell(), &[order], |_| self.0.swap(value, order)),
+                        Some(member) => member.op(
+                            &self.0,
+                            &[order],
+                            Access::Update {
+                                change: &|_| Some(value.to_world()),
+                                weak: false,
+                                success: order,
+                                failure: order,
+                            },
+                            |_| self.0.swap(value, order),
+                            |got| <$int>::of_world(got.value),
+                        ),
                         None => self.0.swap(value, order),
                     }
                 }
@@ -968,16 +1372,26 @@ pub mod scheduled {
                     failure: Ordering,
                 ) -> Result<$int, $int> {
                     match here() {
-                        Some(member) if loads(failure) => member.op(self.cell(), &[success, failure], |_| {
-                            self.0.compare_exchange(current, new, success, failure)
-                        }),
+                        Some(member) if loads(failure) => member.op(
+                            &self.0,
+                            &[success, failure],
+                            Access::Update {
+                                change: &|old| (old == current.to_world()).then(|| new.to_world()),
+                                weak: false,
+                                success,
+                                failure,
+                            },
+                            |_| self.0.compare_exchange(current, new, success, failure),
+                            |got| compared(got),
+                        ),
                         _ => self.0.compare_exchange(current, new, success, failure),
                     }
                 }
 
-                /// On a run's thread: pick 1 fails it without writing, `Err` of the value it
-                /// read; any other pick makes it a strong compare, so no run depends on the
-                /// hardware's own spurious failures.
+                /// On a run's thread of [`super::two`]: pick 1 fails it without writing, `Err`
+                /// of the value it read; any other pick makes it a strong compare, so no run
+                /// depends on the hardware's own spurious failures. Of [`super::two_weak`]: pick
+                /// 2k reads the message k back and pick 2k+1 fails for nothing having read it.
                 pub fn compare_exchange_weak(
                     &self,
                     current: $int,
@@ -986,25 +1400,36 @@ pub mod scheduled {
                     failure: Ordering,
                 ) -> Result<$int, $int> {
                     match here() {
-                        Some(member) if loads(failure) => member.op(self.cell(), &[success, failure], |pick| {
-                            if pick == 1 {
-                                Err(self.0.load(failure))
-                            } else {
-                                self.0.compare_exchange(current, new, success, failure)
-                            }
-                        }),
+                        Some(member) if loads(failure) => member.op(
+                            &self.0,
+                            &[success, failure],
+                            Access::Update {
+                                change: &|old| (old == current.to_world()).then(|| new.to_world()),
+                                weak: true,
+                                success,
+                                failure,
+                            },
+                            |pick| {
+                                if pick == 1 {
+                                    Err(self.0.load(failure))
+                                } else {
+                                    self.0.compare_exchange(current, new, success, failure)
+                                }
+                            },
+                            |got| compared(got),
+                        ),
                         _ => self.0.compare_exchange_weak(current, new, success, failure),
                     }
                 }
 
-                scheduled_int!(@fetch fetch_add, $int);
-                scheduled_int!(@fetch fetch_sub, $int);
-                scheduled_int!(@fetch fetch_and, $int);
-                scheduled_int!(@fetch fetch_or, $int);
-                scheduled_int!(@fetch fetch_xor, $int);
-                scheduled_int!(@fetch fetch_nand, $int);
-                scheduled_int!(@fetch fetch_max, $int);
-                scheduled_int!(@fetch fetch_min, $int);
+                scheduled_int!(@fetch fetch_add, $int, |old, value| old.wrapping_add(value));
+                scheduled_int!(@fetch fetch_sub, $int, |old, value| old.wrapping_sub(value));
+                scheduled_int!(@fetch fetch_and, $int, |old, value| old & value);
+                scheduled_int!(@fetch fetch_or, $int, |old, value| old | value);
+                scheduled_int!(@fetch fetch_xor, $int, |old, value| old ^ value);
+                scheduled_int!(@fetch fetch_nand, $int, |old, value| !(old & value));
+                scheduled_int!(@fetch fetch_max, $int, |old, value| old.max(value));
+                scheduled_int!(@fetch fetch_min, $int, |old, value| old.min(value));
             }
 
             impl Default for $name {
@@ -1025,14 +1450,33 @@ pub mod scheduled {
                 }
             }
         };
-        (@fetch $op:ident, $int:ty) => {
+        (@fetch $op:ident, $int:ty, |$old:ident, $value:ident| $new:expr) => {
             pub fn $op(&self, value: $int, order: Ordering) -> $int {
                 match here() {
-                    Some(member) => member.op(self.cell(), &[order], |_| self.0.$op(value, order)),
+                    Some(member) => member.op(
+                        &self.0,
+                        &[order],
+                        Access::Update {
+                            change: &|old| {
+                                let ($old, $value) = (<$int>::of_world(old), value);
+                                Some(($new).to_world())
+                            },
+                            weak: false,
+                            success: order,
+                            failure: order,
+                        },
+                        |_| self.0.$op(value, order),
+                        |got| <$int>::of_world(got.value),
+                    ),
                     None => self.0.$op(value, order),
                 }
             }
         };
+    }
+
+    /// A compare's answer in the weak world: `Ok` of what it read where it wrote, else `Err`.
+    fn compared<T: Value>(got: crate::world::weak::Got) -> Result<T, T> {
+        if got.flag { Ok(T::of_world(got.value)) } else { Err(T::of_world(got.value)) }
     }
 
     scheduled_int!(
@@ -1056,11 +1500,25 @@ pub mod scheduled {
     pub struct AtomicBool(std::sync::atomic::AtomicBool);
 
     macro_rules! scheduled_bool_fetch {
-        ($($op:ident),*) => {
+        ($($op:ident: |$old:ident, $value:ident| $new:expr),*) => {
             $(
                 pub fn $op(&self, value: bool, order: Ordering) -> bool {
                     match here() {
-                        Some(member) => member.op(self.cell(), &[order], |_| self.0.$op(value, order)),
+                        Some(member) => member.op(
+                            &self.0,
+                            &[order],
+                            Access::Update {
+                                change: &|old| {
+                                    let ($old, $value) = (bool::of_world(old), value);
+                                    Some(($new).to_world())
+                                },
+                                weak: false,
+                                success: order,
+                                failure: order,
+                            },
+                            |_| self.0.$op(value, order),
+                            |got| bool::of_world(got.value),
+                        ),
                         None => self.0.$op(value, order),
                     }
                 }
@@ -1085,30 +1543,41 @@ pub mod scheduled {
             self.0.into_inner()
         }
 
-        /// The word's address: its identity in the world.
-        fn cell(&self) -> usize {
-            self.0.as_ptr().addr()
-        }
-
         pub fn load(&self, order: Ordering) -> bool {
             match here() {
-                Some(member) if loads(order) => member.op(self.cell(), &[order], |_| self.0.load(order)),
+                Some(member) if loads(order) => member.op(
+                    &self.0,
+                    &[order],
+                    Access::Load(order),
+                    |_| self.0.load(order),
+                    |got| bool::of_world(got.value),
+                ),
                 _ => self.0.load(order),
             }
         }
 
         pub fn store(&self, value: bool, order: Ordering) {
             match here() {
-                Some(member) if stores(order) => {
-                    member.op(self.cell(), &[order], |_| self.0.store(value, order))
-                }
+                Some(member) if stores(order) => member.op(
+                    &self.0,
+                    &[order],
+                    Access::Store(value.to_world(), order),
+                    |_| self.0.store(value, order),
+                    |_| (),
+                ),
                 _ => self.0.store(value, order),
             }
         }
 
         pub fn swap(&self, value: bool, order: Ordering) -> bool {
             match here() {
-                Some(member) => member.op(self.cell(), &[order], |_| self.0.swap(value, order)),
+                Some(member) => member.op(
+                    &self.0,
+                    &[order],
+                    Access::Update { change: &|_| Some(value.to_world()), weak: false, success: order, failure: order },
+                    |_| self.0.swap(value, order),
+                    |got| bool::of_world(got.value),
+                ),
                 None => self.0.swap(value, order),
             }
         }
@@ -1121,15 +1590,25 @@ pub mod scheduled {
             failure: Ordering,
         ) -> Result<bool, bool> {
             match here() {
-                Some(member) if loads(failure) => member.op(self.cell(), &[success, failure], |_| {
-                    self.0.compare_exchange(current, new, success, failure)
-                }),
+                Some(member) if loads(failure) => member.op(
+                    &self.0,
+                    &[success, failure],
+                    Access::Update {
+                        change: &|old| (old == current.to_world()).then(|| new.to_world()),
+                        weak: false,
+                        success,
+                        failure,
+                    },
+                    |_| self.0.compare_exchange(current, new, success, failure),
+                    |got| compared(got),
+                ),
                 _ => self.0.compare_exchange(current, new, success, failure),
             }
         }
 
-        /// On a run's thread: pick 1 fails it without writing, `Err` of the value it read; any
-        /// other pick makes it a strong compare.
+        /// On a run's thread of [`super::two`]: pick 1 fails it without writing, `Err` of the
+        /// value it read; any other pick makes it a strong compare. Of [`super::two_weak`]:
+        /// pick 2k reads the message k back and pick 2k+1 fails for nothing having read it.
         pub fn compare_exchange_weak(
             &self,
             current: bool,
@@ -1138,22 +1617,44 @@ pub mod scheduled {
             failure: Ordering,
         ) -> Result<bool, bool> {
             match here() {
-                Some(member) if loads(failure) => member.op(self.cell(), &[success, failure], |pick| {
-                    if pick == 1 {
-                        Err(self.0.load(failure))
-                    } else {
-                        self.0.compare_exchange(current, new, success, failure)
-                    }
-                }),
+                Some(member) if loads(failure) => member.op(
+                    &self.0,
+                    &[success, failure],
+                    Access::Update {
+                        change: &|old| (old == current.to_world()).then(|| new.to_world()),
+                        weak: true,
+                        success,
+                        failure,
+                    },
+                    |pick| {
+                        if pick == 1 {
+                            Err(self.0.load(failure))
+                        } else {
+                            self.0.compare_exchange(current, new, success, failure)
+                        }
+                    },
+                    |got| compared(got),
+                ),
                 _ => self.0.compare_exchange_weak(current, new, success, failure),
             }
         }
 
-        scheduled_bool_fetch!(fetch_and, fetch_or, fetch_xor, fetch_nand);
+        scheduled_bool_fetch!(
+            fetch_and: |old, value| old & value,
+            fetch_or: |old, value| old | value,
+            fetch_xor: |old, value| old ^ value,
+            fetch_nand: |old, value| !(old & value)
+        );
 
         pub fn fetch_not(&self, order: Ordering) -> bool {
             match here() {
-                Some(member) => member.op(self.cell(), &[order], |_| self.0.fetch_not(order)),
+                Some(member) => member.op(
+                    &self.0,
+                    &[order],
+                    Access::Update { change: &|old| Some((!bool::of_world(old)).to_world()), weak: false, success: order, failure: order },
+                    |_| self.0.fetch_not(order),
+                    |got| bool::of_world(got.value),
+                ),
                 None => self.0.fetch_not(order),
             }
         }
@@ -1187,7 +1688,7 @@ mod tests {
 
     use blaze_sim::{Broke, Config, Tape, check};
 
-    use super::{Ended, Step, Woke, clock, now, time, two, wait, wait_until, wake};
+    use super::{Ended, Step, Woke, clock, now, time, two, two_weak, wait, wait_until, wake};
     use crate::atomic::{AtomicU32, Ordering};
 
     /// Thread 1 goes, with the world's pick.
@@ -1671,5 +2172,395 @@ mod tests {
         // The kernel's word moves the clock from `early` to the deadline `late` exactly.
         assert_eq!(sleeper(early, late, &[A, B, a_(2)]), (Ended::Done(Woke::TimedOut), Ended::Done(early)));
         assert_eq!(time(), late);
+    }
+
+    // --- The weak world of Tests/ThreadsWeak.lean -----------------------------------------
+    //
+    // Each litmus run of lean/Blaze/Tests/ThreadsWeak.lean, with the same threads' code, the
+    // same orderings, schedules and picks, and the same answer; Lean's `(-1, -1)` for a thread
+    // that did not return is a value here other than `Ended::Done`.
+
+    use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+
+    /// `sb` (Tests/ThreadsWeak.lean:24): T1: x := 1; r1 := y.  T2: y := 1; r2 := x. In the
+    /// weak world where `weak`, else in `two`'s.
+    fn sb(store: Ordering, load: Ordering, schedule: &[Step], weak: bool) -> (Ended<u32>, Ended<u32>) {
+        let x = AtomicU32::new(0);
+        let y = AtomicU32::new(0);
+        let first = || {
+            x.store(1, store);
+            y.load(load)
+        };
+        let second = || {
+            y.store(1, store);
+            x.load(load)
+        };
+        if weak { two_weak(schedule, first, second) } else { two(schedule, first, second) }
+    }
+
+    /// Store buffering (Tests/ThreadsWeak.lean:33, 35): with release stores and acquire loads
+    /// each load picks the stale message and both read 0; with `SeqCst` in the sequentially
+    /// consistent world, on the same schedule, both read 1.
+    #[test]
+    fn store_buffering_is_shown_with_release_and_acquire() {
+        let schedule = [A, B, a_(1), b_(1)];
+        assert_eq!(sb(Release, Acquire, &schedule, true), (Ended::Done(0), Ended::Done(0)));
+        assert_eq!(sb(SeqCst, SeqCst, &schedule, false), (Ended::Done(1), Ended::Done(1)));
+    }
+
+    /// `mp` (Tests/ThreadsWeak.lean:41): T1: data := 42 (Relaxed); flag := 1 (`flag`).  T2:
+    /// f := flag (Acquire); d := data (Relaxed). T2's `(f, d)`.
+    fn mp(flag: Ordering, schedule: &[Step]) -> Ended<(u32, u32)> {
+        let data = AtomicU32::new(0);
+        let fl = AtomicU32::new(0);
+        let (_, r) = two_weak(
+            schedule,
+            || {
+                data.store(42, Relaxed);
+                fl.store(1, flag);
+            },
+            || (fl.load(Acquire), data.load(Relaxed)),
+        );
+        r
+    }
+
+    /// Message passing (Tests/ThreadsWeak.lean:51..57): with a `Release` flag, f = 1 brings the
+    /// data message into T2's view, so d = 42 whatever the data load picks; T2 reading the flag
+    /// between T1's stores, or picking the stale flag, sees f = 0 and may see d = 0.
+    #[test]
+    fn message_passing_with_a_release_flag() {
+        for pick in 0..=3 {
+            assert_eq!(mp(Release, &[A, A, B, b_(pick)]), Ended::Done((1, 42)), "the data load's pick {pick}");
+        }
+        assert_eq!(mp(Release, &[A, B, A, b_(1)]), Ended::Done((0, 0)));
+        assert_eq!(mp(Release, &[A, A, b_(1), b_(1)]), Ended::Done((0, 0)));
+    }
+
+    /// Message passing kept and lost (Tests/ThreadsWeak.lean:52, 59): on one schedule, the
+    /// `Release` flag keeps the data (d = 42), and the planted weakening of it to `Relaxed`
+    /// loses it (f = 1 and d = 0).
+    #[test]
+    fn message_passing_is_kept_by_release_and_lost_without() {
+        let schedule = [A, A, B, b_(1)];
+        assert_eq!(mp(Release, &schedule), Ended::Done((1, 42)));
+        assert_eq!(mp(Relaxed, &schedule), Ended::Done((1, 0)));
+    }
+
+    /// `coh` (Tests/ThreadsWeak.lean:64): T1: x := 1 (Relaxed).  T2: a := x; b := x (Relaxed).
+    fn coh(schedule: &[Step]) -> Ended<(u32, u32)> {
+        let x = AtomicU32::new(0);
+        two_weak(schedule, || x.store(1, Relaxed), || (x.load(Relaxed), x.load(Relaxed))).1
+    }
+
+    /// Coherence on one cell (Tests/ThreadsWeak.lean:71..76): once a = 1 the second load
+    /// cannot go back to 0, whatever it picks; stale then new, or stale twice, is allowed.
+    #[test]
+    fn coherence_on_one_cell() {
+        assert_eq!(coh(&[A, b_(0), b_(0)]), Ended::Done((1, 1)));
+        assert_eq!(coh(&[A, b_(0), b_(1)]), Ended::Done((1, 1)));
+        assert_eq!(coh(&[A, b_(0), b_(5)]), Ended::Done((1, 1)));
+        assert_eq!(coh(&[A, b_(1), b_(0)]), Ended::Done((0, 1)));
+        assert_eq!(coh(&[A, b_(1), b_(1)]), Ended::Done((0, 0)));
+    }
+
+    /// `adds` (Tests/ThreadsWeak.lean:81): each thread adds 1 (Relaxed); then the caller reads
+    /// the word. What each read, and the total.
+    fn adds(schedule: &[Step]) -> (Ended<u32>, Ended<u32>, u32) {
+        let n = AtomicU32::new(0);
+        let (x, y) = two_weak(schedule, || n.fetch_add(1, Relaxed), || n.fetch_add(1, Relaxed));
+        (x, y, n.load(Relaxed))
+    }
+
+    /// Two `fetch_add`s on one cell (Tests/ThreadsWeak.lean:90..95): 2 on both orders, whatever
+    /// the second update picks: the message it would read back is glued, so it reads the newest.
+    #[test]
+    fn two_fetch_adds_on_one_cell() {
+        let first_then_second = (Ended::Done(0), Ended::Done(1), 2);
+        let second_then_first = (Ended::Done(1), Ended::Done(0), 2);
+        assert_eq!(adds(&[A, b_(0)]), first_then_second);
+        assert_eq!(adds(&[A, b_(1)]), first_then_second);
+        assert_eq!(adds(&[A, b_(2)]), first_then_second);
+        assert_eq!(adds(&[B, a_(0)]), second_then_first);
+        assert_eq!(adds(&[B, a_(1)]), second_then_first);
+        assert_eq!(adds(&[b_(3), a_(7)]), second_then_first);
+    }
+
+    /// `placed` (Tests/ThreadsWeak.lean:100): T1: x := 1 (Release).  T2: x := 2 (Release).
+    /// Then the caller reads x (Acquire).
+    fn placed(schedule: &[Step]) -> u32 {
+        let x = AtomicU32::new(0);
+        two_weak(schedule, || x.store(1, Release), || x.store(2, Release));
+        x.load(Acquire)
+    }
+
+    /// A store placed back in time (Tests/ThreadsWeak.lean:108..109): T2 stores last in the
+    /// schedule, but pick 1 puts its message before T1's, so the newest by timestamp is 1.
+    #[test]
+    fn a_store_placed_back_in_time() {
+        assert_eq!(placed(&[A, b_(1)]), 1);
+        assert_eq!(placed(&[A, b_(0)]), 2);
+    }
+
+    /// `r1` (Tests/ThreadsWeak.lean:114): T1: r := x (Relaxed); y := 1 (`order`).
+    fn r1(order: Ordering) {
+        let x = AtomicU32::new(0);
+        let y = AtomicU32::new(0);
+        two_weak(
+            &[A, A],
+            || {
+                x.load(Relaxed);
+                y.store(1, order);
+            },
+            || (),
+        );
+    }
+
+    /// Rule R1 (Tests/ThreadsWeak.lean:121): a relaxed store after a relaxed load of another
+    /// word could show load buffering: refused, naming the rule.
+    #[test]
+    #[should_panic(expected = "rule R1 of the weak world refuses it")]
+    fn rule_r1_refuses_a_relaxed_store_after_a_relaxed_load() {
+        r1(Relaxed);
+    }
+
+    /// Rule R1 (Tests/ThreadsWeak.lean:123): a release store is ordered after the load
+    /// (trusted), so it runs.
+    #[test]
+    fn rule_r1_lets_a_release_store_run() {
+        r1(Release);
+    }
+
+    /// `spawn` (Tests/ThreadsWeak.lean:129): the caller stores 5 to x before the run; T1 reads
+    /// x (Relaxed); T2 writes 9 to y (Relaxed); then the caller reads y.
+    fn spawn(schedule: &[Step]) -> (Ended<u32>, u32) {
+        let x = AtomicU32::new(0);
+        let y = AtomicU32::new(0);
+        x.store(5, Relaxed);
+        let (r, _) = two_weak(schedule, || x.load(Relaxed), || y.store(9, Relaxed));
+        (r, y.load(Relaxed))
+    }
+
+    /// Spawn and join (Tests/ThreadsWeak.lean:139..141): the spawn shows T1 the 5 on every
+    /// pick; the join shows the caller the 9.
+    #[test]
+    fn spawn_shows_the_child_and_join_shows_the_parent() {
+        assert_eq!(spawn(&[a_(0), B]), (Ended::Done(5), 9));
+        assert_eq!(spawn(&[a_(1), B]), (Ended::Done(5), 9));
+        assert_eq!(spawn(&[B, a_(2)]), (Ended::Done(5), 9));
+    }
+
+    /// Two words with weaker orderings (Tests/ThreadsWeak.lean:146..147): `two` refuses the
+    /// run and its refusal says to state it with `two_weak`, which runs it. The same of a run
+    /// whose every operation is `Relaxed`.
+    #[test]
+    fn two_refuses_two_weak_words_and_two_weak_runs_them() {
+        let schedule = [A, B, a_(1), b_(1)];
+        for (store, load) in [(Release, Acquire), (Relaxed, Relaxed)] {
+            let refused = catch_unwind(AssertUnwindSafe(|| sb(store, load, &schedule, false)))
+                .expect_err("`two` refuses two words with orderings weaker than `SeqCst`");
+            let said = refused.downcast_ref::<String>().map_or("", String::as_str);
+            assert!(said.contains("not a run the world of threads models"), "{said}");
+            assert!(said.contains("is stated with `two_weak`"), "{said}");
+            assert_eq!(sb(store, load, &schedule, true), (Ended::Done(0), Ended::Done(0)));
+        }
+    }
+
+    /// `weak_one` (Tests/ThreadsWeak.lean:150): weaker orderings on one word, and the word
+    /// after, in the weak world.
+    fn weak_one_weakly(schedule: &[Step]) -> u32 {
+        let n = AtomicU32::new(0);
+        two_weak(schedule, || n.store(1, Relaxed), || n.store(2, Release));
+        n.load(Acquire)
+    }
+
+    /// One word with weaker orderings (Tests/ThreadsWeak.lean:156..158): the sequentially
+    /// consistent world's run, and the weak world agrees on it: the last store wins.
+    #[test]
+    fn one_weak_word_is_the_same_in_both_worlds() {
+        assert_eq!(weak_one(&[A, B]), 2);
+        assert_eq!(weak_one_weakly(&[A, B]), 2);
+        assert_eq!(weak_one(&[B, A]), 1);
+        assert_eq!(weak_one_weakly(&[B, A]), 1);
+    }
+
+    /// `slept` (Tests/ThreadsWeak.lean:163), in the weak world: whether the sleeper returned,
+    /// and whether it sleeps with the waker returned.
+    fn slept_weakly(schedule: &[Step]) -> (bool, bool) {
+        let word = AtomicU32::new(0);
+        let (x, y) = two_weak(schedule, || wait(&word, 0, false), || {
+            word.store(1, SeqCst);
+            wake(&word)
+        });
+        (matches!(x, Ended::Done(_)), matches!((x, y), (Ended::Asleep, Ended::Done(_))))
+    }
+
+    /// A futex in the weak world (Tests/ThreadsWeak.lean:169..171): the sleeper and its
+    /// waker as in the sequentially consistent world.
+    #[test]
+    fn a_futex_sleeper_and_its_waker_weakly() {
+        assert_eq!(slept_weakly(&[A, B, B, A]), (true, false));
+        assert_eq!(slept_weakly(&[B, B, A]), (true, false));
+        assert_eq!(slept_weakly(&[A, B]), (false, false));
+    }
+
+    /// The lost wakeup (Tests/ThreadsWeak.lean:174..180): a waker that wakes before it stores;
+    /// the sleeper that looks between the two sleeps with the waker returned.
+    #[test]
+    fn a_wake_before_the_store_is_lost_weakly() {
+        let word = AtomicU32::new(0);
+        let (x, y) = two_weak(&[B, A, B], || wait(&word, 0, false), || {
+            wake(&word);
+            word.store(1, SeqCst);
+        });
+        assert_eq!((x, y), (Ended::Asleep, Ended::Done(())));
+    }
+
+    /// `slept_why` (Tests/ThreadsWeak.lean:183): why the sleeper's wait returned, in the weak
+    /// world where `weak`.
+    fn slept_why(schedule: &[Step], weak: bool) -> Ended<Woke> {
+        let word = AtomicU32::new(0);
+        let first = || wait(&word, 0, false);
+        let second = || {
+            word.store(1, SeqCst);
+            wake(&word);
+        };
+        if weak { two_weak(schedule, first, second).0 } else { two(schedule, first, second).0 }
+    }
+
+    /// Why a wait returned (Tests/ThreadsWeak.lean:191..194): the store done before the look
+    /// is seen with pick 0, in both worlds; a look that picks the stale 0 sleeps although the
+    /// store is done, and the wake then wakes it.
+    #[test]
+    fn a_stale_look_sleeps_and_the_wake_wakes_it() {
+        assert_eq!(slept_why(&[B, A, B], false), Ended::Done(Woke::Changed));
+        assert_eq!(slept_why(&[B, A, B], true), Ended::Done(Woke::Changed));
+        assert_eq!(slept_why(&[B, a_(1), B, A], true), Ended::Done(Woke::Woken));
+    }
+
+    /// `weak_cas` (Tests/ThreadsWeak.lean:199): x goes 0, 1, 0 by T2. T1: a weak
+    /// compare-and-swap of 0 for 5, then a relaxed load: (whether it wrote, what it read, the
+    /// load).
+    fn weak_cas(schedule: &[Step]) -> Ended<(bool, u32, u32)> {
+        let x = AtomicU32::new(0);
+        let (r, _) = two_weak(
+            schedule,
+            || {
+                let got = x.compare_exchange_weak(0, 5, Relaxed, Relaxed);
+                let v = x.load(Relaxed);
+                match got {
+                    Ok(o) => (true, o, v),
+                    Err(o) => (false, o, v),
+                }
+            },
+            || {
+                x.store(1, Relaxed);
+                x.store(0, Relaxed);
+            },
+        );
+        r
+    }
+
+    /// A weak compare-and-swap that fails on a stale read (Tests/ThreadsWeak.lean:211..214):
+    /// pick 5 = 2*2+1 fails for nothing having read the first 0, and the load then reads 1;
+    /// pick 4 reads the first 0 and writes 5 right after it.
+    #[test]
+    fn a_weak_compare_and_swap_fails_on_a_stale_read() {
+        assert_eq!(weak_cas(&[B, B, a_(5), a_(1)]), Ended::Done((false, 0, 1)));
+        assert_eq!(weak_cas(&[B, B, a_(4), a_(0)]), Ended::Done((true, 0, 0)));
+        assert_eq!(weak_cas(&[B, B, a_(4), a_(2)]), Ended::Done((true, 0, 5)));
+    }
+
+    /// `rs` (Tests/ThreadsWeak.lean:220): T1: data := 42 (Relaxed); flag := 1 (Release).  T2:
+    /// f := flag.fetch_add 1 (`order`); d := data (Relaxed).
+    fn rs(order: Ordering, schedule: &[Step]) -> Ended<(u32, u32)> {
+        let data = AtomicU32::new(0);
+        let fl = AtomicU32::new(0);
+        let (_, r) = two_weak(
+            schedule,
+            || {
+                data.store(42, Relaxed);
+                fl.store(1, Release);
+            },
+            || (fl.fetch_add(1, order), data.load(Relaxed)),
+        );
+        r
+    }
+
+    /// Release sequences (Tests/ThreadsWeak.lean:229..233): a relaxed update does not acquire,
+    /// so f = 1 and d = 0; an acquiring one sees d = 42 on every pick once f = 1.
+    #[test]
+    fn an_acquiring_update_synchronises_with_the_release() {
+        assert_eq!(rs(Relaxed, &[A, A, B, b_(1)]), Ended::Done((1, 0)));
+        for pick in 0..=2 {
+            assert_eq!(rs(Acquire, &[A, A, B, b_(pick)]), Ended::Done((1, 42)), "the data load's pick {pick}");
+        }
+        // `AcqRel` acquires as `Acquire` does.
+        assert_eq!(rs(AcqRel, &[A, A, B, b_(1)]), Ended::Done((1, 42)));
+    }
+
+    /// Release sequences kept and lost (Tests/ThreadsWeak.lean:229, 232): on one schedule, the
+    /// `Acquire` update keeps the data (d = 42), and the planted weakening of it to `Relaxed`
+    /// loses it (d = 0).
+    #[test]
+    fn a_release_sequence_is_kept_by_acquire_and_lost_without() {
+        let schedule = [A, A, B, b_(1)];
+        assert_eq!(rs(Acquire, &schedule), Ended::Done((1, 42)));
+        assert_eq!(rs(Relaxed, &schedule), Ended::Done((1, 0)));
+    }
+
+    /// `rs_own` (Tests/ThreadsWeak.lean:239..253): T2's relaxed update continues T1's release
+    /// sequence, so T2's acquire of its own update's message (g = 2) brings the data: d = 42
+    /// whatever the data load picks.
+    #[test]
+    fn an_acquire_of_ones_own_update_continues_the_release_sequence() {
+        let rs_own = |schedule: &[Step]| {
+            let data = AtomicU32::new(0);
+            let fl = AtomicU32::new(0);
+            two_weak(
+                schedule,
+                || {
+                    data.store(42, Relaxed);
+                    fl.store(1, Release);
+                },
+                || (fl.fetch_add(1, Relaxed), fl.load(Acquire), data.load(Relaxed)),
+            )
+            .1
+        };
+        assert_eq!(rs_own(&[A, A, B, B, b_(0)]), Ended::Done((1, 2, 42)));
+        assert_eq!(rs_own(&[A, A, B, B, b_(1)]), Ended::Done((1, 2, 42)));
+    }
+
+    /// After a run of `two_weak` each word holds its newest message's value, not the last
+    /// store made: T2's store to x is placed before T1's (pick 1), its store to y after (pick
+    /// 0), and a word no store reached keeps its own value.
+    #[test]
+    fn a_weak_run_leaves_each_word_its_newest_value() {
+        let x = AtomicU32::new(0);
+        let y = AtomicU32::new(0);
+        let z = AtomicU32::new(7);
+        let (first, second) = two_weak(
+            &[A, A, b_(1), B],
+            || {
+                x.store(1, Release);
+                y.store(1, Release);
+                z.load(Acquire)
+            },
+            || {
+                x.store(2, Release);
+                y.store(3, Release);
+            },
+        );
+        assert_eq!((first, second), (Ended::Running, Ended::Done(())));
+        assert_eq!((x.load(SeqCst), y.load(SeqCst), z.load(SeqCst)), (1, 3, 7));
+    }
+
+    /// A weak run's clock is `two`'s: the script's readings in order, and after the run `time`
+    /// is where the run left it.
+    #[test]
+    fn a_weak_run_keeps_the_clock() {
+        clock(&[ns(5), ns(3), ns(9)]);
+        let (x, _) = two_weak(&[A, A, A, A], || [time(), now(), now(), now()], || ());
+        assert_eq!(x, Ended::Done([ns(0), ns(5), ns(5), ns(9)]));
+        assert_eq!(time(), ns(9));
     }
 }
