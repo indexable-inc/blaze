@@ -76,7 +76,11 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
-  item, imported when needed), `(add-use n "krate::path")` (n any node of the file), and
+  item. A bare name is written as the new item's name and the item is imported: beside the
+  private `use` that brought the old item, which goes once no read the request leaves remains,
+  or else at the end of the module's `use`s. A retargeted `use` leaf is that import, moved the
+  same way. Refused, naming it: a new name that already means something else there, a
+  retargeted `use` a read still needs, a `pub use`, a use-tree prefix or glob), `(add-use n "krate::path")` (n any node of the file), and
   `add-param`, `remove-param` and `reorder-params` (d a fn; every call changes with it; see
   "Changing a fn's parameters"). Templates
   splice `$var`; `$$` is a literal `$`. A template is parsed with each metavariable as a hole,
@@ -122,8 +126,16 @@ argument.
 |---|---|---|
 | `(expr n "pat")` and the other pattern forms | nothing | every matching node and its metavariables |
 | `(syntax n "KIND")` | nothing | every node of that `SyntaxKind` |
+| `(match-arm m a p b)` | nothing | a `match`, each of its arms, the arm's pattern and its expression; from `m`, from `a`, or every arm of the view. A guard is no part of `p` |
+| `(child p c)`, `(descendant p c)` | `p` | each child node of `p`, or each node below it (never `p`), in order; `parent` and `ancestor` are their inverses |
+| `(int-value n i)` | `n` | the integer an integer literal means, in any radix, with `_`s and a suffix (`0x1F` is 31), or a negated one in an expression or a pattern (`-2`); a value past `i64` has no row |
+| `(str-value n s)` | `n` | the text a string literal means, escapes and raw strings read (`"a\tb"` is `a`, a tab, `b`); a byte or C string has no row |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
 | `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused. An associated item is under its impl's ADT, or under the impl segment when the self type is no ADT (`lib::<impl Go for &'_ str>::go`) |
+| `(def-parent d p)` | `d` or `p` | the def that owns `d`: a variant's enum, a field's struct, union or variant, an associated item's impl or trait, an item's or an impl's module, a module's parent (a crate's root has none); or each def `p` owns |
+| `(variant-count e n)` | `e` | how many variants the enum has; any other def has no row |
+| `(type-kind t k)` | `t` | the type's shape as text: `struct`, `enum`, `union`, `ref`, `ptr`, `slice`, `array`, `tuple`, `str`, `bool`, `char`, `int` (signed), `uint`, `float`, `dyn`, `param`, `closure`, `fn`, `impl`, `never`, `unknown`, else `other` |
+| `(type-def t d)` | `t` | the ADT the type is, or the trait of a `dyn Trait`; a reference is not peeled, so `(peel-refs t u)` first |
 | `(def-name d t)` | `d` | the def's own name as text, the last segment of its path (`0` for a tuple field); an impl has none, so no row |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |

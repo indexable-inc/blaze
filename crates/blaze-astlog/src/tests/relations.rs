@@ -399,3 +399,177 @@ fn add_use_imports_the_path_once_into_the_nodes_module() {
     let module = text.find("pub mod outer {").expect("outer");
     assert!(text.find("use dep::helper;").is_some_and(|at| at < module), "into the crate root, not outer: {text}");
 }
+
+const ARMS: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub enum E { A, B(u8) }
+pub fn pick(n: u8) -> E {
+    match n {
+        0 => E::A,
+        k if k > 9 => E::B(k),
+        _ => E::B(1),
+    }
+}
+pub fn other(n: u8) -> u8 { match n { 7 => 1, _ => 2 } }
+"#;
+
+/// `match-arm` gives each arm's match, pattern and expression from the match, from the arm, or
+/// from neither; its guard is no part of the pattern.
+#[test]
+fn match_arm_gives_each_arms_match_pattern_and_expression_from_either_end() {
+    let (db, files) = view(ARMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (every p b) (match-arm m a p b))
+        (rule (of-match p b) (syntax m "MATCH_EXPR") (text-match m "^match n [{] 7") (match-arm m a p b))
+        (rule (of-arm m) (syntax a "MATCH_ARM") (text-match a "^k if") (match-arm m a p b))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let every = [["0", "E::A"], ["k", "E::B(k)"], ["_", "E::B(1)"], ["7", "1"], ["_", "2"]];
+    assert_eq!(texts(&outcome, "every"), every);
+    assert_eq!(texts(&outcome, "of-match"), [["7", "1"], ["_", "2"]]);
+    let of_arm = texts(&outcome, "of-arm");
+    assert_eq!(of_arm.len(), 1, "{of_arm:?}");
+    assert!(of_arm[0][0].starts_with("match n {\n        0 => E::A,"), "{of_arm:?}");
+}
+
+/// `child` gives a node's children in order, and `descendant` every node below it, never the
+/// node itself.
+#[test]
+fn child_and_descendant_walk_down_from_a_bound_node() {
+    let (db, files) = view(ARMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (guarded a) (syntax a "MATCH_ARM") (text-match a "^k if"))
+        (rule (kids k) (guarded a) (child a c) (kind c k))
+        (rule (lits l) (syntax m "MATCH_EXPR") (text-match m "^match n [{] 7") (descendant m l) (kind l "LITERAL"))
+        (rule (self-below m) (syntax m "MATCH_EXPR") (descendant m m))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut kids = texts(&outcome, "kids");
+    kids.sort();
+    assert_eq!(kids, [["CALL_EXPR"], ["IDENT_PAT"], ["MATCH_GUARD"]]);
+    assert_eq!(texts(&outcome, "lits"), [["7"], ["1"], ["2"]]);
+    assert!(texts(&outcome, "self-below").is_empty());
+}
+
+/// `int-value` reads an integer literal in any radix, with `_`s and a suffix, and a negated one
+/// in an expression or a pattern; one past `i64` has no row. `str-value` unescapes a string,
+/// raw ones too.
+#[test]
+fn int_value_and_str_value_read_what_a_literal_means() {
+    let fixture = r##"
+//- /lib.rs crate:lib edition:2021
+pub const A: i64 = 0x1F;
+pub const B: u32 = 1_000u32;
+pub const C: i64 = -7;
+pub fn f(n: i64) -> &'static str { match n { -2 => "neg\ttab", 3 => r#"raw "q""#, _ => "x" } }
+pub const BIG: u64 = 18446744073709551615;
+"##;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (ints n i) (syntax n "LITERAL") (int-value n i))
+        (rule (negated n i) (syntax n "PREFIX_EXPR") (int-value n i))
+        (rule (pats n i) (syntax n "LITERAL_PAT") (int-value n i))
+        (rule (strs s) (syntax n "LITERAL") (str-value n s))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let ints = [["0x1F", "31"], ["1_000u32", "1000"], ["7", "7"], ["2", "2"], ["3", "3"]];
+    assert_eq!(texts(&outcome, "ints"), ints);
+    assert_eq!(texts(&outcome, "negated"), [["-7", "-7"]]);
+    assert_eq!(texts(&outcome, "pats"), [["-2", "-2"], ["3", "3"]]);
+    assert_eq!(texts(&outcome, "strs"), [["neg\ttab"], ["raw \"q\""], ["x"]]);
+}
+
+const OWNED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub enum E { A, B(u8), C { x: u8 } }
+pub struct S { pub f: u8 }
+pub trait T { fn t(&self); }
+impl S { pub fn m(&self) {} }
+impl T for S { fn t(&self) {} }
+pub mod inner { pub fn g() {} }
+"#;
+
+/// `def-parent` goes up from a def to what owns it, and down from an owner to each def it owns;
+/// `variant-count` counts an enum's variants and nothing else's.
+#[test]
+fn def_parent_joins_a_def_and_its_owner_both_ways_and_variant_count_counts_an_enum() {
+    let (db, files) = view(OWNED, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (up d p) (def-path d "lib::E::B") (def-parent d p))
+        (rule (up d p) (def-path d "lib::E::C::x") (def-parent d p))
+        (rule (up d p) (def-path d "lib::S::m") (def-parent d p))
+        (rule (up d p) (def-path d "lib::T::t") (def-parent d p))
+        (rule (up d p) (def-path d "lib::inner::g") (def-parent d p))
+        (rule (up d p) (def-path d "lib::inner") (def-parent d p))
+        (rule (up d p) (syntax n "IMPL") (defines n d) (def-parent d p))
+        (rule (root p) (def-path d "lib") (def-parent d p))
+        (rule (down p d) (def-path p "lib::E") (def-parent d p))
+        (rule (down p d) (def-path p "lib::S") (def-parent d p))
+        (rule (down p d) (def-path p "lib::inner") (def-parent d p))
+        (rule (down p d) (def-path p "lib::T") (def-parent d p))
+        (rule (variants e n) (def-path e "lib::E") (variant-count e n))
+        (rule (variants e n) (def-path e "lib::S") (variant-count e n))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut up = texts(&outcome, "up");
+    up.sort();
+    let want = [
+        ["lib::<impl S>", "lib"],
+        ["lib::<impl T for S>", "lib"],
+        ["lib::E::B", "lib::E"],
+        ["lib::E::C::x", "lib::E::C"],
+        ["lib::S::m", "lib::<impl S>"],
+        ["lib::T::t", "lib::T"],
+        ["lib::inner", "lib"],
+        ["lib::inner::g", "lib::inner"],
+    ];
+    assert_eq!(up, want);
+    assert!(texts(&outcome, "root").is_empty(), "a crate's root has no owner");
+    let mut down = texts(&outcome, "down");
+    down.sort();
+    let want = [
+        ["lib::E", "lib::E::A"],
+        ["lib::E", "lib::E::B"],
+        ["lib::E", "lib::E::C"],
+        ["lib::S", "lib::S::f"],
+        ["lib::T", "lib::T::t"],
+        ["lib::inner", "lib::inner::g"],
+    ];
+    assert_eq!(down, want);
+    assert_eq!(texts(&outcome, "variants"), [["lib::E", "3"]]);
+}
+
+/// `type-kind` names a type's shape, and `type-def` the ADT or the `dyn` trait it is; a
+/// reference is its own kind until `peel-refs` strips it.
+#[test]
+fn type_kind_names_a_types_shape_and_type_def_its_adt_or_trait() {
+    let fixture = r#"
+//- /lib.rs crate:lib edition:2021
+pub struct S;
+pub enum E { A }
+pub union U { a: u8 }
+pub trait T {}
+pub fn f(s: S, e: E, uu: U, r: &S, p: *const u8, sl: &[u8], a: [u8; 2], t: (u8, i8), st: &str, b: bool, c: char, i: i32, u: usize, fl: f64, d: &dyn T) {}
+"#;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (param p t) (syntax n "PARAM") (child n p) (kind p "IDENT_PAT") (type-of p t))
+        (rule (kinds p k) (param p t) (type-kind t k))
+        (rule (peeled p k) (param p t) (peel-refs t u) (type-kind u k))
+        (rule (defs p d) (param p t) (type-def t d))
+        (rule (peeled-defs p d) (param p t) (peel-refs t u) (type-def u d))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let kinds = [
+        "struct", "enum", "union", "ref", "ptr", "ref", "array", "tuple", "ref", "bool", "char", "int",
+        "uint", "float", "ref",
+    ];
+    let found: Vec<String> = texts(&outcome, "kinds").into_iter().map(|it| it[1].clone()).collect();
+    assert_eq!(found, kinds);
+    let peeled = texts(&outcome, "peeled");
+    let of = |name: &str| peeled.iter().find(|it| it[0] == name).map(|it| it[1].clone());
+    assert_eq!([of("sl"), of("st"), of("d")], [Some("slice".to_owned()), Some("str".to_owned()), Some("dyn".to_owned())]);
+    assert_eq!(texts(&outcome, "defs"), [["s", "lib::S"], ["e", "lib::E"], ["uu", "lib::U"]]);
+    let peeled = [["s", "lib::S"], ["e", "lib::E"], ["uu", "lib::U"], ["r", "lib::S"], ["d", "lib::T"]];
+    assert_eq!(texts(&outcome, "peeled-defs"), peeled);
+}

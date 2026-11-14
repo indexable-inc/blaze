@@ -60,6 +60,24 @@ pub enum Atom {
     Defines,
     References,
     Filter(Filter),
+    /// `(match-arm m a p b)`: a `match`, one of its arms, the arm's pattern and its expression.
+    MatchArm,
+    /// `(child p c)`: each child node of `p`, in order.
+    Child,
+    /// `(descendant p c)`: each node below `p`, in order.
+    Descendant,
+    /// `(int-value n i)`: the integer an integer literal, or a negated one, means.
+    IntValue,
+    /// `(str-value n s)`: the text a string literal means, unescaped.
+    StrValue,
+    /// `(def-parent d p)`: the def that owns `d`, or each def `p` owns.
+    DefParent,
+    /// `(variant-count e n)`: how many variants the enum `e` has.
+    VariantCount,
+    /// `(type-def t d)`: the ADT a type is, or the trait of a `dyn Trait`.
+    TypeDef,
+    /// `(type-kind t k)`: the type's shape, as text (`struct`, `ref`, `int`, ...).
+    TypeKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +133,15 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "visibility" => (Atom::Visibility, 2, all0),
         "defines" => (Atom::Defines, 2, Needs::Any(&[0, 1])),
         "references" => (Atom::References, 2, all0),
+        "match-arm" => (Atom::MatchArm, 4, Needs::Nothing),
+        "child" => (Atom::Child, 2, all0),
+        "descendant" => (Atom::Descendant, 2, all0),
+        "int-value" => (Atom::IntValue, 2, all0),
+        "str-value" => (Atom::StrValue, 2, all0),
+        "def-parent" => (Atom::DefParent, 2, Needs::Any(&[0, 1])),
+        "variant-count" => (Atom::VariantCount, 2, all0),
+        "type-def" => (Atom::TypeDef, 2, all0),
+        "type-kind" => (Atom::TypeKind, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

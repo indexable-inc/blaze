@@ -648,12 +648,11 @@ pub fn refused(asked: &Invocation) -> Option<String> {
             if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
                 && !flags.build_only.is_empty() =>
         {
-            let given: Vec<String> = flags.build_only.iter().map(|it| format!("`{it}`")).collect(); // alloc: a refusal's few flags
             Some(format!(
                 "{} runs no build, reads no lock file, fetches nothing and sends no cargo config, \
-                 so {} would change nothing: run it without",
+                 so `{}` would change nothing: run it without",
                 rules_mode(flags),
-                given.join(", ")
+                flags.build_only.join("`, `")
             ))
         }
         Command::Check
