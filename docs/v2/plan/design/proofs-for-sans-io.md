@@ -359,13 +359,24 @@ stated in by the runner it calls (decision D46, below).
   is; each function carries whether it reaches `two` and whether it reaches `two_weak`,
   through its callees and closures; a theorem that reaches `two_weak` has its statement over
   `.valueWeak`, and one that reaches both is refused by name. `Prog.valueAny` is gone.
-- The first statement in the weak world (stated and run 2026-11-14, not yet proved):
+- The first theorem in the weak world (proved 2026-11-14):
   `handoff::no_hand_back_is_missed`, of the real `Wake`: a sender's relaxed store of its slot
   and its `wake`, the driver's `drain` and its relaxed read of the slot, for every schedule
-  and every stale read: the driver saw the slot or the sender was told to wake it. Its
-  control is the same two threads with the flag's swaps `Relaxed`.
-- To build: the induction over a schedule for the weak world (`two_exec` over `execWeak`,
-  with step lemmas that hold for every pick) and that statement's proof.
+  and every stale read: the driver saw the slot or the sender was told to wake it
+  (`BlazeCore/Handoff.lean`, eleven reachable states). Its control is the same two threads
+  with the flag's swaps `Relaxed`: in Rust on the one schedule that shows it, and in Lean a
+  run by evaluation that misses a hand-back (`BlazeCore/HandoffModel.lean`).
+- The method for the weak world (`lean/Blaze/ThreadsWeakAuto.lean`) is the sequentially
+  consistent one's with `execWeak`: `AdvanceWeak`, `two_exec_weak`, `two_ends_weak`, and step
+  lemmas that hold for every pick. A proof does not follow message ids: it states where a
+  thread's view of a cell stands among the cell's messages (`World.place`) and what an
+  update glues, which is enough to say "the later swap read the earlier one's message and
+  acquired its view".
+- Not reached: a relaxed read followed by a non-releasing write of another cell (rule R1),
+  which needs promises; `handoff::Claims` has that shape and keeps its model-checked test.
+  What the first proof asked of the world's presentation, for the next: a stated
+  well-formedness of a world (message ids unique and below the next, a cell's newest message
+  not glued) in place of hypotheses on each step lemma; `AtomicBool`'s conversions public.
 
 **Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
 sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait
