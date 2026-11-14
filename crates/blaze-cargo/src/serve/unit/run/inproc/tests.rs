@@ -9,7 +9,7 @@ use crossbeam_queue::SegQueue;
 
 use super::{
     ARENA, CELLS_PER_FUNCTION, NotPlaced, PLANT, Patch, Plant, Unheld, answer, dev_file_key, dev_run,
-    placed_file, unheld_launch, write_file,
+    is_the_paths, placed_file, unheld_launch, write_file,
 };
 
 const PID: u32 = 41;
@@ -165,6 +165,19 @@ fn a_launch_with_nothing_held_adopts_only_a_placed_dev_executable() {
     assert_eq!(unheld_launch(true, None), Unheld::Refused, "nothing placed: the unheld error, never its file");
     assert_eq!(unheld_launch(false, Some(key)), Unheld::File);
     assert_eq!(unheld_launch(false, None), Unheld::File);
+}
+
+/// The invariant: the program held under a path is launched there only while the jobs' record
+/// names its file (or names nothing, which its start then refuses naming the path); where the
+/// record names another key, another job's value is at the path (a `blaze run`'s launcher's
+/// program over a `blaze build`'s live image), and the launch is of that, as at a path where
+/// nothing is held.
+#[test]
+fn a_held_program_is_launched_only_from_a_path_that_holds_its_file() {
+    let (held, other) = ([7u8; 32], [8u8; 32]);
+    assert!(is_the_paths(held, Some(held)));
+    assert!(is_the_paths(held, None), "no record: its start refuses, naming the path");
+    assert!(!is_the_paths(held, Some(other)), "the path holds another job's value");
 }
 
 /// The placed file laid into a new code memory, as a launch after a start does

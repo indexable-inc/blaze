@@ -1007,6 +1007,7 @@ impl Runs<Real> for Checking {
         &mut self,
         _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        _placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s; Lean is no placed output
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

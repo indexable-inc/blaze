@@ -2213,6 +2213,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.jobs.next_deadline()
     }
 
+    /// The key the jobs' record holds for the output at `path` ([`super::job::Jobs::placed_key`]).
+    #[cfg(test)]
+    pub(super) fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        self.jobs.placed_key(path)
+    }
+
     /// Asks the store to place `key` at `to` as a build would: store traffic that is no step of
     /// its commit, for a test that it does not count as the commit's progress.
     #[cfg(test)]
@@ -3482,8 +3488,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         }
                     }
                 }
-                // `blaze run` of a dev executable: the programs are the steps' (review: the
-                // file it may write is the launch's, once per run).
+                // `blaze run` of a dev executable: the programs are the steps'. The launch
+                // writes no file: it starts the one the build placed, with the key the jobs'
+                // record holds for its path, or is refused naming the path and both keys.
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
                     let placed = self.jobs.placed_key(&program);
                     let (response, ok) = match self.steps.launch(&program, pid, placed) {

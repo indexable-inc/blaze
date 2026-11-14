@@ -22,8 +22,9 @@
 //!   completion. No answer waits for a sync: the span `placed file made its value's home`
 //!   says what the syncs, the mapping and the move took, apart from every request.
 //! - **The record goes by the forget, never the file alone.** A home is not let go when no path
-//!   names it (`Store::names_step` skips a file of its own); its record is forgotten once nothing
-//!   roots it ([`crate::forget`]), and once the head that lists it removed is durable the file
+//!   names it (`Store::names_step` skips a file of its own, and asks no forget of it: D45); its
+//!   record is forgotten by the collector, or once asked ([`crate::forget`]) and nothing roots
+//!   it, and once the head that lists it removed is durable the file
 //!   is a placed file again, removed by the placed files' own steps when no path names it
 //!   ([`Store::let_go`]). The open's sweep of `placed/` keeps a home its head names.
 //! - **A record not yet in a pack** (its put not yet committed) moves once a commit has drained

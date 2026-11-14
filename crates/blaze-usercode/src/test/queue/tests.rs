@@ -121,6 +121,10 @@ struct Fake {
     records: BTreeMap<FileName, Vec<u8>>,
     /// The record reads the queue asked for.
     reads: Vec<FileName>,
+    /// The removes the queue asked for, in order.
+    removed: Vec<FileName>,
+    /// The removes that fail, as one of a file that can't be removed does.
+    unremovable: Vec<FileName>,
     next_conn: u64,
     results: Vec<Finished>,
     /// What the queue allocated in its `complete` calls, and nothing of the fake's.
@@ -145,6 +149,8 @@ impl Fake {
             hangups: Vec::new(),
             records: BTreeMap::new(),
             reads: Vec::new(),
+            removed: Vec::new(),
+            unremovable: Vec::new(),
             next_conn: 0,
             results: Vec::new(),
             allocations: 0,
@@ -215,6 +221,22 @@ impl Fake {
                     }
                     Effect::Timer { after, tag } => {
                         self.timers.push((tag, self.now + after, self.sends))
+                    }
+                    Effect::Remove { file, tag } if self.unremovable.contains(&file) => {
+                        self.removed.push(file);
+                        let error = IoError("Permission denied (os error 13)".into());
+                        answers.push(Completion { tag, done: Done::Failed(error) });
+                    }
+                    Effect::Remove { file, tag } => {
+                        // The directory goes only once nothing is in it, as `rmdir` has it.
+                        assert!(
+                            !self.records.keys().any(|it| it != &file && it.is_under(&file)),
+                            "{file} removed with {:?} in it",
+                            self.records.keys().collect::<Vec<_>>()
+                        );
+                        self.records.remove(&file);
+                        self.removed.push(file);
+                        answers.push(Completion { tag, done: Done::Removed });
                     }
                     Effect::Listen { at, tag } => self.listens.push((tag, at)),
                     Effect::Recv { conn, tag, .. } => self.recvs.push((tag, conn)),
@@ -1037,6 +1059,69 @@ fn a_cancel_kills_what_runs_and_runs_nothing_more() {
     assert!(fake.queue.finished());
 }
 
+/// The invariant: a request leaves nothing in its directory and not the directory. Once the
+/// last result is in and the server's process ended (its sandbox appends to the record until
+/// then), its socket and record are removed, then the directory, and only then is the queue
+/// finished; never while the server may still write. Likewise for a cancelled run and a lost
+/// server. A remove that fails is said once, naming the directory, and the run still ends.
+/// The control: before the server ends, with every result in, nothing is removed.
+#[test]
+fn a_request_s_directory_is_removed_once_its_last_result_is_in_and_its_server_ended() {
+    let ours = [name("req/1/t0"), name("req/1/r0"), name("req/1")];
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
+    let conn = fake.hello(0, &["a"]);
+    let a = fake.run(conn, 0);
+    fake.end(conn, a, End::Exited(0), b"");
+    assert_eq!(fake.result("a").outcome, Outcome::Passed);
+    assert_eq!(fake.frames(conn), vec![Frame::Quit]);
+    // The control: every result is in, and the server can still append to its record.
+    assert!(fake.removed.is_empty(), "removed while the server runs: {:?}", fake.removed);
+    assert!(!fake.queue.finished());
+    fake.exit("/bin/lib", exited(Some(0), None, Some(Traced::default())));
+    assert_eq!(fake.removed, ours, "the files, then the directory");
+    assert!(fake.records.is_empty() && fake.queue.finished());
+    assert_eq!(fake.queue.take_left_behind(), None);
+
+    // Cancelled: removed once the killed server ended.
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 10), job("b", 0)])]);
+    let conn = fake.hello(0, &["a", "b"]);
+    fake.run(conn, 0);
+    fake.cancel();
+    assert!(fake.removed.is_empty() && !fake.queue.finished());
+    fake.exit("/bin/lib", exited(None, Some(9), None));
+    assert_eq!(fake.removed, ours);
+    assert!(fake.queue.finished());
+
+    // A server that could not be started: its record is removed as it ended.
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
+    let spawn = fake.spawn_of("/bin/lib");
+    fake.spawns.clear();
+    fake.complete(spawn, Done::Failed(IoError("no user namespaces".into())));
+    assert_eq!(fake.removed, ours);
+    assert!(fake.queue.finished());
+
+    // A record that can't be removed: said once, naming the directory, which is kept; the
+    // run ends.
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
+    fake.unremovable.push(name("req/1/r0"));
+    let conn = fake.hello(0, &["a"]);
+    let a = fake.run(conn, 0);
+    fake.end(conn, a, End::Exited(0), b"");
+    fake.exit("/bin/lib", exited(Some(0), None, Some(Traced::default())));
+    assert_eq!(fake.removed, ours[..2]);
+    assert!(fake.queue.finished());
+    let said = fake.queue.take_left_behind().expect("a directory left behind is said");
+    assert!(said.contains("/root/req/1 is left behind") && said.contains("Permission denied"), "{said}");
+    assert_eq!(fake.queue.take_left_behind(), None, "said once");
+
+    // A binary run whole makes nothing in the directory: nothing is removed.
+    let threads = Mode::Threads { args: Vec::new(), timeout: Duration::from_secs(60) };
+    let whole = Binary { mode: threads, ..binary("lib", vec![job("a", 0)]) };
+    let mut fake = Fake::new(config(1), vec![whole]);
+    fake.exit("/bin/lib", exited(Some(0), None, Some(Traced::default())));
+    assert!(fake.queue.finished() && fake.removed.is_empty());
+}
+
 /// What the fork server read of a test's region comes with its result, as it was sent.
 #[test]
 fn what_a_test_executed_comes_with_its_result() {
@@ -1177,6 +1262,11 @@ fn simulated(two_outside: bool) {
             }
             results.extend(queue.drain());
         }
+        // Finished is with the request's directory gone: no record is left.
+        for record in ["req/1/r0", "req/1/r1"] {
+            assert!(!sim.exists(&name(record)), "seed {seed}: {record} left behind");
+        }
+        assert_eq!(queue.take_left_behind(), None, "seed {seed}");
         let quit: Vec<bool> = played.iter().map(|it| it.quit).collect();
         assert!(quit.iter().all(|it| *it), "seed {seed}, two outside {two_outside}: quit {quit:?}");
         let mut names: Vec<&str> = results.iter().map(|it| it.test.as_deref().unwrap()).collect();
@@ -1263,6 +1353,38 @@ fn a_line_of_every_scope_is_given_once_however_often_it_comes() {
     fake.append(0, &[libc, Line::new(Seen::Read, "b", "/ws/b")]);
     fake.end(conn, b, End::Exited(0), b"");
     assert_eq!(fake.result("b").trace, lines(&[common[0], common[1], (Seen::Read, "/ws/b")]));
+}
+
+/// The invariant: the server's own start of its program is no test's read. A line of no test's
+/// scope that runs or looks at the binary's own file (the exec, and on macOS the loader's reads,
+/// under either spelling of a `/private` path) is in no test's trace, so a relink is not a
+/// changed read of every test; a test that opens its own executable reads it in its own scope,
+/// and that line stays. The control is the line beside it: another file read at the start is
+/// in every test's trace.
+#[test]
+fn the_servers_start_of_its_own_program_is_no_tests_read() {
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0), job("b", 0)])]);
+    // The path `binary("lib", ..)` is started from.
+    let program = String::from("/bin/lib");
+    let conn = fake.hello(0, &["a", "b"]);
+    let a = fake.run(conn, 0);
+    fake.append(
+        0,
+        &[
+            Line::new(Seen::Read, "", &program),
+            Line::new(Seen::Looked, "", &program),
+            Line::new(Seen::Read, "", &format!("/private{program}")),
+            Line::new(Seen::Read, "", "/lib/libc.so"),
+            Line::new(Seen::Read, "a", "/ws/a"),
+        ],
+    );
+    fake.end(conn, a, End::Exited(0), b"");
+    assert_eq!(fake.result("a").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/a")]));
+    // `b` opens its own executable: its read.
+    let b = fake.run(conn, 1);
+    fake.append(0, &[Line::new(Seen::Read, "b", &program)]);
+    fake.end(conn, b, End::Exited(0), b"");
+    assert_eq!(fake.result("b").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, program.as_str())]));
 }
 
 #[test]

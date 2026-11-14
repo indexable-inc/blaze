@@ -98,6 +98,34 @@ thread_local! {
     /// The planted bug: an output is placed at once whatever is in flight at its path
     /// ([`Jobs::place_output`]), as before outputs outlived their job's answer.
     pub(super) static PLANT_NO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each path a job wrote or cloned a file onto ([`Jobs::place`], [`Jobs::place_made_as`]):
+    /// what a test sees of a placement besides the file's bytes, which a placement of the same
+    /// value leaves as they were.
+    pub(super) static PLACED_PATHS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The planted bug: an output is placed again whatever the path holds, its file not looked
+    /// at first ([`Jobs::place_now`]).
+    pub(super) static PLANT_PLACE_UNLOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a run is given no record of any path ([`Paths::placed_key`]), as
+    /// before launches read the job's record: what starts a program from its path must then
+    /// write the file itself.
+    pub(super) static PLANT_LAUNCH_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a path with any record is taken to hold the job's value and nothing is
+    /// placed or looked at ([`Jobs::place_now`]), as a shortcut that vouches for a path without
+    /// the record's key would: another command's value at a shared path stays there.
+    pub(super) static PLANT_VOUCH_ANY_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a request certificate's check takes an output for the answer's with
+    /// no word from the jobs' record ([`certify::placed_elsewhere`] not asked), so the disk
+    /// alone vouches, as it did until 2026-11-14.
+    pub(super) static PLANT_HIT_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a certificate names each output as the jobs' record holds it when it is
+    /// written, after the build settled, not as its own build left it, as it did until
+    /// 2026-11-14: a file another request placed there meanwhile is named as this answer's.
+    pub(super) static PLANT_CERTIFY_SHARED_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the request certificate said of each request that became a job (why it was not
+    /// checked, or why its check missed: `job: ..`) and of each build whose certificate was
+    /// not written (`not written: ..`), in order, each in its own words: what a test whose
+    /// premise is a certificate's answer says when none answered.
+    pub(super) static CERTIFY_WORDS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
     /// its message. What a test reads of a table only the history's thread writes.
     pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -2084,6 +2112,21 @@ impl<S: Steps> Paths<S> {
         self.placed.push(None);
         self.images.push(None);
         id
+    }
+
+    /// The content key the record of `path` holds: the output placed there whose file was as
+    /// placed at the last look; `None` for a path nothing is placed at, one whose placement is
+    /// in flight, or one whose file a look found changed ([`Jobs::placed_key`]). What a run
+    /// started from the file there is given for it ([`Runs::start`]'s `placed`): the host
+    /// starts a program only from a file its key says is its own, and writes none.
+    fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        let id = *self.ids.get(path)?;
+        let placed = self.placed[id as usize].as_ref()?;
+        #[cfg(test)]
+        if PLANT_LAUNCH_UNRECORDED.get() {
+            return None;
+        }
+        placed.meta.map(|_| placed.key.0.0)
     }
 
     /// The id of `path`, an output of the unit whose outputs are `ids`: a compare of the few
@@ -4932,9 +4975,7 @@ impl<S: Steps> Jobs<S> {
     /// is in flight, or one whose file a look found changed. What a launch of the file there
     /// may take the file for (`serve::unit::run::inproc::DevRuns::launch`).
     pub fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
-        let id = *self.paths.ids.get(path)?;
-        let placed = self.paths.placed[id as usize].as_ref()?;
-        placed.meta.map(|_| placed.key.0.0)
+        self.paths.placed_key(path)
     }
 
     /// How many outputs answered jobs left being placed ([`Settling::placing`]): the loop is
@@ -5118,6 +5159,11 @@ impl<S: Steps> Jobs<S> {
         walks: Option<(String, ContentId)>,
     ) {
         let refused = self.refused.take();
+        #[cfg(test)]
+        CERTIFY_WORDS.with_borrow_mut(|it| {
+            let why = refused.as_deref().or(walks.as_ref().map(|it| it.0.as_str()));
+            it.push(format!("job: {}", why.unwrap_or("no word of the certificate"))); // alloc: a test's record
+        });
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job
@@ -8548,7 +8594,9 @@ impl<S: Steps> Jobs<S> {
         };
         let mut out = std::mem::take(&mut self.out);
         // The writer, or what keeps the run's ask while a write's task holds it.
-        let ended = runs.start(w.store, Some(&mut build.writer), w.effects, &mut out);
+        let paths = &self.paths;
+        let placed = |path: &str| paths.placed_key(path);
+        let ended = runs.start(w.store, Some(&mut build.writer), &placed, w.effects, &mut out);
         let puts = runs.take_puts();
         self.run_put(w, id, puts);
         for response in out.drain(..) {
@@ -8837,10 +8885,18 @@ impl<S: Steps> Jobs<S> {
             self.place_made(w, id, path, key, executable, made);
             return;
         }
+        #[cfg(test)]
+        let planted = PLANT_PLACE_UNLOOKED.get();
+        #[cfg(not(test))]
+        let planted = false;
         let placed = self.paths.placed[path as usize]
             .as_ref()
             .is_some_and(|it| it.key == key && it.executable == executable && it.meta.is_some());
-        if !placed {
+        #[cfg(test)]
+        if PLANT_VOUCH_ANY_KEY.get() && self.paths.placed[path as usize].as_ref().is_some_and(|it| it.meta.is_some()) {
+            return;
+        }
+        if !placed || planted {
             self.place(w, id, path, key, executable);
             return;
         }
@@ -8914,9 +8970,11 @@ impl<S: Steps> Jobs<S> {
         key: blaze_cas::Key,
         executable: bool,
     ) {
-        // The whole file the store kept to clone the path's last value from goes as this is
-        // answered, once no other path names it (`blaze_cas::Store::place`): a build dir
-        // rebuilt again and again keeps no store file of each version.
+        // The path's last value stays in the store, its record and the file that is its home
+        // (D45: a unit record that names it is replayed by the next request that shares the
+        // path); only a whole file kept to clone from that is no value's home goes as this is
+        // answered, once no other path names it (`blaze_cas::Store::place`). What lets a value
+        // go is the collector, by budget.
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {
@@ -8936,6 +8994,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        #[cfg(test)]
+        PLACED_PATHS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
         // An executable is started from its path: a clone placed there is prewarmed.
         w.store.starts(&file, executable);
         match w.store.place(&key, file, w.effects) {
@@ -9013,7 +9073,8 @@ impl<S: Steps> Jobs<S> {
         made: &Arc<Made>,
         over: bool,
     ) {
-        // The store lets go of the whole file of the path's last value as this is answered.
+        // The path's last value stays in the store (D45); a whole file kept only to clone it
+        // from, no value's home, is let go of as this is answered ([`Jobs::place`]).
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {
@@ -9033,6 +9094,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        #[cfg(test)]
+        PLACED_PATHS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
         // An executable is started from its path: its staged file gets its mode before its
         // look and rename, and a clone is prewarmed (`blaze_cas::Store::starts`).
         w.store.starts(&file, executable);
@@ -9860,7 +9923,12 @@ impl<S: Steps> Jobs<S> {
         #[cfg(test)]
         RUNS_STARTED_PLACING.with_borrow_mut(|it| it.push(job.placing));
         let mut out = std::mem::take(&mut self.out);
-        let ended = runs.start(w.store, None, w.effects, &mut out);
+        // Each program it starts is started from the file its path's record holds, with that
+        // record's key: its job's placements have all ended (`release_runs`), so the record is
+        // what the build placed and found as placed, and no one else writes the file.
+        let paths = &self.paths;
+        let placed = |path: &str| paths.placed_key(path);
+        let ended = runs.start(w.store, None, &placed, w.effects, &mut out);
         let puts = runs.take_puts();
         self.run_put(w, id, puts);
         for response in out.drain(..) {
