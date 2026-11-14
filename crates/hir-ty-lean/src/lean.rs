@@ -153,6 +153,9 @@ pub enum Decl {
     /// `deriving instance DecidableEq for name`: Lean's `=` of the type decided, the model of
     /// its derived `==`.
     DeriveDecidableEq(String),
+    /// `opaque name (params) : ty`: a constant of that type with no definition the kernel
+    /// unfolds ([`crate::opaque_module`]).
+    Opaque { name: String, params: Vec<Binder>, ty: Term },
 }
 
 /// A Lean file.
@@ -476,6 +479,11 @@ impl Printer {
             Decl::PrintAxioms(name) => self.line(0, &format!("#print axioms {}", ident(name))),
             Decl::DeriveDecidableEq(name) => {
                 self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)))
+            }
+            Decl::Opaque { name, params, ty } => {
+                let params = binders(params);
+                let space = if params.is_empty() { "" } else { " " };
+                self.line(0, &format!("opaque {}{space}{params} : {}", ident(name), inline(ty)));
             }
         }
     }
