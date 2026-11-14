@@ -493,33 +493,6 @@ fn rules_are_sorted_and_name_one_rule_per_ingredient() {
     }
 }
 
-/// Every read the table may call covered is one the identity says it stands for, with the
-/// same key, and back (design section 6).
-#[test]
-fn the_covered_reads_are_the_identitys() {
-    use crate::identity::Key;
-    let mut ours: Vec<(&str, Key)> = RULES
-        .iter()
-        .filter_map(|&(name, _, rule)| match rule {
-            Rule::Names | Rule::TraitsInScope => Some((name, Key::Any)),
-            Rule::OwnBody | Rule::OwnStore => Some((name, Key::OwnBody)),
-            Rule::CrateInput | Rule::OwnCrate(_) => Some((name, Key::OwnCrate)),
-            _ => None,
-        })
-        .collect();
-    let mut theirs: Vec<(&str, Key)> = crate::identity::covered_queries().to_vec();
-    ours.sort_unstable_by_key(|it| it.0);
-    ours.dedup();
-    theirs.sort_unstable_by_key(|it| it.0);
-    theirs.dedup();
-    let only_ours: Vec<_> = ours.iter().filter(|it| !theirs.contains(it)).collect();
-    let only_theirs: Vec<_> = theirs.iter().filter(|it| !ours.contains(it)).collect();
-    assert!(
-        only_ours.is_empty() && only_theirs.is_empty(),
-        "covered by reads.rs only: {only_ours:?}; by identity::covered_queries only: {only_theirs:?}"
-    );
-}
-
 /// The steps' fixture: one body for each construct the closure test is about.
 const STEPS: &str = r#"
 //- minicore: sized, copy, clone, derive, add, fn, iterator, option, result, try, future, async_fn, index, range, deref, from, send, sync
@@ -952,16 +925,6 @@ fn own_earlier_steps_are_step_facts() {
 }
 
 #[test]
-fn names_rules_are_covered_for_any_key() {
-    let (db, seen) = steps_seen();
-    for it in &seen {
-        if reads::rule_of(&db, it.read, it.name) == Some(Rule::Names) {
-            assert_eq!(it.class, Classified::Covered, "{}", it.name);
-        }
-    }
-}
-
-#[test]
 fn classifying_again_allocates_nothing() {
     let (db, seen) = steps_seen();
     for it in &seen {
@@ -1028,12 +991,10 @@ fn alike_bodies_list_one_shape(
     (a, b): (&str, &str),
     listed: impl Fn(DefWithBodyId, FactRef) -> FactRef,
 ) -> Result<usize, String> {
+    // Their keys differ (each names its own item, `identity::early_parts`' "owner"); their
+    // shapes are what this compares: a shape that names a body's own item relative to it is
+    // the same for two bodies that read the same of themselves.
     let (first, second) = (body_named(db, a), body_named(db, b));
-    assert_eq!(
-        crate::identity::identity(db, first),
-        crate::identity::identity(db, second),
-        "`{a}` and `{b}` are alike but for their names: one identity"
-    );
     let mut own = 0;
     for step in Step::ALL {
         let shape = |def: DefWithBodyId| {
@@ -1195,11 +1156,12 @@ fn scope_and_crate_name_facts_change_with_what_they_hold_and_only_then() {
     ]);
 }
 
-/// Under `Names::Facts` every read of a row of name resolution the steps make is a fact with
-/// a value now, or a handle; none is refused and none is covered that `name_read` does not
-/// call a handle. The control: under `Names::Identity` the same reads are all covered
-/// (`names_rules_are_covered_for_any_key`), so a `classify_with` that ignored its switch
-/// fails here on the first name looked up.
+/// Every read of a row of name resolution the steps make is a fact with a value now, or a
+/// handle; none is refused and none is covered that `name_read` does not call a handle. The
+/// body's key is its text alone, so a name covered by it would be a stale answer after an
+/// edit elsewhere. The control: a `classify` that called every name read covered (what the
+/// deleted identity over the lowered HIR did) fails here on the first name looked up, and one
+/// that made no `RESOLVES` fact fails the count.
 #[test]
 fn recorded_names_are_facts_with_values_or_handles() {
     use hir_def::nameres::{NameRead, name_read};
@@ -1210,9 +1172,7 @@ fn recorded_names_are_facts_with_values_or_handles() {
         if !matches!(rule, Some(Rule::Names | Rule::TraitsInScope)) {
             continue;
         }
-        let names_as = reads::Names::Facts;
-        let class =
-            reads::classify_with(&db, it.def, it.step, it.read, it.kind, it.name, names_as);
+        let class = reads::classify(&db, it.def, it.step, it.read, it.kind, it.name);
         let read = name_read(&db, it.read, it.kind);
         match class {
             Classified::Covered => {
@@ -1646,7 +1606,7 @@ struct KeptTrace {
 fn borrowck_trace(source: &str, body: &'static str) -> KeptTrace {
     let db = super::perturb::db(source);
     let def = body_named(&db, body);
-    let identity = crate::identity::identity(&db, def)
+    let identity = crate::identity::early_identity(&db, def)
         .unwrap_or_else(|it| panic!("`{body}` has no identity: {it:?}"));
     with_steps_run(&db, true, |seen| {
         let mut facts: Vec<(FactRef, Option<ContentId>)> = Vec::new(); // alloc: test
@@ -1683,7 +1643,7 @@ fn reused(kept: &KeptTrace, source: &str) -> bool {
         Mode::Serve,
     )
     .expect("an item store for the changed database");
-    let same = crate::identity::identity(&db, def).ok() == Some(kept.identity)
+    let same = crate::identity::early_identity(&db, def).ok() == Some(kept.identity)
         && kept.facts.iter().all(|&(fact, value)| values::value_in(&db, def, fact) == value);
     drop(installed);
     same
@@ -1704,7 +1664,7 @@ fn seen_by(kept: &KeptTrace, source: &str) -> Vec<String> {
     )
     .expect("an item store for the changed database");
     let mut seen: Vec<String> = Vec::new(); // alloc: test
-    if crate::identity::identity(&db, def).ok() != Some(kept.identity) {
+    if crate::identity::early_identity(&db, def).ok() != Some(kept.identity) {
         seen.push(String::from("the body's identity")); // alloc: test
     }
     for &(fact, value) in &kept.facts {

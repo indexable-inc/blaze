@@ -2,23 +2,19 @@
 //! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
 //! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`), and for the one
 //! [`Event::Nodes`] a batch of columns is said in, for the idle class: idle requests,
-//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`], and for the
-//! gate's admission: a forecast per task fitted to [`PlaneInput::Room`] with the head of line
-//! held ([`crate::plane::Plane::fits`]), [`PlaneInput::Wound`], held tasks and
-//! [`PlaneInput::Unheld`], and [`PlaneOutput::Dropped`]. Written plainly, one ordered set of
-//! ready nodes per request and pool, where the plane keeps two heaps.
+//! [`PlaneInput::Promote`], [`PlaneOutput::Yield`] and [`PlaneInput::Yielded`]. Admission is
+//! by threads alone, as the plane's. Written plainly, one ordered set of ready nodes per
+//! request and pool, where the plane keeps a heap.
 
 #![forbid(unsafe_code)]
 
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_hash::HashMap;
-use blaze_mem::budget::QUANTUM;
 use blaze_protocol::events::{Event, Level, NodeState, Record};
 use std::alloc::Global;
 
 use crate::{
-    admission::forecast_of,
     machine::{Error, NodeId, Outcome, Pool, Spec},
     plane::{
         Counts, Key, Memo, NoMemo, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
@@ -61,23 +57,15 @@ struct Node {
 struct Task {
     key: Option<Key>,
     pool: Pool,
-    /// Its forecast in bytes: whole quanta, 0 at or under the standing frame.
-    forecast: u64,
-    /// Its age at the gate, given as it was made.
-    age: u64,
     /// The node whose id the task runs as, and whose request it counts against: the member
     /// that started it, once it runs.
     runner: usize,
-    /// Every node that settles when it does. While it is not running, nor held, each is ready
-    /// in its own request.
+    /// Every node that settles when it does. While it is not running, each is ready in its
+    /// own request.
     members: Vec<usize>,
     running: bool,
     /// Running, and asked to give way.
     yielding: bool,
-    /// Gave way, held by the gate until an [`PlaneInput::Unheld`].
-    held: bool,
-    /// Gave way at least once: the gate parked it, so its drop is said.
-    gave_way: bool,
 }
 
 struct Request {
@@ -119,19 +107,6 @@ pub(crate) struct Plane<M = NoMemo> {
     /// Keys of tasks not yet settled.
     flight: HashMap<Key, usize, Global>, // alloc: a test's model
     running: [usize; 2],
-    /// What the gate left free at the last [`PlaneInput::Room`].
-    free: Option<u64>,
-    /// The forecasts started since that `Room`.
-    started: u64,
-    /// The forecasts of the running tasks.
-    running_forecast: u64,
-    /// A root with a forecast did not fit in this dispatch: only tasks forecast 0 start.
-    blocked: bool,
-    next_age: u64,
-    /// The tasks held by the gate, by the id they gave way as.
-    held: HashMap<NodeId, usize, Global>, // alloc: a test's model
-    /// The ages of tasks that gave way and were dropped, said after the dispatch.
-    dropped: Vec<u64>,
     /// The virtual time of each pool: that of the request not idle that started a task last.
     vclock: [u128; 2],
     /// The same, of the idle requests.
@@ -152,13 +127,6 @@ fn pool_at(pool: Pool) -> usize {
         Pool::Io => 0,
         Pool::Work => 1,
     }
-}
-
-/// The forecast of a node predicted `memory` bytes, in bytes, held to `u32::MAX` quanta as the
-/// plane's task row holds it.
-fn forecast_bytes(memory: u64) -> u64 {
-    let quanta = u32::try_from(forecast_of(memory) / QUANTUM).unwrap_or(u32::MAX);
-    u64::from(quanta) * QUANTUM
 }
 
 impl Plane {
@@ -191,13 +159,6 @@ impl<M: Memo> Plane<M> {
             memo,
             flight: HashMap::new_in(Global), // alloc: a test's model
             running: [0; 2],
-            free: None,
-            started: 0,
-            running_forecast: 0,
-            blocked: false,
-            next_age: 0,
-            held: HashMap::new_in(Global), // alloc: a test's model
-            dropped: Vec::new(),
             vclock: [0; 2],
             idle_vclock: [0; 2],
             idle_running: Vec::new(),
@@ -214,17 +175,6 @@ impl<M: Memo> Plane<M> {
 
     pub(crate) fn counts(&self) -> Counts {
         self.counts
-    }
-
-    /// The forecasts of the running tasks, in bytes.
-    pub(crate) fn running_forecast(&self) -> u64 {
-        self.running_forecast
-    }
-
-    /// The forecast in bytes of the task of node `id`, if it has a live one.
-    pub(crate) fn memory_of(&self, id: NodeId) -> Option<u64> {
-        let task = self.nodes[*self.index.get(&id)?].task?;
-        Some(self.tasks[task].forecast)
     }
 
     /// The state of `id`, if it was added.
@@ -274,11 +224,10 @@ impl<M: Memo> Plane<M> {
     }
 
     fn free_task(&mut self, task: usize) {
-        self.held.retain(|_, it| *it != task);
         self.free_tasks.push(task);
     }
 
-    /// Drops `task`, not running, once no node is left of it; one that gave way is said.
+    /// Drops `task`, not running, once no node is left of it.
     fn drop_if_empty(&mut self, task: usize) {
         let t = &self.tasks[task];
         if !t.members.is_empty() {
@@ -286,9 +235,6 @@ impl<M: Memo> Plane<M> {
         }
         if let Some(key) = t.key {
             self.flight.remove(&key);
-        }
-        if t.gave_way {
-            self.dropped.push(t.age);
         }
         self.free_task(task);
     }
@@ -390,24 +336,6 @@ impl<M: Memo> Plane<M> {
                 self.add(at, r, added, true, &mut out);
                 touched.push(r);
             }
-            PlaneInput::Room { free, .. } => {
-                self.free = Some(free);
-                self.started = 0;
-            }
-            PlaneInput::Wound { id, .. } => {
-                if let Ok(task) = self.running_task(id)
-                    && !self.tasks[task].yielding
-                {
-                    self.tasks[task].yielding = true;
-                    self.yielding[pool_at(self.tasks[task].pool)] += 1;
-                    out.push(PlaneOutput::Yield { id });
-                }
-            }
-            PlaneInput::Unheld { id, .. } => {
-                if let Some(task) = self.held.remove(&id) {
-                    self.unhold(task, &mut touched);
-                }
-            }
             PlaneInput::Promote { request, .. } => {
                 if let Some(&r) = self.request_index.get(&request)
                     && self.requests[r].idle
@@ -419,9 +347,9 @@ impl<M: Memo> Plane<M> {
                     self.idle_running.retain(|&task| nodes[tasks[task].runner].request != r);
                 }
             }
-            PlaneInput::Yielded { id, held, .. } => {
+            PlaneInput::Yielded { id, .. } => {
                 let task = self.running_task(id)?;
-                self.yielded(at, task, id, held, &mut out, &mut touched);
+                self.yielded(at, task, &mut out, &mut touched);
             }
         }
         self.after(at, out, touched)
@@ -442,29 +370,21 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// Running `task`, run as `id`, gave way: its thread free, no start of its runner's
-    /// request, and each of its nodes ready again in its own request (in no ready set while
-    /// `held`), or skipped as a node added to that request now would be.
+    /// Running `task` gave way: its thread free, no start of its runner's request, and each of
+    /// its nodes ready again in its own request, or skipped as a node added to that request
+    /// now would be.
     fn yielded(
         &mut self,
         at: u64,
         task: usize,
-        id: NodeId,
-        held: bool,
         out: &mut Vec<PlaneOutput>,
         touched: &mut Vec<usize>,
     ) {
         let t = &mut self.tasks[task];
-        let (p, forecast, yielding, runner) = (pool_at(t.pool), t.forecast, t.yielding, t.runner);
+        let (p, yielding, runner) = (pool_at(t.pool), t.yielding, t.runner);
         t.running = false;
         t.yielding = false;
-        t.gave_way = true;
-        t.held = held;
-        if held {
-            self.held.insert(id, task);
-        }
         self.running[p] -= 1;
-        self.running_forecast -= forecast;
         if yielding {
             self.yielding[p] -= 1;
         }
@@ -488,28 +408,12 @@ impl<M: Memo> Plane<M> {
                     self.moved(at, member, NodeState::Skipped { because }, out);
                 }
                 None => {
-                    if !held {
-                        self.make_ready(member, p);
-                    }
+                    self.make_ready(member, p);
                     self.moved(at, member, NodeState::Ready, out);
                 }
             }
         }
         self.drop_if_empty(task);
-    }
-
-    /// The gate let held `task` go: its nodes are ready again.
-    fn unhold(&mut self, task: usize, touched: &mut Vec<usize>) {
-        let t = &self.tasks[task];
-        if !t.held || t.running {
-            return;
-        }
-        self.tasks[task].held = false;
-        let p = pool_at(self.tasks[task].pool);
-        for member in self.tasks[task].members.clone() {
-            touched.push(self.nodes[member].request);
-            self.make_ready(member, p);
-        }
     }
 
     /// Cancels `request`: each of its nodes not started is skipped, because of the request's
@@ -568,7 +472,6 @@ impl<M: Memo> Plane<M> {
         self.settle_deferred(at, &mut out, &mut touched);
         self.last_ns = at;
         self.dispatch(at, &mut out);
-        out.extend(self.dropped.drain(..).map(|age| PlaneOutput::Dropped { age }));
         touched.sort_unstable_by_key(|&r| self.requests[r].seq);
         touched.dedup();
         for r in touched {
@@ -831,10 +734,7 @@ impl<M: Memo> Plane<M> {
                 if self.tasks[task].running {
                     self.moved(at, me, NodeState::Running, out);
                 } else {
-                    // A member of a held task waits in no ready set until the gate lets it go.
-                    if !self.tasks[task].held {
-                        self.make_ready(me, pool_at(self.tasks[task].pool));
-                    }
+                    self.make_ready(me, pool_at(self.tasks[task].pool));
                     self.moved(at, me, NodeState::Ready, out);
                 }
                 return;
@@ -849,19 +749,8 @@ impl<M: Memo> Plane<M> {
             }
         }
         let spec = &self.nodes[me].spec;
-        let made = Task {
-            key,
-            pool: spec.pool,
-            forecast: forecast_bytes(spec.memory),
-            age: self.next_age,
-            runner: me,
-            members: vec![me],
-            running: false,
-            yielding: false,
-            held: false,
-            gave_way: false,
-        };
-        self.next_age += 1;
+        let made =
+            Task { key, pool: spec.pool, runner: me, members: vec![me], running: false, yielding: false };
         let task = match self.free_tasks.pop() {
             Some(task) => {
                 self.tasks[task] = made;
@@ -952,11 +841,9 @@ impl<M: Memo> Plane<M> {
         if t.running {
             return;
         }
-        if !t.held {
-            let (p, r) = (pool_at(t.pool), self.nodes[me].request);
-            let entry = self.entry(me);
-            self.requests[r].ready[p].remove(&entry);
-        }
+        let (p, r) = (pool_at(t.pool), self.nodes[me].request);
+        let entry = self.entry(me);
+        self.requests[r].ready[p].remove(&entry);
         self.drop_if_empty(task);
     }
 
@@ -971,11 +858,10 @@ impl<M: Memo> Plane<M> {
     ) {
         let t = &mut self.tasks[task];
         t.running = false;
-        let (pool, forecast, key, yielding) = (pool_at(t.pool), t.forecast, t.key, t.yielding);
+        let (pool, key, yielding) = (pool_at(t.pool), t.key, t.yielding);
         t.yielding = false;
         let members = std::mem::take(&mut t.members);
         self.running[pool] -= 1;
-        self.running_forecast -= forecast;
         if yielding {
             self.yielding[pool] -= 1;
         }
@@ -1000,18 +886,7 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// Whether a task forecast `forecast` bytes may start now ([`crate::plane::Plane::fits`]).
-    fn fits(&self, forecast: u64) -> bool {
-        match self.free {
-            _ if forecast == 0 => true,
-            None => true,
-            Some(_) if self.running_forecast == 0 => true,
-            Some(free) => forecast <= free.saturating_sub(self.started),
-        }
-    }
-
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>) {
-        self.blocked = false;
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             while self.running[p] < limit {
@@ -1025,36 +900,13 @@ impl<M: Memo> Plane<M> {
         }
     }
 
-    /// The ready node that starts next in pool `p`: the first of the request whose turn it
-    /// is, if it fits; once one does not, for the rest of the dispatch, the first node forecast
-    /// 0 of the request whose turn it is among those that have one.
-    fn next(&mut self, p: usize) -> Option<usize> {
-        loop {
-            if self.blocked {
-                let r = (0..self.requests.len())
-                    .filter(|&r| self.first_unforecast(r, p).is_some())
-                    .min_by_key(|&r| self.turn(r, p))?;
-                return self.first_unforecast(r, p);
-            }
-            let r = (0..self.requests.len())
-                .filter(|&r| !self.requests[r].ready[p].is_empty())
-                .min_by_key(|&r| self.turn(r, p))?;
-            let &(_, _, me) = self.requests[r].ready[p].first()?;
-            if self.fits(self.forecast_at(me)) {
-                return Some(me);
-            }
-            self.blocked = true;
-        }
-    }
-
-    /// The forecast of ready node `me`'s task.
-    fn forecast_at(&self, me: usize) -> u64 {
-        self.tasks[self.nodes[me].task.expect("a ready node's task")].forecast
-    }
-
-    /// Request `r`'s first ready node of pool `p` whose task is forecast 0.
-    fn first_unforecast(&self, r: usize, p: usize) -> Option<usize> {
-        self.requests[r].ready[p].iter().map(|&(_, _, me)| me).find(|&me| self.forecast_at(me) == 0)
+    /// The ready node that starts next in pool `p`: the first of the request whose turn it is.
+    fn next(&self, p: usize) -> Option<usize> {
+        let r = (0..self.requests.len())
+            .filter(|&r| !self.requests[r].ready[p].is_empty())
+            .min_by_key(|&r| self.turn(r, p))?;
+        let &(_, _, me) = self.requests[r].ready[p].first()?;
+        Some(me)
     }
 
     /// The order requests take turns in pool `p`: those not idle first, then by virtual
@@ -1102,7 +954,6 @@ impl<M: Memo> Plane<M> {
 
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
         let task = self.nodes[me].task.expect("a ready node's task");
-        debug_assert!(!self.tasks[task].held, "a held task started");
         let p = pool_at(self.tasks[task].pool);
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];
@@ -1122,8 +973,6 @@ impl<M: Memo> Plane<M> {
         t.runner = me;
         t.running = true;
         self.running[p] += 1;
-        self.started += t.forecast;
-        self.running_forecast += t.forecast;
         self.counts.ran += 1;
         for at_member in 0..self.tasks[task].members.len() {
             let member = self.tasks[task].members[at_member];

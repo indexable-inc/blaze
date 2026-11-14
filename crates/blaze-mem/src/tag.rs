@@ -78,15 +78,10 @@ pub enum Tag {
     /// loaded, counted as each run is made the process's ([`crate::Region::reuse`]) and given
     /// back ([`crate::Region::evict`]). [`Tag::Store`] keeps the store's tables and segments.
     Pool,
-    /// The general heap's arena: the global allocator's pages, which it commits through
-    /// [`crate::Region::reuse`] of a region of this tag, from inside its own commit hook, so
-    /// they pass the memory gate's core. Counted in blaze-mem's committed bytes, so
-    /// [`Snapshot::heap_footprint`] takes them off what the allocator says it committed.
-    Heap,
 }
 
 impl Tag {
-    pub const COUNT: usize = 24;
+    pub const COUNT: usize = 23;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -112,7 +107,6 @@ impl Tag {
         Tag::Other,
         Tag::Solver,
         Tag::Pool,
-        Tag::Heap,
     ];
 
     pub const fn index(self) -> usize {
@@ -144,7 +138,6 @@ impl Tag {
             Tag::Other => "other",
             Tag::Solver => "solver",
             Tag::Pool => "pool",
-            Tag::Heap => "heap",
         }
     }
 
@@ -310,158 +303,6 @@ pub fn heap_pages() -> Option<[HeapPages; Tag::COUNT + 1]> {
     let mut pages = [HeapPages::default(); Tag::COUNT + 1];
     walk(&mut pages);
     Some(pages)
-}
-
-mod give_back;
-
-pub use give_back::Settle;
-
-/// The heap give-backs asked ([`give_back_heap`]) and which counted threads have given back
-/// since ([`give_back::GiveBacks`]): each thread of the global allocator gives back the free
-/// pages its own heaps keep once it sees the generation past the one it last did.
-static HEAP_GIVE_BACKS: give_back::GiveBacks = give_back::GiveBacks::new();
-
-/// What wakes the threads that count for a give-back where they idle ([`heap_wakes_by`]):
-/// one slot an idler, each set once (the worker pool's workers park on its condvar, a wasm
-/// expansion thread blocks in its channel's `recv`), and every one is called at an ask. A
-/// fixed array of four, each slot set once at its idler's start and read without a lock.
-static HEAP_WAKES: [OnceLock<fn()>; 4] = [const { OnceLock::new() }; 4];
-
-thread_local! {
-    /// This thread counts for a give-back ([`count_heap_settles`]), and the generation its
-    /// last counted give-back acked ([`heap_gave_back`]). `const`, without a destructor, so the
-    /// allocator's path may read them.
-    static COUNTED: Cell<bool> = const { Cell::new(false) };
-    static ACKED: Cell<Option<u64>> = const { Cell::new(None) };
-}
-
-/// The global allocator's give-back on the calling thread ([`heap_gives_back_by`]): set once,
-/// by an allocator that keeps free pages per thread (mimalloc's theaps).
-static HEAP_GIVE_BACK: OnceLock<fn()> = OnceLock::new();
-
-/// The global allocator gives back, with `here`, what the calling thread's heaps keep free, once
-/// [`heap_give_backs`] passed what it last did on that thread. The first call wins; it allocates
-/// nothing and takes no lock, so an allocator may call it as it makes its first heap.
-pub fn heap_gives_back_by(here: fn()) {
-    _ = HEAP_GIVE_BACK.set(here);
-}
-
-/// How many heap give-backs were asked: what a thread of the global allocator holds its own
-/// count to, on its allocation path. One relaxed load.
-#[inline]
-pub fn heap_give_backs() -> u64 {
-    HEAP_GIVE_BACKS.asked()
-}
-
-/// The global allocator's give-back on this thread ended, having begun as it read `generation`
-/// from [`heap_give_backs`]: on a thread that counts ([`count_heap_settles`]) it is acked, once
-/// a generation, so a purge waiting on it ([`heap_give_back_settled`]) hears it. Allocates
-/// nothing and takes no lock: the allocator calls it.
-pub fn heap_gave_back(generation: u64) {
-    if !COUNTED.get() || ACKED.get() == Some(generation) {
-        return;
-    }
-    if HEAP_GIVE_BACKS.gave(generation) {
-        ACKED.set(Some(generation));
-    }
-}
-
-/// Whether every thread that counts gave back for the give-back asked now ([`Settle`]): what
-/// a purge reads after its [`ask_heap_give_back`], until it settles or its deadline passes.
-pub fn heap_give_back_settled() -> Settle {
-    HEAP_GIVE_BACKS.settled()
-}
-
-/// The calling thread counts for every give-back until the guard drops: a pool worker, which
-/// allocates for tasks and idles in the pool, the threads a purge waits on. Dropped on the
-/// thread that made it, as the worker ends. Only where the global allocator gives back per
-/// thread ([`heap_gives_back_by`], set as it makes its first heap, before any worker starts):
-/// under std's allocator no thread would ever ack, and a purge would wait out its deadline.
-pub fn count_heap_settles() -> HeapSettles {
-    if HEAP_GIVE_BACK.get().is_some() && !COUNTED.replace(true) {
-        ACKED.set(None);
-        HEAP_GIVE_BACKS.join();
-    }
-    HeapSettles(std::marker::PhantomData)
-}
-
-/// The calling thread counts for give-backs while this lives ([`count_heap_settles`]); not
-/// `Send`, since it is the thread's count it takes back.
-#[must_use = "the thread counts for give-backs only while this lives"]
-pub struct HeapSettles(std::marker::PhantomData<*const ()>);
-
-impl Drop for HeapSettles {
-    fn drop(&mut self) {
-        if COUNTED.replace(false) {
-            HEAP_GIVE_BACKS.leave(ACKED.take());
-        }
-    }
-}
-
-/// The threads that count for a give-back are woken where they idle with `wake`, so one that
-/// parks gives back now rather than at its next job. Each kind of idler (the pool, the wasm
-/// expansion threads) registers its own; each takes the first empty slot of four,
-/// and the same `wake` registered again is not a second slot. Allocates nothing.
-///
-/// # Panics
-///
-/// When every slot is taken by another waker: a fifth kind of idler is a new slot to add, and
-/// one quietly not woken would hold its pages through every purge.
-#[track_caller]
-pub fn heap_wakes_by(wake: fn()) {
-    for slot in &HEAP_WAKES {
-        if slot.get().is_some_and(|set| std::ptr::fn_addr_eq(*set, wake)) {
-            return;
-        }
-        if slot.set(wake).is_ok() {
-            return;
-        }
-        if slot.get().is_some_and(|set| std::ptr::fn_addr_eq(*set, wake)) {
-            return;
-        }
-    }
-    panic!(
-        "blaze_mem::tag::heap_wakes_by: all {} heap-wake slots are taken; the waker registered at \
-         {} has no slot (add one to HEAP_WAKES)",
-        HEAP_WAKES.len(),
-        std::panic::Location::caller(),
-    );
-}
-
-/// Asks every thread of the global allocator to give back the free pages its heaps keep, wakes
-/// those that idle, and gives back this thread's now; the generation asked, for
-/// [`heap_give_back_settled`].
-pub fn ask_heap_give_back() -> u64 {
-    let generation = HEAP_GIVE_BACKS.ask();
-    for wake in HEAP_WAKES.iter().filter_map(OnceLock::get) {
-        wake();
-    }
-    settle_heap();
-    generation
-}
-
-/// Asks every thread of the global allocator to give the system back the free pages its heaps
-/// keep, and gives back this thread's now: a release let go of what the front end kept (B5).
-/// mimalloc purges a freed page only `purge_delay` after the free, and then only as some thread
-/// next takes a page; this purges every freed page at once. The pages a thread's heaps still
-/// allocate from, and those they retire empty, are that thread's alone to collect, and a block
-/// another thread frees there is not even seen as free until it looks: each other thread does
-/// its part as it next allocates for a task, or as a pool worker goes idle ([`settle_heap`])
-/// (memcap5, coord-111), and the idle ones are woken for it ([`heap_wakes_by`]). Nothing here
-/// waits for them: a purge that reads the footprint after waits with
-/// [`heap_give_back_settled`] (2026-11-09: a re-read at once still held up to 7.5 GiB the
-/// other threads kept).
-pub fn give_back_heap() {
-    ask_heap_give_back();
-}
-
-/// Gives back what this thread's heaps keep free if a give-back was asked since it last did
-/// ([`give_back_heap`]); nothing otherwise, or where the allocator keeps no pages per thread.
-/// What a pool worker does as it goes idle, outside any task.
-pub fn settle_heap() {
-    if let Some(here) = HEAP_GIVE_BACK.get() {
-        here();
-    }
 }
 
 /// The process's footprint as the system counts it, where the daemon says how to read it
@@ -880,12 +721,9 @@ impl Snapshot {
     /// What the global heap takes of the footprint, given its live bytes `live`
     /// (`blaze_graph::arena::held`): what its allocator committed where it says, which covers the
     /// live blocks and the free pages it keeps; `live` where it does not say, which is all that is
-    /// known of it there. Less what its arena holds in [`Tag::Heap`] regions: those pages are in
-    /// blaze-mem's committed bytes ([`Snapshot::resident_committed`]) already, and
-    /// [`Snapshot::footprint`] adds both, so they are counted once.
+    /// known of it there.
     pub fn heap_footprint(&self, live: u64) -> u64 {
-        let said = self.heap_committed.map_or(live, |committed| committed.max(live));
-        said.saturating_sub(self.get(Tag::Heap).live)
+        self.heap_committed.map_or(live, |committed| committed.max(live))
     }
 
     /// What blaze itself takes of the process's footprint, at most: the global heap's part

@@ -1,9 +1,7 @@
 //! Model tests (docs/v2/plan/design/model-checker.md) of the tagged lock-free stack every pool
 //! and the chunk cache move batches through: 2 or 3 threads under every interleaving to the
 //! preemption bound and every value C11 lets a load read, against a sequential model (the
-//! multiset of indices on the stack or held). The memory gate's waits and gives-way are the
-//! budget's (`budget::tests`, every interleaving of its sans-IO steps) and the gate's own
-//! tests (`gate::tests`).
+//! multiset of indices on the stack or held).
 
 use std::sync::Arc;
 

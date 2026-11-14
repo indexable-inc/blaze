@@ -33,9 +33,8 @@
 //! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
 //! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
-//! Every page any of them commits passes one gate first ([`gate`], driving [`budget`]): core
-//! regions ask its core owner, a task's frame asks for its task, so the process's committed
-//! memory stays under the ceiling [`gate::install`] set (or one sized from the machine).
+//! Nothing here limits memory: a commit the kernel refuses is a typed [`MemError`], and the
+//! kernel's limit is the one ceiling.
 //!
 //! The store's buffer pool reads and gives back pages of one sparse [`Region`] by ranges
 //! ([`Region::reuse`], [`Region::evict`]), counted to [`Tag::Pool`], and copies bytes the evictor
@@ -48,20 +47,18 @@
 #![feature(allocator_ext)]
 // `memory.grow` on wasm64 (`os.rs`), whose intrinsics are not stable there yet.
 #![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
-// `#![blaze::sans_io]` marks a sans-IO core for `blaze::sans_io_core` (the budget); inert under rustc.
-#![feature(register_tool, custom_inner_attributes)]
+// blaze's lints (`blaze::process_static`, ...) name their tool; inert under rustc.
+#![feature(register_tool)]
 #![register_tool(blaze)]
 
 pub mod align;
 pub mod append;
 pub mod arena;
 pub mod blocks;
-pub mod budget;
 pub mod chunks;
 pub mod column;
 mod error;
 pub mod frame;
-pub mod gate;
 pub mod handle;
 pub mod huge;
 mod os;

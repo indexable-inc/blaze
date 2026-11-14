@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state from checked code to a running program: no codegen units; instance, code, facts and program records; one Program state machine turns demand or a delta into a placement change applied by the launcher or a file writer.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: from checked code to a running program
 

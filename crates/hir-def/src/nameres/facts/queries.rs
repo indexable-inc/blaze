@@ -539,10 +539,26 @@ pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
     frame::task(Tag::Nameres, |frame| driver::import_shape(db, frame, round))
 }
 
+///
+/// Each partition made says its sizes as one kept event, `binding groups` (the census of
+/// docs/v2/plan/design/end-state/engine.md section 6, E0, and its open question 3: how large
+/// name resolution's strongly connected groups are on real crates): `modules`, `groups`, the
+/// `largest` group's modules, and how many groups are `single` (one module). The event names
+/// no crate: a query over the profile joins it to the span it is in.
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
     let shape = import_shape(db, round);
-    frame::task(Tag::Nameres, |frame| super::graph::partition(frame, shape))
+    let partition = frame::task(Tag::Nameres, |frame| super::graph::partition(frame, shape));
+    let groups = partition.len();
+    let (mut modules, mut largest, mut single) = (0u64, 0u64, 0u64);
+    for group in 0..groups {
+        let size = partition.members(group).len() as u64;
+        modules += size;
+        largest = largest.max(size);
+        single += u64::from(size == 1);
+    }
+    tracing::info!(target: "blaze", modules, groups, largest, single, "binding groups");
+    partition
 }
 
 /// The crate env the round's units and steps start from: the root's crate-level ops of every

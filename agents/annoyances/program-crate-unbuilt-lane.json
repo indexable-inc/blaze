@@ -1,0 +1,14 @@
+{
+ "id": "program-crate-unbuilt-lane",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: crates/blaze-program (code records, streaming walk, programs as manifests), merge-1113",
+ "where": "crates/blaze-program/src/{lib,store,key,inline,record,walk,change,program,reach}.rs; crates/blaze-program/src/tests/{mod,model,world,props}.rs",
+ "what": "About 5,000 lines of a new crate and its deterministic simulation were written in a lane that may run nothing: every borrow, inference and API call (the hegel generators, blaze_ids' Hasher) is unverified until the main agent compiles it, and the scope message that removed slots for a running process arrived mid-lane, forcing walk.rs, change.rs and program.rs to be rewritten before any of it had compiled once. The lane also broke its own rule once: a few mechanical text edits to program.rs were made with a python script through Bash instead of the Edit tool.",
+ "cost": "the first compile is the first evidence; the rewrite after the scope change was unchecked twice",
+ "cause": "a write-only lane gets no compiler feedback, and the scope questions (live patching, tiers, demand-driven checks) were answered after the lane started",
+ "class": "a design lane started before its scope is settled, with no compile loop",
+ "prevention": "settle the scope questions before a lane starts; give write-only lanes a check-only compile (no tests, no daemon) of their own crate",
+ "workaround": "the main agent compiles the crate and runs its tests",
+ "fix": "not yet",
+ "state": "open"
+}

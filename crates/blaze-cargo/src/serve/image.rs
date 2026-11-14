@@ -40,11 +40,9 @@
 //!   One of another blaze starts an empty history ([`Unlearned`]), which changes how work is
 //!   ordered and admitted, never what is built; one that is corrupt or does not decode is an
 //!   error ([`HistoryError`]).
-//! - Admission's peaks are a [`Peaks`] (memory.md 4.3), in [`SectionId::ADMISSION_PEAKS`] under
-//!   [`PEAKS_SCHEMA`]; their bytes carry their own layout word ([`PEAKS_LAYOUT`]). None, or of
-//!   another schema or layout, starts the record empty ([`Unpeaked`]): tasks are forecast the
-//!   standing charge until they teach it, which changes when work is admitted, never what is
-//!   built. One that is corrupt or does not decode is an error ([`PeaksFault`]).
+//! - No image holds admission's peaks any more (deleted 2026-11-13 with memory admission): an
+//!   image of an earlier blaze that has a [`SectionId::ADMISSION_PEAKS`] section is read as
+//!   before, the section never looked up.
 //! - An image that is not made is an [`ImageFailed`]: the one before it stays on disk, and
 //!   whoever asked (the image between requests, a snapshot, a stop) fails with it.
 //! - Each image made is logged once mapped: its hash, bytes and sections ([`Shape`]), and how
@@ -64,11 +62,10 @@ use blaze_cas::{
 };
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
 use blaze_format::SchemaHash;
-use blaze_graph::admission::{PEAKS_LAYOUT, Peaks, PeaksError};
 use blaze_history::{DecodeError, History, section::HistoryError};
 use blaze_ids::ContentId;
 use blaze_image::{
-    Builder, Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
+    Builder, Image, OpenError, Refused, SectionId, Stable, TooLarge, Txn,
     place::{Outcome, Placer, Wrote},
 };
 use blaze_vfs::{
@@ -231,84 +228,6 @@ pub fn history<S: Stable>(
     }
 }
 
-/// The schema of [`SectionId::ADMISSION_PEAKS`]: [`Peaks::encode`]'s bytes. The schema names
-/// the record; which layout of it the bytes are is their own layout word ([`PEAKS_LAYOUT`]),
-/// read by [`Peaks::decode`], so a new layout needs no new schema to be told from the old.
-pub const PEAKS_SCHEMA: SchemaHash = blaze_format::schema(
-    "blaze admission peaks 1: blaze_graph::admission::Peaks::encode bytes, magic blzpeaks then a layout word",
-);
-
-/// Writes `peaks` into `builder`'s image.
-pub fn write_peaks(peaks: &Peaks, builder: &mut Builder) {
-    builder.add(SectionId::ADMISSION_PEAKS, PEAKS_SCHEMA, &peaks.encode());
-}
-
-/// Why admission's peaks start empty from an image: the image was written by another blaze,
-/// or the start was asked to leave them unused.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Unpeaked {
-    /// The image has no peaks section, or one of another schema.
-    Refused(Refused),
-    /// The section's bytes are of layout `found`, not this blaze's [`PEAKS_LAYOUT`].
-    Layout { found: u64 },
-    /// The start was asked to leave the history, and the peaks with it, unused
-    /// ([`super::daemon::RESTORE_WITHOUT`] names `history`).
-    Asked,
-}
-
-impl fmt::Display for Unpeaked {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Unpeaked::Refused(refused) => write!(f, "{refused}"),
-            Unpeaked::Layout { found } => write!(
-                f,
-                "the image's {} are of layout {found}, and this blaze reads layout {PEAKS_LAYOUT}",
-                SectionId::ADMISSION_PEAKS
-            ),
-            Unpeaked::Asked => write!(
-                f,
-                "the start was asked to leave the image's {} unused ({} names `history`)",
-                SectionId::ADMISSION_PEAKS,
-                super::daemon::RESTORE_WITHOUT
-            ),
-        }
-    }
-}
-
-/// Why the image's peaks stop the daemon's start: the section is corrupt or does not decode.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum PeaksFault {
-    Corrupt(Corrupt),
-    Decode(PeaksError),
-}
-
-impl fmt::Display for PeaksFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PeaksFault::Corrupt(corrupt) => corrupt.fmt(f),
-            PeaksFault::Decode(error) => write!(f, "{}: {error}", SectionId::ADMISSION_PEAKS),
-        }
-    }
-}
-
-/// Admission's peaks in `image`, and why they start empty when the image was written without
-/// them or with a record of another layout. The daemon does not start on an error: a section
-/// that is corrupt or does not decode.
-pub fn peaks<S: Stable>(image: &Image<S>) -> Result<(Peaks, Option<Unpeaked>), PeaksFault> {
-    let section = match image.section(SectionId::ADMISSION_PEAKS, PEAKS_SCHEMA) {
-        Ok(section) => section,
-        Err(refused) => return Ok((Peaks::new(), Some(Unpeaked::Refused(refused)))),
-    };
-    let bytes = image.whole(&section).map_err(PeaksFault::Corrupt)?;
-    match Peaks::decode(bytes) {
-        Ok(peaks) => Ok((peaks, None)),
-        Err(PeaksError::Layout { found, .. }) => {
-            Ok((Peaks::new(), Some(Unpeaked::Layout { found })))
-        }
-        Err(error) => Err(PeaksFault::Decode(error)),
-    }
-}
-
 /// An image as the logs name it: its hash, its bytes and its sections by what they hold,
 /// largest first.
 pub struct Shape<'a, S: Stable>(pub &'a Image<S>);
@@ -423,8 +342,6 @@ pub struct Parts<'a> {
     /// The store the VFS's texts are put in: flushed while they are not durable.
     pub store: &'a mut Store,
     pub predict: &'a History,
-    /// Admission's peaks ([`write_peaks`]).
-    pub peaks: &'a Peaks,
     pub effects: &'a mut Vec<Effect>,
 }
 
@@ -640,7 +557,6 @@ impl Images {
             }
         };
         blaze_history::section::write(parts.predict, txn.sections());
-        write_peaks(parts.peaks, txn.sections());
         match txn.commit(&mut self.placer, &on_pool, parts.effects) {
             Ok(asked) => {
                 _span.record("bytes", asked.len);
@@ -871,84 +787,27 @@ mod tests {
         assert_eq!(unlearned, Some(Unlearned::Version));
     }
 
-    fn with_peaks(schema: SchemaHash, bytes: &[u8]) -> Image<Vec<u8>> {
-        let mut builder = Builder::new();
-        builder.add(SectionId::ADMISSION_PEAKS, schema, bytes);
-        Image::open(builder.finish().unwrap()).unwrap()
-    }
-
-    fn taught_peaks() -> Peaks {
-        let mut taught = Peaks::new();
-        for n in 0..200u64 {
-            taught.observe(n % 7, (n % 23) as u8, n * 4096 + 1);
+    /// An image of the layout before memory admission was deleted (2026-11-13) has an
+    /// admission peaks section beside the history: its history is read as from any image,
+    /// nothing said, and the old section is never looked up (rule 26, a file of the previous
+    /// layout handled).
+    #[test]
+    fn an_image_with_the_old_peaks_section_reads_its_history() {
+        let mut learned = History::new(blaze_history::Config::default());
+        let key = blaze_graph::plane::Key([9; 32]);
+        for n in 0..20u64 {
+            learned.observe(blaze_graph::admission::kinds::COMPILE, Some(&key), n * 1000, 0);
         }
-        taught
-    }
-
-    /// The invariant: admission's peaks written into an image are restored equal to the record
-    /// written, byte for byte, with nothing said; an image of both the history and the peaks
-    /// gives each back from its own section. Rule 26. Control: one entry changed after the
-    /// image was made is not what comes back, so the comparison reads the restored record.
-    #[test]
-    fn admission_peaks_survive_an_image() {
-        let taught = taught_peaks();
         let mut builder = Builder::new();
-        blaze_history::section::write(&History::new(blaze_history::Config::default()), &mut builder);
-        write_peaks(&taught, &mut builder);
+        blaze_history::section::write(&learned, &mut builder);
+        builder.add(
+            SectionId::ADMISSION_PEAKS,
+            blaze_format::schema("blaze admission peaks 1: blaze_graph::admission::Peaks::encode bytes, magic blzpeaks then a layout word"),
+            b"blzpeaks and what followed",
+        );
         let image = Image::open(builder.finish().unwrap()).unwrap();
-        let (restored, unpeaked) = peaks(&image).unwrap();
-        assert_eq!(unpeaked, None);
-        assert_eq!(restored.encode(), taught.encode());
-        assert_eq!(restored, taught);
-        let (history_back, unlearned) = history(&image, blaze_history::Config::default()).unwrap();
-        assert_eq!((history_back.encode(), unlearned), (empty(), None));
-        let mut changed = taught_peaks();
-        changed.observe(3, 3, 1);
-        assert_ne!(restored.encode(), changed.encode(), "the control reads the restored record");
-    }
-
-    /// An image of the layout before the peaks (no section: every image written before
-    /// 2026-11-13), one whose section is of another schema, and one whose bytes are another
-    /// layout of the record (the per-kind estimates, layout 0, or a later one) start the peaks
-    /// empty, each saying why; a cut or corrupt section stops the start naming the section.
-    #[test]
-    fn peaks_of_another_layout_or_none_start_empty_and_a_cut_record_is_an_error() {
-        let none = Image::open(Builder::new().finish().unwrap()).unwrap();
-        let (restored, unpeaked) = peaks(&none).unwrap();
-        assert!(restored.is_empty());
-        assert!(
-            matches!(unpeaked, Some(Unpeaked::Refused(Refused::Missing { .. }))),
-            "{unpeaked:?}"
-        );
-        let other_schema =
-            with_peaks(blaze_format::schema("blaze admission peaks 0"), &taught_peaks().encode());
-        let (restored, unpeaked) = peaks(&other_schema).unwrap();
-        assert!(restored.is_empty());
-        assert!(
-            matches!(unpeaked, Some(Unpeaked::Refused(Refused::Schema { .. }))),
-            "{unpeaked:?}"
-        );
-        // The per-kind estimates the image held before, read as layout 0.
-        let estimates = with_peaks(PEAKS_SCHEMA, b"blzest01 and what followed");
-        let (restored, unpeaked) = peaks(&estimates).unwrap();
-        assert!(restored.is_empty());
-        assert_eq!(unpeaked, Some(Unpeaked::Layout { found: 0 }));
-        let mut later = taught_peaks().encode();
-        later[8..16].copy_from_slice(&(PEAKS_LAYOUT + 1).to_le_bytes());
-        let (restored, unpeaked) = peaks(&with_peaks(PEAKS_SCHEMA, &later)).unwrap();
-        assert!(restored.is_empty());
-        assert_eq!(unpeaked, Some(Unpeaked::Layout { found: PEAKS_LAYOUT + 1 }));
-        assert!(unpeaked.unwrap().to_string().contains("admission's peaks"));
-
-        let mut cut = taught_peaks().encode();
-        cut.truncate(cut.len() - 1);
-        let Err(error) = peaks(&with_peaks(PEAKS_SCHEMA, &cut)) else {
-            panic!("a cut record of peaks decoded")
-        };
-        assert!(matches!(error, PeaksFault::Decode(_)), "{error:?}");
-        assert!(error.to_string().starts_with("admission's peaks"), "{error}");
-        let not_peaks = with_peaks(PEAKS_SCHEMA, b"blzhis04 and what followed");
-        assert!(matches!(peaks(&not_peaks), Err(PeaksFault::Decode(PeaksError::Magic { .. }))));
+        let (restored, unlearned) = history(&image, blaze_history::Config::default()).unwrap();
+        assert_eq!((restored.encode(), unlearned), (learned.encode(), None));
     }
 
     #[test]

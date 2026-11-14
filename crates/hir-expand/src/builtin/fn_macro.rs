@@ -240,9 +240,14 @@ fn column_expand<'f>(
     place_expand(db, frame, id, tt, span, "column!", |(_, column)| column)
 }
 
-/// `line!()` or `column!()`: the `u32` that `pick` takes of [`written_place`], as rustc's
-/// `expand_line` and `expand_column` give it. Arguments are an error, after which the value is
-/// given all the same (rustc's `check_zero_tts`).
+/// `line!()` or `column!()`: the placeholder [`PLACE_PLACEHOLDER`] as a `u32` literal, which
+/// whoever reads the literal's value resolves to where the call is written, the `u32` that
+/// `pick` takes of [`written_place`], as rustc's `expand_line` and `expand_column` give it
+/// (`hir_ty::body_store::placed_literal`). So the expansion, and the body it is in, read no
+/// line, and a line added above the body changes neither. In the input of an eager macro
+/// (`concat!("at ", line!())`), whose text the eager macro reads, the value itself, as
+/// [`in_eager_input`] tells. Arguments are an error, after which the literal is given all the
+/// same (rustc's `check_zero_tts`).
 fn place_expand<'f>(
     db: &Db,
     frame: &'f Frame,
@@ -256,7 +261,12 @@ fn place_expand<'f>(
         // alloc: an error's message, on the error path
         BuiltinError::new(format!("{name} takes no arguments")).at(call_span(db, id, span))
     });
-    let value = match written_place(db, id) {
+    let place = if in_eager_input(db, id) {
+        written_place(db, id)
+    } else {
+        Some((PLACE_PLACEHOLDER, PLACE_PLACEHOLDER))
+    };
+    let value = match place {
         Some(place) => pick(place),
         None => {
             // alloc: an error's message, on the error path
@@ -285,6 +295,30 @@ fn place_expand<'f>(
         Some(err) => ExpandResult::new(expanded, err),
         None => ExpandResult::ok(expanded),
     }
+}
+
+/// What `line!()` and `column!()` expand to outside an eager macro's input: never a line or a
+/// column, which count from 1, so a reader that took it for one reads a value no call has.
+pub const PLACE_PLACEHOLDER: u32 = 0;
+
+/// Whether the call `id` is in the input of an eager macro (`concat!`, `env!`, `include!`, ...),
+/// directly or through the calls whose expansions are in it: there its expansion is text the
+/// eager macro reads, not an expression a reader of literals sees, so it must be the value.
+/// An input file is the eager macro's call without its `EagerCallInfo`; the expansion of the
+/// eager call itself (the tokens `include!` reads in) is not one, as a call there is lowered as
+/// any other. The walk reads which macro each file is of, no position.
+fn in_eager_input(db: &Db, id: MacroCallId) -> bool {
+    let mut file = id.parent(db);
+    while let HirFileId::MacroFile(call) = file {
+        let loc = call.loc(db);
+        if matches!(loc.def.kind, crate::MacroDefKind::BuiltInEager(..))
+            && matches!(loc.kind, crate::MacroCallKind::FnLike { eager: None, .. })
+        {
+            return true;
+        }
+        file = loc.kind.file_id();
+    }
+    false
 }
 
 /// The line and column, both from 1, where the macro call `id` comes from in the end (rustc's

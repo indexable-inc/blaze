@@ -153,8 +153,9 @@ fn find(cx: &Cx<'_, '_>, lint: Lint) -> Option<(Finding, Vec<StepNote>)> {
     match marked(db, func, effect)? {
         PureAttr::Trusted(_) => None,
         PureAttr::Malformed(text) => {
+            // The text is the attribute's token tree, its delimiters with it.
             let message = format!(
-                "`#[blaze::{}({})]` on `{name}`: the attribute takes nothing, or `trusted = \"why\"`",
+                "`#[blaze::{}{}]` on `{name}`: the attribute takes nothing, or `trusted = \"why\"`",
                 effect.name,
                 text.as_str()
             );

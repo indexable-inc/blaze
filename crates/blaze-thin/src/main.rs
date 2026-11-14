@@ -165,6 +165,7 @@ mod unix {
     use blaze_thin::{
         ENGINE, VERSION, VERSION_LINE,
         handover::{Began, Held},
+        host::Host,
         pin, request,
         route::{self, Asked, Route},
         talk::{self, BUILD, Ended, Read, Timings},
@@ -259,9 +260,10 @@ mod unix {
             return Ok(ExitCode::SUCCESS);
         };
         let var = |name: &str| std::env::var(name).ok();
-        let config = match std::fs::read_to_string(home.join("config.toml")) {
-            Ok(text) => Config::from_toml(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::DEFAULT,
+        // `[terminal]` and `[serve]` of the one file, read once.
+        let (config, host) = match std::fs::read_to_string(home.join("config.toml")) {
+            Ok(text) => (Config::from_toml(&text)?, Host::from_toml(&text)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Config::DEFAULT, Host::Daemon),
             Err(error) => return Err(format!("blaze's config.toml can't be read: {error}")),
         };
         let terminal = std::io::stderr().is_terminal();
@@ -344,6 +346,13 @@ mod unix {
                 return said_and_ran(&said, exec, Rows::Kept(kept));
             }
             blaze_thin::solo::Ended::Daemon(_) => {}
+        }
+        // No daemon to ask (`blaze_thin::host`): the engine serves the request in this process,
+        // which it becomes, and exits. Said before anything was sent or written. The kernel's
+        // start of this process is kept across the `exec`, so the engine's first span counts
+        // from it (`blaze_cargo::serve::once`), this check included.
+        if host == Host::Process {
+            return Err("`[serve] host = \"process\"`: the engine serves the request in this process".to_owned());
         }
         // No daemon: the engine starts one, saying so, as it always has.
         let connect_ns = kernel::mono_ns();

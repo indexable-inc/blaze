@@ -90,49 +90,11 @@ pub trait Positions {
     fn defines(&self, name: &str) -> Option<Defines>;
 }
 
-const SPANS_MAGIC: &[u8; 8] = b"BZSPANS1";
-
-fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-/// The file name and the position of span `index` of `table`, a span table as
-/// `blaze_link::SpanTable` encodes it, read in place: what a [`Positions::of`] over the
-/// build's tables answers.
-pub fn position_in(table: &[u8], index: u32) -> Result<(&str, Position), String> {
-    let bad = || "its span table does not read".to_owned(); // alloc: an error
-    if table.get(..8) != Some(SPANS_MAGIC) {
-        return Err(bad());
-    }
-    let files = u32_at(table, 8).ok_or_else(bad)? as usize;
-    // Past the file names, to the spans.
-    let mut at = 12;
-    for _ in 0..files {
-        at += 4 + u32_at(table, at).ok_or_else(bad)? as usize;
-    }
-    let count = u32_at(table, at).ok_or_else(bad)?;
-    if index >= count {
-        return Err(format!("its span table has {count} spans")); // alloc: an error
-    }
-    let row = at + 4 + index as usize * 12;
-    let position = Position {
-        file: u32_at(table, row).ok_or_else(bad)?,
-        line: u32_at(table, row + 4).ok_or_else(bad)?,
-        column: u32_at(table, row + 8).ok_or_else(bad)?,
-    };
-    if position.file as usize >= files {
-        return Err(bad());
-    }
-    // The file's name: the `position.file`th.
-    let mut at = 12;
-    for _ in 0..position.file {
-        at += 4 + u32_at(table, at).ok_or_else(bad)? as usize;
-    }
-    let len = u32_at(table, at).ok_or_else(bad)? as usize;
-    let name = table.get(at + 4..at + 4 + len).ok_or_else(bad)?;
-    let name = core::str::from_utf8(name).map_err(|_| bad())?;
-    Ok((name, position))
-}
+/// The file name and the absolute position of span `index` of a span table, read in place:
+/// what a [`Positions::of`] over the build's tables answers. The one reader of the table's
+/// layout is the link's (`blaze_link::position`); until 2026-11-13 this crate kept a copy of
+/// it, which the item-relative layout would have left reading bases as rows.
+pub use blaze_link::position_in;
 
 const FILE_NAME_DOMAIN: &str = "blaze launch file name 1";
 const LOCATION_DOMAIN: &str = "blaze launch location 1";

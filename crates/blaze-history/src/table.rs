@@ -46,7 +46,7 @@ pub const RUNS: usize = 4;
 pub struct Record {
     pub kind: TaskKind,
     /// The key's first 16 bytes. Two keys of a kind that share them share a record: a wrong
-    /// prediction costs only an order or an admission, never a result.
+    /// prediction costs only an order, never a result.
     pub key: [u64; 2],
     /// Its runs seen, saturating.
     pub seen: u32,

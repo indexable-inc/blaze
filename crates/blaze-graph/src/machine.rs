@@ -54,10 +54,6 @@ pub struct Spec {
     /// single flight; `None` for work that is not a pure function of its inputs.
     #[serde(default)]
     pub key: Option<Key>,
-    /// Its predicted peak memory in bytes ([`crate::admission::Peaks`]): the plane's forecast,
-    /// for throughput only ([`crate::plane::Plane::fits`]).
-    #[serde(default)]
-    pub memory: u64,
 }
 
 /// What came of a node's work.
@@ -253,9 +249,6 @@ impl Machine {
                 }
                 PlaneOutput::Yield { id } => {
                     unreachable!("node {id} asked to give way: the machine opens no idle request")
-                }
-                PlaneOutput::Dropped { age } => {
-                    unreachable!("task {age} dropped after giving way: the machine has no gate")
                 }
             }));
         }

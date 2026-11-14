@@ -5,11 +5,14 @@
 //!
 //! Found, outside test code: an index of a value whose type, references peeled, is `str` (a
 //! `String` derefs to it) by a range one of whose bounds is not a constant; a call resolved to
-//! `str`'s own `split_at` or `split_at_mut` with an argument that is not. A bound is taken as on
-//! a boundary, and the place is left alone, when it is `x.len()` of a string, when it or the
-//! `let` that made the local it names reads `find`, `rfind`, `char_indices`, `match_indices`,
-//! `len_utf8` or `floor_char_boundary`, or when the function calls `is_char_boundary`: these
-//! read the function's text, so they suppress a finding, never make one.
+//! `str`'s own `split_at` or `split_at_mut` with an argument that is not. Each is read from the
+//! typed tree, never the text. A bound is taken as on a boundary, and the place is left alone,
+//! when it is std's `len` of a string; when it, or what made a local it names (the `let`'s
+//! initializer, the `for`'s or `if let`'s expression), calls one of std's [`BOUNDARY_METHODS`]
+//! (`find`, `char_indices`, `len_utf8`, `floor_char_boundary`, ..); or when a call of std's
+//! `is_char_boundary` on the same string with the same index (same by resolution) dominates
+//! the slice: in an enclosing condition, or in a statement before it (`assert!` included).
+//! These only ever suppress a finding, never make one.
 //!
 //! The fix, where the function returns an `Option` (and the slice is in no closure or `async`
 //! block), is `s.get(a..b)?` for `&s[a..b]` and `s.split_at_checked(n)?` for `s.split_at(n)`,
@@ -22,14 +25,23 @@ use syntax::{
     view::{self as ast, AstNode as _, HasArgList as _, RangeItem as _},
 };
 
-use super::{Fix, in_test, report, returns_option, strip};
+use super::{Fix, dominated, in_test, report, returns_option, same_place, std_method, strip};
 use crate::{blaze::Lint, check::Cx, diag::Applicability};
 
 const LINT: Lint = Lint::StrByteSlice;
 
-/// What, read in a bound or the `let` of a local it names, puts the index on a boundary.
-const BOUNDARY_READS: &[&str] =
-    &["find(", "rfind(", "char_indices(", "match_indices(", "len_utf8(", "char_boundary("];
+/// std's methods whose value is a byte index on a character boundary (or the iterator of
+/// them), resolved, so a bound made from one is on a boundary.
+const BOUNDARY_METHODS: &[&str] = &[
+    "find",
+    "rfind",
+    "char_indices",
+    "match_indices",
+    "rmatch_indices",
+    "len_utf8",
+    "floor_char_boundary",
+    "ceil_char_boundary",
+];
 
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on_blaze(LINT) {
@@ -60,19 +72,16 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 fn sliced<'t>(cx: &Cx<'_, 't>, index: ast::IndexExpr<'t>) -> Option<(&'static str, Option<Fix>)> {
     let base = index.base()?;
     let ast::Expr::RangeExpr(bounds) = strip(index.index()?) else { return None };
-    if !cx.ty(base)?.strip_references().is_str() && !derefs_to_str(cx, base) {
+    if !is_str(cx, base) {
         return None;
     }
-    let mut bounds = [bounds.start(), bounds.end()].into_iter().flatten();
-    if bounds.all(|it| super::constant(cx, it) || on_boundary(cx, it)) {
-        return None;
-    }
-    let checked = index
-        .syntax()
-        .ancestors()
-        .find_map(ast::Fn::cast)
-        .is_some_and(|f| f.syntax().text().contains("is_char_boundary("));
-    if checked {
+    // alloc: a range's two bounds at most
+    let open: Vec<_> = [bounds.start(), bounds.end()]
+        .into_iter()
+        .flatten()
+        .filter(|it| !super::constant(cx, *it) && !on_boundary(cx, *it))
+        .collect();
+    if open.is_empty() || open.iter().all(|it| checked(cx, index.syntax(), base, *it)) {
         return None;
     }
     let fix = (|| {
@@ -94,14 +103,13 @@ fn sliced<'t>(cx: &Cx<'_, 't>, index: ast::IndexExpr<'t>) -> Option<(&'static st
 
 /// What `call`, `str::split_at` or `split_at_mut`, is and its fix.
 fn split<'t>(cx: &Cx<'_, 't>, call: ast::MethodCallExpr<'t>) -> Option<(&'static str, Option<Fix>)> {
-    let name = call.name_ref()?;
-    let what = match name.text() {
-        "split_at" => "a `str` split",
-        "split_at_mut" => "a `str` split",
-        _ => return None,
-    };
     let f = cx.method(call)?;
     let db = cx.db();
+    let checked_name = match f.name(db).as_str() {
+        "split_at" => "split_at_checked",
+        "split_at_mut" => "split_at_mut_checked",
+        _ => return None,
+    };
     let hir::AssocItemContainer::Impl(imp) = hir::AsAssocItem::as_assoc_item(f, db)?.container(db)
     else {
         return None;
@@ -111,54 +119,76 @@ fn split<'t>(cx: &Cx<'_, 't>, call: ast::MethodCallExpr<'t>) -> Option<(&'static
     }
     let mut args = call.arg_list()?.args();
     let (Some(at), None) = (args.next(), args.next()) else { return None };
-    let checked = call
-        .syntax()
-        .ancestors()
-        .find_map(ast::Fn::cast)
-        .is_some_and(|f| f.syntax().text().contains("is_char_boundary("));
-    if super::constant(cx, at) || on_boundary(cx, at) || checked {
+    let receiver = call.receiver()?;
+    if super::constant(cx, at) || on_boundary(cx, at) || checked(cx, call.syntax(), receiver, at) {
         return None;
     }
+    let name = call.name_ref()?;
     let fix = (|| {
         if !returns_option(cx, call.syntax()) {
             return None;
         }
         let (whole, name_at) = (cx.range(call.syntax())?, cx.range(name.syntax())?);
-        let checked = match name.text() {
-            "split_at" => "split_at_checked",
-            _ => "split_at_mut_checked",
-        };
         Some(Fix {
             message: "hand a `None` on where the index is inside a character",
             // alloc: the fix's two parts
-            parts: vec![(name_at, checked.to_owned()), (syntax::TextRange::empty(whole.end()), "?".to_owned())],
+            parts: vec![
+                (name_at, checked_name.to_owned()),
+                (syntax::TextRange::empty(whole.end()), "?".to_owned()),
+            ],
             applicability: Applicability::MachineApplicable,
         })
     })();
-    Some((what, fix))
+    Some(("a `str` split", fix))
 }
 
-/// Whether `expr` is a `String` (or a reference to one), which an index derefs to `str`.
-fn derefs_to_str<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
+/// Whether `expr`'s type, references peeled, is `str`, or a `String`, which an index derefs to
+/// `str`.
+fn is_str<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
     let Some(ty) = cx.ty(expr) else { return false };
+    let ty = ty.strip_references();
+    if ty.is_str() {
+        return true;
+    }
     let Some(hir::ModuleDef::Adt(string)) = cx.std_def(&["alloc", "string", "String"]) else {
         return false;
     };
-    ty.strip_references().as_adt() == Some(string)
+    ty.as_adt() == Some(string)
 }
 
-/// Whether the bound `expr` is taken as on a character boundary: `x.len()` of a string, or it
-/// or the `let` of a local it names reads one of [`BOUNDARY_READS`].
+/// Whether a call of std's `is_char_boundary` on `string` with `index`, the same places by
+/// resolution, dominates `at`.
+fn checked<'t>(cx: &Cx<'_, 't>, at: ast::Node<'t>, string: ast::Expr<'t>, index: ast::Expr<'t>) -> bool {
+    let check = |node: ast::Node<'t>| {
+        let Some(call) = ast::MethodCallExpr::cast(node) else { return false };
+        if !std_method(cx, call, "is_char_boundary") {
+            return false;
+        }
+        let mut args = call.arg_list().into_iter().flat_map(|it| it.args());
+        call.receiver().is_some_and(|it| same_place(cx, it, string))
+            && args.next().is_some_and(|it| same_place(cx, it, index))
+    };
+    dominated(cx, at, &check)
+}
+
+/// Whether `scope` calls one of std's [`BOUNDARY_METHODS`], resolved.
+fn reads_boundary<'t>(cx: &Cx<'_, 't>, scope: ast::Node<'t>) -> bool {
+    scope
+        .descendants()
+        .filter_map(ast::MethodCallExpr::cast)
+        .any(|call| BOUNDARY_METHODS.iter().any(|name| std_method(cx, call, name)))
+}
+
+/// Whether the bound `expr` is taken as on a character boundary: std's `len` of a string, or it
+/// or what made a local it names calls one of [`BOUNDARY_METHODS`].
 fn on_boundary<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
-    let reads = |text: &str| BOUNDARY_READS.iter().any(|it| text.contains(it));
     if let ast::Expr::MethodCallExpr(call) = strip(expr)
-        && call.name_ref().is_some_and(|it| it.text() == "len")
-        && let Some(receiver) = call.receiver()
-        && (cx.ty(receiver).is_some_and(|it| it.strip_references().is_str()) || derefs_to_str(cx, receiver))
+        && std_method(cx, call, "len")
+        && call.receiver().is_some_and(|it| is_str(cx, it))
     {
         return true;
     }
-    if reads(expr.syntax().text()) {
+    if reads_boundary(cx, expr.syntax()) {
         return true;
     }
     let Some(body) = super::body_of(expr.syntax(), false) else { return false };
@@ -167,16 +197,34 @@ fn on_boundary<'t>(cx: &Cx<'_, 't>, expr: ast::Expr<'t>) -> bool {
         let Some(hir::PathResolution::Local(local)) = path.path().and_then(|it| cx.path(it)) else {
             continue;
         };
-        let made_there = body.descendants().filter(|it| it.kind() == SyntaxKind::LET_STMT).any(|it| {
-            let Some(stmt) = ast::LetStmt::cast(it) else { return false };
-            let binds = stmt.pat().into_iter().flat_map(|pat| pat.syntax().descendants()).any(|it| {
-                ast::IdentPat::cast(it).and_then(|it| cx.local(it)) == Some(local)
-            });
-            binds && stmt.initializer().is_some_and(|it| reads(it.syntax().text()))
-        });
-        if made_there {
+        let binding = body
+            .descendants()
+            .filter_map(ast::IdentPat::cast)
+            .find(|it| cx.local(*it) == Some(local));
+        let Some(binding) = binding else { continue };
+        if made_by(binding.syntax()).is_some_and(|it| reads_boundary(cx, it.syntax())) {
             return true;
         }
     }
     false
+}
+
+/// The expression whose value the pattern `pat` is in binds: a `let`'s initializer, a `for`'s
+/// iterable, an `if let`'s or `while let`'s scrutinee.
+fn made_by(pat: ast::Node<'_>) -> Option<ast::Expr<'_>> {
+    let mut child = pat;
+    for ancestor in pat.ancestors().skip(1) {
+        match ancestor.kind() {
+            SyntaxKind::LET_STMT => return ast::LetStmt::cast(ancestor)?.initializer(),
+            SyntaxKind::FOR_EXPR => {
+                let it = ast::ForExpr::cast(ancestor)?;
+                return it.pat().is_some_and(|it| it.syntax() == child).then(|| it.iterable())?;
+            }
+            SyntaxKind::LET_EXPR => return ast::LetExpr::cast(ancestor)?.expr(),
+            k if ast::Pat::can_cast(k) => {}
+            _ => return None,
+        }
+        child = ancestor;
+    }
+    None
 }

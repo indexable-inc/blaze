@@ -95,18 +95,18 @@ fn a_key_is_predicted_by_its_record_and_an_unseen_one_by_its_kind() {
     let mut history = History::new(config(16));
     let (seen, unseen) = (same_bucket(1), same_bucket(2));
     let p = history.predict(KIND, Some(&seen));
-    assert_eq!((p.cost, p.peak), (Some(5_000), 0), "a kind never seen");
+    assert_eq!(p.cost, Some(5_000), "a kind never seen");
     history.observe(KIND, Some(&seen), 400_000, 300);
     history.observe(KIND, None, 800_000, 900);
     let p = history.predict(KIND, Some(&seen));
-    assert_eq!((p.cost, p.peak), (Some(400_000), 300));
-    // The kind's mean moved an eighth of the way to the second run; a kind keeps no peak.
+    assert_eq!(p.cost, Some(400_000));
+    // The kind's mean moved an eighth of the way to the second run.
     let p = history.predict(KIND, Some(&unseen));
-    assert_eq!((p.cost, p.peak), (Some(450_000), 0));
+    assert_eq!(p.cost, Some(450_000));
     assert_eq!(history.predict(KIND, None), p);
     // Another kind with the same key has no record of it.
     let other = history.predict(TaskKind(9), Some(&seen));
-    assert_eq!((other.cost, other.peak), (Some(5_000), 0));
+    assert_eq!(other.cost, Some(5_000));
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn readers_never_see_a_torn_record() {
     });
 }
 
-fn spec(id: u32, deps: &[u32], key: Option<Key>, cost: u64, memory: u64) -> Spec {
+fn spec(id: u32, deps: &[u32], key: Option<Key>, cost: u64) -> Spec {
     Spec {
         id: NodeId(id),
         kind: NodeKind::Codegen,
@@ -367,14 +367,13 @@ fn spec(id: u32, deps: &[u32], key: Option<Key>, cost: u64, memory: u64) -> Spec
         pool: Pool::Work,
         cost,
         key,
-        memory,
     }
 }
 
-/// `spec` with its cost and memory as `history` predicts them, as the daemon's plane adds it.
+/// `spec` with its cost as `history` predicts it, as the daemon's plane adds it.
 fn predicted(history: &History, id: u32, deps: &[u32], key: Key) -> Spec {
     let p = history.predict(KIND, Some(&key));
-    spec(id, deps, Some(key), p.cost.expect("a history predicts every cost"), p.peak)
+    spec(id, deps, Some(key), p.cost.expect("a history predicts every cost"))
 }
 
 /// What the plane gives on opening one request of `specs` and closing it.
@@ -435,9 +434,9 @@ fn the_plane_runs_the_longest_path_of_history_first() {
     assert_eq!(order(specs), [NodeId(2), NodeId(0), NodeId(1)]);
     // With the costs every node has without a history, the longer chain of nodes goes first.
     let flat = vec![
-        spec(0, &[], Some(a), 1, 0),
-        spec(1, &[0], Some(b), 1, 0),
-        spec(2, &[], Some(c), 1, 0),
+        spec(0, &[], Some(a), 1),
+        spec(1, &[0], Some(b), 1),
+        spec(2, &[], Some(c), 1),
     ];
     assert_eq!(order(flat), [NodeId(0), NodeId(1), NodeId(2)]);
 }
@@ -481,18 +480,17 @@ fn the_plane_orders_random_graphs_by_the_history_critical_path() {
     }
 }
 
-/// A key's record keeps its last peak for a reader of that key; a kind has no peak here
-/// (admission forecasts from `blaze_graph::admission::Peaks`, never from this history).
+/// A key's record keeps its last peak for a reader of that key ([`History::record`]); a key
+/// never seen has no record.
 #[test]
-fn a_key_keeps_its_peak_and_a_kind_has_none() {
+fn a_key_keeps_its_peak() {
     let (a, c) = (same_bucket(1), same_bucket(3));
     let mut history = History::new(config(64));
     history.observe(KIND, Some(&a), 1000, 80);
     history.observe(KIND, Some(&c), 1000, 30);
-    assert_eq!(history.predict(KIND, Some(&a)).peak, 80);
-    assert_eq!(history.predict(KIND, Some(&c)).peak, 30);
-    assert_eq!(history.predict(KIND, None).peak, 0);
-    assert_eq!(history.predict(KIND, Some(&same_bucket(2))).peak, 0);
+    assert_eq!(history.record(KIND, &a).map(|it| it.peak), Some(80));
+    assert_eq!(history.record(KIND, &c).map(|it| it.peak), Some(30));
+    assert!(history.record(KIND, &same_bucket(2)).is_none());
 }
 
 #[test]
@@ -501,7 +499,7 @@ fn a_history_is_the_planes_predictor() {
     let mut predict: Box<dyn Predict> = Box::new(History::new(config(16)));
     predict.observe(KIND, Some(key), 3_000_000, 4096);
     let p = predict.predict(KIND, Some(key));
-    assert_eq!((p.cost, p.peak), (Some(3_000_000), 4096));
+    assert_eq!(p.cost, Some(3_000_000));
     let back = History::decode(&predict.encode(), config(16)).unwrap();
     assert_eq!(back.predict(KIND, Some(&key)), p);
 }

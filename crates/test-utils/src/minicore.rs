@@ -40,6 +40,7 @@
 //!     eq: sized, unary_ops, builtin_impls
 //!     error: fmt
 //!     error_union: error, from, clone, hash
+//!     expect: option, fmt
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
 //!     fn: sized, tuple
@@ -1807,6 +1808,15 @@ pub mod option {
             }
         }
 
+        // region:expect
+        pub const fn expect(self, _msg: &str) -> T {
+            match self {
+                Some(val) => val,
+                None => panic!("called `Option::expect()` on a `None` value"),
+            }
+        }
+        // endregion:expect
+
         pub const fn as_ref(&self) -> Option<&T> {
             match self {
                 Some(x) => Some(x),
@@ -1954,6 +1964,19 @@ pub mod result {
                 Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
             }
         }
+
+        // region:expect
+        #[track_caller]
+        pub fn expect(self, _msg: &str) -> T
+        where
+            E: crate::fmt::Debug,
+        {
+            match self {
+                Ok(t) => t,
+                Err(_) => panic!("called `Result::expect()` on an `Err` value"),
+            }
+        }
+        // endregion:expect
         // endregion:fmt
 
         // region:option

@@ -70,7 +70,7 @@ pub(crate) use konst::constant;
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
 pub(crate) use mir::{NONE as NO_PLACE, in_body, kind_code};
-pub use mir::location_literals;
+pub use mir::{calls_place_macro, is_place, location_literals, place_call, placed_literal};
 pub use crate::check_cache::ids::{closure_kind_code, closure_kind_of};
 pub use value::step_value;
 

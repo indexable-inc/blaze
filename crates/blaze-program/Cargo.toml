@@ -1,0 +1,30 @@
+[package]
+name = "blaze-program"
+description = "Code as records and programs as manifests (target decisions 1, 5, 6, 8): the instance code record and its key computed before any lowering, the monomorphization walk as a streaming sans-IO state machine, the program manifest and the `Program` machine that turns a demand or a delta into a placement change of bytes proportional to the edit, and the test-result record"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# ContentId and its domain-separated BLAKE3 Hasher: every key and digest here.
+blaze-ids.workspace = true
+# One-owner maps on the fixed hasher (rule standard-structures).
+blaze-hash.workspace = true
+# The core's kinds, keys, record framing and store interface: every record here is one of its.
+blaze-keyed.workspace = true
+
+[dev-dependencies]
+# `Aligned`: core records are opened 16-aligned.
+blaze-format.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

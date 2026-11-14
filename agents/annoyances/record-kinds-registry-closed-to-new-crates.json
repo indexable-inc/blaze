@@ -1,0 +1,14 @@
+{
+ "id": "record-kinds-registry-closed-to-new-crates",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-findings",
+ "where": "crates/blaze-keyed/src/kind.rs `kind!` and `tags!` (tags 1 to 15, each once, checked at compile time); crates/blaze-findings/src/kinds.rs",
+ "what": "Every record kind must be declared and listed in blaze-keyed's one registry, so a new crate with its own kinds (the four findings kinds) cannot add them without editing blaze-keyed, which another lane owns; blaze-findings declares them locally at tags 20 to 23 instead, outside the store's untyped dispatch.",
+ "cost": "a hand-off: the four kinds move into kind.rs at the next free tags, and the dense tag rule means two lanes adding kinds at once both take tag 16",
+ "cause": "the registry is a hand-kept dense list in one file, not a set each crate contributes to and one test checks",
+ "class": "a closed id space allocated by hand in one shared file, so concurrent additions collide or wait",
+ "prevention": "each crate declares its kinds with a tag range it owns (blaze-keyed's table of ranges per crate), and the store's index is the union, checked for overlap in one test",
+ "workaround": "declare kinds locally past the registry's end and say so in the module doc; move them in when blaze-keyed is free",
+ "fix": "not yet",
+ "state": "open"
+}

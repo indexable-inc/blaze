@@ -629,8 +629,8 @@ pub(super) fn check_body<'db, 't>(
 ///
 /// `Global` is written as it resolves at the call: by its name when that name is std's
 /// `Global` there, by its path from the module when the name is something else, and by its
-/// name with a `use` of that path added to the innermost item list around the call when the
-/// name resolves to nothing. Two fixes in one file that each add the `use` overlap, so
+/// name with a `use` of that path added before the first statement of the function the call
+/// is in when the name resolves to nothing. Two fixes in one function that each add the `use` overlap, so
 /// `--fix` makes one a pass and the next pass finds the name in scope.
 ///
 /// None (the finding stands, with no fix) for a crate whose root does not turn on
@@ -714,7 +714,7 @@ fn explicit_fix<'t>(
         }
         Some(_) => path()?,
         None => {
-            parts.push(import(cx, at, &path()?)?);
+            parts.push(import(cx, &path()?)?);
             "Global".to_owned()
         }
     };
@@ -779,12 +779,18 @@ fn has_inherent(db: &Db, adt: AdtId, name: &str) -> bool {
         })
 }
 
-/// The insertion of `use <path>;` before the first item of the innermost item list (a module's
-/// or the file's) around `at`, at that item's indentation.
-fn import<'t>(cx: &Cx<'_, 't>, at: ast::Node<'t>, path: &str) -> Option<(TextRange, String)> {
-    let scope =
-        at.ancestors().find(|it| matches!(it.kind(), K::SOURCE_FILE | K::ITEM_LIST))?;
-    let first = scope.children().find(|it| ast::Item::cast(*it).is_some())?;
+/// The insertion of `use <path>;` before the first statement of the body's function, at that
+/// statement's indentation: a `use` in a function's block is in scope in all of it, nested
+/// blocks and closures too. The body's query reads the function's own tree, whose ranges begin
+/// at it, so the module's item list around the function is not a place a fix of the body can
+/// write. `None` for a body that is not a function's block (a `const`'s or `static`'s) and for
+/// a block whose first statement shares its line with the `{`.
+fn import<'t>(cx: &Cx<'_, 't>, path: &str) -> Option<(TextRange, String)> {
+    let list = ast::Fn::cast(cx.root())?.body()?.stmt_list()?;
+    let first = match list.statements().next() {
+        Some(stmt) => stmt.syntax(),
+        None => list.tail_expr()?.syntax(),
+    };
     let start = cx.range(first)?.start();
     let text = cx.text();
     let line = text[..usize::from(start)].rfind('\n').map_or(0, |it| it + 1);

@@ -22,8 +22,13 @@
 //!   ended in [`handover::AFTER`]: the engine is handed the connection and what was read of
 //!   the answer ([`handover`]) and prints it, so nothing is asked of the daemon twice.
 //!
+//! With `[serve] host = "process"` in blaze's `config.toml` ([`host`]) there is no daemon to
+//! ask: a request the client's own check does not certify is the engine's, which serves it in
+//! this same process (`exec`) and exits.
+//!
 //! This library is what the engine shares with the program so the two can't differ: cargo's
-//! lines ([`say`]), the color rule and the request ([`request`]), the reader of the kept pin
+//! lines ([`say`]), the color rule and the request ([`request`]), where a build is served
+//! ([`host`]), the reader of the kept pin
 //! lookup and `--version`'s sentences ([`pin`]), and the handover's layout ([`handover`]).
 //! It reads files in [`pin`] and, on Unix, [`solo`]: the client's own check of a build or a
 //! run with nothing changed over the request slot the daemon wrote, which answers it with no
@@ -36,6 +41,7 @@
 
 pub mod answer;
 pub mod handover;
+pub mod host;
 #[cfg(unix)]
 pub mod kept;
 pub mod pin;

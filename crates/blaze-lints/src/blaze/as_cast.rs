@@ -41,6 +41,11 @@
 //! on `integer_widen_truncate` or depend on `blaze-cast` where the fix needs it. A cast a
 //! macro writes is not found; nor is one in a type (an array type's length), outside any body.
 //!
+//! One cast, one finding: where `blaze::implicit_overflow` is on and reports a cast (one that
+//! can lose an integer's value, which its prover can't show keeps it), that finding is the
+//! cast's and this lint says nothing there (`implicit_overflow::reported_casts`). A cast the
+//! prover shows keeps its value is still found here, and its fix names the operation.
+//!
 //! Nested casts are fixed at once: the fix of the outermost cast with a fix holds the fixed text
 //! of each cast inside it, so `--fix` settles in one pass.
 
@@ -87,7 +92,7 @@ const TRUNCATED_HELPERS: &[(&str, &str)] = &[
 
 /// How wide an integer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Width {
+pub(super) enum Width {
     Fixed(u64),
     /// `usize` or `isize`: the target's pointer width, 32 to 64 bits on blaze's targets.
     Pointer,
@@ -95,7 +100,7 @@ enum Width {
 
 impl Width {
     /// The fewest bits it can be.
-    fn least(self) -> u64 {
+    pub(super) fn least(self) -> u64 {
         match self {
             Width::Fixed(bits) => bits,
             Width::Pointer => 32,
@@ -113,9 +118,9 @@ impl Width {
 
 /// An integer type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Int {
-    signed: bool,
-    width: Width,
+pub(super) struct Int {
+    pub(super) signed: bool,
+    pub(super) width: Width,
 }
 
 impl Int {
@@ -185,9 +190,10 @@ impl Int {
     }
 }
 
-/// What a cast's operand or target is.
+/// What a cast's operand or target is: the one classification of what an `as` can lose, which
+/// `implicit_overflow` reads too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Int(Int),
     /// A float of this many bits.
     Float(u64),
@@ -205,7 +211,7 @@ enum Kind {
 }
 
 impl Kind {
-    fn of(ty: &hir::Type<'_>) -> Kind {
+    pub(super) fn of(ty: &hir::Type<'_>) -> Kind {
         match ty.to_next_solver().kind() {
             TyKind::Int(it) => Kind::Int(Int { signed: true, width: int_width(it) }),
             TyKind::Uint(it) => Kind::Int(Int { signed: false, width: uint_width(it) }),
@@ -237,7 +243,7 @@ fn float_bits(it: FloatTy) -> u64 {
 
 /// The bits of a float's significand, its implicit bit included: the widest integer it holds
 /// exactly.
-fn mantissa(bits: u64) -> u64 {
+pub(super) fn mantissa(bits: u64) -> u64 {
     match bits {
         16 => 11,
         32 => 24,
@@ -248,7 +254,7 @@ fn mantissa(bits: u64) -> u64 {
 
 /// What a cast can lose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Loss {
+pub(super) enum Loss {
     /// An integer to a narrower one of the same signedness, or an unsigned one to a narrower
     /// signed one.
     HighBits,
@@ -271,7 +277,7 @@ enum Loss {
 }
 
 /// What casting a `from` to a `to` can lose; `None` when every value survives.
-fn loss(from: Kind, to: Kind) -> Option<Loss> {
+pub(super) fn loss(from: Kind, to: Kind) -> Option<Loss> {
     match (from, to) {
         (Kind::RawPtr { .. } | Kind::Fn, Kind::Int(_)) => Some(Loss::Address),
         (Kind::Int(_), Kind::RawPtr { .. }) => Some(Loss::Provenance),
@@ -297,6 +303,13 @@ fn loss(from: Kind, to: Kind) -> Option<Loss> {
 }
 
 impl Loss {
+    /// Whether it is a loss of an integer's value, which `implicit_overflow` judges with the
+    /// prover where it is on: a cast to a narrower integer, between signed and unsigned, or of
+    /// a float to an integer.
+    pub(super) fn of_value(self) -> bool {
+        matches!(self, Loss::HighBits | Loss::Sign { .. } | Loss::Wrap | Loss::Fraction)
+    }
+
     /// What the cast does to a value it loses, after "which": `to` the target as shown.
     fn said(self, to: &str) -> String {
         // alloc: a finding's message part
@@ -716,6 +729,10 @@ fn find<'t>(cx: &Cx<'_, 't>) -> (Vec<Found<'t>>, Vec<Rewrite>) {
     let target = cx.krate().to_display_target(db);
     let item = super::body_item(db, analysis);
     let root = cx.root();
+    // One cast, one finding: where `implicit_overflow` is on and reports a cast (one that can
+    // lose an integer's value and the prover can't show keeps it), the finding is its, with
+    // its `try_from` fix; this lint gives way and plans no rewrite there.
+    let given_way = super::implicit_overflow::reported_casts(cx);
     // alloc: the casts of one body, in the order written
     let mut casts = Vec::new();
     let mut events = root.preorder();
@@ -733,6 +750,9 @@ fn find<'t>(cx: &Cx<'_, 't>) -> (Vec<Found<'t>>, Vec<Rewrite>) {
     for cast in casts.into_iter().rev() {
         let node = cast.syntax();
         let (Some(operand), Some(range)) = (cast.expr(), cx.range(node)) else { continue };
+        if given_way.contains(&range) {
+            continue;
+        }
         let (Some(from_ty), Some(to_ty)) = (cx.ty(operand), cx.ty(ast::Expr::CastExpr(cast))) else {
             // Not an expression of this body: an array type's length, a signature's.
             continue;

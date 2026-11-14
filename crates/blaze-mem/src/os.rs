@@ -30,8 +30,6 @@
 
 use std::{io, ptr::NonNull, sync::atomic};
 
-use crate::gate::Grant;
-
 #[cfg(unix)]
 use crate::syscalls::{Kind, timed};
 
@@ -566,11 +564,8 @@ fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
 /// The range is page-aligned and inside one reservation of [`reserve`] that is not released.
 /// Committing a range that is already committed is allowed and leaves its contents alone
 /// (a populate never replaces a page that is there).
-///
-/// `_granted` is the memory gate's grant for the pages ([`crate::gate`]): the kernel commits
-/// nothing the gate did not grant first, and its holder keeps from it what it publishes.
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
     const MADV_POPULATE_WRITE: libc::c_int = 23;
     // SAFETY: the caller says the range is inside a live reservation of ours, readable and
@@ -582,7 +577,7 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) ->
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: the caller says the range is inside a live reservation of ours, which nothing
     // else maps; changing its protection touches no other memory.
     let rc = timed(Kind::Mprotect, || unsafe {
@@ -592,7 +587,7 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) ->
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
     // SAFETY: the caller says the range is inside a live reservation of ours; committing
     // committed pages leaves them as they are.
@@ -602,70 +597,8 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) ->
 
 /// The whole reservation is memory already.
 #[cfg(not(any(unix, windows)))]
-pub(crate) unsafe fn commit(_ptr: NonNull<u8>, _bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn commit(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
     Ok(())
-}
-
-/// The machine's physical memory in bytes: what [`crate::gate::machine_config`] sizes the
-/// ceiling of a process that installed none from. A machine that cannot say stops, naming the
-/// call (no-fallback): a gate sized from a guess is no gate.
-#[cfg(target_os = "macos")]
-pub(crate) fn physical_memory() -> u64 {
-    let mut bytes: u64 = 0;
-    let mut len = size_of::<u64>();
-    // SAFETY: `hw.memsize` is a 64-bit integer, written into `bytes`, whose size `len` says;
-    // the name is a NUL-terminated constant.
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"hw.memsize".as_ptr(),
-            (&raw mut bytes).cast(),
-            &raw mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    assert!(
-        rc == 0 && bytes > 0,
-        "sysctl hw.memsize: {} (the memory gate sizes its ceiling from it)",
-        io::Error::last_os_error()
-    );
-    bytes
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn physical_memory() -> u64 {
-    // SAFETY: `sysconf` reads constants of the system; it has no memory preconditions.
-    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
-    assert!(
-        pages > 0,
-        "sysconf(_SC_PHYS_PAGES): {} (the memory gate sizes its ceiling from it)",
-        io::Error::last_os_error()
-    );
-    pages as u64 * page_size() as u64
-}
-
-#[cfg(windows)]
-pub(crate) fn physical_memory() -> u64 {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    // SAFETY: an all-zero `MEMORYSTATUSEX` is a valid value of a plain C struct.
-    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
-    // SAFETY: `status` is a live `MEMORYSTATUSEX` whose `dwLength` says its size.
-    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
-    assert!(
-        ok != 0 && status.ullTotalPhys > 0,
-        "GlobalMemoryStatusEx: {} (the memory gate sizes its ceiling from it)",
-        io::Error::last_os_error()
-    );
-    status.ullTotalPhys
-}
-
-/// Without virtual memory (wasm) the process's memory is what one linear memory can address:
-/// 4 GiB on wasm32; the bootstrap seed on wasm64 runs under its runner's own bound, sized here
-/// the same, as the seed builds one crate at a time.
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn physical_memory() -> u64 {
-    4 << 30
 }
 
 /// The sysfs file of the 2 MiB hugetlb pool's size.
@@ -742,7 +675,6 @@ pub(crate) unsafe fn commit_reserved(
     ptr: NonNull<u8>,
     bytes: usize,
     node: Option<u32>,
-    _granted: &Grant,
 ) -> io::Result<()> {
     /// `mman-common.h`'s `MADV_POPULATE_WRITE`.
     const MADV_POPULATE_WRITE: libc::c_int = 23;
@@ -819,7 +751,6 @@ pub(crate) unsafe fn commit_reserved(
     _ptr: NonNull<u8>,
     _bytes: usize,
     _node: Option<u32>,
-    _granted: &Grant,
 ) -> io::Result<()> {
     reserved_pool()
 }
@@ -1022,7 +953,7 @@ pub(crate) unsafe fn purge(_ptr: NonNull<u8>, _bytes: usize) -> bool {
 ///
 /// As for [`commit`]: the range is inside a live, committed reservation of ours.
 #[cfg(target_os = "macos")]
-pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // Advice: a refusal leaves the pages counted as reusable, which misstates the footprint
     // and costs no correctness, as libmalloc treats it.
     // SAFETY: the caller says the range is committed and ours.
@@ -1031,13 +962,13 @@ pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize, _granted: &Grant) -> 
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize, granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn reuse(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     // SAFETY: as for `commit`: the range is inside a live reservation of ours.
-    unsafe { commit(ptr, bytes, granted) }
+    unsafe { commit(ptr, bytes) }
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-pub(crate) unsafe fn reuse(_ptr: NonNull<u8>, _bytes: usize, _granted: &Grant) -> io::Result<()> {
+pub(crate) unsafe fn reuse(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
     Ok(())
 }
 

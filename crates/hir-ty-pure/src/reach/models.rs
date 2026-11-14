@@ -46,6 +46,23 @@ pub(crate) enum Model {
     /// `Deref::deref` and `as_slice` of a `Vec`, `as_str` of a `String`: a view of the same
     /// length.
     View,
+    // How a method changes a measure (docs/v2/plan/design/refined-values.md, "Measures"):
+    // each takes `&mut self` of a local the state knows, borrowed whole, and gives it a new
+    // value whose length is stated here.
+    /// `Vec::push`: the length goes up by 1.
+    Push,
+    /// `Vec::pop`: `Some` and the length down by 1 when it was above 0, else `None` and 0.
+    Pop,
+    /// `Vec::clear`, `String::clear`: the length is 0.
+    Clear,
+    /// `Vec::truncate(n)`: the length is the lesser of `n` and what it was.
+    Truncate,
+    /// `Vec::extend_from_slice(s)`: the length goes up by `s.len()`.
+    ExtendFromSlice,
+    /// `Vec::new`, `Vec::with_capacity`, `String::new`, `String::with_capacity`: length 0.
+    Empty,
+    /// `alloc::vec::from_elem(x, n)`, what `vec![x; n]` calls: length `n`.
+    FromElem,
 }
 
 #[cfg(test)]
@@ -135,6 +152,14 @@ pub(crate) fn model_of<'db>(
             }
             (Some(it), args.type_at(0))
         }
+        // `vec![x; n]`'s function, the one free function the table has.
+        ItemContainerId::ModuleId(_) => {
+            let alloc = matches!(
+                HasModule::krate(&func, db).data(db).origin,
+                CrateOrigin::Lang(LangCrateOrigin::Alloc)
+            );
+            return (alloc && name == "from_elem").then_some(Model::FromElem);
+        }
         _ => return None,
     };
     let head = head(db, self_ty);
@@ -147,6 +172,12 @@ pub(crate) fn model_of<'db>(
             (Head::Slice, "first" | "last") => Some(Model::First),
             (Head::Slice, "get") => Some(Model::Get),
             (Head::Vec, "as_slice") | (Head::String, "as_str") => Some(Model::View),
+            (Head::Vec, "push") => Some(Model::Push),
+            (Head::Vec, "pop") => Some(Model::Pop),
+            (Head::Vec | Head::String, "clear") => Some(Model::Clear),
+            (Head::Vec, "truncate") => Some(Model::Truncate),
+            (Head::Vec, "extend_from_slice") => Some(Model::ExtendFromSlice),
+            (Head::Vec | Head::String, "new" | "with_capacity") => Some(Model::Empty),
             (Head::Option, "is_some") => Some(Model::IsVariant { discr: 1, is: true }),
             (Head::Option, "is_none") => Some(Model::IsVariant { discr: 1, is: false }),
             (Head::Result, "is_ok") => Some(Model::IsVariant { discr: 0, is: true }),

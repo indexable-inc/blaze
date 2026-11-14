@@ -3,15 +3,16 @@
 //! use), never from a request's [`blaze_api::Cargo::env`]. A daemon is started by whichever
 //! client finds none, with that client's environment; a later client with other values would
 //! build under the first one's (a client with `BLAZE_DAEMON_MEMORY_GB=100` talked to a daemon
-//! started with 80, which kept 80 and failed in memory admission ten minutes into the build).
+//! started with 80, which kept 80 and failed ten minutes into the build; that limit was
+//! deleted with memory admission, 2026-11-13).
 //!
 //! So the daemon says what it was started with ([`blaze_api::Status::settings`], made by
 //! [`of_daemon`]), and a client that may start a daemon compares the settings it sets with
 //! that ([`of_client`], [`drift`]) before it sends any request (`cli::daemon::connect`): a
 //! setting the client sets to another value is refused at once, naming each setting, both
 //! values and the fix ([`said`], `cli::daemon::DaemonError::Drifted`). A setting the client
-//! leaves unset is the daemon's to choose: a daemon started with `--memory-gb 80` serves every
-//! client that does not set `BLAZE_DAEMON_MEMORY_GB` itself. The daemon is never restarted over
+//! leaves unset is the daemon's to choose: a daemon started with `BLAZE_OPT=2` serves every
+//! client that does not set `BLAZE_OPT` itself. The daemon is never restarted over
 //! a difference: it serves every lane of a home, and a restart would cut off a build that
 //! arrived meanwhile and let two lanes of other values take turns restarting it. Socket units
 //! capture these settings from the shell that installs them (`blaze_api::units::here`).
@@ -34,8 +35,6 @@ use blaze_api::Setting;
 /// Every variable the daemon reads from its own environment and keeps, in the order
 /// [`blaze_api::Status::settings`] has them. Each names where it is read.
 pub const STARTED_WITH: &[&str] = &[
-    // The memory limit (`serve::engine`, `told_limit`): `--memory-gb` wins where given.
-    super::MEMORY_VAR,
     // Whether, and after what grace, it exits once no connection holds it (`serve::engine`,
     // read once; `serve::unheld`).
     super::unheld::VAR,
@@ -101,24 +100,12 @@ fn value_of(name: &str, var: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Op
     var(name).map(|it| it.to_string_lossy().into_owned())
 }
 
-/// What the daemon runs with: each of [`STARTED_WITH`] from its environment (`var`), but the
-/// memory limit as it was told it ([`super::told_limit`]'s `told`, `--memory-gb` first), its
-/// number of GiB.
-pub fn of_daemon(
-    told: Option<&(u64, String)>,
-    var: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Vec<Setting> {
+/// What the daemon runs with: each of [`STARTED_WITH`] from its environment (`var`).
+pub fn of_daemon(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<Setting> {
     STARTED_WITH
         .iter()
-        .map(|&name| {
-            let value = match name == super::MEMORY_VAR {
-                true => told.map(|(_, said)| {
-                    said.split_once('=').map_or(said.as_str(), |(_, gb)| gb).to_owned()
-                }),
-                false => value_of(name, &var),
-            };
-            Setting { name: name.to_owned(), value } // alloc: once per daemon start
-        })
+        // alloc: once per daemon start
+        .map(|&name| Setting { name: name.to_owned(), value: value_of(name, &var) })
         .collect()
 }
 
@@ -142,8 +129,8 @@ pub struct Drift {
     pub ours: String,
 }
 
-/// Whether two values of `name` say the same: the memory limit by the bytes each is (`80` and
-/// `80.0`); the cores by the budget and priority each gives on this machine
+/// Whether two values of `name` say the same: the cores by the budget and priority each gives
+/// on this machine
 /// ([`blaze_core::cores::Cores::agrees`]: unset and the default budget agree, `all` and every
 /// core by number do not); every other by its text.
 fn same(name: &str, a: Option<&str>, b: Option<&str>) -> bool {
@@ -155,12 +142,6 @@ fn same(name: &str, a: Option<&str>, b: Option<&str>) -> bool {
         )
     {
         return a.agrees(&b);
-    }
-    if name == super::MEMORY_VAR
-        && let (Some(a), Some(b)) = (a, b)
-        && let (Ok((a, _)), Ok((b, _))) = (super::told_memory(name, a), super::told_memory(name, b))
-    {
-        return a == b;
     }
     a == b
 }
@@ -183,8 +164,8 @@ pub fn drift(ours: &[Setting], theirs: &[Setting]) -> Vec<Drift> {
         .collect()
 }
 
-/// `BLAZE_DAEMON_MEMORY_GB: the daemon has 80, this command 100; BLAZE_OPT: the daemon has it
-/// unset, this command 2`.
+/// `BLAZE_OPT: the daemon has 2, this command 3; BLAZE_LEAN: the daemon has it unset, this
+/// command 1`.
 pub fn said(drift: &[Drift]) -> String {
     let value = |it: &Option<String>| match it {
         Some(it) => format!("`{it}`"),
@@ -215,41 +196,25 @@ mod tests {
         }
     }
 
-    /// The client of 2026-11-03 asked for 100 GiB of a daemon told 80 by `--memory-gb`: the
-    /// one setting that differs is named with both values. The same limit written another way
-    /// (`80.0`), settings both leave unset, and settings the client leaves unset (the daemon's
-    /// `--memory-gb` and `BLAZE_OPT` stand) are no drift; one the client sets that the daemon
-    /// does not is.
+    /// A client that sets a setting to another value than the daemon was started with: the
+    /// one setting that differs is named with both values. Settings both set alike, both
+    /// leave unset, and settings the client leaves unset (the daemon's `BLAZE_OPT` stands) are
+    /// no drift; one the client sets that the daemon does not is.
     #[test]
-    fn a_daemon_told_another_limit_drifts_by_that_setting_alone() {
-        let told = super::super::told_memory("--memory-gb", "80").unwrap();
-        let daemon =
-            of_daemon(Some(&told), env(&[(super::super::MEMORY_VAR, "60"), ("BLAZE_OPT", "2")]));
+    fn a_daemon_started_with_another_value_drifts_by_that_setting_alone() {
+        let daemon = of_daemon(env(&[("BLAZE_OPT", "2"), ("BLAZE_EMIT", "obj")]));
         assert_eq!(daemon.len(), STARTED_WITH.len());
-        let memory = daemon.iter().find(|it| it.name == super::super::MEMORY_VAR).unwrap();
-        assert_eq!(
-            memory.value.as_deref(),
-            Some("80"),
-            "the flag wins over the variable, as the budget does"
-        );
 
-        let ours = of_client(env(&[(super::super::MEMORY_VAR, "100"), ("BLAZE_OPT", "2")]));
+        let ours = of_client(env(&[("BLAZE_OPT", "3"), ("BLAZE_EMIT", "obj")]));
         let drifted = drift(&ours, &daemon);
         assert_eq!(
             drifted,
-            [Drift {
-                name: super::super::MEMORY_VAR.to_owned(),
-                theirs: Some("80".to_owned()),
-                ours: "100".to_owned()
-            }]
+            [Drift { name: "BLAZE_OPT".to_owned(), theirs: Some("2".to_owned()), ours: "3".to_owned() }]
         );
-        assert_eq!(
-            said(&drifted),
-            "BLAZE_DAEMON_MEMORY_GB: the daemon has `80`, this command `100`"
-        );
+        assert_eq!(said(&drifted), "BLAZE_OPT: the daemon has `2`, this command `3`");
 
-        let same_limit = of_client(env(&[(super::super::MEMORY_VAR, "80.0"), ("BLAZE_OPT", "2")]));
-        assert!(drift(&same_limit, &daemon).is_empty());
+        let same = of_client(env(&[("BLAZE_OPT", "2"), ("BLAZE_EMIT", "obj")]));
+        assert!(drift(&same, &daemon).is_empty());
 
         let unset = of_client(env(&[]));
         assert!(
@@ -271,7 +236,7 @@ mod tests {
     fn cores_drift_by_budget_and_priority_beside_the_other_settings() {
         let machine = blaze_core::cores::machine().unwrap();
         let default = blaze_core::cores::default_budget(machine).to_string();
-        let daemon = of_daemon(None, env(&[]));
+        let daemon = of_daemon(env(&[]));
         let ours = of_client(move |name| {
             (name == blaze_core::cores::VAR).then(|| std::ffi::OsString::from(&default))
         });

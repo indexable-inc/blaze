@@ -1,0 +1,28 @@
+[package]
+name = "blaze-findings"
+description = "Lint findings as records: per-body findings keyed like the body's check, per-item rows and workspace folds updated by the delta, deferred analyses keyed by what they read; the sans-IO scheduler of the three classes (with the answer, right after it, in the background), the wait modes and the reply, the view that joins levels, and the adoption ladder from plain Rust to strict"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# ContentId and its domain-separated BLAKE3 Hasher: lint ids, finding ids, digests.
+blaze-ids.workspace = true
+# The record kinds (`kind::Kind`, `KeyHasher`, `record::{Traced, Opaque, StableId}`) and the
+# machine descriptor the class budgets come from.
+blaze-keyed.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

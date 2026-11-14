@@ -1,10 +1,11 @@
 //! Native targets: corosensei's fibers, each on a machine stack with a guard below it.
 //!
 //! On Unix a fiber's stack is a sparse [`Region`] of blaze-mem's ([`Stack`]), so what it holds
-//! is in the memory gate's count (`blaze_mem::gate`, tag [`Tag::Frames`]): its top
-//! [`STANDING`] bytes are counted as it is made, and each deeper 64 KiB as the fiber is seen to
-//! reach it, at its switches out ([`Touch::note`]), through [`Region::reuse`], which asks the
-//! gate first. What a fiber touches below what is counted between two suspends is the one
+//! is counted to tag [`Tag::Frames`], for the profile: its top [`STANDING`] bytes are counted
+//! as it is made, and each deeper 64 KiB as the fiber is seen to reach it, at its switches out
+//! ([`Touch::note`]), through [`Region::reuse`]. Nothing refuses a stack its pages: the count
+//! reports, and the kernel's limit is the one ceiling. What a fiber touches below what is
+//! counted between two suspends is the one
 //! window the count trails; it is counted at the next suspend. Windows keeps corosensei's
 //! `DefaultStack`, uncounted: its stacks need the thread block's fields corosensei keeps.
 
@@ -25,7 +26,7 @@ use super::{RESIDENT, Resumed};
 /// on, so a depth is never under what the kernel committed for it.
 const TOUCH_PAGE: usize = 4 << 10;
 
-/// The unit a stack is reserved, guarded and counted to the gate in: blaze-mem's sparse
+/// The unit a stack is reserved, guarded and counted in: blaze-mem's sparse
 /// granule, so each range is whole pages on every page size blaze runs on.
 #[cfg(unix)]
 const GRANULE: usize = 64 << 10;
@@ -40,14 +41,14 @@ const STANDING: usize = GRANULE;
 /// How deep a fiber's stack was seen to go, at its switches out ([`Yielder::suspend`]): the
 /// bytes from its base to the page of the deepest frame that suspended, what its share of
 /// [`super::resident`] is. A lower bound of what the stack committed: a recursion that
-/// returned before any suspend is not seen. On Unix it owns the stack's mapping, whose count to
-/// the gate it grows to that depth.
+/// returned before any suspend is not seen. On Unix it owns the stack's mapping, whose count it
+/// grows to that depth.
 struct Touch {
     /// The stack's base, its highest address.
     base: usize,
     /// Bytes counted into [`RESIDENT`] for it.
     held: AtomicU64,
-    /// The stack's mapping: what the gate counts of it is its `held`, from the top down.
+    /// The stack's mapping: what is counted of it is its `held`, from the top down.
     #[cfg(unix)]
     region: blaze_mem::Region,
 }
@@ -66,11 +67,10 @@ impl Touch {
         self.count_to(held as usize);
     }
 
-    /// Counts the stack to the gate down to `depth` bytes below its base, in whole granules:
-    /// the bytes past what it counted, through [`blaze_mem::Region::reuse`]. The fiber is
-    /// already on those pages, so a gate that refuses them fails the job that grew its stack
-    /// there, naming it (rule panics-fail-one-job): the pages leave the process with the
-    /// stack, and the gate never counts less than the job went on holding.
+    /// Counts the stack down to `depth` bytes below its base, in whole granules: the bytes
+    /// past what it counted, through [`blaze_mem::Region::reuse`]. The fiber is already on
+    /// those pages, so a kernel that refuses the advice fails the job that grew its stack
+    /// there, naming it (rule panics-fail-one-job).
     #[cfg(unix)]
     fn count_to(&self, depth: usize) {
         let reserved = self.region.reserved();
@@ -81,8 +81,8 @@ impl Touch {
         }
         if let Err(error) = self.region.reuse(reserved - need, need - counted) {
             panic!(
-                "a fiber's stack reached {depth} B deep, past the {counted} B the memory gate \
-                 counted for it, and the gate refused the {} B more: {error} (blaze-graph \
+                "a fiber's stack reached {depth} B deep, past the {counted} B counted for it, \
+                 and counting the {} B more failed: {error} (blaze-graph \
                  sched/stack/native.rs, rule no-fallback)",
                 need - counted
             );
@@ -125,12 +125,11 @@ pub struct Stack {
 
 impl Stack {
     /// A stack of at least `bytes` above its guard. On Unix its top [`STANDING`] bytes are
-    /// counted to the gate now: the floor of a fiber's start, one reservation, one `mprotect`
-    /// and the gate's one compare-and-swap.
+    /// counted now: the floor of a fiber's start, one reservation and one `mprotect`.
     ///
     /// # Errors
     ///
-    /// Where the address space cannot be reserved, the guard cannot be set, or the gate
+    /// Where the address space cannot be reserved, the guard cannot be set, or the kernel
     /// refuses the standing bytes, each naming the stack.
     #[cfg(unix)]
     pub fn new(bytes: usize) -> io::Result<Stack> {
@@ -281,7 +280,7 @@ impl<I, O> Drop for Stackful<I, O> {
             // Its stack is unmapped: its pages are no longer the process's.
             RESIDENT.fetch_sub(self.1.held.load(Ordering::Relaxed), Ordering::Relaxed);
             // SAFETY: dropped once, here, after the coroutine that ran on its mapping; on Unix
-            // the mapping goes with it, and its count leaves the gate.
+            // the mapping goes with it, and its count with it.
             unsafe { ManuallyDrop::drop(&mut self.1) };
         }
         // A coroutine leaked mid-job keeps its stack mapped, and counted.
@@ -423,7 +422,7 @@ mod tests {
         std::hint::black_box(&frame)[100].wrapping_add(below)
     }
 
-    /// The invariant: a fiber's stack is in the gate's count from its start, by its standing
+    /// The invariant: a fiber's stack is in its tag's count from its start, by its standing
     /// bytes, and as deep as it is seen to reach at each suspend; its count leaves with it.
     /// 2 MiB of frames suspended from leave the stack's region holding at least 2 MiB; a fresh
     /// stack holds exactly [`STANDING`]. The control, by removing the cause: a fiber that

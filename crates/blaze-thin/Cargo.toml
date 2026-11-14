@@ -35,6 +35,8 @@ blaze-screen.workspace = true
 # the handover writes and a solo answer's kept record holds. blaze-cargo links it everywhere,
 # the wasm seed too.
 blaze-certify.workspace = true
+# `[serve] host` of blaze's `config.toml` (`host.rs`): where a command's build is served.
+toml.workspace = true
 
 # The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
 # blaze-engine take from here) links none of these, so the wasm seed builds none of them.

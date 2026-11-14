@@ -67,11 +67,36 @@ impl Resolved {
     }
 }
 
-/// What `blaze::wall_clock` reports, after the configured entries: clippy refuses a `lint` key
-/// in `clippy.toml`, so the lint knows its paths, and an entry configured for one wins.
-const WALL_CLOCK: [&str; 3] =
-    ["std::time::Instant::now", "std::time::SystemTime::now", "std::time::Instant::elapsed"];
+/// The paths blaze's own lints report through this table, after the configured entries, each
+/// with its lint and reason: clippy refuses a `lint` key in `clippy.toml`, so the lints know
+/// their paths, and an entry configured for one wins. A path whose crate the linted crate does
+/// not depend on resolves to nothing and is skipped.
+const BUILT_IN: [(&str, blaze::Lint, &str); 19] = [
+    ("std::time::Instant::now", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::SystemTime::now", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::Instant::elapsed", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::time::SystemTime::elapsed", blaze::Lint::WallClock, WALL_CLOCK_REASON),
+    ("std::thread::sleep", blaze::Lint::WallClock, SLEEP_REASON),
+    ("std::thread::sleep_ms", blaze::Lint::WallClock, SLEEP_REASON),
+    ("std::sync::mpsc::channel", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("std::sync::mpmc::channel", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("crossbeam_channel::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("crossbeam::channel::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("tokio::sync::mpsc::unbounded_channel", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("flume::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("async_channel::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("futures::channel::mpsc::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("futures_channel::mpsc::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("kanal::unbounded", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("kanal::unbounded_async", blaze::Lint::UnboundedChannel, UNBOUNDED_CHANNEL_REASON),
+    ("std::process::exit", blaze::Lint::ProcessExit, EXIT_REASON),
+    ("std::process::abort", blaze::Lint::ProcessExit, ABORT_REASON),
+];
 const WALL_CLOCK_REASON: &str = "a core reads time from its injected clock, `advance_clock(now)` (AGENTS.md rule 14); drivers read the wall clock";
+const SLEEP_REASON: &str = "a sleep waits on the wall clock: a core waits for a deadline on its injected clock and a driver does the sleeping (AGENTS.md rule 14), so a test runs it in simulated time";
+const UNBOUNDED_CHANNEL_REASON: &str = "a channel with no bound lets a fast sender grow it until memory runs out, and nothing slows the sender: make it bounded (`crossbeam_channel::bounded(n)`, `mpsc::sync_channel(n)`) so a full channel pushes back";
+const EXIT_REASON: &str = "`exit` runs no destructor of any thread's stack, so a buffered writer, a temporary file and a lock file are left as they are: return from `main` (`-> ExitCode`, or `-> Result<(), E>` with a typed error); a binary's entry module may exit";
+const ABORT_REASON: &str = "`abort` runs no destructor and flushes nothing, and takes every other job of the process with it: return a typed error, or panic so one job fails (AGENTS.md rule 20); where nothing can unwind (an allocator out of memory), say so with `#[expect(blaze::process_exit, reason = \"..\")]`";
 
 /// The `disallowed-*` entries of `key`'s configuration, resolved as `krate` names their paths:
 /// once per crate and configuration.
@@ -134,7 +159,7 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             entries.push(Entry { kind, entry, blaze, replacement });
         }
     }
-    for path in WALL_CLOCK {
+    for (path, lint, reason) in BUILT_IN {
         let defs: Vec<ModuleDef> =
             resolve(db, krate, path).into_iter().filter(|it| of_kind(*it, Kind::Methods)).collect();
         if defs.is_empty() {
@@ -145,17 +170,12 @@ pub(crate) fn disallowed_defs(db: &base_db::Db, krate: base_db::Crate, key: Conf
             resolved.by_def.entry(def).or_insert(at);
         }
         let entry = Disallowed {
-            path: (*path).to_owned(),
-            reason: Some(WALL_CLOCK_REASON.to_owned()),
-            lint: Some(format!("blaze::{}", blaze::Lint::WallClock.name())),
+            path: path.to_owned(),
+            reason: Some(reason.to_owned()),
+            lint: Some(format!("blaze::{}", lint.name())),
             ..Disallowed::default()
         };
-        entries.push(Entry {
-            kind: Kind::Methods,
-            entry,
-            blaze: Some(blaze::Lint::WallClock),
-            replacement: None,
-        });
+        entries.push(Entry { kind: Kind::Methods, entry, blaze: Some(lint), replacement: None });
     }
     resolved.entries = entries.into_boxed_slice();
     resolved.errors = errors.into_boxed_slice();
@@ -270,6 +290,13 @@ fn on(cx: &Cx<'_, '_>, entry: &Entry) -> bool {
     }
 }
 
+/// Whether an entry of the crate's configuration that is on names `def`: a lint of blaze's
+/// whose places a ban of the item already reports leaves them to the ban (`blaze::lock_unwrap`
+/// beside a ban of std's locks).
+pub(crate) fn banned(cx: &Cx<'_, '_>, def: ModuleDef) -> bool {
+    cx.disallowed().of(def).is_some_and(|entry| entry.blaze.is_none() && on(cx, entry))
+}
+
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on(Implemented::DisallowedTypes)
         && !cx.on(Implemented::DisallowedMethods)
@@ -279,7 +306,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     if Kind::ALL.iter().all(|it| cx.conf().value(it.key()).is_none())
-        && !cx.on_blaze(blaze::Lint::WallClock)
+        && !BUILT_IN.iter().any(|(_, lint, _)| cx.on_blaze(*lint))
     {
         return;
     }
@@ -361,6 +388,12 @@ fn module_of<'t>(cx: &Cx<'_, 't>, node: ast::Node<'t>) -> Option<hir::Module> {
 /// Whether `entry` allows `node` by its module: `crate::driver` allows `crate::driver` and the
 /// modules inside it. A node whose module is not known is not allowed.
 fn allowed<'t>(cx: &Cx<'_, 't>, entry: &Entry, node: ast::Node<'t>) -> bool {
+    // `blaze::process_exit` leaves a binary's entry module alone: the process is its to end.
+    if entry.blaze == Some(blaze::Lint::ProcessExit)
+        && module_of(cx, node).is_some_and(|it| !blaze::library_code(cx, it))
+    {
+        return true;
+    }
     if entry.entry.allow_in.is_empty() {
         return false;
     }
@@ -385,8 +418,8 @@ fn allowed<'t>(cx: &Cx<'_, 't>, entry: &Entry, node: ast::Node<'t>) -> bool {
 
 /// What `path` names, for [`Retarget`]: in a use tree of the file's items, each namespace's
 /// item, since the `use` imports them all (`serde::Serialize` is a trait and a derive); else the
-/// one item the path means.
-fn names(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Names {
+/// one item the path means. The one home of it: `blaze::glob_import`'s fix asks it too.
+pub(crate) fn names(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Names {
     let def = |it: Option<PathResolution<'_>>| match it {
         Some(PathResolution::Def(it)) => Some(it),
         _ => None,

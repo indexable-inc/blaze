@@ -656,11 +656,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     }
 
     /// What a literal in a pattern of type `ty` asks.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a `line!()` or `column!()` pattern asks the line or column it is written at"
+    )]
     fn constant_ask<'t>(&self, ty: Ty<'db>, literal: hir_def::hir::ExprId) -> Option<Ask<'t>>
     where
         'a: 't,
     {
         let store = self.store;
+        let expr = literal;
         // A negated literal is one `Literal::negate` takes: an integer or a float.
         let (literal, negated) = match store.expr(literal) {
             Expr::Literal(it) => (it, false),
@@ -672,6 +677,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let signed = matches!(ty.kind(), TyKind::Int(_));
         let ordered = |value: u128| if signed { value ^ (1 << 127) } else { value };
+        // A `line!()` or `column!()` pattern asks the line or column its call is written at,
+        // not the placeholder the store holds. One written nowhere asks nothing this can
+        // follow (every arm is reached); lowering the pattern refuses it by name.
+        if !negated && let Literal::Uint(..) = literal {
+            match hir_ty::body_store::placed_literal(self.db, self.store_owner, expr) {
+                Ok(Some(Literal::Uint(it, _))) => return Some(Ask::Int(ordered(it))),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
         Some(match *literal {
             Literal::Bool(it) => Ask::Bool(it),
             Literal::Char(it) => Ask::Int(u128::from(it)),

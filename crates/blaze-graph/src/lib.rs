@@ -6,10 +6,10 @@
 //! it. [`trace`] keeps a build's inputs, so a build replays as a test.
 //!
 //! [`plane`] is the same graph for every request a daemon has under way
-//! (docs/v2/plan.md): single flight, fair share, critical path and memory
-//! admission, against forecasts from [`admission`]'s peaks, for throughput only: every commit
-//! passes the one gate, `blaze_mem::budget::Budget`, and [`arena`] measures what each task
-//! does hold. It remembers no result: a key done before is the [`Memo`]'s,
+//! (docs/v2/plan.md): single flight, fair share and critical path. A task starts when a thread
+//! of its pool is free: admission is by cores only, and nothing holds a task back, wounds it or
+//! refuses it for memory (the kernel's limit is the one ceiling). [`arena`] measures what each
+//! task holds, for the profile. It remembers no result: a key done before is the [`Memo`]'s,
 //! the query database's. [`Machine`] is the plane with one request.
 //!
 //! [`pool`] is the threads the plane's tasks run on, one per core, stealing work nearest first
@@ -20,10 +20,6 @@
 //! the workspace load, codegen with its store writes, links and test runs (docs/v2/plan.md
 //! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
 //! other.
-//!
-//! [`ledger`] is the machine's ledger in shared memory (docs/v2/plan/design/end-state/memory.md,
-//! section 4.5): every blaze process of the user on the host reserves its memory and takes its
-//! cores' tokens there, so together they never pass the machine.
 //!
 //! [`sched`] is the scheduler the pool and the pump are to become (docs/v2/plan/design/fibers.md):
 //! a state machine with no thread, clock or sleep, in which a waiting job holds no thread.
@@ -39,7 +35,7 @@
 // wasm: the fibers' switch of `__stack_pointer` (`sched::stack`'s wasm layer).
 #![cfg_attr(target_family = "wasm", feature(asm_experimental_arch))]
 // `#[blaze::nonblocking]` / `#[blaze::noalloc]` (docs/v2/plan/design/effects.md) and
-// `#![blaze::sans_io]` (`ledger`); inert under rustc.
+// `#![blaze::sans_io]`; inert under rustc.
 #![register_tool(blaze)]
 
 pub mod admission;
@@ -47,16 +43,12 @@ pub mod arena;
 pub mod build;
 #[allow(unsafe_code)]
 pub mod exec;
-pub mod giveback;
-pub mod ledger;
-pub mod lines;
 pub mod machine;
 #[allow(unsafe_code)]
 pub mod par;
 pub mod plane;
 #[allow(unsafe_code)]
 pub mod pool;
-pub mod poolgive;
 #[allow(unsafe_code)]
 pub mod pump;
 pub mod sched;
@@ -67,14 +59,12 @@ pub mod trace;
 pub mod wait;
 
 pub use machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec};
-pub use arena::Budget;
 pub use plane::{
     Key, Memo, NoMemo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
 };
 
 /// A task stopped before its end because going on could not end: a wait that would close a
-/// cycle of waits (#1301), memory that could not be had while every holder waits for more, or
-/// its request ended. Its task is posted again whole; nothing of it is kept.
+/// cycle of waits (#1301), or its request ended. Its task is posted again whole; nothing of it is kept.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cancelled;
 

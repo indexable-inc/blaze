@@ -20,14 +20,14 @@
 //! - the plane's queued and running tasks from the table the loop publishes for the explorer
 //!   (`blaze_explore::Tasks`), taken only if no one holds it ([`Inspected::tasks_unread`] says
 //!   when it could not be);
-//! - memory: the footprint, the ceiling the guard stops the daemon at, the limit admission
-//!   decides by, and each subsystem's bytes (`blaze_mem::tag::snapshot`);
+//! - memory: the footprint, the number the kernel enforces, and each subsystem's bytes
+//!   (`blaze_mem::tag::snapshot`);
 //! - the loop's turns and the pool's workers, so a reader sees a loop that does not turn.
 //!
 //! What it cannot see, and says nothing false about: a job parked on a fiber keeps its open
 //! spans off every thread, so its wait is in [`Inspected::job_waits`] (with no age: the
-//! scheduler times no wait) and not in [`Inspected::longest`]; and a queued task's reason
-//! (memory, a thread) is in its `admission` span only once it starts.
+//! scheduler times no wait) and not in [`Inspected::longest`]; and a queued task's wait for a
+//! thread is in its `admission` span only once it starts.
 //!
 //! With [`Asked::record`] it also writes a flight recording ([`super::flightrec`]) and names
 //! the file.
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use super::{flightrec, pulse::Pulse};
 
 /// The version of [`Asked`] and [`Answer`]. A change to any type here is a new number.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 /// How long the scheduler's lock is waited for.
 const WAITS_READ: Duration = Duration::from_secs(1);
@@ -151,12 +151,6 @@ pub struct Turn {
 pub struct Memory {
     /// Each subsystem's bytes in use, largest first.
     pub tags: Vec<(String, u64)>,
-    /// What admission decides by: the memory the daemon may hold in all.
-    pub limit: u64,
-    /// The footprint the guard stops the daemon at; 0 for none.
-    pub ceiling: u64,
-    /// `over` its limit, `near` (past 7/8 of it) or `under`: whether admission holds tasks back.
-    pub admission: String,
     /// The footprint, the number the kernel enforces; `None` when it could not be read.
     pub footprint: Option<u64>,
     /// The global heap by holder, largest first: each tag's and `outside` (no task's).
@@ -308,16 +302,6 @@ pub fn longest(threads: &[Thread], locks: &[LockWait]) -> Vec<Waiting> {
     waits
 }
 
-/// Whether admission holds tasks back, from the footprint and the limit it decides by.
-pub fn admission(footprint: Option<u64>, limit: u64) -> &'static str {
-    match footprint {
-        Some(footprint) if footprint >= limit => "over",
-        Some(footprint) if footprint >= limit / 8 * 7 => "near",
-        Some(_) => "under",
-        None => "unknown",
-    }
-}
-
 /// The plane's unsettled tasks from the explorer's table, each joined with the thread inside
 /// its `task` span: running first, then queued, each longest first. `Err` when the table is
 /// held (the loop is writing it, or stuck holding it).
@@ -445,8 +429,6 @@ impl Inspector {
             Err(why) => (Vec::new(), Some(why)),
         };
         let footprint = crate::raw::memory::own_footprint_now();
-        // The memory gate's ceiling: what the daemon may commit in all (`blaze_mem::gate`).
-        let limit = blaze_mem::gate::process().ceiling();
         // alloc: an answer, on demand
         let snapshot = blaze_mem::tag::snapshot();
         let mut tags: Vec<(String, u64)> = blaze_mem::Tag::ALL
@@ -480,9 +462,6 @@ impl Inspector {
             tasks,
             memory: Memory {
                 tags,
-                limit,
-                ceiling: super::ceiling::ceiling(),
-                admission: admission(footprint, limit).to_owned(),
                 footprint,
                 heap,
                 regions: snapshot.resident_committed(),
@@ -704,9 +683,6 @@ mod tests {
             tasks: Vec::new(),
             memory: Memory {
                 tags: vec![("Store".to_owned(), 1 << 20)],
-                limit: 80 << 30,
-                ceiling: 0,
-                admission: admission(Some(75 << 30), 80 << 30).to_owned(),
                 footprint: Some(75 << 30),
                 heap: vec![Heap {
                     holder: "query".to_owned(),
@@ -734,7 +710,6 @@ mod tests {
                     runs: 0,
                     macros: 3,
                     msls: 0,
-                    release: false,
                     readers: 1,
                 },
                 held: 40,
@@ -742,7 +717,6 @@ mod tests {
             }],
             expansion: Some(Expansion { alive: 4, idle: 0, queued: 0, asking: 4, cap: 256 }),
         };
-        assert_eq!(inspected.memory.admission, "near");
         let answer = Answer::Inspected(Box::new(inspected));
         let bytes = blaze_protocol::cbor::to_vec(&answer).unwrap();
         blaze_protocol::cbor::check(&bytes).unwrap();

@@ -52,8 +52,6 @@ anyhow.workspace = true
 # The host's target triple, which names the release archive a pin fetches (`versions.rs`).
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
-# mimalloc, a heap per blaze-mem tag (`heaps.rs`), on base pages (`huge.rs`).
-libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 blaze-mem.workspace = true
 # Reported bugs leave the binary's exit status alone (`program.rs`): its daemon says them.
 stdx.workspace = true
@@ -105,8 +103,6 @@ blaze-codegen-code.workspace = true
 # tests/revisions/oracle.rs: the drawn sequences of the real driver's oracle.
 hegeltest.workspace = true
 blaze-alloc-count.workspace = true
-# tests/malloc.rs: an LLVM context made and disposed of in a task, through LLVM's C API.
-llvm-sys.workspace = true
 # as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
 blaze-codegen-code.workspace = true
 # versions.rs's tests pack a release's `.tar.xz`.
@@ -116,12 +112,11 @@ lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 default = ["native"]
 # Everything the native blaze has and the wasm seed leaves out, as one switch (blaze-cargo's
 # `native`: LLVM and its stencils, HTTPS, `blaze explore`, the terminal view, the daemon,
-# `blaze pprof`) and mimalloc as the general allocator, a heap per blaze-mem tag. LLVM is why
-# every real build has it: std and every opt-level 2/3 unit are compiled by LLVM alone.
-native = ["blaze-cargo/native", "dep:libmimalloc-sys"]
+# `blaze pprof`). LLVM is why every real build has it: std and every opt-level 2/3 unit are
+# compiled by LLVM alone.
+native = ["blaze-cargo/native"]
 # The wasm seed: `--no-default-features --features seed`, which has no C (docs/future/bootstrap.md,
-# "The seed has no C"): the committed stencil libraries (blaze-stencil's `prebuilt/`), std's
-# allocator, no network, and rsasm as the assembler, which has no LLVM. blake3 takes its wasm32
+# "The seed has no C"): the committed stencil libraries (blaze-stencil's `prebuilt/`), no network, and rsasm as the assembler, which has no LLVM. blake3 takes its wasm32
 # SIMD128 code on every wasm32 build (the root manifest).
 seed = ["hir-ty-codegen/rsasm"]
 

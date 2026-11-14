@@ -228,7 +228,7 @@ impl<'p> Scope<'p> {
         live.last.set(name);
         let frame = match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
             Ok(frame) => frame,
-            Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. } | blaze_mem::MemError::CoreFull { .. }) => {
+            Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. }) => {
                 let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
                 let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
                 return Task { name, outcome: Err(error), scope: PhantomData };

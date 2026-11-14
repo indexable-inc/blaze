@@ -12,12 +12,10 @@
 //! one thread that reaps the daemon's children: stuck inside a turn (lane reaphang,
 //! 2026-11-03), it left them zombies and its clients waiting, and nothing said so.
 //!
-//! At each look, every [`super::ceiling::EVERY`] at least, before a stop and during one, it
-//! reads the daemon's footprint against its memory ceiling ([`super::ceiling`], judged by
-//! [`CeilingWatch`]): past it, the daemon writes what it held by tag and what each thread was
-//! inside, and ends ([`Exit::MemoryCeiling`]). A look allocates nothing and takes no lock.
+//! It watches no memory: the kernel's limit is the daemon's one ceiling (its own watch of the
+//! footprint against a ceiling was deleted with memory admission, 2026-11-13).
 //!
-//! At each look too, before a stop and during one, it names the stalls in the wait-for graph
+//! At each look, before a stop and during one, it names the stalls in the wait-for graph
 //! of named locks, signals and kernel waits ([`Stalls`], blaze-core's `lock::graph`): once a
 //! wait is older than [`STALL_THRESHOLD`], each deadlock and each convoy is said once as a
 //! `blaze::stall` event while it lasts, and the top one's line goes in each build's live model
@@ -39,9 +37,8 @@ use blaze_profile::{Watchdog, watchdog::Progress};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use super::{
-    ceiling::{EASED, Gib, NEAR, STOPPED},
     flightrec,
-    pulse::{CeilingLook, CeilingWatch, Look, LoopWatch, Pulse, StallWatch},
+    pulse::{Look, LoopWatch, Pulse, StallWatch},
     signals,
 };
 
@@ -58,10 +55,6 @@ const STALL_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long the guard waits for the scheduler's lock to read its waits: a deadlock may hold it.
 const WAITS_READ: Duration = Duration::from_secs(2);
-
-/// How long a daemon past its memory ceiling waits for the scheduler's lock to name its waits:
-/// its workers go on taking memory meanwhile.
-const WAITS_READ_AT_CEILING: Duration = Duration::from_millis(250);
 
 /// What a stop that ended so says first: `blaze serve: pid 7 stop stalled: ...`.
 pub const STALLED: &str = " stop stalled: ";
@@ -100,10 +93,9 @@ pub fn arm(bound: Duration, pulse: Arc<Pulse>) -> anyhow::Result<Guard> {
     Ok(Guard { done, thread })
 }
 
-/// How often the guard looks: ten looks a bound, between 10 ms and 1 s apart, and at least
-/// every [`super::ceiling::EVERY`], the footprint's watch.
+/// How often the guard looks: ten looks a bound, between 10 ms and 1 s apart.
 fn look_every(bound: Duration) -> Duration {
-    (bound / 10).clamp(Duration::from_millis(10), Duration::from_secs(1)).min(super::ceiling::EVERY)
+    (bound / 10).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
 fn now_ns() -> u64 {
@@ -117,13 +109,10 @@ fn guard(pipe: std::fs::File, bound: Duration, pulse: &Pulse, over: &Receiver<()
     let mut watchdog = Watchdog::new(bound);
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
-    let mut memory = Memory::default();
     let mut stalls = Stalls::new(bound);
     let pid = std::process::id();
     loop {
-        // A stop that writes its image takes memory too: held to the ceiling as before it.
-        memory.look(pid);
-        // And may stall on a lock: named as before it.
+        // A stop may stall on a lock: named as before it.
         stalls.look(pid, pulse);
         let progress = Progress {
             jobs: pool.ended(),
@@ -196,13 +185,11 @@ fn watch_turns(
     let pool = blaze_graph::exec::shared();
     let every = look_every(bound);
     let pid = std::process::id();
-    let mut memory = Memory::default();
     let mut stalls = Stalls::new(bound);
     loop {
         if !matches!(over.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)) {
             return false;
         }
-        memory.look(pid);
         stalls.look(pid, pulse);
         let now = now_ns();
         let turns = pulse.turns();
@@ -384,102 +371,6 @@ fn said(pid: u32, stall: &Stall, now_ns: u64) {
     );
     // logged: the event above
     eprintln!("blaze serve: pid {pid} stall: {line}");
-}
-
-/// What a guard that can't read the daemon's footprint says, once until it reads it again.
-const UNREAD: &str = "its footprint is unread, so its own watch holds it to no memory ceiling until \
-     a read comes back (the kernel's limit, where its ceiling's line names one, still holds it)";
-
-/// The guard's watch of the daemon's footprint against its memory ceiling: the driver of
-/// [`CeilingWatch`], which reads the ceiling ([`super::ceiling::ceiling`]) and the footprint as
-/// the system counts it ([`crate::raw::memory::own_footprint`], as `blaze_mem::tag::resident_by`
-/// reads it for admission), says a footprint near the ceiling or eased from it once, and ends
-/// the daemon past it ([`passed`]).
-#[derive(Debug, Default)]
-struct Memory {
-    watch: CeilingWatch,
-    /// The last look could not read the footprint, and said so.
-    unread: bool,
-}
-
-impl Memory {
-    /// One look. Allocates nothing and takes no lock on a look that finds the footprint under
-    /// the ceiling and no nearer or further than before (an atomic's load and one read of the
-    /// kernel's: `proc_pid_rusage` on macOS; on Linux the daemon's cgroup's `memory.current`
-    /// and `memory.stat`, or `/proc/self/statm` where it has none, into buffers of the stack);
-    /// a line is said only at a crossing.
-    fn look(&mut self, pid: u32) {
-        let ceiling = super::ceiling::ceiling();
-        if ceiling == 0 {
-            return;
-        }
-        let Some(footprint) = crate::raw::memory::own_footprint() else {
-            if !self.unread {
-                self.unread = true;
-                tracing::error!(target: "blaze", "blaze serve: pid {pid}: {UNREAD}");
-                // logged: the event above
-                eprintln!("blaze serve: pid {pid}: {UNREAD}");
-            }
-            return;
-        };
-        self.unread = false;
-        let mut look = self.watch.look(footprint, ceiling);
-        let mut footprint = footprint;
-        if look == CeilingLook::Purge {
-            // Past the ceiling: what the allocators keep freed goes back first, and only a
-            // footprint still past it after that ends the daemon. The purge reads it once every
-            // worker gave back its heaps' free pages (or its wait passed), on this thread, the
-            // guard's, never the loop's: a reading at once still held what they kept.
-            let purged = crate::raw::memory::purge();
-            footprint = purged.after.unwrap_or(footprint);
-            look = self.watch.look(footprint, ceiling);
-            tracing::warn!(
-                target: "blaze",
-                "blaze serve: pid {pid} passed its memory ceiling of {ceiling} bytes and purged what its allocators kept freed: {footprint} bytes after, {} returned, workers' give-back {:?}",
-                purged.returned(),
-                purged.settle,
-            );
-        }
-        let (at, of) = (Gib(footprint), Gib(ceiling));
-        let line = match look {
-            CeilingLook::Under => return,
-            CeilingLook::Near => NEAR,
-            CeilingLook::Eased => EASED,
-            // A purge gave back too little: the second look ends it.
-            CeilingLook::Purge | CeilingLook::Passed => passed(pid, footprint, ceiling),
-        };
-        // A crossing's line, once a crossing: written straight to stderr, which buffers nothing.
-        tracing::warn!(
-            target: "blaze",
-            "blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)"
-        );
-        // logged: the event above
-        eprintln!("blaze serve: pid {pid}{line}{footprint} bytes of {ceiling} bytes ({at} of {of} GiB)");
-    }
-}
-
-/// The daemon's footprint, `footprint` bytes, passed its ceiling, `ceiling`: it writes its
-/// postmortem to its log first (what it holds by tag, as its memory line says it, then the
-/// ceiling, the footprint, what each thread is inside, the scheduler's waits and the children
-/// not reaped), then ends with [`Exit::MemoryCeiling`], which the client a request hung up on
-/// reads from that line and says as a failure naming the ceiling (`cli::daemon::Died`).
-fn passed(pid: u32, footprint: u64, ceiling: u64) -> ! {
-    super::daemon::log_memory(&blaze_mem::tag::snapshot());
-    // alloc: once, as the process ends
-    let said = format!(
-        "blaze serve: pid {pid}{STOPPED}{footprint} bytes passed {ceiling} bytes ({} of {} GiB): it ends with exit status {}; {}",
-        Gib(footprint),
-        Gib(ceiling),
-        Exit::MemoryCeiling,
-        inside_within(WAITS_READ_AT_CEILING),
-    );
-    tracing::error!(target: "blaze", "{said}");
-    // logged: the event above
-    eprintln!("{said}");
-    // The recorder's last seconds only: the daemon is over its memory, and its workers go on
-    // taking more while this is written.
-    _ = flightrec::record(flightrec::Why::MemoryCeiling, &said, flightrec::WINDOW_AT_CEILING);
-    signals::exit_now(Exit::MemoryCeiling);
 }
 
 /// Without its pipe the guard hears no stop: said, and the stop runs unbounded.

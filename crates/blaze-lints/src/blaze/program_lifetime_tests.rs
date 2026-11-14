@@ -13,7 +13,8 @@ use crate::{
     tests::lint,
 };
 
-const FLAGS: &str = "-A clippy::all -A blaze::general --warn=blaze::edition";
+// `program_lifetime` is `blaze::edition`'s; the two suggestions are `blaze::suggest`'s.
+const FLAGS: &str = "-A clippy::all -A blaze::general --warn=blaze::edition --warn=blaze::suggest";
 
 /// A `std` with the pointers and the cells the lints know by path, and a `blaze_mem` with
 /// the arena's two types.

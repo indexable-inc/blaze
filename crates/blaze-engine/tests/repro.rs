@@ -69,6 +69,34 @@ fn shared_root() -> PathBuf {
     Path::new("/tmp").join(format!("blaze-repro-{hash:016x}"))
 }
 
+/// Where the run's builds are served: `[serve] host` of the `config.toml` of the blaze home this
+/// test process runs under (`blaze_thin::host`, the one setting a command reads), so the same
+/// cases run against a daemon or in each command's own process by that one setting and no
+/// other. Each shared case's home is given the same (`served_as_this_run_is`); a case with a
+/// home of its own ([`Case::own`]) tests a daemon's own life and keeps the daemon.
+fn serve_host() -> blaze_thin::host::Host {
+    static HOST: std::sync::OnceLock<blaze_thin::host::Host> = std::sync::OnceLock::new();
+    *HOST.get_or_init(|| {
+        let Ok(home) = blaze_manifest::user_config::home() else { return blaze_thin::host::Host::Daemon };
+        let file = blaze_manifest::user_config::file(&home);
+        match fs::read_to_string(&file) {
+            Ok(text) => blaze_thin::host::Host::from_toml(&text).unwrap_or_else(|why| panic!("{}: {why}", file.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => blaze_thin::host::Host::Daemon,
+            Err(error) => panic!("{} can't be read: {error}", file.display()),
+        }
+    })
+}
+
+/// `home`'s `config.toml` says this run's host ([`serve_host`]); nothing is written for the
+/// daemon, the default.
+fn served_as_this_run_is(home: &Path) {
+    let host = serve_host();
+    if host != blaze_thin::host::Host::Daemon {
+        let text = format!("[{}]\n{} = \"{}\"\n", blaze_thin::host::SECTION, blaze_thin::host::KEY, host.word());
+        fs::write(blaze_manifest::user_config::file(home), text).unwrap();
+    }
+}
+
 /// How long a past run's shared root ([`shared_root`]) is kept with no case made or removed in
 /// it and no daemon at its socket: then it is another build's of this binary, done.
 const PAST_RUN_KEPT: Duration = Duration::from_secs(60 * 60);
@@ -151,6 +179,7 @@ impl Case {
         let dir = root.join(property);
         copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/repro").join(property), &dir);
         fs::create_dir_all(&home).unwrap();
+        served_as_this_run_is(&home);
         fs::create_dir_all(&cache).unwrap();
         Case { root, dir, home, cache, owns_root: true, owns_daemon: false }
     }

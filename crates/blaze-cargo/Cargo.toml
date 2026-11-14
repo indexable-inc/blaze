@@ -84,6 +84,8 @@ blaze-ui.workspace = true
 blaze-units.workspace = true
 blaze-registry.workspace = true
 blaze-report.workspace = true
+# `blaze cache push | pull | status | keys`: the shared cache in an object bucket.
+blaze-remote.workspace = true
 # `.crate` files and `blaze fetch-url`: bytes by their digest, kept in the store.
 blaze-fetch.workspace = true
 # The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).
@@ -151,8 +153,6 @@ crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
 # What a build shows: the screen's one core, driven by `cli/show.rs` (docs/terminal.md).
 blaze-screen.workspace = true
-# `extended`: the `mi_collect` binding.
-libmimalloc-sys = { workspace = true, optional = true, features = ["extended"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
@@ -186,7 +186,7 @@ default = ["native"]
 # leaves out, as one switch: LLVM as a code producer and the stencils it makes at build time
 # (hir-ty-codegen's `llvm`), fetching over HTTPS (rustls on ring) and the global cache's client
 # (`net`), `blaze explore` and `blaze debug sql`'s Arrow IPC (blaze-explore, on Flecs and
-# blaze-http's HTTP/3), mimalloc as the allocator (`raw::memory::purge_freed_pages` asks it), `blaze tree` and `blaze metadata` (blaze-metadata
+# blaze-http's HTTP/3), `blaze tree` and `blaze metadata` (blaze-metadata
 # fetches over the network), `blaze serve`
 # with its socket (`socket.rs`) and the CLI's client of it (`cli/daemon.rs`), and `blaze pprof`
 # (`cli/pprof.rs`). Without it each command runs the same engine in its own process for its one
@@ -198,7 +198,6 @@ native = [
     "dep:blaze-explore",
     "dep:blaze-tree",
     "dep:blaze-metadata",
-    "dep:libmimalloc-sys",
 ]
 
 [lints]

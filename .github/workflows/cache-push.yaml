@@ -1,0 +1,105 @@
+name: cache-push
+
+# Pushes what CI builds on main to the shared cache (crates/blaze-remote, `blaze cache push`):
+# the plain store's segments of the public namespace, each with a statement signed by CI's
+# builder key, the index over them, the root, and the bundle of the pinned toolchain's std for
+# this runner's target, so anyone can pull them precompiled, anonymously (`blaze cache pull`).
+#
+# main only, never a pull request: no fork's code runs where these secrets are. The secrets
+# reach one step's environment and nothing else; blaze never prints them. Until the owner sets
+# them (crates/blaze-remote/src/settings.rs names each), the first step says so and the job
+# ends green.
+#
+# Repository variables (not secret): BLAZE_CACHE_ENDPOINT (https://<account>.r2.cloudflarestorage.com),
+# BLAZE_CACHE_BUCKET, BLAZE_CACHE_PUBLIC_URL, BLAZE_CACHE_PUBLIC_ANCHORS (the anchor's public
+# key, hex), BLAZE_CACHE_KEY_LIST_B64 (the signed key list, base64; it is public).
+# Secrets: BLAZE_CACHE_ACCESS_KEY_ID, BLAZE_CACHE_SECRET_ACCESS_KEY (an R2 token that may write
+# this bucket only), BLAZE_CACHE_SIGNING_SEED (CI's Ed25519 seed, 64 hex).
+on:
+  push:
+    branches: [main]
+
+# One push at a time; a later one waits rather than cancelling one mid-upload (a cancelled push
+# is safe, the next completes it, but it is wasted work).
+concurrency:
+  group: cache-push
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  BLAZE_CORES: all
+
+jobs:
+  push:
+    name: push to the shared cache
+    if: github.repository == 'indexable-inc/blaze'
+    runs-on: [ix, arm64]
+    timeout-minutes: 120
+    steps:
+      - id: configured
+        name: the cache is configured
+        env:
+          ENDPOINT: ${{ vars.BLAZE_CACHE_ENDPOINT }}
+          BUCKET: ${{ vars.BLAZE_CACHE_BUCKET }}
+          ANCHORS: ${{ vars.BLAZE_CACHE_PUBLIC_ANCHORS }}
+          KEY_LIST: ${{ vars.BLAZE_CACHE_KEY_LIST_B64 }}
+          HAS_ACCESS_KEY: ${{ secrets.BLAZE_CACHE_ACCESS_KEY_ID != '' }}
+          HAS_SECRET: ${{ secrets.BLAZE_CACHE_SECRET_ACCESS_KEY != '' }}
+          HAS_SEED: ${{ secrets.BLAZE_CACHE_SIGNING_SEED != '' }}
+        run: |
+          missing=""
+          [ -n "$ENDPOINT" ] || missing="$missing BLAZE_CACHE_ENDPOINT"
+          [ -n "$BUCKET" ] || missing="$missing BLAZE_CACHE_BUCKET"
+          [ -n "$ANCHORS" ] || missing="$missing BLAZE_CACHE_PUBLIC_ANCHORS"
+          [ -n "$KEY_LIST" ] || missing="$missing BLAZE_CACHE_KEY_LIST_B64"
+          [ "$HAS_ACCESS_KEY" = true ] || missing="$missing BLAZE_CACHE_ACCESS_KEY_ID"
+          [ "$HAS_SECRET" = true ] || missing="$missing BLAZE_CACHE_SECRET_ACCESS_KEY"
+          [ "$HAS_SEED" = true ] || missing="$missing BLAZE_CACHE_SIGNING_SEED"
+          if [ -n "$missing" ]; then
+            echo "::notice::the shared cache is not configured, nothing pushed; missing:$missing"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.configured.outputs.ok == 'true'
+        uses: actions/checkout@v7
+      - if: steps.configured.outputs.ok == 'true'
+        id: blaze
+        uses: ./.github/actions/blaze
+        with:
+          job: cache-push
+          llvm: true
+      # The tree's blaze: the release's has no `blaze cache push`.
+      - if: steps.configured.outputs.ok == 'true'
+        run: blaze build --release --locked -p blaze-engine
+      - if: steps.configured.outputs.ok == 'true'
+        run: blaze stop
+      # What CI builds, by the tree's blaze, into a home of its own whose store is pushed.
+      - if: steps.configured.outputs.ok == 'true'
+        name: build with the tree's blaze
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/cache-home
+        run: target/release/blaze build --release --locked -p blaze-engine
+      - if: steps.configured.outputs.ok == 'true'
+        name: blaze cache push
+        env:
+          BLAZE_HOME: ${{ runner.temp }}/cache-home
+          BLAZE_CACHE_ENDPOINT: ${{ vars.BLAZE_CACHE_ENDPOINT }}
+          BLAZE_CACHE_BUCKET: ${{ vars.BLAZE_CACHE_BUCKET }}
+          BLAZE_CACHE_PUBLIC_URL: ${{ vars.BLAZE_CACHE_PUBLIC_URL }}
+          BLAZE_CACHE_PUBLIC_ANCHORS: ${{ vars.BLAZE_CACHE_PUBLIC_ANCHORS }}
+          KEY_LIST_B64: ${{ vars.BLAZE_CACHE_KEY_LIST_B64 }}
+          BLAZE_CACHE_ACCESS_KEY_ID: ${{ secrets.BLAZE_CACHE_ACCESS_KEY_ID }}
+          BLAZE_CACHE_SECRET_ACCESS_KEY: ${{ secrets.BLAZE_CACHE_SECRET_ACCESS_KEY }}
+          BLAZE_CACHE_SIGNING_SEED: ${{ secrets.BLAZE_CACHE_SIGNING_SEED }}
+        run: |
+          printf '%s' "$KEY_LIST_B64" | base64 -d > "$RUNNER_TEMP/cache-keys.bin"
+          export BLAZE_CACHE_KEY_LIST="$RUNNER_TEMP/cache-keys.bin"
+          target/release/blaze stop
+          toolchain="$(cat harness/toolchain)"
+          target/release/blaze cache push "$(jq -nc --arg toolchain "$toolchain" '{toolchain: $toolchain, namespace: "public", tier: "top", bundle: {target: "aarch64-unknown-linux-gnu", cfg: "std"}}')"
+      - if: failure() && steps.configured.outputs.ok == 'true'
+        uses: ./.github/actions/daemon-log

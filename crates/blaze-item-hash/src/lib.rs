@@ -2,11 +2,12 @@
 //! and borrow check are filed under in blaze's store, and the rest of what
 //! `hir_ty::body_store` asks above hir-ty.
 //!
-//! - [`identity`]: a body's identity (section 3): its crate's inputs, its owner's interface, its
-//!   own HIR as `hir_def::item_hash` writes it with no spans, each id of it by what it is in
-//!   every database, what each of its paths resolves to, the traits in scope and the module
-//!   chain. One tracked query per body, with early cutoff.
-//! - [`reads`]: what each read of a step stands for (section 6): covered by the identity, one
+//! - [`identity`]: a body's key, made before the body is lowered
+//!   (docs/v2/plan/design/end-state/engine.md 4.2, the `Fn` record; restore.md, "The entry's
+//!   key, made before lowering"): its crate's settings, its owner by key, its module chain and
+//!   its item's own text. Nothing it resolves is in it: what a step resolves is a fact of the
+//!   step's shape, negatives included. One tracked query per body, with early cutoff.
+//! - [`reads`]: what each read of a step stands for (section 6): covered by the key, one
 //!   fact, or refused.
 //! - [`values`]: each fact's value now (section 5), lane items' and this crate's own.
 //! - [`keys`]: the item key of a definition a record names, and back.
@@ -44,63 +45,16 @@ use hir_ty::{
     next_solver::{SolverDefId, goal_store::FactRef},
 };
 
-/// Lane item-hash's side of `hir_ty::body_store`.
+/// Lane item-hash's side of `hir_ty::body_store`: a body's steps are filed under its key made
+/// before lowering ([`identity::early_identity`]) and every name its steps look up is a fact
+/// of their shape ([`reads::classify`]). The identity made from the lowered, resolved body
+/// and the switch between the two (`RecordedNames`, `reads::Names`) are deleted
+/// (end-state/engine.md section 5); `.clippy.toml` bans their names.
 pub struct Bodies;
-
-/// [`Bodies`] with name resolution's reads recorded as facts ([`reads::Names::Facts`]): the
-/// form that replaces it (docs/v2/plan/design/restore.md, "The switch and what deletes the
-/// old identity"). Installed by tests only until that paragraph's conditions hold; then
-/// `Bodies` becomes this and the type goes.
-pub struct RecordedNames;
-
-impl BodyFacts for RecordedNames {
-    fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
-        identity::early_identity(db, def).ok()
-    }
-
-    fn classify(
-        &self,
-        db: &Db,
-        def: DefWithBodyId,
-        step: Step,
-        read: blaze_query::db::DatabaseKeyIndex,
-        kind: blaze_query::db::ReadKind,
-        name: &'static str,
-    ) -> Classified {
-        reads::classify_with(db, def, step, read, kind, name, reads::Names::Facts)
-    }
-
-    fn value(&self, db: &Db, def: DefWithBodyId, fact: FactRef) -> Option<ContentId> {
-        Bodies.value(db, def, fact)
-    }
-
-    fn sealed(
-        &self,
-        db: &Db,
-        def: DefWithBodyId,
-        group: blaze_query::db::SealGroup,
-        facts: &mut Vec<FactRef>,
-    ) -> bool {
-        reads::sealed(db, def, group, facts)
-    }
-
-    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
-        Bodies.def_key(db, body, def)
-    }
-
-    fn def_of<'db>(
-        &self,
-        db: &'db Db,
-        body: DefWithBodyId,
-        key: ContentId,
-    ) -> Option<SolverDefId<'db>> {
-        Bodies.def_of(db, body, key)
-    }
-}
 
 impl BodyFacts for Bodies {
     fn identity(&self, db: &Db, def: DefWithBodyId) -> Option<ContentId> {
-        identity::identity(db, def).ok()
+        identity::early_identity(db, def).ok()
     }
 
     fn classify(

@@ -211,6 +211,113 @@ implicit_overflow = "allow"
 # line, `blaze check --deny blaze::todo` (.github/workflows/blaze.yaml, `lint-baselines`): a
 # command line's level comes after this table's.
 todo = "warn"
+# A write through a `&mut` left half done by an early exit (docs/lints.md#half_done), in
+# `internal` above and named here: many findings are deliberate (a counter bumped before a
+# fallible call), so it warns, held at each crate's count by its baseline, until the real ones are
+# fixed and the rest say why.
+half_done = "warn"
+# The rest of the suspicious-code lints (docs/lints.md#suspicious-code), in `internal` above: at
+# `warn` until each has a baseline (`blaze check --new-baseline`, once the tree can check
+# itself), since `deny` with none fails the first run; then each goes to `deny` but
+# `option_question_mark_hides` and `shadow_changes_meaning`, which stay at `warn` (many findings
+# are a judgement, not a bug).
+skipped_pair = "warn"
+hidden_exit = "warn"
+question_mark_converts = "warn"
+option_question_mark_hides = "warn"
+unseen_target = "warn"
+glob_import = "warn"
+shadow_changes_meaning = "warn"
+versioned_name = "warn"
+unused_parameter = "warn"
+fallback = "warn"
+placeholder_body = "warn"
+test_asserts_nothing = "warn"
+assertion_cannot_fail = "warn"
+test_misses_its_subject = "warn"
+ignored_without_reason = "warn"
+doc_names_nothing = "warn"
+# The complexity lints (docs/lints.md#complexity), in `internal` above: at `warn` until
+# `crates/blaze-lints/baselines/items.tsv` holds each existing item at its value (a bless, once
+# the tree can check itself), since `deny` with no held values fails every item over a bound;
+# then each goes to `deny`, and only new code is held to the bounds.
+function_weight = "warn"
+path_count = "warn"
+live_state = "warn"
+effect_breadth = "warn"
+exits = "warn"
+long_function = "warn"
+long_file = "warn"
+many_params = "warn"
+wide_type = "warn"
+deep_nesting = "warn"
+fan_out = "warn"
+module_cycle = "warn"
+# The correct-by-construction lints (docs/lints.md#correct-by-construction), in `internal`
+# above: at `warn` until a baseline holds what the tree has today. `unit_mismatch` is a bug
+# wherever it fires and goes to `deny` then; the others stay findings to fix toward a type.
+proof_forgotten = "warn"
+unit_mismatch = "warn"
+primitive_meaning = "warn"
+sentinel_value = "warn"
+state_in_flags = "warn"
+bool_pair_state = "warn"
+out_parameter = "warn"
+parallel_collections = "warn"
+untyped_index = "warn"
+validated_but_raw = "warn"
+# The claim lints (docs/lints.md#claims, docs/v2/plan/design/claims.md), in `internal` above.
+# A doc the effect walk refutes is a bug wherever it is. A promise held by nothing, a stale
+# pointer and a SAFETY comment naming no invariant are held at each crate's count by their
+# baselines (`unmeasured` until the tree can check itself), so new ones fail. A provable claim
+# warns (its fix writes the attribute); a body comment's claim is advice.
+claim_contradicts_facts = "deny"
+claim_without_evidence = "deny"
+evidence_is_stale = "deny"
+safety_without_invariant = "deny"
+claim_is_derivable = "warn"
+comment_claims = "allow"
+# The duplicate-code lints (docs/lints.md#duplicates), in `internal` above. A function, a block,
+# a type or a constant written twice and a pasted block left half renamed are denied, each held
+# at its crate's count by its baseline (`unmeasured` until the tree can check itself), so only
+# new copies fail. A near copy, a body written in several impls and the anti-unification
+# findings (one function, one test table, one generic) are a judgement of where the shared code
+# goes, so they warn. Across crates is the workspace pass's (blaze-findings), not wired yet.
+near_duplicate = "warn"
+same_impl_fn = "warn"
+extractable_duplicate = "warn"
+tests_differ_by_literal = "warn"
+impls_differ_by_type = "warn"
+duplicate_across_crates = "warn"
+# The test-strength lints (docs/lints.md#test-strength), in `internal` above: at `warn` until
+# each has a baseline (`blaze check --new-baseline`, once the tree can check itself), since
+# `deny` with none fails the first run. Then `result_part_unobserved`, `weak_assertion` and
+# `mirror_assertion` go to `deny` (a test that cannot catch the bug it is for); the other four
+# stay at `warn`, held at each crate's count, since reaching or pinning everything is a goal,
+# not a rule.
+result_part_unobserved = "warn"
+weak_assertion = "warn"
+mirror_assertion = "warn"
+pseudo_tested = "warn"
+unreached_by_tests = "warn"
+error_path_untested = "warn"
+property_over_examples = "warn"
+# The structural lints (docs/lints.md#structural), in `internal` above: code written by hand
+# that the type's structure gives. The bug forms (a field-wise body or a key pair that leaves a
+# field out, a variant list that drifted, a conversion that crosses or drops a field) are meant
+# to be `deny`; they are held at `warn` until each has a baseline (`blaze check
+# --new-baseline`, once the tree can check itself), since `deny` with none fails the first run.
+# An impl exactly the derive warns (its fix is mechanical); the rest are advice.
+impl_misses_field = "warn"
+variant_list_drift = "warn"
+conversion_misses_field = "warn"
+hand_written_derivable = "warn"
+hand_kept_variant_list = "allow"
+hand_written_codec = "allow"
+field_wise_conversion = "allow"
+hand_written_visitor = "allow"
+repeated_field_list = "allow"
+registry_spread = "allow"
 # `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
 # hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
 # code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own
@@ -448,6 +555,7 @@ blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
 blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-expansion = { path = "crates/blaze-expansion" }
 blaze-ext = { path = "crates/blaze-ext" }
 blaze-ext-host = { path = "crates/blaze-ext-host" }
 blaze-fetch = { path = "crates/blaze-fetch" }
@@ -456,10 +564,15 @@ blaze-hash = { path = "crates/blaze-hash" }
 # blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
+# The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
+blaze-keyed = { path = "crates/blaze-keyed" }
+# Lint findings as records, their three-class scheduler, wait modes and the adoption ladder.
+blaze-findings = { path = "crates/blaze-findings" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
+blaze-remote = { path = "crates/blaze-remote" }
 # The request certificate, its slot and the client's own check, with no compiler in it.
 blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
@@ -486,6 +599,8 @@ blaze-launch = { path = "crates/blaze-launch" }
 blaze-pack = { path = "crates/blaze-pack" }
 blaze-launch-host = { path = "crates/blaze-launch-host" }
 blaze-launch-rt = { path = "crates/blaze-launch-rt" }
+blaze-program = { path = "crates/blaze-program" }
+blaze-mutants = { path = "crates/blaze-mutants" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lints = { path = "crates/blaze-lints" }
@@ -494,6 +609,9 @@ blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-query-macros = { path = "crates/blaze-query-macros" }
+# The session memo that replaces blaze-query under the front end, and its attributes.
+blaze-memo = { path = "crates/blaze-memo" }
+blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
@@ -617,12 +735,6 @@ inventory = "0.3.25"
 itertools = "0.15.0"
 libc = "0.2.191"
 memchr = "2.8.3"
-# mimalloc's C side: the `blaze` binary's general-purpose allocator, a first-class heap per
-# blaze-mem tag (blaze-engine's `heaps.rs`, docs/v2/plan/design/memory.md), `mi_collect` when the
-# daemon gives freed pages back, and (`extended`) its options. `no_thp`: its arenas are on base
-# pages, not advised onto transparent huge pages, which were 1.25 GiB of a hello-world daemon
-# for nothing it holds (blaze-engine's `huge.rs` has the measurement).
-libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended", "no_thp"] }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 syntax-tree = { path = "crates/syntax-tree", version = "0.0.0" }
@@ -870,13 +982,25 @@ print_stderr = "warn"
 
 ## restriction lints for code written by agents: more typing, and each choice made where it
 ## is written (`blaze check` implements each of these; crates/blaze-lints/src/lints/mod.rs)
-# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is
+# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is. These two are
+# the "unexplained allow" check (any `#[allow]`, an `#[expect]` with no reason), so blaze has no
+# lint of its own for it (docs/lints.md#suspicious-code); `--fix` turns an outer `allow` into
+# `expect`.
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 # `let _ = f()` of a `#[must_use]` value throws away what it says
 let_underscore_must_use = "warn"
+# Copy-paste mistakes in one expression (docs/lints.md#duplicates): `eq_op`, `ifs_same_cond` and
+# `self_assignment` are in `correctness`, denied above. Two branches written alike is the same
+# mistake, so `if_same_then_else` (in `style`) is denied too; `match_same_arms` (pedantic) warns,
+# since arms kept apart for their patterns' sake are common. Like the list below, `blaze check`
+# does not implement these yet.
+if_same_then_else = "deny"
+match_same_arms = "warn"
 # Listed in clippy's table but not implemented by `blaze check`, so turning them on does nothing
-# until they are: string_slice, missing_assert_message. wildcard_enum_match_arm and
+# until they are: string_slice, missing_assert_message, let_underscore_lock, unused_async,
+# unused_self. wildcard_imports and shadow_unrelated are `blaze::glob_import` and
+# `blaze::shadow_changes_meaning` instead (in `internal`; their levels are in `lints-ratchet`). wildcard_enum_match_arm and
 # match_wildcard_for_single_variants are `blaze::wildcard_arm` instead, which checks the
 # workspace's enums only (clippy's also fires on other crates' enums such as
 # `std::io::ErrorKind`).

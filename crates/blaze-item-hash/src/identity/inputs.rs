@@ -1,19 +1,14 @@
-//! Section 3.1: what a body's crate is built with, one hash per crate, and the build of the
-//! front end itself.
+//! What a body's crate is built with, one hash per crate (the "crate inputs" part of a body's
+//! key, `super::early_parts`), and the build of the front end itself. A lang item's signature
+//! is not here: a step that reads one reads it as a fact.
 
 use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::db::{Database as _, Setter as _};
-use hir_def::{
-    lang_item::{LangItemEnum, LangItemTarget, lang_items},
-    nameres::crate_def_map,
-};
+use hir_def::nameres::crate_def_map;
 use hir_ty::next_solver::goal_store::{GoalFacts, solver_version};
 
-use super::item::{Part, item_part, variant_part};
-
 const CRATE_INPUTS_DOMAIN: &str = "blaze v2 item identity crate inputs 1";
-const LANG_ITEMS_DOMAIN: &str = "blaze v2 item identity lang items 1";
 
 /// The build of the front end that computes identities: the content identity of the front
 /// end's code and of how it was built (`blaze_codegen_code::FRONT_END`), as the goal store is
@@ -60,7 +55,7 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
 /// - the attributes of its root: the `#![feature]` set, `#![register_tool]`s, `no_std`,
 ///   `no_core`, `proc-macro`, `rustc_coherence_is_core` and `recursion_limit`, which covers
 ///   `UnstableFeatures::query` and `crate_recursion_limit` (`no_implicit_prelude` changes
-///   only what names resolve to, which section 3.5 hashes);
+///   only what names resolve to, each a name fact of the step that looked it up);
 /// - the borrow checker's mode (`hir_ty_borrowck::mode`, one per database).
 ///
 /// MIR building reads no option of its own: overflow checks, debug assertions and the panic
@@ -103,36 +98,4 @@ pub fn crate_inputs(db: &Db, krate: Crate) -> ContentId {
         hir_ty_borrowck::Mode::PoloniusFlow => 3,
     }]);
     h.finish()
-}
-
-/// Each lang item of `krate` by key and signature (section 3.1): what operators, `?`, `for`,
-/// closures and `Box` are checked against. [`crate_inputs`] names them by key only.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn lang_item_signatures(db: &Db, krate: Crate) -> Result<ContentId, &'static str> {
-    let items = lang_items(db, krate);
-    let mut h = Hasher::new(LANG_ITEMS_DOMAIN);
-    for (at, item) in LangItemEnum::ALL.iter().enumerate() {
-        let Some(target) = item.from_lang_items(items) else { continue };
-        let part = lang_item_part(db, target)?;
-        h.update(&(at as u32).to_le_bytes()).update(&part);
-    }
-    Ok(h.finish())
-}
-
-fn lang_item_part(db: &Db, target: LangItemTarget) -> Result<Part, &'static str> {
-    use blaze_items::ItemId;
-    let item = match target {
-        LangItemTarget::EnumVariantId(it) => return variant_part(db, it),
-        LangItemTarget::EnumId(it) => ItemId::Adt(it.into()),
-        LangItemTarget::StructId(it) => ItemId::Adt(it.into()),
-        LangItemTarget::UnionId(it) => ItemId::Adt(it.into()),
-        LangItemTarget::FunctionId(it) => ItemId::Function(it),
-        LangItemTarget::ImplId(it) => ItemId::Impl(it),
-        LangItemTarget::StaticId(it) => ItemId::Static(it),
-        LangItemTarget::TypeAliasId(it) => ItemId::Alias(it),
-        LangItemTarget::TraitId(it) => ItemId::Trait(it),
-        LangItemTarget::ConstId(it) => ItemId::Const(it),
-        LangItemTarget::MacroId(it) => ItemId::Macro(it),
-    };
-    item_part(db, item)
 }

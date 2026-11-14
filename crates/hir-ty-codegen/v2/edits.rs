@@ -29,7 +29,8 @@
 //! The same model checks code identity (`hir-ty-identity`, docs/v2/plan/design/code-identity.md):
 //! an edit of comments, formatting or item order keeps every function's `instance_identity` and
 //! the root's `code_id`, and an edit of behaviour changes the root's `code_id`
-//! (`edits/identity.rs`).
+//! (`edits/identity.rs`). A line added above a function recompiles nothing below it: its code
+//! identity, template key, bytes and line rows are as they were (`edits/shift.rs`).
 //!
 //! `HEGEL_TEST_CASES=<n>` runs either longer.
 
@@ -37,6 +38,7 @@
 mod db;
 mod identity;
 mod revisions;
+mod shift;
 
 use std::collections::BTreeMap;
 

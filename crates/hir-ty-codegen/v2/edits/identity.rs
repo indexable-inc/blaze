@@ -103,7 +103,7 @@ const ROOTS: [&str; 6] = ["entry", "mix", "mode", "wide", "read_s", "boxed"];
 /// Of each of [`ROOTS`]: its compile identity in a debug, a moving and a release unit, and its
 /// `CodeId`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Ids {
+pub(super) struct Ids {
     debug: CompileIdentity,
     moved: CompileIdentity,
     release: CompileIdentity,
@@ -112,14 +112,14 @@ struct Ids {
 
 /// Which way round [`identities`] asks for [`ROOTS`].
 #[derive(Clone, Copy)]
-enum Order {
+pub(super) enum Order {
     TopDown,
     BottomUp,
 }
 
 /// [`Ids`] of each root of `text`, in a database of its own, as another process would have
-/// them, asked in `order`.
-fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
+/// them, asked in `order`. Also the shift property's (`edits/shift.rs`).
+pub(super) fn identities(text: &str, order: Order) -> BTreeMap<&'static str, Ids> {
     let db = fixture::db(text).into_db();
     blaze_query::db::attach(&db, || {
         let env: StoredParamEnvAndCrate =

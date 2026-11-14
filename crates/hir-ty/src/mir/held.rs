@@ -413,6 +413,35 @@ impl MirBody<'_> {
         })
     }
 
+    /// The locals live after the call that ends each block of `points`: used or dropped on
+    /// some path after it returns, the call's own destination not. What a lock's guard is held
+    /// across: its lock is released by its drop, so it is held exactly while it is live. A
+    /// borrow of it taken before the call holds nothing once the guard is dead, unlike
+    /// [`MirBody::held_across_calls_in`], which keeps a borrowed local's storage for a
+    /// coroutine's layout. One slice per point, in order, each in the order the body declares
+    /// its locals; an unreached block's is empty.
+    pub fn live_after_calls_in<'f>(
+        &self,
+        frame: &'f Frame,
+        points: &[BasicBlockId],
+    ) -> &'f [&'f [LocalId]] {
+        let reached = reachable(frame, self);
+        let live_out = self.liveness(frame, reached);
+        let mut live = Vec::new_in(frame);
+        frame.alloc_slice_fill_with(points.len(), |at| {
+            let id = points[at];
+            if !reached[block_index(id)] {
+                return &[][..];
+            }
+            let out = &live_out[block_index(id)];
+            live.clear();
+            live.extend(
+                self.locals.iter().map(|(local, _)| local).filter(|&it| out.contains(local_index(it))),
+            );
+            &*frame.alloc_slice_copy(&live)
+        })
+    }
+
     /// `always_storage_live_locals`: the locals no `StorageLive` or `StorageDead` mentions.
     fn always_storage_live<'f>(&self, frame: &'f Frame) -> Set<'f> {
         let mut always = filled_in(frame, self.locals.len());

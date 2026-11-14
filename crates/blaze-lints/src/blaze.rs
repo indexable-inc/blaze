@@ -9,6 +9,7 @@
 //! at the outermost macro call that wrote it (`format!`, `vec!`), and dropped where its
 //! exemption comment is.
 
+mod absolute_position;
 mod alloc;
 mod arc_clone_only_borrowed;
 mod as_cast;
@@ -27,16 +28,20 @@ mod build_script_ambient;
 mod cbor_field_order;
 mod not_latest_edition;
 mod checkfree;
+mod claims;
 mod clone;
 mod cold_error;
 mod could_be_program_lifetime;
 mod could_be_ref32;
 mod collect_then_consume;
 mod combined_identity;
+mod complexity;
+mod construct;
 #[cfg(test)]
 mod correctness_general_tests;
 mod deep_drop_at_exit;
 mod default_policy;
+mod dup;
 mod dispatch;
 mod dos_hasher_on_input;
 mod dropped_error;
@@ -92,10 +97,9 @@ mod lock_order;
 mod lock_order_tests;
 mod loops;
 mod implicit_overflow;
-#[allow(dead_code, reason = "its check is `as_cast`'s now; `implicit_overflow` reads its facts until the two share one module")]
-mod lossy_as;
 #[cfg(test)]
 mod implicit_overflow_tests;
+mod magic;
 mod many_bools;
 mod missing_size_hint;
 mod mut_ref;
@@ -125,6 +129,9 @@ mod program_lifetime;
 mod proved_unreachable;
 #[cfg(test)]
 mod reach_tests;
+mod refinement;
+#[cfg(test)]
+mod refinement_tests;
 #[cfg(test)]
 mod program_lifetime_tests;
 mod push_without_reserve;
@@ -143,14 +150,19 @@ mod small_map;
 mod soa_candidate;
 mod span_field_unrecorded;
 mod stable_sort_needless;
+mod std_mistakes;
 mod std_use;
 #[cfg(test)]
 mod std_use_tests;
 mod stdout_lock_in_loop;
 mod string_key;
+mod suggest;
+mod suspicious;
 mod struct_update;
+mod structural;
 mod syscall_in_loop;
 mod test_code;
+mod test_strength;
 #[cfg(test)]
 mod tests;
 mod thread_local_in_waiting_fn;
@@ -172,6 +184,7 @@ mod unwind_across_ffi;
 mod unwired;
 #[cfg(test)]
 mod waits_tests;
+mod weight;
 mod wide_index;
 mod wildcard_arm;
 
@@ -185,6 +198,7 @@ use syntax::{NodeOrToken, TextRange, view as ast};
 use ast::AstNode as _;
 
 use crate::{check::Cx, diag::Applicability};
+pub(crate) use std_mistakes::library_code;
 
 macro_rules! docs {
     () => {
@@ -319,11 +333,13 @@ pub enum Lint {
     CouldBeRef32,
     SpanFieldUnrecorded,
     Unreachable,
+    Refinement,
     Todo,
     EnvRead,
     UntiedChild,
     UnboundedTestWait,
     ReadsPositions,
+    AbsolutePosition,
     CborFieldOrder,
     GappedLiteral,
     Retry,
@@ -338,6 +354,143 @@ pub enum Lint {
     LockAcrossWait,
     // docs/lints.md#as_cast: the wrapping operations `as_cast`'s fix writes.
     TruncatingCast,
+    // docs/lints.md#the-std-mistakes: std's API used in the ways people and LLMs get wrong.
+    PartialWrite,
+    PartialCmpUnwrap,
+    UnboundedRead,
+    LenMinus,
+    StrByteSlice,
+    Forget,
+    PathToStrUnwrap,
+    DetachedThread,
+    UnboundedChannel,
+    Transmute,
+    CloneToSatisfy,
+    UncheckedIndexInLoop,
+    DefaultNumericFallbackLen,
+    RefcellBorrowAcrossCall,
+    ProcessExit,
+    PrintInLib,
+    LockUnwrap,
+    // The suspicious-code lints (`suspicious`): what compiles and reads as right but leaves
+    // something implicit that the next reader reconstructs wrong.
+    SkippedPair,
+    HalfDone,
+    HiddenExit,
+    QuestionMarkConverts,
+    OptionQuestionMarkHides,
+    UnseenTarget,
+    GlobImport,
+    ShadowChangesMeaning,
+    VersionedName,
+    UnusedParameter,
+    Fallback,
+    PlaceholderBody,
+    TestAssertsNothing,
+    AssertionCannotFail,
+    TestMissesItsSubject,
+    IgnoredWithoutReason,
+    DocNamesNothing,
+    // The magic literals (`magic`): a number or a name stated in place of its one home.
+    MagicNumber,
+    MagicString,
+    RepeatedFormat,
+    // The workspace pass's (`crates/blaze-findings`, from `magic::shared::merge_strings`): a
+    // key-like string two sibling crates write, the same or nearly.
+    StringSharedAcrossCrates,
+    StringNearMissAcrossCrates,
+    // Code that carries no weight (`weight`): a field nothing reads, a helper only tests call,
+    // a trait with one impl, a function that only forwards, arguments in the wrong order.
+    SwappedArguments,
+    WriteOnlyField,
+    OnlyUsedInTests,
+    SingleImplTrait,
+    ForwardingFn,
+    ConstantArgument,
+    AlwaysSameResult,
+    NeverConstructed,
+    NeverMatched,
+    SwappableParameters,
+    // How hard code is to hold in one's head (`complexity`): each measure over its bound, an
+    // existing item held at its value (`baseline::items`).
+    FunctionWeight,
+    PathCount,
+    LiveState,
+    EffectBreadth,
+    Exits,
+    LongFunction,
+    LongFile,
+    ManyParams,
+    WideType,
+    DeepNesting,
+    FanOut,
+    ModuleCycle,
+    // Correct by construction (`construct`): a check at run time, a convention or a name
+    // standing in for a type.
+    ProofForgotten,
+    UnitMismatch,
+    PrimitiveMeaning,
+    SentinelValue,
+    StateInFlags,
+    BoolPairState,
+    OutParameter,
+    ParallelCollections,
+    UntypedIndex,
+    ValidatedButRaw,
+    // A promise of a doc comment (`claims`, docs/v2/plan/design/claims.md): derived, checked,
+    // or pointing at what proves it; a `SAFETY:` comment naming its invariant; a body
+    // comment's claim and its checked form.
+    ClaimContradictsFacts,
+    ClaimIsDerivable,
+    ClaimWithoutEvidence,
+    EvidenceIsStale,
+    SafetyWithoutInvariant,
+    CommentClaims,
+    // Duplicated code and copy-paste mistakes (`dup`), by the shape of code: locals numbered
+    // by first use, everything else as written.
+    SameFn,
+    SameImplFn,
+    SameBlock,
+    NearDuplicate,
+    PasteMismatch,
+    SameType,
+    SameConst,
+    ExtractableDuplicate,
+    TestsDifferByLiteral,
+    ImplsDifferByType,
+    // The workspace pass's (`crates/blaze-findings`, from `dup::index::merge_siblings`): a
+    // function, constant or type two sibling crates each write.
+    DuplicateAcrossCrates,
+    // Test strength (`test_strength`): which parts of what a function hands back no test
+    // observes, found without running anything.
+    ResultPartUnobserved,
+    WeakAssertion,
+    MirrorAssertion,
+    PseudoTested,
+    UnreachedByTests,
+    ErrorPathUntested,
+    PropertyOverExamples,
+    // Suggestions (`suggest`, the adoption ladder's second step): where a plain Rust project
+    // gains from a blaze feature or a tighter type.
+    CouldBeNarrower,
+    CouldBeSansIo,
+    CouldBeLinear,
+    CouldHaveInvariant,
+    // Code written by hand that the type's structure gives (`structural`): one analysis, is
+    // this body uniform over the type's fields or variants, and the bugs of the one that is
+    // nearly.
+    HandWrittenDerivable,
+    ImplMissesField,
+    HandKeptVariantList,
+    VariantListDrift,
+    HandWrittenCodec,
+    FieldWiseConversion,
+    ConversionMissesField,
+    HandWrittenVisitor,
+    RepeatedFieldList,
+    RegistrySpread,
+    // Duplicated behaviour (`dup::semantic`): two functions whose canonical runtime MIR is one.
+    SameBehaviour,
 }
 
 /// Which workspaces a lint is for.
@@ -362,6 +515,11 @@ pub(crate) enum Kind {
     /// blaze already has ([`Lint::warns_by_default`]), which warns everywhere; a check of what
     /// the code declared (`program_lifetime`) is `deny` where it fires ([`DENY_BY_DEFAULT`]).
     Edition,
+    /// Advice: where a plain Rust project gains from a blaze feature or a tighter type. Allowed
+    /// until the adoption ladder's `suggest` step, or the group `blaze::suggest`, turns it on;
+    /// never part of `blaze::edition`, which is what the edition changes. The effect lints
+    /// (`unmarked_*`) are the edition's: the edition writes effects at a crate's border.
+    Suggest,
 }
 
 /// The lints that are `deny` by default rather than their kind's level: they fire only where
@@ -384,13 +542,12 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     Lint::ProgramLifetime,
     // Fires only on a `blaze::unreachable!()`.
     Lint::Unreachable,
+    // Fires only where code states an invariant or a contract
+    // (docs/v2/plan/design/refined-values.md).
+    Lint::Refinement,
     // Fire only on a function marked with its role (docs/v2/plan/design/effect-summary.md).
     Lint::LoopTurnEffects,
     Lint::SyncOnAnswerPath,
-    // Not asked for: a lock-order cycle is a deadlock and a guard across a thread's wait a
-    // convoy wherever they are written.
-    Lint::LockOrder,
-    Lint::LockAcrossWait,
 ];
 
 /// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
@@ -399,7 +556,7 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
 /// (`proved_unreachable::check_waiver`), and a flag that does refuses the crate's check
 /// ([`crate::diag::CheckError::Unwaivable`]). A group or `warnings` that covers one does not
 /// reach it and is no error: only naming the lint is.
-pub(crate) const UNWAIVABLE: &[Lint] = &[Lint::Unreachable];
+pub(crate) const UNWAIVABLE: &[Lint] = &[Lint::Unreachable, Lint::Refinement];
 
 /// Each lint of [`Kind::Edition`] with whether what its help tells code to move to is in this
 /// blaze, so that it warns by default and not only where a workspace turns `blaze::edition`
@@ -432,10 +589,8 @@ pub(crate) const EDITION_READY: &[(Lint, bool)] = &[
     (Lint::MutRef, false),
     // docs/v2/plan/design/facts.md: `program_lifetime` checks what the code declared and is
     // `deny` where it fires ([`DENY_BY_DEFAULT`], which wins over this); the two that say where
-    // the attribute and `Ref32` would pay wait for the group, as blaze-lint-defs has them.
+    // the attribute and `Ref32` would pay are [`Kind::Suggest`]'s.
     (Lint::ProgramLifetime, false),
-    (Lint::CouldBeProgramLifetime, false),
-    (Lint::CouldBeRef32, false),
 ];
 
 /// The group `blaze::proc_macro`: one lint per kind of procedural macro a workspace crate
@@ -615,11 +770,13 @@ impl Lint {
         Lint::CouldBeRef32,
         Lint::SpanFieldUnrecorded,
         Lint::Unreachable,
+        Lint::Refinement,
         Lint::Todo,
         Lint::EnvRead,
         Lint::UntiedChild,
         Lint::UnboundedTestWait,
         Lint::ReadsPositions,
+        Lint::AbsolutePosition,
         Lint::CborFieldOrder,
         Lint::GappedLiteral,
         Lint::Retry,
@@ -632,6 +789,116 @@ impl Lint {
         Lint::LockOrder,
         Lint::LockAcrossWait,
         Lint::TruncatingCast,
+        Lint::PartialWrite,
+        Lint::PartialCmpUnwrap,
+        Lint::UnboundedRead,
+        Lint::LenMinus,
+        Lint::StrByteSlice,
+        Lint::Forget,
+        Lint::PathToStrUnwrap,
+        Lint::DetachedThread,
+        Lint::UnboundedChannel,
+        Lint::Transmute,
+        Lint::CloneToSatisfy,
+        Lint::UncheckedIndexInLoop,
+        Lint::DefaultNumericFallbackLen,
+        Lint::RefcellBorrowAcrossCall,
+        Lint::ProcessExit,
+        Lint::PrintInLib,
+        Lint::LockUnwrap,
+        Lint::SkippedPair,
+        Lint::HalfDone,
+        Lint::HiddenExit,
+        Lint::QuestionMarkConverts,
+        Lint::OptionQuestionMarkHides,
+        Lint::UnseenTarget,
+        Lint::GlobImport,
+        Lint::ShadowChangesMeaning,
+        Lint::VersionedName,
+        Lint::UnusedParameter,
+        Lint::Fallback,
+        Lint::PlaceholderBody,
+        Lint::TestAssertsNothing,
+        Lint::AssertionCannotFail,
+        Lint::TestMissesItsSubject,
+        Lint::IgnoredWithoutReason,
+        Lint::DocNamesNothing,
+        Lint::MagicNumber,
+        Lint::MagicString,
+        Lint::RepeatedFormat,
+        Lint::StringSharedAcrossCrates,
+        Lint::StringNearMissAcrossCrates,
+        Lint::SwappedArguments,
+        Lint::WriteOnlyField,
+        Lint::OnlyUsedInTests,
+        Lint::SingleImplTrait,
+        Lint::ForwardingFn,
+        Lint::ConstantArgument,
+        Lint::AlwaysSameResult,
+        Lint::NeverConstructed,
+        Lint::NeverMatched,
+        Lint::SwappableParameters,
+        Lint::FunctionWeight,
+        Lint::PathCount,
+        Lint::LiveState,
+        Lint::EffectBreadth,
+        Lint::Exits,
+        Lint::LongFunction,
+        Lint::LongFile,
+        Lint::ManyParams,
+        Lint::WideType,
+        Lint::DeepNesting,
+        Lint::FanOut,
+        Lint::ModuleCycle,
+        Lint::ProofForgotten,
+        Lint::UnitMismatch,
+        Lint::PrimitiveMeaning,
+        Lint::SentinelValue,
+        Lint::StateInFlags,
+        Lint::BoolPairState,
+        Lint::OutParameter,
+        Lint::ParallelCollections,
+        Lint::UntypedIndex,
+        Lint::ValidatedButRaw,
+        Lint::ClaimContradictsFacts,
+        Lint::ClaimIsDerivable,
+        Lint::ClaimWithoutEvidence,
+        Lint::EvidenceIsStale,
+        Lint::SafetyWithoutInvariant,
+        Lint::CommentClaims,
+        Lint::SameFn,
+        Lint::SameImplFn,
+        Lint::SameBlock,
+        Lint::NearDuplicate,
+        Lint::PasteMismatch,
+        Lint::SameType,
+        Lint::SameConst,
+        Lint::ExtractableDuplicate,
+        Lint::TestsDifferByLiteral,
+        Lint::ImplsDifferByType,
+        Lint::DuplicateAcrossCrates,
+        Lint::ResultPartUnobserved,
+        Lint::WeakAssertion,
+        Lint::MirrorAssertion,
+        Lint::PseudoTested,
+        Lint::UnreachedByTests,
+        Lint::ErrorPathUntested,
+        Lint::PropertyOverExamples,
+        Lint::CouldBeNarrower,
+        Lint::CouldBeSansIo,
+        Lint::CouldBeLinear,
+        Lint::CouldHaveInvariant,
+        Lint::HandWrittenDerivable,
+        Lint::ImplMissesField,
+        Lint::HandKeptVariantList,
+        Lint::VariantListDrift,
+        Lint::HandWrittenCodec,
+        Lint::FieldWiseConversion,
+        Lint::ConversionMissesField,
+        Lint::HandWrittenVisitor,
+        Lint::RepeatedFieldList,
+        Lint::RegistrySpread,
+        Lint::SameBehaviour,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -678,6 +945,8 @@ impl Lint {
             | Lint::Checkfree
             // Fires only on a `blaze::unreachable!()`, `deny` there.
             | Lint::Unreachable
+            // Fires only where code states an invariant or a contract, `deny` there.
+            | Lint::Refinement
             // A hole left in code: a warning everywhere, an error where the gate denies it.
             | Lint::Todo
             // Fire only on functions marked with their attribute, `deny` there.
@@ -689,10 +958,6 @@ impl Lint {
             // `#[blaze::answers_request]`), `deny` there.
             | Lint::LoopTurnEffects
             | Lint::SyncOnAnswerPath
-            // A lock-order cycle is a deadlock and a guard across a thread's wait a convoy in
-            // any code that takes std's or `lock_api`'s locks.
-            | Lint::LockOrder
-            | Lint::LockAcrossWait
             // Fires only in a crate with `#![blaze::capabilities]`, `deny` there.
             | Lint::Capabilities
             // Its fix passes stable Rust's borrow checker too, so it is right for any crate.
@@ -749,6 +1014,10 @@ impl Lint {
             | Lint::ThreadLocalInWaitingFn
             | Lint::LockAcrossQuery
             | Lint::LockHeldAcrossSlow
+            // Allowed by default: two locks the class can't tell apart (one type, handed in)
+            // share a class, so a cycle between them may be false.
+            | Lint::LockOrder
+            | Lint::LockAcrossWait
             | Lint::BlockingOnPool
             | Lint::UnnamedWait
             | Lint::SharedCollectionLock
@@ -794,8 +1063,9 @@ impl Lint {
             | Lint::UntiedChild
             | Lint::UnboundedTestWait
             // Rule keys-cover-every-input for the front end: a query reads positions only in a
-            // function marked `#[blaze::renders_positions]`.
+            // function marked `#[blaze::renders_positions]`, and a key or record holds none.
             | Lint::ReadsPositions
+            | Lint::AbsolutePosition
             // blaze-api's deterministic CBOR: a `#![blaze::canonical_cbor]` type declares its
             // fields in their keys' order.
             | Lint::CborFieldOrder
@@ -810,12 +1080,132 @@ impl Lint {
             | Lint::ProcessStatic
             // The wrapping operations `as_cast`'s fix writes: a list of places to decide,
             // allowed in blaze's ratchet too.
-            | Lint::TruncatingCast => Kind::Internal,
+            | Lint::TruncatingCast
+            // The std mistakes: internal while each is proved on blaze's own tree.
+            | Lint::PartialWrite
+            | Lint::PartialCmpUnwrap
+            | Lint::UnboundedRead
+            | Lint::LenMinus
+            | Lint::StrByteSlice
+            | Lint::Forget
+            | Lint::PathToStrUnwrap
+            | Lint::DetachedThread
+            | Lint::UnboundedChannel
+            | Lint::Transmute
+            | Lint::CloneToSatisfy
+            | Lint::UncheckedIndexInLoop
+            | Lint::DefaultNumericFallbackLen
+            | Lint::RefcellBorrowAcrossCall
+            | Lint::ProcessExit
+            | Lint::PrintInLib
+            | Lint::LockUnwrap
+            | Lint::SkippedPair
+            | Lint::HalfDone
+            | Lint::HiddenExit
+            | Lint::QuestionMarkConverts
+            | Lint::OptionQuestionMarkHides
+            | Lint::UnseenTarget
+            | Lint::GlobImport
+            | Lint::ShadowChangesMeaning
+            | Lint::VersionedName
+            | Lint::UnusedParameter
+            | Lint::Fallback
+            | Lint::PlaceholderBody
+            | Lint::TestAssertsNothing
+            | Lint::AssertionCannotFail
+            | Lint::TestMissesItsSubject
+            | Lint::IgnoredWithoutReason
+            | Lint::DocNamesNothing
+            | Lint::MagicNumber
+            | Lint::MagicString
+            | Lint::RepeatedFormat
+            | Lint::StringSharedAcrossCrates
+            | Lint::StringNearMissAcrossCrates
+            | Lint::SwappedArguments
+            | Lint::WriteOnlyField
+            | Lint::OnlyUsedInTests
+            | Lint::SingleImplTrait
+            | Lint::ForwardingFn
+            | Lint::ConstantArgument
+            | Lint::AlwaysSameResult
+            | Lint::NeverConstructed
+            | Lint::NeverMatched
+            | Lint::SwappableParameters
+            | Lint::FunctionWeight
+            | Lint::PathCount
+            | Lint::LiveState
+            | Lint::EffectBreadth
+            | Lint::Exits
+            | Lint::LongFunction
+            | Lint::LongFile
+            | Lint::ManyParams
+            | Lint::WideType
+            | Lint::DeepNesting
+            | Lint::FanOut
+            | Lint::ModuleCycle
+            | Lint::ProofForgotten
+            | Lint::UnitMismatch
+            | Lint::PrimitiveMeaning
+            | Lint::SentinelValue
+            | Lint::StateInFlags
+            | Lint::BoolPairState
+            | Lint::OutParameter
+            | Lint::ParallelCollections
+            | Lint::UntypedIndex
+            | Lint::ValidatedButRaw
+            // Opt-in elsewhere, from the adoption ladder's `suggest` step.
+            | Lint::ClaimContradictsFacts
+            | Lint::ClaimIsDerivable
+            | Lint::ClaimWithoutEvidence
+            | Lint::EvidenceIsStale
+            | Lint::SafetyWithoutInvariant
+            | Lint::CommentClaims
+            // Allowed elsewhere: what counts as one copy too many is the workspace's call.
+            | Lint::SameFn
+            | Lint::SameImplFn
+            | Lint::SameBlock
+            | Lint::NearDuplicate
+            | Lint::PasteMismatch
+            | Lint::SameType
+            | Lint::SameConst
+            | Lint::ExtractableDuplicate
+            | Lint::TestsDifferByLiteral
+            | Lint::ImplsDifferByType
+            | Lint::DuplicateAcrossCrates
+            // Allowed elsewhere: how strong a project's tests must be is its own call.
+            | Lint::ResultPartUnobserved
+            | Lint::WeakAssertion
+            | Lint::MirrorAssertion
+            | Lint::PseudoTested
+            | Lint::UnreachedByTests
+            | Lint::ErrorPathUntested
+            | Lint::PropertyOverExamples
+            // Allowed elsewhere: which hand-written impls and lists a project derives is its
+            // call, from the adoption ladder's `suggest` step.
+            | Lint::HandWrittenDerivable
+            | Lint::ImplMissesField
+            | Lint::HandKeptVariantList
+            | Lint::VariantListDrift
+            | Lint::HandWrittenCodec
+            | Lint::FieldWiseConversion
+            | Lint::ConversionMissesField
+            | Lint::HandWrittenVisitor
+            | Lint::RepeatedFieldList
+            | Lint::RegistrySpread => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
-            Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
-                Kind::Edition
-            }
+            Lint::ProgramLifetime => Kind::Edition,
+            // The suggestions: blaze features a plain Rust project adopts one step at a time,
+            // off until the ladder's `suggest` step turns their group on; the two that say
+            // where `#[blaze::program_lifetime]` and `Ref32` would pay among them.
+            Lint::CouldBeProgramLifetime
+            | Lint::CouldBeRef32
+            | Lint::CouldBeNarrower
+            | Lint::CouldBeSansIo
+            | Lint::CouldBeLinear
+            | Lint::CouldHaveInvariant => Kind::Suggest,
+            // Allowed elsewhere, as the other duplicate lints: held by the ratchet baselines.
+            Lint::SameBehaviour => Kind::Internal,
         }
     }
 
@@ -915,6 +1305,7 @@ impl Lint {
             Lint::PodSerializedByField => "pod_serialized_by_field",
             Lint::Checkfree => "checkfree",
             Lint::Unreachable => "unreachable",
+            Lint::Refinement => "refinement",
             Lint::Todo => "todo",
             Lint::Nopanic => "nopanic",
             Lint::Noalloc => "noalloc",
@@ -958,6 +1349,7 @@ impl Lint {
             Lint::UntiedChild => "untied_child",
             Lint::UnboundedTestWait => "unbounded_test_wait",
             Lint::ReadsPositions => "reads_positions",
+            Lint::AbsolutePosition => "absolute_position",
             Lint::CborFieldOrder => "cbor_field_order",
             Lint::GappedLiteral => "gapped_literal",
             Lint::Retry => "retry",
@@ -970,6 +1362,116 @@ impl Lint {
             Lint::LockOrder => "lock_order",
             Lint::LockAcrossWait => "lock_across_wait",
             Lint::TruncatingCast => "truncating_cast",
+            Lint::PartialWrite => "partial_write",
+            Lint::PartialCmpUnwrap => "partial_cmp_unwrap",
+            Lint::UnboundedRead => "unbounded_read",
+            Lint::LenMinus => "len_minus",
+            Lint::StrByteSlice => "str_byte_slice",
+            Lint::Forget => "forget",
+            Lint::PathToStrUnwrap => "path_to_str_unwrap",
+            Lint::DetachedThread => "detached_thread",
+            Lint::UnboundedChannel => "unbounded_channel",
+            Lint::Transmute => "transmute",
+            Lint::CloneToSatisfy => "clone_to_satisfy",
+            Lint::UncheckedIndexInLoop => "unchecked_index_in_loop",
+            Lint::DefaultNumericFallbackLen => "default_numeric_fallback_len",
+            Lint::RefcellBorrowAcrossCall => "refcell_borrow_across_call",
+            Lint::ProcessExit => "process_exit",
+            Lint::PrintInLib => "print_in_lib",
+            Lint::LockUnwrap => "lock_unwrap",
+            Lint::SkippedPair => "skipped_pair",
+            Lint::HalfDone => "half_done",
+            Lint::HiddenExit => "hidden_exit",
+            Lint::QuestionMarkConverts => "question_mark_converts",
+            Lint::OptionQuestionMarkHides => "option_question_mark_hides",
+            Lint::UnseenTarget => "unseen_target",
+            Lint::GlobImport => "glob_import",
+            Lint::ShadowChangesMeaning => "shadow_changes_meaning",
+            Lint::VersionedName => "versioned_name",
+            Lint::UnusedParameter => "unused_parameter",
+            Lint::Fallback => "fallback",
+            Lint::PlaceholderBody => "placeholder_body",
+            Lint::TestAssertsNothing => "test_asserts_nothing",
+            Lint::AssertionCannotFail => "assertion_cannot_fail",
+            Lint::TestMissesItsSubject => "test_misses_its_subject",
+            Lint::IgnoredWithoutReason => "ignored_without_reason",
+            Lint::DocNamesNothing => "doc_names_nothing",
+            Lint::MagicNumber => "magic_number",
+            Lint::MagicString => "magic_string",
+            Lint::RepeatedFormat => "repeated_format",
+            Lint::StringSharedAcrossCrates => "string_shared_across_crates",
+            Lint::StringNearMissAcrossCrates => "string_near_miss_across_crates",
+            Lint::SwappedArguments => "swapped_arguments",
+            Lint::WriteOnlyField => "write_only_field",
+            Lint::OnlyUsedInTests => "only_used_in_tests",
+            Lint::SingleImplTrait => "single_impl_trait",
+            Lint::ForwardingFn => "forwarding_fn",
+            Lint::ConstantArgument => "constant_argument",
+            Lint::AlwaysSameResult => "always_same_result",
+            Lint::NeverConstructed => "never_constructed",
+            Lint::NeverMatched => "never_matched",
+            Lint::SwappableParameters => "swappable_parameters",
+            Lint::FunctionWeight => "function_weight",
+            Lint::PathCount => "path_count",
+            Lint::LiveState => "live_state",
+            Lint::EffectBreadth => "effect_breadth",
+            Lint::Exits => "exits",
+            Lint::LongFunction => "long_function",
+            Lint::LongFile => "long_file",
+            Lint::ManyParams => "many_params",
+            Lint::WideType => "wide_type",
+            Lint::DeepNesting => "deep_nesting",
+            Lint::FanOut => "fan_out",
+            Lint::ModuleCycle => "module_cycle",
+            Lint::ProofForgotten => "proof_forgotten",
+            Lint::UnitMismatch => "unit_mismatch",
+            Lint::PrimitiveMeaning => "primitive_meaning",
+            Lint::SentinelValue => "sentinel_value",
+            Lint::StateInFlags => "state_in_flags",
+            Lint::BoolPairState => "bool_pair_state",
+            Lint::OutParameter => "out_parameter",
+            Lint::ParallelCollections => "parallel_collections",
+            Lint::UntypedIndex => "untyped_index",
+            Lint::ValidatedButRaw => "validated_but_raw",
+            Lint::ClaimContradictsFacts => "claim_contradicts_facts",
+            Lint::ClaimIsDerivable => "claim_is_derivable",
+            Lint::ClaimWithoutEvidence => "claim_without_evidence",
+            Lint::EvidenceIsStale => "evidence_is_stale",
+            Lint::SafetyWithoutInvariant => "safety_without_invariant",
+            Lint::CommentClaims => "comment_claims",
+            Lint::SameFn => "same_fn",
+            Lint::SameImplFn => "same_impl_fn",
+            Lint::SameBlock => "same_block",
+            Lint::NearDuplicate => "near_duplicate",
+            Lint::PasteMismatch => "paste_mismatch",
+            Lint::SameType => "same_type",
+            Lint::SameConst => "same_const",
+            Lint::ExtractableDuplicate => "extractable_duplicate",
+            Lint::TestsDifferByLiteral => "tests_differ_by_literal",
+            Lint::ImplsDifferByType => "impls_differ_by_type",
+            Lint::DuplicateAcrossCrates => "duplicate_across_crates",
+            Lint::ResultPartUnobserved => "result_part_unobserved",
+            Lint::WeakAssertion => "weak_assertion",
+            Lint::MirrorAssertion => "mirror_assertion",
+            Lint::PseudoTested => "pseudo_tested",
+            Lint::UnreachedByTests => "unreached_by_tests",
+            Lint::ErrorPathUntested => "error_path_untested",
+            Lint::PropertyOverExamples => "property_over_examples",
+            Lint::CouldBeNarrower => "could_be_narrower",
+            Lint::CouldBeSansIo => "could_be_sans_io",
+            Lint::CouldBeLinear => "could_be_linear",
+            Lint::CouldHaveInvariant => "could_have_invariant",
+            Lint::HandWrittenDerivable => "hand_written_derivable",
+            Lint::ImplMissesField => "impl_misses_field",
+            Lint::HandKeptVariantList => "hand_kept_variant_list",
+            Lint::VariantListDrift => "variant_list_drift",
+            Lint::HandWrittenCodec => "hand_written_codec",
+            Lint::FieldWiseConversion => "field_wise_conversion",
+            Lint::ConversionMissesField => "conversion_misses_field",
+            Lint::HandWrittenVisitor => "hand_written_visitor",
+            Lint::RepeatedFieldList => "repeated_field_list",
+            Lint::RegistrySpread => "registry_spread",
+            Lint::SameBehaviour => "same_behaviour",
         }
     }
 
@@ -1053,6 +1555,7 @@ impl Lint {
             Lint::PodSerializedByField => concat!(general_docs!(), "#pod_serialized_by_field"),
             Lint::Checkfree => concat!(general_docs!(), "#checkfree"),
             Lint::Unreachable => concat!(general_docs!(), "#unreachable"),
+            Lint::Refinement => concat!(general_docs!(), "#refinement"),
             Lint::Todo => concat!(general_docs!(), "#todo"),
             Lint::Nopanic => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
             Lint::Noalloc => concat!(general_docs!(), "#nopanic-noalloc-nonblocking"),
@@ -1096,6 +1599,7 @@ impl Lint {
             Lint::UntiedChild => concat!(docs!(), "#untied_child"),
             Lint::UnboundedTestWait => concat!(docs!(), "#unbounded_test_wait"),
             Lint::ReadsPositions => concat!(docs!(), "#reads_positions"),
+            Lint::AbsolutePosition => concat!(docs!(), "#absolute_position"),
             Lint::CborFieldOrder => concat!(docs!(), "#cbor_field_order"),
             Lint::GappedLiteral => concat!(docs!(), "#gapped_literal"),
             Lint::Retry => concat!(docs!(), "#retry"),
@@ -1104,11 +1608,123 @@ impl Lint {
             Lint::NarrowedLen => concat!(docs!(), "#narrowed_len"),
             Lint::ProcessStatic => concat!(docs!(), "#process_static"),
             Lint::TruncatingCast => concat!(docs!(), "#truncating_cast"),
+            Lint::PartialWrite => concat!(docs!(), "#partial_write"),
+            Lint::PartialCmpUnwrap => concat!(docs!(), "#partial_cmp_unwrap"),
+            Lint::UnboundedRead => concat!(docs!(), "#unbounded_read"),
+            Lint::LenMinus => concat!(docs!(), "#len_minus"),
+            Lint::StrByteSlice => concat!(docs!(), "#str_byte_slice"),
+            Lint::Forget => concat!(docs!(), "#forget"),
+            Lint::PathToStrUnwrap => concat!(docs!(), "#path_to_str_unwrap"),
+            Lint::DetachedThread => concat!(docs!(), "#detached_thread"),
+            Lint::UnboundedChannel => concat!(docs!(), "#unbounded_channel"),
+            Lint::Transmute => concat!(docs!(), "#transmute"),
+            Lint::CloneToSatisfy => concat!(docs!(), "#clone_to_satisfy"),
+            Lint::UncheckedIndexInLoop => concat!(docs!(), "#unchecked_index_in_loop"),
+            Lint::DefaultNumericFallbackLen => concat!(docs!(), "#default_numeric_fallback_len"),
+            Lint::RefcellBorrowAcrossCall => concat!(docs!(), "#refcell_borrow_across_call"),
+            Lint::ProcessExit => concat!(docs!(), "#process_exit"),
+            Lint::PrintInLib => concat!(docs!(), "#print_in_lib"),
+            Lint::LockUnwrap => concat!(docs!(), "#lock_unwrap"),
+            Lint::SkippedPair => concat!(docs!(), "#skipped_pair"),
+            Lint::HalfDone => concat!(docs!(), "#half_done"),
+            Lint::HiddenExit => concat!(docs!(), "#hidden_exit"),
+            Lint::QuestionMarkConverts => concat!(docs!(), "#question_mark_converts"),
+            Lint::OptionQuestionMarkHides => concat!(docs!(), "#option_question_mark_hides"),
+            Lint::UnseenTarget => concat!(docs!(), "#unseen_target"),
+            Lint::GlobImport => concat!(docs!(), "#glob_import"),
+            Lint::ShadowChangesMeaning => concat!(docs!(), "#shadow_changes_meaning"),
+            Lint::VersionedName => concat!(docs!(), "#versioned_name"),
+            Lint::UnusedParameter => concat!(docs!(), "#unused_parameter"),
+            Lint::Fallback => concat!(docs!(), "#fallback"),
+            Lint::PlaceholderBody => concat!(docs!(), "#placeholder_body"),
+            Lint::TestAssertsNothing => concat!(docs!(), "#test_asserts_nothing"),
+            Lint::AssertionCannotFail => concat!(docs!(), "#assertion_cannot_fail"),
+            Lint::TestMissesItsSubject => concat!(docs!(), "#test_misses_its_subject"),
+            Lint::IgnoredWithoutReason => concat!(docs!(), "#ignored_without_reason"),
+            Lint::DocNamesNothing => concat!(docs!(), "#doc_names_nothing"),
+            Lint::MagicNumber => concat!(docs!(), "#magic_number"),
+            Lint::MagicString => concat!(docs!(), "#magic_string"),
+            Lint::RepeatedFormat => concat!(docs!(), "#repeated_format"),
+            Lint::StringSharedAcrossCrates => concat!(docs!(), "#string_shared_across_crates"),
+            Lint::StringNearMissAcrossCrates => concat!(docs!(), "#string_near_miss_across_crates"),
+            Lint::SwappedArguments => concat!(docs!(), "#swapped_arguments"),
+            Lint::WriteOnlyField => concat!(docs!(), "#write_only_field"),
+            Lint::OnlyUsedInTests => concat!(docs!(), "#only_used_in_tests"),
+            Lint::SingleImplTrait => concat!(docs!(), "#single_impl_trait"),
+            Lint::ForwardingFn => concat!(docs!(), "#forwarding_fn"),
+            Lint::ConstantArgument => concat!(docs!(), "#constant_argument"),
+            Lint::AlwaysSameResult => concat!(docs!(), "#always_same_result"),
+            Lint::NeverConstructed => concat!(docs!(), "#never_constructed-never_matched"),
+            Lint::NeverMatched => concat!(docs!(), "#never_constructed-never_matched"),
+            Lint::SwappableParameters => concat!(docs!(), "#swappable_parameters"),
+            Lint::FunctionWeight => concat!(docs!(), "#function_weight"),
+            Lint::PathCount => concat!(docs!(), "#path_count"),
+            Lint::LiveState => concat!(docs!(), "#live_state"),
+            Lint::EffectBreadth => concat!(docs!(), "#effect_breadth"),
+            Lint::Exits => concat!(docs!(), "#exits"),
+            Lint::LongFunction => concat!(docs!(), "#long_function"),
+            Lint::LongFile => concat!(docs!(), "#long_file"),
+            Lint::ManyParams => concat!(docs!(), "#many_params"),
+            Lint::WideType => concat!(docs!(), "#wide_type"),
+            Lint::DeepNesting => concat!(docs!(), "#deep_nesting"),
+            Lint::FanOut => concat!(docs!(), "#fan_out"),
+            Lint::ModuleCycle => concat!(docs!(), "#module_cycle"),
+            Lint::ProofForgotten => concat!(docs!(), "#proof_forgotten"),
+            Lint::UnitMismatch => concat!(docs!(), "#unit_mismatch-primitive_meaning"),
+            Lint::PrimitiveMeaning => concat!(docs!(), "#unit_mismatch-primitive_meaning"),
+            Lint::SentinelValue => concat!(docs!(), "#sentinel_value"),
+            Lint::StateInFlags => concat!(docs!(), "#state_in_flags-bool_pair_state"),
+            Lint::BoolPairState => concat!(docs!(), "#state_in_flags-bool_pair_state"),
+            Lint::OutParameter => concat!(docs!(), "#out_parameter"),
+            Lint::ParallelCollections => concat!(docs!(), "#parallel_collections"),
+            Lint::UntypedIndex => concat!(docs!(), "#untyped_index"),
+            Lint::ValidatedButRaw => concat!(docs!(), "#validated_but_raw"),
+            Lint::ClaimContradictsFacts => concat!(docs!(), "#claim_contradicts_facts"),
+            Lint::ClaimIsDerivable => concat!(docs!(), "#claim_is_derivable"),
+            Lint::ClaimWithoutEvidence => concat!(docs!(), "#claim_without_evidence"),
+            Lint::EvidenceIsStale => concat!(docs!(), "#evidence_is_stale"),
+            Lint::SafetyWithoutInvariant => concat!(docs!(), "#safety_without_invariant"),
+            Lint::CommentClaims => concat!(docs!(), "#comment_claims"),
+            Lint::SameFn => concat!(docs!(), "#same_fn-same_impl_fn"),
+            Lint::SameImplFn => concat!(docs!(), "#same_fn-same_impl_fn"),
+            Lint::SameBlock => concat!(docs!(), "#same_block"),
+            Lint::NearDuplicate => concat!(docs!(), "#near_duplicate"),
+            Lint::PasteMismatch => concat!(docs!(), "#paste_mismatch"),
+            Lint::SameType => concat!(docs!(), "#same_type-same_const"),
+            Lint::SameConst => concat!(docs!(), "#same_type-same_const"),
+            Lint::ExtractableDuplicate => concat!(docs!(), "#extractable_duplicate"),
+            Lint::TestsDifferByLiteral => concat!(docs!(), "#tests_differ_by_literal"),
+            Lint::ImplsDifferByType => concat!(docs!(), "#impls_differ_by_type"),
+            Lint::DuplicateAcrossCrates => concat!(docs!(), "#duplicate_across_crates"),
+            Lint::ResultPartUnobserved => concat!(docs!(), "#result_part_unobserved"),
+            Lint::WeakAssertion => concat!(docs!(), "#weak_assertion"),
+            Lint::MirrorAssertion => concat!(docs!(), "#mirror_assertion"),
+            Lint::PseudoTested => concat!(docs!(), "#pseudo_tested"),
+            Lint::UnreachedByTests => concat!(docs!(), "#unreached_by_tests"),
+            Lint::ErrorPathUntested => concat!(docs!(), "#error_path_untested"),
+            Lint::PropertyOverExamples => concat!(docs!(), "#property_over_examples"),
+            Lint::CouldBeNarrower => concat!(docs!(), "#could_be_narrower"),
+            Lint::CouldBeSansIo => concat!(docs!(), "#could_be_sans_io"),
+            Lint::CouldBeLinear => concat!(docs!(), "#could_be_linear"),
+            Lint::CouldHaveInvariant => concat!(docs!(), "#could_have_invariant"),
+            Lint::SameBehaviour => concat!(docs!(), "#same_behaviour"),
+            Lint::HandWrittenDerivable => concat!(docs!(), "#hand_written_derivable"),
+            Lint::ImplMissesField => concat!(docs!(), "#impl_misses_field"),
+            Lint::HandKeptVariantList | Lint::VariantListDrift => {
+                concat!(docs!(), "#hand_kept_variant_list-variant_list_drift")
+            }
+            Lint::HandWrittenCodec => concat!(docs!(), "#hand_written_codec"),
+            Lint::FieldWiseConversion | Lint::ConversionMissesField => {
+                concat!(docs!(), "#field_wise_conversion-conversion_misses_field")
+            }
+            Lint::HandWrittenVisitor => concat!(docs!(), "#hand_written_visitor"),
+            Lint::RepeatedFieldList => concat!(docs!(), "#repeated_field_list"),
+            Lint::RegistrySpread => concat!(docs!(), "#registry_spread"),
             Lint::LoopTurnEffects | Lint::SyncOnAnswerPath => {
                 concat!(general_docs!(), "#loop_turn_effects-sync_on_answer_path")
             }
             Lint::LockOrder | Lint::LockAcrossWait => {
-                concat!(general_docs!(), "#lock_order-lock_across_wait")
+                concat!(docs!(), "#lock_order-lock_across_wait")
             }
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
@@ -1193,6 +1809,9 @@ impl Lint {
             Lint::ReadsPositions => {
                 "read the position-free fact instead (the body, `ExpressionStore::is_synthesized`, the outline, the item index), or mark the function `#[blaze::renders_positions]` when what it makes is about where code is written (a diagnostic's words, debug info, an IDE lookup); else `#[expect(blaze::reads_positions, reason = \"<what must change>\")]`"
             }
+            Lint::AbsolutePosition => {
+                "hold the position item-relative (the item by key with `blaze_format::SpanRef` or `blaze_format::RelSpan`; in the process a `blaze_core::site::Site`) and make `file:line:column` only where it is printed, from the item's start; or, for a value that is shown and never a key, say why with `#[expect(blaze::absolute_position, reason = \"..\")]`"
+            }
             Lint::CborFieldOrder => {
                 "declare the fields in their keys' order, shorter key first, then bytewise (`blaze check --fix` moves each field whole; review the reorder when the type derives `PartialOrd`, `Ord` or `Hash`, whose derived order follows the declaration); or say why the declaration order must stay with `#[expect(blaze::cbor_field_order, reason = \"..\")]`"
             }
@@ -1228,6 +1847,330 @@ impl Lint {
             }
             Lint::TruncatingCast => {
                 "where a value that doesn't fit is a bug, convert with `T::try_from(x)` and a typed error naming the thing; where wrapping is meant, say why with `#[expect(blaze::truncating_cast, reason = \"..\")]`"
+            }
+            Lint::PartialWrite => {
+                "call `write_all`, which writes every byte or returns the error; where the count is the point, loop on it until the buffer is written"
+            }
+            Lint::PartialCmpUnwrap => {
+                "compare with `total_cmp`, or refuse NaN before the comparison with a typed error naming the value"
+            }
+            Lint::UnboundedRead => {
+                "bound the read (`.take(limit)`, a checked `metadata().len()`) and refuse the input past the limit, or say what bounds it with `#[expect(blaze::unbounded_read, reason = \"..\")]`"
+            }
+            Lint::LenMinus => {
+                "`checked_sub` with a typed error naming both lengths, a check before that the length is the larger, or `saturating_sub` where zero is the meant answer"
+            }
+            Lint::StrByteSlice => {
+                "`s.get(a..b)` or `split_at_checked` with the `None` handed on or refused with a typed error, or find the index with `char_indices`/`find` so it is on a boundary"
+            }
+            Lint::Forget => {
+                "end the `ManuallyDrop` with `drop`, `into_inner` or `take`, keep the `Box` with the owner that drops it, or say why the value lives for the process with `#[expect(blaze::forget, reason = \"..\")]`"
+            }
+            Lint::PathToStrUnwrap => {
+                "keep the `Path`/`OsStr` where the name goes back to the OS or into a key, `to_str().ok_or_else(..)?` with an error naming the path where UTF-8 is needed, `.display()` where it is shown"
+            }
+            Lint::DetachedThread => {
+                "keep the `JoinHandle` and `join` it, or spawn in `std::thread::scope`, which joins every thread it spawned"
+            }
+            Lint::UnboundedChannel => {
+                "make the channel bounded (`crossbeam_channel::bounded(n)`), so a full channel pushes back on its sender, or say what bounds it with `#[expect(blaze::unbounded_channel, reason = \"..\")]`"
+            }
+            Lint::Transmute => {
+                "use the safe function for the pair (`to_bits`, `from_bits`, `to_ne_bytes`, `from_ne_bytes`, `cast_signed`, `cast`), or say why no safe form exists with `#[expect(blaze::transmute, reason = \"..\")]`"
+            }
+            Lint::CloneToSatisfy => {
+                "borrow the value itself (`&x`, `x.method()`); where the borrow then conflicts, end the conflicting borrow first instead of copying the value"
+            }
+            Lint::UncheckedIndexInLoop => {
+                "iterate the items (`v.iter()`, `v.iter().enumerate()`, `v.iter().zip(w)`, `v.windows(n)`), or index with `get` and hand the `None` on"
+            }
+            Lint::DefaultNumericFallbackLen => {
+                "write the type the value is (`let mut n: usize = 0;`) and drop the casts"
+            }
+            Lint::RefcellBorrowAcrossCall => {
+                "end the guard before the call (`drop(guard)`, or a block around its use), or copy out what the call needs"
+            }
+            Lint::ProcessExit => {
+                "return from `main` (`-> ExitCode`, or `-> Result<(), E>` with a typed error) so destructors and flushes run; exit only in the binary's entry module, or say why with `#[expect(blaze::process_exit, reason = \"..\")]`"
+            }
+            Lint::PrintInLib => {
+                "hand the caller what it shows (a value, a typed error), take a `&mut impl Write`, or emit a `tracing` event; printing is the binary's choice, made in its entry module"
+            }
+            Lint::LockUnwrap => {
+                "use a lock that does not poison (`parking_lot::Mutex`, `blaze_core::lock::Lock`), or handle the `PoisonError`: `into_inner` where the data is still whole after a panic, a typed error naming the lock where it is not"
+            }
+            Lint::SkippedPair => {
+                "make the second half the drop of a guard the first returns, or a `#[blaze::linear]` value that must be ended; then no exit can skip it"
+            }
+            Lint::HalfDone => {
+                "compute the new state first and commit it in one step after the last fallible call, or change a copy and swap it in"
+            }
+            Lint::HiddenExit => {
+                "make the exit visible at the call: have the macro produce a value (a `Result`, an `Option`, a `ControlFlow`) and write the `?`, `return` or `break` beside the call"
+            }
+            Lint::QuestionMarkConverts => {
+                "convert at the `?` with what the error is about: `.map_err(|source| Error::Variant { path, source })?`, a variant that carries the subject"
+            }
+            Lint::OptionQuestionMarkHides => {
+                "return a `Result` whose error names the key or text that was missing or did not parse; keep `Option` for an answer whose absence is normal"
+            }
+            Lint::UnseenTarget => {
+                "write the target where the conversion is: `.parse::<u32>()`, `.collect::<Vec<_>>()`, `let n: u64 = ...`"
+            }
+            Lint::GlobImport => {
+                "import each name the scope uses (`use a::{B, C};`); a trait used for its methods only is `Trait as _`"
+            }
+            Lint::ShadowChangesMeaning => {
+                "give each value its own name, or end the first one's scope with a block"
+            }
+            Lint::VersionedName => {
+                "keep one item under the plain name and move every caller to it (`.clippy.toml` ban, `blaze check --replace`); or name each for what it does differently"
+            }
+            Lint::UnusedParameter => {
+                "read the parameter again where the body lost its use, or remove it with its argument at every call; a signature fixed for a reason says it in an `#[expect(.., reason)]`"
+            }
+            Lint::Fallback => {
+                "return the error (with `?` and what it was about), or match the one error that has another route and say why it has one"
+            }
+            Lint::PlaceholderBody => {
+                "do what the signature and doc promise, or make the stub loud (`todo!()`, a typed `Unsupported` error naming the item); delete an override that repeats the trait's default"
+            }
+            Lint::TestAssertsNothing => {
+                "assert the result the test is for (`assert_eq!` against the expected value), or let it fail through `?` or `unwrap` where running without a panic is the claim"
+            }
+            Lint::AssertionCannotFail => {
+                "compare the value under test with an expected value computed another way, or delete the assertion"
+            }
+            Lint::TestMissesItsSubject => {
+                "call the crate's code the test is named for; a test of a helper or of std belongs beside that code, or nowhere"
+            }
+            Lint::IgnoredWithoutReason => {
+                "say why and until when: `#[ignore = \"needs a network; runs in the nightly job\"]`"
+            }
+            Lint::DocNamesNothing => {
+                "write the path of an item that exists (`[`crate::store::Store`]`), or plain words for what is not an item"
+            }
+            Lint::MagicNumber => {
+                "derive the number from what it depends on (an array's `len()`, an enum's variant count, `size_of`, another `const`), or name it: a `const` whose doc comment says why that value, used everywhere the fact is used"
+            }
+            Lint::MagicString => {
+                "give the name one home: an enum where the set of names is closed, else a `const` (or a field of the typed settings) used everywhere the name is"
+            }
+            Lint::RepeatedFormat => {
+                "give the sentence one owner: a function that formats it, or a variant of the typed error whose `Display` writes it, called from every place"
+            }
+            Lint::StringSharedAcrossCrates => {
+                "name the string once, in a `const` of the crate that owns what it names (or a crate both depend on), and use it from both"
+            }
+            Lint::StringNearMissAcrossCrates => {
+                "make the two one name: one `const` both crates use, so the writer and the reader cannot spell it differently"
+            }
+            Lint::SwappedArguments => {
+                "pass each argument as the parameter its name matches; give the two a newtype each, or take a struct of named fields, so a swap no longer compiles"
+            }
+            Lint::WriteOnlyField => {
+                "delete the field and its writes, or read it where it was meant to be used"
+            }
+            Lint::OnlyUsedInTests => {
+                "move the function into the tests' module, or call it from the code it was written for"
+            }
+            Lint::SingleImplTrait => {
+                "give the type inherent methods and drop the trait until a second implementation needs it"
+            }
+            Lint::ForwardingFn => {
+                "call the function it forwards to and delete this one"
+            }
+            Lint::ConstantArgument => {
+                "put the value inside the function, as a `const` or a local, and drop the parameter from the signature and every call"
+            }
+            Lint::AlwaysSameResult => {
+                "return the value itself: a `const` for a constant, `T` for an `Option<T>` or `Result<T, E>` that never fails"
+            }
+            Lint::NeverConstructed => {
+                "delete the variant, or construct it where the case it names happens"
+            }
+            Lint::NeverMatched => {
+                "handle the variant by name where it differs, or merge it into the variant it means the same as"
+            }
+            Lint::SwappableParameters => {
+                "give each parameter a newtype, or take one struct of named fields, so that passing them in each other's place is a type error"
+            }
+            Lint::FunctionWeight => {
+                "move the part the help points at into its own function, named for what it does; or return early in place of nesting"
+            }
+            Lint::PathCount => {
+                "move a branching part into its own function, so each can be tested on its own paths"
+            }
+            Lint::LiveState => {
+                "finish each piece of state before the call, or move it with the code that changes it into a function that returns its result"
+            }
+            Lint::EffectBreadth => {
+                "move the calls of one kind of effect into a function of this crate of their own"
+            }
+            Lint::Exits => {
+                "return from one place while a value whose drop finishes something is held, or finish it explicitly in one place"
+            }
+            Lint::LongFunction => "split the function at its steps, each step a function",
+            Lint::LongFile => "move a group of items that belong together into a module of its own",
+            Lint::ManyParams => {
+                "group the parameters that travel together into one struct, or make the function a method"
+            }
+            Lint::WideType => {
+                "group the fields (or variants) that are used together into a type of their own, held by this one"
+            }
+            Lint::DeepNesting => {
+                "return early (`let .. else`, `?`, a guard `if` that returns) in place of nesting, or move the deep part into its own function"
+            }
+            Lint::FanOut => "move the calls of one concern into a function of their own",
+            Lint::ModuleCycle => {
+                "cut the edge the help names: move what one module uses of the other into it, or both into a module neither depends on"
+            }
+            Lint::ProofForgotten => {
+                "keep what the check proved: bind it (`if let Some(x) = x`, `let Ok(x) = r else { .. }`, `v.get(i)`) and use the binding, so no second check is left to fail"
+            }
+            Lint::UnitMismatch => {
+                "carry the unit in the type (`Duration`, a byte-count newtype) and convert with a named call; a sum of two units is then a type error"
+            }
+            Lint::PrimitiveMeaning => {
+                "take `Duration` for a time and a typed id (a newtype per thing, or `la_arena::Idx<T>`) for an identity, so the signature says what the number is"
+            }
+            Lint::SentinelValue => {
+                "make \"none\" a variant: `Option<T>`, with a niche (`Option<NonZero<T>>`, a `NonMax` newtype) where the size matters"
+            }
+            Lint::StateInFlags => {
+                "replace the flags with an enum of the states the value has (or one type per state), so a combination that means nothing can't be made"
+            }
+            Lint::BoolPairState => {
+                "name the states: an enum with one variant per state that occurs, made once where the `bool`s are"
+            }
+            Lint::OutParameter => {
+                "return the value: `Option<T>` when it may not be made, `T` when it always is, `Result<T, E>` when the flag was an error"
+            }
+            Lint::ParallelCollections => {
+                "keep one `Vec` of a struct holding each element's parts, or a struct-of-arrays type with one `push`, so the lengths can't drift"
+            }
+            Lint::UntypedIndex => {
+                "give the index a type made only by its collection: `la_arena::Idx<T>`, or a newtype with `Index<ThatIdx>` on the collection"
+            }
+            Lint::ValidatedButRaw => {
+                "return a newtype whose one constructor is the check (`impl TryFrom<T> for Valid`); with ranged integers or `#[blaze::invariant]` the check is the type's"
+            }
+            Lint::ClaimContradictsFacts => {
+                "make the code hold what the doc says and mark it with the attribute, or say in the doc what the code does"
+            }
+            Lint::ClaimIsDerivable => {
+                "write the attribute the effect walk proves (`#[blaze::nopanic]`, `noalloc`, `nonblocking`, `pure`) and delete the sentence it replaces"
+            }
+            Lint::ClaimWithoutEvidence => {
+                "list the promise under `# Guarantees` (or `# Invariants`) ending in `Evidence: [`a_test`]`, `Evidence: Lean `Theorem``, or `Unverified: why`"
+            }
+            Lint::EvidenceIsStale => {
+                "point at a test or oracle that calls the item, by a path that resolves from it, or at a Lean theorem by its name"
+            }
+            Lint::SafetyWithoutInvariant => {
+                "name the invariant by its path and where it is upheld: `// SAFETY: `Ring::cap` is a power of two; upheld by `Ring::new``"
+            }
+            Lint::CommentClaims => {
+                "state the claim in a form that is checked: an assertion, `blaze::unreachable!()`, a `strict_` operation, an effect attribute, or a type that rules the case out"
+            }
+            Lint::SameFn => {
+                "keep one copy and call it from where the others were called; two that must stay apart say why with `#[expect(blaze::same_fn, reason = ..)]`"
+            }
+            Lint::SameImplFn => {
+                "write the body once: a default method of the trait, a blanket impl, or a macro the impls share"
+            }
+            Lint::SameBlock => {
+                "make the code a function of its free locals, named for what it does, and call it from each place"
+            }
+            Lint::NearDuplicate => {
+                "make one function of the two, the lines that differ its parameters, or say with `#[expect(blaze::near_duplicate, reason = ..)]` why the two must drift apart"
+            }
+            Lint::PasteMismatch => {
+                "finish the rename: the name the note points at is the copy's original, left where the copy renamed it everywhere else"
+            }
+            Lint::SameType => {
+                "keep one type and name it from the other's places (a `use`, or a type alias), so the two cannot drift apart"
+            }
+            Lint::SameConst => {
+                "keep one constant and use it where the other was, so the value has one home"
+            }
+            Lint::ExtractableDuplicate => {
+                "make one function of the two whose parameters are the holes the message names, and call it from both"
+            }
+            Lint::TestsDifferByLiteral => {
+                "write one test over a table of the values, or a property where the expected value can be computed"
+            }
+            Lint::ImplsDifferByType => {
+                "make one generic function or a blanket impl over the types, or `for const` reflection where they are a closed list"
+            }
+            Lint::DuplicateAcrossCrates => {
+                "the same fn, const or type is written in two crates: keep it in their nearest common dependency, or a crate both depend on, and use it from both"
+            }
+            Lint::ResultPartUnobserved => {
+                "assert on the whole value (`assert_eq!(f(..), expected)`), or on the part the message names, in a test that calls the function"
+            }
+            Lint::WeakAssertion => {
+                "compare the value itself with the one expected (`assert_eq!(f(..), Some(expected))`), not one property of it"
+            }
+            Lint::MirrorAssertion => {
+                "write the expected value out, or compute it a way that shares no code with the code under test"
+            }
+            Lint::PseudoTested => {
+                "assert on what the function returns or writes, in a test that calls it"
+            }
+            Lint::UnreachedByTests => {
+                "call the function from a test that checks what it returns, or delete it"
+            }
+            Lint::ErrorPathUntested => {
+                "add a test that hands it a bad input and asserts which error comes back (`assert_eq!(f(bad), Err(..))`)"
+            }
+            Lint::PropertyOverExamples => {
+                "add a property test (Hegel) that draws a value and asserts the inverse gives it back"
+            }
+            Lint::CouldBeNarrower => {
+                "return the narrower type (callers widen with `.into()` where they need to); or say why with `#[expect(blaze::could_be_narrower, reason = \"..\")]`"
+            }
+            Lint::CouldBeSansIo => {
+                "add `#![blaze::sans_io]` to the module, so `blaze::sans_io_core` keeps it free of IO"
+            }
+            Lint::CouldBeLinear => {
+                "mark the type `#[blaze::linear]` and its finishing method `#[blaze::consumes]` (docs/v2/plan/design/linear.md)"
+            }
+            Lint::CouldHaveInvariant => {
+                "write the condition once as `#[blaze::invariant(..)]` on the struct, in terms of its fields, and drop the repeated assertions"
+            }
+            Lint::SameBehaviour => {
+                "keep the original and call it; where the two must stay apart, say why with `#[expect(blaze::same_behaviour, reason = \"..\")]`"
+            }
+            Lint::HandWrittenDerivable => {
+                "derive the impls (`#[derive(Clone, PartialEq, Hash)]`) and delete the hand-written bodies; the fix does both"
+            }
+            Lint::ImplMissesField => {
+                "cover the field the way the others are, or destructure every field and write `field: _, // left out: <why>` for the one left out on purpose"
+            }
+            Lint::HandKeptVariantList => {
+                "derive the list from the declaration where a derive or table exists; the end state is `variants_of::<E>()` with `Variant::NAME` and `Variant::INDEX`"
+            }
+            Lint::VariantListDrift => {
+                "make the list the declaration's again (every variant once, in order, named by the one rule); the fix regenerates a list that is one array or literal"
+            }
+            Lint::HandWrittenCodec => {
+                "write the record's layout once with `blaze_format::record!`, or one generic codec over `for const f in fields_of::<T>()`, in place of a body per type"
+            }
+            Lint::FieldWiseConversion => {
+                "write the field mapping once (a declarative macro over the shared field list today, a generic conversion over `fields_of` in the end state)"
+            }
+            Lint::ConversionMissesField => {
+                "fill each field from its namesake, or say why one is not with `field: _, // left out: <why>` in a destructuring of the source"
+            }
+            Lint::HandWrittenVisitor => {
+                "write one generic walk over `for const f in fields_of::<T>()` in place of one per type"
+            }
+            Lint::RepeatedFieldList => {
+                "derive what a derive writes, and give the rest one body over the field list (a declarative macro today, `for const f in fields_of::<T>()` in the end state)"
+            }
+            Lint::RegistrySpread => {
+                "give each variant one row of one table (a `const` array of records or one declarative macro invocation) and derive every list from the rows"
             }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
@@ -1269,7 +2212,7 @@ impl Lint {
                 "take what the call reads as a parameter (`advance_clock(now)`) and hand back decisions (`take_decisions`, `next_deadline`); a driver injects IO through a trait object or a type parameter the core takes. Or say why with `#[expect(blaze::sans_io_core, reason = \"..\")]`"
             }
             Lint::KeyIgnoresField => {
-                "destructure every field (`let Self { a, b, cache: _ } = self;`), each left out with `// not in key: <why>`, or say why with `#[expect(blaze::key_ignores_field, reason = \"..\")]`"
+                "destructure every field (`let Self { a, b, cache: _ } = self;`), each left out with `// left out: <why>`, or say why with `#[expect(blaze::key_ignores_field, reason = \"..\")]`"
             }
             Lint::WildcardArm => {
                 "list the variants the catch-all stands for, so a variant added to the enum is a compile error at this `match` until its arm is chosen; or say why the catch-all stays with `#[expect(blaze::wildcard_arm, reason = \"..\")]`"
@@ -1400,6 +2343,9 @@ impl Lint {
             Lint::Unreachable => {
                 "add the check that rules the path out (a `match` or `if let` on the value, `is_some`, a comparison with the length or with zero) so that it dominates the site, or write `unreachable!()` for a promise blaze does not check"
             }
+            Lint::Refinement => {
+                "add the check that shows it (an `if` or a `match` that dominates the site), take the value as a narrower type (`u30`, a struct with its own invariant), or state it as a `requires` of the function"
+            }
             Lint::Todo => {
                 "write the expression the hole stands for; a test may keep a `todo!()`"
             }
@@ -1528,6 +2474,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         return;
     }
     proved_unreachable::check_waiver(cx, node);
+    refinement::check_waiver(cx, node);
     if let Some(ty) = ast::PathType::cast(node)
         && cx.on_blaze(Lint::DefaultHasher)
         && let Some(written) = hashmap::check_type(cx, ty)
@@ -1574,8 +2521,10 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
         cbor_field_order::check(cx, adt);
+        absolute_position::check(cx, adt);
         program_lifetime::check(cx, adt);
         could_be_program_lifetime::check(cx, adt);
+        refinement::check_adt(cx, adt);
         default_policy::check_adt(cx, adt);
         intern_candidate::check(cx, adt);
         boxed_recursive_node::check(cx, adt);
@@ -1616,6 +2565,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     }
     if let Some(item) = ast::Enum::cast(node) {
         large_move::check_enum(cx, item);
+        complexity::check_enum(cx, item);
     }
     if let Some(item) = ast::Struct::cast(node) {
         false_sharing::check(cx, item);
@@ -1630,6 +2580,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         pod_serialized_by_field::check(cx, item);
         packable::check(cx, item);
         soa_candidate::check(cx, item);
+        complexity::check_struct(cx, item);
     }
     if let Some(item) = ast::Impl::cast(node) {
         missing_size_hint::check(cx, item);
@@ -1660,7 +2611,18 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     unwired::check(cx, node);
     retry::check(cx, node);
     narrowed_len::check(cx, node);
+    std_mistakes::check_node(cx, node);
+    suspicious::check_node(cx, node);
+    claims::check_node(cx, node);
+    weight::check_node(cx, node);
+    suggest::check_node(cx, node);
+    construct::check_node(cx, node);
+    dup::check_item(cx, node);
     if node == cx.root() && cx.in_file() {
+        complexity::check(cx);
+        dup::check(cx);
+        suspicious::check_body(cx);
+        claims::check_body(cx);
         error_debug::check(cx);
         dropped_error::check(cx);
         hash_order_output::check(cx);
@@ -1689,6 +2651,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         syscall_in_loop::check(cx);
         query_in_loop::check(cx);
         string_key::check(cx);
+        magic::check(cx);
         outline_generic_body::check(cx);
         cold_error::check(cx);
         small_map::check(cx);
@@ -1708,6 +2671,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         checkfree::check(cx);
         effects::check(cx);
         proved_unreachable::check(cx);
+        refinement::check(cx);
         todo::check(cx);
         unmarked_effects::check(cx);
         expect::check(cx);
@@ -1727,6 +2691,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         unbounded_test_wait::check(cx);
         reads_positions::check(cx);
         tmp_path::check_body(cx);
+        construct::check_body(cx);
+        test_strength::check(cx);
+        structural::check(cx);
         check_body(cx);
     }
 }

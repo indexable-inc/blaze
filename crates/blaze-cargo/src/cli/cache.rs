@@ -35,7 +35,7 @@ use blaze_gc::{Collector, Config, Inventory};
 
 use super::say;
 
-const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaze gc --budget <size> (64G, 512M) | blaze clean --unkept | blaze store verify [--dry-run]";
+const USAGE_TEXT: &str = "blaze gc [--dry-run | --kept] | blaze gc --last | blaze gc --budget <size> (64G, 512M) | blaze clean --unkept | blaze store verify [--dry-run] | blaze cache status | blaze cache pull <toolchain> <target> <cfg> [<namespace>] | blaze cache push '<json>' | blaze cache keys public | blaze cache keys sign '<json>'";
 
 /// `blaze cache`, with the words after it.
 pub fn main(words: &[OsString], color: bool) -> i32 {
@@ -53,6 +53,13 @@ pub fn main(words: &[OsString], color: bool) -> i32 {
         // Lane packs-1112: packs out of and into the store (`cli::store`).
         Some(["store", "export" | "import" | "install", ..]) => {
             return super::store::main(&words.as_deref().unwrap_or_default()[1..], color);
+        }
+        // Lane blaze-remote: the shared cache (`blaze_remote::cmd`), settings under the state.
+        Some(all @ [verb, ..]) if blaze_remote::cmd::WORDS.contains(verb) => {
+            let now_s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |it| it.as_secs());
+            crate::serve::state()
+                .map_err(|error| format!("{error:#}"))
+                .and_then(|state| blaze_remote::cmd::main(&state, &|name| std::env::var_os(name), all, now_s))
         }
         Some(["store", "verify"]) => verify(false),
         Some(["store", "verify", "--dry-run" | "-n"]) => verify(true),

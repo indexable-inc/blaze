@@ -68,7 +68,6 @@ macro_rules! per_tag {
             concat!($prefix, "other"),
             concat!($prefix, "solver"),
             concat!($prefix, "pool"),
-            concat!($prefix, "heap"),
         ]
     };
 }

@@ -675,7 +675,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && !self.is_line_slot(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }
@@ -980,7 +980,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                             let operand = match self.store.expr(*value) {
                                 Expr::Literal(l) if !self.has_adjustments(*value) => {
                                     let ty = self.expr_ty_without_adjust(*value);
-                                    self.lower_literal_to_operand(ty, l)?
+                                    self.lower_store_literal(ty, *value, l)?
                                 }
                                 _ => {
                                     let Some(konst) = self.inline_const(*value) else {
@@ -2480,7 +2480,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             Expr::Literal(l) => {
                 let ty = self.expr_ty_without_adjust(expr_id);
-                let mut op = self.lower_literal_to_operand(ty, l)?;
+                let mut op = self.lower_store_literal(ty, expr_id, l)?;
                 op.span = Some(expr_id.into());
                 self.push_assignment(current, place, op.into(), expr_id.into());
                 Ok(Some(current))
@@ -2760,7 +2760,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
 
     fn lower_literal_or_const(&mut self, ty: Ty<'db>, loc: &ExprId) -> Result<'db, Operand> {
         match self.store.expr(*loc) {
-            Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
+            Expr::Literal(l) => self.lower_store_literal(ty, *loc, l),
             Expr::Path(c) => {
                 if let Some((CandidateId::ConstId(c), subst)) =
                     self.infer.assoc_resolutions_for_expr(*loc)
@@ -2792,6 +2792,37 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             _ => {
                 not_supported!("only `char` and numeric types are allowed in range patterns");
             }
+        }
+    }
+
+    /// The literal `l` that the store's `expr` is, as a constant of type `ty`: a `line!()` or
+    /// `column!()` placeholder is first given the value of where its call is written
+    /// ([`Self::placed`]). Every literal of the store is lowered through this, never through
+    /// [`Self::lower_literal_to_operand`] alone.
+    fn lower_store_literal(
+        &mut self,
+        ty: Ty<'db>,
+        expr: ExprId,
+        l: &Literal,
+    ) -> Result<'db, Operand> {
+        let placed = self.placed(expr, l)?;
+        self.lower_literal_to_operand(ty, &placed)
+    }
+
+    /// `l`, the literal the store's `expr` is, with a `line!()` or `column!()` placeholder
+    /// resolved to the line or column of its call (`hir_ty::body_store::placed_literal`); a
+    /// call written in no file's text is an error naming it, never a zero.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a `line!()` or `column!()` lowered where it is a constant is the line or column \
+                  it is written at, as rustc's is; one read where the code runs takes none \
+                  (`Self::is_line_slot`)"
+    )]
+    fn placed<'l>(&self, expr: ExprId, l: &'l Literal) -> Result<'db, Cow<'l, Literal>> {
+        match hir_ty::body_store::placed_literal(self.db, self.store_owner, expr) {
+            Ok(Some(placed)) => Ok(Cow::Owned(placed)),
+            Ok(None) => Ok(Cow::Borrowed(l)),
+            Err(message) => Err(MirLowerError::UnplacedLiteral(message.into_boxed_str())),
         }
     }
 
@@ -3619,6 +3650,13 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         };
         let literal = |expr: ExprId| match self.store.expr(expr) {
             Expr::Literal(&Literal::Int(it, _)) => Some(it),
+            // A `line!()` or `column!()` is a `u32` of at least 1 wherever it is written: a
+            // divisor rustc promotes by, told without reading the line (its placeholder is 0).
+            Expr::Literal(&Literal::Uint(..))
+                if hir_ty::body_store::place_call(self.db, self.store_owner, expr).is_some() =>
+            {
+                Some(1)
+            }
             Expr::Literal(&Literal::Uint(it, _)) => i128::try_from(it).ok(),
             Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Neg } => match self.store.expr(expr) {
                 Expr::Literal(&Literal::Int(it, _)) => Some(-it),
@@ -3827,7 +3865,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             && let Expr::Literal(l) = self.store.expr(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
-            let mut operand = self.lower_literal_to_operand(ty, l)?;
+            let mut operand = self.lower_store_literal(ty, expr_id, l)?;
             operand.span = Some(expr_id.into());
             return Ok(Some((operand, current)));
         }

@@ -332,50 +332,56 @@ main with all the others, so:
 - **Work comes from the ledger.** A lane is one task: an objective of
   [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
   picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
-- **Builds, tests, benchmarks and experiments run on the Mac or in the lane's ix VM**, never
-  on an AWS dev host or any other AWS machine. Anything large (a cold build, a harness, a
-  benchmark) goes to the VM: blaze's daemons have run the Mac out of memory.
-  - Make it: `ix new --name <lane> --no-shell`. The default image is NixOS with `nix`, `git`
-    and `gh`; `nix develop -c ...` in the checkout brings up `harness/toolchain`'s nightly
-    (about 30 s the first time). `--cpus` (2 to 128, the default is the architecture's cap) and
-    `--memory` (a ceiling in GiB it grows to on demand; add `--memory-commit` for a build,
-    whose memory ramps faster than that) size it, `--arch x86_64` or `--arch arm64` picks the
-    platform, and `--ttl 8h` deletes it on its own.
-  - Use it: `ix shell <lane> -- <command>`. Its arguments go through as they are (no remote
-    shell parses them again, as ssh's does) and stdin streams, so send a checkout with
-    `git bundle create - <branch> | ix shell <lane> -- bash -c 'cat > src.bundle && git clone
-    -b <branch> src.bundle src'` (git can't clone a bundle from a pipe).
-    The VM has no GitHub or AWS credentials. For a benchmark, give it its own VM, pinned to a
-    host CPU class (`--cpu epyc-5`, `xeon-6` or `graviton-5`) with `--memory-commit`, and build
-    nothing else there.
-  - Remove it: `ix rm <lane>` when the lane is done.
-  - Where neither can do something, stop and say what is missing; never take it to AWS.
-- **One worktree per lane, named for it** (`blaze-<lane>-<date>`). Its build directory is its
-  own without a `CARGO_TARGET_DIR`: blaze builds each workspace root into a directory of its
-  own under blaze's root, never in the checkout ([cargo.md](cargo.md#where-a-build-writes)).
-  Two lanes that pass one `CARGO_TARGET_DIR` still wait on each other's lock and overwrite each
-  other's binaries.
+- **Linux work runs on the one build VM, `blaze-vm`**, through its one queue
+  (`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`; how-to `H12`
+  under `agents/howto/`); nobody makes a VM per lane, and nothing runs on AWS. The Mac is for
+  what only macOS can show, one build at a time. Where neither can do something, stop and say
+  what is missing (rule `work-in-ix-vms`).
+- **Every command has a timeout** sized to its expected time, and on expiry the status or
+  stall line (`blaze debug inspect`, `blaze slow`) is taken and quoted; a hang is a bug to
+  report, never waited out (rule `every-command-has-a-timeout`).
+- **Lanes write; the main agent compiles.** A lane writes in the one integration directory, in
+  new files or one area's files no other lane touches, with the edit tools or `ast-grep` and
+  never a heredoc, `sed` or a script (rule `edit-rust-by-syntax`), and runs nothing. At most
+  four lanes write in one tree at once; a rewrite gets a fresh core in new crates beside the old
+  code. The main agent compiles each piece within minutes of its report and admits it alone
+  onto the last green head; no new wave of lanes starts while the tree does not compile (rules
+  `fan-out-write-only`, `worktree-per-lane`, `agents-are-a-cost`). A worktree is the exception,
+  for two lanes that must change one file or a variant tree.
 - **Never `git stash`.** The stash is one stack for every worktree of the repository, so a pop
-  can take another lane's changes. Commit work in progress to the lane's branch.
+  can take another lane's changes.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
   not a backtrace into what the harness compares.
-- **Land small and often, through a pull request** ([below](#landing-a-change)). A lane that
-  waits hours for one large merge meets every other lane's changes at once. For anything the
-  fast tier does not cover, run the release train on the branch first
-  (`gh workflow run train.yaml --ref <branch>`: everything, without the release).
-- **Clean up when done:** remove the worktree's build directory (`blaze clean` in it), the
-  worktree (`git worktree remove`) and the lane's VM (`ix rm <lane>`); delete the merged branch.
+- **Land small and often, through a pull request** ([below](#landing-a-change)), each merge
+  after the smoke run of its exact merge commit. For anything the fast tier does not cover, run
+  the release train on the branch first (`gh workflow run train.yaml --ref <branch>`:
+  everything, without the release).
+- **Clean up when done:** the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
+  process it left running, any worktree (`blaze clean` in it, then `git worktree remove`) and
+  the merged branch (rule `clean-up-lane`).
 
 ## Landing a change
 
-Main moves only through pull requests: nobody pushes to it or merges into it by hand. Once the
-branch's work is committed and the local gate passed ([What a change needs](#what-a-change-needs)),
-run in the lane's worktree
+Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
+merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
+branch merged into the main it joins) has run the hello-world smoke on blaze-vm (a cold run, a
+no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
+program's own line) and the result is quoted in the pull request; a compile check is not evidence
+that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
+quote, merge origin/main into the branch, build a release blaze of that commit on blaze-vm and run
+`blaze run -q -p scripts --bin smoke -- '{"blaze": "<that blaze>", "work": "<an empty directory>"}' > smoke.txt`
+(`scripts/src/bin/smoke.rs`; it exits 0 only for `verdict ok`). The quote, the block in smoke.txt
+whose first line is `blaze-smoke 1`, goes in the pull request's body, and `land.py` puts it there
+from the file you give it. `land.py` refuses to open, resume or merge a pull request whose quote
+does not name its head's exact tree, clean, with verdict ok, or whose head no longer contains
+main; no flag skips this, and an admin merge needs the quote too. Once the branch's work is
+committed, the local gate passed ([What a change needs](#what-a-change-needs)) and the smoke run,
+run
 
-    python3 .github/scripts/land.py "what the branch does"
+    python3 .github/scripts/land.py '{"what": "what the branch does", "smoke": "smoke.txt"}'
 
-It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") and turns
-on auto-merge. The pull request's own run is the merge gate, the build and the unit tests on
+It pushes the branch, opens its pull request ("Merge <branch>: what the branch does") with the
+quote in its body, and starts the waiting that merges it. The pull request's own run is the merge gate, the build and the unit tests on
 Linux x86-64 and the released blaze's `blaze check --workspace` on Linux x86-64 and macOS, with
 astlog's rules after it, and the lint baselines ([harness.md](harness.md#ci)); a failure there ends `land.py`
 with the check's link. The gate also holds the budget smoke's guards with the blaze the change
@@ -383,15 +389,17 @@ built ([harness.md](harness.md#the-smokes-guards)): what a warm no-op build, a c
 body edit of two small fixtures may cost, and that blaze runs inside its build-script sandbox. A
 merge that goes around the gate goes around them: on 2026-11-10, with 4 of the last 300 gate
 runs green and merges going around it, every build had been lowering its program anew for days.
-A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it passes, GitHub merges the branch with a merge commit, as
-`git merge --no-ff` would. There is no merge queue and the branch need not be up to date with
-main: two changes that each pass but break together are caught on main by the release train.
-`land.py` waits for the merge and prints the commit, or says why the pull request did not
-merge; then fix the branch and run it again. The waiting runs in a process of
-its own that outlives `land.py`, its terminal and a tool that ends its process group, writing to
-`.git/land/pr-N.log` in the main checkout; `land.py --wait` (or `--wait N`) follows it again, as
-does running `land.py` again on the branch, so nobody polls GitHub by hand. A branch that conflicts with main
-gets `git merge origin/main` first. Once it has merged, GitHub deletes the branch on origin;
+A red gate is fixed or its failure is listed as known with its cause, never passed by. Once it
+passes, the waiting asks `smoke` again about the body's quote and the head GitHub has, and merges
+the branch with a merge commit pinned to that head, as `git merge --no-ff` would. The branch
+must contain main, since the quote is of the tree that becomes main: when main has moved past
+the head, the waiting refuses, and the branch gets `git merge origin/main`, a new build and a new
+smoke. There is no merge queue. `land.py` waits for the merge and prints the commit, or says why
+the pull request did not merge; then fix the branch and run it again. The waiting runs in a
+process of its own that outlives `land.py`, its terminal and a tool that ends its process group,
+writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}'` (or
+`'{"follow": N}'`) follows it again, as does running `land.py` again on the branch, so nobody
+polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
 remove the worktree and the local branch
 (`git worktree remove <dir> && git branch -D <branch>`).
 

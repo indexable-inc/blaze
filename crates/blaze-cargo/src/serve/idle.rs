@@ -6,7 +6,7 @@
 //!    it has had nothing to do for [`AFTER`]: each thread's warm frames
 //!    (`blaze_mem::frame::WARM`, 32 MiB a thread at most), the pages its allocator keeps freed
 //!    (a purge, on the purger's thread and the workers' own as they park), blaze-mem's warm
-//!    chunks and the names the flight reader keeps of past generations (`job::giving`). The
+//!    chunks and the names the flight reader keeps of past generations (`job::fronts`). The
 //!    stores' pools are not trimmed for idleness: their pages are the next edit's reads, and
 //!    an exit returns them with the rest. The next task takes those
 //!    pages from the kernel again: a page fault a page. Nothing the next edit would make again
@@ -28,7 +28,7 @@
 //! and its body edit after 60 s idle took 150.2 ms where one with no idle took 42.3: the
 //! ladder had dropped the front end, which is dear to remake, and the bytes stayed, since a
 //! value freed on the loop's thread into a worker's mimalloc heap leaves the footprint only
-//! once that worker collects (`blaze_mem::tag::give_back_heap`), and the type interner, the
+//! once that worker collects, and the type interner, the
 //! solver's caches, codegen's kept walks and link images are process statics no front end's
 //! drop frees (/tmp/plan/5-memory.md). A process that exits returns every byte by
 //! construction, and the next command starts one, or answers alone where nothing changed
@@ -66,7 +66,7 @@ pub(crate) const EXIT_UNWORKED: Duration = EXIT_LEAST;
 
 /// How long a daemon that built something or took a save waits, idle, before it exits, where
 /// `remake` is what the next edit would pay again without it: the dearest kept front end's
-/// last lowering from nothing to kept (`job::giving`'s `Jobs::exit_wait`; zero where none is
+/// last lowering from nothing to kept (`job::fronts`'s `Jobs::exit_wait`; zero where none is
 /// kept). [`EXIT_TIMES`] times that, at least [`EXIT_LEAST`] and at most [`EXIT_MOST`]. The
 /// wait shortens by itself as a remake gets cheap: a hello-world's 100 ms remake waits the
 /// 30 s floor; a reth front end's minutes wait the half hour. The daemon's own start, which

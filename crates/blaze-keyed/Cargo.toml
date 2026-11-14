@@ -1,0 +1,27 @@
+[package]
+name = "blaze-keyed"
+description = "The fresh core's vocabulary (docs/v2/plan/design/target.md): record kinds keyed from text before the work, with read lists that let a moved key reuse its result; the store, pool, memo and machine interfaces; the sans-IO driver of one request and its simulation"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Flat records: `record!`, `Writer`, `open`, `Aligned`.
+blaze-format.workspace = true
+# `ContentId`, `Hasher`: every key and digest.
+blaze-ids.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

@@ -73,15 +73,13 @@ pub const KEPT: usize = 16;
 /// How much of the recorder a recording takes: the stall watchdog's two minutes.
 pub const WINDOW: Duration = Duration::from_secs(120);
 
-/// How much one taken at the memory ceiling takes: the daemon is over its memory already.
-pub const WINDOW_AT_CEILING: Duration = Duration::from_secs(5);
-
 /// Why a recording was written.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {
     /// A panic no job's runner caught.
     Panic,
-    /// The daemon's footprint passed its ceiling.
+    /// The daemon's footprint passed its ceiling. The ceiling watch is deleted and writes none
+    /// now; the variant stays so a recording it wrote still reads.
     MemoryCeiling,
     /// A build made no progress for the stall bound.
     Stall,

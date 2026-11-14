@@ -366,15 +366,13 @@ fn reported(
                     at.anchor
                 ));
             };
-            let body = super::linked::positions(db, owner).as_ref().map_err(Clone::clone)?;
-            let start = body.starts[table] as usize;
-            let end = body.starts[table + 1] as usize;
-            let Some(&(file, line, column)) = body.rows[start..end].get(at.index as usize) else {
+            let rows = super::linked::table_rows(db, owner, table)?;
+            let Some(&(file, line, column)) = rows.get(at.index as usize) else {
                 // alloc: the error's message
                 return Err(format!(
                     "`{function}`'s finding is span {} of a table of {}",
                     at.index,
-                    end - start
+                    rows.len()
                 ));
             };
             if !files.contains_key(&file) {

@@ -1,0 +1,14 @@
+{
+ "id": "plain-store-unbuilt-lane",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane: the plain store (crates/blaze-cas/src/plain*), int-1113",
+ "where": "crates/blaze-cas/src/plain/{format,core,driven,settings,tests}.rs; crates/blaze-cas/src/plain.rs",
+ "what": "About 4,000 lines of a new store and its deterministic simulation were written in a lane that may run nothing, against blaze-core's sim and effect API read from source, so every signature it assumes (Sim::rot, Sim::contents, Effect::Lock, Faults) and every refusal message its tests match is unverified until the main agent compiles it; and the daemon cannot use it without changing about 40 Store method call sites in blaze-cargo, outside the lane.",
+ "cost": "the first compile of the lane's crate is the first evidence any of it is right; a hello-world on the plain store waits on another lane",
+ "cause": "the daemon talks to the old Store's concrete type (about 40 methods), not to a narrow get/put interface, so a second store cannot be dropped in behind one setting",
+ "class": "a store's users bound to its concrete type, so a new physical form needs a port of every user",
+ "prevention": "one narrow trait (get, put, commit, root) the daemon and kernel use, with each store form an impl, so a form is selected by Settings and nothing else changes",
+ "workaround": "Opened::{Packs, Plain} selected by <root>/store.json; Packs stays the default",
+ "fix": "not yet",
+ "state": "open"
+}

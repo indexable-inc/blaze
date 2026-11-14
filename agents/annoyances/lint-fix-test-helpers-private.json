@@ -1,0 +1,14 @@
+{
+ "id": "lint-fix-test-helpers-private",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), magic_number/magic_string lane, blaze-merge-1113",
+ "where": "crates/blaze-lints/src/blaze/std_mistakes/tests.rs offered, fixed, suggested; crates/blaze-lints/src/tests.rs",
+ "what": "A new blaze lint with a fix needs its suggestion applied and the result linted again clean, but the helpers that do it lived private to std_mistakes' tests, built on that module's own fixture, so a lint elsewhere would copy them.",
+ "cost": "a third copy of the apply-and-relint helpers, or a lint shipped with its fix untested",
+ "cause": "the helpers were written for the first lint that needed them, in its own test file, with its fixture baked in",
+ "class": "test machinery every lint needs kept beside the one lint that first needed it",
+ "prevention": "the crate's test module owns every helper that takes a fixture and flags (lint, lint_with, suggested_in, offered_in, fixed_in); a lint's test file only builds its fixture",
+ "workaround": "none needed",
+ "fix": "crates/blaze-lints/src/tests.rs suggested_in, offered_in, fixed_in; std_mistakes/tests.rs offered and fixed delegate to them; magic_tests.rs uses them (uncompiled at the time of writing)",
+ "state": "fixed"
+}

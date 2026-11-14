@@ -20,8 +20,8 @@ use crate::{
     table::{self, RUNS, Record, WAYS, Writer},
 };
 
-/// `04`: no kinds' peaks (`Estimates` deleted 2026-11-13; admission's one peak record is
-/// `blaze_graph::admission::Peaks`, in a section of its own). A `03` history is of another
+/// `04`: no kinds' peaks (`Estimates` deleted 2026-11-13; nothing forecasts memory since
+/// memory admission was deleted). A `03` history is of another
 /// blaze: an image of it starts its history empty and says so, as one of `02` or `01` does.
 ///
 /// `03`: peaks as charged to each task's memory account (`blaze_graph::arena::account`): what

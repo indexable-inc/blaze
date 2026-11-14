@@ -716,7 +716,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                     (next, Some(else_target))
                 }
             },
-            Pat::Lit(l) => match self.store.expr(l) {
+            Pat::Lit(lit) => match self.store.expr(lit) {
                 Expr::Literal(l) => {
                     if mode == MatchingMode::Check {
                         let mut ty = self.infer.pat_ty(pattern);
@@ -744,7 +744,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
                             cond_place = reference.into();
                             ty = ref_ty;
                         }
-                        let c = self.lower_literal_to_operand(ty, l)?;
+                        let c = self.lower_store_literal(ty, lit, l)?;
                         self.pattern_match_const(current_else, current, c, cond_place, pattern)?
                     } else {
                         (current, current_else)

@@ -1,0 +1,38 @@
+[package]
+name = "blaze-memo"
+description = "The session memo the front end's queries run on (docs/v2/plan/design/target.md, design 4): a table per crate arena, inputs fixed for a snapshot, single flight, declared cycles and an opt-in read recorder; no revisions, no edges, no durability"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `Lock`: the `Alone` flight's table and an arena's input destructors, both off the hit path.
+blaze-core.workspace = true
+# `pump::Flights`: the scheduler's single flight behind `Scheduled`; `sched::carry` for the
+# task's stack of runs.
+blaze-graph.workspace = true
+# `FixedState`: the one deterministic hasher of keys.
+blaze-hash.workspace = true
+# `ContentId`: a record's key in `Resident`.
+blaze-ids.workspace = true
+# `record::Fact`: the (fact id, digest) pair the recorder lists, the read list's own type.
+blaze-keyed.workspace = true
+# `Arena`, `ArenaLocal`, `Tag`: every entry, node and slice lives in its arena.
+blaze-mem.workspace = true
+blaze-memo-macros.workspace = true
+
+[dev-dependencies]
+# The simulation's seeded draws.
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

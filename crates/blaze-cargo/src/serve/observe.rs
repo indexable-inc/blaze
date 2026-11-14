@@ -2292,6 +2292,15 @@ impl Observe {
             self.explorer = None;
         }
     }
+
+    /// The history let go of, for a daemon whose process ends without dropping it
+    /// (`serve::Running::exit`): its sender, the last one once [`Observe::stop`] closed the
+    /// explorer, goes, so the history's thread writes its last flush and ends. Nothing is sent
+    /// to it after: every later send finds no history, as a daemon that keeps none.
+    pub fn let_go_of_history(&mut self) {
+        self.profiling = None;
+        self.history_gone = true;
+    }
 }
 
 const NO_PROFILING: &str = "this daemon keeps no profile history (only `blaze serve`'s does)";

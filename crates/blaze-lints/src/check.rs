@@ -637,7 +637,7 @@ pub(crate) fn plan_of(db: &Db, krate: base_db::Crate) -> Plan {
 }
 
 /// Where `def`'s body is in the file the driver names it by.
-fn body_at(db: &Db, def: DefWithBodyId) -> Option<BodyAt> {
+pub(crate) fn body_at(db: &Db, def: DefWithBodyId) -> Option<BodyAt> {
     let (file, offset, item) = match body_syntax(db, def) {
         Some(syntax) => {
             let file = syntax.file_id.file_id()?;
@@ -952,6 +952,16 @@ impl<'q: 't, 't> Cx<'q, 't> {
 
     pub(crate) fn krate(&self) -> hir::Crate {
         hir::Crate::from(self.krate)
+    }
+
+    /// The body the query lints; `None` for the items of a file.
+    pub(crate) fn body_def(&self) -> Option<DefWithBodyId> {
+        self.def
+    }
+
+    /// The file the query's tree is written in.
+    pub(crate) fn file(&self) -> EditionedFileId {
+        self.base.file
     }
 
     pub(crate) fn edition(&self) -> Edition {
@@ -2195,7 +2205,7 @@ fn is_body_owner(node: ast::Node<'_>) -> bool {
 
 /// clippy's `is_cfg_test`: the `cfg`'s list has the word `test`, as `cfg(test)` and two `cfg`s
 /// one of which is `cfg(test)` do.
-fn names_test(cfg: &CfgExpr) -> bool {
+pub(crate) fn names_test(cfg: &CfgExpr) -> bool {
     let is_test =
         |it: &CfgExpr| matches!(it, CfgExpr::Atom(CfgAtom::Flag(it)) if *it == intern::sym::test);
     match cfg {

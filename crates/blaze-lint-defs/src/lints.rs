@@ -204,7 +204,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // In blaze-lints' `Lint::ALL` order (its discriminant), after the lints added before it.
     l("blaze::lock_held_across_slow", Allow, "detects a lock guard held across IO or a global-heap allocation")
         .externally_loaded(),
-    l("blaze::lossy_as", Allow, "detects an `as` cast that can lose value or sign, or that goes between a pointer and an integer, which `From`, `TryFrom` or a method naming the loss says")
+    l("blaze::as_cast", Allow, "detects every `as` cast, which says neither whether it loses value, sign or provenance nor how, and writes it as the operation it is: `From`, a named widening, truncation or sign change, a float conversion naming its rounding, or a pointer method")
         .externally_loaded(),
     l("blaze::implicit_overflow", Allow, "detects integer `+`, `-`, `*`, `<<`, `>>`, unary `-` and a value-losing `as` that blaze cannot show fit, whose meaning (a panic or a wrap) is the profile's; `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*` or `try_from` says which is meant")
         .externally_loaded(),
@@ -260,6 +260,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::unreachable", Deny, "detects a `blaze::unreachable!()` that blaze cannot prove no path reaches")
         .externally_loaded(),
+    l("blaze::refinement", Deny, "detects a value built, changed, passed or returned where blaze cannot prove what its type's `#[blaze::invariant(..)]` or a function's `requires` or `ensures` needs, and an invariant blaze cannot check")
+        .externally_loaded(),
     l("blaze::todo", Warn, "detects a `todo!()` outside test code, with the type the hole must have; the merge gate and a build for a release deny it")
         .externally_loaded(),
     l("blaze::env_read", Allow, "detects a read of the process's environment (`std::env::var`, `var_os`, `vars`, `vars_os`) outside the settings modules `env-read-allowed` names")
@@ -269,6 +271,8 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::unbounded_test_wait", Allow, "detects a test that waits with no deadline: a park, a condition wait, a channel `recv` or a child's `wait`, or a loop around `Child::try_wait` that compares no deadline")
         .externally_loaded(),
     l("blaze::reads_positions", Allow, "detects a function of the front end's query crates that reads where code is written (a source map, the live parse, an ast id's range) without being marked `#[blaze::renders_positions]`, so its result depends on every edit above it")
+        .externally_loaded(),
+    l("blaze::absolute_position", Allow, "detects a field holding an absolute source position (a `core::panic::Location`, a `TextRange`, a `LineCol`, a `FileRange`) in a type that is hashed or persisted, or a `Location` copied into a field, so the key or record moves with every line added above the code")
         .externally_loaded(),
     l("blaze::cbor_field_order", Allow, "detects a struct or struct variant deriving serde's `Serialize` in a `#![blaze::canonical_cbor]` module with its fields declared out of their keys' deterministic-CBOR order (shorter first, then bytewise), which makes the encoder sort and copy the map")
         .externally_loaded(),
@@ -291,6 +295,243 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::lock_order", Allow, "detects locks taken in a cycle: one function holds A while taking B and another holds B while taking A, through any call, which can deadlock two threads")
         .externally_loaded(),
     l("blaze::lock_across_wait", Allow, "detects a lock guard held across a call that blocks the thread (a condvar it is not handed, a channel, a sleep, a join, a blocking syscall), through any call")
+        .externally_loaded(),
+    l("blaze::truncating_cast", Allow, "lists each integer truncation and sign change (`truncate`, `cast_signed`, `cast_unsigned`, blaze-cast's `*_truncated_from_*`), which wraps a value that does not fit, for a decision: a typed error, a bound said with `expect`, or the wrap kept")
+        .externally_loaded(),
+    l("blaze::partial_write", Allow, "detects a call of `std::io::Write::write` whose count of bytes written is thrown away, so the bytes it did not write are lost without an error")
+        .externally_loaded(),
+    l("blaze::partial_cmp_unwrap", Allow, "detects `partial_cmp(..).unwrap()` or `.expect(..)` of two floats, which panics on the first NaN")
+        .externally_loaded(),
+    l("blaze::unbounded_read", Allow, "detects a read of std's that takes as much as its input holds (`read_to_end`, `read_to_string`, `fs::read`, `Command::output`, `lines`, `read_line`) with no `take` bound")
+        .externally_loaded(),
+    l("blaze::len_minus", Allow, "detects a length minus something in an unsigned type where nothing before it says the length is the larger, which underflows")
+        .externally_loaded(),
+    l("blaze::str_byte_slice", Allow, "detects a `str` sliced or split at a byte index nothing says is on a character boundary, which panics inside a multi-byte character")
+        .externally_loaded(),
+    l("blaze::forget", Allow, "detects a `ManuallyDrop` never dropped, taken apart or handed on, and a `Box::leak` outside a `static` or a `#[blaze::program_lifetime]` type")
+        .externally_loaded(),
+    l("blaze::path_to_str_unwrap", Allow, "detects `Path::to_str` or `OsStr::to_str` unwrapped, which panics on a name that is not UTF-8, and `to_string_lossy` outside display code, which changes it silently")
+        .externally_loaded(),
+    l("blaze::detached_thread", Allow, "detects a `thread::spawn` or `thread::Builder::spawn` whose `JoinHandle` is dropped or never named, so nobody joins the thread")
+        .externally_loaded(),
+    l("blaze::unbounded_channel", Allow, "detects a channel made with no bound (`mpsc::channel`, `crossbeam_channel::unbounded`, tokio's `unbounded_channel`, `flume::unbounded`), which a fast sender grows until memory runs out")
+        .externally_loaded(),
+    l("blaze::transmute", Allow, "detects `std::mem::transmute` and `transmute_copy`, which check nothing but the sizes, and writes std's safe function where one exists for the pair")
+        .externally_loaded(),
+    l("blaze::clone_to_satisfy", Allow, "detects a clone of a heap-owning value only borrowed at once (`&x.clone()`, `x.clone().len()`), which copies the whole value for a read")
+        .externally_loaded(),
+    l("blaze::unchecked_index_in_loop", Allow, "detects a `for i in 0..v.len()` loop that only indexes `v`, indexes another sequence with `i`, or indexes past the range with `i + k`/`i - k`")
+        .externally_loaded(),
+    l("blaze::default_numeric_fallback_len", Allow, "detects an integer literal binding that falls back to `i32` and is cast `as usize` where it is used: a length, count or index in the wrong type")
+        .externally_loaded(),
+    l("blaze::refcell_borrow_across_call", Allow, "detects a `RefCell` guard held while the function borrows the cell again or calls something handed the cell or what holds it, which panics on re-entry")
+        .externally_loaded(),
+    l("blaze::process_exit", Allow, "detects `std::process::exit` and `abort` outside a binary's entry module, which end the process with no destructor run and no buffer flushed")
+        .externally_loaded(),
+    l("blaze::print_in_lib", Allow, "detects `print!`, `println!`, `eprint!` and `eprintln!` in library code, which writes to a stream the caller owns")
+        .externally_loaded(),
+    l("blaze::lock_unwrap", Allow, "detects std's `Mutex::lock`, `RwLock::read` or `write` unwrapped, which turns one panic into a panic of every thread that takes the lock after it")
+        .externally_loaded(),
+    // The suspicious-code lints: what compiles and reads as right but leaves something implicit.
+    l("blaze::skipped_pair", Allow, "detects the first call of a pair (`push`/`pop`, `begin`/`end`, `#[blaze::pairs_with]`) whose second an early exit between them skips")
+        .externally_loaded(),
+    l("blaze::half_done", Allow, "detects a write through a `&mut` parameter, then a fallible exit, then more writes to it: the error leaves the value half changed")
+        .externally_loaded(),
+    l("blaze::hidden_exit", Allow, "detects a call of a workspace macro whose expansion returns, `?`s, breaks or continues out of the caller, unseen at the call")
+        .externally_loaded(),
+    l("blaze::question_mark_converts", Allow, "detects a `?` whose `From` conversion drops what the error was about: a subject-less std error, or one turned into a general error type")
+        .externally_loaded(),
+    l("blaze::option_question_mark_hides", Allow, "detects a `?` on an `Option` from a failed lookup or parse in a function returning `Option`, which makes missing and broken one `None`")
+        .externally_loaded(),
+    l("blaze::unseen_target", Allow, "detects `.into()`, `.parse()`, `.collect()`, `Default::default()`, `.sum()` and the like whose target type only distant inference fixes")
+        .externally_loaded(),
+    l("blaze::glob_import", Allow, "detects a private `use path::*`, which brings names into scope unseen")
+        .externally_loaded(),
+    l("blaze::shadow_changes_meaning", Allow, "detects a `let` that shadows a binding still in scope with a value not made from it")
+        .externally_loaded(),
+    l("blaze::versioned_name", Allow, "detects an item named another's with a version on it (`_v2`, `_new`, `_old`, `_legacy`, `_tmp`, `2`) while the other is still declared beside it")
+        .externally_loaded(),
+    l("blaze::unused_parameter", Allow, "detects a parameter of a function that its body never reads, an underscore name included")
+        .externally_loaded(),
+    l("blaze::fallback", Allow, "detects an error branch that computes the same kind of result another way without looking at the error")
+        .externally_loaded(),
+    l("blaze::placeholder_body", Allow, "detects a function whose whole body is a constant success while its inputs go unread or its doc promises an effect")
+        .externally_loaded(),
+    l("blaze::test_asserts_nothing", Allow, "detects a test with no path that can fail")
+        .externally_loaded(),
+    l("blaze::assertion_cannot_fail", Allow, "detects an assertion that cannot fail: a constant, a value compared with itself, or one after an unconditional exit")
+        .externally_loaded(),
+    l("blaze::test_misses_its_subject", Allow, "detects a test that calls none of its crate's non-test code")
+        .externally_loaded(),
+    l("blaze::ignored_without_reason", Allow, "detects `#[ignore]` with no reason")
+        .externally_loaded(),
+    l("blaze::doc_names_nothing", Allow, "detects a path in backticks in a doc comment that resolves to no item")
+        .externally_loaded(),
+    // The magic literals: a number or a name stated in place of its one home.
+    l("blaze::magic_number", Allow, "detects a number written in code that is neither derived from what it depends on nor a named `const`")
+        .externally_loaded(),
+    l("blaze::magic_string", Allow, "detects a string the program branches or looks up by, or writes in more than one place, that is neither a named `const` nor an enum")
+        .externally_loaded(),
+    l("blaze::repeated_format", Allow, "detects one format template of several words written in two or more places of a crate")
+        .externally_loaded(),
+    // The workspace pass's (blaze-findings): sibling crates compared, neither depending on the other.
+    l("blaze::string_shared_across_crates", Allow, "detects one key-like string written in two or more crates of the workspace")
+        .externally_loaded(),
+    l("blaze::string_near_miss_across_crates", Allow, "detects two key-like strings of two crates that differ only by case, separators, a plural or one character")
+        .externally_loaded(),
+    // Code that carries no weight: what the workspace writes and never uses, abstraction with
+    // one user, and arguments in the wrong order.
+    l("blaze::swapped_arguments", Allow, "detects two same-typed arguments whose names match each other's parameters better than their own")
+        .externally_loaded(),
+    l("blaze::write_only_field", Allow, "detects a field the workspace writes and production code never reads, only a derive, a serde impl or a test")
+        .externally_loaded(),
+    l("blaze::only_used_in_tests", Allow, "detects an exported function production code never calls or names, that tests do")
+        .externally_loaded(),
+    l("blaze::single_impl_trait", Allow, "detects a trait the whole workspace implements once")
+        .externally_loaded(),
+    l("blaze::forwarding_fn", Allow, "detects a function whose whole body calls another with its own parameters, in order, unchanged")
+        .externally_loaded(),
+    l("blaze::constant_argument", Allow, "detects a parameter every call in the workspace passes the same constant")
+        .externally_loaded(),
+    l("blaze::always_same_result", Allow, "detects a function returning the same constant at every return, a `Result` never `Err` or an `Option` never `None`")
+        .externally_loaded(),
+    l("blaze::never_constructed", Allow, "detects a variant of an exported enum no production code of the workspace constructs")
+        .externally_loaded(),
+    l("blaze::never_matched", Allow, "detects a variant production code constructs that no pattern names, of an enum others are matched by")
+        .externally_loaded(),
+    l("blaze::swappable_parameters", Allow, "detects two adjacent parameters of one primitive or string type")
+        .externally_loaded(),
+    // How hard code is to hold in one's head: each measure over its bound (docs/lints.md,
+    // "Complexity"), an existing item held at its value.
+    l("blaze::function_weight", Allow, "detects a function whose cognitive complexity is over its bound")
+        .externally_loaded(),
+    l("blaze::path_count", Allow, "detects a function with more acyclic paths through it, loops taken once, than its bound")
+        .externally_loaded(),
+    l("blaze::live_state", Allow, "detects a function holding more mutable places live across one call than its bound")
+        .externally_loaded(),
+    l("blaze::effect_breadth", Allow, "detects a function whose own calls into other crates bring more kinds of effect than its bound")
+        .externally_loaded(),
+    l("blaze::exits", Allow, "detects a function with more early exits than its bound while it holds a value whose drop finishes something")
+        .externally_loaded(),
+    l("blaze::long_function", Allow, "detects a function with more lines of code, or MIR statements, than its bound")
+        .externally_loaded(),
+    l("blaze::long_file", Allow, "detects a file with more lines of code, its tests left out, than its bound")
+        .externally_loaded(),
+    l("blaze::many_params", Allow, "detects a function with more parameters than its bound")
+        .externally_loaded(),
+    l("blaze::wide_type", Allow, "detects a struct with more fields, or an enum with data with more variants, than its bound")
+        .externally_loaded(),
+    l("blaze::deep_nesting", Allow, "detects a function whose control flow nests deeper than its bound")
+        .externally_loaded(),
+    l("blaze::fan_out", Allow, "detects a function calling more distinct functions than its bound")
+        .externally_loaded(),
+    l("blaze::module_cycle", Allow, "detects modules of one crate that import from each other")
+        .externally_loaded(),
+    // Correct by construction: a check at run time, a convention or a name standing in for a type.
+    l("blaze::proof_forgotten", Allow, "detects an `unwrap`, `expect` or index that a check of the same value just before already proved, so the proof is dropped and asked again at run time")
+        .externally_loaded(),
+    l("blaze::unit_mismatch", Allow, "detects a sum, difference or comparison of two numbers whose names carry different units")
+        .externally_loaded(),
+    l("blaze::primitive_meaning", Allow, "detects a parameter or field of a bare number whose name carries a unit of time or the identity of a thing")
+        .externally_loaded(),
+    l("blaze::sentinel_value", Allow, "detects a number compared with `-1`, `MAX` or a zero id standing in for \"none\"")
+        .externally_loaded(),
+    l("blaze::state_in_flags", Allow, "detects a struct keeping the state of its life in two or more `bool` fields")
+        .externally_loaded(),
+    l("blaze::bool_pair_state", Allow, "detects a tuple of `bool`s, an `Option<bool>` or a `match` on a tuple of `bool`s: states with no names")
+        .externally_loaded(),
+    l("blaze::out_parameter", Allow, "detects a `&mut` parameter only written through, a second return value beside a `bool` or `()`")
+        .externally_loaded(),
+    l("blaze::parallel_collections", Allow, "detects two `Vec` fields of one value pushed together or read at the same index, kept the same length by convention")
+        .externally_loaded(),
+    l("blaze::untyped_index", Allow, "detects an integer field used only as an index into one collection, with no type saying which")
+        .externally_loaded(),
+    l("blaze::validated_but_raw", Allow, "detects a function that checks its primitive parameter and returns the same raw value")
+        .externally_loaded(),
+    // A promise of a doc comment (docs/v2/plan/design/claims.md).
+    l("blaze::claim_contradicts_facts", Allow, "detects a doc comment saying an effect (`never panics`, `does not allocate`) the effect walk refutes, or a `# Panics` section on a function proved not to panic")
+        .externally_loaded(),
+    l("blaze::claim_is_derivable", Allow, "detects a doc comment saying an effect the effect walk proves, which an attribute would state and check")
+        .externally_loaded(),
+    l("blaze::claim_without_evidence", Allow, "detects a promise of a doc comment that is not derived, not an attribute, not evidenced and not declared unverified")
+        .externally_loaded(),
+    l("blaze::evidence_is_stale", Allow, "detects an `Evidence:` pointer that resolves to nothing, to what is not a test, or to a test that does not reach the item")
+        .externally_loaded(),
+    l("blaze::safety_without_invariant", Allow, "detects a `// SAFETY:` comment that does not name its invariant by a resolving path or say where it is upheld")
+        .externally_loaded(),
+    l("blaze::comment_claims", Allow, "detects a body comment claiming what nothing checks (`cannot overflow`, `unreachable`, `can't be None`)")
+        .externally_loaded(),
+    // Duplicated code and copy-paste mistakes, by the shape of code (docs/lints.md, Duplicates).
+    l("blaze::same_fn", Allow, "detects two functions with the same body and signature up to the names of their locals")
+        .externally_loaded(),
+    l("blaze::same_impl_fn", Allow, "detects one method body written in several impls, which a default method or blanket impl would hold once")
+        .externally_loaded(),
+    l("blaze::same_block", Allow, "detects a run of statements over the size floor written more than once, up to the names of its locals")
+        .externally_loaded(),
+    l("blaze::near_duplicate", Allow, "detects two functions most of whose runs of tokens agree, with the lines that differ")
+        .externally_loaded(),
+    l("blaze::paste_mismatch", Allow, "detects a pasted block that renames a name everywhere but one place, and a row of a run of rows that repeats the row above")
+        .externally_loaded(),
+    l("blaze::same_type", Allow, "detects two structs or enums with the same fields or variants")
+        .externally_loaded(),
+    l("blaze::same_const", Allow, "detects two constants or statics with the same type and value")
+        .externally_loaded(),
+    l("blaze::extractable_duplicate", Allow, "detects two functions that differ only in a few literals, paths, fields or expressions of one type, which one function with those as parameters would replace")
+        .externally_loaded(),
+    l("blaze::tests_differ_by_literal", Allow, "detects tests that differ only in their literals, which one test over a table of values would replace")
+        .externally_loaded(),
+    l("blaze::impls_differ_by_type", Allow, "detects functions that differ only in their types, which one generic function or blanket impl would replace")
+        .externally_loaded(),
+    l("blaze::duplicate_across_crates", Allow, "detects the same function, constant or type written in two crates of a workspace, and names the crate it belongs in")
+        .externally_loaded(),
+    // Test strength (`blaze-lints`' `test_strength`): what no test observes, without running one.
+    l("blaze::result_part_unobserved", Allow, "detects a part of what a function returns (a field, the payload of `Ok`) that no test calling it ever looks at")
+        .externally_loaded(),
+    l("blaze::weak_assertion", Allow, "detects a test that checks only one property of a result (`is_ok()`, `len()`, `contains`) where the value has more in it")
+        .externally_loaded(),
+    l("blaze::mirror_assertion", Allow, "detects an assertion whose expected value is computed by the code under test")
+        .externally_loaded(),
+    l("blaze::pseudo_tested", Allow, "detects a function tests call whose result no test looks at, so any body that does not panic passes them")
+        .externally_loaded(),
+    l("blaze::unreached_by_tests", Allow, "detects a public function no test reaches, directly or through what it calls")
+        .externally_loaded(),
+    l("blaze::error_path_untested", Allow, "detects a function returning `Result` whose tests never check which error it returns")
+        .externally_loaded(),
+    l("blaze::property_over_examples", Allow, "detects a function with an inverse beside it (`encode` and `decode`) that no property test checks the round trip of")
+        .externally_loaded(),
+    // Suggestions (`blaze::suggest`, the adoption ladder's second step).
+    l("blaze::could_be_narrower", Allow, "detects a function whose every result is an integer literal that a narrower integer type than its declared one holds")
+        .externally_loaded(),
+    l("blaze::could_be_sans_io", Allow, "detects a module whose code reaches no ambient effect but is not marked `#![blaze::sans_io]`")
+        .externally_loaded(),
+    l("blaze::could_be_linear", Allow, "detects a type whose `Drop` does the work of a method that takes it by value, where `#[blaze::linear]` would make every value finished explicitly")
+        .externally_loaded(),
+    l("blaze::could_have_invariant", Allow, "detects a struct whose constructors and `&mut self` methods start with the same assertion, a condition `#[blaze::invariant(..)]` states once")
+        .externally_loaded(),
+    // Code written by hand that the type's structure gives (`blaze-lints`' `structural`): one
+    // analysis, whether a body is uniform over the type's fields or variants.
+    l("blaze::hand_written_derivable", Allow, "detects a `Clone`, `Debug`, `Default`, `PartialEq`, `Hash`, `PartialOrd` or `Ord` impl whose body is exactly what the derive writes")
+        .externally_loaded(),
+    l("blaze::impl_misses_field", Allow, "detects a field-wise body that covers every field but one the same way, and a `PartialEq`, `Ord` or decoder that leaves out a field its `Hash` or encoder covers")
+        .externally_loaded(),
+    l("blaze::hand_kept_variant_list", Allow, "detects an enum's variants listed again by hand (`ALL`, `COUNT`, `fn name`, `fn index`, a names table) where the list is derivable from the declaration")
+        .externally_loaded(),
+    l("blaze::variant_list_drift", Allow, "detects a hand-kept list of an enum's variants that misses or repeats one, miscounts them, misspells a name, is out of order, or leaves exactly one variant to `_`")
+        .externally_loaded(),
+    l("blaze::hand_written_codec", Allow, "detects an encoder or decoder written field by field, the same call on each, which one record layout or generic codec would replace")
+        .externally_loaded(),
+    l("blaze::field_wise_conversion", Allow, "detects a conversion between two structs that copies each field into its namesake by hand")
+        .externally_loaded(),
+    l("blaze::conversion_misses_field", Allow, "detects a field-by-field conversion that fills a field from another field's namesake, or never reads a field the target has too")
+        .externally_loaded(),
+    l("blaze::hand_written_visitor", Allow, "detects a walk (`visit`, `walk`, `fold`) written by hand for three or more types, each the same call on every field")
+        .externally_loaded(),
+    l("blaze::repeated_field_list", Allow, "detects a struct whose whole field list is written out, field by field, in three or more methods")
+        .externally_loaded(),
+    l("blaze::registry_spread", Allow, "detects an enum whose variants' facts are spread over five or more parallel lists, which one table of rows would replace")
+        .externally_loaded(),
+    // Duplicated behaviour, by a canonical form of runtime MIR.
+    l("blaze::same_behaviour", Allow, "detects a function written differently from another but compiled to the same behaviour, by a canonical form of their runtime MIR")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for disk: a blaze home is one closed tree with one table of owners and one tracing collector with admission at commit; small records in sorted batches with index runs; a pack is the same bytes as a store extent.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # Disk: the store, a blaze home, collection, sharing
 

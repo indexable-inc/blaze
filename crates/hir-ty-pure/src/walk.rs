@@ -852,6 +852,8 @@ struct Walk<'a, 'db> {
     workspace: bool,
     /// Functions trusted for some effect called with no site (Summary::trusted_calls).
     trusted_calls: SmallVec<[FunctionId; 2]>,
+    /// The calls of foreign functions that may block the thread ([`crate::locks::ForeignBlock`]).
+    foreign: Vec<crate::locks::ForeignBlock>,
     dropped: HashSet<Ty<'db>, Global>,
     statics: HashSet<StaticId, Global>,
     code: HashMap<(Ty<'db>, Reach), bool, Global>,
@@ -973,7 +975,7 @@ fn summarize<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> Summary {
             crate::locks::LockSite { instance, call: site.call, given: site.given }
         })
         .collect(); // alloc: a view of the body's sites, once per instance
-    let locks = crate::locks::of(cx, body, &lock_sites, &|instance| match instance.def {
+    let locks = crate::locks::of(cx, body, &lock_sites, &walk.foreign, &|instance| match instance.def {
         // clone: the query's key, reference counts
         Def::Body(_) => Some(cx.summary(instance.clone())),
         Def::Leaf(..) => None,
@@ -1089,24 +1091,17 @@ impl Fold {
             Body::Fn(func) => Some(func),
             Body::Closure(_) | Body::Coroutine(_) | Body::CoroutineByMove(_) => None,
         };
-        if let Some(func) = func
-            && let Some(rule) = effect_attrs::allocator_rule(db, func, args)
-        {
-            // The allocator's own body is not walked: its kind is the call's.
-            return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
-                format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
-            });
-        }
-        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) =
-            match func.and_then(|it| effect_row(db, it)) {
-                Some(modeled) if !modeled.from_workspace || workspace => {
-                    (modeled.kinds, modeled.covers, Some(modeled.does))
-                }
-                _ => match func.and_then(|it| effect_attrs::row_of(db, it)) {
-                    Some(row) => (row.kinds(), row.kinds(), Some(row.says)),
-                    None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
-                },
-            };
+        let found = func.and_then(|func| Some((func, call_row(db, func, args, workspace)?)));
+        let (row, covers, said): (EffectSet, EffectSet, Option<&'static str>) = match found {
+            Some((func, CallRow::Allocator(rule))) => {
+                // The allocator's own body is not walked: its kind is the call's.
+                return self.row(db, func, EffectSet::one(rule), EffectSet::EMPTY, at, || {
+                    format!("calls {}, a method of an allocator", fn_name(db, func)) // alloc: a witness's text
+                });
+            }
+            Some((_, CallRow::Row { kinds, covers, does })) => (kinds, covers, Some(does)),
+            None => (EffectSet::EMPTY, EffectSet::EMPTY, None),
+        };
         self.kinds = self.kinds.union(row).union(callee.kinds);
         let trusted = self.trusted_for(db, def_crate(db, Def::Body(def)));
         // The toolchain's `unsafe` precondition checks (`Rule::Precondition`): what the check
@@ -1177,6 +1172,43 @@ impl Fold {
     fn finish(mut self) -> (EffectSet, Sets, Box<[Witness]>) {
         self.witnesses.sort_by_key(|it| (it.effect, it.rule));
         (self.kinds, self.sets, self.witnesses.into_boxed_slice())
+    }
+}
+
+/// What a call of `func` adds at its site beside what its body does ([`call_row`]).
+#[derive(Clone, Copy)]
+pub(crate) enum CallRow {
+    /// A method of an allocator: its kind is the call's, and its body is not walked.
+    Allocator(Rule),
+    /// A row of a toolchain table ([`crate::effects::MODELS`]) or of an effect attribute: the
+    /// kinds it adds, the kinds of the body it answers for, and what it says the call does.
+    Row { kinds: EffectSet, covers: EffectSet, does: &'static str },
+}
+
+/// The one lookup of what a call of `func<args>` adds at its site, from a body of a workspace
+/// crate when `workspace`: an allocator's kind first, then the toolchain table's row (one
+/// counted only from a workspace crate's body is skipped otherwise), then an effect attribute's
+/// row; `None` when nothing is added beside the body.
+pub(crate) fn call_row<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: GenericArgs<'db>,
+    workspace: bool,
+) -> Option<CallRow> {
+    if let Some(rule) = effect_attrs::allocator_rule(db, func, args) {
+        return Some(CallRow::Allocator(rule));
+    }
+    match effect_row(db, func) {
+        Some(modeled) if !modeled.from_workspace || workspace => Some(CallRow::Row {
+            kinds: modeled.kinds,
+            covers: modeled.covers,
+            does: modeled.does,
+        }),
+        _ => effect_attrs::row_of(db, func).map(|row| CallRow::Row {
+            kinds: row.kinds(),
+            covers: row.kinds(),
+            does: row.says,
+        }),
     }
 }
 
@@ -1491,6 +1523,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             calls: vec![CallKind::Sites; body.map_or(0, |it| it.basic_blocks.len())],
             workspace: body.is_some_and(|it| effects::workspace(cx.db, it.owner.krate(cx.db))),
             trusted_calls: SmallVec::new(),
+            foreign: Vec::new_in(Global),
             dropped: HashSet::new_in(Global),
             statics: HashSet::new_in(Global),
             code: HashMap::new_in(Global),
@@ -1987,6 +2020,21 @@ impl<'a, 'db> Walk<'a, 'db> {
             }
             let except = self.trusted_call(g);
             self.observe_except(kinds, &what, except);
+            // No site is made of a foreign function: the lock pass sees a guard held across one
+            // that may block only through this list.
+            let nonblocking =
+                effects::effect_index(&effect_attrs::NONBLOCKING).map_or(0, |it| 1 << it);
+            if let Some(call) = at
+                && !self.giving
+                && kinds.has(Rule::Block)
+                && (except | self.kinds.base) & nonblocking == 0
+            {
+                self.foreign.push(crate::locks::ForeignBlock {
+                    call,
+                    link: link.as_str().into(), // alloc: a name, once per blocking foreign call
+                    span: self.span,
+                });
+            }
             // A build script may call none: its sandbox is the proof.
             if self.own.is_none() && !self.giving {
                 self.own = Some(what);

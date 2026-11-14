@@ -69,7 +69,7 @@ impl Build {
     ) -> NodeId {
         let id = NodeId(self.next);
         self.next += 1;
-        self.specs.push(Spec { id, kind, name, deps: deps.into(), pool, cost, key, memory: 0 });
+        self.specs.push(Spec { id, kind, name, deps: deps.into(), pool, cost, key });
         id
     }
 
@@ -274,9 +274,7 @@ mod tests {
                         PlaneOutput::Run { id, .. } => running.push(id),
                         PlaneOutput::Finished { ok, .. } => finished = Some(ok),
                         PlaneOutput::Said { .. } => {}
-                        PlaneOutput::Yield { .. } => unreachable!("no request is idle"),
-                        PlaneOutput::Dropped { .. } => unreachable!("no task gives way"),
-                    }
+                        PlaneOutput::Yield { .. } => unreachable!("no request is idle"),                    }
                 }
                 if let Some(ok) = finished {
                     return (ran, together, ok);

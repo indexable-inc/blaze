@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for the command line, output and the agent interface: one ordered stream of typed rows that the terminal, the pipe format, the agent API and why all fold; a registry of homes so every daemon is visible and stoppable. Not yet reconciled with the shared page.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: what people and agents see and call
 

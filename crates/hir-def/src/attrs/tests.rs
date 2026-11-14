@@ -395,6 +395,7 @@ fn old_match_attr_flags(
                         "nonblocking" => attr_flags.insert(AttrFlags::NONBLOCKING),
                         "bounded_turn" => attr_flags.insert(AttrFlags::BOUNDED_TURN),
                         "answers_request" => attr_flags.insert(AttrFlags::ANSWERS_REQUEST),
+                        "lock_checked" => attr_flags.insert(AttrFlags::LOCK_CHECKED),
                         "expect" => attr_flags.insert(AttrFlags::EXPECT),
                         "effects" => attr_flags.insert(AttrFlags::BLAZE_EFFECTS),
                         "specialization" => attr_flags.insert(AttrFlags::BLAZE_SPECIALIZATION),

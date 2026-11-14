@@ -14,31 +14,15 @@
 //! page long and whole huge pages past it, so a small one costs a few base pages and a big
 //! one is huge pages from its second 2 MB on (and from its first under transparent huge
 //! pages, collapsed when it outgrows it).
-//!
-//! Every page it commits passes the memory gate first ([`crate::gate`]): a region is its gate's
-//! core until a task's frame takes it as a span ([`Region::hand_to_task`]), and from then its
-//! pages are the task's quanta, committed only on a grant its frame got
-//! ([`Region::ensure_granted`]). The kernel's commit calls take the grant as proof, and the
-//! region keeps from it exactly what it publishes as committed, so the gate's core count is
-//! what its core regions hold: committed, plus the ranges a sparse one holds, less what a
-//! purge gave the kernel.
 
 use std::{
     io,
     ops::Range,
     ptr::NonNull,
-    sync::{
-        PoisonError,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::{PoisonError, atomic::AtomicUsize, atomic::Ordering},
 };
 
-use crate::{
-    MemError, Tag,
-    gate::{self, Gate, Grant},
-    huge::Pages,
-    os, tag,
-};
+use crate::{MemError, Tag, huge::Pages, os, tag};
 
 /// The largest single commit: past it a region grows 64 MB per system call.
 const MAX_STEP: usize = 64 << 20;
@@ -78,14 +62,6 @@ pub struct Region {
     /// `committed`, which such a region leaves at what its reservation counted.
     held: AtomicUsize,
     tag: Tag,
-    /// The gate its pages pass: counted to its core owner while `task` is false.
-    gate: &'static Gate,
-    /// A running task's span ([`Region::hand_to_task`]): its pages are the task's quanta, which
-    /// its frame reserves and gives back; core counts none of them.
-    task: AtomicBool,
-    /// Bytes [`Region::purge`] gave the kernel and no [`Region::reuse`] took back: committed,
-    /// and out of core's count.
-    purged: AtomicUsize,
 }
 
 // SAFETY: a region is an address range and counters; commits from any thread are atomic and
@@ -163,30 +139,10 @@ impl Region {
             sparse: true,
             held: AtomicUsize::new(0),
             tag,
-            gate: gate::process(),
-            task: AtomicBool::new(false),
-            purged: AtomicUsize::new(0),
         };
         if cfg!(windows) {
-            // Windows commits a sparse reservation whole, so core is asked for all of it now;
-            // the region drops (and gives its reservation back) when core has no room.
-            let mut grant = region.gate.core_reserve(tag, reserved)?;
-            region.publish_kept(reserved, &mut grant);
+            region.publish(reserved);
         }
-        Ok(region)
-    }
-
-    /// As [`Region::reserve_pages`], its pages counted to `gate`'s core rather than the
-    /// process's: for a test's own gate.
-    #[cfg(test)]
-    pub(crate) fn reserve_under(
-        gate: &'static Gate,
-        bytes: usize,
-        pages: Pages,
-        tag: Tag,
-    ) -> Result<Region, MemError> {
-        let mut region = Region::placed(bytes, pages, None, tag)?;
-        region.gate = gate;
         Ok(region)
     }
 
@@ -219,9 +175,6 @@ impl Region {
             sparse: false,
             held: AtomicUsize::new(0),
             tag,
-            gate: gate::process(),
-            task: AtomicBool::new(false),
-            purged: AtomicUsize::new(0),
         })
     }
 
@@ -325,22 +278,6 @@ impl Region {
         self.tag
     }
 
-    /// The gate its pages pass.
-    pub(crate) fn gate(&self) -> &'static Gate {
-        self.gate
-    }
-
-    /// What this region holds in its gate's core count by its own fields: its committed and
-    /// held bytes less what purges took off, nothing while it is a task's. The oracle of
-    /// `gate/tests.rs` sums it over a gate's regions.
-    #[cfg(test)]
-    pub(crate) fn core_counted(&self) -> usize {
-        if self.task.load(Ordering::Acquire) {
-            return 0;
-        }
-        self.committed() + self.held.load(Ordering::Acquire) - self.purged.load(Ordering::Acquire)
-    }
-
     pub fn is_huge(&self) -> bool {
         self.pages.is_huge()
     }
@@ -352,14 +289,8 @@ impl Region {
 
     /// Makes at least `[base, base + len)` readable and writable. Lock-free but on the
     /// reserved pool: threads that grow at once may commit overlapping pages, which is
-    /// harmless, and each byte is counted once. The growth is asked of the gate's core first
-    /// ([`Gate::core_reserve`]). Errs when `len` passes the reservation, core has no room for it
-    /// (naming the tag and the core size), or the kernel refuses.
-    ///
-    /// # Panics
-    ///
-    /// On a task's span ([`Region::hand_to_task`]) that would grow: its frame grows it on its
-    /// task's grant ([`Region::ensure_granted`]).
+    /// harmless, and each byte is counted once. Errs when `len` passes the reservation or the
+    /// kernel refuses.
     #[inline]
     pub fn ensure(&self, len: usize) -> Result<(), MemError> {
         if len <= self.committed.load(Ordering::Acquire) {
@@ -391,33 +322,12 @@ impl Region {
 
     #[cold]
     fn grow(&self, len: usize) -> Result<(), MemError> {
-        let from = self.committed.load(Ordering::Acquire);
-        let target = self.committed_after(len)?;
-        if target <= from {
-            return Ok(());
-        }
-        if self.task.load(Ordering::Acquire) {
-            panic!(
-                "growing a {:?} span of a running task to {len} bytes without its grant: a task's \
-                 span grows only through its frame, on what the memory gate granted the task \
-                 (blaze_mem::gate)",
-                self.tag
-            );
-        }
-        // At most what the growth adds: a grower that loses the race keeps less, and the rest
-        // goes back to core as the grant drops.
-        let mut grant = self.gate.core_reserve(self.tag, target - from)?;
-        self.commit_to(target, &mut grant)
-    }
-
-    /// Commits `[committed, target)` on `grant`, keeping from it what this call publishes.
-    /// `target` is a length [`Region::committed_after`] could give: aligned to its unit.
-    fn commit_to(&self, target: usize, grant: &mut Grant) -> Result<(), MemError> {
         if self.pages == Pages::Reserved {
             let _one = RESERVED_GROWTH.lock().unwrap_or_else(PoisonError::into_inner);
-            return self.commit_reserved_to(target, grant);
+            return self.grow_reserved(len);
         }
         let from = self.committed.load(Ordering::Acquire);
+        let target = self.committed_after(len)?;
         if target <= from {
             return Ok(());
         }
@@ -426,7 +336,7 @@ impl Region {
                 self.mixed("committing a prefix of");
             }
             // Readable and writable already: only the count moves.
-            self.publish_kept(target, grant);
+            self.publish(target);
             return Ok(());
         }
         if os::RESERVATION_WRITABLE {
@@ -438,11 +348,10 @@ impl Region {
             // huge pages already, so each 2 MiB's first touch makes one; its first 2 MiB, base
             // pages while small, is advised and collapsed once, as it grows past them.
             if let Some(before) = self.publish(target) {
-                grant.keep(target - before, self.tag);
                 let start = crate::align::align_down(before, self.granule);
                 // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
                 // reservation (`target <= reserved`), which lives as long as `self`.
-                unsafe { os::commit(self.at(start), target - start, grant) }.map_err(|os| {
+                unsafe { os::commit(self.at(start), target - start) }.map_err(|os| {
                     MemError::Commit { tag: self.tag, bytes: target - start, os }
                 })?;
                 let unit = huge_unit();
@@ -457,8 +366,10 @@ impl Region {
         let start = crate::align::align_down(from, self.granule);
         // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
         // reservation (`target <= reserved`), which lives as long as `self`.
-        unsafe { os::commit(self.at(start), target - start, grant) }.map_err(|os| {
-            MemError::Commit { tag: self.tag, bytes: target - start, os }
+        unsafe { os::commit(self.at(start), target - start) }.map_err(|os| MemError::Commit {
+            tag: self.tag,
+            bytes: target - start,
+            os,
         })?;
         let unit = huge_unit();
         if self.pages == Pages::Transparent && from > 0 && from < unit && target > unit {
@@ -466,14 +377,15 @@ impl Region {
             // committed (`target > unit`), inside the reservation.
             unsafe { os::collapse(self.base, unit) };
         }
-        self.publish_kept(target, grant);
+        self.publish(target);
         Ok(())
     }
 
-    /// [`Region::commit_to`] on the reserved pool, under [`RESERVED_GROWTH`]: the first huge
-    /// page's worth in base pages, each huge page past it mapped once from the pool.
-    fn commit_reserved_to(&self, target: usize, grant: &mut Grant) -> Result<(), MemError> {
+    /// [`Region::grow`] on the reserved pool, under [`RESERVED_GROWTH`]: the first huge page's
+    /// worth in base pages, each huge page past it mapped once from the pool.
+    fn grow_reserved(&self, len: usize) -> Result<(), MemError> {
         let from = self.committed.load(Ordering::Acquire);
+        let target = self.committed_after(len)?;
         if target <= from {
             return Ok(());
         }
@@ -484,7 +396,7 @@ impl Region {
             // SAFETY: `[start, base_end)` is granule-aligned and inside the reservation; the
             // first huge page's worth is never mapped from the pool, so this only changes the
             // protection of reserved space.
-            unsafe { os::commit(self.at(start), base_end - start, grant) }
+            unsafe { os::commit(self.at(start), base_end - start) }
                 .map_err(|os| MemError::Commit { tag: self.tag, bytes: base_end - start, os })?;
         }
         let huge_from = from.max(unit);
@@ -494,62 +406,11 @@ impl Region {
             // page are whole huge pages, `unit`), inside the reservation and not committed
             // (`huge_from >= from`), so nothing reaches it; the lock held makes this the only
             // commit of it.
-            unsafe {
-                os::commit_reserved(self.at(huge_from), target - huge_from, self.node, grant)
-            }
-            .map_err(|os| MemError::Commit { tag: self.tag, bytes: target - huge_from, os })?;
+            unsafe { os::commit_reserved(self.at(huge_from), target - huge_from, self.node) }
+                .map_err(|os| MemError::Commit { tag: self.tag, bytes: target - huge_from, os })?;
         }
-        self.publish_kept(target, grant);
+        self.publish(target);
         Ok(())
-    }
-
-    /// [`Region::publish`], keeping from `grant` what it added.
-    fn publish_kept(&self, target: usize, grant: &mut Grant) {
-        if let Some(before) = self.publish(target) {
-            grant.keep(target - before, self.tag);
-        }
-    }
-
-    /// Commits toward [`Region::committed_after`]`(len)` a task's span, at most `grant`'s bytes
-    /// more (rounded down to the region's unit), keeping from it what it commits: its frame's
-    /// step, which never commits more than its task was granted. Whether `len` is committed
-    /// now; when not, the frame asks its task for more and steps again.
-    pub(crate) fn ensure_granted(&self, len: usize, grant: &mut Grant) -> Result<bool, MemError> {
-        let from = self.committed.load(Ordering::Acquire);
-        if len <= from {
-            return Ok(true);
-        }
-        debug_assert!(self.task.load(Ordering::Acquire), "a granted step of a core region");
-        let want = self.committed_after(len)?;
-        let mut target = want.min(from.saturating_add(grant.bytes()));
-        if target < want {
-            target = crate::align::align_down(target, self.unit(target));
-        }
-        if target > from {
-            self.commit_to(target, grant)?;
-        }
-        Ok(self.committed.load(Ordering::Acquire) >= len)
-    }
-
-    /// The region becomes a running task's span: what it has committed leaves core's count, and
-    /// from now it grows only on its task's grants ([`Region::ensure_granted`]). The bytes it
-    /// says are the task's to reserve.
-    pub(crate) fn hand_to_task(&self) -> usize {
-        assert!(!self.sparse, "a sparse {:?} region handed to a task", self.tag);
-        let was = self.task.swap(true, Ordering::AcqRel);
-        assert!(!was, "a {:?} span handed to a task twice", self.tag);
-        let purged = self.purged.swap(0, Ordering::AcqRel);
-        let committed = self.committed();
-        self.gate.core_release(committed.saturating_sub(purged));
-        committed
-    }
-
-    /// The task's span goes back to core with what it holds committed. Whether core is within
-    /// its size after: if not, its giver drops it rather than keep it.
-    pub(crate) fn hand_to_core(&self) -> bool {
-        let was = self.task.swap(false, Ordering::AcqRel);
-        assert!(was, "a {:?} region handed back to core that was not a task's", self.tag);
-        self.gate.core_take(self.committed())
     }
 
     /// Publishes `[base, base + target)` as committed and counts what it adds: counted before
@@ -615,14 +476,6 @@ impl Region {
         *self.committed.get_mut() = keep;
         tag::sub(self.tag, committed - keep);
         tag::decommitted(committed - keep);
-        if !*self.task.get_mut() {
-            // Core counted the range but for what a purge gave back already.
-            let freed = committed - keep;
-            let purged = self.purged.get_mut();
-            let gone = freed.min(*purged);
-            *purged -= gone;
-            self.gate.core_release(freed - gone);
-        }
         #[cfg(target_os = "linux")]
         if remapped && let Some(node) = self.node {
             // SAFETY: the range just mapped afresh, inside this live reservation and holding no
@@ -658,15 +511,7 @@ impl Region {
         }
         // SAFETY: `[start, end)` is page-aligned, committed, and the caller says nothing
         // holds data in it.
-        if !unsafe { os::purge(self.at(start), end - start) } {
-            return 0;
-        }
-        let given = end - start;
-        if !self.task.load(Ordering::Acquire) {
-            self.purged.fetch_add(given, Ordering::AcqRel);
-            self.gate.core_release(given);
-        }
-        given
+        if unsafe { os::purge(self.at(start), end - start) } { end - start } else { 0 }
     }
 
     /// Makes `[from, from + len)` (rounded out to pages), which [`Region::purge`] may have given
@@ -708,37 +553,13 @@ impl Region {
         if end <= start {
             return Ok(());
         }
-        assert!(
-            !self.task.load(Ordering::Acquire),
-            "reusing bytes of a {:?} span of a running task: a span is never purged",
-            self.tag
-        );
-        // A reuse is over a range a purge gave back (a cold chunk, a block given back cold), so
-        // what core asks for again is what the purges took off it, up to the range.
-        let back = match self.purged.try_update(Ordering::AcqRel, Ordering::Acquire, |purged| {
-            Some(purged - purged.min(end - start))
-        }) {
-            Ok(purged) | Err(purged) => purged.min(end - start),
-        };
-        let mut grant = match self.gate.core_reserve(self.tag, back) {
-            Ok(grant) => grant,
-            Err(error) => {
-                self.purged.fetch_add(back, Ordering::AcqRel);
-                return Err(error);
-            }
-        };
         // SAFETY: `[start, end)` is page-aligned, inside the committed prefix of this live
         // reservation (checked just above).
-        match unsafe { os::reuse(self.at(start), end - start, &grant) } {
-            Ok(()) => {
-                grant.keep(back, self.tag);
-                Ok(())
-            }
-            Err(os) => {
-                self.purged.fetch_add(back, Ordering::AcqRel);
-                Err(MemError::Commit { tag: self.tag, bytes: end - start, os })
-            }
-        }
+        unsafe { os::reuse(self.at(start), end - start) }.map_err(|os| MemError::Commit {
+            tag: self.tag,
+            bytes: end - start,
+            os,
+        })
     }
 }
 
@@ -751,19 +572,17 @@ impl Region {
             return Ok(());
         }
         self.by_ranges("reusing");
-        let mut grant = self.gate.core_reserve(self.tag, len)?;
         self.held.fetch_add(len, Ordering::AcqRel);
         tag::add(self.tag, len);
         tag::committed(len);
         // SAFETY: `[from, end)` is page-aligned inside this live reservation (checked above),
         // every byte of which is mapped readable and writable.
-        if let Err(os) = unsafe { os::reuse(self.at(from), len, &grant) } {
+        if let Err(os) = unsafe { os::reuse(self.at(from), len) } {
             self.held.fetch_sub(len, Ordering::AcqRel);
             tag::sub(self.tag, len);
             tag::decommitted(len);
             return Err(MemError::Commit { tag: self.tag, bytes: len, os });
         }
-        grant.keep(len, self.tag);
         Ok(())
     }
 
@@ -838,7 +657,6 @@ impl Region {
         self.held.fetch_sub(given, Ordering::AcqRel);
         tag::sub(self.tag, given);
         tag::decommitted(given);
-        self.gate.core_release(given);
         Ok(given)
     }
 
@@ -898,11 +716,6 @@ impl Drop for Region {
         let committed = *self.committed.get_mut();
         tag::sub(self.tag, committed);
         tag::decommitted(committed);
-        // A task's span is the task's quanta, which its frame gives back; a core region's
-        // pages leave core's count with it.
-        if !*self.task.get_mut() {
-            self.gate.core_release(committed + held - *self.purged.get_mut());
-        }
         // SAFETY: `base` and `reserved` are this reservation's own, and the region is gone, so
         // nothing reaches its memory.
         unsafe { os::release(self.base, self.reserved) };

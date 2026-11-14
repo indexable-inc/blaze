@@ -86,7 +86,8 @@ pub use output::{
     Undefined,
 };
 pub use position::{
-    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, SpanTable, file_name, location,
+    COLUMN, LINE, LOCATION_ALIGN, LOCATION_SIZE, Position, Span, SpanTable, file_name, location,
+    position_in,
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;

@@ -1,0 +1,28 @@
+[package]
+name = "blaze-mutants"
+description = "Mutation testing cheap enough for every change: a mutant is one function's code record replaced in a program's manifest, and only the tests whose reach includes it run. The operators, the arid and equivalence rules, the sans-IO planner and runner within a time budget, verdicts as records keyed by body and tests, and their rendering as diagnostics"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# ContentId and its domain-separated BLAKE3 Hasher: seeds, tie-breaks, diagnostic ids.
+blaze-ids.workspace = true
+# The verdict's record kind (`kind::Kind`, `KeyHasher`, `record::Opaque`) and the machine descriptor.
+blaze-keyed.workspace = true
+# Item, body and test identities: `key::{ItemId, BodyKey}`, `record::TestKey`.
+blaze-program.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true

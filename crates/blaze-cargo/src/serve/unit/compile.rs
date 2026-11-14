@@ -1794,8 +1794,8 @@ mod erased {
 }
 
 /// The job's kind as `unit`'s record key holds it: what making the unit reads of it, which is
-/// whether the job only checks ([`super::checks_only`], and the front end's
-/// `release::Release::new`: the two readers of the kind while a unit is made). So 0 for a check
+/// whether the job only checks ([`super::checks_only`], and the front end's `BuildEnd::new`:
+/// the two readers of the kind while a unit is made). So 0 for a check
 /// and 1 for a build, a test and a run alike: a library `blaze build` made is the library
 /// `blaze test` and `blaze run` link, found by its record, where its unit and plan are the
 /// same (a test's own program is another unit, of mode `Test`). A build script's compile is
@@ -3329,9 +3329,8 @@ fn generate(
         let generated = codegen::generate(job, reader, unit, krate, &makes, &job.mounted, checks);
         (makes, generated)
     });
-    // Its build may have stopped for the cancel, or to give memory back (`Job::gives_way`,
-    // set until the release it is for has run), with an error that is not the unit's.
-    if job.cancelled() || job.gives_way.load(std::sync::atomic::Ordering::Acquire) {
+    // Its build may have stopped for the cancel, with an error that is not the unit's.
+    if job.cancelled() {
         return Err(Failed::Again);
     }
     lock(slot).generated = Some(generated);

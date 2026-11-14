@@ -35,7 +35,7 @@ use blaze_format::{
 };
 use blaze_hash::HashMap;
 use hir_def::{
-    DefWithBodyId, FieldId, LocalFieldId, VariantId,
+    DefWithBodyId, ExpressionStoreOwnerId, FieldId, LocalFieldId, VariantId,
     expr_store::ExpressionStore,
     hir::{
         AsmOperand as HirAsmOperand, AsmOptions, AsmPiece, BindingId, Expr, ExprId,
@@ -79,6 +79,10 @@ const WORDS_VERSION: u64 = 6;
 /// from the store on reading.
 #[derive(Clone, Copy)]
 pub(crate) struct Locations<'a> {
+    pub(crate) db: &'a Db,
+    /// Whose store `store` is: what a `line!()` or `column!()` placeholder is resolved in
+    /// ([`crate::body_store::placed_literal`]).
+    pub(crate) owner: ExpressionStoreOwnerId,
     pub(crate) store: &'a ExpressionStore,
     pub(crate) exprs: &'a [ExprId],
     /// How many bytes an address of the body's target takes.
@@ -118,9 +122,18 @@ impl Locations<'_> {
 
     /// The constant of type `ty` that MIR building makes of the literal `expr` as the store
     /// has it now, by its rule (`lower_literal_to_operand`) for the literals location macros
-    /// expand to; `None` for another.
+    /// expand to; `None` for another. A `line!()` or `column!()` literal is the placeholder the
+    /// expansion leaves, so its value is the one [`crate::body_store::placed_literal`] reads
+    /// from where the call is written now; a call written nowhere is `None`, a refusal.
+    #[expect(
+        blaze::reads_positions,
+        reason = "a location slot is filled with the value its literal has where it is written \
+                  now: that is what lets the record itself hold none"
+    )]
     fn constant<'db>(&self, expr: ExprId, ty: Ty<'db>) -> Option<StoredAllocation> {
         let Expr::Literal(literal) = self.store.expr(expr) else { return None };
+        let placed = crate::body_store::placed_literal(self.db, self.owner, expr).ok()?;
+        let literal = placed.as_ref().unwrap_or(literal);
         let word = self.word;
         let (memory, memory_map): (Box<[u8]>, MemoryMap<'db>) = match *literal {
             Literal::String(ref text) => {

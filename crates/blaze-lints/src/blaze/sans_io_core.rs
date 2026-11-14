@@ -327,7 +327,7 @@ pub(super) fn root_path(db: &Db, f: FunctionId) -> String {
 }
 
 /// `module`'s path, its crate's name first.
-fn module_path(db: &Db, module: hir::Module) -> String {
+pub(super) fn module_path(db: &Db, module: hir::Module) -> String {
     let krate =
         module.krate(db).display_name(db).map(|it| it.crate_name().symbol().as_str().to_owned());
     // alloc: a finding's path, reported at the edge

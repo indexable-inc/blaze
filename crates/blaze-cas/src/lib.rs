@@ -78,6 +78,7 @@ mod peers;
     allow(dead_code, reason = "lane 4b of docs/v2/plan/design/store-pool.md: the store commits through the pool (`hot`); its reads move onto it next, and its tests are not built under the model checker")
 )]
 mod pool;
+pub mod plain;
 mod publish;
 mod pump;
 mod read;
@@ -559,7 +560,7 @@ impl std::fmt::Display for Ticket {
 }
 
 /// A value whose bytes are not what the store recorded.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Corrupt {
     pub key: Key,
     pub pack: FileName,

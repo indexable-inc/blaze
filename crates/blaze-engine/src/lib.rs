@@ -14,12 +14,6 @@
 #![register_tool(blaze)]
 
 mod as_rustc;
-#[cfg(feature = "native")]
-mod heaps;
-#[cfg(feature = "native")]
-mod huge;
-#[cfg(feature = "native")]
-pub mod malloc;
 mod pin;
 mod program;
 mod update;
@@ -27,19 +21,11 @@ mod versions;
 
 pub use program::main;
 
-/// What the general allocator still serves (startup, configuration, rare large one-offs; the
-/// bulk of a build comes from `blaze-mem`, which gives its pages back itself) wants the fastest
-/// small-object allocator, mimalloc, with a heap per blaze-mem tag (`heaps.rs`). Counted, so
-/// that the plane's `arena::account` and admission's `arena::held` see its bytes, and each
-/// tag's share of them (`blaze_mem::tag::Counters::heap`) is named in the memory line. C's and
-/// C++'s allocations (LLVM's) come through the same counts (`malloc.rs`).
-#[cfg(all(not(test), feature = "native"))]
-#[global_allocator]
-static ALLOC: blaze_graph::arena::Counting<heaps::Heaps> =
-    blaze_graph::arena::Counting(heaps::Heaps);
-
-/// Without `native` (the seed profile, which has no C): std's allocator, counted the same way.
-#[cfg(all(not(test), not(feature = "native")))]
+/// The system's allocator (the bulk of a build comes from `blaze-mem`'s frames, which give
+/// their pages back themselves), counted, so the plane's `arena::account` and the reports see
+/// its bytes per task. It never refuses, waits or limits: the kernel's limit is the one
+/// ceiling. The same in every profile, the native one and the seed.
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOC: blaze_graph::arena::Counting<std::alloc::System> =
     blaze_graph::arena::Counting(std::alloc::System);

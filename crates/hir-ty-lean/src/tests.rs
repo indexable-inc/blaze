@@ -621,12 +621,25 @@ fn what_v0_does_not_translate_is_refused_by_name() {
 
 // ---- The first proof: `blaze_graph::ledger::fnv1a_from`. ----
 
-/// `fnv1a_from` as crates/blaze-graph/src/ledger.rs has it, in a crate and a module of the
-/// same names, with the clauses blaze's own crates cannot carry yet (`blaze_verify` is not on
-/// for them): the signature's return is named and an `ensures` follows it. The body is the
-/// tree's, byte for byte.
+/// `fnv1a_from` as blaze-graph's machine ledger had it (the ledger was deleted with the memory
+/// control stack on 2026-11-13; the function's text is kept here, byte for byte, as the subject
+/// of the first proof), in a crate and a module of the same names (`blaze_graph::ledger`, which
+/// the checked-in Lean models are named by), with the clauses blaze's own crates cannot carry
+/// yet (`blaze_verify` is not on for them): the signature's return is named and an `ensures`
+/// follows it.
+const FNV1A_FROM: &str = "const fn fnv1a_from(mut hash: u64, bytes: &[u8]) -> u64 {
+    let mut at = 0;
+    while at < bytes.len() {
+        hash ^= bytes[at] as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        at += 1;
+    }
+    hash
+}
+";
+
 fn fnv1a_fixture() -> String {
-    let ledger = include_str!("../../blaze-graph/src/ledger.rs");
+    let ledger = FNV1A_FROM;
     let head = "const fn fnv1a_from(mut hash: u64, bytes: &[u8]) -> u64 {";
     let start = ledger.find(head).expect("the ledger has `fnv1a_from`");
     let end = start + ledger[start..].find("\n}\n").expect("the function ends") + 3;
@@ -801,8 +814,8 @@ fn fnv1a(db: &Db) -> FunctionId {
 /// The invariant: the ledger's
 /// checksum loop `fnv1a_from` never panics (no index out of bounds, no counter overflow) and
 /// returns FNV-1a's fold of the seed over the bytes, for every seed and every slice. The
-/// proof is of the model this test holds to the tree's source: the function's text is read
-/// from crates/blaze-graph/src/ledger.rs, its emitted Lean must be the checked-in module the
+/// proof is of the model this test holds to the function's source: its text is [`FNV1A_FROM`]
+/// (the deleted ledger's, kept byte for byte), its emitted Lean must be the checked-in module the
 /// proof imports, and its structured MIR runs to the same fold on the inputs here.
 /// Lean 4.20.0 accepts the proof of the model (crates/blaze-graph/lean/BlazeGraph/Ledger.lean)
 /// and a proof is written that the model is what the function's MIR runs to

@@ -47,9 +47,9 @@ It covers the body and each closure's body.
   amount below the bit width, `a != MIN`, a cast's range end. The message names that fact.
 - **Shifts** are judged by their amount only: dropping high bits is defined in every profile.
 - **Casts** are checked against the target's portable range: `usize` and `isize` count as
-  32 bits on the target side, as `lossy_as` counts them. The candidates come from the same
-  classification as `lossy_as`, which leaves value-losing casts to this lint wherever this lint
-  is on.
+  32 bits on the target side, as `as_cast` counts them. The candidates come from `as_cast`'s
+  classification, its one home. Where this lint is on and reports a cast, `as_cast` gives way
+  there, so one cast has one finding.
 - **Masks and remainders** bound their result (`x & 0xff`, `i % len`), so code that means to
   truncate passes once it says so.
 - `u128` values above `i128::MAX` are outside the prover's range, so any `u128` operation is

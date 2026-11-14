@@ -87,7 +87,9 @@ impl MirLowerError<'_> {
                 writeln!(f, "{}", hir_ty::intrinsic::UnknownIntrinsic(name.clone()))?
             }
             MirLowerError::ComptimeUnexpanded(it) => writeln!(f, "{it}")?,
-            MirLowerError::RpititValue(message) => writeln!(f, "{message}")?,
+            MirLowerError::RpititValue(message) | MirLowerError::UnplacedLiteral(message) => {
+                writeln!(f, "{message}")?
+            }
             MirLowerError::LayoutError(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern
