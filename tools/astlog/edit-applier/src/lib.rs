@@ -88,7 +88,8 @@ pub fn check_overlaps(paths: &[PathBuf], edits: &[Edit]) -> Result<(), OverlapEr
 /// `files` is `(path, contents)` indexed by [`Edit::file`]. Within each file the
 /// edits are spliced right-to-left so earlier offsets stay valid as later ranges
 /// are replaced; the caller is responsible for non-overlap (see
-/// [`check_overlaps`]).
+/// [`check_overlaps`]). Edits of one range keep the order given: of two
+/// insertions at one offset, the one given first comes first in the text.
 #[must_use]
 pub fn apply(files: &[Source], edits: &[Edit]) -> Vec<FileRewrite> {
     let mut by_file: Vec<Vec<&Edit>> = vec![Vec::new(); files.len()];
@@ -106,7 +107,8 @@ pub fn apply(files: &[Source], edits: &[Edit]) -> Vec<FileRewrite> {
         .zip(by_file)
         .filter(|(_, edits)| !edits.is_empty())
         .map(|((path, text), mut file_edits)| {
-            file_edits.sort();
+            // Stable and by place alone: their text never decides the order.
+            file_edits.sort_by_key(|edit| (edit.start, edit.end));
             let mut content = text.clone();
             for edit in file_edits.into_iter().rev() {
                 content.replace_range(edit.start..edit.end, &edit.replacement);

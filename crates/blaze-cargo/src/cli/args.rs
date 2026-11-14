@@ -616,6 +616,24 @@ pub fn refused(asked: &Invocation) -> Option<String> {
         Command::Check if flags.dry_run && flags.rules.is_none() && flags.replace.is_empty() => {
             Some("`--dry-run` shows the edits `--rules` or `--replace` would make: give one of them".to_owned())
         }
+        // The view a rules file runs over is the daemon's of the whole checkout; nothing yet
+        // narrows it, so a selection would be accepted and change nothing.
+        Command::Check
+            if (flags.query.is_some() || flags.rules.is_some() || !flags.replace.is_empty())
+                && !flags.selection.is_empty() =>
+        {
+            let what = match (&flags.query, &flags.rules) {
+                (Some(_), _) => "`--query`",
+                (None, Some(_)) => "`--rules`",
+                (None, None) => "`--replace`",
+            };
+            let given: Vec<String> = flags.selection.iter().map(|it| format!("`--{it}`")).collect(); // alloc: a refusal's few flags
+            Some(format!(
+                "{what} reads the daemon's view of the whole checkout, which no build selection narrows yet, \
+                 so {} would change nothing: run it without",
+                given.join(", ")
+            ))
+        }
         Command::Check
             if (flags.rules.is_some() || flags.query.is_some())
                 && (flags.fix || flags.baselines.is_some() || !flags.lint_levels.is_empty()) =>
@@ -725,10 +743,43 @@ pub struct Flags {
     /// (`--deny=blaze::todo`), in the order given, as the daemon's load keeps them
     /// (`Asked::lint_levels` of blaze-units).
     pub lint_levels: Vec<String>,
+    /// Each flag of [`SELECTS_A_BUILD`] given, by its long name, in order.
+    pub selection: Vec<&'static str>,
 }
+
+/// The flags that choose what a build compiles and reports: packages, features, profile,
+/// target and targets. `--query`, `--rules` and `--replace` read the checkout as the daemon's
+/// view opens it, so they refuse each of these by name ([`refused`]).
+const SELECTS_A_BUILD: &[&str] = &[
+    "package",
+    "workspace",
+    "all",
+    "exclude",
+    "features",
+    "all-features",
+    "no-default-features",
+    "release",
+    "profile",
+    "target",
+    "lib",
+    "bin",
+    "bins",
+    "example",
+    "examples",
+    "test",
+    "tests",
+    "bench",
+    "benches",
+    "all-targets",
+    "unit-graph",
+    "timings",
+];
 
 impl Flags {
     fn read(&mut self, flag: &Flag, value: Option<&str>) {
+        if let Some(name) = flag.long.filter(|it| SELECTS_A_BUILD.contains(it)) {
+            self.selection.push(name);
+        }
         let owned = || value.map(str::to_owned);
         match flag.long.unwrap_or("") {
             "manifest-path" => self.manifest_path = owned(),

@@ -2,6 +2,7 @@
 //! whose `(succ a b)` is demand-driven on `a`.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
@@ -266,6 +267,25 @@ fn unstratifiable_program_names_its_cycle() {
     assert!(!message.contains("`s`"), "s is on no cycle: {message}");
 }
 
+/// `nested(n)` is `n` lists, each holding the next, around one atom.
+fn nested(depth: usize) -> String {
+    format!("{}x{}", "(".repeat(depth), ")".repeat(depth))
+}
+
+#[test]
+fn a_rules_file_nested_past_the_depth_cap_is_refused_naming_its_line() {
+    let max = crate::sexpr::MAX_DEPTH;
+    let at_cap = crate::sexpr::parse::<GraphError>(&nested(max));
+    assert!(at_cap.is_ok(), "{max} levels read: {at_cap:?}");
+    let text = format!("(rule (r a) (edge a b))\n{}", nested(max + 1));
+    let past = Program::<Graph>::parse(&text).expect_err("one level past the cap");
+    assert!(matches!(past, Error::TooDeep { line: 2, .. }), "{past}");
+    assert!(past.to_string().starts_with("rules:2: ") && past.to_string().contains("nested"));
+    // Far past the cap is refused the same way, not by the reader overflowing its stack.
+    let far = crate::sexpr::parse::<GraphError>(&nested(1_000_000)).expect_err("far past the cap");
+    assert!(matches!(far, Error::TooDeep { line: 1, .. }), "{far}");
+}
+
 #[test]
 fn count_counts_rows_per_bound_key() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(
@@ -290,6 +310,23 @@ fn count_local_variable_cannot_escape() {
 }
 
 #[test]
+fn a_count_whose_result_it_also_counts_over_is_refused_naming_the_variable() {
+    let error = Program::<Graph>::parse(
+        "(rule (out a b) (edge a b))
+         (rule (bad a x) (edge a y) (count x (out a x)))",
+    )
+    .expect_err("x is the count and a column it counts over: it derives nothing");
+    let message = error.to_string();
+    assert!(message.starts_with("rules:2: ") && message.contains("`x`"), "{message}");
+    // A result bound before the count compares the count with it, which is meaningful.
+    let compared = Program::<Graph>::parse(
+        "(rule (out a b) (edge a b))
+         (rule (two a) (edge a n) (count n (out a b)))",
+    );
+    assert!(compared.is_ok(), "{compared:?}");
+}
+
+#[test]
 fn demanded_argument_must_be_bound_on_the_left() {
     let error = Program::<Graph>::parse("(rule (next a b) (succ a b) (edge a b))")
         .expect_err("succ is demand-driven on a");
@@ -299,8 +336,69 @@ fn demanded_argument_must_be_bound_on_the_left() {
     assert!(program.is_ok(), "bound on the left is fine");
 }
 
+/// [`Edges`] that counts its `succ` calls.
+struct Counted {
+    edges: Edges,
+    succ_calls: Cell<usize>,
+}
+
+impl Facts for Counted {
+    type Lang = Graph;
+    type Node = u32;
+
+    fn solve(
+        &self,
+        atom: &GraphAtom,
+        line: usize,
+        inputs: &[Option<Value<u32>>],
+        out: &mut Vec<Row<u32>>,
+    ) -> Result<(), Error<GraphError>> {
+        if matches!(atom, GraphAtom::Succ) {
+            self.succ_calls.set(self.succ_calls.get() + 1);
+        }
+        self.edges.solve(atom, line, inputs, out)
+    }
+
+    fn parent(&self, node: u32) -> Option<u32> {
+        self.edges.parent(node)
+    }
+
+    fn kind(&self, node: u32) -> Cow<'_, str> {
+        self.edges.kind(node)
+    }
+
+    fn text(&self, node: u32) -> Cow<'_, str> {
+        self.edges.text(node)
+    }
+
+    fn span(&self, node: u32) -> Option<(usize, Range<usize>)> {
+        self.edges.span(node)
+    }
+
+    fn path(&self, file: usize) -> Cow<'_, str> {
+        self.edges.path(file)
+    }
+}
+
 #[test]
-fn dollar_templates_splice_and_escape() -> Result<(), Error<GraphError>> {
+fn a_source_atom_asked_the_same_inputs_twice_is_called_once() -> Result<(), Error<GraphError>> {
+    // `next` asks `succ` with `a` = 1, 1, 2, 2, 3: three distinct inputs in five asks.
+    // `skip` asks the negated `succ` with (1, 3), (1, 4), (1, 4), (2, 4): three in four.
+    let program = Program::<Graph>::parse(
+        "(rule (next a b) (edge a x) (succ a b))
+         (rule (skip a c) (edge a b) (edge b c) (not (succ a c)))",
+    )?;
+    let edges = Edges(vec![(1, 2), (1, 3), (2, 3), (2, 4), (3, 4)]);
+    let facts = Counted { edges, succ_calls: Cell::new(0) };
+    let (db, _) = crate::run(&program, &facts)?;
+    assert_eq!(db.relations["next"].rows().len(), 3);
+    assert_eq!(db.relations["skip"].rows().len(), 3);
+    assert_eq!(facts.succ_calls.get(), 3 + 3, "one call per (atom occurrence, inputs)");
+    Ok(())
+}
+
+#[test]
+fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
     let template =
         parse_template::<GraphError>(TemplateSyntax::Dollar, "$a + ${b}c $$ $$$args", 1)?;
     assert_eq!(
@@ -315,5 +413,26 @@ fn dollar_templates_splice_and_escape() -> Result<(), Error<GraphError>> {
     );
     let stray = parse_template::<GraphError>(TemplateSyntax::Dollar, "cost $5", 1);
     assert!(stray.is_err(), "`$5` is no variable");
+    Ok(())
+}
+
+#[test]
+fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (path a b) (edge a b))
+         (rule (path a c) (path a b) (path b c))",
+    )?;
+    let edges = Edges(vec![(1, 2), (2, 3), (3, 4), (4, 5)]);
+    let run = |rows: usize| crate::run_with(&program, &edges, crate::Limits { rows });
+    // 4 `edge` answers kept and 10 `path` rows.
+    let (db, _) = run(20)?;
+    assert_eq!(db.relations["path"].rows().len(), 10);
+    let error = run(10).err().expect("10 rows hold the edges and the first 6 paths only");
+    assert!(
+        matches!(error, Error::TooManyRows { ref relation, line: 2, cap: 10 } if relation == "path"),
+        "{error}"
+    );
+    let error = run(3).err().expect("the 4 `edge` answers alone are past 3");
+    assert!(matches!(error, Error::TooManySourceRows { line: 1, cap: 3 }), "{error}");
     Ok(())
 }
