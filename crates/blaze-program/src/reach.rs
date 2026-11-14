@@ -1,11 +1,14 @@
-//! Tests are programs: a test is an entry function of a program, and its result is a record
-//! ([`crate::record::TestRecord`]) keyed by what it can observe.
+//! Tests are programs: a test is an entry function of a program. Its result is the core's
+//! `TestRun`, an outside record (docs/v2/plan/design/test-selection.md, built in
+//! blaze-testsel): keyed by the test's identity ([`test_key`]: the entry, the base inputs, never
+//! what its code is), asking the functions it executed and the outside reads it made.
 //!
-//! **The key** ([`test_key`]): the entry, its reach ([`reach`]: every function instance whose
-//! code it can run, transitively, by plan key: each one it can call and each one any of those
-//! took in at any depth; every static it can read, by the key of its initial value; and the
-//! span of every item a reached panic location is in, as panic messages print lines), and its
-//! arguments.
+//! **The reach** ([`reach`]): every function instance whose code a test can run, transitively,
+//! by plan key: each one it can call and each one any of those took in at any depth; every
+//! static it can read, by the key of its initial value; and the span of every item a reached
+//! panic location is in, as panic messages print lines. It is what a test is kept under when its
+//! execution record is not whole (the reached basis), and what blaze-mutants' verdicts cover
+//! ([`reach_digest`]).
 //!
 //! **A tier is not in it.** Both tiers compile one plan of one body under the same settings
 //! but the tier ([`crate::key::Settings::plan_key`]: overflow checks, debug info and the panic
@@ -13,10 +16,7 @@
 //! changes no program's meaning ([`crate::inline`]); so what a test observes is the same at
 //! either tier, and a tier-up, which only moves code to the top tier, never runs a test again.
 //! The reach is therefore over plan keys, never instance keys (which hold the tier), and it
-//! lists inlined instances too, so the set does not depend on which calls a tier inlined. The outside reads it made (files,
-//! environment) are kept in the record and checked when it is found
-//! ([`crate::record::TestRecord::holds`]). Only tests whose key moved, or whose outside reads
-//! read differently, run again.
+//! lists inlined instances too, so the set does not depend on which calls a tier inlined.
 //!
 //! A static's value reaches a test two ways: the test reads it, and the functions its value
 //! points at (a vtable, a function pointer) are callable. Both are in the reach; a reach that
@@ -35,7 +35,7 @@ use crate::program::{Program, SpanRow};
 use crate::record::{TestKey, ValueKey};
 use crate::codec::{Digest, Hasher};
 
-use blaze_keyed::kind::{Kind, TestInputs, TestRun};
+use blaze_keyed::kind::{Kind, Settings as UnitSettings, TestInputs, TestRun, ToolId};
 
 /// The domain of a test's key.
 pub const TEST_DOMAIN: &str = "blaze program test 1";
@@ -101,17 +101,37 @@ pub fn reach(program: &Program, entry: &Symbol, plant: Plant) -> Reach {
     out
 }
 
-/// The key of the result of test `entry` with `args`, over its `reach`: tier-free (see the
-/// module docs), so a tier-up never moves it.
-/// The key is the core's [`TestRun`] key (its one rule) over the entry, the digest of the reach
-/// ([`reach_digest`]) and the arguments.
-pub fn test_key(entry: &Symbol, reach: &Reach, args: &[u8]) -> TestKey {
-    let inputs = TestInputs { item: entry.item.0, entry_args: entry.args.0, reach: reach_digest(reach), args };
+/// What a test is besides its entry: everything its base key covers.
+#[derive(Clone, Copy, Debug)]
+pub struct TestBase<'a> {
+    pub tool: ToolId,
+    pub settings: UnitSettings,
+    /// The variables blaze gives the test, sorted by name, each once.
+    pub env: Digest,
+    /// Its libtest name, `#[ignore]` and `#[should_panic]`.
+    pub attrs: Digest,
+    pub args: &'a [u8],
+}
+
+/// The base key of test `entry`: the core's [`TestRun`] key (its one rule) over the test's
+/// identity. Nothing its code is is in it, so no edit moves it; what it executed and read are
+/// its asks (blaze-testsel).
+pub fn test_key(entry: &Symbol, base: &TestBase<'_>) -> TestKey {
+    let inputs = TestInputs {
+        tool: base.tool,
+        settings: base.settings,
+        env: base.env,
+        item: entry.item.0,
+        entry_args: entry.args.0,
+        attrs: base.attrs,
+        args: base.args,
+    };
     TestKey(TestRun::key(&inputs).id())
 }
 
 /// The digest of what a test can observe: every reached function by plan key, every static by
-/// value key and every span row, each list length-prefixed.
+/// value key and every span row, each list length-prefixed. Tier-free (see the module docs), so
+/// a tier-up never moves it.
 pub fn reach_digest(reach: &Reach) -> Digest {
     let mut hasher = Hasher::new(TEST_DOMAIN);
     hasher.update(&(reach.functions.len() as u64).to_le_bytes());

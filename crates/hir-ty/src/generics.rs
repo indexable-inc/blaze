@@ -350,7 +350,11 @@ impl<'db> Generics<'db> {
             TypeOrConstParamData::TypeParamData(p) => match p.provenance {
                 TypeParamProvenance::TypeParamList => non_impl_trait_type_params += 1,
                 TypeParamProvenance::TraitSelf => has_self_param |= true,
-                TypeParamProvenance::ArgumentImplTrait => impl_trait_type_params += 1,
+                // An anonymous `_` (`#![feature(blaze_anon_params)]`) is unnamed as an
+                // argument's `impl Trait` is, and after the named ones as it is.
+                TypeParamProvenance::ArgumentImplTrait | TypeParamProvenance::Anonymous => {
+                    impl_trait_type_params += 1
+                }
             },
             TypeOrConstParamData::ConstParamData(_) => const_params += 1,
         });

@@ -3814,7 +3814,9 @@ impl TypeParam {
         let data = &params[self.id.local_id()];
         match data.type_param().unwrap().provenance {
             TypeParamProvenance::TypeParamList => false,
-            TypeParamProvenance::TraitSelf | TypeParamProvenance::ArgumentImplTrait => true,
+            TypeParamProvenance::TraitSelf
+            | TypeParamProvenance::ArgumentImplTrait
+            | TypeParamProvenance::Anonymous => true,
         }
     }
 

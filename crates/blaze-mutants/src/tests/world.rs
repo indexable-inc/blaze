@@ -249,7 +249,7 @@ impl World {
     }
 
     /// The facts and test infos the planner reads, made again after an edit. A test's key
-    /// covers the bodies it executes, as `blaze_program::reach::test_key` covers the instance
+    /// covers the bodies it executes, as `blaze_program::reach::reach_digest` covers the instance
     /// keys it reaches.
     fn refresh(&mut self) {
         for index in 0..self.funs.len() {
