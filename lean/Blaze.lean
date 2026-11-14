@@ -14,3 +14,4 @@ import Blaze.Opaque
 import Blaze.Threads
 import Blaze.Atomic
 import Blaze.ThreadsWeak
+import Blaze.ThreadsWeakAuto

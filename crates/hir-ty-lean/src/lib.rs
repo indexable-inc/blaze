@@ -84,6 +84,7 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Atomic", include_str!("../../../lean/Blaze/Atomic.lean")),
     // The weak world, which a theorem that reaches `threads::two_weak` is stated in.
     ("Blaze.ThreadsWeak", include_str!("../../../lean/Blaze/ThreadsWeak.lean")),
+    ("Blaze.ThreadsWeakAuto", include_str!("../../../lean/Blaze/ThreadsWeakAuto.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),

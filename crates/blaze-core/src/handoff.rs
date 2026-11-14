@@ -139,15 +139,17 @@ fn hands(schedule: &[Step], flagged: bool) -> bool {
     }
 }
 
-/// The invariant: no hand-back is missed, in the weak memory. For every schedule of a sender
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Handoff.lean): no hand-back is
+/// missed, in the weak memory. For every schedule of a sender
 /// and the driver, every value each read may see under its ordering, and the flag set or
 /// clear as they begin: where both returned, the driver read the sender's slot after its
 /// drain, or the sender was told to wake the driver ([`hands`]). It is the orderings that
 /// make it so: the two swaps of the flag are one after the other, and the later acquires what
-/// the earlier released. Run on drawn schedules below; not yet proved. Its control is
-/// `the_oracle_catches_a_flag_swapped_relaxed`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Handoff.lean) lands: "(proved: that file)" in
-// the first line above. Until then a landing branch drops the attribute below.
+/// the earlier released. The proof is of the weak world's every pick: eleven reachable
+/// combinations of the two threads' points, the flag's messages and whose view names the
+/// slot's store. Run on drawn schedules below too. Its control is
+/// `the_oracle_catches_a_flag_swapped_relaxed`, and in Lean the same two threads with
+/// `Relaxed` swaps, a run by evaluation that misses a hand-back (`BlazeCore.HandoffModel`).
 #[cfg(not(blaze_check))]
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
