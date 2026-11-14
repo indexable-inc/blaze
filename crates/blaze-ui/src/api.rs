@@ -346,6 +346,9 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                     blaze_api::ProofRecord::Refused { function, what, .. } => {
                         put!(out, "{} {function}: {what}\n", paint(RED, "refused"))
                     }
+                    blaze_api::ProofRecord::ModelBroken { function, at, .. } => {
+                        put!(out, "{} {function}: its generated Lean model does not build at {at}\n", paint(RED, "model broken"))
+                    }
                 }
             }
         }

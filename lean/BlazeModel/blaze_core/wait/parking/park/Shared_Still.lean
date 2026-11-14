@@ -10,9 +10,9 @@ import BlazeModel.blaze_core.wait.parking.Still.type
 import BlazeModel.blaze_core.wait.parking.ParkPlant.type
 import BlazeModel.blaze_core.wait.retry.Retry.type
 import BlazeModel.blaze_core.wait.retry.Next.type
+import BlazeModel.blaze_core.wait.parking.ParkPlant.impl
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.switch
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.prepare
-import BlazeModel.blaze_core.wait.parking.ParkPlant.PartialEq.eq
 import BlazeModel.blaze_core.wait.parking.Still.Clock.now
 import BlazeModel.blaze_core.wait.retry.Retry.new
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.wait.Still
@@ -191,7 +191,7 @@ def blaze_core.wait.parking.park.Shared_Still (fuel : Nat) (word : core.sync.ato
   if core.result.Result.is_ok t8 then
     Threads.Prog.done (Result.ok (core.result.Result.Ok (blaze_core.wait.retry.Waited.unit.Ready () : blaze_core.wait.retry.Waited.unit) : core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError))
   else
-    if blaze_core.wait.parking.ParkPlant.PartialEq.eq plant (blaze_core.wait.parking.ParkPlant.None : blaze_core.wait.parking.ParkPlant) then do
+    if core.cmp.PartialEq.eq plant (blaze_core.wait.parking.ParkPlant.None : blaze_core.wait.parking.ParkPlant) then do
       let t9 ←
         core.sync.atomic.Atomic.compare_exchange word (0 : U32) (4294967295 : U32) (core.sync.atomic.Ordering.AcqRel : core.sync.atomic.Ordering) (core.sync.atomic.Ordering.Acquire : core.sync.atomic.Ordering)
       if core.result.Result.is_err t9 then do

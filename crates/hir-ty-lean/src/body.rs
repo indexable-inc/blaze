@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use base_db::Db;
 use hir_def::{
     AdtId, AttrDefId, attrs::AttrFlags,
-    builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
+    builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ItemContainerId,
     Lookup as _, ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::generics::GenericParams,
@@ -744,6 +744,22 @@ impl Stmt {
         }
     }
 
+    /// The places the statement reads a value from (a write of a part of a place reads none).
+    pub fn read_places(&self) -> Vec<&Place> {
+        match self {
+            Stmt::Assign { value, .. } => value.places(),
+            Stmt::Call { args, .. } => args
+                .iter()
+                .filter_map(|it| match it {
+                    Operand::Place(place) => Some(place),
+                    _ => None,
+                })
+                .collect(),
+            Stmt::Assert { cond: Operand::Place(place), .. } => vec![place],
+            Stmt::Assert { .. } => Vec::new(),
+        }
+    }
+
     /// The local the statement gives a whole new value, whatever it held.
     pub fn writes(&self) -> Option<Local> {
         match self {
@@ -1201,6 +1217,24 @@ enum Structural {
     PartialEq,
 }
 
+/// The builtin derive `func` is a method of an expansion of, if it is one: `func`'s impl was
+/// written by expanding `#[derive(..)]` (as a build expands every builtin derive, where the
+/// front end's fast path records the impl without expanding it and the trait solver answers
+/// with a `BuiltinDeriveImplId`). The impl's file is the expansion of a macro call, and the
+/// macro called is the standard library's derive of that trait (`lang_items`'
+/// `PartialEqDerive`, `CloneDerive`, ..): a hand-written impl, or one written by any other
+/// macro, is none.
+fn expanded_derive(db: &Db, func: FunctionId) -> Option<BuiltinDeriveImplTrait> {
+    let ItemContainerId::ImplId(imp) = func.lookup(db).container else { return None };
+    let call = imp.lookup(db).id.file_id.macro_file()?;
+    let called = call.lookup(db).def;
+    let lang = hir_def::lang_item::lang_items(db, imp.krate(db));
+    BuiltinDeriveImplTrait::ALL
+        .iter()
+        .copied()
+        .find(|it| it.derive_macro(&lang).is_some_and(|derive| derive.definition(db) == called))
+}
+
 /// Where a function of the standard library is, which tells its model.
 enum Home {
     /// An inherent method of this integer type.
@@ -1384,13 +1418,15 @@ pub(crate) fn closure_of<'db>(
 }
 
 /// Whether `func` has type or const parameters, its own or its impl's. Lifetimes are dropped:
-/// a function generic only over lifetimes is one function.
+/// a function generic only over lifetimes is one function. A trait's own method (its provided
+/// body) is generic over `Self`, as a generic function is over its parameters.
 pub(crate) fn is_generic(db: &Db, func: FunctionId) -> bool {
     if GenericParams::of(db, func.into()).len_type_or_consts() != 0 {
         return true;
     }
     match func.lookup(db).container {
         ItemContainerId::ImplId(imp) => GenericParams::of(db, imp.into()).len_type_or_consts() != 0,
+        ItemContainerId::TraitId(_) => true,
         _ => false,
     }
 }
@@ -1697,12 +1733,25 @@ fn owner<'db>(
         ItemContainerId::ExternBlockId(_) => {
             return Err("a function without a body (rule Ffi)".to_owned());
         }
-        // A trait's own method: with a body, it is the trait's default, written once for every
-        // `Self`, which is generic over `Self` as a generic function is over its parameters.
-        _ => {
-            return Err("a method of a trait (a default body, generic over `Self`; only an \
-                        impl's method is translated)"
-                .to_owned());
+        // A trait's own method, its provided body: written once for every `Self`, so it is
+        // generic over `Self` as a generic function is over its parameters, and translated at
+        // the instance whose `Self` is the implementor a call resolves to. It is named in the
+        // namespace an impl's method of that type and trait has (`krate.Square.Shape`), where
+        // the impl has no method of its name (it would be called instead); a `Self` with no
+        // module of its own (an integer, `bool`) is named in the trait's module.
+        ItemContainerId::TraitId(trait_id) => {
+            let Some(args) = args else {
+                return Err("a method of a trait (a default body, generic over `Self`, translated at \
+                            each implementor a call reaches)"
+                    .to_owned());
+            };
+            return blaze_query::db::attach(db, || {
+                let interner = DbInterner::new_with(db, func.krate(db));
+                let parent = hir_ty::generics::generics(db, func.into()).len_parent();
+                let trait_args: GenericArgs<'db> = GenericArgs::new_from_iter(args.iter().take(parent));
+                let of = TraitRef::new_from_args(interner, trait_id.into(), trait_args);
+                trait_impl_owner(db, trait_id.lookup(db).container, of, args.type_at(0)).map(Some)
+            });
         }
     };
     blaze_query::db::attach(db, || {
@@ -1717,7 +1766,7 @@ fn owner<'db>(
             None => (db.impl_self_ty(imp).skip_binder(), db.impl_trait(imp).map(|it| it.skip_binder())),
         };
         if let Some(of) = of {
-            return trait_impl_owner(db, imp, of, self_ty).map(Some);
+            return trait_impl_owner(db, imp.module(db), of, self_ty).map(Some);
         }
         let TyKind::Adt(def, adt_args) = self_ty.kind() else {
             return Err("a method of a type that is not a struct or an enum".to_owned());
@@ -1747,11 +1796,13 @@ fn owner<'db>(
     })
 }
 
-/// [`owner`] of a method of the impl `imp` of the trait `of` for `self_ty`, both at the
-/// instance: refused unless `self_ty` is a struct or enum, an integer or `bool`.
+/// [`owner`] of a method of the trait `of` for `self_ty`, both at the instance, an impl's in
+/// `module` (or the trait's provided body, `module` the trait's): refused unless `self_ty` is
+/// a struct or enum, an integer or `bool`. A primitive has no module, so it is named in
+/// `module`.
 fn trait_impl_owner<'db>(
     db: &'db Db,
-    imp: ImplId,
+    module: ModuleId,
     of: TraitRef<'db>,
     self_ty: HTy<'db>,
 ) -> Result<Owner, String> {
@@ -1771,12 +1822,12 @@ fn trait_impl_owner<'db>(
         }
         // A primitive has no module: its impls are named in the impl's.
         TyKind::Bool => {
-            let mut path = module_path(db, imp.module(db));
+            let mut path = module_path(db, module);
             path.push("bool".to_owned());
             (path.clone(), path)
         }
         _ if int_ty(self_ty).is_some() => {
-            let mut path = module_path(db, imp.module(db));
+            let mut path = module_path(db, module);
             path.push(format!("{:?}", int_ty(self_ty).expect("an integer")).to_lowercase());
             (path.clone(), path)
         }
@@ -3328,8 +3379,10 @@ impl<'db> Cx<'db> {
     /// A method of the standard library's trait that no impl of this program's crates
     /// implements (an integer's `Ord::max`, a derive's `PartialEq::eq`, `From` between
     /// integers) stays the trait's: [`Cx::std_call`] models it by its trait and name, as
-    /// before. A method of a crate's own trait that is not an impl's is refused by what it is:
-    /// a call through a generic bound, through a trait object, or of the trait's default body.
+    /// before, and so does a derive of `Clone` or `PartialEq` whether it was recorded or
+    /// expanded ([`expanded_derive`]). A method of a crate's own trait that no impl overrides
+    /// is the trait's provided body at the instance whose `Self` is the implementor. A call
+    /// through a generic bound or a trait object is refused by what it is.
     fn dispatch(
         &self,
         callee: FunctionId,
@@ -3357,18 +3410,25 @@ impl<'db> Cx<'db> {
             .lookup_impl_method_or_why(env, callee, generics)
             .map(|(found, args)| (found.left(), args));
         match looked {
-            Ok((Some(found), args)) if !found.krate(db).data(db).origin.is_lang() => {
-                match found.lookup(db).container {
-                    ItemContainerId::ImplId(_) => Ok((found, args)),
-                    _ => Err(self.refuse(
-                        format!(
-                            "a call of `{trait_name}::{name}`, the trait's default method, whose \
-                             body is generic over `Self` (only an impl's method is translated)"
-                        ),
-                        at,
-                    )),
-                }
+            // A derive of `Clone` or `PartialEq` that was expanded (as a build expands every
+            // builtin derive, `hir_def::nameres::set_expand_builtin_derives`) is the derive the
+            // fast path records without expanding: the trait's method, which `std_call` models
+            // as the value's own structure ([`Cx::structural`]), never the expansion's body
+            // (which reads `discriminant_value`).
+            Ok((Some(found), _))
+                if of_std
+                    && matches!(
+                        expanded_derive(db, found),
+                        Some(BuiltinDeriveImplTrait::Clone | BuiltinDeriveImplTrait::PartialEq)
+                    ) =>
+            {
+                Ok((callee, generics))
             }
+            // An impl's method, or the trait's provided (default) body, which no impl
+            // overrides: translated at the instance whose `Self` is the implementor
+            // ([`owner`] names it `<type>.<trait>.<method>`), so a required method it calls is
+            // resolved there to the implementor's.
+            Ok((Some(found), args)) if !found.krate(db).data(db).origin.is_lang() => Ok((found, args)),
             // The standard library's: its model is the trait's method's, by name.
             Ok(_) if of_std => Ok((callee, generics)),
             Err(why) if of_std && why.is_expected() => Ok((callee, generics)),
@@ -4196,7 +4256,7 @@ impl<'db> Cx<'db> {
             Err(_) => (None, generics),
         };
         let Some(found) = found else { return Ok(None) };
-        if found.krate(db).data(db).origin.is_lang() {
+        if found.krate(db).data(db).origin.is_lang() || expanded_derive(db, found).is_some() {
             return Ok(None);
         }
         self.crate_callee(found, args, "eq", at).map(Some)
@@ -4286,10 +4346,12 @@ impl<'db> Cx<'db> {
                     Structural::Clone => (BuiltinDeriveImplTrait::Clone, "Clone"),
                     Structural::PartialEq => (BuiltinDeriveImplTrait::PartialEq, "PartialEq"),
                 };
+                // Derived: the builtin derive of the trait, recorded or expanded.
                 let derived = match db.lookup_impl_method_or_why(env, method, generics) {
-                    Ok((found, _)) => match found.right() {
-                        Some((id, _)) => id.loc(db).trait_ == wanted,
-                        None => false,
+                    Ok((found, _)) => match (found.left(), found.right()) {
+                        (_, Some((id, _))) => id.loc(db).trait_ == wanted,
+                        (Some(func), _) => expanded_derive(db, func) == Some(wanted),
+                        (None, None) => false,
                     },
                     Err(_) => false,
                 };

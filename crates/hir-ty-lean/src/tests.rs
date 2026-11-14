@@ -1001,6 +1001,7 @@ fn lean_checks_blaze_cores_proofs_by_the_plan() {
                 assert_eq!(key.how, crate::Prover::Lean);
             }
             plan::Verdict::Open { why, .. } => panic!("`{name}` is not proved: {why}"),
+            other => panic!("`{name}` is not proved: {other:?}"),
         }
     }
     // The proof file without its last theorem: the check of that theorem finds no proof.
@@ -1016,6 +1017,37 @@ fn lean_checks_blaze_cores_proofs_by_the_plan() {
         }
         other => panic!("the theorem with no proof is open at its check: {other:?}"),
     }
+}
+
+/// End to end, with the pinned Lean: blaze-core's two theorems with no proof file, the first's
+/// model made invalid Lean (a match with a redundant arm, which Lean refused on 2026-11-14 in
+/// a model `blaze prove` had answered `Open`). The plan compiles both models all the same: the
+/// first is blaze's bug in Lean's words, at the line of the arm; the second, whose model
+/// builds, is open for want of its proof file.
+#[test]
+fn a_model_lean_refuses_without_a_proof_file_is_blazes_bug_by_the_plan() {
+    let source = busy_fixture();
+    let names = ["next_is_bounded", "next_is_the_doubling_schedule"];
+    let mut theorems: Vec<Emitted> = names.iter().map(|name| emitted(FLAGS, "blaze_core", name, &source)).collect();
+    theorems[0].text.push_str("\ndef blaze_core.busy.broken : Nat :=\n  match (0 : Nat) with\n  | _ => 0\n  | 0 => 1\n");
+    // The redundant arm's line, which Lean's error names.
+    let line = 1 + theorems[0].text.lines().position(|it| it == "  | 0 => 1").expect("the arm");
+    let proofs = BTreeMap::new();
+    let planned = plan::plan(plan::Ask { theorems: &theorems, proofs: &proofs }).unwrap_or_else(|err| panic!("{err}"));
+    let out = blaze_core::temp::TempDir::for_test("blaze-hir-ty-lean-plan-broken-");
+    let ran = run_plan(&planned, out.path());
+    let verdicts = plan::conclude(&planned, &ran).unwrap_or_else(|err| panic!("{err}"));
+    match &verdicts[0] {
+        plan::Verdict::ModelBroken { function, module, at, error } => {
+            assert_eq!(function, "blaze_core::busy::next_is_bounded");
+            assert_eq!(module, "BlazeModel.blaze_core.busy.next_is_bounded");
+            assert!(at.starts_with(&format!("BlazeModel/blaze_core/busy/next_is_bounded.lean:{line}:")), "{at}: {error}");
+            assert!(error.to_lowercase().contains("redundant"), "{at}: {error}");
+            eprintln!("{}", plan::Verdict::model_broken_said(function, module, at, error));
+        }
+        other => panic!("a model Lean refuses is blaze's bug, not {other:?}"),
+    }
+    assert!(matches!(&verdicts[1], plan::Verdict::Open { why: plan::Why::NoProofFile, .. }), "{:?}", verdicts[1]);
 }
 
 // ---- MIR, embedded (`body::embed`): what `lean/Blaze/Mir` runs. ----
@@ -2061,6 +2093,34 @@ pub fn distinct(v: &[u32]) -> bool {
     }
     true
 }
+pub enum Probe { Hit(u32), Miss(u32) }
+fn probe(n: u32) -> Probe { if n % 7 == 3 { Probe::Hit(n * 2) } else { Probe::Miss(n + 1) } }
+pub fn hunt(from: u32, most: u32) -> u32 {
+    let mut n = from;
+    let mut tries = 0;
+    loop {
+        if tries >= most { return 0; }
+        match probe(n) {
+            Probe::Hit(found) => return found,
+            Probe::Miss(next) => { n = next; tries += 1; }
+        }
+    }
+}
+pub fn hunt_past(from: u32) -> u32 {
+    let mut n = from;
+    let found = loop {
+        if n > 1000 { break 0; }
+        match probe(n) {
+            Probe::Hit(found) => break found,
+            Probe::Miss(next) => n = next,
+        }
+    };
+    found + 1
+}
+#[blaze::theorem]
+pub fn hunts_find_the_hit() -> bool {
+    hunt(0, 10) == 6 && hunt(0, 2) == 0 && hunt_past(4) == 21
+}
 ";
 
 /// Each construct the worlds use becomes the model its golden holds: the or-pattern one
@@ -2069,7 +2129,7 @@ pub fn distinct(v: &[u32]) -> bool {
 /// other arm returns; the early `return` the loop function's result; the constant its value.
 #[test]
 fn the_worlds_constructs_become_their_models() {
-    let cases: [(&str, &[&str]); 11] = [
+    let cases: [(&str, &[&str]); 14] = [
         // `blaze_core::world::asks::World::allows`'s shape: or-patterns after another arm, some
         // binding, of a nine-variant enum behind a reference: one arm per variant, and no `_`
         // arm after them, which Lean refuses as redundant.
@@ -2086,6 +2146,11 @@ fn the_worlds_constructs_become_their_models() {
         ("slots", &["core.option.Option.take", "core.option.Option.is_none", "Slice.update", "core.option.Option.is_some"]),
         ("grown", &["blaze_shapes.grow self.bytes more", "{ self with bytes := x0 }"]),
         ("drain", &["← Vec.remove v (0 : Usize)", "blaze_shapes.drain.loop_0", "blaze_shapes.drain.loop_1"]),
+        // A `return` and a `break` with a value from a loop's `match` arm, of the arm's
+        // binding: the code after the loop is the arm's way out, where the binding is.
+        ("hunt", &["| blaze_shapes.Probe.Hit v", "blaze_shapes.hunt.loop_0"]),
+        ("hunt_past", &["| blaze_shapes.Probe.Hit v", "blaze_shapes.hunt_past.loop_0"]),
+        ("hunts_find_the_hit", &["blaze_shapes.hunt fuel (0 : U32) (10 : U32)"]),
     ];
     for (name, models) in cases {
         let out = golden(WORLD_FLAGS, "blaze_shapes", name, WORLD_SHAPES);
@@ -2107,7 +2172,12 @@ fn the_worlds_constructs_become_their_models() {
         if name == "size" {
             assert!(!text.contains("| _ =>"), "`{name}`:\n{text}");
         }
+        if matches!(name, "hunt" | "hunt_past") {
+            assert!(!out.text.contains("Error.unreachable"), "`{name}`:\n{}", out.text);
+        }
     }
+    let out = golden(WORLD_FLAGS, "blaze_shapes", "hunts_find_the_hit", WORLD_SHAPES);
+    assert_eq!(out.statement.as_deref(), Some("blaze_shapes.hunts_find_the_hit.spec.statement"));
 }
 
 // ---- Methods of trait impls (docs/v2/plan/design/proofs-for-sans-io.md, section 3 step b). ----
@@ -2148,6 +2218,29 @@ pub fn by_type_path(s: &Square) -> u32 { Square::corners(s) }
 pub fn by_default() -> Clock { Clock::default() }
 pub fn by_eq(a: &Square, b: &Square) -> bool { *a == *b }
 pub fn by_add(a: Square, b: Square) -> Square { a + b }
+pub trait Measure {
+    fn width(&self) -> u64;
+    fn twice(&self) -> u64 { self.width() * 2 }
+    fn wide(&self) -> bool { self.width() > 10 }
+    fn note(&self, at: u64) {}
+}
+impl Measure for Square { fn width(&self) -> u64 { self.side } }
+impl Measure for Tile {
+    fn width(&self) -> u64 { match self { Tile::Empty => 0, Tile::Rect(w, _) => *w } }
+    fn wide(&self) -> bool { true }
+}
+pub fn by_provided(s: &Square, t: &Tile) -> u64 { s.twice() + t.twice() }
+pub fn by_provided_pure(s: &Square, t: &Tile) -> bool { s.wide() && t.wide() }
+pub fn by_provided_unit(s: &Square) -> u64 { s.note(1); s.side }
+#[blaze::theorem]
+pub fn provided_agree(side: u32) -> bool {
+    let wide = side as u64;
+    let square = Square { side: wide };
+    by_provided(&square, &Tile::Rect(wide, 1)) == wide * 4
+        && by_provided_pure(&Square { side: 11 }, &Tile::Empty)
+        && !Square { side: 10 }.wide()
+        && by_provided_unit(&square) == wide
+}
 #[blaze::theorem]
 pub fn shapes_agree(side: u32) -> bool {
     let wide = side as u64;
@@ -2192,10 +2285,50 @@ fn a_method_of_a_trait_impl_is_a_function_named_by_its_type_and_trait() {
     assert_eq!(square_size.map(|it| it.function.as_str()), Some("traits::Square::Shape::size"));
 }
 
+/// A trait's provided (default) method that no impl overrides is its body at the implementor:
+/// one function per implementor, named as an impl's method of that type and trait
+/// (`<type>.<trait>.<method>`), and the required method it calls is that implementor's. An
+/// impl's own method of the name is called instead.
+#[test]
+fn a_provided_method_is_its_body_at_the_implementor() {
+    let cases: [(&str, &[&str], &[&str]); 4] = [
+        (
+            "by_provided",
+            &["traits.Square.Measure.twice s", "traits.Tile.Measure.twice t"],
+            &["BlazeModel.traits.Square.Measure.twice", "BlazeModel.traits.Tile.Measure.twice"],
+        ),
+        (
+            "by_provided_pure",
+            &["traits.Square.Measure.wide s", "traits.Tile.Measure.wide t"],
+            &["BlazeModel.traits.Square.Measure.wide", "BlazeModel.traits.Tile.Measure.wide"],
+        ),
+        ("by_provided_unit", &["traits.Square.Measure.note"], &["BlazeModel.traits.Square.Measure.note"]),
+        ("provided_agree", &["traits.by_provided"], &["BlazeModel.traits.Square.Measure.width"]),
+    ];
+    for (name, calls, modules) in cases {
+        let out = golden(TRAIT_FLAGS, "traits", name, TRAITS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    let out = golden(TRAIT_FLAGS, "traits", "by_provided", TRAITS);
+    let twice = |of: &str| out.imports.iter().find(|it| it.name == format!("traits.{of}.Measure.twice")).expect("imported");
+    // The provided body calls the implementor's `width`.
+    assert!(twice("Square").text.contains("traits.Square.Measure.width"), "{}", twice("Square").text);
+    assert!(twice("Tile").text.contains("traits.Tile.Measure.width"), "{}", twice("Tile").text);
+    assert_eq!(twice("Square").function, "traits::Square::Measure::twice");
+    let out = golden(TRAIT_FLAGS, "traits", "provided_agree", TRAITS);
+    assert_eq!(out.statement.as_deref(), Some("traits.provided_agree.spec.statement"));
+}
+
 /// What a trait impl's method needs beyond the subset is refused by name: a generic function
-/// asked for alone, a call through a trait object, of a trait's default method, an impl for a
-/// type that is not a struct, an enum, an integer or `bool`, and two traits of one name on one
-/// type. An impl for an instance of a generic type is that instance's.
+/// asked for alone, a call through a trait object, a trait's default method and an impl's
+/// method for a type that is not a struct, an enum, an integer or `bool`, and two traits of one
+/// name on one type. An impl for an instance of a generic type is that instance's.
 #[test]
 fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
     let shape = "pub trait Shape { fn size(&self) -> u64; }\npub struct S { pub x: u64 }\n\
@@ -2205,10 +2338,10 @@ fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
         (format!("{shape}pub fn f(s: &dyn Shape) -> u64 {{ s.size() }}\n"), "a trait object"),
         (
             "pub trait Shape { fn size(&self) -> u64; fn twice(&self) -> u64 { self.size() * 2 } }\n\
-             pub struct S { pub x: u64 }\nimpl Shape for S { fn size(&self) -> u64 { self.x } }\n\
-             pub fn f(s: &S) -> u64 { s.twice() }\n"
+             impl Shape for [u32; 2] { fn size(&self) -> u64 { 0 } }\n\
+             pub fn f(a: &[u32; 2]) -> u64 { a.twice() }\n"
                 .to_owned(),
-            "a call of `Shape::twice`, the trait's default method, whose body is generic over `Self`",
+            "a call of `twice`, a method of a trait impl of `Shape` for a type that is not a struct, an enum, an integer or `bool`",
         ),
         (
             "pub trait Shape { fn size(&self) -> u64; }\n\
@@ -2473,6 +2606,21 @@ pub fn copy_own(a: &Own) -> Own { a.clone() }
 pub fn clone_is_equal(p: Path, s: Shape) -> bool {
     p.clone() == p && s.clone() == s && !(s.clone() != s)
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Waited<T> { Ready(T), Deadline }
+pub fn is_ready(w: Waited<()>) -> bool { w == Waited::Ready(()) }
+pub fn waited_differ(a: &Waited<u32>, b: &Waited<u32>) -> bool { a != b }
+pub fn copy_waited(w: &Waited<Point>) -> Waited<Point> { w.clone() }
+pub fn ready_or(w: Waited<u32>, x: u32) -> u32 { if w == Waited::Deadline { 0 } else { x + 1 } }
+#[blaze::theorem]
+pub fn waited_eq_is_the_values(x: u32) -> bool {
+    is_ready(Waited::Ready(()))
+        && !is_ready(Waited::Deadline)
+        && waited_differ(&Waited::Ready(x), &Waited::Deadline)
+        && !waited_differ(&Waited::Ready(x), &Waited::Ready(x))
+        && copy_waited(&Waited::Ready(Point { x, y: 1 })) == Waited::Ready(Point { x, y: 1 })
+        && ready_or(Waited::Deadline, x) == 0
+}
 ";
 
 /// A derived `clone` is the value and a derived `==` is Lean's `=`, decided by the instance
@@ -2504,6 +2652,54 @@ fn derived_clone_and_eq_are_the_value_and_its_equality() {
     let modules: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
     for module in ["BlazeModel.derives.Point.impl", "BlazeModel.derives.Shape.impl", "BlazeModel.derives.Path.impl"] {
         assert!(modules.contains(&module), "imports {module}: {modules:?}");
+    }
+}
+
+/// A derived `==`, `!=` and `clone` of an instance of a generic enum are its value's own, as
+/// they are of a non-generic type: `==` is decided by the `DecidableEq` the instance's `impl`
+/// module derives, and `clone` is the value. A derive the front end expands, as a build
+/// expands every builtin derive (`hir_def::nameres::set_expand_builtin_derives`), gives every
+/// function of the fixture the model the recorded one does: its body (which reads
+/// `discriminant_value`) is never translated.
+#[test]
+fn a_derive_at_an_instance_is_the_values_own_recorded_or_expanded() {
+    let cases: [(&str, &[&str], &[&str]); 4] = [
+        ("is_ready", &["core.cmp.PartialEq.eq w"], &["BlazeModel.derives.Waited.unit.impl"]),
+        ("waited_differ", &["core.cmp.PartialEq.ne a b"], &["BlazeModel.derives.Waited.u32.impl"]),
+        ("copy_waited", &["(w : derives.Waited.Point) : derives.Waited.Point := w"], &["BlazeModel.derives.Waited.Point.type"]),
+        ("ready_or", &["core.cmp.PartialEq.eq w", "Scalar.add x (1 : U32)"], &["BlazeModel.derives.Waited.u32.impl"]),
+    ];
+    for (name, says, modules) in cases {
+        let out = golden(DERIVE_FLAGS, "derives", name, DERIVES);
+        for it in says {
+            assert!(out.text.contains(it), "`{name}` says `{it}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    let out = golden(DERIVE_FLAGS, "derives", "waited_eq_is_the_values", DERIVES);
+    assert_eq!(out.statement.as_deref(), Some("derives.waited_eq_is_the_values.spec.statement"));
+    let fixture = fixture_of(DERIVE_FLAGS, "derives", DERIVES);
+    let mut expanded = db(&fixture);
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+    let names = [
+        "copy_point", "same_point", "differ", "copy_path", "same_path", "same_points", "copy_label",
+        "same_own", "copy_own", "clone_is_equal", "is_ready", "waited_differ", "copy_waited", "ready_or",
+        "waited_eq_is_the_values",
+    ];
+    for name in names {
+        let recorded = emitted_from(&fixture, "derives", name);
+        let out = match emit(&expanded, function(&expanded, "derives", name)) {
+            Ok(it) => it,
+            Err(err) => panic!("`{name}` with its derives expanded: {err}"),
+        };
+        assert_eq!(out.text, recorded.text, "`{name}` with its derives expanded");
+        let modules = |it: &Emitted| -> Vec<(String, String)> {
+            it.imports.iter().map(|it| (it.module.clone(), it.text.clone())).collect()
+        };
+        assert_eq!(modules(&out), modules(&recorded), "`{name}`'s imports with its derives expanded");
     }
 }
 
@@ -3434,13 +3630,23 @@ pub fn claim(n: &AtomicU32, from: u32, to: u32) -> u32 {
 pub fn add_until_done(n: &AtomicU32, by: u32) -> u32 {
     let mut seen = n.load(Ordering::Relaxed);
     loop {
-        // On `Ok` the old value is `seen`. (`Ok(old) => return old` is refused today: the
-        // return reads the variant's field after the loop's match, outside its arm.)
         match n.compare_exchange_weak(seen, seen + by, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(old) => return old,
             Err(now) => seen = now,
-            Ok(_) => return seen,
         }
     }
+}
+pub trait Kernel {
+    fn kind(&self) -> u32;
+    fn prepare(&self, word: &AtomicU32) { _ = word; }
+    fn poke(&self, word: &AtomicU32) -> u32 { word.fetch_add(self.kind(), Ordering::SeqCst) }
+}
+pub struct Real;
+impl Kernel for Real { fn kind(&self) -> u32 { 1 } }
+pub fn poke_twice(k: &Real, word: &AtomicU32) -> u32 {
+    k.prepare(word);
+    k.poke(word);
+    k.poke(word)
 }
 pub struct Counter { pub hits: AtomicU32 }
 impl Counter {
@@ -3477,6 +3683,17 @@ pub fn two_adds_make_two() -> bool {
     n.fetch_add(1, Ordering::SeqCst);
     n.load(Ordering::SeqCst) == 2
 }
+#[blaze::theorem]
+pub fn adds_until_done() -> bool {
+    let n = AtomicU32::new(5);
+    add_until_done(&n, 2) == 5 && n.load(Ordering::SeqCst) == 7
+}
+#[blaze::theorem]
+pub fn pokes_count() -> bool {
+    let word = AtomicU32::new(0);
+    let kernel = Real;
+    poke_twice(&kernel, &word) == 1 && word.load(Ordering::SeqCst) == 2
+}
 pub fn race(schedule: &[Step]) -> bool {
     let n = AtomicU32::new(0);
     match threads::two(schedule, || bump(&n), || bump(&n)) {
@@ -3511,7 +3728,12 @@ pub fn bump_and_wake(word: &AtomicU32) -> bool {
 #[test]
 fn atomics_are_programs_over_shared_memory() {
     let fixture = atomics_fixture("atomics", ATOMICS);
-    let cases: [(&str, &[&str]); 14] = [
+    let cases: [(&str, &[&str]); 17] = [
+        // A trait's provided bodies at the implementor `Real`, the required `kind` they call
+        // resolved to `Real`'s.
+        ("poke_twice", &["atomics.Real.Kernel.poke k word"]),
+        ("adds_until_done", &["atomics.add_until_done fuel n (2 : U32)"]),
+        ("pokes_count", &["atomics.poke_twice"]),
         ("bump", &["def atomics.bump (n : core.sync.atomic.Atomic .U32) : Threads.Prog U32"]),
         ("claim", &["(core.sync.atomic.Ordering.AcqRel : core.sync.atomic.Ordering) (core.sync.atomic.Ordering.Acquire"]),
         ("add_until_done", &["Threads.Prog.done Result.div"]),
@@ -3544,8 +3766,19 @@ fn atomics_are_programs_over_shared_memory() {
     let out = golden_from(&fixture, "atomics", "bump_and_wake");
     assert!(out.text.contains("Threads.wake word"), "{}", out.text);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    let theorem = emitted_from(&fixture, "atomics", "two_adds_make_two");
-    assert_eq!(theorem.statement.as_deref(), Some("atomics.two_adds_make_two.spec.statement"));
+    for name in ["two_adds_make_two", "adds_until_done", "pokes_count"] {
+        let theorem = emitted_from(&fixture, "atomics", name);
+        assert_eq!(theorem.statement, Some(format!("atomics.{name}.spec.statement")));
+    }
+    // The `Ok` arm's binding is what the loop returns: no second test of the `Result` after the
+    // loop, and no arm that cannot be reached.
+    let out = emitted_from(&fixture, "atomics", "add_until_done");
+    assert!(!out.text.contains("Error.unreachable"), "{}", out.text);
+    let pokes = emitted_from(&fixture, "atomics", "poke_twice");
+    let modules: Vec<&str> = pokes.imports.iter().map(|it| it.module.as_str()).collect();
+    for module in ["BlazeModel.atomics.Real.Kernel.prepare", "BlazeModel.atomics.Real.Kernel.poke", "BlazeModel.atomics.Real.Kernel.kind"] {
+        assert!(modules.contains(&module), "`poke_twice` imports {module}: {modules:?}");
+    }
 }
 
 /// What the model of shared memory does not have is refused by name: `AtomicPtr`, an access

@@ -12,9 +12,9 @@ import BlazeModel.blaze_core.wait.parking.Shared.type
 import BlazeModel.blaze_core.wait.parking.Still.type
 import BlazeModel.blaze_core.wait.retry.Retry.type
 import BlazeModel.blaze_core.wait.retry.Next.type
+import BlazeModel.blaze_core.wait.parking.ParkPlant.impl
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.switch
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.prepare
-import BlazeModel.blaze_core.wait.parking.ParkPlant.PartialEq.eq
 import BlazeModel.blaze_core.wait.parking.Still.Clock.now
 import BlazeModel.blaze_core.wait.retry.Retry.new
 import BlazeModel.blaze_core.wait.parking.Shared.Futex.wait.Still

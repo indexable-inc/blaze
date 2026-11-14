@@ -15,6 +15,7 @@ import BlazeModel.blaze_core.wait.reaping.reap.Script_Still.closure0.type
 import BlazeModel.blaze_core.wait.retry.Waited.unit.type
 import BlazeModel.core.ops.control_flow.ControlFlow.Result_never_WaitError_Waited_unit.type
 import BlazeModel.blaze_core.wait.reaping.reap.Script_Still.closure1.type
+import BlazeModel.blaze_core.wait.reaping.ReapPlant.impl
 import BlazeModel.blaze_core.world.children.NoChild.type
 import BlazeModel.blaze_core.world.children.Child.reap_now
 import BlazeModel.core.io.error.Error.other.ref_str
@@ -26,7 +27,6 @@ import BlazeModel.core.result.Result.Option_i32_Error.map_err.WaitError_closure0
 import BlazeModel.core.result.Result.Option_i32_WaitError.Try.branch
 import BlazeModel.blaze_core.wait.retry.WaitError.From.«from»
 import BlazeModel.core.result.Result.Waited_i32_WaitError.FromResidual.Result_never_WaitError.from_residual
-import BlazeModel.blaze_core.wait.reaping.ReapPlant.PartialEq.eq
 import BlazeModel.blaze_core.world.children.Child.exit
 import BlazeModel.blaze_core.world.children.Child.waited
 import BlazeModel.blaze_core.wait.reaping.Script.looked

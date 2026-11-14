@@ -890,6 +890,47 @@ impl<'a> Translate<'a> {
         self.narrowed.retain(|(of, _)| of.local != local && !of.indexed_by(local));
     }
 
+    /// Whether `nodes` read a field of an enum's variant at a place that neither a `match` in
+    /// them nor one in scope ([`Translate::bound`]) tests: read where they are, it would be
+    /// refused ([`Translate::read`]).
+    fn reads_unbound_field(&self, nodes: &Nodes) -> bool {
+        fn unbound(place: &Place, matched: &[&Place], bound: &[(Place, u32, Vec<String>)]) -> bool {
+            place.elems.iter().enumerate().any(|(upto, elem)| {
+                matches!(elem, Elem::VariantField { .. }) && {
+                    let prefix = Place { local: place.local, elems: place.elems[..upto].to_vec() };
+                    !matched.iter().any(|it| **it == prefix) && !bound.iter().any(|(of, _, _)| *of == prefix)
+                }
+            })
+        }
+        fn walk<'n>(nodes: &'n Nodes, matched: &mut Vec<&'n Place>, bound: &[(Place, u32, Vec<String>)]) -> bool {
+            nodes.iter().any(|node| match node {
+                Node::Do(statement) => statement.read_places().iter().any(|it| unbound(it, matched, bound)),
+                Node::Branch { on, arms, otherwise } => {
+                    let tested = match on {
+                        Cond::Operand(Operand::Place(place), _) | Cond::Discriminant(place, _) => Some(place),
+                        Cond::Operand(..) => None,
+                    };
+                    if tested.is_some_and(|it| unbound(it, matched, bound)) {
+                        return true;
+                    }
+                    let matches = match on {
+                        Cond::Discriminant(place, _) => Some(place),
+                        Cond::Operand(..) => None,
+                    };
+                    matched.extend(matches);
+                    let reads = arms.iter().any(|(_, arm)| walk(arm, matched, bound)) || walk(otherwise, matched, bound);
+                    if matches.is_some() {
+                        matched.pop();
+                    }
+                    reads
+                }
+                Node::Block(body) | Node::Loop(body) => walk(body, matched, bound),
+                Node::Break(_) | Node::Continue(_) | Node::Return | Node::End(_) => false,
+            })
+        }
+        walk(nodes, &mut Vec::new(), &self.bound)
+    }
+
     fn operand(
         &mut self,
         operand: &Operand,
@@ -1321,7 +1362,14 @@ impl<'a> Translate<'a> {
                     Node::Block(body) => escapes(body, 1),
                     _ => escapes(std::slice::from_ref(node), 0),
                 };
-                if leaves {
+                // The code after reads a field of an enum's variant that no `match` arm in
+                // scope binds: a `return` or a `break` with a value from inside an arm of a
+                // loop's `match` that uses the arm's binding (`loop { match r { Ok(v) => return
+                // v, .. } }`), whose code MIR's structure puts after the loop. That code is
+                // translated at each way out, inside the arm that binds the field, as it is
+                // when the node leaves further; never as an expression after the node, where
+                // the binding is out of scope.
+                if leaves || self.reads_unbound_field(after) {
                     let then = Then::Seq {
                         rest: after,
                         then: Rc::new(then.clone()),
