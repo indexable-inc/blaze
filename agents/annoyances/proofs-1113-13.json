@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-13",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "my own merge of main into proofs-1113 (a shell line: resolve a conflict with a script, then `git add` and `git commit`)",
+ "what": "The script that resolved docs/v2/plan/objectives.json raised before writing (the file was a diff3 conflict, with a `|||||||` base section my pattern did not expect), and the same shell line went on, with `;`, to `git add` and `git commit`: the merge commit held the file with its conflict markers. `lean_gate.py sources` printed the JSON error on the next line and I saw it at once; the commit was amended a minute later, never pushed.",
+ "cost": "a minute; it would have been a broken ledger on a landing branch had I not read the output",
+ "cause": "a commit chained after a step with `;` instead of `&&`",
+ "whys": [
+  "the commit ran though the step before it failed",
+  "the line was written as a sequence, not as a chain that stops",
+  "nothing refuses a commit of a file with conflict markers"
+ ],
+ "class": "a step that runs after a failed one because the line did not chain them",
+ "prevention": "in a merge, resolve and verify in one command and commit in the next, or chain with `&&`; a check that no tracked file holds a line starting `<<<<<<< ` before any commit in a merge (`git grep`), which I now run. A hook would make it impossible; not built.",
+ "workaround": "",
+ "fix": "the merge commit was amended with the file resolved; `git grep` finds no marker",
+ "state": "fixed"
+}
