@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-114 theorems: 101 in `lean`, 13 in `lean/analysis`.
+115 theorems: 102 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1007,6 +1007,13 @@ theorem blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.pro
 ```lean
 theorem blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof :
     blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.statement
+```
+
+**`blaze_core.world.asks.a_synced_append_survives_a_crash.spec.proof`** (`BlazeCore.World.Asks`, `lean`): The statement blaze generates from blaze-core's theorem function a_synced_append_survives_a_crash holds of its model, the disk world with effects in flight: from every well-formed disk within the bounds with nothing in flight, bytes are appended to a file and told done, a sync of the file is asked, and while it is in flight more is appended to the file (done or failed part way) and other syncs of it are asked and told, in any order and with any answers the world allows; once the first sync is told, after every crash the world allows the file is there and begins with everything it read as when that sync was asked; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.asks.a_synced_append_survives_a_crash.spec.proof :
+    blaze_core.world.asks.a_synced_append_survives_a_crash.spec.statement
 ```
 
 ## V15

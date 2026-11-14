@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-11",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113; reported by the lanes realpark and reapproof (claude-opus-5-5)",
+ "where": "crates/hir-ty-lean, the shape of emitted models, as met by the proofs of the real park (BlazeCore/Wait/ParkingLib.lean) and the reap",
+ "what": "A proof about two threads names each thread`s program points, and the emitted model gives them no names: the park`s loop body after its wait, the retry step, its two swap exits and the unpark`s tail after its swap are inline subterms of `park.Shared_Still.loop_0` and `unpark.Shared`. The lane copied the model`s text into eight Lean definitions (`afterProg`, `swapDProg`, `unparkK`, ..) so its shape lemmas hold by `rfl`, and one copy first failed because the model`s `let _ <- if ..` elaborates to a join point inside a bind. Also: one loop emitted twice (`loop_0`, `loop_1`, a copy per branch of a `match` before it); an early `return` lowered by copying the rest of the function into each arm (the reap`s `reaps`, twice its size); `{ self with f := .. }` over a `match` copying the match into every field.",
+ "cost": "about a third of ParkingLib.lean (296 lines) is the copied continuations; the copies must be redone when the Rust changes",
+ "cause": "the translator emits one definition per function and per loop; a continuation after a call is an anonymous lambda of a bind",
+ "whys": [
+  "a concurrency proof speaks of `where the thread stands`, which is a continuation, and the model has no name for one",
+  "models were shaped for sequential proofs, where a function is used whole",
+  "duplicated tails come from structuring MIR`s control flow back into expressions without sharing"
+ ],
+ "class": "generated text whose structure a proof must refer to but cannot name",
+ "prevention": "in a shared function, emit the continuation after each operation on shared memory (and each loop body) as its own definition over the live variables, named by its place (`park.Shared_Still.after_3`), with the function as their composition; emit a tail shared by several arms once, as a definition the arms call. Proofs then name points the translator keeps stable. Not built.",
+ "workaround": "copy the continuation`s text into the proof`s library and show it equal by `rfl`",
+ "fix": "",
+ "state": "open"
+}

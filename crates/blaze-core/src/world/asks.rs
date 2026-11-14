@@ -707,7 +707,7 @@ fn synced_append(
     Some(survives(&before, &world.disk.contents(file)))
 }
 
-/// The invariant: what was
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Asks.lean): what was
 /// appended before a sync was asked survives every crash after the sync is told. From every
 /// well-formed disk within the bounds with nothing in flight: bytes are appended to a file
 /// and told done, a sync of the file is asked, and while it is in flight more is appended to
@@ -720,11 +720,6 @@ fn synced_append(
 /// them. So a core that waits for its sync's answer before it says "written" never says it of
 /// bytes a crash can take, whatever else it has in flight to that file. Its control is
 /// `the_oracle_catches_an_append_lost_before_its_sync_was_told`.
-///
-/// Run on drawn disks, effects and cuts today; not yet proved.
-// when its proof (crates/blaze-core/lean/BlazeCore/World/Asks.lean) lands: `#[blaze::theorem]`
-// here, and "(proved: that file)" in the first line above. Until then it is no theorem of
-// `blaze prove`'s, which exits 1 on one that is stated and not proved.
 #[blaze::theorem]
 pub fn a_synced_append_survives_a_crash(
     disk: Disk,
