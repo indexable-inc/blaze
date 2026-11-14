@@ -5,18 +5,41 @@ import Blaze.Mir.Syntax
 open Blaze Blaze.Mir
 
 def early.clamp.mir : Program :=
-  { adts := [],
+  { adts := [{ name := "!", discr := ScalarTy.I128, variants := [] }],
     fns := [
       { name := "early::clamp",
         args := 2,
-        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.bool],
+        locals := [Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.unit, Ty.bool, Ty.int ScalarTy.U32, Ty.int ScalarTy.U32, Ty.adt 0, Ty.adt 0],
         blocks := [
           { stmts := [
-              Statement.assign (Place.mk 3 []) (Rvalue.binary BinOp.gt (Operand.copy (Place.mk 1 [])) (Operand.copy (Place.mk 2 [])))],
-            terminator := Terminator.switchInt (Operand.move (Place.mk 3 [])) [(0, 1)] 2 },
+              Statement.storageLive 3,
+              Statement.storageLive 4,
+              Statement.storageLive 5,
+              Statement.assign (Place.mk 5 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.storageLive 6,
+              Statement.assign (Place.mk 6 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.assign (Place.mk 4 []) (Rvalue.binary BinOp.gt (Operand.move (Place.mk 5 [])) (Operand.move (Place.mk 6 []))),
+              Statement.storageDead 6,
+              Statement.storageDead 5],
+            terminator := Terminator.switchInt (Operand.copy (Place.mk 4 [])) [(1, 1)] 2 },
           { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 [])))],
+              Statement.storageLive 7,
+              Statement.storageLive 8,
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 []))),
+              Statement.storageDead 8,
+              Statement.storageDead 7,
+              Statement.storageDead 4,
+              Statement.storageDead 3,
+              Statement.storageDead 2,
+              Statement.storageDead 1],
+            terminator := Terminator.goto 3 },
+          { stmts := [
+              Statement.assign (Place.mk 3 []) (Rvalue.use (Operand.const Const.unit)),
+              Statement.storageDead 3,
+              Statement.storageDead 4,
+              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 1 []))),
+              Statement.storageDead 2,
+              Statement.storageDead 1],
             terminator := Terminator.ret },
-          { stmts := [
-              Statement.assign (Place.mk 0 []) (Rvalue.use (Operand.copy (Place.mk 2 [])))],
+          { stmts := [],
             terminator := Terminator.ret }] }] }

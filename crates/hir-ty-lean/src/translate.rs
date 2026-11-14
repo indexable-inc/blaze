@@ -182,7 +182,7 @@ fn occurs(term: &Term, x: &str) -> usize {
         Term::Infix(_, left, right) => occurs(left, x) + occurs(right, x),
         Term::If(a, b, c) => occurs(a, x) + occurs(b, x) + occurs(c, x),
         // Not made by a body's expressions; counted as many so nothing is put into them.
-        Term::Match(..) | Term::Let(..) | Term::Do(_) | Term::Forall(..) => 2,
+        Term::Match(..) | Term::Let(..) | Term::Do(_) | Term::Forall(..) | Term::Exists(..) => 2,
     }
 }
 
@@ -217,7 +217,7 @@ fn substitute(term: &mut Term, x: &str, with: &Term) {
             substitute(b, x, with);
             substitute(c, x, with);
         }
-        Term::Match(..) | Term::Let(..) | Term::Do(_) | Term::Forall(..) => {}
+        Term::Match(..) | Term::Let(..) | Term::Do(_) | Term::Forall(..) | Term::Exists(..) => {}
     }
 }
 
@@ -1204,24 +1204,19 @@ impl<'a> Translate<'a> {
     }
 }
 
-/// The declarations of `body`'s types.
-fn type_decls(body: &Body) -> Vec<Decl> {
+/// The declaration of the struct or enum `adt`: the one declaration of its module
+/// ([`crate::type_module`]).
+pub(crate) fn type_decl(adt: &crate::body::AdtDecl) -> Decl {
     let fields = |fields: &[crate::body::Field]| -> Vec<Binder> {
         fields.iter().map(|it| Binder { name: it.name.clone(), ty: lean_ty(&it.ty) }).collect()
     };
-    body.adts
-        .iter()
-        .map(|adt| match &adt.kind {
-            AdtKind::Struct(all) => Decl::Structure { name: adt.name.clone(), fields: fields(all) },
-            AdtKind::Enum(variants) => Decl::Inductive {
-                name: adt.name.clone(),
-                constructors: variants
-                    .iter()
-                    .map(|it| (it.name.clone(), fields(&it.fields)))
-                    .collect(),
-            },
-        })
-        .collect()
+    match &adt.kind {
+        AdtKind::Struct(all) => Decl::Structure { name: adt.name.clone(), fields: fields(all) },
+        AdtKind::Enum(variants) => Decl::Inductive {
+            name: adt.name.clone(),
+            constructors: variants.iter().map(|it| (it.name.clone(), fields(&it.fields))).collect(),
+        },
+    }
 }
 
 /// Each local's Lean variable: its binding's name, told apart by the local's number where two
@@ -1301,8 +1296,8 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     binders.extend(params.iter().cloned());
     let result = translate.result.clone();
     let ty = if monadic { app("Result", vec![result.clone()]) } else { result.clone() };
-    let mut decls = type_decls(body);
-    decls.append(&mut translate.loops);
+    // The types are not declared here: each has a module of its own, which this one imports.
+    let mut decls = std::mem::take(&mut translate.loops);
     decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, monadic) });
     Ok(Model {
         decls,

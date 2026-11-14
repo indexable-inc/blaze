@@ -18,7 +18,8 @@
 //!   write of the place. A `&mut` parameter is a local holding the referent's value, which
 //!   the function gives back when it returns.
 //! - **A read of a discriminant followed by a switch on it is one `match`**
-//!   ([`Cond::Discriminant`]).
+//!   ([`Cond::Discriminant`]), and a chain of them on one place, which is how MIR building
+//!   tests a `match`'s arms, is one `match` of all their arms ([`merge_tests`]).
 //!
 //! Anything outside v0 is a [`NotTranslated`] naming the construct and where it is.
 
@@ -143,6 +144,39 @@ impl Ty {
             Ty::Ref(inner) | Ty::RefMut(inner) => inner.value(),
             other => other,
         }
+    }
+
+    /// The structs and enums it names, by Lean name, into `out`.
+    pub fn adts(&self, out: &mut BTreeSet<String>) {
+        match self {
+            Ty::Bool | Ty::Int(_) | Ty::Unit | Ty::Never => {}
+            Ty::Adt(name) => {
+                out.insert(name.clone());
+            }
+            Ty::Tuple(all) => all.iter().for_each(|it| it.adts(out)),
+            Ty::Result(ok, err) => {
+                ok.adts(out);
+                err.adts(out);
+            }
+            Ty::Option(inner)
+            | Ty::Ref(inner)
+            | Ty::RefMut(inner)
+            | Ty::Slice(inner)
+            | Ty::Array(inner, _) => inner.adts(out),
+        }
+    }
+}
+
+impl AdtDecl {
+    /// The structs and enums its fields name, by Lean name.
+    pub fn uses(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let fields: Vec<&Field> = match &self.kind {
+            AdtKind::Struct(fields) => fields.iter().collect(),
+            AdtKind::Enum(variants) => variants.iter().flat_map(|it| &it.fields).collect(),
+        };
+        fields.iter().for_each(|it| it.ty.adts(&mut out));
+        out
     }
 }
 
@@ -485,6 +519,39 @@ fn is_field(operand: &Operand, local: Local, field: u32) -> bool {
         && matches!(place.elems.as_slice(), [Elem::TupleField { index, .. }] if *index == field))
 }
 
+/// A `match` on `on` whose rest is only another `match` on the same place is one `match`.
+/// MIR building tests a `match`'s arms one after the other (hir-ty-mir's
+/// `pattern_matching_variant`: `d = discriminant(p); switch d { v => arm, _ => next }` for
+/// each arm), so a `match` of `n` variants is `n` tests nested in each other's rest. The inner
+/// test runs only on a discriminant none of the outer arms has, and nothing runs between the
+/// two, so an inner arm for a value an outer arm already has is never reached and goes, and
+/// the inner rest is the rest of the whole. `arms` and `otherwise` are folded already, so a
+/// chain of any length is one `match` by the time it gets here.
+fn merge_tests(
+    on: &Cond,
+    mut arms: Vec<(u128, Vec<Node<Stmt, Cond>>)>,
+    mut otherwise: Vec<Node<Stmt, Cond>>,
+) -> (Vec<(u128, Vec<Node<Stmt, Cond>>)>, Vec<Node<Stmt, Cond>>) {
+    let Cond::Discriminant(place, ty) = on else { return (arms, otherwise) };
+    let same = matches!(
+        otherwise.as_slice(),
+        [Node::Branch { on: Cond::Discriminant(inner, inner_ty), .. }]
+            if inner == place && inner_ty == ty
+    );
+    if !same {
+        return (arms, otherwise);
+    }
+    let Some(Node::Branch { arms: inner_arms, otherwise: rest, .. }) = otherwise.pop() else {
+        unreachable!("matched above")
+    };
+    for (value, arm) in inner_arms {
+        if !arms.iter().any(|(it, _)| *it == value) {
+            arms.push((value, arm));
+        }
+    }
+    (arms, rest)
+}
+
 /// Folds what runtime MIR spreads over statements back into one operation, and a discriminant
 /// read with the switch on it into a `match`: see the module.
 pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
@@ -512,6 +579,7 @@ pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
                 match matched {
                     Some(on) => {
                         out.pop();
+                        let (arms, otherwise) = merge_tests(&on, arms, otherwise);
                         Node::Branch { on, arms, otherwise }
                     }
                     None => Node::Branch { on, arms, otherwise },
@@ -654,11 +722,85 @@ fn module_path(db: &Db, module: ModuleId) -> Vec<String> {
     segments
 }
 
-/// `func`'s path, its segments: the crate, the modules, the name.
+/// `func`'s path, its segments: the crate, the modules, the type for a method or an associated
+/// function of an inherent impl, the name.
 pub(crate) fn function_path(db: &Db, func: FunctionId) -> Vec<String> {
-    let mut path = module_path(db, func.module(db));
+    let mut path = match owner(db, func) {
+        Ok(Some((path, _))) => path,
+        // A function refused for its impl is named by its module: the refusal says the rest.
+        Ok(None) | Err(_) => module_path(db, func.module(db)),
+    };
     path.push(FunctionSignature::of(db, func).name.as_str().to_owned());
     path
+}
+
+/// `func`'s name in Lean: its path, dotted. A method lives in its type's namespace
+/// (`krate.Counter.bump`), where Lean has already put the type's fields, constructors and
+/// what it derives from them; a method of one of those names is `<name>_fn`.
+pub(crate) fn function_lean_name(db: &Db, func: FunctionId) -> String {
+    let mut path = function_path(db, func);
+    if let Ok(Some((_, taken))) = owner(db, func) {
+        let name = path.last_mut().expect("a path ends in the function's name");
+        if taken.contains(name) || LEAN_DERIVED.contains(&name.as_str()) {
+            name.push_str("_fn");
+        }
+    }
+    path.join(".")
+}
+
+/// The names Lean declares in the namespace of every structure and inductive type.
+const LEAN_DERIVED: &[&str] = &[
+    "mk", "rec", "recOn", "casesOn", "noConfusion", "noConfusionType", "below", "brecOn",
+    "binductionOn", "ibelow", "sizeOf", "ctorIdx", "toCtorIdx", "ctorElim", "inj", "injEq", "ext",
+    "ext_iff",
+];
+
+/// The type whose inherent impl holds `func`: its path and the names Lean's declaration of
+/// it takes (a struct's fields, an enum's variants). `None` for a function of a module; `Err`
+/// names the kind of impl whose functions are not translated.
+fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<String>)>, &'static str> {
+    let imp = match func.lookup(db).container {
+        ItemContainerId::ModuleId(_) => return Ok(None),
+        ItemContainerId::ImplId(imp) => imp,
+        ItemContainerId::ExternBlockId(_) => return Err("a function without a body (rule Ffi)"),
+        _ => return Err("a method of a trait"),
+    };
+    blaze_query::db::attach(db, || {
+        if db.impl_trait(imp).is_some() {
+            return Err("a method of a trait impl");
+        }
+        let TyKind::Adt(def, args) = db.impl_self_ty(imp).skip_binder().kind() else {
+            return Err("a method of a type that is not a struct or an enum");
+        };
+        if !args.is_empty() {
+            return Err("a method of a generic type");
+        }
+        let adt = def.def_id();
+        let mut taken = BTreeSet::new();
+        let own = match adt {
+            AdtId::StructId(it) => {
+                let data = VariantId::StructId(it).fields(db);
+                let positional = matches!(data.shape, FieldsShape::Tuple);
+                for (at, (_, field)) in data.fields().iter().enumerate() {
+                    taken.insert(match positional {
+                        true => format!("f{at}"),
+                        false => field.name.as_str().to_owned(),
+                    });
+                }
+                StructSignature::of(db, it).name.as_str().to_owned()
+            }
+            AdtId::EnumId(it) => {
+                for (variant, _) in it.enum_variants(db).variants.iter() {
+                    taken.insert(variant.as_str().to_owned());
+                }
+                EnumSignature::of(db, it).name.as_str().to_owned()
+            }
+            AdtId::UnionId(_) => return Err("a method of a union"),
+        };
+        let mut path = module_path(db, adt.module(db));
+        path.push(own);
+        Ok(Some((path, taken)))
+    })
 }
 
 fn index(local: m::LocalId) -> Local {
@@ -1286,15 +1428,16 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse(format!("a call of the generic function `{name}`"), at));
             }
             match container {
-                ItemContainerId::ModuleId(_) => {}
                 ItemContainerId::ExternBlockId(_) => {
                     return Err(self.refuse(format!("a call of the extern function `{name}` (rule Ffi)"), at));
                 }
                 _ => {
-                    return Err(self.refuse(format!("a call of the method `{name}`"), at));
+                    if let Err(why) = owner(db, callee) {
+                        return Err(self.refuse(format!("a call of `{name}`, {why}"), at));
+                    }
                 }
             }
-            let lean = function_path(db, callee).join(".");
+            let lean = function_lean_name(db, callee);
             if !self.callees.iter().any(|(_, it)| *it == callee) {
                 self.callees.push((lean.clone(), callee));
             }
@@ -1401,8 +1544,8 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         at: fn_text.clone(),
     };
     let sig = FunctionSignature::of(db, func);
-    if !matches!(func.lookup(db).container, ItemContainerId::ModuleId(_)) {
-        return Err(refuse("a method or an associated function".to_owned()));
+    if let Err(why) = owner(db, func) {
+        return Err(refuse(why.to_owned()));
     }
     if !sig.generic_params.is_empty() {
         return Err(refuse("a generic function".to_owned()));
@@ -1552,7 +1695,7 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         Err(err) => return Err(refuse(err.to_string())),
     };
     let body = Body {
-        name: path.join("."),
+        name: function_lean_name(db, func),
         display,
         locals: cx.locals,
         params: mir.param_locals.iter().map(|it| index(*it)).collect(),

@@ -24,7 +24,7 @@ use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::budget::{self, Pass};
 
 use crate::{
-    Emitted, body::*, driver, emit, embed_mir, embed_mir_body, lean,
+    Emitted, body::*, driver, emit, embed_mir, embed_mir_body, embed_mir_body_as, lean,
     structured::{
         self, Cfg, CfgBlock, End, Ended, Exit, Machine, Node, Plant, ill_formed, lower,
         reconstruct, reconstruct_planted, run_cfg, run_structured,
@@ -530,6 +530,10 @@ pub fn bump(counter: &mut Counter) { counter.hits = counter.limit; }
 ",
     );
     expect_file!["../../../lean/BlazeModel/structs/bump.lean"].assert_eq(&out.text);
+    // The struct is declared in a module of its own, which the function's imports.
+    let [counter] = out.imports.as_slice() else { panic!("one import: {:?}", out.imports) };
+    assert_eq!(counter.module, "BlazeModel.structs.Counter.type");
+    expect_file!["../../../lean/BlazeModel/structs/Counter/type.lean"].assert_eq(&counter.text);
     assert_eq!(out.shape.mut_params, [0]);
     assert!(!out.shape.monadic, "nothing in it can fail: a plain function");
 }
@@ -545,6 +549,8 @@ pub fn side(shape: Shape) -> u32 { match shape { Shape::Dot => 0, Shape::Square(
 ",
     );
     expect_file!["../../../lean/BlazeModel/enums/side.lean"].assert_eq(&out.text);
+    let [shape] = out.imports.as_slice() else { panic!("one import: {:?}", out.imports) };
+    expect_file!["../../../lean/BlazeModel/enums/Shape/type.lean"].assert_eq(&shape.text);
 }
 
 #[test]
@@ -595,6 +601,71 @@ pub fn quadruple(x: u32) -> u32 { double(double(x)) }
     let [double] = out.imports.as_slice() else { panic!("one import: {:?}", out.imports) };
     assert_eq!(double.module, "BlazeModel.calls.double");
     expect_file!["../../../lean/BlazeModel/calls/double.lean"].assert_eq(&double.text);
+}
+
+/// A state machine's shape: a constructor, a `&mut self` step and a `&self` read, called from
+/// a function of the module. Each is a function in the namespace of its type, and the type is
+/// declared once however many of them use it.
+#[test]
+fn a_method_is_a_function_in_its_types_namespace() {
+    let out = emitted(
+        FLAGS,
+        "methods",
+        "twice",
+        "pub struct Counter { pub hits: u32, pub limit: u32 }
+impl Counter {
+    pub fn new(limit: u32) -> Counter { Counter { hits: 0, limit } }
+    pub fn bump(&mut self) -> bool {
+        if self.hits < self.limit { self.hits += 1; true } else { false }
+    }
+    pub fn hits(&self) -> u32 { self.hits }
+}
+pub fn twice(limit: u32) -> u32 {
+    let mut counter = Counter::new(limit);
+    counter.bump();
+    counter.bump();
+    counter.hits()
+}
+",
+    );
+    expect_file!["../../../lean/BlazeModel/methods/twice.lean"].assert_eq(&out.text);
+    let modules: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+    // `hits` is also a field, whose projection Lean has put at `methods.Counter.hits`: the
+    // method is `hits_fn`.
+    assert_eq!(
+        modules,
+        [
+            "BlazeModel.methods.Counter.type",
+            "BlazeModel.methods.Counter.new",
+            "BlazeModel.methods.Counter.bump",
+            "BlazeModel.methods.Counter.hits_fn",
+        ]
+    );
+    let [ty, new, bump, hits] = out.imports.as_slice() else { unreachable!() };
+    expect_file!["../../../lean/BlazeModel/methods/Counter/type.lean"].assert_eq(&ty.text);
+    expect_file!["../../../lean/BlazeModel/methods/Counter/new.lean"].assert_eq(&new.text);
+    expect_file!["../../../lean/BlazeModel/methods/Counter/bump.lean"].assert_eq(&bump.text);
+    expect_file!["../../../lean/BlazeModel/methods/Counter/hits_fn.lean"].assert_eq(&hits.text);
+    assert_eq!(bump.function, "methods::Counter::bump");
+    assert_eq!(bump.shape.mut_params, [0]);
+}
+
+#[test]
+fn a_method_of_a_trait_impl_or_a_generic_type_is_refused_by_name() {
+    let cases = [
+        (
+            "pub trait T { fn g(&self) -> u32; }\npub struct S;\nimpl T for S { fn g(&self) -> u32 { 0 } }\npub fn f(s: S) -> u32 { S::h(&s) }\nimpl S { pub fn h(&self) -> u32 { <S as T>::g(self) } }\n",
+            "generic function",
+        ),
+        (
+            "pub struct W<T> { pub x: T }\nimpl<T> W<T> { pub fn get(&self) -> u32 { 0 } }\npub fn f(w: W<u32>) -> u32 { w.get() }\n",
+            "generic",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    }
 }
 
 #[test]
@@ -1064,8 +1135,11 @@ fn validation(db: &Db, krate: &str, name: &str, pass: Pass) -> String {
             .unwrap_or_else(|err| panic!("{pass_name} on `{krate}::{name}`: {err:?}"));
         (before, after)
     });
+    // `after` over `before`'s blocks: the pass is compared alone, not the pass and then the
+    // encoder's dropping of a block the pass left unreachable.
+    let after =
+        embed_mir_body_as(db, func, &after, &before).unwrap_or_else(|err| panic!("{err}"));
     let before = embed_mir_body(db, func, &before).unwrap_or_else(|err| panic!("{err}"));
-    let after = embed_mir_body(db, func, &after).unwrap_or_else(|err| panic!("{err}"));
     let namespace = lean::ident(&format!("BlazeValidated.{pass_name}.{krate}.{name}"));
     format!(
         "namespace {namespace}\n\ndef before : Program :=\n{before}\n\ndef after : Program :=\n{after}\n\n\
@@ -1245,4 +1319,74 @@ fn mir_semantics_corpus() {
     write("Corpus.lean", &corpus);
     write("evaluator.txt", &answers);
     write("Validate.lean", &validate);
+}
+
+// ---- Theorem functions (docs/v2/plan/design/proofs-for-sans-io.md). ----
+
+/// A state machine's per-step obligation as its author writes it: a well-formedness predicate,
+/// a step, and a `#[blaze::theorem]` function saying the step keeps the predicate.
+const KEPT: &str = "pub struct Counter { pub hits: u32, pub limit: u32 }
+impl Counter {
+    pub fn wf(&self) -> bool { self.hits <= self.limit }
+    pub fn bump(&mut self) -> bool {
+        if self.hits < self.limit { self.hits += 1; true } else { false }
+    }
+}
+#[blaze::theorem]
+pub fn bump_keeps_wf(counter: Counter) -> bool {
+    if !counter.wf() { return true; }
+    let mut counter = counter;
+    counter.bump();
+    counter.wf()
+}
+#[blaze::theorem]
+pub fn counting_ends(n: u32) -> bool {
+    let mut i = 0;
+    while i < n { i += 1; }
+    i == n
+}
+";
+
+#[test]
+fn a_theorem_function_states_that_it_returns_true() {
+    let out = emitted(FLAGS, "theorems", "bump_keeps_wf", KEPT);
+    expect_file!["../../../lean/BlazeModel/theorems/bump_keeps_wf.lean"].assert_eq(&out.text);
+    // What it imports is checked in beside it, so Lean builds the statement from the tree.
+    let [ty, wf, bump] = out.imports.as_slice() else { panic!("three imports: {:?}", out.imports) };
+    expect_file!["../../../lean/BlazeModel/theorems/Counter/type.lean"].assert_eq(&ty.text);
+    expect_file!["../../../lean/BlazeModel/theorems/Counter/wf.lean"].assert_eq(&wf.text);
+    expect_file!["../../../lean/BlazeModel/theorems/Counter/bump.lean"].assert_eq(&bump.text);
+    assert_eq!(out.statement.as_deref(), Some("theorems.bump_keeps_wf.spec.statement"));
+    assert_eq!(out.clauses, ["#[blaze::theorem]"]);
+    assert!(
+        out.text.contains("theorems.bump_keeps_wf counter = Result.ok true"),
+        "the statement is an equation, so a model that panics does not meet it:\n{}",
+        out.text
+    );
+}
+
+/// The statement of a theorem with a loop is total: some fuel gives `true`. `Result.div` for
+/// every fuel (a loop that never ends) does not meet it.
+#[test]
+fn a_theorem_with_a_loop_states_that_it_returns() {
+    let out = emitted(FLAGS, "theorems", "counting_ends", KEPT);
+    expect_file!["../../../lean/BlazeModel/theorems/counting_ends.lean"].assert_eq(&out.text);
+    assert!(out.shape.fuel);
+    assert!(
+        out.text.contains("∃ (fuel : Nat), theorems.counting_ends fuel n = Result.ok true"),
+        "{}",
+        out.text
+    );
+}
+
+#[test]
+fn a_theorem_function_that_cannot_be_one_is_refused_by_name() {
+    let cases = [
+        ("#[blaze::theorem]\npub fn f() -> u32 { 0 }\n", "does not return `bool`"),
+        ("#[blaze::theorem]\npub fn f(x: &mut u32) -> bool { *x = 0; true }\n", "`&mut` parameter"),
+    ];
+    for (source, what) in cases {
+        let err = refused(FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    }
 }

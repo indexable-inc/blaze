@@ -35,6 +35,7 @@ pub enum Term {
     Let(Pat, Box<Term>, Box<Term>),
     Do(Vec<DoElem>),
     Forall(Vec<Binder>, Box<Term>),
+    Exists(Vec<Binder>, Box<Term>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -337,6 +338,7 @@ pub fn inline(term: &Term) -> String {
             format!("do {}", elems.join("; "))
         }
         Term::Forall(bound, body) => format!("∀ {}, {}", binders(bound), inline(body)),
+        Term::Exists(bound, body) => format!("∃ {}, {}", binders(bound), inline(body)),
     }
 }
 
@@ -345,7 +347,7 @@ fn is_block(term: &Term) -> bool {
     match term {
         Term::Let(..) | Term::Do(_) | Term::Match(..) => true,
         Term::If(_, then, otherwise) => is_block(then) || is_block(otherwise),
-        Term::Forall(_, body) => is_block(body),
+        Term::Forall(_, body) | Term::Exists(_, body) => is_block(body),
         Term::Infix(Infix::Implies, _, right) => is_block(right),
         _ => false,
     }
@@ -418,6 +420,9 @@ impl Printer {
             }
             Term::Forall(bound, body) if is_block(term) || !fits(&inline(term), indent) => {
                 self.after(indent, &format!("∀ {},", binders(bound)), body);
+            }
+            Term::Exists(bound, body) if is_block(term) || !fits(&inline(term), indent) => {
+                self.after(indent, &format!("∃ {},", binders(bound)), body);
             }
             Term::Infix(Infix::Implies, left, right)
                 if is_block(term) || !fits(&inline(term), indent) =>

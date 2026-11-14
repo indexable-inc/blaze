@@ -67,11 +67,11 @@ theorem State.read_write_other (st st' : State) (p q : Pointer) (v : Value)
 
 ## V7
 
-**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 4 steps or more.
+**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 5 steps or more.
 
 ```lean
 theorem fnv1a_from_model_agrees (hash : U64) (bytes : Slice U8) (extra : Nat) :
-    run P (4 * bytes.val.length + 4 + extra) (entry hash bytes) =
+    run P (4 * bytes.val.length + 5 + extra) (entry hash bytes) =
       Outcome.map (Value.int ScalarTy.U64)
         (Outcome.ofResult
           (blaze_graph.ledger.fnv1a_from (bytes.val.length + 1) hash bytes))
@@ -98,7 +98,7 @@ theorem agrees (x : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (x limit : U32) (extra : Nat) :
-    run P (extra + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
+    run P (extra + 1 + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
       Outcome.ok (Value.int ScalarTy.U32 (early.clamp x limit))
 ```
 
@@ -106,7 +106,7 @@ theorem agrees (x limit : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (n : U32) (extra : Nat) :
-    run P (loopFuel 2 2 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
+    run P (loopFuel 2 3 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
       Outcome.map (Value.int ScalarTy.U32)
         (Outcome.ofResult (loops.count (n.val.toNat + 1) n))
 ```
@@ -170,7 +170,7 @@ theorem validate_sound (a b : Program) (h : validate a b = true) (fuel : Nat) (s
 ```lean
 theorem execStmt_ctl (adts : List AdtDecl) (st : State) :
     ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.ctl = st.ctl) (execStmt adts st s)
-  | Statement.assign p rv =>
+  | Statement.assign _ rv =>
     Outcome.all_bind (evalRvalue_ctl adts st rv) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         Outcome.All.imp (State.write_ctl r.2 ptr r.1) (fun _ h => Eq.trans h hr)))
