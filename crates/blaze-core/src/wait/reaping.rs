@@ -231,7 +231,8 @@ fn reaps(
     }
 }
 
-/// The invariant: every child reaped is reported with its status, by the one call that reaps
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/Reaping.lean): every child
+/// reaped is reported with its status, by the one call that reaps
 /// it; a reap that ends at its deadline leaves the child for the next reap; and a child's reap
 /// never fails (no wait reaps it and leaves the reap after it `ECHILD`, its exit unreported).
 /// For every life the child starts with (running, or exited with any status), every moment its
@@ -240,8 +241,6 @@ fn reaps(
 /// where both come in one wait) and every deadline or none, the real [`reap`] against one
 /// child's world ([`Script`], `crate::world::children`) ends as [`reaps`] says. Its control is
 /// `the_oracle_catches_a_child_reaped_in_the_wait`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/Reaping.lean) lands: "(proved: that
-// file)" in the first line above.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
 pub(crate) fn a_reaped_child_is_reported(

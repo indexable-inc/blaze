@@ -4,11 +4,12 @@
 //! its registered wait region, `IORING_OP_FUTEX_WAKE`); on macOS the wait on an address
 //! (`os_sync_wait_on_address_with_deadline`, `wait/macos.rs`); elsewhere std's thread park.
 //!
-//! That no unpark is lost is stated here for every interleaving of a park and an unpark
-//! ([`no_unpark_is_lost`]): the two run as two threads of [`crate::world::threads`], one
-//! atomic operation at a time by a schedule, on that world's futex. The DST in
-//! `wait/tests.rs` runs these functions against a simulated futex whose unparks come whole
-//! between two of the park's atomics ([`Futex::switch`]), with a clock and latencies, and
+//! That no unpark is lost is proved here for every interleaving of a park and an unpark
+//! ([`no_unpark_is_lost`], `crates/blaze-core/lean/BlazeCore/Wait/Parking.lean`): the two run
+//! as two threads of [`crate::world::threads`], one atomic operation at a time by a schedule,
+//! on that world's futex. The DST in `wait/tests.rs` runs these functions against a simulated
+//! futex whose unparks come whole between two of the park's atomics ([`Futex::switch`]), with
+//! a clock that moves and latencies (that a park ends by its deadline, and promptly), and
 //! through the direct driver; both plant a lost wakeup ([`ParkPlant::CheckThenStore`]).
 //!
 //! The word is a token, as std's park is: [`unpark`] leaves [`NOTIFIED`], which the next
@@ -227,21 +228,21 @@ fn parks(plant: ParkPlant, schedule: &[Step], now: Duration, deadline: Option<De
     }
 }
 
-/// The invariant: no unpark is lost, on any interleaving. For every schedule of a park and an
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/Parking.lean): no unpark is
+/// lost, on any interleaving. For every schedule of a park and an
 /// unpark of one word as two threads, one atomic operation at a time, every choice of the
 /// kernel's (a wait returned for nothing, or told its time ran out where the park has a
 /// deadline), every reading of a clock that stands still and every deadline or none: once the
 /// unpark has returned the park is never asleep with no wake coming; where both returned, the
 /// token was taken once and the word is empty, or the park had left before the token came and
 /// it is there for the next; and a park with no deadline never says one passed ([`parks`]).
-/// The simulation test it joins (`wait/tests.rs`, `no_unpark_is_lost_under_interruption`) ran
-/// each unpark whole between two of the park's atomics; here a park's step may come between
-/// the unpark's swap and its wake. Run on drawn schedules below; its proof is being written
-/// (`lean/Blaze/Tests/ThreadsParkProof.lean` is the same proof over these functions' order of
-/// atomics written by hand). Its control is `the_oracle_catches_a_lost_wakeup_in_a_schedule`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/Parking.lean) lands: `#[blaze::theorem]`
-// here, and "(proved: that file)" in the first line above. Until then it is no theorem of
-// `blaze prove`'s, which exits 1 on one that is stated and not proved.
+/// The simulation test beside it (`wait/tests.rs`, `no_unpark_is_lost_under_interruption`)
+/// runs each unpark whole between two of the park's atomics; here a park's step may come
+/// between the unpark's swap and its wake, and the proof is of every such run: the park's
+/// eight kinds of program point and the unpark's three, 26 reachable states, each thread's
+/// step with any choice of the kernel's keeps them. That test stays for what this does not
+/// state: that a park ends by its deadline and promptly after its wake, on a clock that moves.
+/// Its control is `the_oracle_catches_a_lost_wakeup_in_a_schedule`.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
 pub(crate) fn no_unpark_is_lost(schedule: Vec<Step>, now: Duration, deadline: Option<Duration>) -> bool {
