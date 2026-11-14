@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-13",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "blaze's front end, `unused_variables`; `blaze check -p blaze-sim --all-targets` on blaze-vm with blaze built from 7e8b7e56b9",
+ "what": "blaze reports `warning: unused variable: `calm`` at crates/blaze-sim/src/draw/tests.rs:430 (as of 7e8b7e56b9) for `let calm = Tape::calm;`, a local bound to a function item that the next 25 lines call as `calm()`, most inside `assert_eq!(calm().any::<T>(\"x\"), ..)` and one as a plain statement `calm().any::<()>(\"x\");`. cargo with the pinned nightly reports nothing there. The lint lane removed the local (it now writes `Tape::calm()`), so the repro is that commit's file.",
+ "cost": "small: one finding among 730; but it is a wrong diagnostic on plain Rust, and a `--fix` that prefixes the name with `_` would leave the calls not compiling",
+ "cause": "not found; a guess, not checked: a use of a local as the callee of a call whose result takes a turbofish method call is not recorded as a read",
+ "whys": "the unused-variable pass is blaze's own and its only check against the reference is whatever crate somebody happens to run; no test compares blaze's warnings with the pinned nightly's on a corpus",
+ "class": "a diagnostic blaze gives on a program the pinned nightly accepts silently",
+ "prevention": "a harness row that runs blaze check and the pinned nightly's check on the same crates and lists warnings only one of them gives (the warn-by-default rustc lints blaze reimplements), with each difference either fixed or stated as intended. Not built.",
+ "workaround": "wrote the path at each call",
+ "state": "open"
+}
