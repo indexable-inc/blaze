@@ -99,10 +99,6 @@ paths.workspace = true
 syntax.workspace = true
 span.workspace = true
 stdx.workspace = true
-# The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
-# each a feature tokio has on wasm too, so the seed builds the same.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
-futures-util = { workspace = true, features = ["std"] }
 url.workspace = true
 semver.workspace = true
 tar = { workspace = true, features = ["default"] }
@@ -168,7 +164,6 @@ blaze-alloc-count.workspace = true
 blaze-codegen-code.workspace = true
 # `Writer::hold_put`, for the gate's tests of a put counted and not yet published.
 blaze-cas = { workspace = true, features = ["test-hooks"] }
-tokio = { workspace = true, features = ["net"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
 # The property tests and simulations (the no-op lane's `serve/job/noop/tests.rs`, ..).

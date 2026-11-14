@@ -366,6 +366,14 @@
    "why": "claude-fable-5-2, main agent. (1) cargo still builds blaze's crates, so they cannot carry clause syntax, and a property test and a theorem are then one function. (1) to (3) as changed by an outside review the same evening (an Opus 5.5 advise agent given the spec and the code): a statement that let a non-returning core pass would prove less than the test it replaces; a choice script proves nothing about the answers it cannot produce; a per-step goal is what automation closes. (4) 4.35.0 ships grind, mvcgen with Std.Do, and verified maps; the move cost three String API fixes and renames.",
    "recommended": "Yes.",
    "state": "on proofs-1113: (4) done; (1) the attribute and total statements, the translator's methods and integer primitives, `Blaze.Machine`, `blaze_auto`; (5) `blaze prove` with its plan and its sandboxed driver written; (2) used once by hand (a counter); (3) not started"
+  },
+  {
+   "id": "D42",
+   "date": "2026-11-14",
+   "decision": "blaze carries a patched copy of rustls 0.23.46 (vendor/rustls; vendor/rustls/SOURCE.md lists the change). The patch is additive, two functions: a TLS 1.3 client session ticket written as bytes (`Tls13ClientSessionValue::to_bytes`) and read back under a config (`ClientConfig::tls13_ticket_from_bytes`). With it a blaze process keeps the tickets its cache origin sent in an owner-only file beside the credentials (`remote-tickets.bin`, mode 0600, none older than seven days), and the next process sends its first anonymous reads of the public cache as 0-RTT early data. Only a GET or HEAD of an immutable, content-addressed `public/` object goes as early data; everything signed stays on HTTP/1.1.",
+   "why": "A blaze command is a process that answers and exits, so each one opens its QUIC connection to the cache from cold: without a ticket from an earlier process that is one round trip before the first request leaves. rustls 0.23 cannot hand a ticket to another process (the value's fields are private, its constructor is crate-private, it has no encoding, and it is tied by pointer to the config that received it), so the piece is built where the fields are (rule build-the-missing-piece), as the tree already does for quinn-proto, cranelift and 20 other crates under vendor/.",
+   "recommended": "The main agent (claude-fable-5-2) decided it, after raising it with the owner several times without an answer. A patched TLS library is a thing an owner may not want: the owner has not ruled and it is his to reverse. Reversing is deleting vendor/rustls and its `[patch]` line and blaze-http's `Tickets::add` and `fresh` (crates/blaze-http/src/h3/config.rs) with blaze-remote's tickets file; resumption then works inside one process only.",
+   "state": "Built with the HTTP/3 reads of the remote cache (crates/blaze-http/src/h3, crates/blaze-remote/src/http3.rs); no bucket is configured, so nothing uses it against a real origin yet."
   }
  ]
 }
