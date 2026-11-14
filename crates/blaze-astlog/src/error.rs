@@ -15,6 +15,12 @@ pub enum SourceError {
     #[snafu(display("rules:{line}: the {form} pattern `{text}`: {message}"))]
     PatternShape { line: usize, form: &'static str, text: String, message: String },
 
+    #[snafu(display(
+        "rules:{line}: the {form} pattern `{text}` reads as other Rust in edition {edition}, the edition of \
+         {place}, than in edition {parsed}, the one patterns are parsed in, so it cannot match that file's code"
+    ))]
+    PatternEdition { line: usize, form: &'static str, text: String, parsed: usize, edition: usize, place: String },
+
     #[snafu(display("rules:{line}: `{kind}` is no syntax kind (they are spelled `METHOD_CALL_EXPR`)"))]
     UnknownKind { line: usize, kind: String },
 
@@ -58,6 +64,7 @@ pub fn api_error(error: &Error) -> blaze_api::ApiError {
             SourceError::Edit { at, .. } => at.clone(),
             SourceError::PatternParse { .. }
             | SourceError::PatternShape { .. }
+            | SourceError::PatternEdition { .. }
             | SourceError::UnknownKind { .. }
             | SourceError::DefPath { .. }
             | SourceError::CfgUnread { .. }

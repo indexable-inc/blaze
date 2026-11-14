@@ -92,6 +92,10 @@ pub struct Pattern {
     /// The longest identifier or literal every match spells as written: a file without its
     /// bytes holds no match.
     pub literal: Option<String>,
+    /// The editions that read the pattern's text as other Rust than [`Edition::CURRENT`], the
+    /// one it is parsed in (`async {}` is a struct literal in 2015): code of such an edition
+    /// is refused, never matched against the wrong tree.
+    pub reads_otherwise: Vec<Edition>,
 }
 
 impl fmt::Debug for Pattern {
@@ -314,6 +318,22 @@ impl Pattern {
                 }
             }
         }
+        let tree = |parse: &Parse<SourceFile>| -> Vec<SyntaxKind> {
+            // alloc: one pattern's kinds, once an edition a load
+            let walk = parse.root().preorder_with_tokens();
+            walk.filter_map(|event| match event {
+                WalkEvent::Enter(element) => Some(element.kind()),
+                WalkEvent::Leave(_) => None,
+            })
+            .collect()
+        };
+        let current = tree(&parse);
+        let reads_otherwise = Edition::iter()
+            .filter(|edition| {
+                let other = SourceFile::parse(&source, *edition);
+                !other.errors_with_bodies().is_empty() || tree(&other) != current
+            })
+            .collect();
         Ok(Pattern {
             form,
             text: text.to_owned(),
@@ -321,6 +341,7 @@ impl Pattern {
             root_kind: root.kind(),
             root: root.id(),
             literal: literal.map(str::to_owned),
+            reads_otherwise,
             parse,
             vars,
             paths,

@@ -159,6 +159,25 @@ fn a_tree_sitter_match_is_a_load_error_naming_the_pattern_forms() {
 }
 
 #[test]
+fn a_pattern_that_reads_as_other_code_in_a_files_edition_is_refused_naming_it() {
+    // In 2015 `async` is a name, so `async {}` is a struct literal; from 2018 it is a block.
+    let fixture = "//- /lib.rs crate:lib edition:2015\n\
+                   #[allow(non_camel_case_types)]\n\
+                   pub struct async {}\n\
+                   pub fn made() -> async { async {} }\n\
+                   pub fn sum() -> u32 { 1 + 2 }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let error = match query(&db, &files, r#"(rule (made e) (expr e "async {}"))"#) {
+        Ok(outcome) => panic!("matched as one edition reads it: {:?}", texts(&outcome, "made")),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("rules:1") && error.contains("2015") && error.contains("lib.rs"), "{error}");
+    // A pattern every edition reads alike matches a 2015 file.
+    let outcome = query(&db, &files, r#"(rule (sum e) (expr e "1 + 2"))"#).unwrap();
+    assert_eq!(texts(&outcome, "sum"), [["1 + 2"]]);
+}
+
+#[test]
 fn a_metavariable_used_twice_binds_equal_code() {
     let fixture = r#"
 //- /lib.rs crate:lib edition:2021

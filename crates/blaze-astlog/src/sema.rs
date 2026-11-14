@@ -24,7 +24,7 @@ use syntax::{
     view::{self as ast, AstNode as _, NodeId},
 };
 
-use crate::error::{CfgUnreadSnafu, DefPathSnafu, Error, WrongValueSnafu};
+use crate::error::{CfgUnreadSnafu, DefPathSnafu, Error, PatternEditionSnafu, WrongValueSnafu};
 use crate::pattern::{Bound, Length, Pattern, TypePattern, TypeShape, node_at};
 use crate::program::{Atom, Blaze, Enclosing, Filter};
 
@@ -897,10 +897,28 @@ impl<'a, F: Files> Sema<'a, F> {
         inputs: &[Option<Value<Node>>],
         out: &mut Vec<Row<Node>>,
     ) -> Res<()> {
+        let trees = match &inputs[0] {
+            Some(_) => vec![self.tree(self.need_syn(&inputs[0], "a pattern", pattern.line)?)],
+            None => self.searched(pattern.literal.as_deref()),
+        };
+        for &tree in &trees {
+            let edition = self.tree_at(tree).file.edition(self.db);
+            if pattern.reads_otherwise.contains(&edition) {
+                return PatternEditionSnafu {
+                    line: pattern.line,
+                    form: pattern.form.name(),
+                    text: &pattern.text,
+                    parsed: syntax::Edition::CURRENT.number(),
+                    edition: edition.number(),
+                    place: self.path(tree as usize),
+                }
+                .fail()
+                .map_err(Error::from);
+            }
+        }
         let candidates: Vec<ast::Node<'a>> = match &inputs[0] {
             Some(_) => vec![self.need_syn(&inputs[0], "a pattern", pattern.line)?],
-            None => self
-                .searched(pattern.literal.as_deref())
+            None => trees
                 .into_iter()
                 .flat_map(|tree| {
                     let root = self.tree_at(tree).root;
