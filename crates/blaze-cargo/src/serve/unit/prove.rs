@@ -825,7 +825,11 @@ impl Checking {
                 let version = String::from_utf8_lossy(&exit.stdout);
                 if exit.code != Some(0) || !version.contains(&format!("version {LEAN_VERSION}")) {
                     let lean = self.lean.as_deref().unwrap_or(Path::new(""));
-                    let why = no_lean(format!("{} is `{}`, not Lean {LEAN_VERSION}", lean.display(), version.trim()));
+                    let why = no_lean(format!(
+                        "`{} --version` {}, not Lean {LEAN_VERSION}",
+                        lean.display(),
+                        ended(&exit)
+                    ));
                     return self.fail(why, out);
                 }
                 self.pinned = true;
@@ -992,6 +996,26 @@ fn said(done: &Done) -> String {
     match done {
         Done::Failed(error) => error.to_string(),
         other => format!("{other:?}"),
+    }
+}
+
+/// How a run of Lean that was asked its version ended, for the refusal: its exit, what it
+/// printed, and the end of what it wrote to standard error, which is where a loader that
+/// could not start the program says why.
+fn ended(exit: &blaze_core::Exit) -> String {
+    let how = match (exit.code, exit.signal) {
+        (Some(code), _) => format!("exited with {code}"),
+        (None, Some(signal)) => format!("was ended by signal {signal}"),
+        (None, None) => "ended with no exit code".to_owned(),
+    };
+    let printed = String::from_utf8_lossy(&exit.stdout);
+    let errors = String::from_utf8_lossy(&exit.stderr);
+    let errors = errors.trim();
+    // The end of it: the last line is the one that says what stopped it.
+    let from = errors.char_indices().rev().nth(599).map_or(0, |(at, _)| at);
+    match errors.is_empty() {
+        true => format!("{how} and printed `{}`", printed.trim()),
+        false => format!("{how}, printed `{}` and wrote `{}` to standard error", printed.trim(), &errors[from..]),
     }
 }
 
