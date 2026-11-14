@@ -526,9 +526,12 @@ impl<'a, F: Files> Sema<'a, F> {
         };
         match owner {
             Some(AssocItemContainer::Trait(it)) => segments.push(it.name(db).as_str().to_owned()),
-            Some(AssocItemContainer::Impl(it)) => {
-                segments.push(it.self_ty(db).as_adt()?.name(db).as_str().to_owned());
-            }
+            // An impl on a type no path names (`u32`, `&str`, a blanket `T`) is its own
+            // segment, so the item has a path a reader can place, as rustc writes one.
+            Some(AssocItemContainer::Impl(it)) => segments.push(match it.self_ty(db).as_adt() {
+                Some(adt) => adt.name(db).as_str().to_owned(),
+                None => self.impl_segment(it),
+            }),
             None => {}
         }
         // A variant is under its enum, and a field under its struct, union or variant.

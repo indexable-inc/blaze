@@ -307,6 +307,28 @@ fn callee_sees_through_parentheses_around_the_called_path() {
 }
 
 #[test]
+fn a_callee_in_an_impl_on_a_type_no_path_names_has_a_def_path_through_the_impl() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub trait Go { fn go(&self) -> u8; }\n\
+                   impl Go for u32 { fn go(&self) -> u8 { 1 } }\n\
+                   impl Go for &str { fn go(&self) -> u8 { 2 } }\n\
+                   pub struct S;\n\
+                   impl S { pub fn own(&self) -> u8 { 3 } }\n\
+                   pub fn calls(s: S) -> u8 { 1u32.go() + \"a\".go() + s.own() }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (called e p) (syntax e "METHOD_CALL_EXPR") (callee e d) (def-path d p))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(
+        texts(&outcome, "called"),
+        [
+            ["1u32.go()", "lib::<impl Go for u32>::go"],
+            ["\"a\".go()", "lib::<impl Go for &'_ str>::go"],
+            ["s.own()", "lib::S::own"],
+        ]
+    );
+}
+
+#[test]
 fn enclosing_impl_holds_for_code_in_an_impl_only() {
     let (db, files) = lib();
     let rules = r#"(rule (in-impl e) (syntax e "PATH_EXPR") (enclosing-impl e i))"#;
