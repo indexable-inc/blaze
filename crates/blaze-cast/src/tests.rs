@@ -1,4 +1,4 @@
-//! Each function is the `as` it names: `f(x) == (x as T)` for every `x` Hegel draws and for
+//! Each function is the `as` it names: `f(x) == (x as T)` for every `x` the tape draws and for
 //! every boundary value of the source type, a float compared by its bits so NaN and the sign
 //! of zero count. And each composition `blaze::as_cast`'s fix writes from std's own operations
 //! (a width change in the source's sign, then the sign) is the `as` it replaces.
@@ -6,7 +6,7 @@
 //! The invariant: for every function `f: F -> T` here and every `x: F`, `f(x)` and `x as T`
 //! are the same bits; for every composition the lint writes for `x as T`, the same.
 
-use hegel::generators as gs;
+use blaze_sim::Config;
 
 use super::*;
 
@@ -94,13 +94,17 @@ impl Same for char {
     }
 }
 
-/// `f(x)` and `x as T` for each named function, on Hegel's draws and on the boundaries.
+/// `f(x)` and `x as T` for each named function, on the tape's draws and on the boundaries.
+/// A source is drawn by its own rule (`Tape::any`): any integer of its type, any float with NaN
+/// and the infinities among them.
 macro_rules! is_the_cast {
-    ($($test:ident: $f:ident($from:ty) -> $to:ty, $draw:expr;)*) => {$(
-        #[hegel::test]
-        fn $test(tc: hegel::TestCase) {
-            let x: $from = tc.draw($draw);
-            assert_eq!($f(x).bits(), (x as $to).bits(), "{}({x:?})", stringify!($f));
+    ($($test:ident: $f:ident($from:ty) -> $to:ty;)*) => {$(
+        #[test]
+        fn $test() {
+            blaze_sim::check(Config::DEFAULT, |tape| {
+                let x: $from = tape.any::<$from>("x");
+                assert_eq!($f(x).bits(), (x as $to).bits(), "{}({x:?})", stringify!($f));
+            });
         }
     )*
         #[test]
@@ -113,74 +117,74 @@ macro_rules! is_the_cast {
 }
 
 is_the_cast! {
-    usize_from_u32_is_its_cast: usize_from_u32(u32) -> usize, gs::integers::<u32>();
-    isize_from_i32_is_its_cast: isize_from_i32(i32) -> isize, gs::integers::<i32>();
-    isize_from_u16_is_its_cast: isize_from_u16(u16) -> isize, gs::integers::<u16>();
-    u64_from_usize_is_its_cast: u64_from_usize(usize) -> u64, gs::integers::<usize>();
-    u128_from_usize_is_its_cast: u128_from_usize(usize) -> u128, gs::integers::<usize>();
-    i128_from_usize_is_its_cast: i128_from_usize(usize) -> i128, gs::integers::<usize>();
-    i64_from_isize_is_its_cast: i64_from_isize(isize) -> i64, gs::integers::<isize>();
-    i128_from_isize_is_its_cast: i128_from_isize(isize) -> i128, gs::integers::<isize>();
+    usize_from_u32_is_its_cast: usize_from_u32(u32) -> usize;
+    isize_from_i32_is_its_cast: isize_from_i32(i32) -> isize;
+    isize_from_u16_is_its_cast: isize_from_u16(u16) -> isize;
+    u64_from_usize_is_its_cast: u64_from_usize(usize) -> u64;
+    u128_from_usize_is_its_cast: u128_from_usize(usize) -> u128;
+    i128_from_usize_is_its_cast: i128_from_usize(usize) -> i128;
+    i64_from_isize_is_its_cast: i64_from_isize(isize) -> i64;
+    i128_from_isize_is_its_cast: i128_from_isize(isize) -> i128;
 
-    u32_truncated_from_usize_is_its_cast: u32_truncated_from_usize(usize) -> u32, gs::integers::<usize>();
-    i32_truncated_from_isize_is_its_cast: i32_truncated_from_isize(isize) -> i32, gs::integers::<isize>();
-    usize_truncated_from_u64_is_its_cast: usize_truncated_from_u64(u64) -> usize, gs::integers::<u64>();
-    isize_truncated_from_i64_is_its_cast: isize_truncated_from_i64(i64) -> isize, gs::integers::<i64>();
-    usize_truncated_from_u128_is_its_cast: usize_truncated_from_u128(u128) -> usize, gs::integers::<u128>();
-    isize_truncated_from_i128_is_its_cast: isize_truncated_from_i128(i128) -> isize, gs::integers::<i128>();
+    u32_truncated_from_usize_is_its_cast: u32_truncated_from_usize(usize) -> u32;
+    i32_truncated_from_isize_is_its_cast: i32_truncated_from_isize(isize) -> i32;
+    usize_truncated_from_u64_is_its_cast: usize_truncated_from_u64(u64) -> usize;
+    isize_truncated_from_i64_is_its_cast: isize_truncated_from_i64(i64) -> isize;
+    usize_truncated_from_u128_is_its_cast: usize_truncated_from_u128(u128) -> usize;
+    isize_truncated_from_i128_is_its_cast: isize_truncated_from_i128(i128) -> isize;
 
-    f64_from_f32_is_its_cast: f64_from_f32(f32) -> f64, gs::floats::<f32>();
-    f32_from_u8_is_its_cast: f32_from_u8(u8) -> f32, gs::integers::<u8>();
-    f32_from_i8_is_its_cast: f32_from_i8(i8) -> f32, gs::integers::<i8>();
-    f32_from_u16_is_its_cast: f32_from_u16(u16) -> f32, gs::integers::<u16>();
-    f32_from_i16_is_its_cast: f32_from_i16(i16) -> f32, gs::integers::<i16>();
-    f64_from_u8_is_its_cast: f64_from_u8(u8) -> f64, gs::integers::<u8>();
-    f64_from_i8_is_its_cast: f64_from_i8(i8) -> f64, gs::integers::<i8>();
-    f64_from_u16_is_its_cast: f64_from_u16(u16) -> f64, gs::integers::<u16>();
-    f64_from_i16_is_its_cast: f64_from_i16(i16) -> f64, gs::integers::<i16>();
-    f64_from_u32_is_its_cast: f64_from_u32(u32) -> f64, gs::integers::<u32>();
-    f64_from_i32_is_its_cast: f64_from_i32(i32) -> f64, gs::integers::<i32>();
+    f64_from_f32_is_its_cast: f64_from_f32(f32) -> f64;
+    f32_from_u8_is_its_cast: f32_from_u8(u8) -> f32;
+    f32_from_i8_is_its_cast: f32_from_i8(i8) -> f32;
+    f32_from_u16_is_its_cast: f32_from_u16(u16) -> f32;
+    f32_from_i16_is_its_cast: f32_from_i16(i16) -> f32;
+    f64_from_u8_is_its_cast: f64_from_u8(u8) -> f64;
+    f64_from_i8_is_its_cast: f64_from_i8(i8) -> f64;
+    f64_from_u16_is_its_cast: f64_from_u16(u16) -> f64;
+    f64_from_i16_is_its_cast: f64_from_i16(i16) -> f64;
+    f64_from_u32_is_its_cast: f64_from_u32(u32) -> f64;
+    f64_from_i32_is_its_cast: f64_from_i32(i32) -> f64;
 
-    f32_rounded_from_u32_is_its_cast: f32_rounded_from_u32(u32) -> f32, gs::integers::<u32>();
-    f32_rounded_from_i32_is_its_cast: f32_rounded_from_i32(i32) -> f32, gs::integers::<i32>();
-    f32_rounded_from_u64_is_its_cast: f32_rounded_from_u64(u64) -> f32, gs::integers::<u64>();
-    f32_rounded_from_i64_is_its_cast: f32_rounded_from_i64(i64) -> f32, gs::integers::<i64>();
-    f32_rounded_from_u128_is_its_cast: f32_rounded_from_u128(u128) -> f32, gs::integers::<u128>();
-    f32_rounded_from_i128_is_its_cast: f32_rounded_from_i128(i128) -> f32, gs::integers::<i128>();
-    f32_rounded_from_usize_is_its_cast: f32_rounded_from_usize(usize) -> f32, gs::integers::<usize>();
-    f32_rounded_from_isize_is_its_cast: f32_rounded_from_isize(isize) -> f32, gs::integers::<isize>();
-    f64_rounded_from_u64_is_its_cast: f64_rounded_from_u64(u64) -> f64, gs::integers::<u64>();
-    f64_rounded_from_i64_is_its_cast: f64_rounded_from_i64(i64) -> f64, gs::integers::<i64>();
-    f64_rounded_from_u128_is_its_cast: f64_rounded_from_u128(u128) -> f64, gs::integers::<u128>();
-    f64_rounded_from_i128_is_its_cast: f64_rounded_from_i128(i128) -> f64, gs::integers::<i128>();
-    f64_rounded_from_usize_is_its_cast: f64_rounded_from_usize(usize) -> f64, gs::integers::<usize>();
-    f64_rounded_from_isize_is_its_cast: f64_rounded_from_isize(isize) -> f64, gs::integers::<isize>();
-    f32_rounded_from_f64_is_its_cast: f32_rounded_from_f64(f64) -> f32, gs::floats::<f64>();
+    f32_rounded_from_u32_is_its_cast: f32_rounded_from_u32(u32) -> f32;
+    f32_rounded_from_i32_is_its_cast: f32_rounded_from_i32(i32) -> f32;
+    f32_rounded_from_u64_is_its_cast: f32_rounded_from_u64(u64) -> f32;
+    f32_rounded_from_i64_is_its_cast: f32_rounded_from_i64(i64) -> f32;
+    f32_rounded_from_u128_is_its_cast: f32_rounded_from_u128(u128) -> f32;
+    f32_rounded_from_i128_is_its_cast: f32_rounded_from_i128(i128) -> f32;
+    f32_rounded_from_usize_is_its_cast: f32_rounded_from_usize(usize) -> f32;
+    f32_rounded_from_isize_is_its_cast: f32_rounded_from_isize(isize) -> f32;
+    f64_rounded_from_u64_is_its_cast: f64_rounded_from_u64(u64) -> f64;
+    f64_rounded_from_i64_is_its_cast: f64_rounded_from_i64(i64) -> f64;
+    f64_rounded_from_u128_is_its_cast: f64_rounded_from_u128(u128) -> f64;
+    f64_rounded_from_i128_is_its_cast: f64_rounded_from_i128(i128) -> f64;
+    f64_rounded_from_usize_is_its_cast: f64_rounded_from_usize(usize) -> f64;
+    f64_rounded_from_isize_is_its_cast: f64_rounded_from_isize(isize) -> f64;
+    f32_rounded_from_f64_is_its_cast: f32_rounded_from_f64(f64) -> f32;
 
-    u8_saturated_from_f32_is_its_cast: u8_saturated_from_f32(f32) -> u8, gs::floats::<f32>();
-    u16_saturated_from_f32_is_its_cast: u16_saturated_from_f32(f32) -> u16, gs::floats::<f32>();
-    u32_saturated_from_f32_is_its_cast: u32_saturated_from_f32(f32) -> u32, gs::floats::<f32>();
-    u64_saturated_from_f32_is_its_cast: u64_saturated_from_f32(f32) -> u64, gs::floats::<f32>();
-    u128_saturated_from_f32_is_its_cast: u128_saturated_from_f32(f32) -> u128, gs::floats::<f32>();
-    usize_saturated_from_f32_is_its_cast: usize_saturated_from_f32(f32) -> usize, gs::floats::<f32>();
-    i8_saturated_from_f32_is_its_cast: i8_saturated_from_f32(f32) -> i8, gs::floats::<f32>();
-    i16_saturated_from_f32_is_its_cast: i16_saturated_from_f32(f32) -> i16, gs::floats::<f32>();
-    i32_saturated_from_f32_is_its_cast: i32_saturated_from_f32(f32) -> i32, gs::floats::<f32>();
-    i64_saturated_from_f32_is_its_cast: i64_saturated_from_f32(f32) -> i64, gs::floats::<f32>();
-    i128_saturated_from_f32_is_its_cast: i128_saturated_from_f32(f32) -> i128, gs::floats::<f32>();
-    isize_saturated_from_f32_is_its_cast: isize_saturated_from_f32(f32) -> isize, gs::floats::<f32>();
-    u8_saturated_from_f64_is_its_cast: u8_saturated_from_f64(f64) -> u8, gs::floats::<f64>();
-    u16_saturated_from_f64_is_its_cast: u16_saturated_from_f64(f64) -> u16, gs::floats::<f64>();
-    u32_saturated_from_f64_is_its_cast: u32_saturated_from_f64(f64) -> u32, gs::floats::<f64>();
-    u64_saturated_from_f64_is_its_cast: u64_saturated_from_f64(f64) -> u64, gs::floats::<f64>();
-    u128_saturated_from_f64_is_its_cast: u128_saturated_from_f64(f64) -> u128, gs::floats::<f64>();
-    usize_saturated_from_f64_is_its_cast: usize_saturated_from_f64(f64) -> usize, gs::floats::<f64>();
-    i8_saturated_from_f64_is_its_cast: i8_saturated_from_f64(f64) -> i8, gs::floats::<f64>();
-    i16_saturated_from_f64_is_its_cast: i16_saturated_from_f64(f64) -> i16, gs::floats::<f64>();
-    i32_saturated_from_f64_is_its_cast: i32_saturated_from_f64(f64) -> i32, gs::floats::<f64>();
-    i64_saturated_from_f64_is_its_cast: i64_saturated_from_f64(f64) -> i64, gs::floats::<f64>();
-    i128_saturated_from_f64_is_its_cast: i128_saturated_from_f64(f64) -> i128, gs::floats::<f64>();
-    isize_saturated_from_f64_is_its_cast: isize_saturated_from_f64(f64) -> isize, gs::floats::<f64>();
+    u8_saturated_from_f32_is_its_cast: u8_saturated_from_f32(f32) -> u8;
+    u16_saturated_from_f32_is_its_cast: u16_saturated_from_f32(f32) -> u16;
+    u32_saturated_from_f32_is_its_cast: u32_saturated_from_f32(f32) -> u32;
+    u64_saturated_from_f32_is_its_cast: u64_saturated_from_f32(f32) -> u64;
+    u128_saturated_from_f32_is_its_cast: u128_saturated_from_f32(f32) -> u128;
+    usize_saturated_from_f32_is_its_cast: usize_saturated_from_f32(f32) -> usize;
+    i8_saturated_from_f32_is_its_cast: i8_saturated_from_f32(f32) -> i8;
+    i16_saturated_from_f32_is_its_cast: i16_saturated_from_f32(f32) -> i16;
+    i32_saturated_from_f32_is_its_cast: i32_saturated_from_f32(f32) -> i32;
+    i64_saturated_from_f32_is_its_cast: i64_saturated_from_f32(f32) -> i64;
+    i128_saturated_from_f32_is_its_cast: i128_saturated_from_f32(f32) -> i128;
+    isize_saturated_from_f32_is_its_cast: isize_saturated_from_f32(f32) -> isize;
+    u8_saturated_from_f64_is_its_cast: u8_saturated_from_f64(f64) -> u8;
+    u16_saturated_from_f64_is_its_cast: u16_saturated_from_f64(f64) -> u16;
+    u32_saturated_from_f64_is_its_cast: u32_saturated_from_f64(f64) -> u32;
+    u64_saturated_from_f64_is_its_cast: u64_saturated_from_f64(f64) -> u64;
+    u128_saturated_from_f64_is_its_cast: u128_saturated_from_f64(f64) -> u128;
+    usize_saturated_from_f64_is_its_cast: usize_saturated_from_f64(f64) -> usize;
+    i8_saturated_from_f64_is_its_cast: i8_saturated_from_f64(f64) -> i8;
+    i16_saturated_from_f64_is_its_cast: i16_saturated_from_f64(f64) -> i16;
+    i32_saturated_from_f64_is_its_cast: i32_saturated_from_f64(f64) -> i32;
+    i64_saturated_from_f64_is_its_cast: i64_saturated_from_f64(f64) -> i64;
+    i128_saturated_from_f64_is_its_cast: i128_saturated_from_f64(f64) -> i128;
+    isize_saturated_from_f64_is_its_cast: isize_saturated_from_f64(f64) -> isize;
 }
 
 /// The functions whose source has values a generator does not draw.
@@ -198,13 +202,16 @@ fn the_bool_and_char_functions_are_their_casts() {
 }
 
 /// The compositions `blaze::as_cast` writes for a cast that changes width and sign, or
-/// narrows: each is the `as` it replaces, on Hegel's draws and on the boundaries.
+/// narrows: each is the `as` it replaces, on the tape's draws (any value of the source type)
+/// and on the boundaries.
 macro_rules! composes {
-    ($($test:ident: |$x:ident: $from:ty| $written:expr => $to:ty, $draw:expr;)*) => {$(
-        #[hegel::test]
-        fn $test(tc: hegel::TestCase) {
-            let $x: $from = tc.draw($draw);
-            assert_eq!(($written).bits(), ($x as $to).bits(), "{} at {:?}", stringify!($written), $x);
+    ($($test:ident: |$x:ident: $from:ty| $written:expr => $to:ty;)*) => {$(
+        #[test]
+        fn $test() {
+            blaze_sim::check(Config::DEFAULT, |tape| {
+                let $x: $from = tape.any::<$from>("x");
+                assert_eq!(($written).bits(), ($x as $to).bits(), "{} at {:?}", stringify!($written), $x);
+            });
         }
     )*
         #[test]
@@ -218,24 +225,24 @@ macro_rules! composes {
 
 composes! {
     // A sign change alone.
-    i32_from_u32_is_cast_signed: |x: u32| x.cast_signed() => i32, gs::integers::<u32>();
-    usize_from_isize_is_cast_unsigned: |x: isize| x.cast_unsigned() => usize, gs::integers::<isize>();
+    i32_from_u32_is_cast_signed: |x: u32| x.cast_signed() => i32;
+    usize_from_isize_is_cast_unsigned: |x: isize| x.cast_unsigned() => usize;
     // A narrowing between fixed widths.
-    u32_from_u64_is_truncate: |x: u64| x.truncate::<u32>() => u32, gs::integers::<u64>();
-    i8_from_i64_is_truncate: |x: i64| x.truncate::<i8>() => i8, gs::integers::<i64>();
-    u16_from_usize_is_truncate: |x: usize| x.truncate::<u16>() => u16, gs::integers::<usize>();
+    u32_from_u64_is_truncate: |x: u64| x.truncate::<u32>() => u32;
+    i8_from_i64_is_truncate: |x: i64| x.truncate::<i8>() => i8;
+    u16_from_usize_is_truncate: |x: usize| x.truncate::<u16>() => u16;
     // A widening in the source's sign, then the sign: a negative source sign-extends.
-    u64_from_i32_is_from_then_cast_unsigned: |x: i32| i64::from(x).cast_unsigned() => u64, gs::integers::<i32>();
-    i64_from_u32_is_from_then_cast_signed: |x: u32| u64::from(x).cast_signed() => i64, gs::integers::<u32>();
-    usize_from_i32_is_widened_then_cast_unsigned: |x: i32| isize_from_i32(x).cast_unsigned() => usize, gs::integers::<i32>();
-    u64_from_i8_in_a_const_is_widen: |x: i8| x.widen::<i64>().cast_unsigned() => u64, gs::integers::<i8>();
-    usize_from_u8_in_a_const_is_widen: |x: u8| x.widen::<usize>() => usize, gs::integers::<u8>();
+    u64_from_i32_is_from_then_cast_unsigned: |x: i32| i64::from(x).cast_unsigned() => u64;
+    i64_from_u32_is_from_then_cast_signed: |x: u32| u64::from(x).cast_signed() => i64;
+    usize_from_i32_is_widened_then_cast_unsigned: |x: i32| isize_from_i32(x).cast_unsigned() => usize;
+    u64_from_i8_in_a_const_is_widen: |x: i8| x.widen::<i64>().cast_unsigned() => u64;
+    usize_from_u8_in_a_const_is_widen: |x: u8| x.widen::<usize>() => usize;
     // A narrowing in the source's sign, then the sign.
-    i32_from_u64_is_truncate_then_cast_signed: |x: u64| x.truncate::<u32>().cast_signed() => i32, gs::integers::<u64>();
-    u8_from_i32_is_truncate_then_cast_unsigned: |x: i32| x.truncate::<i8>().cast_unsigned() => u8, gs::integers::<i32>();
-    i32_from_usize_is_truncated_then_cast_signed: |x: usize| u32_truncated_from_usize(x).cast_signed() => i32, gs::integers::<usize>();
+    i32_from_u64_is_truncate_then_cast_signed: |x: u64| x.truncate::<u32>().cast_signed() => i32;
+    u8_from_i32_is_truncate_then_cast_unsigned: |x: i32| x.truncate::<i8>().cast_unsigned() => u8;
+    i32_from_usize_is_truncated_then_cast_signed: |x: usize| u32_truncated_from_usize(x).cast_signed() => i32;
     // Through the pointer width.
-    u32_from_isize_is_truncated_then_cast_unsigned: |x: isize| i32_truncated_from_isize(x).cast_unsigned() => u32, gs::integers::<isize>();
+    u32_from_isize_is_truncated_then_cast_unsigned: |x: isize| i32_truncated_from_isize(x).cast_unsigned() => u32;
     // A float through an integer the lint names first.
-    f64_from_i8_through_i32: |x: i8| f64::from(i32::from(x)) => f64, gs::integers::<i8>();
+    f64_from_i8_through_i32: |x: i8| f64::from(i32::from(x)) => f64;
 }

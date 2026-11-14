@@ -4,7 +4,7 @@ use std::alloc::Global;
 use std::collections::BTreeMap;
 
 use blaze_fetch::{Algo, Digest};
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use semver::{Op, Version, VersionReq};
 
 use crate::advisory::{Advisory, AdvisoryRefused, Database, MOST_ADVISORY_BYTES};
@@ -81,29 +81,29 @@ fn req(range: &[Cmp]) -> VersionReq {
 /// Parts up to this, so small ranges meet small versions often.
 const MOST_PART: u64 = 3;
 
-fn draw_cmp(tc: &hegel::TestCase) -> Cmp {
-    let op = OPS[tc.draw(gs::integers::<usize>().max_value(OPS.len() - 1))];
+fn draw_cmp(tape: &Tape) -> Cmp {
+    let op = *tape.one_of(&OPS, "op");
     let len = match op {
-        "*" => tc.draw(gs::integers::<usize>().min_value(1).max_value(2)),
-        _ => tc.draw(gs::integers::<usize>().min_value(1).max_value(3)),
+        "*" => tape.int_in(1usize..=2, "wildcard parts"),
+        _ => tape.int_in(1usize..=3, "parts"),
     };
-    let parts = (0..len).map(|_| tc.draw(gs::integers::<u64>().max_value(MOST_PART))).collect();
+    let parts = (0..len).map(|_| tape.int_in(0u64..=MOST_PART, "part")).collect();
     Cmp { op, parts }
 }
 
-fn draw_ranges(tc: &hegel::TestCase) -> Vec<Vec<Cmp>> {
-    let ranges = tc.draw(gs::integers::<usize>().max_value(3));
+fn draw_ranges(tape: &Tape) -> Vec<Vec<Cmp>> {
+    let ranges = tape.int_in(0usize..=3, "ranges");
     (0..ranges)
         .map(|_| {
             let wild = |c: &Cmp| c.op == "*";
-            let first = draw_cmp(tc);
+            let first = draw_cmp(tape);
             // A wildcard stands alone in its range, as people write one.
-            if wild(&first) || !tc.draw(gs::booleans()) {
+            if wild(&first) || !tape.bool("a second comparator") {
                 return vec![first];
             }
-            let mut second = draw_cmp(tc);
+            let mut second = draw_cmp(tape);
             while wild(&second) {
-                second = draw_cmp(tc);
+                second = draw_cmp(tape);
             }
             vec![first, second]
         })
@@ -114,22 +114,24 @@ fn draw_ranges(tc: &hegel::TestCase) -> Vec<Vec<Cmp>> {
 /// operator, with one, two or three parts, and every version with parts up to
 /// [`MOST_PART`] + 1, [`affected`] says what the part-by-part model of cargo's comparators
 /// says.
-#[hegel::test]
-fn the_matcher_agrees_with_the_model(tc: hegel::TestCase) {
-    let ranges = draw_ranges(&tc);
-    let reqs: Vec<VersionReq> = ranges.iter().map(|it| req(it)).collect();
-    let v = (
-        tc.draw(gs::integers::<u64>().max_value(MOST_PART + 1)),
-        tc.draw(gs::integers::<u64>().max_value(MOST_PART + 1)),
-        tc.draw(gs::integers::<u64>().max_value(MOST_PART + 1)),
-    );
-    let version = Version::new(v.0, v.1, v.2);
-    assert_eq!(
-        affected(&reqs, &[], &version),
-        model_affected(&ranges, v),
-        "{version} against {:?}",
-        reqs.iter().map(ToString::to_string).collect::<Vec<_>>()
-    );
+#[test]
+fn the_matcher_agrees_with_the_model() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ranges = draw_ranges(tape);
+        let reqs: Vec<VersionReq> = ranges.iter().map(|it| req(it)).collect();
+        let v = (
+            tape.int_in(0u64..=MOST_PART + 1, "major"),
+            tape.int_in(0u64..=MOST_PART + 1, "minor"),
+            tape.int_in(0u64..=MOST_PART + 1, "patch"),
+        );
+        let version = Version::new(v.0, v.1, v.2);
+        assert_eq!(
+            affected(&reqs, &[], &version),
+            model_affected(&ranges, v),
+            "{version} against {:?}",
+            reqs.iter().map(ToString::to_string).collect::<Vec<_>>()
+        );
+    });
 }
 
 /// The matcher with a planted bug: `^0.m.p` taken to keep the major only, as for `^1.m.p`.
@@ -403,18 +405,17 @@ fn a_workspace_reports_each_package_once_with_its_chain_and_fix() {
 
 /// The invariant: the report, as JSON and as text, does not depend on the order of the
 /// lock's packages.
-#[hegel::test]
-fn the_report_does_not_depend_on_the_lock_order(tc: hegel::TestCase) {
-    let mut order: Vec<usize> = (0..blocks().len()).collect();
-    for at in (1..order.len()).rev() {
-        let other = tc.draw(gs::integers::<usize>().max_value(at));
-        order.swap(at, other);
-    }
-    let settings = settings("{ id = \"RUSTSEC-2024-0001\", reason = \"gone\", until = \"2027-01-01\" }");
-    let base = report_on(&[0, 1, 2, 3, 4], &settings, "2026-11-13");
-    let shuffled = report_on(&order, &settings, "2026-11-13");
-    assert_eq!(shuffled.json(), base.json(), "order {order:?}");
-    assert_eq!(shuffled.text(), base.text());
+#[test]
+fn the_report_does_not_depend_on_the_lock_order() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut order: Vec<usize> = (0..blocks().len()).collect();
+        tape.shuffle(&mut order, "lock order");
+        let settings = settings("{ id = \"RUSTSEC-2024-0001\", reason = \"gone\", until = \"2027-01-01\" }");
+        let base = report_on(&[0, 1, 2, 3, 4], &settings, "2026-11-13");
+        let shuffled = report_on(&order, &settings, "2026-11-13");
+        assert_eq!(shuffled.json(), base.json(), "order {order:?}");
+        assert_eq!(shuffled.text(), base.text());
+    });
 }
 
 #[test]

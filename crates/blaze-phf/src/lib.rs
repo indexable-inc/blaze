@@ -548,12 +548,13 @@ mod tests {
         assert!(seen.iter().all(|&it| it), "every key placed");
     }
 
-    #[hegel::test]
-    fn bytes_eq_is_slice_eq(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let a: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(3)).max_size(7));
-        let b: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(3)).max_size(7));
-        assert_eq!(bytes_eq(&a, &b), a == b);
-        assert!(bytes_eq(&a, &a));
+    #[test]
+    fn bytes_eq_is_slice_eq() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let a: Vec<u8> = tape.vec(0..=7, "a", |tape| tape.int_in(0..=3, "byte"));
+            let b: Vec<u8> = tape.vec(0..=7, "b", |tape| tape.int_in(0..=3, "byte"));
+            assert_eq!(bytes_eq(&a, &b), a == b);
+            assert!(bytes_eq(&a, &a));
+        });
     }
 }
