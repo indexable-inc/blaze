@@ -349,6 +349,12 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 }
             }
         }
+        Response::TestsOf(of) => {
+            put!(out, "{} {} tests in {}, {} filtered out\n", status("Tests"), of.tests, of.binary, of.filtered_out);
+            for near in &of.nearest {
+                put!(out, "  {} {}\n", paint(DIM, "near"), near.name);
+            }
+        }
     }
 }
 

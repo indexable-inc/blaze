@@ -2486,6 +2486,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

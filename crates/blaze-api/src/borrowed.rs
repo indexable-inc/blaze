@@ -19,7 +19,7 @@ use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
     Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, NotKept,
     Proven, Ranked, Reach, Rebuilt, Report, Response, Seen, Span, Status, Table, TargetKind, TestOutcome,
-    TestResult,
+    TestResult, TestsOf,
     Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb, Worked,
 };
 
@@ -134,6 +134,8 @@ pub enum ResponseRef<'a> {
     Diagnostics(Seen),
     /// Once a request: read owned.
     Proven(Proven),
+    /// Once a test executable a test run: read owned.
+    TestsOf(TestsOf),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -283,9 +285,9 @@ pub struct TestResultRef<'a> {
     pub output: &'a [u8],
     pub outcome: TestOutcome,
     pub outside: bool,
-    pub executable: u32,
     #[serde(borrow)]
     pub not_kept: Option<NotKeptRef<'a>>,
+    pub executable: u32,
 }
 
 /// [`NotKept`], read where it lies.
@@ -393,6 +395,7 @@ impl ResponseRef<'_> {
             ResponseRef::Doing(it) => Response::Doing(it),
             ResponseRef::Diagnostics(it) => Response::Diagnostics(it),
             ResponseRef::Proven(it) => Response::Proven(it),
+            ResponseRef::TestsOf(it) => Response::TestsOf(it),
         }
     }
 }

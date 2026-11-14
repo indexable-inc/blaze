@@ -56,6 +56,7 @@ mod say;
 mod script;
 pub(crate) use compile::{Filed, PendingRecord, file_records, span_unit};
 pub(crate) use script::compile_of;
+pub(super) use test::image::pinned as test_heads_pinned;
 mod test;
 
 #[cfg(test)]
@@ -396,6 +397,10 @@ impl Steps for Real {
 
     fn launch_kept(&self) -> Vec<super::work::LaunchKept> {
         self.shared.launches.kept()
+    }
+
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        self.shared.selectors.restore(marked.into_iter());
     }
 
     fn launch_wants(&self) -> Vec<String> {

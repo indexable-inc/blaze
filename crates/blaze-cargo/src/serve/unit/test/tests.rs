@@ -298,14 +298,14 @@ fn a_suite_holds_its_head_and_the_image_it_was_filed_at() {
     let taken = selectors.take(given, first, || image("t", &exec_table([0, 0, 0]))).expect("made");
     assert!(taken.head.is_none() && taken.before.is_none() && taken.held.is_none());
     assert_eq!(selectors.len(), 0);
-    selectors.give(given, Held { binary: first, image: taken.now, head: Some(head) });
+    let state = taken.now.state();
+    selectors.give(given, Held { binary: Some(first), state, image: Some(taken.now), head: Some(head), postings: None });
     assert_eq!(selectors.len(), 1);
     let taken = selectors
         .take(given, first, || panic!("the held image is of this binary"))
         .expect("held");
     assert_eq!((taken.head, taken.before.is_none(), selectors.len()), (Some(head), true, 0));
     let held = taken.held.expect("what was held is given back when the run does not end");
-    let state = held.image.state();
     selectors.give(given, held);
     let mut made = false;
     let taken = selectors
@@ -325,6 +325,33 @@ fn a_suite_holds_its_head_and_the_image_it_was_filed_at() {
         Some("no table"),
         "none is held while one run holds it: a new image is asked for"
     );
+}
+
+/// The invariant: a head restored from its journal mark after a start (no image held) is
+/// used for a binary of the program state it was filed at, and for another binary it is a
+/// miss by key (no head, no image before), never a head whose changes can't be told
+/// (`HostError::UnknownState`). Control: the same mark's head is used for its own state.
+#[test]
+fn a_restored_head_is_used_only_for_the_binary_it_was_filed_at() {
+    let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
+    let binary = ContentId::of("blaze v2 cargo test bin 1", b"1");
+    let head = ContentId::of("blaze v2 cargo test head 1", b"h");
+    let postings = Some(ContentId::of("blaze v2 cargo test postings 1", b"p"));
+    let state = image("t", &exec_table([0, 0, 0])).expect("made").state();
+    let restored = || {
+        let selectors = Selectors::default();
+        let mark = crate::serve::local::TestHeadMark { given, head, postings, state };
+        selectors.restore(std::iter::once(mark));
+        assert_eq!(selectors.len(), 1);
+        selectors
+    };
+    let selectors = restored();
+    let taken = selectors.take(given, binary, || image("t", &exec_table([0, 0, 0]))).expect("made");
+    assert_eq!((taken.head.map(|it| it.id()), taken.before.is_none()), (Some(head), true), "the control");
+    let selectors = restored();
+    let taken = selectors.take(given, binary, || image("t", &exec_table([0, 0, 1]))).expect("made");
+    assert_ne!(taken.now.state(), state);
+    assert_eq!((taken.head, taken.before.is_none()), (None, true), "another binary's head is a miss by key");
 }
 
 fn of(lines: &[(Seen, String)]) -> Lines {

@@ -963,6 +963,8 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     );
     // alloc: once a request, for the daemon's tests; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
+    // What the daemon said of each test executable: what a refusal of a run of none says.
+    let mut tests_of = Vec::new_in(std::alloc::Global);
     let mut unwritten = None;
     let mut docs = doc::Docs::default();
     let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
@@ -1009,6 +1011,10 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                 // alloc: a result held to the end, where libtest's format groups them by
                 // executable; only the daemon's tests have them.
                 results.push(result.into_owned());
+                Ok(())
+            }
+            ResponseRef::TestsOf(of) => {
+                tests_of.push(of);
                 Ok(())
             }
             response => printer.on(response),
@@ -1168,7 +1174,7 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
             let (out, mut err) = printer.streams();
             let passed = test::from_daemon(&results, speaking, &mut *out, &mut err)?;
             let mut code = if passed && ok { 0 } else { Exit::Failed.code() };
-            let mut tally = test::tally_of(&results);
+            let mut tally = test::tally_of(&results, &tests_of);
             // The doc tests, which the daemon does not run, after its results as cargo runs
             // them after the test executables; `--fail-fast` stops before them once one failed,
             // and `--ub` compiled nothing to run.
@@ -1179,18 +1185,16 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                     code = docs;
                 }
             }
-            // The daemon ran them: the names it sent are the tests this run knows exist.
-            let names = || test::Names {
-                names: results.iter().map(|it| it.name.clone()).collect(), // clone: a refusal's help, once
-                unlisted: Vec::new(),                                      // alloc: none
-            };
+            // The daemon ran them: what it said of each executable is what exists, and the
+            // nearest names to a filter that matched none. The doc tests' own listing, when
+            // they ran, is not asked: a refusal of a run of none is of the executables'.
             let code = test::conclude(
                 &test::Selection::of(asked),
                 &tally,
                 code,
                 ok,
                 started.elapsed(),
-                names,
+                || test::Names::of_daemon(&tests_of),
                 speaking,
                 &mut *out,
                 &mut err,
@@ -1220,7 +1224,7 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                 code,
                 ok,
                 began.elapsed(),
-                || test::names_of(&artifacts, programs),
+                || test::names_of(&artifacts, programs, &test::Selection::of(asked).filters),
                 speaking,
                 &mut *out,
                 &mut err,

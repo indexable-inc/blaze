@@ -413,6 +413,12 @@ def compare_backends(project: str, steps: tuple[Step, ...],
     return found
 
 
+def run_all(command: Command, args: tuple[str, ...]) -> tuple[str, ...]:
+    """`args` of `command`, a test run's with `--run-all` (`blaze_cli.run_all`): the backends
+    are compared on each one's own run of every test, never a pass kept."""
+    return tuple[str, ...](blaze_cli.run_all(args)) if command == "test" else args
+
+
 def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch: Path,
             ours_env: dict[str, str], label: str) -> tuple[Found, Outcome]:
     """The outcome of `step` named `label: <step>`, and what it gave."""
@@ -427,11 +433,11 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
         who = None
         mine = blaze_cli.program_output(ours)
     else:
-        ours = eng.build(name, ws, ours_env, step.args, command=step.command)
+        ours = eng.build(name, ws, ours_env, run_all(step.command, step.args), command=step.command)
         who = eng.not_blazes(ours)
         if step.command == "test":
-            # `blaze test` writes no `tests.ndjson`: a test whose kept pass stands is reported
-            # passed and marked cached (docs/cargo.md, "Which tests run").
+            # `blaze test` writes no `tests.ndjson`; with `--run-all` every test asked runs, so
+            # what the backends are compared on is each one's own run, never a pass kept.
             kept: list[str] = []
             mine = blaze_cli.test_results(Tested(ours.returncode, ours.stdout, kept))
         elif step.command == "run":
@@ -657,6 +663,13 @@ def test_unpack() -> None:
         assert not (Path(tmp) / "escaped").exists()
 
 
+def test_run_all() -> None:
+    assert run_all("test", ("-p", "a")) == ("-p", "a", "--run-all")
+    assert run_all("test", ("-p", "a", "--", "--exact")) == ("-p", "a", "--run-all", "--", "--exact")
+    assert run_all("test", ("--run-all",)) == ("--run-all",)
+    assert run_all("build", ("-p", "a")) == ("-p", "a")
+
+
 def test_judge() -> None:
     none: frozenset[str] = frozenset()
     assert judge("build", ran_with(0, ""), (0,), None, none) == ("pass", "")
@@ -850,7 +863,7 @@ def test_overhead() -> None:
     assert overhead(before, before, 0.0)["harness_share"] == 0.0
 
 
-SELFTESTS = (test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
+SELFTESTS = (test_index_path, test_listed_cksum, test_verified, test_unpack, test_run_all, test_judge, test_test_results, test_corpus,
              test_pinned, test_backends_input, test_dev_backend, test_panics, test_compare_backends, test_overhead,
              test_largest_first)
 

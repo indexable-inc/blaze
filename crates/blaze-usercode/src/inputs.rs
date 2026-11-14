@@ -155,6 +155,15 @@ impl Began {
     /// own write of what it read, counts as a move, and the pass is not kept, never a stale
     /// one kept.
     pub fn moved(&self, traced: &blaze_core::Traced) -> bool {
+        // A `stat` of each name the watches can't vouch for, and of every directory above it:
+        // a row naming how many paths were asked, so its time is never unnamed.
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "ask whether what a run read changed since it began",
+            files = traced.files.len() as u64,
+            dirs = traced.dirs.len() as u64,
+        )
+        .entered();
         let files = traced.files.iter().map(|(path, answer)| (path, *answer));
         let dirs = traced.dirs.iter().map(|(path, _)| (path, Some(DIRECTORY)));
         files.chain(dirs).any(|(path, answer)| self.path_moved(path, answer))

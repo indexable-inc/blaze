@@ -296,6 +296,9 @@ pub struct Report<A: Allocator> {
     pub verdicts: Vec<Verdict, A>,
     /// The suite's head now: the root the host keeps for the next request.
     pub head: Key<TestIndex>,
+    /// The postings the head names, when it names any: kept with the head, as the next request
+    /// reads both.
+    pub postings: Option<ContentId>,
     pub checks: Checks,
     pub cost: Cost,
 }
@@ -483,6 +486,8 @@ pub struct Selection<'s, A: AllocatorClone> {
     put_at: usize,
     put_issued: bool,
     new_head: Option<Key<TestIndex>>,
+    /// The postings the new head names.
+    new_postings: Option<ContentId>,
     failed: Option<SelectError>,
     report: Option<Report<A>>,
 }
@@ -551,6 +556,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             put_at: 0,
             put_issued: false,
             new_head: None,
+            new_postings: None,
             failed: None,
             report: None,
             alloc,
@@ -633,6 +639,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             put_at: self.put_at,
             put_issued: self.put_issued,
             new_head: self.new_head,
+            new_postings: self.new_postings,
             failed: self.failed,
             report: self.report,
         })
@@ -1479,6 +1486,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         }
         self.index_puts = puts;
         self.new_head = Some(key);
+        self.new_postings = postings_key;
         self.stage = Stage::Index;
         Ok(())
     }
@@ -1496,7 +1504,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             self.failed = Some(SelectError::Misused("a request ended with no head"));
             return;
         };
-        self.report = Some(Report { verdicts, head, checks: self.checks, cost: self.cost });
+        self.report = Some(Report { verdicts, head, postings: self.new_postings, checks: self.checks, cost: self.cost });
         self.stage = Stage::Done;
     }
 }

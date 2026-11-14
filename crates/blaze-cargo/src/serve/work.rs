@@ -900,6 +900,12 @@ pub trait Steps: Sized + Send + Sync + 'static {
     ) {
         let _ = (store, waker, marked);
     }
+    /// On the loop, once, as the daemon starts: each test suite's index head its journal mark
+    /// names (`Jobs::test_heads`), which the suite's next run takes. Steps that run no tests
+    /// keep nothing.
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        let _ = marked;
+    }
     /// On the loop, each turn: the start images to put and, once durable, mark.
     fn launch_kept(&self) -> Vec<LaunchKept> {
         Vec::new() // alloc: none, empty
@@ -1509,6 +1515,20 @@ pub struct RunPuts {
     /// The tests a run finished, for the history's `test_runs` table: handed to its job with
     /// its puts, which gives them its build id as it ends.
     pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// Each test suite's index head a run filed, or let go: marked in the journal once the
+    /// run's puts are durable ([`crate::serve::job::Jobs::test_heads`]).
+    pub heads: Vec<HeadFiled>,
+}
+
+/// A test suite's index head as its run left it ([`RunPuts::heads`]): the suite's settings
+/// (`Suite::given`), and the head's mark, or `None` for a suite whose head the store did not
+/// hold, whose mark is let go so its next run starts with no head.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeadFiled {
+    /// The suite's settings: what its mark is named by.
+    pub given: ContentId,
+    /// The mark to write, or `None` to let the suite's mark go.
+    pub mark: Option<super::local::TestHeadMark>,
 }
 
 impl RunPuts {
@@ -1533,5 +1553,6 @@ impl RunPuts {
         self.retracted |= other.retracted;
         self.misses.extend(other.misses);
         self.test_runs.extend(other.test_runs);
+        self.heads.extend(other.heads);
     }
 }

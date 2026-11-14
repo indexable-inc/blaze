@@ -142,6 +142,13 @@ thread_local! {
     static KEEPS_FOR: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     /// How many of its runs started.
     static KEEPS_STARTED: Cell<usize> = const { Cell::new(0) };
+    /// ... and files this test suite's index head, its record put as the run's own
+    /// ([`Keeps`]), or lets the suite's head go: the runner's `Suited::ended` and
+    /// `Suited::refused`, as `RunPuts::heads` hands them to the loop.
+    static TESTS_HEAD: Cell<Option<crate::serve::work::HeadFiled>> = const { Cell::new(None) };
+    /// The test suites' head marks the last start handed to the steps
+    /// (`Steps::test_heads_marked`).
+    static HEADS_MARKED: RefCell<Vec<crate::serve::local::TestHeadMark>> = const { RefCell::new(Vec::new()) };
     /// How many lowerings anew found in the store all a build of their checkout left for it
     /// ([`kept_key`]): what a restarted daemon's first build reads instead of working it out.
     static KEPT_READS: Cell<usize> = const { Cell::new(0) };
@@ -878,6 +885,10 @@ impl Steps for Fake {
         launched_restart::kept()
     }
 
+    fn test_heads_marked(&self, marked: Vec<crate::serve::local::TestHeadMark, std::alloc::Global>) {
+        HEADS_MARKED.set(marked);
+    }
+
     fn launch_wants(&self) -> Vec<String> {
         launched_restart::wants()
     }
@@ -1268,6 +1279,15 @@ fn test_record_key() -> blaze_cas::Key {
 
 const TEST_RECORD: &[u8] = b"how the tests of /w ran\n";
 
+/// The store key of the test index head `head` ([`TESTS_HEAD`]), as the runner files it and
+/// the pin `collect::TEST_HEADS` keeps it.
+fn test_head_key(head: ContentId) -> blaze_cas::Key {
+    let mut keys = crate::serve::unit::test_heads_pinned(head, None);
+    keys.next().expect("a head's own key")
+}
+
+const TEST_HEAD: &[u8] = b"the index head of the tests of /w\n";
+
 /// The tests' run as a real one is to its job (`UnitRuns`): it ends on a completion of its
 /// own, and on it keeps how its tests ran in the store, handing the put's ticket over
 /// ([`Runs::take_puts`]) for its job to wait on before it answers.
@@ -1319,6 +1339,14 @@ impl Runs<Fake> for Keeps {
         };
         if self.tells {
             self.puts.kept([ticket]);
+        }
+        if let Some(filed) = TESTS_HEAD.get() {
+            if let Some(mark) = filed.mark {
+                let key = test_head_key(mark.head);
+                let ticket = store.put(key, blaze_cas::Kind::Run, TEST_HEAD).expect("one value under its key");
+                self.puts.kept([ticket]);
+            }
+            self.puts.heads.push(filed);
         }
         Some(true)
     }
@@ -6046,6 +6074,111 @@ fn the_oracle_catches_a_mark_made_before_its_puts_are_durable() {
     let planted: Vec<Result<(), String>> = seeds.map(|seed| body_marks_after(seed, true).1).collect();
     super::job::MARK_EARLY.set(false);
     assert!(planted.iter().any(Result::is_err), "no crash lost a session marked early: {planted:?}");
+}
+
+/// The head mark [`test_heads_after`]'s run files for the suite of `/w`.
+fn test_head_mark() -> crate::serve::local::TestHeadMark {
+    let id = |what: &[u8]| ContentId::of("blaze serve tests test head", what);
+    crate::serve::local::TestHeadMark { given: id(b"given"), head: id(b"head"), postings: None, state: id(b"state") }
+}
+
+/// What a start after a test run of `/w` that filed its suite's index head ([`TESTS_HEAD`])
+/// was handed of the suites' head marks (`Steps::test_heads_marked`), and whether the store
+/// holds the head each names. `crashes`: the run is answered and the daemon loses power then,
+/// unsettled; else it settles and stops. `let_go`: a second run, settled, lets the suite's
+/// head go (as one that found its head missing does) before the stop.
+fn test_heads_after(
+    seed: u64,
+    crashes: bool,
+    let_go: bool,
+) -> (Vec<crate::serve::local::TestHeadMark>, Result<(), String>) {
+    use crate::serve::work::HeadFiled;
+    TESTS_KEEP.set(true);
+    HEADS_MARKED.with_borrow_mut(Vec::clear);
+    let mark = test_head_mark();
+    TESTS_HEAD.set(Some(HeadFiled { given: mark.given, mark: Some(mark) }));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    assert!(HEADS_MARKED.with_borrow(Vec::is_empty), "seed {seed}: a new home marks no head");
+    let mut client = dial(&mut daemon);
+    let request = || Request::Test {
+        view: ViewRef::Head("/w".into()),
+        targets: agent(),
+        filter: Vec::new(),
+        all: false,
+        args: Vec::new(),
+        ub: None,
+    };
+    let id = client.send(&mut daemon, request());
+    assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+    let daemon = match crashes {
+        true => {
+            let mut sim = daemon.into_driver();
+            sim.crash();
+            start(sim, &steps, seed + 1000)
+        }
+        false => {
+            settle(&mut daemon, &mut client);
+            if let_go {
+                TESTS_HEAD.set(Some(HeadFiled { given: mark.given, mark: None }));
+                let id = client.send(&mut daemon, request());
+                assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }), "seed {seed}");
+                settle(&mut daemon, &mut client);
+            }
+            restart(daemon, &steps, seed + 1)
+        }
+    };
+    TESTS_HEAD.set(None);
+    TESTS_KEEP.set(false);
+    let marked = HEADS_MARKED.with_borrow_mut(std::mem::take);
+    let held = marked
+        .iter()
+        .find(|it| daemon.store().get(&test_head_key(it.head)).unwrap().is_none_or(|entry| entry.bytes != TEST_HEAD))
+        .map_or(Ok(()), |it| {
+            Err(format!("seed {seed}: the mark of suite {:?} names the head {:?}, which the store lost", it.given, it.head))
+        });
+    (marked, held)
+}
+
+/// Rule persisted-state-round-trips for test selection's heads: the head a run filed is
+/// marked in the journal once the run's puts are durable (`Jobs::test_heads`), and after a stop
+/// and a start the steps are handed exactly that mark (`Steps::test_heads_marked`, which the
+/// runner's `Selectors::restore` takes), the store holding the head it names; a head let go
+/// leaves no mark.
+///
+/// The invariant: the start is handed the filed mark, equal field for field (its bytes are a
+/// function of its fields, `TestHeadMark::encode`), and its head is in the store; after a let
+/// go, nothing. The control is [`the_oracle_catches_a_test_head_marked_before_its_puts_are_durable`].
+#[test]
+fn a_restart_restores_each_suites_marked_test_head() {
+    for seed in [301, 303, 305] {
+        let (marked, held) = test_heads_after(seed, false, false);
+        assert_eq!(marked, [test_head_mark()], "seed {seed}");
+        held.unwrap();
+        let (marked, held) = test_heads_after(seed, false, true);
+        assert!(marked.is_empty(), "seed {seed}: a head let go is restored: {marked:?}");
+        held.unwrap();
+    }
+}
+
+/// The invariant: a test suite's head mark never names a head a crash can lose: across seeds
+/// whose crash keeps a random prefix of what was not synced, every mark the next start is
+/// handed names a head its store holds (a crash between the puts and the mark leaves no mark,
+/// the old one, or the new one with its head). The control: a loop that marks a head before
+/// its puts are durable (`job::MARK_EARLY`) leaves, for some seed, a mark whose head the crash
+/// lost.
+#[test]
+fn the_oracle_catches_a_test_head_marked_before_its_puts_are_durable() {
+    let seeds = 311..327;
+    for seed in seeds.clone() {
+        test_heads_after(seed, true, false).1.unwrap();
+    }
+    super::job::MARK_EARLY.set(true);
+    let planted: Vec<Result<(), String>> = seeds.map(|seed| test_heads_after(seed, true, false).1).collect();
+    super::job::MARK_EARLY.set(false);
+    assert!(planted.iter().any(Result::is_err), "no crash lost a head marked early: {planted:?}");
 }
 
 /// How many turns past its answer the first build of `/w` (on seed `seed`) takes until what it

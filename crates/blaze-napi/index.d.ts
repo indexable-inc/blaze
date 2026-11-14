@@ -44,7 +44,7 @@ export type ArtifactKind =
 export type Level = 'Error' | 'Warning' | 'Note' | 'Help' | 'FailureNote';
 export type Applicability =
   | 'MachineApplicable' | 'MaybeIncorrect' | 'HasPlaceholders' | 'Unspecified';
-export type TestOutcome = 'Passed' | 'Failed' | 'Ignored' | 'Unreached';
+export type TestOutcome = 'Passed' | 'Failed' | 'Ignored';
 export type NodeKind =
   | 'Manifest' | 'Fetch' | 'Script' | 'ScriptRun' | 'Macro' | 'Std' | 'Names' | 'Bodies'
   | 'Codegen' | 'Store' | 'Link' | 'Test';
@@ -179,11 +179,25 @@ export interface TestResult {
     millis: number;
     outcome: TestOutcome;
   } | null;
+  /** A pass that ran and is not kept: why, as a word (`clock`, `moved`, ...) and a sentence. */
+  not_kept: { no: string; why: string } | null;
   millis: number;
   output: Bytes;
   outcome: TestOutcome;
   outside: boolean;
   executable: number;
+}
+
+/**
+ * What a test run asked of one test executable, once per executable: its tests, how many the
+ * name filters left out, and when they left out every one, the names nearest them.
+ */
+export interface TestsOf {
+  tests: number;
+  binary: string;
+  nearest: { name: string; distance: number }[];
+  executable: number;
+  filtered_out: number;
 }
 
 /** The build's live model (blaze-protocol's `now::Now`), as serde writes it. */
@@ -285,6 +299,7 @@ export type Response =
   | { Work: Worked }
   | { Unchecked: Unchecked }
   | { TestResult: TestResult }
+  | { TestsOf: TestsOf }
   | { TestReady: Artifact }
   | { Status: Status }
   | { Rebuilt: Rebuilt }

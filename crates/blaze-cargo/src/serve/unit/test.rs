@@ -45,7 +45,7 @@ use blaze_lower::Db;
 use blaze_testsel::{
     ask::Basis,
     host::{self, BaseOf, Driver, Drove, Ended, HostError, Out, Program},
-    machine::{NotKept, Selection as Selecting, Start, Test as Asked, Verdict},
+    machine::{NotKept, SelectError, Selection as Selecting, Start, Test as Asked, Verdict},
 };
 use blaze_units::schema::{Mode, Unit};
 use blaze_usercode::test::{
@@ -60,7 +60,8 @@ use super::{
     graph::flag,
     package_of,
 };
-use crate::serve::work::{Asks, Failed, RunPuts, Runs, Selection};
+use crate::serve::local::TestHeadMark;
+use crate::serve::work::{Asks, Failed, HeadFiled, RunPuts, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -435,6 +436,23 @@ fn cached(binary: &str, executable: u32, name: &str, by: Basis, micros: Option<u
     }
 }
 
+/// What the run asked of the test binary `binary`, the run's executable `executable`, whose
+/// tests are `tests`: how many, how many `filter` left out, and when it left out every one,
+/// those nearest its names (`cli::test::nearest`, the one rule for both sides).
+#[expect(
+    blaze::implicit_allocator,
+    reason = "the response owns its binary's name and the nearest names, once a binary a run"
+)]
+fn tests_of(binary: &str, executable: u32, tests: &[TestOf], filtered_out: u32, filter: &Filter) -> blaze_api::TestsOf {
+    let all = u32::try_from(tests.len()).expect("under 2^32 tests");
+    let mut nearest = Vec::new_in(Global);
+    if all > 0 && filtered_out == all && !filter.names.is_empty() {
+        let near = crate::cli::test::nearest(&filter.names, tests.iter().map(|it| it.name.as_str()));
+        nearest.extend(near.into_iter().map(|(distance, name)| blaze_api::Near { name: name.to_owned(), distance }));
+    }
+    blaze_api::TestsOf { tests: all, binary: binary.to_owned(), nearest, executable, filtered_out }
+}
+
 /// One binary's tests as the queue and selection see them. Its tests are its unit's
 /// ([`listing`]), by place in the harness's order.
 struct Suited {
@@ -512,10 +530,14 @@ impl Suited {
         let (tests, _) = listing(job, self.unit);
         let mut asked: Vec<Asked<'_>, Global> = Vec::new_in(Global);
         self.asked.clear();
+        let mut filtered_out = 0u32;
         for (n, test) in tests.iter().enumerate() {
             let attrs = &self.attrs[n];
             match select::asked(&test.name, attrs, filter) {
-                Wanted::Filtered => continue,
+                Wanted::Filtered => {
+                    filtered_out += 1;
+                    continue;
+                }
                 Wanted::Ignored => {
                     let report = test::report_unrun(&self.name, &test.name, Reported::Ignored, None);
                     out.push(Response::TestResult(result(report, executable, false, None)));
@@ -534,6 +556,7 @@ impl Suited {
             });
             asked.push(Asked { base, name: &test.name });
         }
+        out.push(Response::TestsOf(tests_of(&self.name, executable, tests, filtered_out, filter)));
         if asked.is_empty() {
             self.give_back(&job.shared.selectors);
             return Ok(None);
@@ -563,10 +586,12 @@ impl Suited {
             let drove = driver.drive(&mut selection, records, program, disk, runs)?;
             Ok((selection.detach()?, drove))
         });
-        let (selection, drove) = begun.map_err(|why| {
+        let (selection, drove) = match begun {
+            Ok(begun) => begun,
+            Err(HostError::Select(why)) => return Err(self.refused(&why, records.puts)),
             // alloc: error path
-            format!("selecting the tests of `{}` to run: {why}", self.name)
-        })?;
+            Err(why) => return Err(format!("selecting the tests of `{}` to run: {why}", self.name)),
+        };
         self.selection = Some(selection);
         Ok(Some(drove))
     }
@@ -642,11 +667,12 @@ impl Suited {
         let verdict = selection.verdict(place);
         let program = Program { now: &taken.now, before: taken.before.as_deref() };
         let mut runs = Vec::new_in(Global);
-        let drove = self
-            .driver
-            .drive(selection, records, program, &mut self.disk, &mut runs)
+        let drove = match self.driver.drive(selection, records, program, &mut self.disk, &mut runs) {
+            Ok(drove) => drove,
+            Err(HostError::Select(why @ SelectError::MissingIndex { .. })) => return Err(self.refused(&why, records.puts)),
             // alloc: error path
-            .map_err(|why| format!("selecting the tests of `{suite}` after `{name}` ran: {why}"))?;
+            Err(why) => return Err(format!("selecting the tests of `{suite}` after `{name}` ran: {why}")),
+        };
         if let Some(late) = runs.first() {
             // alloc: error path
             return Err(format!("the tests of `{suite}`: {}", HostError::LateRun { test: late.test }));
@@ -654,13 +680,15 @@ impl Suited {
         Ok((verdict, Some(drove)))
     }
 
-    /// Its selection ended: the new head given to `selectors` for its next run.
-    fn ended(&mut self, selectors: &image::Selectors) -> Result<(), String> {
-        let head = match self.selection.as_ref().and_then(|it| it.outcome()) {
-            Some(Ok(report)) => report.head,
+    /// Its selection ended: the new head given to `selectors` for its next run, and to `puts`
+    /// to be marked in the journal once what the run put is durable.
+    fn ended(&mut self, selectors: &image::Selectors, puts: &mut RunPuts) -> Result<(), String> {
+        let (head, postings) = match self.selection.as_ref().and_then(|it| it.outcome()) {
+            Some(Ok(report)) => (report.head, report.postings),
             Some(Err(why)) => {
-                // alloc: error path
-                let what = format!("selecting the tests of `{}`: {why}", self.name);
+                // clone: an error path, the refusal out of the selection it is dropped with
+                let why = why.clone();
+                let what = self.refused(&why, puts);
                 self.give_back(selectors);
                 return Err(what);
             }
@@ -672,13 +700,43 @@ impl Suited {
         };
         self.selection = None;
         if let Some(taken) = self.taken.take() {
-            selectors.give(self.given, image::Held { binary: self.content, image: taken.now, head: Some(head) });
+            let state = taken.now.state();
+            let mark = TestHeadMark { given: self.given, head: head.id(), postings, state };
+            puts.heads.push(HeadFiled { given: self.given, mark: Some(mark) });
+            let held =
+                image::Held { binary: Some(self.content), state, image: Some(taken.now), head: Some(head), postings };
+            selectors.give(self.given, held);
         }
         Ok(())
     }
 
+    /// What its selection's refusal `why` says, naming the suite. A head (or its postings)
+    /// the store does not hold is said once, naming the suite and the head's key: its suite
+    /// starts its next run with no head (each test looked up by its answers), as the head is
+    /// not given back and its journal mark is let go (`puts`). Never selected against
+    /// (rule no-fallback), and never failing every later run.
+    fn refused(&mut self, why: &SelectError, puts: &mut RunPuts) -> String {
+        let head = self.taken.as_ref().and_then(|it| it.head);
+        if let (SelectError::MissingIndex { key }, Some(taken)) = (why, self.taken.as_mut()) {
+            taken.head = None;
+            taken.held = None;
+            puts.heads.push(HeadFiled { given: self.given, mark: None });
+            // alloc: error path
+            return format!(
+                "the tests of `{}`: the store does not hold {key:?} of their index head {:?}, so nothing is \
+                 selected against it (rule no-fallback); the head is let go, and the next run of these tests \
+                 starts with no head, each test looked up by its answers",
+                self.name,
+                head.map(|it| it.id()),
+            );
+        }
+        // alloc: error path
+        format!("selecting the tests of `{}`: {why}", self.name)
+    }
+
     /// Its selection dropped, and what it was taken from given back to `selectors` as it was:
-    /// the head stands, as nothing replaced it.
+    /// the head stands, as nothing replaced it. A head [`Suited::refused`] found missing is
+    /// not given back.
     fn give_back(&mut self, selectors: &image::Selectors) {
         self.selection = None;
         if let Some(held) = self.taken.take().and_then(|it| it.held) {
@@ -1029,7 +1087,7 @@ impl TestRun {
                 Ok((verdict, drove)) => {
                     out.push(Response::TestResult(result(report, executable, outside, verdict)));
                     if drove == Some(Drove::Ended)
-                        && let Err(why) = suite.ended(&job.shared.selectors)
+                        && let Err(why) = suite.ended(&job.shared.selectors, &mut self.puts)
                     {
                         self.ok = false;
                         out.push(refused(why));
@@ -1167,7 +1225,7 @@ impl Runs<Real> for TestRun {
                         }
                     }
                     if drove == Drove::Ended
-                        && let Err(why) = suite.ended(&job.shared.selectors)
+                        && let Err(why) = suite.ended(&job.shared.selectors, &mut self.puts)
                     {
                         self.ok = false;
                         out.push(Response::Diagnostic(super::say::refused(why, None, color)));

@@ -123,7 +123,9 @@ use serde::{Deserialize, Serialize};
 /// 57: [`Request::Prove`] and [`Response::Proven`] ([`Proven`], [`ProofRecord`], [`Subset`]):
 /// `blaze prove`, the theorem functions of the crates selected translated to Lean and checked.
 /// 58: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
-/// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0.
+/// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0; and
+/// [`Response::TestsOf`] ([`TestsOf`], [`Near`]): each test executable's count of tests, how
+/// many the filter left out, and the nearest names to a filter that matched none.
 pub const SCHEMA: u32 = 58;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
@@ -1052,6 +1054,9 @@ pub enum Response {
     Diagnostics(Seen),
     /// [`Request::Prove`]'s one answer.
     Proven(Proven),
+    /// What a test run asked of one test executable, said once per executable: what a client
+    /// refusing a run of none names.
+    TestsOf(TestsOf),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -1772,12 +1777,41 @@ pub struct TestResult {
     /// It ran outside the sandbox (docs/cargo.md), so the command's summary names it. False for
     /// a cached result, whose run is not this one.
     pub outside: bool,
-    /// The daemon's index of `binary` among the request's test executables: dense from 0, the
-    /// same for every result of one executable, so a client groups results by it.
-    pub executable: u32,
     /// A pass that ran and was not kept, so the test runs again next time: why. `None` for a
     /// failure (never kept), a cached result and a pass that was kept.
     pub not_kept: Option<NotKept>,
+    /// The daemon's index of `binary` among the request's test executables: dense from 0, the
+    /// same for every result of one executable, so a client groups results by it.
+    pub executable: u32,
+}
+
+/// What a test run asked of one test executable ([`Response::TestsOf`]), one per executable
+/// of the request whose tests were selected: how many tests it has, how many the name
+/// filter left out, and, when the filter left out every one, its tests nearest the filter. A
+/// client that refuses a run of none says the counts and the nearest names from these. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct TestsOf {
+    /// Its tests, ignored ones included.
+    pub tests: u32,
+    /// The test executable, as [`TestResult::binary`] names it.
+    pub binary: String,
+    /// When the filter left out every one of its tests: those nearest it, nearest first, at
+    /// most three. Empty otherwise.
+    pub nearest: Vec<Near>,
+    /// As [`TestResult::executable`].
+    pub executable: u32,
+    /// Those the name filter left out.
+    pub filtered_out: u32,
+}
+
+/// A test's name near a filter that matched none ([`TestsOf::nearest`]): `distance` is the
+/// edit distance (rustc's, with substrings) between a filter and its whole path or its last
+/// segment, so a client ranks the nearest of every executable together.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Near {
+    pub name: String,
+    pub distance: u32,
 }
 
 /// Why a pass was not kept (blaze-testsel's `machine::NotKept`): `no` is the stable word a
@@ -2344,6 +2378,7 @@ mod tests {
             name: "t".to_owned(),
             binary: "b".to_owned(),
             cached: None,
+            not_kept: None,
             millis: 1,
             output: vec![9; 30],
             outcome: TestOutcome::Passed,

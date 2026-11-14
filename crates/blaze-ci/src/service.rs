@@ -1044,6 +1044,7 @@ impl Report {
             | Response::UnitEnded(_)
             | Response::UnitBegan(_)
             | Response::TestReady(_)
+            | Response::TestsOf(_)
             | Response::Fetched { .. }
             | Response::BuildScript(_)
             | Response::Unchecked(_)

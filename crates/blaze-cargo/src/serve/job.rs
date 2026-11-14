@@ -57,8 +57,9 @@ mod tests;
 
 #[cfg(test)]
 thread_local! {
-    /// The planted bug of `serve::tests`' durability control: [`Jobs::body_sessions`] marks a
-    /// session as if its puts were durable, whatever their tickets say.
+    /// The planted bug of `serve::tests`' durability controls: [`Jobs::body_sessions`] marks a
+    /// session, and [`Jobs::test_heads`] a test suite's head, as if its puts were durable,
+    /// whatever their tickets say.
     pub(super) static MARK_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The planted bug of `serve::tests`' certificate control: a build's certificate is written
     /// as it ends ([`Jobs::heard`]), before what it left to settle after its answer is durable.
@@ -2312,6 +2313,36 @@ fn body_marks(vfs: &Vfs, checkout: &str) -> BTreeMap<String, blaze_cas::Key> {
     marks
 }
 
+/// The test suites' head marks the journal holds ([`Jobs::test_heads`]), as a start hands them
+/// to the steps (`Steps::test_heads_marked`): each head and its postings queued for the pin
+/// [`super::collect::TEST_HEADS`] again, so a crash between a mark and its pin's write leaves
+/// the head kept from the next build's end on. A mark that does not decode (another layout,
+/// another length, another suite's under this one's name) is said, naming it, and let go: its
+/// suite's next run starts with no head.
+pub(super) fn test_heads_marked(vfs: &mut Vfs) -> Vec<super::local::TestHeadMark, Global> {
+    let mut marked = Vec::new_in(Global);
+    let mut undecoded = Vec::new_in(Global);
+    for (name, bytes) in vfs.marks(super::local::TESTS) {
+        match super::local::TestHeadMark::decode(name, bytes) {
+            Ok(mark) => marked.push(mark),
+            Err(why) => undecoded.push(why),
+        }
+    }
+    for why in undecoded {
+        let (super::local::Undecoded::Layout { name, .. } | super::local::Undecoded::Length { name, .. }) = &why;
+        tracing::error!(target: "blaze", "a test suite's head mark is let go, and its next run starts with no head: {why}");
+        _ = vfs.unmark(name);
+    }
+    for mark in &marked {
+        super::collect::keep_in_place_of(
+            super::collect::TEST_HEADS,
+            super::unit::test_heads_pinned(mark.head, mark.postings),
+            Vec::new_in(Global),
+        );
+    }
+    marked
+}
+
 fn carry_view(vfs: &mut Vfs, root: ContentId) -> Result<ViewId, String> {
     vfs.open(blaze_vfs::View { root })
         // alloc: an error
@@ -2559,6 +2590,71 @@ impl<S: Steps> Jobs<S> {
             }
         }
         self.body_sessions(vfs, store);
+        self.test_heads(vfs, store);
+    }
+
+    /// Marks each test suite's index head whose puts are durable in `store`, in the VFS's
+    /// journal under [`super::local::TESTS`] and the suite's settings
+    /// ([`super::local::TestHeadMark`]): what a start restores
+    /// (`unit::test::image::Selectors::restore`). A suite's heads are marked in the order its
+    /// runs filed them, each once it is durable, so a mark never goes back and never names a
+    /// head a crash can lose; a head let go unmarks its suite. Each mark moves the pin
+    /// [`super::collect::TEST_HEADS`] from the head the mark named to the one it names now.
+    /// A mark the journal refuses is said, named; the suite's next run after a restart then
+    /// starts from the mark before it.
+    pub fn test_heads(&mut self, vfs: &mut Vfs, store: &blaze_cas::Store) {
+        if self.heads.is_empty() {
+            return;
+        }
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "test heads: mark those whose puts are durable",
+            waiting = self.heads.len() as u64,
+        )
+        .entered();
+        // The suites with an earlier head not durable yet: their later ones wait behind it.
+        let mut blocked: Vec<ContentId, Global> = Vec::new_in(Global);
+        let mut left = Vec::new_in(Global);
+        for (filed, tickets) in std::mem::replace(&mut self.heads, Vec::new_in(Global)) {
+            let durable = tickets.pending(|ticket| store.durable(ticket)).is_none();
+            #[cfg(test)]
+            let durable = durable || MARK_EARLY.get();
+            if !durable || blocked.contains(&filed.given) {
+                blocked.push(filed.given);
+                left.push((filed, tickets));
+                continue;
+            }
+            let name = super::local::TestHeadMark::name(filed.given);
+            let before = vfs.marked(&name).and_then(|bytes| super::local::TestHeadMark::decode(&name, bytes).ok());
+            let let_go = || {
+                let mut keys = Vec::new_in(Global);
+                if let Some(it) = before {
+                    keys.extend(super::unit::test_heads_pinned(it.head, it.postings));
+                }
+                keys
+            };
+            match filed.mark {
+                Some(mark) if before == Some(mark) => {}
+                Some(mark) => match vfs.mark(&name, &mark.encode()) {
+                    Ok(_) => super::collect::keep_in_place_of(
+                        super::collect::TEST_HEADS,
+                        super::unit::test_heads_pinned(mark.head, mark.postings),
+                        let_go(),
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "blaze",
+                        mark = %name.escape_debug(),
+                        "the journal refused a test suite's head mark, so its next run after a restart starts from the mark before: {error:?}"
+                    ),
+                },
+                None => {
+                    if vfs.unmark(&name).is_some() {
+                        super::collect::keep_in_place_of(super::collect::TEST_HEADS, std::iter::empty(), let_go());
+                    }
+                }
+            }
+        }
+        self.heads = left;
     }
 
     /// Marks each body entries' session a unit saved whose puts are durable in `store`, in the
@@ -4604,6 +4700,10 @@ pub struct Jobs<S: Steps> {
     /// root it was saved under, and the tickets of the unit's puts (its rows among them), in
     /// the order the units ended ([`Jobs::body_sessions`]).
     bodies: Vec<(String, blaze_cas::Key, blaze_cas::Tickets)>,
+    /// Each test suite's index head a run filed or let go that the journal has not marked yet,
+    /// in the order the runs handed them over, with the tickets of every put of the suite's
+    /// runs since its last mark ([`Jobs::test_heads`]).
+    heads: Vec<(super::work::HeadFiled, blaze_cas::Tickets)>,
     /// Each build that ended whose certificate waits for what its job left to settle after its
     /// answer ([`Settling`]): its records, kept front end and outputs durable and placed. Handed
     /// to the certificate's writer once its job settled ([`Jobs::certify_settled`]), and dropped,
@@ -4758,6 +4858,7 @@ impl<S: Steps> Jobs<S> {
             runs,
             put: blaze_cas::Tickets::default(),
             bodies: Vec::new(), // alloc: none until a unit saves a body entries' session
+            heads: Vec::new_in(Global),
             certify_held: Vec::new(), // alloc: none until a build ends with something to settle
             settling: Vec::new(), // alloc: none until a job leaves something to settle
             lost: Vec::new(),     // alloc: none until settling loses something
@@ -9215,6 +9316,21 @@ impl<S: Steps> Jobs<S> {
             job.durable.extend(&puts.tickets);
             job.misses.append(&mut puts.misses);
             job.test_runs.append(&mut puts.test_runs);
+        }
+        for filed in puts.heads.drain(..) {
+            // A head is marked only once every put of its suite's runs since its last mark is
+            // durable: a run that found its head filed already put nothing for it, and its
+            // put's ticket is an earlier run's. A head let go waits for nothing.
+            let mut tickets = blaze_cas::Tickets::default();
+            if filed.mark.is_some() {
+                tickets.extend(&puts.tickets);
+                for (earlier, waits) in &self.heads {
+                    if earlier.given == filed.given {
+                        tickets.extend(waits);
+                    }
+                }
+            }
+            self.heads.push((filed, tickets));
         }
         if puts.retracted {
             // A retraction is flushed at once: every other checkout must stop being given

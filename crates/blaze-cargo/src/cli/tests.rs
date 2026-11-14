@@ -480,6 +480,27 @@ fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
         driven(&mut FakeApi::answering(none.clone()), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
     assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
     assert!(err.contains("error: no test ran: `blaze test parsse` selected no test executable\n"), "{err}");
+    // What the daemon said of each executable it filtered: the counts and the nearest names.
+    let said = vec![
+        Response::TestsOf(blaze_api::TestsOf {
+            tests: 6,
+            binary: "foo".to_owned(),
+            nearest: vec![blaze_api::Near { name: "tests::parses".to_owned(), distance: 1 }],
+            executable: 0,
+            filtered_out: 6,
+        }),
+        Response::Done { ok: true },
+    ];
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(said), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(
+        err.contains(
+            "error: no test ran: `blaze test parsse` matched none of the 6 tests in 1 test executable\n\
+             note: the nearest that exist: tests::parses\n"
+        ),
+        "{err}"
+    );
     let (then, _, _) = driven(
         &mut FakeApi::answering(none),
         &["blaze", "test", "--ub", "parsse", "--no-tests=pass"],

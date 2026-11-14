@@ -93,7 +93,7 @@ fn concluded(asked: &Invocation, fake: &mut Fake, speaking: Speaking<'_>) -> (i3
         code,
         true,
         std::time::Duration::from_millis(12),
-        || names_of(&built, fake),
+        || names_of(&built, fake, &Selection::of(asked).filters),
         speaking,
         &mut out,
         &mut err,
@@ -868,7 +868,8 @@ fn the_refusal_names_why_nothing_ran() {
     // No test near the filter: how many exist, and how to list them; and a listing that failed.
     let filtered = Tally { binaries: 2, filtered_out: 40, ..Tally::default() };
     let names = || Names {
-        names: vec!["a::b".to_owned(), "c::d".to_owned()],
+        count: 2,
+        nearest: Vec::new(),
         unlisted: vec!["`/w/x --list`: exit status: 1".to_owned()],
     };
     let said = refusal(&typed(&["zzzzzzzz"]), &filtered, names).unwrap();
@@ -896,10 +897,44 @@ fn the_daemons_results_are_counted_by_outcome_and_executable() {
         result("/w/target/debug/deps/x-4567", "d", TestOutcome::Ignored, ""),
     ];
     assert_eq!(
-        tally_of(&results),
+        tally_of(&results, &[]),
         Tally { binaries: 2, passed: 2, failed: 1, ignored: 1, cached: 1, ..Tally::default() }
     );
-    assert_eq!(tally_of(&[]), Tally::default());
+    assert_eq!(tally_of(&[], &[]), Tally::default());
+    // An executable whose every test the filter left out has no result: what the daemon said
+    // of it counts it, and what it left out.
+    let of = |executable: u32, filtered_out: u32| blaze_api::TestsOf {
+        tests: filtered_out,
+        binary: format!("/w/target/debug/deps/e{executable}"),
+        nearest: Vec::new(),
+        executable,
+        filtered_out,
+    };
+    assert_eq!(
+        tally_of(&results, &[of(0, 3), of(1, 0), of(2, 5)]),
+        Tally { binaries: 3, passed: 2, failed: 1, ignored: 1, cached: 1, filtered_out: 8, ..Tally::default() }
+    );
+}
+
+/// The daemon's nearest names of every executable are ranked together by distance, at most
+/// three, so a refusal reads as the CLI's own listing makes it.
+#[test]
+fn a_refusal_ranks_the_daemons_nearest_names_together() {
+    let near = |name: &str, distance: u32| blaze_api::Near { name: name.to_owned(), distance };
+    let of = |executable: u32, nearest: Vec<blaze_api::Near>| blaze_api::TestsOf {
+        tests: 4,
+        binary: format!("/w/target/debug/deps/e{executable}"),
+        nearest,
+        executable,
+        filtered_out: 4,
+    };
+    let tests_of = [of(0, vec![near("a::parse", 1), near("a::pass", 3)]), of(1, vec![near("b::parser", 2), near("b::far", 4)])];
+    let names = Names::of_daemon(&tests_of);
+    assert_eq!(names.count, 8);
+    let filtered = Tally { binaries: 2, filtered_out: 8, ..Tally::default() };
+    let said = refusal(&Selection::of(&asked(Command::Test, &["parsse"])), &filtered, || names).unwrap();
+    assert_eq!(said.what, "no test ran: `blaze test parsse` matched none of the 8 tests in 2 test executables");
+    assert_eq!(said.help[0], "the nearest that exist: a::parse, b::parser, a::pass");
 }
 
 /// A libtest name listing, as `--list --format terse` prints it.

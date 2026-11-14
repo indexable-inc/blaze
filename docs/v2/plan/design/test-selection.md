@@ -132,22 +132,26 @@ blaze-usercode's `Passes`-based selection. blaze-program's `TestRecord`, `Outsid
 What the runner gives the machine (`blaze_testsel::host::Driver`): per suite, the tests asked
 by base (`host::base` over the test's id) and name; the program now and the image the suite
 was last filed at (`Program{now, before}`, held in the daemon's `image::Selectors`), from which
-the changed functions are read by `FnId`; the head the suite last wrote, held in memory; and,
+the changed functions are read by `FnId`; the head the suite last wrote; and,
 per run, the bound code of each executed function (slots mapped through `Image`), the traced
 reads as names and digests, whether the run was sandboxed, whether the trace exists, and whether
 codegen marked the test as reaching code the tracer cannot see (`foreign`).
 
 Not given yet, so a pass is refused or costs more rather than kept wrongly: writes outside the
 sandbox's private overlay (not built, so a test that writes outside is not refused for it);
-a raw syscall or the vDSO as `foreign` (codegen marks only what it sees); a head after a daemon
-restart (every test is then looked up by its answers, the same verdict at a lookup per test).
-A durable head needs three pieces the tree does not have together: a journal mark of the head
-key per suite (`serve/local.rs` marks are the home, written once the head's puts are durable,
-as `Jobs::body_sessions` writes its marks), a store pin over the head and its postings (the
-collector forgets a record unused for two periods, and a missing head is `MissingIndex`, which
-today's in-memory head can hit after a long idle too), and the image the head was filed at, or
-the program state in the mark so a head is used only when the binary's state is the same
-(`host::changes` refuses a head whose state it has no image of).
+a raw syscall or the vDSO as `foreign` (codegen marks only what it sees).
+
+The head outlives the daemon. Each head a run files is a journal mark per suite
+(`serve/local.rs` `TestHeadMark`: the suite's settings, the head and postings keys, and the
+program state its rows hold at), written by `Jobs::test_heads` only once every put of the
+suite's runs since its last mark is durable, so a crash leaves no mark, the old one, or the new
+one with its head. The store pin `test heads` (`collect::TEST_HEADS`) keeps each marked head and
+its postings, moved from the old head to the new as the mark is, and queued again at each start
+for every mark. A start hands the marks to the runner (`Selectors::restore`) with no image: the
+head is used for a binary of its state, and another binary's is a miss by key (each test looked
+up by its answers), never `UnknownState`. A head the store does not hold for all that
+(`MissingIndex`) fails that one run with an error naming the suite and the key, once: the head is
+not given back and its mark is let go, so the next run starts with no head.
 
 The queue orders each test by its head row's last run (`Selection::last_micros`); a test with no
 row has no expected duration. File digests are taken when the trace is assembled, not at the

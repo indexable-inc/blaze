@@ -439,9 +439,7 @@ pub fn doc_tests(
         return Ok(0);
     }
     if !speaking.quiet {
-        let mut said = String::new(); // alloc: one note, once a run with doc tests
-        say::note_into(&mut said, DOC_TESTS_NOT_KEPT, speaking.color);
-        err.write_all(said.as_bytes())?;
+        err.write_all(say::note(DOC_TESTS_NOT_KEPT, speaking.color).as_bytes())?;
     }
     let spec_flag = needs_spec_flag(asked, members);
     let mut failed = Vec::new_in(Global);
@@ -596,9 +594,7 @@ fn ran(
     err.write_all(caused(&what, &[cause], speaking.color).as_bytes())?;
     let nocapture = asked.program.iter().any(|it| it == "--nocapture" || it == "--no-capture");
     if code.is_some() && artifact.harness && !nocapture && !speaking.quiet {
-        let mut said = String::new();
-        say::note_into(
-            &mut said,
+        let said = say::note(
             "test exited abnormally; to see the full output pass --no-capture to the harness.",
             speaking.color,
         );
@@ -718,18 +714,35 @@ pub fn listed(text: &str) -> Vec<String> {
         .collect() // alloc: on a refusal's path, once
 }
 
-/// The tests that exist, for a refusal's help: the names listed, and for each executable
-/// whose listing failed, why.
+/// The tests that exist, for a refusal's help: how many, those nearest the filters with their
+/// distance ([`nearest`]), and for each executable whose listing failed, why.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Names {
-    pub names: Vec<String>,
+    pub count: usize,
+    pub nearest: Vec<(u32, String)>,
     pub unlisted: Vec<String>,
 }
 
-/// The tests of every libtest executable among `artifacts`, each asked for its list.
-pub fn names_of(artifacts: &[Artifact], programs: &mut impl Programs) -> Names {
+impl Names {
+    /// What the daemon said of each test executable of its run ([`blaze_api::TestsOf`]): the
+    /// nearest of every executable ranked together by distance.
+    pub fn of_daemon(tests_of: &[blaze_api::TestsOf]) -> Names {
+        let mut names = Names::default();
+        for of in tests_of {
+            names.count += of.tests as usize;
+            // clone: a refusal's help, once
+            names.nearest.extend(of.nearest.iter().map(|it| (it.distance, it.name.clone())));
+        }
+        names
+    }
+}
+
+/// The tests of every libtest executable among `artifacts`, each asked for its list, and
+/// those nearest `filters`.
+pub fn names_of(artifacts: &[Artifact], programs: &mut impl Programs, filters: &[String]) -> Names {
     let (tests, _) = executables(artifacts);
     let mut names = Names::default();
+    let mut listed_all = Vec::new_in(Global);
     for test in tests.into_iter().filter(|it| it.harness) {
         let executable = PathBuf::from(test.executable.as_deref().unwrap_or(&test.path));
         let exec = Exec::of(test, executable, LIST.map(OsString::from), package_root(test));
@@ -737,10 +750,16 @@ pub fn names_of(artifacts: &[Artifact], programs: &mut impl Programs) -> Names {
             .started(test, &exec)
             .and_then(|exec| programs.names(&exec).map_err(|error| error.to_string()));
         match listed {
-            Ok(listed) => names.names.extend(listed),
+            Ok(listed) => listed_all.extend(listed),
             Err(why) => names.unlisted.push(format!("{}: {why}", exec.shown())), // alloc: as above
         }
     }
+    names.count = listed_all.len();
+    // clone: a refusal's help, once
+    names.nearest = nearest(filters, listed_all.iter().map(String::as_str))
+        .into_iter()
+        .map(|(distance, name)| (distance, name.to_owned()))
+        .collect();
     names
 }
 
@@ -837,14 +856,23 @@ pub fn refusal(selection: &Selection, tally: &Tally, names: impl FnOnce() -> Nam
             tally.ignored
         )
     } else if tally.filtered_out > 0 {
-        let names = names();
-        let near = nearest(&selection.filters, &names.names);
-        if !near.is_empty() {
-            help.push(format!("the nearest that exist: {}", near.join(", ")));
-        } else if !names.names.is_empty() {
+        let mut names = names();
+        names.nearest.sort_unstable();
+        names.nearest.dedup();
+        names.nearest.truncate(NEAREST);
+        if !names.nearest.is_empty() {
+            let mut said = String::from("the nearest that exist: ");
+            for (at, (_, name)) in names.nearest.iter().enumerate() {
+                if at > 0 {
+                    said.push_str(", ");
+                }
+                said.push_str(name);
+            }
+            help.push(said);
+        } else if names.count > 0 {
             help.push(format!(
                 "none of the {} that exist is near it; `blaze test -- --list` lists them",
-                names.names.len()
+                names.count
             ));
         }
         for unlisted in names.unlisted {
@@ -864,11 +892,14 @@ pub fn refusal(selection: &Selection, tally: &Tally, names: impl FnOnce() -> Nam
     Some(Refusal { what, help })
 }
 
-/// The tests nearest any of `filters`, nearest first, at most [`NEAREST`]: by rustc's edit
-/// distance (`stdx::edit_distance`, the tree's one "did you mean") between a filter and a
-/// test's whole path or its last segment, within a third of the filter's length.
-fn nearest<'a>(filters: &[String], names: &'a [String]) -> Vec<&'a str> {
-    let mut scored: Vec<(usize, &str)> = Vec::new(); // alloc: on a refusal's path, once
+/// The tests nearest any of `filters`, nearest first, at most [`NEAREST`], each with its
+/// distance: by rustc's edit distance (`stdx::edit_distance`, the tree's one "did you mean")
+/// between a filter and a test's whole path or its last segment, within a third of the
+/// filter's length. The one rule for both sides: the CLI's over the names its executables
+/// list, and the daemon's over each executable's tests (`blaze_api::TestsOf::nearest`), which
+/// the CLI ranks together by distance.
+pub(crate) fn nearest<'a>(filters: &[String], names: impl Iterator<Item = &'a str>) -> Vec<(u32, &'a str), Global> {
+    let mut scored = Vec::new_in(Global);
     for name in names {
         let last = name.rsplit("::").next().unwrap_or(name);
         let score = filters
@@ -881,22 +912,27 @@ fn nearest<'a>(filters: &[String], names: &'a [String]) -> Vec<&'a str> {
             })
             .min();
         if let Some(score) = score {
-            scored.push((score, name.as_str()));
+            scored.push((u32::try_from(score).unwrap_or(u32::MAX), name));
         }
     }
     scored.sort_unstable();
     scored.dedup();
-    scored.into_iter().take(NEAREST).map(|(_, name)| name).collect()
+    scored.truncate(NEAREST);
+    scored
 }
 
-/// The counts of the results the daemon sent: one executable for each index it numbered. A
-/// cached test is a pass, and counted in [`Tally::cached`] too.
-pub fn tally_of(results: &[TestResult]) -> Tally {
+/// The counts of the results the daemon sent: one executable for each index it numbered, in
+/// its results or in what it said of each executable (`tests_of`, which also says how many
+/// tests the filter left out). A cached test is a pass, and counted in [`Tally::cached`] too.
+pub fn tally_of(results: &[TestResult], tests_of: &[blaze_api::TestsOf]) -> Tally {
     let mut tally = Tally::default();
-    let mut executables: Vec<u32> = results.iter().map(|it| it.executable).collect(); // alloc: once a request
+    let mut executables = Vec::with_capacity_in(results.len() + tests_of.len(), Global);
+    executables.extend(results.iter().map(|it| it.executable));
+    executables.extend(tests_of.iter().map(|it| it.executable));
     executables.sort_unstable();
     executables.dedup();
     tally.binaries = u32::try_from(executables.len()).unwrap_or(u32::MAX);
+    tally.filtered_out = tests_of.iter().map(|it| it.filtered_out).sum();
     for result in results {
         match result.outcome {
             TestOutcome::Passed => tally.passed += 1,

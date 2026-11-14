@@ -13,7 +13,7 @@ use blaze_core::lock::Lock;
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_keyed::{
-    kind::{Key, Namespace, Tag, TestIndex},
+    kind::{Key, Kind as _, Namespace, Tag, TestIndex, TestPostings},
     store::Put,
 };
 use blaze_testsel::{Bound, FnId, Image, Record, Version, host::Records};
@@ -65,13 +65,17 @@ pub(crate) fn record(executed: Executed) -> Record {
 }
 
 /// A suite's selection state between requests: its index head (the root the machine's
-/// `Start::head` is) and the binary the head's rows hold at, whose image answers the
-/// changes since.
+/// `Start::head` is), the postings it names, and the program state its rows hold at, with
+/// the image of that state when this daemon made it, which answers the changes since.
 pub(crate) struct Held {
-    /// The binary's content.
-    pub(crate) binary: ContentId,
-    pub(crate) image: Arc<Image>,
+    /// The binary's content, when this daemon made `image` of it; none for a head restored
+    /// from its journal mark ([`Selectors::restore`]).
+    pub(crate) binary: Option<ContentId>,
+    /// The program state (`Image::state`) the head was filed at.
+    pub(crate) state: ContentId,
+    pub(crate) image: Option<Arc<Image>>,
     pub(crate) head: Option<Key<TestIndex>>,
+    pub(crate) postings: Option<ContentId>,
 }
 
 /// What a request starts a suite's selection from ([`Selectors::take`]).
@@ -85,14 +89,17 @@ pub(crate) struct Taken {
     pub(crate) held: Option<Held>,
 }
 
-/// The daemon's suites' heads, one per suite (its given) for the daemon's life: each test run
-/// takes its suite's ([`Selectors::take`]) and gives the new head back when its selection ends
+/// The daemon's suites' heads, one per suite (its given): each test run takes its suite's
+/// ([`Selectors::take`]) and gives the new head back when its selection ends
 /// ([`Selectors::give`]); one that does not gives back what it took. The lock is taken twice
 /// per suite per run, never per test.
 ///
-/// Held in memory only: after a restart a suite has no head, and each of its tests is looked
-/// up by its asks (exact, a lookup per test where the head's no-op is one read; said in the
-/// design's table).
+/// A head outlives the daemon through its journal mark (`serve::local::TestHeadMark`, written
+/// once its puts are durable, `Jobs::test_heads`), and the store keeps it through the pin
+/// `collect::TEST_HEADS` while the mark names it. A start restores each mark
+/// ([`Selectors::restore`]) with no image: the head is used for a binary of the state it was
+/// filed at, and another binary's is a miss by key (each test looked up by its answers), as
+/// the changes since a state with no image can't be told.
 pub(crate) struct Selectors(Lock<HashMap<ContentId, Held, Global>>);
 
 impl Default for Selectors {
@@ -112,25 +119,46 @@ impl Selectors {
     ) -> Result<Taken, String> {
         // An insert or a remove that panicked left the map as it was: its value stands.
         let held = self.0.lock().remove(&given);
-        Ok(match held {
-            Some(held) if held.binary == binary => {
-                // clone: a reference count, once per suite per run
-                Taken { now: held.image.clone(), before: None, head: held.head, held: Some(held) }
-            }
-            Some(held) => Taken {
-                now: Arc::new(image()?),
-                // clone: a reference count, once per suite per run
-                before: Some(held.image.clone()),
-                head: held.head,
-                held: Some(held),
-            },
-            None => Taken { now: Arc::new(image()?), before: None, head: None, held: None },
-        })
+        let Some(held) = held else {
+            return Ok(Taken { now: Arc::new(image()?), before: None, head: None, held: None });
+        };
+        if let (Some(at), Some(kept)) = (held.binary, &held.image)
+            && at == binary
+        {
+            // clone: a reference count, once per suite per run
+            return Ok(Taken { now: kept.clone(), before: None, head: held.head, held: Some(held) });
+        }
+        let now = Arc::new(image()?);
+        let (before, head) = match &held.image {
+            _ if now.state() == held.state => (None, held.head),
+            // clone: a reference count, once per suite per run
+            Some(kept) => (Some(kept.clone()), held.head),
+            // A head restored from its mark, of another binary: no image of its state is
+            // held, so its changes can't be told and it is not used. A miss by key.
+            None => (None, None),
+        };
+        Ok(Taken { now, before, head, held: Some(held) })
     }
 
     /// Keeps `held` for the next run of the suite `given`.
     pub(crate) fn give(&self, given: ContentId, held: Held) {
         self.0.lock().insert(given, held);
+    }
+
+    /// Each suite's head its journal mark names, as a daemon's start reads them: held with no
+    /// image, until a run takes it ([`Selectors::take`]). A suite this daemon holds a head of
+    /// already keeps its own.
+    pub(crate) fn restore(&self, marked: impl Iterator<Item = crate::serve::local::TestHeadMark>) {
+        let mut held = self.0.lock();
+        for mark in marked {
+            held.entry(mark.given).or_insert(Held {
+                binary: None,
+                state: mark.state,
+                image: None,
+                head: Some(Key::from_id(mark.head)),
+                postings: mark.postings,
+            });
+        }
     }
 
     #[cfg(test)]
@@ -153,6 +181,13 @@ fn store_key(tag: Tag, key: ContentId) -> blaze_cas::Key {
     let mut hasher = Hasher::new(RECORD_DOMAIN);
     hasher.update(&tag.0.to_le_bytes()).id(&key);
     blaze_cas::Key(hasher.finish())
+}
+
+/// The store keys of a suite's index head `head` and the postings it names: what the pin
+/// `collect::TEST_HEADS` keeps while the suite's journal mark names them.
+pub(crate) fn pinned(head: ContentId, postings: Option<ContentId>) -> impl Iterator<Item = blaze_cas::Key> {
+    std::iter::once(store_key(TestIndex::TAG, head))
+        .chain(postings.map(|postings| store_key(TestPostings::TAG, postings)))
 }
 
 impl Records for Filed<'_> {

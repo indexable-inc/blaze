@@ -23,7 +23,7 @@ use crate::{
 };
 
 const REQUESTS: usize = 38;
-const RESPONSES: usize = 46;
+const RESPONSES: usize = 47;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -904,6 +904,13 @@ impl Gen {
                     _ => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
                 }),
             }),
+            45 => Response::TestsOf(crate::TestsOf {
+                tests: self.u32(),
+                binary: self.text(),
+                nearest: self.many(depth, |g| crate::Near { name: g.text(), distance: g.u32() }),
+                executable: self.u32(),
+                filtered_out: self.u32(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -1173,7 +1180,8 @@ fn response_index(response: &Response) -> usize {
         Response::Doing(_) => 42,
         Response::Diagnostics(_) => 43,
         Response::Proven(_) => 44,
-        Response::Of { .. } => 45,
+        Response::TestsOf(_) => 45,
+        Response::Of { .. } => 46,
     }
 }
 
