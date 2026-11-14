@@ -7752,7 +7752,6 @@ impl<S: Steps> Jobs<S> {
                 self.store_kept(w, id, root, checkout, kept, u64::from(request.0), true, &input);
             }
             Err(error) => {
-                // alloc: a loss, once
                 let what = format!(
                     "the query's front end is not kept, and the checkout's next job lowers anew: {}",
                     error.what
@@ -10125,7 +10124,6 @@ impl<S: Steps> Jobs<S> {
                 }
                 None => "did not all build".to_owned(),
             })), // alloc: an error, once
-            // alloc: an error, once
             _ if let Some(broke) = broke.as_deref() => Some(refused(format!("did not apply: {broke}"))),
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
