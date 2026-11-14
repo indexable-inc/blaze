@@ -313,24 +313,27 @@ elab_rules : tactic
       let shown := MessageData.joinSep (gs.map MessageData.ofGoal) m!"\n\n"
       throwError m!"blaze_auto: {gs.length} goal(s) left open:{indentD shown}"
 
-/-- `blaze_auto [defs]` proves a statement about a model: a Hoare triple, the generated
-partial-correctness `match`, or total correctness (`f args = .ok v`, `∃ r, f args = .ok r ∧ Q r`,
-or `∃ r, f args = .ok r`). It turns the statement into a triple, generates its verification
-conditions with `vcgen` (unfolding `defs`, using the `@[spec]`s and any triple given in `defs`,
-such as an induction hypothesis or a loop's invariant lemma), unfolds `defs` in what is left,
-opens what Rust's `&&`, `||` and `!` became (an `if` whose value is a `Bool`, a comparison that
-is `false`) into propositions about the integers' values, and
-closes each goal with `grind` over the integers' bounds (and `ediv_bounds`, `emod_bounds`). A statement that is not about a `Result`
-(a total function, or that an operation fails) is unfolded and given to `grind` directly. It
-fails, naming each goal it left open, when it cannot close them all. -/
-syntax "blaze_auto" (" [" term,* "]")? : tactic
+/-- A call no case reaches satisfies anything: the specification `blaze_auto` gives each opaque
+function (`opaque f : .. → Result R`, no definition) for `vcgen`. Its precondition is `False`, so
+a call that some case does reach leaves `False` to prove under that case's path condition, and the
+proof fails there, as it must: nothing is assumed of what an opaque function gives. -/
+theorem Result.false_spec {α : Type} (x : Result α) {post : α → Prop} {epost : Result.EPost} :
+    Triple x False post epost := by
+  constructor
+  intro h
+  exact h.elim
+
+/-- `blaze_auto_core [defs]`: the pipeline `blaze_auto` runs on one case once its arguments are
+split. It turns the goal into a triple, generates its verification conditions with `vcgen`
+(unfolding `defs`, using the `@[spec]`s and any triple given in `defs`), unfolds `defs` in what
+is left, opens what Rust's `&&`, `||` and `!` became into propositions about the integers'
+values, and closes each goal with `grind`; it fails naming each goal it left open. -/
+syntax "blaze_auto_core" " [" term,* "]" : tactic
 
 macro_rules
-  | `(tactic| blaze_auto) => `(tactic| blaze_auto [])
-  | `(tactic| blaze_auto [$ts,*]) => do
+  | `(tactic| blaze_auto_core [$ts,*]) => do
     let ls ← ts.getElems.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
     `(tactic| (
-    intros
     first
       | blaze_partial
       | apply Blaze.Result.eq_ok_of_triple
@@ -349,5 +352,316 @@ macro_rules
       grind [ScalarTy.min, ScalarTy.max, ScalarTy.bits, Scalar.ofNat_val, Scalar.add, Scalar.sub, Scalar.mul,
         Scalar.checked, List.length_pos_iff, List.head?_eq_getElem?]
     blaze_all_closed))
+
+/-- A cast of an integer to its own type is the integer (`From<u8> for u8`, the error conversion
+of `?` between two `Result`s with one error type). -/
+theorem Scalar.cast_self {ty : ScalarTy} (a : Scalar ty) : Scalar.cast ty a = a :=
+  Scalar.ext (Scalar.cast_val ty a ⟨a.hmin, a.hmax⟩)
+
+/-- A cast to a type at least as wide keeps the value (`side as u64` of a `u32`). `simp`
+discharges the side condition from the types' bounds. -/
+theorem Scalar.cast_val_widen {ty : ScalarTy} (tgt : ScalarTy) (a : Scalar ty)
+    (h : tgt.min ≤ ty.min ∧ ty.max ≤ tgt.max) : (Scalar.cast tgt a).val = a.val :=
+  Scalar.cast_val tgt a ⟨Int.le_trans h.1 a.hmin, Int.le_trans a.hmax h.2⟩
+
+/-- `blaze_auto_full [defs]`: `blaze_auto_core` with the library's whole simp set (and the
+library facts of `blaze_auto_lib`) after `vcgen` in place of its `simp only`: for conditions
+about `Duration`s, `==` of a type with `DecidableEq`, `if True`, and what `vcgen` leaves as
+`true == b`. -/
+syntax "blaze_auto_full" " [" term,* "]" : tactic
+
+macro_rules
+  | `(tactic| blaze_auto_full [$ts,*]) => do
+    let ls ← ts.getElems.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
+    `(tactic| (
+    first
+      | blaze_partial
+      | apply Blaze.Result.eq_ok_of_triple
+      | apply Blaze.Result.ok_of_triple
+      | apply Blaze.Result.exists_ok_of_triple
+      | skip
+    blaze_vcs [$ls,*]
+    all_goals try (set_option linter.unusedSimpArgs false in
+      simp [Bool.not_eq_true', Bool.not_eq_false', Bool.ite_eq_true_distrib,
+        Bool.ite_eq_false_distrib, Scalar.lt_eq_false, Scalar.le_eq_false, Scalar.gt_eq_false,
+        Scalar.ge_eq_false, Scalar.eq_false_eq, Scalar.ne_false_eq, core.cmp.PartialEq.ne,
+        Scalar.saturating_add, Scalar.saturating_sub, Scalar.cast_self, Scalar.cast_val_widen,
+        ScalarTy.min, ScalarTy.max, $ls,*] at *)
+    all_goals try
+      grind [ScalarTy.min, ScalarTy.max, ScalarTy.bits, Scalar.ofNat_val, Scalar.add, Scalar.sub, Scalar.mul,
+        Scalar.checked, List.length_pos_iff, List.head?_eq_getElem?]
+    blaze_all_closed))
+
+namespace AutoImpl
+
+open Lean Elab Tactic Meta
+
+/-- The most cases `blaze_auto` splits a goal into: past it, an argument is left whole and the
+error says which. -/
+def maxCases : Nat := 64
+
+/-- The most constructors an inductive type of the model may have to be split on. -/
+def maxCtors : Nat := 8
+
+/-- How deep `blaze_auto` (with no list) follows calls from the goal into the models. -/
+def maxDepth : Nat := 32
+
+/-- The most definitions `blaze_auto` (with no list) unfolds. -/
+def maxDefs : Nat := 512
+
+/-- A constant generated from Rust: declared in a module under `BlazeModel`. -/
+def inModel (n : Name) : MetaM Bool := do
+  match ← findModuleOf? n with
+  | some m => return m.getRoot == `BlazeModel
+  | none => return false
+
+/-- A definition of a model `blaze_auto` unfolds: a function of the model, not a matcher,
+recursor, projection, instance or type, and not a name the compiler made up. -/
+def unfoldable (n : Name) (info : DefinitionVal) : MetaM Bool := do
+  let env ← getEnv
+  if n.isInternal || n.hasMacroScopes then return false
+  if isMatcherCore env n || isAuxRecursor env n || isNoConfusion env n then return false
+  if env.isProjectionFn n then return false
+  if (← isInstance n) then return false
+  if (← isTypeFormerType info.type) then return false
+  inModel n
+
+/-- An opaque function giving a `Result`, which `vcgen` would otherwise find no spec for. -/
+def opaqueResult (info : OpaqueVal) : MetaM Bool := do
+  unless info.levelParams.isEmpty do return false
+  forallTelescope info.type fun _ b => return b.isAppOf ``Blaze.Result
+
+/-- What `blaze_auto` with no list unfolds: the model definitions the goal names and those they
+call, to `maxDepth` and at most `maxDefs`; and the opaque functions met on the way. -/
+structure Closure where
+  defs : Array Name := #[]
+  opaques : Array Name := #[]
+  truncated : Option MessageData := none
+
+/-- The definitions and opaque functions reachable from `roots` through the models' bodies. -/
+def closure (roots : Array Name) : MetaM Closure := do
+  let env ← getEnv
+  let mut seen : NameSet := {}
+  let mut frontier := roots
+  let mut out : Closure := {}
+  for _ in [0:maxDepth] do
+    if frontier.isEmpty then break
+    let mut next := #[]
+    for c in frontier do
+      if seen.contains c then continue
+      seen := seen.insert c
+      match env.find? c with
+      | some (.defnInfo info) =>
+        if (← unfoldable c info) then
+          if out.defs.size < maxDefs then
+            out := { out with defs := out.defs.push c }
+            next := next ++ info.value.getUsedConstants
+          else
+            out := { out with truncated := some m!"it unfolds at most {maxDefs} definitions" }
+      | some (.opaqueInfo info) =>
+        if (← opaqueResult info) then out := { out with opaques := out.opaques.push c }
+      | _ => pure ()
+    frontier := next.filter (!seen.contains ·)
+  unless frontier.isEmpty do
+    out := { out with truncated := some m!"it follows calls {maxDepth} deep" }
+  return out
+
+/-- How many cases splitting a local of type `ty` gives: `Bool`, `Option`, a Rust `Result`, or
+an inductive type of the model with at most `maxCtors` constructors and no recursion. -/
+def finiteArity (ty : Expr) : MetaM (Option Nat) := do
+  let ty ← whnfR (← instantiateMVars ty)
+  let .const n _ := ty.getAppFn | return none
+  if n == ``Bool || n == ``Option || n == ``Blaze.core.result.Result then return some 2
+  let env ← getEnv
+  let some (.inductInfo i) := env.find? n | return none
+  if i.isRec || i.numIndices != 0 || i.ctors.isEmpty || i.ctors.length > maxCtors then
+    return none
+  if isStructure env n then return none
+  unless (← inModel n) do return none
+  return some i.ctors.length
+
+/-- The locals to split, in order, each at most once, while the cases stay within `maxCases`;
+and the locals left whole because splitting them would pass it. -/
+def plan (g : MVarId) : MetaM (Array Name × Array Name × Nat) := g.withContext do
+  let mut split := #[]
+  let mut whole := #[]
+  let mut cases := 1
+  for d in (← getLCtx) do
+    if d.isImplementationDetail || d.isLet then continue
+    if (← isProp d.type) then continue
+    let some k ← finiteArity d.type | continue
+    if cases * k ≤ maxCases then
+      split := split.push d.userName
+      cases := cases * k
+    else
+      whole := whole.push d.userName
+  return (split, whole, cases)
+
+/-- Split `g` on each named local by its constructors. -/
+def splitOn (g : MVarId) (names : Array Name) : MetaM (Array MVarId) := do
+  let mut gs := #[g]
+  for n in names do
+    let mut next := #[]
+    for g in gs do
+      match (← g.getDecl).lctx.findFromUserName? n with
+      | some d =>
+        let subs ← g.cases d.fvarId
+        next := next ++ subs.map (·.mvarId)
+      | none => next := next.push g
+    gs := next
+  return gs
+
+/-- Unfold a goal that is a statement (`f.spec.statement`, a definition of a `Prop` with no
+arguments) and introduce its quantifiers, again while the goal is such a name. -/
+def openStatement : TacticM Unit := do
+  for _ in [0:4] do
+    evalTactic (← `(tactic| intros))
+    let g ← getMainGoal
+    let tgt ← instantiateMVars (← g.getType)
+    let .const c ls := tgt | return
+    let some (.defnInfo info) := (← getEnv).find? c | return
+    unless info.type.isProp do return
+    replaceMainGoal [← g.replaceTargetDefEq (info.value.instantiateLevelParams info.levelParams ls)]
+
+/-- Give `g` a hypothesis `∀ args, Triple (f args) False post epost` for each opaque `f`, and
+their names. -/
+def withOpaqueSpecs (g : MVarId) (fs : Array Name) : MetaM (MVarId × Array Ident) := do
+  let mut g := g
+  let mut ids := #[]
+  for f in fs do
+    let info ← getConstInfo f
+    let pf ← forallTelescope info.type fun xs b => do
+      mkLambdaFVars xs (mkAppN (mkConst ``Blaze.Result.false_spec) #[b.appArg!, mkAppN (mkConst f) xs])
+    let n := Name.mkSimple s!"blaze_opaque_{ids.size}"
+    let (_, g') ← (← g.assert n (← inferType pf) pf).intro1P
+    g := g'
+    ids := ids.push (mkIdent n)
+  return (g, ids)
+
+/-- Run `tac` on `g` alone with a fresh heartbeat budget; `none` when it closed `g`, else why
+not. Nothing it did stays when it fails. -/
+def attempt (g : MVarId) (tac : TacticM Unit) : TacticM (Option MessageData) := do
+  let s ← saveState
+  tryCatchRuntimeEx
+    (withCurrHeartbeats do
+      setGoals [g]
+      tac
+      let gs ← getGoals
+      unless gs.isEmpty do
+        throwError m!"{gs.length} goal(s) left:{indentD (MessageData.joinSep (gs.map MessageData.ofGoal) m!"\n\n")}"
+      return none)
+    (fun e => do
+      let msg := e.toMessageData
+      s.restore (restoreInfo := true)
+      return some msg)
+
+/-- Close one case: a closed goal by evaluation (`rfl`, or `∃ fuel` with fuel `64`); then `simp`
+with the definitions and the library's simp set; then the pipeline (`vcgen`, `grind`) with the
+definitions and a `False` spec for each opaque function. `none` when closed, else the
+pipeline's error. -/
+def closeCase (g : MVarId) (us : Array Term) (opaques : Array Name) :
+    TacticM (Option (MessageData × MessageData)) := do
+  let tgt ← instantiateMVars (← g.getType)
+  let fuel := tgt.isAppOfArity ``Exists 2 && tgt.appFn!.appArg!.isConstOf ``Nat
+  if !tgt.hasFVar && !tgt.hasMVar then
+    if (← attempt g (evalTactic (← `(tactic| rfl)))).isNone then return none
+    if fuel then
+      if (← attempt g (evalTactic (← `(tactic| (refine ⟨64, ?_⟩; rfl))))).isNone then return none
+  let ls ← us.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
+  let simpTac ← `(tactic| open Std.WP Lean.Order in
+    (set_option linter.unusedSimpArgs false in
+      simp [core.cmp.PartialEq.ne, Scalar.saturating_add, Scalar.saturating_sub,
+        Scalar.cast_self, Scalar.cast_val_widen, ScalarTy.min, ScalarTy.max, $ls,*]))
+  if (← attempt g (evalTactic simpTac)).isNone then return none
+  let core ← attempt g do
+    let (g', ids) ← withOpaqueSpecs g opaques
+    setGoals [g']
+    let vs := us ++ ids.map (⟨·.raw⟩ : Ident → Term)
+    evalTactic (← `(tactic| open Std.WP Lean.Order in
+      (set_option linter.unusedSimpArgs false in blaze_auto_core [$vs,*])))
+  let some why := core | return none
+  let full ← attempt g do
+    let (g', ids) ← withOpaqueSpecs g opaques
+    setGoals [g']
+    let vs := us ++ ids.map (⟨·.raw⟩ : Ident → Term)
+    evalTactic (← `(tactic| open Std.WP Lean.Order in
+      (set_option linter.unusedSimpArgs false in blaze_auto_full [$vs,*])))
+  match full with
+  | none => return none
+  | some why' => return some (why, m!"{why}\n\nwith the whole simp set:\n{why'}")
+
+/-- `blaze_auto`, with the definitions to unfold given (`some`) or found from the goal. -/
+def runAuto (defsGiven : Option (Array Term)) : TacticM Unit := do
+  openStatement
+  let g ← getMainGoal
+  let roots ← g.withContext do
+    let mut cs := (← instantiateMVars (← g.getType)).getUsedConstants
+    for d in (← getLCtx) do
+      unless d.isImplementationDetail do
+        cs := cs ++ (← instantiateMVars d.type).getUsedConstants
+    return cs
+  let clo ← closure roots
+  let us : Array Term := defsGiven.getD (clo.defs.map fun n => ⟨(mkCIdent n).raw⟩)
+  let (split, whole, _) ← plan g
+  let cases ← splitOn g split
+  let mut failed : Array (Nat × MVarId × (MessageData × MessageData)) := #[]
+  for h : i in [0:cases.size] do
+    let c := cases[i]
+    if let some why ← closeCase c us clo.opaques then
+      failed := failed.push (i, c, why)
+  if failed.isEmpty then
+    setGoals []
+    return
+  -- A goal the split made harder than it was: try it whole before failing.
+  if !split.isEmpty then
+    if (← closeCase g us clo.opaques).isNone then
+      setGoals []
+      return
+  -- One case, nothing split and nothing cut short: the pipeline's own error, as before.
+  if let #[(_, _, (why, _))] := failed then
+    if split.isEmpty && whole.isEmpty && (defsGiven.isSome || clo.truncated.isNone) then
+      throwError why
+  let mut msg := m!"blaze_auto: {failed.size} of {cases.size} case(s) left open"
+  unless split.isEmpty do
+    msg := msg ++ m!" (split on {split.toList})"
+  unless whole.isEmpty do
+    msg := msg ++ m!"; not split, past {maxCases} cases: {whole.toList}"
+  if let some t := clo.truncated then
+    if defsGiven.isNone then msg := msg ++ m!"; unfolding stopped: {t}"
+  for (i, c, (_, why)) in failed.toList.take 3 do
+    msg := msg ++ m!"\n\ncase {i + 1}:{indentD (MessageData.ofGoal c)}\n{why}"
+  if failed.size > 3 then
+    msg := msg ++ m!"\n\n... and {failed.size - 3} more"
+  throwError msg
+
+end AutoImpl
+
+/-- `blaze_auto [defs]` proves a statement about a model: the generated `f.spec.statement`
+(`∀ args, f args = Result.ok true`, or a closed one with `∃ fuel`), a Hoare triple, the generated
+partial-correctness `match`, or total correctness (`f args = .ok v`, `∃ r, f args = .ok r ∧ Q r`,
+or `∃ r, f args = .ok r`). It needs nothing opened at its call site.
+
+1. It unfolds a statement name and introduces its arguments.
+2. It splits the arguments (and any local) of a finite type by their constructors, in order,
+   each once: `Bool`, `Option`, a Rust `Result`, an enum of the model with at most 8
+   constructors; at most 64 cases, past which an argument is left whole and the error says so.
+3. It closes each case on its own, with a fresh heartbeat budget: a closed goal by evaluation
+   (`rfl`; `∃ fuel` at fuel 64); then `simp` with `defs` and the library's simp set; then the
+   pipeline `blaze_auto_core`: the goal as a triple, `vcgen` (unfolding `defs`, using the
+   `@[spec]`s and any triple in `defs`, such as an induction hypothesis or a loop's invariant
+   lemma), `defs` unfolded in what is left, Rust's `&&`, `||` and `!` opened into propositions
+   about the integers' values, and `grind` over their bounds. Each opaque function the model
+   calls gets the spec `Result.false_spec` (precondition `False`): a call no case reaches does
+   not stop `vcgen`, and a call some case reaches fails the proof.
+4. Without `[defs]` it unfolds the goal's model and every model definition it calls (declared
+   under `BlazeModel`), at most 32 calls deep and 512 definitions; `[defs]` unfolds exactly
+   `defs` (hand lemmas such as a loop's specification go there).
+
+It fails naming each case it left open and the goals its pipeline left. -/
+syntax "blaze_auto" (" [" term,* "]")? : tactic
+
+elab_rules : tactic
+  | `(tactic| blaze_auto) => AutoImpl.runAuto none
+  | `(tactic| blaze_auto [$ts,*]) => AutoImpl.runAuto (some ts.getElems)
 
 end Blaze
