@@ -314,6 +314,15 @@ const SCRIPT_AT: &str = "/w/target/debug/build/app-b/build-script-build";
 
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
+
+/// The key the fakes' compile gives an output of `bytes`: the file hashed whole, as a real
+/// unit keys what it places (`serve::unit::output_key`) and as a request certificate's check
+/// hashes the file at an output's path (`certify`'s `content_of`). Under a key of their own
+/// the fakes' outputs never matched that hash, and no simulated certificate with an output
+/// answered.
+fn output_key(bytes: &[u8]) -> blaze_cas::Key {
+    crate::serve::unit::output_key(bytes)
+}
 /// The program as a run's compile gives it under [`RUN_IMAGE`]: another image of the same unit,
 /// at [`APP_AT`] too.
 const RUN_APP: &[u8] = b"\x7fELF the program as a run links it\n";
@@ -339,7 +348,7 @@ fn app_artifact() -> Artifact {
             src_path: "/w/src/main.rs".into(),
             crate_types: vec![CrateType::Bin],
         },
-        content: ContentId::of("blaze serve tests output", APP),
+        content: output_key(APP).0,
         harness: true,
         package: "path+file:///w#0.1.0".into(),
         profile: UnitProfile {
@@ -1561,7 +1570,7 @@ impl Front<Fake> for FakeFront {
         }
         let (mut puts, mut outputs) = (Vec::new(), Vec::new());
         if SCRIPT_OUTPUT.get() == Some(unit) {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SCRIPT));
+            let key = output_key(SCRIPT);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SCRIPT.to_vec() });
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
@@ -1570,12 +1579,12 @@ impl Front<Fake> for FakeFront {
                 true => RUN_APP,
                 false => APP,
             };
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", app));
+            let key = output_key(app);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: app.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && SIDE_OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", SIDE));
+            let key = output_key(SIDE);
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: SIDE.to_vec() });
             outputs.push(Output { path: SIDE_AT.into(), key, executable: true, made: None });
         }
@@ -5693,12 +5702,12 @@ fn the_oracle_catches_an_output_placed_over_its_own_value() {
 /// The key the fakes' compile files [`APP`] under: the program's file, as its code memory
 /// holds it.
 fn app_key() -> [u8; 32] {
-    ContentId::of("blaze serve tests output", APP).0
+    output_key(APP).0.0
 }
 
 /// The key the fakes' compile files [`RUN_APP`] under.
 fn run_app_key() -> [u8; 32] {
-    ContentId::of("blaze serve tests output", RUN_APP).0
+    output_key(RUN_APP).0.0
 }
 
 /// The invariant: two commands whose outputs share a path (a run's image of the program and a
@@ -5719,7 +5728,7 @@ fn two_commands_sharing_an_output_path_each_place_their_own_before_answering() {
                 let changed = image_of(steps[at - 1].0) != own;
                 assert_eq!(*placed, usize::from(changed), "seed {seed}: step {at} ({request}) placed {APP_AT} {placed} times");
             }
-            let key = ContentId::of("blaze serve tests output", own).0;
+            let key = output_key(own).0.0;
             for (with, refused) in launched {
                 assert_eq!((*with, refused.as_deref()), (Some(key), None), "seed {seed}: step {at} ({request})");
             }
@@ -5752,7 +5761,7 @@ fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
         let steps = shared_path_certified(seed, false, false);
         for (at, (command, certified, contents, recorded, placed, _, said)) in steps.iter().enumerate() {
             let own = image_of(command);
-            let key = ContentId::of("blaze serve tests output", own).0;
+            let key = output_key(own).0.0;
             assert_eq!(
                 &contents[..],
                 own,
