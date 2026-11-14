@@ -37,6 +37,14 @@ use std::alloc::Global;
 /// all when the power goes or the write fails.
 pub const SECTOR: usize = 512;
 
+/// The most bytes a file's durable part, a change or an offset may be on a disk the theorems
+/// below speak of ([`Disk::small`]), and the most changes a file may have not synced. Far
+/// under what a `usize` holds (a file is at most `MOST_BYTES + MOST_CHANGES * 2 * MOST_BYTES`
+/// long, under 2^58), so no length the world computes overflows.
+pub const MOST_BYTES: usize = 1 << 40;
+/// See [`MOST_BYTES`].
+pub const MOST_CHANGES: usize = 1 << 16;
+
 /// A change to a file's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
@@ -177,6 +185,47 @@ fn land(bytes: &mut Vec<u8>, at: usize, more: &[u8], landed: &[bool]) {
         }
         from = to;
         sector += 1;
+    }
+}
+
+/// A copy of `bytes`.
+fn copy(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new_in(Global);
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Whether `bytes` begins with `prefix`.
+pub fn starts_with(bytes: &[u8], prefix: &[u8]) -> bool {
+    if prefix.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if bytes[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether `after`, what a file reads as after a crash, is all of `read`, what it read as
+/// before: the file is there, with those bytes and no others.
+pub fn kept(read: &[u8], after: &Option<Vec<u8>>) -> bool {
+    match after {
+        Some(bytes) => bytes.len() == read.len() && starts_with(bytes, read),
+        None => false,
+    }
+}
+
+/// Whether `after`, what a file reads as after a crash, is a part of `read`, what it read as
+/// before, that begins with all of `durable`: the file is there, nothing that was durable is
+/// gone, and nothing is in it that was not written in that place.
+pub fn cut_to_a_prefix(durable: &[u8], read: &[u8], after: &Option<Vec<u8>>) -> bool {
+    match after {
+        Some(bytes) => starts_with(bytes, durable) && starts_with(read, bytes),
+        None => false,
     }
 }
 
@@ -362,6 +411,42 @@ impl File {
         self.changes.clear();
         self.barriers.clear();
         self.undo = None;
+    }
+
+    /// Whether its durable bytes, each change and each offset are at most [`MOST_BYTES`], and
+    /// its changes not synced at most [`MOST_CHANGES`].
+    fn small(&self) -> bool {
+        if self.durable.len() > MOST_BYTES || self.changes.len() > MOST_CHANGES {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.changes.len() {
+            let fits = match &self.changes[i].change {
+                Change::Append(more) => more.len() <= MOST_BYTES,
+                Change::At(at, more) | Change::Sectors(at, more) => {
+                    *at <= MOST_BYTES && more.len() <= MOST_BYTES
+                }
+                Change::Cut(len) => *len <= MOST_BYTES,
+            };
+            if !fits {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Whether every change of it not synced is an append.
+    pub fn only_appended(&self) -> bool {
+        let mut i = 0;
+        while i < self.changes.len() {
+            match &self.changes[i].change {
+                Change::Append(_) => {}
+                Change::At(_, _) | Change::Sectors(_, _) | Change::Cut(_) => return false,
+            }
+            i += 1;
+        }
+        true
     }
 
     /// Whether the file is well formed on a disk whose epoch is `epoch`: each barrier covers
@@ -689,6 +774,22 @@ impl Disk {
         }
     }
 
+    /// Whether the disk is within the bounds the theorems below speak of: at most
+    /// [`MOST_CHANGES`] files, each within [`MOST_BYTES`] and [`MOST_CHANGES`].
+    pub fn small(&self) -> bool {
+        if self.files.len() > MOST_CHANGES {
+            return false;
+        }
+        let mut i = 0;
+        while i < self.files.len() {
+            if !self.files[i].small() {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     /// Whether the disk is well formed, which every function here keeps: the files are in
     /// the order of their names, each name once, and each is well formed at the disk's epoch
     /// (`File::wf`).
@@ -710,5 +811,303 @@ impl Disk {
 impl Default for Disk {
     fn default() -> Disk {
         Disk::new()
+    }
+}
+
+/// The invariant: a crash keeps a synced file. From every well-formed disk within the bounds,
+/// once a sync of `file` that covers all its changes has completed, whatever cut a crash is
+/// allowed to make, `file` is there after it and reads as it did before ([`kept`]): no change
+/// of it is lost or torn, no write or rename of another file that is undone takes its name,
+/// and nothing here overflows or panics. Its control is
+/// `the_oracle_catches_a_file_that_lost_what_was_not_synced`.
+#[blaze::theorem]
+pub fn a_crash_keeps_a_synced_file(disk: Disk, file: u64, cut: Vec<Kept>) -> bool {
+    let mut disk = disk;
+    if !disk.wf() || !disk.small() {
+        return true;
+    }
+    let Some(at) = disk.find(file) else { return true };
+    let read = disk.files[at].contents();
+    let all = disk.files[at].changes.len();
+    disk.sync(file, all);
+    if !disk.allows(&cut) {
+        return true;
+    }
+    disk.crash(&cut);
+    kept(&read, &disk.contents(file))
+}
+
+/// The invariant: a crash cuts an appended file to a prefix. From every well-formed disk
+/// within the bounds, for a file whose changes not synced are all appends and that no crash
+/// may undo, whatever cut a crash is allowed to make, the file is there after it, begins with
+/// all its durable bytes and is a prefix of what it read as before ([`cut_to_a_prefix`]). So
+/// a log that is only appended to loses at most its end, and never holds a byte that was not
+/// written in that place. Its control is `the_oracle_catches_a_file_cut_in_its_middle`.
+#[blaze::theorem]
+pub fn a_crash_cuts_an_appended_file_to_a_prefix(disk: Disk, file: u64, cut: Vec<Kept>) -> bool {
+    let mut disk = disk;
+    if !disk.wf() || !disk.small() {
+        return true;
+    }
+    let Some(at) = disk.find(file) else { return true };
+    if !disk.files[at].only_appended() || disk.files[at].undo.is_some() {
+        return true;
+    }
+    let read = disk.files[at].contents();
+    let durable = copy(&disk.files[at].durable);
+    if !disk.allows(&cut) {
+        return true;
+    }
+    disk.crash(&cut);
+    cut_to_a_prefix(&durable, &read, &disk.contents(file))
+}
+
+/// The invariant: a barrier orders. From every well-formed disk within the bounds, once a
+/// barrier of `file` that covers all its changes has completed and `bytes` were then appended
+/// to `later` (any file, `file` itself too), a cut a crash is allowed to make that keeps any
+/// part of that append keeps whole every change the barrier covered. So a commit record
+/// appended after a barrier of the data it names is on the disk after a crash only if the
+/// data is, without a sync between them. Its control is
+/// `the_oracle_catches_a_later_append_kept_without_what_was_ordered`.
+#[blaze::theorem]
+pub fn a_crash_keeps_what_a_barrier_ordered(
+    disk: Disk,
+    file: u64,
+    later: u64,
+    bytes: Vec<u8>,
+    cut: Vec<Kept>,
+) -> bool {
+    let mut disk = disk;
+    // At the last epoch a counter holds, a later change is not told from an earlier one.
+    if !disk.wf() || !disk.small() || disk.epoch == u64::MAX {
+        return true;
+    }
+    let Some(at) = disk.find(file) else { return true };
+    let covers = disk.files[at].changes.len();
+    disk.barrier(file, covers);
+    disk.append(later, bytes);
+    if !disk.allows(&cut) {
+        return true;
+    }
+    let Some(ordered) = disk.find(file) else { return false };
+    let Some(appended) = disk.find(later) else { return false };
+    let last = disk.files[appended].changes.len() - 1;
+    ordered_first(disk.files[appended].reach(&cut[appended]), last, cut[ordered].whole, covers)
+}
+
+/// Whether a cut that leaves `reach` changes of the later file on the disk in whole or in
+/// part, the append after the barrier being its change `last`, and keeps `whole` changes of
+/// the ordered file whole, keeps the barrier's order: none of the append, or all `covers`
+/// changes the barrier covered.
+pub const fn ordered_first(reach: usize, last: usize, whole: usize, covers: usize) -> bool {
+    reach <= last || whole >= covers
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_sim::{Broke, Config, Tape, check};
+
+    use super::*;
+
+    /// A disk a run of drawn completions leaves: three names, small changes, syncs and
+    /// barriers that cover all or a part, the writes and renames that wait for no sync.
+    fn disk(tape: &Tape) -> Disk {
+        let mut disk = Disk::new();
+        let file = |tape: &Tape| tape.below(3, "the file");
+        let bytes = |tape: &Tape| match tape.one_in(5, "bytes over sectors") {
+            true => tape.bytes(SECTOR..=2 * SECTOR + 9, "the bytes"),
+            false => tape.bytes(1..=5, "the bytes"),
+        };
+        for _ in 0..tape.below(14, "more completions") {
+            let name = file(tape);
+            let covers = |disk: &Disk, tape: &Tape| {
+                let all = disk.find(name).map_or(0, |at| disk.files[at].changes.len());
+                all - tape.index(all + 1, "changes the sync does not cover")
+            };
+            match tape.below(10, "the completion") {
+                0 => disk.append(name, bytes(tape)),
+                1 => {
+                    let covers = covers(&disk, tape);
+                    disk.sync(name, covers);
+                }
+                2 => {
+                    let covers = covers(&disk, tape);
+                    disk.barrier(name, covers);
+                }
+                3 => _ = disk.write_at(name, tape.index(2 * SECTOR, "the offset"), bytes(tape)),
+                4 => _ = disk.write_from(name, tape.index(3, "the sector") * SECTOR, bytes(tape)),
+                5 => disk.truncate(name, tape.index(SECTOR + 9, "the length")),
+                6 => disk.write_unsynced(name, bytes(tape)),
+                7 => _ = disk.rename_unsynced(name, file(tape)),
+                8 => disk.write(name, bytes(tape)),
+                _ => _ = disk.rename(name, file(tape)),
+            }
+            assert!(disk.wf(), "{disk:?}");
+        }
+        disk
+    }
+
+    /// A cut drawn for `disk`, each file's share fitting it: whether the disk allows it is
+    /// the barriers' to say. Calm keeps every change whole and undoes nothing.
+    fn cut(tape: &Tape, disk: &Disk) -> Vec<Kept> {
+        disk.files
+            .iter()
+            .map(|file| {
+                let all = file.changes.len();
+                let whole = all - tape.index(all + 1, "changes not kept");
+                let torn = match file.changes.get(whole).map(|it| &it.change) {
+                    Some(Change::Append(more) | Change::At(_, more)) if tape.coin("torn") => {
+                        Torn::Prefix(tape.index(more.len() + 1, "bytes that landed"))
+                    }
+                    Some(Change::Sectors(_, more)) if tape.coin("torn") => {
+                        Torn::Sectors((0..sectors(more.len())).map(|_| tape.coin("a sector landed")).collect())
+                    }
+                    _ => Torn::Nothing,
+                };
+                Kept { whole, torn, undone: file.undo.is_some() && tape.one_in(3, "undone") }
+            })
+            .collect()
+    }
+
+    fn holds(what: &str, held: bool, disk: &Disk, cut: &[Kept]) -> Result<(), Broke> {
+        match held {
+            true => Ok(()),
+            false => Err(Broke::Oracle(format!("{what} does not hold of {disk:?} cut to {cut:?}"))),
+        }
+    }
+
+    /// The theorem functions hold where they are run: on drawn disks and drawn cuts, each
+    /// reached with a cut its disk allows, a crash that tears and a crash that undoes among
+    /// them. What Lean is to prove of their models for every disk and cut.
+    #[test]
+    fn the_theorems_hold_where_they_are_run() {
+        let config = Config {
+            must_reach: &[
+                "a synced file and an allowed cut",
+                "an appended file and an allowed cut that loses some",
+                "a barrier and an allowed cut that keeps the later append",
+                "a cut the barriers refuse",
+            ],
+            ..Config::cases(4000)
+        };
+        check(config, |tape| -> Result<(), Broke> {
+            let made = disk(tape);
+            let name = tape.below(3, "the theorem's file");
+            let Some(at) = made.find(name) else { return Ok(()) };
+
+            // A synced file: the cut is of the disk the sync leaves.
+            // clone: the test's copy of the disk, as each theorem takes its own
+            let mut synced = made.clone();
+            synced.sync(name, made.files[at].changes.len());
+            let drawn = cut(tape, &synced);
+            if synced.allows(&drawn) {
+                tape.reached("a synced file and an allowed cut");
+            } else {
+                tape.reached("a cut the barriers refuse");
+            }
+            // clone: as above
+            holds("a_crash_keeps_a_synced_file", a_crash_keeps_a_synced_file(made.clone(), name, drawn.clone()), &made, &drawn)?;
+
+            // An appended file: the cut is of the disk as it is.
+            let drawn = cut(tape, &made);
+            let file = &made.files[at];
+            if file.only_appended() && file.undo.is_none() && made.allows(&drawn) && drawn[at].whole < file.changes.len() {
+                tape.reached("an appended file and an allowed cut that loses some");
+            }
+            // clone: as above
+            holds(
+                "a_crash_cuts_an_appended_file_to_a_prefix",
+                a_crash_cuts_an_appended_file_to_a_prefix(made.clone(), name, drawn.clone()),
+                &made,
+                &drawn,
+            )?;
+
+            // A barrier and a later append: the cut is of the disk they leave.
+            let later = tape.below(3, "the file appended to after the barrier");
+            let bytes = tape.bytes(1..=4, "the later append");
+            // clone: as above
+            let mut ordered = made.clone();
+            ordered.barrier(name, made.files[at].changes.len());
+            // clone: the test's copy of the bytes
+            ordered.append(later, bytes.clone());
+            let drawn = cut(tape, &ordered);
+            let appended = ordered.find(later).expect("appended to");
+            if ordered.allows(&drawn)
+                && ordered.files[appended].reach(&drawn[appended]) == ordered.files[appended].changes.len()
+                && !made.files[at].changes.is_empty()
+            {
+                tape.reached("a barrier and an allowed cut that keeps the later append");
+            }
+            // clone: as above
+            holds(
+                "a_crash_keeps_what_a_barrier_ordered",
+                a_crash_keeps_what_a_barrier_ordered(made.clone(), name, later, bytes, drawn.clone()),
+                &made,
+                &drawn,
+            )
+        });
+    }
+
+    /// A file that lost its last bytes, or is gone, is not [`kept`]: without the sync, a
+    /// crash that keeps none of an append leaves a file the oracle refuses.
+    #[test]
+    fn the_oracle_catches_a_file_that_lost_what_was_not_synced() {
+        let mut disk = Disk::new();
+        disk.write(1, b"synced".to_vec());
+        disk.append(1, b"-not".to_vec());
+        let read = disk.contents(1).expect("there");
+        let none = [Kept { whole: 0, torn: Torn::Nothing, undone: false }];
+        assert!(disk.allows(&none));
+        disk.crash(&none);
+        assert_eq!(disk.contents(1).as_deref(), Some(&b"synced"[..]));
+        assert!(!kept(&read, &disk.contents(1)));
+        assert!(!kept(&read, &None));
+        assert!(kept(b"synced", &disk.contents(1)));
+    }
+
+    /// A file with a hole where a middle change was lost, a file missing its durable bytes
+    /// and no file at all are not [`cut_to_a_prefix`]: a write at an offset, which the
+    /// theorem leaves out, is torn to what the oracle refuses.
+    #[test]
+    fn the_oracle_catches_a_file_cut_in_its_middle() {
+        let mut disk = Disk::new();
+        disk.write(1, b"durable".to_vec());
+        disk.append(1, b"-more".to_vec());
+        assert!(disk.write_at(1, 0, b"DUR".to_vec()));
+        let read = disk.contents(1).expect("there");
+        // The append kept whole and a byte of the write at the start.
+        let torn = [Kept { whole: 1, torn: Torn::Prefix(1), undone: false }];
+        assert!(disk.allows(&torn));
+        disk.crash(&torn);
+        assert_eq!(disk.contents(1).as_deref(), Some(&b"Durable-more"[..]));
+        assert!(!cut_to_a_prefix(b"durable", &read, &disk.contents(1)));
+        assert!(!cut_to_a_prefix(b"durable", b"durable-more", &Some(b"dur".to_vec())));
+        assert!(!cut_to_a_prefix(b"durable", b"durable-more", &None));
+        assert!(cut_to_a_prefix(b"durable", b"durable-more", &Some(b"durable-m".to_vec())));
+    }
+
+    /// A cut that keeps the append made after a barrier and not what the barrier covered is
+    /// one [`ordered_first`] refuses, and one the disk does not allow; with a write-back's
+    /// nothing where the barrier was, the disk allows it.
+    #[test]
+    fn the_oracle_catches_a_later_append_kept_without_what_was_ordered() {
+        let appended = |barrier: bool| {
+            let mut disk = Disk::new();
+            disk.append(1, b"data".to_vec());
+            if barrier {
+                disk.barrier(1, 1);
+            }
+            disk.append(2, b"commit".to_vec());
+            disk
+        };
+        // None of the data, all of the commit.
+        let cut = [
+            Kept { whole: 0, torn: Torn::Nothing, undone: false },
+            Kept { whole: 1, torn: Torn::Nothing, undone: false },
+        ];
+        assert!(!ordered_first(1, 0, 0, 1));
+        assert!(!appended(true).allows(&cut));
+        assert!(appended(false).allows(&cut));
+        assert!(ordered_first(0, 0, 0, 1) && ordered_first(1, 0, 1, 1));
     }
 }
