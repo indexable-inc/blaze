@@ -547,6 +547,13 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("scope", "hir-def/src/nameres.rs", Rule::Names),
     ("scope", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("scope_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
+    // The slots a crate was given (`Crate::given`): read where a runtime MIR is taken from its
+    // crate's record (`check_cache::runtime::served`), under the runtime MIR a borrow check
+    // reads through. The record's entry is checked against the owner's key and is what
+    // building it gives, so for the body's own crate no answer depends on whether one was
+    // given (covered); another crate's is its `Crate` fact. A slot's `value`, read only when
+    // one was, has no rule and is refused by that name.
+    ("slots", "base-db/src/input.rs", Rule::CrateInput),
     ("specializes_query", "hir-ty/src/specialization.rs", Rule::Items),
     ("struct_flags", "hir-ty/src/layout.rs", Rule::Through),
     ("struct_tail_may_be_unsized", "hir-ty/src/layout.rs", Rule::Through),

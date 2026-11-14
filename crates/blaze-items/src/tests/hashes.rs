@@ -53,7 +53,7 @@ fn f(s: &S) -> u32 {
 }
 
 #[test]
-fn rename_keeps_hashes_and_changes_the_key() {
+fn a_rename_keeps_its_own_hashes_moves_every_hash_naming_it_and_changes_the_key() {
     let (mut db, file) = single(
         r#"
 struct S { x: u32 }
@@ -62,6 +62,7 @@ fn g(s: &S) -> u32 { f(s) }
 "#,
     );
     let (f, s, g) = (of(&db, "f"), of(&db, "S"), of(&db, "g"));
+    let sigs = ["f", "g"].map(|it| signature_hash(&db, item(&db, it)).unwrap());
     let f_key = item_key(&db, item(&db, "f"));
     edit(
         &mut db,
@@ -72,9 +73,18 @@ fn h(s: &T) -> u32 { s.x }
 fn g(s: &T) -> u32 { h(s) }
 "#,
     );
-    assert_eq!(of(&db, "h"), f);
+    // A renamed item keeps its own hashes (`T` names no item; `h`'s and `g`'s deep hashes name
+    // theirs by deep hash alone, what inlines), and every interface, signature and code hash
+    // that names it moves (D46): `h` and `g` name `T` in place of `S`, and `g` calls `h`.
     assert_eq!(of(&db, "T"), s);
-    assert_eq!(of(&db, "g"), g);
+    for (name, before) in [("h", f), ("g", g)] {
+        let after = of(&db, name);
+        assert_eq!(after.deep, before.deep, "{name}: the deep hash is name-free");
+        assert_ne!(after.interface, before.interface, "{name}: its interface names `T`");
+        assert_ne!(after.code, before.code, "{name}: its code names `T`");
+        let signature = |db: &TestDB, path| signature_hash(db, item(db, path)).unwrap();
+        assert_ne!(signature(&db, name), sigs[usize::from(name == "g")], "{name}: its signature");
+    }
     assert_ne!(item_key(&db, item(&db, "h")), f_key);
 }
 
