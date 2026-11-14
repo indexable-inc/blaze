@@ -239,6 +239,26 @@ fn def_kind_names_what_each_def_is() {
 }
 
 #[test]
+fn def_name_is_the_last_segment_and_an_impl_has_none() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct S { pub field: u32 }\n\
+                   pub struct P(pub u8);\n\
+                   impl S { pub fn legacy_make() -> S { S { field: 0 } } }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (named d t) (syntax n "FN") (defines n d) (def-name d t))
+        (rule (named d t) (def-path d "lib::S::field") (def-name d t))
+        (rule (named d t) (def-path d "lib::P::0") (def-name d t))
+        (rule (impls t) (syntax n "IMPL") (defines n d) (def-name d t))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut found = texts(&outcome, "named");
+    found.sort();
+    assert_eq!(found, [["lib::P::0", "0"], ["lib::S::field", "field"], ["lib::S::legacy_make", "legacy_make"]]);
+    assert!(texts(&outcome, "impls").is_empty());
+}
+
+#[test]
 fn each_impl_has_a_path_of_its_own_that_names_no_def_back() {
     let fixture = "//- /lib.rs crate:lib edition:2021\n\
                    pub struct S;\n\

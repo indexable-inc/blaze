@@ -1116,6 +1116,13 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     }
                 }
             }
+            Atom::DefName => {
+                let Some(def) = self.need_def(&inputs[0], "def-name", line)? else { return Ok(()) };
+                // An impl has no name, so no row.
+                if let Some(name) = self.name_of(def) {
+                    out.push(vec![node(self.def(def)), text(&name)]);
+                }
+            }
             Atom::DefKind => {
                 let Some(def) = self.need_def(&inputs[0], "def-kind", line)? else { return Ok(()) };
                 out.push(vec![node(self.def(def)), text(self.def_kind(def))]);

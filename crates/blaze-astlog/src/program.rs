@@ -40,6 +40,8 @@ pub enum Atom {
     Syntax(SyntaxKind),
     Resolves,
     DefPath,
+    /// A def's own name, the last segment of its path.
+    DefName,
     TypeOf,
     /// A type with every leading `&` and `&mut` stripped.
     PeelRefs,
@@ -99,6 +101,7 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
     Some(match head {
         "resolves" => (Atom::Resolves, 2, all0),
         "def-path" => (Atom::DefPath, 2, Needs::Any(&[0, 1])),
+        "def-name" => (Atom::DefName, 2, all0),
         "type-of" => (Atom::TypeOf, 2, all0),
         "peel-refs" => (Atom::PeelRefs, 2, all0),
         "callee" => (Atom::Callee, 2, all0),
