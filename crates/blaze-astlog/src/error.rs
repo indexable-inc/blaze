@@ -21,6 +21,11 @@ pub enum SourceError {
     #[snafu(display("rules:{line}: `{path}`: {message}"))]
     DefPath { line: usize, path: String, message: String },
 
+    #[snafu(display(
+        "rules:{line}: `cfg-off` reads the `#[cfg]` of an item, a variant or a field, and `{attr}` at {place} is on a {kind}"
+    ))]
+    CfgUnread { line: usize, place: String, attr: String, kind: String },
+
     #[snafu(display("rules:{line}: `{name}` needs {needs}, but `{arg}` is {what}"))]
     WrongValue { line: usize, name: &'static str, needs: &'static str, arg: String, what: &'static str },
 
@@ -55,6 +60,7 @@ pub fn api_error(error: &Error) -> blaze_api::ApiError {
             | SourceError::PatternShape { .. }
             | SourceError::UnknownKind { .. }
             | SourceError::DefPath { .. }
+            | SourceError::CfgUnread { .. }
             | SourceError::WrongValue { .. } => None,
         },
         _ => None,

@@ -109,6 +109,26 @@ fn cfg_off_holds_inside_an_item_its_cfg_removes_only() {
 }
 
 #[test]
+fn cfg_off_holds_inside_a_variant_or_a_field_its_cfg_removes() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub enum E { On = 1 + 2, #[cfg(any())] Off = 3 + 4 }\n\
+                   pub struct Named { pub on: [u8; 5 + 6], #[cfg(any())] pub off: [u8; 7 + 8] }\n\
+                   pub struct Tuple(pub [u8; 9 + 1], #[cfg(any())] pub [u8; 2 + 3]);\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (off e) (syntax e "BIN_EXPR") (cfg-off e))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "off"), [["3 + 4"], ["7 + 8"], ["2 + 3"]], "the compiled ones are no cfg-off");
+    // A statement's cfg has no def to tell whether it is on: refused, not guessed.
+    let fixture = "//- /lib.rs crate:lib edition:2021\npub fn f() { #[cfg(any())] let _ = 4 + 5; }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let error = match query(&db, &files, rules) {
+        Ok(outcome) => panic!("a statement's cfg was read: {:?}", texts(&outcome, "off")),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("rules:1") && error.contains("`#[cfg(any())]` at lib.rs:1"), "{error}");
+}
+
+#[test]
 fn in_macro_input_holds_for_an_expansions_nodes_from_the_input_only() {
     let (db, files) = lib();
     let rules = r#"(rule (from-input e) (syntax e "BIN_EXPR") (in-macro-input e))"#;
@@ -145,6 +165,20 @@ fn attribute_holds_for_the_item_that_carries_it_only() {
     let rules = r#"(rule (cfgd n) (syntax n "FN") (attribute n "cfg"))"#;
     let outcome = query(&db, &files, rules).unwrap();
     assert_eq!(lines(&outcome, "cfgd"), [line("#[cfg(any())]")], "the #[test] fn is no cfg");
+}
+
+#[test]
+fn defines_maps_a_macro_rules_to_its_macro_and_back() {
+    let (db, files) = lib();
+    let rules = r#"
+        (rule (macros d k) (syntax n "MACRO_RULES") (defines n d) (def-kind d k))
+        (rule (back n) (syntax m "MACRO_RULES") (defines m d) (defines n d))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut found = texts(&outcome, "macros");
+    found.sort();
+    assert_eq!(found, [["lib::make", "macro"], ["lib::twice", "macro"]]);
+    assert_eq!(lines(&outcome, "back"), [line("macro_rules! twice"), line("macro_rules! make")]);
 }
 
 #[test]
