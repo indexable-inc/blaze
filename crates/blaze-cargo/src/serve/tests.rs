@@ -633,8 +633,21 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             tests: TestSandbox::default(),
             const_macros: None,
         };
+    // The program's plan lists the files its compile gives ([`Fake`]'s store step: unit 3's),
+    // as cargo's plan lists every file it writes for a unit (`UnitPlan::outputs`): what a
+    // request certificate names its outputs by. With none listed, a simulated certificate
+    // named no output and answered whatever was at the program's path.
+    let mut plans = vec![plan; graph.units.len()];
+    if let Some(program) = plans.get_mut(3) {
+        if OUTPUT.get() {
+            program.outputs.push(APP_AT.to_owned());
+        }
+        if SIDE_OUTPUT.get() {
+            program.outputs.push(SIDE_AT.to_owned());
+        }
+    }
     Units {
-        plans: vec![plan; graph.units.len()],
+        plans,
         graph,
         packages: vec![
             package(&dep, "dep", "1.0.0", Some("registry `crates-io`".into()), false),
