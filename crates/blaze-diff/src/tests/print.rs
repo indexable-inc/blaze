@@ -37,16 +37,21 @@ fn printing_the_same_derivative_twice_gives_the_same_bytes() {
     assert_eq!(first[1], "fn f(x: f64, y: f64) -> f64 {\n    (x * y).sin() / (1.0 + x * x)\n}\n");
 }
 
-#[hegel::test]
-fn node_order_is_insertion_order_whatever_was_added_before(tc: hegel::TestCase) {
+#[test]
+fn node_order_is_insertion_order_whatever_was_added_before() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, node_order_case);
+}
+
+/// One case of [`node_order_is_insertion_order_whatever_was_added_before`].
+fn node_order_case(tape: &blaze_sim::Tape) {
     // The same term built in an empty graph and in one that already holds other terms: the
     // new nodes come in the same order, and the term prints the same.
     let mut scratch = Graph::new(Width::F64);
-    let term = float_term(&tc, &mut scratch, 2, 3, false);
+    let term = float_term(tape, &mut scratch, 2, 3, false);
     let reached = scratch.reached(&[term]);
 
     let mut crowded = Graph::new(Width::F64);
-    float_term(&tc, &mut crowded, 2, 3, false);
+    float_term(tape, &mut crowded, 2, 3, false);
     let offset = crowded.len();
     let mut alone = Graph::new(Width::F64);
     let copy = |into: &mut Graph| {

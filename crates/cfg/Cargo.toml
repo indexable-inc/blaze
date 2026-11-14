@@ -22,8 +22,8 @@ syntax.workspace = true
 intern.workspace = true
 
 [dev-dependencies]
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 
 # local deps
 syntax-bridge.workspace = true

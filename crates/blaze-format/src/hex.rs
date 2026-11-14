@@ -91,8 +91,7 @@ fn decode_with<const N: usize>(table: &[u8; 256], text: &[u8]) -> Option<[u8; N]
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
@@ -177,27 +176,31 @@ mod tests {
         });
     }
 
-    #[hegel::test]
-    fn encodes_as_the_copies_did(tc: TestCase) {
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(79));
-        let text = encode(&bytes);
-        assert_eq!(&text, &encode_reference(&bytes));
-        assert!(is_encoding(&text, &bytes));
-        let mut fixed = [0u8; 8];
-        let n = bytes.len().min(8);
-        fixed[..n].copy_from_slice(&bytes[..n]);
-        assert_eq!(decode::<8>(encode(&fixed)), Some(fixed));
-        assert_eq!(decode_lower::<8>(encode(&fixed)), Some(fixed));
+    #[test]
+    fn encodes_as_the_copies_did() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let bytes: Vec<u8> = tape.bytes(0..=79, "bytes");
+            let text = encode(&bytes);
+            assert_eq!(&text, &encode_reference(&bytes));
+            assert!(is_encoding(&text, &bytes));
+            let mut fixed = [0u8; 8];
+            let n = bytes.len().min(8);
+            fixed[..n].copy_from_slice(&bytes[..n]);
+            assert_eq!(decode::<8>(encode(&fixed)), Some(fixed));
+            assert_eq!(decode_lower::<8>(encode(&fixed)), Some(fixed));
+        });
     }
 
-    #[hegel::test]
-    fn decodes_as_the_copies_did(tc: TestCase) {
-        let text: Vec<u8> = tc.draw(
-            gs::vecs(hegel::one_of!(gs::sampled_from(b"09afAFg+".to_vec()), gs::integers::<u8>(),))
-                .max_size(19),
-        );
-        assert_eq!(decode::<8>(&text), decode_reference::<8>(&text));
-        assert_eq!(decode_lower::<8>(&text), decode_lower_reference::<8>(&text));
-        assert_eq!(decode::<4>(&text), decode_reference::<4>(&text));
+    #[test]
+    fn decodes_as_the_copies_did() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let text: Vec<u8> = tape.vec(0..=19, "text", |tape| match tape.below(2, "kind") {
+                0 => *tape.one_of(b"09afAFg+", "digit or near one"),
+                _ => tape.int::<u8>("any byte"),
+            });
+            assert_eq!(decode::<8>(&text), decode_reference::<8>(&text));
+            assert_eq!(decode_lower::<8>(&text), decode_lower_reference::<8>(&text));
+            assert_eq!(decode::<4>(&text), decode_reference::<4>(&text));
+        });
     }
 }

@@ -234,7 +234,7 @@ fn level_features(
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -320,9 +320,10 @@ mod tests {
 
     /// A drawn case: a unit past the baseline, up to four levels, and what the CPU has (closed
     /// by what it implies, as a CPU's features are). `None` when the levels are no plan.
-    fn drawn(tc: &hegel::TestCase) -> Option<(Plan, TargetFeatureSet)> {
-        let unit = baseline().union(&subset(tc.draw(gs::integers::<u8>().max_value(127))));
-        let masks: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().max_value(126)).max_size(4));
+    fn drawn(tape: &Tape) -> Option<(Plan, TargetFeatureSet)> {
+        let unit = baseline().union(&subset(tape.int_in(0..=127u8, "unit mask")));
+        let masks: Vec<u8> =
+            tape.vec(0..=4, "level masks", |tape| tape.int_in(0..=126u8, "level mask"));
         // A level names at least one feature: masks from 1.
         let levels: Vec<String> = masks.iter().map(|&mask| level(mask + 1)).collect();
         let levels: Vec<&str> = levels.iter().map(String::as_str).collect();
@@ -330,7 +331,7 @@ mod tests {
         if levels.is_empty() {
             return None;
         }
-        let has = subset(tc.draw(gs::integers::<u8>().max_value(127))).implied_in(TargetArch::X86);
+        let has = subset(tape.int_in(0..=127u8, "cpu mask")).implied_in(TargetArch::X86);
         match plan(&unit, &levels) {
             Ok(plan) => Some((plan, has)),
             Err(Refusal::Same { .. }) => None,
@@ -341,12 +342,14 @@ mod tests {
     /// The invariant: the clone selected is supported by the CPU (every feature it adds to the
     /// unit is present), and no supported clone is declared after it; the baseline is selected
     /// only when no clone is supported.
-    #[hegel::test]
-    fn the_selected_clone_is_supported_and_the_best(tc: hegel::TestCase) {
-        let Some((plan, has)) = drawn(&tc) else { return };
-        if let Err(why) = check(&plan, &has, plan.select(&has)) {
-            panic!("{plan:?} on {has:?}: {why}");
-        }
+    #[test]
+    fn the_selected_clone_is_supported_and_the_best() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let Some((plan, has)) = drawn(tape) else { return };
+            if let Err(why) = check(&plan, &has, plan.select(&has)) {
+                panic!("{plan:?} on {has:?}: {why}");
+            }
+        });
     }
 
     #[test]
@@ -405,12 +408,14 @@ mod tests {
     /// The invariant: no two clones of a plan have one feature set, and none has the unit's, so
     /// the baseline and the clones are compiled with pairwise different sets and (their feature
     /// names being part of an instance's shape) never share a code identity.
-    #[hegel::test]
-    fn clones_never_share_a_feature_set(tc: hegel::TestCase) {
-        let Some((plan, _)) = drawn(&tc) else { return };
-        if let Err(why) = distinct(plan.unit(), plan.clones()) {
-            panic!("{plan:?}: {why}");
-        }
+    #[test]
+    fn clones_never_share_a_feature_set() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let Some((plan, _)) = drawn(tape) else { return };
+            if let Err(why) = distinct(plan.unit(), plan.clones()) {
+                panic!("{plan:?}: {why}");
+            }
+        });
     }
 
     /// The oracle of [`clones_never_share_a_feature_set`].

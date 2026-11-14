@@ -7,7 +7,7 @@ use blaze_diff::{
     DiffError as RuleError, Op,
     eval::{Scalar, eval, same},
 };
-use hegel::generators as gs;
+use blaze_sim::Config;
 use hir_def::FunctionId;
 use hir_expand::fixture;
 use hir_ty_mir::mir::{
@@ -294,22 +294,23 @@ fn lifting_and_lowering_keep_what_the_body_computes_on_special_values() {
 }
 
 /// The refinement: the same at drawn inputs of any bits.
-#[hegel::test(test_cases = 12)]
-fn lifting_and_lowering_keep_what_the_body_computes_on_any_bits(tc: hegel::TestCase) {
-    let name =
-        LIFTABLE[tc.draw(gs::integers::<u32>().max_value(LIFTABLE.len() as u32 - 1)) as usize];
-    let mut points = Vec::new();
-    for _ in 0..6 {
-        let x = f64::from_bits(tc.draw(gs::integers::<u64>()));
-        let y = f64::from_bits(tc.draw(gs::integers::<u64>()));
-        points.push([x, y]);
-    }
-    with_db(|db| {
-        for point in &points {
-            if let Err(message) = refines(db, name, point, Planted::None) {
-                panic!("{message}");
-            }
+#[test]
+fn lifting_and_lowering_keep_what_the_body_computes_on_any_bits() {
+    blaze_sim::check(Config::cases(12), |tape| {
+        let name = LIFTABLE[tape.index(LIFTABLE.len(), "function")];
+        let mut points = Vec::new();
+        for _ in 0..6 {
+            let x = f64::from_bits(tape.int::<u64>("x bits"));
+            let y = f64::from_bits(tape.int::<u64>("y bits"));
+            points.push([x, y]);
         }
+        with_db(|db| {
+            for point in &points {
+                if let Err(message) = refines(db, name, point, Planted::None) {
+                    panic!("{message}");
+                }
+            }
+        });
     });
 }
 

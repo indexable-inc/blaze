@@ -2,7 +2,8 @@
 //! each with its own virtual clock, latency, faults and counts. An op takes effect when its
 //! answer is delivered, so clients stepped in turn interleave at request grain.
 //!
-//! Faults, per client, each drawn from the client's seeded generator:
+//! Faults, per client, each drawn from the tape the client is given (a case's one tape, so a
+//! failure shrinks with its schedule):
 //! - `fail_one_in`: the op does not take effect, answered [`Reply::Failed`];
 //! - `ambiguous_one_in`: the op takes effect, answered [`Reply::Failed`] (the answer was lost);
 //! - `timeout_one_in`: no answer by the deadline, answered [`Reply::TimedOut`]; it takes effect
@@ -12,7 +13,7 @@
 
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use blaze_rng::SplitMix64;
+use blaze_sim::Tape;
 
 use crate::bucket::{Asked, Bucket, Cond, Counts, Op, Reply, Ticket};
 
@@ -151,7 +152,8 @@ struct Flying {
 /// One client of the fake bucket.
 pub(crate) struct Fake {
     store: Shared,
-    rng: SplitMix64,
+    /// Where the client's latencies and faults are drawn from.
+    tape: Tape,
     faults: Faults,
     now: u64,
     flying: Vec<Flying>,
@@ -160,16 +162,13 @@ pub(crate) struct Fake {
 }
 
 impl Fake {
-    pub(crate) fn new(store: &Shared, seed: u64, faults: Faults) -> Fake {
-        Fake { store: Rc::clone(store), rng: SplitMix64::new(seed), faults, now: 0, flying: Vec::new(), applied: 0, counts: Counts::default() }
+    /// A client drawing from `tape`. With `Faults::default()` it draws nothing.
+    pub(crate) fn new(store: &Shared, tape: &Tape, faults: Faults) -> Fake {
+        Fake { store: Rc::clone(store), tape: tape.clone(), faults, now: 0, flying: Vec::new(), applied: 0, counts: Counts::default() }
     }
 
     pub(crate) fn dead(&self) -> bool {
         self.faults.crash_after.is_some_and(|it| self.applied >= it)
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        n > 0 && self.rng.below(n) == 0
     }
 
     fn deliver(&mut self, it: Flying) -> (Ticket, Reply) {
@@ -178,18 +177,19 @@ impl Fake {
         }
         let late = it.ready_ms > it.deadline_ms;
         if late {
-            if self.rng.below(2) == 0 {
+            // Calm: the late op took effect.
+            if !self.tape.coin("a late op is lost") {
                 self.applied += 1;
                 drop(self.store.borrow_mut().apply(&it.op));
             }
             return (it.ticket, Reply::TimedOut);
         }
-        if self.one_in(self.faults.fail_one_in) {
+        if self.tape.one_in(self.faults.fail_one_in, "the op fails") {
             return (it.ticket, Reply::Failed { why: format!("{}: injected failure", it.op.name()) });
         }
         self.applied += 1;
         let reply = self.store.borrow_mut().apply(&it.op);
-        if self.one_in(self.faults.ambiguous_one_in) {
+        if self.tape.one_in(self.faults.ambiguous_one_in, "the answer is lost") {
             return (it.ticket, Reply::Failed { why: format!("{}: injected failure after it took effect", it.op.name()) });
         }
         if let Reply::Got { bytes, .. } = &reply {
@@ -227,8 +227,8 @@ impl Bucket for Fake {
             self.counts.requests += 1;
             self.counts.sent += op.sends();
             self.store.borrow_mut().requests += 1;
-            let latency = if self.faults.latency_ms == 0 { 1 } else { 1 + self.rng.below(self.faults.latency_ms) };
-            let ready_ms = if self.one_in(self.faults.timeout_one_in) { deadline_ms + 1 } else { self.now + latency };
+            let latency = if self.faults.latency_ms == 0 { 1 } else { 1 + self.tape.below(self.faults.latency_ms, "latency ms") };
+            let ready_ms = if self.tape.one_in(self.faults.timeout_one_in, "the op times out") { deadline_ms + 1 } else { self.now + latency };
             self.flying.push(Flying { ticket, op, ready_ms, deadline_ms });
         }
     }

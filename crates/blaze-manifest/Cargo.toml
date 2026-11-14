@@ -46,8 +46,8 @@ toml = { workspace = true, features = ["preserve_order"] }
 url.workspace = true
 
 [dev-dependencies]
+blaze-sim.workspace = true
 dunce.workspace = true
-hegeltest.workspace = true
 
 [lints]
 workspace = true

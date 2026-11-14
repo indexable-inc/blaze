@@ -1,10 +1,9 @@
-//! What the tests share: an in-memory store of the core's [`Store`], a source of draws (Hegel's
-//! or a seed's), and the outcome of a simulated run.
+//! What the tests share: an in-memory store of the core's [`Store`], the cases a control runs,
+//! and how a filing's refusal is judged.
 
 use std::{
     alloc::{Allocator, Global},
     cell::{Cell, RefCell},
-    fmt,
 };
 
 use blaze_format::Aligned;
@@ -15,13 +14,13 @@ use blaze_keyed::{
     outside::OutsideError,
     store::{Compacted, Generation, InProcess, Put as Filing, Read, RootRef, Store, StoreError},
 };
-use blaze_rng::SplitMix64;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config};
 
 use crate::machine::Refusal;
 
-/// Seeds a control runs before it says its plant went uncaught.
-pub(crate) const CONTROL_SEEDS: u64 = 128;
+/// The cases a control runs (seeds 0..128, as the hand-rolled control looped) before it says its
+/// plant went uncaught.
+pub(crate) const CONTROL: Config = Config::cases(128);
 
 /// The core's store in memory, every kind in one table by (tag, key), each record immutable
 /// once filed. Single-threaded, as the simulations are.
@@ -100,68 +99,4 @@ pub(crate) fn filing(refusal: Refusal) -> Broke {
         }
         other => Broke::Harness(other.to_string()),
     }
-}
-
-/// A source of draws: Hegel's (shrunk and replayed by Hegel) or a seed's (the controls).
-pub(crate) trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-
-    /// In `0..n`, `n` at least one.
-    fn under(&mut self, n: usize) -> usize {
-        self.int(0, n as u64 - 1) as usize
-    }
-}
-
-pub(crate) struct Drawn<'a>(pub(crate) &'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for SplitMix64 {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + SplitMix64::below(self, n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-/// How a simulated run broke: its oracle saw the invariant fail, or the harness itself did.
-#[derive(Debug)]
-pub(crate) enum Broke {
-    Oracle(String),
-    Harness(String),
-}
-
-impl fmt::Display for Broke {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Broke::Oracle(why) => write!(f, "the oracle: {why}"),
-            Broke::Harness(why) => write!(f, "the harness: {why}"),
-        }
-    }
-}
-
-/// Runs `run` on seeded plans until the oracle catches `plant` (test-the-cause on the test: a
-/// green simulation with a blind oracle proves nothing).
-pub(crate) fn control<P: fmt::Debug + Copy>(plant: P, run: impl Fn(&mut SplitMix64, P) -> Result<(), Broke>) {
-    for seed in 0..CONTROL_SEEDS {
-        match run(&mut SplitMix64::new(seed), plant) {
-            Err(Broke::Oracle(why)) => {
-                eprintln!("{plant:?} caught at seed {seed}: {why}");
-                return;
-            }
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
-        }
-    }
-    panic!("the oracle caught {plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak");
 }
