@@ -1,6 +1,7 @@
 import BlazeCore.Wait.ParkingTime
 import BlazeModel.blaze_core.wait.parking.keeps.Timed.closure0.call
 import BlazeModel.blaze_core.wait.parking.keeps.Timed.closure1.call
+import BlazeModel.blaze_core.wait.parking.a_park_keeps_its_deadline
 
 /-!
 A park keeps its deadline (`blaze_core::wait::parking::a_park_keeps_its_deadline`, over
@@ -340,4 +341,58 @@ theorem keeps_run (d : Option Deadline) (schedule : List Step) (readings : List 
   | none => simp [untilNs, Threads.passed] at hp
   | some dl => exact ⟨dl, rfl, hp⟩
 
+/-- `Threads.time` reads the clock and changes nothing. -/
+theorem time_exec (w : World) :
+    Threads.time.exec w = .ok (core.time.Duration.ofNanosSat w.clock, w) := rfl
+
+/-- `keeps` on the timed kernel, with fuel one more than the schedule's steps, returns `true`:
+the world it makes, the run (`keeps_run`), the reading of the clock after it (unchanged) and
+`keeps`'s last `match` on how the park stood. -/
+theorem keeps_true (d : Option Deadline) (schedule : Slice Step)
+    (readings : Slice core.time.Duration) :
+    (keeps.Timed (schedule.val.length + 1) KT schedule readings d).value = .ok true := by
+  obtain ⟨ea, eb, w', he, h1, h2, h3⟩ :=
+    keeps_run d schedule.val (readings.val.map core.time.Duration.toNanos)
+  apply Prog.value_of_exec (w := w')
+  have hnew : (Atomic.new (0 : U32)).exec World.new =
+      .ok (W, ⟨[0], [], [], [], false, 0, []⟩) := by rw [new_exec, u32_0]
+  have hcl : (Threads.clock readings).exec ⟨[0], [], [], [], false, 0, []⟩ =
+      .ok ((), ⟨[0], [], [], [], false, 0, readings.val.map core.time.Duration.toNanos⟩) := rfl
+  simp only [keeps.Timed, keeps.Timed.at_1, keeps.Timed.at_2, keeps.Timed.at_3, Prog.exec_bind,
+    Threads.two_of]
+  rw [hnew]
+  simp only []
+  rw [hcl]
+  simp only []
+  rw [he]
+  simp only []
+  rw [time_exec]
+  simp only []
+  cases ea with
+  | Asleep =>
+    have hp := h2 rfl
+    cases d with
+    | none => rfl
+    | some dl =>
+      have hp' : Threads.passed w'.clock (some (Deadline.get dl).toNanos) = false := hp
+      simp only [keeps.Timed.at_4, passed_ofNanosSat dl w'.clock h3, hp', Bool.not_false,
+        Prog.exec_done_ok]
+  | Done r =>
+    cases r with
+    | Ok v =>
+      cases v with
+      | Ready u => rfl
+      | Deadline =>
+        obtain ⟨dl, rfl, hp⟩ := h1 rfl
+        simp only [keeps.Timed.at_4, passed_ofNanosSat dl w'.clock h3, hp, Prog.exec_done_ok]
+    | Err e => rfl
+  | Running => rfl
+
 end BlazeCore.Wait.ParkingDeadlineProof
+
+open BlazeCore.Wait.ParkingDeadlineProof in
+/-- Fuel: the schedule's steps and one more, for the park's loop (each turn takes a step). -/
+theorem blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof :
+    blaze_core.wait.parking.a_park_keeps_its_deadline.spec.statement := by
+  intro schedule readings deadline
+  exact ⟨schedule.val.length + 1, keeps_true _ schedule readings⟩

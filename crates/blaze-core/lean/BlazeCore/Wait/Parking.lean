@@ -1,5 +1,6 @@
 import BlazeCore.Wait.ParkingLib
 import BlazeCore.Wait.ParkingTime
+import BlazeCore.Wait.ParkingDeadline
 
 /-!
 No unpark is lost (`blaze_core::wait::parking::no_unpark_is_lost`), on every schedule, over the

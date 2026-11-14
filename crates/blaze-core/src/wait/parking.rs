@@ -363,16 +363,14 @@ fn settles<K: Futex + Sync>(
     }
 }
 
-/// The invariant: a park keeps its deadline. For every schedule of a park and an unpark of
-/// one word, every script of the clock's readings, every choice of the kernel's and every
-/// deadline or none, on a kernel whose wait has the deadline ([`Timed`]) and the world's
-/// clock: a park that says its deadline passed has one and the clock is at or past it (never
-/// early); and with the clock at or past the deadline no schedule ends with the park asleep
-/// ([`keeps`]). Run on drawn schedules and readings below; not yet proved. Its controls are
-/// `the_oracle_catches_a_deadline_said_early` and
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/ParkingDeadline.lean): a park
+/// keeps its deadline. For every schedule of a park and an unpark of one word, every script of
+/// the clock's readings, every choice of the kernel's and every deadline or none, on a kernel
+/// whose wait has the deadline ([`Timed`]) and the world's clock: a park that says its deadline
+/// passed has one and the clock is at or past it (never early); and with the clock at or past
+/// the deadline no schedule ends with the park asleep ([`keeps`]). Run on drawn schedules and
+/// readings below too. Its controls are `the_oracle_catches_a_deadline_said_early` and
 /// `the_oracle_catches_a_park_asleep_past_its_deadline`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: "(proved: that
-// file)" in the first line above.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
 pub(crate) fn a_park_keeps_its_deadline(
