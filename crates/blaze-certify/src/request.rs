@@ -194,7 +194,7 @@ pub enum How {
     Unsteady,
     /// The daemon's record of the path (blaze-cargo's `Paths::placed_key`) names another key
     /// than the certificate's, or a placement is in flight there: another request placed it
-    /// after this answer was certified. Found with no look at the disk (one writer, D43).
+    /// after this answer was certified. Found with no look at the disk (one writer, D45).
     Placed,
 }
 

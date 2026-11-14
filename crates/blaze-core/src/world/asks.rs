@@ -24,7 +24,7 @@
 
 use std::alloc::Global;
 
-use crate::world::disk::{Barrier, Change, Disk, File, Kept, Made, Undo, sectors};
+use crate::world::disk::{Barrier, Change, Disk, File, Kept, Made, Undo, sectors, starts_with};
 
 /// An effect on the disk, as it was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,5 +606,250 @@ impl World {
 impl Default for World {
     fn default() -> World {
         World::new()
+    }
+}
+
+/// One effect asked of a file and answered while a sync of it is in flight, in the run of
+/// [`a_synced_append_survives_a_crash`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Between {
+    /// More bytes appended, told done, or told failed after this many of them landed.
+    Append { bytes: Vec<u8>, failed_after: Option<usize> },
+    /// Another sync of the file, told it covered this many of its changes.
+    Sync { covers: usize },
+}
+
+/// Whether `after`, a file read after a crash, still begins with `before`.
+fn survives(before: &[u8], after: &Option<Vec<u8>>) -> bool {
+    match after {
+        Some(bytes) => starts_with(bytes, before),
+        None => false,
+    }
+}
+
+/// The run of [`a_synced_append_survives_a_crash`] on `disk` with nothing in flight: `bytes`
+/// appended to `file` and told done; a sync of `file` asked; `between` asked and answered one
+/// by one; the sync told it covered `covers`, where there is one (`None`: it is still in
+/// flight at the crash); then a crash that lands `landings` and keeps `cut`. `None` where the
+/// run is not one of the world's (an answer or a crash it does not allow, a disk out of the
+/// bounds, a file some change not synced of which is not an append or that a crash may undo);
+/// else whether the file then begins with everything it read as when the sync was asked.
+fn synced_append(
+    disk: Disk,
+    file: u64,
+    bytes: Vec<u8>,
+    between: &[Between],
+    covers: Option<usize>,
+    landings: &[Landing],
+    cut: &[Kept],
+) -> Option<bool> {
+    if !disk.wf() || !disk.small() {
+        return None;
+    }
+    let mut world = World { disk, asked: Vec::new_in(Global) };
+    if !world.ask(0, Ask::Append { file, bytes }) || !world.tell(0, &Told::Done) {
+        return None;
+    }
+    let Some(at) = world.disk.find(file) else { return None };
+    if !world.disk.files[at].only_appended() || world.disk.files[at].undo.is_some() {
+        return None;
+    }
+    let before = world.disk.files[at].contents();
+    if !world.ask(1, Ask::Sync { file }) {
+        return None;
+    }
+    let mut i = 0;
+    while i < between.len() {
+        if !world.disk.small() {
+            return None;
+        }
+        match &between[i] {
+            Between::Append { bytes, failed_after } => {
+                if !world.ask(2, Ask::Append { file, bytes: copy_bytes(bytes) }) {
+                    return None;
+                }
+                let told = match failed_after {
+                    Some(landed) => Told::FailedAfter(*landed),
+                    None => Told::Done,
+                };
+                if !world.tell(2, &told) {
+                    return None;
+                }
+            }
+            Between::Sync { covers } => {
+                if !world.ask(2, Ask::Sync { file }) {
+                    return None;
+                }
+                if !world.tell(2, &Told::Covered(*covers)) {
+                    return None;
+                }
+            }
+        }
+        i += 1;
+    }
+    if !world.disk.small() {
+        return None;
+    }
+    if let Some(covers) = covers {
+        if !world.tell(1, &Told::Covered(covers)) {
+            return None;
+        }
+    }
+    if !world.allows_crash(landings, cut) {
+        return None;
+    }
+    world.crash(landings, cut);
+    Some(survives(&before, &world.disk.contents(file)))
+}
+
+/// The invariant: what was
+/// appended before a sync was asked survives every crash after the sync is told. From every
+/// well-formed disk within the bounds with nothing in flight: bytes are appended to a file
+/// and told done, a sync of the file is asked, and while it is in flight more is appended to
+/// the file (done, or failed part way) and other syncs of it are asked and told, in any
+/// order; whatever the kernel says each covered, within what the world allows
+/// ([`World::allows`]: a sync covers at least what it owes, and what it owes is lowered only
+/// by what another made durable). Once the first sync is told, after every crash the world
+/// allows ([`World::allows_crash`]) the file is there and begins with everything it read as
+/// when that sync was asked ([`survives`]): the bytes appended before it and all before
+/// them. So a core that waits for its sync's answer before it says "written" never says it of
+/// bytes a crash can take, whatever else it has in flight to that file. Its control is
+/// `the_oracle_catches_an_append_lost_before_its_sync_was_told`.
+///
+/// Run on drawn disks, effects and cuts today; not yet proved.
+// when its proof (crates/blaze-core/lean/BlazeCore/World/Asks.lean) lands: `#[blaze::theorem]`
+// here, and "(proved: that file)" in the first line above. Until then it is no theorem of
+// `blaze prove`'s, which exits 1 on one that is stated and not proved.
+pub fn a_synced_append_survives_a_crash(
+    disk: Disk,
+    file: u64,
+    bytes: Vec<u8>,
+    between: Vec<Between>,
+    covers: usize,
+    landings: Vec<Landing>,
+    cut: Vec<Kept>,
+) -> bool {
+    match synced_append(disk, file, bytes, &between, Some(covers), &landings, &cut) {
+        Some(survived) => survived,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_sim::{Broke, Config, Tape, check};
+
+    use super::*;
+    use crate::world::disk::{Torn, tests as disks};
+
+    /// What is asked and answered while the sync is in flight, drawn: appends that end done
+    /// or part way, and syncs told a count near what the file has not synced.
+    fn between(tape: &Tape) -> Vec<Between> {
+        let mut between = Vec::new_in(Global);
+        for _ in 0..tape.below(5, "effects between") {
+            between.push(match tape.coin("another sync") {
+                true => Between::Sync { covers: tape.index(6, "the other sync covers") },
+                false => {
+                    let bytes = tape.bytes(0..=4, "more bytes");
+                    let failed_after =
+                        tape.option("failed part way", |tape| tape.index(bytes.len() + 2, "bytes landed"));
+                    Between::Append { bytes, failed_after }
+                }
+            });
+        }
+        between
+    }
+
+    /// The theorem's function holds where it is run: on drawn disks, drawn effects between
+    /// and drawn cuts, reached with runs the world allows to the end, among them one whose
+    /// crash loses an append made after the sync was asked and one where another sync
+    /// lowered what the first owed.
+    #[test]
+    fn a_synced_append_survives_a_crash_where_it_is_run() {
+        let config = Config {
+            must_reach: &[
+                "a run the world allows to its end",
+                "a crash that loses a later append",
+                "another sync told first",
+                "a run the world refuses",
+            ],
+            ..Config::cases(4000)
+        };
+        check(config, |tape| {
+            let disk = disks::disk(tape);
+            let file = tape.below(3, "the theorem's file");
+            let bytes = tape.bytes(1..=5, "the append");
+            let between = between(tape);
+            // What the file has not synced when the first sync is told, to draw an answer
+            // near it: the same run with the sync left in flight says nothing of that, so
+            // the count is drawn wide and the world refuses what it does not allow.
+            let covers = tape.index(12, "the sync covers");
+            // The cut is drawn for the disk as it stands at the crash: run to there first.
+            let mut world = World { disk: copy_disk(&disk), asked: Vec::new_in(Global) };
+            let reached = world.ask(0, Ask::Append { file, bytes: bytes.clone() })
+                && world.tell(0, &Told::Done)
+                && world.ask(1, Ask::Sync { file })
+                && between.iter().all(|it| match it {
+                    Between::Append { bytes, failed_after } => {
+                        world.ask(2, Ask::Append { file, bytes: bytes.clone() })
+                            && world.tell(
+                                2,
+                                &failed_after.map_or(Told::Done, Told::FailedAfter),
+                            )
+                    }
+                    Between::Sync { covers } => {
+                        world.ask(2, Ask::Sync { file }) && world.tell(2, &Told::Covered(*covers))
+                    }
+                })
+                && world.tell(1, &Told::Covered(covers));
+            let cut = disks::cut(tape, &world.disk);
+            let landings: Vec<Landing> = Vec::new_in(Global);
+            let ran = synced_append(copy_disk(&disk), file, bytes.clone(), &between, Some(covers), &landings, &cut);
+            match ran {
+                None => tape.reached("a run the world refuses"),
+                Some(_) => {
+                    tape.reached("a run the world allows to its end");
+                    if between.iter().any(|it| matches!(it, Between::Sync { covers } if *covers > 0)) {
+                        tape.reached("another sync told first");
+                    }
+                    let lost = world.disk.find(file).is_some_and(|at| {
+                        let file = &world.disk.files[at];
+                        !file.changes.is_empty() && cut[at].whole < file.changes.len() && cut[at].torn == Torn::Nothing
+                    });
+                    if reached && lost {
+                        tape.reached("a crash that loses a later append");
+                    }
+                }
+            }
+            match a_synced_append_survives_a_crash(disk.clone(), file, bytes, between.clone(), covers, landings, cut.clone()) {
+                true => Ok(()),
+                false => Err(Broke::Oracle(format!(
+                    "an append told done before a sync that was told did not survive: {disk:?} file {file} between {between:?} covers {covers} cut {cut:?}"
+                ))),
+            }
+        });
+    }
+
+    /// The cause removed (test-the-cause): the same run with the sync still in flight at the
+    /// crash. The world then allows a cut that keeps none of the file's changes, the append
+    /// is gone, and [`survives`] says so; told, the sync covers the append and the same cut
+    /// is one the world refuses.
+    #[test]
+    fn the_oracle_catches_an_append_lost_before_its_sync_was_told() {
+        let run = |covers| {
+            let mut bytes = Vec::new_in(Global);
+            bytes.extend_from_slice(b"abc");
+            let mut cut = Vec::new_in(Global);
+            cut.push(Kept { whole: 0, torn: Torn::Nothing, undone: false });
+            let landings: Vec<Landing> = Vec::new_in(Global);
+            synced_append(Disk::new(), 7, bytes, &[], covers, &landings, &cut)
+        };
+        // Not told: the crash keeps nothing of the append, and the file is empty.
+        assert_eq!(run(None), Some(false));
+        // Told it covered the one change: nothing is left for a cut to drop, so the cut
+        // that keeps 0 of 0 changes is allowed and the file reads "abc".
+        assert_eq!(run(Some(1)), Some(true));
+        // Told it covered nothing is not an answer the world allows a sync that owes one.
+        assert_eq!(run(Some(0)), None);
     }
 }

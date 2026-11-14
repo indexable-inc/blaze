@@ -447,7 +447,7 @@ fn code_of_no_named_build_leaves_no_certificate() {
     assert!(why.contains(PROGRAM) && why.contains("no build blaze can name"), "{why}");
 }
 
-/// The invariant (one writer, D43): an output another request placed since the build answered
+/// The invariant (one writer, D45): an output another request placed since the build answered
 /// leaves no certificate, named with both keys; never an entry naming that request's file as
 /// this answer's, never one left out.
 #[test]
@@ -461,7 +461,7 @@ fn an_output_placed_by_another_request_since_the_answer_leaves_no_certificate() 
     assert!(why.contains(PROGRAM) && why.contains("nothing"), "{why}");
 }
 
-/// The invariant (one writer, D43): a certificate's output is the answer's only where the
+/// The invariant (one writer, D45): a certificate's output is the answer's only where the
 /// jobs' record holds the answer's key there; another key, or a placement in flight, is
 /// another request's file, and the request goes to its job. With no record (a start, a path
 /// this daemon never placed) the disk alone is the evidence. Each case, and the planted

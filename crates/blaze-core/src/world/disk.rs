@@ -914,14 +914,14 @@ pub const fn ordered_first(reach: usize, last: usize, whole: usize, covers: usiz
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use blaze_sim::{Broke, Config, Tape, check};
 
     use super::*;
 
     /// A disk a run of drawn completions leaves: three names, small changes, syncs and
     /// barriers that cover all or a part, the writes and renames that wait for no sync.
-    fn disk(tape: &Tape) -> Disk {
+    pub(crate) fn disk(tape: &Tape) -> Disk {
         let mut disk = Disk::new();
         let file = |tape: &Tape| tape.below(3, "the file");
         let bytes = |tape: &Tape| match tape.one_in(5, "bytes over sectors") {
@@ -959,7 +959,7 @@ mod tests {
 
     /// A cut drawn for `disk`, each file's share fitting it: whether the disk allows it is
     /// the barriers' to say. Calm keeps every change whole and undoes nothing.
-    fn cut(tape: &Tape, disk: &Disk) -> Vec<Kept> {
+    pub(crate) fn cut(tape: &Tape, disk: &Disk) -> Vec<Kept> {
         disk.files
             .iter()
             .map(|file| {

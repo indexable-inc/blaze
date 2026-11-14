@@ -43,8 +43,6 @@ mod parking;
 mod reaping;
 mod retry;
 
-#[cfg(test)]
-pub(crate) use self::retry::Plant;
 pub use self::{
     choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
     retry::{Clock, Deadline, Once, WaitError, Waited},
@@ -181,7 +179,7 @@ pub fn until<T>(
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
+    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
     drop(registered);
     waited
 }

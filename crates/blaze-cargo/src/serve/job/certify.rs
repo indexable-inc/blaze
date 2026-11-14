@@ -552,12 +552,12 @@ pub(super) enum AtPath {
     /// The build left `left` there as it answered, and the jobs' record holds `holds` now
     /// (none: nothing on record): another request placed the path since, or this build's
     /// placement there failed. No certificate names another request's file as this answer's
-    /// (one writer, D43).
+    /// (one writer, D45).
     Replaced { left: ContentId, holds: Option<ContentId> },
 }
 
 /// What the jobs' record says of an output's path as the request certificate's check asks
-/// it (one writer, D43): read in place, with no look at the disk.
+/// it (one writer, D45): read in place, with no look at the disk.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Recorded {
     /// No placement of this daemon is on record there (a start, a path it never placed, one
@@ -968,7 +968,7 @@ impl<S: Steps> Jobs<S> {
     /// Each of `asks` of the check at `at` answered where the loop holds the answer, else
     /// asked of the driver.
     fn certify_ask(&mut self, w: &mut World<'_, S>, id: JobId, at: usize, asks: Vec<Ask>) {
-        // One writer (D43): an output the answer names whose path the jobs' record says holds
+        // One writer (D45): an output the answer names whose path the jobs' record says holds
         // another key, or has a placement in flight, is another request's file. The request
         // goes to its job, which places this answer's file there (a clone from the store)
         // before it answers; no stamp is taken and no file read for it.
@@ -1452,7 +1452,7 @@ impl<S: Steps> Jobs<S> {
         // and a request after it may have placed its own file at a shared path in between (a
         // run's image where a build's was). Read from the record now, that file was named as
         // this answer's, with its stamp, and the next request of this shape was answered over
-        // it (one writer, D43; measured 2026-11-14: run, build, run, build, the second build
+        // it (one writer, D45; measured 2026-11-14: run, build, run, build, the second build
         // answered in 11 ms over the run's launcher).
         #[cfg(test)]
         let shared = PLANT_CERTIFY_SHARED_RECORD.get();

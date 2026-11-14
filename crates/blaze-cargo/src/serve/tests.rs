@@ -5704,7 +5704,7 @@ fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
     assert!(caught, "the planted bug's steps went unseen: {:?}", steps.iter().map(|it| it.0).collect::<Vec<_>>());
 }
 
-/// The invariant (one writer, D43), at the request certificate: a request is answered with
+/// The invariant (one writer, D45), at the request certificate: a request is answered with
 /// no job only where, for every output path its answer names, the jobs' record holds that
 /// answer's key. Two shapes of one checkout whose program shares [`APP_AT`] (cargo's `run`, a
 /// launcher's image; cargo's `build`, the program's own): after every answer the file there

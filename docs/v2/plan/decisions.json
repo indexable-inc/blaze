@@ -378,10 +378,26 @@
   {
    "id": "D43",
    "date": "2026-11-14",
+   "decision": "A sans-IO loop takes its world as one value, and is proved by running it: the retry loop of every blocking wait (`blaze_core::wait::retry::drive`) takes a `Kernel` (its calls and its clock; a clock and a closure are one), a theorem's function gives the real loop a kernel that answers from a list of answers the world (`crates/blaze-core/src/world/blocking.rs`) allows, and its statement for every list is every run. The loop's simulation test and that test's hand-written kernel are deleted (wait/tests.rs), `a_wait_ends_by_its_deadline` being proved in Lean.",
+   "why": "The loop read its clock through `&self` beside a closure that moved it, which only a `Cell` can share; the translator has no model of interior mutability and a functional model should not need one. One value needs none, callers of `until` do not change, and the loop the theorem runs is the loop production runs. The world is at least as liberal as the deleted test's kernel (each of its behaviours is an answer the world allows) and allows more: a timeout early with the event still to come, a call that starts after the clock was read.",
+   "recommended": "The main agent (claude-fable-5-2) decided it under the owner's 2026-11-13 request that proofs replace simulation tests. Reversing is restoring wait/tests.rs's deleted section from git and keeping both.",
+   "state": "on proofs-1113: built and proved (Lean 4.35.0, the three allowed axioms)"
+  },
+  {
+   "id": "D44",
+   "date": "2026-11-14",
+   "decision": "Threads that share atomics are modelled as programs over one world (`lean/Blaze/Threads.lean`): a function that reaches an atomic operation is a tree of operations, `blaze_core::world::threads::two(schedule, first, second)` runs two closures one operation at a time in the schedule's order, and a theorem for every schedule is every interleaving. The world's memory is sequentially consistent and it refuses, never approximates, a run it is not the meaning of: orderings weaker than `SeqCst` are accepted only where the run's threads touch one cell (where every memory model is sequentially consistent); weaker orderings over two or more cells are `Error.unmodelled` until the world has views, and `Relaxed` there until it has promises.",
+   "why": "The park's simulation test ran an unpark whole between two of the park's atomics, so it never tried a park's step between the unpark's swap and its wake; an exhaustive statement needs both threads as steppable programs. Treating a weaker ordering as `SeqCst` would be a proof about a program blaze does not compile (rule no-fallback); the single-cell rule makes the first slice sound on real code (a park, a once, a flag, a lock word) without the weak world.",
+   "recommended": "The main agent (claude-fable-5-2) decided it. The weak world (views, then promises) is objective V17's remainder.",
+   "state": "on proofs-1113: the Lean library and its tests by evaluation are built; the translator's support, the Rust `two` and the park's proof are in lanes"
+  },
+  {
+   "id": "D45",
+   "date": "2026-11-14",
    "decision": "An output path has one writer: the job's placement (`Jobs`). The code-memory host, which starts dev test binaries and dev runs, writes no file. A program is launched from a path only after its job's placements have ended, with the key the job's record holds for that path; the host starts it only where that key is its image's key, and otherwise the launch fails with a typed error naming the path, the key placed and the key held. There is no fallback write.",
    "why": "claude-fable-5-2, from measurements of #2145's binaries: a `blaze test` that executed tests replaced its test executable every time (a new inode, 168 MB on macOS, 173 MB on Linux, with `built=0`), where an all-cached run and `test --no-run` did not. The cause, read out of the code by a Claude Opus 5.5 lane: two writers of one path, each with its own record of what the path holds (the build's placement in serve/job.rs and `Host::write_executable` in blaze-inproc), so each one's write made the other's record stale and the next build placed the file again. On macOS a sandboxed test's trace holds its own executable's path, so the rewrite after the test began made `Began::moved` refuse every pass: an opted-in package kept nothing. The two writers always wrote the same bytes under the same key.",
    "recommended": "One writer, not two records kept in sync: a record that is told of the other's writes drifts (it compared length and time only), and any new launch site that forgets to tell it brings the rewriting back. The floor of a run that executes tests is to do nothing to its executable; one writer is at the floor.",
-   "state": "Being built on branch fix-test-place-1114 (from main abd609be6c); not compiled, not landed. Open beside it: after a restart with no certificate the jobs place every output again."
+   "state": "Built on branch fix-test-place-1114: the code-memory host writes no file, a launch takes the key the job's record holds, a certificate names what its build left at each output and answers only where the record still holds it. Open beside it: after a restart with no certificate the jobs place every output again."
   }
  ]
 }
