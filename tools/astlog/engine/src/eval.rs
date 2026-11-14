@@ -231,6 +231,9 @@ enum Step<'p, A, N> {
     Not { relation: usize, args: Vec<Arg<N>>, index: Option<usize> },
     Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
     Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
+    /// `(not (text-match ...))`: every argument bound, it holds when the builtin gives no row
+    /// that agrees with them.
+    NotBuiltin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
     /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
     /// text, so two occurrences never share answers they might not agree on.
     Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
@@ -388,6 +391,9 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                         Step::Scan { relation, args, index, recursive }
                     }
                 },
+                BodyAtom::Negation(app) if let Some(builtin) = Builtin::of(&app.name) => {
+                    Step::NotBuiltin { builtin, app, args: args(&mut names, &app.args, false) }
+                }
                 BodyAtom::Negation(neg) => {
                     let relation = self.relation(&neg.name)?;
                     let args = args(&mut names, &neg.args, false);
@@ -626,6 +632,20 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                         self.solve(body, at + 1, windows, env, emit)?;
                         clear(env, &set);
                     }
+                }
+            }
+            Step::NotBuiltin { builtin, app, args } => {
+                let rows = self.builtin(*builtin, app, args, env)?;
+                let mut held = false;
+                for row in &rows {
+                    if let Some(set) = unify(args, row, env) {
+                        clear(env, &set);
+                        held = true;
+                        break;
+                    }
+                }
+                if !held {
+                    self.solve(body, at + 1, windows, env, emit)?;
                 }
             }
         }

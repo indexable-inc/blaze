@@ -533,6 +533,32 @@ fn case_is_a_builtin_with_a_literal_style_and_refuses_text_that_is_no_identifier
 }
 
 #[test]
+fn a_negated_builtin_holds_when_the_builtin_gives_no_row() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (plain a) (edge a b) (not (text-match a \"^1\")))
+         (rule (out a b) (edge a b))
+         (rule (single a) (edge a x) (count n (out a b)) (not (lt 1 n)))
+         (rule (kept a) (edge a b) (text a t) (not (same-text t \"12\")))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (1, 4), (12, 3), (5, 6)]))?;
+    assert_eq!(rows(&sets, "plain"), [["5"]]);
+    assert_eq!(rows(&sets, "single"), [["5"], ["12"]]);
+    assert_eq!(rows(&sets, "kept"), [["1"], ["5"]]);
+    Ok(())
+}
+
+#[test]
+fn a_negated_builtin_with_an_unbound_variable_or_a_counted_builtin_is_refused() {
+    let unbound =
+        Program::<Graph>::parse("(rule (r a) (edge a b) (not (text-capture a \"(\\\\d)\" g)))")
+            .expect_err("`g` is bound by nothing to the left");
+    assert!(matches!(unbound, Error::UnsafeNegation { ref var, .. } if var == "g"), "{unbound}");
+    let counted = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text a t)))")
+        .expect_err("a builtin is no finite relation to count");
+    assert!(counted.to_string().contains("(count ...) cannot read the builtin `text`"), "{counted}");
+}
+
+#[test]
 fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(
         "(rule (path a b) (edge a b))

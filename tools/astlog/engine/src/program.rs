@@ -451,9 +451,14 @@ impl<L: Language> Program<L> {
                     BodyAtom::App(app) if builtin(&app.name).is_none() => {
                         edges.push((rule.name.as_str(), app.name.as_str(), false));
                     }
-                    BodyAtom::Negation(neg) => edges.push((&rule.name, &neg.name, true)),
+                    BodyAtom::Negation(neg) if builtin(&neg.name).is_none() => {
+                        edges.push((&rule.name, &neg.name, true));
+                    }
                     BodyAtom::Count(count) => edges.push((&rule.name, &count.inner.name, true)),
-                    BodyAtom::App(_) | BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => {}
+                    BodyAtom::App(_)
+                    | BodyAtom::Negation(_)
+                    | BodyAtom::Source(_)
+                    | BodyAtom::NegatedSource(_) => {}
                 }
             }
         }
@@ -547,8 +552,14 @@ fn check_atoms<A, S: std::error::Error + 'static>(
                 continue;
             }
         };
-        // A negated or counted atom must name a defined relation (not a builtin: builtins are
-        // filters, not finite relations to scan) with matching arity.
+        // A negated builtin is a test of bound values (every variable is bound to its left, as
+        // `check_modes` requires of any negation), so it holds when the builtin gives no row.
+        if let (BodyAtom::Negation(neg), Some((arity, _))) = (atom, builtin(&relation.name)) {
+            check_builtin(neg, arity)?;
+            continue;
+        }
+        // A counted atom must name a defined relation (not a builtin: builtins are filters,
+        // not finite relations to scan) with matching arity.
         if builtin(&relation.name).is_some() {
             return DslSnafu {
                 line: relation.line,

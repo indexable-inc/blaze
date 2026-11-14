@@ -140,8 +140,10 @@ Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`
 `same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
 args...))` binds `c` to the number of distinct rows of a lower-stratum relation that agree with the
 bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
-`(not (atom ...))` negates a source atom as well as a relation: every variable bound to its left,
-it needs no stratum, and it is how a rule excludes macro-made matches.
+`(not (atom ...))` negates a source atom or a builtin as well as a relation: every variable bound to its left,
+it needs no stratum, and it is how a rule excludes macro-made matches. `(not (text-match x "re"))`
+holds when the regex finds nothing in `x`. `(count ...)` over a builtin is refused; a builtin is
+no finite relation.
 
 Text builtins take a node or text first and need it bound. A regex is a string literal,
 compiled when the file is read; one that does not compile, or whose compiled program is past

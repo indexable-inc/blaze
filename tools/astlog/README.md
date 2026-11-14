@@ -48,7 +48,7 @@ Negation and counting are stratified:
 (rule (hot f) (fn-item f) (count n (caller g f)) (lt 9 n))
 ```
 
-A program whose negation or count sits on a recursive cycle is a load error naming the relations on the cycle. A variable used inside `(count ...)` and not bound before it is local to the count and may not appear outside it, so `(count x (r a x))` with `x` unbound is a load error too.
+`(not ...)` also takes a builtin, `(not (text-match n "^test_"))`, and holds when the builtin gives no row for the bound arguments; `(count ...)` takes relations only. A program whose negation or count sits on a recursive cycle is a load error naming the relations on the cycle. A variable used inside `(count ...)` and not bound before it is local to the count and may not appear outside it, so `(count x (r a x))` with `x` unbound is a load error too.
 
 A rules file nested past 64 lists is a load error naming the line. A run holds at most 10,000,000 rows at once (`MAX_ROWS`, or another cap through `run_with`) and stops past it, naming the relation and rule, the source atom or the rewrite. Two insertions at one offset are written in the rules file's rewrite order, then each rewrite's action order, whatever their text.
 
