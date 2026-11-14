@@ -129,12 +129,12 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
 impl<S: ChildCalls> Children for Direct<'_, S> {
     type Reaped = S::Reaped;
 
-    fn reap_now(&self, pid: i32) -> io::Result<Option<Self::Reaped>> {
+    fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>> {
         self.0.reap_now(pid)
     }
 
     fn exited<C: Clock>(
-        &self,
+        &mut self,
         what: &'static str,
         pid: i32,
         keep: bool,
@@ -642,7 +642,7 @@ mod tests {
         running.kill().unwrap();
         let deadline = Some(Deadline::after(clock.now(), LONG));
         let (what, plant) = ("a test's child", ReapPlant::None);
-        let reaped = reaping::reap(what, &Direct(&Kernel), pid, deadline, &clock, plant);
+        let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
                 assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
@@ -667,7 +667,7 @@ mod tests {
         let clock = Monotonic::new();
         let deadline = Some(Deadline::after(clock.now(), LONG));
         let (what, plant) = ("a test's child", ReapPlant::None);
-        let reaped = reaping::reap(what, &Direct(&Kernel), pid, deadline, &clock, plant);
+        let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
                 assert!(libc::WIFEXITED(status));

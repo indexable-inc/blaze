@@ -443,9 +443,9 @@ pub(crate) fn reap(
 ) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
     let plant = reaping::ReapPlant::None;
     match choice::chosen() {
-        Waits::Ring => reaping::reap(what, &ring::Kids, pid, deadline, clock, plant),
+        Waits::Ring => reaping::reap(what, &mut ring::Kids, pid, deadline, clock, plant),
         Waits::Direct => {
-            reaping::reap(what, &direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
+            reaping::reap(what, &mut direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
         }
     }
 }

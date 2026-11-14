@@ -668,10 +668,9 @@ impl ChildSim<'_> {
     }
 }
 
-impl Children for ChildSim<'_> {
-    type Reaped = i32;
-
-    fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
+impl ChildSim<'_> {
+    /// `wait4(WNOHANG)` of `pid`: its status if it had exited, which reaps it.
+    fn reaped(&self, pid: i32) -> io::Result<Option<i32>> {
         self.now.set(self.now.get() + self.latency());
         self.settle();
         let mut kids = self.kids.borrow_mut();
@@ -685,9 +684,19 @@ impl Children for ChildSim<'_> {
             Life::Reaped => Err(ChildSim::no_child(pid)),
         }
     }
+}
+
+/// On a shared borrow, so a test reaps through `&mut &sim` and still reads the children
+/// between reaps.
+impl Children for &ChildSim<'_> {
+    type Reaped = i32;
+
+    fn reap_now(&mut self, pid: i32) -> io::Result<Option<i32>> {
+        self.reaped(pid)
+    }
 
     fn exited<C: Clock>(
-        &self,
+        &mut self,
         what: &'static str,
         pid: i32,
         keep: bool,
@@ -705,7 +714,7 @@ impl ChildCalls for ChildSim<'_> {
     type Pidfd = i32;
 
     fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
-        Children::reap_now(self, pid)
+        self.reaped(pid)
     }
 
     fn exited_now(&self, pid: i32, keep: bool) -> io::Result<bool> {
@@ -769,9 +778,9 @@ fn run_reaps_through(tape: &Tape, plan: &ReapPlan, plant: ReapPlant, through: Th
             .insert(pid, SimChild { exits, status: kid.status, life: Life::Running });
         let deadline = kid.deadline.map(|it| Deadline::after(start, it));
         let reap = |deadline| match through {
-            Through::Core => reaping::reap(what, &sim, pid, deadline, &clock, plant),
+            Through::Core => reaping::reap(what, &mut &sim, pid, deadline, &clock, plant),
             #[cfg(target_os = "linux")]
-            Through::Direct => reaping::reap(what, &Direct(&sim), pid, deadline, &clock, plant),
+            Through::Direct => reaping::reap(what, &mut Direct(&sim), pid, deadline, &clock, plant),
         };
         let reaped = reap(deadline);
         let end = now.get();

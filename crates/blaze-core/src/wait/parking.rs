@@ -186,8 +186,9 @@ impl Futex for Shared {
     fn switch(&self) {}
 }
 
-/// The clock of [`no_unpark_is_lost`]: one reading, whenever it is read.
-struct Still(Duration);
+/// The clock of [`no_unpark_is_lost`] and of `reaping::a_reaped_child_is_reported`: one
+/// reading, whenever it is read.
+pub(crate) struct Still(pub(crate) Duration);
 
 impl Clock for Still {
     fn now(&self) -> Duration {

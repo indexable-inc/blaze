@@ -13,6 +13,8 @@
 //! it. [`threads`] is threads that share atomic words: [`threads::two`] runs two closures as
 //! two threads, one atomic operation at a time in the order a schedule gives, and is the one
 //! world here that starts threads (its meaning is `Blaze.Threads.two`, section 8).
+//! [`children`] is one child of the process: it runs, exits and is a zombie until reaped, and
+//! its exit is reported once, by the call that reaps it (a wait with `WNOWAIT` leaves it).
 //!
 //! Three things read the one text. A proof: `blaze prove` translates a world's functions as it
 //! does a core's, so a core's theorem quantifies over every answer the world allows and needs
@@ -31,6 +33,7 @@
 
 pub mod asks;
 pub mod blocking;
+pub mod children;
 pub mod clock;
 pub mod disk;
 pub mod threads;

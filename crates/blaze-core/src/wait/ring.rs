@@ -797,7 +797,7 @@ pub(crate) struct Kids;
 impl Children for Kids {
     type Reaped = (libc::c_int, libc::rusage);
 
-    fn reap_now(&self, pid: i32) -> io::Result<Option<Self::Reaped>> {
+    fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>> {
         let mut status = 0;
         // SAFETY: all-zero bytes is a valid `rusage`.
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -816,7 +816,7 @@ impl Children for Kids {
     }
 
     fn exited<C: Clock>(
-        &self,
+        &mut self,
         what: &'static str,
         pid: i32,
         keep: bool,
