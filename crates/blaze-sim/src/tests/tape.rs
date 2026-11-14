@@ -489,8 +489,8 @@ fn a_vecs_elements_are_spans_and_its_length_stays_in_sizes() {
         assert_eq!(record.spans.len(), list.len(), "seed {seed}");
         for span in &record.spans {
             assert_eq!(span.label, "list");
-            assert_eq!(span.end, span.start + 1);
-            assert_eq!(record.choices[span.start as usize].label, "element");
+            assert_eq!(span.range().len(), 1, "seed {seed}");
+            assert_eq!(record.choices[span.range()][0].label, "element");
         }
     }
     assert!(lengths.contains(&2) && lengths.contains(&5), "lengths {lengths:?}");

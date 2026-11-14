@@ -198,7 +198,10 @@ pub fn answer_with<P: AsRef<Path>>(
         })
     };
     // A crate built for its tests as well is linted once, as that build: what it finds outside
-    // `cfg(test)` is what the plain build finds.
+    // `cfg(test)` is what the plain build finds. Not so for `#[expect]`: a test build leaves an
+    // expectation outside `cfg(test)` to the plain build (`check::Driver::production_judged_plain`),
+    // so a stale one on production code is said by a run that lints the plain build, never here,
+    // and its silence here is no verdict.
     let tested: HashSet<FileId, Global> = crates
         .iter()
         .filter(|&&it| has_tests(it))
