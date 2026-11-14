@@ -2033,7 +2033,14 @@ impl Sim {
                 Done::Appended
             }
             Effect::Sync { file, .. } => {
-                self.files.entry(file).or_default().sync(covers);
+                let less = self.planted(host::Plant::SyncCoversLess);
+                let sim = self.files.entry(file).or_default();
+                // The planted bug: one change fewer made durable than the sync covered.
+                let covers = match less && covers.min(sim.ops.len()) > 0 {
+                    true => covers.min(sim.ops.len()) - 1,
+                    false => covers,
+                };
+                sim.sync(covers);
                 self.flushed();
                 Done::Synced
             }

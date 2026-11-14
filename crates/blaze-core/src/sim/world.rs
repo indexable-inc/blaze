@@ -9,18 +9,27 @@
 //! cut the simulation drew ([`Sim::crash_cut`]) is one the world allows ([`Disk::allows`]) and
 //! leaves the world's disk ([`Disk::crash`]).
 //!
+//! Beside the disk it keeps the asks' world ([`World`]): each effect is asked of it when it
+//! is given to `Sim`, and each completion is an answer ([`Told`]) read off what `Sim` did. Every
+//! answer `Sim` gives is one the world allows ([`World::allows`]) at the moment it is given
+//! (a sync covers at least what was written before it was asked and is still not durable), the
+//! world stays well formed, its disk is the disk told directly, and at a crash the sectors the
+//! writes in flight landed, in the order the simulation landed them, and the cut drawn are a
+//! crash the world allows.
+//!
 //! So a proof against the world and a simulation test under `Sim` are about one file system:
 //! what `Sim` does, the world allows. The reverse (every cut the world allows, `Sim` draws on
 //! some seed) is not checked here: where `Sim` draws fewer, a simulation test sees less than a
 //! proof covers, never more.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::host::Plant;
-use super::{Cut, Faults, Op, Sim, SimFile};
+use super::{Cut, FAULT, Faults, Op, Sim, SimFile};
+use crate::world::asks::{Ask, Landing, Told, World, unsynced};
 use crate::world::disk::{Barrier, Change, Disk, File, Kept, SECTOR, Torn, sectors};
 use crate::{Cache, Completion, Done, Driver, Effect, FileName, Memory, Tag, wait::Deadline};
 
@@ -299,6 +308,186 @@ fn tell(sim: &Sim, world: &mut Disk, flying: Flying, done: &Done) -> Result<(), 
     }
 }
 
+/// The effect as the asks' world takes it; none for a write-back, which the world does not
+/// have (nothing a crash keeps changes).
+fn ask_of(effect: &Effect) -> Option<Ask> {
+    // clone: the test's copy of an effect's bytes, which the world keeps while it is in flight
+    Some(match effect {
+        Effect::Append { file, bytes, .. } => Ask::Append { file: number(file), bytes: bytes.clone() },
+        Effect::Sync { file, .. } => Ask::Sync { file: number(file) },
+        Effect::Barrier { file, .. } => Ask::Barrier { file: number(file) },
+        Effect::WriteAt { file, at, bytes, .. } => {
+            Ask::WriteAt { file: number(file), at: *at as usize, bytes: bytes.clone() }
+        }
+        Effect::WriteFrom { file, at, from, .. } => Ask::WriteFrom {
+            file: number(file),
+            at: *at as usize,
+            bytes: pattern(from.offset as usize, from.len as usize),
+        },
+        Effect::Truncate { file, len, .. } => Ask::Truncate { file: number(file), len: *len as usize },
+        Effect::SyncDir { .. } => Ask::SyncDir,
+        Effect::Write { file, bytes, .. } => Ask::Write { file: number(file), bytes: bytes.clone() },
+        Effect::WriteUnsynced { file, bytes, .. } => {
+            Ask::WriteUnsynced { file: number(file), bytes: bytes.clone() }
+        }
+        Effect::Rename { from, to, .. } => Ask::Rename { from: number(from), to: number(to) },
+        Effect::RenameUnsynced { from, to, .. } => Ask::RenameUnsynced { from: number(from), to: number(to) },
+        Effect::Remove { file, .. } => Ask::Remove { file: number(file) },
+        _ => return None,
+    })
+}
+
+/// Of a failed write from memory to `file`, each of its sectors the simulation landed: the
+/// changes its file has past the world's `has`, each a sector of the write's.
+fn mask(sim: &Sim, file: &FileName, at: u64, len: usize, has: usize) -> Result<Vec<bool>, Broke> {
+    let mut mask = vec![false; sectors(len)];
+    let Some(ours) = sim.files.get(file) else { return Ok(mask) };
+    for op in ours.ops.iter().skip(has) {
+        match op {
+            Op::Sectors(sector, _) => mask[(*sector - at) as usize / SECTOR] = true,
+            other => return Err(harness(format!("{file}: a failed write from memory left {other:?}"))),
+        }
+    }
+    Ok(mask)
+}
+
+/// The answer the simulation gave to `flying`, read off what it did, the world's disk `world`
+/// being as it was before it. `alone`: it is the only completion of its poll, so the
+/// simulation's state after the poll is the state after it.
+fn answer(sim: &Sim, world: &Disk, flying: &Flying, done: &Done, alone: bool) -> Result<Told, Broke> {
+    let injected = |why: &crate::IoError| why.0 == FAULT;
+    let told = match (&flying.effect, done) {
+        (Effect::Append { file, .. }, Done::Failed(_)) => {
+            // The prefix that landed, a change of its own, the one past the world's.
+            let has = unsynced(world, number(file));
+            match sim.files.get(file).and_then(|it| it.ops.get(has)) {
+                Some(Op::Append(part)) => Told::FailedAfter(part.len()),
+                other => return Err(harness(format!("{file}: a failed append left {other:?}"))),
+            }
+        }
+        (Effect::WriteFrom { file, at, from, .. }, Done::Failed(why)) => match world.find(number(file)) {
+            Some(found) => Told::FailedLanding(mask(sim, file, *at, from.len as usize, world.files[found].changes.len())?),
+            None if injected(why) => Told::Failed,
+            None => Told::Missing,
+        },
+        (Effect::WriteAt { .. } | Effect::Rename { .. } | Effect::RenameUnsynced { .. }, Done::Failed(why)) => {
+            match injected(why) {
+                true => Told::Failed,
+                false => Told::Missing,
+            }
+        }
+        (_, Done::Failed(_)) => Told::Failed,
+        (Effect::Sync { file, .. }, _) => {
+            let before = unsynced(world, number(file));
+            let covered = match alone {
+                // Read off the simulation's state: how many of the file's changes are durable
+                // now that were not before (its own and, where the flush made more durable,
+                // what its barriers covered: an answer the world gives the same disk for).
+                true => {
+                    let after = sim.files.get(file).map_or(0, |it| it.ops.len());
+                    before.checked_sub(after).ok_or_else(|| {
+                        harness(format!("{file}: a sync left {after} changes not synced of {before}"))
+                    })?
+                }
+                // With another completion in the poll the state between them is not seen:
+                // what the simulation's own rule says, `covers.min(ops.len())` at completion.
+                false => flying.covers.min(before),
+            };
+            Told::Covered(covered)
+        }
+        (Effect::Barrier { file, .. }, _) => {
+            let before = unsynced(world, number(file));
+            let covered = match alone {
+                // The barrier the simulation made, of the epoch it completed in; none where
+                // it covered nothing.
+                true => sim
+                    .files
+                    .get(file)
+                    .and_then(|it| it.barriers.iter().find(|(_, epoch)| *epoch + 1 == sim.epoch))
+                    .map_or(0, |(covers, _)| *covers),
+                // As for a sync.
+                false => flying.covers.min(before),
+            };
+            Told::Covered(covered)
+        }
+        _ => Told::Done,
+    };
+    Ok(told)
+}
+
+/// The sectors of the writes from memory in flight that the simulation landed at a crash, in
+/// the order it landed them: each change its file has past the world's is one sector, made as
+/// `Sim::crash_cut` landed it. Each is given to the first write in flight, in the order asked,
+/// to that file whose sector it is (offset and bytes) and whose sector has not landed yet:
+/// where two writes could have made it, their sectors are the same change, so the choice
+/// leaves the same disk. The files are taken one after another, the run's names in order: a
+/// landing on one file and one on another leave the same disk in either order.
+fn landings(sim: &Sim, world: &World) -> Result<Vec<Landing>, Broke> {
+    let mut out: Vec<Landing> = Vec::new();
+    for (file, name) in NAMES.iter().enumerate() {
+        let Some(ours) = sim.files.get(&name_of(name)) else { continue };
+        let past = unsynced(&world.disk, file as u64);
+        for op in ours.ops.iter().skip(past) {
+            let Op::Sectors(sector, part) = op else {
+                return Err(harness(format!("{name}: a write in flight at a crash left {op:?}")));
+            };
+            let sector = *sector as usize;
+            let landing = world.asked.iter().enumerate().find_map(|(ask, asked)| {
+                let Ask::WriteFrom { file: of, at, bytes } = &asked.ask else { return None };
+                let from = sector.checked_sub(*at)?;
+                let landing = Landing { ask, sector: from / SECTOR };
+                let fits = *of == file as u64
+                    && from % SECTOR == 0
+                    && from < bytes.len()
+                    && bytes[from..(from + SECTOR).min(bytes.len())] == part[..]
+                    && !out.contains(&landing);
+                fits.then_some(landing)
+            });
+            match landing {
+                Some(landing) => out.push(landing),
+                None => {
+                    return Err(oracle(format!(
+                        "{name}: the crash landed {} bytes at {sector}, a sector of no write in flight \
+                         that has not landed: in flight {:?}",
+                        part.len(),
+                        in_flight(world)
+                    )));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `landings` lands a sector of a write in flight after a sector of one asked after
+/// it, both to one file.
+fn out_of_order(world: &World, landings: &[Landing]) -> bool {
+    let file = |landing: &Landing| match &world.asked[landing.ask].ask {
+        Ask::WriteFrom { file, .. } => Some(*file),
+        _ => None,
+    };
+    landings.iter().enumerate().any(|(i, early)| {
+        landings[i + 1..].iter().any(|late| late.ask < early.ask && file(late) == file(early))
+    })
+}
+
+/// What is in flight in the asks' world, as tags, kinds and offsets.
+fn in_flight(asks: &World) -> Vec<String> {
+    asks.asked
+        .iter()
+        .map(|it| match &it.ask {
+            Ask::WriteFrom { file, at, bytes } => {
+                format!("{}: {} from memory at {at} of {}", it.tag, bytes.len(), NAMES[*file as usize])
+            }
+            other => format!("{}: {other:?}", it.tag),
+        })
+        .collect()
+}
+
+fn name_of(name: &str) -> FileName {
+    FileName::new(name).expect("a name")
+}
+
 /// One effect drawn. Calm is an append of a few bytes to the first file.
 fn draw(tape: &Tape, memory: &Memory, tag: u64) -> Effect {
     let file = || name(tape.index(NAMES.len(), "the file"));
@@ -376,6 +565,51 @@ fn kept(sim: &Sim, cuts: &[Cut]) -> Result<Vec<Kept>, Broke> {
     Ok(out)
 }
 
+/// The asks' world told `told` of `tag`, which must be an answer it allows; and the points the
+/// run must reach, seen.
+fn told_to(
+    asks: &mut World,
+    effect: &Effect,
+    tag: u64,
+    told: &Told,
+    overtaken: &mut BTreeSet<u64>,
+    renamed: &mut BTreeSet<u64>,
+    tape: &Tape,
+) -> Result<(), Broke> {
+    if !asks.allows(tag, told) {
+        return Err(oracle(format!(
+            "the simulation told {told:?} of {effect:?}, an answer the world does not allow: {asks:?}"
+        )));
+    }
+    let syncs_of = |asks: &World, name: u64| -> Vec<u64> {
+        asks.asked
+            .iter()
+            .filter(|it| matches!(it.ask, Ask::Sync { file } if file == name) && it.tag != tag)
+            .map(|it| it.tag)
+            .collect()
+    };
+    match (effect, told) {
+        (Effect::Sync { file, .. }, Told::Covered(_)) => {
+            if overtaken.remove(&tag) {
+                tape.reached("a sync told after a sync of its file asked after it");
+            }
+            if renamed.remove(&tag) {
+                tape.reached("a sync whose name was renamed while it was in flight");
+            }
+            overtaken.extend(syncs_of(asks, number(file)).into_iter().filter(|it| *it < tag));
+        }
+        (Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. }, Told::Done) => {
+            renamed.extend(syncs_of(asks, number(from)));
+            renamed.extend(syncs_of(asks, number(to)));
+        }
+        _ => {}
+    }
+    if !asks.tell(tag, told) {
+        return Err(oracle(format!("the asks' world allowed {told:?} of {effect:?} and its tell refused it")));
+    }
+    Ok(())
+}
+
 /// One run: effects drawn and given to a simulation and, completion by completion, to the
 /// world, with crashes between and in the middle of them. `Err` where the two disagree.
 fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
@@ -392,6 +626,11 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
     }
     let memory = memory();
     let mut world = Disk::new();
+    let mut asks = World::new();
+    // The syncs another sync of their file, asked after them, was told before; and the syncs
+    // whose file's name a rename moved while they were in flight.
+    let mut overtaken: BTreeSet<u64> = BTreeSet::new();
+    let mut renamed: BTreeSet<u64> = BTreeSet::new();
     let mut tag = 0;
     let mut flying: BTreeMap<Tag, Flying> = BTreeMap::new();
     let mut done: Vec<Completion> = Vec::new();
@@ -409,6 +648,11 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
                 .map_or(0, |at| world.files[at].changes.len());
             // clone: the test's copy of the effect, to tell the world its completion
             flying.insert(effect.tag(), Flying { effect: copy(effect), covers });
+            if let Some(ask) = ask_of(effect)
+                && !asks.ask(effect.tag().0, ask)
+            {
+                return Err(harness(format!("{:?} asked twice", effect.tag())));
+            }
         }
         sim.submit(&mut effects);
         // A crash in the middle of them: after this many polls, with the rest in flight.
@@ -422,11 +666,25 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
             if sim.poll(&mut done, until) == 0 {
                 return Err(harness(format!("{} effects in flight and none completed in {POLL:?}", sim.in_flight())));
             }
+            let alone = done.len() == 1;
             for completion in done.drain(..) {
                 let Some(was) = flying.remove(&completion.tag) else {
                     return Err(harness(format!("a completion of {:?}, which was not in flight", completion.tag)));
                 };
+                if ask_of(&was.effect).is_some() {
+                    let told = answer(&sim, &world, &was, &completion.done, alone)?;
+                    told_to(&mut asks, &was.effect, completion.tag.0, &told, &mut overtaken, &mut renamed, tape)?;
+                }
                 tell(&sim, &mut world, was, &completion.done)?;
+                if !asks.wf() {
+                    return Err(oracle(format!("the asks' world is not well formed: {asks:?}")));
+                }
+                if asks.disk != world {
+                    return Err(oracle(format!(
+                        "the asks' world's disk is not the disk told directly: {:?} and {world:?}",
+                        asks.disk
+                    )));
+                }
             }
             same(&sim, &world)?;
             polls += 1;
@@ -434,6 +692,7 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
         if crash_after.is_some() || tape.one_in(3, "a crash") {
             tape.reached("a crash");
             let cuts = sim.crash_cut();
+            let sectors_landed = landings(&sim, &asks)?;
             // What was in flight is gone, but for the sectors a write from memory landed.
             for was in std::mem::take(&mut flying).into_values() {
                 if let Effect::WriteFrom { file, .. } = &was.effect {
@@ -441,6 +700,16 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
                 }
             }
             same(&sim, &world)?;
+            if asks.landed(&sectors_landed).as_ref() != Some(&world) {
+                return Err(oracle(format!(
+                    "the writes in flight at the crash landed {sectors_landed:?}, which on the asks' world \
+                     is not the simulation's disk: in flight {:?}",
+                    in_flight(&asks)
+                )));
+            }
+            if out_of_order(&asks, &sectors_landed) {
+                tape.reached("a crash that lands sectors of two writes in flight out of the order they were asked");
+            }
             let cut = kept(&sim, &cuts)?;
             if !world.allows(&cut) {
                 return Err(oracle(format!(
@@ -453,8 +722,21 @@ fn holds(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
             if cut.iter().any(|it| it.torn != Torn::Nothing) {
                 tape.reached("a crash that tears");
             }
+            if !asks.allows_crash(&sectors_landed, &cut) {
+                return Err(oracle(format!(
+                    "the simulation's crash landed {sectors_landed:?} of the writes in flight and kept {cut:?}, \
+                     a crash the asks' world does not allow: {asks:?}"
+                )));
+            }
             sim.crash_with(cuts);
             world.crash(&cut);
+            asks.crash(&sectors_landed, &cut);
+            if !asks.wf() || !asks.asked.is_empty() || asks.disk != world {
+                return Err(oracle(format!(
+                    "after the crash that landed {sectors_landed:?} and kept {cut:?}, the asks' world is \
+                     {asks:?} and the disk told directly {world:?}"
+                )));
+            }
             same(&sim, &world).map_err(|broke| match broke {
                 Broke::Oracle(why) => oracle(format!("after the crash that kept {cut:?}: {why}")),
                 other => other,
@@ -495,7 +777,17 @@ fn copy(effect: &Effect) -> Effect {
 
 /// The cases of the refinement and of each control.
 fn config() -> Config {
-    Config { must_reach: &["a crash", "a crash that undoes", "a crash that tears"], ..Config::cases(3000) }
+    Config {
+        must_reach: &[
+            "a crash",
+            "a crash that undoes",
+            "a crash that tears",
+            "a sync told after a sync of its file asked after it",
+            "a sync whose name was renamed while it was in flight",
+            "a crash that lands sectors of two writes in flight out of the order they were asked",
+        ],
+        ..Config::cases(3000)
+    }
 }
 
 /// The refinement: the simulation's file system is the disk world's. Whatever effects a run
@@ -529,4 +821,76 @@ fn the_oracle_catches_a_rename_whose_flush_misses_its_own_file() {
 #[test]
 fn the_oracle_catches_a_file_put_back_with_the_barriers_of_what_it_lost() {
     control(config(), None, Some(Plant::PutBackWithBarriers), "in the simulation and", holds);
+}
+
+/// The planted bug: a sync that completes makes durable one change fewer than it covered. With
+/// nothing between its ask and its answer it owes every change it covered, and the world
+/// refuses an answer that covers fewer.
+#[test]
+fn the_oracle_catches_a_sync_that_makes_less_durable_than_it_owes() {
+    control(config(), None, Some(Plant::SyncCoversLess), "an answer the world does not allow", holds);
+}
+
+/// The asks' world alone: a sync asked after two appends were told owes both, so an answer
+/// that covers one is refused and one that covers two is allowed; once an earlier sync of the
+/// file, asked after the first append, is told to cover it, the later sync owes one, and an
+/// answer that covers one is allowed.
+#[test]
+fn the_oracle_catches_a_sync_answer_that_covers_less_than_it_owes() {
+    let mut asks = World::new();
+    assert!(asks.ask(1, Ask::Append { file: 0, bytes: b"one".to_vec() }));
+    assert!(asks.tell(1, &Told::Done));
+    assert!(asks.ask(2, Ask::Sync { file: 0 }));
+    assert!(asks.ask(3, Ask::Append { file: 0, bytes: b"two".to_vec() }));
+    assert!(asks.tell(3, &Told::Done));
+    assert!(asks.ask(4, Ask::Sync { file: 0 }));
+    assert!(!asks.ask(4, Ask::SyncDir), "a tag in flight is not asked again");
+    assert!(asks.wf());
+    assert!(!asks.allows(4, &Told::Covered(1)));
+    assert!(!asks.tell(4, &Told::Covered(1)), "a refused answer changes nothing");
+    assert!(asks.allows(4, &Told::Covered(2)));
+    assert!(!asks.allows(4, &Told::Covered(3)), "no more than the file has not synced");
+    assert!(asks.tell(2, &Told::Covered(1)));
+    assert!(asks.wf());
+    assert!(asks.allows(4, &Told::Covered(1)));
+    assert!(!asks.allows(4, &Told::Covered(0)));
+    assert!(asks.tell(4, &Told::Covered(1)));
+    assert!(asks.wf() && asks.asked.is_empty());
+    assert_eq!(asks.disk.contents(0).as_deref(), Some(&b"onetwo"[..]));
+    assert!(asks.disk.files[0].changes.is_empty());
+}
+
+/// The asks' world alone, in the shape of the refinement's seed 683: two writes from memory in
+/// flight to one file, the one asked second landing its middle sector before the one asked
+/// first lands its last two. The world allows it, and the bytes where they overlap are the
+/// last landed: 1024..1436 the first write's, 1436..1536 the second's. A sector landed twice,
+/// one a write does not have, and a landing of what is not a write from memory are refused.
+#[test]
+fn the_oracle_catches_a_crash_that_lands_what_no_write_in_flight_has() {
+    let mut asks = World::new();
+    assert!(asks.ask(1, Ask::Write { file: 0, bytes: vec![0; 2048] }));
+    assert!(asks.tell(1, &Told::Done));
+    assert!(asks.ask(14, Ask::WriteFrom { file: 0, at: 0, bytes: vec![14; 1436] }));
+    assert!(asks.ask(15, Ask::Sync { file: 0 }));
+    assert!(asks.ask(16, Ask::WriteFrom { file: 0, at: 512, bytes: vec![16; 1436] }));
+    let landings = [Landing { ask: 2, sector: 1 }, Landing { ask: 0, sector: 1 }, Landing { ask: 0, sector: 2 }];
+    let all = [Kept { whole: 3, torn: Torn::Nothing, undone: false }];
+    for refused in [
+        vec![Landing { ask: 0, sector: 1 }, Landing { ask: 0, sector: 1 }],
+        vec![Landing { ask: 2, sector: 3 }],
+        vec![Landing { ask: 1, sector: 0 }],
+        vec![Landing { ask: 3, sector: 0 }],
+    ] {
+        assert!(!asks.allows_crash(&refused, &all), "{refused:?}");
+    }
+    assert!(asks.allows_crash(&landings, &all));
+    asks.crash(&landings, &all);
+    assert!(asks.wf() && asks.asked.is_empty());
+    let read = asks.disk.contents(0).expect("there");
+    assert_eq!(read.len(), 2048);
+    assert!(read[..512].iter().all(|it| *it == 0));
+    assert!(read[512..1024].iter().all(|it| *it == 14));
+    assert!(read[1024..1436].iter().all(|it| *it == 14));
+    assert!(read[1436..1536].iter().all(|it| *it == 16));
+    assert!(read[1536..].iter().all(|it| *it == 0));
 }
