@@ -8954,9 +8954,11 @@ impl<S: Steps> Jobs<S> {
         key: blaze_cas::Key,
         executable: bool,
     ) {
-        // The whole file the store kept to clone the path's last value from goes as this is
-        // answered, once no other path names it (`blaze_cas::Store::place`): a build dir
-        // rebuilt again and again keeps no store file of each version.
+        // The path's last value stays in the store, its record and the file that is its home
+        // (D45: a unit record that names it is replayed by the next request that shares the
+        // path); only a whole file kept to clone from that is no value's home goes as this is
+        // answered, once no other path names it (`blaze_cas::Store::place`). What lets a value
+        // go is the collector, by budget.
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {
@@ -9055,7 +9057,8 @@ impl<S: Steps> Jobs<S> {
         made: &Arc<Made>,
         over: bool,
     ) {
-        // The store lets go of the whole file of the path's last value as this is answered.
+        // The path's last value stays in the store (D45); a whole file kept only to clone it
+        // from, no value's home, is let go of as this is answered ([`Jobs::place`]).
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {

@@ -149,7 +149,11 @@ made only of a clone waits for the file to be made, sealed and written back firs
   refuses, from the record alone and with no look at the file, an output whose path's record
   holds another key or has a placement in flight (`certify::placed_elsewhere`): that request
   goes to its job, which clones the answer's file back. Alternating two commands that share
-  a path places one file per switch, and a repeat places nothing.
+  a path places one file per switch, and a repeat places nothing. A value placed over stays
+  in the store, its record and its home (`blaze_cas::Store::names_step` asks no forget of it
+  since 2026-11-14; until then the first `run` after run, build, run, build failed on
+  "the store has nothing under .. to place"): only the collector, by budget, lets it go, and a
+  unit record whose outputs the store no longer holds is not replayed (`header::check`).
 - **The loop thread.** `FICLONE` runs on a thread off the ring with a span `io clone <file>`;
   the ring's eventfd is written only while its thread is parked. Still in line on the ring's
   thread, each one metadata call: mode, seal, times, readlink, flock, truncate, mmap.
