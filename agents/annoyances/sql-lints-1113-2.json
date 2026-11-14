@@ -1,0 +1,13 @@
+{
+ "id": "sql-lints-1113-2",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent of the blaze-sql work",
+ "where": "the daemon, building the scripts package cold with the tree`s blaze (hir_ty_codegen v2 frontend)",
+ "what": "`blaze run -q -p scripts --bin smoke` with /root/inst/blaze of sql-lints-1113 (b67093c4cb, main 779a5372dd plus leaf crates) on a fresh home: `the daemon hung up: the daemon (blaze serve) was ended by signal 6, SIGABRT`; serve.log ends in `HirFrontend::described_now` / `Frontend::describe` / `Build::described` `inside job`. Two earlier starts on /root/homes/main failed too: `was started and did not listen ... it was reading its state (the VFS journal` and `ended with exit code 1 (USAGE: its command line was refused)`.",
+ "cost": "The smoke program had to be built with cargo instead; three VM runs.",
+ "cause": "Not investigated.",
+ "class": "a panic inside a job ends the daemon instead of failing that job (rule panics-fail-one-job)",
+ "prevention": "not designed here",
+ "workaround": "cargo +nightly-2026-10-27 build -p scripts --bin smoke, then run target/debug/smoke",
+ "state": "open"
+}
