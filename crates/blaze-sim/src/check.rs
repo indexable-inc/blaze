@@ -82,6 +82,10 @@ mod local {
         blaze::std_use,
         reason = "the panic hook is process-wide and finds the search it serves through the panicking thread: how deep in searches the thread is, and the panic it kept"
     )]
+    #![expect(
+        blaze::process_static,
+        reason = "the kept panic is one per thread, and the search that ran the case takes it before its next run: it holds at most one panic's message and place"
+    )]
 
     use std::cell::Cell;
 
@@ -101,6 +105,10 @@ use local::{DEPTH, KEPT};
 #[expect(
     blaze::std_use,
     reason = "a panic hook is one per process: the process's one `Once` says whether it is installed"
+)]
+#[expect(
+    blaze::effect_breadth,
+    reason = "std's `Once::call_once` alone brings IO, blocking, locking, allocating and panicking: the function that installs the process's one hook once has all five, however it is split"
 )]
 fn install_hook() {
     #[expect(
@@ -334,10 +342,6 @@ pub(crate) fn report_here(verdict: &Verdict, at: &Location<'_>) -> String {
 #[expect(
     clippy::disallowed_methods,
     reason = "the driver is the entry point: the one place blaze-sim reads what the person gave"
-)]
-#[expect(
-    blaze::env_read,
-    reason = "the driver is the entry point: the three settings are read here once, as a `Given`, and handed to `check_given`"
 )]
 #[expect(
     blaze::std_use,

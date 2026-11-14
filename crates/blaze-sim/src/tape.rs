@@ -15,9 +15,6 @@ use std::sync::{Arc, TryLockError};
 
 use blaze_rng::SplitMix64;
 
-#[cfg(test)]
-mod tests;
-
 /// One choice a case made, in canonical form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Choice {
@@ -32,10 +29,6 @@ pub struct Choice {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub label: &'static str,
-    #[expect(
-        blaze::untyped_index,
-        reason = "a span's ends are counts of choices drawn, which the shrinker deletes by and other crates' tests read as numbers; a public field's type stays"
-    )]
     pub start: u32,
     pub end: u32,
 }
@@ -205,7 +198,7 @@ impl State {
     /// Choices drawn so far; never more than `most_choices`, so it fits a `u32` (and saturates
     /// if it did not).
     fn drawn(&self) -> u32 {
-        u32::try_from(self.choices.len()).unwrap_or(u32::MAX)
+        count(self.choices.len())
     }
 
     fn start(&mut self, prefix: &[u64], tail: Tail) {
@@ -233,6 +226,19 @@ impl State {
             Some(given)
         }
     }
+}
+
+/// A length as a `u32` count, saturating.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+#[expect(
+    blaze::dropped_error,
+    reason = "the only failure is a length past `u32::MAX`, which saturates: the bound on a case's choices, a `u32`, is met long before"
+)]
+fn count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 /// The lock a tape's handles share. It is only ever tried: a second draw while one is under way
@@ -309,10 +315,6 @@ impl Tape {
     /// label.
     #[blaze::pure]
     #[blaze::nonblocking]
-    #[expect(
-        blaze::constant_argument,
-        reason = "the general constructor of a recorded tape, public: tests build seeded recorded tapes with it (`Tail::Seeded`); the driver starts each seeded case through `reset`, so only its non-test callers pass `Tail::Calm`"
-    )]
     pub fn new(prefix: &[u64], tail: Tail, most_choices: u32) -> Tape {
         Tape::make(prefix, tail, most_choices, Recording::Kept)
     }
@@ -427,7 +429,7 @@ impl Tape {
             into.clamped = state.clamped;
             // What is left of the prefix is what the case never drew; a prefix past `u32::MAX`
             // values saturates.
-            into.unused = u32::try_from(state.prefix.len()).unwrap_or(u32::MAX);
+            into.unused = count(state.prefix.len());
         });
     }
 
@@ -437,6 +439,10 @@ impl Tape {
     }
 
     /// The high half of a draw: `SplitMix64::next_u32`.
+    #[expect(
+        blaze::dropped_error,
+        reason = "the high half of a `u64` always fits a `u32`: there is no error to drop"
+    )]
     pub fn next_u32(&self, label: &'static str) -> u32 {
         let high = self.draw(label, u64::from(u32::MAX), |r| r >> u32::BITS);
         // The draw's bound is `u32::MAX`, so it always fits and nothing is clamped.
@@ -555,10 +561,6 @@ impl Tape {
 
     /// `body`'s draws as one span. The lock is held only to note the start and the end, never
     /// while `body` runs; a span `body` leaves by a panic stays open until `finish` closes it.
-    #[expect(
-        blaze::parallel_collections,
-        reason = "`open` is not kept the length of `spans`: it is the stack of the spans still open, each an index into `spans`, pushed as a span opens and popped as it closes"
-    )]
     pub fn span<R>(&self, label: &'static str, body: impl FnOnce(&Tape) -> R) -> R {
         if self.recording == Recording::Skipped {
             return body(self);

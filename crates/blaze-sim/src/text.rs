@@ -9,9 +9,6 @@ use std::fmt::Write as _;
 
 use crate::tape::Tape;
 
-#[cfg(test)]
-mod tests;
-
 /// The fewest zeros written as a run `0*n`: a lone zero is shorter written `0` than `0*1`, so
 /// `print` writes runs from two zeros on and `parse` takes no shorter run.
 const LEAST_RUN: usize = 2;
@@ -36,7 +33,7 @@ pub fn print(values: &[u64]) -> String {
 
 /// `print`, writing a run of zeros as `0*n` from `least_run` zeros on. `print` is 2; a control
 /// passes 1, the planted bug its test catches.
-fn print_runs(values: &[u64], least_run: usize) -> String {
+pub(crate) fn print_runs(values: &[u64], least_run: usize) -> String {
     let kept = values.iter().rposition(|&value| value != 0).map_or(0, |last| last + 1);
     let values = &values[..kept];
     let mut out = String::new();

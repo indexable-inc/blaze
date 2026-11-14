@@ -16,9 +16,19 @@ use std::alloc::Global;
 
 use blaze_rng::{GAMMA, mix};
 
-#[cfg(test)]
-use crate::search::Plant;
 use crate::tape::{Record, Span};
+
+/// A bug a control plants in the shrinker, for a test's oracle to catch (rule dst-not-review).
+/// Passed in by value through [`Shrinker::planted`].
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Plant {
+    None,
+    /// The shrinker keeps a simpler candidate whether or not it failed.
+    KeepsPassing,
+    /// The shrinker keeps a failing candidate without asking whether its record is simpler.
+    KeepsNotSimpler,
+}
 
 /// Whether tape `a` is simpler than `b`: trailing zeros cut from both, the shorter is simpler,
 /// and of two of one length the one with the smaller value at the first difference.
@@ -100,10 +110,11 @@ enum Lowering {
     MinusOne,
 }
 
-/// Whether some value lies strictly between `lo` and `hi`, so a binary search between them has
-/// a value to try.
-const fn has_room(lo: u64, hi: u64) -> bool {
-    hi > lo.saturating_add(1)
+/// Whether some value lies strictly between the ends of `between`, so a binary search between
+/// them has a value to try: `between.start` is a value known not to fail the same way,
+/// `between.end` one that does.
+const fn has_room(between: Range<u64>) -> bool {
+    between.end > between.start.saturating_add(1)
 }
 
 /// Where a round is: the pass, the position in it (from the back for [`Pass::DeleteBlocks`]),
@@ -369,7 +380,7 @@ impl Shrinker {
         let (fails, simpler) = match self.plant {
             Plant::KeepsPassing => (Fails::TheSameWay, simpler),
             Plant::KeepsNotSimpler => (fails, true),
-            Plant::None | Plant::ReportsProposed | Plant::SkipsFinalRun => (fails, simpler),
+            Plant::None => (fails, simpler),
         };
         match fails {
             Fails::TheSameWay if simpler => Fate::Kept,
@@ -483,7 +494,7 @@ impl Shrinker {
         let to = match lowering {
             Lowering::Zero => 0,
             Lowering::Between { lo, hi } => {
-                if !has_room(lo, hi) {
+                if !has_room(lo..hi) {
                     self.cursor.lowering = Lowering::MinusOne;
                     return Built::Moved;
                 }
@@ -549,7 +560,7 @@ impl Shrinker {
             Lowering::Zero => match fate {
                 Fate::Kept => None,
                 Fate::Dropped => match self.best.get(at) {
-                    Some(&value) if has_room(0, value) => {
+                    Some(&value) if has_room(0..value) => {
                         Some(Lowering::Between { lo: 0, hi: value })
                     }
                     _ => None,
@@ -561,7 +572,7 @@ impl Shrinker {
                     Fate::Kept => (lo, self.best.get(at).copied().unwrap_or(0)),
                     Fate::Dropped => (lo + (hi - lo) / 2, hi),
                 };
-                match has_room(lo, hi) {
+                match has_room(lo..hi) {
                     false => Some(Lowering::MinusOne),
                     true => Some(Lowering::Between { lo, hi }),
                 }

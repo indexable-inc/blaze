@@ -91,6 +91,10 @@ fn the_oracle_catches_an_option_that_is_some_when_calm() {
     blaze::as_cast,
     reason = "the casts are the operation: each 128-bit draw is written as its high and low 64 bits"
 )]
+#[expect(
+    blaze::truncating_cast,
+    reason = "the bits are what is mixed: a negative value's two's complement is its 64 or 128 bits"
+)]
 fn mix(t: &Tape) -> Vec<u64> {
     let mut out = Vec::new();
     out.push(u64::from(t.bool("bool")));

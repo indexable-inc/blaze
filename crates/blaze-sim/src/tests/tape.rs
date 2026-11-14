@@ -8,7 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use blaze_rng::SplitMix64;
 
-use super::{Choice, Int, Note, Plant, Record, Span, Tail, Tape};
+use crate::tape::{Choice, Int, Note, Plant, Record, Span, Tail, Tape};
 use crate::{Broke, Config};
 
 /// One call of a method `Tape` and `SplitMix64` share, with its arguments.
@@ -63,8 +63,9 @@ fn call(tape: &Tape) -> Call {
         0 => Call::NextU64,
         1 => Call::NextU32,
         2 => Call::Below(bound(tape)),
-        // On the 64-bit hosts tests run on, every bound is a `usize`.
-        3 => Call::Index(usize::try_from(bound(tape)).unwrap_or(usize::MAX)),
+        3 => Call::Index(usize::try_from(bound(tape)).expect(
+            "a bound is any `u64`, which is a `usize` on the 64-bit targets blaze's tests run on",
+        )),
         4 => {
             let start = bound(tape);
             Call::Range(start, bound(tape))

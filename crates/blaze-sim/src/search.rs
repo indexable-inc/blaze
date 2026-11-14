@@ -13,12 +13,11 @@ use std::alloc::Global;
 
 use blaze_rng::SplitMix64;
 
+#[cfg(test)]
+use crate::shrink;
 use crate::shrink::Shrinker;
 use crate::tape::{Record, Tail, Tape};
 use crate::text::{self, TextError};
-
-#[cfg(test)]
-mod tests;
 
 /// The setting that gives one seed to run alone.
 pub const SEED: &str = "BLAZE_SIM_SEED";
@@ -279,10 +278,6 @@ pub enum Phase {
 
 /// The case to run next.
 pub struct Proposal<'s> {
-    #[expect(
-        blaze::write_only_field,
-        reason = "the phase is how a test sees the order of a search's stages; the driver runs every proposal the same way"
-    )]
     pub phase: Phase,
     pub prefix: &'s [u64],
     pub tail: Tail,
@@ -367,6 +362,16 @@ pub(crate) enum Plant {
     ReportsProposed,
     /// The search skips the final run and reports the shrinker's best as a failure.
     SkipsFinalRun,
+}
+
+/// The shrinker's half of a search's plant: the bug it plants in the shrinker, if any.
+#[cfg(test)]
+fn shrinker_plant(plant: Plant) -> shrink::Plant {
+    match plant {
+        Plant::KeepsPassing => shrink::Plant::KeepsPassing,
+        Plant::KeepsNotSimpler => shrink::Plant::KeepsNotSimpler,
+        Plant::None | Plant::ReportsProposed | Plant::SkipsFinalRun => shrink::Plant::None,
+    }
 }
 
 /// The first failure, kept while it is shrunk.
@@ -656,7 +661,8 @@ impl Search {
                     return;
                 }
                 #[cfg(test)]
-                let shrinker = Shrinker::planted(record, self.config.shrink_runs, self.plant);
+                let shrinker =
+                    Shrinker::planted(record, self.config.shrink_runs, shrinker_plant(self.plant));
                 #[cfg(not(test))]
                 let shrinker = Shrinker::new(record, self.config.shrink_runs);
                 self.found = Some(found);

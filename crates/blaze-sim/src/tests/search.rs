@@ -11,11 +11,11 @@ use std::collections::BTreeSet;
 
 use blaze_rng::SplitMix64;
 
-use super::{
-    Config, Ended, Failure, Given, GivenError, Next, Origin, Passed, Phase, Plant, SEED, SEEDS,
-    Search, TAPE, Verdict,
-};
 use crate::check::{search, search_planted};
+use crate::search::{
+    Broke, Config, Ended, Failure, Given, GivenError, Next, Origin, Passed, Phase, Plant, SEED,
+    SEEDS, Search, TAPE, Verdict,
+};
 use crate::shrink::{Shrinker, simpler};
 use crate::tape::{Record, Tail, Tape};
 
@@ -192,7 +192,7 @@ fn replays_exactly(plant: Plant, t: u64) -> Result<(), String> {
     }
 }
 
-/// The invariant: the least tape of a `Failed` verdict, given back as `Given.tape`, fails with
+/// The invariant: the least tape of a `Verdict::Failed` verdict, given back as `Given.tape`, fails with
 /// the same origin and an equal record (replay is exact).
 #[test]
 fn the_least_tape_replays_exactly() {
@@ -432,27 +432,49 @@ fn simpler_is_strict(
     Ok(())
 }
 
+/// The order on tapes a test checks.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    /// The crate's own `simpler`.
+    Simpler,
+    /// The planted bug: an order that counts trailing zeros (shorter raw length first, then the
+    /// smaller value at the first difference).
+    ByRawLength,
+}
+
+/// Whether `a` is shorter than `b` as it is, trailing zeros counted, or of one length and smaller
+/// at the first difference.
+fn by_raw_length(a: &[u64], b: &[u64]) -> bool {
+    a.len() < b.len() || (a.len() == b.len() && a < b)
+}
+
+/// Draws three tapes and checks that `order` is a strict order on them blind to trailing zeros.
+fn strict(tape: &Tape, order: Order) -> Result<(), Broke> {
+    let draw = |tape: &Tape| tape.vec(0..=4, "tape", |tape| tape.below(4, "value"));
+    let (a, b, c) = (draw(tape), draw(tape), draw(tape));
+    let order: fn(&[u64], &[u64]) -> bool = match order {
+        Order::Simpler => simpler,
+        Order::ByRawLength => by_raw_length,
+    };
+    simpler_is_strict(order, &a, &b, &c).map_err(Broke::Oracle)
+}
+
 /// The invariant: `simpler` is irreflexive and transitive on drawn triples, and trailing zeros
 /// do not change it.
 #[test]
 fn simpler_is_a_strict_order_blind_to_trailing_zeros() {
-    crate::check(Config::cases(200), |tape| {
-        let draw = |tape: &Tape| tape.vec(0..=4, "tape", |tape| tape.below(4, "value"));
-        let (a, b, c) = (draw(tape), draw(tape), draw(tape));
-        simpler_is_strict(simpler, &a, &b, &c)
-    });
+    crate::check(Config::cases(200), |tape| strict(tape, Order::Simpler));
 }
 
 #[test]
 fn the_oracle_catches_a_simpler_that_counts_trailing_zeros() {
-    fn by_raw_length(a: &[u64], b: &[u64]) -> bool {
-        a.len() < b.len() || (a.len() == b.len() && a < b)
-    }
-    assert!(
-        simpler_is_strict(simpler, &[1], &[2], &[3]).is_ok(),
-        "the oracle refused `simpler` itself on [1], [2], [3]"
+    crate::control(
+        Config::cases(200),
+        Order::Simpler,
+        Order::ByRawLength,
+        "trailing zeros",
+        strict,
     );
-    assert!(simpler_is_strict(by_raw_length, &[1], &[2], &[3]).is_err());
 }
 
 #[test]

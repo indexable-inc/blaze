@@ -106,11 +106,19 @@ const SPECIAL_F32: [f32; 12] = [
 ];
 
 /// 0, -1, 1, -2, 2, ..: small canonical values are small magnitudes of either sign.
+#[expect(
+    blaze::truncating_cast,
+    reason = "`u >> 1` is at most `i64::MAX` and `u & 1` is 0 or 1, so neither cast changes a value"
+)]
 fn zigzag_64(u: u64) -> i64 {
     (u >> 1).cast_signed() ^ -(u & 1).cast_signed()
 }
 
 /// [`zigzag_64`] over 128 bits.
+#[expect(
+    blaze::truncating_cast,
+    reason = "`u >> 1` is at most `i128::MAX` and `u & 1` is 0 or 1, so neither cast changes a value"
+)]
 fn zigzag_128(u: u128) -> i128 {
     (u >> 1).cast_signed() ^ -(u & 1).cast_signed()
 }
@@ -216,6 +224,10 @@ impl Tape {
     /// Any character: printable ASCII most often (five times in eight), then the rest of the
     /// basic plane (twice in eight), then any scalar value; calm is a space. Never a surrogate:
     /// the draw counts scalar values only.
+    #[expect(
+        blaze::dropped_error,
+        reason = "a code that does not fit `u32` is no scalar value either, and the one `expect` that follows says both"
+    )]
     pub fn char(&self, label: &'static str) -> char {
         let code = match self.below(CHAR_KINDS, label) {
             0..=4 => PRINTABLE_FROM + self.below(PRINTABLE_COUNT, label),

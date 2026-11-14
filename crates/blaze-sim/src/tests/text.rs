@@ -3,7 +3,7 @@
     reason = "a test's failure message shows the values it compared as they are"
 )]
 
-use super::{Problem, TextError, parse, print, print_runs};
+use crate::text::{Problem, TextError, parse, print, print_runs};
 use crate::{Broke, Config, Tape};
 
 /// A bug a control plants in `print`.

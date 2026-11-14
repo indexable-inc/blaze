@@ -45,6 +45,9 @@ pub mod shrink;
 pub mod tape;
 pub mod text;
 
+#[cfg(test)]
+mod tests;
+
 pub use check::{Outcome, check, check_given, search};
 pub use control::control;
 pub use draw::Any;
