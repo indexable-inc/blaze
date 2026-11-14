@@ -61,10 +61,10 @@ example : isDiverge (loops.count.mir.call 5 0 [] [u32 3]) = true := by decide
 /-! An enum: `discriminant`, `switchInt` on it, a field of a variant. -/
 
 example :
-    isInt ScalarTy.U32 0 (enums.side.mir.call 4 0 [] [Value.adt 0 []]) = true := by decide
+    isInt ScalarTy.U32 0 (enums.side.mir.call 5 0 [] [Value.adt 0 []]) = true := by decide
 
 example :
-    isInt ScalarTy.U32 7 (enums.side.mir.call 4 0 [] [Value.adt 1 [u32 7]]) = true := by
+    isInt ScalarTy.U32 7 (enums.side.mir.call 5 0 [] [Value.adt 1 [u32 7]]) = true := by
   decide
 
 /-- A variant the enum does not declare is undefined, not a panic. -/

@@ -12,7 +12,7 @@ use std::{
     cell::{OnceCell, RefCell},
 };
 
-use base_db::{Db, EditionedFileId};
+use base_db::{Db, EditionedFileId, TargetKind};
 use blaze_diagnostics::model;
 use blaze_hash::{HashMap, HashSet};
 use cfg::{CfgAtom, CfgDiff, CfgExpr, CfgOptions};
@@ -148,6 +148,17 @@ struct Driver<'q> {
     cfg: &'q CfgOptions,
     /// The crate's cfg without `test`, when it has `test`.
     without_test: Option<CfgOptions>,
+    /// Whether the crate is the `--test` build of a manifest target cargo also builds plain
+    /// (a library, a binary, an example), so an `#[expect]` the plain build also has is the
+    /// plain build's to judge, never this one's ([`Driver::plain_build_judges`]). Every
+    /// expectation has one judge: a lint that leaves a test build's production code unjudged
+    /// (`test_code::is_test_code`, `env_read`) or folds test bodies into its facts
+    /// (`untyped_index`) does not find in that code here what the plain build finds, so "what
+    /// it finds outside `cfg(test)` is what the plain build finds" (`serve.rs`) does not hold
+    /// for its expectations, and this build would call one unfulfilled that the plain build
+    /// sees fulfilled, which the person who gets it cannot fix. A stale one is still said by
+    /// every run that lints the plain build.
+    production_judged_plain: bool,
     name_of: NameOf<'q>,
     command_line: On,
     files: Vec<File<'q>>,
@@ -175,6 +186,16 @@ impl<'q> Driver<'q> {
             it.apply_diff(CfgDiff::new(Vec::new(), vec![test]));
             it
         });
+        let has_plain_build = match krate.base().data(db).manifest_kind {
+            // Built plain by cargo (a build script is never built with `--test` at all).
+            TargetKind::Lib { .. }
+            | TargetKind::Bin
+            | TargetKind::Example
+            | TargetKind::BuildScript => true,
+            // Built only with `--test`, or no cargo target: no other build judges its code.
+            TargetKind::Test | TargetKind::Bench | TargetKind::Other => false,
+        };
+        let production_judged_plain = without_test.is_some() && has_plain_build;
         let hits = setup.conf.profile.as_ref().map(|loaded| {
             // clone: the profile's settings and a refcount, once per crate
             query::profile_hits(db, krate.base(), query::ProfileKey::new(db, loaded.clone()))
@@ -186,6 +207,7 @@ impl<'q> Driver<'q> {
             conf: &setup.conf,
             cfg,
             without_test,
+            production_judged_plain,
             name_of,
             command_line,
             files: Vec::new(),
@@ -391,24 +413,7 @@ impl<'q> Driver<'q> {
     }
 
     fn sets_at(&self, file: usize, at: TextRange) -> (Vec<Set>, bool) {
-        let db = self.db;
-        let mut owners: Vec<(usize, ast::AnyHasAttrs<'q>)> = Vec::new();
-        let mut place = Some((file, at));
-        while let Some((file, at)) = place.take() {
-            let root = self.files[file].id.parse(db).root();
-            if root.text_range().contains_range(at) {
-                let start = match root.covering_element(at) {
-                    NodeOrToken::Node(it) => Some(it),
-                    NodeOrToken::Token(it) => it.parent(),
-                };
-                for node in start.into_iter().flat_map(|it| it.ancestors()) {
-                    if let Some(owner) = ast::AnyHasAttrs::cast(node) {
-                        owners.push((file, owner));
-                    }
-                }
-            }
-            place = self.files[file].declared;
-        }
+        let owners = self.owners_at(file, at);
         let mut sets = Vec::new();
         let mut test_only = false;
         for &(file, owner) in owners.iter().rev() {
@@ -432,6 +437,62 @@ impl<'q> Driver<'q> {
             }
         }
         (sets, test_only)
+    }
+
+    /// What has attributes around `at` of `file`, innermost first, each with its file: the
+    /// nodes of `file` that hold it, then the `mod` item declaring the file, and so on up.
+    fn owners_at(&self, file: usize, at: TextRange) -> Vec<(usize, ast::AnyHasAttrs<'q>)> {
+        let db = self.db;
+        let mut owners: Vec<(usize, ast::AnyHasAttrs<'q>)> = Vec::new();
+        let mut place = Some((file, at));
+        while let Some((file, at)) = place.take() {
+            let root = self.files[file].id.parse(db).root();
+            if root.text_range().contains_range(at) {
+                let start = match root.covering_element(at) {
+                    NodeOrToken::Node(it) => Some(it),
+                    NodeOrToken::Token(it) => it.parent(),
+                };
+                for node in start.into_iter().flat_map(|it| it.ancestors()) {
+                    if let Some(owner) = ast::AnyHasAttrs::cast(node) {
+                        owners.push((file, owner));
+                    }
+                }
+            }
+            place = self.files[file].declared;
+        }
+        owners
+    }
+
+    /// Whether `expectation` is the plain build's to judge, so this build says nothing of it:
+    /// an `#[expect]` the plain build of the same target also has is judged there alone
+    /// ([`Driver::production_judged_plain`]). The plain build has none of these, so this build
+    /// judges them: one in code only `cfg(test)` keeps (`test_only`, [`Driver::sets_at`]'s),
+    /// one on or in a `#[test]` function, and one written under `cfg_attr(test, ..)`, which
+    /// the attributes read without `test` do not hold.
+    fn plain_build_judges(&self, expectation: &Expectation, test_only: bool) -> bool {
+        let Some(without_test) = &self.without_test else { return false };
+        if !self.production_judged_plain || test_only {
+            return false;
+        }
+        let owners = self.owners_at(expectation.file, expectation.at);
+        let in_test_fn = owners.iter().any(|&(_, owner)| {
+            let mut test = false;
+            if ast::Fn::can_cast(owner.syntax().kind()) {
+                for_each_meta(self.cfg, owner.attrs(), |meta| {
+                    test |= meta.simple_name() == Some("test");
+                });
+            }
+            test
+        });
+        if in_test_fn {
+            return false;
+        }
+        owners.iter().any(|&(file, owner)| {
+            let name = &self.files[file].name;
+            lint_attrs(without_test, owner).iter().any(|it| {
+                matches!(it.level, Level::Expect) && Span::new(name, it.range) == expectation.span
+            })
+        })
     }
 
     /// The diagnostics of the lints found, at their levels, with what `#[expect]` was set for
@@ -519,6 +580,9 @@ impl<'q> Driver<'q> {
                 continue;
             }
             let (sets, test_only) = self.sets_at(expectation.file, expectation.at);
+            if self.plain_build_judges(&expectation, test_only) {
+                continue;
+            }
             let spec = levels.of(unfulfilled, &sets);
             if matches!(spec.level, Level::Allow | Level::Expect) {
                 continue;
@@ -1064,6 +1128,18 @@ impl<'q: 't, 't> Cx<'q, 't> {
 
     pub(crate) fn original_range(&self, node: ast::Node<'_>) -> Option<TextRange> {
         self.range(node)
+    }
+
+    /// Where `node` is written in its file, as `hir`'s source maps give it: [`Cx::range`],
+    /// moved by where the anchor begins in a body's query, whose tree is the body's anchor
+    /// alone. Reads where the body is in the file, so a query that asks reruns when it moves:
+    /// ask only once a node is known to be compared with a source map's pointer.
+    pub(crate) fn file_range(&self, node: ast::Node<'_>) -> Option<TextRange> {
+        let range = self.range(node)?;
+        if !self.base.relative {
+            return Some(range);
+        }
+        Some(range + Body::anchor_offset(self.db, self.def?)?)
     }
 
     /// Where `range` of `file` (the walked file or an expansion) is written in the tree of

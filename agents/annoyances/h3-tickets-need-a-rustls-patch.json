@@ -1,0 +1,14 @@
+{
+ "id": "h3-tickets-need-a-rustls-patch",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane remote-cache-quic",
+ "where": "vendor/rustls (persist.rs, client_conn.rs); crates/blaze-http/src/h3/config.rs Tickets; crates/blaze-http/src/h3/tokio_driver.rs",
+ "what": "Keeping 0-RTT tickets between processes needs the bytes of a TLS 1.3 client session, and rustls 0.23 has no serializer for Tls13ClientSessionValue, so rustls is vendored and patched (to_bytes, tls13_ticket_from_bytes). Separately, the h3 tokio driver matches h3::Event exhaustively, so each new event variant (the request events here) breaks a file another lane is deleting.",
+ "cost": "a vendored dependency to keep in step with upstream; a hand-off for the tokio driver's match (five arms) or its deletion before the tree compiles",
+ "cause": "resumption state is the TLS library's private type, with no stable byte form; and the driver contract makes every driver interpret every event, rather than routing each event to its asker by kind",
+ "class": "state a sans-IO core must hand its driver is locked inside a dependency's private type; a closed event enum matched in full by each driver",
+ "prevention": "send rustls upstream a serializer for client sessions and drop the patch; drivers route events by the asker they name (session, stream, request) through one `asker()` on Event, so a new kind of asker is one file's change",
+ "workaround": "vendor/rustls with SOURCE.md naming the patch; the tokio driver is being deleted in favour of drivers on blaze-core's effects",
+ "fix": "not yet",
+ "state": "open"
+}

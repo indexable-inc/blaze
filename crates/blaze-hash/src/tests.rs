@@ -3,8 +3,7 @@ use std::{
     hash::{BuildHasher, Hash, Hasher},
 };
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config;
 
 use crate::{BuildKeyHasher, ByHash, ByHashSet, FixedHasher, FixedState, HashMap, KeyHasher};
 
@@ -157,14 +156,16 @@ fn a_lookup_on_a_hash_allocates_nothing() {
     });
 }
 
-#[hegel::test]
-fn hashes_as_the_copies_did(tc: TestCase) {
-    let bytes: [u8; 32] = tc.draw(gs::arrays(gs::integers()));
-    let word: u64 = tc.draw(gs::integers());
-    assert_eq!(key_hash_of(&Id(bytes)), reference_of(&Id(bytes)));
-    assert_eq!(key_hash_of(&bytes), reference_of(&bytes));
-    assert_eq!(key_hash_of(&word), word_reference(word));
-    assert_eq!(key_hash_of(&word), reference_of(&word));
+#[test]
+fn hashes_as_the_copies_did() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let bytes: [u8; 32] = tape.array("bytes", |tape| tape.int::<u8>("byte"));
+        let word: u64 = tape.int("word");
+        assert_eq!(key_hash_of(&Id(bytes)), reference_of(&Id(bytes)));
+        assert_eq!(key_hash_of(&bytes), reference_of(&bytes));
+        assert_eq!(key_hash_of(&word), word_reference(word));
+        assert_eq!(key_hash_of(&word), reference_of(&word));
+    });
 }
 
 #[test]

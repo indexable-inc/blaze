@@ -7,7 +7,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::kind::{Body, Key, Namespace, ToolId};
 use blaze_keyed::machine::Machine;
 use blaze_keyed::record::StableId;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::finding::{Applicability, Arg, Edit, Finding, FindingId, Findings, Fix, ItemRange, LintId, Writer};
 use crate::fold::{Fold, Narrow, Observed, Row, Subject as FoldSubject};
@@ -159,7 +159,7 @@ impl Model {
             match decl.over {
                 Over::Body | Over::Rows => {
                     for i in 0..ITEMS {
-                        let key = self.sched.key_of(decl.id, self.body_key(i), &[], &self.view).map_err(|e| e.to_string())?;
+                        let key = self.sched.key_of(decl.id, self.body_key(i).id(), &[], &self.view).map_err(|e| e.to_string())?;
                         let wanted = Wanted { pass: decl.id, subject: Subject::Item(item(i)), key, reads: vec![item(i)] };
                         out.push((wanted, vec![self.versions[i]]));
                     }
@@ -351,16 +351,18 @@ fn run(ops: &[Op], plant: Plant) -> Result<(), String> {
     result
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let a = tc.draw(gs::integers::<u8>().max_value(7));
-    let b = tc.draw(gs::integers::<u8>().max_value(5));
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
-        0 | 1 => Op::Edit(a),
-        2 => Op::Level(a, b),
-        3 | 4 => Op::Command(b),
-        5 => Op::Tick(a * 8),
-        _ => Op::Complete(a),
+/// One op; the completion order is drawn here (`Complete(k)` finishes the `k`-th run modulo the
+/// runs in flight). Calm (every draw 0) is completing the oldest run, a no-op when none runs.
+fn op(tape: &Tape) -> Op {
+    let a = tape.int_in(0..=7u8, "a");
+    let b = tape.int_in(0..=5u8, "b");
+    // Ten kinds in the weights of before; the quietest, a completion, is at 0.
+    match tape.int_in(0..=9u8, "op") {
+        0..=3 => Op::Complete(a),
+        4 | 5 => Op::Edit(a),
+        6 => Op::Level(a, b),
+        7 | 8 => Op::Command(b),
+        _ => Op::Tick(a * 8),
     }
 }
 
@@ -369,12 +371,12 @@ fn op(tc: &hegel::TestCase) -> Op {
 /// answer class and is never pending; a newer command cancels exactly the works that read a
 /// moved item (or that it no longer wants, and their dependents); pending is exactly what was
 /// not computed; changing levels recomputes nothing (the first, across level changes).
-#[hegel::test(test_cases = 300)]
-fn lint_work_is_computed_once_and_pending_is_exact(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(40));
-    if let Err(error) = run(&ops, Plant::None) {
-        panic!("{error}\nops: {ops:?}");
-    }
+#[test]
+fn lint_work_is_computed_once_and_pending_is_exact() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let ops = tape.vec(0..=40, "ops", op);
+        run(&ops, Plant::None).map_err(|error| format!("{error}\nops: {ops:?}"))
+    });
 }
 
 fn caught(ops: &[Op], plant: Plant, needle: &str) {
@@ -443,13 +445,12 @@ fn observed(v: u8) -> Observed {
     }
 }
 
-#[hegel::composite]
-fn fold_op(tc: &hegel::TestCase) -> FoldOp {
+fn fold_op(tape: &Tape) -> FoldOp {
     let mut rows = [(0u8, 0u8); 3];
     for row in &mut rows {
-        *row = (tc.draw(gs::integers::<u8>().max_value(7)), tc.draw(gs::integers::<u8>().max_value(9)));
+        *row = (tape.int_in(0..=7u8, "subject"), tape.int_in(0..=9u8, "value"));
     }
-    FoldOp::Set { c: tc.draw(gs::integers::<u8>().max_value(3)), rows, len: tc.draw(gs::integers::<u8>().max_value(3)) }
+    FoldOp::Set { c: tape.int_in(0..=3u8, "contributor"), rows, len: tape.int_in(0..=3u8, "len") }
 }
 
 fn fold_run(ops: &[FoldOp], plant: Plant) -> Result<(), String> {
@@ -481,12 +482,12 @@ fn fold_run(ops: &[FoldOp], plant: Plant) -> Result<(), String> {
 
 /// The invariant: a fold after any sequence of deltas equals the fold of the same rows from
 /// scratch, leaf for leaf and verdict for verdict.
-#[hegel::test(test_cases = 300)]
-fn a_fold_after_a_delta_is_the_fold_from_scratch(tc: hegel::TestCase) {
-    let ops: Vec<FoldOp> = tc.draw(gs::vecs(fold_op()).max_size(20));
-    if let Err(error) = fold_run(&ops, Plant::None) {
-        panic!("{error}\nops: {ops:?}");
-    }
+#[test]
+fn a_fold_after_a_delta_is_the_fold_from_scratch() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let ops = tape.vec(0..=20, "fold ops", fold_op);
+        fold_run(&ops, Plant::None).map_err(|error| format!("{error}\nops: {ops:?}"))
+    });
 }
 
 #[test]

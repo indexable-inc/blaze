@@ -22,8 +22,8 @@ blaze-report.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-sim.workspace = true
 blaze-store-check.workspace = true
-hegeltest.workspace = true
 hir-expand.workspace = true
 span.workspace = true
 

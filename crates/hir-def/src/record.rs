@@ -56,8 +56,7 @@ pub fn index_of(list: &str, name: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::{canonical_order, index_of, joined, names};
 
@@ -130,42 +129,44 @@ mod tests {
         }
     }
 
-    fn drawn(tc: &TestCase) -> Vec<Field> {
-        let count: usize = tc.draw(gs::integers().max_value(5));
+    fn drawn(tape: &Tape) -> Vec<Field> {
+        let count: usize = tape.int_in(0..=5, "fields");
         (0..count)
             .map(|_| {
-                let name: usize = tc.draw(gs::integers().max_value(NAMES.len() - 1));
-                let ty: u8 = tc.draw(gs::integers().max_value(2));
-                let default: bool = tc.draw(gs::booleans());
+                let name: usize = tape.index(NAMES.len(), "name");
+                let ty: u8 = tape.int_in(0..=2, "ty");
+                let default: bool = tape.bool("default");
                 (NAMES[name], ty, default)
             })
             .collect()
     }
 
     /// The invariant: two record types are equal exactly when their (name, type) sets are.
-    #[hegel::test]
-    fn records_are_equal_exactly_when_their_field_sets_are(tc: TestCase) {
-        let a = drawn(&tc);
-        // Half the draws are `a` again in another order with other defaults, so that equal
-        // sets are as common as different ones.
-        let b = match tc.draw(gs::booleans()) {
-            false => drawn(&tc),
-            true => {
-                let turn: usize = tc.draw(gs::integers().max_value(5));
-                let mut b: Vec<Field> = a.iter().map(|&(name, ty, d)| (name, ty, !d)).collect();
-                if !b.is_empty() {
-                    let by = turn % b.len();
-                    b.rotate_left(by);
+    #[test]
+    fn records_are_equal_exactly_when_their_field_sets_are() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let a = drawn(tape);
+            // Half the draws are `a` again in another order with other defaults, so that equal
+            // sets are as common as different ones.
+            let b = match tape.bool("b is a again") {
+                false => drawn(tape),
+                true => {
+                    let turn: usize = tape.int_in(0..=5, "turn");
+                    let mut b: Vec<Field> = a.iter().map(|&(name, ty, d)| (name, ty, !d)).collect();
+                    if !b.is_empty() {
+                        let by = turn % b.len();
+                        b.rotate_left(by);
+                    }
+                    if tape.bool("reverse") {
+                        b.reverse();
+                    }
+                    b
                 }
-                if tc.draw(gs::booleans()) {
-                    b.reverse();
-                }
-                b
+            };
+            if let Err(what) = check(&a, &b, Plant::None) {
+                panic!("{what}");
             }
-        };
-        if let Err(what) = check(&a, &b, Plant::None) {
-            panic!("{what}");
-        }
+        })
     }
 
     /// Every pair of field lists of up to three fields over two names, two types and both

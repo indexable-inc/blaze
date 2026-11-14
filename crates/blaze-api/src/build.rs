@@ -52,8 +52,9 @@ pub enum Work {
     Check(Targets),
     /// Then [`crate::Response::Built`] and [`crate::Response::Work`].
     Build(Targets),
-    /// Then a [`crate::Response::TestResult`] per test, [`crate::TestOutcome::Unreached`] for
-    /// each the change reached none of (all run with `all`), and [`crate::Response::Work`].
+    /// Then a [`crate::Response::TestResult`] per test, cached ([`crate::TestResult::cached`])
+    /// for each whose executed code and reads did not change (all run with `all`), and
+    /// [`crate::Response::Work`].
     /// `args` is libtest's selection; with `ub` each test runs in the MIR evaluator, checked
     /// for undefined behavior, and nothing is compiled.
     Test { targets: Targets, filter: Vec<String>, all: bool, args: Vec<String>, ub: Option<Ub> },
@@ -83,6 +84,10 @@ pub enum Work {
     /// trees the edits left are the front end's parses of the files they wrote. Builds only
     /// the view's proc macros and build scripts' runs, applied before the edits read it.
     Edit(Vec<Edit>),
+    /// An astlog rules file run over the view's front end (`blaze_astlog::query`), reported as
+    /// [`crate::Response::Rows`] before an `ok` finish; writes nothing. Builds only the view's
+    /// proc macros and build scripts' runs, applied before the rules read it.
+    Query(String),
     /// Built ahead for [`crate::Request::WillTest`]: the test units holding a test `filter`
     /// selects, and the functions those tests reached when they last ran first
     /// (`blaze_intent::ahead::plan`), chosen once the view's proc macros and build scripts'
@@ -91,6 +96,11 @@ pub enum Work {
     /// [`crate::Request::Lock`]: the view's plan made, which writes its lock files, and the job
     /// over; nothing lowered, checked or built.
     Lock(Targets),
+    /// [`crate::Request::Prove`]: each theorem function of the library crates `targets`
+    /// selects translated to Lean and, unless `emit`, its proof checked by the Lean at `lean`,
+    /// answered with [`crate::Response::Proven`]. Builds only the view's proc macros and build
+    /// scripts' runs, applied before its front end is read.
+    Prove { targets: Targets, emit: bool, subset: bool, lean: Option<String> },
 }
 
 /// The daemon's build, as the session drives it.

@@ -31,7 +31,6 @@ use std::{
     io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     ptr,
-    sync::atomic::AtomicU32,
     time::Duration,
 };
 
@@ -42,6 +41,7 @@ use super::{
     reaping::Children,
     until,
 };
+use crate::atomic::AtomicU32;
 
 /// `FUTEX_BITSET_MATCH_ANY`: a wake of any bit ends the wait.
 const FUTEX_ANY: u32 = u32::MAX;
@@ -129,12 +129,12 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
 impl<S: ChildCalls> Children for Direct<'_, S> {
     type Reaped = S::Reaped;
 
-    fn reap_now(&self, pid: i32) -> io::Result<Option<Self::Reaped>> {
+    fn reap_now(&mut self, pid: i32) -> io::Result<Option<Self::Reaped>> {
         self.0.reap_now(pid)
     }
 
     fn exited<C: Clock>(
-        &self,
+        &mut self,
         what: &'static str,
         pid: i32,
         keep: bool,
@@ -457,7 +457,7 @@ mod tests {
 
     use std::sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;
@@ -642,7 +642,7 @@ mod tests {
         running.kill().unwrap();
         let deadline = Some(Deadline::after(clock.now(), LONG));
         let (what, plant) = ("a test's child", ReapPlant::None);
-        let reaped = reaping::reap(what, &Direct(&Kernel), pid, deadline, &clock, plant);
+        let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
                 assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL);
@@ -667,7 +667,7 @@ mod tests {
         let clock = Monotonic::new();
         let deadline = Some(Deadline::after(clock.now(), LONG));
         let (what, plant) = ("a test's child", ReapPlant::None);
-        let reaped = reaping::reap(what, &Direct(&Kernel), pid, deadline, &clock, plant);
+        let reaped = reaping::reap(what, &mut Direct(&Kernel), pid, deadline, &clock, plant);
         match reaped.unwrap() {
             Waited::Ready((status, _)) => {
                 assert!(libc::WIFEXITED(status));

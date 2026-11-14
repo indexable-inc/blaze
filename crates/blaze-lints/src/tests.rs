@@ -145,7 +145,8 @@ pub(crate) fn try_lint_once(
                 }
             }
         }
-        let krate = linted.expect("the fixture writes the crate it lints at `/src/lib.rs` or `/src/main.rs`");
+        let krate = linted
+            .expect("the fixture writes the crate it lints at `/src/lib.rs` or `/src/main.rs`");
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
         let setup =
             Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
@@ -171,7 +172,10 @@ pub(crate) fn main_crate(db: &Db) -> hir::Crate {
 /// The `Setup` of a lint test's flags.
 fn setup_of(flags: &str) -> Setup {
     let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
-    Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() }
+    Setup {
+        command_line: CommandLine::parse(&flags).expect("the flags read"),
+        conf: Conf::default(),
+    }
 }
 
 /// The text of the fixture's last file (the crate `main`'s `src/lib.rs`), the findings `flags`
@@ -252,6 +256,117 @@ pub(crate) fn fixed_in(fixture: &str, flags: &str) -> String {
     assert_eq!(again.applied, 0, "the fixed file has nothing left to fix:\n{twice}");
     assert_eq!(twice, after, "fixing the fixed file changes nothing");
     after
+}
+
+/// Makes the fixture's crate `main` a crate of `target` built from a manifest target of kind
+/// `manifest`, as blaze's lowering sets them (`blaze-lower`'s `crates::target_kind` and
+/// `manifest_kind`); its cfg is the fixture's (`cfg:test` on the crate for a `--test` build).
+fn built_as(fx: &mut fixture::Fixture, target: base_db::TargetKind, manifest: base_db::TargetKind) {
+    let main = blaze_query::db::attach(fx.db(), || main_crate(fx.db()).base());
+    // clone: the crate's data, to change two fields of
+    let mut data = blaze_query::db::attach(fx.db(), || main.data(fx.db()).clone());
+    data.target_kind = target;
+    data.manifest_kind = manifest;
+    main.set_data(fx.db_mut(), data);
+    fx.db_mut().note_crates_changed();
+}
+
+/// The `--test` build of a library: a test crate whose manifest target is the library.
+fn library_built_with_test(fx: &mut fixture::Fixture) {
+    let lib = base_db::TargetKind::Lib { is_proc_macro: false };
+    built_as(fx, base_db::TargetKind::Test, lib);
+}
+
+/// An integration test: built only with `--test`, its manifest target a test.
+fn integration_test(fx: &mut fixture::Fixture) {
+    built_as(fx, base_db::TargetKind::Test, base_db::TargetKind::Test);
+}
+
+/// The refinement: every `#[expect]` has one judge. One on code the plain build has too is the
+/// plain build's to judge, and a library's `--test` build never says it unfulfilled; one the
+/// plain build does not have (in code only `cfg(test)` keeps, on a `#[test]` function, under
+/// `cfg_attr(test, ..)`) is judged by the test build; a target built only with `--test`
+/// judges all of its own. (dst-1113-15: an expectation the plain build saw fulfilled was said
+/// unfulfilled by the test build, whose lints leave its production code unjudged.)
+#[test]
+fn a_test_build_leaves_production_expectations_to_the_plain_build() {
+    const FLAGS: &str = "-A clippy::all --warn=blaze::tmp_path";
+    const UNFULFILLED: &str = "lint expectation is unfulfilled";
+    let production = r#"
+#[expect(blaze::tmp_path, reason = "a production item the lint does not fire on")]
+pub const HOME: &str = "/home";
+"#;
+    let in_tests = r#"
+pub const HOME: &str = "/home";
+#[cfg(test)]
+mod tests {
+    #[expect(blaze::tmp_path, reason = "an item only the test build has")]
+    pub const HERE: &str = "/here";
+}
+"#;
+    let fixture = |cfg: &str, main: &str| {
+        format!(
+            "{}//- /src/lib.rs crate:main deps:std{cfg}\n{}",
+            STD.trim_start_matches('\n'),
+            main.trim_start_matches('\n')
+        )
+    };
+    let count = |out: &str| out.matches(UNFULFILLED).count();
+    // 1. The plain build of a library judges its production expectation.
+    let plain = lint(&fixture("", production), FLAGS);
+    assert_eq!(count(&plain), 1, "the plain build:\n{plain}");
+    // 2. The library's `--test` build leaves it to the plain build.
+    let test = lint_given(
+        &fixture(" cfg:test", production),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(count(&test), 0, "the library's test build:\n{test}");
+    // 3. One inside `#[cfg(test)]` is the test build's alone, and judged there.
+    let only = lint_given(
+        &fixture(" cfg:test", in_tests),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(count(&only), 1, "the library's test build, an expectation in its tests:\n{only}");
+    // 4. A target built only with `--test` has no other build to leave it to.
+    let integration =
+        lint_given(&fixture(" cfg:test", production), FLAGS, Conf::default(), integration_test);
+    assert_eq!(count(&integration), 1, "an integration test:\n{integration}");
+    // 5. One on a `#[test]` function outside a `cfg(test)` module: the test build judges it.
+    let test_fn = r#"
+#[expect(blaze::tmp_path, reason = "a test function the lint does not fire in")]
+#[test]
+fn finds_home() {}
+"#;
+    let out =
+        lint_given(&fixture(" cfg:test", test_fn), FLAGS, Conf::default(), library_built_with_test);
+    assert_eq!(
+        count(&out),
+        1,
+        "the library's test build, an expectation on a `#[test]` function:\n{out}"
+    );
+    // 6. One written under `cfg_attr(test, ..)` is the test build's alone, and judged there.
+    let under_test = r#"
+#[cfg_attr(test, expect(blaze::tmp_path, reason = "only the test build has this attribute"))]
+pub const HOME: &str = "/home";
+"#;
+    let out = lint_given(
+        &fixture(" cfg:test", under_test),
+        FLAGS,
+        Conf::default(),
+        library_built_with_test,
+    );
+    assert_eq!(
+        count(&out),
+        1,
+        "the library's test build, an expectation under `cfg_attr(test)`:\n{out}"
+    );
+    // 7. The plain build does not have that attribute at all.
+    let out = lint(&fixture("", under_test), FLAGS);
+    assert_eq!(count(&out), 0, "the plain build, an expectation under `cfg_attr(test)`:\n{out}");
 }
 
 #[test]

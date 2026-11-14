@@ -343,15 +343,23 @@ const MANIFEST: &[Flag] = &[
     Flag::new("manifest-path", Some('m'), Takes::Value, "PATH"),
     Flag::pointing(Some("path"), None, Points::Arg("--manifest-path")),
 ];
-/// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
-/// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
+/// `--run-all` and `--ub*` are blaze's: `blaze test` reruns only a test whose executed code or
+/// reads changed (docs/cargo.md, "Which tests run"), and `--run-all` runs every test asked,
+/// still keeping what each run learns; the `--ub` tests run in blaze's MIR evaluator, checked
+/// for undefined behavior (`hir-ty-ub`). `--reached`, the flag that once opted into selection,
+/// is refused naming both: selection is the default, and never a flag accepted and ignored.
 const TEST_ONLY: &[Flag] = &[
     Flag::switch("doc"),
-    Flag::switch("reached"),
+    Flag::switch("run-all"),
+    Flag::pointing(Some("reached"), None, Points::Says(REACHED_GONE)),
     Flag::switch("ub"),
     Flag::new("ub-seed", None, Takes::Value, "N"),
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
+
+/// What `--reached` is refused with.
+pub const REACHED_GONE: &str = "`blaze test` already reruns only the tests whose executed code or \
+     reads changed, by default; `--run-all` runs every test asked";
 
 /// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
 /// `fail` (the default) refuses it, naming the selection that matched nothing
@@ -383,11 +391,17 @@ const PREBUILT: &[Flag] = &[Flag::switch("no-prebuilt")];
 /// `check`'s edits, blaze's: `--fix` makes every machine-applicable suggestion of the check
 /// ([`super::fix`]), only those of each `--lint NAME` when any is given; `--replace FROM=TO`
 /// retargets every reference to the item `FROM` to `TO` by name resolution
-/// ([`super::replace`]), and checks nothing.
+/// ([`super::replace`]), and checks nothing; `--rules FILE` makes every rewrite of an astlog
+/// rules file the same way, after the replaces; `--dry-run` prints the diff either would write
+/// and writes nothing; `--query FILE` prints what a rules file derives and finds, and writes
+/// nothing (docs/v2/plan/design/astlog-sema.md).
 const CHECK_ONLY: &[Flag] = &[
     Flag::switch("fix"),
     Flag::new("lint", None, Takes::Value, "NAME").many(),
     Flag::new("replace", None, Takes::Value, "FROM=TO").many(),
+    Flag::new("rules", None, Takes::Value, "FILE"),
+    Flag::new("query", None, Takes::Value, "FILE"),
+    Flag::switch("dry-run"),
 ];
 
 /// `check`'s baselines, blaze's (`blaze_lints::baseline`): `--baselines DIR` checks the run's
@@ -417,7 +431,7 @@ fn blaze_only(flag: &Flag) -> bool {
     matches!(
         flag.long,
         Some(
-            "reached"
+            "run-all"
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
@@ -430,6 +444,9 @@ fn blaze_only(flag: &Flag) -> bool {
                 | "fix"
                 | "lint"
                 | "replace"
+                | "rules"
+                | "query"
+                | "dry-run"
                 | "no-prebuilt"
         )
     )
@@ -471,10 +488,14 @@ pub enum Asked {
     Why(Vec<OsString>),
     /// `blaze reach [ROOT]`, with the words after it ([`super::reach::main`]).
     Reach(Vec<OsString>),
+    /// `blaze prove`, with the words after it ([`super::prove::main`]).
+    Prove(Vec<OsString>),
     /// `blaze slow`, with the words after it ([`super::observe::slow`]).
     Slow(Vec<OsString>),
     /// `blaze doctor`, with the words after it ([`super::doctor::main`]).
     Doctor(Vec<OsString>),
+    /// `blaze audit [pin|fetch]`, with the words after it ([`super::audit::main`]).
+    Audit(Vec<OsString>),
     /// `blaze diagnostics`, with the words after it ([`super::diagnostics::main`]).
     Diagnostics(Vec<OsString>),
     /// `blaze agents install|hook|status|remove`, with the words after `agents`
@@ -589,6 +610,18 @@ pub fn refused(asked: &Invocation) -> Option<String> {
                 format!("`blaze doc` writes no JSON messages for the pages yet (`--message-format {it}`)")
             })
         }
+        Command::Check if flags.query.is_some() && (flags.rules.is_some() || !flags.replace.is_empty() || flags.dry_run) => {
+            Some("`--query` writes nothing: run `--rules`, `--replace` and `--dry-run` apart".to_owned())
+        }
+        Command::Check if flags.dry_run && flags.rules.is_none() && flags.replace.is_empty() => {
+            Some("`--dry-run` shows the edits `--rules` or `--replace` would make: give one of them".to_owned())
+        }
+        Command::Check
+            if (flags.rules.is_some() || flags.query.is_some())
+                && (flags.fix || flags.baselines.is_some() || !flags.lint_levels.is_empty()) =>
+        {
+            Some("`--rules` and `--query` check nothing: run `--fix`, `--baselines` and lint levels apart".to_owned())
+        }
         Command::Check if !flags.replace.is_empty() && (flags.fix || flags.baselines.is_some()) => {
             Some("`--replace` makes its edits and checks nothing: run `--fix` and `--baselines` apart".to_owned())
         }
@@ -657,7 +690,9 @@ pub struct Flags {
     /// lists what failed and what each failure left unbuilt. Passed on to the daemon.
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
-    pub reached: bool,
+    /// `--run-all`: every test asked runs, none reported cached; what each run learns is still
+    /// kept.
+    pub run_all: bool,
     /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
     /// Without it such a run is refused ([`super::test::refusal`]).
     pub no_tests_pass: bool,
@@ -676,6 +711,10 @@ pub struct Flags {
     pub lints: Vec<String>,
     /// `check`'s `--replace`, each `FROM=TO` as given.
     pub replace: Vec<String>,
+    /// `check`'s `--rules` and `--query`, each a rules file's path as given, and `--dry-run`.
+    pub rules: Option<String>,
+    pub query: Option<String>,
+    pub dry_run: bool,
     /// `check`'s `--baselines`, `--bless-baselines` and each `--new-baseline`.
     pub baselines: Option<String>,
     pub bless_baselines: bool,
@@ -727,7 +766,7 @@ impl Flags {
             "no-run" => self.no_run = true,
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
-            "reached" => self.reached = true,
+            "run-all" => self.run_all = true,
             // `check_value` held it to `fail` and `pass` first.
             "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,
@@ -747,6 +786,9 @@ impl Flags {
             "fix" => self.fix = true,
             "lint" => self.lints.extend(owned()),
             "replace" => self.replace.extend(owned()),
+            "rules" => self.rules = owned(),
+            "query" => self.query = owned(),
+            "dry-run" => self.dry_run = true,
             "baselines" => self.baselines = owned(),
             "bless-baselines" => self.bless_baselines = true,
             "no-prebuilt" => self.no_prebuilt = true,
@@ -852,8 +894,10 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
             Some("reach") => return Ok(Asked::Reach(words.collect())),
+            Some("prove") => return Ok(Asked::Prove(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("doctor") => return Ok(Asked::Doctor(words.collect())),
+            Some("audit") => return Ok(Asked::Audit(words.collect())),
             Some("diagnostics") => return Ok(Asked::Diagnostics(words.collect())),
             Some("agents") => return Ok(Asked::Agents(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),

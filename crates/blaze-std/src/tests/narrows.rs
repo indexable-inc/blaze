@@ -11,9 +11,9 @@
 
 use std::collections::VecDeque;
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{check, control, path, root, world};
 use crate::{
     Cx, Plant,
     audio::{AudioIn, AudioOut, Pcm},
@@ -65,10 +65,11 @@ struct Plan {
     chain: Vec<u64>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    // 840 is divisible by every `STEPS` here, so each narrowing is as likely as another.
-    let chain = (0..d.int(1, 5)).map(|_| d.int(0, 839)).collect();
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    // 840 is divisible by every `STEPS` here, so each narrowing is as likely as another: a
+    // uniform `below`, as `int_in` leans to the ends of a range this wide.
+    let chain = (0..tape.int_in(1..=5u64, "narrowings")).map(|_| tape.below(840, "step")).collect();
     Plan { seed, chain }
 }
 
@@ -766,14 +767,14 @@ impl Narrows for LocalCase {
 /// The property and its control, for one case.
 macro_rules! narrowing {
     ($case:ident, $never_widens:ident, $caught:ident) => {
-        #[hegel::test(test_cases = 40)]
-        fn $never_widens(tc: TestCase) {
-            check(plan(&mut Drawn(&tc)), run::<$case>);
+        #[test]
+        fn $never_widens() {
+            blaze_sim::check(Config::cases(40), |tape| check(plan(tape), run::<$case>));
         }
 
         #[test]
         fn $caught() {
-            control(Plant::OnlyWidens, |seeds: &mut Seeds| plan(seeds), run::<$case>);
+            control(Plant::OnlyWidens, plan, run::<$case>);
         }
     };
 }

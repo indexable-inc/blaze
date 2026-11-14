@@ -8,11 +8,12 @@
 pub(crate) mod batch;
 pub(crate) mod diagnostics;
 mod error_union;
+pub(crate) mod implied;
 pub(crate) mod path;
 pub(crate) mod record;
 pub mod persist;
 
-use std::{alloc::Allocator, iter, mem};
+use std::{alloc::Allocator, iter, mem, ops::ControlFlow};
 
 use base_db::Db;
 use blaze_mem::Frame;
@@ -3696,6 +3697,14 @@ enum AssocTypeShorthandResolution {
 /// This is a query mostly to handle cycles somewhat gracefully; e.g. the
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.
+///
+/// With `#![feature(blaze_implied_bounds)]` the bounds an owner's header implies on the
+/// parameter count as written ones ([`implied::shorthand_bounds`]). They are read from the
+/// header's written types and their definitions' declared bounds, lowering of the header only
+/// the arguments a bound names besides the parameter, so the one cycle left is a bound whose
+/// other arguments are written with this same shorthand (`fn f<A>(_: C<A, A::Out>)` with
+/// `struct C<A: Tr<B>, B>`): the cycle error E0391 naming the parameter, as rustc's
+/// `fn f<A: Tr<A::Out>>` is.
 #[tracing::instrument(target = "blaze", skip(db), ret)]
 #[blaze_query::tracked(
     returns(ref),
@@ -3752,7 +3761,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
         }
     }
 
-    let mut supertraits_resolution = None;
+    let mut found = ShorthandFound { this_trait: this_trait_resolution, supertraits: None };
     for maybe_parent_generics in generics.iter_owners().rev() {
         ctx.set_owner(maybe_parent_generics);
         for pred in maybe_parent_generics.where_predicates() {
@@ -3784,88 +3793,151 @@ fn resolve_type_param_assoc_type_shorthand_in(
             let Some(TypeNs::TraitId(bounded_trait)) = ctx.resolve_path_in_type_ns_fully() else {
                 continue;
             };
-            // rustc's `trait_may_define_assoc_item`: `hygienic_eq` in each supertrait, so the
-            // bounded trait's own lookup below finds the same item.
-            if !SupertraitsInfo::query(db, bounded_trait)
-                .defined_assoc_types
-                .iter()
-                .any(|&(name, id)| trait_item_is_written(db, name, id.into(), assoc_name))
-            {
+            if !trait_may_define_assoc_type(db, bounded_trait, assoc_name) {
                 continue;
             }
 
             let bounded_trait_ref =
                 ctx.lower_trait_ref_from_resolved_path(bounded_trait, param_ty, false, Span::Dummy);
-            // Now, search from the start on the *bounded* trait like if we wrote `Self::Assoc`. Eventually, we'll get
-            // the correct trait ref (or a cycle).
-            let lookup_on_bounded_trait = resolve_type_param_assoc_type_shorthand(
-                db,
-                bounded_trait.into(),
-                TypeParamId::trait_self(bounded_trait),
-                assoc_name,
-            );
-            let assoc_type_and_args = match &lookup_on_bounded_trait {
-                AssocTypeShorthandResolution::Resolved(trait_ref) => trait_ref,
-                AssocTypeShorthandResolution::Ambiguous {
-                    sub_trait_resolution: Some(trait_ref),
-                } => trait_ref,
-                AssocTypeShorthandResolution::Ambiguous { sub_trait_resolution: None } => {
-                    return AssocTypeShorthandResolution::Ambiguous {
-                        sub_trait_resolution: this_trait_resolution,
-                    };
-                }
-                AssocTypeShorthandResolution::NotFound => {
-                    unreachable!("we checked that the trait defines this assoc type")
-                }
-                AssocTypeShorthandResolution::Cycle => return AssocTypeShorthandResolution::Cycle,
-            };
-            let (assoc_type, args) = assoc_type_and_args
-                .get_with(|(assoc_type, args)| (*assoc_type, args.as_ref()))
-                .skip_binder();
-            let args = EarlyBinder::bind(interner, args)
-                .instantiate(interner, bounded_trait_ref.args)
-                .skip_norm_wip();
-            let current_result =
-                StoredEarlyBinder::bind_assoc_ty(interner, assoc_type, args.store());
-            if let Some(this_trait_resolution) = &this_trait_resolution {
-                if *this_trait_resolution == current_result {
-                    continue;
-                } else {
-                    return AssocTypeShorthandResolution::Ambiguous {
-                        sub_trait_resolution: Some(*this_trait_resolution),
-                    };
-                }
-            } else if let Some(prev_resolution) = &supertraits_resolution {
-                if let AssocTypeShorthandResolution::Ambiguous {
-                    sub_trait_resolution: Some(prev_resolution),
-                }
-                | AssocTypeShorthandResolution::Resolved(prev_resolution) = prev_resolution
-                    && *prev_resolution == current_result
-                {
-                    continue;
-                } else {
-                    return AssocTypeShorthandResolution::Ambiguous { sub_trait_resolution: None };
-                }
-            } else {
-                supertraits_resolution = Some(match lookup_on_bounded_trait {
-                    AssocTypeShorthandResolution::Resolved(_) => {
-                        AssocTypeShorthandResolution::Resolved(current_result)
-                    }
-                    AssocTypeShorthandResolution::Ambiguous { .. } => {
-                        AssocTypeShorthandResolution::Ambiguous {
-                            sub_trait_resolution: Some(current_result),
-                        }
-                    }
-                    AssocTypeShorthandResolution::NotFound
-                    | AssocTypeShorthandResolution::Cycle => unreachable!(),
-                });
+            let added = found.add(db, interner, bounded_trait, bounded_trait_ref, assoc_name);
+            if let ControlFlow::Break(it) = added {
+                return it;
             }
         }
     }
 
-    supertraits_resolution
-        .or_else(|| this_trait_resolution.map(AssocTypeShorthandResolution::Resolved))
-        .unwrap_or(AssocTypeShorthandResolution::NotFound)
+    // `#![feature(blaze_implied_bounds)]`: the bounds where each owner's header names `param`
+    // (`fn sum<I>(it: Wrapper<I>) -> I::Item` with `struct Wrapper<I: Iterator>`), found from
+    // the header's written types and their definitions before the header is lowered
+    // ([`implied::shorthand_bounds`]), and taken as a written bound is: two that give two
+    // associated types are the ambiguity they would be written.
+    for owner in generics.iter_owners().rev() {
+        if !implied::applies(db, owner.def()) {
+            continue;
+        }
+        ctx.set_owner(owner);
+        let bounds = implied::shorthand_bounds(
+            &mut ctx,
+            owner.def(),
+            param,
+            param_ty,
+            Some(assoc_name),
+            frame,
+        );
+        for (bounded_trait, bounded_trait_ref) in bounds {
+            let added = found.add(db, interner, bounded_trait, bounded_trait_ref, assoc_name);
+            if let ControlFlow::Break(it) = added {
+                return it;
+            }
+        }
+    }
+
+    found.finish()
+}
+
+/// rustc's `trait_may_define_assoc_item`: whether `trait_` or a supertrait has an associated
+/// type `assoc_name` names (`hygienic_eq` in each), so the trait's own lookup finds the item.
+fn trait_may_define_assoc_type(db: &Db, trait_: TraitId, assoc_name: Name) -> bool {
+    SupertraitsInfo::query(db, trait_)
+        .defined_assoc_types
+        .iter()
+        .any(|&(name, id)| trait_item_is_written(db, name, id.into(), assoc_name))
+}
+
+/// What [`resolve_type_param_assoc_type_shorthand`] has found so far: the trait's own
+/// associated type when the parameter is a trait's `Self`, and the one the bounds give.
+struct ShorthandFound {
+    this_trait: Option<StoredEarlyBinder<(TypeAliasId, StoredGenericArgs)>>,
+    supertraits: Option<AssocTypeShorthandResolution>,
+}
+
+impl ShorthandFound {
+    /// Takes the bound `param: bounded_trait_ref`, whose trait may define `assoc_name`: the
+    /// search from the start on the bounded trait, as if `Self::Assoc` were written there,
+    /// gives the associated type (or a cycle). `Break` is the answer, when this bound decides
+    /// it: an ambiguity or a cycle.
+    fn add<'db>(
+        &mut self,
+        db: &'db Db,
+        interner: DbInterner<'db>,
+        bounded_trait: TraitId,
+        bounded_trait_ref: TraitRef<'db>,
+        assoc_name: Name,
+    ) -> ControlFlow<AssocTypeShorthandResolution> {
+        let lookup_on_bounded_trait = resolve_type_param_assoc_type_shorthand(
+            db,
+            bounded_trait.into(),
+            TypeParamId::trait_self(bounded_trait),
+            assoc_name,
+        );
+        let assoc_type_and_args = match lookup_on_bounded_trait {
+            AssocTypeShorthandResolution::Resolved(trait_ref) => trait_ref,
+            AssocTypeShorthandResolution::Ambiguous { sub_trait_resolution: Some(trait_ref) } => {
+                trait_ref
+            }
+            AssocTypeShorthandResolution::Ambiguous { sub_trait_resolution: None } => {
+                return ControlFlow::Break(AssocTypeShorthandResolution::Ambiguous {
+                    sub_trait_resolution: self.this_trait,
+                });
+            }
+            AssocTypeShorthandResolution::NotFound => {
+                unreachable!("we checked that the trait defines this assoc type")
+            }
+            AssocTypeShorthandResolution::Cycle => {
+                return ControlFlow::Break(AssocTypeShorthandResolution::Cycle);
+            }
+        };
+        let (assoc_type, args) = assoc_type_and_args
+            .get_with(|(assoc_type, args)| (*assoc_type, args.as_ref()))
+            .skip_binder();
+        let args = EarlyBinder::bind(interner, args)
+            .instantiate(interner, bounded_trait_ref.args)
+            .skip_norm_wip();
+        let current_result = StoredEarlyBinder::bind_assoc_ty(interner, assoc_type, args.store());
+        if let Some(this_trait_resolution) = &self.this_trait {
+            if *this_trait_resolution == current_result {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(AssocTypeShorthandResolution::Ambiguous {
+                    sub_trait_resolution: Some(*this_trait_resolution),
+                })
+            }
+        } else if let Some(prev_resolution) = &self.supertraits {
+            if let AssocTypeShorthandResolution::Ambiguous {
+                sub_trait_resolution: Some(prev_resolution),
+            }
+            | AssocTypeShorthandResolution::Resolved(prev_resolution) = prev_resolution
+                && *prev_resolution == current_result
+            {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(AssocTypeShorthandResolution::Ambiguous {
+                    sub_trait_resolution: None,
+                })
+            }
+        } else {
+            self.supertraits = Some(match lookup_on_bounded_trait {
+                AssocTypeShorthandResolution::Resolved(_) => {
+                    AssocTypeShorthandResolution::Resolved(current_result)
+                }
+                AssocTypeShorthandResolution::Ambiguous { .. } => {
+                    AssocTypeShorthandResolution::Ambiguous {
+                        sub_trait_resolution: Some(current_result),
+                    }
+                }
+                AssocTypeShorthandResolution::NotFound | AssocTypeShorthandResolution::Cycle => {
+                    unreachable!()
+                }
+            });
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn finish(self) -> AssocTypeShorthandResolution {
+        self.supertraits
+            .or_else(|| self.this_trait.map(AssocTypeShorthandResolution::Resolved))
+            .unwrap_or(AssocTypeShorthandResolution::NotFound)
+    }
 }
 
 fn resolve_type_param_assoc_type_shorthand_cycle_result(
@@ -4905,6 +4977,12 @@ pub enum PredicateSource {
     ConstParamType(ConstParamId),
     /// From `GenericParams::of(def).where_consts()[index]`: a `where const { COND }` condition.
     WhereConst { def: GenericDefId, index: u32 },
+    /// Implied by the item's header (`#![feature(blaze_implied_bounds)]`, `lower::implied`):
+    /// the `index`th of the predicates `from` declares, a struct, enum, union or trait the
+    /// header names. `index` counts [`GenericPredicates::explicit_predicates`] of `from`
+    /// without its own implied ones, which are the sources of `from` that are neither this
+    /// nor [`PredicateSource::ImpliedTrait`], in order.
+    Implied { from: GenericDefId, index: u32 },
 }
 
 /// The source of each predicate of [`GenericPredicates::query_all`]`(db, def)`, in its order:
@@ -4917,13 +4995,144 @@ pub fn predicate_sources(db: &Db, def: GenericDefId) -> Vec<PredicateSource> {
     })
 }
 
+/// The predicates written on `def` that its header already implies
+/// (`#![feature(blaze_implied_bounds)]`, `lower::implied`), by their index in
+/// [`GenericPredicates::query_all`]`(db, def)`: what the lint `blaze::implied_bound_written`
+/// reports. Empty without the feature. A written bound and the one its header implies are one
+/// predicate (the implied one is not added again), so each found here is said twice.
+///
+/// Exact: a bound whose removal would change what compiles is not found. The one thing that
+/// reads a written bound and not the implied one is the shorthand `T::Name`, which sees the
+/// header as written ([`implied::shorthand_bounds`]), not lowered: a bound implied only
+/// through a shorthand projection's trait or a type alias in the header is not seen there. So
+/// a trait bound on a parameter whose trait defines an associated type is found only when the
+/// shorthand would still see it.
+pub fn written_implied_predicates(db: &Db, def: GenericDefId) -> Vec<u32> {
+    // alloc: a lint's findings, one per bound said twice
+    let mut found = Vec::new();
+    if !implied::applies(db, def) {
+        return found;
+    }
+    let sources = predicate_sources(db, def);
+    blaze_mem::frame::current(|frame| {
+        let implied = implied::implied_clauses(db, def, frame);
+        let all = GenericPredicates::query(db, def).all_predicates().skip_binder();
+        for (index, (clause, source)) in all.zip(&sources).enumerate() {
+            let written = matches!(*source, PredicateSource::Written { def: it, .. } if it == def);
+            if written
+                && implied.iter().any(|&(it, _)| it == clause)
+                && shorthand_keeps(db, def, clause, frame)
+            {
+                found.push(index as u32);
+            }
+        }
+    });
+    found
+}
+
+/// Whether every shorthand `T::Name` resolves as it does were `clause`, a written predicate of
+/// `def` that its header implies, removed: it is no trait bound on a parameter whose trait
+/// defines an associated type, or some owner's header gives the shorthand that same bound.
+fn shorthand_keeps<'db>(
+    db: &'db Db,
+    def: GenericDefId,
+    clause: Clause<'db>,
+    frame: &Frame,
+) -> bool {
+    let ClauseKind::Trait(bound) = clause.kind().skip_binder() else { return true };
+    let TyKind::Param(subject) = bound.self_ty().kind() else { return true };
+    let trait_ = bound.trait_ref.def_id.0;
+    if bound.polarity != rustc_type_ir::ClausePolarity::Positive
+        || SupertraitsInfo::query(db, trait_).defined_assoc_types.is_empty()
+    {
+        return true;
+    }
+    let param = subject.id;
+    let generics = generics(db, def);
+    let store = generics.store();
+    let generics = &generics;
+    let resolver = def.resolver(db);
+    let mut ctx = TyLoweringContext::new(
+        db,
+        &resolver,
+        store,
+        ExpressionStoreOwnerId::Signature(def),
+        def,
+        generics,
+        LifetimeElisionKind::AnonymousReportError,
+        LifetimeLoweringMode::Bound,
+        frame,
+    );
+    let param_ty =
+        Ty::new_param(ctx.interner, param, generics.type_or_const_param_idx(param.into()));
+    for owner in generics.iter_owners().rev() {
+        if !implied::applies(db, owner.def()) {
+            continue;
+        }
+        ctx.set_owner(owner);
+        let seen = implied::shorthand_bounds(&mut ctx, owner.def(), param, param_ty, None, frame);
+        if seen.iter().any(|&(_, it)| it == bound.trait_ref) {
+            return true;
+        }
+    }
+    false
+}
+
 fn lower_generic_predicates<'db, 'f>(
     db: &'db Db,
     def: GenericDefId,
     frame: &'f Frame,
     sources: Option<&mut Vec<PredicateSource>>,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
-    lower_generic_predicates_with(db, def, frame, sources, PredicateFilter::All)
+    lower_generic_predicates_with(db, def, frame, sources, PredicateFilter::All, Implied::Added)
+}
+
+/// Whether [`lower_generic_predicates_with`] adds the where clauses an item's header implies
+/// (`lower::implied`), which only an item of a crate with `blaze_implied_bounds` has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Implied {
+    Added,
+    /// The predicates as declared: what a header naming a trait reads of it, so a trait's own
+    /// implied bounds are never implied again.
+    Left,
+}
+
+/// A trait's predicates without the bounds its supertraits imply, for a trait of a crate with
+/// `blaze_implied_bounds` (`implied::declared_trait_predicates`, which reads this only there).
+fn declared_trait_predicates(db: &Db, trait_: TraitId) -> &GenericPredicates {
+    return &declared_trait_predicates_of(db, trait_).value;
+
+    #[blaze_query::tracked(
+        returns(ref),
+        cycle_result = declared_trait_predicates_cycle_result,
+        mem_tag = Infer
+    )]
+    fn declared_trait_predicates_of<'db>(
+        db: &'db Db,
+        trait_: TraitId,
+    ) -> TyLoweringResult<'db, GenericPredicates> {
+        // Every diagnostic of these clauses is the one `GenericPredicates::query_with_diagnostics`
+        // reports.
+        blaze_mem::frame::current(|frame| {
+            let lowered = lower_generic_predicates_with(
+                db,
+                trait_.into(),
+                frame,
+                None,
+                PredicateFilter::All,
+                Implied::Left,
+            );
+            TyLoweringResult::empty(lowered.value)
+        })
+    }
+
+    fn declared_trait_predicates_cycle_result<'db>(
+        db: &'db Db,
+        _: blaze_query::db::Id,
+        trait_: TraitId,
+    ) -> TyLoweringResult<'db, GenericPredicates> {
+        cycle_predicates(db, trait_.into(), CycleQuery::Predicates)
+    }
 }
 
 /// The where clauses of `def` that `filter` keeps, with the implicit `MetaSized` of a trait's
@@ -4936,7 +5145,7 @@ fn lower_generic_predicates_filtered<'db, 'f>(
     frame: &'f Frame,
     filter: PredicateFilter,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
-    lower_generic_predicates_with(db, def, frame, None, filter)
+    lower_generic_predicates_with(db, def, frame, None, filter, Implied::Left)
 }
 
 fn lower_generic_predicates_with<'db, 'f>(
@@ -4945,6 +5154,7 @@ fn lower_generic_predicates_with<'db, 'f>(
     frame: &'f Frame,
     sources: Option<&mut Vec<PredicateSource>>,
     filter: PredicateFilter,
+    with_implied: Implied,
 ) -> FrameLowered<'f, 'db, GenericPredicates> {
     // alloc: error path, only when `sources` is asked for
     let mut own_sources = sources.is_some().then(Vec::new);
@@ -5070,6 +5280,20 @@ fn lower_generic_predicates_with<'db, 'f>(
     generics.iter_with_idx().for_each(|(param_idx, param_id, param_data)| {
         add_sized_clause(param_idx, param_id, param_data);
     });
+
+    // `#![feature(blaze_implied_bounds)]`: the bounds the header's types and traits declare,
+    // after every written one, so a written clause keeps its index.
+    if filter == PredicateFilter::All
+        && with_implied == Implied::Added
+        && implied::applies(db, def)
+    {
+        for (clause, source) in implied::implied_clauses(db, def, frame) {
+            if !own_predicates.contains(&clause) {
+                own_predicates.push(clause);
+                own_sources.iter_mut().for_each(|it| it.push(source));
+            }
+        }
+    }
 
     let parent_predicates = parent.predicates.get().skip_binder().as_slice();
     let mut all = Vec::with_capacity_in(

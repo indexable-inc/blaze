@@ -421,6 +421,8 @@ pub fn named(request: &Request) -> &'static str {
         Request::Lock { .. } => "Lock",
         Request::ClientRows { .. } => "ClientRows",
         Request::Diagnostics { .. } => "Diagnostics",
+        Request::Prove { .. } => "Prove",
+        Request::Query { .. } => "Query",
     }
 }
 

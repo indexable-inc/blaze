@@ -10,9 +10,9 @@
 use std::time::Duration;
 
 use blaze_core::{sim::Faults, wait::Deadline};
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{File, ReadWrite},
@@ -34,11 +34,16 @@ struct Plan {
     ops: Vec<Op>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 50, 2_000]);
-    let ops = (0..d.int(1, 24))
-        .map(|_| Op { write: d.coin(), at: d.int(0, 48), len: d.int(1, 16) as usize, cancel: d.coin() })
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 50, 2_000], "latency us");
+    let ops = (0..tape.int_in(1..=24u64, "ops"))
+        .map(|_| Op {
+            write: tape.coin("write"),
+            at: tape.int_in(0..=48u64, "at"),
+            len: tape.int_in(1..=16u64, "len") as usize,
+            cancel: tape.coin("cancel"),
+        })
         .collect();
     Plan { seed, latency_us, ops }
 }
@@ -120,12 +125,12 @@ fn ops(plan: &Plan, io: &Io, cx: &Cx, file: &File<ReadWrite>) -> Result<(), Stri
 /// The invariant: an op in flight is finished. Once `Pending::wait` or `Pending::cancel` has
 /// returned, the driver holds nothing of it and nothing it does happens later: the file holds
 /// what the model says then and once the world has moved on.
-#[hegel::test(test_cases = 150)]
-fn a_finished_op_never_lands_later(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_finished_op_never_lands_later() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_cancel_that_skips_its_wait() {
-    control(Plant::CancelSkipsWait, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::CancelSkipsWait, plan, run);
 }

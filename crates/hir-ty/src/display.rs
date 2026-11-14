@@ -1153,18 +1153,24 @@ fn render_const_scalar_from_valtree_inner<'db>(
             render_const_scalar_from_valtree_inner(f, inner_ty, valtree, _param_env)
         }
         TyKind::Str => {
-            let bytes = valtree
-                .inner()
-                .to_branch()
-                .iter()
-                .map(|konst| match konst.kind() {
-                    ConstKind::Value(value) => Some(value.value.inner().to_leaf().to_u8()),
-                    _ => None,
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(bytes) = bytes else { return f.write_str("<invalid-str>") };
+            let branch = valtree.inner().to_branch();
+            let mut bytes = Vec::with_capacity_in(branch.as_slice().len(), Global);
+            for konst in branch.as_slice() {
+                match konst.kind() {
+                    ConstKind::Value(value) => bytes.push(value.value.inner().to_leaf().to_u8()),
+                    _ => return f.write_str("<invalid-str>"),
+                }
+            }
             let s = std::str::from_utf8(&bytes).unwrap_or("<utf8-error>");
-            write!(f, "{s:?}")
+            // A diagnostic shows a long string constant cut, with its length, so a type of
+            // a query's text stays readable; source code is written out whole.
+            match crate::const_valtree::shown_str(s) {
+                (_, true) if f.display_kind.is_source_code() => write!(f, "{s:?}"),
+                (shown, true) => {
+                    write!(f, "\"{}…\" ({} bytes)", shown.escape_debug(), s.len())
+                }
+                (_, false) => write!(f, "{s:?}"),
+            }
         }
         TyKind::Slice(inner_ty) | TyKind::Array(inner_ty, _) => {
             let mut first = true;
@@ -1781,6 +1787,9 @@ impl<'db> Ty<'db> {
                                 trait_bounds_need_parens,
                             )?;
                         }
+                        // An anonymous parameter (`#![feature(blaze_anon_params)]`) is
+                        // shown as it is written.
+                        TypeParamProvenance::Anonymous => write!(f, "_")?,
                     },
                     TypeOrConstParamData::ConstParamData(p) => {
                         write!(f, "{}", p.name.display(f.db, f.edition()))?;

@@ -3,8 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -24,25 +23,21 @@ enum Op {
 }
 
 /// Small bytes, noise past a chunk, or text that compresses.
-fn bytes(tc: &TestCase) -> Vec<u8> {
-    match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => tc.draw(gs::binary().max_size(300)),
-        1 => noise(tc.draw(gs::integers().max_value(400 << 10)), tc.draw(gs::integers())),
-        _ => text(
-            tc.draw(gs::integers().max_value(1 << 20)),
-            tc.draw(gs::integers().max_value(64 << 10)),
-        ),
+fn bytes(tape: &Tape) -> Vec<u8> {
+    match tape.int_in(0..=2u8, "bytes kind") {
+        0 => tape.bytes(0..=300, "small bytes"),
+        1 => noise(tape.int_in(0..=400usize << 10, "noise len"), tape.int::<u64>("noise seed")),
+        _ => text(tape.int_in(0..=1u64 << 20, "text"), tape.int_in(0..=64usize << 10, "text len")),
     }
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(10)) {
-        0..5 => Op::Put(tc.draw(gs::integers().max_value(15)), bytes(tc)),
-        5 | 6 => Op::Get(tc.draw(gs::integers().max_value(15))),
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=10u8, "op") {
+        0..5 => Op::Put(tape.int_in(0..=15u64, "key"), bytes(tape)),
+        5 | 6 => Op::Get(tape.int_in(0..=15u64, "key")),
         7 => Op::Flush,
         8 => Op::Settle,
-        9 => Op::Steps(tc.draw(gs::integers().min_value(1).max_value(300 << 10))),
+        9 => Op::Steps(tape.int_in(1..=300u64 << 10, "step bytes")),
         _ => Op::Reopen,
     }
 }
@@ -140,28 +135,21 @@ fn runs_as_a_map_does(ops: Vec<Op>, seed: u64, plant: bool) -> Result<(), String
     }
 }
 
-fn reads_back_what_a_map_holds(tc: &TestCase) {
-    let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
-    let seed = tc.draw(gs::integers());
+fn reads_back_what_a_map_holds(tape: &Tape) {
+    let ops = tape.vec(1..=40, "ops", op);
+    let seed = tape.next_u64("sim seed");
     let said = format!("{ops:?}");
     if let Err(why) = runs_as_a_map_does(ops, seed, false) {
         panic!("seed {seed}, {said}: {why}");
     }
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-pub(super) fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The refinement: the store is a map. Any run of puts, gets, flushes, settles and reopens
 /// reads back what a `BTreeMap` given the same puts holds, refuses other bytes under a key it
-/// has, and verifies clean. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// has, and verifies clean. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn the_store_reads_back_what_a_map_holds() {
-    run_cases(48, |tc| reads_back_what_a_map_holds(&tc));
+    blaze_sim::check(SimConfig::cases(48), reads_back_what_a_map_holds);
 }
 
 /// The planted-bug control: a commit that drains no writer's segment (`Store::plant_no_drain`)

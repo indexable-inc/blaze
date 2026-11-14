@@ -53,8 +53,7 @@ impl Placed {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::Placed;
     use crate::{SchemaHash, Slice, Writer};
@@ -87,33 +86,37 @@ mod tests {
         Writer::new(SchemaHash(blaze_ids::ContentId([0; 32])))
     }
 
-    #[hegel::test]
-    fn placed_is_the_copies_it_replaced(tc: TestCase) {
-        let before: Vec<u8> = tc.draw(gs::binary().max_size(8));
-        let values: Vec<u32> = tc.draw(gs::vecs(gs::integers()).max_size(63));
-        let gap: u64 = tc.draw(gs::integers().max_value(63));
-        let (mut ours, mut theirs) = (writer(), writer());
-        ours.push_slice(&before);
-        theirs.push_slice(&before);
-        let placed = Placed::push(&mut ours, &values);
-        let reference = Reference::push(&mut theirs, &values);
-        assert_eq!(&ours.bytes, &theirs.bytes);
-        assert_eq!((placed.at, placed.len), (reference.at, reference.len));
-        let field_at = ours.next::<Slice<u32>>() + gap;
-        assert_eq!(placed.slice::<u32>(field_at), reference.slice::<u32>(field_at));
+    #[test]
+    fn placed_is_the_copies_it_replaced() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let before: Vec<u8> = tape.bytes(0..=8, "before");
+            let values: Vec<u32> = tape.vec(0..=63, "values", |tape| tape.int("value"));
+            let gap: u64 = tape.int_in(0..=63, "gap");
+            let (mut ours, mut theirs) = (writer(), writer());
+            ours.push_slice(&before);
+            theirs.push_slice(&before);
+            let placed = Placed::push(&mut ours, &values);
+            let reference = Reference::push(&mut theirs, &values);
+            assert_eq!(&ours.bytes, &theirs.bytes);
+            assert_eq!((placed.at, placed.len), (reference.at, reference.len));
+            let field_at = ours.next::<Slice<u32>>() + gap;
+            assert_eq!(placed.slice::<u32>(field_at), reference.slice::<u32>(field_at));
+        });
     }
 
-    #[hegel::test]
-    fn push_each_writes_what_push_writes(tc: TestCase) {
-        let before: Vec<u8> = tc.draw(gs::binary().max_size(8));
-        let values: Vec<u64> = tc.draw(gs::vecs(gs::integers()).max_size(63));
-        let (mut each, mut whole) = (writer(), writer());
-        each.push_slice(&before);
-        whole.push_slice(&before);
-        let a = Placed::push_each(&mut each, values.len(), values.iter().copied());
-        let b = Placed::push(&mut whole, &values);
-        assert_eq!(a, b);
-        assert_eq!(&each.bytes, &whole.bytes);
+    #[test]
+    fn push_each_writes_what_push_writes() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let before: Vec<u8> = tape.bytes(0..=8, "before");
+            let values: Vec<u64> = tape.vec(0..=63, "values", |tape| tape.int("value"));
+            let (mut each, mut whole) = (writer(), writer());
+            each.push_slice(&before);
+            whole.push_slice(&before);
+            let a = Placed::push_each(&mut each, values.len(), values.iter().copied());
+            let b = Placed::push(&mut whole, &values);
+            assert_eq!(a, b);
+            assert_eq!(&each.bytes, &whole.bytes);
+        });
     }
 
     #[test]

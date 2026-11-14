@@ -46,7 +46,10 @@ pub const SETTINGS_DOMAIN: &str = "blaze program settings 1";
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct ItemId(pub Digest);
 
-/// A body's key, as the front end makes it from text before the body is lowered.
+/// What an instance plan is keyed by: the body record's result digest
+/// (`blaze_keyed::record::result_digest`, [`blaze_keyed::kind::PlanInputs::body`]): what the
+/// body's check made, found by the address of what it read. A body whose text moved but whose
+/// check made the same bytes plans under the same key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct BodyKey(pub Digest);
 

@@ -1,16 +1,32 @@
 //! Running the async [`Registry`](crate::Registry) from the resolver's loop:
 //! `src/util/local_poll_adapter.rs` of cargo 1.99.0 (5f94df4789), with an executor of its
-//! own in place of the `futures` crate's.
+//! own in place of the `futures` crate's, parked on blaze-core's deadline wait. One future
+//! polled to its end is [`blaze_core::wait::block_on`] ([`answer`]), named by its caller.
 
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread::Thread;
+use std::task::{Context, Poll, Waker};
 
+use blaze_core::wait::{Monotonic, Parker, Unfinished, Waited};
 use blaze_hash::HashMap;
 use std::alloc::Global;
+
+/// What the resolver's loop waits for between its polls ([`LocalPollAdapter::wait`]), with no
+/// bound of its own: every query ends by its HTTP client's deadlines (its timeout and stall
+/// bound), or at once for a registry in memory or on disk.
+const QUERY: &str = "the registry's answers to the resolver's queries (bounded by the HTTP client's timeouts)";
+
+/// [`blaze_core::wait::block_on`] of a registry query `future`, waiting for `what` with no
+/// bound of its own (a query ends by its HTTP client's deadlines, which `what` says): the
+/// wait's failure and the query's own as one error.
+pub(crate) fn answer<T>(
+    what: &'static str,
+    future: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    blaze_core::wait::block_on(what, None, future)?
+}
 
 /// Caches and runs an async method from code that is not async, on one thread.
 ///
@@ -65,11 +81,16 @@ where
         self.pool.len()
     }
 
-    /// Runs the pending work to its end. True if there was none.
-    pub(crate) fn wait(&mut self) -> bool {
+    /// Runs the pending work to its end. True if there was none. Between polls the thread parks
+    /// on blaze-core's deadline wait for [`QUERY`], with no bound of its own: each piece of work
+    /// ends by its HTTP client's deadlines.
+    pub(crate) fn wait(&mut self) -> Result<bool, Unfinished> {
         let is_empty = self.pool.is_empty();
-        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let clock = Monotonic::new();
+        let parker = Arc::new_in(Parker::new(), Global);
+        let waker = Waker::from(Arc::clone(&parker));
         let mut cx = Context::from_waker(&waker);
+        // Bounded by the work's own deadlines: each turn ends a piece or parks until one is woken.
         while !self.pool.is_empty() {
             let mut progressed = false;
             let mut i = 0;
@@ -84,11 +105,20 @@ where
                 }
             }
             if !progressed {
-                // wakes: the `Unpark` waker given to every pending future, which unparks this thread when one can go on
-                std::thread::park();
+                // Woken by the waker given to every pending future, which unparks this thread
+                // when one can go on.
+                match parker.park(QUERY, None, &clock) {
+                    Ok(Waited::Ready(())) => {}
+                    // A park with no deadline ends only when woken; said as `block_on` says it.
+                    Ok(Waited::Deadline) => {
+                        let within = std::time::Duration::MAX;
+                        return Err(Unfinished::TimedOut { what: QUERY, within });
+                    }
+                    Err(error) => return Err(Unfinished::Wait(error)),
+                }
             }
         }
-        is_empty
+        Ok(is_empty)
     }
 }
 
@@ -104,33 +134,6 @@ impl<T> PollExt<T> for Poll<T> {
             Poll::Ready(val) => val,
             Poll::Pending => panic!("{msg}"),
         }
-    }
-}
-
-/// Runs `future` to its end on this thread.
-pub fn block_on<F: Future>(future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
-    let mut cx = Context::from_waker(&waker);
-    loop {
-        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
-            return v;
-        }
-        // wakes: the `Unpark` waker given to the future, which unparks this thread when it can go on
-        std::thread::park();
-    }
-}
-
-/// Wakes the thread that waits; a wake before it parks makes the park return at once.
-struct Unpark(Thread);
-
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
     }
 }
 
@@ -215,7 +218,7 @@ pub(crate) mod tests {
         }
 
         fn wait(&mut self) -> bool {
-            self.poller.wait()
+            self.poller.wait().unwrap()
         }
     }
 

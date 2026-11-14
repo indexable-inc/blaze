@@ -5,7 +5,7 @@
 
 use std::alloc::Global;
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 
 use super::{Block, Body, Operand, Place, Rvalue, Stmt, Term, body_semantic, canonical, fingerprint};
@@ -117,62 +117,68 @@ fn a_jump_through_empty_blocks_and_a_negated_switch_are_the_plain_switch() {
     assert_eq!(canonical(&negated), canonical(&plain));
 }
 
-fn below(tc: &hegel::TestCase, n: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().min_value(0).max_value(n.saturating_sub(1)))
+/// Below `n`, 0 when `n` is 0; calm is 0.
+fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+    u32::try_from(tape.below(u64::from(n), label)).expect("below a u32")
 }
 
-fn draw_operand(tc: &hegel::TestCase, locals: u32) -> Operand {
-    match below(tc, 3) {
-        0 => read(below(tc, locals)),
-        1 => Operand::Const(u64::from(below(tc, 3))),
-        _ => Operand::Bool(below(tc, 2) == 1),
+fn draw_operand(tape: &Tape, locals: u32) -> Operand {
+    match below(tape, 3, "operand") {
+        0 => read(below(tape, locals, "local read")),
+        1 => Operand::Const(u64::from(below(tape, 3, "constant"))),
+        _ => Operand::Bool(below(tape, 2, "bool") == 1),
     }
 }
 
 /// A body of up to six blocks over up to two parameters and four temporaries, every target
 /// and local in range, switch arms by distinct values.
-fn draw_body(tc: &hegel::TestCase) -> Body {
-    let params = below(tc, 3);
-    let locals = params + 1 + below(tc, 5);
-    let blocks = 1 + below(tc, 6);
+fn draw_body(tape: &Tape) -> Body {
+    let params = below(tape, 3, "params");
+    let locals = params + 1 + below(tape, 5, "temporaries");
+    let blocks = 1 + below(tape, 6, "more blocks");
     let mut out = Vec::new_in(Global);
     for _ in 0..blocks {
         let mut stmts = Vec::new_in(Global);
-        for _ in 0..below(tc, 4) {
-            let dest = Place::whole(below(tc, locals));
-            let rvalue = match below(tc, 4) {
-                0 => Rvalue::Use(draw_operand(tc, locals)),
+        for _ in 0..below(tape, 4, "statements") {
+            let dest = Place::whole(below(tape, locals, "destination"));
+            let rvalue = match below(tape, 4, "rvalue") {
+                0 => Rvalue::Use(draw_operand(tape, locals)),
                 1 => Rvalue::Op {
-                    head: u64::from(below(tc, 3)),
-                    args: vec_of([draw_operand(tc, locals), draw_operand(tc, locals)]),
-                    commutes: below(tc, 2) == 1,
+                    head: u64::from(below(tape, 3, "head")),
+                    args: vec_of([draw_operand(tape, locals), draw_operand(tape, locals)]),
+                    commutes: below(tape, 2, "commutes") == 1,
                 },
-                2 => Rvalue::Not(draw_operand(tc, locals)),
+                2 => Rvalue::Not(draw_operand(tape, locals)),
                 _ => Rvalue::BoolEq {
-                    negated: below(tc, 2) == 1,
-                    a: draw_operand(tc, locals),
-                    b: draw_operand(tc, locals),
+                    negated: below(tape, 2, "negated") == 1,
+                    a: draw_operand(tape, locals),
+                    b: draw_operand(tape, locals),
                 },
             };
             stmts.push(Stmt::Assign(dest, rvalue));
         }
-        let term = match below(tc, 5) {
-            0 => Term::Goto(below(tc, blocks)),
+        let term = match below(tape, 5, "terminator") {
+            0 => Term::Goto(below(tape, blocks, "target")),
             1 => {
-                let on_bool = below(tc, 2) == 1;
+                let on_bool = below(tape, 2, "on bool") == 1;
                 let mut arms = Vec::new_in(Global);
-                for value in 0..below(tc, 3) {
-                    arms.push((u128::from(value), below(tc, blocks)));
+                for value in 0..below(tape, 3, "arms") {
+                    arms.push((u128::from(value), below(tape, blocks, "target")));
                 }
-                Term::Switch { discr: draw_operand(tc, locals), on_bool, arms, otherwise: below(tc, blocks) }
+                Term::Switch {
+                    discr: draw_operand(tape, locals),
+                    on_bool,
+                    arms,
+                    otherwise: below(tape, blocks, "target"),
+                }
             }
             2 => Term::Return,
             3 => Term::Unreachable,
             _ => Term::Call {
                 func: Operand::Const(9),
-                args: vec_of([draw_operand(tc, locals)]),
-                dest: Place::whole(below(tc, locals)),
-                target: Some(below(tc, blocks)),
+                args: vec_of([draw_operand(tape, locals)]),
+                dest: Place::whole(below(tape, locals, "destination")),
+                target: Some(below(tape, blocks, "target")),
                 cleanup: None,
             },
         };
@@ -180,16 +186,16 @@ fn draw_body(tc: &hegel::TestCase) -> Body {
     }
     let mut types = Vec::new_in(Global);
     for _ in 0..locals {
-        types.push(u64::from(below(tc, 3)));
+        types.push(u64::from(below(tape, 3, "type")));
     }
-    Body { params, locals: types, entry: below(tc, blocks), blocks: out }
+    Body { params, locals: types, entry: below(tape, blocks, "entry"), blocks: out }
 }
 
 /// A permutation of `0..n` drawn as sort keys: `out[old]` is the new place.
-fn draw_permutation(tc: &hegel::TestCase, n: u32) -> Vec<u32, Global> {
+fn draw_permutation(tape: &Tape, n: u32) -> Vec<u32, Global> {
     let mut keyed = Vec::new_in(Global);
     for at in 0..n {
-        keyed.push((below(tc, 1000), at));
+        keyed.push((below(tape, 1000, "sort key"), at));
     }
     keyed.sort_unstable();
     let mut out = vec_of((0..n).map(|_| 0));
@@ -227,16 +233,19 @@ fn permuted(body: &Body, blocks: &[u32], temps: &[u32]) -> Body {
 
 /// The invariant: the canonical form of a body is its own canonical form, and is the same
 /// for the body with its blocks in another order and its temporaries numbered otherwise.
-#[hegel::test(test_cases = 256)]
-fn the_canonical_form_is_idempotent_and_blind_to_block_order_and_temporary_names(tc: hegel::TestCase) {
-    let body = draw_body(&tc);
-    let blocks = draw_permutation(&tc, u32::try_from(body.blocks.len()).expect("a small body"));
-    let temps = draw_permutation(&tc, u32::try_from(body.locals.len()).expect("a small body") - body.params - 1);
-    let canon = canonical(&body);
-    assert_eq!(canonical(&permuted(&body, &blocks, &temps)), canon, "{body:?}");
-    if let Some(canon) = &canon {
-        assert_eq!(canonical(canon).as_ref(), Some(canon), "{body:?}");
-    }
+#[test]
+fn the_canonical_form_is_idempotent_and_blind_to_block_order_and_temporary_names() {
+    blaze_sim::check(Config::cases(256), |tape| {
+        let body = draw_body(tape);
+        let blocks = draw_permutation(tape, u32::try_from(body.blocks.len()).expect("a small body"));
+        let temps =
+            draw_permutation(tape, u32::try_from(body.locals.len()).expect("a small body") - body.params - 1);
+        let canon = canonical(&body);
+        assert_eq!(canonical(&permuted(&body, &blocks, &temps)), canon, "{body:?}");
+        if let Some(canon) = &canon {
+            assert_eq!(canonical(canon).as_ref(), Some(canon), "{body:?}");
+        }
+    });
 }
 
 // expectation unverified: main agent decides after first run (the match on a `bool` lowers to

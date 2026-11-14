@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-90 theorems: 77 in `lean`, 13 in `lean/analysis`.
+130 theorems: 117 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -67,11 +67,11 @@ theorem State.read_write_other (st st' : State) (p q : Pointer) (v : Value)
 
 ## V7
 
-**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 4 steps or more.
+**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 5 steps or more.
 
 ```lean
 theorem fnv1a_from_model_agrees (hash : U64) (bytes : Slice U8) (extra : Nat) :
-    run P (4 * bytes.val.length + 4 + extra) (entry hash bytes) =
+    run P (4 * bytes.val.length + 5 + extra) (entry hash bytes) =
       Outcome.map (Value.int ScalarTy.U64)
         (Outcome.ofResult
           (blaze_graph.ledger.fnv1a_from (bytes.val.length + 1) hash bytes))
@@ -98,7 +98,7 @@ theorem agrees (x : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (x limit : U32) (extra : Nat) :
-    run P (extra + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
+    run P (extra + 1 + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
       Outcome.ok (Value.int ScalarTy.U32 (early.clamp x limit))
 ```
 
@@ -106,7 +106,7 @@ theorem agrees (x limit : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (n : U32) (extra : Nat) :
-    run P (loopFuel 2 2 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
+    run P (loopFuel 2 3 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
       Outcome.map (Value.int ScalarTy.U32)
         (Outcome.ofResult (loops.count (n.val.toNat + 1) n))
 ```
@@ -170,7 +170,7 @@ theorem validate_sound (a b : Program) (h : validate a b = true) (fuel : Nat) (s
 ```lean
 theorem execStmt_ctl (adts : List AdtDecl) (st : State) :
     ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.ctl = st.ctl) (execStmt adts st s)
-  | Statement.assign p rv =>
+  | Statement.assign _ rv =>
     Outcome.all_bind (evalRvalue_ctl adts st rv) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         Outcome.All.imp (State.write_ctl r.2 ptr r.1) (fun _ h => Eq.trans h hr)))
@@ -897,4 +897,310 @@ theorem removeDead_call (cert : List (List (List (List Local))))
 ```lean
 theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local)))) :
     PreservesWhen FrameZero (removeDeadStoresChecked cert)
+```
+
+## V13
+
+**`theorems.bump_keeps_wf.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function bump_keeps_wf holds of its model: from a counter with hits at most its limit, bump does not panic and leaves hits at most the limit.
+
+```lean
+theorem theorems.bump_keeps_wf.spec.proof : theorems.bump_keeps_wf.spec.statement
+```
+
+**`theorems.counting_ends.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function counting_ends holds of its model: for every n some fuel makes the loop return, with i equal to n.
+
+```lean
+theorem theorems.counting_ends.spec.proof : theorems.counting_ends.spec.statement
+```
+
+**`blaze_core.busy.next_is_bounded.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_bounded holds of its model: for every number of tries and every time waited, busy::next does not panic and its wait is positive, at most the cap and at most what is left of the bound (so the waits of an exec that met ETXTBSY end, on the bound exactly).
+
+```lean
+theorem blaze_core.busy.next_is_bounded.spec.proof :
+    blaze_core.busy.next_is_bounded.spec.statement
+```
+
+**`blaze_core.busy.next_is_the_doubling_schedule.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_the_doubling_schedule holds of its model: for every number of tries and every time waited, busy::next (one shift) gives the wait of busy::doubling (the loop that doubles and caps), which returns.
+
+```lean
+theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
+    blaze_core.busy.next_is_the_doubling_schedule.spec.statement
+```
+
+## V14
+
+**`blaze_core.world.clock.a_timer_never_fires_early.spec.proof`** (`BlazeCore.World.Clock`, `lean`): The statement blaze generates from blaze-core's theorem function a_timer_never_fires_early holds of its model: for every clock, wait and reading, a timer the clock world allows fired waited at least its time (or its deadline did not fit a u64 and the reading is the last there is), the clock after the reading allows none before it, and nothing overflows or panics.
+
+```lean
+theorem blaze_core.world.clock.a_timer_never_fires_early.spec.proof :
+    blaze_core.world.clock.a_timer_never_fires_early.spec.statement
+```
+
+**`BlazeCore.World.DiskAllows.allows_orders`** (`BlazeCore.World.DiskAllows`, `lean`): Of the disk world's model as the translator emits it from disk.rs: a cut `Disk::allows` accepts has one share per file, and if it keeps, whole or in part, a change of any file made after a barrier of any file completed, it keeps whole every change that barrier covers.
+
+```lean
+theorem allows_orders (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) (H : Disk.allows fuel d cut = Result.ok true) :
+    cut.val.length = d.files.val.length ∧
+      ∀ j1 (h1 : j1 < d.files.val.length) (h1c : j1 < cut.val.length)
+        j2 (h2 : j2 < d.files.val.length) (h2c : j2 < cut.val.length),
+        ∀ b ∈ (d.files.val[j1]).barriers.val,
+        ∀ c (hc : c < (d.files.val[j2]).changes.val.length),
+          c < reachOf d.files.val[j2] cut.val[j2] →
+          b.epoch.val < ((d.files.val[j2]).changes.val[c]).epoch.val →
+          b.covers.val ≤ (cut.val[j1]).whole.val
+```
+
+**`BlazeCore.World.DiskAllows.allows_total`** (`BlazeCore.World.DiskAllows`, `lean`): `Disk::allows` neither panics nor runs out of fuel, for every disk and every cut.
+
+```lean
+theorem allows_total (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) :
+    ∃ b, Disk.allows fuel d cut = Result.ok b
+```
+
+**`BlazeCore.World.DiskBytes.cut_appended`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a crash cuts a file within the bounds whose changes not synced are all appends, by any share that fits it, to a prefix of what it read as that begins with all its durable bytes; the file keeps its name and has no change and nothing to undo left.
+
+```lean
+theorem cut_appended (fuel : Nat) (f : File) (k : Kept) (hs : Small f) (ha : AllAppend f)
+    (hfits : File.fits f k = Result.ok true) (hfuel : 73786976294838206464 ≤ fuel) :
+    ∃ f', File.cut fuel f k = Result.ok f' ∧ f'.name = f.name ∧ f'.changes.val = [] ∧
+      f'.undo = none ∧ f.durable.val <+: f'.durable.val ∧
+      f'.durable.val <+: f.durable.val ++ appended f
+```
+
+**`BlazeCore.World.DiskBytes.cut_synced`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a share that fits a file with no change not synced keeps nothing and tears nothing, and the crash leaves the file's durable bytes and name as they were.
+
+```lean
+theorem cut_synced (fuel : Nat) (f : File) (k : Kept) (hs : Small f) (hc : f.changes.val = [])
+    (hfits : File.fits f k = Result.ok true) (hfuel : 73786976294838206464 ≤ fuel) :
+    k.whole.val = 0 ∧ k.torn = Torn.Nothing ∧
+      ∃ f', File.cut fuel f k = Result.ok f' ∧ f'.durable.val = f.durable.val ∧
+        f'.name = f.name ∧ f'.changes.val = [] ∧ f'.undo = none
+```
+
+**`BlazeCore.World.DiskBytes.sync_all`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a sync that covers every change of a file within the bounds, whatever kinds they are, leaves no change and nothing to undo, and its durable bytes are what the file read as.
+
+```lean
+theorem sync_all (fuel : Nat) (f : File) (covers : Usize) (hs : Small f)
+    (hall : (f.changes.val.length : Int) ≤ covers.val) (hfuel : 73786976294838206464 ≤ fuel) :
+    ∃ r v, File.sync fuel f covers = Result.ok r ∧ File.contents fuel f = Result.ok v ∧
+      r.changes.val = [] ∧ r.undo = none ∧ r.name = f.name ∧ r.durable.val = v.val
+```
+
+**`blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_keeps_what_a_barrier_ordered holds of its model: from every well-formed disk within the bounds, after a barrier of a file that covers all its changes and then an append to any file, a cut a crash is allowed to make that keeps any part of that append keeps whole every change the barrier covered; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof :
+    blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.statement
+```
+
+**`blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_cuts_an_appended_file_to_a_prefix holds of its model: from every well-formed disk within the bounds, a file whose changes not synced are all appends and that no crash may undo is, after every cut a crash is allowed to make, still there, begins with all its durable bytes and is a prefix of what it read as; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.proof :
+    blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.statement
+```
+
+**`blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_keeps_a_synced_file holds of its model: from every well-formed disk within the bounds, once a sync of a file that covers all its changes has completed, after every cut a crash is allowed to make the file is there and reads as it did, whatever undone writes and renames of other files are put back; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof :
+    blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.statement
+```
+
+**`blaze_core.world.asks.a_synced_append_survives_a_crash.spec.proof`** (`BlazeCore.World.Asks`, `lean`): The statement blaze generates from blaze-core's theorem function a_synced_append_survives_a_crash holds of its model, the disk world with effects in flight: from every well-formed disk within the bounds with nothing in flight, bytes are appended to a file and told done, a sync of the file is asked, and while it is in flight more is appended to the file (done or failed part way) and other syncs of it are asked and told, in any order and with any answers the world allows; once the first sync is told, after every crash the world allows the file is there and begins with everything it read as when that sync was asked; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.asks.a_synced_append_survives_a_crash.spec.proof :
+    blaze_core.world.asks.a_synced_append_survives_a_crash.spec.statement
+```
+
+## V15
+
+**`queue.new_is_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function new_is_wf holds of its model: a new bounded queue (a `Vec` and a limit) is well formed for every limit.
+
+```lean
+theorem queue.new_is_wf.spec.proof : queue.new_is_wf.spec.statement
+```
+
+**`queue.offer_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function offer_keeps_wf holds of its model: from every queue and item, offer does not panic and leaves a well-formed queue well formed (its `Vec::push` never passes the limit).
+
+```lean
+theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
+```
+
+**`queue.take_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function take_keeps_wf holds of its model: from every queue, take (a `Vec::pop`) leaves a well-formed queue well formed.
+
+```lean
+theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
+```
+
+**`derives.tagged_eq_is_its_id.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function tagged_eq_is_its_id holds of its model: a struct with a PhantomData field is equal, copied and cloned by its other fields; the marker is one value.
+
+```lean
+theorem derives.tagged_eq_is_its_id.spec.proof : derives.tagged_eq_is_its_id.spec.statement
+```
+
+**`derives.point_and_tag_eq.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function point_and_tag_eq holds of its model: two types whose names end alike have each their own derived equality (their instances are named apart) and one model uses both.
+
+```lean
+theorem derives.point_and_tag_eq.spec.proof : derives.point_and_tag_eq.spec.statement
+```
+
+**`orders.pair_order_is_lexicographic.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function pair_order_is_lexicographic holds of its model: the derived order of a struct of two fields compares the first field, then the second.
+
+```lean
+theorem orders.pair_order_is_lexicographic.spec.proof :
+    orders.pair_order_is_lexicographic.spec.statement
+```
+
+**`orders.key_order_is_by_variant_then_fields.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function key_order_is_by_variant_then_fields holds of its model: the derived order of an enum compares discriminants (a signed repr's too), then the fields of one variant in order.
+
+```lean
+theorem orders.key_order_is_by_variant_then_fields.spec.proof :
+    orders.key_order_is_by_variant_then_fields.spec.statement
+```
+
+**`orders.id_order_is_by_bytes.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function id_order_is_by_bytes holds of its model: the derived order of a struct over an array is the array's lexicographic order.
+
+```lean
+theorem orders.id_order_is_by_bytes.spec.proof : orders.id_order_is_by_bytes.spec.statement
+```
+
+**`consts.constants_are_their_values.spec.proof`** (`BlazeModel.consts.proved`, `lean`): The statement blaze generates from the fixture's theorem function constants_are_their_values holds of its model: a trait's associated constant at its implementor (its own value or the trait's default), an inherent constant, an anonymous constant and an array length given by an expression are the values blaze's evaluator gives.
+
+```lean
+theorem consts.constants_are_their_values.spec.proof :
+    consts.constants_are_their_values.spec.statement
+```
+
+**`derives.waited_eq_is_the_values.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function waited_eq_is_the_values holds of its model: the derived ==, != and clone of a generic enum at its instances (Waited<()>, Waited<u32>, Waited<Point>) are the values' own.
+
+```lean
+theorem derives.waited_eq_is_the_values.spec.proof :
+    derives.waited_eq_is_the_values.spec.statement
+```
+
+**`blaze_shapes.hunts_find_the_hit.spec.proof`** (`BlazeModel.blaze_shapes.proved`, `lean`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names.
+
+```lean
+theorem blaze_shapes.hunts_find_the_hit.spec.proof : blaze_shapes.hunts_find_the_hit.spec.statement
+```
+
+**`traits.provided_agree.spec.proof`** (`BlazeModel.traits.proved`, `lean`): The statement blaze generates from the fixture's theorem function provided_agree holds of its model: a trait's provided methods at two implementors, one overriding one of them, give the Rust's values.
+
+```lean
+theorem traits.provided_agree.spec.proof : traits.provided_agree.spec.statement
+```
+
+**`ranges.contains_at_the_ends.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function contains_at_the_ends holds of its model: a..b holds a exactly when a < b and never holds b; a..=b holds a and b exactly when a <= b; start and end read back what the range was made of.
+
+```lean
+theorem ranges.contains_at_the_ends.spec.proof : ranges.contains_at_the_ends.spec.statement
+```
+
+**`ranges.a_subslice_is_its_part.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function a_subslice_is_its_part holds of its model: for every Vec and a < b <= len, &v[a..b] does not panic, has b - a elements, and its first is v[a].
+
+```lean
+theorem ranges.a_subslice_is_its_part.spec.proof : ranges.a_subslice_is_its_part.spec.statement
+```
+
+**`defaults.derived_default_is_each_fields.spec.proof`** (`BlazeModel.defaults.proved`, `lean`): The statement blaze generates from the fixture's theorem function derived_default_is_each_fields holds of its model: a derived Default of a struct is each field's default (a hand-written one's own value among them), an enum's is its #[default] variant, and an array's holds its element's default in each place.
+
+```lean
+theorem defaults.derived_default_is_each_fields.spec.proof :
+    defaults.derived_default_is_each_fields.spec.statement
+```
+
+## V16
+
+**`blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_retry_waits_what_is_left holds of its model: from every state of a blocking wait and every reading of the clock after a call that was not ready, the wait ends exactly when its deadline has passed at that reading, and where it goes on the next call is given what is left of the deadline at that reading, never an earlier timeout; and nothing panics.
+
+```lean
+theorem blaze_core.wait.retry.a_retry_waits_what_is_left.spec.proof :
+    blaze_core.wait.retry.a_retry_waits_what_is_left.spec.statement
+```
+
+**`blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_stopped_clock_ends_the_wait holds of its model: from every state of a blocking wait, 65,536 calls in a row that return not ready with the clock at or before the wait's last reading do not all say again: the deadline passes or the wait fails, naming the clock.
+
+```lean
+theorem blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof :
+    blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.statement
+```
+
+**`blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof`** (`BlazeCore.Wait.Retry`, `lean`): The statement blaze generates from blaze-core's theorem function a_wait_ends_by_its_deadline holds of its model: for every start, deadline or none, event or none, lateness and list of answers, the real retry loop (drive), its calls answered from the list, each answer one the blocking call's world allows (interrupted, woken for nothing or timed out early at any moment before the event, read up to the lateness after), does not fail or panic, ends at most the lateness past its deadline, says the deadline passed only at a reading that has passed it and never where the event came the lateness or more before it, and with no deadline ends only ready.
+
+```lean
+theorem blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof :
+    blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.statement
+```
+
+**`blaze_core.wait.reaping.a_reaped_child_is_reported.spec.proof`** (`BlazeCore.Wait.Reaping`, `lean`): The statement blaze generates from blaze-core's theorem function a_reaped_child_is_reported holds of its model: for a child that runs or has exited with any status, every moment its exit comes relative to the reap's calls (between the first look and the wait, during the wait, or never), the kernel told the exit or the deadline where both come in one wait, and every deadline or none, the real reap against the children's world never fails, reports a child it reaped with the status it exited with and leaves it reaped, and where it ends at its deadline there was one, the child is not reaped and had not exited when the wait began.
+
+```lean
+theorem blaze_core.wait.reaping.a_reaped_child_is_reported.spec.proof :
+    blaze_core.wait.reaping.a_reaped_child_is_reported.spec.statement
+```
+
+## V17
+
+**`Blaze.Threads.two_ends`** (`Blaze.ThreadsAuto`, `lean`): The induction principle for two threads run by a schedule (Blaze.Threads.two): an invariant over the two threads' remaining programs, the shared world and the schedule steps left, which every step of either thread with any pick of the world's keeps, gives, for every schedule, that the run ends and how each thread stood satisfies what the invariant gives with no step left.
+
+```lean
+theorem two_ends {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop)
+    (first : ∀ n a b w pick, Inv (n + 1) a b w → Advance 1 pick a w (fun a' w' => Inv n a' b w'))
+    (second : ∀ n a b w pick, Inv (n + 1) a b w → Advance 2 pick b w (fun b' w' => Inv n a b' w'))
+    (Post : Ended α → Ended β → World → Prop)
+    (last : ∀ a b w, Inv 0 a b w →
+      ∃ ea eb w', (two [] a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w')
+    (schedule : List Step) (a : Prog α) (b : Prog β) (w : World)
+    (h : Inv schedule.length a b w) :
+    ∃ ea eb w', (two schedule a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w'
+```
+
+**`Blaze.Tests.ThreadsPark.no_unpark_is_lost`** (`Blaze.Tests.ThreadsParkProof`, `lean`): Of a park and an unpark on one word ordered as crates/blaze-core/src/wait/parking.rs orders their atomics, written by hand as programs over Blaze.Threads (a futex wait and wake, a compare-and-swap, a swap): for every schedule of the two threads and every pick of the world's (spurious returns, timeouts), no run ends with the unpark returned and the park asleep with no wake coming; where both returned the token was taken once and the word is empty, or the park left at its timeout before the token came and it is still there; and a park with no time limit returns only with a token.
+
+```lean
+theorem no_unpark_is_lost (timed : Bool) (schedule : List Step) :
+    ∃ fuel parked unparked last,
+      (run park fuel timed schedule).value = .ok (parked, unparked, last) ∧
+      -- the unpark returned: the park is not asleep with no wake coming
+      (unparked = .Done () → parked ≠ .Asleep) ∧
+      -- both returned: the token was taken once, or the park left at its timeout before it came and it is still there
+      (∀ took, parked = .Done took → unparked = .Done () →
+          (took = true ∧ last.val = EMPTY.val) ∨ (took = false ∧ timed = true ∧ last.val = NOTIFIED.val)) ∧
+      -- a park with no time limit returns only with a token
+      (∀ took, parked = .Done took → timed = false → took = true)
+```
+
+**`blaze_core.wait.parking.no_unpark_is_lost.spec.proof`** (`BlazeCore.Wait.Parking`, `lean`): The statement blaze generates from blaze-core's theorem function no_unpark_is_lost holds of its model, the real park and unpark of wait/parking.rs as programs over shared cells: for every schedule of the two as two threads one atomic operation at a time, every choice of the kernel's (a wait returned for nothing, or told its time ran out where the park has a deadline), every reading of a clock that stands still and every deadline or none, no run ends with the unpark returned and the park asleep with no wake coming; where both returned the park took the token and the word is empty, or it left without it (at its deadline, or because its clock stood still) before the token came and the token is still there; a park says its deadline passed only where it has one; and nothing panics.
+
+```lean
+theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
+    blaze_core.wait.parking.no_unpark_is_lost.spec.statement
+```
+
+**`atomics.two_adds_make_two.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function two_adds_make_two holds of its model, a program over shared cells: two SeqCst fetch_add(1) on a new AtomicU32 and then a load give 2 (the first theorem whose model is a Threads.Prog, by evaluation).
+
+```lean
+theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
+```
+
+**`atomics.parks_once.spec.proof`** (`BlazeModel.atomics.parks`, `lean`): The statement blaze generates from the fixture's theorem function parks_once holds of the park and unpark it translates (an AtomicU32 token word: two compare-exchanges, a futex wait loop, a swap and a wake): for every schedule of the two threads and every pick of the world's, no run ends with the unpark returned and the park asleep; where both returned the token was taken and the word is empty, or a timed park left first and the token is still there; and an untimed park returns only with a token. Proved over the program points the translator names (park.at_n, park_loop.loop_0.at_n, unpark.at_1), with no model text copied.
+
+```lean
+theorem atomics.parks_once.spec.proof : atomics.parks_once.spec.statement
+```
+
+**`atomics.adds_until_done.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function adds_until_done holds of its model, a program over shared cells: a compare-exchange loop that returns its Ok value returns what the cell held and leaves the sum.
+
+```lean
+theorem atomics.adds_until_done.spec.proof : atomics.adds_until_done.spec.statement
+```
+
+**`atomics.pokes_count.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function pokes_count holds of its model: a trait's provided methods, translated at their implementor, on a shared word: two pokes of a zeroed word return 1 and leave 2.
+
+```lean
+theorem atomics.pokes_count.spec.proof : atomics.pokes_count.spec.statement
 ```

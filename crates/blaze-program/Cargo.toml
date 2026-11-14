@@ -1,6 +1,6 @@
 [package]
 name = "blaze-program"
-description = "Code as records and programs as manifests (target decisions 1, 5, 6, 8): the instance code record and its key computed before any lowering, the monomorphization walk as a streaming sans-IO state machine, the program manifest and the `Program` machine that turns a demand or a delta into a placement change of bytes proportional to the edit, and the test-result record"
+description = "Code as records and programs as manifests (target decisions 1, 5, 6, 8): the instance code record and its key computed before any lowering, the monomorphization walk as a streaming sans-IO state machine, the program manifest and the `Program` machine that turns a demand or a delta into a placement change of bytes proportional to the edit, and a test's base key and reach"
 publish = false
 
 version.workspace = true
@@ -24,7 +24,7 @@ blaze-keyed.workspace = true
 [dev-dependencies]
 # `Aligned`: core records are opened 16-aligned.
 blaze-format.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

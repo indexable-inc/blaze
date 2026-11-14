@@ -4,7 +4,7 @@
 //!
 //! A small real crate (a struct, consts, an `#[inline]` callee, a pair of `cfg`-chosen
 //! functions, a generic, a static, and a boxed struct whose `Drop` comes and goes, boxed by a
-//! small `alloc` of the fixture's) is rendered from a [`Model`]; Hegel draws a sequence of
+//! small `alloc` of the fixture's) is rendered from a [`Model`]; the tape draws a sequence of
 //! [`Edit`]s, each a change of the model, so every edited source is a valid crate, and whether
 //! allocations may move to the stack (`Policy::heap_to_stack`, `hir-ty-mir`'s `HeapToStack`).
 //! After each edit the one database is changed in place and built again with the memo and
@@ -22,7 +22,7 @@
 //! - the code, statics, symbols, roots, items and digests by `apart` too, a function's code by
 //!   its first differing byte ([`blaze_store_check::bytes`]).
 //!
-//! Every finding of a step is reported at once. Hegel shrinks a failure to the shortest edit
+//! Every finding of a step is reported at once. blaze-sim shrinks a failure to the shortest edit
 //! sequence that still breaks it; save that as a `#[test]` calling [`replay`], named for the
 //! property it breaks.
 //!
@@ -32,7 +32,7 @@
 //! (`edits/identity.rs`). A line added above a function recompiles nothing below it: its code
 //! identity, template key, bytes and line rows are as they were (`edits/shift.rs`).
 //!
-//! `HEGEL_TEST_CASES=<n>` runs either longer.
+//! `BLAZE_SIM_SEEDS=<n>` runs either longer.
 
 #[path = "tests/db.rs"]
 mod db;
@@ -52,7 +52,7 @@ use blaze_codegen::{
 };
 use blaze_query::QueryKey;
 use blaze_v2_proof::{Apart, Stale, Trace, TraceBuilder, apart, kernel, over, under};
-use hegel::{Hegel, Settings, TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 
 use crate::v2::{
@@ -234,21 +234,15 @@ impl Model {
     }
 }
 
-fn edit(tc: &TestCase) -> Edit {
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
-        0 => Edit::AddField(tc.draw(gs::sampled_from(vec![Width::U8, Width::U32, Width::U64]))),
-        1 => Edit::ChangeConst(
-            tc.draw(gs::integers().max_value(1)),
-            tc.draw(gs::integers::<u32>().max_value(99)),
-        ),
-        2 => Edit::ChangeInlined(tc.draw(gs::integers::<u32>().max_value(99))),
+fn edit(tape: &Tape) -> Edit {
+    match tape.int_in(0..=7u8, "edit") {
+        0 => Edit::AddField(*tape.one_of(&[Width::U8, Width::U32, Width::U64], "width")),
+        1 => Edit::ChangeConst(tape.int_in(0..=1, "const"), tape.int_in(0..=99u32, "value")),
+        2 => Edit::ChangeInlined(tape.int_in(0..=99u32, "inlined")),
         3 => Edit::FlipCfg,
-        4 => Edit::Reorder(
-            tc.draw(gs::integers().max_value(ITEMS - 1)),
-            tc.draw(gs::integers().max_value(ITEMS - 1)),
-        ),
-        5 => Edit::Reformat(tc.draw(gs::integers::<u8>().max_value(2))),
-        6 => Edit::EditComment(tc.draw(gs::integers::<u32>().max_value(99))),
+        4 => Edit::Reorder(tape.index(ITEMS, "from"), tape.index(ITEMS, "to")),
+        5 => Edit::Reformat(tape.int_in(0..=2u8, "reformat")),
+        6 => Edit::EditComment(tape.int_in(0..=99u32, "comment")),
         _ => Edit::ToggleDrop,
     }
 }
@@ -589,21 +583,14 @@ fn database(text: &str) -> (TestDB, base_db::FileId) {
     (db, file)
 }
 
-fn edits(tc: &TestCase) -> Vec<Edit> {
-    let count: usize = tc.draw(gs::integers().min_value(1).max_value(4));
-    (0..count).map(|_| edit(tc)).collect()
+fn edits(tape: &Tape) -> Vec<Edit> {
+    let count: usize = tape.int_in(1..=4, "edits");
+    (0..count).map(|_| edit(tape)).collect()
 }
 
-fn incremental_is_clean(tc: &TestCase) {
-    let heap_to_stack = tc.draw(gs::booleans());
-    replay(&edits(tc), heap_to_stack);
-}
-
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
+fn incremental_is_clean(tape: &Tape) {
+    let heap_to_stack = tape.bool("heap to stack");
+    replay(&edits(tape), heap_to_stack);
 }
 
 /// Each edit kind once, in a fixed order, with allocations moving to the stack and without:
@@ -630,5 +617,5 @@ fn each_edit_kind_builds_incrementally_as_clean() {
 
 #[test]
 fn any_edit_sequence_builds_incrementally_as_clean() {
-    run_cases(12, |tc| incremental_is_clean(&tc));
+    blaze_sim::check(Config::cases(12), incremental_is_clean);
 }

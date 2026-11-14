@@ -1,0 +1,8 @@
+{
+ "id": "dst-1113-7",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane dst-1113 R3",
+ "where": "write-only lane briefs (Edit/Write only, no commands)",
+ "what": "A writer lane told to remove a dev-dependency once nothing in the crate needs it has no search tool (no Grep, Bash limited to this one command), so it cannot check that no other file of the crate still uses the crate it removes (here hegeltest from blaze-engine); the brief should give the lane a read-only search or name the files that use it.",
+ "state": "open"
+}

@@ -330,9 +330,9 @@ fn a_record_of_the_layout_before_is_refused_and_never_read_as_empty() {
     assert!(refused.contains("said"), "it names what the bytes lack: {refused}");
     // The domain moves with every layout since (12: what a unit said; 13: written against the
     // build's directories, `portable`; 14: a library built up to the crate boundary lists its
-    // own roots alone, `owned_inputs`), so no key of this blaze names a record of layout 11,
-    // 12 or 13.
-    assert_eq!(compile::RECORD_DOMAIN, "blaze v2 cargo unit record 14");
+    // own roots alone, `owned_inputs`; 15: a test binary's execution table names its jump
+    // table), so no key of this blaze names a record of layout 11 to 14.
+    assert_eq!(compile::RECORD_DOMAIN, "blaze v2 cargo unit record 15");
 }
 
 /// A record under its narrow key keeps the places of its diagnostics' spans, and is drawn

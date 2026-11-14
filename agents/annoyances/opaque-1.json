@@ -1,0 +1,9 @@
+{
+ "id": "opaque-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (lane opaque)",
+ "where": "crates/hir-ty-lean/src/lib.rs accepted(); crates/test-utils/src/minicore.rs",
+ "state": "open",
+ "what": "A fixture missing a minicore flag (Result::is_err sits under region option_methods, from_utf8_unchecked under str_methods, ? needs try and from) is refused only with \"not checked: TypeErrors\", naming no expression or missing item: one VM round per guess.",
+ "fix": "Name the first type error (its expression and the unresolved method or trait) in the refusal, as the borrow checker case already does."
+}

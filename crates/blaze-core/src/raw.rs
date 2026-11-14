@@ -509,18 +509,19 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::Aligned;
 
     /// The aligned view against the safe reference, the bytes themselves.
-    #[hegel::test]
-    fn aligned_bytes_are_the_bytes_copied(tc: TestCase) {
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(299));
-        let aligned = Aligned::copy(&bytes);
-        assert_eq!(aligned.bytes(), &bytes[..]);
-        assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
+    #[test]
+    fn aligned_bytes_are_the_bytes_copied() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let bytes: Vec<u8> = tape.bytes(0..=299, "bytes");
+            let aligned = Aligned::copy(&bytes);
+            assert_eq!(aligned.bytes(), &bytes[..]);
+            assert_eq!(aligned.bytes().as_ptr() as usize % 16, 0);
+        })
     }
 
     #[cfg(unix)]

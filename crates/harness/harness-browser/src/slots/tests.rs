@@ -15,11 +15,12 @@
 //!
 //! Controls: each [`Plant`] must be caught on one of the first [`CONTROL_SEEDS`] seeded plans.
 use super::*;
+use blaze_sim::{Broke, Config, Tape};
 use std::collections::VecDeque;
 
 /// The app's Mach queue limit in the model (harness-mach's is larger; small here so Full is reached).
 const LIMIT: usize = 3;
-const CONTROL_SEEDS: u64 = 2000;
+const CONTROL_SEEDS: u32 = 2000;
 /// Quiet rounds allowed for the run to settle.
 const SETTLE_ROUNDS: usize = 64;
 
@@ -225,46 +226,36 @@ fn run(ops: &[(u8, bool)], plant: Plant) -> Result<(), String> {
     w.settle()
 }
 
-/// A seeded plan (splitmix64), for the controls and replays.
-fn plan_of(seed: u64) -> Vec<(u8, bool)> {
-    let mut s = seed;
-    let mut next = || {
-        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    let n = 10 + next() % 70;
-    (0..n).map(|_| { let r = next(); ((r & 0xff) as u8, (r >> 8) % 8 == 0) }).collect() // alloc: a test plan
+/// A plan drawn from the tape, for the controls and replays: 10 to 79 steps, each an actor uniform over `u8` and,
+/// one time in eight, a send that fails Full.
+fn plan(tape: &Tape) -> Vec<(u8, bool)> {
+    let n = tape.int_in(10..=79usize, "steps");
+    (0..n)
+        .map(|_| tape.span("step", |tape| (tape.int_in(0..=u8::MAX, "actor"), tape.one_in(8, "the send fails Full"))))
+        .collect() // alloc: a test plan
 }
 
-#[hegel::test]
-fn the_host_never_writes_a_slot_the_app_may_sample_and_the_app_ends_on_the_newest_picture(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let ops: Vec<(u8, bool)> = tc.draw(gs::vecs(gs::tuples2(gs::integers(), gs::booleans())).max_size(150));
-    if let Err(e) = run(&ops, Plant::None) {
-        panic!("{e}");
-    }
+#[test]
+fn the_host_never_writes_a_slot_the_app_may_sample_and_the_app_ends_on_the_newest_picture() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ops: Vec<(u8, bool)> = tape.vec(0..=150, "ops", |tape| (tape.int::<u8>("actor"), tape.bool("the send fails Full")));
+        if let Err(e) = run(&ops, Plant::None) {
+            panic!("{e}");
+        }
+    });
 }
 
 #[test]
 fn seeded_plans_pass() {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(e) = run(&plan_of(seed), Plant::None) {
-            panic!("seed {seed}: {e}");
-        }
-    }
+    blaze_sim::check(Config::cases(CONTROL_SEEDS), |tape| run(&plan(tape), Plant::None));
 }
 
+/// Every finding of the oracle (a write the app may sample, a latch the core refuses, a run that does not settle on the
+/// newest picture) counts as the catch, as the seed loop this replaced accepted any.
 fn control(plant: Plant) {
-    for seed in 0..CONTROL_SEEDS {
-        if let Err(e) = run(&plan_of(seed), plant) {
-            eprintln!("Plant::{plant:?} caught at seed {seed}: {e}");
-            return;
-        }
-    }
-    panic!("the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak");
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, plant, "", |tape, plant| {
+        run(&plan(tape), plant).map_err(Broke::Oracle)
+    });
 }
 
 #[test]

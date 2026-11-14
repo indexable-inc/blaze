@@ -42,6 +42,7 @@ pub mod reach;
 pub mod refined;
 pub mod roles;
 mod sealed;
+pub mod trust;
 mod values;
 mod walk;
 

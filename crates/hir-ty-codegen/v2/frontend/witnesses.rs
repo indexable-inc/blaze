@@ -342,31 +342,22 @@ pub(super) fn digest<T: std::fmt::Debug>(value: &T) -> [u8; 16] {
     out
 }
 
-#[expect(
-    blaze::process_static,
-    reason = "a per-thread read buffer taken out for each run, uncapped: it keeps the most reads one run made; the run should own it"
-)]
-thread_local! {
-    /// The read keys of the witnessed run on this thread: taken out for the run and put back
-    /// after, so no borrow of it is held across the run's waits, and a run nested in it (on
-    /// a fiber the thread runs while this one waits) takes its own.
-    // alloc: one buffer a thread, as large as the most reads one run made
-    static READS: std::cell::Cell<Vec<u64>> = const { std::cell::Cell::new(Vec::new()) };
-}
-
 /// Runs `run` witnessed (`blaze_query::db::witnessed`), then `note` with what it made, the
 /// keys it read below `HIGH` and whether those are all of its reads.
+///
+/// The run owns its read buffer. It was a thread-local taken out before the run and put back
+/// after it: `run` can wait, a fiber that waits may go on on another thread, and the put-back
+/// then wrote the first thread's slot from the second (the slot's address is computed once a
+/// function), so two threads held one buffer: a reth cold build ended in SIGSEGV with the heap
+/// corrupted (rule no-wait-across-thread-locals).
 pub(super) fn witnessed<R>(
     db: &Db,
     run: impl FnOnce() -> R,
     note: impl FnOnce(&R, &mut [u64], bool),
 ) -> R {
-    let mut reads = READS.take();
-    reads.clear();
+    let mut reads: Vec<u64, Global> = Vec::new_in(Global);
     let (made, witness) = blaze_query::db::witnessed(db, &mut reads, run);
     note(&made, &mut reads, witness.complete);
-    reads.clear();
-    READS.set(reads);
     made
 }
 
@@ -390,7 +381,7 @@ pub(super) fn of_in(slot: &mut Option<Arc<Witnesses>>, db: &Db) -> Arc<Witnesses
 
 #[cfg(test)]
 mod tests {
-    use hegel::{Hegel, Settings, TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::{Plant, Table};
 
@@ -486,22 +477,22 @@ mod tests {
         Ok(())
     }
 
-    fn steps(tc: &TestCase) -> Vec<Step> {
-        let count: usize = tc.draw(gs::integers().min_value(1).max_value(24));
-        let read = || tc.draw(gs::integers::<u64>().max_value(40));
+    fn steps(tape: &Tape) -> Vec<Step> {
+        let count: usize = tape.int_in(1..=24, "steps");
+        let read = || tape.int_in(0..=40u64, "read");
         (0..count)
-            .map(|_| match tc.draw(gs::integers::<u8>().max_value(2)) {
+            .map(|_| match tape.int_in(0..=2u8, "step") {
                 0 => {
-                    let changed = tc.draw(gs::integers::<u8>().max_value(3));
+                    let changed = tape.int_in(0..=3u8, "changed");
                     Step::Change((0..changed).map(|_| read()).collect())
                 }
                 _ => {
-                    let reads = tc.draw(gs::integers::<u8>().max_value(5));
+                    let reads = tape.int_in(0..=5u8, "reads");
                     Step::Note {
-                        key: tc.draw(gs::integers::<u32>().max_value(7)),
+                        key: tape.int_in(0..=7u32, "key"),
                         reads: (0..reads).map(|_| read()).collect(),
-                        complete: tc.draw(gs::integers::<u8>().max_value(4)) != 0,
-                        value: tc.draw(gs::integers::<u8>().max_value(2)),
+                        complete: tape.int_in(0..=4u8, "complete") != 0,
+                        value: tape.int_in(0..=2u8, "value"),
                     }
                 }
             })
@@ -522,15 +513,7 @@ mod tests {
     /// the read changed).
     #[test]
     fn no_changed_read_is_held_or_left_unnamed() {
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(300);
-        Hegel::new(|tc: TestCase| {
-            if let Err(why) = check(&steps(&tc), Plant::None) {
-                panic!("{why}");
-            }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        blaze_sim::check(Config::cases(300), |tape| check(&steps(tape), Plant::None));
 
         let read = of_first_shard();
         let rerun = [

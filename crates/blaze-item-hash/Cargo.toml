@@ -38,7 +38,7 @@ syntax.workspace = true
 [dev-dependencies]
 blaze-core.workspace = true
 blaze-alloc-count.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

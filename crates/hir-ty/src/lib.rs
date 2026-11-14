@@ -64,6 +64,7 @@ pub mod record;
 pub mod solver_errors;
 mod store_registry;
 pub mod traits;
+pub mod type_of;
 pub mod used_imports;
 pub mod where_const;
 
@@ -138,6 +139,7 @@ pub use lower::{
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
     persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources,
+    written_implied_predicates,
     record::{
         RecordParamDefault, record_defaults_owner, record_param_default, record_param_defaults,
     },

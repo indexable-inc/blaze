@@ -35,6 +35,8 @@ hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure.workspace = true
 hir-ty-borrowck.workspace = true
+# `blaze prove`: theorem functions translated to Lean and their proofs checked (serve/unit/prove.rs).
+hir-ty-lean.workspace = true
 # `blaze doc`'s pages, made in the daemon from the front end (`serve::unit::doc`).
 blaze-doc.workspace = true
 # `blaze fmt`: blaze's formatter, run in the client's process; it asks nothing of the daemon.
@@ -73,6 +75,11 @@ blaze-explore = { workspace = true, optional = true }
 arrow-array.workspace = true
 blaze-inproc.workspace = true
 blaze-intent.workspace = true
+# Astlog rules over the front end: `Request::Query`'s rows and `Edit::Rules`' rewrites. The
+# daemon links its engine only; tree-sitter stays in `tools/astlog`.
+blaze-astlog.workspace = true
+# `--dry-run`'s unified diff of the edits a `--rules` or `--replace` would write.
+similar.workspace = true
 # `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
 # baselines the client checks a run's counts against.
 blaze-lints.workspace = true
@@ -82,6 +89,8 @@ blaze-protocol.workspace = true
 proc-macro-api.workspace = true
 blaze-ui.workspace = true
 blaze-units.workspace = true
+# `blaze audit`, and the git fetcher's check of a tree against its pin (`weak_source_pin`).
+blaze-audit.workspace = true
 blaze-registry.workspace = true
 blaze-report.workspace = true
 # `blaze cache push | pull | status | keys`: the shared cache in an object bucket.
@@ -95,10 +104,6 @@ paths.workspace = true
 syntax.workspace = true
 span.workspace = true
 stdx.workspace = true
-# The toolchain's downloads (`toolchain.rs`): a current-thread runtime, its timers and channels,
-# each a feature tokio has on wasm too, so the seed builds the same.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
-futures-util = { workspace = true, features = ["std"] }
 url.workspace = true
 semver.workspace = true
 tar = { workspace = true, features = ["default"] }
@@ -137,6 +142,8 @@ blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true
 blaze-testsel.workspace = true
+# Test selection's keys, records and snapshot (`serve/unit/test.rs`, `serve/unit/test/image.rs`).
+blaze-keyed.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 # The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).
@@ -164,11 +171,10 @@ blaze-alloc-count.workspace = true
 blaze-codegen-code.workspace = true
 # `Writer::hold_put`, for the gate's tests of a put counted and not yet published.
 blaze-cas = { workspace = true, features = ["test-hooks"] }
-tokio = { workspace = true, features = ["net"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
-# The property test of the no-op lane (`serve/job/noop/tests.rs`).
-hegeltest.workspace = true
+# The property tests and simulations (the no-op lane's `serve/job/noop/tests.rs`, ..).
+blaze-sim.workspace = true
 # The request machine's planted bugs, for the controls of `serve/job/certify/tests.rs`.
 blaze-certify = { workspace = true, features = ["plants"] }
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. For sans-IO code a proof takes the place of the simulation test (decision D38, proofs-for-sans-io.md); what is not proved keeps its simulation test. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -59,6 +59,13 @@ to them rather than repeating them:
 
 ### DST on everything, proofs on small stable cores
 
+Changed on 2026-11-13 (decision D40, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
+sans-IO code the translator reads, a proof Lean has checked in the gate takes the place of
+the simulation test, which is deleted; that doc says what stands for what a proof does not
+cover (a conformance test per world model, and each translated function run as its Lean model
+and as built code). The first two points below are as they were decided on 2026-11-04 and
+hold for code that is not proved.
+
 - **DST stays the requirement.** The testing skill's `dst-not-review` rule holds for all
   concurrent, durable, crash-recovering, billing and data-deleting code, proved or not. A
   proof covers a model of the code. A DST runs the real binary that blaze built.
@@ -67,8 +74,8 @@ to them rather than repeating them:
   code whose shape is still changing wastes the proof, just as `testing` says about unit
   tests.
 - **One kernel and crash model, shared.** The semantics of fsync, rename, mmap and torn
-  writes are written once, as a Lean model. `hegel::sim`'s simulated kernel follows the same
-  model. Two checks keep the model honest:
+  writes are written once, as a Lean model. The three-layer disk that `Sim` is to take
+  ([sim.md](sim.md), "Order") follows the same model. Two checks keep the model honest:
   1. **DST traces checked against the model.** The sim's trace of effects and crash states
      is replayed through the Lean model, compiled to an executable, which must allow every
      state the sim produced.
@@ -116,7 +123,7 @@ proves every clause it proved: two provers are two trust bases and two lowerings
   - a loop's `invariant` as an obligation, and termination from `decreases`: the Lean
     statement of a function with a loop is partial correctness, and `decreases`, `recommends`
     and a loop's `ensures` are refused by name;
-  - a counterexample from the solver's model: contracts part 2's Hegel run is the one source.
+  - a counterexample from the solver's model: contracts part 2's blaze-sim run is the one source.
 
 ## Shared pieces (all phases)
 
@@ -186,14 +193,14 @@ agents as data over the agent API ([roadmap §8](../../plan.md)):
          | Failed { tactic_error }
          | Unknown { heartbeats }
          | Refused { rule, at },     -- the VerifyRefused rule and the construct
-  counterexample?,                   -- from contracts part 2's Hegel run, which goes first
+  counterexample?,                   -- from contracts part 2's blaze-sim run, which goes first
   model: path of the generated Lean }
 ```
 
 - **The goal state is the main value for an agent.** An agent edits the proof file, reruns,
   and sees the goals that are left.
 - **`Open` and `Unknown` never count as success.**
-- **Hegel goes first.** A Hegel counterexample (contracts part 2) is reported before any
+- **The property test goes first.** A blaze-sim counterexample (contracts part 2) is reported before any
   proof is attempted, so nobody spends effort proving a false spec.
 
 ## v0: safe Rust, functional translation
@@ -244,7 +251,7 @@ used, `sort_unstable_by_key`, and `chunk_by`.
 - **Starting point.** It begins from a fork of Aeneas's Lean library (its `Std`, the monad,
   and the `progress` tactic), so SymCrypt-style proof scripts and agent prompts carry over.
 - **Trust.** It is part of the trust base. Each model function carries the pinned library
-  path it stands for, and a Hegel differential test compares the Lean model, compiled, with
+  path it stands for, and a blaze-sim differential test compares the Lean model, compiled, with
   the real std function that blaze built, on drawn inputs.
 
 **Refused.** Each names the item, the rule and the construct (`hir_ty_lean::NotTranslated`
@@ -275,7 +282,7 @@ transitive walk, so a refusal names the shortest call chain to the construct.
   something to prove correct.
 - **An LLBC emitter is a second, small back end** on the same structured-MIR query. It writes
   Charon's JSON at Charon's pinned version, so upstream Aeneas can run on a corpus. Its
-  output is checked two ways: (a) both Lean models run on Hegel-drawn inputs and must agree,
+  output is checked two ways: (a) both Lean models run on blaze-sim-drawn inputs and must agree,
   including on panics; and (b) for small functions, a Lean equivalence theorem between the two.
   This is the translator's test oracle in CI.
 - **It is not the bootstrap.** Charon's LLBC tracks rustc's MIR closely, and blaze's MIR
@@ -285,7 +292,7 @@ transitive walk, so a refusal names the shortest call chain to the construct.
 
 **How the translator is checked.**
 - The LLBC oracle above.
-- Differential execution: blaze-built Rust against the compiled Lean model on Hegel-drawn
+- Differential execution: blaze-built Rust against the compiled Lean model on blaze-sim-drawn
   inputs, for every function in the corpus.
 - Later, v4's soundness proof.
 
@@ -419,7 +426,7 @@ out of fuel is allowed, so a function with a loop gets partial correctness.
   `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof`, which fails to elaborate, naming
   the theorem, when the proof is of anything else.
 
-**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.20.0
+**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.35.0
 (`lean/lean-toolchain`), named by `BLAZE_LEAN_PROVER` (an absolute path to `lean`; no `PATH`,
 no elan; `BLAZE_LEAN` was taken by the code generator), and refused when `--version` says
 another. Proved means Lean accepts the check module and `#print axioms` lists only `propext`,
@@ -980,8 +987,8 @@ generated table's wiring into `diff::RULES` and `simplify::REWRITES`, the fix of
   (`lake build` in `lean/`).
 - `lean/analysis` (package `blazeAnalysis`, library `BlazeDiff`) is for proofs that need real
   analysis. Its `lean-toolchain` equals `lean/`'s. It requires Mathlib at commit
-  `c211948581bde9846a99e32d97a03f0d5307c31e`, which is what Mathlib's tag `v4.20.0` names (the
-  Mathlib built for Lean 4.20.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
+  `56a005855ea17e0b0958f73ec801ae140b0a1679`, which is what Mathlib's tag `v4.35.0` names (the
+  Mathlib built for Lean 4.35.0), and it requires `lean/` by path, so it reuses `Blaze.*` and
   does not copy it: a `powi` exponent is `Blaze.I32`, Rust's `i32` as `Blaze.Scalar` models it.
   Build: in `lean/analysis`, `lake exe cache get` (Mathlib's prebuilt files; Mathlib is never
   compiled here), then `lake build`. `lake-manifest.json` is checked in, so what Mathlib itself
@@ -1170,7 +1177,8 @@ lifetime-logic port is a separate effort of similar size.
 - **Weak memory is needed for the fix.** Proving the fixed protocol with its actual
   `Relaxed`, `Release` and `Acquire` orderings needs step two.
 - **The DST must catch it too.** The same bug is a planted case that the DST must catch
-  under `hegel::sim`'s scheduled atomics. The proof and the DST pin the same invariant.
+  under `blaze-check`'s interleaved atomics today, and in one case that interleaves the threads
+  and crashes a disk once the tape drives both ([sim.md](sim.md), "Order"). The proof and the DST pin the same invariant.
 
 **Refused:** `SeqCst` mixed with weaker accesses to the same location until the RC11 SC
 condition is modelled. Also refused: memory-model questions RC11 leaves open, such as
@@ -1191,7 +1199,8 @@ the code took to write. This is why it is only for small, stable rings, and why 
 **Scope.** A crash-aware concurrent logic, in the style of
 [Perennial](https://github.com/mit-pdos/perennial) (crash framing and logically atomic crash
 specs; [GoJournal, OSDI 2021](https://www.usenix.org/conference/osdi21/presentation/chajed)).
-It sits over the Lean model of the kernel that `hegel::sim` shares: what fsync and
+It sits over the Lean model of the kernel that `Sim`'s three-layer disk
+([sim.md](sim.md), "Order") shares: what fsync and
 `F_FULLFSYNC` make durable, renames made durable before their data, errseq, ENOSPC, and what a
 crash keeps of a dirty mapped page. The code under proof is a sans-IO core on blaze-core's
 effects, so the model's effects are the core's effects.

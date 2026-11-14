@@ -328,6 +328,88 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{} {}: {}\n", paint(GREEN, "new"), found.level.name(), found.message);
             }
         }
+        Response::Proven(proven) => {
+            if let Some(why) = &proven.failed {
+                put!(out, "{} {why}\n", paint(RED, "no proof checked:"));
+            }
+            for record in &proven.records {
+                match record {
+                    blaze_api::ProofRecord::Proved { function, theorem, .. } => {
+                        put!(out, "{} {function}: {theorem}\n", paint(GREEN, "proved"))
+                    }
+                    blaze_api::ProofRecord::Open { function, proof_file, .. } => {
+                        put!(out, "{} {function}: {proof_file}\n", paint(RED, "open"))
+                    }
+                    blaze_api::ProofRecord::Emitted { function, statement, .. } => {
+                        put!(out, "{} {function}: {statement}\n", paint(CYAN, "emitted"))
+                    }
+                    blaze_api::ProofRecord::Refused { function, what, .. } => {
+                        put!(out, "{} {function}: {what}\n", paint(RED, "refused"))
+                    }
+                    blaze_api::ProofRecord::ModelBroken { function, at, .. } => {
+                        put!(out, "{} {function}: its generated Lean model does not build at {at}\n", paint(RED, "model broken"))
+                    }
+                }
+            }
+        }
+        Response::TestsOf(of) => {
+            put!(out, "{} {} tests in {}, {} filtered out\n", status("Tests"), of.tests, of.binary, of.filtered_out);
+            for near in &of.nearest {
+                put!(out, "  {} {}\n", paint(DIM, "near"), near.name);
+            }
+        }
+        Response::Rows(rows) => rows_into(out, rows, color),
+    }
+}
+
+/// A rules query's answer: each finding as `level: message` and its place, then each relation's
+/// name and row count, a row a line, its cells tab-separated.
+fn rows_into(out: &mut String, rows: &blaze_api::query::Rows, color: bool) {
+    use blaze_api::query::{Cell, Severity};
+    let paint = |code, text| Painted(code, text, color);
+    for finding in &rows.findings {
+        let level = match finding.severity {
+            Severity::Error => paint(RED, "error"),
+            Severity::Warning => paint(YELLOW, "warning"),
+        };
+        put!(out, "{level}: {}\n", finding.message);
+        match &finding.at {
+            Some(Cell::Code { path, line: Some(line), .. }) => put!(out, "  --> {path}:{line}\n"),
+            Some(Cell::Code { path, line: None, .. }) => put!(out, "  --> {path}\n"),
+            Some(Cell::Expanded { call, .. }) => put!(out, "  --> {call} (a macro made it)\n"),
+            Some(_) | None => {}
+        }
+    }
+    for relation in &rows.relations {
+        let count = relation.rows.len();
+        put!(out, "{} {} ({}): {count} rows\n", Painted(GREEN, Status("Derived"), color), relation.name, relation.columns.join(", "));
+        for row in &relation.rows {
+            out.push_str("  ");
+            for (at, cell) in row.iter().enumerate() {
+                if at > 0 {
+                    out.push('\t');
+                }
+                match cell {
+                    Cell::Code { path, line: Some(line), text, .. } => {
+                        put!(out, "{path}:{line} {}", one_line(text))
+                    }
+                    Cell::Code { path, line: None, text, .. } => put!(out, "{path} {}", one_line(text)),
+                    Cell::Expanded { call, text } => put!(out, "{call} (made) {}", one_line(text)),
+                    Cell::Def { path } => out.push_str(path),
+                    Cell::Type { text } | Cell::Text(text) => out.push_str(text),
+                    Cell::Int(int) => put!(out, "{int}"),
+                }
+            }
+            out.push('\n');
+        }
+    }
+}
+
+/// Code text on one line: its first line, `…` when there were more.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.split_once('\n') {
+        Some((first, _)) => format!("{}…", first.trim_end()).into(),
+        None => text.into(),
     }
 }
 
@@ -476,15 +558,18 @@ fn test_lines(out: &mut String, result: &TestResult, color: bool) {
         TestOutcome::Passed => (GREEN, "ok"),
         TestOutcome::Failed => (RED, "FAILED"),
         TestOutcome::Ignored => (YELLOW, "ignored"),
-        TestOutcome::Unreached => (DIM, "unreached"),
     };
     let verdict = Painted(code, verdict, color);
-    match &result.cached {
-        None => {
-            put!(out, "test {} ... {verdict} ({} ms)\n", result.name, result.millis);
-        }
-        Some(cached) => {
+    match (&result.cached, &result.not_kept) {
+        (Some(cached), _) => {
             put!(out, "test {} ... {verdict} (cached, {} ms)\n", result.name, cached.millis);
+        }
+        (None, Some(not)) => {
+            let why = Painted(DIM, &not.why, color);
+            put!(out, "test {} ... {verdict} ({} ms, not kept: {why})\n", result.name, result.millis);
+        }
+        (None, None) => {
+            put!(out, "test {} ... {verdict} ({} ms)\n", result.name, result.millis);
         }
     }
     if result.outcome == TestOutcome::Failed {
@@ -792,7 +877,7 @@ fn bytes(out: &mut String, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use blaze_api::{ApiError, Basis, Cached, FactRead, Span};
+    use blaze_api::{ApiError, Basis, Cached, FactRead, NotKept, Span};
     use blaze_ids::ContentId;
     use blaze_query::QueryKind;
 
@@ -1058,6 +1143,7 @@ mod tests {
     #[test]
     fn a_failed_test_shows_its_output_and_a_passed_one_does_not() {
         let mut result = TestResult {
+            ran: None,
             binary: "t".to_owned(),
             name: "parses".to_owned(),
             cached: None,
@@ -1066,6 +1152,7 @@ mod tests {
             millis: 4,
             outside: false,
             executable: 0,
+            not_kept: None,
         };
         let passed = lines(&Response::TestResult(result.clone()), false);
         assert_eq!(passed, "test parses ... ok (4 ms)\n");
@@ -1079,12 +1166,18 @@ mod tests {
             cached: Some(cached),
             millis: 0,
             output: Vec::new(),
-            outcome: TestOutcome::Unreached,
-            ..result
+            outcome: TestOutcome::Passed,
+            ..result.clone()
         };
         assert_eq!(
             lines(&Response::TestResult(kept), false),
             "test parses ... ok (cached, 9 ms)\n"
+        );
+        let not = NotKept { no: "clock".to_owned(), why: "it read the wall clock".to_owned() };
+        let unkept = TestResult { outcome: TestOutcome::Passed, not_kept: Some(not), ..result };
+        assert_eq!(
+            lines(&Response::TestResult(unkept), false),
+            "test parses ... ok (4 ms, not kept: it read the wall clock)\n"
         );
     }
 

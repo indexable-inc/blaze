@@ -17,6 +17,8 @@
 //! - [`replace`]: `check --replace`, a path moved through the front end's name resolution.
 //! - [`reach`]: `reach`, what the checkout's edits since a root reach, building only what its
 //!   front end applies.
+//! - [`prove`]: `prove`, the theorem functions of the crates selected translated to Lean and
+//!   their proofs checked, building only what the front end applies.
 //! - [`baselines`]: `check --baselines`, a run's lint counts held to the checked-in ones.
 //! - [`fix`]: `check --fix`, the check's machine-applicable suggestions made and checked.
 //! - [`clean`]: `clean`, a workspace's build directory under blaze's root removed; `--list`
@@ -40,6 +42,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod doc;
 pub mod doctor;
+pub mod audit;
 mod duckdb;
 pub mod edits;
 pub mod fetch_url;
@@ -57,6 +60,7 @@ pub mod place;
 #[cfg(feature = "native")]
 pub mod pprof;
 pub mod print;
+pub mod prove;
 pub mod reach;
 pub mod replace;
 pub mod resume;
@@ -130,9 +134,11 @@ Commands:
     explain RULE|PACKAGE|VIEW      A rule's long text, the last failure of PACKAGE with all it blocks, or a history view
     why [ITEM] [--all] [--json]    What the last build computed again instead of reusing, and why
     reach [ROOT] [--json]          What the edits since ROOT reach (items, functions, tests), and the root now
+    prove [-p PKG] [--emit] [--subset] [--json]   Each `#[blaze::theorem]` translated to Lean and its proof checked (`BLAZE_LEAN_PROVER`)
     slow [--build N] [--top N] [--json]   What made the last build slow, ranked by the time each fix saves
     diagnostics [--since TOKEN] [-p PKG] [--file F] [--json]   What a check says that is new since TOKEN, and the next token
     doctor [--json]                What is wrong with blaze here: its version, agents, daemon, state, toolchain, project, sandbox
+    audit [pin|fetch] [--json]     Locked packages against RustSec advisories and yanks; every source pinned by a strong digest
     agents install|hook|status|remove [claude|codex|all]   Coding agents told to use blaze, and shown its diagnostics after each edit
     pprof FILE|URL [top|peek|tree|list|flame|diff|export|--http]   Any program's profile (.ixprof or pprof), like `go tool pprof`
     perf record|runs|diff          The performance history of programs blaze built: what changed between runs, and why
@@ -346,9 +352,11 @@ const COMMANDS: &[&str] = &[
     "explain",
     "why",
     "reach",
+    "prove",
     "slow",
     "diagnostics",
     "doctor",
+    "audit",
     "agents",
     "pprof",
     "perf",
@@ -519,8 +527,10 @@ fn command_began(words: Vec<OsString>, began: Option<blaze_thin::handover::Began
         Asked::Explain(words) => observe::explain(words, auto_color()),
         Asked::Why(words) => observe::why(words, auto_color()),
         Asked::Reach(words) => reach::main(words, auto_color()),
+        Asked::Prove(words) => prove::main(words, auto_color()),
         Asked::Slow(words) => observe::slow(words, auto_color()),
         Asked::Doctor(words) => doctor::main(words, auto_color()),
+        Asked::Audit(words) => audit::main(words, auto_color()),
         Asked::Diagnostics(words) => diagnostics::main(words, auto_color()),
         Asked::Agents(words) => agents::main(words, auto_color()),
         #[cfg(feature = "native")]
@@ -566,10 +576,10 @@ fn fmt(words: Vec<OsString>) -> i32 {
     blaze_fmt::command::main(args)
 }
 
-/// The request of a cargo command line, once its place and `Cargo` are known. `test` runs in
-/// the daemon under blaze's `--reached` (the tests the edit reached) and `--ub` (every selected
-/// test, or the reached ones, in the MIR evaluator, nothing compiled); else the CLI runs what the
-/// build placed.
+/// The request of a cargo command line, once its place and `Cargo` are known. `test` runs its
+/// tests in the daemon, which reruns only those whose executed code or reads changed
+/// (`--run-all`: every one asked), and `--ub` runs them in the MIR evaluator, nothing
+/// compiled; `bench`, `--no-run` and `--doc` build, and the CLI runs what the build placed.
 pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let view = ViewRef::Head(cargo.root.clone());
     let targets = place::targets(asked, cargo).map_err(|it| it.to_string())?;
@@ -598,7 +608,10 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
                 view,
                 targets,
                 filter: asked.filter.iter().cloned().collect(),
-                all: !flags.reached,
+                // `--ub` runs every test it selects: its runs are in the MIR evaluator, which
+                // compiles nothing, so no test's reach is known and no kept pass is asked of
+                // (`serve::unit::test::ub_tests` refuses a `--ub` request that is not `all`).
+                all: flags.run_all || flags.ub,
                 args,
                 ub,
             }
@@ -609,9 +622,12 @@ pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     })
 }
 
-/// The tests run in the daemon, which sends their results: blaze's `--reached` and `--ub`.
+/// The tests run in the daemon, which sends their results: every `test` that runs tests other
+/// than doc tests (`--doc` runs only those, `--no-run` none), and `--ub`. The doc tests of a
+/// `test` run in the daemon are run by the CLI after its results ([`test::doc_tests`]).
 fn in_daemon(asked: &Invocation) -> bool {
-    asked.flags.reached || asked.flags.ub
+    let flags = &asked.flags;
+    (asked.command() == Command::Test && !flags.no_run && !flags.doc) || flags.ub
 }
 
 /// Everything of the machine the request needs: where it runs and what it sends.
@@ -708,8 +724,13 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     if let Err(what) = found {
         return refused(&what, color);
     }
-    if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
-        return replaced(&place, &asked.flags.replace, color);
+    if asked.command() == Command::Check && let Some(file) = &asked.flags.query {
+        return queried(&place, file, format.json(), color);
+    }
+    if asked.command() == Command::Check
+        && (!asked.flags.replace.is_empty() || asked.flags.rules.is_some())
+    {
+        return replaced(&place, &asked.flags, color);
     }
     let pinned = match asked.command() == Command::Check && asked.flags.fix {
         true => match fix::pin(&mut request) {
@@ -891,11 +912,54 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     }
 }
 
-/// `check --replace`'s edits made in the checkout: its exit code.
-fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
-    let done = replace::edits(pairs).and_then(|edits| replace::replace(&place.root, edits));
+/// `check --query FILE`: what the rules derive and find, on stdout (one JSON line of
+/// [`blaze_api::Response::Rows`] with `--message-format json`); its exit code, failed when a
+/// lint of severity `error` found anything.
+fn queried(place: &Place, file: &str, json: bool, color: bool) -> i32 {
+    let done = replace::rules(&place.cwd, file).and_then(|rules| replace::query(&place.root, rules));
+    let rows = match done {
+        Ok(rows) => rows,
+        Err(what) => {
+            blaze_report::err!("{}", say::error(&what, color));
+            return Exit::Failed.code();
+        }
+    };
+    let failed = rows.findings.iter().any(|it| it.severity == blaze_api::query::Severity::Error);
+    let response = blaze_api::Response::Rows(rows);
+    let shown = match json {
+        true => serde_json::to_string(&response).map(|mut it| {
+            it.push('\n');
+            it
+        }),
+        false => Ok(blaze_ui::api::lines(&response, color && io::stdout().is_terminal())),
+    };
+    let written = shown
+        .map_err(io::Error::other)
+        .and_then(|it| io::stdout().lock().write_all(it.as_bytes()));
+    match (written, failed) {
+        (Ok(()), false) => 0,
+        // stdout closed under it, or an error-severity finding.
+        (Ok(()), true) | (Err(_), _) => Exit::Failed.code(),
+    }
+}
+
+/// `check --replace` and `--rules`' edits made in the checkout, or with `--dry-run` their
+/// diff on stdout: its exit code.
+fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
+    let done = replace::edits(&flags.replace).and_then(|mut edits| {
+        if let Some(file) = &flags.rules {
+            edits.push(blaze_api::Edit::Rules { rules: replace::rules(&place.cwd, file)? });
+        }
+        replace::replace(&place.root, edits, flags.dry_run)
+    });
     match done {
-        Ok(edited) => {
+        Ok(replace::Made { diff: Some(diff), edited }) => {
+            let written = io::stdout().lock().write_all(diff.as_bytes());
+            let rest = format!("{} item(s), nothing written", edited.items.len());
+            blaze_report::err!("{}", say::status("Would edit", &rest, color));
+            if written.is_ok() { 0 } else { Exit::Failed.code() }
+        }
+        Ok(replace::Made { edited, diff: None }) => {
             let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
             files.sort_unstable();
             files.dedup();
@@ -948,8 +1012,10 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
         blaze_core::home::user().ok().and_then(|it| it.into_os_string().into_string().ok()),
         observe::last_failure(),
     );
-    // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
+    // alloc: once a request, for the daemon's tests; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
+    // What the daemon said of each test executable: what a refusal of a run of none says.
+    let mut tests_of = Vec::new_in(std::alloc::Global);
     let mut unwritten = None;
     let mut docs = doc::Docs::default();
     let mut counted = asked.flags.baselines.is_some().then(baselines::Counted::default);
@@ -994,8 +1060,12 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
             }
             ResponseRef::TestResult(result) => {
                 // alloc: a result held to the end, where libtest's format groups them by
-                // executable; only `--reached` and `--ub` have them.
+                // executable; only the daemon's tests have them.
                 results.push(result.into_owned());
+                Ok(())
+            }
+            ResponseRef::TestsOf(of) => {
+                tests_of.push(of);
                 Ok(())
             }
             response => printer.on(response),
@@ -1153,20 +1223,29 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
         }
         Command::Test | Command::Bench if in_daemon(asked) => {
             let (out, mut err) = printer.streams();
-            let passed = test::reached(&results, speaking, &mut *out, &mut err)?;
-            let code = if passed && ok { 0 } else { Exit::Failed.code() };
-            // The daemon ran them: the names it sent are the tests this run knows exist.
-            let names = || test::Names {
-                names: results.iter().map(|it| it.name.clone()).collect(), // clone: a refusal's help, once
-                unlisted: Vec::new(),                                      // alloc: none
-            };
+            let passed = test::from_daemon(&results, speaking, &mut *out, &mut err)?;
+            let mut code = if passed && ok { 0 } else { Exit::Failed.code() };
+            let mut tally = test::tally_of(&results, &tests_of);
+            // The doc tests, which the daemon does not run, after its results as cargo runs
+            // them after the test executables; `--fail-fast` stops before them once one failed,
+            // and `--ub` compiled nothing to run.
+            if !asked.flags.ub && !(asked.flags.fail_fast && code != 0) {
+                let docs =
+                    test::doc_tests(asked, &artifacts, members, speaking, &mut err, programs, &mut tally)?;
+                if code == 0 {
+                    code = docs;
+                }
+            }
+            // The daemon ran them: what it said of each executable is what exists, and the
+            // nearest names to a filter that matched none. The doc tests' own listing, when
+            // they ran, is not asked: a refusal of a run of none is of the executables'.
             let code = test::conclude(
                 &test::Selection::of(asked),
-                &test::tally_of(&results),
+                &tally,
                 code,
                 ok,
                 started.elapsed(),
-                names,
+                || test::Names::of_daemon(&tests_of),
                 speaking,
                 &mut *out,
                 &mut err,
@@ -1196,7 +1275,7 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                 code,
                 ok,
                 began.elapsed(),
-                || test::names_of(&artifacts, programs),
+                || test::names_of(&artifacts, programs, &test::Selection::of(asked).filters),
                 speaking,
                 &mut *out,
                 &mut err,

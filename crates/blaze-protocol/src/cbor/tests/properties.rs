@@ -2,94 +2,91 @@
 //! every shape writes the reference's bytes, which check and read as the reference reads them,
 //! and so do those bytes cut, flipped, grown and swapped.
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::{NAMES, Shape, same_reading};
 use crate::cbor::{check, reference, to_vec};
 
-fn text(tc: &TestCase) -> String {
-    tc.draw(gs::text().alphabet("aZ0 \u{e9}\u{6c34}\u{1f525}").max_size(11))
+fn text(tape: &Tape) -> String {
+    tape.text_from("aZ0 \u{e9}\u{6c34}\u{1f525}", 0..=11, "text")
 }
 
-fn name(tc: &TestCase) -> usize {
-    tc.draw(gs::integers().max_value(NAMES.len() - 1))
+fn name(tape: &Tape) -> usize {
+    tape.index(NAMES.len(), "name")
 }
 
 /// Mostly a few, now and then past CBOR's one-byte lengths.
-fn count(tc: &TestCase) -> usize {
-    if tc.draw(gs::weighted_booleans(0.025)) {
-        tc.draw(gs::integers().min_value(24).max_value(323))
+fn count(tape: &Tape) -> usize {
+    if tape.chance(0.025, "a long count") {
+        tape.int_in(24usize..=323, "long count")
     } else {
-        tc.draw(gs::integers().max_value(5))
+        tape.int_in(0usize..=5, "count")
     }
 }
 
-fn fields(tc: &TestCase, depth: u32) -> Vec<(usize, Shape)> {
-    let len: usize = tc.draw(gs::integers().max_value(6));
-    (0..len).map(|_| (name(tc), shape(tc, depth - 1))).collect()
+fn fields(tape: &Tape, depth: u32) -> Vec<(usize, Shape)> {
+    let len = tape.int_in(0usize..=6, "fields");
+    (0..len).map(|_| (name(tape), shape(tape, depth - 1))).collect()
 }
 
-fn shape(tc: &TestCase, depth: u32) -> Shape {
-    let leaf = depth == 0 || tc.draw(gs::weighted_booleans(1.0 / 3.0));
-    let kinds =
-        if leaf { gs::integers().max_value(7) } else { gs::integers().min_value(8).max_value(13) };
-    let kind: u8 = tc.draw(kinds);
+fn shape(tape: &Tape, depth: u32) -> Shape {
+    let leaf = depth == 0 || tape.chance(1.0 / 3.0, "leaf");
+    let kind: u8 = if leaf { tape.int_in(0u8..=7, "leaf kind") } else { tape.int_in(8u8..=13, "kind") };
     match kind {
-        0 => Shape::Unsigned(tc.draw(gs::integers())),
-        1 => Shape::Signed(tc.draw(gs::integers())),
-        2 => Shape::Wide(tc.draw(gs::integers())),
-        3 => Shape::Float(tc.draw(gs::floats())),
-        4 => Shape::Bool(tc.draw(gs::booleans())),
+        0 => Shape::Unsigned(tape.int::<u64>("unsigned")),
+        1 => Shape::Signed(tape.int::<i64>("signed")),
+        2 => Shape::Wide(tape.i128("wide")),
+        3 => Shape::Float(tape.f64("float")),
+        4 => Shape::Bool(tape.bool("bool")),
         5 => Shape::Null,
-        6 => Shape::Text(text(tc)),
-        7 => Shape::Bytes(tc.draw(gs::binary().max_size(39))),
+        6 => Shape::Text(text(tape)),
+        7 => Shape::Bytes(tape.bytes(0..=39, "bytes")),
         8 => {
-            let items = (0..count(tc)).map(|_| shape(tc, depth - 1)).collect();
-            Shape::Seq { said: tc.draw(gs::booleans()), items }
+            let items = (0..count(tape)).map(|_| shape(tape, depth - 1)).collect();
+            Shape::Seq { said: tape.bool("said"), items }
         }
         9 => {
-            let len: usize = tc.draw(gs::integers().max_value(4));
-            Shape::Tuple((0..len).map(|_| shape(tc, depth - 1)).collect())
+            let len = tape.int_in(0usize..=4, "tuple len");
+            Shape::Tuple((0..len).map(|_| shape(tape, depth - 1)).collect())
         }
         10 => {
-            let n = count(tc);
-            let said = match tc.draw(gs::integers::<u8>().max_value(2)) {
+            let n = count(tape);
+            let said = match tape.int_in(0u8..=2, "said") {
                 0 => None,
                 1 => Some(n),
-                _ => Some(tc.draw(gs::integers().max_value(29))),
+                _ => Some(tape.int_in(0usize..=29, "said len")),
             };
-            let entries = (0..n).map(|_| (shape(tc, 0), shape(tc, depth - 1))).collect();
+            let entries = (0..n).map(|_| (shape(tape, 0), shape(tape, depth - 1))).collect();
             Shape::Map { said, entries }
         }
-        11 => Shape::Struct(fields(tc, depth)),
+        11 => Shape::Struct(fields(tape, depth)),
         12 => {
-            let name = name(tc);
-            let of = tc.draw(gs::booleans()).then(|| Box::new(shape(tc, depth - 1)));
+            let name = name(tape);
+            let of = tape.bool("variant has a value").then(|| Box::new(shape(tape, depth - 1)));
             Shape::Variant { name, of }
         }
-        _ => Shape::StructVariant { name: name(tc), fields: fields(tc, depth) },
+        _ => Shape::StructVariant { name: name(tape), fields: fields(tape, depth) },
     }
 }
 
-fn mutate(tc: &TestCase, bytes: &mut Vec<u8>) {
-    for _ in 0..=tc.draw(gs::integers::<u8>().max_value(3)) {
-        match tc.draw(gs::integers::<u8>().max_value(4)) {
+fn mutate(tape: &Tape, bytes: &mut Vec<u8>) {
+    for _ in 0..=tape.int_in(0u8..=3, "mutations") {
+        match tape.int_in(0u8..=4, "mutation") {
             0 if !bytes.is_empty() => {
-                let at = tc.draw(gs::integers().max_value(bytes.len() - 1));
-                bytes[at] ^= 1 << tc.draw(gs::integers::<u8>().max_value(7));
+                let at = tape.index(bytes.len(), "flip at");
+                bytes[at] ^= 1 << tape.int_in(0u8..=7, "flip bit");
             }
             1 if !bytes.is_empty() => {
-                let at = tc.draw(gs::integers().max_value(bytes.len() - 1));
-                bytes[at] = tc.draw(gs::integers());
+                let at = tape.index(bytes.len(), "set at");
+                bytes[at] = tape.int::<u8>("set to");
             }
-            2 => bytes.truncate(tc.draw(gs::integers().max_value(bytes.len()))),
+            2 => bytes.truncate(tape.int_in(0usize..=bytes.len(), "cut to")),
             3 => {
-                let at = tc.draw(gs::integers().max_value(bytes.len()));
-                bytes.insert(at, tc.draw(gs::integers()));
+                let at = tape.int_in(0usize..=bytes.len(), "insert at");
+                bytes.insert(at, tape.int::<u8>("insert"));
             }
             _ if bytes.len() >= 2 => {
-                let at = tc.draw(gs::integers().max_value(bytes.len() - 2));
+                let at = tape.index(bytes.len() - 1, "swap at");
                 bytes.swap(at, at + 1);
             }
             _ => bytes.push(0),
@@ -97,27 +94,20 @@ fn mutate(tc: &TestCase, bytes: &mut Vec<u8>) {
     }
 }
 
-fn writes_and_reads_as_the_reference_does(tc: &TestCase) {
-    let shape = shape(tc, 4);
+fn writes_and_reads_as_the_reference_does(tape: &Tape) {
+    let shape = shape(tape, 4);
     let new = to_vec(&shape);
     assert_eq!(new, reference::to_vec(&shape), "{shape:?}");
     if let Ok(mut bytes) = new {
         check(&bytes).unwrap();
         same_reading(&bytes);
-        mutate(tc, &mut bytes);
+        mutate(tape, &mut bytes);
         same_reading(&bytes);
     }
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn every_shape_writes_and_reads_as_the_reference_does() {
-    run_cases(500, |tc| writes_and_reads_as_the_reference_does(&tc));
+    blaze_sim::check(Config::cases(500), writes_and_reads_as_the_reference_does);
 }

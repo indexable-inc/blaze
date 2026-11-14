@@ -66,29 +66,29 @@ fn v3(c: [f32; 3]) -> Vec3 {
 }
 
 /// The port's HDR and sRGB curves are hdr.rs's: the same operations in the same order, so the same floats.
-#[hegel::test]
-fn port_curves_are_hdrs(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let f = |lo: f32, hi: f32| gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false);
-    let h = tc.draw(f(0.0, 64.0));
-    let peak = tc.draw(gs::sampled_from(vec![0.0f32, f32::INFINITY, 0.5, 1.0, 4.0, 49.26, 200.0]));
-    let x = tc.draw(f(-4.0, 400.0));
-    let rgb = [x, tc.draw(f(-4.0, 400.0)), tc.draw(f(-4.0, 400.0))];
-    let e = [tc.draw(f(-0.5, 1.5)), tc.draw(f(-0.5, 1.5)), tc.draw(f(-0.5, 1.5))];
+#[test]
+fn port_curves_are_hdrs() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let h = tape.f32_in(0.0..=64.0, "h");
+        let peak = *tape.one_of(&[0.0f32, f32::INFINITY, 0.5, 1.0, 4.0, 49.26, 200.0], "peak");
+        let x = tape.f32_in(-4.0..=400.0, "x");
+        let rgb = [x, tape.f32_in(-4.0..=400.0, "g"), tape.f32_in(-4.0..=400.0, "b")];
+        let e = [tape.f32_in(-0.5..=1.5, "e.r"), tape.f32_in(-0.5..=1.5, "e.g"), tape.f32_in(-0.5..=1.5, "e.b")];
 
-    assert_eq!(port::tone_map(x, peak, h), hdr::tone_map(x, peak, h), "tone_map({x}, {peak}, {h})");
-    assert_eq!(port::tone_map_rgb(v3(rgb), peak, h), v3(hdr::tone_map_rgb(rgb, peak, h)), "tone_map_rgb({rgb:?})");
-    assert_eq!(port::hdr_knee(h), hdr::knee(h));
-    assert_eq!(port::pq_linear(v3(e)), v3(e.map(hdr::pq_linear)), "pq_linear({e:?})");
-    assert_eq!(port::hlg_scene(v3(e)), v3(e.map(hdr::hlg_scene)), "hlg_scene({e:?})");
-    assert_eq!(port::hlg_linear(v3(e)), v3(hdr::hlg_linear(e)), "hlg_linear({e:?})");
-    assert_eq!(port::bt2020_to_709(v3(rgb)), v3(hdr::bt2020_to_709(rgb)), "bt2020_to_709({rgb:?})");
-    // sign() where hdr.rs has copysign: the same for every finite value, zeros equal as floats.
-    assert_eq!(port::srgb_encode_ext(v3(rgb)), v3(rgb.map(hdr::srgb_encode_ext)), "srgb_encode_ext({rgb:?})");
-    assert_eq!(port::srgb_decode_ext(v3(e)), v3(e.map(hdr::srgb_decode_ext)), "srgb_decode_ext({e:?})");
+        assert_eq!(port::tone_map(x, peak, h), hdr::tone_map(x, peak, h), "tone_map({x}, {peak}, {h})");
+        assert_eq!(port::tone_map_rgb(v3(rgb), peak, h), v3(hdr::tone_map_rgb(rgb, peak, h)), "tone_map_rgb({rgb:?})");
+        assert_eq!(port::hdr_knee(h), hdr::knee(h));
+        assert_eq!(port::pq_linear(v3(e)), v3(e.map(hdr::pq_linear)), "pq_linear({e:?})");
+        assert_eq!(port::hlg_scene(v3(e)), v3(e.map(hdr::hlg_scene)), "hlg_scene({e:?})");
+        assert_eq!(port::hlg_linear(v3(e)), v3(hdr::hlg_linear(e)), "hlg_linear({e:?})");
+        assert_eq!(port::bt2020_to_709(v3(rgb)), v3(hdr::bt2020_to_709(rgb)), "bt2020_to_709({rgb:?})");
+        // sign() where hdr.rs has copysign: the same for every finite value, zeros equal as floats.
+        assert_eq!(port::srgb_encode_ext(v3(rgb)), v3(rgb.map(hdr::srgb_encode_ext)), "srgb_encode_ext({rgb:?})");
+        assert_eq!(port::srgb_decode_ext(v3(e)), v3(e.map(hdr::srgb_decode_ext)), "srgb_decode_ext({e:?})");
 
-    let frame = pack::Frame { textfx: [h, 0.0], ..pack::Frame::default() };
-    let ours = port::Frame { textfx: vec2(h, 0.0), ..port::Frame::default() };
-    assert_eq!(port::frame_headroom(&ours), frame.headroom());
-    assert_eq!((port::HDR_WHITE_NITS, port::HDR_HLG_PEAK_NITS, port::HDR_KNEE), (hdr::WHITE_NITS, hdr::HLG_PEAK_NITS, hdr::KNEE));
+        let frame = pack::Frame { textfx: [h, 0.0], ..pack::Frame::default() };
+        let ours = port::Frame { textfx: vec2(h, 0.0), ..port::Frame::default() };
+        assert_eq!(port::frame_headroom(&ours), frame.headroom());
+        assert_eq!((port::HDR_WHITE_NITS, port::HDR_HLG_PEAK_NITS, port::HDR_KNEE), (hdr::WHITE_NITS, hdr::HLG_PEAK_NITS, hdr::KNEE));
+    });
 }

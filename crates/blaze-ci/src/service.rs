@@ -986,7 +986,8 @@ struct Report {
     passed: usize,
     failed: usize,
     ignored: usize,
-    unreached: usize,
+    /// Of `passed`, the ones not run whose kept pass stood.
+    cached: usize,
     /// Each failed test as `\n<failure>\n`.
     failures: String,
     failures_count: usize,
@@ -1023,9 +1024,11 @@ impl Report {
                 Level::Note | Level::Help | Level::FailureNote => {}
             },
             Response::TestResult(test) => match test.outcome {
-                TestOutcome::Passed => self.passed += 1,
+                TestOutcome::Passed => {
+                    self.passed += 1;
+                    self.cached += usize::from(test.cached.is_some());
+                }
                 TestOutcome::Ignored => self.ignored += 1,
-                TestOutcome::Unreached => self.unreached += 1,
                 TestOutcome::Failed => {
                     self.failed += 1;
                     if self.failures_count < MOST_LISTED {
@@ -1041,6 +1044,7 @@ impl Report {
             | Response::UnitEnded(_)
             | Response::UnitBegan(_)
             | Response::TestReady(_)
+            | Response::TestsOf(_)
             | Response::Fetched { .. }
             | Response::BuildScript(_)
             | Response::Unchecked(_)
@@ -1096,12 +1100,13 @@ impl Report {
         );
         match kind {
             CheckKind::Test => {
-                let _ = write!(
-                    text,
-                    "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
-                     last results stand)",
-                    self.passed, self.failed, self.ignored, self.unreached
-                );
+                // The cached clause only when some pass is a kept one: a run that kept none
+                // reads as libtest's counts alone.
+                let _ = write!(text, "; tests: {} passed", self.passed);
+                if self.cached > 0 {
+                    let _ = write!(text, " ({} cached: their kept passes stand)", self.cached);
+                }
+                let _ = write!(text, ", {} failed, {} ignored", self.failed, self.ignored);
             }
             CheckKind::Build => {
                 let _ = write!(text, "; {} artifacts built", self.artifacts);

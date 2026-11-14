@@ -522,15 +522,14 @@ fn delta_differs(base: Option<&Built>, now: &Built) -> Option<String> {
 /// describes); up to two
 /// statics some function names, one maybe pointing to a function; a body per function for the
 /// recursion limit to count; maybe a call through a `dyn`. And how it is built.
-fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
-    use hegel::generators as gs;
-    let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(8));
-    let among = || gs::integers::<u32>().min_value(1).max_value(count);
+fn drawn(tape: &blaze_sim::Tape) -> (Program, Run) {
+    let count: u32 = tape.int_in(3..=8u32, "functions");
+    let among = |label: &'static str| tape.int_in(1..=count, label);
     let mut program = Program::default();
     for id in 1..=count {
         let mut calls: Vec<u32> = Vec::new();
         for callee in id + 1..=count {
-            if callee == id + 1 || tc.draw(gs::integers::<u8>().max_value(2)) == 0 {
+            if callee == id + 1 || tape.int_in(0..=2u8, "skips a call") == 0 {
                 calls.push(callee);
             }
         }
@@ -540,7 +539,7 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
             program.functions.get_mut(&1).expect("just made").symbol = Some("main".to_owned());
             continue;
         }
-        let kind = tc.draw(gs::integers::<u8>().max_value(5));
+        let kind = tape.int_in(0..=5u8, "kind");
         if kind == 3 && id > 2 {
             // One code with the function before it, and its calls: one key of two describes,
             // as two instances of a generic whose code reads their arguments alike.
@@ -569,22 +568,23 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
             _ => {}
         }
     }
-    let statics: u32 = tc.draw(gs::integers::<u32>().max_value(2));
+    let statics: u32 = tape.int_in(0..=2u32, "statics");
     for id in 1..=statics {
         program.statics.insert(id, (id as u8, None));
-        let names = tc.draw(among());
+        let names = among("named by");
         program.functions.get_mut(&names).expect("drawn among them").statics.push(id);
-        if tc.draw(gs::booleans()) {
-            program.static_calls.insert(id, vec![tc.draw(among())]);
+        if tape.bool("points to a function") {
+            program.static_calls.insert(id, vec![among("points to")]);
         }
     }
-    if tc.draw(gs::booleans()) {
-        program.dyn_sites.insert(tc.draw(among()), tc.draw(among()));
+    if tape.bool("a dyn site") {
+        let site = among("dyn caller");
+        program.dyn_sites.insert(site, among("dyn callee"));
     }
     let run = Run {
-        live: tc.draw(gs::booleans()),
-        static_root: statics > 0 && tc.draw(gs::booleans()),
-        check: tc.draw(gs::booleans()).then(|| tc.draw(among())),
+        live: tape.bool("live"),
+        static_root: statics > 0 && tape.bool("static root"),
+        check: tape.bool("check").then(|| among("checked")),
     };
     (program, run)
 }
@@ -599,20 +599,21 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Run) {
 /// asks only of what the front end names as changed since the kept walk's view
 /// (`Frontend::changed_since`) and of the functions asked each build, whose body edits the
 /// front end names nowhere: so the walk patched from the named set is the whole walk's.
-#[hegel::test(test_cases = 64)]
-fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let (program, run) = drawn(&tc);
-    let count: usize = tc.draw(gs::integers::<usize>().max_value(8));
-    let mut edits = Vec::with_capacity(count);
-    for _ in 0..count {
-        let edit = EDITS[tc.draw(gs::integers::<usize>().max_value(EDITS.len() - 1))];
-        let picks = (tc.draw(gs::integers::<u32>()), tc.draw(gs::integers::<u32>()));
-        edits.push((edit, picks));
-    }
-    if let Some(found) = first_difference(program, run, &edits, None) {
-        panic!("{found}");
-    }
+#[test]
+fn a_walk_over_kept_describes_builds_what_a_fresh_walk_builds() {
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| {
+        let (program, run) = drawn(tape);
+        let count: usize = tape.int_in(0..=8usize, "edits");
+        let mut edits = Vec::with_capacity(count);
+        for _ in 0..count {
+            let edit = EDITS[tape.index(EDITS.len(), "edit")];
+            let picks = (tape.int::<u32>("first pick"), tape.int::<u32>("second pick"));
+            edits.push((edit, picks));
+        }
+        if let Some(found) = first_difference(program, run, &edits, None) {
+            panic!("{found}");
+        }
+    })
 }
 
 const WHOLE: Run = Run { live: false, static_root: false, check: None };

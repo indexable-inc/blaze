@@ -1,0 +1,19 @@
+{
+ "id": "proofs-1113-9",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113; found by the lane asksproof (claude-opus-5-5)",
+ "where": "crates/blaze-core/src/world/asks.rs, the theorem function a_synced_append_survives_a_crash as first stated",
+ "what": "The theorem was false: it checked `disk.small()` on the starting disk only, then appended `bytes` of any length and read the file; with a file of one durable byte and `bytes` of `usize::MAX` the read is a `Vec` of more than `usize::MAX` bytes: the model fails at every fuel and the Rust function panics. 4,000 drawn runs (appends of 1 to 5 bytes) did not find it; the proof lane did before proving anything, and proved the negation in Lean.",
+ "cost": "about 25 minutes of a proof lane; nothing landed",
+ "cause": "a bound was checked before the step that can leave it, not after",
+ "whys": [
+  "the theorem function reads a file after an append whose size nothing bounds",
+  "the bounds check sat at the top, where the other disk theorems have it, and those change nothing before they read",
+  "a drawn test draws small inputs, so a statement that is false only at the edge of a machine integer passes every run"
+ ],
+ "class": "a statement that is false only at the bounds of a machine type; the second in this lane (the first: a file`s barriers, barrier-1)",
+ "prevention": "what found both is a proof attempt, which is the prevention the lane is building; for statements not yet proved, the run-where-stated test should draw the edges of every argument`s type too (a `Vec` argument of a length near `usize::MAX` cannot be built, so the edge has to be drawn on the model: evaluate the Lean model on boundary lengths, not built)",
+ "workaround": "",
+ "fix": "the bounds are checked again after the first append, before the read",
+ "state": "fixed"
+}

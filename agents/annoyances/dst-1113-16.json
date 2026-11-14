@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-16",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "blaze-vm, ending a check daemon left behind by a command /root/loop.sh stopped at 600 s",
+ "what": "Two things in one. (1) A `blaze check` that loop.sh stops at its 600 s limit leaves its daemon running (`/root/inst/<branch>/blaze-engine serve`, here 657 s old at 29% CPU), because the `\"$BLAZE\" stop` after it in the same command never runs. (2) Ending it with `kill -9 $(pgrep -f \"/root/inst/<branch>/blaze-engine serve\")` inside `ix shell .. bash -c '..'` killed the shell that ran it: the pattern is in that shell's own command line, so the rest of the command (a `cat` of the smoke quote) printed nothing and I verified an empty quote before seeing why.",
+ "cost": "one wrong `no blaze-smoke 1 line` verdict and a rerun; a daemon that ran ten minutes on a loaded machine",
+ "cause": "loop.sh's timeout kills the command, not what the command started; `pgrep -f` matches its caller",
+ "whys": "a daemon is started as a side effect of a client command and outlives it by design; the queue script bounds the command only; ending a daemon is by a pattern over command lines, which the ending command itself contains",
+ "class": "a process a bounded command started that the bound does not end",
+ "prevention": "loop.sh ends the branch's daemon itself when its command returns or is stopped (it already ends the old one before installing: the same three lines, after the command); until then, match with a bracketed first letter (`[b]laze-engine`) or by `BLAZE_HOME`'s pid file. Not built.",
+ "workaround": "`pgrep -f 'inst/<branch>/[b]laze-engine'`",
+ "state": "open"
+}

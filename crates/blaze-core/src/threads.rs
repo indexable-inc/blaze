@@ -1343,6 +1343,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         | Effect::SendTo { .. }
         | Effect::RecvFrom { .. }
         | Effect::Unbind { .. }
+        | Effect::Resolve { .. }
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
@@ -2200,6 +2201,7 @@ impl Driver for Threads {
                 | Effect::SendTo { .. }
                 | Effect::RecvFrom { .. }
                 | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }) => {
                     let tag = effect.tag();

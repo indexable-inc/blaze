@@ -8,6 +8,7 @@ members = [
     "tools/astlog/cli",
     "tools/astlog/core",
     "tools/astlog/edit-applier",
+    "tools/astlog/engine",
     "tools/astlog/error-chain",
     "tools/astlog/langs",
 ]
@@ -22,10 +23,6 @@ exclude = [
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
-    # Hegel, built only as a dependency of blaze's tests (vendor/hegeltest/SOURCE.md).
-    "vendor/hegeltest",
-    "vendor/hegeltest-c",
-    "vendor/hegeltest-macros",
     # Patched below; its own tests need dev-dependencies blaze has no use for.
     "vendor/sonic-rs",
     # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
@@ -47,10 +44,16 @@ exclude = [
     # workspace for its tests, whose dev-dependencies stay out of blaze's lock (vendor/*/PATCHES.md).
     "vendor/quinn-proto",
     "vendor/ra-ap-rustc_pattern_analysis",
+    # Patched below with a ticket's bytes; its tests and benches need dev-dependencies blaze has
+    # no use for (vendor/rustls/SOURCE.md).
+    "vendor/rustls",
 ]
 resolver = "2"
 
 [workspace.metadata.blaze]
+# `sandboxed-tests` sandboxes every member's tests on macOS, where tests are sandboxed only on
+# an opt-in (docs/cargo.md, "Sandboxed tests"), and on the stage 0 at `version` below, which
+# predates sandboxed tests by default. On Linux a blaze since notes that it does nothing there.
 experimental = ["sandboxed-tests"]
 version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
@@ -473,6 +476,9 @@ corosensei = { path = "vendor/corosensei" }
 # (docs/v2/plan/design/http3-sans-io.md).
 quinn-proto = { path = "vendor/quinn-proto" }
 ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
+# 0.23.46 plus a TLS 1.3 client ticket as bytes, so a process resumes (and sends 0-RTT) with a
+# ticket an earlier one got: the remote cache's HTTP/3 reads (vendor/rustls/SOURCE.md).
+rustls = { path = "vendor/rustls" }
 
 [workspace.dependencies]
 # local crates
@@ -558,16 +564,22 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-expansion = { path = "crates/blaze-expansion" }
 blaze-ext = { path = "crates/blaze-ext" }
 blaze-ext-host = { path = "crates/blaze-ext-host" }
+# `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
+blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
-# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+# blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
 # Lint findings as records, their three-class scheduler, wait modes and the adoption ladder.
 blaze-findings = { path = "crates/blaze-findings" }
+# The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
+# and the process that performs the driver's effects.
+blaze-unitkey = { path = "crates/blaze-unitkey" }
+blaze-host = { path = "crates/blaze-host" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
@@ -577,6 +589,8 @@ blaze-remote = { path = "crates/blaze-remote" }
 blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
+blaze-sim = { path = "crates/blaze-sim" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-sqlite = { path = "crates/blaze-sqlite" }
@@ -603,6 +617,7 @@ blaze-program = { path = "crates/blaze-program" }
 blaze-mutants = { path = "crates/blaze-mutants" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
+blaze-astlog = { path = "crates/blaze-astlog" }
 blaze-lints = { path = "crates/blaze-lints" }
 blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
 blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
@@ -726,9 +741,6 @@ addr2line = { version = "0.26", default-features = false }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.19.0"
 expect-test = "1.5.1"
-# Property tests: Hegel, Hypothesis's engine, linked as a Rust crate; test-only, imported as `hegel`
-# (docs/contributing.md, vendor/hegeltest/SOURCE.md).
-hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
 # hir-ty's MIR provider table, which hir-ty-mir registers into.
 inventory = "0.3.25"
@@ -864,7 +876,6 @@ tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = "1.54.1"
 toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"
 unicode-segmentation = "=1.12.0"
@@ -877,6 +888,7 @@ zip = { version = "9.1.3", default-features = false }
 astlog-core = { path = "tools/astlog/core" }
 ast-merge-langs = { path = "tools/astlog/langs" }
 edit-applier = { path = "tools/astlog/edit-applier" }
+astlog-engine = { path = "tools/astlog/engine" }
 error-chain = { path = "tools/astlog/error-chain" }
 clap = "4.6.7"
 ignore = "0.4.33"

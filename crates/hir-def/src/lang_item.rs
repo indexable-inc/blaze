@@ -846,6 +846,13 @@ language_item_table! { LangItems =>
     ReflectFnItem,           sym::blaze_fn_item,       TraitId;
     /// `core::reflect::MemoPoint`: the item type of a function written `#[blaze::memo]`.
     ReflectMemoPoint,        sym::blaze_memo_point,    TraitId;
+    /// `core::reflect::Described<'a, D, Args>`: the type `D`, a `TypeDesc`, describes over
+    /// `Args` (docs/v2/plan/design/type-of.md).
+    ReflectDescribed,        sym::blaze_described,     StructId;
+    /// `core::reflect::TypeOf`, which the solver answers for a `Described`.
+    ReflectTypeOf,           sym::blaze_type_of,       TraitId;
+    /// `<Described<'a, D, Args> as TypeOf>::Type`, what `type_of!` names.
+    ReflectTypeOfType,       sym::blaze_type_of_type,  TypeAliasId;
 
     RangeMin,                sym::RangeMin,            ConstId;
     /// `SizedTypeProperties::SIZE` and `::ALIGN`.

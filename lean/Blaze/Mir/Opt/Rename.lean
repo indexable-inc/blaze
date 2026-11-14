@@ -62,18 +62,18 @@ theorem findFrame_renameStack (ρ : FnId → BlockId → BlockId) (id : Nat) :
       have left : findFrame (renameStack ρ (fr :: rest)) id =
           some (fr.rename ρ (headFn (rest.map ctlOf))) :=
         (findFrame_cons (fr.rename ρ (headFn (rest.map ctlOf))) (renameStack ρ rest) id).trans
-          (if_pos h')
+          (ite_eq_left h')
       have right : findFrame (fr :: rest) id = some fr :=
-        (findFrame_cons fr rest id).trans (if_pos h)
+        (findFrame_cons fr rest id).trans (ite_eq_left h)
       rw [left, right]
       try rfl
     · have h' : ¬ (fr.rename ρ (headFn (rest.map ctlOf))).id = id := h
       have left : findFrame (renameStack ρ (fr :: rest)) id =
           findFrame (renameStack ρ rest) id :=
         (findFrame_cons (fr.rename ρ (headFn (rest.map ctlOf))) (renameStack ρ rest) id).trans
-          (if_neg h')
+          (ite_eq_right h')
       have right : findFrame (fr :: rest) id = findFrame rest id :=
-        (findFrame_cons fr rest id).trans (if_neg h)
+        (findFrame_cons fr rest id).trans (ite_eq_right h)
       rw [left, right]
       exact ih
 
@@ -119,17 +119,17 @@ theorem setFrame_renameStack (ρ : FnId → BlockId → BlockId) (id : Nat) (slo
       have left : setFrame (renameStack ρ (fr :: rest)) id slots =
           (fr.rename ρ (headFn (rest.map ctlOf))).withLocals slots :: renameStack ρ rest :=
         (setFrame_cons (fr.rename ρ (headFn (rest.map ctlOf))) (renameStack ρ rest) id
-          slots).trans (if_pos h')
+          slots).trans (ite_eq_left h')
       have right : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
-        (setFrame_cons fr rest id slots).trans (if_pos h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_left h)
       exact left.trans (congrTo (renameStack ρ) right).symm
     · have h' : ¬ (fr.rename ρ (headFn (rest.map ctlOf))).id = id := h
       have left : setFrame (renameStack ρ (fr :: rest)) id slots =
           fr.rename ρ (headFn (rest.map ctlOf)) :: setFrame (renameStack ρ rest) id slots :=
         (setFrame_cons (fr.rename ρ (headFn (rest.map ctlOf))) (renameStack ρ rest) id
-          slots).trans (if_neg h')
+          slots).trans (ite_eq_right h')
       have right : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
-        (setFrame_cons fr rest id slots).trans (if_neg h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_right h)
       have hd : headFn ((setFrame rest id slots).map ctlOf) = headFn (rest.map ctlOf) :=
         congrTo headFn (setFrame_ctl id slots rest)
       have last : fr.rename ρ (headFn (rest.map ctlOf)) :: renameStack ρ (setFrame rest id slots) =
@@ -144,17 +144,17 @@ theorem State.setSlots_rename (ρ : FnId → BlockId → BlockId) (st : State) (
   by_cases hf : f = 0
   · have left : (st.rename ρ).setSlots f slots =
         { base := slots, stack := renameStack ρ st.stack, next := st.next } :=
-      (State.setSlots_def (st.rename ρ) f slots).trans (if_pos hf)
+      (State.setSlots_def (st.rename ρ) f slots).trans (ite_eq_left hf)
     have right : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     exact left.trans (congrTo (State.rename ρ) right).symm
   · have left : (st.rename ρ).setSlots f slots =
         { base := st.base, stack := setFrame (renameStack ρ st.stack) f slots,
           next := st.next } :=
-      (State.setSlots_def (st.rename ρ) f slots).trans (if_neg hf)
+      (State.setSlots_def (st.rename ρ) f slots).trans (ite_eq_right hf)
     have right : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     have mid : State.mk st.base (setFrame (renameStack ρ st.stack) f slots) st.next =
         State.rename ρ (State.mk st.base (setFrame st.stack f slots) st.next) :=
       congrTo (fun s => State.mk st.base s st.next) (setFrame_renameStack ρ f slots st.stack)
@@ -352,8 +352,8 @@ theorem switchTarget_rename (r : BlockId → BlockId) (key : Int) (otherwise : B
         if key = arm.1 then arm.2 else switchTarget key rest otherwise :=
       switchTarget_cons key arm rest otherwise
     by_cases h : key = arm.1
-    · exact (left.trans (if_pos h)).trans (congrTo r (right.trans (if_pos h))).symm
-    · exact (left.trans (if_neg h)).trans (ih.trans (congrTo r (right.trans (if_neg h))).symm)
+    · exact (left.trans (ite_eq_left h)).trans (congrTo r (right.trans (ite_eq_left h))).symm
+    · exact (left.trans (ite_eq_right h)).trans (ih.trans (congrTo r (right.trans (ite_eq_right h))).symm)
 
 theorem switchOn_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : FnId)
     (hfn : st.topFn = fn) (arms : List (Int × BlockId)) (otherwise : BlockId) :
@@ -379,16 +379,16 @@ theorem assertOn_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn : F
     by_cases h : b = expected
     · have left : assertOn (st.rename ρ) expected kind (ρ fn target) (Value.bool b) =
           (st.rename ρ).jump (ρ fn target) :=
-        (assertOn_bool (st.rename ρ) expected kind (ρ fn target) b).trans (if_pos h)
+        (assertOn_bool (st.rename ρ) expected kind (ρ fn target) b).trans (ite_eq_left h)
       have right : assertOn st expected kind target (Value.bool b) = st.jump target :=
-        (assertOn_bool st expected kind target b).trans (if_pos h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_left h)
       exact left.trans ((State.jump_rename ρ st fn hfn target).trans
         (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
     · have left : assertOn (st.rename ρ) expected kind (ρ fn target) (Value.bool b) =
           Outcome.panic kind :=
-        (assertOn_bool (st.rename ρ) expected kind (ρ fn target) b).trans (if_neg h)
+        (assertOn_bool (st.rename ρ) expected kind (ρ fn target) b).trans (ite_eq_right h)
       have right : assertOn st expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool st expected kind target b).trans (if_neg h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_right h)
       exact left.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm
   | Value.unit => rfl
   | Value.int _ _ => rfl
@@ -443,10 +443,10 @@ theorem State.enter_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn 
   · have left : (st.rename ρ).enter id sig args dest (mapTarget (ρ fn) target) =
         Outcome.ok (Next.state
           (enterState (st.rename ρ) id sig args dest (mapTarget (ρ fn) target))) :=
-      (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (if_pos hl)
+      (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (ite_eq_left hl)
     have right : st.enter id sig args dest target =
         Outcome.ok (Next.state (enterState st id sig args dest target)) :=
-      (State.enter_eq st id sig args dest target).trans (if_pos hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_left hl)
     have mid : Outcome.map (Next.map (State.rename ρ))
           (Outcome.ok (Next.state (enterState st id sig args dest target))) =
         Outcome.ok (Next.state
@@ -457,9 +457,9 @@ theorem State.enter_rename (ρ : FnId → BlockId → BlockId) (st : State) (fn 
       (mid.symm.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm)
   · have left : (st.rename ρ).enter id sig args dest (mapTarget (ρ fn) target) =
         Outcome.undefined Undefined.illFormed :=
-      (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (if_neg hl)
+      (State.enter_eq (st.rename ρ) id sig args dest (mapTarget (ρ fn) target)).trans (ite_eq_right hl)
     have right : st.enter id sig args dest target = Outcome.undefined Undefined.illFormed :=
-      (State.enter_eq st id sig args dest target).trans (if_neg hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_right hl)
     exact left.trans (congrTo (Outcome.map (Next.map (State.rename ρ))) right).symm
 
 /-- The running frame returns: its caller goes on at the renamed target. -/

@@ -35,8 +35,21 @@ const _: () = {
 
 /// The schema of an image buffer: its root record's, and the version of what the parts are.
 /// Version 3: the def map is no part of it; a crate's def map is its pages, a record of its
-/// own (`super::serve::pages_key`), read a name at a time.
+/// own (`super::serve::pages_key`), read a name at a time. Version 4: a third part, the
+/// crate's diagnostic items ([`Part::DiagnosticItems`]), so a served crate's are read from
+/// it and not by a walk of its pages. The key moves with it (`super::key::PRODUCER` hashes
+/// this schema), so an image of version 3 is never found; one read all the same is refused
+/// here by its schema, never read as an image with no diagnostic items.
 pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
+    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::U64(4),
+    SchemaPart::Schema(<Root as Record>::SCHEMA),
+]);
+
+/// The schema of version 3 ([`IMAGE_SCHEMA`]), two parts: what a test writes to show an
+/// image of it is refused.
+#[cfg(test)]
+const LAYOUT_3_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str("blaze v2 dependency image"),
     SchemaPart::U64(3),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
@@ -80,24 +93,41 @@ pub enum Part {
     LangItems = 0,
     /// The signatures of the crate's items, a buffer of [`super::signatures`]'s schema.
     Signatures = 1,
-    /// The crate's `DefMap` and `LocalDefMap`: no part of an image, which holds the two above.
-    /// A crate's def map is its pages (`crate::nameres::frozen::pages`), a record of its own;
-    /// this names them in a refusal of the crate ([`super::Refused`]).
-    DefMap = 2,
+    /// The crate's own diagnostic items, as
+    /// [`crate::nameres::frozen::encode_diagnostic_items`] writes them: a table of a few
+    /// hundred rows read whole, so `crate_diagnostic_items` of a served crate reads no page of
+    /// its def map and no item's attributes.
+    DiagnosticItems = 2,
+    /// The crate's `DefMap` and `LocalDefMap`: no part of an image, which holds the three
+    /// above. A crate's def map is its pages (`crate::nameres::frozen::pages`), a record of its
+    /// own; this names them in a refusal of the crate ([`super::Refused`]). Its tag follows
+    /// the parts' so the tag of each part is its place in [`Part::ALL`]; the tag is never
+    /// written.
+    DefMap = 3,
 }
 
 impl Part {
-    /// The parts an image holds, in the order of their tags.
-    pub const ALL: [Part; 2] = [Part::LangItems, Part::Signatures];
+    /// The parts an image holds, in the order of their tags: each part's tag is its place
+    /// here, which [`ImageRef::part`] and [`PartBytes::of`] index by.
+    pub const ALL: [Part; 3] = [Part::LangItems, Part::Signatures, Part::DiagnosticItems];
 
     pub fn name(self) -> &'static str {
         match self {
             Part::DefMap => "def map pages",
             Part::LangItems => "lang items",
             Part::Signatures => "signatures",
+            Part::DiagnosticItems => "diagnostic items",
         }
     }
 }
+
+const _: () = {
+    let mut at = 0;
+    while at < Part::ALL.len() {
+        assert!(Part::ALL[at] as usize == at, "a part's tag is not its place in `Part::ALL`");
+        at += 1;
+    }
+};
 
 /// Why an image does not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,6 +310,15 @@ pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
 #[cfg(test)]
 pub(super) fn write_layout_7_image(key: ContentId, parts: [&[u8]; 3]) -> Vec<u8> {
     write_parts(LAYOUT_7_SCHEMA, key, parts, [0, 1, 2])
+}
+
+/// An image without the diagnostic items part: of version 3's schema when `old_schema`, else
+/// of this schema with two parts. What a test writes to show either is refused, never read
+/// as an image whose crate has no diagnostic items.
+#[cfg(test)]
+pub(super) fn write_two_part_image(key: ContentId, parts: [&[u8]; 2], old_schema: bool) -> Vec<u8> {
+    let schema = if old_schema { LAYOUT_3_SCHEMA } else { IMAGE_SCHEMA };
+    write_parts(schema, key, parts, [0, 1])
 }
 
 /// The image of `key` under `schema` whose parts are `parts`, tagged `tags`.

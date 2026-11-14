@@ -43,6 +43,7 @@ pub mod goal;
 pub mod http;
 pub mod intent;
 pub mod json;
+pub mod query;
 pub mod server;
 pub mod session;
 pub mod units;
@@ -55,8 +56,8 @@ pub use blaze_protocol::events::NodeKind;
 pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
 pub use blaze_vfs::{Mode, Op};
 pub use borrowed::{
-    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
-    SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
+    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, RanWhyRef,
+    ResponseRef, SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
 pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
@@ -120,7 +121,22 @@ use serde::{Deserialize, Serialize};
 /// 56: [`Request::Diagnostics`] and [`Response::Diagnostics`] ([`Seen`]): a check's errors and
 /// warnings against what the client was last told, as new, fixed and unchanged, by stable id
 /// (`blaze diagnostics --since`, `blaze agents hook`).
-pub const SCHEMA: u32 = 56;
+/// 57: [`Request::Prove`] and [`Response::Proven`] ([`Proven`], [`ProofRecord`], [`Subset`]):
+/// `blaze prove`, the theorem functions of the crates selected translated to Lean and checked.
+/// 58: [`Subset::outcomes`] ([`SubsetFunction`], [`SubsetOutcome`]), each function of the
+/// sans-IO cores with its outcome by path, and [`Subset::generic`], the generic functions
+/// counted apart from the refused.
+/// 59: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
+/// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0; and
+/// [`Response::TestsOf`] ([`TestsOf`], [`Near`]): each test executable's count of tests, how
+/// many the filter left out, and the nearest names to a filter that matched none.
+/// 60: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
+/// name, and for a changed ask which one with its answers then and now.
+/// 61: [`ProofRecord::ModelBroken`]: a theorem whose generated Lean model Lean refuses,
+/// answered as blaze's bug with Lean's first error, proof file or none, never `Open`.
+/// 62: [`Edit::Rules`], an astlog rules file's rewrites as one edit, and [`Request::Query`] and
+/// [`Response::Rows`] ([`query::Rows`]): its relations and findings, as data, nothing written.
+pub const SCHEMA: u32 = 62;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -368,11 +384,13 @@ pub enum Request {
     Stop,
     /// Edits by meaning, applied in the front end to `base` and committed to `head` as
     /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
-    /// [`Response::Committed`] once durable. The view's proc macros and build scripts' runs,
-    /// which its front end applies before it resolves a name as rustc would, are built first.
+    /// [`Response::Committed`] once durable. With no `head`, a dry run: answered with
+    /// [`Response::Edited`] and `Done`, nothing committed. The view's proc macros and build
+    /// scripts' runs, which its front end applies before it resolves a name as rustc would, are
+    /// built first.
     Edit {
         base: ContentId,
-        head: String,
+        head: Option<String>,
         edits: Vec<Edit>,
     },
     /// Declared intent: the tests `filter` selects in the view will be run soon. What they
@@ -525,6 +543,14 @@ pub enum Request {
         targets: Targets,
         wait_ms: u64,
     },
+    /// An astlog rules file run over the view's front end and nothing written: every relation
+    /// it derives and every lint's finding, answered with one [`Response::Rows`]
+    /// (docs/v2/plan/design/astlog-sema.md). Builds only the view's proc macros and build
+    /// scripts' runs, applied before the rules read it, as [`Request::Edit`] does.
+    Query {
+        view: ViewRef,
+        rules: String,
+    },
     /// What a client recorded of build `build` (its [`Worked::build_id`]), sent as the request
     /// that asked for it ends: its own `spans`, `events` and `folded` rows, each an Arrow IPC
     /// stream of the profile schema's table (empty for none), every row's `build_id` the
@@ -557,6 +583,21 @@ pub enum Request {
         folded: Vec<u8>,
         ended_ns: i64,
         started_ns: i64,
+    },
+    /// `blaze prove`: every function marked `#[blaze::theorem]` in the library crates `targets`
+    /// selects (as [`Request::Check`] selects them), translated to Lean from the view's front
+    /// end (`hir_ty_lean::emit`), and unless `emit`, its proof checked by the Lean at `lean`
+    /// (an absolute path; the client reads it from `BLAZE_LEAN_PROVER`) against the crate's
+    /// proof file under `lean/` beside its `src/`. Nothing is compiled: the view's proc macros
+    /// and build scripts' runs, which its front end applies before it is read, are built
+    /// first. With `subset`, also the count of what the translator takes over every function
+    /// in a `#![blaze::sans_io]` module of those crates. Answered with [`Response::Proven`].
+    Prove {
+        emit: bool,
+        lean: Option<String>,
+        view: ViewRef,
+        subset: bool,
+        targets: Targets,
     },
 }
 
@@ -1031,6 +1072,13 @@ pub enum Response {
     Doing(Doing),
     /// [`Request::Diagnostics`]'s one answer.
     Diagnostics(Seen),
+    /// [`Request::Prove`]'s one answer.
+    Proven(Proven),
+    /// What a test run asked of one test executable, said once per executable: what a client
+    /// refusing a run of none names.
+    TestsOf(TestsOf),
+    /// [`Request::Query`]'s one answer.
+    Rows(query::Rows),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -1736,13 +1784,17 @@ impl ArtifactKind {
     }
 }
 
+/// One test's result. Its fields are declared in the order CBOR writes a map's keys.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct TestResult {
+    /// It ran although selection was asked: why no kept pass of it held. `None` for a cached
+    /// result, an ignored test and a run selection did not judge.
+    pub ran: Option<RanWhy>,
     pub name: String,
     /// The test executable, as cargo's `Running` line names it.
     pub binary: String,
-    /// Not run: the result that stands, and what it was kept by. A cached result is
-    /// `Unreached` with `millis` 0.
+    /// Not run: the pass that stands, and what it was kept by. A cached result is
+    /// [`TestOutcome::Passed`] with `millis` 0; only a pass is ever kept.
     pub cached: Option<Cached>,
     pub millis: u64,
     #[serde(with = "blaze_protocol::bytes")]
@@ -1751,9 +1803,65 @@ pub struct TestResult {
     /// It ran outside the sandbox (docs/cargo.md), so the command's summary names it. False for
     /// a cached result, whose run is not this one.
     pub outside: bool,
+    /// A pass that ran and was not kept, so the test runs again next time: why. `None` for a
+    /// failure (never kept), a cached result and a pass that was kept.
+    pub not_kept: Option<NotKept>,
     /// The daemon's index of `binary` among the request's test executables: dense from 0, the
     /// same for every result of one executable, so a client groups results by it.
     pub executable: u32,
+}
+
+/// What a test run asked of one test executable ([`Response::TestsOf`]), one per executable
+/// of the request whose tests were selected: how many tests it has, how many the name
+/// filter left out, and, when the filter left out every one, its tests nearest the filter. A
+/// client that refuses a run of none says the counts and the nearest names from these. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct TestsOf {
+    /// Its tests, ignored ones included.
+    pub tests: u32,
+    /// The test executable, as [`TestResult::binary`] names it.
+    pub binary: String,
+    /// When the filter left out every one of its tests: those nearest it, nearest first, at
+    /// most three. Empty otherwise.
+    pub nearest: Vec<Near>,
+    /// As [`TestResult::executable`].
+    pub executable: u32,
+    /// Those the name filter left out.
+    pub filtered_out: u32,
+}
+
+/// A test's name near a filter that matched none ([`TestsOf::nearest`]): `distance` is the
+/// edit distance (rustc's, with substrings) between a filter and its whole path or its last
+/// segment, so a client ranks the nearest of every executable together.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Near {
+    pub name: String,
+    pub distance: u32,
+}
+
+/// Why a test ran rather than being reported cached (blaze-testsel's `machine::Missed`):
+/// `why` is the stable word a tool matches on (`run-all`, `no-head`, `unknown-state`,
+/// `no-row`, `function-changed`, `read-changed`) and `said` the sentence a person reads. For a
+/// changed ask, `ask` names it (`fn` and its id, or `file`, `dir` or `env` and its name) and
+/// `before` and `now` are its answers at the kept pass and now, as short ids (`absent` for
+/// nothing there, `gone` for a function no longer in the binary); `None` where not known. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RanWhy {
+    pub ask: Option<String>,
+    pub now: Option<String>,
+    pub why: String,
+    pub said: String,
+    pub before: Option<String>,
+}
+
+/// Why a pass was not kept (blaze-testsel's `machine::NotKept`): `no` is the stable word a
+/// tool matches on (`clock`, `unsandboxed`, `doctest`, ...), `why` the sentence a person reads.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct NotKept {
+    pub no: String,
+    pub why: String,
 }
 
 /// The run that stands for a test not run.
@@ -1779,8 +1887,6 @@ pub enum TestOutcome {
     Passed,
     Failed,
     Ignored,
-    /// Not run: the edit reached none of its code; its last result stands.
-    Unreached,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -2041,6 +2147,93 @@ pub struct ReachedItem {
     pub facts: Vec<FactRead>,
 }
 
+/// What `blaze prove` found ([`Request::Prove`]): one record per theorem function, sorted
+/// (by function, then the whole record), so the same tree answers the same bytes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Proven {
+    /// Why no proof was checked, where none could be: no Lean was named, the one named is not
+    /// the pinned release, a file could not be written, or Lean refused blaze's own library.
+    /// The records are then the refusals alone, and the command fails with this.
+    pub failed: Option<String>,
+    /// With [`Request::Prove`]'s `subset`: what the translator takes of the sans-IO cores.
+    pub subset: Option<Subset>,
+    pub records: Vec<ProofRecord>,
+}
+
+/// One theorem function's outcome. `function` is the translator's path of it
+/// (`krate::module::name`); a refusal in a function it calls names that function.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ProofRecord {
+    /// Not proved: no proof file at `proof_file`, or Lean refused it (or the model, or the
+    /// check that it proves `statement`); `why` is that, with Lean's whole output, whose
+    /// remaining goals are what the proof's writer reads.
+    Open { why: String, function: String, statement: String, proof_file: String },
+    /// The pinned Lean's kernel accepted the proof of `theorem`, resting only on `axioms`
+    /// (among Lean's three). `key` is the proof's identity (`hir_ty_lean::proof_key`): every
+    /// input the verdict depends on. `model` is the generated model's file.
+    Proved {
+        key: ContentId,
+        model: String,
+        axioms: Vec<String>,
+        theorem: String,
+        function: String,
+    },
+    /// `--emit`: the model and statement written, nothing checked. `path` is the model's file,
+    /// `module` its Lean module.
+    Emitted { path: String, module: String, function: String, statement: String },
+    /// The translator refused it: what construct, and where (`hir_ty_lean::NotTranslated`).
+    Refused { at: String, what: String, function: String },
+    /// Lean refused the generated model of the theorem (`module`: its own, or one it
+    /// imports): a bug in blaze's translator, which no proof file can fix. Given whether or
+    /// not there is a proof file. `at` is where Lean's first error is (`<file>:<line>:<column>`,
+    /// the file absolute) and `error` the rest of it as Lean printed it (`error(<code>): ...`).
+    ModelBroken { at: String, error: String, module: String, function: String },
+}
+
+/// What the translator takes of every function in a `#![blaze::sans_io]` module of the crates
+/// proved, theorem or not: what decides the subset's next step
+/// (docs/v2/plan/design/proofs-for-sans-io.md, section 3).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Subset {
+    /// Generic functions, which the translator takes at each instance a theorem reaches and
+    /// alone at none: neither translated here nor refused.
+    pub generic: u32,
+    /// Each refusal's `what` with the number of functions refused for it, most first (then by
+    /// `what`). A function is counted under the first refusal the translator meets; how many
+    /// it would meet past that one is not known. A generic function is not among them: it is
+    /// counted in `generic`.
+    pub refused: Vec<SubsetRefusal>,
+    /// Every function counted, with its outcome, sorted by path (two of one path, two impls'
+    /// methods of one name, in the item table's key order).
+    pub outcomes: Vec<SubsetFunction>,
+    /// Every function counted: `translated + generic` and the refused counts add up to it.
+    pub functions: u32,
+    pub translated: u32,
+}
+
+/// One function of a sans-IO core and what the translator made of it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SubsetFunction {
+    /// Its path (`blaze_core::world::disk::Disk::find`).
+    pub path: String,
+    pub outcome: SubsetOutcome,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum SubsetOutcome {
+    Translated,
+    /// A generic function: translated at each instance a theorem reaches, none asked for here.
+    Generic,
+    /// Refused for `what`, the first construct the translator does not take.
+    Refused { what: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SubsetRefusal {
+    pub what: String,
+    pub count: u32,
+}
+
 /// One candidate of a best-of-N, as it was ranked: fewest errors, then fewest failed tests,
 /// then most passed, then fewest warnings, then its place in the request; a candidate whose
 /// ops did not apply or whose job could not run goes after every one that ran.
@@ -2239,6 +2432,104 @@ mod tests {
         assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
     }
 
+    /// `Request::Query`, `Edit::Rules` and `Response::Rows` are written in the codec's key
+    /// order: each one's bytes pinned whole, so a field renamed or reordered is a schema change
+    /// this test names.
+    #[test]
+    fn a_rules_query_and_its_rows_are_written_in_key_order() {
+        let key = |want: &mut Vec<u8>, key: &str| {
+            want.push(0x60 | key.len() as u8);
+            want.extend_from_slice(key.as_bytes());
+        };
+
+        let request =
+            Request::Query { view: ViewRef::Head("/w".to_owned()), rules: "(r)".to_owned() };
+        let bytes = blaze_protocol::cbor::to_vec(&request).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Query");
+        want.push(0xa2);
+        key(&mut want, "view");
+        want.push(0xa1);
+        key(&mut want, "Head");
+        key(&mut want, "/w");
+        key(&mut want, "rules");
+        key(&mut want, "(r)");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Request>(&bytes).unwrap(), request);
+
+        let edit = Edit::Rules { rules: "(r)".to_owned() };
+        let bytes = blaze_protocol::cbor::to_vec(&edit).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Rules");
+        want.push(0xa1);
+        key(&mut want, "rules");
+        key(&mut want, "(r)");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Edit>(&bytes).unwrap(), edit);
+
+        let code = query::Cell::Code {
+            end: 2,
+            line: Some(1),
+            path: "a".to_owned(),
+            text: "x".to_owned(),
+            start: 1,
+        };
+        let rows = Response::Rows(query::Rows {
+            findings: vec![query::Finding {
+                at: None,
+                message: "m".to_owned(),
+                relation: "r".to_owned(),
+                severity: query::Severity::Warning,
+            }],
+            relations: vec![query::Relation {
+                name: "r".to_owned(),
+                rows: vec![vec![code, query::Cell::Int(-1)]],
+                columns: vec!["e".to_owned(), "n".to_owned()],
+            }],
+        });
+        let bytes = blaze_protocol::cbor::to_vec(&rows).unwrap();
+        let mut want = vec![0xa1];
+        key(&mut want, "Rows");
+        want.push(0xa2);
+        key(&mut want, "findings");
+        want.extend_from_slice(&[0x81, 0xa4]);
+        key(&mut want, "at");
+        want.push(0xf6);
+        key(&mut want, "message");
+        key(&mut want, "m");
+        key(&mut want, "relation");
+        key(&mut want, "r");
+        key(&mut want, "severity");
+        key(&mut want, "Warning");
+        key(&mut want, "relations");
+        want.extend_from_slice(&[0x81, 0xa3]);
+        key(&mut want, "name");
+        key(&mut want, "r");
+        key(&mut want, "rows");
+        want.extend_from_slice(&[0x81, 0x82, 0xa1]);
+        key(&mut want, "Code");
+        want.push(0xa5);
+        key(&mut want, "end");
+        want.push(0x02);
+        key(&mut want, "line");
+        want.push(0x01);
+        key(&mut want, "path");
+        key(&mut want, "a");
+        key(&mut want, "text");
+        key(&mut want, "x");
+        key(&mut want, "start");
+        want.push(0x01);
+        want.push(0xa1);
+        key(&mut want, "Int");
+        want.push(0x20);
+        key(&mut want, "columns");
+        want.push(0x82);
+        key(&mut want, "e");
+        key(&mut want, "n");
+        assert_eq!(bytes, want, "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Response>(&bytes).unwrap(), rows);
+    }
+
     /// A run's output is one byte string; JSON shows it as the array of numbers it was.
     #[test]
     fn bytes_go_out_as_byte_strings() {
@@ -2254,9 +2545,11 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), ran);
 
         let result = TestResult {
+            ran: None,
             name: "t".to_owned(),
             binary: "b".to_owned(),
             cached: None,
+            not_kept: None,
             millis: 1,
             output: vec![9; 30],
             outcome: TestOutcome::Passed,

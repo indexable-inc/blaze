@@ -1,4 +1,4 @@
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use super::{
     path::{self, LinkKind, Reached},
@@ -649,7 +649,7 @@ fn the_trace_has_a_track_per_fiber_and_a_flow_from_waker_to_woken() {
 /// A schedule a pool of `threads` workers could run: jobs start, park (on a key, a counter, or
 /// to move), become ready, resume on any idle thread (so a job migrates), and end, while
 /// opening and closing nested spans, a wait span around each key park.
-fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
+fn schedule(tape: &Tape) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
     #[derive(Clone)]
     enum Job {
         New,
@@ -657,9 +657,9 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
         Parked { wait_span: Option<usize>, ready: bool },
         Ended,
     }
-    let threads = tc.draw(gs::integers::<u32>().min_value(1).max_value(4));
-    let jobs = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
-    let steps = tc.draw(gs::integers::<usize>().max_value(80));
+    let threads = tape.int_in(1..=4u32, "threads");
+    let jobs = tape.int_in(1..=6usize, "jobs");
+    let steps = tape.int_in(0..=80usize, "steps");
     let mut state = vec![Job::New; jobs];
     let mut busy: Vec<Option<usize>> = vec![None; threads as usize];
     // Each job's open spans, innermost last, as indexes into `spans`.
@@ -669,12 +669,12 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
     let id = |job: usize| (job as u64 + 1) | 1 << 32;
     for _ in 0..steps {
         // At least 1 ns apart: two rows of one job at one instant are ordered by rank alone.
-        t += tc.draw(gs::integers::<i64>().min_value(1).max_value(50));
-        let job = tc.draw(gs::integers::<usize>().max_value(jobs - 1));
+        t += tape.int_in(1..=50i64, "apart ns");
+        let job = tape.index(jobs, "job");
         let idle = busy.iter().position(Option::is_none);
         let core_of = |thread: u32| thread + 100;
         let ready_now =
-            matches!(state[job], Job::Parked { ready: false, .. }) && tc.draw(gs::booleans());
+            matches!(state[job], Job::Parked { ready: false, .. }) && tape.bool("ready now");
         match state[job].clone() {
             Job::Parked { wait_span, ready: false } if ready_now => {
                 let by = (0..jobs).find(|it| matches!(state[*it], Job::Running { .. }));
@@ -698,7 +698,7 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                 state[job] = Job::Parked { wait_span, ready: true };
             }
             Job::New | Job::Parked { .. } if idle.is_some() => {
-                let thread = tc.draw(gs::integers::<u32>().max_value(threads - 1));
+                let thread = tape.int_in(0..=threads - 1, "thread");
                 if busy[thread as usize].is_some() {
                     continue;
                 }
@@ -727,7 +727,7 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                 let row = |event| {
                     SwitchIn::of(P, thread + 1, t, event, id(job), job as u32, core_of(thread))
                 };
-                match tc.draw(gs::integers::<u8>().max_value(4)) {
+                match tape.int_in(0..=4u8, "running job does") {
                     0 => {
                         let parent = open[job].last().map(|it| spans[*it].0.span_id);
                         let mut it = span(thread + 1, spans.len() as u64 + 1, parent, "work", t, 0);
@@ -745,7 +745,7 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                         }
                     }
                     2 => {
-                        let on = match tc.draw(gs::integers::<u8>().max_value(2)) {
+                        let on = match tape.int_in(0..=2u8, "parked on") {
                             0 => WaitedOn::Key,
                             1 => WaitedOn::Counter,
                             _ => WaitedOn::Moved,
@@ -757,8 +757,7 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
                             it.depth = open[job].len() as u16;
                             it.job = Some(id(job));
                             // The owner column is the runner's job, as `switches.job` names it.
-                            it.owner =
-                                Some(id(tc.draw(gs::integers::<usize>().max_value(jobs - 1))));
+                            it.owner = Some(id(tape.index(jobs, "owner")));
                             open[job].push(spans.len());
                             spans.push((it, false));
                             spans.len() - 1
@@ -796,8 +795,8 @@ fn schedule(tc: &TestCase) -> (Vec<SwitchIn>, Vec<SpanIn>, i64) {
     (switches, spans, t)
 }
 
-fn generated(tc: &TestCase) -> Model {
-    let (switches, spans, end) = schedule(tc);
+fn generated(tape: &Tape) -> Model {
+    let (switches, spans, end) = schedule(tape);
     let empty = switches.is_empty() && spans.is_empty();
     match Model::build(Input {
         build: 1,
@@ -814,122 +813,131 @@ fn generated(tc: &TestCase) -> Model {
     }
 }
 
-#[hegel::test(test_cases = 300)]
-fn every_lane_is_cut_end_to_end_and_its_states_add_up_to_its_lifetime(tc: TestCase) {
-    let m = generated(&tc);
-    for lane in &m.lanes {
-        for pair in lane.intervals.windows(2) {
-            assert_eq!(pair[0].to_ns, pair[1].from_ns, "{}: intervals meet", lane.id);
+#[test]
+fn every_lane_is_cut_end_to_end_and_its_states_add_up_to_its_lifetime() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let m = generated(tape);
+        for lane in &m.lanes {
+            for pair in lane.intervals.windows(2) {
+                assert_eq!(pair[0].to_ns, pair[1].from_ns, "{}: intervals meet", lane.id);
+            }
+            assert!(lane.intervals.iter().all(|it| it.dur_ns() > 0), "{}: no empty interval", lane.id);
+            assert_eq!(lane.totals().total(), lane.end_ns() - lane.begin_ns(), "{}", lane.id);
         }
-        assert!(lane.intervals.iter().all(|it| it.dur_ns() > 0), "{}: no empty interval", lane.id);
-        assert_eq!(lane.totals().total(), lane.end_ns() - lane.begin_ns(), "{}", lane.id);
-    }
+    });
 }
 
-#[hegel::test(test_cases = 300)]
-fn every_spans_states_add_up_to_its_wall_time_and_its_own_time_is_never_negative(tc: TestCase) {
-    let m = generated(&tc);
-    assert_eq!(m.anomalies.misnested, 0, "the schedule nests its spans");
-    for (span, time) in m.spans.iter().zip(&m.span_time) {
-        assert_eq!(time.totals.total(), span.dur_ns, "span {}", span.span_id);
-        let own = time.own;
-        for (what, ns) in [
-            ("running", own.running_ns),
-            ("parked", own.parked_ns),
-            ("queued", own.queued_ns),
-            ("parked or queued", own.parked_or_queued_ns),
-            ("unrecorded", own.unrecorded_ns),
-        ] {
-            assert!(ns >= 0, "span {}: own {what} {ns}", span.span_id);
-        }
-    }
-    // Uncovered time is never hidden: a lane's running is its spans' own running plus what ran
-    // under no span, so the spans' own running never exceeds it.
-    for (l, lane) in m.lanes.iter().enumerate() {
-        let own: i64 = lane.spans.iter().map(|&i| m.span_time[i].uncovered_ns()).sum();
-        assert!(own <= lane.totals().running_ns, "lane {l}");
-        assert!(lane.spans.iter().all(|&i| m.span_time[i].lane == Some(l)));
-    }
-}
-
-#[hegel::test(test_cases = 300)]
-fn no_two_runs_share_a_core_so_running_is_at_most_cores_times_wall(tc: TestCase) {
-    let m = generated(&tc);
-    let mut runs: Vec<(u32, i64, i64)> = Vec::new();
-    for lane in &m.lanes {
-        for it in &lane.intervals {
-            if let State::Running { core: Some(core), .. } = it.state {
-                runs.push((core, it.from_ns, it.to_ns));
+#[test]
+fn every_spans_states_add_up_to_its_wall_time_and_its_own_time_is_never_negative() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let m = generated(tape);
+        assert_eq!(m.anomalies.misnested, 0, "the schedule nests its spans");
+        for (span, time) in m.spans.iter().zip(&m.span_time) {
+            assert_eq!(time.totals.total(), span.dur_ns, "span {}", span.span_id);
+            let own = time.own;
+            for (what, ns) in [
+                ("running", own.running_ns),
+                ("parked", own.parked_ns),
+                ("queued", own.queued_ns),
+                ("parked or queued", own.parked_or_queued_ns),
+                ("unrecorded", own.unrecorded_ns),
+            ] {
+                assert!(ns >= 0, "span {}: own {what} {ns}", span.span_id);
             }
         }
-    }
-    runs.sort_unstable();
-    for pair in runs.windows(2) {
-        if pair[0].0 == pair[1].0 {
-            assert!(pair[0].2 <= pair[1].1, "two runs on core {} overlap: {pair:?}", pair[0].0);
+        // Uncovered time is never hidden: a lane's running is its spans' own running plus what ran
+        // under no span, so the spans' own running never exceeds it.
+        for (l, lane) in m.lanes.iter().enumerate() {
+            let own: i64 = lane.spans.iter().map(|&i| m.span_time[i].uncovered_ns()).sum();
+            assert!(own <= lane.totals().running_ns, "lane {l}");
+            assert!(lane.spans.iter().all(|&i| m.span_time[i].lane == Some(l)));
         }
-    }
-    let util = report::utilization(&m);
-    assert!(util.running_ns <= i64::from(util.cores) * util.wall_ns);
-    for it in report::core_busy(&m, 7) {
-        assert!(it.running_ns <= it.t1_ns - it.t0_ns, "{it:?}");
-    }
+    });
 }
 
-#[hegel::test(test_cases = 300)]
-fn the_critical_path_is_contiguous_inside_the_build_and_no_longer_than_it(tc: TestCase) {
-    let m = generated(&tc);
-    let path = path::critical(&m);
-    assert!(!matches!(path.reached, Reached::Fuel { .. }), "the walk ends within its bound");
-    for pair in path.links.windows(2) {
-        assert_eq!(pair[0].to_ns, pair[1].from_ns, "links meet");
-    }
-    assert!(path.links.iter().all(|it| it.dur_ns() > 0));
-    if let (Some(start), Some(end)) = (path.start_ns(), path.end_ns()) {
-        assert!(start >= m.bounds.start_ns && end <= m.bounds.end_ns);
-        assert_eq!(path.len_ns(), end - start);
-    }
+#[test]
+fn no_two_runs_share_a_core_so_running_is_at_most_cores_times_wall() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let m = generated(tape);
+        let mut runs: Vec<(u32, i64, i64)> = Vec::new();
+        for lane in &m.lanes {
+            for it in &lane.intervals {
+                if let State::Running { core: Some(core), .. } = it.state {
+                    runs.push((core, it.from_ns, it.to_ns));
+                }
+            }
+        }
+        runs.sort_unstable();
+        for pair in runs.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                assert!(pair[0].2 <= pair[1].1, "two runs on core {} overlap: {pair:?}", pair[0].0);
+            }
+        }
+        let util = report::utilization(&m);
+        assert!(util.running_ns <= i64::from(util.cores) * util.wall_ns);
+        for it in report::core_busy(&m, 7) {
+            assert!(it.running_ns <= it.t1_ns - it.t0_ns, "{it:?}");
+        }
+    });
 }
 
-/// `it` in an order `seed` picks.
-fn shuffled<T>(mut it: Vec<T>, seed: u64) -> Vec<T> {
-    blaze_ids::rng::SplitMix64::new(seed).shuffle(&mut it);
+#[test]
+fn the_critical_path_is_contiguous_inside_the_build_and_no_longer_than_it() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let m = generated(tape);
+        let path = path::critical(&m);
+        assert!(!matches!(path.reached, Reached::Fuel { .. }), "the walk ends within its bound");
+        for pair in path.links.windows(2) {
+            assert_eq!(pair[0].to_ns, pair[1].from_ns, "links meet");
+        }
+        assert!(path.links.iter().all(|it| it.dur_ns() > 0));
+        if let (Some(start), Some(end)) = (path.start_ns(), path.end_ns()) {
+            assert!(start >= m.bounds.start_ns && end <= m.bounds.end_ns);
+            assert_eq!(path.len_ns(), end - start);
+        }
+    });
+}
+
+/// `it` in an order the tape picks.
+fn shuffled<T>(tape: &Tape, mut it: Vec<T>, label: &'static str) -> Vec<T> {
+    tape.shuffle(&mut it, label);
     it
 }
 
-#[hegel::test(test_cases = 200)]
-fn the_model_does_not_depend_on_the_order_rows_came_in(tc: TestCase) {
-    let (switches, spans, end) = schedule(&tc);
-    if switches.is_empty() && spans.is_empty() {
-        return;
-    }
-    let seed = tc.draw(gs::integers::<u64>());
-    let a = Model::build(Input {
-        build: 1,
-        build_row: Some((0, end)),
-        switches: switches.clone(),
-        spans: spans.clone(),
-        events: Vec::new(),
-    })
-    .unwrap();
-    let b = Model::build(Input {
-        build: 1,
-        build_row: Some((0, end)),
-        switches: shuffled(switches, seed),
-        spans: shuffled(spans, seed),
-        events: Vec::new(),
-    })
-    .unwrap();
-    let lanes = |m: &Model| m.lanes.iter().map(|it| (it.id, states(it))).collect::<Vec<_>>();
-    assert_eq!(lanes(&a), lanes(&b));
-    let by_id = |m: &Model| {
-        let mut it: Vec<_> =
-            m.spans.iter().zip(&m.span_time).map(|(s, t)| (s.span_id, t.totals, t.own)).collect();
-        it.sort_by_key(|it| it.0);
-        it
-    };
-    assert_eq!(by_id(&a), by_id(&b));
-    assert_eq!(report::rows(&a, By::Wait, None), report::rows(&b, By::Wait, None));
+#[test]
+fn the_model_does_not_depend_on_the_order_rows_came_in() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let (switches, spans, end) = schedule(tape);
+        if switches.is_empty() && spans.is_empty() {
+            return;
+        }
+        let a = Model::build(Input {
+            build: 1,
+            build_row: Some((0, end)),
+            switches: switches.clone(),
+            spans: spans.clone(),
+            events: Vec::new(),
+        })
+        .unwrap();
+        let b = Model::build(Input {
+            build: 1,
+            build_row: Some((0, end)),
+            switches: shuffled(tape, switches, "switch order"),
+            spans: shuffled(tape, spans, "span order"),
+            events: Vec::new(),
+        })
+        .unwrap();
+        let lanes = |m: &Model| m.lanes.iter().map(|it| (it.id, states(it))).collect::<Vec<_>>();
+        assert_eq!(lanes(&a), lanes(&b));
+        let by_id = |m: &Model| {
+            let mut it: Vec<_> =
+                m.spans.iter().zip(&m.span_time).map(|(s, t)| (s.span_id, t.totals, t.own)).collect();
+            it.sort_by_key(|it| it.0);
+            it
+        };
+        assert_eq!(by_id(&a), by_id(&b));
+        assert_eq!(report::rows(&a, By::Wait, None), report::rows(&b, By::Wait, None));
+    });
 }
 
 fn event(thread: u32, t_ns: i64, job: Option<u64>, span: Option<u64>, message: &str) -> EventIn {

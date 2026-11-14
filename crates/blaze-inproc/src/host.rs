@@ -1,5 +1,6 @@
-//! The daemon's side of a run: the executable written to cargo's path, the command that
-//! spawns it through `blaze-core`'s `Effect::Spawn`, and the handshake that lays the code
+//! The daemon's side of a run: the command that spawns the executable its build placed at
+//! cargo's path through `blaze-core`'s `Effect::Spawn` (the host writes no file: the build's
+//! placement is the path's one writer, [`StartError`]), and the handshake that lays the code
 //! memory over it before `main` (the crate docs' "The start of a run").
 //!
 //! A [`Host`] listens on a socket of its own (a named pipe on Windows) in a directory only
@@ -13,8 +14,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use blaze_core::{Command, Sandbox};
 use blaze_core::lock::{Lock, LockGuard};
@@ -23,64 +24,85 @@ use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
 use crate::handshake::{Grant, HOST_VAR, Hello, Lookup, Overlay, Place, VERSION, decode_map, hex};
 use crate::sys::{self, Rights};
-use crate::{Access, CodeMemory, CodeRange, Error, FixedMap, ImageLookup, ImageWrite, ask};
+use crate::{Access, CodeMemory, Error, FixedMap, ImageLookup, ImageWrite, ask};
 
 /// How long a start hook may take between its frames during the handshake.
 const HANDSHAKE: Duration = Duration::from_secs(30);
 
-/// The executable a run starts: `len` bytes of the image part of its code memory, the file the
-/// linker wrote, to go at cargo's `path`. `key` names those bytes (the store's content hash of
-/// the link's output); `store`, when given, is the store's file of exactly them, verified by
-/// the store against `key`, which a filesystem with clones shares blocks with.
-pub struct Executable<'a> {
-    pub path: &'a Path,
-    pub key: [u8; 32],
-    pub len: u64,
-    pub store: Option<&'a Path>,
+/// Why a program was not started from its path ([`Program::command`]).
+///
+/// The invariant: an output path has one writer, the build's placement. The host writes no
+/// file: it has no effect that writes one. A program is started from its path only where the
+/// build's record of that path holds the key of the file the program's memory is, `held`;
+/// anywhere else it is this refusal, never a write of the memory's bytes there in its place.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StartError {
+    /// The build's record of `path` holds `placed` (`None`: no record, a launch asked before
+    /// its job's placements ended, which is a bug of the caller's), and the memory's file is
+    /// `held`.
+    NotPlaced { path: PathBuf, placed: Option<[u8; 32]>, held: [u8; 32] },
+    /// The launch itself failed.
+    Launch(Error),
 }
 
-/// What [`Host::write_executable`] did.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Wrote {
-    /// The file at the path is the caller's: the build placed it there as its output of this
-    /// key and has looked at it since ([`Program::command_placed`]). Nothing is written, and
-    /// the host keeps no word of it: the build's placement is the one record of that file.
-    Placed,
-    /// The file at the path is the one written for this key, unchanged since: nothing.
-    Kept,
-    /// A clone of the store's file: no bytes copied.
-    Cloned,
-    /// The bytes, once.
-    Written,
-}
-
-/// What a written file was when it was written: a file changed since (a rebuild by another
-/// tool, `cargo clean`) is written again.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Identity {
-    len: u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    inode: (u64, u64),
-}
-
-impl Identity {
-    fn of(path: &Path) -> Option<Identity> {
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        Some(Identity {
-            len: metadata.len(),
-            modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            inode: {
-                use std::os::unix::fs::MetadataExt;
-                (metadata.dev(), metadata.ino())
-            },
-        })
+impl StartError {
+    /// The one rule of a start ([`Program::command`]): a program whose memory's file is `held`
+    /// starts from `path` only where the build's record of `path` holds `placed == held`;
+    /// otherwise [`StartError::NotPlaced`], naming the path and both keys. What every launch
+    /// checks, and what a model of the host in a test checks the same.
+    pub fn check(path: &std::path::Path, placed: Option<[u8; 32]>, held: [u8; 32]) -> Result<(), StartError> {
+        match placed == Some(held) {
+            true => Ok(()),
+            // alloc: error path, the path
+            false => Err(StartError::NotPlaced { path: path.to_path_buf(), placed, held }),
+        }
     }
 }
 
-/// A run to start: `program`, the executable written from `image`'s code memory
-/// ([`Host::write_executable`]), with the `maps` laid over its reservations too.
+impl From<Error> for StartError {
+    fn from(error: Error) -> StartError {
+        StartError::Launch(error)
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::NotPlaced { path, placed: Some(placed), held } => write!(
+                f,
+                "{} holds the build's output {}, and the code memory it is started on holds {}: a program starts \
+                 only from the file its build placed (the code memory's host writes no file)",
+                path.display(),
+                Hex(placed),
+                Hex(held)
+            ),
+            StartError::NotPlaced { path, placed: None, held } => write!(
+                f,
+                "{} holds no output its build placed and looked at, and the code memory it is started on holds {}: \
+                 a program starts only once its job's placements have ended, from the file placed (the code \
+                 memory's host writes no file)",
+                path.display(),
+                Hex(held)
+            ),
+            StartError::Launch(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// A content key in lowercase hex, as the store names it.
+struct Hex<'a>(&'a [u8; 32]);
+
+impl std::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A run to start: `program`, the executable the build placed at its path, whose file
+/// `image`'s code memory is, with the `maps` laid over its reservations too.
 pub struct Launch<'a> {
     pub image: &'a CodeMemory,
     /// Each a dependency image's (`blaze-premap`'s): the run must be unslid while there is one.
@@ -141,15 +163,15 @@ impl Drop for Alive {
     }
 }
 
+/// The daemon's side of dev runs: it lays a code memory over a program the kernel started from
+/// its file. It writes no file, and has nothing that could: the file at a program's path is
+/// its build's output, placed by the build alone ([`StartError`]).
 pub struct Host {
     address: String,
     waiting: Table,
     /// The handshake threads alive: one a start hook connected and not yet started or
     /// refused, each ended within [`HANDSHAKE`] of its hook's last frame.
     handshakes: Threads,
-    /// The executables written, by path: the key and the file as written.
-    written: Lock<HashMap<PathBuf, ([u8; 32], Identity)>>,
-    temporaries: AtomicU64,
 }
 
 impl Host {
@@ -165,97 +187,7 @@ impl Host {
             .name("blaze-inproc host".to_owned())
             .spawn(move || accept(&listener, &table, &counted))
             .map_err(|it| Error::new(format!("starting the host's thread: {it}")))?;
-        Ok(Host {
-            address,
-            waiting,
-            handshakes,
-            written: Lock::new("inproc.host.written", HashMap::new()),
-            temporaries: AtomicU64::new(0),
-        })
-    }
-
-    /// Puts `executable` at its path from `memory`: nothing when this host wrote the same key
-    /// there and the file is unchanged since, else a clone of the store's file or the bytes
-    /// of the image part, into a new file renamed over the path (a process still running the
-    /// old one keeps it). The bytes are the image part's only while it is pristine
-    /// ([`CodeMemory::is_pristine`]): a memory patched since is an error, never a file that
-    /// differs from what the overlay swaps in.
-    pub fn write_executable(
-        &self,
-        memory: &CodeMemory,
-        executable: &Executable<'_>,
-    ) -> Result<Wrote, Error> {
-        let path = executable.path;
-        let mut written = self.written.lock();
-        if let Some((key, identity)) = written.get(path)
-            && *key == executable.key
-            && Identity::of(path) == Some(*identity)
-        {
-            return Ok(Wrote::Kept);
-        }
-        if !memory.is_pristine() {
-            return Err(Error::new(format!(
-                "writing {}: the code memory's image part changed since it was laid out, so it is no longer the file the \
-                 linker wrote",
-                path.display()
-            )));
-        }
-        if executable.len == 0 || executable.len > memory.image_len() {
-            return Err(Error::new(format!(
-                "writing {}: an executable of {:#x} bytes from an image part of {:#x}",
-                path.display(),
-                executable.len,
-                memory.image_len()
-            )));
-        }
-        let bytes = memory.bytes(CodeRange { offset: 0, len: executable.len })?;
-        let io = |what: &str, at: &Path, it: std::io::Error| {
-            Error::new(format!("{what} {}: {it}", at.display()))
-        };
-        let name = path.file_name().ok_or_else(|| {
-            Error::new(format!("an executable path {} with no file name", path.display()))
-        })?;
-        let mut temporary = name.to_owned();
-        temporary.push(format!(
-            ".blaze-{}-{}.tmp",
-            std::process::id(),
-            self.temporaries.fetch_add(1, Ordering::Relaxed)
-        ));
-        let temporary = path.with_file_name(temporary);
-        let wrote = match executable.store {
-            Some(store) if sys::clone_file(store, &temporary)? => {
-                let cloned = std::fs::read(&temporary)
-                    .map_err(|it| io("reading the clone", &temporary, it))?;
-                if cloned != bytes {
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(Error::new(format!(
-                        "the store's file {} for {} is not the image the code memory holds",
-                        store.display(),
-                        path.display()
-                    )));
-                }
-                Wrote::Cloned
-            }
-            _ => {
-                std::fs::write(&temporary, bytes).map_err(|it| io("writing", &temporary, it))?;
-                Wrote::Written
-            }
-        };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))
-                .map_err(|it| io("making executable", &temporary, it))?;
-        }
-        if let Err(error) = std::fs::rename(&temporary, path) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(io("renaming the new executable over", path, error));
-        }
-        let identity = Identity::of(path).ok_or_else(|| {
-            Error::new(format!("{} is gone right after it was written", path.display()))
-        })?;
-        written.insert(path.to_owned(), (executable.key, identity));
-        Ok(wrote)
+        Ok(Host { address, waiting, handshakes })
     }
 
     /// The command that starts `launch`, for an `Effect::Spawn`, and what becomes its
@@ -279,14 +211,31 @@ impl Host {
             launch.env.iter().filter(|(name, _)| name != HOST_VAR).cloned().collect();
         env.push((HOST_VAR.into(), var));
         let mut sandbox = launch.sandbox.clone();
-        if let Sandbox::On { read, write, services, .. } = &mut sandbox {
+        if let Sandbox::On { read, services, .. } = &mut sandbox {
             read.push(launch.program.clone());
             services.extend(sys::service());
-            // Connecting to a Unix socket is a write of the socket alone: the program gets
-            // neither the directory nor the other runs' sockets in it. A named pipe is not a
-            // path the sandbox's file rules cover.
+            // The host's socket is a readable entry, never a writable one: the sandbox makes
+            // a readable socket one its process may connect to by that exact path and nothing
+            // more (Linux: bound read-only into its view, and the supervisor lets `connect`
+            // through to exactly that path; macOS: a `(remote unix-socket (path-literal ..))`
+            // rule), as it does the fork server's. It gets neither the directory nor the other
+            // runs' sockets in it, and may not bind, unlink or replace the socket. A writable
+            // entry would have been a writable directory to make (macOS) or a bind the Linux
+            // sandbox refuses for a socket, and either way more than a connect.
+            //
+            // What the run can now do that it could not: connect to this host and, within
+            // [`HANDSHAKE`], send a first frame. The host answers a connection only from a
+            // process of the daemon's user (the kernel's peer credentials), only for a HELLO
+            // naming a token of a launch still waiting, and each token once (the first HELLO
+            // naming it takes it from the table): anything else is dropped with nothing sent.
+            // The run's own token is taken by its start hook before `main`, so the program's
+            // code holds no token it can use. Another launch's token is in that process's
+            // environment alone; a sandbox that keeps a run from reading another process's
+            // environment (Linux: a PID namespace with its own `/proc`, or Landlock's scoping
+            // of `ptrace` access when confined) keeps the host from being reached for anything
+            // but nothing. A named pipe (Windows) is not a path the sandbox's file rules cover.
             if cfg!(unix) {
-                write.push(PathBuf::from(&self.address));
+                read.push(PathBuf::from(&self.address));
             }
         }
         let command = Command {
@@ -527,15 +476,16 @@ impl Session {
 const START: Duration = Duration::from_secs(60);
 
 /// A program placed in a code memory, which any number of processes run: what the daemon's
-/// dev `run` and test paths hold for an executable. Each [`Program::command`] writes the
-/// executable to the command's path when it is not there yet and is a launch of it; a thread
-/// of its own waits for the start hook, attaches the process to the memory and hands the
-/// session on (to whoever answers the process's asks: `blaze-lazy`'s runner).
+/// dev `run` and test paths hold for an executable. Each [`Program::command`] is a launch of
+/// the file its build placed at the command's path, where that file is the memory's
+/// ([`StartError`]); a thread of its own waits for the start hook, attaches the process to the
+/// memory and hands the session on (to whoever answers the process's asks: `blaze-lazy`'s
+/// runner).
 pub struct Program {
     host: Arc<Host>,
     memory: Arc<Lock<CodeMemory>>,
     /// Changed only with `memory` locked ([`Program::relaid`]), so a launch, which reads it
-    /// with `memory` locked, writes the file of the memory it maps.
+    /// with `memory` locked, compares the placed key with the file of the memory it maps.
     image: Lock<Image>,
     sessions: crossbeam_channel::Sender<Result<Session, Error>>,
     starts: Arc<Lock<Starts>>,
@@ -544,12 +494,13 @@ pub struct Program {
     starting: Threads,
 }
 
-/// The executable of a [`Program`], as [`Executable`] names it, for any path.
+/// The executable of a [`Program`]: `len` bytes of the image part of its code memory, the file
+/// the linker wrote, which `key` names (the store's content hash of the link's output, the key
+/// the build places that file under).
 #[derive(Clone, Debug)]
 pub struct Image {
     pub key: [u8; 32],
     pub len: u64,
-    pub store: Option<PathBuf>,
 }
 
 /// One [`Program::command`]'s process, for [`Program::exited`]: the spawn's completion names
@@ -592,7 +543,8 @@ impl Program {
 
     /// The executable is now `image`: `memory`, which the caller holds locked, was committed
     /// into and laid out again ([`CodeMemory::lay_out`]), so its image part is that file. Runs
-    /// started from here on are written from it; runs already started keep theirs.
+    /// started from here on start only from that file placed at their path; runs already
+    /// started keep theirs.
     pub fn relaid(&self, memory: &CodeMemory, image: Image) -> Result<(), Error> {
         if !memory.is_pristine() {
             return Err(Error::new(
@@ -613,82 +565,35 @@ impl Program {
         self.image.lock().key
     }
 
-    /// The command that runs what `command` would have, its program the executable at its
-    /// path: arguments, environment, directory, stdin, sandbox and memory limit stay. `forks`
-    /// says the process forks children that run the program (a fork server): see
+    /// The command that runs what `command` would have, its program the executable its build
+    /// placed at its path: arguments, environment, directory, stdin, sandbox and memory limit
+    /// stay. `forks` says the process forks children that run the program (a fork server): see
     /// [`CodeMemory::attach_forking`].
-    pub fn command(&self, command: Command, forks: bool) -> Result<(Command, Started), Error> {
-        self.command_with(command, forks, Vec::new(), Vec::new(), Vec::new()) // alloc: none, empty
-    }
-
-    /// As [`Program::command`], for a caller that knows what file is at the command's path:
-    /// `placed` is the content key of the output the build placed there and found unchanged
-    /// since, or `None` when it placed none. Where that is the key of this program's
-    /// executable as its memory is now, the file is the memory's file already and nothing is
-    /// written ([`Wrote::Placed`]): the build is the one writer of its outputs, and a second
-    /// write of the same bytes here would only make the build place it again (its file's time
-    /// moved) and its outputs' watch hear a change. Any other key, or none, and the host
-    /// writes the file as [`Program::command`] does. With what was done of the file.
-    pub fn command_placed(
+    ///
+    /// `placed` is the key the build's record holds for the command's path, read once the
+    /// job's placements have ended (`None`: it holds none). The program starts from that file
+    /// only where it is the memory's file, this program's [`Image::key`]; anything else is
+    /// [`StartError::NotPlaced`] naming the path and both keys. Nothing is written: the build
+    /// is the one writer of the path, so its next look finds the file as it placed it and its
+    /// outputs' watch hears nothing.
+    pub fn command(
         &self,
         command: Command,
         forks: bool,
         placed: Option<[u8; 32]>,
-    ) -> Result<(Command, Started, Wrote), Error> {
-        // alloc: none, empty
-        self.start(command, forks, Some(placed), Vec::new(), Vec::new(), Vec::new())
-    }
-
-    /// As [`Program::command`], with dependency images mapped into the run: `maps` laid over
-    /// the executable's reservation for fixed maps (`blaze_premap::map::Memory::maps`), and
-    /// their open words written and bound before the program runs (`blaze_premap::start::plan`'s
-    /// writes and lookups, [`Launch::writes`]). The maps' memory is only borrowed for the launch:
-    /// the grant holds references of its own.
-    pub fn command_with(
-        &self,
-        command: Command,
-        forks: bool,
-        maps: Vec<FixedMap<'_>>,
-        writes: Vec<ImageWrite>,
-        lookups: Vec<ImageLookup<'_>>,
-    ) -> Result<(Command, Started), Error> {
-        let (command, started, _) = self.start(command, forks, None, maps, writes, lookups)?;
-        Ok((command, started))
-    }
-
-    /// What [`Program::command_with`] and [`Program::command_placed`] do. `placed`: `None`
-    /// from a caller that says nothing of the file at the path, `Some` what the build placed
-    /// there.
-    fn start(
-        &self,
-        command: Command,
-        forks: bool,
-        placed: Option<Option<[u8; 32]>>,
-        maps: Vec<FixedMap<'_>>,
-        writes: Vec<ImageWrite>,
-        lookups: Vec<ImageLookup<'_>>,
-    ) -> Result<(Command, Started, Wrote), Error> {
-        let (command, pending, wrote) = {
+    ) -> Result<(Command, Started), StartError> {
+        let (command, pending) = {
             let memory = lock(&self.memory);
-            // clone: once per launch, a key, a length and a store path
-            let image = self.image.lock().clone();
-            let executable = Executable {
-                path: &command.program,
-                key: image.key,
-                len: image.len,
-                store: image.store.as_deref(),
-            };
             // Compared with `memory` locked, as the image is read: a link that commits into
             // the memory changes both under that lock ([`Program::relaid`]).
-            let wrote = match placed {
-                Some(Some(key)) if key == image.key => Wrote::Placed,
-                _ => self.host.write_executable(&memory, &executable)?,
-            };
+            let held = self.image.lock().key;
+            StartError::check(&command.program, placed, held)?;
             let launch = Launch {
                 image: &memory,
-                maps,
-                writes,
-                lookups,
+                // alloc: none, empty: no dependency image is mapped into a dev run yet
+                maps: Vec::new(),
+                writes: Vec::new(),
+                lookups: Vec::new(),
                 program: command.program,
                 args: command.args,
                 env: command.env,
@@ -697,8 +602,7 @@ impl Program {
                 sandbox: command.sandbox,
                 memory: command.memory,
             };
-            let (command, pending) = self.host.launch(&launch)?;
-            (command, pending, wrote)
+            self.host.launch(&launch)?
         };
         let started = {
             let mut starts = lock_starts(&self.starts);
@@ -752,7 +656,7 @@ impl Program {
             .map_err(|it| {
                 Error::new(format!("starting the thread that waits for a start hook: {it}"))
             })?;
-        Ok((command, started, wrote))
+        Ok((command, started))
     }
 
     /// Whether the start of `started` ended with its start hook never attached (the process
@@ -881,7 +785,7 @@ fn serve(
     launch: &Waiting,
     seq: &mut u32,
 ) -> Result<(sys::Remote, sys::Bells, u64), Error> {
-    if hello.pid != peer {
+    if !is_peer(peer, hello.pid)? {
         return Err(Error::new(format!(
             "a start hook that says it is process {} on a connection from process {peer}",
             hello.pid
@@ -952,4 +856,31 @@ fn serve(
             }
         }
     }
+}
+
+/// Whether the start hook on a connection from `peer` (a process ID in the daemon's PID
+/// namespace, from the kernel) saying it is `said` (its own `getpid`) speaks of itself. A
+/// sandboxed run on Linux is in a PID namespace of its own, where `getpid` answers its ID
+/// there; the kernel lists its ID in every namespace from the daemon's down in `NSpid` of
+/// `/proc/<peer>/status`, the last its own. What a hook says is not what authenticates it
+/// (the token and the peer's user are): this catches a hook that names another process.
+fn is_peer(peer: u32, said: u32) -> Result<bool, Error> {
+    if said == peer {
+        return Ok(true);
+    }
+    if !cfg!(target_os = "linux") {
+        return Ok(false);
+    }
+    let path = format!("/proc/{peer}/status");
+    let status = std::fs::read_to_string(&path).map_err(|it| {
+        Error::new(format!("reading {path}, the process IDs of process {peer}: {it}"))
+    })?;
+    Ok(innermost(&status) == Some(said))
+}
+
+/// The last ID of the `NSpid` line of a `/proc/<pid>/status`: the process's ID in its own
+/// PID namespace. `None` where there is no such line or it is not IDs.
+pub(crate) fn innermost(status: &str) -> Option<u32> {
+    let line = status.lines().find_map(|it| it.strip_prefix("NSpid:"))?;
+    line.split_whitespace().last()?.parse().ok()
 }

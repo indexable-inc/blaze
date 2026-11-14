@@ -199,8 +199,9 @@ pub struct Spec {
     /// Whether rustc's MIR inliner runs on the bodies of the crates compiled at these
     /// settings (`Inline::is_enabled`): `-Copt-level` 2 or 3, not `s`/`z`, which share
     /// `Llvm { opt: 2 }`, and not in a build that patches, as rustc runs it only outside
-    /// incremental builds ([`crate::plan::Policy::choose`]). The library's MIR is inlined
-    /// whatever this says, as rustc ships it.
+    /// incremental builds ([`crate::plan::Policy::choose`]). The library's MIR is inlined, as
+    /// rustc ships it, only where this says so too: a tier 0 unit inlines nothing at the MIR
+    /// level (`hir-ty-codegen` `Build::options`).
     pub mir_inline: bool,
     /// The sanitizers and coverage the LLVM back end instruments with: a sanitized build's
     /// code is never a plain one's.

@@ -413,6 +413,22 @@ impl ClientConfig {
         &self.provider
     }
 
+    /// blaze: a TLS 1.3 ticket from [`persist::Tls13ClientSessionValue::to_bytes`] (another
+    /// process's, typically), bound to this config's verifier and client credentials so a
+    /// connection made with this config may resume with it. What the server's ticket allows
+    /// (its age, its lifetime, its early data) is checked as for any ticket, when it is used.
+    pub fn tls13_ticket_from_bytes(
+        &self,
+        bytes: &[u8],
+    ) -> Result<persist::Tls13ClientSessionValue, crate::error::InvalidMessage> {
+        persist::Tls13ClientSessionValue::from_bytes(
+            bytes,
+            &self.provider.cipher_suites,
+            &self.verifier,
+            &self.client_auth_cert_resolver,
+        )
+    }
+
     /// Access configuration options whose use is dangerous and requires
     /// extra care.
     pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {

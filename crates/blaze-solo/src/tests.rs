@@ -19,9 +19,9 @@ use blaze_core::{
 use blaze_front_items::{Reading, steps::{FileKey, Items}};
 use blaze_ids::ContentId;
 use blaze_kernel::{CodeId, Get, Put, Session};
+use blaze_sim::{Broke, Config as SimConfig, Tape};
 use blaze_store_check::Setting;
 use blaze_vfs::watch::fixed_out;
-use hegel::generators as gs;
 use syntax::{Edition, Extensions};
 
 use crate::{
@@ -511,20 +511,19 @@ enum Op {
     LoseStore,
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let file = tc.draw(gs::integers::<u8>().max_value(FILES.len() as u8 - 1));
-    let other = tc.draw(gs::integers::<u8>().max_value(FILES.len() as u8 - 1));
-    match tc.draw(gs::integers::<u8>().max_value(15)) {
-        0..=2 => Op::Write(file, tc.draw(gs::integers::<u8>().max_value(12))),
+fn op(tape: &Tape) -> Op {
+    let file = tape.int_in(0..=FILES.len() as u8 - 1, "file");
+    let other = tape.int_in(0..=FILES.len() as u8 - 1, "other file");
+    match tape.int_in(0..=15u8, "op") {
+        0..=2 => Op::Write(file, tape.int_in(0..=12u8, "content")),
         3 => Op::Remove(file),
         4 => Op::Rename(file, other),
         5 => Op::Touch(file),
         6 => Op::Tag(file, other),
-        7 => Op::Tick(tc.draw(gs::integers::<u16>().max_value(3_000))),
+        7 => Op::Tick(tape.int_in(0..=3_000u16, "tick ms")),
         8 => Op::Tick(5),
         9 => Op::Interleave,
-        10 => Op::Crash(tc.draw(gs::integers::<u8>().max_value(40))),
+        10 => Op::Crash(tape.int_in(0..=40u8, "crash before delivery")),
         11 => Op::LoseStore,
         _ => Op::Run,
     }
@@ -550,15 +549,17 @@ static CONTROLS: Once = Once::new();
 /// and once settled, a run after a run with nothing changed hashes 0 files and repairs 0
 /// entries, the table on disk holds exactly the view's files with their bytes' ids, and every
 /// file asked is answered as a fresh state answers it.
-#[hegel::test(test_cases = 200)]
-fn a_command_answers_as_a_fresh_state_does(tc: hegel::TestCase) {
+#[test]
+fn a_command_answers_as_a_fresh_state_does() {
     CONTROLS.call_once(each_planted_bug_is_caught);
-    let seed = tc.draw(gs::integers::<u64>());
-    let coarse = tc.draw(gs::booleans());
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    if let Err(why) = scenario(seed, coarse, &ops) {
-        panic!("seed {seed}, coarse {coarse}: {why}");
-    }
+    blaze_sim::check(SimConfig::cases(200), |tape| {
+        let seed = tape.next_u64("sim seed");
+        let coarse = tape.bool("coarse");
+        let ops: Vec<Op> = tape.vec(0..=30, "ops", op);
+        if let Err(why) = scenario(seed, coarse, &ops) {
+            panic!("seed {seed}, coarse {coarse}: {why}");
+        }
+    });
 }
 
 /// A file rewritten within its racy window, to the same length in the same coarse tick: its
@@ -622,25 +623,32 @@ fn crash_at_flush(h: &mut Harness) -> Result<(), String> {
     h.settle()
 }
 
-/// `scenario` passes on every seed of `seeds` with nothing planted, and with `plant` fails on
-/// at least one (`every`: on each).
-fn caught(plant: Plant, scenario: fn(&mut Harness) -> Result<(), String>, seeds: u64, every: bool) {
-    let mut failed = 0;
-    for seed in 0..seeds {
-        PLANT.set(Plant::None);
-        if let Err(why) = scenario(&mut Harness::new(seed, false)) {
-            panic!("seed {seed}, nothing planted: {why}");
-        }
+/// `scenario` passes on every case of `cases` with nothing planted, and with `plant` fails on
+/// at least one (`every`: on each); a case's simulation seed is drawn from its tape.
+fn caught(plant: Plant, scenario: fn(&mut Harness) -> Result<(), String>, cases: u32, every: bool) {
+    let ran = |seed: u64, plant: Plant| {
         PLANT.set(plant);
         let result = scenario(&mut Harness::new(seed, false));
         PLANT.set(Plant::None);
-        match result {
-            Err(_) => failed += 1,
-            Ok(()) if every => panic!("seed {seed}: {plant:?} planted, and the oracle passed"),
-            Ok(()) => {}
-        }
+        result
+    };
+    if every {
+        blaze_sim::check(SimConfig::cases(cases), |tape| {
+            let seed = tape.next_u64("sim seed");
+            if let Err(why) = ran(seed, Plant::None) {
+                return Err(Broke::Oracle(format!("seed {seed}, nothing planted: {why}")));
+            }
+            match ran(seed, plant) {
+                Err(_) => Ok(()),
+                Ok(()) => Err(Broke::Oracle(format!("seed {seed}: {plant:?} planted, and the oracle passed"))),
+            }
+        });
+    } else {
+        // Any finding of the oracle is the catch: `caught` asked for no words.
+        blaze_sim::control(SimConfig::cases(cases), Plant::None, plant, "", |tape, plant| {
+            ran(tape.next_u64("sim seed"), plant).map_err(Broke::Oracle)
+        });
     }
-    assert!(failed > 0, "{plant:?} planted on {seeds} seeds, and the oracle passed on each");
 }
 
 /// The controls: each planted bug makes the oracle fail, and its scenario passes without it.
@@ -656,37 +664,38 @@ fn each_planted_bug_is_caught() {
     caught(Plant::SlotBeforeFlush, crash_at_flush, 64, false);
 }
 
-#[hegel::composite]
-fn row(tc: &hegel::TestCase) -> (String, Row) {
+fn row(tape: &Tape) -> (String, Row) {
     const PARTS: [&str; 5] = ["a", "b", "src", "x.rs", "CACHEDIR.TAG"];
-    let depth = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
-    let path: Vec<&str> = (0..depth).map(|_| PARTS[tc.draw(gs::integers::<usize>().max_value(PARTS.len() - 1))]).collect();
+    let depth = tape.int_in(1..=3usize, "depth");
+    let path: Vec<&str> = (0..depth).map(|_| PARTS[tape.index(PARTS.len(), "part")]).collect();
     let path = path.join("/");
     let stamp = Stamp {
-        ino: tc.draw(gs::integers::<u64>()),
-        size: tc.draw(gs::integers::<u64>()),
-        mtime_ns: tc.draw(gs::integers::<u64>()),
-        ctime_ns: tc.draw(gs::integers::<u64>()),
-        mode: tc.draw(gs::integers::<u32>()),
+        ino: tape.int::<u64>("ino"),
+        size: tape.int::<u64>("size"),
+        mtime_ns: tape.int::<u64>("mtime ns"),
+        ctime_ns: tape.int::<u64>("ctime ns"),
+        mode: tape.int::<u32>("mode"),
     };
-    let id = tc.draw(gs::booleans()).then(|| ContentId::of("a test id", &stamp.ino.to_le_bytes()));
-    let kind = [Kind::File, Kind::Dir, Kind::Link, Kind::Hidden, Kind::Tag][tc.draw(gs::integers::<usize>().max_value(4))];
+    let id = tape.bool("has an id").then(|| ContentId::of("a test id", &stamp.ino.to_le_bytes()));
+    let kind = [Kind::File, Kind::Dir, Kind::Link, Kind::Hidden, Kind::Tag][tape.index(5, "kind")];
     (path.clone(), Row { path, stamp, id, kind })
 }
 
 /// The refinement: a table's bytes decode to the table, and encode back to the same bytes.
-#[hegel::test(test_cases = 200)]
-fn table_round_trips(tc: hegel::TestCase) {
-    let drawn: Vec<(String, Row)> = tc.draw(gs::vecs(row()).max_size(20));
-    let mut rows: BTreeMap<String, Row> = drawn.into_iter().collect();
-    if tc.draw(gs::booleans()) {
-        rows.insert(String::new(), Row { path: String::new(), stamp: Stamp::GONE, id: None, kind: Kind::Dir });
-    }
-    let table = Table { instant_ns: tc.draw(gs::integers::<u64>()), rows: rows.into_values().collect() };
-    let bytes = table.encode();
-    let back = Table::decode(&bytes).expect("a table's own bytes decode");
-    assert_eq!(back, table);
-    assert_eq!(back.encode(), bytes);
+#[test]
+fn table_round_trips() {
+    blaze_sim::check(SimConfig::cases(200), |tape| {
+        let drawn: Vec<(String, Row)> = tape.vec(0..=20, "rows", row);
+        let mut rows: BTreeMap<String, Row> = drawn.into_iter().collect();
+        if tape.bool("has a root row") {
+            rows.insert(String::new(), Row { path: String::new(), stamp: Stamp::GONE, id: None, kind: Kind::Dir });
+        }
+        let table = Table { instant_ns: tape.int::<u64>("instant ns"), rows: rows.into_values().collect() };
+        let bytes = table.encode();
+        let back = Table::decode(&bytes).expect("a table's own bytes decode");
+        assert_eq!(back, table);
+        assert_eq!(back.encode(), bytes);
+    });
 }
 
 /// A table of another layout word is refused by that word, by `decode` and by a command,

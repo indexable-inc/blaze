@@ -262,9 +262,65 @@ impl Facts {
     }
 }
 
+/// Whether the analyses behind a fact may run the reach prover (`hir-ty-pure`'s `reach`, which
+/// takes a dead panic site or a check that cannot fail off a body's effects). A proof costs
+/// more than the rest of a body's walk together, so spending one is a tier's choice
+/// ([`proofs_at`]); it is an input of every summary and fact made under it and of the code a
+/// pass changes on those facts (through [`crate::mir::MirOptions::tier`]), so a value made
+/// under one is never read in place of the other's (rule `keys-cover-every-input`).
+///
+/// Both are sound: under [`Proofs::None`] every panic site and check stays a panic, so fewer
+/// facts are inferred, never a wrong one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+pub enum Proofs {
+    /// No proof is run: every site is what it is written as.
+    None,
+    /// Each body's proof is asked for and what it discharges is not a panic.
+    Spent,
+}
+
+/// What a body's code is built at (docs/v2/plan/design/tiers.md): which of blaze's passes that
+/// read past the body run on its MIR (`hir-ty-mir`'s `optimize::passes_at`), and whether the
+/// facts they read spend proofs ([`proofs_at`]). An input of the optimized MIR's key
+/// ([`crate::mir::MirOptions::tier`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
+pub enum Tier {
+    /// Code a request waits for: copy-and-patch stencils, Cranelift, LLVM at `-O0` (the edit
+    /// loop, a cold dev build). No pass reads past the body: no MIR inlining (only the code
+    /// generator's `#[inline(always)]`), no pass on facts, so optimizing a body costs a pass
+    /// over its own statements and nothing that grows with its callees.
+    Zero,
+    /// The library's bodies as rustc shipped them, under a unit that optimizes and in the copy
+    /// a caller inlines: rustc's own pipeline, its inliner included, and no pass on facts
+    /// (rustc has none), so one body serves every optimizing unit and the one answer of which
+    /// library functions are inlinable (`cross_crate_inlinable`).
+    Shipped,
+    /// Optimized code: LLVM above `-O0` (release, a dependency built once and kept, background
+    /// tier-up), and MIR at level 2 where no unit is asking (the interpreter's). The tier the
+    /// pass on facts (`SpendFacts`) is for, though for now its list does not have it (`passes_at`
+    /// says why: each callee's summary is a walk of all it reaches); its tests run it here
+    /// through `hir-ty-mir`'s `spend_facts_at`.
+    Optimizing,
+}
+
+/// Whether code built at `tier` spends proofs: the one rule. Tier 0 never runs the prover to
+/// generate code (nor any pass on facts); the library as shipped runs no pass on facts; an
+/// optimizing tier spends them. The only readers of a tier's proofs are the two runs of
+/// `SpendFacts`, which no tier runs for now (`hir-ty-mir`'s `passes_at`), so no build spends a
+/// proof today; the answer stays the tier's for when the pass comes back, and its tests ask
+/// with it. The checks (`#[blaze::nopanic]`, `pure`, `noalloc`,
+/// `nonblocking`, the role lints, `blaze::unreachable`, `proved_unreachable`) are no tier: they
+/// ask with [`Proofs::Spent`], per definition and on demand.
+pub const fn proofs_at(tier: Tier) -> Proofs {
+    match tier {
+        Tier::Zero | Tier::Shipped => Proofs::None,
+        Tier::Optimizing => Proofs::Spent,
+    }
+}
+
 /// The analyses' code for [`facts_of`], registered by the crate that has them.
 pub struct Provider {
-    pub facts_of: for<'db> fn(&'db Db, FactItem) -> &'db Facts,
+    pub facts_of: for<'db> fn(&'db Db, FactItem, Proofs) -> &'db Facts,
     /// `cfg!(test)` where the table is built, as [`crate::providers::Mir::own_tests`].
     pub own_tests: bool,
 }
@@ -292,14 +348,17 @@ pub fn linked() -> Option<&'static Provider> {
     })
 }
 
-/// Every fact of `item`: the one query the optimizer, the code generator and tools read.
+/// Every fact of `item`, proved with `proofs`: the one query the optimizer, the code generator
+/// and tools read. A pass asks with its body's tier's ([`proofs_at`] of
+/// [`crate::mir::MirOptions::tier`]); a tool or a
+/// check with [`Proofs::Spent`].
 ///
 /// Panics, naming what to link, in a binary without the analyses: a caller that can run in
 /// one (a MIR pass under a crate's own tests) asks [`linked`] first.
-pub fn facts_of(db: &Db, item: FactItem) -> &Facts {
+pub fn facts_of(db: &Db, item: FactItem, proofs: Proofs) -> &Facts {
     let table =
         linked().unwrap_or_else(|| panic!("no facts provider is linked: link hir-ty-pure"));
-    (table.facts_of)(db, item)
+    (table.facts_of)(db, item, proofs)
 }
 
 #[cfg(test)]
@@ -350,6 +409,17 @@ mod tests {
         // Trusted for it is not proved of it.
         let trusted = Facts { trusted: FactSet::one(Fact::NoUnwind), ..Facts::none([3; 32]) };
         assert_eq!(trusted.license(Spend::UnwindEdge), None);
+    }
+
+    /// The invariant: tier 0 spends no proof and an optimizing tier does (for `SpendFacts`,
+    /// when it runs there); the two modes are two values, so no key that holds one can hold
+    /// the other.
+    #[test]
+    fn tier_zero_spends_no_proof() {
+        assert_eq!(proofs_at(Tier::Zero), Proofs::None);
+        assert_eq!(proofs_at(Tier::Shipped), Proofs::None);
+        assert_eq!(proofs_at(Tier::Optimizing), Proofs::Spent);
+        assert_ne!(Proofs::None, Proofs::Spent);
     }
 
     #[test]

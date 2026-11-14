@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use base_db::{CrateOrigin, Db};
 use hir_def::{AdtId, FunctionId, HasModule as _, ModuleDefId, VariantId};
-use hir_ty::{next_solver::TyKind, traits::StoredParamEnvAndCrate};
+use hir_ty::{facts::Proofs, next_solver::TyKind, traits::StoredParamEnvAndCrate};
 use hir_ty_mir::mir::{
     BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
     Rvalue, StatementKind, StoredPlace, TerminatorKind, dispatch::Body, return_slot,
@@ -778,7 +778,8 @@ pub fn lock_facts(db: &Db, func: FunctionId) -> LockFacts {
 /// The edges of `func`'s own body with their places and chains.
 pub fn held_while_taking(db: &Db, func: FunctionId) -> Box<[HeldWhileTaking]> {
     let (env, root) = root_of(db, func);
-    let cx = Cx::new(db, env.clone()); // clone: a handle, reference counts
+    // A lint's: proofs spent, as [`summary`]'s.
+    let cx = Cx::new(db, env.clone(), Proofs::Spent); // clone: a handle, reference counts
     let summary = summary(db, env, root.clone()); // clone: the query's key, reference counts
     summary
         .locks
@@ -803,7 +804,8 @@ pub fn held_while_taking(db: &Db, func: FunctionId) -> Box<[HeldWhileTaking]> {
 )]
 pub fn held_across(db: &Db, func: FunctionId) -> Box<[HeldAcross]> {
     let (env, root) = root_of(db, func);
-    let cx = Cx::new(db, env.clone()); // clone: a handle, reference counts
+    // A lint's: proofs spent, as [`summary`]'s.
+    let cx = Cx::new(db, env.clone(), Proofs::Spent); // clone: a handle, reference counts
     let summary = summary(db, env.clone(), root.clone()); // clone: the query's key
     let Some(index) = effect_index(&NONBLOCKING) else { return Box::default() };
     summary

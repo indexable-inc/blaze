@@ -6,14 +6,12 @@ extern crate std;
 
 use alloc::alloc::Global;
 use std::boxed::Box;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::string::String;
 use std::string::ToString;
 use std::vec::Vec;
 use std::{eprintln, format};
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Broke, Config, Tape};
 
 use crate::ast::{
     self, Assignment, CallArgs, CaseArm, ChainLink, ChainOp, CompareOp, Delete, Expr, ExprKind,
@@ -43,59 +41,60 @@ fn leak(text: String) -> &'static str {
 }
 
 /// A number in `0..n`, for `n` at least 1.
-fn below(tc: &TestCase, n: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().max_value(n.saturating_sub(1)))
+fn below(tape: &Tape, n: u32) -> u32 {
+    tape.int_in(0..=n.saturating_sub(1), "below")
 }
 
-fn coin(tc: &TestCase) -> bool {
-    tc.draw(gs::booleans())
+fn coin(tape: &Tape) -> bool {
+    tape.bool("coin")
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*`, from a small alphabet so names collide with keywords (`by`) and
 /// with each other in other cases.
-fn identifier(tc: &TestCase) -> String {
-    let mut text: String = tc.draw(gs::text().alphabet("abcxyzABCXYZ_").min_size(1).max_size(1));
-    let rest: String = tc.draw(gs::text().alphabet("abcxyzABCXYZ_0189").max_size(6));
+fn identifier(tape: &Tape) -> String {
+    let mut text = tape.text_from("abcxyzABCXYZ_", 1..=1, "identifier start");
+    let rest = tape.text_from("abcxyzABCXYZ_0189", 0..=6, "identifier rest");
     text.push_str(&rest);
     text
 }
 
 /// A name that is not a keyword: quoted (any text without `"`) or a plain identifier.
-fn name(tc: &TestCase) -> Name<'static> {
-    if below(tc, 4) == 0 {
-        let text: String =
-            tc.draw(gs::text().alphabet("ab XY_09-+.,'é;()*$").min_size(1).max_size(6));
-        return Name { text: leak(text), quoted: true, span: NOWHERE };
-    }
-    let mut text = identifier(tc);
-    if keyword(&text).is_some() {
-        // No keyword ends in `_`.
-        text.push('_');
-    }
-    Name { text: leak(text), quoted: false, span: NOWHERE }
+fn name(tape: &Tape) -> Name<'static> {
+    tape.span("name", |tape| {
+        if below(tape, 4) == 0 {
+            let text = tape.text_from("ab XY_09-+.,'é;()*$", 1..=6, "quoted name");
+            return Name { text: leak(text), quoted: true, span: NOWHERE };
+        }
+        let mut text = identifier(tape);
+        if keyword(&text).is_some() {
+            // No keyword ends in `_`.
+            text.push('_');
+        }
+        Name { text: leak(text), quoted: false, span: NOWHERE }
+    })
 }
 
 /// A parameter's name: any identifier, keywords included (`$select` is a parameter).
-fn param(tc: &TestCase) -> Name<'static> {
-    Name { text: leak(identifier(tc)), quoted: false, span: NOWHERE }
+fn param(tape: &Tape) -> Name<'static> {
+    Name { text: leak(identifier(tape)), quoted: false, span: NOWHERE }
 }
 
 /// Finite and not negative: a sign is a `Neg` around the literal.
-fn real(tc: &TestCase) -> f64 {
-    let value: f64 =
-        tc.draw(gs::floats::<f64>().min_value(0.0).allow_nan(false).allow_infinity(false));
+fn real(tape: &Tape) -> f64 {
+    // `f64_finite` folded to its magnitude: every finite value at least 0.0.
+    let value = tape.f64_finite("real").abs();
     // `-0.0` would print as `-0.0`, which is `Neg` around `0.0`.
     if value == 0.0 { 0.0 } else { value }
 }
 
 /// The source of a text literal: any text with each `'` doubled.
-fn text_literal(tc: &TestCase) -> &'static str {
-    let raw: String = tc.draw(gs::text().max_size(8));
+fn text_literal(tape: &Tape) -> &'static str {
+    let raw = tape.text(0..=8, "text literal");
     leak(raw.replace('\'', "''"))
 }
 
-fn blob(tc: &TestCase) -> &'static str {
-    let mut digits: String = tc.draw(gs::text().alphabet("0123456789abcdefABCDEF").max_size(8));
+fn blob(tape: &Tape) -> &'static str {
+    let mut digits = tape.text_from("0123456789abcdefABCDEF", 0..=8, "blob");
     if digits.len() % 2 == 1 {
         digits.pop();
     }
@@ -126,72 +125,80 @@ const TYPES: [Storage; 5] =
     [Storage::Boolean, Storage::Integer, Storage::Real, Storage::Text, Storage::Blob];
 
 /// An expression `depth` levels down (the top is 1); at [`TREE_DEPTH`] only leaves.
-fn expr(tc: &TestCase, depth: u32) -> Ex {
+fn expr(tape: &Tape, depth: u32) -> Ex {
+    tape.span("expr", |tape| expr_kind(tape, depth))
+}
+
+fn expr_kind(tape: &Tape, depth: u32) -> Ex {
     let kinds = if depth >= TREE_DEPTH { 8 } else { 19 };
-    let kind = match below(tc, kinds) {
+    let kind = match below(tape, kinds) {
         0 => ExprKind::Null,
-        1 => ExprKind::Boolean(coin(tc)),
-        2 => ExprKind::Integer(tc.draw(gs::integers::<u64>())),
-        3 => ExprKind::Real(real(tc)),
-        4 => ExprKind::Text(text_literal(tc)),
-        5 => ExprKind::Blob(blob(tc)),
+        1 => ExprKind::Boolean(coin(tape)),
+        2 => ExprKind::Integer(tape.int("integer")),
+        3 => ExprKind::Real(real(tape)),
+        4 => ExprKind::Text(text_literal(tape)),
+        5 => ExprKind::Blob(blob(tape)),
         6 => {
-            let table = if coin(tc) { Some(name(tc)) } else { None };
-            ExprKind::Column { table, column: name(tc) }
+            let table = if coin(tape) { Some(name(tape)) } else { None };
+            ExprKind::Column { table, column: name(tape) }
         }
-        7 => ExprKind::Param(param(tc)),
+        7 => ExprKind::Param(param(tape)),
         8 => {
-            let op = if coin(tc) { UnaryOp::Neg } else { UnaryOp::Not };
-            ExprKind::Unary { op, operand: sub(tc, depth) }
+            let op = if coin(tape) { UnaryOp::Neg } else { UnaryOp::Not };
+            ExprKind::Unary { op, operand: sub(tape, depth) }
         }
         9 => {
             // 1 to 4 links of one level; operands of any kind, nested chains among them.
-            let ops = CHAIN_LEVELS[below(tc, 5) as usize];
-            let first = sub(tc, depth);
+            let ops = CHAIN_LEVELS[below(tape, 5) as usize];
+            let first = sub(tape, depth);
             let mut rest = Vec::new_in(Global);
-            for _ in 0..1 + below(tc, 4) {
-                let op = ops[below(tc, ops.len() as u32) as usize];
-                rest.push(ChainLink { op, operand: expr(tc, depth + 1) });
+            for _ in 0..1 + below(tape, 4) {
+                let op = ops[below(tape, ops.len() as u32) as usize];
+                rest.push(ChainLink { op, operand: expr(tape, depth + 1) });
             }
             ExprKind::Chain { first, rest }
         }
-        10 => ExprKind::IsNull { operand: sub(tc, depth), negated: coin(tc) },
+        10 => ExprKind::IsNull { operand: sub(tape, depth), negated: coin(tape) },
         11 => ExprKind::InList {
-            operand: sub(tc, depth),
-            list: exprs(tc, depth, 1, 3),
-            negated: coin(tc),
+            operand: sub(tape, depth),
+            list: exprs(tape, depth, 1, 3),
+            negated: coin(tape),
         },
-        12 => ExprKind::InParam { operand: sub(tc, depth), list: param(tc), negated: coin(tc) },
-        13 => ExprKind::Between {
-            operand: sub(tc, depth),
-            low: sub(tc, depth),
-            high: sub(tc, depth),
-            negated: coin(tc),
-        },
-        14 => {
-            ExprKind::Like { operand: sub(tc, depth), pattern: sub(tc, depth), negated: coin(tc) }
+        12 => {
+            ExprKind::InParam { operand: sub(tape, depth), list: param(tape), negated: coin(tape) }
         }
+        13 => ExprKind::Between {
+            operand: sub(tape, depth),
+            low: sub(tape, depth),
+            high: sub(tape, depth),
+            negated: coin(tape),
+        },
+        14 => ExprKind::Like {
+            operand: sub(tape, depth),
+            pattern: sub(tape, depth),
+            negated: coin(tape),
+        },
         15 => {
-            let operand = if coin(tc) { Some(sub(tc, depth)) } else { None };
+            let operand = if coin(tape) { Some(sub(tape, depth)) } else { None };
             let mut arms = Vec::new_in(Global);
-            for _ in 0..1 + below(tc, 2) {
-                arms.push(CaseArm { when: expr(tc, depth + 1), then: expr(tc, depth + 1) });
+            for _ in 0..1 + below(tape, 2) {
+                arms.push(CaseArm { when: expr(tape, depth + 1), then: expr(tape, depth + 1) });
             }
-            let otherwise = if coin(tc) { Some(sub(tc, depth)) } else { None };
+            let otherwise = if coin(tape) { Some(sub(tape, depth)) } else { None };
             ExprKind::Case { operand, arms, otherwise }
         }
-        16 => ExprKind::Cast { operand: sub(tc, depth), to: TYPES[below(tc, 5) as usize] },
+        16 => ExprKind::Cast { operand: sub(tape, depth), to: TYPES[below(tape, 5) as usize] },
         17 => {
-            let op = COMPARE[below(tc, 8) as usize];
-            ExprKind::Compare { op, left: sub(tc, depth), right: sub(tc, depth) }
+            let op = COMPARE[below(tape, 8) as usize];
+            ExprKind::Compare { op, left: sub(tape, depth), right: sub(tape, depth) }
         }
         _ => {
-            let function = name(tc);
-            let args = if below(tc, 4) == 0 {
+            let function = name(tape);
+            let args = if below(tape, 4) == 0 {
                 CallArgs::Star
             } else {
-                let distinct = coin(tc);
-                let args = exprs(tc, depth, if distinct { 1 } else { 0 }, 3);
+                let distinct = coin(tape);
+                let args = exprs(tape, depth, if distinct { 1 } else { 0 }, 3);
                 CallArgs::List { distinct, args }
             };
             ExprKind::Call { function, args }
@@ -200,32 +207,32 @@ fn expr(tc: &TestCase, depth: u32) -> Ex {
     Expr { kind, span: NOWHERE }
 }
 
-fn sub(tc: &TestCase, depth: u32) -> Box<Ex, Global> {
-    Box::new_in(expr(tc, depth + 1), Global)
+fn sub(tape: &Tape, depth: u32) -> Box<Ex, Global> {
+    Box::new_in(expr(tape, depth + 1), Global)
 }
 
 /// `least..=most` expressions one level below `depth`.
-fn exprs(tc: &TestCase, depth: u32, least: u32, most: u32) -> Vec<Ex, Global> {
+fn exprs(tape: &Tape, depth: u32, least: u32, most: u32) -> Vec<Ex, Global> {
     let mut exprs = Vec::new_in(Global);
-    for _ in 0..least + below(tc, most - least + 1) {
-        exprs.push(expr(tc, depth + 1));
+    for _ in 0..least + below(tape, most - least + 1) {
+        exprs.push(expr(tape, depth + 1));
     }
     exprs
 }
 
-fn maybe(tc: &TestCase) -> Option<Ex> {
-    if coin(tc) { Some(expr(tc, 1)) } else { None }
+fn maybe(tape: &Tape) -> Option<Ex> {
+    if coin(tape) { Some(expr(tape, 1)) } else { None }
 }
 
-fn result_columns(tc: &TestCase, least: u32) -> Vec<ResultColumn<'static, Global>, Global> {
+fn result_columns(tape: &Tape, least: u32) -> Vec<ResultColumn<'static, Global>, Global> {
     let mut columns = Vec::new_in(Global);
-    for _ in 0..least + below(tc, 3 - least + 1) {
-        columns.push(match below(tc, 4) {
+    for _ in 0..least + below(tape, 3 - least + 1) {
+        columns.push(match below(tape, 4) {
             0 => ResultColumn::Star { span: NOWHERE },
-            1 => ResultColumn::TableStar { table: name(tc) },
+            1 => ResultColumn::TableStar { table: name(tape) },
             _ => {
-                let expr = expr(tc, 1);
-                let alias = if coin(tc) { Some(name(tc)) } else { None };
+                let expr = expr(tape, 1);
+                let alias = if coin(tape) { Some(name(tape)) } else { None };
                 ResultColumn::Expr { expr, alias }
             }
         });
@@ -233,70 +240,70 @@ fn result_columns(tc: &TestCase, least: u32) -> Vec<ResultColumn<'static, Global
     columns
 }
 
-fn table_ref(tc: &TestCase) -> TableRef<'static> {
-    let table = name(tc);
-    let alias = if coin(tc) { Some(name(tc)) } else { None };
+fn table_ref(tape: &Tape) -> TableRef<'static> {
+    let table = name(tape);
+    let alias = if coin(tape) { Some(name(tape)) } else { None };
     TableRef { table, alias }
 }
 
-fn select(tc: &TestCase) -> Select<'static, Global> {
-    let distinct = coin(tc);
-    let columns = result_columns(tc, 1);
-    let from = if coin(tc) {
-        let first = table_ref(tc);
+fn select(tape: &Tape) -> Select<'static, Global> {
+    let distinct = coin(tape);
+    let columns = result_columns(tape, 1);
+    let from = if coin(tape) {
+        let first = table_ref(tape);
         let mut joins = Vec::new_in(Global);
-        for _ in 0..below(tc, 3) {
-            let kind = if coin(tc) { JoinKind::Inner } else { JoinKind::Left };
-            joins.push(Join { kind, table: table_ref(tc), on: expr(tc, 1) });
+        for _ in 0..below(tape, 3) {
+            let kind = if coin(tape) { JoinKind::Inner } else { JoinKind::Left };
+            joins.push(Join { kind, table: table_ref(tape), on: expr(tape, 1) });
         }
         Some(ast::From { first, joins })
     } else {
         None
     };
-    let filter = maybe(tc);
-    let group_by = exprs(tc, 0, 0, 2);
-    let having = maybe(tc);
+    let filter = maybe(tape);
+    let group_by = exprs(tape, 0, 0, 2);
+    let having = maybe(tape);
     let mut order_by = Vec::new_in(Global);
-    for _ in 0..below(tc, 3) {
-        order_by.push(OrderTerm { expr: expr(tc, 1), descending: coin(tc) });
+    for _ in 0..below(tape, 3) {
+        order_by.push(OrderTerm { expr: expr(tape, 1), descending: coin(tape) });
     }
-    let limit = maybe(tc);
+    let limit = maybe(tape);
     // `offset` stands only after `limit`.
-    let offset = if limit.is_some() { maybe(tc) } else { None };
+    let offset = if limit.is_some() { maybe(tape) } else { None };
     Select { distinct, columns, from, filter, group_by, having, order_by, limit, offset }
 }
 
 /// A statement of every form, with every node kind below it.
-fn statement(tc: &TestCase) -> Tree {
-    match below(tc, 4) {
-        0 => Statement::Select(select(tc)),
+fn statement(tape: &Tape) -> Tree {
+    match below(tape, 4) {
+        0 => Statement::Select(select(tape)),
         1 => {
-            let table = name(tc);
+            let table = name(tape);
             let mut columns = Vec::new_in(Global);
-            for _ in 0..1 + below(tc, 3) {
-                columns.push(name(tc));
+            for _ in 0..1 + below(tape, 3) {
+                columns.push(name(tape));
             }
             let mut rows = Vec::new_in(Global);
-            for _ in 0..1 + below(tc, 2) {
-                rows.push(exprs(tc, 0, 1, 3));
+            for _ in 0..1 + below(tape, 2) {
+                rows.push(exprs(tape, 0, 1, 3));
             }
-            let returning = result_columns(tc, 0);
+            let returning = result_columns(tape, 0);
             Statement::Insert(Insert { table, columns, rows, returning })
         }
         2 => {
-            let table = name(tc);
+            let table = name(tape);
             let mut sets = Vec::new_in(Global);
-            for _ in 0..1 + below(tc, 2) {
-                sets.push(Assignment { column: name(tc), value: expr(tc, 1) });
+            for _ in 0..1 + below(tape, 2) {
+                sets.push(Assignment { column: name(tape), value: expr(tape, 1) });
             }
-            let filter = maybe(tc);
-            let returning = result_columns(tc, 0);
+            let filter = maybe(tape);
+            let returning = result_columns(tape, 0);
             Statement::Update(Update { table, sets, filter, returning })
         }
         _ => {
-            let table = name(tc);
-            let filter = maybe(tc);
-            let returning = result_columns(tc, 0);
+            let table = name(tape);
+            let filter = maybe(tape);
+            let returning = result_columns(tape, 0);
             Statement::Delete(Delete { table, filter, returning })
         }
     }
@@ -532,42 +539,22 @@ fn round_trip(tree: &Statement<'_, Global>, planted: bool) -> Result<(), String>
     spans_hold(&text, &back)
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: for every tree of the subset (every statement form and every expression
 /// kind, four deep), `same(parse(print(s)), s)`; the reparsed tree prints to the same text;
 /// and every name of the reparsed tree has a span that slices the text to the name as
-/// written. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// written. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_printed_tree_parses_back_to_itself() {
-    run_cases(512, |tc| {
-        let tree = statement(&tc);
-        if let Err(why) = round_trip(&tree, false) {
-            panic!("{why}");
-        }
-    });
+    blaze_sim::check(Config::cases(512), |tape| round_trip(&statement(tape), false));
 }
 
 /// Control: without its parentheses the printer's text depends on precedence, and the round
 /// trip must fail for some generated tree within the same case count.
 #[test]
 fn the_oracle_catches_a_printer_that_drops_parentheses() {
-    let caught = catch_unwind(AssertUnwindSafe(|| {
-        Hegel::new(|tc: TestCase| {
-            let tree = statement(&tc);
-            if let Err(why) = round_trip(&tree, true) {
-                panic!("{why}");
-            }
-        })
-        .settings(Settings::new().test_cases(512).database(None))
-        .run();
-    }));
-    assert!(caught.is_err(), "the round trip passed with a printer that drops parentheses");
+    blaze_sim::control(Config::cases(512), false, true, "", |tape, planted| {
+        round_trip(&statement(tape), planted).map_err(Broke::Oracle)
+    });
 }
 
 /// Text parses or is refused, never panics; a refusal's span lies in the text and its message
@@ -596,10 +583,7 @@ fn parses_or_is_refused(text: &str) {
 
 #[test]
 fn any_text_parses_or_is_refused_without_a_panic() {
-    run_cases(1024, |tc| {
-        let text: String = tc.draw(gs::text().max_size(64));
-        parses_or_is_refused(&text);
-    });
+    blaze_sim::check(Config::cases(1024), |tape| parses_or_is_refused(&tape.text(0..=64, "text")));
 }
 
 /// Pieces of the subset and of what it refuses, so random sequences reach deep into the
@@ -682,12 +666,11 @@ const PIECES: &[&str] = &[
 
 #[test]
 fn token_soup_parses_or_is_refused_without_a_panic() {
-    run_cases(2048, |tc| {
-        let picks: Vec<usize> =
-            tc.draw(gs::vecs(gs::integers::<usize>().max_value(PIECES.len() - 1)).max_size(24));
-        let mut text = String::from(if coin(&tc) { "select " } else { "" });
-        for pick in picks {
-            text.push_str(PIECES[pick]);
+    blaze_sim::check(Config::cases(2048), |tape| {
+        let picks = tape.vec(0..=24, "pieces", |tape| *tape.one_of(PIECES, "piece"));
+        let mut text = String::from(if coin(tape) { "select " } else { "" });
+        for piece in picks {
+            text.push_str(piece);
             text.push(' ');
         }
         parses_or_is_refused(&text);

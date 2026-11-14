@@ -95,6 +95,24 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
         unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(),
         "a replace checks nothing"
     );
+    let rules = cargo(&["check", "--rules", "move.astlog", "--dry-run", "--replace=a::B=c::D"]);
+    assert_eq!(rules.flags.rules.as_deref(), Some("move.astlog"));
+    assert!(rules.flags.dry_run);
+    assert!(rules.args.is_empty(), "`--rules` and `--dry-run` stay with the client");
+    assert_eq!(unhonored(&["check", "--rules", "r", "--replace", "a::B=c::D"]), None);
+    let query = cargo(&["check", "--query=find.astlog"]);
+    assert_eq!(query.flags.query.as_deref(), Some("find.astlog"));
+    assert!(query.args.is_empty(), "`--query` stays with the client");
+    for (words, why) in [
+        (&["check", "--query", "q", "--rules", "r"][..], "a query writes nothing"),
+        (&["check", "--query", "q", "--dry-run"][..], "a query writes nothing already"),
+        (&["check", "--dry-run"][..], "a dry run of no edits"),
+        (&["check", "--rules", "r", "--fix"][..], "rules check nothing"),
+        (&["check", "--query", "q", "--deny", "unused_imports"][..], "a query checks nothing"),
+    ] {
+        assert!(unhonored(words).is_some(), "{why}: {words:?}");
+    }
+    assert!(refused(&["build", "--rules", "r"]).contains("--rules"), "`check`'s alone");
     assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
     let whole = |words: &[&str]| unhonored(&[&["check", "--workspace", t], words].concat());
     assert_eq!(
@@ -383,9 +401,9 @@ fn test_names_its_filter_and_the_harness_args() {
     assert_eq!(bench.test_args(), os(&["fast", "--bench"]));
     assert_eq!(bench.profile(), "bench");
 
-    let reached = cargo(&["test", "--reached"]);
-    assert!(reached.flags.reached);
-    assert!(reached.args.is_empty());
+    let run_all = cargo(&["test", "--run-all"]);
+    assert!(run_all.flags.run_all && !cargo(&["test"]).flags.run_all);
+    assert!(run_all.args.is_empty(), "cargo never sees `--run-all`");
 }
 
 #[test]
@@ -503,8 +521,8 @@ fn an_unknown_flag() {
         "error: unexpected argument 'b' found\n\nUsage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor \
          more information, try '--help'.\n"
     );
-    // `--doc` and `--reached` are `test`'s alone.
-    assert!(parse(os(&["build", "--reached"])).is_err());
+    // `--doc` and `--run-all` are `test`'s alone.
+    assert!(parse(os(&["build", "--run-all"])).is_err());
     assert!(parse(os(&["build", "--", "x"])).is_err());
 }
 
@@ -541,6 +559,14 @@ fn hidden_flags_that_point_elsewhere() {
     tip(&["build", "-s"], "--silent", &similar("--quiet"), "cargo build [OPTIONS]");
     tip(&["run", "--silent"], "--silent", &similar("--quiet"), "cargo run [OPTIONS] [ARGS]...");
     tip(&["build", "-t", "x"], "-t", &similar("--target"), "cargo build [OPTIONS]");
+    // Selection is the default: the flag that opted into it is refused, naming the default and
+    // `--run-all`, never accepted and ignored.
+    tip(
+        &["test", "--reached"],
+        "--reached",
+        super::REACHED_GONE,
+        "cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]",
+    );
     tip(&["build", "--path", "x"], "--path", &similar("--manifest-path"), "cargo build [OPTIONS]");
     tip(
         &["build", "--out-dir", "x"],

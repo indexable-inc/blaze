@@ -10,8 +10,7 @@
 use std::collections::BTreeSet;
 
 use blaze_api::Targets;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -558,11 +557,10 @@ fn runs_as(ops: &[Op], plant: Option<Plant>, lenient: bool, from: usize) -> Resu
     ran.map(|()| model)
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let head = usize::from(tc.draw(gs::booleans()));
-    let conn = tc.draw(gs::integers::<u8>().max_value(2));
-    match tc.draw(gs::integers::<u8>().max_value(23)) {
+fn op(tape: &Tape) -> Op {
+    let head = usize::from(tape.bool("head"));
+    let conn = tape.int_in(0..=2u8, "conn");
+    match tape.int_in(0..=23u8, "op") {
         0..=3 => Op::Save(head),
         4 => Op::Switch(head),
         5..=7 => Op::Deliver(head),
@@ -570,23 +568,16 @@ fn op(tc: &TestCase) -> Op {
         11..=14 => Op::Request {
             conn,
             head,
-            check: tc.draw(gs::integers::<u8>().max_value(4)) == 0,
-            variant: u8::from(tc.draw(gs::integers::<u8>().max_value(5)) == 0),
+            check: tape.int_in(0..=4u8, "check") == 0,
+            variant: u8::from(tape.int_in(0..=5u8, "variant") == 0),
         },
         15 => Op::Reads { conn, head },
         16 => Op::Status { conn },
         17 => Op::Cancel { conn },
         18 => Op::Gone { conn },
         19 => Op::Restart,
-        _ => Op::Tick(tc.draw(gs::integers::<u8>().min_value(1).max_value(8))),
+        _ => Op::Tick(tape.int_in(1..=8u8, "ticks")),
     }
-}
-
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 /// The invariant: over any schedule of saves, branch switches, watcher commits, flushes,
@@ -598,11 +589,11 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// and a build ahead goes on beside no other request that reads a checkout or builds; what
 /// is built ahead is the checkout's last build or check, as its client sent it; a root is
 /// built ahead at most [`STARTS`] times; and left alone, the daemon answers every request.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_build_ahead_changes_no_answer_and_delays_no_request() {
-    run_cases(512, |tc| {
-        let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(60));
+    blaze_sim::check(Config::cases(512), |tape| {
+        let ops = tape.vec(1..=60, "ops", op);
         if let Err(why) = runs(&ops, None) {
             panic!("{ops:?}: {why}");
         }

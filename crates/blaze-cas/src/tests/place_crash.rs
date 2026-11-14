@@ -6,7 +6,7 @@
 //! or gone, may undo a rename onto an output's path, and may tear an output written where it
 //! goes; the oracle is what a build may rely on all the same.
 //! The same harness as the race of two stores (`place_race`): the store's own state machine on
-//! the simulated disk, Hegel drawing the run.
+//! the simulated disk, the case's tape drawing the run.
 //!
 //! The simulation also charges a clone of a file with data not written back the write-back
 //! it forces ([`Sim::bytes_forced`]): on a real disk that is what the clone waits for, the
@@ -18,10 +18,8 @@
 
 use std::collections::BTreeSet;
 
-use hegel::TestCase;
-use hegel::generators as gs;
-
 use blaze_core::sim::SECTOR;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -619,46 +617,40 @@ fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     Ok(world.sim.bytes_forced())
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let byte = |tc: &TestCase| tc.draw(gs::integers::<u8>());
-    match tc.draw(gs::integers::<u8>().max_value(15)) {
+fn op(tape: &Tape) -> Op {
+    let byte = |tape: &Tape, label: &'static str| tape.int::<u8>(label);
+    match tape.int_in(0..=15u8, "op") {
         0 | 1 => Op::Whole {
-            seed: tc.draw(gs::integers()),
+            seed: tape.int::<u64>("whole seed"),
             // Mostly long enough to be cloned from a whole file; sometimes written in place.
-            len: match tc.draw(gs::integers::<u8>().max_value(4)) {
-                0 => tc.draw(gs::integers::<u32>().min_value(1).max_value(3000)),
-                _ => tc.draw(gs::integers::<u32>().min_value(CLONE_FROM as u32).max_value(40 << 10)),
+            len: match tape.int_in(0..=4u8, "whole len kind") {
+                0 => tape.int_in(1..=3000u32, "whole len"),
+                _ => tape.int_in((CLONE_FROM as u32)..=(40 << 10), "whole len"),
             },
         },
         2..5 => Op::Derived {
-            base: byte(tc),
-            seed: tc.draw(gs::integers()),
-            ranges: byte(tc),
-            len: [Len::Same, Len::Same, Len::Shorter, Len::Longer]
-                [usize::from(tc.draw(gs::integers::<u8>().max_value(3)))],
+            base: byte(tape, "base"),
+            seed: tape.int::<u64>("derived seed"),
+            ranges: byte(tape, "ranges"),
+            len: [Len::Same, Len::Same, Len::Shorter, Len::Longer][usize::from(tape.int_in(0..=3u8, "derived len"))],
         },
         5..11 => Op::Place {
-            value: byte(tc),
-            path: byte(tc),
-            steps: match tc.draw(gs::booleans()) {
-                true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
-                false => None,
-            },
+            value: byte(tape, "value"),
+            path: byte(tape, "path"),
+            steps: tape.option("steps", |tape| tape.int_in(0..=12u8, "steps")),
         },
         11 => Op::Settle,
-        12 => Op::Fill { room: tc.draw(gs::integers::<u32>().max_value(60 << 10)) },
+        12 => Op::Fill { room: tape.int_in(0..=60u32 << 10, "room") },
         13 | 14 => Op::Crash,
         _ => Op::Reopen,
     }
 }
 
-#[hegel::composite]
-fn case(tc: &TestCase) -> Case {
+fn case(tape: &Tape) -> Case {
     Case {
-        seed: tc.draw(gs::integers()),
-        latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
-        ops: tc.draw(gs::vecs(op()).min_size(1).max_size(24)),
+        seed: tape.next_u64("sim seed"),
+        latency_us: tape.int_in(1..=2000u64, "latency us"),
+        ops: tape.vec(1..=24, "ops", op),
     }
 }
 
@@ -673,20 +665,74 @@ fn case(tc: &TestCase) -> Case {
 /// value written where it goes, or a derived value's base with any of its ranges written),
 /// never bytes of anything else; (4) no clone the store asks for is of a file with data not written back,
 /// so no place waits for a write-back a clone forced; and the store opens.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_place_gives_its_values_bytes_whole_through_any_crash() {
-    super::model_check::run_cases(96, |tc| {
-        let case = tc.draw(case());
-        match forced(&case, PlacePlant::None) {
-            Err(why) => panic!("{case:?}: {why}"),
-            Ok(0) => {}
-            Ok(forced) => panic!(
-                "{case:?}: its clones forced {forced} bytes out of their sources: a file was \
-                 cloned from before its write-back completed"
-            ),
+    blaze_sim::check(SimConfig::cases(96), gives_its_values_bytes_whole);
+}
+
+/// The property's body: a drawn case, run with no bug planted. The reason comes first and the
+/// case after it, so a report cut short still says why.
+fn gives_its_values_bytes_whole(tape: &Tape) {
+    let case = case(tape);
+    match forced(&case, PlacePlant::None) {
+        Err(why) => panic!("{why}\ncase: {case:?}"),
+        Ok(0) => {}
+        Ok(forced) => panic!(
+            "its clones forced {forced} bytes out of their sources: a file was cloned from \
+             before its write-back completed\ncase: {case:?}"
+        ),
+    }
+}
+
+/// The case the search found (seed 31 of the property, shrunk): an output, then a value derived
+/// from it and one derived from that, and a place of the last. Before 2026-11-13 the place made
+/// the output's whole file to derive the middle value's from and named it nowhere, so it was
+/// left in `placed/` with no path's value placed from it.
+#[test]
+fn a_place_gives_its_values_bytes_whole_in_the_found_case() {
+    gives_its_values_bytes_whole(&Tape::replay(&[
+        0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        1, 6, 0, 1, 2, 0, 6, 0, 0, 0, 1, 2, 3, 6, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 1, 5, 75,
+    ]));
+}
+
+/// A chain of derived values `depth` long over one output, and a place of the last at
+/// `one/build/a`: each value derived from the one before ([`Op::Derived`]'s `base` picks among
+/// the values kept as whole files, which are all of them here).
+fn chain(depth: u8) -> Vec<Op> {
+    let mut ops = vec![whole(6)];
+    for n in 0..depth {
+        ops.push(Op::Derived { base: n, seed: 13 + u64::from(n), ranges: 2, len: Len::Same });
+    }
+    ops.push(place(depth, 0));
+    ops
+}
+
+/// A place of a value derived from a derived value makes each base's whole file down the
+/// chain that is not there (`Store::derive_file`), and names every one of them while it is in
+/// flight, so each goes at its answer: `placed/` then holds only the file the path names
+/// (the oracle `bounded`). Two deep and three deep.
+#[test]
+fn a_place_of_a_value_derived_from_a_derived_value_leaves_no_base_behind() {
+    for depth in [2, 3] {
+        for seed in 0..8 {
+            let case = Case { seed, latency_us: 300, ops: chain(depth) };
+            if let Err(why) = run(&case, PlacePlant::None) {
+                panic!("a chain {depth} deep, seed {seed}: {why}");
+            }
         }
-    });
+    }
+}
+
+/// The planted-bug control: a place of a derived value names only its nearest base's whole
+/// file, as before 2026-11-13, so the output's file it made for the middle value's is left in
+/// `placed/` with nothing naming it, and the bound's oracle says so.
+#[test]
+fn the_oracle_catches_a_deeper_base_left_in_placed() {
+    let (seed, why) = caught(&chain(2), 0..8, PlacePlant::NamesNearestBaseOnly)
+        .expect("the oracle missed a deeper base's whole file left in placed/");
+    assert!(why.contains("is in placed/ and no path's value is placed from it"), "seed {seed}: {why}");
 }
 
 /// A whole output, long enough to be cloned from a whole file.

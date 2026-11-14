@@ -161,6 +161,7 @@ fn package(
         is_member,
         default_run: None,
         checksum: None,
+        tree: None,
         tests: TestSandbox::default(),
         const_macros: None,
     }
@@ -255,7 +256,6 @@ fn units() -> Units {
         build_dir: "/w/target".to_owned(),
         finished: "`dev` profile [unoptimized + debuginfo]".to_owned(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }

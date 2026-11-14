@@ -19,8 +19,7 @@ use crate::{
     Plant,
     exec::RecordRef,
     planted,
-    record::{Headed, ManifestRoot, Opaque, Sections, StableId, Traced},
-    text::NameHash,
+    record::{ChunkRoot, Headed, ManifestRoot, MarkRoot, Opaque, Sections, ShapeRoot, StableId, Traced},
 };
 
 /// A kind's number in a record's head and the store's index.
@@ -74,22 +73,26 @@ pub enum Keep {
 pub enum Trace {
     /// The key is all: an equal key is the record.
     Key,
-    /// The record carries the reads its work made, at item grain ((fact id, digest), absence
-    /// included). On a key miss the old record's list is checked against the current facts: all
-    /// equal and the old result is filed under the new key, byte for byte; else the work is
-    /// redone.
-    Reuse,
+    /// Read-addressed (read-addressed.md): the record is filed at
+    /// [`crate::record::address`]`(key, shape with the digests its work saw)`, never under its key
+    /// alone. A lookup answers a candidate shape now and reads the address; a changed fact is a
+    /// new address, an undone one the old address again. Nothing is refiled or copied.
+    Read,
     /// The record carries the outside reads its run made (environment, files): a hit needs an
-    /// equal key and every outside read still equal.
+    /// equal key and every outside read still equal ([`crate::outside`]).
     Outside,
+    /// Filed by content: its address is the hash of its parts (a unit manifest's root and
+    /// chunks), so two values never share one; what names it is another record (a mark, a
+    /// root).
+    Content,
 }
 
 /// One kind of record. Every constant is read at compile time: a generic over `K: Kind` folds
 /// each branch on them away.
 ///
 /// The invariant: [`Kind::key`] covers every input the record's value depends on, except what a
-/// [`Trace::Reuse`] or [`Trace::Outside`] list covers (rule 21); two values under one key are a
-/// typed refusal ([`crate::store::Put::Other`]).
+/// [`Trace::Read`] shape or a [`Trace::Outside`] list covers (rule 21); two values under one
+/// filing key are a typed refusal ([`crate::store::Put::Other`]).
 pub trait Kind: Sized + 'static {
     const TAG: Tag;
     const NAME: &'static str;
@@ -329,16 +332,40 @@ pub struct LateRead<'a> {
     pub value: Option<ContentId>,
 }
 
-/// One name a body mentions and the closure of what it can resolve to in the body's universe
-/// ([`crate::text::Graph::name_closure`]); `None` when nothing is found under it, so a name that
-/// appears later moves the key.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct NameRead {
-    pub name: NameHash,
-    pub closure: Option<ContentId>,
-}
-
 macro_rules! kind {
+    (
+        $(#[$meta:meta])*
+        $name:ident {
+            tag: $tag:literal, version: $version:literal, layout: $layout:ident,
+            grain: $grain:ident, trace: $trace:ident, keep: $keep:ident, root: $root:ty,
+            owned_inputs: $inputs:ident,
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub struct $name;
+
+        impl Kind for $name {
+            const TAG: Tag = Tag($tag);
+            const NAME: &'static str = ::core::stringify!($name);
+            const DOMAIN: &'static str = ::core::concat!("blaze-keyed ", ::core::stringify!($name), " key");
+            const VERSION: u16 = $version;
+            const LAYOUT: Layout = Layout::$layout;
+            const GRAIN: Grain = Grain::$grain;
+            const TRACE: Trace = Trace::$trace;
+            const KEEP: Keep = Keep::$keep;
+            type Root = $root;
+            type Inputs<'a> = $inputs;
+            fn key(inputs: &$inputs) -> Key<$name> {
+                inputs.key()
+            }
+        }
+
+        const _: () = assert!(
+            listed($name::TAG, $name::NAME),
+            ::core::concat!(::core::stringify!($name), " is not in `TAGS` at its tag: list it in `tags!`")
+        );
+    };
     (
         $(#[$meta:meta])*
         $name:ident {
@@ -400,9 +427,13 @@ impl CertificateInputs<'_> {
 }
 
 kind! {
-    /// A file's image: tokens, the flat tree, each item's piece hash, the names, the line table.
+    /// A file's image: tokens, the flat tree, the names, the line table, and per item its
+    /// header digest, its own-text digest, the digests of the items that escape its bodies, a
+    /// flag for a non-quiet macro call or derive in a body, and the token ranges of the item and
+    /// its body (blaze-unitkey). Version 2: that row layout; an older image is not found rather
+    /// than misread.
     FileImage {
-        tag: 2, version: 1, layout: Plain, grain: File, trace: Key, keep: DiskAndResident,
+        tag: 2, version: 2, layout: Plain, grain: File, trace: Key, keep: DiskAndResident,
         root: Sections, inputs: FileInputs,
     }
 }
@@ -426,76 +457,63 @@ impl FileInputs<'_> {
 kind! {
     /// A crate's surface: scopes, exports, the impl index by (trait, simplified self type),
     /// signatures, field lists, layouts and const values, each an exported fact with its own
-    /// digest; and the import table of what it read of other crates, by stable id and digest.
+    /// digest (its `facts`, sorted by id, with the [`crate::record::seen_id`] row), and its shape:
+    /// what it read of other crates' surfaces and made tables, with the digests seen.
     Surface {
-        tag: 3, version: 1, layout: Plain, grain: Surface, trace: Reuse, keep: DiskAndResident,
+        tag: 3, version: 2, layout: Plain, grain: Surface, trace: Read, keep: DiskAndResident,
         root: Traced, inputs: SurfaceInputs,
     }
 }
 
-/// A surface's key: its own items' pieces (bodies cut, except bodies that count as interface:
-/// see target.md, "Key rules") and its dependencies' surface keys. A dependency's moved key
-/// moves this one; the import table then settles it, fact by fact.
+/// A surface's key: what it is, from text alone: the unit's identity and its own items' pieces
+/// (bodies cut, except what counts as interface: target.md, "Key rules"). Nothing of a
+/// dependency: what it reads of one is its shape ([`Trace::Read`]).
 pub struct SurfaceInputs<'a> {
     pub tool: ToolId,
     pub settings: Settings,
+    /// The unit's identity (package, version, target kind, crate name).
+    pub unit: ContentId,
+    /// One piece per active node, in stable-id order (blaze-unitkey).
     pub pieces: &'a [ContentId],
-    pub deps: &'a [Key<Surface>],
-    pub late: &'a [LateRead<'a>],
 }
 
 impl SurfaceInputs<'_> {
     fn key(&self) -> Key<Surface> {
-        KeyHasher::of::<Surface>()
-            .toolchain(&self.tool)
-            .id(&self.settings.0)
-            .ids(self.pieces)
-            .keys(self.deps)
-            .late(self.late)
-            .finish()
+        KeyHasher::of::<Surface>().toolchain(&self.tool).id(&self.settings.0).id(&self.unit).ids(self.pieces).finish()
     }
 }
 
 kind! {
     /// A body's check: inference, MIR, the borrow-check verdict and its item-relative
-    /// diagnostics, with the read list the check made.
+    /// diagnostics, with the shape the check asked and the facts it makes (a const's value, a
+    /// hidden type, what escapes the body, its effects).
     Body {
-        tag: 4, version: 1, layout: Flat, grain: Item, trace: Reuse, keep: DiskAndResident,
-        root: Traced, inputs: BodyInputs,
+        tag: 4, version: 2, layout: Flat, grain: Item, trace: Read, keep: DiskAndResident,
+        root: Traced, owned_inputs: BodyInputs,
     }
 }
 
-/// A body's text-closure key.
-pub struct BodyInputs<'a> {
+/// A body's key: what it is, from its own text: the unit, the item and the item's own tokens.
+/// What it reads of anything else is its shape ([`Trace::Read`]).
+pub struct BodyInputs {
     pub tool: ToolId,
     pub settings: Settings,
-    /// The sysroot as one unit: a new std moves every key.
-    pub sysroot: ContentId,
-    /// The item's own text, piece and body, hashed with its crate's identity.
+    /// The unit's identity.
+    pub unit: ContentId,
+    pub item: StableId,
+    /// The digest of the item's own tokens, positions item-relative (blaze-unitkey).
     pub text: ContentId,
-    /// Each name the text mentions, sorted by name, with what it can resolve to.
-    pub names: &'a [NameRead],
-    /// The crate's "always" closure: glob and `as _` imports, inner attributes, unexpanded item
-    /// macros ([`crate::text::Graph::always`]).
-    pub always: ContentId,
-    pub late: &'a [LateRead<'a>],
-    /// The expansions of the macro calls in the body, by key.
-    pub expansions: &'a [Key<Expansion>],
 }
 
-impl BodyInputs<'_> {
+impl BodyInputs {
     fn key(&self) -> Key<Body> {
-        let mut hasher = KeyHasher::of::<Body>();
-        hasher.toolchain(&self.tool).id(&self.settings.0).id(&self.sysroot).id(&self.text);
-        let names = match planted(Plant::KeyLeavesOutNames) && !self.names.is_empty() {
-            true => &self.names[1..],
-            false => self.names,
-        };
-        hasher.u64(names.len() as u64);
-        for read in names {
-            hasher.u64(read.name.0).opt_id(read.closure.as_ref());
-        }
-        hasher.id(&self.always).late(self.late).keys(self.expansions).finish()
+        KeyHasher::of::<Body>()
+            .toolchain(&self.tool)
+            .id(&self.settings.0)
+            .id(&self.unit)
+            .id(&self.item.0)
+            .id(&self.text)
+            .finish()
     }
 }
 
@@ -503,17 +521,20 @@ kind! {
     /// An instance's plan: its calls in MIR order and its own facts, made before any backend
     /// runs, so one plan serves both tiers (blaze-program's `Plan` is the payload).
     InstancePlan {
-        tag: 12, version: 1, layout: Flat, grain: Instance, trace: Key, keep: DiskAndResident,
+        tag: 12, version: 2, layout: Flat, grain: Instance, trace: Key, keep: DiskAndResident,
         root: Opaque, inputs: PlanInputs,
     }
 }
 
-/// A plan's key: the instance's symbol (its item and type arguments), the body's key, and the
+/// A plan's key: the instance's symbol (its item and type arguments), the body's result digest
+/// ([`crate::record::result_digest`] of the body's record: what its check made, not what it is
+/// from text, so a body found at a new address with the same result keeps its plan), and the
 /// digest of the code settings but the tier (target, target features, code generator, panic
 /// strategy, debug info, overflow checks). The toolchain and target come in through `settings`.
 pub struct PlanInputs<'a> {
     pub item: ContentId,
     pub args: ContentId,
+    /// The body's result digest.
     pub body: ContentId,
     pub settings: ContentId,
     pub of: PhantomData<&'a ()>,
@@ -738,60 +759,173 @@ impl ScriptInputs<'_> {
 }
 
 kind! {
-    /// One test's result, with the outside reads it made.
+    /// One test's result: an outside kind ([`crate::outside`]) whose asks are the functions the
+    /// test executed and the outside reads it made (blaze-testsel's `ask`), so an edit misses
+    /// only the tests that executed what it changed, and an undone edit finds its old result
+    /// (docs/v2/plan/design/test-selection.md).
     TestRun {
-        tag: 8, version: 1, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
+        tag: 8, version: 2, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
         inputs: TestInputs,
     }
 }
 
-/// A test's key: its entry's symbol (item and type arguments), the digest of what its program
-/// reaches from the entry (every reachable function's and static's symbol and instance key, and
-/// the spans a panic message can name: blaze-program's `reach_digest`), and the arguments it is
-/// run with. The instance keys carry the toolchain, target and settings.
+/// A test's base key: its identity, nothing its code is. The toolchain, the unit's settings, the
+/// environment blaze declares to tests, its entry's symbol (item and type arguments), its
+/// libtest attributes (name, ignore, should_panic) and its arguments. What it executes and reads
+/// is in its asks, never here: a reach in the key made every reachable edit a miss.
 pub struct TestInputs<'a> {
+    pub tool: ToolId,
+    pub settings: Settings,
+    /// The variables blaze gives the test, sorted by name, each once (declared, not traced).
+    pub env: ContentId,
     pub item: ContentId,
     pub entry_args: ContentId,
-    pub reach: ContentId,
+    /// The test's libtest name, `#[ignore]` and `#[should_panic]` (and its expected message).
+    pub attrs: ContentId,
     pub args: &'a [u8],
 }
 
 impl TestInputs<'_> {
     fn key(&self) -> Key<TestRun> {
-        KeyHasher::of::<TestRun>().id(&self.item).id(&self.entry_args).id(&self.reach).bytes(self.args).finish()
+        KeyHasher::of::<TestRun>()
+            .toolchain(&self.tool)
+            .id(&self.settings.0)
+            .id(&self.env)
+            .id(&self.item)
+            .id(&self.entry_args)
+            .id(&self.attrs)
+            .bytes(self.args)
+            .finish()
     }
 }
 
 kind! {
-    /// One unit's list: its surface's and bodies' keys, by item. Written after every record it
-    /// names. (Instances are a program's: blaze-program files them under the program manifest.)
+    /// A test suite's index head (blaze-testsel's `index`): one row per kept test, the read
+    /// table and the program state the rows hold at. It changes with every edit, so it is filed
+    /// by content; which head is a suite's current one is a root the host keeps.
+    TestIndex {
+        tag: 20, version: 1, layout: Flat, grain: Unit, trace: Key, keep: Disk, root: Opaque,
+        inputs: IndexInputs,
+    }
+}
+
+kind! {
+    /// A test suite's postings: from each ask to the tests that asked it. Rewritten only when a
+    /// head's inline asks pass half of it, so filed by content like the head.
+    TestPostings {
+        tag: 21, version: 1, layout: Flat, grain: Unit, trace: Key, keep: Disk, root: Opaque,
+        inputs: IndexInputs,
+    }
+}
+
+/// An index record's key, by its content: the toolchain, what suite it is of, and the digest of
+/// its payload, so its bytes are one value under one key.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexInputs<'a> {
+    pub tool: ToolId,
+    pub suite: ContentId,
+    pub content: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl IndexInputs<'_> {
+    fn key<K: Kind>(&self) -> Key<K> {
+        KeyHasher::of::<K>().toolchain(&self.tool).id(&self.suite).id(&self.content).finish()
+    }
+}
+
+kind! {
+    /// One unit's manifest root ([`ManifestRoot`]): its surface, a chunk per file
+    /// ([`UnitChunk`]), the dictionary of every fact the unit's records read with the digest
+    /// seen and which chunks read it, and the facts its bodies make with their makers. Filed by
+    /// content after every record it names; named by the unit's [`Mark`] and the certificate.
+    /// (Instances are a program's: blaze-program files them under the program manifest.)
     UnitManifest {
-        tag: 9, version: 2, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
+        tag: 9, version: 3, layout: Flat, grain: Unit, trace: Content, keep: DiskAndResident,
         root: ManifestRoot, inputs: UnitInputs,
     }
 }
 
-/// A unit manifest's key: its files' keys, its late inputs and its dependencies' surfaces' keys.
-/// The firewall: a dependency whose surface is unchanged leaves this key equal, so its
-/// dependents are settled by one manifest hit and none of their records is looked at. Sound
-/// because a unit's records read a dependency only through its surface (the pieces a name
-/// closure crosses are in the surface's key).
+/// A unit's text key (`M`): what the unit is from its text alone: its identity, its files'
+/// keys in the unit's file order and every late read's answer. With the unit's view it keys the
+/// unit's [`Mark`]; it is also stored in the root ([`ManifestRoot::key`]) so a manifest that
+/// still stands is known without its chunks. Nothing of a dependency is in it.
 pub struct UnitInputs<'a> {
     pub tool: ToolId,
     pub settings: Settings,
+    pub unit: ContentId,
     pub files: &'a [Key<FileImage>],
     pub late: &'a [LateRead<'a>],
-    pub deps: &'a [Key<Surface>],
 }
 
 impl UnitInputs<'_> {
     fn key(&self) -> Key<UnitManifest> {
         let mut hasher = KeyHasher::of::<UnitManifest>();
-        hasher.toolchain(&self.tool).id(&self.settings.0).keys(self.files);
+        hasher.toolchain(&self.tool).id(&self.settings.0).id(&self.unit).keys(self.files);
         if !planted(Plant::KeyLeavesOutLateInputs) {
             hasher.late(self.late);
         }
-        hasher.keys(self.deps).finish()
+        hasher.finish()
+    }
+}
+
+kind! {
+    /// One file's chunk of a unit manifest ([`ChunkRoot`]): its items' entries, their shapes as
+    /// ordinals into the chunk's own dictionary, and the postings from a fact to the entries that
+    /// read it. Filed by content; it holds no digest, so it moves only when one of its items'
+    /// key, address or shape does, and an unchanged file's chunk is named again by address.
+    UnitChunk {
+        tag: 24, version: 1, layout: Flat, grain: File, trace: Content, keep: DiskAndResident,
+        root: ChunkRoot, inputs: ContentInputs,
+    }
+}
+
+/// The key of a record filed by content: the digest of its parts, computed by its writer
+/// ([`crate::record::write_chunk`]); a key is never computed from it here but taken.
+pub struct ContentInputs<'a> {
+    pub content: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl ContentInputs<'_> {
+    fn key<K>(&self) -> Key<K> {
+        Key::from_id(self.content)
+    }
+}
+
+kind! {
+    /// One node of a key's shape trie (read-addressed.md, "Finding the shape"): the fact ids of
+    /// a shape a run of the key asked. The first run's at [`crate::record::shape_root`]`(key)`;
+    /// after a missed address `A`, the shape a later run filed at
+    /// [`crate::record::shape_next`]`(A)`. A node is a hint: any shape is sound to try (an
+    /// address names the answers it was made with), so a node another run filed first is
+    /// counted ([`crate::proof::Checks::shape_races`]), never a failure.
+    Shape {
+        tag: 22, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
+        root: ShapeRoot, inputs: ContentInputs,
+    }
+}
+
+kind! {
+    /// A unit's mark: under its text key and its view (its direct dependencies' universe
+    /// digests), the manifest that stands, its surface's address and the unit's own universe
+    /// digest. One lookup settles a unit: a hit reads no manifest, no chunk and no record.
+    Mark {
+        tag: 23, version: 1, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
+        root: MarkRoot, inputs: MarkInputs,
+    }
+}
+
+/// A mark's key: the unit's text key and its view ([`crate::record::view`]).
+pub struct MarkInputs<'a> {
+    pub manifest: Key<UnitManifest>,
+    pub view: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl MarkInputs<'_> {
+    fn key(&self) -> Key<Mark> {
+        KeyHasher::of::<Mark>().id(&self.manifest.id()).id(&self.view).finish()
     }
 }
 
@@ -919,12 +1053,11 @@ impl KeyHasher {
 
 kind! {
     /// One body's findings of one lint pass (blaze-findings): the body check's sibling. Its key
-    /// is the body's key and the keys of the summaries of other items the pass reads, so an
-    /// equal key is the finding with no other check; a key miss with an unchanged read list
-    /// files the old record under the new key, byte for byte. The version is blaze-findings'
-    /// payload format.
+    /// is the body's result digest and the keys of the summaries of other items the pass reads,
+    /// so an equal key is the finding with no other check: a body found at a new address with
+    /// the same result keeps its findings. The version is blaze-findings' payload format.
     BodyFindings {
-        tag: 16, version: 1, layout: Flat, grain: Item, trace: Reuse, keep: Disk, root: Traced,
+        tag: 16, version: 1, layout: Flat, grain: Item, trace: Key, keep: Disk, root: Traced,
         inputs: PerBody,
     }
 }
@@ -933,7 +1066,7 @@ kind! {
     /// One item's rows for the folds of one pass: (subject, value) facts the item contributes,
     /// such as "this function calls `f` with argument 0 in `0..=3`".
     ItemRows {
-        tag: 17, version: 1, layout: Flat, grain: Item, trace: Reuse, keep: Disk, root: Traced,
+        tag: 17, version: 1, layout: Flat, grain: Item, trace: Key, keep: Disk, root: Traced,
         inputs: PerBody,
     }
 }
@@ -943,7 +1076,9 @@ kind! {
 #[derive(Clone, Copy, Debug)]
 pub struct PerBody<'a> {
     pub tool: ToolId,
-    pub body: Key<Body>,
+    /// The body's result digest ([`crate::record::result_digest`]): everything the pass reads of
+    /// the body's check.
+    pub body: ContentId,
     pub pass: Pass,
     /// The keys of other items' records the pass reads (a callee's effect summary), sorted.
     pub beyond: &'a [ContentId],
@@ -952,7 +1087,7 @@ pub struct PerBody<'a> {
 impl PerBody<'_> {
     fn key<K: Kind>(&self) -> Key<K> {
         let mut hasher = KeyHasher::of::<K>();
-        hasher.toolchain(&self.tool).id(&self.body.id());
+        hasher.toolchain(&self.tool).id(&self.body);
         hasher.pass(self.pass).ids(self.beyond).finish()
     }
 }
@@ -1016,6 +1151,37 @@ impl DeferredInputs<'_> {
     }
 }
 
+kind! {
+    /// One session-memo entry of the crate being built, in its crate's own image
+    /// (blaze-memo's `image`): the entry's read list and its value's bytes, filed when the
+    /// entry is computed and read back after the crate's arena is dropped by an edit. Filed by
+    /// key; on a hit blaze-memo checks the entry's read list once against its own facts now
+    /// (all equal: the value is the entry, with no further check in that snapshot; else the
+    /// query runs again): the read list is blaze-memo's, not the driver's. The value is a plain
+    /// record (`blaze_format::Record::PLAIN`), so the bytes are the value.
+    MemoEntry {
+        tag: 25, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
+        root: Traced, inputs: MemoEntryInputs,
+    }
+}
+
+/// A memo entry's key: the toolchain, the query (its kind's id, a hash of its path and name)
+/// and the key's stable bytes (blaze-memo's `Stable`: an input by its fact id, data by its
+/// bytes), which mean the same item in every snapshot and process.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoEntryInputs<'a> {
+    pub tool: ToolId,
+    pub query: u64,
+    pub key: &'a [u8],
+}
+
+impl MemoEntryInputs<'_> {
+    fn key(&self) -> Key<MemoEntry> {
+        let mut hasher = KeyHasher::of::<MemoEntry>();
+        hasher.toolchain(&self.tool).u64(self.query).bytes(self.key).finish()
+    }
+}
+
 /// Every kind, once: [`TAGS`] and the compile-time check that each kind declared here is listed
 /// under its own tag.
 macro_rules! tags {
@@ -1046,6 +1212,12 @@ tags![
     ItemRows,
     FoldFindings,
     DeferredFindings,
+    TestIndex,
+    TestPostings,
+    Shape,
+    Mark,
+    UnitChunk,
+    MemoEntry,
 ];
 
 const fn same_name(a: &str, b: &str) -> bool {

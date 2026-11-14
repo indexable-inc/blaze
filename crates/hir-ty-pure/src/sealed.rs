@@ -50,19 +50,24 @@ use base_db::{Crate, Db};
 use blaze_hash::{HashMap, SharedMap, SharedSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::db::Witness;
-use hir_ty::traits::StoredParamEnvAndCrate;
+use hir_ty::{facts::Proofs, traits::StoredParamEnvAndCrate};
 
 use crate::walk::{Def, Instance, Summary, home_env, name_of, step_key, summarized};
 
 /// The domain of a sealed crate's cover, and of the `build` its image keys are asked by.
 pub(crate) const COVER_DOMAIN: &str = "blaze v2 pure sealed cover 1";
 
-/// The summaries of one sealed crate's instances, by the environment and instance asked.
-pub(crate) type Table = SharedMap<(StoredParamEnvAndCrate, Instance), Arc<Summary>>;
+/// What a summary is made of and kept under, in a table, a run's attempt and a crate's rows
+/// below `HIGH`: the environment asked, whether proofs are spent ([`Proofs`]; a summary
+/// made with them discharges sites one made without does not), and the instance.
+pub(crate) type Key = (StoredParamEnvAndCrate, Proofs, Instance);
 
-/// The values one witnessed run settled, by the environment and instance, each with the table
-/// of its home's crate: written to those tables only once the run read nothing below `HIGH`.
-pub(crate) type Attempt = SharedMap<(StoredParamEnvAndCrate, Instance), (Arc<Table>, Arc<Summary>)>;
+/// The summaries of one sealed crate's instances, by [`Key`].
+pub(crate) type Table = SharedMap<Key, Arc<Summary>>;
+
+/// The values one witnessed run settled, by [`Key`], each with the table of its home's crate:
+/// written to those tables only once the run read nothing below `HIGH`.
+pub(crate) type Attempt = SharedMap<Key, (Arc<Table>, Arc<Summary>)>;
 
 /// The summaries of instances whose home is `krate`, shared by every task: a function of
 /// `cover` alone, so two of one cover are equal whatever their tables hold.
@@ -71,9 +76,9 @@ pub(crate) struct Sealed {
     cover: ContentId,
     krate: Crate,
     table: Arc<Table>,
-    /// The instances of `krate` whose run read below `HIGH`, by the environment asked: each is
-    /// a row ([`summary_in`]), and how many there are is the crate's count ([`below_high`]).
-    below_high: Arc<SharedSet<(StoredParamEnvAndCrate, Instance)>>,
+    /// The instances of `krate` whose run read below `HIGH`, by [`Key`]: each is a row
+    /// ([`summary_in`]), and how many there are is the crate's count ([`below_high`]).
+    below_high: Arc<SharedSet<Key>>,
     /// Each crate below `krate` (all sealed) by its own [`Sealed`]: where a run under the
     /// witness frame finds its callees' tables without a read.
     below: Arc<HashMap<Crate, Sealed, Global>>,
@@ -191,15 +196,30 @@ pub(crate) fn below_high(db: &Db, krate: Crate) -> usize {
 ///
 /// The read of [`sealed`] is made before the witness frame opens, so a persistent caller holds
 /// it: its one read of the sealed crate's code.
+///
+/// This is the checks' summary: proofs spent ([`Proofs::Spent`]), as every effect and role
+/// lint asks, on demand. What a tier asks for code is [`summary_at`].
 pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
-    summary_within(db, None, env, instance)
+    summary_at(db, Proofs::Spent, env, instance)
 }
 
-/// [`summary`], asked from a run under the witness frame of the sealed crate `within` (`None`:
-/// from a persistent caller, or none).
+/// [`summary`] made with `proofs`: [`Proofs::None`] for the facts a tier 0 body spends.
+pub(crate) fn summary_at(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> Arc<Summary> {
+    summary_within(db, None, proofs, env, instance)
+}
+
+/// [`summary_at`], asked from a run under the witness frame of the sealed crate `within`
+/// (`None`: from a persistent caller, or none). A run asks its callees with its own `proofs`,
+/// so a summary made without proofs never reads one made with them.
 pub(crate) fn summary_within(
     db: &Db,
     within: Option<&Sealed>,
+    proofs: Proofs,
     env: StoredParamEnvAndCrate,
     instance: Instance,
 ) -> Arc<Summary> {
@@ -210,13 +230,13 @@ pub(crate) fn summary_within(
     match within {
         Some(outer) => {
             let sealed = outer.of(home.krate, db, &instance);
-            from_table(db, sealed, home, instance)
+            from_table(db, sealed, proofs, home, instance)
         }
         #[cfg(test)]
-        None if plant::all_rows() => summary_in(db, home, instance),
+        None if plant::all_rows() => summary_in(db, home, proofs, instance),
         None => match sealed(db, home.krate) {
-            None => summary_in(db, home, instance),
-            Some(sealed) => sealed_or_row(db, &sealed, home, instance),
+            None => summary_in(db, home, proofs, instance),
+            Some(sealed) => sealed_or_row(db, &sealed, proofs, home, instance),
         },
     }
 }
@@ -228,16 +248,17 @@ pub(crate) fn summary_within(
 fn sealed_or_row(
     db: &Db,
     sealed: &Sealed,
+    proofs: Proofs,
     home: StoredParamEnvAndCrate,
     instance: Instance,
 ) -> Arc<Summary> {
     // clone: the table's key, reference counts
-    let key = (home.clone(), instance.clone());
+    let key = (home.clone(), proofs, instance.clone());
     if let Some(it) = sealed.table.pin().get(&key) {
         return Arc::clone(it);
     }
     if sealed.below_high.pin().contains(&key) {
-        return summary_in(db, home, instance);
+        return summary_in(db, home, proofs, instance);
     }
     let attempt = Arc::new(Attempt::default()); // alloc: one witnessed run's settled values
     // clone: reference counts
@@ -245,7 +266,7 @@ fn sealed_or_row(
     let mut reads = Vec::new(); // alloc: the keys of one witnessed run's reads below `HIGH`
     // clone: the scoped key, reference counts
     let (value, witness) = blaze_query::db::witnessed(db, &mut reads, || {
-        from_table(db, part, home.clone(), instance.clone())
+        from_table(db, part, proofs, home.clone(), instance.clone())
     });
     #[cfg(test)]
     let witness = match plant::shares_below_high() {
@@ -278,7 +299,7 @@ fn sealed_or_row(
                 count = sealed.below_high.len(),
             )
             .entered();
-            summary_in(db, home, instance)
+            summary_in(db, home, proofs, instance)
         }
         None => {
             // Under another witness frame (whose reads this one cannot name) or a run it could
@@ -291,7 +312,7 @@ fn sealed_or_row(
                 instance = %name,
             )
             .entered();
-            summary_in(db, home, instance)
+            summary_in(db, home, proofs, instance)
         }
     }
 }
@@ -311,41 +332,47 @@ fn crate_name(db: &Db, krate: Crate) -> String {
 fn from_table(
     db: &Db,
     sealed: Sealed,
+    proofs: Proofs,
     home: StoredParamEnvAndCrate,
     instance: Instance,
 ) -> Arc<Summary> {
     // clone: the table's key, reference counts
-    let key = (home.clone(), instance.clone());
+    let key = (home.clone(), proofs, instance.clone());
     if let Some(it) = sealed.table.pin().get(&key) {
         return Arc::clone(it);
     }
     if sealed.below_high.pin().contains(&key) {
-        return summary_in(db, home, instance);
+        return summary_in(db, home, proofs, instance);
     }
-    blaze_query::db::task_scope(db, || summary_sealed(db, sealed, home, instance))
+    blaze_query::db::task_scope(db, || summary_sealed(db, sealed, home, proofs, instance))
 }
 
-/// What the instance does, in `env`, a workspace crate's: a row an edit verifies. A cycle of
-/// instances starts from the summary of a recursion (`Summary::recursive`) and iterates to its
-/// fixpoint: each local's value only rises, in a lattice three high, and the recursion's witness
-/// keeps one depth.
-#[blaze_query::tracked(returns(clone), cycle_initial = |_, _, _, _| Arc::new(Summary::recursive()))]
+/// What the instance does, in `env`, a workspace crate's, made with `proofs`: a row an edit
+/// verifies. A cycle of instances starts from the summary of a recursion (`Summary::recursive`)
+/// and iterates to its fixpoint: each local's value only rises, in a lattice three high, and the
+/// recursion's witness keeps one depth.
+#[blaze_query::tracked(returns(clone), cycle_initial = |_, _, _, _, _| Arc::new(Summary::recursive()))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
 )]
-pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
-    summarized(db, None, env, &instance)
+pub(crate) fn summary_in(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    proofs: Proofs,
+    instance: Instance,
+) -> Arc<Summary> {
+    summarized(db, None, proofs, env, &instance)
 }
 
-/// What the instance does, in `env`, the environment of `sealed`'s crate: the task scope's
-/// value, no row. A cycle iterates in the scope as [`summary_in`]'s does in the engine; each
-/// final value is offered to the crate's table ([`publish`]), never a round's.
+/// What the instance does, in `env`, the environment of `sealed`'s crate, made with `proofs`:
+/// the task scope's value, no row. A cycle iterates in the scope as [`summary_in`]'s does in the
+/// engine; each final value is offered to the crate's table ([`publish`]), never a round's.
 #[blaze_query::tracked(
     scope = task,
     returns(clone),
     settled = publish,
-    cycle_initial = |_, _, _, _| Arc::new(Summary::recursive())
+    cycle_initial = |_, _, _, _, _| Arc::new(Summary::recursive())
 )]
 #[expect(
     clippy::needless_pass_by_value,
@@ -355,17 +382,22 @@ fn summary_sealed(
     db: &Db,
     sealed: Sealed,
     env: StoredParamEnvAndCrate,
+    proofs: Proofs,
     instance: Instance,
 ) -> Arc<Summary> {
-    summarized(db, Some(&sealed), env, &instance)
+    summarized(db, Some(&sealed), proofs, env, &instance)
 }
 
 /// Offers a final value of [`summary_sealed`] to its crate's table, through the attempt it is
 /// a part of: the table has it once the attempt's run is found to read nothing below `HIGH`
 /// ([`sealed_or_row`]). Two tasks may summarize one instance at once: both values are equal (a
 /// function of the cover and the key), and the first is kept.
-fn publish(_db: &Db, key: &(Sealed, StoredParamEnvAndCrate, Instance), value: &Arc<Summary>) {
-    let (sealed, env, instance) = key;
+fn publish(
+    _db: &Db,
+    key: &(Sealed, StoredParamEnvAndCrate, Proofs, Instance),
+    value: &Arc<Summary>,
+) {
+    let (sealed, env, proofs, instance) = key;
     let attempt = sealed.attempt.as_ref().unwrap_or_else(|| {
         panic!(
             "a summary of {instance:?} in crate {:?} settled outside a witnessed run: a \
@@ -381,7 +413,7 @@ fn publish(_db: &Db, key: &(Sealed, StoredParamEnvAndCrate, Instance), value: &A
     };
     // clone: the attempt's key and value, reference counts
     let settled = (Arc::clone(&sealed.table), Arc::clone(value));
-    _ = attempt.pin().try_insert((env.clone(), instance.clone()), settled);
+    _ = attempt.pin().try_insert((env.clone(), *proofs, instance.clone()), settled);
 }
 
 #[cfg(test)]

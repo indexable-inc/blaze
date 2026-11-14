@@ -1,19 +1,12 @@
 //! The sealed layer's core under a simulated machine: two installs of one cover interleaved
-//! under every schedule Hegel draws, the cover's inputs, prebuilt records turned off, and
-//! which crates a home resolves from source once a layer is installed.
+//! under every schedule a case's tape draws, the cover's inputs, prebuilt records turned off,
+//! and which crates a home resolves from source once a layer is installed.
 
 use std::path::{Path, PathBuf};
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::Config;
 
 use super::*;
-
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases = std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
 
 fn base(n: usize) -> Base {
     Base::Dir(PathBuf::from(format!("/bases/{n}")))
@@ -111,9 +104,9 @@ fn wrong(has: &[bool], ended: &[Installed; 2], machine: &Machine) -> Option<Stri
 /// `NoPack` only when every base answered `Absent`, naming each.
 #[test]
 fn the_layer_is_installed_once_and_a_second_home_imports_nothing() {
-    run_cases(512, |tc| {
-        let has = tc.draw(gs::vecs(gs::booleans()).min_size(1).max_size(3));
-        let schedule = tc.draw(gs::vecs(gs::booleans()).max_size(24));
+    blaze_sim::check(Config::cases(512), |tape| {
+        let has = tape.vec(1..=3, "has", |tape| tape.bool("holds the pack"));
+        let schedule = tape.vec(0..=24, "schedule", |tape| tape.bool("second moves"));
         let (ended, machine) = interleaved(&has, &schedule, |_| {});
         if let Some(why) = wrong(&has, &ended, &machine) {
             panic!("bases {has:?}, schedule {schedule:?}: {why}");
@@ -137,12 +130,12 @@ fn the_oracle_catches_an_install_that_skips_the_stat() {
 /// a dependency named twice).
 #[test]
 fn a_cover_moves_with_each_input_and_with_nothing_else() {
-    run_cases(256, |tc| {
-        let tree = tc.draw(gs::text().alphabet("abc-").max_size(12));
-        let host = tc.draw(gs::text().alphabet("abc-").max_size(12));
+    blaze_sim::check(Config::cases(256), |tape| {
+        let tree = tape.text_from("abc-", 0..=12, "tree");
+        let host = tape.text_from("abc-", 0..=12, "host");
         let on: Vec<Cover> =
-            tc.draw(gs::vecs(gs::integers::<u8>()).max_size(4)).into_iter().map(|n| Cover(ContentId([n; 32]))).collect();
-        let makers = ContentId([tc.draw(gs::integers::<u8>()); 32]);
+            tape.vec(0..=4, "on", |tape| tape.int::<u8>("cover")).into_iter().map(|n| Cover(ContentId([n; 32]))).collect();
+        let makers = ContentId([tape.int::<u8>("makers"); 32]);
         let of = CoverOf { tree: &tree, on: &on, makers, host: &host };
         let at = cover(&of);
         let mut turned = on.clone();
@@ -344,10 +337,19 @@ fn package(manifest: &str, source: Option<&str>, checksum: Option<[u8; 32]>, is_
         is_member,
         default_run: None,
         checksum,
+        tree: None,
         tests: blaze_units::query::TestSandbox::default(),
         const_macros: None,
     }
 }
+
+/// A git package's tree pinned in `blaze.lock`, as the plan names it (`PackagePlan::tree`).
+fn with_tree(package: blaze_units::query::PackagePlan, tree: &str) -> blaze_units::query::PackagePlan {
+    blaze_units::query::PackagePlan { tree: Some(tree.to_owned()), ..package }
+}
+
+const TREE: &str = "blake3:9f2c000000000000000000000000000000000000000000000000000000000001";
+const OTHER_TREE: &str = "blake3:9f2c000000000000000000000000000000000000000000000000000000000002";
 
 const SOURCES: &str = "/home/a/.blaze/sources";
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -364,23 +366,26 @@ fn pinned<'a>(package: &'a blaze_units::query::PackagePlan, shipped: &'a [Placed
 }
 
 /// The invariant: a package is sealed exactly when a digest pins its tree: a shipped tree's,
-/// a registry checksum, a git dependency's whole locked commit; a workspace member and a path
-/// dependency never are, whatever they hold, and a git checkout named by a prefix pins
-/// nothing. The control: the path dependency would be sealed by its origin (it is no member,
-/// which is all the origin rule asked of a library), and this rule says no.
+/// a registry checksum, a git dependency's tree digest in `blaze.lock` at its whole locked
+/// commit; a workspace member and a path dependency never are, whatever they hold, a git
+/// checkout named by a prefix pins nothing, and nor does a whole commit alone (SHA-1). The
+/// control: the path dependency would be sealed by its origin (it is no member, which is all
+/// the origin rule asked of a library), and this rule says no.
 #[test]
 fn a_package_is_sealed_exactly_when_a_digest_pins_its_tree() {
     let shipped = shipped_trees();
     let registry = package("/home/a/.blaze/sources/registry/src/r/p-1.0.0/Cargo.toml", Some("(registry `crates-io`)"), Some([3; 32]), false);
     let git_dir = format!("{SOURCES}/git/checkouts/p-0123/{COMMIT}/crates/p/Cargo.toml");
-    let git = package(&git_dir, Some("(https://github.com/a/p#01234567)"), None, false);
+    let commit_only = package(&git_dir, Some("(https://github.com/a/p#01234567)"), None, false);
+    let git = with_tree(commit_only.clone(), TREE);
+    assert_eq!(pinned(&commit_only, &shipped), None, "a whole commit without its tree's digest");
     let shipped_package = package("/m/bstd/d1/crates/blaze-std/Cargo.toml", Some("(/m/bstd/d1/crates/blaze-std)"), None, false);
     let path = package("/home/a/w/vendor/p/Cargo.toml", Some("(/home/a/w/vendor/p)"), None, false);
     let member = package("/m/bstd/d1/crates/blaze-std/Cargo.toml", None, Some([3; 32]), true);
     let prefix_dir = format!("{SOURCES}/git/checkouts/p-0123/01234567/Cargo.toml");
     let prefix = package(&prefix_dir, Some("(https://github.com/a/p#01234567)"), None, false);
     assert_eq!(pinned(&registry, &shipped), Some(Pin::Registry(&[3; 32])));
-    assert_eq!(pinned(&git, &shipped), Some(Pin::Git(COMMIT)));
+    assert_eq!(pinned(&git, &shipped), Some(Pin::Git { commit: COMMIT, tree: TREE }));
     assert_eq!(pinned(&shipped_package, &shipped), Some(Pin::Shipped(&shipped[0])));
     assert_eq!(pinned(&path, &shipped), None, "a path dependency");
     assert_eq!(pinned(&member, &shipped), None, "a workspace member, even under a shipped tree");
@@ -394,27 +399,33 @@ fn a_package_is_sealed_exactly_when_a_digest_pins_its_tree() {
 }
 
 /// The invariant: a git dependency's pin, and the cover its tree is installed under, move
-/// with its locked commit and with nothing of the checkout's directory else. The control:
-/// two checkouts of one commit under two idents have one pin.
+/// with its locked commit and with its tree's digest, and with nothing of the checkout's
+/// directory else. The control: two checkouts of one commit and one tree under two idents
+/// have one pin.
 #[test]
-fn a_git_dependencys_cover_moves_with_its_commit() {
+fn a_git_dependencys_cover_moves_with_its_commit_and_tree() {
     let shipped = shipped_trees();
-    let at = |ident: &str, commit: &str| {
-        package(
-            &format!("{SOURCES}/git/checkouts/{ident}/{commit}/Cargo.toml"),
-            Some("(https://github.com/a/p#0123)"),
-            None,
-            false,
+    let at = |ident: &str, commit: &str, tree: &str| {
+        with_tree(
+            package(
+                &format!("{SOURCES}/git/checkouts/{ident}/{commit}/Cargo.toml"),
+                Some("(https://github.com/a/p#0123)"),
+                None,
+                false,
+            ),
+            tree,
         )
     };
-    let (one, two, moved) = (at("p-1", COMMIT), at("p-2", COMMIT), at("p-1", OTHER_COMMIT));
+    let (one, two) = (at("p-1", COMMIT, TREE), at("p-2", COMMIT, TREE));
+    let (moved, retree) = (at("p-1", OTHER_COMMIT, TREE), at("p-1", COMMIT, OTHER_TREE));
     let cover_of = |it: &blaze_units::query::PackagePlan| {
         let pin = pinned(it, &shipped).unwrap();
         let tree = pin.tree();
         (pin.digest(), cover(&CoverOf { tree: &tree, on: &[], makers: ContentId([7; 32]), host: "aarch64-apple-darwin" }))
     };
     assert_ne!(cover_of(&one), cover_of(&moved), "another commit is another cover");
-    assert_eq!(cover_of(&one), cover_of(&two), "the commit alone pins it");
+    assert_ne!(cover_of(&one), cover_of(&retree), "another tree is another cover");
+    assert_eq!(cover_of(&one), cover_of(&two), "the commit and the tree pin it");
 }
 
 /// The invariant: every crate of the library blaze placed is sealed as a build names it, under

@@ -9,6 +9,7 @@ use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::Funct
 use hir_expand::fixture;
 use hir_ty::{
     ParamEnvAndCrate,
+    facts::Tier,
     mir::{MirOptLevel, MirOptions, MirOwner, MirStage},
     next_solver::{GenericArgs, ParamEnv},
     providers::monomorphized_mir_at,
@@ -29,17 +30,11 @@ const DEBUG: Compiled = Compiled::every(MirOptions {
     inline: false,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Zero,
 });
 
 /// A release unit: MIR at level 2 with the inliner on.
-const INLINE: Compiled = Compiled::every(MirOptions {
-    level: MirOptLevel::Release,
-    ub_checks: false,
-    lifetime_markers: true,
-    inline: true,
-    heap_to_stack: false,
-    world: None,
-});
+const INLINE: Compiled = Compiled::every(INLINE_OPTIONS);
 
 /// The options [`INLINE`] compiles every body with.
 const INLINE_OPTIONS: MirOptions = MirOptions {
@@ -49,6 +44,7 @@ const INLINE_OPTIONS: MirOptions = MirOptions {
     inline: true,
     heap_to_stack: false,
     world: None,
+    tier: Tier::Optimizing,
 };
 
 /// A crate `kernel` whose root file is at `path`, with `text`, in a database of its own.
@@ -985,4 +981,38 @@ fn the_oracle_catches_a_step_walk_that_keeps_each_instances_body() {
         many >= few + 56,
         "the memoized walk held {few} MIR values for 8 instances and {many} for 64"
     );
+}
+
+const STR_PARAM: &str = r#"
+#![feature(adt_const_params, unsized_const_params)]
+pub fn named<const S: &'static str>() -> &'static str { S }
+"#;
+
+/// The compile identity of `named::<s>`, in `db`.
+fn str_instance(db: &Db, s: &str) -> CompileIdentity {
+    blaze_query::db::attach(db, || {
+        let interner = hir_ty::next_solver::DbInterner::new_with(db, fixture::test_crate(db));
+        let arg = hir_ty::record::names_const(interner, s);
+        let instance = Instance {
+            subject: Subject::Body(Body::Fn(function(db, "named"))),
+            args: GenericArgs::new_from_slice(&[arg.into()]).store(),
+        };
+        match instance_identity(db, &instance, &env(db), DEBUG) {
+            Ok(it) => *it,
+            Err(error) => panic!("`named::<{s:?}>` has no identity: {error}"),
+        }
+    })
+}
+
+/// A `&'static str` const argument (row Q5 of docs/v2/plan/design/sql.md) keys its instance
+/// by its bytes: `named::<"abc">` has one identity in two databases, as in two processes, and
+/// `named::<"abd">` another. The link name is the instance key, so it is bounded whatever the
+/// string's length.
+#[test]
+fn a_str_const_argument_keys_its_instance_by_its_bytes() {
+    let one = program("/src/lib.rs", STR_PARAM);
+    let two = program("/src/lib.rs", STR_PARAM);
+    assert_eq!(str_instance(&one, "abc"), str_instance(&two, "abc"), "built twice");
+    assert_ne!(str_instance(&one, "abc"), str_instance(&one, "abd"), "other bytes");
+    assert_ne!(str_instance(&one, "abc"), str_instance(&one, "abc\0"), "a longer string");
 }

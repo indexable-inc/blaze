@@ -3098,6 +3098,13 @@ pub struct MirOptions {
     /// and only where the code generator builds a body for one final binary whose every
     /// instance it walked; `None` everywhere else, and in every body inlined into another.
     pub world: Option<devirt::DevirtWorld>,
+    /// The tier the body's code is built at ([`crate::facts::Tier`]), given by the code
+    /// generator's `Build::options`: which of blaze's passes that read past the body may run
+    /// (`hir-ty-mir`'s `optimize::passes_at`, each still under the settings above) and whether
+    /// the facts those read spend proofs ([`crate::facts::proofs_at`]). The pass list is so an
+    /// input of the body's key: a tier 0 body, which no pass on facts or inliner touched, is
+    /// never served for an optimizing one, nor the other way.
+    pub tier: crate::facts::Tier,
 }
 
 impl MirOptions {
@@ -3105,8 +3112,11 @@ impl MirOptions {
     /// nothing inlined (rustc's CTFE MIR is not, and the interpreter reads no [`Inlined`]).
     /// Allocations go to the stack wherever the level optimizes: the interpreter runs no
     /// `#[global_allocator]` a program could read, and every test that runs a program at each
-    /// level checks that this changes nothing it prints.
+    /// level checks that this changes nothing it prints. The tier is the one the level is of
+    /// ([`crate::facts::Tier`]): optimizing at level 2, the only one `SpendFacts` runs at.
     pub fn at(level: MirOptLevel) -> MirOptions {
+        use crate::facts::Tier;
+        let tier = if level >= MirOptLevel::Release { Tier::Optimizing } else { Tier::Zero };
         MirOptions {
             level,
             ub_checks: false,
@@ -3114,6 +3124,7 @@ impl MirOptions {
             inline: false,
             heap_to_stack: level != MirOptLevel::Off,
             world: None,
+            tier,
         }
     }
 
@@ -3292,6 +3303,11 @@ mod tests {
             [(MirOptLevel::Off, false), (MirOptLevel::Debug, false), (MirOptLevel::Release, true)]
         {
             let heap_to_stack = level != MirOptLevel::Off;
+            // Optimizing only at level 2, the one `SpendFacts` runs at.
+            let tier = match lifetime_markers {
+                true => crate::facts::Tier::Optimizing,
+                false => crate::facts::Tier::Zero,
+            };
             assert_eq!(
                 MirOptions::at(level),
                 MirOptions {
@@ -3300,7 +3316,8 @@ mod tests {
                     lifetime_markers,
                     inline: false,
                     heap_to_stack,
-                    world: None
+                    world: None,
+                    tier,
                 }
             );
         }

@@ -1,34 +1,39 @@
-//! The thin HTTP driver: a [`Bucket`] over blaze-http's client on its tokio driver, on a
-//! runtime of its own. It does IO and nothing else: what to ask is the machines'.
+//! The thin HTTP driver: a [`Bucket`] over blaze-http's client on its driver on blaze-core's
+//! effects (`blaze_http::driver`, a thread of its own; no async runtime). It does IO and
+//! nothing else: what to ask is the machines'.
 //!
 //! - A read (GET, HEAD) of a public object goes to the bucket's public address unsigned, with
 //!   no credential at all: the public cache is read anonymously.
 //! - Everything else (every write, and reads of an organisation's namespace) goes to the S3
 //!   endpoint, signed ([`crate::s3::sign`]); with no endpoint or credentials it is answered
 //!   [`Reply::Failed`] naming the setting, and nothing is sent.
-//! - Each ask runs under its own deadline and is answered [`Reply::TimedOut`] past it. Nothing
-//!   is asked again, and redirects are not followed (an S3 answer never needs one).
+//! - Each ask runs under its own deadline, kept by the driver on its clock, and is answered
+//!   [`Reply::TimedOut`] past it. Nothing is asked again, and redirects are not followed (an
+//!   S3 answer never needs one).
 //! - No header, address with a query, or body is ever logged or put in a reply: a failure says
 //!   the object, the status and the client's kind of error.
 //!
-//! The wait for answers ([`Bucket::wait`]) opens no span yet: blaze-trace is not in this
-//! crate's graph, like blaze-http's own waits. Each wait is bounded by the asks' deadlines.
+//! The wait for answers ([`Bucket::wait`]) parks in `blaze_http::mailbox::block_on`, named
+//! (every-wait-says-what), and is bounded by the asks' deadlines.
 
 use std::{
+    alloc::Global,
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use blaze_http::{
-    Client, Config, Event, Request,
-    tokio_driver::{Answer, Driver},
+    Client, Config, Request,
+    driver::{Fetched, Handle},
+    mailbox::{self, Rx, Tx},
 };
-use tokio::sync::mpsc;
 
 use crate::{
     bucket::{Asked, Bucket, Cond, Counts, Failure, Op, Reply, Ticket},
     s3,
-    settings::{Credentials, Settings},
+    http3,
+    settings::{Credentials, Settings, TRANSPORT_SETTING, Transport},
 };
 
 /// The most bytes an S3 answer that is not an object may be (XML of a multipart upload).
@@ -62,10 +67,16 @@ fn cond_header(cond: &Cond) -> Vec<(&'static str, String)> {
     }
 }
 
+/// Whether `op` is an anonymous read: a GET or HEAD of a public object, sent unsigned to the
+/// public address (over HTTP/3 when `bucket.transport` says so, [`crate::http3`]).
+pub fn anonymous(op: &Op) -> bool {
+    matches!(op, Op::Get { .. } | Op::Head { .. }) && op.name().starts_with("public/")
+}
+
 /// The request for `op` at `unix_s`, and how to read its answer. Why not, naming the setting
 /// missing.
 pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), String> {
-    let anonymous = matches!(op, Op::Get { .. } | Op::Head { .. }) && op.name().starts_with("public/");
+    let anonymous = anonymous(&op);
     if anonymous && let Some(public_url) = &access.public_url {
         let url = s3::public(public_url, op.name());
         let (method, want, most, headers) = match op {
@@ -143,31 +154,29 @@ pub fn reply(object: &str, want: Want, status: u16, headers: &[(String, String)]
     }
 }
 
-async fn exchange(mut answer: Answer, object: String, want: Want) -> Reply {
-    let (mut status, mut headers, mut body) = (0, Vec::new(), Vec::new());
-    loop {
-        match answer.next().await {
-            Some(Event::Head { status: s, headers: h, .. }) => {
-                status = s;
-                headers = h;
-            }
-            Some(Event::Body { bytes, .. }) => body.extend_from_slice(&bytes),
-            Some(Event::Done { .. }) => return reply(&object, want, status, &headers, body),
-            // The error's text is its kind: never its address or headers.
-            Some(Event::Failed { error, .. }) => return Reply::Failed { why: format!("{object}: {error}") },
-            None => return Reply::Failed { why: format!("{object}: the HTTP driver ended") },
-        }
+/// The reply to one ask's [`Fetched`], for `object` read as `want`.
+fn fetched(object: &str, want: Want, fetched: Fetched) -> Reply {
+    match fetched {
+        Fetched::Answered { status, headers, body, .. } => reply(object, want, status, &headers, body),
+        // The error's text is its kind: never its address or headers.
+        Fetched::Failed(error) => Reply::Failed { why: format!("{object}: {error}") },
+        Fetched::TimedOut => Reply::TimedOut,
     }
 }
 
 /// The bucket over HTTPS.
 pub struct HttpBucket {
-    runtime: tokio::runtime::Runtime,
-    driver: Driver,
-    access: Arc<Access>,
+    http: Handle,
+    access: Arc<Access, Global>,
     start: Instant,
-    to_us: mpsc::UnboundedSender<(Ticket, Reply)>,
-    from_tasks: mpsc::UnboundedReceiver<(Ticket, Reply)>,
+    /// Where the driver hands each ask's answer, by its key.
+    to_us: Tx<(u64, Fetched)>,
+    answers: Rx<(u64, Fetched)>,
+    /// Each ask in flight in the driver, by its key: its ticket, its object and how to read it.
+    asked: BTreeMap<u64, (Ticket, String, Want), Global>,
+    next_key: u64,
+    /// Replies made without asking (a request that could not be made), for the next wait.
+    ready: Vec<(Ticket, Reply), Global>,
     in_flight: usize,
     counts: Counts,
 }
@@ -178,15 +187,32 @@ impl HttpBucket {
         let Some(bucket) = settings.contacts() else {
             return Err(Failure::NotConfigured { missing: vec!["the cache is not configured or is disabled (remote.json)".to_owned()] });
         };
+        if bucket.transport == Transport::H3 {
+            // The HTTP/3 reads ([`crate::http3::Routed`] over this bucket) need a `Wire` over
+            // blaze-http's HTTP/3 loop (`blaze_http::h3::driver::Loop`), which is not built
+            // yet. Refused, never read over HTTP/1.1 instead.
+            return Err(Failure::NotConfigured {
+                missing: vec![format!("{TRANSPORT_SETTING} is \"h3\", and this blaze has no HTTP/3 driver to read with yet: set it to \"h1\"")],
+            });
+        }
         let access = Access { endpoint: bucket.endpoint.clone(), bucket: bucket.name.clone(), public_url: bucket.public_url.clone(), credentials: settings.credentials.clone() };
-        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("blaze-remote http").enable_all().build().map_err(|e| Failure::Misused(format!("making the cache's HTTP runtime: {e}")))?;
         let tls = blaze_http::roots::native().map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
         let proxies = blaze_http::proxy_env::from_env().map_err(|e| Failure::Misused(format!("the proxy settings: {e}")))?;
         let config = Config { idle_most: crate::push::IN_FLIGHT, proxies, redirects: 0, ..Config::new(tls, "blaze (https://github.com/indexable-inc/blaze)", Duration::from_secs(30)) };
-        let driver = Driver::spawn(runtime.handle(), Client::new(config));
-        let (to_us, from_tasks) = mpsc::unbounded_channel();
-        // alloc: the driver's settings, made once with it.
-        Ok(HttpBucket { runtime, driver, access: Arc::new(access), start: Instant::now(), to_us, from_tasks, in_flight: 0, counts: Counts::default() })
+        let http = Handle::spawn(Client::new(config), crate::push::IN_FLIGHT).map_err(|e| Failure::Misused(format!("starting the cache's HTTP driver: {e}")))?;
+        let (to_us, answers) = mailbox::channel(None);
+        Ok(HttpBucket {
+            http,
+            access: Arc::new_in(access, Global),
+            start: Instant::now(),
+            to_us,
+            answers,
+            asked: BTreeMap::new_in(Global),
+            next_key: 0,
+            ready: Vec::new_in(Global),
+            in_flight: 0,
+            counts: Counts::default(),
+        })
     }
 }
 
@@ -203,18 +229,14 @@ impl Bucket for HttpBucket {
             self.counts.requests += 1;
             self.counts.sent += op.sends();
             let object = op.name().to_owned();
-            let to_us = self.to_us.clone();
             match request(&self.access, op, unix_s) {
-                Err(why) => {
-                    _ = to_us.send((ticket, Reply::Failed { why }));
-                }
+                Err(why) => self.ready.push((ticket, Reply::Failed { why })),
                 Ok((req, want)) => {
-                    let answer = self.driver.ask(req);
+                    let key = self.next_key;
+                    self.next_key += 1;
+                    self.asked.insert(key, (ticket, object, want));
                     let allowed = Duration::from_millis(deadline_ms.saturating_sub(now));
-                    self.runtime.spawn(async move {
-                        let reply = tokio::time::timeout(allowed, exchange(answer, object, want)).await.unwrap_or(Reply::TimedOut);
-                        _ = to_us.send((ticket, reply));
-                    });
+                    self.http.fetch(req, allowed, key, &self.to_us);
                 }
             }
         }
@@ -225,26 +247,100 @@ impl Bucket for HttpBucket {
     }
 
     fn wait(&mut self) -> Vec<(Ticket, Reply)> {
+        let mut out = Vec::new_in(Global);
         if self.in_flight == 0 {
-            return Vec::new();
+            return out;
         }
-        // Bounded: every ask's task answers by its deadline. We hold a sender, so `None`
-        // cannot come; it is read as nothing answered.
-        let first = self.runtime.block_on(self.from_tasks.recv());
-        let mut out: Vec<(Ticket, Reply)> = first.into_iter().collect();
-        while let Ok(it) = self.from_tasks.try_recv() {
-            out.push(it);
-        }
-        self.in_flight -= out.len();
-        for (_, reply) in &out {
-            if let Reply::Got { bytes, .. } = reply {
-                self.counts.received += bytes.len() as u64;
+        if self.ready.is_empty() {
+            // Bounded: the driver answers every ask by its deadline, on its clock. This holds
+            // a sender, so `None` (every sender gone) cannot come while it lives.
+            match mailbox::block_on("the cache's HTTP answers", None, self.answers.recv()) {
+                Ok(Some((key, answer))) => self.answered(key, answer, &mut out),
+                Ok(None) => self.fail_all("the HTTP driver ended", &mut out),
+                Err(blocked) => self.fail_all(&format!("waiting for the HTTP driver: {blocked}"), &mut out),
             }
         }
+        self.taken(&mut out);
         out
     }
 
     fn counts(&self) -> Counts {
         self.counts
     }
+}
+
+impl HttpBucket {
+    /// Adds every answer ready to `out`, and counts what `out` holds as taken.
+    fn taken(&mut self, out: &mut Vec<(Ticket, Reply)>) {
+        out.append(&mut self.ready);
+        // `Err` is every sender gone, which cannot be while this holds one; `Ok(None)` is
+        // nothing more ready.
+        while let Ok(Some((key, answer))) = self.answers.try_recv() {
+            self.answered(key, answer, out);
+        }
+        self.in_flight -= out.len();
+        for (_, reply) in out.iter() {
+            if let Reply::Got { bytes, .. } = reply {
+                self.counts.received += bytes.len() as u64;
+            }
+        }
+    }
+}
+
+impl HttpBucket {
+    /// The reply to the ask `key`.
+    fn answered(&mut self, key: u64, answer: Fetched, out: &mut Vec<(Ticket, Reply)>) {
+        let Some((ticket, object, want)) = self.asked.remove(&key) else {
+            panic!("blaze-remote's HTTP bucket: the driver answered key {key}, which names no ask in flight")
+        };
+        out.push((ticket, fetched(&object, want, answer)));
+    }
+
+    /// Every ask in flight answered [`Reply::Failed`] with `why`: the driver can answer none.
+    fn fail_all(&mut self, why: &str, out: &mut Vec<(Ticket, Reply)>) {
+        for (_, (ticket, object, _)) in std::mem::take(&mut self.asked) {
+            out.push((ticket, Reply::Failed { why: format!("{object}: {why}") }));
+        }
+    }
+}
+
+impl http3::Ready for HttpBucket {
+    fn ready(&mut self) -> Vec<(Ticket, Reply)> {
+        let mut out = Vec::new_in(std::alloc::Global);
+        self.taken(&mut out);
+        out
+    }
+}
+
+/// The HTTP/3 tickets kept in `dir` ([`http3::TICKETS_FILE`]) usable at `now_unix_s`; none
+/// when there is no file yet. A file anyone but its owner can read is refused, as the
+/// credentials file is: its tickets resume sessions as this client.
+pub fn load_tickets(dir: &std::path::Path, now_unix_s: u64) -> Result<Vec<blaze_http::h3::Ticket, std::alloc::Global>, String> {
+    use std::{io::Read, os::unix::fs::PermissionsExt};
+    let path = dir.join(http3::TICKETS_FILE);
+    let file = match std::fs::File::open(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new_in(std::alloc::Global)),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Ok(file) => file,
+    };
+    let mode = file.metadata().map_err(|e| format!("{}: {e}", path.display()))?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(format!("{}: its mode is {:o}: a file of tickets is read only when no one but its owner can read it (chmod 600)", path.display(), mode & 0o777));
+    }
+    let mut bytes = Vec::new_in(std::alloc::Global);
+    // One byte past the bound, so a file past it is seen to be.
+    file.take(http3::TICKETS_FILE_MOST as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    http3::decode_tickets(&bytes, now_unix_s)
+}
+
+/// Writes `tickets` to `dir`'s tickets file, owner-only, replacing it whole (written aside,
+/// synced, then renamed over it).
+pub fn save_tickets(dir: &std::path::Path, tickets: &[blaze_http::h3::Ticket]) -> Result<(), String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let path = dir.join(http3::TICKETS_FILE);
+    let aside = dir.join(format!("{}.new", http3::TICKETS_FILE));
+    let bytes = http3::encode_tickets(tickets);
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&aside).map_err(|e| format!("{}: {e}", aside.display()))?;
+    file.write_all(&bytes).and_then(|()| file.sync_all()).map_err(|e| format!("{}: {e}", aside.display()))?;
+    std::fs::rename(&aside, &path).map_err(|e| format!("{}: {e}", path.display()))
 }

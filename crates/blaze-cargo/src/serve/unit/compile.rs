@@ -192,8 +192,11 @@ struct RecordRef<'a> {
 /// a narrow key that holds its dependencies' interfaces in place of their code
 /// ([`blaze_lower::Narrowed::built`]), and its record lists of its codegen's inputs its own
 /// roots alone ([`owned_inputs`]): a record of layout 13 lists a dependency's functions with
-/// the code they had, so under such a key it would be found after one of them changed.
-const RECORD: &str = "blaze v2 cargo unit record 14";
+/// the code they had, so under such a key it would be found after one of them changed. 15: a
+/// test binary's execution table names the jump table it is of ([`blaze_codegen::JumpTable`]:
+/// the image's lineage and generation, its capacity and the slots given out), which a record
+/// of layout 14 lacks; its bytes would not read as this layout.
+const RECORD: &str = "blaze v2 cargo unit record 15";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev
@@ -1060,6 +1063,7 @@ fn with_record_inputs<T>(
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?,
         false => None,
     };
+    let build = keyed_build(job, unit, links && !checks_only(job.input.kind, u))?;
     let places = Places::of(job);
     let inputs = RecordInputs {
         identity,
@@ -1073,6 +1077,7 @@ fn with_record_inputs<T>(
         makers,
         kind: keyed_kind(job.input.kind, u),
         goal: keyed_goal(job, unit)?,
+        build,
         verified,
         reached: reached_only(job, u)?,
         pgo,
@@ -1602,6 +1607,10 @@ pub(crate) struct RecordInputs<'a> {
     pub(crate) kind: u8,
     /// [`keyed_goal`].
     pub(crate) goal: u8,
+    /// [`keyed_build`]: what kind of image a unit that links makes (a plain file, a live
+    /// image, a launcher's program), which decides its outputs' bytes and how a replay of its
+    /// record holds them.
+    pub(crate) build: u8,
     pub(crate) verified: bool,
     pub(crate) reached: bool,
     /// The bytes of a `-C profile-use` profile.
@@ -1654,7 +1663,7 @@ impl RecordInputs<'_> {
             )
         })?;
         hasher.id(&self.makers.front_end).id(&self.makers.codegen).id(&self.makers.record).update(
-            &[self.kind, self.goal, u8::from(self.verified), u8::from(self.reached)],
+            &[self.kind, self.goal, self.build, u8::from(self.verified), u8::from(self.reached)],
         );
         if let Some(profile) = &self.pgo {
             hasher.id(profile);
@@ -1733,6 +1742,7 @@ impl RecordInputs<'_> {
             ),
             bytes("the job's kind", &[self.kind]),
             bytes("the build goal (tier 0 code or optimized code)", &[self.goal]),
+            bytes("what image it links (a file, a live image, a launcher's program)", &[self.build]),
             flag("BLAZE_ELIDE=verify (built to verify an inert build script)", self.verified),
             flag("BLAZE_DEPS (only what programs reach)", self.reached),
             id("the -C profile-use profile", self.pgo.as_ref()),
@@ -1942,6 +1952,34 @@ pub(crate) fn keyed_goal(job: &Job, unit: usize) -> Result<u8, ApiError> {
     let goal = codegen::goal(job, unit)
         .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?; // alloc: error path
     Ok(goal_byte(goal))
+}
+
+/// The byte of what image `unit` links in a record key, from the very policy its link is
+/// asked with ([`codegen::policy`]'s `mode`): a plain file, a live image, a tiered one or a
+/// launcher's program. Each is another value of the unit's outputs, and the mode is chosen by
+/// inputs no other part of the key holds (the request's command: `blaze run` links a
+/// launcher's program where `blaze build` links a live image, `launch::launched`), so
+/// without it a `build` after a `run` replayed the launcher's file and held it as a live
+/// image. 0 for a unit that links nothing, or only checks (`links`).
+pub(crate) fn keyed_build(job: &Job, unit: usize, links: bool) -> Result<u8, ApiError> {
+    if !links {
+        return Ok(0);
+    }
+    let u = job.unit(unit)?;
+    let policy = codegen::toolchain(job, unit)
+        .and_then(|toolchain| codegen::policy(job, unit, toolchain))
+        .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?; // alloc: error path
+    Ok(build_byte(policy.mode))
+}
+
+/// A build mode's byte in a record key: never 0, a unit that links nothing.
+pub(crate) fn build_byte(mode: blaze_codegen::plan::Mode) -> u8 {
+    match mode {
+        blaze_codegen::plan::Mode::Output => 1,
+        blaze_codegen::plan::Mode::Live => 2,
+        blaze_codegen::plan::Mode::Tiered => 3,
+        blaze_codegen::plan::Mode::Launched => 4,
+    }
 }
 
 /// A goal's byte in a record key: never 0, a unit only checked.

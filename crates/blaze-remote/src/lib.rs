@@ -93,7 +93,7 @@
 //! requests). An organisation's namespace is opt-in, by naming it.
 
 #![deny(unsafe_code)]
-#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![feature(allocator_api, btreemap_alloc, register_tool, custom_inner_attributes)]
 // `#![blaze::sans_io]` in each core module; inert under rustc.
 #![register_tool(blaze)]
 
@@ -104,6 +104,7 @@ pub mod exec;
 pub mod expire;
 pub mod find;
 pub mod http;
+pub mod http3;
 pub mod name;
 pub mod privacy;
 pub mod pull;
@@ -117,6 +118,8 @@ mod wire;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod http3_tests;
 #[cfg(test)]
 mod tests;
 

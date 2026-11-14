@@ -142,17 +142,18 @@ fn o3() -> Build {
 /// The invariant (docs/v2/plan/design/tiers.md, "Key shape"): tier 0 code of a crate that is
 /// not the library's is built from its own body alone. A unit at tier 0 (stencils, or LLVM at
 /// `-O0` for a CPU the stencils do not cover) asks for MIR level 1, no inliner and no
-/// devirtualization, so `hir-ty-mir`'s `optimize` runs neither `Inline` nor `SpendFacts` on
-/// it and its body reads no callee's body or effect summary: a body edit changes the key of
-/// one tier 0 function. The optimized tier asks for all three. (The library's own bodies are
-/// at level 2 and inlined under every unit, [`Build::options`]: they are std's, which no edit
-/// of the workspace reaches.)
+/// devirtualization, so `hir-ty-mir`'s `optimize` runs no `Inline` on it and its body reads no
+/// callee's body: a body edit changes the key of one tier 0 function. The optimized tier asks
+/// for all three. No tier runs `SpendFacts` for now (`hir_ty_mir::mir::passes_at`), so no
+/// unit's body reads an effect summary; tier 0's would not even with it switched on, as it
+/// runs only at level 2. (The library's own bodies are at level 2 and inlined under every
+/// unit, [`Build::options`]: they are std's, which no edit of the workspace reaches.)
 #[test]
 fn a_tier_zero_unit_builds_no_callee_into_its_bodies() {
     let tier_zero = [Backend::Stencil, Backend::Llvm { opt: 0 }];
     for backend in tier_zero {
         let build = Build::of(&Spec { backend, ..spec() });
-        assert!(!build.optimized, "{backend:?}: MIR level 2 runs `SpendFacts`");
+        assert!(!build.optimized, "{backend:?}: MIR level 2, which passes on facts run at");
         assert!(!build.inlines, "{backend:?}: the inliner builds callees in");
         assert!(build.world.is_none(), "{backend:?}: devirtualized against the program");
     }
@@ -840,10 +841,11 @@ fn described_in(
     })
 }
 
-/// The library's bodies are MIR-inlined in every unit, as shipped (`Build::options`), so a
-/// body of a `Lang` crate is its callees' bodies too: it is kept under its code, never a
-/// template code its callees' interfaces alone make, and fills no anchors of its own. Two
-/// forwarders written alike over two callees of one signature are so two keys.
+/// The library's bodies are MIR-inlined as shipped wherever a unit inlines (`Build::options`),
+/// so a body of a `Lang` crate may be its callees' bodies too: it is kept under its code under
+/// every unit, a tier 0 one included, never a template code its callees' interfaces alone
+/// make, and fills no anchors of its own. Two forwarders written alike over two callees of one
+/// signature are so two keys.
 #[test]
 fn a_library_body_the_library_inlines_into_is_kept_under_its_code() {
     let policy = policy(OptLevel::O0);
@@ -1056,8 +1058,9 @@ fn a_root_takes_function_items_for_its_type_parameters() {
 
 /// A generic is shared under every options a unit of its origin builds a body with: the
 /// first spec's, the LLVM spec a live build tiers it up to, the LLVM tier of a tiered run,
-/// and UB checks where its crate has debug assertions. The library's bodies are at level 2,
-/// inlined, as shipped. Leaving one out would key two bodies as one under it.
+/// and UB checks where its crate has debug assertions. The library's bodies are at level 2:
+/// at tier 0 under a tier 0 unit, uninlined; as shipped, inlined, under one that inlines.
+/// Leaving one out would key two bodies as one under it.
 #[test]
 fn a_generic_is_shared_under_every_options_its_units_build_with() {
     use hir_ty_mir::mir::{
@@ -1072,6 +1075,10 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
             .with_policy(policy);
         frontend.body_options(&origin).expect("the options")
     };
+    use hir_ty::facts::Tier;
+    // A body of the program's crates is at the optimizing tier where its unit optimizes (level
+    // 2 here), else at tier 0; the library's as shipped where the unit optimizes
+    // (`Build::tier_of`).
     let at = |level, ub_checks, inline| MirOptions {
         level,
         ub_checks,
@@ -1079,11 +1086,19 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
         inline,
         heap_to_stack: false,
         world: None,
+        tier: match level {
+            Release => Tier::Optimizing,
+            _ => Tier::Zero,
+        },
     };
+    let lang_zero = MirOptions { tier: Tier::Zero, ..at(Release, false, false) };
+    let lang_shipped = MirOptions { tier: Tier::Shipped, ..at(Release, false, true) };
     let o0 = options(&policy(OptLevel::O0));
     assert!(o0.other.contains(at(Debug, false, false)), "{o0:?}");
     assert!(!o0.other.contains(at(Release, false, false)), "{o0:?}");
-    assert!(o0.lang.contains(at(Release, false, true)), "{o0:?}");
+    assert!(o0.lang.contains(lang_zero), "{o0:?}");
+    assert!(!o0.lang.contains(lang_shipped), "a tier 0 unit inlines none of the library: {o0:?}");
+    assert!(!o0.lang.contains(at(Release, false, true)), "nor spends facts on it: {o0:?}");
     let live = options(&Policy { mode: Mode::Live, ..policy(OptLevel::O3) });
     assert!(live.other.contains(at(Debug, false, false)), "{live:?}");
     assert!(live.other.contains(at(Release, false, false)), "{live:?}");
@@ -1094,6 +1109,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
     assert!(tiered.other.contains(at(Release, false, false)), "{tiered:?}");
     let o3 = options(&policy(OptLevel::O3));
     assert!(o3.other.contains(at(Release, false, true)), "{o3:?}");
+    assert!(o3.lang.contains(lang_shipped), "{o3:?}");
     let mut checked = policy(OptLevel::O0);
     checked.profile.debug_assertions = true;
     let checked = options(&checked);
@@ -1577,6 +1593,52 @@ fn a_units_mir_level_is_rustcs() {
     assert!(Build::of(&spec).options(db, krate, false).ub_checks);
 }
 
+/// The invariant: a tier 0 unit builds every body at tier 0, the library's (at level 2) and
+/// the walk's included, so it spends no proof and runs no pass that reads past the body; an
+/// optimizing unit builds the program's bodies at the optimizing tier, whose proofs are
+/// `Proofs::Spent`, and the library's as shipped, spending none.
+///
+/// What the optimizing tier's `Proofs::Spent` is spent on: in `hir-ty-mir`'s `optimize` the
+/// tier's proofs go only to the two runs of `SpendFacts`, which no tier's list has for now
+/// (`hir_ty_mir::mir::passes_at`), so a build at the optimizing tier reads no proof today; the
+/// pass's tests run it through `hir_ty_mir::mir::spend_facts_at` and ask with these proofs. The
+/// checks (`#[blaze::nopanic]`, `pure`, ...) are no tier's: they ask `Proofs::Spent` on their
+/// own.
+#[test]
+fn a_tier_zero_unit_spends_no_proof() {
+    use hir_ty::facts::{Proofs, Tier, proofs_at};
+    let (db, _) = frontend(SIBLINGS);
+    let krate = fixture::test_crate(&db);
+    let core = base_db::all_crates(db)
+        .iter()
+        .copied()
+        .find(|it| it.data(db).origin.is_lang())
+        .expect("minicore's crate");
+    let tier = |build: Build, written, per_user| build.options(db, written, per_user).tier;
+    let proofs = |build: Build, written, per_user| proofs_at(tier(build, written, per_user));
+    for backend in [
+        Backend::Cranelift { speed: false },
+        Backend::Cranelift { speed: true },
+        Backend::Llvm { opt: 0 },
+        Backend::Stencil,
+    ] {
+        let build = Build::of(&Spec { backend, ..spec() });
+        for (written, per_user) in [(krate, false), (krate, true), (core, false), (core, true)] {
+            assert_eq!(tier(build, written, per_user), Tier::Zero, "{backend:?}");
+            assert_eq!(proofs(build, written, per_user), Proofs::None, "{backend:?}");
+            assert!(!build.options(db, written, per_user).inline, "{backend:?} inlines");
+        }
+    }
+    let optimized = Build::of(&Spec { backend: Backend::Llvm { opt: 3 }, mir_inline: true, ..spec() });
+    assert_eq!(tier(optimized, krate, false), Tier::Optimizing);
+    assert_eq!(proofs(optimized, krate, false), Proofs::Spent);
+    assert_eq!(tier(optimized, core, true), Tier::Shipped, "the library's bodies are as shipped");
+    assert_eq!(proofs(optimized, core, true), Proofs::None);
+    for written in [krate, core] {
+        assert_eq!(tier(Build::WALK, written, false), Tier::Zero);
+    }
+}
+
 /// An entry of the allocator shim is built against what its walk lists, the function it
 /// calls by symbol, and is another code for another callee.
 #[test]
@@ -2035,8 +2097,9 @@ fn built_as(db: &Db, spec: &Spec, instance: &HirInstance) -> super::Built {
         .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
 }
 
-/// A unit's bodies are MIR-inlined as rustc's: the library's always, as shipped; every other
-/// crate's only in an LLVM unit at level 2 or 3, and in the walk for such a unit.
+/// A unit's bodies are MIR-inlined as rustc's `Inline::is_enabled` says of the unit: only in
+/// an LLVM unit at level 2 or 3, and in the walk for such a unit, the library's as every other
+/// crate's (a tier 0 unit inlines nothing at the MIR level).
 #[test]
 fn a_units_bodies_are_inlined_as_rustcs() {
     let (db, _) = frontend(SIBLINGS);
@@ -2058,14 +2121,16 @@ fn a_units_bodies_are_inlined_as_rustcs() {
     for (backend, inlines) in backends {
         let build = Build::of(&Spec { backend, mir_inline: inlines, ..spec() });
         assert_eq!(inline(build, krate), inlines, "{backend:?}");
-        assert!(inline(build, core), "the library's at {backend:?}");
+        assert_eq!(inline(build, core), inlines, "the library's at {backend:?}");
     }
     // `s`, `z` and a build that patches are at LLVM's level 2 without the inliner.
     let sized = Build::of(&Spec { backend: Backend::Llvm { opt: 2 }, mir_inline: false, ..spec() });
     assert!(!inline(sized, krate));
-    assert!(inline(sized, core));
+    assert!(!inline(sized, core));
     assert!(!inline(Build::WALK, krate));
+    assert!(!inline(Build::WALK, core));
     assert!(inline(Build::WALK_INLINED, krate));
+    assert!(inline(Build::WALK_INLINED, core));
 }
 
 /// A member at O3 is inlined, at O0 not, and a package the profile sets apart is as the

@@ -19,12 +19,12 @@ use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as Ef
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, Put},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Put, StoreError, StoreFile},
 };
 
 use super::format::{
-    self, Entry, FORMAT, HEAD_LEN, HeadRead, Manifest, OFFSET_MOST, Retired, Root, SLOT_AT, Segment,
-    Slot, aligned, record_crc,
+    self, Entry, FORMAT, HEAD_LEN, HeadRead, LostKind, LostMark, Manifest, OFFSET_MOST, Retired, Root,
+    SLOT_AT, Segment, Slot, aligned, record_crc,
 };
 use super::verified::{Boot, Checks, Unverified, Verified};
 use crate::{Corrupt, Key, Mismatch, content_of};
@@ -73,6 +73,9 @@ const LOG_DOMAIN: &str = "blaze plain store log 1";
 const HEAD: &str = "head";
 const FLIP: &str = "flip";
 const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// What [`StoreError::Io`] says a failed map was doing.
+const MAPPING: &str = "mapping a segment its generation names";
 
 /// The cache directory tag (bford.info/cachedir): backup and indexing tools that honour it
 /// skip the store.
@@ -132,22 +135,30 @@ pub struct Placed {
     pub len: u32,
 }
 
-/// Why a put or a commit was refused.
+/// Why a put was refused. A commit's, a compaction's and the store's own stops are
+/// [`StoreError`]s (blaze-keyed's, the one home: rule 30); a put keeps its own type only
+/// because a mismatch is an answer there ([`Put::Other`]), not a failure.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum PutError {
     /// The key holds other bytes.
     Mismatch(Mismatch),
     /// A value of 4 GiB or more, or a batch past what an entry's offset holds.
     TooLong { key: Key, len: u64 },
-    /// The key's committed record, read to compare, is corrupt.
-    Corrupt(Corrupt),
-    /// The store is not ready for it (opening, committing, compacting or broken).
-    Busy(&'static str),
-    /// Two batches of one commit hold one key with other values: why, naming the key.
-    TwoValues(String),
     /// A put names a namespace this store does not write ([`PlainConfig::writes`]): a machine
     /// that is not a trusted writer writes only [`Namespace::LOCAL`].
     NotWritable { namespace: Namespace },
+}
+
+impl PutError {
+    /// The refusal of a put of `tag`, as the store's error: a mismatch outside a put (a commit
+    /// laying out two batches, a root) is two values under one key (rule 21).
+    pub fn into_store(self, tag: Tag) -> StoreError {
+        match self {
+            PutError::Mismatch(it) => StoreError::TwoValues { tag, key: it.key.0 },
+            PutError::TooLong { key, len } => StoreError::TooLong { tag, key: key.0, len },
+            PutError::NotWritable { namespace } => StoreError::NotWritable { namespace },
+        }
+    }
 }
 
 impl std::fmt::Display for PutError {
@@ -156,9 +167,6 @@ impl std::fmt::Display for PutError {
             PutError::NotWritable { namespace } => write!(f, "a put names namespace {:x}, which this store does not write: a machine that is not a trusted writer writes only the local namespace", namespace.0),
             PutError::Mismatch(it) => write!(f, "{:x} holds other bytes ({:x}) than the put's ({:x}): a key covers every input its value depends on", it.key.0, it.kept, it.given),
             PutError::TooLong { key, len } => write!(f, "the value of {:x} is {len} bytes: a plain store's record is shorter than 4 GiB and a segment shorter than 16 TiB", key.0),
-            PutError::Corrupt(it) => it.fmt(f),
-            PutError::Busy(what) => write!(f, "the plain store is {what}: a commit waits for it to be ready"),
-            PutError::TwoValues(why) => f.write_str(why),
         }
     }
 }
@@ -238,6 +246,9 @@ pub(crate) enum Plant {
     ForgetCheck,
     /// A lookup searches every namespace, not only those it names.
     IgnoresNamespace,
+    /// The flip that retires a loss clears its "lost, not yet reported" mark at once: a
+    /// report that dies with its process is never made again.
+    ClearMarkAtOnce,
 }
 
 /// Puts one worker holds for one namespace, laid out as they will lie in a segment: each
@@ -393,7 +404,7 @@ struct Flip {
     manifest_bytes: Vec<u8>,
     removals: Vec<FileName>,
     /// The commit was refused under the lock, or the compaction aborted: unlock and stop.
-    refused: Option<String>,
+    refused: Option<StoreError>,
     aborted: bool,
 }
 
@@ -406,7 +417,7 @@ enum Phase {
     /// A manifest's read failed: the directory is listed to tell a log a power cut took (not
     /// there: the same as torn) from a read that failed (there: the error, by name). A failed
     /// read is never taken for a lost generation.
-    CheckLog { ctx: Ctx, slots: [Option<Slot>; 2], at: usize, why: String },
+    CheckLog { ctx: Ctx, slots: [Option<Slot>; 2], at: usize, why: StoreError },
     /// The head was short of its length (never made, or made and not synced before a power
     /// cut): it is cut to [`HEAD_LEN`] and synced, then read again.
     MakeHead,
@@ -475,10 +486,23 @@ pub struct Plain {
     checked: BTreeSet<u64>,
     dropped: BTreeSet<u64>,
     orphans: Vec<(u64, bool)>,
+    /// The segments this open found lost, with why: the next flip marks the rows that retire
+    /// them "lost, not yet reported" in the same manifest ([`Retired::lost`]).
+    marks: Vec<(u64, LostMark)>,
+    /// Marked rows this process's report names, its report not yet handed to its caller.
+    unreported: Vec<u64>,
+    /// Marked rows whose report was handed to the caller ([`Plain::handed`]): the next flip
+    /// this process makes clears them.
+    clearable: Vec<u64>,
     report: Report,
-    committed: Option<Result<Committed, String>>,
+    committed: Option<Result<Committed, StoreError>>,
     sliced: Option<Sliced>,
-    broken: Option<String>,
+    /// The first stop, typed: each reason is a [`StoreError`] variant naming the file, the
+    /// step and what was found, never text.
+    broken: Option<StoreError>,
+    /// The files a flip retired past their grace, being unlinked: by the index of their
+    /// effects, so a failed unlink names its file.
+    removing: Vec<FileName>,
     seq: u64,
     /// Lists and footers of the open's fallback, by tag index.
     listed: Vec<(FileName, u64)>,
@@ -490,7 +514,7 @@ pub struct Plain {
     late_sync: Vec<FileName>,
     /// Segments of an earlier boot whose map failed, with why: lost only if the directory no
     /// longer holds them (a power cut took the file); a failed map of one it holds is an error.
-    unopened: Vec<(Segment, FileName, String)>,
+    unopened: Vec<(Segment, FileName, StoreError)>,
     /// This open made the head at its length already (it is made once, never twice).
     head_made: bool,
     /// The flip lock is held (taken, and its unlock not yet asked): a step that fails under it
@@ -529,6 +553,26 @@ fn failed(done: &Done) -> Option<String> {
         Done::Broken { error, .. } => Some(error.0.clone()),
         _ => None,
     }
+}
+
+/// Which of the store's files `file` (the store's directory, or a file in it) is, for an
+/// error that names it by role and id.
+fn store_file(file: &FileName) -> StoreFile {
+    let Some((_, leaf)) = file.as_str().rsplit_once('/') else { return StoreFile::Directory };
+    match parse_leaf(leaf) {
+        Some((id, true)) => StoreFile::Log { id },
+        Some((id, false)) => StoreFile::Segment { id },
+        None if leaf == HEAD => StoreFile::Head,
+        None if leaf == FLIP => StoreFile::FlipLock,
+        None if leaf == CACHEDIR_TAG => StoreFile::CacheTag,
+        None => unreachable!("{file}: the store asks effects only on the files it names"),
+    }
+}
+
+/// `done` failed `doing` on `file`: the driver's error (its text: blaze-core's `IoError`
+/// carries no errno), with the file by role.
+fn io(doing: &'static str, file: &FileName, done: &Done) -> Option<StoreError> {
+    failed(done).map(|error| StoreError::Io { doing, file: store_file(file), error })
 }
 
 /// The id of a file named `seg-<16 hex>` or `manifests-<16 hex>`, and whether it is a log.
@@ -587,10 +631,14 @@ impl Plain {
             checked: BTreeSet::new(),
             dropped: BTreeSet::new(),
             orphans: Vec::new_in(Global),
+            marks: Vec::new_in(Global),
+            unreported: Vec::new_in(Global),
+            clearable: Vec::new_in(Global),
             report: Report::default(),
             committed: None,
             sliced: None,
             broken: None,
+            removing: Vec::new_in(Global),
             seq: 0,
             listed: Vec::new_in(Global),
             flip_parked: None,
@@ -616,6 +664,7 @@ impl Plain {
         self.name(&format!("manifests-{id:016x}"))
     }
 
+
     fn tag(&self, op: u8, index: u32) -> EffectTag {
         tag_of(self.cfg.tags, op, index)
     }
@@ -629,8 +678,8 @@ impl Plain {
         matches!(self.phase, Phase::Ready)
     }
 
-    pub fn broken(&self) -> Option<&str> {
-        self.broken.as_deref()
+    pub fn broken(&self) -> Option<&StoreError> {
+        self.broken.as_ref()
     }
 
     /// The generation this process reads.
@@ -647,7 +696,7 @@ impl Plain {
     }
 
     /// The last commit's outcome, once.
-    pub fn take_committed(&mut self) -> Option<Result<Committed, String>> {
+    pub fn take_committed(&mut self) -> Option<Result<Committed, StoreError>> {
         self.committed.take()
     }
 
@@ -690,7 +739,7 @@ impl Plain {
         out
     }
 
-    fn stop(&mut self, why: String) {
+    fn stop(&mut self, why: StoreError) {
         self.broken = Some(why);
         self.phase = Phase::Broken;
     }
@@ -888,7 +937,7 @@ impl Plain {
     /// Names `keys` as kept under `name` at the next commit: a [`ROOT_TAG`] record of the
     /// sorted keys under [`Namespace::LOCAL`], and the root. Compaction keeps every record a
     /// root names.
-    pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, PutError> {
+    pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
         let mut sorted = Vec::with_capacity_in(keys.len(), Global);
         sorted.extend_from_slice(keys);
         sorted.sort_unstable();
@@ -898,7 +947,7 @@ impl Plain {
             bytes.extend_from_slice(&key.0.0);
         }
         let key = Key(ContentId::of(ROOT_DOMAIN, &bytes));
-        self.put(key, Namespace::LOCAL, ROOT_TAG, &bytes)?;
+        self.put(key, Namespace::LOCAL, ROOT_TAG, &bytes).map_err(|it| it.into_store(ROOT_TAG))?;
         self.roots_pending.push(RootEdit::Set { name: name.to_owned(), key });
         Ok(key)
     }
@@ -914,12 +963,12 @@ impl Plain {
     /// for each namespace that holds records, one after another, with no lock, then flips the
     /// head once to a generation naming them all. The outcome is [`Plain::take_committed`]'s
     /// once the store is ready again.
-    pub fn commit(&mut self, batches: Vec<Batch>, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), PutError> {
+    pub fn commit(&mut self, batches: Vec<Batch>, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
-            return Err(PutError::Busy(self.what()));
+            return Err(StoreError::Busy { phase: self.what() });
         }
         if let Some(batch) = batches.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
-            return Err(PutError::NotWritable { namespace: batch.namespace });
+            return Err(StoreError::NotWritable { namespace: batch.namespace });
         }
         // The held batches stay readable while they are written: sealed until the commit ends.
         let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), Global);
@@ -954,7 +1003,7 @@ impl Plain {
 
     /// One segment laid out for each namespace of [`PlainConfig::writes`] (in its order) that
     /// holds a record not already committed under it.
-    fn lay_out(&self, batches: Vec<Batch>) -> Result<Vec<Laid>, PutError> {
+    fn lay_out(&self, batches: Vec<Batch>) -> Result<Vec<Laid>, StoreError> {
         let mut out = Vec::with_capacity_in(self.cfg.writes.len(), Global);
         let mut batches = batches;
         for &namespace in &self.cfg.writes {
@@ -968,16 +1017,17 @@ impl Plain {
             let mut theirs = Vec::new_in(Global);
             theirs.extend(batches.extract_if(.., |it| it.namespace == namespace));
             // Lays out one batch's entries after what is laid: the offset its bytes go at.
-            let mut lay = |batch: &Batch| -> Result<u64, PutError> {
+            let mut lay = |batch: &Batch| -> Result<u64, StoreError> {
                 let at = base;
                 for entry in &batch.entries {
-                    if let Some((at, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
+                    if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
                         if kept.same_record(entry) {
                             // Its bytes stay in the segment unreferenced; compaction drops them.
                             continue;
                         }
-                        let kept = self.maps[at].payload(&kept);
-                        return Err(PutError::Mismatch(Mismatch { key: Key(entry.key), kept: content_of(kept), given: content_of(batch.payload(entry)) }));
+                        // A record committed under the key with other bytes: two values
+                        // under one key (rule 21).
+                        return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
                     }
                     let mut moved = *entry;
                     moved.at += base;
@@ -988,7 +1038,9 @@ impl Plain {
                 }
                 base += batch.bytes.len() as u64;
                 if base > OFFSET_MOST {
-                    return Err(PutError::TooLong { key: Key(batch.entries.last().map_or(ContentId([0; 32]), |it| it.key)), len: base });
+                    // Bytes past the bound are some entry's: the last one laid is named.
+                    let last = batch.entries.last().expect("a batch's bytes are its entries'");
+                    return Err(StoreError::TooLong { tag: last.tag, key: last.key, len: base });
                 }
                 Ok(at)
             };
@@ -1007,7 +1059,7 @@ impl Plain {
             if entries.is_empty() {
                 continue;
             }
-            let run = format::sorted_run(entries).map_err(PutError::TwoValues)?;
+            let run = format::sorted_run(entries)?;
             out.push(Laid { pieces, index_at: base, run, namespace });
         }
         Ok(out)
@@ -1018,7 +1070,7 @@ impl Plain {
         !self.checked.is_empty() || !self.dropped.is_empty() || !self.orphans.is_empty() || self.torn_stamp
     }
 
-    fn what(&self) -> &'static str {
+    pub(crate) fn what(&self) -> &'static str {
         match self.phase {
             Phase::New => "not opened",
             Phase::ReadHead(_) | Phase::MakeHead | Phase::ReadManifest { .. } | Phase::CheckLog { .. } | Phase::Orphans { .. } => "opening",
@@ -1075,18 +1127,18 @@ impl Plain {
     /// Names segments fetched from a source (their files already written here, unchanged,
     /// each checked by [`super::format::check_segment`] and its statement verified by the
     /// driver) in a new generation: here, published.
-    pub fn adopt(&mut self, fetched: Vec<Segment>, effects: &mut Vec<Effect>) -> Result<(), PutError> {
+    pub fn adopt(&mut self, fetched: Vec<Segment>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
-            return Err(PutError::Busy(self.what()));
+            return Err(StoreError::Busy { phase: self.what() });
         }
         self.start_flip(Change::Adopt { segs: fetched }, effects);
         Ok(())
     }
 
     /// Marks segments as published (pushed to a shared bucket): compaction never rewrites them.
-    pub fn publish(&mut self, ids: Vec<u64>, effects: &mut Vec<Effect>) -> Result<(), PutError> {
+    pub fn publish(&mut self, ids: Vec<u64>, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
-            return Err(PutError::Busy(self.what()));
+            return Err(StoreError::Busy { phase: self.what() });
         }
         self.start_flip(Change::Publish { ids }, effects);
         Ok(())
@@ -1148,12 +1200,12 @@ impl Plain {
     }
 
     /// The keys roots name, and the roots' own records.
-    fn rooted(&self) -> Result<BTreeSet<ContentId>, Corrupt> {
+    fn rooted(&self) -> Result<BTreeSet<ContentId>, StoreError> {
         let mut out = BTreeSet::new();
         for root in &self.manifest.roots {
             out.insert(root.key);
             let Some((at, entry)) = self.find_in(&[Namespace::LOCAL], &Key(root.key)) else {
-                return Err(Corrupt { key: Key(root.key), pack: self.head.clone(), what: format!("the root `{}` names a record no segment holds", root.name) });
+                return Err(StoreError::RootGone { generation: self.manifest.generation, key: root.key });
             };
             let bytes = self.maps[at].payload(&entry);
             for key in bytes.chunks_exact(32) {
@@ -1177,7 +1229,7 @@ impl Plain {
         }
         let (candidates, prune) = self.plan();
         let mut stats = Sliced { orphans: orphans.len() as u32, ..Sliced::default() };
-        let expired = self.manifest.retired.iter().any(|it| it.since_ns.saturating_add(GRACE_NS) <= now_ns);
+        let expired = self.manifest.retired.iter().any(|it| it.lost.is_none() && it.since_ns.saturating_add(GRACE_NS) <= now_ns);
         if candidates.is_empty() {
             if orphans.is_empty() && !expired {
                 self.sliced = Some(stats);
@@ -1189,7 +1241,7 @@ impl Plain {
         }
         let live = match prune.then(|| self.rooted()).transpose() {
             Ok(live) => live,
-            Err(corrupt) => return self.stop(corrupt.to_string()),
+            Err(why) => return self.stop(why),
         };
         let current = self.manifest.generation;
         // A published segment is let go of whole, or kept whole: it is never rewritten.
@@ -1227,7 +1279,7 @@ impl Plain {
                 // Copied from a proved segment with its CRC as recorded: nothing is checked
                 // or computed again.
                 if let Err(error) = out.put_known(&entry, mapped.payload(&entry)) {
-                    return self.stop(error.to_string());
+                    return self.stop(error.into_store(entry.tag));
                 }
                 stats.kept += 1;
             }
@@ -1282,7 +1334,7 @@ impl Plain {
         m.generation = generation;
         let retire = |m: &mut Manifest, id: u64, log: bool| {
             if !m.retired.iter().any(|it| it.id == id && it.log == log) {
-                m.retired.push(Retired { id, log, since_ns: now_ns });
+                m.retired.push(Retired { id, log, since_ns: now_ns, lost: None });
             }
         };
         for seg in m.segments.iter_mut() {
@@ -1310,11 +1362,9 @@ impl Plain {
         match &mut flip.change {
             Change::Commit { segs, started_ns, roots } => {
                 if now_ns.saturating_sub(*started_ns) > GRACE_NS / 2 {
-                    refused = Some(format!(
-                        "the commit started {} s ago, past half the store's grace period of {} s: a compaction may have retired its segment as named by no generation; it is not flipped",
-                        now_ns.saturating_sub(*started_ns) / 1_000_000_000,
-                        GRACE_NS / 1_000_000_000
-                    ));
+                    // A compaction may have retired its segment as named by no generation:
+                    // it is not flipped.
+                    refused = Some(StoreError::CommitTooSlow { took_s: now_ns.saturating_sub(*started_ns) / 1_000_000_000, grace_s: GRACE_NS / 1_000_000_000 });
                 } else {
                     for (seg, _) in segs.iter_mut() {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
@@ -1388,10 +1438,32 @@ impl Plain {
             self.unlock(effects);
             return;
         }
-        // Files retired past their grace go now: out of the list, and unlinked once unlocked.
+        // Marks of losses whose report this process handed to its caller are cleared (rows
+        // another process cleared already, or that a commit named again, need nothing); a
+        // mark not yet written stays clearable for the flip after the one that writes it.
+        let clearable = std::mem::replace(&mut self.clearable, Vec::new_in(Global));
+        for id in clearable {
+            if self.marks.iter().any(|(it, _)| *it == id) {
+                self.clearable.push(id);
+                continue;
+            }
+            if let Some(row) = m.retired.iter_mut().find(|it| it.id == id && !it.log) {
+                row.lost = None;
+            }
+        }
+        // The losses this open found are marked in the rows this same manifest retires them
+        // with: on disk with the retirement, so a failure or a crash anywhere after the slot
+        // lands leaves them for the next open to report.
+        for (id, mark) in std::mem::replace(&mut self.marks, Vec::new_in(Global)) {
+            if let Some(row) = m.retired.iter_mut().find(|it| it.id == id && !it.log) {
+                row.lost = if self.plant() == Plant::ClearMarkAtOnce { None } else { Some(mark) };
+            }
+        }
+        // Files retired past their grace go now: out of the list, and unlinked once unlocked;
+        // a row marked lost stays until its report is handed, whatever its age.
         let mut removals = Vec::new_in(Global);
         m.retired.retain(|it| {
-            let keep = it.since_ns.saturating_add(GRACE_NS) > now_ns;
+            let keep = it.lost.is_some() || it.since_ns.saturating_add(GRACE_NS) > now_ns;
             if !keep {
                 removals.push(if it.log { self.log_file(it.id) } else { self.segment_file(it.id) });
             }
@@ -1431,7 +1503,7 @@ impl Plain {
     /// other slot blanked) is written, and has succeeded, before it, so no write of a flip can
     /// fail once its generation is on disk. A flip that commits and then stops would leave a
     /// durable generation whose news (the losses an open found and retired, a commit's
-    /// outcome) dies with the process (Hegel's seed 875559: an open's fresh flip retired the
+    /// outcome) dies with the process (seed 875559 of the property tests' former engine: an open's fresh flip retired the
     /// orphans a power cut left, its slot landed beside a failed cache tag write, it stopped,
     /// and the next open found them retired and reported none).
     fn write_slot(&self, effects: &mut Vec<Effect>) {
@@ -1493,6 +1565,8 @@ impl Plain {
             match seg {
                 Some((_, file)) => {
                     // Never named: this process's own, removed now.
+                    self.removing.clear();
+                    self.removing.push(file.clone());
                     effects.push(Effect::Remove { file, tag: self.tag(REMOVE, 0) });
                     self.phase = Phase::Removing { left: 1, then: Then::Compact(stats) };
                 }
@@ -1524,9 +1598,10 @@ impl Plain {
             }
         }
         let left = flip.removals.len() as u32;
-        for (i, file) in flip.removals.into_iter().enumerate() {
-            effects.push(Effect::Remove { file, tag: self.tag(REMOVE, i as u32) });
+        for (i, file) in flip.removals.iter().enumerate() {
+            effects.push(Effect::Remove { file: file.clone(), tag: self.tag(REMOVE, i as u32) });
         }
+        self.removing = flip.removals;
         if left == 0 {
             self.map_new(then, effects);
         } else {
@@ -1571,7 +1646,7 @@ impl Plain {
 
     /// One segment's map came back: checked (its length always; its CRC once, when it is of
     /// another boot) and its index touched a page at a time.
-    fn on_map(&mut self, index: u32, done: Done) -> Result<(), String> {
+    fn on_map(&mut self, index: u32, done: Done) -> Result<(), StoreError> {
         let seg = self.manifest.segments[index as usize];
         let file = self.segment_file(seg.id);
         let generation = self.manifest.generation;
@@ -1579,13 +1654,15 @@ impl Plain {
         let map = match done {
             Done::Mapped(map) => map,
             done => {
-                let why = failed(&done).unwrap_or_else(|| format!("{done:?}"));
+                // A segment this boot's generation names that cannot be mapped: something
+                // outside blaze removed it.
+                let why = io(MAPPING, &file, &done).unwrap_or(StoreError::Unasked { op: MAP, index, phase: "mapping a segment" });
                 if earlier_boot {
                     // Decided once every map is in, by whether the directory still holds it.
                     self.unopened.push((seg, file, why));
                     return Ok(());
                 }
-                return Err(format!("{file}: generation {generation} names it and it cannot be mapped: {why}; something outside blaze removed it"));
+                return Err(why);
             }
         };
         // The proof: this boot's row needs no byte read; an earlier boot's segment is checked
@@ -1595,12 +1672,7 @@ impl Plain {
         let proved = match Verified::recorded(unverified, self.boot) {
             Ok(proved) => Ok(proved),
             Err(unverified) if !earlier_boot => {
-                return Err(format!(
-                    "{}: it is {} bytes and generation {generation} of this boot names {}: changed outside blaze",
-                    unverified.file(),
-                    unverified.len(),
-                    unverified.seg().file_len()
-                ));
+                return Err(StoreError::Changed { segment: seg.id, generation, len: unverified.len(), named: unverified.seg().file_len() });
             }
             Err(unverified) if self.plant() == Plant::TrustBoot => Ok(self.trust_for_a_plant(unverified)),
             Err(unverified) => {
@@ -1615,7 +1687,7 @@ impl Plain {
             Ok(proved) => proved,
             Err((seg, file, what)) => {
                 let why = format!("it was written in an earlier boot and did not survive its end whole ({what}): a power cut before the kernel wrote it back; its records are dropped");
-                self.lose(seg, file, why);
+                self.lose(seg, file, LostKind::NotWhole, why);
                 return Ok(());
             }
         };
@@ -1645,9 +1717,48 @@ impl Plain {
         unreachable!("outside tests a store's plant is always none")
     }
 
-    fn lose(&mut self, seg: Segment, file: FileName, why: String) {
+    /// A segment its generation names, lost: dropped from the next generation, reported with
+    /// `why` (the open's own words, with what it saw), and marked as `kind` in the row that
+    /// retires it (a later open's report of the mark says [`LostMark::why`]).
+    fn lose(&mut self, seg: Segment, file: FileName, kind: LostKind, why: String) {
         self.dropped.insert(seg.id);
+        self.marks.push((seg.id, LostMark { kind, records: Some(seg.count) }));
+        self.unreported.push(seg.id);
         self.report.lost.push(Lost { file, segment: Some(seg.id), records: Some(u64::from(seg.count)), why });
+    }
+
+    /// A segment named by no generation, found at an open's fallback: reported, and marked in
+    /// the row its next flip retires it with.
+    fn lose_orphan(&mut self, file: FileName, id: u64, records: Option<u64>) {
+        self.marks.push((id, LostMark { kind: LostKind::Orphan, records: records.and_then(|it| u32::try_from(it).ok()) }));
+        self.unreported.push(id);
+        self.report.lost.push(Lost { file, segment: Some(id), records, why: lost_orphan() });
+    }
+
+    /// The open's report was handed to its caller (for [`super::Driven`], its open returning
+    /// with [`Plain::report`] holding the losses): from now on the marks it reported may go,
+    /// at the next flip this process makes (a commit's or a compaction's own, or
+    /// [`Plain::acknowledge`]'s). Until then a crash or a failure anywhere leaves them for the
+    /// next open, which reports them again: a loss is reported at least once, never zero
+    /// times, and more than once only across a crash or a failure between its report and the
+    /// flip that clears it.
+    pub fn handed(&mut self) {
+        let reported = std::mem::take(&mut self.unreported);
+        for id in reported {
+            if !self.clearable.contains(&id) {
+                self.clearable.push(id);
+            }
+        }
+    }
+
+    /// For a process that makes no flip of its own: one flip that clears the marks its handed
+    /// report named. `false` when there is none to clear or the store is not ready.
+    pub fn acknowledge(&mut self, effects: &mut Vec<Effect>) -> bool {
+        if !self.ready() || self.clearable.is_empty() {
+            return false;
+        }
+        self.start_flip(Change::Stamp, effects);
+        true
     }
 
     fn mapped(&mut self, then: Then, effects: &mut Vec<Effect>) {
@@ -1708,9 +1819,9 @@ impl Plain {
         }
     }
 
-    fn step(&mut self, op: u8, index: u32, done: Done, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), String> {
-        let unexpected = |phase: &str| format!("a completion of {op}:{index} while {phase}: the store did not ask for it");
-        let fail = |what: &str, file: &FileName, done: &Done| failed(done).map(|why| format!("{file}: {what}: {why}"));
+    fn step(&mut self, op: u8, index: u32, done: Done, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+        let unexpected = |phase: &'static str| StoreError::Unasked { op, index, phase };
+        let fail = |doing: &'static str, file: &FileName, done: &Done| io(doing, file, done);
         match (op, &mut self.phase) {
             (HEAD_READ, Phase::ReadHead(ctx)) => {
                 let ctx = *ctx;
@@ -1719,22 +1830,19 @@ impl Plain {
                 };
                 let read = format::read_head(&bytes);
                 if let HeadRead::Refused(why) = &read {
-                    return Err(format!("{}: {why}", self.head));
+                    return Err(why.clone());
                 }
-                if let HeadRead::Version { slot, found } = read {
+                if let HeadRead::Version { found, .. } = read {
                     // A store of the previous layout (rule 26): refused by name, never read as
                     // empty; there is no migration, the store is rebuilt from what made it.
-                    return Err(format!(
-                        "{}: its slot {slot} is of format {found}, and this blaze reads format {FORMAT}: a store of another layout; remove the directory and blaze rebuilds it",
-                        self.head
-                    ));
+                    return Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: FORMAT });
                 }
                 if bytes.len() < HEAD_LEN {
                     // A plain head (or nothing) short of its length: made at its full length
                     // and synced before anything else is written, so no flip ever extends or
                     // rewrites it. The cut extends with zeros and never touches a byte there.
                     if ctx == Ctx::Flip || self.head_made {
-                        return Err(format!("{}: it is {} bytes after this process made it {HEAD_LEN} and synced it: it was cut outside blaze", self.head, bytes.len()));
+                        return Err(StoreError::Head { what: format::HEAD_CUT, at: bytes.len() as u64 });
                     }
                     self.head_made = true;
                     // The trace a cut head holds is kept: the zeros the cut adds are not one.
@@ -1809,7 +1917,7 @@ impl Plain {
                         }
                         self.resolved(ctx, Base { slot: Some(slot), manifest }, false, fell_back, now_ns, effects)
                     }
-                    Err(why) => Err(format!("{log}: generation {}'s manifest at {}: {why}", slot.generation, slot.manifest_at)),
+                    Err(why) => Err(why),
                     _ => self.manifest_torn(ctx, slots, at, now_ns, effects),
                 }
             }
@@ -1859,7 +1967,7 @@ impl Plain {
                     }
                     let file = self.segment_file(id);
                     if meta.len < FOOTER as u64 {
-                        self.report.lost.push(Lost { file, segment: Some(id), records: None, why: lost_orphan() });
+                        self.lose_orphan(file, id, None);
                         continue;
                     }
                     effects.push(Effect::Read { file: file.clone(), at: meta.len - FOOTER as u64, len: FOOTER, tag: self.tag(FOOTER_READ, self.listed.len() as u32) });
@@ -1881,7 +1989,7 @@ impl Plain {
                     Done::Read(bytes) => format::footer_count(bytes).map(u64::from),
                     _ => None,
                 };
-                self.report.lost.push(Lost { file, segment: Some(id), records, why: lost_orphan() });
+                self.lose_orphan(file, id, records);
                 if left == 0 {
                     self.map_new(Then::Open, effects);
                 }
@@ -1910,10 +2018,11 @@ impl Plain {
                 for (seg, file, why) in std::mem::take(&mut self.unopened) {
                     let leaf = file.as_str().rsplit('/').next().unwrap_or(file.as_str());
                     if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
-                        return Err(format!("{file}: generation {generation} names it and it is here, and it cannot be mapped: {why}"));
+                        // Here, and its map failed: the failure, by name, never a loss.
+                        return Err(why);
                     }
                     let why = format!("generation {generation} names it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped");
-                    self.lose(seg, file, why);
+                    self.lose(seg, file, LostKind::Gone, why);
                 }
                 self.mapped(then, effects);
                 Ok(())
@@ -1921,8 +2030,8 @@ impl Plain {
             (REMOVE, Phase::Removing { left, then }) => {
                 *left -= 1;
                 let (left, then) = (*left, *then);
-                if let Some(why) = failed(&done) {
-                    return Err(format!("unlinking a file retired past its grace period: {why}"));
+                if let Some(why) = fail("unlinking a file retired past its grace period", &self.removing[index as usize], &done) {
+                    return Err(why);
                 }
                 if left == 0 {
                     match then {
@@ -1991,7 +2100,10 @@ impl Plain {
                 Done::Contended => {
                     flip.waits += 1;
                     if flip.waits > LOCK_STEPS_MOST {
-                        return Err(format!("{}: another process held the flip lock for {} s, and a flip holds it for milliseconds: it is stuck", self.flip, LOCK_STEP.as_millis() as u64 * u64::from(LOCK_STEPS_MOST) / 1000));
+                        // Another process held it past the bound, and a flip holds it for
+                        // milliseconds: it is stuck.
+                        const _: () = assert!(LOCK_STEP.as_millis() * LOCK_STEPS_MOST as u128 == 60_000, "the text below says 60 s");
+                        return Err(StoreError::Stalled { waited_for: "the flip lock, which another process held for 60 s" });
                     }
                     effects.push(Effect::Timer { after: LOCK_STEP, tag: self.tag(LOCK_WAIT, 0) });
                     Ok(())
@@ -2093,7 +2205,7 @@ impl Plain {
 
     /// `slots[at]`'s manifest is not whole (torn, cut short, or its log gone): said by name at
     /// an open, then the older slot's generation is read, or, with none, nothing survived.
-    fn manifest_torn(&mut self, ctx: Ctx, slots: [Option<Slot>; 2], at: usize, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), String> {
+    fn manifest_torn(&mut self, ctx: Ctx, slots: [Option<Slot>; 2], at: usize, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         let slot = slots[at].expect("read");
         if ctx == Ctx::Open {
             self.report.lost.push(Lost {
@@ -2115,11 +2227,21 @@ impl Plain {
     }
 
     /// A generation to read (at the open) or to build on (under the lock).
-    fn resolved(&mut self, ctx: Ctx, base: Base, fresh: bool, fell_back: bool, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), String> {
+    fn resolved(&mut self, ctx: Ctx, base: Base, fresh: bool, fell_back: bool, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         match ctx {
             Ctx::Open => {
                 self.slot = base.slot;
                 self.manifest = base.manifest;
+                // Rows retired as lost and not yet reported to a caller who got the report
+                // (whoever wrote them: this open's process before a crash, or another): this
+                // open reports them, and clears them only after its own report is handed.
+                for row in self.manifest.retired.iter().filter(|it| !it.log) {
+                    let Some(mark) = row.lost else { continue };
+                    self.report.lost.push(Lost { file: self.segment_file(row.id), segment: Some(row.id), records: mark.records.map(u64::from), why: mark.why() });
+                    if !self.unreported.contains(&row.id) {
+                        self.unreported.push(row.id);
+                    }
+                }
                 if fell_back {
                     self.phase = Phase::Orphans { left: 0 };
                     effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
@@ -2159,5 +2281,5 @@ impl Plain {
 }
 
 fn lost_orphan() -> String {
-    "no whole generation names it: the generation that did was lost in a power cut, and its records with it".to_owned()
+    LostMark { kind: LostKind::Orphan, records: None }.why()
 }

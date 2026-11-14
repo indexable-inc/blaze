@@ -32,6 +32,9 @@ pub(crate) const LIBRARY: &str = "library";
 /// The prefix of a launched program's start image mark ([`LaunchMark`]); the program's path
 /// (the one its link was asked for) follows.
 pub(crate) const LAUNCH: &str = "launch\0";
+/// The prefix of a test suite's index head mark ([`TestHeadMark`]); the suite's settings
+/// (`Suite::given`) in hex follow.
+pub(crate) const TESTS: &str = "tests\0";
 
 /// The tool's executable as last looked at, and its hash: 1 + 36 + 8 + 32 bytes, the layout
 /// of `<state>/tool` ([`tool_hash`]).
@@ -73,6 +76,23 @@ pub(crate) struct LaunchMark {
     pub record: ContentId,
     pub start: blaze_cas::Key,
     pub runs_as: String,
+}
+
+/// A test suite's index head (blaze-testsel's `TestIndex` key), the postings it names, and the
+/// program state (the image digest, `Image::state`) its rows hold at, its puts durable when
+/// marked: 1 + 32 (the suite's settings, which its name says too) + 32 + 32 + 1 + 32 bytes,
+/// the postings' 32 zero when the flag byte is 0. A run uses the head only for a binary of
+/// that state: another binary's is a miss by key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TestHeadMark {
+    /// The suite's settings (`Suite::given`).
+    pub given: ContentId,
+    /// The head's `TestIndex` key.
+    pub head: ContentId,
+    /// The `TestPostings` key the head names, when it names one.
+    pub postings: Option<ContentId>,
+    /// The program state its rows hold at.
+    pub state: ContentId,
 }
 
 /// blaze's own copy of the standard library as last mounted: its `DIGEST` file's stamp when
@@ -134,6 +154,7 @@ const BODIES_BYTES: usize = 1 + 32;
 /// A launch mark's length before the path it runs from's bytes: the layout, two keys and the
 /// path's length.
 const LAUNCH_HEAD: usize = 1 + 32 + 32 + 4;
+pub(crate) const TESTS_BYTES: usize = 1 + 32 + 32 + 32 + 1 + 32;
 
 /// The value's bytes past its layout byte, if it is `len` long and of [`LAYOUT`].
 fn body<'a>(name: &str, bytes: &'a [u8], len: usize) -> Result<&'a [u8], Undecoded> {
@@ -229,6 +250,45 @@ impl BodiesMark {
     pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<BodiesMark, Undecoded> {
         let body = body(name, bytes, BODIES_BYTES)?;
         Ok(BodiesMark { session: blaze_cas::Key(ContentId(id(body))) })
+    }
+}
+
+impl TestHeadMark {
+    /// The mark's name for the suite whose settings are `given`.
+    #[expect(blaze::implicit_allocator, reason = "the VFS names a mark by a `String`, once a head marked or let go")]
+    pub(crate) fn name(given: ContentId) -> String {
+        format!("{TESTS}{given:x}")
+    }
+
+    /// The mark's bytes, in a fixed buffer: the VFS copies what it keeps.
+    pub(crate) fn encode(&self) -> [u8; TESTS_BYTES] {
+        let mut out = [0; TESTS_BYTES];
+        out[0] = LAYOUT;
+        out[1..33].copy_from_slice(&self.given.0);
+        out[33..65].copy_from_slice(&self.head.0);
+        out[65..97].copy_from_slice(&self.state.0);
+        if let Some(postings) = self.postings {
+            out[97] = 1;
+            out[98..].copy_from_slice(&postings.0);
+        }
+        out
+    }
+
+    /// A flag byte other than 0 or 1 is refused as another layout's, and a mark whose settings
+    /// are not the ones its name says is refused as another length's: both by the mark's name.
+    #[expect(blaze::implicit_allocator, reason = "an error path, the mark's name")]
+    pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<TestHeadMark, Undecoded> {
+        let body = body(name, bytes, TESTS_BYTES)?;
+        let postings = match body[96] {
+            0 => None,
+            1 => Some(ContentId(id(&body[97..]))),
+            found => return Err(Undecoded::Layout { name: name.to_owned(), found }),
+        };
+        let given = ContentId(id(body));
+        if TestHeadMark::name(given) != name {
+            return Err(Undecoded::Length { name: name.to_owned(), len: bytes.len() });
+        }
+        Ok(TestHeadMark { given, head: ContentId(id(&body[32..])), postings, state: ContentId(id(&body[64..])) })
     }
 }
 
@@ -470,36 +530,40 @@ fn placed_by(
 #[cfg(test)]
 mod tests {
     use blaze_core::S_IFREG;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
-    fn draw_stamp(tc: &hegel::TestCase) -> Stamp {
+    fn draw_stamp(tape: &Tape) -> Stamp {
         Stamp {
-            ino: tc.draw(gs::integers::<u64>()),
-            size: tc.draw(gs::integers::<u64>()),
-            mtime_ns: tc.draw(gs::integers::<u64>()),
-            ctime_ns: tc.draw(gs::integers::<u64>()),
-            mode: tc.draw(gs::integers::<u32>()),
+            ino: tape.int::<u64>("ino"),
+            size: tape.int::<u64>("size"),
+            mtime_ns: tape.int::<u64>("mtime ns"),
+            ctime_ns: tape.int::<u64>("ctime ns"),
+            mode: tape.int::<u32>("mode"),
         }
     }
 
-    fn draw_id(tc: &hegel::TestCase) -> [u8; 32] {
+    fn draw_id(tape: &Tape) -> [u8; 32] {
         let mut id = [0; 32];
         for at in 0..4 {
-            id[at * 8..at * 8 + 8].copy_from_slice(&tc.draw(gs::integers::<u64>()).to_le_bytes());
+            id[at * 8..at * 8 + 8].copy_from_slice(&tape.int::<u64>("id").to_le_bytes());
         }
         id
     }
 
     /// The invariant: every value decodes from its bytes to itself, and encodes again to the
     /// same bytes, of its layout's length. Control: a value one byte short is refused.
-    #[hegel::test]
-    fn a_value_round_trips_byte_for_byte(tc: hegel::TestCase) {
+    #[test]
+    fn a_value_round_trips_byte_for_byte() {
+        blaze_sim::check(Config::DEFAULT, a_value_round_trips);
+    }
+
+    fn a_value_round_trips(tape: &Tape) {
         let tool = Tool {
-            exe: draw_stamp(&tc),
-            looked_ns: tc.draw(gs::integers::<u64>()),
-            hash: draw_id(&tc),
+            exe: draw_stamp(tape),
+            looked_ns: tape.int::<u64>("looked ns"),
+            hash: draw_id(tape),
         };
         let bytes = tool.encode();
         assert_eq!(bytes.len(), 1 + 36 + 8 + 32);
@@ -508,9 +572,9 @@ mod tests {
         assert!(Tool::decode("tool", &bytes[..bytes.len() - 1]).is_err(), "the control");
 
         let placed = Placed {
-            stamp: draw_stamp(&tc),
-            looked_ns: tc.draw(gs::integers::<u64>()),
-            content: ContentId(draw_id(&tc)),
+            stamp: draw_stamp(tape),
+            looked_ns: tape.int::<u64>("looked ns"),
+            content: ContentId(draw_id(tape)),
         };
         let name = format!("{PLACED}/out/a");
         let bytes = placed.encode();
@@ -519,8 +583,8 @@ mod tests {
         assert_eq!(Placed::decode(&name, &bytes).unwrap().encode(), bytes);
 
         let carry = CarryMark {
-            session: blaze_cas::Key(ContentId(draw_id(&tc))),
-            root: ContentId(draw_id(&tc)),
+            session: blaze_cas::Key(ContentId(draw_id(tape))),
+            root: ContentId(draw_id(tape)),
         };
         let name = format!("{CARRY}/ws");
         let bytes = carry.encode();
@@ -528,7 +592,7 @@ mod tests {
         assert_eq!(CarryMark::decode(&name, &bytes), Ok(carry));
         assert_eq!(CarryMark::decode(&name, &bytes).unwrap().encode(), bytes);
 
-        let bodies = BodiesMark { session: blaze_cas::Key(ContentId(draw_id(&tc))) };
+        let bodies = BodiesMark { session: blaze_cas::Key(ContentId(draw_id(tape))) };
         let name = format!("{BODIES}/ws\0core");
         let bytes = bodies.encode();
         assert_eq!(bytes.len(), 1 + 32);
@@ -540,13 +604,17 @@ mod tests {
     /// The invariant (rule 26): a library's mark decodes from its bytes to itself and encodes
     /// again to the same bytes; a value cut short, with a byte past its end, or of another
     /// layout is refused by the mark's name. Control: the cut value is refused.
-    #[hegel::test]
-    fn a_library_mark_round_trips_byte_for_byte(tc: hegel::TestCase) {
-        let fingerprint = format!("{:x}", tc.draw(gs::integers::<u64>()));
-        let at = format!("/rustc/{:x}/library", tc.draw(gs::integers::<u64>()));
+    #[test]
+    fn a_library_mark_round_trips_byte_for_byte() {
+        blaze_sim::check(Config::DEFAULT, a_library_mark_round_trips);
+    }
+
+    fn a_library_mark_round_trips(tape: &Tape) {
+        let fingerprint = format!("{:x}", tape.int::<u64>("fingerprint"));
+        let at = format!("/rustc/{:x}/library", tape.int::<u64>("at"));
         let mark = LibraryMark {
-            digest_file: draw_stamp(&tc),
-            looked_ns: tc.draw(gs::integers::<u64>()),
+            digest_file: draw_stamp(tape),
+            looked_ns: tape.int::<u64>("looked ns"),
             fingerprint,
             at,
         };
@@ -554,7 +622,7 @@ mod tests {
         assert_eq!(bytes.len(), 1 + 36 + 8 + 4 + mark.fingerprint.len() + 4 + mark.at.len());
         assert_eq!(LibraryMark::decode(LIBRARY, &bytes), Ok(mark.clone())); // clone: compared
         assert_eq!(LibraryMark::decode(LIBRARY, &bytes).unwrap().encode(), bytes);
-        let cut = tc.draw(gs::integers::<usize>().max_value(bytes.len() - 1));
+        let cut = tape.int_in(0..=bytes.len() - 1, "cut");
         assert!(LibraryMark::decode(LIBRARY, &bytes[..cut]).is_err(), "the control: cut at {cut}");
         let mut longer = bytes.clone(); // clone: a test's value, changed
         longer.push(0);
@@ -631,10 +699,14 @@ mod tests {
     /// longer, of another layout (byte 0 or 2), or of the previous layout (the two keys with
     /// no path the program runs from) is refused naming the mark, never read as this one.
     /// Control: the cut value is refused.
-    #[hegel::test]
-    fn a_launch_mark_round_trips_and_another_layout_is_refused_by_name(tc: hegel::TestCase) {
-        let runs_as = format!("/w/target/debug/app{}", tc.draw(gs::integers::<u32>()));
-        let (record, start) = (ContentId(draw_id(&tc)), blaze_cas::Key(ContentId(draw_id(&tc))));
+    #[test]
+    fn a_launch_mark_round_trips_and_another_layout_is_refused_by_name() {
+        blaze_sim::check(Config::DEFAULT, a_launch_mark_round_trips);
+    }
+
+    fn a_launch_mark_round_trips(tape: &Tape) {
+        let runs_as = format!("/w/target/debug/app{}", tape.int::<u32>("runs as"));
+        let (record, start) = (ContentId(draw_id(tape)), blaze_cas::Key(ContentId(draw_id(tape))));
         // clone: a test's value, compared below
         let mark = LaunchMark { record, start, runs_as: runs_as.clone() };
         let name = format!("{LAUNCH}/w/target/debug/deps/app-0123");
@@ -645,7 +717,7 @@ mod tests {
         let previous = &bytes[..1 + 32 + 32];
         assert_eq!(LaunchMark::decode(&name, previous), Err(Undecoded::Length { name: name.clone(), len: previous.len() }));
         assert_eq!(LaunchMark::decode(&name, &bytes).unwrap().encode(), bytes);
-        let cut = tc.draw(gs::integers::<usize>().max_value(bytes.len() - 1));
+        let cut = tape.int_in(0..=bytes.len() - 1, "cut");
         assert_eq!(
             LaunchMark::decode(&name, &bytes[..cut]),
             Err(Undecoded::Length { name: name.clone(), len: cut }),
@@ -661,6 +733,46 @@ mod tests {
             assert_eq!(refused, Undecoded::Layout { name: name.clone(), found });
             assert!(refused.to_string().contains("/w/target/debug/deps/app-0123"), "{refused}");
         }
+    }
+
+    /// The invariant: a test suite's head mark decodes from its bytes to itself and encodes
+    /// again to the same bytes, with postings and without. The mark has no layout before this
+    /// one: a value of another layout byte, another flag byte or another length is refused by
+    /// the mark's name (the restore lets it go, and the suite starts with no head). Control:
+    /// the cut value is refused.
+    #[test]
+    fn a_test_head_mark_round_trips_and_another_layout_is_refused_by_name() {
+        blaze_sim::check(Config::DEFAULT, a_test_head_mark_round_trips);
+    }
+
+    fn a_test_head_mark_round_trips(tape: &Tape) {
+        let given = ContentId(draw_id(tape));
+        let name = TestHeadMark::name(given);
+        assert!(name.starts_with(TESTS), "{name:?}");
+        let postings = tape.bool("postings").then(|| ContentId(draw_id(tape)));
+        let mark = TestHeadMark { given, head: ContentId(draw_id(tape)), postings, state: ContentId(draw_id(tape)) };
+        let bytes = mark.encode();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 32 + 1 + 32);
+        assert_eq!(TestHeadMark::decode(&name, &bytes), Ok(mark));
+        assert_eq!(TestHeadMark::decode(&name, &bytes).unwrap().encode(), bytes);
+        let cut = tape.int_in(0..=bytes.len() - 1, "cut");
+        assert_eq!(
+            TestHeadMark::decode(&name, &bytes[..cut]),
+            Err(Undecoded::Length { name: name.clone(), len: cut }),
+            "the control: cut at {cut}"
+        );
+        for found in [0u8, LAYOUT + 1] {
+            let mut other = bytes;
+            other[0] = found;
+            assert_eq!(TestHeadMark::decode(&name, &other), Err(Undecoded::Layout { name: name.clone(), found }));
+        }
+        let mut flag = bytes;
+        flag[1 + 96] = 2;
+        assert_eq!(TestHeadMark::decode(&name, &flag), Err(Undecoded::Layout { name: name.clone(), found: 2 }));
+        // Another suite's mark under this suite's name is not this suite's.
+        let mut other = bytes;
+        other[1] ^= 1;
+        assert_eq!(TestHeadMark::decode(&name, &other), Err(Undecoded::Length { name: name.clone(), len: bytes.len() }));
     }
 
     /// Every case of the window: a stamp changed at `CHANGED` (a whole second: the coarse

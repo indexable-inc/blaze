@@ -1,8 +1,7 @@
 //! [`code_text_of`] on files written here: which comment edits a crate's code can observe.
 
 use blaze_ids::ContentId;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config;
 use span::Edition;
 use syntax::{AstNode, SourceFile};
 
@@ -719,34 +718,34 @@ fn check(items: &[Item], at: usize, edit: Edit) -> Result<(), String> {
 /// item or calls an unknown macro, a `cfg`, a line moved) changes its interface text, and an
 /// edit of a comment or of a plain function's body that moves no line leaves it as it was.
 /// Drawn: up to five items of any kind, and one edit of one of them.
-#[hegel::test]
-fn the_interface_text_moves_exactly_with_what_a_dependent_observes(tc: TestCase) {
-    let drawn: Vec<(u8, u8, u8, bool)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(10),
-            gs::integers().max_value(2),
-            gs::integers().max_value(9),
-            gs::booleans()
-        ))
-        .min_size(1)
-        .max_size(5),
-    );
-    let items: Vec<Item> = drawn
-        .iter()
-        .map(|&(kind, sig, value, long)| Item {
-            kind: KINDS[usize::from(kind)],
-            sig,
-            value,
-            long,
-            gated: false,
-            noted: false,
-        })
-        .collect();
-    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
-    let edit: usize = tc.draw(gs::integers().max_value(EDITS.len() - 1));
-    if let Err(found) = check(&items, at, EDITS[edit]) {
-        panic!("{found}\n{}", file(&items));
-    }
+#[test]
+fn the_interface_text_moves_exactly_with_what_a_dependent_observes() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let drawn: Vec<(u8, u8, u8, bool)> = tape.vec(1..=5, "items", |tape| {
+            (
+                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=2, "sig"),
+                tape.int_in(0u8..=9, "value"),
+                tape.bool("long"),
+            )
+        });
+        let items: Vec<Item> = drawn
+            .iter()
+            .map(|&(kind, sig, value, long)| Item {
+                kind: KINDS[usize::from(kind)],
+                sig,
+                value,
+                long,
+                gated: false,
+                noted: false,
+            })
+            .collect();
+        let at = tape.index(items.len(), "at");
+        let edit = tape.index(EDITS.len(), "edit");
+        if let Err(found) = check(&items, at, EDITS[edit]) {
+            panic!("{found}\n{}", file(&items));
+        }
+    });
 }
 
 /// The invariant: a unit's key moves exactly when something its results depend on moves. Of
@@ -757,36 +756,36 @@ fn the_interface_text_moves_exactly_with_what_a_dependent_observes(tc: TestCase)
 /// comment or blank lines after the last line) leaves it as it was.
 /// Drawn: up to five items of any kind, some with a comment at a line's end already, and one
 /// edit of one of them.
-#[hegel::test]
-fn a_units_own_key_moves_exactly_with_what_its_results_depend_on(tc: TestCase) {
-    // The last of each: whether its body has a line more (1) and a comment ends its first
-    // line (2).
-    let drawn: Vec<(u8, u8, u8, u8)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(10),
-            gs::integers().max_value(2),
-            gs::integers().max_value(9),
-            gs::integers().max_value(3)
-        ))
-        .min_size(1)
-        .max_size(5),
-    );
-    let items: Vec<Item> = drawn
-        .iter()
-        .map(|&(kind, sig, value, laid)| Item {
-            kind: KINDS[usize::from(kind)],
-            sig,
-            value,
-            long: laid & 1 != 0,
-            gated: false,
-            noted: laid & 2 != 0,
-        })
-        .collect();
-    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
-    let edit: usize = tc.draw(gs::integers().max_value(OWN.len() - 1));
-    if let Err(found) = check_own(&items, at, OWN[edit]) {
-        panic!("{found}\n{}", file(&items));
-    }
+#[test]
+fn a_units_own_key_moves_exactly_with_what_its_results_depend_on() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        // The last of each: whether its body has a line more (1) and a comment ends its first
+        // line (2).
+        let drawn: Vec<(u8, u8, u8, u8)> = tape.vec(1..=5, "items", |tape| {
+            (
+                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=2, "sig"),
+                tape.int_in(0u8..=9, "value"),
+                tape.int_in(0u8..=3, "laid"),
+            )
+        });
+        let items: Vec<Item> = drawn
+            .iter()
+            .map(|&(kind, sig, value, laid)| Item {
+                kind: KINDS[usize::from(kind)],
+                sig,
+                value,
+                long: laid & 1 != 0,
+                gated: false,
+                noted: laid & 2 != 0,
+            })
+            .collect();
+        let at = tape.index(items.len(), "at");
+        let edit = tape.index(OWN.len(), "edit");
+        if let Err(found) = check_own(&items, at, OWN[edit]) {
+            panic!("{found}\n{}", file(&items));
+        }
+    });
 }
 
 /// One item of `kind`, edited by `edit`, asked of its own unit's key: the directed case of a
@@ -957,34 +956,34 @@ fn check_still(items: &[Item], at: usize, edit: Own) -> Result<(), String> {
 /// key as it was.
 /// Drawn: up to five items of any kind, some with a comment at a line's end already, and one
 /// edit of one of them.
-#[hegel::test]
-fn a_files_still_text_moves_with_every_edit_but_what_no_code_text_holds(tc: TestCase) {
-    let drawn: Vec<(u8, u8, u8, u8)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(10),
-            gs::integers().max_value(2),
-            gs::integers().max_value(9),
-            gs::integers().max_value(3)
-        ))
-        .min_size(1)
-        .max_size(5),
-    );
-    let items: Vec<Item> = drawn
-        .iter()
-        .map(|&(kind, sig, value, laid)| Item {
-            kind: KINDS[usize::from(kind)],
-            sig,
-            value,
-            long: laid & 1 != 0,
-            gated: false,
-            noted: laid & 2 != 0,
-        })
-        .collect();
-    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
-    let edit: usize = tc.draw(gs::integers().max_value(OWN.len() - 1));
-    if let Err(found) = check_still(&items, at, OWN[edit]) {
-        panic!("{found}\n{}", file(&items));
-    }
+#[test]
+fn a_files_still_text_moves_with_every_edit_but_what_no_code_text_holds() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let drawn: Vec<(u8, u8, u8, u8)> = tape.vec(1..=5, "items", |tape| {
+            (
+                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=2, "sig"),
+                tape.int_in(0u8..=9, "value"),
+                tape.int_in(0u8..=3, "laid"),
+            )
+        });
+        let items: Vec<Item> = drawn
+            .iter()
+            .map(|&(kind, sig, value, laid)| Item {
+                kind: KINDS[usize::from(kind)],
+                sig,
+                value,
+                long: laid & 1 != 0,
+                gated: false,
+                noted: laid & 2 != 0,
+            })
+            .collect();
+        let at = tape.index(items.len(), "at");
+        let edit = tape.index(OWN.len(), "edit");
+        if let Err(found) = check_still(&items, at, OWN[edit]) {
+            panic!("{found}\n{}", file(&items));
+        }
+    });
 }
 
 /// Every edit of every kind of item, one item a file: the still text's oracle case by case.
@@ -1113,34 +1112,34 @@ fn check_surface(items: &[Item], at: usize, edit: Edit) -> Result<(), String> {
 /// an edit of a comment, of a plain, generic, `#[inline]` or default-method body, or of the
 /// lines of one with nothing placed after it, leaves it as it was.
 /// Drawn: up to five items of any kind, and one edit of one of them.
-#[hegel::test]
-fn the_surface_text_moves_exactly_with_what_a_front_end_observes(tc: TestCase) {
-    let drawn: Vec<(u8, u8, u8, bool)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(10),
-            gs::integers().max_value(2),
-            gs::integers().max_value(9),
-            gs::booleans()
-        ))
-        .min_size(1)
-        .max_size(5),
-    );
-    let items: Vec<Item> = drawn
-        .iter()
-        .map(|&(kind, sig, value, long)| Item {
-            kind: KINDS[usize::from(kind)],
-            sig,
-            value,
-            long,
-            gated: false,
-            noted: false,
-        })
-        .collect();
-    let at: usize = tc.draw(gs::integers().max_value(items.len() - 1));
-    let edit: usize = tc.draw(gs::integers().max_value(EDITS.len() - 1));
-    if let Err(found) = check_surface(&items, at, EDITS[edit]) {
-        panic!("{found}\n{}", file(&items));
-    }
+#[test]
+fn the_surface_text_moves_exactly_with_what_a_front_end_observes() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let drawn: Vec<(u8, u8, u8, bool)> = tape.vec(1..=5, "items", |tape| {
+            (
+                tape.int_in(0u8..=10, "kind"),
+                tape.int_in(0u8..=2, "sig"),
+                tape.int_in(0u8..=9, "value"),
+                tape.bool("long"),
+            )
+        });
+        let items: Vec<Item> = drawn
+            .iter()
+            .map(|&(kind, sig, value, long)| Item {
+                kind: KINDS[usize::from(kind)],
+                sig,
+                value,
+                long,
+                gated: false,
+                noted: false,
+            })
+            .collect();
+        let at = tape.index(items.len(), "at");
+        let edit = tape.index(EDITS.len(), "edit");
+        if let Err(found) = check_surface(&items, at, EDITS[edit]) {
+            panic!("{found}\n{}", file(&items));
+        }
+    });
 }
 
 /// One item of `kind`, edited by `edit`, asked of the surface text.

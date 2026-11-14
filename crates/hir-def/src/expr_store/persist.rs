@@ -164,7 +164,8 @@ blaze_format::record! {
         pub(crate) field_hygiene: Slice<IdPair>,
         /// The block and its edition, by block in increasing order.
         pub(crate) block_editions: Slice<IdPair>,
-        pub(crate) overflow_inheriting: Slice<u32>,
+        /// The expressions an attribute changes the lowering of, in increasing order.
+        pub(crate) marked_exprs: Slice<u32>,
         /// The expressions lowering made with no syntax of their own, in increasing order.
         pub(crate) synthesized: Slice<u32>,
         /// blaze_verify's clause groups and their kinds, by group in increasing order.
@@ -783,7 +784,7 @@ struct StoreColumns {
     ident_hygiene: Column,
     field_hygiene: Column,
     block_editions: Column,
-    overflow_inheriting: Column,
+    marked_exprs: Column,
     synthesized: Column,
     spec_clauses: Column,
     expr_roots: Column,
@@ -887,8 +888,8 @@ impl StoreColumns {
             a: raw(block),
             b: edition as u32,
         });
-        let inheriting = expr_only.map_or(&[][..], |it| &*it.overflow_inheriting);
-        let overflow_inheriting = push_mapped(out, u32s, inheriting, |&closure| raw(closure));
+        let marked = expr_only.map_or(&[][..], |it| &*it.marked_exprs);
+        let marked_exprs = push_mapped(out, u32s, marked, |&expr| raw(expr));
         let synthesized = expr_only.map_or(&[][..], |it| &*it.synthesized);
         let synthesized = push_mapped(out, u32s, synthesized, |&expr| raw(expr));
         let clauses = expr_only.map_or(&[][..], |it| &*it.spec_clauses);
@@ -943,7 +944,7 @@ impl StoreColumns {
             ident_hygiene,
             field_hygiene,
             block_editions,
-            overflow_inheriting,
+            marked_exprs,
             synthesized,
             spec_clauses,
             expr_roots,
@@ -986,8 +987,8 @@ impl StoreColumns {
             ident_hygiene: self.ident_hygiene.slice(field(offset_of!(StoreRoot, ident_hygiene))),
             field_hygiene: self.field_hygiene.slice(field(offset_of!(StoreRoot, field_hygiene))),
             block_editions: self.block_editions.slice(field(offset_of!(StoreRoot, block_editions))),
-            overflow_inheriting: (self.overflow_inheriting)
-                .slice(field(offset_of!(StoreRoot, overflow_inheriting))),
+            marked_exprs: (self.marked_exprs)
+                .slice(field(offset_of!(StoreRoot, marked_exprs))),
             synthesized: self.synthesized.slice(field(offset_of!(StoreRoot, synthesized))),
             spec_clauses: self.spec_clauses.slice(field(offset_of!(StoreRoot, spec_clauses))),
             expr_roots: self.expr_roots.slice(field(offset_of!(StoreRoot, expr_roots))),
@@ -1035,7 +1036,7 @@ pub struct ExpressionStoreRef<'a> {
     ident_hygiene: &'a [IdPair],
     field_hygiene: &'a [IdPair],
     block_editions: &'a [IdPair],
-    overflow_inheriting: &'a [u32],
+    marked_exprs: &'a [u32],
     synthesized: &'a [u32],
     spec_clauses: &'a [IdPair],
     expr_roots: &'a [ExprRootRec],
@@ -1078,7 +1079,7 @@ impl<'a> ExpressionStoreRef<'a> {
             ident_hygiene: root.ident_hygiene.follow(buffer)?,
             field_hygiene: root.field_hygiene.follow(buffer)?,
             block_editions: root.block_editions.follow(buffer)?,
-            overflow_inheriting: root.overflow_inheriting.follow(buffer)?,
+            marked_exprs: root.marked_exprs.follow(buffer)?,
             synthesized: root.synthesized.follow(buffer)?,
             spec_clauses: root.spec_clauses.follow(buffer)?,
             expr_roots: root.expr_roots.follow(buffer)?,
@@ -1149,7 +1150,7 @@ impl<'a> ExpressionStoreRef<'a> {
                 && self.ident_hygiene.is_empty()
                 && self.field_hygiene.is_empty()
                 && self.block_editions.is_empty()
-                && self.overflow_inheriting.is_empty()
+                && self.marked_exprs.is_empty()
                 && self.synthesized.is_empty()
                 && self.spec_clauses.is_empty()
                 && self.expr_roots.is_empty();
@@ -1204,9 +1205,9 @@ impl<'a> ExpressionStoreRef<'a> {
             ensure(pair.a < exprs, pair, buffer, "the edition of a block past the expressions")?;
             ensure(edition_of(pair.b).is_some(), pair, buffer, "an edition out of range")?;
         }
-        ascending(self.overflow_inheriting, |&it| it, buffer, "closures out of order")?;
-        for closure in self.overflow_inheriting {
-            ensure(*closure < exprs, closure, buffer, "a closure past the expressions")?;
+        ascending(self.marked_exprs, |&it| it, buffer, "marked expressions out of order")?;
+        for expr in self.marked_exprs {
+            ensure(*expr < exprs, expr, buffer, "a marked expression past the expressions")?;
         }
         ascending(self.synthesized, |&it| it, buffer, "synthesized expressions out of order")?;
         for expr in self.synthesized {
@@ -1323,7 +1324,22 @@ impl<'a> ExpressionStoreRef<'a> {
 
     /// As [`ExpressionStore::inherits_overflow_checks`].
     pub fn inherits_overflow_checks(self, closure: ExprId) -> bool {
-        self.overflow_inheriting.binary_search(&raw(closure)).is_ok()
+        self.is_marked(closure, ExprKind::Closure)
+    }
+
+    /// As [`ExpressionStore::is_loop_match`].
+    pub fn is_loop_match(self, expr: ExprId) -> bool {
+        self.is_marked(expr, ExprKind::Loop)
+    }
+
+    /// As [`ExpressionStore::is_const_continue`].
+    pub fn is_const_continue(self, expr: ExprId) -> bool {
+        self.is_marked(expr, ExprKind::Break)
+    }
+
+    /// The column holds closures, loops and breaks together; the kind says which attribute.
+    fn is_marked(self, expr: ExprId, kind: ExprKind) -> bool {
+        self.marked_exprs.binary_search(&raw(expr)).is_ok() && self.expr_kind(expr) == Some(kind)
     }
 
     /// As [`ExpressionStore::is_synthesized`].
@@ -1522,7 +1538,7 @@ impl<'a> ExpressionStoreRef<'a> {
                     // alloc: the decode's one copy of the column.
                     .collect(),
                 // alloc: the decode's one copy of the column.
-                overflow_inheriting: self.overflow_inheriting.iter().map(|&it| idx(it)).collect(),
+                marked_exprs: self.marked_exprs.iter().map(|&it| idx(it)).collect(),
                 // alloc: the decode's one copy of the column.
                 synthesized: self.synthesized.iter().map(|&it| idx(it)).collect(),
                 spec_clauses: (self.spec_clauses.iter())
@@ -1611,7 +1627,9 @@ impl Persist for ExpressionStore {
         // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
         // words of `extra` and one per field).
         // 16: the expressions lowering made with no syntax of their own (`synthesized`).
-        Part::U64(16),
+        // 17: `marked_exprs` (was `overflow_inheriting`) also holds `#[loop_match]` loops and
+        // `#[const_continue]` breaks; a 16 store would read with none, and lower them plain.
+        Part::U64(17),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1696,7 +1714,9 @@ impl Persist for Body {
         // 15: a type's kind may be `Union` (an error union) or `Record` (a record type, three
         // words of `extra` and one per field).
         // 16: the expressions lowering made with no syntax of their own (`synthesized`).
-        Part::U64(16),
+        // 17: `marked_exprs` (was `overflow_inheriting`) also holds `#[loop_match]` loops and
+        // `#[const_continue]` breaks; a 16 store would read with none, and lower them plain.
+        Part::U64(17),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2706,6 +2726,8 @@ mod tests {
         for (id, expr) in store.exprs() {
             assert_eq!(read.expr_kind(id), Some(expr_kind_of(expr)), "{expr:?}");
             assert_eq!(read.inherits_overflow_checks(id), store.inherits_overflow_checks(id));
+            assert_eq!(read.is_loop_match(id), store.is_loop_match(id));
+            assert_eq!(read.is_const_continue(id), store.is_const_continue(id));
             assert_eq!(read.block_edition(id), store.block_edition(id));
         }
         for (id, pat) in store.pats() {
