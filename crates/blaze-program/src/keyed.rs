@@ -9,9 +9,9 @@
 //!   and instance key.
 //! - An instance's plan is the core's [`InstancePlan`], keyed by [`crate::key::plan_key`] (the
 //!   core's [`blaze_keyed::kind::PlanInputs`]).
-//! - A test's result is the core's [`TestRun`] (a `Traced` root: its outside reads as facts,
-//!   the payload [`TestRecord`]'s), keyed by [`crate::reach::test_key`] (the core's
-//!   [`blaze_keyed::kind::TestInputs`]).
+//! - A test's result is the core's `TestRun`, an outside record whose base key is
+//!   [`crate::reach::test_key`] (the core's [`blaze_keyed::kind::TestInputs`]); its shapes,
+//!   values and the suite index are blaze-testsel's.
 //! - A program's manifest is the core's [`ProgramManifest`] (its head: the header and the chunk
 //!   directory, keyed by content, [`head_key`]) and its content-defined [`ProgramChunk`]s.
 //!
@@ -29,16 +29,14 @@ use std::alloc::Global;
 use std::fmt;
 use std::marker::PhantomData;
 
-use blaze_keyed::kind::{
-    ChunkInputs, Instance, InstancePlan, Key, Kind, ProgramChunk, ProgramInputs, ProgramManifest, TestRun,
-};
+use blaze_keyed::kind::{ChunkInputs, Instance, InstancePlan, Key, Kind, ProgramChunk, ProgramInputs, ProgramManifest};
 use blaze_keyed::proof::{self, Holds};
-use blaze_keyed::record::{self, Fact, FactKind, RecordError, StableId};
+use blaze_keyed::record::{self, RecordError};
 
 use crate::codec::{CodecError, Digest, In, Out, Payload};
 use crate::key::{InstanceKey, PlanKey};
 use crate::program::{CHUNK_DOMAIN, Chunks, Program};
-use crate::record::{CodeHead, InstanceCode, Plan, TestKey, TestRecord};
+use crate::record::{CodeHead, InstanceCode, Plan};
 
 /// Why a filed record is not the value asked for: the core refused its framing, or the payload
 /// does not decode.
@@ -111,34 +109,6 @@ pub fn write_plan(key: &PlanKey, plan: &Plan) -> Vec<u8> {
 
 pub fn read_plan(holds: &Holds<'_, InstancePlan>, bytes: &[u8]) -> Result<Plan, FiledError> {
     Ok(Plan::decode(proof::payload(holds, bytes)?)?)
-}
-
-/// The core key of the result of the test keyed `key`: the same id, computed by the core's
-/// rule ([`crate::reach::test_key`]).
-pub fn test_key(key: &TestKey) -> Key<TestRun> {
-    Key::from_id(key.0)
-}
-
-/// What an absent outside read digests to in a fact: absence is a value (rule 21).
-pub const ABSENT: Digest = Digest([0; 32]);
-
-/// The record filing `result`: its outside reads as the core's facts (an outside read's fact
-/// id is its bytes', [`FactKind::Late`]), the result as the payload.
-pub fn write_test(result: &TestRecord) -> Vec<u8> {
-    let mut reads = Vec::with_capacity_in(result.reads.len(), Global);
-    for read in &result.reads {
-        let id = record::fact_id(FactKind::Late, &StableId::of(&read.what, 0), b"");
-        reads.push(Fact { id, digest: read.digest.unwrap_or(ABSENT) });
-    }
-    record::write_traced(&test_key(&result.key), &reads, &[], &result.encode())
-}
-
-/// The test result the record `bytes` its proof `holds` is of holds. The key in the payload is
-/// the record's own by [`write_test`]; it is not compared again.
-pub fn read_test(holds: &Holds<'_, TestRun>, bytes: &[u8]) -> Result<TestRecord, FiledError> {
-    let result = TestRecord::decode(proof::payload(holds, bytes)?)?;
-    debug_assert_eq!(result.key.0, holds.key().id(), "a test record's payload names its own key");
-    Ok(result)
 }
 
 /// The key a manifest head is filed under: the program's key, its header and its chunk

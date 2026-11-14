@@ -7,6 +7,7 @@ mod defs;
 mod features;
 mod generics;
 mod impl_trait_in_trait;
+mod implied_bounds;
 mod impls;
 mod krate;
 mod lifetimes;

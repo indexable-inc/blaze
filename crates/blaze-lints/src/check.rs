@@ -1066,6 +1066,18 @@ impl<'q: 't, 't> Cx<'q, 't> {
         self.range(node)
     }
 
+    /// Where `node` is written in its file, as `hir`'s source maps give it: [`Cx::range`],
+    /// moved by where the anchor begins in a body's query, whose tree is the body's anchor
+    /// alone. Reads where the body is in the file, so a query that asks reruns when it moves:
+    /// ask only once a node is known to be compared with a source map's pointer.
+    pub(crate) fn file_range(&self, node: ast::Node<'_>) -> Option<TextRange> {
+        let range = self.range(node)?;
+        if !self.base.relative {
+            return Some(range);
+        }
+        Some(range + Body::anchor_offset(self.db, self.def?)?)
+    }
+
     /// Where `range` of `file` (the walked file or an expansion) is written in the tree of
     /// [`Cx::text`]: `None` for what a macro made up, or a range of another file. An argument
     /// of a macro call is written where the call is, so a lint of expressions reaches it: the
