@@ -62,6 +62,10 @@ pub enum Atom {
     Filter(Filter),
     /// `(match-arm m a p b)`: a `match`, one of its arms, the arm's pattern and its expression.
     MatchArm,
+    /// `(child p c)`: each child node of `p`, in order.
+    Child,
+    /// `(descendant p c)`: each node below `p`, in order.
+    Descendant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +122,8 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "defines" => (Atom::Defines, 2, Needs::Any(&[0, 1])),
         "references" => (Atom::References, 2, all0),
         "match-arm" => (Atom::MatchArm, 4, Needs::Nothing),
+        "child" => (Atom::Child, 2, all0),
+        "descendant" => (Atom::Descendant, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

@@ -1210,6 +1210,16 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     ]);
                 }
             }
+            Atom::Child | Atom::Descendant => {
+                let name = if matches!(atom, Atom::Child) { "child" } else { "descendant" };
+                let at = self.need_syn(&inputs[0], name, line)?;
+                let p = node(self.syn(at));
+                let below: Vec<ast::Node<'a>> = match atom {
+                    Atom::Child => at.children().collect(),
+                    _ => at.descendants().filter(|it| *it != at).collect(),
+                };
+                out.extend(below.into_iter().map(|it| vec![p.clone(), node(self.syn(it))]));
+            }
         }
         Ok(())
     }

@@ -431,3 +431,22 @@ fn match_arm_gives_each_arms_match_pattern_and_expression_from_either_end() {
     assert_eq!(of_arm.len(), 1, "{of_arm:?}");
     assert!(of_arm[0][0].starts_with("match n {\n        0 => E::A,"), "{of_arm:?}");
 }
+
+/// `child` gives a node's children in order, and `descendant` every node below it, never the
+/// node itself.
+#[test]
+fn child_and_descendant_walk_down_from_a_bound_node() {
+    let (db, files) = view(ARMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (guarded a) (syntax a "MATCH_ARM") (text-match a "^k if"))
+        (rule (kids k) (guarded a) (child a c) (kind c k))
+        (rule (lits l) (syntax m "MATCH_EXPR") (text-match m "^match n [{] 7") (descendant m l) (kind l "LITERAL"))
+        (rule (self-below m) (syntax m "MATCH_EXPR") (descendant m m))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut kids = texts(&outcome, "kids");
+    kids.sort();
+    assert_eq!(kids, [["CALL_EXPR"], ["IDENT_PAT"], ["MATCH_GUARD"]]);
+    assert_eq!(texts(&outcome, "lits"), [["7"], ["1"], ["2"]]);
+    assert!(texts(&outcome, "self-below").is_empty());
+}
