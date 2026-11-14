@@ -1264,11 +1264,11 @@ fn past_cap_in<'a>(
     rule: CapRule,
 ) -> BTreeSet<usize> {
     // alloc: empty unless past the cap
-    let gone = BTreeSet::new();
-    if total <= cap {
-        return gone;
+    let mut gone = BTreeSet::new();
+    if total > cap {
+        units_past_cap(kept, total, cap, running, keep, rule, &mut gone);
     }
-    units_past_cap(kept, total, cap, running, keep, rule, gone)
+    gone
 }
 
 /// How [`past_cap_in`] decides: the rule, or a bug a test plants to show its oracle catches it.
@@ -1328,9 +1328,9 @@ impl CapRule {
 /// The builds the rule keeps whole: every one in `running`, and the `keep` highest-numbered of
 /// the others any file of `kept` holds rows of, sorted. A file whose rows span `lo..=hi` says
 /// builds `lo` and `hi` had rows; one between them is in the same unit whatever it is.
-fn kept_builds<'a, A: Allocator + Clone>(
+fn kept_builds<'a, R: Allocator + Clone, A: Allocator + Clone>(
     kept: impl Iterator<Item = &'a Kept>,
-    running: &BTreeSet<u64>,
+    running: &BTreeSet<u64, R>,
     keep: usize,
     alloc: A,
 ) -> Vec<u64, A> {
@@ -1363,16 +1363,16 @@ fn past_cap<'a>(
 }
 
 /// [`past_cap_in`] once the history is past its cap: the units, the kept builds set aside, then
-/// the rest retired oldest first into `gone`.
-fn units_past_cap<'a>(
+/// the rest retired oldest first into `gone`, the caller's set, of the caller's allocator.
+fn units_past_cap<'a, R: Allocator + Clone, A: Allocator + Clone>(
     kept: impl Iterator<Item = &'a Kept> + Clone,
     total: u64,
     cap: u64,
-    running: &BTreeSet<u64>,
+    running: &BTreeSet<u64, R>,
     keep: usize,
     rule: CapRule,
-    mut gone: BTreeSet<usize>,
-) -> BTreeSet<usize> {
+    gone: &mut BTreeSet<usize, A>,
+) {
     let listed = || kept.clone().enumerate().filter(|(_, it)| it.listed == Listed::Listed);
     let newest = kept.clone().last().map_or(0, |it| it.name.last);
     // The builds kept whole, set aside before the cap is looked at: what the rule promises
@@ -1459,7 +1459,6 @@ fn units_past_cap<'a>(
             gone.insert(at);
         }
     }
-    gone
 }
 
 /// Whether the kept file at `at` goes with the files `gone` ([`past_cap_in`]).

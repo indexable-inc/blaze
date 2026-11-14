@@ -3,7 +3,12 @@
 //! `sql/examples.sql`, cut out at compile time; [`PRELUDE`] (`sql/views.sql`) defines the tables
 //! and views that SQL reads, over the files of the directories [`prelude`] is given.
 
-use std::{fmt, fmt::Write as _, path::Path};
+use std::{
+    alloc::{Allocator, Global},
+    fmt,
+    fmt::Write as _,
+    path::Path,
+};
 
 use serde_json::{Map, Value};
 
@@ -110,27 +115,28 @@ impl NoBuild {
         manifest.capped().map_or(NoBuild::NoneRan, NoBuild::Capped)
     }
 
-    /// The SQL expression of the message ([`NO_BUILD`]).
-    fn sql(self, out: &mut String) {
+    /// The SQL expression of the message ([`NO_BUILD`]), written onto `out`.
+    fn sql<A: Allocator>(self, out: &mut blaze_mem::String<A>) {
         out.push_str("concat(");
+        // Writing to a `blaze_mem::String` does not fail: it grows.
         match self {
-            NoBuild::Unknown => quote(
+            NoBuild::Unknown => _ = quote(
                 "the profile history holds no build for this view: none has run here, or its cap \
                  retired every one; name one with build=N",
                 out,
             ),
-            NoBuild::Capped(capped) => quote(
-                &format!(
-                    "the profile history holds no build for this view: its cap retired builds \
-                     through build {} (at flush {}), and those it keeps (every running build and \
-                     the last {} finished) hold none for it; name one with build=N",
-                    capped.through,
-                    capped.flush,
-                    crate::history::KEEP_BUILDS,
-                ),
+            // Written straight between its quotes: its text has no quote and its numbers none,
+            // so nothing in it needs doubling.
+            NoBuild::Capped(capped) => _ = write!(
                 out,
+                "'the profile history holds no build for this view: its cap retired builds \
+                 through build {} (at flush {}), and those it keeps (every running build and the \
+                 last {} finished) hold none for it; name one with build=N'",
+                capped.through,
+                capped.flush,
+                crate::history::KEEP_BUILDS,
             ),
-            NoBuild::NoneRan => quote(
+            NoBuild::NoneRan => _ = quote(
                 "the profile history holds no build for this view: none has run here (its cap \
                  retired none); name one with build=N",
                 out,
@@ -483,21 +489,29 @@ fn scan(
 /// An argument it does not take, one it needs and is not given, and one of the wrong type are
 /// errors.
 pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewError> {
-    render_saying(view, args, NoBuild::Unknown)
-}
-
-/// [`render`], a default build that finds none failing with `no_build` as its reason.
-fn render_saying(
-    view: &View,
-    args: &Map<String, Value>,
-    no_build: NoBuild,
-) -> Result<String, ViewError> {
     if let Some(arg) = args.keys().find(|key| !view.args.iter().any(|it| it.name == key.as_str())) {
         // alloc: an error, once a request
         return Err(ViewError::UnknownArg { view: view.name, arg: arg.to_owned() });
     }
-    // alloc: the query, once a request
-    let mut out = String::with_capacity(view.sql.len() + 64);
+    let out = render_in(view, |name| args.get(name), NoBuild::Unknown, Global)?;
+    // The bytes move into the std `String` callers take, with no copy.
+    match String::from_utf8(out.into_bytes()) {
+        Ok(it) => Ok(it),
+        Err(_) => unreachable!("a `blaze_mem::String` holds UTF-8"),
+    }
+}
+
+/// [`render`]'s binding of each argument, into a string of `alloc`: `value_of` gives an
+/// argument's value by name (`None`: not given, so its default), and a default build that
+/// finds none fails with `no_build` as its reason. The arguments are checked against the
+/// view's by the caller.
+fn render_in<'v, A: Allocator>(
+    view: &View,
+    value_of: impl Fn(&str) -> Option<&'v Value>,
+    no_build: NoBuild,
+    alloc: A,
+) -> Result<blaze_mem::String<A>, ViewError> {
+    let mut out = blaze_mem::String::with_capacity_in(view.sql.len() + 64, alloc);
     let mut copied = 0;
     scan(view.sql, |it| {
         if it.sigil != b'$' {
@@ -508,7 +522,7 @@ fn render_saying(
             return Err(ViewError::Undeclared { view: view.name, name: it.name.to_owned() });
         };
         out.push_str(&view.sql[copied..it.at]);
-        literal(view, arg, args.get(arg.name), no_build, &mut out)?;
+        literal(view, arg, value_of(arg.name), no_build, &mut out)?;
         copied = it.end;
         Ok(())
     })?;
@@ -516,12 +530,12 @@ fn render_saying(
     Ok(out)
 }
 
-fn literal(
+fn literal<A: Allocator>(
     view: &View,
     arg: &Arg,
     value: Option<&Value>,
     no_build: NoBuild,
-    out: &mut String,
+    out: &mut blaze_mem::String<A>,
 ) -> Result<(), ViewError> {
     let bad = |got: &Value| ViewError::BadArg {
         view: view.name,
@@ -543,7 +557,7 @@ fn literal(
         }
         return Ok(());
     };
-    // Writing to a `String` does not fail.
+    // Writing to a `blaze_mem::String` does not fail: it grows.
     match arg.ty {
         ArgType::U64 => _ = write!(out, "{}", value.as_u64().ok_or_else(|| bad(value))?),
         ArgType::I64 => _ = write!(out, "{}", value.as_i64().ok_or_else(|| bad(value))?),
@@ -553,23 +567,24 @@ fn literal(
         }
         ArgType::Text => {
             let it = value.as_str().filter(|it| !it.contains('\0')).ok_or_else(|| bad(value))?;
-            quote(it, out);
+            _ = quote(it, out);
         }
     }
     Ok(())
 }
 
-/// `text` as an SQL string literal: in single quotes, each quote doubled. DuckDB's plain
-/// literals take backslashes as they are.
-pub(crate) fn quote(text: &str, out: &mut String) {
-    out.push('\'');
+/// `text` as an SQL string literal onto `out`: in single quotes, each quote doubled. DuckDB's
+/// plain literals take backslashes as they are. Generic over the text it writes onto (a std
+/// `String`, a `blaze_mem::String` of any allocator), whose writes are what can fail.
+pub(crate) fn quote<W: fmt::Write>(text: &str, out: &mut W) -> fmt::Result {
+    out.write_char('\'')?;
     for (i, part) in text.split('\'').enumerate() {
         if i > 0 {
-            out.push_str("''");
+            out.write_str("''")?;
         }
-        out.push_str(part);
+        out.write_str(part)?;
     }
-    out.push('\'');
+    out.write_char('\'')
 }
 
 /// [`PRELUDE`] reading each table from the files of the history `dir` its `manifest` lists for
@@ -611,8 +626,9 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
         };
         out.push_str(&PRELUDE[copied..it.at]);
         out.push('[');
+        // Writing to a `String` does not fail.
         // alloc: the prelude, once a query
-        quote(&format!("{dir}/schema.{}.parquet", table.name), &mut out);
+        _ = quote(&format!("{dir}/schema.{}.parquet", table.name), &mut out);
         for (file, entry) in manifest.scoped(table.name, scope) {
             schema::readable(entry.version).map_err(|why| ViewError::Version {
                 // alloc: an error, once a request
@@ -622,22 +638,20 @@ pub fn prelude(dir: &Path, manifest: &Manifest, scope: Scope) -> Result<String, 
             })?;
             out.push_str(", ");
             // alloc: the prelude, once a query
-            quote(&format!("{dir}/{file}"), &mut out);
+            _ = quote(&format!("{dir}/{file}"), &mut out);
         }
         out.push(']');
         copied = it.end;
         Ok(())
     })?;
     out.push_str(&PRELUDE[copied..]);
+    let no_build = NoBuild::of(manifest);
     for view in VIEWS.iter().filter(|it| it.args.iter().all(|arg| arg.default.is_some())) {
+        // Every argument at its default: none is given.
+        let sql = render_in(view, |_| None, no_build, Global)?;
         // Writing to a `String` does not fail; a section may end in a comment, so `;` goes on a
         // line of its own.
-        _ = write!(
-            out,
-            "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n",
-            view.name,
-            render_saying(view, &Map::new(), NoBuild::of(manifest))?
-        );
+        _ = write!(out, "\nCREATE OR REPLACE VIEW {} AS\n{}\n;\n", view.name, sql.as_str());
     }
     crate::span::views(&mut out);
     Ok(out)
