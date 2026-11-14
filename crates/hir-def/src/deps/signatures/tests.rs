@@ -159,6 +159,18 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
         Err("these fixtures expand no proc macro".to_owned())
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn crate::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(crate::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
 }
 
 /// A store with the images of a fresh database of `fixture`, every dependency written.

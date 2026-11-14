@@ -654,6 +654,18 @@ impl ImageStore for Memory {
     fn reads_now(&self, _: &base_db::Env, _: &[u8]) -> Result<ContentId, String> {
         Err(String::from("an item store reads no expansion"))
     }
+
+    // dyn: `ImageStore::pages`'s signature, once per crate read from pages
+    fn pages(&self, key: &ContentId) -> Result<Option<std::sync::Arc<dyn hir_def::deps::PageSource>>, String> {
+        // A test's store holds each value whole: no part of one is read alone.
+        Ok(hir_def::deps::whole_pages(self.get(key)?, std::alloc::Global))
+    }
+
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        // A test's store runs a batch in order on its own thread: the same result.
+        (0..count).for_each(task);
+    }
 }
 
 /// Runs inference, MIR building and the borrow check of every body of [`STEPS`] with an item
