@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-6",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "the daemon's job (crates/blaze-cargo/src/serve/job.rs, `applied`), met through `blaze prove`",
+ "what": "`blaze prove -p blaze-cas -p blaze-keyed -p blaze-profile -p blaze-graph --subset --json` on blaze-vm, with a release build of 7683e9bcb1 on a fresh home, ended after 514 s with exit 101 and one line: `error: the prove's answer on the view of /root/wt/proofs-1113/src can't be told: the proc macros and build scripts its front end applies did not all build`. Nothing on standard error or in the answer says which proc macro or build script did not build, or why. The same command for blaze-core alone answers in 80 s.",
+ "cost": "nine minutes for an answer that names nothing; the count of what the translator takes in blaze's durable crates (row V15) is not made",
+ "cause": "not known: which unit failed was not found. `applied` is told only `ok: bool` for the units a view's front end applies, and its refusal is made from that",
+ "whys": "the job waits for a view's proc macros and build scripts as one step and keeps one bit of how it went; the units' own failures are diagnostics of another request shape (a build's), which a job that is not a build does not print; so a failure below a reach, a prove or a check of a view is reported by the layer that knows least about it",
+ "class": "an error made from a boolean: the layer that reports knows that something failed and not what (rule errors-name-the-thing)",
+ "prevention": "`applied` takes the failed units, not `ok`: each with its name and its first diagnostic, and the refusal lists them (`.. did not all build: proc-macro serde_derive 1.0.x: <first error>`); a lint on `Option<..>`/`bool` outcomes that reach an `ApiError::new` with no name in the text. Not built.",
+ "workaround": "ask for the crates one at a time, and run `blaze build` of the failing one's dependencies to see the unit",
+ "state": "open"
+}
