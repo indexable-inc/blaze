@@ -884,7 +884,16 @@ impl Gen {
             44 => Response::Proven(crate::Proven {
                 failed: self.maybe(|g| g.text()),
                 subset: self.maybe(|g| crate::Subset {
+                    generic: g.u32(),
                     refused: g.many(depth, |g| crate::SubsetRefusal { what: g.text(), count: g.u32() }),
+                    outcomes: g.many(depth, |g| crate::SubsetFunction {
+                        path: g.text(),
+                        outcome: match g.below(3) {
+                            0 => crate::SubsetOutcome::Translated,
+                            1 => crate::SubsetOutcome::Generic,
+                            _ => crate::SubsetOutcome::Refused { what: g.text() },
+                        },
+                    }),
                     functions: g.u32(),
                     translated: g.u32(),
                 }),

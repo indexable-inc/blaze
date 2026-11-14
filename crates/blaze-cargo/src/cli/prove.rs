@@ -1,17 +1,19 @@
-//! `blaze prove [cargo's package and target flags] [--emit] [--subset] [--json]`
+//! `blaze prove [cargo's package and target flags] [--emit] [--subset [--functions]] [--json]`
 //! ([`Request::Prove`], docs/cargo.md, docs/v2/plan/design/proofs-for-sans-io.md section 5):
 //! every function marked `#[blaze::theorem]` in the library crates `blaze check` with the same
 //! flags selects, translated to Lean in the daemon's front end and checked by the pinned Lean
 //! (`BLAZE_LEAN_PROVER`) against the crate's proof file under `lean/`. Nothing is compiled.
 //! `--emit` writes the models and statements and checks nothing, so needs no Lean; `--subset`
-//! adds what the translator takes of every function in a `#![blaze::sans_io]` module.
+//! adds what the translator takes of every function in a `#![blaze::sans_io]` module: the
+//! counts (translated, generic, refused) and the refusals grouped, and with `--functions` one
+//! line a function naming its outcome; `--json` always carries every function's outcome.
 //!
 //! Exit status: 0 when every theorem selected is proved (with `--emit`, emitted), or there is
 //! none; 1 otherwise; a command line it refuses is [`Exit::Usage`].
 
 use std::{alloc::Global, ffi::OsString, io::Write as _, path::Path};
 
-use blaze_api::{ProofRecord, Proven, Request, ResponseRef};
+use blaze_api::{ProofRecord, Proven, Request, ResponseRef, Subset, SubsetOutcome};
 use blaze_core::exit::Exit;
 
 use super::{
@@ -23,7 +25,8 @@ use super::{
 /// The variable Lean's path is read from: here, where the command's environment is.
 const LEAN_VARIABLE: &str = "BLAZE_LEAN_PROVER";
 
-const USAGE: &str = "blaze prove [-p PKG]... [--workspace] [cargo's target flags] [--emit] [--subset] [--json]";
+const USAGE: &str =
+    "blaze prove [-p PKG]... [--workspace] [cargo's target flags] [--emit] [--subset [--functions]] [--json]";
 
 /// `blaze prove`: its exit code.
 pub fn main(words: Vec<OsString>, color: bool) -> i32 {
@@ -39,16 +42,22 @@ pub fn main(words: Vec<OsString>, color: bool) -> i32 {
 fn prove(words: Vec<OsString>, color: bool) -> Result<i32, (String, i32)> {
     let usage = |what: String| (format!("{USAGE}: {what}"), Exit::Usage.code());
     let failed = |what: String| (what, Exit::Failed.code());
-    let (mut emit, mut subset, mut json) = (false, false, false);
+    let (mut emit, mut subset, mut functions, mut json) = (false, false, false, false);
     // The words of the `blaze check` whose targets are proved: `check` and the cargo flags.
     let mut check = vec![OsString::from("check")];
     for word in words {
         match word.to_str() {
             Some("--emit") => emit = true,
             Some("--subset") => subset = true,
+            Some("--functions") => functions = true,
             Some("--json") => json = true,
             _ => check.push(word),
         }
+    }
+    // `--functions` lists the subset's functions: without `--subset` there is none to list, and
+    // the flag is refused rather than ignored.
+    if functions && !subset {
+        return Err(usage("`--functions` lists the functions `--subset` counts; it needs `--subset`".to_owned()));
     }
     let asked = match args::parse(check) {
         Ok(Asked::Cargo(asked)) => asked,
@@ -99,7 +108,7 @@ fn prove(words: Vec<OsString>, color: bool) -> Result<i32, (String, i32)> {
         true => {
             let _ = writeln!(text, "{}", self::json(&proven));
         }
-        false => lines(&mut text, &proven, emit),
+        false => lines(&mut text, &proven, emit, functions),
     }
     blaze_report::out!("{}", String::from_utf8_lossy(&text));
     // No proof could be checked: the command's failure, after what it did find.
@@ -115,9 +124,9 @@ fn prove(words: Vec<OsString>, color: bool) -> Result<i32, (String, i32)> {
     Ok(if done { 0 } else { 1 })
 }
 
-/// One line a record, Lean's message under an open one indented, then the counts, written
-/// to `text`.
-fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool) {
+/// One line a record, Lean's message under an open one indented, the subset's counts and
+/// refusals (with `functions`, a line a function of it), then the counts, written to `text`.
+fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool, functions: bool) {
     if proven.records.is_empty() {
         let _ = writeln!(text, "no function marked `#[blaze::theorem]` in the crates selected");
     }
@@ -146,19 +155,37 @@ fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool) {
         }
     }
     if let Some(subset) = &proven.subset {
-        let _ = writeln!(
-            text,
-            "subset: {} of {} functions in sans-IO modules translated",
-            subset.translated, subset.functions
-        );
-        for it in &subset.refused {
-            let _ = writeln!(text, "    {} refused for {}", it.count, it.what);
-        }
+        subset_lines(text, subset, functions);
     }
     let _ = match emit {
         true => writeln!(text, "{emitted} emitted, {refused} refused"),
         false => writeln!(text, "{proved} proved, {open} open, {refused} refused"),
     };
+}
+
+/// The subset's counts, its refusals most first, and with `functions` one line a function by
+/// path, written to `text`.
+fn subset_lines(text: &mut Vec<u8>, subset: &Subset, functions: bool) {
+    let refused: u32 = subset.refused.iter().map(|it| it.count).sum();
+    let _ = writeln!(
+        text,
+        "subset: {} functions in sans-IO modules, {} translated, {} generic (translated by \
+         instance), {refused} refused",
+        subset.functions, subset.translated, subset.generic
+    );
+    for it in &subset.refused {
+        let _ = writeln!(text, "    {} refused for {}", it.count, it.what);
+    }
+    if !functions {
+        return;
+    }
+    for it in &subset.outcomes {
+        let _ = match &it.outcome {
+            SubsetOutcome::Translated => writeln!(text, "translated {}", it.path),
+            SubsetOutcome::Generic => writeln!(text, "generic {}", it.path),
+            SubsetOutcome::Refused { what } => writeln!(text, "refused {}: {what}", it.path),
+        };
+    }
 }
 
 /// The records as JSON with their own field names, each `{"outcome": .., ..}`, the key in hex.
@@ -183,5 +210,71 @@ fn json(proven: &Proven) -> serde_json::Value {
             }),
         });
     }
-    serde_json::json!({ "records": records, "subset": proven.subset, "failed": proven.failed })
+    let subset = proven.subset.as_ref().map(|subset| {
+        let mut outcomes: Vec<serde_json::Value> = Vec::with_capacity_in(subset.outcomes.len(), Global);
+        for it in &subset.outcomes {
+            outcomes.push(match &it.outcome {
+                SubsetOutcome::Translated => serde_json::json!({ "path": it.path, "outcome": "Translated" }),
+                SubsetOutcome::Generic => serde_json::json!({ "path": it.path, "outcome": "Generic" }),
+                SubsetOutcome::Refused { what } => {
+                    serde_json::json!({ "path": it.path, "outcome": "Refused", "what": what })
+                }
+            });
+        }
+        serde_json::json!({
+            "functions": subset.functions, "translated": subset.translated,
+            "generic": subset.generic, "refused": subset.refused, "outcomes": outcomes,
+        })
+    });
+    serde_json::json!({ "records": records, "subset": subset, "failed": proven.failed })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Global;
+
+    use blaze_api::{Proven, Subset, SubsetFunction, SubsetOutcome, SubsetRefusal};
+
+    /// `--subset` prints the counts and the grouped refusals; `--functions` adds a line a
+    /// function, by path, naming its outcome.
+    #[test]
+    fn the_subset_says_each_function_s_outcome_with_functions() {
+        let function = |path: &str, outcome| SubsetFunction { path: path.to_owned(), outcome };
+        let raw = "a raw pointer (rule RawPointer)";
+        let proven = Proven {
+            failed: None,
+            subset: Some(Subset {
+                refused: vec![SubsetRefusal { what: raw.to_owned(), count: 1 }],
+                outcomes: vec![
+                    function("cores::addr", SubsetOutcome::Refused { what: raw.to_owned() }),
+                    function("cores::double", SubsetOutcome::Translated),
+                    function("cores::first", SubsetOutcome::Generic),
+                ],
+                functions: 3,
+                translated: 1,
+                generic: 1,
+            }),
+            records: Vec::new(),
+        };
+        let counts = "no function marked `#[blaze::theorem]` in the crates selected\n\
+                      subset: 3 functions in sans-IO modules, 1 translated, 1 generic (translated \
+                      by instance), 1 refused\n    \
+                      1 refused for a raw pointer (rule RawPointer)\n";
+        let mut text = Vec::new_in(Global);
+        super::lines(&mut text, &proven, false, false);
+        assert_eq!(String::from_utf8(text).unwrap(), format!("{counts}0 proved, 0 open, 0 refused\n"));
+        let mut text = Vec::new_in(Global);
+        super::lines(&mut text, &proven, false, true);
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            format!(
+                "{counts}refused cores::addr: a raw pointer (rule RawPointer)\ntranslated cores::double\n\
+                 generic cores::first\n0 proved, 0 open, 0 refused\n"
+            )
+        );
+        let json = super::json(&proven);
+        assert_eq!(json["subset"]["outcomes"][0]["outcome"], "Refused", "{json}");
+        assert_eq!(json["subset"]["outcomes"][2]["path"], "cores::first", "{json}");
+        assert_eq!(json["subset"]["generic"], 1, "{json}");
+    }
 }

@@ -44,6 +44,7 @@
 //!     expect: option, fmt
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
+//!     fmt_write: fmt
 //!     fn: sized, tuple
 //!     from: sized, result
 //!     future: pin
@@ -63,6 +64,7 @@
 //!     int_overflow: non_zero, from, result, option, iterator
 //!     int_cast: from
 //!     int_methods: int_overflow, int_wrapping
+//!     io_error:
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -94,6 +96,7 @@
 //!     send: sized
 //!     size_of: sized
 //!     sized:
+//!     string: vec, eq
 //!     slice:
 //!     str: sized, result
 //!     str_methods: str, eq
@@ -1716,6 +1719,14 @@ pub mod fmt {
         pub fn write_str(&mut self, _data: &str) -> Result {
             Ok(())
         }
+
+        // region:fmt_write
+        // What `write!` calls (library/core/src/fmt/mod.rs: `pub fn write_fmt(&mut self, fmt:
+        // Arguments<'_>) -> Result`).
+        pub fn write_fmt(&mut self, _args: Arguments<'_>) -> Result {
+            Ok(())
+        }
+        // endregion:fmt_write
     }
 
     impl DebugTuple {
@@ -3844,6 +3855,46 @@ pub mod int_cast {
     }
 }
 // endregion:int_cast
+
+// region:io_error
+// `std::io::Error` where the pinned nightly's library defines it: `core::io::error::Error`
+// (library/core/src/io/error.rs, re-exported as `core::io::Error` and by std), its one field a
+// stand-in for the real `Repr`. `other` is alloc's incoherent inherent method
+// (library/alloc/src/io/error.rs), here without its `E: Into<Box<dyn Error + Send + Sync>>`
+// bound, which needs `Box`.
+pub mod io {
+    mod error {
+        pub struct Error {
+            repr: u64,
+        }
+
+        impl Error {
+            pub fn other<E>(_error: E) -> Error {
+                loop {}
+            }
+        }
+    }
+
+    pub use self::error::Error;
+}
+// endregion:io_error
+
+// region:string
+// `alloc::string::String` (lang item `String`, library/alloc/src/string.rs), with its derived
+// `PartialEq` written out.
+pub mod string {
+    #[lang = "String"]
+    pub struct String {
+        vec: crate::vec::Vec<u8>,
+    }
+
+    impl crate::cmp::PartialEq for String {
+        fn eq(&self, _other: &String) -> bool {
+            loop {}
+        }
+    }
+}
+// endregion:string
 
 // region:error
 pub mod error {

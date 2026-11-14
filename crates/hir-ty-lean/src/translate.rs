@@ -85,6 +85,7 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Duration => name("core.time.Duration"),
         Ty::Ordering => name("core.cmp.Ordering"),
         Ty::Str => name("Str"),
+        Ty::Opaque(opaque) => name(opaque.lean()),
     }
 }
 

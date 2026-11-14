@@ -2928,3 +2928,204 @@ fn what_closures_leave_out_is_refused_by_name() {
         assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
     }
 }
+
+// ---- Opaque items (docs/v2/plan/design/proofs-for-sans-io.md, section 3, step 0). ----
+
+/// What the `opaques` fixture enables: `std::io::Error` (core's, `io::error`), `fmt`'s
+/// `Formatter`, `Error`, `Arguments` and `write_fmt`, `Location`, `String`, `Option`, `Result`
+/// and `Vec`.
+const OPAQUE_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, option, option_methods, result, \
+                            vec, slice, index, fmt, fmt_write, io_error, string, panic_location";
+
+/// Opaque types carried through a struct, an enum, `Option`, `Result`, `Vec`, parameters,
+/// results, `&` and `&mut`; the opaque functions `io::Error::other` (at an opaque argument and
+/// at the crate's own type) and `Formatter::write_str` (from a hand-written `Display::fmt`);
+/// and theorem functions over them, whose statements quantify over the opaque type and which
+/// `lean/BlazeModel/opaques/proved.lean` proves.
+const OPAQUES: &str = "use core::{fmt, io, panic::Location, string::String};
+pub struct Failed { pub code: u32, pub why: io::Error }
+pub enum Outcome { Done(u32), Broke(io::Error) }
+pub struct Stuck { pub calls: u32 }
+pub struct Code(pub u32);
+pub fn pass(r: Result<u32, io::Error>) -> Result<u32, io::Error> {
+    match r { Ok(x) => Ok(x), Err(e) => Err(e) }
+}
+pub fn fail(code: u32, why: io::Error) -> Failed { Failed { code, why } }
+pub fn code_of(f: &Failed) -> u32 { f.code }
+pub fn why_of(f: Failed) -> io::Error { f.why }
+pub fn why_ref(f: &Failed) -> &io::Error { &f.why }
+pub fn outcome(r: Result<u32, io::Error>) -> Outcome {
+    match r { Ok(x) => Outcome::Done(x), Err(e) => Outcome::Broke(e) }
+}
+pub fn either(a: Option<io::Error>, b: io::Error) -> io::Error { match a { Some(e) => e, None => b } }
+pub fn errors(v: &Vec<io::Error>) -> usize { v.len() }
+pub fn wrap(e: io::Error) -> io::Error { io::Error::other(e) }
+pub fn give_up(s: Stuck) -> io::Error { io::Error::other(s) }
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(\"code\") }
+}
+pub fn show(c: &Code, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(c, f) }
+pub fn site(at: Option<&'static Location<'static>>) -> Option<&'static Location<'static>> { at }
+pub fn named(s: String, n: u32) -> (u32, String) { (n, s) }
+#[blaze::theorem]
+pub fn pass_keeps_ok(x: u32, e: io::Error) -> bool {
+    let kept = match pass(Ok(x)) { Ok(y) => y == x, Err(_) => false };
+    kept && pass(Err(e)).is_err()
+}
+#[blaze::theorem]
+pub fn failed_keeps_its_code(code: u32, why: io::Error) -> bool {
+    let f = fail(code, why);
+    code_of(&f) == code
+}
+";
+
+/// An opaque type is its Lean name in `Blaze.Opaque`, carried as any value; a call of an
+/// opaque function is a call of its `opaque` constant, declared in a module of its own named by
+/// its path at its instance, which imports the modules of the crate's types it names and gives
+/// back what it is lent by `&mut`, as a translated function does.
+#[test]
+fn opaque_items_are_carried_and_never_looked_inside() {
+    let cases: [(&str, &[&str], &[&str]); 5] = [
+        ("fail", &["why := why"], &[]),
+        ("wrap", &["core.io.error.Error.other.Error e"], &["BlazeModel.core.io.error.Error.other.Error"]),
+        (
+            "give_up",
+            &["core.io.error.Error.other.Stuck s"],
+            &["BlazeModel.opaques.Stuck.type", "BlazeModel.core.io.error.Error.other.Stuck"],
+        ),
+        ("show", &["opaques.Code.Display.fmt c f"], &["BlazeModel.core.fmt.Formatter.write_str"]),
+        ("errors", &["Slice.len v"], &[]),
+    ];
+    for (name, calls, modules) in cases {
+        let out = golden(OPAQUE_FLAGS, "opaques", name, OPAQUES);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules.iter() {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    for name in ["pass", "code_of", "why_of", "why_ref", "outcome", "either", "site", "named"] {
+        golden(OPAQUE_FLAGS, "opaques", name, OPAQUES);
+    }
+    // The opaque function's module: its type, the crate's type it names imported, nothing more.
+    let out = golden(OPAQUE_FLAGS, "opaques", "give_up", OPAQUES);
+    let other = out.imports.iter().find(|it| it.module == "BlazeModel.core.io.error.Error.other.Stuck").expect("imported");
+    assert!(
+        other.text.contains("import BlazeModel.opaques.Stuck.type\n")
+            && other.text.contains("\nopaque core.io.error.Error.other.Stuck (a0 : opaques.Stuck) : Result core.io.error.Error\n"),
+        "{}",
+        other.text
+    );
+    assert_eq!(other.function, "core::io::error::Error::other::<opaques::Stuck>");
+    assert!(other.shape.monadic && other.shape.mut_params.is_empty() && !other.shape.fuel);
+    // `write_str` is lent the formatter and gives it back after its result.
+    let out = golden(OPAQUE_FLAGS, "opaques", "show", OPAQUES);
+    let write = out.imports.iter().find(|it| it.module == "BlazeModel.core.fmt.Formatter.write_str").expect("imported");
+    assert!(
+        write.text.contains(
+            "\nopaque core.fmt.Formatter.write_str (a0 : core.fmt.Formatter) (a1 : Str) : \
+             Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter)\n"
+        ),
+        "{}",
+        write.text
+    );
+    assert_eq!(write.shape.mut_params, [0]);
+    for name in ["pass_keeps_ok", "failed_keeps_its_code"] {
+        let out = golden(OPAQUE_FLAGS, "opaques", name, OPAQUES);
+        assert_eq!(out.statement.as_deref(), Some(format!("opaques.{name}.spec.statement").as_str()));
+        assert!(out.text.contains("(e : core.io.error.Error)") || out.text.contains("(why : core.io.error.Error)"), "{}", out.text);
+    }
+    // The list of opaque types is what `Blaze.Opaque` declares, each with no definition.
+    let library = crate::LIBRARY.iter().find(|it| it.0 == "Blaze.Opaque").expect("in the library").1;
+    for entry in OPAQUE_TYPES {
+        assert!(library.contains(&format!("\nopaque {} : Type\n", entry.lean)), "`{}` is declared", entry.lean);
+    }
+    assert_eq!(library.matches("\nopaque ").count(), OPAQUE_TYPES.len());
+}
+
+/// What opaque items leave out is refused by name: an inspection of an opaque value (`==`, a
+/// method not in the list, building one from its fields), `Location::caller` (its value is
+/// the call site's, not a function of its arguments), a type of the standard library not in the
+/// list, a call not in the list, a derived `Debug::fmt`, `write!` with arguments, and `?`.
+#[test]
+fn what_opaque_items_leave_out_is_refused_by_name() {
+    let uses = "use core::{fmt, io, panic::Location, string::String};\n";
+    let cases: [(&str, &str, &str); 10] = [
+        (
+            "",
+            "pub fn f(a: &String, b: &String) -> bool { a == b }\n",
+            "`==` of `alloc::string::String`, an opaque type, whose value is carried and never looked \
+             inside (rule NoModel)",
+        ),
+        (
+            "",
+            "pub fn f(l: &Location<'_>) -> u32 { l.line() }\n",
+            "a call of `core::panic::location::Location::line`, a method of an opaque type that is not \
+             in the list of opaque functions (an opaque value is carried, never looked inside; rule \
+             NoModel)",
+        ),
+        (
+            "",
+            "pub fn f() -> &'static Location<'static> { Location::caller() }\n",
+            "a call of `core::panic::location::Location::caller`, a method of an opaque type that is \
+             not in the list of opaque functions",
+        ),
+        (
+            "",
+            "pub fn f(fm: &mut fmt::Formatter<'_>) -> u32 { fm.debug_struct(\"x\"); 0 }\n",
+            "a call of `core::fmt::Formatter::debug_struct`, a method of an opaque type that is not in \
+             the list of opaque functions",
+        ),
+        (
+            "",
+            "pub fn f() -> fmt::Result { Err(fmt::Error) }\n",
+            "a value of the opaque type `core::fmt::Error` built from its fields (an opaque type has no \
+             structure in the model; rule NoModel)",
+        ),
+        (
+            "",
+            "pub fn f(d: fmt::DebugStruct) -> u32 { 0 }\n",
+            "the standard library's type `DebugStruct`, which has no model and is not in the list of \
+             opaque types (rule NoModel)",
+        ),
+        (
+            ", str_methods",
+            "pub fn f(b: &[u8]) -> usize { unsafe { core::str::from_utf8_unchecked(b) }.len() }\n",
+            "a call of the standard library's `from_utf8_unchecked`, which has no model and is not in \
+             the list of opaque functions (rule NoModel)",
+        ),
+        (
+            "",
+            "#[derive(Debug)]\npub struct D;\n\
+             pub fn f(d: &D, fm: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(d, fm) }\n",
+            // The trait is the standard library's, so its call is modelled by name, and no model
+            // of `fmt` is: refused at the call of the derived impl.
+            "a call of the standard library's `fmt`, which has no model and is not in the list of \
+             opaque functions (rule NoModel)",
+        ),
+        (
+            "",
+            "pub fn f(fm: &mut fmt::Formatter<'_>, x: u32) -> fmt::Result { write!(fm, \"{}\", x) }\n",
+            "a call of the standard library's `new_display`, which has no model and is not in the list \
+             of opaque functions (rule NoModel)",
+        ),
+        (
+            ", try, from",
+            "pub fn f(r: Result<u32, io::Error>) -> Result<u32, io::Error> { let x = r?; Ok(x) }\n",
+            // `?` is `Try::branch`, which has no model yet: refused at it.
+            "a call of the standard library's `branch`, which has no model and is not in the list of \
+             opaque functions (rule NoModel)",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (extra, source, what) in cases {
+        let flags = format!("{OPAQUE_FLAGS}, str, write, derive{extra}");
+        let err = refused(&flags, "f", &format!("{uses}{source}"));
+        if !err.what.contains(what) {
+            wrong.push(format!("`{source}` is refused for {what}: {err}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

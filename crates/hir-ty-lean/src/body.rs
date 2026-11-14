@@ -156,6 +156,142 @@ pub enum Ty {
     /// `str`, behind any reference: its bytes (`lean/Blaze/Str.lean`'s `Str`), with the
     /// UTF-8 invariant not carried.
     Str,
+    /// A type of the standard library the model carries and never looks inside
+    /// ([`OPAQUE_TYPES`]): `lean/Blaze/Opaque.lean` declares it with no definition, so what is
+    /// proved of code that holds one holds whatever its values are.
+    Opaque(Opaque),
+}
+
+/// A type of the standard library the model takes as opaque: step 0 of
+/// docs/v2/plan/design/proofs-for-sans-io.md, section 3. One of [`OPAQUE_TYPES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Opaque {
+    IoError,
+    FmtError,
+    Formatter,
+    Arguments,
+    Location,
+    String,
+}
+
+/// An opaque type: what it is, its Lean name (in `lean/Blaze/Opaque.lean`, namespace
+/// `Blaze`), how Rust writes it, and why the model need not look inside it.
+pub struct OpaqueType {
+    pub opaque: Opaque,
+    pub lean: &'static str,
+    pub rust: &'static str,
+    pub why: &'static str,
+}
+
+/// The types the model carries without a structure: a value of one is moved, stored in a
+/// struct, an enum, an `Option`, a `Result` or a `Vec`, passed, returned and lent, and never
+/// inspected (no field, no `==`, no `Clone`, no method but those of [`OPAQUE_FUNCTIONS`]). Each is
+/// a Lean `opaque <name> : Type` (`lean/Blaze/Opaque.lean`): a constant the kernel never
+/// unfolds, so a proof cannot use what it is and holds for every meaning of it. A type is
+/// recognised by its lang item where it has one, else by its definition's path under its
+/// crate, as the pinned nightly's library defines it (`library/core/src/io/error.rs`,
+/// `library/core/src/fmt/mod.rs`); a type not here is refused by name.
+pub const OPAQUE_TYPES: &[OpaqueType] = &[
+    OpaqueType {
+        opaque: Opaque::IoError,
+        lean: "core.io.error.Error",
+        rust: "core::io::error::Error",
+        why: "`std::io::Error` (defined in core, `io::error`): an operating system's error, carried \
+              from the call that failed to the code that reports it",
+    },
+    OpaqueType {
+        opaque: Opaque::FmtError,
+        lean: "core.fmt.Error",
+        rust: "core::fmt::Error",
+        why: "the error of a formatter's write, carried in `fmt::Result`",
+    },
+    OpaqueType {
+        opaque: Opaque::Formatter,
+        lean: "core.fmt.Formatter",
+        rust: "core::fmt::Formatter",
+        why: "the formatter a `Display::fmt` or `Debug::fmt` writes to, lent by `&mut`; its value \
+              stands for the whole state of the writer behind it",
+    },
+    OpaqueType {
+        opaque: Opaque::Arguments,
+        lean: "core.fmt.Arguments",
+        rust: "core::fmt::Arguments",
+        why: "what `format_args!` makes (lang item `format_arguments`), given to a formatter",
+    },
+    OpaqueType {
+        opaque: Opaque::Location,
+        lean: "core.panic.location.Location",
+        rust: "core::panic::location::Location",
+        why: "a place in the source (lang item `panic_location`), carried to a report",
+    },
+    OpaqueType {
+        opaque: Opaque::String,
+        lean: "alloc.string.String",
+        rust: "alloc::string::String",
+        why: "an owned string (lang item `String`), carried only: it gets a model of its bytes \
+              later (step d), and until then nothing reads it",
+    },
+];
+
+impl Opaque {
+    fn entry(self) -> &'static OpaqueType {
+        OPAQUE_TYPES.iter().find(|it| it.opaque == self).expect("every opaque type is in the list")
+    }
+
+    /// Its Lean name, in namespace `Blaze`.
+    pub fn lean(self) -> &'static str {
+        self.entry().lean
+    }
+
+    /// Its path as the library defines it.
+    pub fn rust(self) -> &'static str {
+        self.entry().rust
+    }
+}
+
+/// The standard library's functions the model takes as opaque: a call of one is a call of a
+/// Lean `opaque` constant of its type, declared in a module of its own named by its Rust path
+/// at its instance ([`crate::opaque_module`]), giving a `Result` (it may panic or run forever:
+/// nothing assumes it returns). The model takes it as a function of its arguments, which is
+/// sound only for a Rust function whose result is fixed by them: each entry says why it is.
+/// A function is an inherent method of an [`OPAQUE_TYPES`] type, by that type and its name;
+/// every type its signature has at the instance must be modelled or opaque, else the call is
+/// refused naming the type. Any other call of the standard library with no model is refused by
+/// name (rule NoModel).
+pub const OPAQUE_FUNCTIONS: &[(Opaque, &str, &str)] = &[
+    (
+        Opaque::Formatter,
+        "write_str",
+        "`fmt.rs`: `self.buf.write_str(data)`. A `Formatter` is neither `Clone` nor `Copy` and \
+         is only lent, so each value of it is used once: its opaque value stands for the state \
+         of the writer behind it, what that writer will do included, and the result and the \
+         formatter after are a function of that value and the string",
+    ),
+    (
+        Opaque::Formatter,
+        "write_fmt",
+        "`fmt.rs`: `write(self.buf, fmt)`, or `write_str` of a string known statically. As \
+         `write_str`, with the arguments' values and their `fmt` (called through the \
+         arguments) held in the `Arguments`, which the formatter's single use makes a function \
+         of its inputs",
+    ),
+    (
+        Opaque::IoError,
+        "other",
+        "`alloc/src/io/error.rs`: `Self::new(ErrorKind::Other, error)`, an error of kind `Other` \
+         holding `error` boxed: its kind, message, source and payload are fixed by `error`; only \
+         the box's address differs between two calls, which no model reads",
+    ),
+];
+
+/// A call of an [`OPAQUE_FUNCTIONS`] function at an instance: its Lean name and Rust path, and
+/// its parameters' and result's types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueFn {
+    pub lean: String,
+    pub display: String,
+    pub params: Vec<Ty>,
+    pub result: Ty,
 }
 
 impl Ty {
@@ -177,7 +313,8 @@ impl Ty {
             | Ty::TryFromIntError
             | Ty::Duration
             | Ty::Ordering
-            | Ty::Str => {}
+            | Ty::Str
+            | Ty::Opaque(_) => {}
             Ty::Adt(name) => {
                 out.insert(name.clone());
             }
@@ -773,6 +910,8 @@ pub(crate) struct Lowered<'db> {
     /// The structs and enums whose derived `==` the body calls, or that a field of one holds:
     /// each gets a Lean `DecidableEq` instance ([`crate::eq_module`]).
     pub(crate) derives: BTreeSet<String>,
+    /// The opaque functions it calls ([`OPAQUE_FUNCTIONS`]), each once.
+    pub(crate) opaques: Vec<OpaqueFn>,
 }
 
 /// Why a `&mut` into a `Vec` (`v[i]`, `&mut v[..]`, `as_mut_slice`) is refused when it is not
@@ -1593,6 +1732,8 @@ struct Cx<'db> {
     /// environment that holds a capture by `&mut`, and the place the capture borrows. See
     /// [`Cx::give_back_lent`].
     lent: BTreeMap<Local, Vec<(String, Place)>>,
+    /// The opaque functions called, each once ([`OPAQUE_FUNCTIONS`]).
+    opaques: Vec<OpaqueFn>,
 }
 
 type Refused<T> = Result<T, NotTranslated>;
@@ -1716,6 +1857,9 @@ impl<'db> Cx<'db> {
                         ("Ordering", [cmp]) if cmp == "cmp" => return Ok(Ty::Ordering),
                         _ => {}
                     }
+                    if let Some(opaque) = self.opaque_adt(adt) {
+                        return Ok(Ty::Opaque(opaque));
+                    }
                     return match (name, args.len()) {
                         ("Option", 1) => {
                             Ok(Ty::Option(Box::new(self.ty(args.type_at(0), false, at)?)))
@@ -1728,7 +1872,7 @@ impl<'db> Cx<'db> {
                         _ => Err(self.refuse(
                             format!(
                                 "the standard library's type `{name}`, which has no model \
-                                 (rule NoModel)"
+                                 and is not in the list of opaque types (rule NoModel)"
                             ),
                             at,
                         )),
@@ -1768,6 +1912,34 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse(what, at));
             }
         })
+    }
+
+    /// The [`OPAQUE_TYPES`] type the standard library's struct `adt` is, if it is one: by its
+    /// lang item (`format_arguments`, `panic_location`, `String`), else by its own name and its
+    /// definition's modules under its crate (`io::error` for `Error`, `fmt` for `Error` and
+    /// `Formatter`), which is where the pinned nightly's library defines each (std re-exports
+    /// core's `io::Error`).
+    fn opaque_adt(&self, adt: AdtId) -> Option<Opaque> {
+        let AdtId::StructId(it) = adt else { return None };
+        let lang = self.interner.lang_items();
+        if Some(it) == lang.FormatArguments {
+            return Some(Opaque::Arguments);
+        }
+        if Some(it) == lang.PanicLocation {
+            return Some(Opaque::Location);
+        }
+        if Some(it) == lang.String {
+            return Some(Opaque::String);
+        }
+        let name = StructSignature::of(self.db, it).name.as_str().to_owned();
+        let module = module_path(self.db, adt.module(self.db)).split_off(1);
+        let module: Vec<&str> = module.iter().map(String::as_str).collect();
+        match (name.as_str(), module.as_slice()) {
+            ("Error", ["io", "error"]) => Some(Opaque::IoError),
+            ("Error", ["fmt"]) => Some(Opaque::FmtError),
+            ("Formatter", ["fmt"]) => Some(Opaque::Formatter),
+            _ => None,
+        }
     }
 
     /// The Lean name of the environment of the closure `id` at `args` ([`closure_of`]),
@@ -2351,6 +2523,14 @@ impl<'db> Cx<'db> {
             (VariantId::UnionId(_), _) => Err(self.refuse("a union", at)),
             // `Global` and `RangeFull`, the structs whose type is `()` ([`Cx::ty`]).
             (VariantId::StructId(_), Ty::Unit) if args.is_empty() => Ok(Rvalue::Use(Operand::Unit)),
+            (_, Ty::Opaque(opaque)) => Err(self.refuse(
+                format!(
+                    "a value of the opaque type `{}` built from its fields (an opaque type has no \
+                     structure in the model; rule NoModel)",
+                    opaque.rust()
+                ),
+                at,
+            )),
             (_, other) => Err(self.refuse(format!("a struct or enum value of type `{other:?}`"), at)),
         }
     }
@@ -2849,7 +3029,8 @@ impl<'db> Cx<'db> {
         let no_model = |this: &Self| {
             this.refuse(
                 format!(
-                    "a call of the standard library's `{name}`, which has no model (rule NoModel)"
+                    "a call of the standard library's `{name}`, which has no model and is not \
+                     in the list of opaque functions (rule NoModel)"
                 ),
                 at,
             )
@@ -2900,6 +3081,9 @@ impl<'db> Cx<'db> {
             let (of, _) = self.operand(&args[0], at)?;
             out.push(Stmt::Assign { place: dest, value: Rvalue::Use(of), at: at.to_owned() });
             return Ok(None);
+        }
+        if let Some(callee) = self.opaque_call(callee, generics, name, container, at)? {
+            return Ok(Some((callee, self.operands(args, at)?)));
         }
         match self.home(container) {
             Home::Int(int) => {
@@ -3118,6 +3302,64 @@ impl<'db> Cx<'db> {
             }
             Home::Module(_) | Home::Other => Err(no_model(self)),
         }
+    }
+
+    /// A call of an inherent method of an [`OPAQUE_TYPES`] type: the [`OPAQUE_FUNCTIONS`]
+    /// function it is, at its instance, put among the opaque functions called; a method not in
+    /// that list is refused by name, for it would look inside the value. `None` for a function
+    /// of no opaque type's inherent impl.
+    fn opaque_call(
+        &mut self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        container: ItemContainerId,
+        at: &str,
+    ) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let ItemContainerId::ImplId(imp) = container else { return Ok(None) };
+        if db.impl_trait(imp).is_some() {
+            return Ok(None);
+        }
+        let TyKind::Adt(def, _) = db.impl_self_ty(imp).skip_binder().kind() else { return Ok(None) };
+        let Some(opaque) = self.opaque_adt(def.def_id()) else { return Ok(None) };
+        if !OPAQUE_FUNCTIONS.iter().any(|it| it.0 == opaque && it.1 == name) {
+            return Err(self.refuse(
+                format!(
+                    "a call of `{}::{name}`, a method of an opaque type that is not in the list of \
+                     opaque functions (an opaque value is carried, never looked inside; rule \
+                     NoModel)",
+                    opaque.rust()
+                ),
+                at,
+            ));
+        }
+        // Its signature at the instance: every type in it modelled or opaque, else refused here
+        // naming the type. A `&mut` is taken at the top of a parameter, as a function's own.
+        let sig = db.callable_item_signature(callee.into()).instantiate(self.interner, generics).skip_norm_wip();
+        let sig = sig.skip_binder();
+        let mut params = Vec::new();
+        for input in sig.inputs().iter() {
+            params.push(self.ty(*input, true, at)?);
+        }
+        let result = self.ty(sig.output(), false, at)?;
+        let args = is_generic(db, callee).then_some(generics);
+        let named = match instance_name(db, callee, args) {
+            Ok(named) => named,
+            Err(why) => return Err(self.refuse(format!("a call of `{name}`, {why}"), at)),
+        };
+        let lean = named.lean.clone();
+        match self.opaques.iter().find(|it| it.lean == lean) {
+            None => self.opaques.push(OpaqueFn { lean: named.lean, display: named.display, params, result }),
+            Some(it) if it.display != named.display => {
+                return Err(self.refuse(
+                    format!("two functions with one Lean name, `{lean}` (`{}` and `{}`)", it.display, named.display),
+                    at,
+                ));
+            }
+            Some(_) => {}
+        }
+        Ok(Some(Callee::Function { name: lean }))
     }
 
     /// Whether `ty` is a `Vec`.
@@ -3518,6 +3760,14 @@ impl<'db> Cx<'db> {
                 if adt.krate(db).data(db).origin.is_lang() {
                     return match self.ty(ty, false, at)? {
                         Ty::Duration | Ty::Ordering | Ty::TryFromIntError | Ty::Unit => Ok(()),
+                        Ty::Opaque(opaque) => Err(self.refuse(
+                            format!(
+                                "{what} of `{}`, an opaque type, whose value is carried and never \
+                                 looked inside (rule NoModel)",
+                                opaque.rust()
+                            ),
+                            at,
+                        )),
                         Ty::Option(_) | Ty::Vec(_) => self.structural(method, args.type_at(0), which, seen, at),
                         Ty::Result(..) => {
                             self.structural(method, args.type_at(0), which, seen, at)?;
@@ -3805,6 +4055,7 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         derives: BTreeSet::new(),
         envs: BTreeMap::new(),
         lent: BTreeMap::new(),
+        opaques: Vec::new(),
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
@@ -3944,5 +4195,5 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         adts: cx.adts,
         nodes,
     };
-    Ok(Lowered { body, callees: cx.callees, derives: cx.derives })
+    Ok(Lowered { body, callees: cx.callees, derives: cx.derives, opaques: cx.opaques })
 }

@@ -122,13 +122,16 @@ use serde::{Deserialize, Serialize};
 /// (`blaze diagnostics --since`, `blaze agents hook`).
 /// 57: [`Request::Prove`] and [`Response::Proven`] ([`Proven`], [`ProofRecord`], [`Subset`]):
 /// `blaze prove`, the theorem functions of the crates selected translated to Lean and checked.
-/// 58: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
+/// 58: [`Subset::outcomes`] ([`SubsetFunction`], [`SubsetOutcome`]), each function of the
+/// sans-IO cores with its outcome by path, and [`Subset::generic`], the generic functions
+/// counted apart from the refused.
+/// 59: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
 /// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0; and
 /// [`Response::TestsOf`] ([`TestsOf`], [`Near`]): each test executable's count of tests, how
 /// many the filter left out, and the nearest names to a filter that matched none.
-/// 59: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
+/// 60: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
 /// name, and for a changed ask which one with its answers then and now.
-pub const SCHEMA: u32 = 59;
+pub const SCHEMA: u32 = 60;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -2170,12 +2173,37 @@ pub enum ProofRecord {
 /// (docs/v2/plan/design/proofs-for-sans-io.md, section 3).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Subset {
+    /// Generic functions, which the translator takes at each instance a theorem reaches and
+    /// alone at none: neither translated here nor refused.
+    pub generic: u32,
     /// Each refusal's `what` with the number of functions refused for it, most first (then by
     /// `what`). A function is counted under the first refusal the translator meets; how many
-    /// it would meet past that one is not known.
+    /// it would meet past that one is not known. A generic function is not among them: it is
+    /// counted in `generic`.
     pub refused: Vec<SubsetRefusal>,
+    /// Every function counted, with its outcome, sorted by path (two of one path, two impls'
+    /// methods of one name, in the item table's key order).
+    pub outcomes: Vec<SubsetFunction>,
+    /// Every function counted: `translated + generic` and the refused counts add up to it.
     pub functions: u32,
     pub translated: u32,
+}
+
+/// One function of a sans-IO core and what the translator made of it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SubsetFunction {
+    /// Its path (`blaze_core::world::disk::Disk::find`).
+    pub path: String,
+    pub outcome: SubsetOutcome,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum SubsetOutcome {
+    Translated,
+    /// A generic function: translated at each instance a theorem reaches, none asked for here.
+    Generic,
+    /// Refused for `what`, the first construct the translator does not take.
+    Refused { what: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

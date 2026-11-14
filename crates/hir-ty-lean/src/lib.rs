@@ -74,6 +74,7 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Duration", include_str!("../../../lean/Blaze/Duration.lean")),
     ("Blaze.Str", include_str!("../../../lean/Blaze/Str.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
+    ("Blaze.Opaque", include_str!("../../../lean/Blaze/Opaque.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
@@ -253,38 +254,46 @@ fn emit_in<'db>(
     let mut imports: Vec<Emitted> = body.adts.iter().map(type_module).collect();
     imports.extend(body.adts.iter().filter(|it| lowered.derives.contains(&it.name)).map(eq_module));
     let mut shapes = BTreeMap::new();
+    // What a callee imports comes first; a module two callees share is listed once.
+    let admit = |imports: &mut Vec<Emitted>, import: &Emitted| -> Result<(), NotTranslated> {
+        match imports.iter().find(|it| it.module == import.module) {
+            None => {
+                // Two modules whose files differ only by letter case are one file where the
+                // file system folds case (macOS's, by default).
+                if let Some(it) =
+                    imports.iter().find(|it| it.module.eq_ignore_ascii_case(&import.module))
+                {
+                    return Err(refuse(format!(
+                        "two modules whose files differ only by letter case, `{}` and `{}`",
+                        it.module, import.module
+                    )));
+                }
+                imports.push(import.clone());
+                Ok(())
+            }
+            // One module, two texts: two items with one Lean name (methods of two traits of one
+            // name from two modules, on one type; two instances whose arguments are written
+            // alike). Neither may stand for the other.
+            Some(it) if it.text != import.text => Err(refuse(format!(
+                "two functions with one Lean name, `{}` (`{}` and `{}`)",
+                import.name, it.function, import.function
+            ))),
+            Some(_) => Ok(()),
+        }
+    };
     for (callee_name, callee) in &lowered.callees {
         let callee = emit_in(db, *callee, stack)?;
         shapes.insert(callee_name.clone(), callee.shape.clone());
-        // What the callee imports comes first; a module two callees share is listed once.
         for import in callee.imports.iter().chain([&callee]) {
-            match imports.iter().find(|it| it.module == import.module) {
-                None => {
-                    // Two modules whose files differ only by letter case are one file where
-                    // the file system folds case (macOS's, by default).
-                    if let Some(it) = imports
-                        .iter()
-                        .find(|it| it.module.eq_ignore_ascii_case(&import.module))
-                    {
-                        return Err(refuse(format!(
-                            "two modules whose files differ only by letter case, `{}` and `{}`",
-                            it.module, import.module
-                        )));
-                    }
-                    imports.push(import.clone())
-                }
-                // One module, two texts: two items with one Lean name (methods of two traits
-                // of one name from two modules, on one type; two instances whose arguments are
-                // written alike). Neither may stand for the other.
-                Some(it) if it.text != import.text => {
-                    return Err(refuse(format!(
-                        "two functions with one Lean name, `{}` (`{}` and `{}`)",
-                        import.name, it.function, import.function
-                    )));
-                }
-                Some(_) => {}
-            }
+            admit(&mut imports, import)?;
         }
+    }
+    // An opaque function's module imports only the library and the modules of the types its
+    // signature names, which are among this body's, so it comes after them.
+    for opaque in &lowered.opaques {
+        let module = opaque_module(opaque);
+        shapes.insert(opaque.lean.clone(), module.shape.clone());
+        admit(&mut imports, &module)?;
     }
     stack.pop();
     let func = instance.func;
@@ -383,6 +392,7 @@ pub(crate) fn rust_ty(ty: &body::Ty) -> String {
         Ty::Duration => "core::time::Duration".to_owned(),
         Ty::Ordering => "core::cmp::Ordering".to_owned(),
         Ty::Str => "str".to_owned(),
+        Ty::Opaque(opaque) => opaque.rust().to_owned(),
     }
 }
 
@@ -476,6 +486,68 @@ pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
         statement: None,
         clauses: Vec::new(),
         shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        imports: Vec::new(),
+    }
+}
+
+/// The module of the opaque function `opaque` ([`body::OPAQUE_FUNCTIONS`]) at its instance,
+/// `BlazeModel.<its Lean name>`: `opaque <name> (a0 : A0) .. : Result R`, a Lean constant with
+/// no definition the kernel unfolds, so a proof about a caller holds whatever the function
+/// does. `R` is what a translated function of that signature gives: its result (unless `()`),
+/// then the value after of each `&mut` parameter; in `Result`, for it may panic or run
+/// forever. Lean's `opaque` needs only that the type is inhabited, which `Blaze.Opaque`'s
+/// `Inhabited (Result α)` (by `Result.div`) gives without an axiom; nothing is assumed of the
+/// function but its type. Being a constant, it gives one result for one set of arguments: why
+/// that is true of the Rust function is said by its entry in the list.
+pub fn opaque_module(opaque: &body::OpaqueFn) -> Emitted {
+    let module = format!("BlazeModel.{}", opaque.lean);
+    let about = vec![
+        format!(
+            "Generated by blaze ({TRANSLATOR}) from `{}`: an opaque function, declared with no \
+             definition.",
+            opaque.display
+        ),
+        "Do not edit: the functions that call it import this module.".to_owned(),
+    ];
+    let mut uses = std::collections::BTreeSet::new();
+    for ty in opaque.params.iter().chain([&opaque.result]) {
+        ty.adts(&mut uses);
+    }
+    let mut imports = vec!["Blaze".to_owned()];
+    imports.extend(uses.iter().map(|it| lean::ident(&type_module_name(it))));
+    let returns_unit = matches!(opaque.result, body::Ty::Unit | body::Ty::Never);
+    let mut gives = Vec::new();
+    if !returns_unit {
+        gives.push(translate::lean_ty(&opaque.result));
+    }
+    let mut mut_params = Vec::new();
+    for (at, ty) in opaque.params.iter().enumerate() {
+        if let body::Ty::RefMut(inner) = ty {
+            mut_params.push(at);
+            gives.push(translate::lean_ty(inner));
+        }
+    }
+    let gives = gives
+        .into_iter()
+        .rev()
+        .reduce(|rest, ty| infix(Infix::Prod, ty, rest))
+        .unwrap_or_else(|| name("Unit"));
+    let params = opaque
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, ty)| Binder { name: format!("a{at}"), ty: translate::lean_ty(ty) })
+        .collect();
+    let decl = Decl::Opaque { name: opaque.lean.clone(), params, ty: app("Result", vec![gives]) };
+    let text = Module { about, imports, decls: vec![decl] }.print();
+    Emitted {
+        function: opaque.display.clone(),
+        name: opaque.lean.clone(),
+        module,
+        text,
+        statement: None,
+        clauses: Vec::new(),
+        shape: Shape { fuel: false, monadic: true, mut_params, returns_unit },
         imports: Vec::new(),
     }
 }

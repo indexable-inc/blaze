@@ -7,8 +7,8 @@
 //! (`hir_ty_lean::emit`), each crate's proof files read from the view (`lean/` beside its
 //! `Cargo.toml`), and the plan of their check made (`hir_ty_lean::plan`): the files to write
 //! and the runs of Lean to make, each keyed by what its verdict depends on. With `--subset`,
-//! the translator's count over every function in a `#![blaze::sans_io]` module of those
-//! crates. The worker writes no file and starts no process: what it found is a [`Proving`].
+//! the translator's outcome for every function in a `#![blaze::sans_io]` module of those
+//! crates (translated, generic, or refused for what), by path, and their counts. The worker writes no file and starts no process: what it found is a [`Proving`].
 //!
 //! **On the loop** ([`Checking`], a [`Runs`]): the plan's files written under the build
 //! directory's `lean/` and each step run as an [`Effect::Spawn`] of the pinned Lean in
@@ -43,7 +43,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{ApiError, ProofRecord, Proven, Response, Subset, SubsetRefusal};
+use blaze_api::{ApiError, ProofRecord, Proven, Response, Subset, SubsetFunction, SubsetOutcome, SubsetRefusal};
 use blaze_cas::Store;
 use blaze_core::{Command, Completion, Done, Effect, FileName, Sandbox, Tag};
 use blaze_ids::ContentId;
@@ -125,9 +125,9 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
     let functions = functions_of(db, &members, subset);
 
     let mut records = Vec::new();
-    // `what` of each refusal of a core's function, counted below.
-    let mut refusals: Vec<String> = Vec::new();
-    let (mut in_cores, mut translated) = (0u32, 0u32);
+    // Each core's function with its outcome, in the order of `functions` (by path).
+    let mut outcomes: Vec<SubsetFunction> = Vec::new();
+    let (mut in_cores, mut translated, mut generic) = (0u32, 0u32, 0u32);
     let mut theorems: Vec<Vec<Emitted>> = members.iter().map(|_| Vec::new()).collect();
     for function in &functions {
         if job.cancelled() {
@@ -145,11 +145,20 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
         };
         if function.in_core && subset {
             in_cores += 1;
-            match &emitted {
-                Ok(_) => translated += 1,
-                // clone: one refusal's construct, counted once
-                Err(refused) => refusals.push(refused.what.clone()),
-            }
+            let outcome = match &emitted {
+                Ok(_) => {
+                    translated += 1;
+                    SubsetOutcome::Translated
+                }
+                Err(refused) if is_generic_unasked(refused) => {
+                    generic += 1;
+                    SubsetOutcome::Generic
+                }
+                // clone: one refusal's construct, kept once in the answer
+                Err(refused) => SubsetOutcome::Refused { what: refused.what.clone() },
+            };
+            // clone: the answer names each function once
+            outcomes.push(SubsetFunction { path: function.path.clone(), outcome });
         }
         if !function.theorem {
             continue;
@@ -192,7 +201,13 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
             plan,
         });
     }
-    let subset = subset.then(|| Subset { refused: counted(refusals), functions: in_cores, translated });
+    let subset = subset.then(|| Subset {
+        refused: counted(&outcomes),
+        outcomes,
+        functions: in_cores,
+        translated,
+        generic,
+    });
     Ok(Proving { emit, sandbox_off: job.sandbox_off(), out, records, subset, crates })
 }
 
@@ -337,14 +352,32 @@ fn function_of(record: &ProofRecord) -> &str {
     }
 }
 
-/// Each `what` with how many functions it refused, most first, then by `what`.
-fn counted(mut whats: Vec<String>) -> Vec<SubsetRefusal> {
+/// Whether the translator's refusal is its answer for a generic function asked for alone:
+/// not a refusal but "translated at each instance a theorem reaches", counted apart. The one
+/// place `blaze prove` tells it, by the translator's own text,
+/// `hir_ty_lean::body::GENERIC_UNASKED` (crates/hir-ty-lean/src/body.rs), which hir-ty-lean
+/// gives whole as the `what` of every such refusal.
+fn is_generic_unasked(refused: &NotTranslated) -> bool {
+    refused.what == hir_ty_lean::body::GENERIC_UNASKED
+}
+
+/// Each refused `what` among `outcomes` with how many functions it refused, most first, then
+/// by `what`.
+fn counted(outcomes: &[SubsetFunction]) -> Vec<SubsetRefusal> {
+    let mut whats: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|it| match &it.outcome {
+            SubsetOutcome::Refused { what } => Some(what.as_str()),
+            SubsetOutcome::Translated | SubsetOutcome::Generic => None,
+        })
+        .collect();
     whats.sort_unstable();
     let mut counted: Vec<SubsetRefusal> = Vec::new();
     for what in whats {
         match counted.last_mut() {
             Some(last) if last.what == what => last.count += 1,
-            _ => counted.push(SubsetRefusal { what, count: 1 }),
+            // clone: one line's construct, once per refusal counted
+            _ => counted.push(SubsetRefusal { what: what.to_owned(), count: 1 }),
         }
     }
     counted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.what.cmp(&b.what)));
