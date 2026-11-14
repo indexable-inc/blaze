@@ -122,9 +122,11 @@ proof does not wait for iterators and closures.
 used by every core's crash proof. Proved: `allows_orders` and `allows_total`
 (`BlazeCore/World/DiskAllows.lean`): a cut `allows` accepts that keeps, whole or in part, a
 change made after a barrier completed keeps whole all that barrier covers. Stated as theorem
-functions in disk.rs, run on drawn disks and cuts, not yet proved: a synced file survives
-every allowed crash; a file that is only appended to is cut to a prefix that holds all its
-durable bytes; a barrier and a later append are ordered. A loop of a model is specified as
+functions in disk.rs, run on drawn disks and cuts, and proved (`BlazeCore/World/Disk.lean`,
+2026-11-14): a synced file survives every allowed crash; a file that is only appended to is
+cut to a prefix that holds all its durable bytes; a barrier and a later append are ordered.
+The first attempt at the third found the statement false (nothing bounded a file's
+barriers), which no run of it could. A loop of a model is specified as
 an equation that holds with enough fuel, by induction on the fuel, and one constant fuel
 serves a whole theorem, since a slice is at most 2^64 - 1 long.
 

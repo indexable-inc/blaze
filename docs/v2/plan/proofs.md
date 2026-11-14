@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-104 theorems: 91 in `lean`, 13 in `lean/analysis`.
+106 theorems: 93 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -993,6 +993,20 @@ theorem sync_all (fuel : Nat) (f : File) (covers : Usize) (hs : Small f)
 ```lean
 theorem blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof :
     blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.statement
+```
+
+**`blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_cuts_an_appended_file_to_a_prefix holds of its model: from every well-formed disk within the bounds, a file whose changes not synced are all appends and that no crash may undo is, after every cut a crash is allowed to make, still there, begins with all its durable bytes and is a prefix of what it read as; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.proof :
+    blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.statement
+```
+
+**`blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof`** (`BlazeCore.World.Disk`, `lean`): The statement blaze generates from blaze-core's theorem function a_crash_keeps_a_synced_file holds of its model: from every well-formed disk within the bounds, once a sync of a file that covers all its changes has completed, after every cut a crash is allowed to make the file is there and reads as it did, whatever undone writes and renames of other files are put back; and nothing panics or fails to end.
+
+```lean
+theorem blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof :
+    blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.statement
 ```
 
 ## V15
