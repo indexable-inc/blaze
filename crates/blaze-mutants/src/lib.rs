@@ -27,8 +27,8 @@
 //! blaze's design removes the cost. A mutant is a replaced instance code record: one function's
 //! MIR rewritten after type checking (so it compiles by construction) and made at the fast tier
 //! in milliseconds. A program is a manifest patched in place, so a mutant program is one
-//! placement delta, never a link. A test result is a record keyed by what the test reaches
-//! (`blaze_program::reach::test_key`), so only the tests whose reach includes the mutated
+//! placement delta, never a link. A verdict covers what each test reaches
+//! (`blaze_program::reach::reach_digest`), so only the tests whose reach includes the mutated
 //! function run, cheapest-looking first, stopping at the first that fails.
 //!
 //! # The floor, and the cost against it

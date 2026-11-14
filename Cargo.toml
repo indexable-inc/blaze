@@ -566,6 +566,10 @@ blaze-ids = { path = "crates/blaze-ids" }
 blaze-keyed = { path = "crates/blaze-keyed" }
 # Lint findings as records, their three-class scheduler, wait modes and the adoption ladder.
 blaze-findings = { path = "crates/blaze-findings" }
+# The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
+# and the process that performs the driver's effects.
+blaze-unitkey = { path = "crates/blaze-unitkey" }
+blaze-host = { path = "crates/blaze-host" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }

@@ -2,6 +2,10 @@
 //! (the `Debug` pipeline, which spends nothing) and after (`Release`), what the body records,
 //! the calls that must stay as they are, and the evaluator giving the same outcome with and
 //! without. The refinement over random programs is `crate::facts::model`'s.
+//!
+//! No tier's pass list has `SpendFacts` for now (`hir_ty_mir::mir::passes_at` says why), so
+//! every test of the pass runs it through the one switch, `hir_ty_mir::mir::spend_facts_at`,
+//! in a database of its own ([`spending`]).
 
 use base_db::{Crate, Db};
 use hir_def::{AdtId, FunctionId, ModuleDefId, nameres::crate_def_map};
@@ -13,8 +17,8 @@ use hir_ty::{
     next_solver::{GenericArgs, TyKind},
 };
 use hir_ty_mir::mir::{
-    MirBody, MirOptLevel, MirOptions, OperandKind, TerminatorKind, interpret_mir,
-    relied_on_own_no_unwind, set_interpreter_mir_opt_level,
+    MirBody, MirOptLevel, MirOptions, OperandKind, Reaching, TerminatorKind, interpret_mir,
+    relied_on_own_no_unwind, runs, set_interpreter_mir_opt_level, spend_facts_at,
 };
 use intern::Symbol;
 use rustc_type_ir::inherent::IntoKind as _;
@@ -131,6 +135,19 @@ fn release() -> MirOptions {
     MirOptions::at(MirOptLevel::Release)
 }
 
+/// `run` over a database of `text` whose bodies at [`release`]'s tier run `SpendFacts`
+/// ([`spend_facts_at`]). The switch is no input of the optimized MIR's key, so the database is
+/// made after it is switched on and dropped before it is off: every body the database holds was
+/// built with the pass, and no body built without it is served in its place, nor the other way.
+fn spending<R>(text: &str, run: impl FnOnce(&Db) -> R) -> R {
+    let switch = spend_facts_at(release().tier);
+    let db = db_with(text);
+    let ran = run(&db);
+    drop(db);
+    drop(switch);
+    ran
+}
+
 /// The calls by name of the body's blocks off the unwind path: for each, whether it has an
 /// unwind edge.
 fn call_edges(body: &MirBody<'_>) -> Vec<bool> {
@@ -166,19 +183,21 @@ fn named_calls(body: &MirBody<'_>) -> usize {
         .count()
 }
 
-/// `check` given the `Debug` body and the `Release` body of the function `name` of `CALLS`.
+/// `check` given the `Debug` body and the `Release` body of the function `name` of `CALLS`,
+/// the `Release` one built with `SpendFacts` switched on ([`spending`]).
 #[track_caller]
 fn bodies(name: &str, check: impl FnOnce(&Db, FunctionId, &MirBody<'_>, &MirBody<'_>)) {
-    let db = db_with(CALLS);
-    let func = fn_named(&db, crate_named(&db, "kernel"), name);
-    blaze_query::db::attach(&db, || {
-        let before = db
-            .optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
-            .unwrap_or_else(|error| panic!("`{name}` at Debug: {error:?}"));
-        let after = db
-            .optimized_mir_body(func.into(), release())
-            .unwrap_or_else(|error| panic!("`{name}` at Release: {error:?}"));
-        check(&db, func, before, after);
+    spending(CALLS, |db| {
+        let func = fn_named(db, crate_named(db, "kernel"), name);
+        blaze_query::db::attach(db, || {
+            let before = db
+                .optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
+                .unwrap_or_else(|error| panic!("`{name}` at Debug: {error:?}"));
+            let after = db
+                .optimized_mir_body(func.into(), release())
+                .unwrap_or_else(|error| panic!("`{name}` at Release: {error:?}"));
+            check(db, func, before, after);
+        });
     });
 }
 
@@ -231,9 +250,18 @@ fn an_unwind_edge_stays_where_nothing_proves_the_callee() {
 
 #[test]
 fn a_repeated_call_of_a_pure_function_takes_the_firsts_result() {
-    // The premises, each its own failure: the body is built at the tier `SpendFacts` runs at,
-    // and the callee is proved pure under the proofs that tier spends.
-    assert_eq!(release().tier, Tier::Optimizing, "`SpendFacts` runs only at the optimizing tier");
+    // The premises, each its own failure: the pass runs only where the test switch turns it on
+    // (no tier lists it), `bodies` turns it on at the tier it builds the `Release` body at, and
+    // the callee is proved pure under the proofs that tier spends.
+    let repeats = Reaching::SpendFactsRepeats;
+    assert!(
+        !runs(release().tier, repeats),
+        "`SpendFacts` runs only where the test switch turns it on"
+    );
+    {
+        let _switch = spend_facts_at(release().tier);
+        assert!(runs(release().tier, repeats), "the switch `bodies` turns on runs `SpendFacts`");
+    }
     let pure = |db: &Db, name: &str| {
         let func = fn_named(db, crate_named(db, "kernel"), name);
         let facts = facts_of(db, FactItem::Fn(func), proofs_at(release().tier));
@@ -289,13 +317,14 @@ fn returns(db: &Db, name: &str, level: MirOptLevel) -> bool {
 
 #[test]
 fn the_evaluator_ends_the_same_with_facts_spent() {
-    let db = db_with(CALLS);
-    for (name, want) in
-        [("run_quiet", true), ("run_loud", false), ("run_twice_loud", false), ("run_dyn", false)]
-    {
-        assert_eq!(returns(&db, name, MirOptLevel::Off), want, "`{name}` as written");
-        assert_eq!(returns(&db, name, MirOptLevel::Release), want, "`{name}` with facts spent");
-    }
+    spending(CALLS, |db| {
+        for (name, want) in
+            [("run_quiet", true), ("run_loud", false), ("run_twice_loud", false), ("run_dyn", false)]
+        {
+            assert_eq!(returns(db, name, MirOptLevel::Off), want, "`{name}` as written");
+            assert_eq!(returns(db, name, MirOptLevel::Release), want, "`{name}` with facts spent");
+        }
+    });
 }
 
 const TYPES: &str = r#"
@@ -518,59 +547,88 @@ pub fn checked(v: &[u32; 4], a: usize) -> u32 {
 "#;
 
 /// How many effect summaries and proofs building `checked`'s optimized MIR with `options`
-/// made, in a database of its own, `planted` with `SpendFacts` left in tier 0's list.
-fn summaries_and_proofs(options: MirOptions, planted: bool) -> (u64, u64) {
+/// made, in a database of its own, with `SpendFacts` switched on at `spend_facts` if it is
+/// `Some` ([`spend_facts_at`]: at `Tier::Zero`, the planted bug of the tier 0 control). The
+/// database is made after the switch and dropped before it, as [`spending`]'s.
+fn summaries_and_proofs(options: MirOptions, spend_facts: Option<Tier>) -> (u64, u64) {
+    let switch = spend_facts.map(spend_facts_at);
     let db = db_with(PROVABLE);
     let func = fn_named(&db, crate_named(&db, "kernel"), "checked");
-    blaze_query::db::attach(&db, || {
-        hir_ty_mir::mir::plant_facts_at_tier_zero(planted);
+    let counted = blaze_query::db::attach(&db, || {
         let (((), proofs), summaries) = crate::walk::plant::counting_summaries(|| {
             crate::walk::plant::counting_proofs(|| {
                 db.optimized_mir_body(func.into(), options)
                     .unwrap_or_else(|error| panic!("`checked` with {options:?}: {error:?}"));
             })
         });
-        hir_ty_mir::mir::plant_facts_at_tier_zero(false);
         (summaries, proofs)
-    })
+    });
+    drop(db);
+    drop(switch);
+    counted
 }
 
 /// The invariant: building a tier 0 body runs no pass whose input is a whole-program summary:
 /// `checked`'s optimized MIR at tier 0, at level 2 with the inliner asked for (as the library's
 /// bodies were under a tier 0 unit), over a call tree four deep, computes zero effect
 /// summaries and runs the prover zero times. The control is the planted bug, `SpendFacts`
-/// left in tier 0's list: the same build then makes summaries, so the zero is the list's and
-/// not the fixture's. The optimizing tier makes them and spends proofs.
+/// switched on at tier 0: the same build then makes summaries, so the zero is the list's and
+/// not the fixture's. The optimizing tier, whose list has no `SpendFacts` for now
+/// (`passes_at`), makes none either; switched on there, the pass makes them and spends proofs.
 #[test]
 fn a_tier_zero_body_computes_no_effect_summary() {
     let zero = MirOptions { inline: true, tier: Tier::Zero, ..release() };
     assert_eq!(proofs_at(Tier::Zero), Proofs::None, "tier 0 spends no proof");
-    assert_eq!(summaries_and_proofs(zero, false), (0, 0), "a tier 0 body asked for summaries");
-    let (planted, _) = summaries_and_proofs(zero, true);
+    assert_eq!(summaries_and_proofs(zero, None), (0, 0), "a tier 0 body asked for summaries");
+    let (planted, _) = summaries_and_proofs(zero, Some(Tier::Zero));
     assert!(planted > 0, "the planted bug (`SpendFacts` at tier 0) is not caught");
     let optimizing = MirOptions { tier: Tier::Optimizing, ..zero };
-    let (summaries, proofs) = summaries_and_proofs(optimizing, false);
-    assert!(summaries > 0 && proofs > 0, "the optimizing tier spends facts: {summaries}, {proofs}");
+    assert_eq!(
+        summaries_and_proofs(optimizing, None),
+        (0, 0),
+        "an optimizing body asked for summaries, though no tier runs `SpendFacts`"
+    );
+    let (summaries, proofs) = summaries_and_proofs(optimizing, Some(Tier::Optimizing));
+    assert!(
+        summaries > 0 && proofs > 0,
+        "`SpendFacts` switched on at the optimizing tier spends facts: {summaries}, {proofs}"
+    );
 }
 
 /// The invariant: what each tier runs is what `passes_at` declares and the design says
 /// (docs/v2/plan/design/tiers.md): nothing that reads past the body at tier 0, rustc's
-/// inliner for the library as shipped, every pass at the optimizing tier, and no pass on facts
-/// anywhere but there.
+/// inliner for the library as shipped, every pass but `SpendFacts` at the optimizing tier,
+/// and `SpendFacts` at no tier for now, run only where the test switch names the tier. Only
+/// the optimizing tier spends proofs: the pass's facts, when the switch runs it there.
 #[test]
 fn each_tier_runs_the_passes_its_declaration_lists() {
     use hir_ty_mir::mir::{Reaching::*, passes_at};
     assert!(passes_at(Tier::Zero).is_empty(), "{:?}", passes_at(Tier::Zero));
     assert_eq!(passes_at(Tier::Shipped), &[Inline, Specialize]);
-    assert_eq!(
-        passes_at(Tier::Optimizing),
-        &[Inline, Devirtualize, SpendFactsUnwind, SpendFactsRepeats, Specialize]
-    );
-    for tier in [Tier::Zero, Tier::Shipped, Tier::Optimizing] {
-        let facts =
-            passes_at(tier).iter().any(|it| matches!(it, SpendFactsUnwind | SpendFactsRepeats));
-        assert_eq!(facts, tier == Tier::Optimizing, "{tier:?} spends facts");
-        assert_eq!(proofs_at(tier) == Proofs::Spent, facts, "{tier:?}'s proofs follow its passes");
+    assert_eq!(passes_at(Tier::Optimizing), &[Inline, Devirtualize, Specialize]);
+    let tiers = [Tier::Zero, Tier::Shipped, Tier::Optimizing];
+    for tier in tiers {
+        for &pass in passes_at(tier) {
+            assert!(runs(tier, pass), "{tier:?} lists {pass:?} and does not run it");
+        }
+        for pass in [SpendFactsUnwind, SpendFactsRepeats] {
+            assert!(!passes_at(tier).contains(&pass), "{tier:?} lists {pass:?}");
+            assert!(!runs(tier, pass), "{tier:?} runs {pass:?} with the switch off");
+            // The control: the switch at this tier runs it there and at no other tier, and
+            // dropped, it runs nowhere again.
+            let switch = spend_facts_at(tier);
+            assert!(runs(tier, pass), "the switch at {tier:?} does not run {pass:?}");
+            for other in tiers.into_iter().filter(|it| *it != tier) {
+                assert!(!runs(other, pass), "the switch at {tier:?} runs {pass:?} at {other:?}");
+            }
+            drop(switch);
+            assert!(!runs(tier, pass), "the switch at {tier:?} outlived its guard");
+        }
+        assert_eq!(
+            proofs_at(tier) == Proofs::Spent,
+            tier == Tier::Optimizing,
+            "{tier:?}'s proofs: only the optimizing tier spends them"
+        );
     }
 }
 

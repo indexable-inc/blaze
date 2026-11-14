@@ -1297,6 +1297,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-host"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-core",
+ "blaze-format",
+ "blaze-graph",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-vfs",
+ "crossbeam-queue",
+ "hegeltest",
+ "tracing",
+]
+
+[[package]]
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
@@ -1487,7 +1503,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-format",
  "blaze-ids",
- "blaze-sim",
+ "blaze-rng",
+ "hegeltest",
 ]
 
 [[package]]
@@ -2342,10 +2359,14 @@ dependencies = [
  "blaze-api",
  "blaze-cas",
  "blaze-core",
+ "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-protocol",
+ "blaze-rng",
  "blaze-usercode",
+ "hegeltest",
 ]
 
 [[package]]
@@ -2398,6 +2419,19 @@ dependencies = [
  "blaze-v2-proof",
  "blaze-vfs",
  "serde_json",
+]
+
+[[package]]
+name = "blaze-unitkey"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-ids",
+ "blaze-keyed",
+ "cfg",
+ "hegeltest",
+ "intern",
+ "syntax",
 ]
 
 [[package]]

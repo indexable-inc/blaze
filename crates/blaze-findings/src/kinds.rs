@@ -9,11 +9,11 @@
 //! | [`DeferredFindings`] | 19 | tool, pass, item, digests of everything it read | key | opaque |
 //!
 //! No key covers a level, a group or the ratchet: those are the view's. A body findings record
-//! is the body check's sibling: its key is the body's key (which covers the body's text and the
-//! closure of every name it mentions) and the keys of the summaries of other items the pass
+//! is the body check's sibling: its key is the body record's result digest (what the body's
+//! check made, found by what it read) and the keys of the summaries of other items the pass
 //! reads (a callee's effect summary, known from the body's record before the pass runs), so an
-//! equal key is the finding with no other check; a key miss with an unchanged read list files
-//! the old record under the new key, byte for byte (`Trace::Reuse`).
+//! equal key is the finding with no other check, and an edit that leaves the body's check equal
+//! finds the findings under the same key: nothing is refiled.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]

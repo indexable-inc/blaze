@@ -1787,6 +1787,9 @@ impl<'db> Ty<'db> {
                                 trait_bounds_need_parens,
                             )?;
                         }
+                        // An anonymous parameter (`#![feature(blaze_anon_params)]`) is
+                        // shown as it is written.
+                        TypeParamProvenance::Anonymous => write!(f, "_")?,
                     },
                     TypeOrConstParamData::ConstParamData(p) => {
                         write!(f, "{}", p.name.display(f.db, f.edition()))?;

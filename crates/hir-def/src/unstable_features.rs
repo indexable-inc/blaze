@@ -110,4 +110,20 @@ define_unstable_features! {
     blaze_const_exprs,
     // blaze's native verification clauses (`docs/v2/plan/design/verus.md`).
     blaze_verify,
+    // blaze's implied bounds: the bounds a type's or a trait's definition declares hold where
+    // an item's header names it (`docs/v2/plan/design/implied-bounds.md`).
+    blaze_implied_bounds,
+    // blaze's anonymous parameters: a `_` in a function's parameter types or an impl's header
+    // is a type parameter of the item (`docs/v2/plan/design/implied-bounds.md`); it implies
+    // `blaze_implied_bounds` ([`UnstableFeatures::implied_bounds`]).
+    blaze_anon_params,
+}
+
+impl UnstableFeatures {
+    /// Whether the crate's items get the bounds their headers imply: `blaze_implied_bounds`,
+    /// or `blaze_anon_params`, whose `_` is bounded by them and nothing else.
+    #[inline]
+    pub fn implied_bounds(&self) -> bool {
+        self.blaze_implied_bounds || self.blaze_anon_params
+    }
 }

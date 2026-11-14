@@ -1,14 +1,15 @@
 ---
 status: plan
-summary: The fresh core. One process per command answers from records keyed from text before the work, each with the read list its work made; no daemon, no query graph, no memory admission. Says the scope, the processes, verifying once, the records and their key rules, memory, positions, sharing and remote execution, what is deleted and reused, the order, the floors and how the finished system is judged. Interface crate crates/blaze-keyed.
+summary: The fresh core. One process per command answers from records keyed from text before the work and filed at the address of what their work read; no daemon, no query graph, no memory admission. Says the scope, the processes, verifying once, the records and their key rules, memory, positions, sharing and remote execution, what is deleted and reused, the order, the floors and how the finished system is judged. Interface crate crates/blaze-keyed.
 date: 2026-11-13
 ---
 # The target: records keyed before the work, in processes that die
 
 Owner: the main agent, on the owner's instruction. Built from the outside audit
 (`/Volumes/Projects/blaze-int-1112-notes/audit-1113.md`) and `target-decisions-1113.md` beside it
-(which holds where they differ), and Relax (MIT; its key rules copied with credit in
-`crates/blaze-keyed/src/text.rs`). Supersedes `end-state.md` and `end-state/`. Every number is an
+(which holds where they differ), and Relax (MIT; its text-closure key rules were copied with
+credit into blaze-keyed's `text.rs`, deleted under decision D39: a derived record is found by
+what it read, read-addressed.md). Supersedes `end-state.md` and `end-state/`. Every number is an
 **estimate**. The owner: "dont measure just build": nothing waits for a measurement.
 
 **The order when two things trade** (the owner, for "a huge mono repo, a million lines of rust"):
@@ -69,60 +70,64 @@ cores, 16-64 GB). One code path sized by a machine descriptor (`blaze_keyed::mac
   task's frame; plain arrays are mapped.
 - Every record's root starts with a head: the full 32-byte key, the kind's tag and version.
 
-| Record (`Kind`) | Key, computed before the work | Contents |
-|---|---|---|
-| Certificate | tool, request base (blaze-certify) | what the last answer read |
-| FileImage | tool, edition, file bytes | tokens, flat tree, piece hashes, names, line table |
-| Surface | tool, settings, own pieces, dep surface keys, late reads | scopes, exports, impl index by (trait, simplified self), signatures, fields, layouts, const values: one digest per exported fact; import table; read in place |
-| Body | text-closure key (below) | inference, MIR, borrow-check verdict, item-relative diagnostics; read list |
-| Instance | body *result* digest, type-argument keys, settings, inlinees' instance keys | code |
-| Expansion | expander code id, input tokens, attribute, visible context | tokens |
-| ScriptRun, TestRun | script program / reached instances, package, declared env, settings | outputs; traced outside reads |
-| UnitManifest | file keys, late reads, dep manifest keys | (item, kind, key) of every record of the unit |
-| ProgramManifest | link settings, instance keys | the instances; image digest |
+| Record (`Kind`) | Key, computed before the work | Filed at | Contents |
+|---|---|---|---|
+| Certificate | tool, request base | its shape's answers (outside form) | the manifest roots, in plan order |
+| FileImage | tool, edition, file bytes | the key | tokens, flat tree, piece hashes, names, line table |
+| Surface | tool, settings, unit, own pieces | key + its shape's answers | one digest per exported fact (and the unit's seen row), sorted, read in place; its shape |
+| Body | tool, settings, unit, item, own text | key + its shape's answers | inference, MIR, verdict, item-relative diagnostics; the facts it makes; its shape |
+| Shape | (a trie node) | `shape_root(key)`, then `shape_next(address)` | the fact ids one run of the key asked |
+| UnitManifest | tool, settings, unit, file keys, late reads | its content | the root: dictionary, files, surface, made facts and their makers |
+| UnitChunk | (one per file) | its content | entries (item, key, address, shape as ordinals), postings |
+| Mark | the unit's text key, its view (its deps' universe digests) | the key | the manifest root, the surface, the universe digest |
+| Instance | body *result* digest, type-argument keys, settings, inlinees' instance keys | the key | code |
+| Expansion | expander code id, input tokens, attribute, visible context | outside form | tokens |
+| ScriptRun, TestRun | script program / reached instances, package, declared env, settings | outside form | outputs; traced outside reads |
+| ProgramManifest | link settings, instance keys | the key | the instances; image digest |
 
-Validity is two traces, both built from the start:
+Validity is two traces, both built from the start (decision D39, read-addressed.md):
 
-- **The key** (trace a), computed from text before the work: an equal key is a hit, no check.
-- **The read list** (trace b), recorded while the work ran: (fact id, digest) at item grain,
-  absence a read (a signature, fields, a layout, impl rows for (trait, self head), a binding in a
-  scope, a const's value, the record's own text, a late input). On a key miss the driver checks
-  the list of the record the last manifest names for the item against the current surfaces (an
-  O(1) lookup per read in a mapped fact table): all equal, and the old result is filed under the
-  new key, byte for byte what redoing it writes; else the body is redone. No reverse index, no
-  postings, no dependency graph: candidates are found forward. Cost: candidates × reads compares,
-  and the lists on disk, accepted because disk is last.
+- **The key** (trace a), computed from text before the work: what the record is (its own text and
+  settings), never what it reads. An equal key with equal answers is the same address.
+- **The shape** (trace b), recorded while the work ran: the sorted set of (fact id, digest) it
+  asked, absence a digest too (a signature, fields, a layout, impl rows for (trait, self head), a
+  binding in a scope, a const's value, a late input). The record is filed at
+  `H(key, shape ids, answers)`. To find it again, the driver answers a candidate shape now (one
+  lookup per fact in a mapped table, `front::Universe::answer`) and reads that address: a hit is
+  the record, with nothing refiled or copied; an undone edit finds its old record. Candidates
+  are the item's last shape (from its unit's chunk), then its key's shape trie, at most 64 nodes.
+- **Postings** inside a unit say which items read a fact; a unit's dictionary holds every fact
+  its records read from outside it. A unit whose dependencies' universe digests and text are as
+  they were is settled by its mark: one lookup.
 
 **Key rules, exactly.**
 
-- A text-closure key covers the item's own text (piece and body, with its crate's identity);
-  each name the text mentions, with the closure of every node found under it in the crate's
-  universe (Relax's rules; an absent name is a key too); the crate's "always" closure (glob and
-  `as _` imports, inner attributes, unexpanded item macros); late values (`env!`, `option_env!`,
-  `include*!`) and the expansions' keys; the sysroot as one unit; and the toolchain identity
-  (blaze and its pinned nightly, the target, the namespace). Nothing of the machine: no path,
-  host name, time or address.
-- Coarse, or a body counted as interface (it joins the piece, so its readers' keys move with it):
-  a macro outside item position not on the quiet list (the crate's whole print); const fn, async
-  fn and return-position `impl Trait` bodies; generic and `#[inline]` bodies instantiated
-  elsewhere; trait impls selected by method calls, through the impl index under the self type's
-  names (the trait's name for a generic, primitive, alias or non-path self), narrowed to impls of
-  types reachable from the types the body names, plus blanket impls.
-- Soundness (rule 21): (a) a checker can only look up names its text mentions and types in their
-  closure, and the key covers each by content, absences included; (b) a read list is exactly
-  what was read, negative reads included, its first read the record's own text, and reuse needs
-  every one unchanged. The simulation holds both to a from-scratch build.
-- The honest over-approximation: a signature edit to a common name (`new`, `from`) moves the key
-  of every body in the universe that mentions it; each is a candidate (a fetch and a compare), and
-  only the N true dependents of the C are redone.
-- Firewalls: a body edit changes no surface fact, so no other crate is looked at. What crosses: a
-  signature, a field, an impl, a const's value, an inlinable body's code key (code records only).
-- Content-addressed code, as Unison has it, at the grain that keeps edits fast: an item's key is a
-  hash over its own text and the interface digests of what it names (a DAG of hashes); code
-  records are shared by content across crates, versions and machines; names and positions are not
-  code identity. Not taken: a body's key holds the interfaces of what it calls, not their bodies
-  (for code, only the bodies it inlined), because holding bodies would re-key every caller on
-  every body edit. Source stays in files.
+- A key covers what the record is, never what it reads: the item's own text (piece and body,
+  with its unit's identity), the settings, and the toolchain identity (blaze and its pinned
+  nightly, the target, the namespace); a unit's text key adds its file images and its late
+  values (`env!`, `option_env!`, `include*!`). Nothing of the machine: no path, host name, time
+  or address. Names a text mentions are not in its key: what they resolve to is read, and so in
+  the shape.
+- A fact belongs to its owner: a surface's to its unit (the id's first eight bytes are the
+  owner's), a made fact (a const's value, a hidden type, what escapes a body, its effects) to the
+  unit whose body makes it, listed with its maker in the unit's manifest root; what the asking
+  unit sees as a whole is its own surface's row, else its seen row; a late read is the
+  request's. A maker settles before its readers; an edge found only on a redo redoes the reader;
+  a cycle is `Failure::MadeCycle` naming the items.
+- A unit's mark is keyed by its text key and its view (its direct dependencies' universe
+  digests), never by another record's key; the universe digest hashes its surface result, its
+  made table and its dependencies' universe digests.
+- Soundness (rule 21): a record's shape is every fact its work asked, absences included, and
+  what the work asks first depends only on its key. Then equal answers mean the same questions
+  and the same result, so any candidate shape is sound to try. The simulation holds the driver to
+  a from-scratch build with a model that reads by value, and the `Audit` memo redoes every hit
+  and compares bytes.
+- Firewalls: a body edit changes no surface fact, so no other unit is looked at unless a fact it
+  makes moved. What crosses: a signature, a field, an impl, a const's value, an inlinable body's
+  code key (code records only).
+- Content-addressed code, as Unison has it, at the grain that keeps edits fast: code records are
+  shared by content across crates, versions and machines; names and positions are not code
+  identity. Source stays in files.
 
 ## In memory
 
@@ -181,10 +186,10 @@ twice cannot be written and skipping it cannot either.
   branded with what it is valid for (the snapshot, the boot, the generation) so it cannot outlive
   it. Checking consumes the unchecked value and returns the proof.
 - A coarse proof covers everything under it: a certified request checks nothing below; an
-  unchanged surface means no dependent is looked at; a holding unit manifest settles every body it
-  names; only under a parent that moved is the next level compared.
-- An equal key is followed by no other check. A read list is verified at most once per (item,
-  snapshot), and its result is filed under the new key so the next request hits by key.
+  unchanged universe digest means no dependent is looked at; a mark that holds settles its unit
+  and every record its manifest names; only under a parent that moved is the next level compared.
+- A record read at the address its shape's answers make is followed by no other check; a shape
+  is answered at most once per (item, snapshot), and nothing is refiled.
 - Bytes are verified once: a segment this process wrote is trusted; one from an earlier boot is
   checked in full once, recorded in the manifest; a fetched one's signature and digest at fetch,
   recorded. A read of a record in a verified segment checks nothing.
@@ -198,10 +203,10 @@ twice cannot be written and skipping it cannot either.
 
 A lint finding is a record keyed like the check it comes from, never a side effect of one.
 
-- **Records.** Per (body, pass): `BodyFindings` (tag 20, key = toolchain, body key, pass id and
+- **Records.** Per (body, pass): `BodyFindings` (tag 16, key = toolchain, body key, pass id and
   version, and the ids of what the pass read beyond the body). Per item for a workspace fold:
-  `ItemRows` (21, same key). The fold's leaves: `FoldFindings` (22, key = pass, scope, leaf,
-  rows digest). An analysis that reads beyond its item: `DeferredFindings` (23, key = pass,
+  `ItemRows` (17, same key). The fold's leaves: `FoldFindings` (18, key = pass, scope, leaf,
+  rows digest). An analysis that reads beyond its item: `DeferredFindings` (19, key = pass,
   item, the ids it read). A finding holds the lint, its item, a range relative to the item, a
   message id with typed arguments and a fix of item-relative edits; no level and no file
   position, so a level change or a moved item re-keys nothing. Its id hashes the lint, item,
@@ -252,7 +257,7 @@ A lint finding is a record keyed like the check it comes from, never a side effe
 1. In parallel: this page and `blaze-keyed`; the store's physical form; the in-process mode; the
    lints, positions and text keys ported.
 2. In parallel on `blaze-keyed`, as new crates beside the old code: the front end over surface
-   images; body records with key and read list; `blaze-memo`; `blaze-program` (instance records,
+   images; body records with key and shape; `blaze-memo`; `blaze-program` (instance records,
    the streaming monomorphization walk, programs as patched manifests); `blaze-expansion`
    (macro-call and script-run records); test records.
 3. Deletions, each after its replacement passes. 4. The fetch seam with std's records; the matrix.
@@ -261,8 +266,10 @@ A lint finding is a record keyed like the check it comes from, never a side effe
 
 - Both traces from the start, not keys alone: incremental time comes first and disk last. A unit
   manifest is filed after every record it names, so one read settles a unit.
-- An instance is keyed by its body's *result* digest, so a reuse keeps its code; a reuse is a
-  re-headed byte copy, not a pointer record (one read later, not two).
+- An instance (and its plan) is keyed by its body's *result* digest, so a body found at a new
+  address with the same result keeps its code.
+- At the certificate's 64 shapes the request ends `Built { filed: Full }`: it costs the next
+  request a mark lookup per unit, not a failed build (before D39 the cap failed the request).
 - Commands run `RecordsOnly`; a build's helper `Resident`. The crate is `blaze-keyed`:
   `blaze-record` (the read-list form it replaces) has the name.
 
@@ -275,15 +282,16 @@ Floor: an oracle that redoes only what changed and its direct readers, plus unav
 | No-op | journal read + certificate: 2 ms | 3-5 ms | 3-5 ms (FSEvents) | ~2 |
 | Comment edit | reparse one file + line table | + manifest key, all hits: 5-10 ms | same | ~1.2 |
 | Private body edit | one body check | start + key + 1 body + 1 instance: 10-30 ms | 15-40 ms | ~1.2 |
-| Signature edit, N of C | N bodies | N bodies + C read-list compares (~1 µs each) | same, fewer cores | ~1.1 at C ≤ 100N |
+| Signature edit, N readers | N bodies | N bodies + the units' dictionary rows answered + N shape answers | same, fewer cores | ~1.1 |
 | Add an item | its body + names now found | the same as a signature edit of its name | same | ~1.1 |
 | Add a derive | one expansion + its item | one Wasmtime call + the derived items | same | ~1.2 |
 | Restart then edit | the edit | the edit (no state to restore) | same | ~1 |
 | Memory between edits | 0 private | 0 one-shot; file-backed pages when resident | same | ~1 |
-| Disk | the records | records + read lists + a 40 B index entry each | same | ~1.3 |
+| Disk | the records | records + shapes + chunks and a mark per unit state | same | ~1.3 |
 
-What cannot reach the floor, plainly: the over-approximation of a common name's signature edit
-costs C − N compares on top of the floor. That is cheap per compare, but unbounded in C.
+What cannot reach the floor, plainly: a unit whose dependency moved answers every row of its
+dictionary owned by others (r lookups), where the floor is the changed facts; the rows are not
+indexed by the dependency fact that moved. Bounded by the unit's own reads.
 
 ## What blaze must do that Relax does not, and its cost here
 
@@ -304,6 +312,9 @@ costs C − N compares on top of the floor. That is cheap per compare, but unbou
   `Kind::KEEP`. Each result names its tree and binary and is reported against its floor.
 - The correctness gate is the simulation (`crates/blaze-keyed/src/tests.rs`). It runs generated
   edits, restarts and kills under both memos. Every hit and every reuse must equal a from-scratch
-  build, and `Resident` must refine `RecordsOnly`. Six planted bugs are caught: a name left out
-  of a key, late inputs left out, a dropped read, an over-committed pool, an early manifest, and a
-  stale resident entry.
+  build, `Resident` must refine `RecordsOnly`, and `Audit` faults on nothing. Each plant in
+  `blaze_keyed::Plant` is caught by name (late inputs left out of a key, a dropped read, a dropped
+  absence, a hit that does not replay, a made fact not asked, a dictionary missing a fact, a
+  reader before its maker, an over-committed pool, two values at one address, an early
+  manifest, a stale resident entry, a lookup under a mark), and a case no run reaches fails by
+  name.

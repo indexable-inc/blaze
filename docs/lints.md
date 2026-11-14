@@ -828,6 +828,36 @@ call's arguments is still found).
 
 **Allowing it.** `#[expect(blaze::implicit_overflow, reason = "..")]`.
 
+## `implied_bound_written`
+
+**What it catches.** In a crate with `#![feature(blaze_implied_bounds)]` (or
+`blaze_anon_params`), a bound written on a function or an impl that the types and traits its
+header names already declare (docs/v2/plan/design/implied-bounds.md):
+
+```rust
+struct Pool<T, A: Allocator> { .. }
+impl<T, A: Allocator> Pool<T, A> { .. } // `A: Allocator` is implied by `Pool<T, A>`
+```
+
+It is found by what the front end lowered: a written predicate equal to one the header
+implies. In a crate without the feature it says nothing.
+
+**Why it matters.** The bound is said twice, once where it belongs and once copied; when the
+type relaxes it, the copy stays required.
+
+**How to fix it.** Remove the bound. There is no automatic fix: a bound shares its list with
+others (`T: X + Y`, a where clause's commas).
+
+It is exact: it never reports a bound whose removal changes what compiles. A bound a short
+form (`A::Item`) goes through is found when the short form also sees it implied.
+
+**Not found.** A bound the short form sees only as written: one implied only through a
+shorthand projection's trait (`B: Iterator` with `trait Tr<B: Iterator>` and a header
+`A::Out`) or a type alias in the header, where removing it would make `B::Item` E0220
+(docs/v2/plan/design/implied-bounds.md, "Not given"). Test code and what a macro wrote.
+
+**Allowing it.** `#[expect(blaze::implied_bound_written, reason = "..")]` on the item.
+
 ## `intern_candidate`
 
 **What it catches.** A non-generic type of the crate that is `Clone`, `PartialEq` and `Hash`

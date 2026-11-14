@@ -83,6 +83,9 @@ mod hash_twice;
 mod hashmap;
 mod held_across_wait;
 mod implicit_allocator;
+mod implied_bound_written;
+#[cfg(test)]
+mod implied_bound_written_tests;
 mod intern_candidate;
 mod jagged_vec;
 mod key_ignores_field;
@@ -308,6 +311,7 @@ pub enum Lint {
     BorrowWorkaround,
     NllWorkaround,
     NativeContracts,
+    ImpliedBoundWritten,
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
@@ -761,6 +765,7 @@ impl Lint {
         Lint::BorrowWorkaround,
         Lint::NllWorkaround,
         Lint::NativeContracts,
+        Lint::ImpliedBoundWritten,
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
@@ -990,6 +995,8 @@ impl Lint {
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
             | Lint::NativeContracts
+            // Fires only in a crate with `#![feature(blaze_implied_bounds)]`.
+            | Lint::ImpliedBoundWritten
             // Fire only where the code declares what a function is expected to do
             // (`#[blaze::expect(..)]`, a module's default, `#![blaze::effects]`):
             // `undeclared_effect` and `unfulfilled_effect` are `deny` there.
@@ -1353,6 +1360,7 @@ impl Lint {
             Lint::BorrowWorkaround => "borrow_workaround",
             Lint::NllWorkaround => "nll_workaround",
             Lint::NativeContracts => "native_contracts",
+            Lint::ImpliedBoundWritten => "implied_bound_written",
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
@@ -1609,6 +1617,7 @@ impl Lint {
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
             Lint::NllWorkaround => concat!(general_docs!(), "#nll_workaround"),
             Lint::NativeContracts => concat!(general_docs!(), "#native_contracts"),
+            Lint::ImpliedBoundWritten => concat!(general_docs!(), "#implied_bound_written"),
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
@@ -2432,6 +2441,9 @@ impl Lint {
             Lint::LenientDeserialize => {
                 "add `#[serde(deny_unknown_fields)]` under the derive (`blaze check --fix` does), so an unknown field is an error naming it; or say why the format must accept fields it doesn't know with `#[expect(blaze::lenient_deserialize, reason = \"..\")]`"
             }
+            Lint::ImpliedBoundWritten => {
+                "remove the bound: the type or trait the header names declares it once, for every item that names it; or say why it is written again with `#[expect(blaze::implied_bound_written, reason = \"..\")]`"
+            }
             Lint::NativeContracts => {
                 "write the contract as `requires`/`ensures` clauses between the signature and the body (`blaze check --fix` does), naming the return `-> (r: T)` for the `ensures`"
             }
@@ -2607,6 +2619,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cold_error::check_fn(cx, f);
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
+        implied_bound_written::check_fn(cx, f);
         proc_macro::check(cx, f);
         async_fn::check_fn(cx, f);
     }
@@ -2653,6 +2666,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(item) = ast::Impl::cast(node) {
         missing_size_hint::check(cx, item);
         default_policy::check_impl(cx, item);
+        implied_bound_written::check_impl(cx, item);
     }
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);

@@ -874,3 +874,35 @@ fn a_contended_lock_on_two_threads_records_one_wait_behind_its_holder() {
     assert_eq!(probe.began.load(Ordering::Relaxed), 1);
     assert_eq!(probe.ended.load(Ordering::Relaxed), 1);
 }
+
+const TIE: &str = "dst.graph.tie";
+
+/// The invariant: a convoy's oldest wait does not depend on the order its rows were taken in
+/// (rule 25). Two waiters that began at one instant, given in either order, name the lower
+/// thread. The control is in the assertion's other half: the two orders are different inputs
+/// (the first rows differ), so a tie broken by arrival would name two different threads.
+#[test]
+fn a_convoys_oldest_is_the_same_whatever_order_its_rows_came_in() {
+    let wait = |thread: u64| stall::WaitRow {
+        thread,
+        span: 0,
+        since_ns: 3_000,
+        deadline_ns: None,
+        on: Blocked::Lock { name: TIE, mode: Mode::Lock, at: 0x1000 },
+        holder: Some(100),
+        site: None,
+    };
+    let oldest_of = |order: [u64; 2]| {
+        let mut snapshot = Snapshot::default();
+        for thread in order {
+            snapshot.waits.push(wait(thread));
+        }
+        assert_eq!(snapshot.waits[0].thread, order[0]);
+        let stalls = stall::analyze(&snapshot, 3_000 + 1_000_000, 1_000_000);
+        let [Stall::Convoy { waiters: 2, oldest, .. }] = stalls.as_slice() else {
+            panic!("not one convoy of two: {stalls:?}");
+        };
+        oldest.thread
+    };
+    assert_eq!((oldest_of([1, 2]), oldest_of([2, 1])), (1, 1));
+}
