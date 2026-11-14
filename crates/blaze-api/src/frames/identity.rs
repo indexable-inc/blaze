@@ -24,30 +24,25 @@ use crate::{
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
-/// One variant of an enum, each variant that can be made here as likely, made by its arm.
+/// One variant of an enum, made by its arm, drawn by [`blaze_ids::rng::choose!`] from `$g.rng`:
+/// each variant that can be made here as likely.
 ///
 /// An arm is a variant's name and what follows it in a constructor (`{ fields }`, `(values)`
 /// or nothing), then optionally `if` the condition under which it can be made. The list of arms
-/// is all the bookkeeping there is: a variant's position and the count are the list's, so two
-/// changes that each add an arm merge without renumbering, and a variant of the enum the list
-/// leaves out does not compile ("patterns `&Request::New { .. }` not covered").
+/// is all the bookkeeping there is, and a variant of the enum it leaves out does not compile
+/// ("pattern `&Request::New { .. }` not covered").
 macro_rules! one_of {
     ($g:expr, $enum:path {
         $($variant:ident $({ $($fields:tt)* })? $(( $($values:tt)* ))? $(if $can:expr)?),+ $(,)?
     }) => {{
         type This = $enum;
-        #[derive(Clone, Copy)]
-        enum Kind {
-            $($variant),+
-        }
         // Every variant of `This` has an arm: the check that one added gets a generator.
         const _: fn(&This) = |it| match it {
             $(This::$variant { .. } => {})+
         };
-        let kinds = [$((Kind::$variant, true $(&& $can)?)),+];
-        match $g.pick(&kinds) {
-            $(Kind::$variant => This::$variant $({ $($fields)* })? $(( $($values)* ))?,)+
-        }
+        blaze_ids::rng::choose!($g.rng;
+            $($(if $can =>)? This::$variant $({ $($fields)* })? $(( $($values)* ))?),+
+        )
     }};
 }
 
@@ -70,14 +65,6 @@ impl Gen {
 
     fn yes(&mut self) -> bool {
         self.next() & 1 == 1
-    }
-
-    /// One of the `kinds` marked `true`, each as likely: what [`one_of!`] draws with.
-    fn pick<K: Copy>(&mut self, kinds: &[(K, bool)]) -> K {
-        let can = kinds.iter().filter(|(_, can)| *can).count();
-        let at = self.rng.index(can);
-        let mut can = kinds.iter().filter(|(_, can)| *can).map(|&(kind, _)| kind);
-        can.nth(at).expect("one_of! with no arm that can be made here")
     }
 
     /// One of a type's own list of its values (`Goal::ALL`), each as likely.

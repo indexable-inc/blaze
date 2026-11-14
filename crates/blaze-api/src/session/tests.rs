@@ -4,7 +4,10 @@ use std::{
 };
 
 use blaze_core::{Conn, FileName};
-use blaze_ids::{ContentId, rng::SplitMix64};
+use blaze_ids::{
+    ContentId,
+    rng::{SplitMix64, choose},
+};
 use blaze_mem::{
     Tag,
     tag::{Counters, Snapshot},
@@ -1248,10 +1251,10 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                     let next = ids.entry(conn).or_insert(0);
                     let id = *next;
                     *next += 1;
-                    let request = match rng.index(7) {
-                        0 => Request::Check { view: head("main"), targets: targets() },
-                        1 => Request::Snapshot,
-                        2 => Request::BestOf {
+                    let request = choose!(rng;
+                        Request::Check { view: head("main"), targets: targets() },
+                        Request::Snapshot,
+                        Request::BestOf {
                             base: head("main"),
                             candidates: vec![
                                 vec![write("x.rs", "x")],
@@ -1262,16 +1265,16 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                             test: rng.index(2) == 0,
                             filter: Vec::new(),
                         },
-                        3 => {
+                        {
                             written += 1;
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             let ops = vec![write(&format!("f{written}.rs"), "")];
                             Request::Commit { head: "main".to_owned(), base, ops }
-                        }
-                        4 if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
-                        5 => Request::Open { view: head("main") },
-                        _ => Request::Status,
-                    };
+                        },
+                        if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
+                        Request::Open { view: head("main") },
+                        Request::Status,
+                    );
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);
@@ -1639,30 +1642,30 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     *next += 1;
                     let text = texts[rng.index(texts.len())];
                     let wait_ms = rng.index(40) as u64;
-                    let request = match rng.index(5) {
-                        0 => Request::WillSave {
+                    let request = choose!(rng;
+                        Request::WillSave {
                             ops: vec![write("a.rs", text)],
                             head: "main".to_owned(),
                             test: rng.index(2) == 0,
                             targets: targets(),
                             wait_ms,
                         },
-                        1 => Request::WillTest {
+                        Request::WillTest {
                             view: head("main"),
                             filter: Vec::new(),
                             targets: targets(),
                             wait_ms,
                         },
-                        2 => {
+                        {
                             let base = world.vfs.head("main").unwrap_or_else(|| world.vfs.empty());
                             Request::Commit {
                                 head: "main".to_owned(),
                                 base,
                                 ops: vec![write("a.rs", text)],
                             }
-                        }
-                        _ => Request::Check { view: head("main"), targets: targets() },
-                    };
+                        },
+                        Request::Check { view: head("main"), targets: targets() },
+                    );
                     seen.asked.insert(to(conn, id));
                     let replies = world.request(conn, id, request);
                     seen.take(replies);
