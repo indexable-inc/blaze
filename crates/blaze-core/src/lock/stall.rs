@@ -71,6 +71,7 @@ pub struct Snapshot {
 pub enum Stall {
     /// A cycle: each wait's holder is the next wait's thread, the last's the first's. Each
     /// row names a thread, what it waits on and (as the previous row's `on`) what it holds.
+    /// The first row is the cycle's least thread.
     Deadlock { cycle: Vec<WaitRow> },
     /// A chain ending at `head`, which holds what the first link waits on and is not itself
     /// waiting on a lock another holds: `head_wait` is its own wait when it has one (IO, a
@@ -78,10 +79,12 @@ pub enum Stall {
     Convoy {
         head: u64,
         head_wait: Option<WaitRow>,
-        /// What the head holds that the waiters directly behind it wait on.
+        /// What the head holds that the waiters directly behind it wait on: when they wait on
+        /// different things it holds, what the oldest of them (in `oldest`'s order) waits on.
         holds: Blocked,
         waiters: usize,
-        /// The oldest wait behind it.
+        /// The oldest wait behind it: the least `since_ns`, and among waits queued at the same
+        /// instant the least `thread`, then the least `span`.
         oldest: WaitRow,
     },
 }
@@ -121,9 +124,20 @@ impl Stall {
     }
 }
 
+/// The order in which one wait is older than another: the least `since_ns` first, and among
+/// waits queued at the same instant the least `thread`, then the least `span`. A total order on
+/// the rows' contents, so which of two tied waits is the oldest never depends on which the
+/// snapshot listed first.
+fn age(row: &WaitRow) -> (u64, u64, u64) {
+    (row.since_ns, row.thread, row.span)
+}
+
 /// The stalls among `snapshot`'s waits older than `threshold_ns` at `now_ns`: each deadlock
-/// once (by its cycle's threads), each convoy once (by its head), deadlocks first, then
-/// convoys by how many wait behind them, most first.
+/// once (by its cycle's threads), each convoy once (by its head), deadlocks first by their
+/// least thread, then convoys by how many wait behind them, most first, then by head.
+///
+/// The invariant: the answer is a function of the rows' contents; it does not depend on the
+/// order of the snapshot's rows (each thread has at most one row, as the registry keeps it).
 pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall> {
     // alloc: a watchdog's check, once a threshold passes.
     let mut by_thread: HashMap<u64, usize, Global> = HashMap::new_in(Global);
@@ -134,8 +148,8 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
     // alloc: as above.
     let mut stalls: Vec<Stall> = Vec::new();
     let mut seen_cycles: Vec<Vec<u64>> = Vec::new(); // alloc: as above
-    // head -> (index of the stall in `stalls`)
-    let mut convoys: HashMap<u64, usize, Global> = HashMap::new_in(Global);
+    // head -> (index of the stall in `stalls`, the direct waiter its `holds` is taken from)
+    let mut convoys: HashMap<u64, (usize, WaitRow), Global> = HashMap::new_in(Global);
     for row in &snapshot.waits {
         // The walk from this wait, bounded by the number of waits (`bounded-progress`).
         let mut path: Vec<usize> = Vec::new(); // alloc: as above
@@ -158,11 +172,15 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
         }
         match end {
             Some(Err(start)) => {
-                let cycle: Vec<WaitRow> =
+                let mut cycle: Vec<WaitRow> =
                     path[start..].iter().map(|&i| snapshot.waits[i]).collect(); // alloc: as above
                 if !cycle.iter().any(old) {
                     continue;
                 }
+                // Start at the least thread, not where the walk from this row entered it.
+                let least =
+                    cycle.iter().enumerate().min_by_key(|(_, it)| it.thread).map_or(0, |(i, _)| i);
+                cycle.rotate_left(least);
                 let mut key: Vec<u64> = cycle.iter().map(|it| it.thread).collect(); // alloc: as above
                 key.sort_unstable();
                 if !seen_cycles.contains(&key) {
@@ -174,34 +192,35 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
                 // The head: a holder that is not waiting, or the last thread on the path when
                 // it waits on something no thread holds (IO, a signal). A wait with no holder
                 // of its own is no convoy.
-                let (head, holds) = match holder {
-                    Some(head) => (head, snapshot.waits[path[path.len() - 1]].on),
-                    None if path.len() >= 2 => (
-                        snapshot.waits[path[path.len() - 1]].thread,
-                        snapshot.waits[path[path.len() - 2]].on,
-                    ),
+                // `direct` is the wait on this path directly behind the head.
+                let last = snapshot.waits[path[path.len() - 1]];
+                let (head, direct) = match holder {
+                    Some(head) => (head, last),
+                    None if path.len() >= 2 => (last.thread, snapshot.waits[path[path.len() - 2]]),
                     None => continue,
                 };
                 if !old(row) {
                     continue;
                 }
-                match convoys.get(&head) {
-                    Some(&i) => {
-                        if let Stall::Convoy { waiters, oldest, .. } = &mut stalls[i] {
+                match convoys.get_mut(&head) {
+                    Some((i, holds_from)) => {
+                        if let Stall::Convoy { waiters, holds, oldest, .. } = &mut stalls[*i] {
                             *waiters += 1;
-                            // Two waits that began at one instant: the lower thread is the
-                            // oldest, whatever order the rows came in (rule 25).
-                            if (row.since_ns, row.thread) < (oldest.since_ns, oldest.thread) {
+                            if age(row) < age(oldest) {
                                 *oldest = *row;
+                            }
+                            if age(&direct) < age(holds_from) {
+                                *holds_from = direct;
+                                *holds = direct.on;
                             }
                         }
                     }
                     None => {
-                        convoys.insert(head, stalls.len());
+                        convoys.insert(head, (stalls.len(), direct));
                         stalls.push(Stall::Convoy {
                             head,
                             head_wait: None,
-                            holds,
+                            holds: direct.on,
                             waiters: 1,
                             oldest: *row,
                         });
@@ -220,9 +239,12 @@ pub fn analyze(snapshot: &Snapshot, now_ns: u64, threshold_ns: u64) -> Vec<Stall
             *head_wait = Some(snapshot.waits[i]);
         }
     }
+    // A key of each stall's own: a deadlock by its least thread (its first row; cycles share
+    // no thread), a convoy by its count, then its head (one convoy per head). No two stalls
+    // share a key, so the order is the rows' contents', not their positions'.
     stalls.sort_by_key(|it| match it {
-        Stall::Deadlock { .. } => (0, 0),
-        Stall::Convoy { waiters, .. } => (1, usize::MAX - waiters),
+        Stall::Deadlock { cycle } => (0u8, 0usize, cycle.first().map_or(0, |row| row.thread)),
+        Stall::Convoy { head, waiters, .. } => (1u8, usize::MAX - waiters, *head),
     });
     stalls
 }

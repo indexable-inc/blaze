@@ -677,17 +677,18 @@ mod tests {
         })
     }
 
-    #[hegel::test]
-    fn levels_are_named_as_the_reference_named_them(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
-        let name: String = tc.draw(hegel::one_of!(
-            gs::sampled_from(names.to_vec()),
-            gs::text().alphabet("abcdefghijklmnopqrstuvwxyz-").max_size(12),
-        ));
-        assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
-        let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
-        assert_eq!(Level::of_cap(&name), cap);
+    #[test]
+    fn levels_are_named_as_the_reference_named_them() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
+            let name: String = match tape.below(2, "a level's name or any word") {
+                0 => tape.one_of(&names, "name").clone(),
+                _ => tape.text_from("abcdefghijklmnopqrstuvwxyz-", 0..=12, "name"),
+            };
+            assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
+            let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
+            assert_eq!(Level::of_cap(&name), cap);
+        });
     }
 
     #[test]

@@ -1,0 +1,9 @@
+{
+ "id": "check-harness-tests-from-a-worktree",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "task": "Compile and run the tests of a crate under crates/harness from a worktree on the Mac",
+ "do": "cargo cannot load that workspace (`artifact = \"gpu\"` is blaze's), so use blaze, and of the three on this Mac only the installed dev build worked on 2026-11-13: in <worktree>/crates/harness run `BLAZE_HOME=<a directory of your own> BLAZE_LIBRARY=<dir>/library blaze --ignore-pin check -p <crate> --tests` then `blaze --ignore-pin test -p <crate>`, one crate at a time, and `blaze --ignore-pin stop` after. <dir>/library is the standard library of the commit that blaze was built from (`blaze --version` prints it): `git archive <commit> library | tar -x -C <dir>`. A cold check of harness-chat-library took 53 s; harness-native-render does not build this way (`const_eval_select is not lowered to the device` in harness-native-shaders' gpu build), on main as on a branch.",
+ "why": "The pinned release (0.20261105.4) refuses the manifests (`artifact = … requires -Z bindeps`); a blaze built from main at 4630d471fa refuses the lock (three git dependencies with no blaze.lock pin, rule weak_source_pin); a dev build cannot download its library source (`library-<digest>.tar.xz: not there`) and says BLAZE_LIBRARY can name it.",
+ "state": "current"
+}

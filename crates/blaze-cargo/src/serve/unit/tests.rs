@@ -188,7 +188,6 @@ fn build(dir: &std::path::Path) -> Units {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }
@@ -1323,7 +1322,6 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -1640,7 +1638,6 @@ fn script_front_for(
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -1693,6 +1690,7 @@ fn script_front_for(
         makers: one_maker(),
         kind: compile::keyed_kind(crate::serve::work::JobKind::Build, script),
         goal: compile::goal_byte(blaze_api::Goal::Edit),
+        build: 0,
         verified: false,
         reached: false,
         pgo: None,
@@ -2003,7 +2001,6 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2138,7 +2135,6 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2412,6 +2408,7 @@ fn each_maker_of_a_record_moves_its_key() {
             makers,
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2461,6 +2458,7 @@ fn a_units_key_holds_what_of_its_plan_is_read_and_nothing_else() {
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2526,6 +2524,7 @@ fn the_goal_moves_a_units_record_key() {
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal,
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2543,6 +2542,56 @@ fn the_goal_moves_a_units_record_key() {
     assert_ne!(key(&mut front, max), at_edit, "tier 0 code and optimized code under one key");
     assert_ne!(key(&mut front, 0), at_edit);
     assert_ne!(key(&mut front, 0), key(&mut front, max));
+}
+
+/// The invariant: a unit's record key holds what image its unit links (`compile::keyed_build`,
+/// the link's own policy's mode), so a `blaze run`'s launcher program, a `blaze build`'s live
+/// image and a plain file, each another value of the same unit, are under three keys, and a
+/// `build` after a `run` never replays the launcher's file as its live image (2026-11-14: "the
+/// dev executable `hi`'s kept file: the image exports no __blaze_live"). The control is the
+/// key as it was before, with no byte of the mode: the oracle sees the three collide.
+#[test]
+fn what_image_a_unit_links_moves_its_record_key() {
+    use blaze_codegen::plan::Mode;
+    let key = |front: &mut MemFront, build: u8| {
+        let identity = front.lowered.identity(0).unwrap();
+        let u = &front.units.graph.units[0];
+        compile::RecordInputs {
+            identity,
+            places: &test_places(),
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[0],
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
+            makers: one_maker(),
+            // `run` and `build` are one kind (`compile::keyed_kind`): only the mode tells them.
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Run, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build,
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let mut front = orphan_front(false);
+    let modes = [Mode::Output, Mode::Live, Mode::Tiered, Mode::Launched];
+    let keys: Vec<_> = modes.iter().map(|it| key(&mut front, compile::build_byte(*it))).collect();
+    for (at, a) in keys.iter().enumerate() {
+        assert_eq!(key(&mut front, compile::build_byte(modes[at])), *a, "one mode, one key");
+        for b in &keys[at + 1..] {
+            assert_ne!(a, b, "two images of one unit under one key");
+        }
+    }
+    assert!(modes.iter().all(|it| compile::build_byte(*it) != 0), "0 is a unit that links nothing");
+    // The control: the key with no byte of the mode, as before, is one key for all four.
+    let planted: Vec<_> = modes.iter().map(|_| key(&mut front, 0)).collect();
+    assert!(planted.windows(2).all(|it| it[0] == it[1]), "the planted key told the images apart");
 }
 
 /// Rule 21 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
@@ -2567,6 +2616,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: true,
             pgo: None,

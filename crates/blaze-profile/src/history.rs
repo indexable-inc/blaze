@@ -3188,20 +3188,21 @@ mod tests {
     /// The invariant: unset, the cap never falls as the home's store grows and stays within
     /// [`CAP_LEAST`] and [`CAP_MOST`]; a [`CAP_VAR`] that reads is the cap whatever the store
     /// holds; one that does not is refused, naming it.
-    #[hegel::test(test_cases = 300)]
-    fn the_cap_follows_the_store_between_its_bounds(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let small = tc.draw(gs::integers::<u64>());
-        let large = tc.draw(gs::integers::<u64>().min_value(small));
-        cap_follows(|store| cap_of(None, store).unwrap(), small, large).unwrap();
-        let mib = tc.draw(gs::integers::<u64>().min_value(1).max_value(u64::MAX >> 20));
-        assert_eq!(cap_of(Some(&mib.to_string()), small), Ok(mib << 20), "the variable wins");
-        assert_eq!(cap_of(Some(" 1 "), large), Ok(1 << 20));
-        for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
-            let said = cap_of(Some(bad), small).expect_err(bad);
-            assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
-        }
-        assert_eq!(cap_for(64 << 20), 16 << 20, "a quarter of the store between the bounds");
+    #[test]
+    fn the_cap_follows_the_store_between_its_bounds() {
+        blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+            let small = tape.int::<u64>("small");
+            let large = tape.int_in(small..=u64::MAX, "large");
+            cap_follows(|store| cap_of(None, store).unwrap(), small, large).unwrap();
+            let mib = tape.int_in(1..=u64::MAX >> 20, "mib");
+            assert_eq!(cap_of(Some(&mib.to_string()), small), Ok(mib << 20), "the variable wins");
+            assert_eq!(cap_of(Some(" 1 "), large), Ok(1 << 20));
+            for bad in ["0", "", "64MB", "-1", "1.5", "18446744073709551615"] {
+                let said = cap_of(Some(bad), small).expect_err(bad);
+                assert!(said.contains(CAP_VAR) && said.contains(&format!("{bad:?}")), "{said}");
+            }
+            assert_eq!(cap_for(64 << 20), 16 << 20, "a quarter of the store between the bounds");
+        });
     }
 
     /// The control: the oracle refuses a cap that is a quarter of the store with the clamp

@@ -1,5 +1,5 @@
 //! bstd's deterministic simulation tests (skill `testing`, dst-not-review): each draws a plan
-//! with Hegel, runs bstd's real capabilities on [`Io`]'s simulation, and checks one invariant
+//! from a `blaze_sim` tape, runs bstd's real capabilities on [`Io`]'s simulation, and checks one invariant
 //! after every step. Each has a planted bug ([`Plant`]) its oracle must catch in one of
 //! [`CONTROL_SEEDS`] seeded plans, so a green run is not a blind oracle's.
 //!
@@ -93,8 +93,7 @@ mod world;
 
 use std::{fmt, time::Duration};
 
-use blaze_core::sim::Rng as Seeds;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
     Plant,
@@ -106,71 +105,33 @@ use crate::{
 };
 
 /// Seeded plans a control runs looking for one its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
+const CONTROL_SEEDS: u32 = 256;
 
 /// The root context's budget: longer than any plan's waits, so only the deadlines a plan draws
 /// end them.
 const BUDGET: Duration = Duration::from_secs(3600);
 
-/// Where a plan's draws come from: Hegel's test case, or a control's seeded generator.
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        self.int(0, n - 1) == 0
-    }
-
-    /// One of `of`, which is not empty.
-    fn pick<T: Copy>(&mut self, of: &[T]) -> T {
-        of[self.int(0, of.len() as u64 - 1) as usize]
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Seeds {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-/// One Hegel case: `plan`, drawn by the test case, run with no plant; a broken invariant fails
-/// it with the plan to replay.
+/// One case of a `blaze_sim::check`: `plan`, drawn from the case's tape, run with no plant; a
+/// broken invariant fails it with the plan (the tape that replays it is in the report).
 fn check<P: fmt::Debug>(plan: P, run: impl Fn(&P, Plant) -> Result<(), String>) {
     if let Err(why) = run(&plan, Plant::None) {
         panic!("{why}\nreplay: plan {plan:?}");
     }
 }
 
-/// A plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself).
+/// A plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans, and the code as it is
+/// passes all of them (test-the-cause on the test itself). Any error of `run` is the oracle's,
+/// as it was when this looped seeds by hand, so the words it must say are none in particular.
+#[track_caller]
 fn control<P: fmt::Debug>(
     plant: Plant,
-    plan: impl Fn(&mut Seeds) -> P,
+    plan: impl Fn(&Tape) -> P,
     run: impl Fn(&P, Plant) -> Result<(), String>,
 ) {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan(&mut Seeds::new(seed));
-        if let Err(why) = run(&plan, plant) {
-            eprintln!("Plant::{plant:?} caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!("the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak");
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, plant, "", |tape, plant| {
+        let plan = plan(tape);
+        run(&plan, plant).map_err(|why| Broke::Oracle(format!("{why}\nplan {plan:?}")))
+    });
 }
 
 /// A simulated world of `seed` with `plant`.

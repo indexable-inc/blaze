@@ -1,11 +1,16 @@
 //! The driver: panics caught by place and message, the hook's depth, nesting, and the report.
 
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
 use std::cell::Cell;
 use std::panic::Location;
 
-use super::*;
-use crate::search::Passed;
-use crate::tape::{Choice, Note};
+use super::{check_given, depth, report, search, take_kept};
+use crate::search::{Config, Ended, Failed, Failure, Given, Origin, Passed, Verdict};
+use crate::tape::{Choice, Note, Record, Tape};
 
 #[test]
 fn a_panic_in_a_body_is_caught_with_its_place_and_message() {
@@ -16,7 +21,13 @@ fn a_panic_in_a_body_is_caught_with_its_place_and_message() {
     });
     let Verdict::Failed(failed) = &verdict else { panic!("{verdict:?}") };
     let Origin::Panic { at } = &failed.failure.origin else { panic!("{verdict:?}") };
-    let line: u32 = failed.failure.text.strip_prefix("boom on line ").expect("the message is kept").parse().unwrap();
+    let line: u32 = failed
+        .failure
+        .text
+        .strip_prefix("boom on line ")
+        .expect("the message is kept")
+        .parse()
+        .unwrap();
     let place = format!("{}:{line}:", file!());
     assert!(at.starts_with(&place), "the panic was kept at `{at}`, not at `{place}<column>`");
     assert!(at[place.len()..].parse::<u32>().is_ok(), "`{at}` does not end in a column");
@@ -98,10 +109,14 @@ fn check_passes_a_passing_body_and_panics_with_the_report_otherwise() {
         tape.below(2, "x");
     });
     let failed = std::panic::catch_unwind(|| {
-        check_given(Config::cases(4).shrink_runs(0), Given::NOTHING, |tape: &Tape| -> Result<(), String> {
-            tape.below(2, "x");
-            Err("always".to_owned())
-        });
+        check_given(
+            Config::cases(4).shrink_runs(0),
+            Given::NOTHING,
+            |tape: &Tape| -> Result<(), String> {
+                tape.below(2, "x");
+                Err("always".to_owned())
+            },
+        );
     });
     let payload = failed.expect_err("a failing check panics");
     let said = payload.downcast_ref::<String>().expect("the report is the panic's text");
@@ -126,7 +141,10 @@ fn golden_failed() -> Failed {
         seed: Some(41),
         case: 42,
         cases: 256,
-        failure: Failure { origin: Origin::Panic { at: "src/queue.rs:10:5".to_owned() }, text: "the queue lost a message".to_owned() },
+        failure: Failure {
+            origin: Origin::Panic { at: "src/queue.rs:10:5".to_owned() },
+            text: "the queue lost a message".to_owned(),
+        },
         first_len: 4812,
         least,
         shrink_runs: 318,
@@ -135,7 +153,8 @@ fn golden_failed() -> Failed {
 
 #[test]
 fn the_report_of_a_failure_is_exactly_this() {
-    let said = report(&Verdict::Failed(golden_failed()), Location::caller(), Some("queue_keeps_messages"));
+    let said =
+        report(&Verdict::Failed(golden_failed()), Location::caller(), Some("queue_keeps_messages"));
     let expected = "\
 blaze-sim: `queue_keeps_messages` failed at seed 41 (case 42 of 256): the queue lost a message
   at src/queue.rs:10:5
@@ -155,7 +174,10 @@ fn the_report_of_every_other_verdict_names_what_it_is() {
         let said = report(&verdict, at, Some("the_test"));
         assert!(said.starts_with("blaze-sim: `the_test`"), "{said}");
         for word in words {
-            assert!(said.contains(word), "the report of {verdict:?} does not say `{word}`:\n{said}");
+            assert!(
+                said.contains(word),
+                "the report of {verdict:?} does not say `{word}`:\n{said}"
+            );
         }
     };
     says(
@@ -169,11 +191,20 @@ fn the_report_of_every_other_verdict_names_what_it_is() {
             first: Failure { origin: Origin::Oracle, text: "the first".to_owned() },
             again: Ended::Passed,
         },
-        &["not a function of its tape", "`the first`", "passed", "BLAZE_SIM_TAPE='2 0 1'", "BLAZE_SIM_SEED=5"],
+        &[
+            "not a function of its tape",
+            "`the first`",
+            "passed",
+            "BLAZE_SIM_TAPE='2 0 1'",
+            "BLAZE_SIM_SEED=5",
+        ],
     );
     says(Verdict::DrewNothing { cases: 9 }, &["9 cases drew no choice"]);
     says(Verdict::AllDiscarded { cases: 9 }, &["all 9 cases were discarded"]);
-    says(Verdict::Unreached { cases: 9, missing: vec!["a crash", "a torn write"] }, &["9 cases", "`a crash`", "`a torn write`"]);
+    says(
+        Verdict::Unreached { cases: 9, missing: vec!["a crash", "a torn write"] },
+        &["9 cases", "`a crash`", "`a torn write`"],
+    );
     says(
         Verdict::Misfit { clamped: 2, unused: 3, ended: Ended::Discarded },
         &["does not fit", "2 values lowered", "3 never drawn", "was discarded"],
@@ -181,5 +212,8 @@ fn the_report_of_every_other_verdict_names_what_it_is() {
     let mut given = golden_failed();
     given.seed = None;
     given.shrink_runs = 0;
-    says(Verdict::Failed(given), &["failed on the given tape", "as given", "replay: BLAZE_SIM_TAPE='3 0*2 1 0*2 2'"]);
+    says(
+        Verdict::Failed(given),
+        &["failed on the given tape", "as given", "replay: BLAZE_SIM_TAPE='3 0*2 1 0*2 2'"],
+    );
 }

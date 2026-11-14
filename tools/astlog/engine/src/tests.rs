@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::eval::{Facts, Row, Value};
 use crate::program::{
@@ -134,35 +134,34 @@ fn rows(sets: &Sets, name: &str) -> Vec<Vec<String>> {
 
 /// One generated rule for relation `r{head}`: positive atoms over `edge` and `r0..=r{head}`,
 /// negations and counts over `r0..r{head}` only, so every generated program stratifies.
-#[hegel::composite]
-fn rule(tc: &hegel::TestCase, head: usize) -> String {
+fn rule(tape: &Tape, head: usize) -> String {
     let vars = ["a", "b", "c"];
-    let var = |tc: &hegel::TestCase| vars[tc.draw(gs::integers::<usize>().max_value(2))];
+    let var = |tape: &Tape| vars[tape.index(vars.len(), "a variable")];
     let mut bound: Vec<&str> = Vec::new();
     let mut body = Vec::new();
-    let atoms = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let atoms = tape.int_in(1..=3usize, "a rule's atoms");
     for at in 0..atoms {
-        let pick = tc.draw(gs::integers::<u8>().max_value(5));
+        let pick = tape.int_in(0..=5u8, "an atom's kind");
         if at > 0 && pick == 5 && !bound.is_empty() {
-            let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
-            let y = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+            let x = bound[tape.index(bound.len(), "a bound variable")];
+            let y = bound[tape.index(bound.len(), "a bound variable")];
             body.push(format!("(not (edge {x} {y}))"));
         } else if at > 0 && pick == 3 && head > 0 && !bound.is_empty() {
-            let rel = tc.draw(gs::integers::<usize>().max_value(head - 1));
-            let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
-            let y = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+            let rel = tape.index(head, "a lower relation");
+            let x = bound[tape.index(bound.len(), "a bound variable")];
+            let y = bound[tape.index(bound.len(), "a bound variable")];
             body.push(format!("(not (r{rel} {x} {y}))"));
         } else if at > 0 && pick == 4 && head > 0 && !bound.is_empty() {
-            let rel = tc.draw(gs::integers::<usize>().max_value(head - 1));
-            let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+            let rel = tape.index(head, "a lower relation");
+            let x = bound[tape.index(bound.len(), "a bound variable")];
             body.push(format!("(count n{at} (r{rel} {x} z{at}))"));
             body.push(format!("(lt n{at} 2)"));
         } else {
-            let (x, y) = (var(tc), var(tc));
+            let (x, y) = (var(tape), var(tape));
             let rel = if pick % 2 == 0 {
                 "edge".to_owned()
             } else {
-                format!("r{}", tc.draw(gs::integers::<usize>().max_value(head)))
+                format!("r{}", tape.index(head + 1, "a relation up to the head"))
             };
             body.push(format!("({rel} {x} {y})"));
             for v in [x, y] {
@@ -172,38 +171,38 @@ fn rule(tc: &hegel::TestCase, head: usize) -> String {
             }
         }
     }
-    let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
-    let y = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+    let x = bound[tape.index(bound.len(), "a bound variable")];
+    let y = bound[tape.index(bound.len(), "a bound variable")];
     format!("(rule (r{head} {x} {y}) {})", body.join(" "))
 }
 
-#[hegel::test]
-fn semi_naive_derives_what_naive_derives(tc: hegel::TestCase) {
-    let edges: Vec<(u32, u32)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers::<u32>().max_value(5),
-            gs::integers::<u32>().max_value(5)
-        ))
-        .max_size(12),
-    );
-    let mut text = String::new();
-    for head in 0..3 {
-        // Every relation gets at least one rule so the generated references resolve.
-        text.push_str(&format!("(rule (r{head} a b) (edge a b))\n"));
-        let more = tc.draw(gs::integers::<usize>().max_value(2));
-        for _ in 0..more {
-            text.push_str(&tc.draw(rule(head)));
-            text.push('\n');
+/// The refinement: semi-naive evaluation derives exactly what the naive fixpoint derives, for
+/// any stratifiable program over any small graph.
+#[test]
+fn semi_naive_derives_what_naive_derives() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let edges: Vec<(u32, u32)> = tape.vec(0..=12, "edges", |tape| {
+            (tape.int_in(0..=5u32, "an edge's start"), tape.int_in(0..=5u32, "an edge's end"))
+        });
+        let mut text = String::new();
+        for head in 0..3 {
+            // Every relation gets at least one rule so the generated references resolve.
+            text.push_str(&format!("(rule (r{head} a b) (edge a b))\n"));
+            let more = tape.int_in(0..=2usize, "a relation's further rules");
+            for _ in 0..more {
+                text.push_str(&rule(tape, head));
+                text.push('\n');
+            }
         }
-    }
-    let program = match Program::<Graph>::parse(&text) {
-        Ok(program) => program,
-        Err(error) => panic!("generated program refused: {error}\n{text}"),
-    };
-    let edges = Edges(edges);
-    let fast = semi_naive(&program, &edges).unwrap_or_else(|error| panic!("{error}\n{text}"));
-    let reference = crate::naive::fixpoint(&program, &edges);
-    assert_eq!(fast, reference, "{text}");
+        let program = match Program::<Graph>::parse(&text) {
+            Ok(program) => program,
+            Err(error) => panic!("generated program refused: {error}\n{text}"),
+        };
+        let edges = Edges(edges);
+        let fast = semi_naive(&program, &edges).unwrap_or_else(|error| panic!("{error}\n{text}"));
+        let reference = crate::naive::fixpoint(&program, &edges);
+        assert_eq!(fast, reference, "{text}");
+    });
 }
 
 #[test]

@@ -18,7 +18,7 @@ use crate::dependency::Dependency;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::package_id_spec::PackageIdSpec;
-use crate::poll::block_on;
+use crate::poll::answer;
 use crate::registry::{IndexSummary, QueryKind, Registry};
 use crate::resolve::{Resolve, ResolveVersion};
 use crate::resolver::{
@@ -184,7 +184,8 @@ impl<R: Registry> PackageRegistry<R> {
             };
             debug!("registering a patch for `{}` with `{}`", url, dep.package_name());
 
-            let summaries = block_on(self.sources.query_vec(dep, QueryKind::Exact))
+            let what = "the registry's versions of a `[patch]` dependency (bounded by the HTTP client's timeouts)";
+            let summaries = answer(what, self.sources.query_vec(dep, QueryKind::Exact))
                 .with_context(|| format!("unable to update {}", dep.source_id()))
                 .with_context(|| {
                     format!("failed to load source for dependency `{}`", dep.package_name())
@@ -524,7 +525,8 @@ fn summary_for_patch(
     }
     assert!(summaries.is_empty());
     let candidates = |dep: &Dependency| -> Vec<Summary> {
-        block_on(source.query_vec(dep, QueryKind::Exact))
+        let what = "the registry's versions of a patch's dependency, for its error (bounded by the HTTP client's timeouts)";
+        answer(what, source.query_vec(dep, QueryKind::Exact))
             .unwrap_or_else(|e| {
                 tracing::warn!("could not query {:?}: {:?}", dep, e);
                 Vec::new()

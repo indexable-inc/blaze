@@ -1,0 +1,14 @@
+{
+ "id": "barrier-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane barrier (V14) under proofs-1113",
+ "where": "crates/blaze-core/src/world/disk.rs (File::small, File::wf) and its model lean/BlazeModel/blaze_core/world/disk/Disk/barrier.lean",
+ "what": "a_crash_keeps_what_a_barrier_ordered is false of its generated model: wf and small bound no file's number of barriers, and Vec.push fails at usize::MAX elements, so a well-formed small disk whose file has 2^64-1 barriers makes Disk::barrier panic and the theorem function never returns true",
+ "cost": "the lane stopped before writing any proof",
+ "cause": "File::small bounds changes (MOST_CHANGES) but not barriers; the Vec model allows lengths up to usize::MAX while a real Vec<Barrier> holds at most isize::MAX / 16",
+ "whys": "the bounds in small were written for byte lengths and change counts the theorems compute; a push onto barriers was not counted as a length that can overflow; the Vec model takes usize::MAX as the bound for every element type",
+ "class": "a theorem hypothesis that misses a bound a model operation needs (push overflow on an unbounded Vec)",
+ "prevention": "File::small checks barriers.len() <= MOST_CHANGES; or the Vec model bounds length by isize::MAX / size_of::<T>() for sized non-ZST T, which makes every push on a Vec under the bound provably safe",
+ "workaround": "none in the proof: the statement must change",
+ "state": "fixed in a45e087f2d: File::small holds a file to 2^16 barriers; the theorem is proved (crates/blaze-core/lean/BlazeCore/World/Disk.lean)"
+}

@@ -12,9 +12,9 @@
 
 use std::{collections::VecDeque, num::NonZero, time::Duration};
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, root, world};
+use super::{check, control, root, world};
 use crate::{
     Cx, Plant, Stopped,
     io::Io,
@@ -36,13 +36,13 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let capacity = NonZero::new(d.pick(&[1usize, 4, 16, 64])).expect("a test's capacity is not zero");
-    let acts = (0..d.int(1, 40))
-        .map(|_| match d.coin() {
-            true => Act::Write { by_first: d.coin(), len: d.int(0, 24) as usize },
-            false => Act::Read { by_first: d.coin(), most: d.int(0, 24) as usize },
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let capacity = NonZero::new(*tape.one_of(&[1usize, 4, 16, 64], "capacity")).expect("a test's capacity is not zero");
+    let acts = (0..tape.int_in(1..=40u64, "acts"))
+        .map(|_| match tape.coin("write") {
+            true => Act::Write { by_first: tape.coin("by first"), len: tape.int_in(0..=24u64, "len") as usize },
+            false => Act::Read { by_first: tape.coin("by first"), most: tape.int_in(0..=24u64, "most") as usize },
         })
         .collect();
     Plan { seed, capacity, acts }
@@ -162,12 +162,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a local pair delivers bytes in order, exactly once. Each read gives the next
 /// bytes written and not yet read, a write that stops half way says how many bytes it wrote,
 /// and once an end is finished its peer reads what was left, then 0.
-#[hegel::test(test_cases = 200)]
-fn a_local_pair_delivers_in_order_exactly_once(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_local_pair_delivers_in_order_exactly_once() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_dropped_chunk() {
-    control(Plant::LocalDropsChunk, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::LocalDropsChunk, plan, run);
 }

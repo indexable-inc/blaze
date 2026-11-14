@@ -293,6 +293,7 @@ fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
     assert_eq!((read, seen.len()), (Ok(true), 32));
 
     let result = TestResult {
+        ran: None,
         binary: "blaze_ci".to_owned(),
         name: "a_test".to_owned(),
         cached: None,
@@ -301,6 +302,7 @@ fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
         millis: 3,
         outside: false,
         executable: 0,
+        not_kept: None,
     };
     incoming
         .push(&frames::encode(&Envelope::new(40, Response::TestResult(result.clone()))).unwrap());

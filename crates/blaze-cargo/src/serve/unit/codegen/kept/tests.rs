@@ -10,7 +10,7 @@ use blaze_codegen::{
 };
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_ty_codegen::v2::{InputsWork, LinkInputs, Table, span_table_id};
 
 use super::{Listed, Rows, Spans, Work};
@@ -351,12 +351,11 @@ fn kept_is_whole(start: &Program, edits: &[Edit], plant: Plant) -> Result<Work, 
     Ok(work)
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let slot = 1 + tc.draw(gs::integers::<u8>().max_value(5));
-    let other = 1 + tc.draw(gs::integers::<u8>().max_value(5));
-    let value = tc.draw(gs::integers::<u8>().max_value(2));
-    match tc.draw(gs::integers::<u8>().max_value(8)) {
+fn edit(tape: &Tape) -> Edit {
+    let slot = 1 + tape.int_in(0..=5u8, "slot");
+    let other = 1 + tape.int_in(0..=5u8, "other");
+    let value = tape.int_in(0..=2u8, "value");
+    match tape.int_in(0..=8u8, "edit") {
         0 | 1 => Edit::Body(slot),
         2 | 3 => Edit::Calls(slot, other),
         4 => Edit::Remove(slot),
@@ -374,17 +373,19 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// dropped, a function removed, a static or a span table changed or gone), the rows, span
 /// tables and id a link keeps by applying each build's delta are those of rows made whole
 /// from the build, and what it says changed is what did.
-#[hegel::test]
-fn the_rows_kept_by_deltas_are_the_rows_made_whole(tc: hegel::TestCase) {
-    let start: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(10));
-    let mut program = Program::default();
-    for edit in start {
-        program.apply(edit);
-    }
-    if let Err(why) = kept_is_whole(&program, &edits, Plant::Nothing) {
-        panic!("{why}");
-    }
+#[test]
+fn the_rows_kept_by_deltas_are_the_rows_made_whole() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let start: Vec<Edit> = tape.vec(0..=8, "start", edit);
+        let edits: Vec<Edit> = tape.vec(0..=10, "edits", edit);
+        let mut program = Program::default();
+        for edit in start {
+            program.apply(edit);
+        }
+        if let Err(why) = kept_is_whole(&program, &edits, Plant::Nothing) {
+            panic!("{why}");
+        }
+    });
 }
 
 /// `main` (3) calls `call` (2), which calls `log` (1).

@@ -1,0 +1,11 @@
+{
+ "id": "drift-rust-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5, lane drift-rust",
+ "where": "lean/BlazeModel/enums/side.lean, lean/BlazeMir/** (goldens of crates/hir-ty-lean)",
+ "what": "The enum-match and embedded-MIR goldens were written by hand in commits that say they were never run (0653689e0d, 73789d7172), so they never matched what the translator emits on blaze MIR (chained per-arm discriminant tests into an i128 temporary, StorageLive/Dead). It read as MIR drift; the translator files and the match lowering are unchanged since then.",
+ "cost": "a lane spent its first hour looking for a MIR commit that changed enum matches",
+ "cause": "a golden landed without its test having run once, and nothing in the gate runs cargo test -p hir-ty-lean",
+ "workaround": "git show <golden commit> for the translator and lowering files before assuming drift; regenerate with UPDATE_EXPECT and read each diff",
+ "state": "open"
+}

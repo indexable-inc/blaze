@@ -82,9 +82,9 @@ blaze-alloc-count.workspace = true
 # The code identity, held to what rustc says each of the code generator's crates read
 # (`toolchain/tests.rs`).
 blaze-codegen-code.workspace = true
+blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 blaze-store-check.workspace = true
-hegeltest.workspace = true
 # The revision tests' cases (`v2/edits/revisions.rs`): each `test.toml`, and the report's lines.
 toml.workspace = true
 serde_json.workspace = true

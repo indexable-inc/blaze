@@ -30,7 +30,7 @@ const skills = {
 	"build-and-test": {
 		title: "Building, testing and measuring blaze",
 		description:
-			"How blaze is built, checked, tested and measured, and how a lane runs: cargo with the pinned nightly in the dev loop while blaze still builds blaze as the proof, the one build VM `blaze-vm` (never AWS, never a VM per lane), a timeout on every command, at most four lanes writing in one directory while the main agent compiles each piece within minutes and admits it onto the last green head, cleaning up and measuring the exact tree. How tests are written (Hegel property tests, deterministic simulation, testing a causal claim) is the `testing` skill; the smoke run before a merge is the `landing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before running any command that can hang, before splitting work across subagents, and when starting or ending a lane.",
+			"How blaze is built, checked, tested and measured, and how a lane runs: cargo with the pinned nightly in the dev loop while blaze still builds blaze as the proof, the one build VM `blaze-vm` (never AWS, never a VM per lane), a timeout on every command, at most four lanes writing in one directory while the main agent compiles each piece within minutes and admits it onto the last green head, cleaning up and measuring the exact tree. How tests are written (property tests, deterministic simulation, testing a causal claim) is the `testing` skill; the smoke run before a merge is the `landing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before running any command that can hang, before splitting work across subagents, and when starting or ending a lane.",
 	},
 	"compiler-correctness": {
 		title: "Compiler correctness",

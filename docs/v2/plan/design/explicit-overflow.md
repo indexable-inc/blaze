@@ -89,7 +89,7 @@ The lint is in `blaze::edition` and allowed by default. In this workspace's ratc
   when unbounded and accepted when guarded; each explicit form is accepted; `strict_add`,
   `pow` and `abs` are found; macro arguments and closures are covered; the `--fix` output is
   checked. Every case runs under both profiles, and the results must match.
-- `crates/hir-ty-pure/src/tests/reach_oracle.rs`: a Hegel oracle. If an operation is shown to
+- `crates/hir-ty-pure/src/tests/reach_oracle.rs`: a blaze-sim oracle. If an operation is shown to
   fit, a run with overflow checks must not panic, and the proof must be the same in both
   profiles. A control plants a prover that takes every `+` to fit (`PLANT_ADD_ALWAYS_FITS`),
   and the oracle catches it.

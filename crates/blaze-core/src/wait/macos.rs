@@ -6,9 +6,11 @@ use std::{
     ffi::c_void,
     io,
     os::fd::RawFd,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
+
+use crate::atomic::AtomicU32;
 
 use super::{Clock, Deadline, Once, WaitError, Waited, parking::Futex, unix::timespec, until};
 
@@ -334,12 +336,11 @@ pub fn sleep_until(
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicU32, Ordering},
-        },
+        sync::{Arc, atomic::Ordering},
         time::Duration,
     };
+
+    use crate::atomic::AtomicU32;
 
     use super::{
         super::{Clock as _, Deadline, Monotonic, Parker, Waited, parking},

@@ -18,7 +18,7 @@
 //! and unmarked ones still mark. So a slot first called before a switch keeps the target it
 //! copied, for the rest of the process.
 //!
-//! It is the dev runtime's, so every dev executable has `__blaze_exec_slots` and
+//! It is the dev runtime's, so every dev executable has `__blaze_exec_table` and
 //! `__blaze_exec_arm` whatever it depends on: the recording fork server of a test binary with
 //! slots imports both.
 
@@ -324,13 +324,34 @@ unsafe fn carry(from: u64, to: u64, bytes: Range<u64>) {
     }
 }
 
-/// The jump table's slot count, for the server to write in a region's header before it
-/// forks; 0 when the program has none this runtime can find. Call it before forking: the
-/// first call finds the table, which a forked child of a threaded process mustn't (it
-/// allocates), and [`__blaze_exec_arm`] uses what it found.
+/// How many bytes [`__blaze_exec_table`] writes: the image's lineage (16), then its generation
+/// (a little-endian `u64`). The server reads them as `blaze_usercode::test::wire::Table::of_id`
+/// (its `TABLE_ID`, the same layout: the harness text links nothing of this crate).
+pub const TABLE_ID: usize = 24;
+
+/// The jump table's identity, for the server to send with every record it reads
+/// (`blaze_usercode::test::wire::Table`): its slot count, returned (what the server writes in
+/// a region's header before it forks; the table's capacity, the linker's header count, of
+/// which an image has given out fewer), and into `out` ([`TABLE_ID`] bytes) the lineage and
+/// generation of the image as its live descriptor names them, which together name one commit
+/// of one image and so one assignment of functions to slots (blaze-link's `Image::lineage`
+/// and `Image::generation`). 0 with nothing written when the program has no table this
+/// runtime can find. Call it before forking: the first call finds the table, which a forked
+/// child of a threaded process mustn't (it allocates), and [`__blaze_exec_arm`] uses what it
+/// found.
+///
+/// # Safety
+///
+/// `out..out + TABLE_ID` is writable.
 #[unsafe(no_mangle)]
-pub extern "C" fn __blaze_exec_slots() -> u32 {
-    Header::this().map_or(0, |it| it.slots())
+pub unsafe extern "C" fn __blaze_exec_table(out: *mut u8) -> u32 {
+    let (Ok(header), Ok((_, layout))) = (Header::this(), this_layout()) else { return 0 };
+    let mut id = [0u8; TABLE_ID];
+    id[..16].copy_from_slice(&layout.id);
+    id[16..].copy_from_slice(&layout.generation.to_le_bytes());
+    // SAFETY: the caller's: `out` has room for `TABLE_ID` bytes; `id` is a local of as many.
+    unsafe { std::ptr::copy_nonoverlapping(id.as_ptr(), out, TABLE_ID) };
+    header.slots()
 }
 
 /// Arms the execution log into `region` (`len` bytes), in a forked child with one thread,

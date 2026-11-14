@@ -182,7 +182,7 @@ impl Sums {
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::super::crc32;
     use super::*;
@@ -202,24 +202,26 @@ mod tests {
     /// The refinement: after any sequence of writes, the sums kept through them give the
     /// CRC-32 a pass over the whole file gives, for files of any length (none, less than a
     /// block, a block's multiple, between).
-    #[hegel::test]
-    fn sums_kept_through_writes_give_the_whole_files_crc(tc: hegel::TestCase) {
-        let len: usize = tc.draw(gs::integers::<usize>().max_value(5 * BLOCK + 17));
-        let mut bytes = file(tc.draw(gs::integers::<u64>()), len);
-        let mut sums = Sums::of(&bytes);
-        assert_eq!(sums.crc32(), crc32(&bytes), "made whole, {len} bytes");
-        let writes: usize = tc.draw(gs::integers::<usize>().max_value(12));
-        for _ in 0..writes {
-            let at: usize = tc.draw(gs::integers::<usize>().max_value(len + 8));
-            let count: usize = tc.draw(gs::integers::<usize>().max_value(2 * BLOCK));
-            let value: u8 = tc.draw(gs::integers::<u8>());
-            let end = (at + count).min(len);
-            for byte in bytes.get_mut(at.min(len)..end).unwrap_or(&mut []) {
-                *byte = byte.wrapping_add(value);
+    #[test]
+    fn sums_kept_through_writes_give_the_whole_files_crc() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let len: usize = tape.int_in(0..=5 * BLOCK + 17, "len");
+            let mut bytes = file(tape.int::<u64>("file seed"), len);
+            let mut sums = Sums::of(&bytes);
+            assert_eq!(sums.crc32(), crc32(&bytes), "made whole, {len} bytes");
+            let writes: usize = tape.int_in(0..=12usize, "writes");
+            for _ in 0..writes {
+                let at: usize = tape.int_in(0..=len + 8, "at");
+                let count: usize = tape.int_in(0..=2 * BLOCK, "count");
+                let value: u8 = tape.int::<u8>("value");
+                let end = (at + count).min(len);
+                for byte in bytes.get_mut(at.min(len)..end).unwrap_or(&mut []) {
+                    *byte = byte.wrapping_add(value);
+                }
+                sums.wrote(&bytes, at as u64, count as u64);
+                assert_eq!(sums.crc32(), crc32(&bytes), "after a write of {count} at {at} of {len}");
             }
-            sums.wrote(&bytes, at as u64, count as u64);
-            assert_eq!(sums.crc32(), crc32(&bytes), "after a write of {count} at {at} of {len}");
-        }
+        })
     }
 
     /// The control of [`sums_kept_through_writes_give_the_whole_files_crc`]: a write the

@@ -2,3 +2,14 @@ import Blaze.Result
 import Blaze.Scalar
 import Blaze.Slice
 import Blaze.Std
+import Blaze.Vec
+import Blaze.Range
+import Blaze.ScalarOps
+import Blaze.Ordering
+import Blaze.Duration
+import Blaze.Order
+import Blaze.Str
+import Blaze.Machine
+import Blaze.Opaque
+import Blaze.Threads
+import Blaze.Atomic

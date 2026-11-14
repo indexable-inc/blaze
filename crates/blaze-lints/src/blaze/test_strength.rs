@@ -165,7 +165,8 @@ pub(crate) struct Reads {
     pub(crate) unread: bool,
     pub(crate) calls: Vec<Called>,
     pub(crate) mirrors: Vec<Mirror>,
-    /// It calls a property-testing crate (Hegel, proptest, quickcheck).
+    /// It calls a property-testing crate (`blaze_sim`, or Hegel, proptest, quickcheck in other
+    /// people's projects).
     pub(crate) property: bool,
     /// The workspace functions outside test code it calls or names.
     pub(crate) reached: Vec<FunctionId>,
@@ -910,9 +911,9 @@ impl Code<'_, '_, '_> {
             self.name
         );
         let note = format!(
-            "add a property test of the round trip (Hegel: `#[hegel::test] fn round_trip(tc: \
-             TestCase) {{ let x = tc.draw(..); assert_eq!({name}(&{}(&x)), Ok(x)) }}`): it tries \
-             the inputs no example wrote down",
+            "add a property test of the round trip over generated inputs (blaze's own form: \
+             `blaze_sim::check(Config::cases(200), |tape| {{ let x = tape.any(\"x\"); \
+             assert_eq!({name}(&{}(&x)), Ok(x)) }})`): it tries the inputs no example wrote down",
             self.name
         );
         facts::push(out, Lint::PropertyOverExamples, self.at, message, Some(note));

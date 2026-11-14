@@ -1,0 +1,13 @@
+{
+ "id": "dst-1113-11",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "blaze built from main (fae038aef and 3fcd8110e), `blaze test` of crates/blaze-engine/tests/repro/generated_test_finds_planted_bug on blaze-vm",
+ "what": "The repro test generated_test_finds_planted_bug fails on main and on the branch alike with `double's test did not fail`: blaze never builds the fixture. `error: blaze panicked at .../inkwell-0.11.0/src/values/instruction_value.rs:186:13 on thread blaze-work-93, inside job > release summarize: assertion failed: value.is_instruction(), making this unit`, for blaze-rng v0.0.0 (lib) and repro v0.1.0 (lib) on the branch, and for the build scripts of libc, libm, parking_lot_core, proc-macro2, quote and rustix on main; `2 test targets never built, so never ran`.",
+ "cost": "the end-to-end proof that #[blaze::contract_test] finds a planted bug cannot run, on main or for the change that moved its generated code to blaze-sim",
+ "cause": "not established; `release summarize` is the dependency tier's pass, which changed in #2122",
+ "class": "a compiler crash that a repro test turns into an unrelated-looking test failure",
+ "prevention": "the smoke builds only hello-world, which has no dependency; a smoke project with one registry dependency and one build script would have caught it (how-to real-smoke has such a workspace); not done here",
+ "workaround": "the expansion's unit test (hir-def expr_store::tests::body::contract_test_expands_to_a_test_of_the_clauses) passes; the generated code was also compiled by hand under cargo",
+ "state": "open"
+}

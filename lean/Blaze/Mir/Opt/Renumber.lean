@@ -98,12 +98,12 @@ theorem nth?_position {β : Type} (g : BlockId → β) (b : BlockId) :
   | cons a rest ih =>
     intro h
     by_cases e : a = b
-    · have p : position b (a :: rest) = 0 := (position_cons b a rest).trans (if_pos e)
+    · have p : position b (a :: rest) = 0 := (position_cons b a rest).trans (ite_eq_left e)
       exact (congrTo (nth? (List.map g (a :: rest))) p).trans
         (congrTo (fun x => some (g x)) e)
     · have p : position b (a :: rest) = position b rest + 1 :=
-        (position_cons b a rest).trans (if_neg e)
-      have h' : has b rest = true := ((has_cons b a rest).trans (if_neg e)).symm.trans h
+        (position_cons b a rest).trans (ite_eq_right e)
+      have h' : has b rest = true := ((has_cons b a rest).trans (ite_eq_right e)).symm.trans h
       exact (congrTo (nth? (List.map g (a :: rest))) p).trans (ih h')
 
 /-- A block not listed has the order's length as its position. -/
@@ -117,11 +117,11 @@ theorem position_not_has (b : BlockId) :
   | cons a rest ih =>
     intro h
     by_cases e : a = b
-    · have t : has b (a :: rest) = true := (has_cons b a rest).trans (if_pos e)
+    · have t : has b (a :: rest) = true := (has_cons b a rest).trans (ite_eq_left e)
       exact true_eq_false_elim (t.symm.trans h)
     · have p : position b (a :: rest) = position b rest + 1 :=
-        (position_cons b a rest).trans (if_neg e)
-      have h' : has b rest = false := ((has_cons b a rest).trans (if_neg e)).symm.trans h
+        (position_cons b a rest).trans (ite_eq_right e)
+      have h' : has b rest = false := ((has_cons b a rest).trans (ite_eq_right e)).symm.trans h
       exact p.trans (congrTo (fun n => n + 1) (ih h'))
 
 /-- So nothing is there in the renumbered blocks. -/
@@ -148,7 +148,7 @@ theorem has_lt (n : Nat) (b : BlockId) :
     · have below : a < n := of_decide_eq_true (and_true_left ha)
       rw [← e]
       exact below
-    · exact ih (and_true_right ha) (((has_cons b a rest).trans (if_neg e)).symm.trans hh)
+    · exact ih (and_true_right ha) (((has_cons b a rest).trans (ite_eq_right e)).symm.trans hh)
 
 /-- The order lists every block below `n`. -/
 def covers (order : List BlockId) : Nat → Bool
@@ -179,11 +179,11 @@ def startsZero : List BlockId → Bool
 
 theorem position_zero : ∀ (order : List BlockId), startsZero order = true → position 0 order = 0
   | [], h => false_eq_true_elim h
-  | a :: rest, h => (position_cons 0 a rest).trans (if_pos (of_decide_eq_true h))
+  | a :: rest, h => (position_cons 0 a rest).trans (ite_eq_left (of_decide_eq_true h))
 
 theorem has_zero : ∀ (order : List BlockId), startsZero order = true → has 0 order = true
   | [], h => false_eq_true_elim h
-  | a :: rest, h => (has_cons 0 a rest).trans (if_pos (of_decide_eq_true h))
+  | a :: rest, h => (has_cons 0 a rest).trans (ite_eq_left (of_decide_eq_true h))
 
 /-! The targets of listed blocks are listed. -/
 
@@ -254,7 +254,7 @@ theorem closedIn_has (order : List BlockId) (blocks : List BasicBlock) (b : Bloc
     by_cases e : a = b
     · rw [← e]
       exact and_true_left hc
-    · exact ih (and_true_right hc) (((has_cons b a rest).trans (if_neg e)).symm.trans hh)
+    · exact ih (and_true_right hc) (((has_cons b a rest).trans (ite_eq_right e)).symm.trans hh)
 
 /-! The pass. -/
 

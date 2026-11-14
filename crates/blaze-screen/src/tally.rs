@@ -18,6 +18,7 @@ use crate::text;
 pub struct Tally {
     /// The test executables that were started.
     pub binaries: u32,
+    /// The tests that passed: those that ran and passed, and those `cached` counts.
     pub passed: u32,
     /// The tests that failed, and each executable that ended badly outside any test.
     pub failed: u32,
@@ -27,23 +28,24 @@ pub struct Tally {
     pub measured: u32,
     /// The tests the filter left out, as libtest counts them.
     pub filtered_out: u32,
-    /// Selected and not run because the edit did not reach them (`--reached`).
-    pub unreached: u32,
+    /// Of `passed`, the tests not run because nothing they executed or read changed: their kept
+    /// pass stands.
+    pub cached: u32,
     /// The test executables that never built, so never ran.
     pub unbuilt: u32,
 }
 
 impl Tally {
-    /// The tests the selection held: every one that ran, and every one it kept and did not run.
+    /// The tests the selection held: every one that ran, every cached one and every ignored one.
     #[must_use]
     pub const fn selected(&self) -> u32 {
-        self.ran().saturating_add(self.ignored).saturating_add(self.unreached)
+        self.ran().saturating_add(self.cached).saturating_add(self.ignored)
     }
 
-    /// The tests that ran: the only ones a pass says anything about.
+    /// The tests that ran now: the passes that were not cached, the failures and the measured.
     #[must_use]
     pub const fn ran(&self) -> u32 {
-        self.passed.saturating_add(self.failed).saturating_add(self.measured)
+        self.passed.saturating_sub(self.cached).saturating_add(self.failed).saturating_add(self.measured)
     }
 
     /// `other`'s counts added to this one's.
@@ -54,7 +56,7 @@ impl Tally {
         self.ignored = self.ignored.saturating_add(other.ignored);
         self.measured = self.measured.saturating_add(other.measured);
         self.filtered_out = self.filtered_out.saturating_add(other.filtered_out);
-        self.unreached = self.unreached.saturating_add(other.unreached);
+        self.cached = self.cached.saturating_add(other.cached);
         self.unbuilt = self.unbuilt.saturating_add(other.unbuilt);
     }
 
@@ -65,11 +67,11 @@ impl Tally {
     }
 
     /// The counts as `key=value` fields, every one always there and in one order:
-    /// `selected=9 ran=8 passed=7 failed=1 ignored=1 measured=0 filtered_out=0 unreached=0 binaries=3 unbuilt=0`.
+    /// `selected=9 ran=8 passed=7 failed=1 ignored=1 measured=0 filtered_out=0 cached=0 binaries=3 unbuilt=0`.
     #[must_use]
     pub fn fields(&self) -> String {
         format!(
-            "selected={} ran={} passed={} failed={} ignored={} measured={} filtered_out={} unreached={} \
+            "selected={} ran={} passed={} failed={} ignored={} measured={} filtered_out={} cached={} \
              binaries={} unbuilt={}",
             self.selected(),
             self.ran(),
@@ -78,7 +80,7 @@ impl Tally {
             self.ignored,
             self.measured,
             self.filtered_out,
-            self.unreached,
+            self.cached,
             self.binaries,
             self.unbuilt
         ) // alloc: the run's line, once
@@ -86,7 +88,7 @@ impl Tally {
 }
 
 /// Off a terminal, a test run's end, one whole line after the test executables' own output:
-/// `blaze: tests ok selected=9 ran=9 passed=8 failed=0 ignored=1 measured=0 filtered_out=0 unreached=0 binaries=3 unbuilt=0 elapsed_ms=31800`,
+/// `blaze: tests ok selected=9 ran=8 passed=8 failed=0 ignored=1 measured=0 filtered_out=0 cached=0 binaries=3 unbuilt=0 elapsed_ms=31800`,
 /// or `blaze: tests failed ... why="no test ran"`. `ok` is the command's verdict (its exit
 /// code is 0), never worked out again here; `why` is what refused a run in which no test
 /// failed.
@@ -116,7 +118,7 @@ mod tests {
         assert_eq!(
             tests_line(&none, false, Some("no test ran"), 12),
             "blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=312 \
-             unreached=0 binaries=3 unbuilt=0 elapsed_ms=12 why=\"no test ran\""
+             cached=0 binaries=3 unbuilt=0 elapsed_ms=12 why=\"no test ran\""
         );
         let some = Tally { binaries: 3, passed: 7, failed: 1, ignored: 1, ..Tally::default() };
         assert_eq!((some.selected(), some.ran()), (9, 8));
@@ -124,14 +126,15 @@ mod tests {
         assert_eq!(
             tests_line(&some, false, None, 31_800),
             "blaze: tests failed selected=9 ran=8 passed=7 failed=1 ignored=1 measured=0 filtered_out=0 \
-             unreached=0 binaries=3 unbuilt=0 elapsed_ms=31800"
+             cached=0 binaries=3 unbuilt=0 elapsed_ms=31800"
         );
     }
 
-    /// A test that is selected and not run (ignored, unreached) is selected and is not a run.
+    /// A test that is selected and not run (ignored, or cached: a pass that stands) is
+    /// selected and is not a run.
     #[test]
     fn what_is_kept_and_not_run_is_selected_and_not_ran() {
-        let tally = Tally { ignored: 2, unreached: 5, measured: 1, ..Tally::default() };
+        let tally = Tally { passed: 5, ignored: 2, cached: 5, measured: 1, ..Tally::default() };
         assert_eq!((tally.selected(), tally.ran()), (8, 1));
         let mut sum = tally;
         sum.add(&Tally { binaries: 1, passed: 4, filtered_out: 9, unbuilt: 1, ..Tally::default() });
@@ -139,14 +142,15 @@ mod tests {
             sum,
             Tally {
                 binaries: 1,
-                passed: 4,
+                passed: 9,
                 failed: 0,
                 ignored: 2,
                 measured: 1,
                 filtered_out: 9,
-                unreached: 5,
+                cached: 5,
                 unbuilt: 1
             }
         );
+        assert_eq!((sum.selected(), sum.ran()), (12, 5));
     }
 }

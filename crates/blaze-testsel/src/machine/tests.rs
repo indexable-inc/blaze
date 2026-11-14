@@ -1,7 +1,7 @@
 //! The simulation of [`Selection`]: a model program (functions with versions and a call graph
 //! their code decides, outside files, an environment variable, the code not called through a
-//! slot, a clock), a host that answers the machine's effects in a seeded random order from a
-//! simulated store, and an oracle that reruns every asked test from scratch after each request.
+//! slot, a clock), a host that answers the machine's effects in an order drawn from the tape from
+//! a simulated store, and an oracle that reruns every asked test from scratch after each request.
 
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,8 +15,7 @@ use blaze_keyed::{
     proof,
     store::Put,
 };
-use blaze_rng::SplitMix64;
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config, Tape};
 
 use super::{By, Effect, Executed, Input, NotKept, NotWhole, Ran, Read, Selection, Start, Step, Test, Verdict};
 use crate::{
@@ -267,17 +266,33 @@ struct Reached {
 }
 
 impl Reached {
-    fn add(&mut self, other: &Reached) {
-        self.unchanged_after_edit += other.unchanged_after_edit;
-        self.answers_after_undo += other.answers_after_undo;
-        self.untraceable_runs += other.untraceable_runs;
-        self.cached_judged += other.cached_judged;
-        self.kept_judged += other.kept_judged;
-        self.failed_runs += other.failed_runs;
-        self.raced += other.raced;
-        self.compactions += other.compactions;
+    /// Each count, in the order of [`POINTS`].
+    fn counts(&self) -> [u32; 8] {
+        let Reached {
+            unchanged_after_edit,
+            answers_after_undo,
+            untraceable_runs,
+            cached_judged,
+            kept_judged,
+            failed_runs,
+            raced,
+            compactions,
+        } = *self;
+        [unchanged_after_edit, answers_after_undo, untraceable_runs, cached_judged, kept_judged, failed_runs, raced, compactions]
     }
 }
+
+/// What each count of [`Reached`] means, as the point a case that counted it reaches.
+const POINTS: [&str; 8] = [
+    "a row cached as unchanged after an edit elsewhere",
+    "a test cached by its answers after an undone edit",
+    "a run that read what cannot be traced",
+    "a cached test rerun by the oracle",
+    "a test whose state now was kept before",
+    "a failing run",
+    "a request with a race",
+    "a compaction of the postings",
+];
 
 /// Which clause of the oracle a request broke.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -330,12 +345,21 @@ fn violation<T>(clause: Clause, what: String) -> Result<T, Failure> {
     Err(Failure::Violation { clause, what })
 }
 
-fn sim(ops: &[Op], seed: u64, order: u64, plant: Plant) -> Result<Sim, Failure> {
+/// A failure as blaze-sim's: a clause broken is the oracle's finding, anything else the
+/// harness's.
+fn broke(failure: Failure) -> Broke {
+    match failure {
+        Failure::Violation { .. } => Broke::Oracle(failure.to_string()),
+        Failure::Broke(what) => Broke::Harness(format!("broke: {what}")),
+    }
+}
+
+/// Runs `ops` on the program `seed` picks, the host answering in the order `order` draws.
+fn sim(ops: &[Op], seed: u64, order: &Tape, plant: Plant) -> Result<Sim, Failure> {
     PLANT.set(plant);
     let result = (|| -> Result<Sim, Failure> {
         let mut host = Host { store: BTreeMap::new(), head: None, programs: BTreeMap::new(), filed: Default::default() };
         let mut world = World::new();
-        let mut order = SplitMix64::new(order);
         let mut edits: Vec<(usize, u8)> = Vec::new();
         let mut requests = Vec::new();
         let mut reached = Reached::default();
@@ -362,13 +386,13 @@ fn sim(ops: &[Op], seed: u64, order: u64, plant: Plant) -> Result<Sim, Failure> 
                 Op::Request { mask, race } => {
                     let tests: Vec<usize> = (0..TESTS).filter(|test| mask == 0 || mask & (1 << test) != 0).collect();
                     let asked = Asked { tests: &tests, run_all: false, race, since };
-                    requests.push(request(&mut host, &mut world, seed, &mut order, &asked, &mut reached)?);
+                    requests.push(request(&mut host, &mut world, seed, order, &asked, &mut reached)?);
                     since = Since::default();
                 }
                 Op::RunAll => {
                     let tests: Vec<usize> = (0..TESTS).collect();
                     let asked = Asked { tests: &tests, run_all: true, race: false, since };
-                    requests.push(request(&mut host, &mut world, seed, &mut order, &asked, &mut reached)?);
+                    requests.push(request(&mut host, &mut world, seed, order, &asked, &mut reached)?);
                     since = Since::default();
                 }
             }
@@ -401,7 +425,7 @@ fn request(
     host: &mut Host,
     world: &mut World,
     seed: u64,
-    order: &mut SplitMix64,
+    order: &Tape,
     asked: &Asked<'_>,
     reached: &mut Reached,
 ) -> Result<Vec<(usize, Verdict)>, Failure> {
@@ -446,7 +470,7 @@ fn request(
             if pending.is_empty() {
                 return Err(Failure::Broke("the machine waits with nothing asked".into()));
             }
-            match pending.swap_remove(order.index(pending.len())) {
+            match pending.swap_remove(order.index(pending.len(), "which answer")) {
                 Pending::Get { ticket, tag, key } => {
                     let record = host.store.get(&(tag, key)).map(|bytes| &bytes[..]);
                     selection.give(Input::Got { ticket, record });
@@ -493,6 +517,9 @@ fn request(
                         reads: &out.reads,
                         untraceable: &out.untraceable,
                         sandboxed: true,
+                        traced: true,
+                        foreign: false,
+                        moved: false,
                     };
                     selection.give(Input::Ran { ticket, ran: given });
                     ran[at] = Some(out);
@@ -601,18 +628,17 @@ fn request(
     Ok(out)
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let at = tc.draw(gs::integers::<u8>().max_value(7)) as usize;
-    let value = tc.draw(gs::integers::<u8>().max_value(3));
-    match tc.draw(gs::integers::<u8>().max_value(11)) {
+fn op(tape: &Tape) -> Op {
+    let at = tape.int_in(0..=7u8, "at") as usize;
+    let value = tape.int_in(0..=3u8, "value");
+    match tape.int_in(0..=11u8, "op") {
         0 | 1 => Op::Edit(at, value),
         2 => Op::Undo,
         3 => Op::File(at % FILES, (value > 0).then_some(value)),
         4 => Op::Env((value > 0).then_some(value)),
         5 => Op::Unlogged(value),
         6 => Op::Tick,
-        7 => Op::Request { mask: tc.draw(gs::integers::<u8>().max_value(31)), race: tc.draw(gs::integers::<u8>().max_value(1)) == 1 },
+        7 => Op::Request { mask: tape.int_in(0..=31u8, "mask"), race: tape.int_in(0..=1u8, "race") == 1 },
         8 => Op::RunAll,
         _ => REQUEST,
     }
@@ -625,71 +651,37 @@ fn op(tc: &hegel::TestCase) -> Op {
 /// (a fresh run's state was never kept); (c) so an undone edit reruns nothing that was kept;
 /// (d) a test that reads what cannot be traced is never cached; a failure is never cached; at
 /// most `WORKERS` tests run at once; every request ends.
-#[hegel::test(test_cases = 300)]
-fn a_cached_result_is_what_a_rerun_gives(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    let order = tc.draw(gs::integers::<u64>());
-    if let Err(why) = sim(&ops, seed, order, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_cached_result_is_what_a_rerun_gives() {
+    blaze_sim::check(Config::cases(300), |tape| -> Result<(), Broke> {
+        let ops: Vec<Op> = tape.vec(0..=30, "ops", op);
+        let seed = tape.next_u64("program seed");
+        sim(&ops, seed, tape, Plant::None).map(drop).map_err(broke)
+    });
 }
 
-fn random_ops(rng: &mut SplitMix64) -> Vec<Op> {
-    (0..30)
-        .map(|_| {
-            let at = rng.index(FNS);
-            let value = rng.index(4) as u8;
-            match rng.index(12) {
-                0 | 1 => Op::Edit(at, value),
-                2 => Op::Undo,
-                3 => Op::File(at % FILES, (value > 0).then_some(value)),
-                4 => Op::Env((value > 0).then_some(value)),
-                5 => Op::Unlogged(value),
-                6 => Op::Tick,
-                7 => Op::Request { mask: rng.index(32) as u8, race: rng.index(2) == 1 },
-                8 => Op::RunAll,
-                _ => REQUEST,
-            }
-        })
-        .collect()
+/// Thirty ops, each drawn as `op` draws one.
+fn random_ops(tape: &Tape) -> Vec<Op> {
+    (0..30).map(|_| op(tape)).collect()
 }
 
-/// The same invariant over many fixed seeds, replayable by number; and those seeds reach every
-/// situation a clause judges (a pass that holds no clause to a case proves nothing).
+/// The same invariant over many cases of thirty ops, replayable by seed; and those cases reach
+/// every situation a clause judges (a pass that holds no clause to a case proves nothing): each
+/// of [`POINTS`] is a point some passing case has to reach.
 #[test]
 fn many_seeds_hold_the_invariant() {
-    let mut reached = Reached::default();
-    for seed in 0..200 {
-        let mut rng = SplitMix64::new(seed);
-        let ops = random_ops(&mut rng);
-        match sim(&ops, seed, seed ^ 0x5eed, Plant::None) {
-            Ok(sim) => reached.add(&sim.reached),
-            Err(why) => panic!("seed {seed}: {why}\nops: {ops:?}"),
+    blaze_sim::check(Config::cases(200).must_reach(&POINTS), |tape| -> Result<(), Broke> {
+        let ops = random_ops(tape);
+        let seed = tape.next_u64("program seed");
+        tape.note(format_args!("ops: {ops:?}"));
+        let sim = sim(&ops, seed, tape, Plant::None).map_err(broke)?;
+        for (count, point) in sim.reached.counts().into_iter().zip(POINTS) {
+            if count > 0 {
+                tape.reached(point);
+            }
         }
-    }
-    let Reached {
-        unchanged_after_edit,
-        answers_after_undo,
-        untraceable_runs,
-        cached_judged,
-        kept_judged,
-        failed_runs,
-        raced,
-        compactions,
-    } = reached;
-    for (count, what) in [
-        (unchanged_after_edit, "a row cached as unchanged after an edit elsewhere"),
-        (answers_after_undo, "a test cached by its answers after an undone edit"),
-        (untraceable_runs, "a run that read what cannot be traced"),
-        (cached_judged, "a cached test rerun by the oracle"),
-        (kept_judged, "a test whose state now was kept before"),
-        (failed_runs, "a failing run"),
-        (raced, "a request with a race"),
-        (compactions, "a compaction of the postings"),
-    ] {
-        assert!(count > 0, "no seed reached {what}: widen the generator ({reached:?})");
-    }
+        Ok(())
+    });
 }
 
 /// Edits to every function, each then undone, with a request after each.
@@ -717,55 +709,61 @@ fn file_changes() -> Vec<Op> {
 /// the first request is cached by the last.
 #[test]
 fn an_undone_edit_reruns_nothing() {
-    for seed in 0..64 {
-        let ops = [REQUEST, Op::Edit((seed % FNS as u64) as usize, 1), Op::Edit(0, 3), REQUEST, Op::Undo, Op::Undo, REQUEST];
-        let sim = sim(&ops, seed, seed, Plant::None).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+    blaze_sim::check(Config::cases(64), |tape| -> Result<(), Broke> {
+        let edited = tape.index(FNS, "edited function");
+        let seed = tape.next_u64("program seed");
+        let ops = [REQUEST, Op::Edit(edited, 1), Op::Edit(0, 3), REQUEST, Op::Undo, Op::Undo, REQUEST];
+        let sim = sim(&ops, seed, tape, Plant::None).map_err(broke)?;
         let (first, last) = (&sim.requests[0], &sim.requests[2]);
         for ((test, before), (_, after)) in first.iter().zip(last) {
             let kept = matches!(before, Verdict::Ran { .. } | Verdict::Cached { .. });
             if kept && !matches!(after, Verdict::Cached { .. }) {
-                panic!("seed {seed}: test {test} was kept, the edit was undone, and it was {after:?}");
+                return Err(Broke::Oracle(format!("test {test} was kept, the edit was undone, and it was {after:?}")));
             }
         }
-    }
+        Ok(())
+    });
 }
 
 /// The records and verdicts are the same whatever order the host answers in.
 #[test]
 fn the_records_do_not_depend_on_answer_order() {
-    for seed in 0..32 {
-        let mut rng = SplitMix64::new(seed);
-        let ops: Vec<Op> = random_ops(&mut rng)
+    blaze_sim::check(Config::cases(32), |tape| -> Result<(), Broke> {
+        let ops: Vec<Op> = random_ops(tape)
             .into_iter()
             .map(|op| match op {
                 Op::Request { mask, .. } => Op::Request { mask, race: false },
                 op => op,
             })
             .collect();
-        let a = sim(&ops, seed, 1, Plant::None).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
-        let b = sim(&ops, seed, 2, Plant::None).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
-        assert_eq!(a.requests, b.requests, "seed {seed}: the verdicts depend on the order of the answers");
-        assert!(a.store == b.store, "seed {seed}: the store depends on the order of the answers");
-    }
+        let seed = tape.next_u64("program seed");
+        let a = sim(&ops, seed, &Tape::seeded(1), Plant::None).map_err(broke)?;
+        let b = sim(&ops, seed, &Tape::seeded(2), Plant::None).map_err(broke)?;
+        assert_eq!(a.requests, b.requests, "the verdicts depend on the order of the answers");
+        assert!(a.store == b.store, "the store depends on the order of the answers");
+        Ok(())
+    });
 }
 
-/// `ops` pass as the code is, and with `plant` some seed breaks a clause; every seed that
+/// `ops` pass as the code is, and with `plant` some case breaks a clause; every case that
 /// breaks one breaks one of `causes`, the clauses the plant can cause. Any other failure (another
 /// clause, or the machine breaking) fails the control: a control caught by an unrelated clause
-/// is not a control.
+/// is not a control. A clause of `causes` is the oracle's finding; anything else is the harness's,
+/// which ends the control at once.
 fn caught(ops: &[Op], plant: Plant, causes: &[Clause]) {
-    let mut caught = false;
-    for seed in 0..64 {
-        if let Err(why) = sim(ops, seed, seed, Plant::None) {
-            panic!("seed {seed} with no plant: {why}");
+    blaze_sim::control(Config::cases(64), Plant::None, plant, "", |tape, plant| {
+        let seed = tape.next_u64("program seed");
+        match sim(ops, seed, tape, plant) {
+            Ok(_) => Ok(()),
+            Err(Failure::Violation { clause, what }) if causes.contains(&clause) => {
+                Err(Broke::Oracle(format!("{clause:?}: {what}")))
+            }
+            Err(Failure::Violation { clause, what }) => Err(Broke::Harness(format!(
+                "{plant:?}: {clause:?} is not a clause it can cause ({causes:?}): {what}"
+            ))),
+            Err(Failure::Broke(what)) => Err(Broke::Harness(format!("{plant:?}: broke: {what}"))),
         }
-        match sim(ops, seed, seed, plant) {
-            Ok(_) => {}
-            Err(Failure::Violation { clause, .. }) if causes.contains(&clause) => caught = true,
-            Err(why) => panic!("{plant:?}, seed {seed}: not a clause it can cause ({causes:?}): {why}"),
-        }
-    }
-    assert!(caught, "the oracle missed {plant:?}");
+    });
 }
 
 /// A function left out of a kept pass's asks: an edit to it is not seen, so the test is cached

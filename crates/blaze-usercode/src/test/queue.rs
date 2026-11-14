@@ -45,9 +45,10 @@
 //! driver timer at its soonest deadline.
 //!
 //! The queue asks with tags `tags..tags + 2^32` ([`Config::tags`]). It reads no clock: the
-//! driver's `now` comes with each call. It is [`Queue::finished`] once every test has a result
-//! and every process it started has ended; timers still in flight then are stale and their
-//! completions are dropped.
+//! driver's `now` comes with each call. It is [`Queue::finished`] once every test has a result,
+//! every process it started has ended, and the request's directory ([`Config::dir`]) with its
+//! sockets and records is removed (`Tidy`), cancelled or not; timers still in flight then are
+//! stale and their completions are dropped.
 
 use std::{borrow::Cow, ffi::OsString, io::Write as _, path::PathBuf, sync::Arc, time::Duration};
 
@@ -64,6 +65,7 @@ use blaze_inproc::host::{Program, Started};
 use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
     confine,
+    provider::Provider,
     trace::{self, BadRecord, Inputs, Seen},
 };
 
@@ -111,13 +113,13 @@ pub struct Binary {
     pub memory: Option<u64>,
     pub mode: Mode,
     pub jobs: Vec<Job>,
-    /// The binary as blaze holds it in memory: [`Program::command`] writes its executable at
-    /// `program`, once per binary, and that file is what is spawned.
+    /// The binary as blaze holds it in memory: what is spawned is the file its build placed at
+    /// `program`, started by [`Program::command`] with the key the job's record holds there
+    /// ([`Loaded`]'s second field), which writes no file.
     pub loaded: Option<Loaded>,
     /// Whether it runs in a sandbox that traces what each test reads (docs/cargo.md, "Sandboxed
-    /// tests"): only where the workspace opts into `sandboxed-tests` or the package says
-    /// `tests = true` under `[package.metadata.blaze.sandbox]`, and neither the package says
-    /// `tests = false` nor the command `BLAZE_SANDBOX=off`. Outside, it runs as cargo runs it,
+    /// tests"): the default, unless the package says `tests = false` under
+    /// `[package.metadata.blaze.sandbox]` or the command `BLAZE_SANDBOX=off`. Outside, it runs as cargo runs it,
     /// with [`Sandbox::Off`]: no record, no [`confine::LIVE`], each test still a process of its
     /// own from the fork server, and every result's trace [`Trace::Unknown`] ([`OUTSIDE`]), so
     /// no pass is kept. `read`, `write` and `network` are the sandbox's, unused outside.
@@ -128,17 +130,30 @@ pub struct Binary {
     /// executable into two runs. Each binary has files and a socket of its own, by its place
     /// in the queue, and the outside one starts once the sandboxed tests have their results.
     /// No binary goes outside but by this field: one sandboxed whose sandbox can't be made
-    /// loses its tests, saying why.
+    /// loses its tests, saying why, and stops the run ([`Queue::take_unsandboxable`]).
     pub sandboxed: bool,
+    /// What its processes' randomness comes from when it is sandboxed: its suite's
+    /// ([`Provider::of_suite`]), named to them by [`crate::provider::VAR`] in their
+    /// environment (not in `env`, which a test's base key is made of: the provider is a
+    /// function of that key's inputs and adds none). std reads its hash maps' keys and its
+    /// `fill_bytes` from it with no system call, and the sandbox answers from it what a
+    /// process asks the kernel, each test from a stream of its own name. A sandboxed binary
+    /// with none is refused as it starts, naming it: without one, std's start reads the
+    /// kernel's randomness, which no test can be kept on. Unused outside the sandbox.
+    pub provider: Option<Provider>,
 }
 
-/// A binary blaze holds in memory. Two are the same when they are one program.
+/// A binary blaze holds in memory, and the content key the job's record holds for the path
+/// it starts from: the output its build placed there and found as placed, or `None` (the
+/// record read as the run starts, `Runs::start`'s `placed`). Its launch is refused where that
+/// is not the program's file's key ([`blaze_inproc::host::StartError::NotPlaced`]). Two are
+/// the same when they are one program at one key.
 #[derive(Clone)]
-pub struct Loaded(pub Arc<Program>);
+pub struct Loaded(pub Arc<Program>, pub Option<[u8; 32]>);
 
 impl PartialEq for Loaded {
     fn eq(&self, other: &Loaded) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && self.1 == other.1
     }
 }
 
@@ -154,7 +169,8 @@ impl std::fmt::Debug for Loaded {
 pub struct Config {
     /// The driver's root, as the processes it starts see it.
     pub root: PathBuf,
-    /// The request's directory under the root, where the sockets and records go.
+    /// The request's directory under the root, where the sockets and records go: the queue's
+    /// own, removed as it finishes ([`Queue::finished`]).
     pub dir: FileName,
     /// How many tests (children, or libtest threads) run at once: blaze's core budget
     /// (`blaze_core::cores`), which every test thread is charged to.
@@ -203,7 +219,7 @@ pub enum Trace {
 pub const OUTSIDE: &str = "it ran outside the sandbox, which alone records what a test reads";
 
 impl Trace {
-    /// What was read, hashed as `inputs` has it now: what [`super::select::record`] keeps a
+    /// What was read, hashed as `inputs` has it now: what blaze-testsel's machine keeps a
     /// pass by. To be asked as the result comes, before anything else changes the files.
     pub fn traced<I: Inputs>(&self, inputs: &mut I) -> Result<Option<Traced>, I::Error> {
         match self {
@@ -359,6 +375,28 @@ enum For {
     /// The driver timer at the wheel's soonest deadline.
     Tick,
     Whole(u32),
+    /// A socket or record of the request's directory removed ([`Tidy`]).
+    Remove,
+    /// The request's directory removed, once its files are.
+    RemoveDir,
+}
+
+/// The request's directory ([`Config::dir`]) in its end: kept while anything can write or
+/// read in it; then its sockets and records removed, then the directory itself. Never left
+/// behind by a run that ends: a run cancelled or a server lost ends the same way, once its
+/// processes ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tidy {
+    /// In use, or may be: a test without a result, or a process, listen, write or read of it
+    /// in flight.
+    Open,
+    /// Its files being removed: how many removes are in flight, and whether one failed (the
+    /// directory is then kept, as it is not empty).
+    Files { left: u32, failed: bool },
+    /// The directory being removed.
+    Dir,
+    /// Gone, or never made.
+    Gone,
 }
 
 /// What a timer of the wheel is for.
@@ -473,6 +511,9 @@ struct Server {
     /// The IDs in `names` of its socket's and its record's paths (as the record names them)
     /// and of the two variables blaze set for it: the lines that are blaze's own.
     ours: [u32; 4],
+    /// The program's own file, as its binary names it: the server's start of it (the exec, the
+    /// loader's reads of the image) is blaze's own too ([`own_start`]).
+    program: String,
     /// The tests its replicas run now, by id, in the order they started: those a lost server
     /// or replica takes end in that order.
     running: Vec<u64>,
@@ -649,6 +690,15 @@ pub struct Queue {
     busy: usize,
     stopping: bool,
     cancelled: bool,
+    /// Why the first sandboxed fork server could not be started in its sandbox, until the
+    /// driver takes it ([`Queue::take_unsandboxable`]): the run stops there, nothing else
+    /// starts, and the driver says once how to run outside and why.
+    unsandboxable: Option<String>,
+    /// The request's directory in its end.
+    tidy: Tidy,
+    /// What of the request's directory could not be removed, and why, until the driver takes
+    /// it ([`Queue::take_left_behind`]).
+    left_behind: Option<String>,
     now: Duration,
     results: Vec<Finished>,
 }
@@ -700,6 +750,9 @@ impl Queue {
             busy: 0,
             stopping: false,
             cancelled: false,
+            unsandboxable: None,
+            tidy: Tidy::Open,
+            left_behind: None,
             now,
             results: Vec::with_capacity(cores),
         };
@@ -770,6 +823,7 @@ impl Queue {
             }
         }
         queue.schedule(effects);
+        queue.tidy(effects);
         queue.flush(effects);
         queue
     }
@@ -794,16 +848,89 @@ impl Queue {
         &self.bins[at].plan
     }
 
-    /// Every test has a result and every process the queue started has ended.
+    /// Every test has a result, every process the queue started has ended, and the request's
+    /// directory is gone ([`Tidy`]).
     pub fn finished(&self) -> bool {
-        self.bins.iter().all(|bin| {
+        self.tidy == Tidy::Gone
+    }
+
+    /// Whether nothing can write or read in the request's directory any more: every test has
+    /// a result, every process the queue started has ended (a server's sandbox appends to its
+    /// record until its spawn completes), and no listen, write or read of its files is in
+    /// flight.
+    fn done_with_files(&self) -> bool {
+        let quiet = self.bins.iter().all(|bin| {
             bin.left == 0
                 && bin.whole.is_none()
                 && bin
                     .server
                     .as_ref()
-                    .is_none_or(|it| it.spawn.is_none() && it.phase != Phase::Writing)
-        })
+                    .is_none_or(|it| it.spawn.is_none() && it.phase != Phase::Writing && !it.reading)
+        });
+        quiet
+            && !self
+                .tags
+                .iter()
+                .any(|it| matches!(it, For::Write(_) | For::Listen(_) | For::Spawn(_) | For::Read(_)))
+    }
+
+    /// The request's directory removed once the queue is done with its files: each server's
+    /// socket and record, then, once those are gone, the directory. Removing what is gone
+    /// already is done, so a socket its listener took with it, or a record never made, is no
+    /// error.
+    fn tidy(&mut self, effects: &mut Vec<Effect>) {
+        if self.tidy != Tidy::Open || !self.done_with_files() {
+            return;
+        }
+        let mut removes = 0u32;
+        for b in 0..self.bins.len() {
+            let Some(server) = &self.bins[b].server else { continue };
+            // clone: once per server, at its end: the driver's remove owns its file name
+            let (socket, record) = (server.socket.clone(), server.record.clone());
+            let sandboxed = self.bins[b].plan.sandboxed;
+            for file in [Some(socket), sandboxed.then_some(record)].into_iter().flatten() {
+                let tag = self.tag(For::Remove);
+                effects.push(Effect::Remove { file, tag });
+                removes += 1;
+            }
+        }
+        match removes {
+            // No server was started: nothing was made in the directory, nor the directory.
+            0 => self.tidy = Tidy::Gone,
+            left => self.tidy = Tidy::Files { left, failed: false },
+        }
+    }
+
+    /// A remove of the request's directory completed: once its files are gone, the directory;
+    /// one that failed is said ([`Queue::take_left_behind`]) and the directory is kept.
+    fn removed(&mut self, dir: bool, done: Done, effects: &mut Vec<Effect>) {
+        let failed = matches!(done, Done::Failed(_));
+        if let Done::Failed(error) = done
+            && self.left_behind.is_none()
+        {
+            let at = self.path(&self.config.dir);
+            // alloc: error path
+            self.left_behind = Some(format!("the test run's directory {} is left behind: {error}", at.display()));
+        }
+        self.tidy = match (self.tidy, dir) {
+            (Tidy::Files { left, failed: before }, false) if left > 1 => {
+                Tidy::Files { left: left - 1, failed: before || failed }
+            }
+            (Tidy::Files { failed: false, .. }, false) if !failed => {
+                let tag = self.tag(For::RemoveDir);
+                // clone: once per run, at its end: the driver's remove owns its file name
+                effects.push(Effect::Remove { file: self.config.dir.clone(), tag });
+                Tidy::Dir
+            }
+            (Tidy::Files { .. } | Tidy::Dir, _) => Tidy::Gone,
+            (other, _) => other,
+        };
+    }
+
+    /// What of the request's directory could not be removed, and why, once: the driver says
+    /// it, by name. `None` ever after, and when it was all removed.
+    pub fn take_left_behind(&mut self) -> Option<String> {
+        self.left_behind.take()
     }
 
     /// Stops the run: what has not started is not run, and what runs is killed and reported
@@ -819,7 +946,16 @@ impl Queue {
             self.kill_server(b, "the run was cancelled", effects);
         }
         self.let_go(effects);
+        self.tidy(effects);
         self.flush(effects);
+    }
+
+    /// Why a sandboxed fork server could not be started in its sandbox, the first time one
+    /// could not, once: the queue stopped there (what had not started is not run), and the
+    /// driver says it to the person once, with the way to run outside, rather than only in
+    /// each lost test's output. `None` ever after, and when every sandbox was made.
+    pub fn take_unsandboxable(&mut self) -> Option<String> {
+        self.unsandboxable.take()
     }
 
     /// Takes a completion of one of its tags.
@@ -851,10 +987,10 @@ impl Queue {
                     loaded.0.exited(started);
                 }
                 let server = self.server(b);
-                let (why, output) = match completion.done {
+                let (why, output, failed) = match completion.done {
                     Done::Exited(exit) => {
                         let why = server.lost.take().unwrap_or_else(|| ended(&exit));
-                        (why, [exit.stdout, exit.stderr].concat())
+                        (why, [exit.stdout, exit.stderr].concat(), false)
                     }
                     Done::Failed(error) => (
                         format!(
@@ -863,10 +999,21 @@ impl Queue {
                             started_in(&self.bins[b].plan)
                         ), // alloc: error path
                         Vec::new(), // alloc: error path
+                        true,
                     ),
-                    other => (format!("its spawn completed as {other:?}"), Vec::new()), // alloc: error path
+                    other => (format!("its spawn completed as {other:?}"), Vec::new(), false), // alloc: error path
                 };
+                // A fork server whose spawn failed in its sandbox (the sandbox could not be
+                // made, or kept no record: `Done::Failed`, not an exit of the program) says so
+                // of the machine and its sandbox, not of its tests: every other sandboxed
+                // server would fail the same way. The run stops there, and the driver says once
+                // how to run outside and why.
+                let unsandboxable = failed && self.bins[b].plan.sandboxed && !self.stopping;
                 self.server_ended(b, &why, &output, effects);
+                if unsandboxable {
+                    self.unsandboxable = Some(why);
+                    self.stop();
+                }
             }
             For::Recv(b, r) => self.received(b as usize, r, completion.done, effects),
             For::Send(b, r) => match completion.done {
@@ -892,9 +1039,12 @@ impl Queue {
                 }
             }
             For::Whole(b) => self.whole_ended(b as usize, completion.done),
+            For::Remove => self.removed(false, completion.done, effects),
+            For::RemoveDir => self.removed(true, completion.done, effects),
         }
         self.expire(effects);
         self.schedule(effects);
+        self.tidy(effects);
     }
 
     #[expect(
@@ -1104,6 +1254,7 @@ impl Queue {
             scope_job: Vec::new(), // alloc: empty, allocates nothing
             names,
             ours,
+            program: self.bins[b].plan.program.to_string_lossy().into_owned(), // alloc: setup, once per server
             running: Vec::with_capacity(self.config.jobs),
             at: 0,
             partial: Vec::new(),      // alloc: empty, allocates nothing
@@ -1153,6 +1304,9 @@ impl Queue {
         let sandbox = match plan.sandboxed {
             true => {
                 env.push((confine::LIVE.into(), record_path.into()));
+                if let Some(provider) = &plan.provider {
+                    env.push(provider.entry());
+                }
                 let mut read = plan.read.clone(); // clone: setup, once per server: the driver's command owns its parts
                 read.push(PathBuf::from(socket_path));
                 Sandbox::On {
@@ -1175,20 +1329,13 @@ impl Queue {
             memory: plan.memory,
         };
         let at = Address::Unix(server.socket.clone()); // clone: setup, once per server: the driver's command owns its parts
-        let (command, loaded) = match &plan.loaded {
-            None => (command, None),
-            Some(loaded) => match loaded.0.command(command, true) {
-                Ok((command, started)) => (command, Some(started)),
-                Err(error) => {
-                    let why = format!(
-                        "{} could not be made ready to start: {error}",
-                        plan.program.display()
-                    ); // alloc: error path
-                    self.server(b).phase = Phase::Ended;
-                    self.server_ended(b, &why, &[], effects);
-                    return;
-                }
-            },
+        let (command, loaded) = match launch(plan, command, true) {
+            Ok(it) => it,
+            Err(why) => {
+                self.server(b).phase = Phase::Ended;
+                self.server_ended(b, &why, &[], effects);
+                return;
+            }
         };
         let listen = self.tag(For::Listen(b as u32));
         let spawn = self.tag(For::Spawn(b as u32));
@@ -1964,6 +2111,10 @@ impl Queue {
             args.push("--include-ignored".into());
         }
         args.extend(given.iter().cloned());
+        let mut env = plan.env.clone(); // clone: setup, once per binary run whole: the driver's command owns its parts
+        if let (true, Some(provider)) = (plan.sandboxed, &plan.provider) {
+            env.push(provider.entry());
+        }
         let sandbox = match plan.sandboxed {
             true => Sandbox::On {
                 read: plan.read.clone(),
@@ -1977,37 +2128,30 @@ impl Queue {
         let command = Command {
             program: plan.program.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             args,
-            env: plan.env.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
+            env,
             dir: plan.dir.clone(), // clone: setup, once per binary run whole: the driver's command owns its parts
             stdin: Vec::new(),     // alloc: empty, allocates nothing
             sandbox,
             memory: plan.memory,
         };
         let timeout = *timeout;
-        let (command, loaded) = match &plan.loaded {
-            None => (command, None),
-            Some(loaded) => match loaded.0.command(command, false) {
-                Ok((command, started)) => (command, Some(started)),
-                Err(error) => {
-                    let why = format!(
-                        "{} could not be made ready to start: {error}",
-                        plan.program.display()
-                    ); // alloc: once per binary run whole
-                    let unit = self.bins[b].first;
-                    self.finish(
-                        unit,
-                        Went {
-                            outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
-                            attempts: 1,
-                            output: Vec::new(), // alloc: empty, allocates nothing
-                            took: Duration::ZERO,
-                            trace: Trace::Unknown(why),
-                            executed: Executed::Not(WHOLE_UNRECORDED.to_owned()), // alloc: once per binary run whole
-                        },
-                    );
-                    return;
-                }
-            },
+        let (command, loaded) = match launch(plan, command, false) {
+            Ok(it) => it,
+            Err(why) => {
+                let unit = self.bins[b].first;
+                self.finish(
+                    unit,
+                    Went {
+                        outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
+                        attempts: 1,
+                        output: Vec::new(), // alloc: empty, allocates nothing
+                        took: Duration::ZERO,
+                        trace: Trace::Unknown(why),
+                        executed: Executed::Not(WHOLE_UNRECORDED.to_owned()), // alloc: once per binary run whole
+                    },
+                );
+                return;
+            }
         };
         let spawn = self.tag(For::Whole(b as u32));
         // What the profile's `processes` row of the binary run whole names it by.
@@ -2169,6 +2313,22 @@ fn ours(server: &Server, seen: Seen, id: u32) -> bool {
     }
 }
 
+/// Whether a line of no test's scope is the server's own start of its program: `program`, the
+/// binary's file, run or looked at before any test (the exec, and on macOS the loader's reads of
+/// the image, which the sandbox there records). The program's code is what each test's
+/// execution record is of (every function the test ran, by its code identity), so its file is
+/// no input beside it: left in, every relink would be a changed read of every test, and no
+/// pass would outlive an edit. A test that opens its own executable does so in its own scope,
+/// and that line is its read. macOS names `/tmp` and `/var` under `/private`: either spelling
+/// is the file.
+fn own_start(program: &str, seen: Seen, what: &str) -> bool {
+    const PRIVATE: &str = "/private";
+    matches!(seen, Seen::Read | Seen::Looked)
+        && (what == program
+            || what.strip_prefix(PRIVATE) == Some(program)
+            || program.strip_prefix(PRIVATE) == Some(what))
+}
+
 /// A line of the record without its line break, borrowed: the parts [`trace::Line::parse`] reads,
 /// its kind by its first byte.
 fn record_line(text: &str) -> Option<(Seen, &str, &str)> {
@@ -2216,6 +2376,9 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
                 None => continue,
             },
         };
+        if job.is_none() && own_start(&server.program, seen, what) {
+            continue;
+        }
         let id = server.names.intern(what).ok_or_else(|| {
             format!("it names more than {} paths and variables, or 4 GiB of them", names::MOST)
         })?; // alloc: error path
@@ -2247,6 +2410,61 @@ fn started_in(plan: &Binary) -> &'static str {
     match plan.sandboxed {
         true => " in its sandbox",
         false => "",
+    }
+}
+
+/// `command`, `plan`'s, as it is spawned: for a binary blaze holds in memory, the command its
+/// [`Program::command`] makes of it (the file its build placed, with the key the job's record
+/// holds there, [`Loaded`]; the start hook's variable set, and attached forking as `forks`
+/// says), which may add to its sandbox what it reads and the Mach names it looks up but
+/// nothing to write ([`adds_no_write`]); otherwise `command` as it is. `Err` says why it
+/// can't start, naming the program: a path that holds another key or none names both keys.
+fn launch(
+    plan: &Binary,
+    command: Command,
+    forks: bool,
+) -> Result<(Command, Option<Started>), String> {
+    if plan.sandboxed && plan.provider.is_none() {
+        return Err(format!(
+            "{} is to run sandboxed and was given no provider (`Binary::provider`): its \
+             start would read the kernel's randomness, on which none of its tests can be kept",
+            plan.program.display()
+        ));
+    }
+    let Some(loaded) = &plan.loaded else { return Ok((command, None)) };
+    let (command, started) = loaded.0.command(command, forks, loaded.1).map_err(|error| {
+        format!("{} could not be made ready to start: {error}", plan.program.display())
+    })?;
+    if let Err(entry) = adds_no_write(&plan.write, &command.sandbox) {
+        loaded.0.exited(started);
+        return Err(format!(
+            "{} was made ready to start with {} writable in its sandbox, which its plan does not \
+             give: a sandboxed test writes only what its own sandbox gives it, never a path of \
+             the daemon's",
+            plan.program.display(),
+            entry.display()
+        ));
+    }
+    Ok((command, Some(started)))
+}
+
+/// Whether `sandbox`, as a dev executable's launch made it of a test binary's, gives it nothing
+/// to write beyond `planned`, its plan's `write`: `Err` names the first entry that is more.
+///
+/// The daemon's side of a dev run (its code memory's host) hands a run a channel to the
+/// daemon: a Unix socket under the daemon's home (`BLAZE_HOME/v2/inproc`). That socket is for
+/// the run to connect to, which a sandbox gives as a readable entry, that exact path alone
+/// (`Recorder::may_connect`; a `SOCKET` parameter of the macOS profile); listed as writable it
+/// asked the sandbox for a path of the daemon's home to write, which Linux's refuses and which
+/// would be one if it did not. So no launch may add a writable entry: what a test writes is its
+/// plan's alone.
+fn adds_no_write<'a>(planned: &[PathBuf], sandbox: &'a Sandbox) -> Result<(), &'a PathBuf> {
+    match sandbox {
+        Sandbox::Off => Ok(()),
+        Sandbox::On { write, .. } => match write.iter().find(|it| !planned.contains(it)) {
+            Some(entry) => Err(entry),
+            None => Ok(()),
+        },
     }
 }
 

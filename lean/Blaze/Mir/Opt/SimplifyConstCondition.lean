@@ -66,10 +66,10 @@ theorem execTerm_simplifyAssert (sig : FnId → Option FnSig) (st : State) (b ex
         (Terminator.assert (Operand.const (Const.bool b)) expected kind target) := by
   unfold simplifyAssert
   by_cases h : b = expected
-  · rw [if_pos h, execTerm_assert_const]
+  · rw [ite_eq_left h, execTerm_assert_const]
     show st.jump target = if b = expected then st.jump target else Outcome.panic kind
-    rw [if_pos h]
-  · rw [if_neg h]
+    rw [ite_eq_left h]
+  · rw [ite_eq_right h]
 
 /-- The rewrite of a terminator does what the terminator does, from every state. -/
 theorem execTerm_simplifyTerminator (sig : FnId → Option FnSig) (st : State)

@@ -42,9 +42,19 @@ macro_rules! assert_eq {
 pub macro test($item:item) {}
 //- /hegel/lib.rs crate:hegel
 pub fn draw() -> u8 { 0 }
+//- /blaze_sim/lib.rs crate:blaze_sim
+pub struct Config { pub cases: u32 }
+impl Config {
+    pub const fn cases(cases: u32) -> Config { Config { cases } }
+}
+pub struct Tape;
+impl Tape {
+    pub fn int(&self, label: &'static str) -> u8 { 0 }
+}
+pub fn check<F: FnMut(&Tape)>(config: Config, mut body: F) { body(&Tape) }
 "#;
 
-const MAIN: &str = "//- /src/lib.rs crate:main deps:std,hegel cfg:test\n";
+const MAIN: &str = "//- /src/lib.rs crate:main deps:std,hegel,blaze_sim cfg:test\n";
 
 /// What `blaze::<lint_name>` alone says of `main`.
 fn found(lint_name: &str, main: &str) -> String {
@@ -315,6 +325,30 @@ pub fn decode(n: u16) -> u8 { n as u8 }
 fn encodes() { assert_eq!(encode(1), 1); }
 #[test]
 fn round_trips() { let x = hegel::draw(); assert_eq!(decode(encode(x)), x); }
+"#,
+    );
+    assert!(!out.contains("property_over_examples"), "{out}");
+}
+
+/// A plain `#[test]` whose body is a call of `blaze_sim::check` with a closure is a property
+/// test by that call alone, with no attribute of its own: the round trip it checks inside the
+/// closure answers `property_over_examples`.
+#[test]
+fn a_blaze_sim_check_is_a_property_test() {
+    let out = found(
+        "property_over_examples",
+        r#"
+pub fn encode(n: u8) -> u16 { n as u16 }
+pub fn decode(n: u16) -> u8 { n as u8 }
+#[test]
+fn encodes() { assert_eq!(encode(1), 1); }
+#[test]
+fn round_trips() {
+    blaze_sim::check(blaze_sim::Config::cases(200), |tape| {
+        let x = tape.int("x");
+        assert_eq!(decode(encode(x)), x);
+    });
+}
 "#,
     );
     assert!(!out.contains("property_over_examples"), "{out}");

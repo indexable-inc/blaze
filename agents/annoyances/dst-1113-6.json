@@ -1,0 +1,13 @@
+{
+ "id": "dst-1113-6",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": ".github/scripts/land.py (its smoke verify) and blaze built from main at 4630d471fa on macOS arm64",
+ "what": "land.py cannot open a pull request from this Mac. With the installed blaze (a build of 2026-11-12) its `blaze run -q -p scripts --bin smoke` exits 101: `[workspace.metadata.blaze.lints-ratchet] ... not_latest_edition is no lint or group of blaze`s`. With a release blaze built from the landing head (main`s compiler code) the same command aborts: `SIGABRT ... at __rust_dealloc / drop_glue::<Vec<hir_ty::mir::Statement>> / drop_glue::<hir_ty::mir::MirBody> / hir_ty_codegen::v2::refs ... inside job > codegen describe`, building the scripts package.",
+ "cost": "a 223 s release build of blaze on the Mac (the first attempt filled the disk), and the pull request opened by hand",
+ "cause": "not established for the abort. land.py runs its checker through `blaze run`, so the merge path depends on the tree`s blaze being able to build the scripts crate on the machine that lands",
+ "class": "the proof a merge needs is checked by a program that the thing being proved has to build first",
+ "prevention": "land.py runs a prebuilt smoke verify (or builds it with cargo while cargo is the dev-loop builder), and the abort gets its own reproduction; not built",
+ "workaround": "smoke.rs verify built by cargo (`cargo run -q -p scripts --bin smoke -- {verify..}`, exit 0), then `gh pr create` with the quote in the body, as #2119 to #2123 were opened",
+ "state": "open"
+}

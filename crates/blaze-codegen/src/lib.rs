@@ -51,7 +51,7 @@ pub mod unwind;
 pub mod wasm;
 
 pub use driver::{BuiltId, Changes, Delta, Fresh, Owner, StaticId};
-pub use exec::ExecTable;
+pub use exec::{ExecTable, JumpTable};
 pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 
 /// A function instance: what is compiled.

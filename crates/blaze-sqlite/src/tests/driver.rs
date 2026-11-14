@@ -9,10 +9,12 @@ use blaze_sql::Checked;
 use blaze_sql::ddl::create_table;
 use blaze_sql::desc::{Backend, RustTy, Slot, Storage, ValueRef};
 use blaze_sql::schema::{Column, Schema, Table};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
-use crate::{Connection, Error, Found, SchemaDifference, Statement, Step};
+use crate::{
+    ColumnTypeError, Connection, DeclaredType, Error, Found, SchemaDifference, SchemaError,
+    Statement, Step,
+};
 
 const BOOL: RustTy<'static> = RustTy { name: "bool", id: TypeId::of::<bool>() };
 const I64: RustTy<'static> = RustTy { name: "i64", id: TypeId::of::<i64>() };
@@ -205,7 +207,7 @@ fn verify_after(script: &str) -> Error {
 fn assert_schema_error(error: Error, table: &str, want: SchemaDifference) {
     let message = format!("{error}");
     match error {
-        Error::Schema { table: got_table, difference } => {
+        Error::Schema(SchemaError { table: got_table, difference }) => {
             assert_eq!(got_table, table, "{message}");
             assert_eq!(difference, want, "{message}");
             assert!(message.contains(table), "the message names the table: {message}");
@@ -238,10 +240,10 @@ fn verify_names_a_column_of_another_storage() {
     let message = format!("{error}");
     // SQLite may give the declared type in another case than it was written in.
     match error {
-        Error::Schema {
+        Error::Schema(SchemaError {
             table,
-            difference: SchemaDifference::Storage { column, expected, declared },
-        } => {
+            difference: SchemaDifference::Storage(DeclaredType { column, expected, declared }),
+        }) => {
             assert_eq!(table, "maybe", "{message}");
             assert_eq!(column, "ratio", "{message}");
             assert_eq!(expected, Storage::Real, "{message}");
@@ -345,7 +347,7 @@ fn column_refuses_text_in_an_integer_column_of_a_table_not_strict() {
         statement.column(0).err().unwrap_or_else(|| panic!("column read text as an integer"));
     let message = format!("{error}");
     match error {
-        Error::ColumnType { column, index, expected, got, .. } => {
+        Error::ColumnType(ColumnTypeError { column, index, expected, got, .. }) => {
             assert_eq!(column, "n");
             assert_eq!(index, 0);
             assert_eq!(expected.storage, Storage::Integer);
@@ -471,25 +473,21 @@ fn reads_back(row: &Kinds, plant: Option<Plant>) -> Result<(), String> {
     if got == want { Ok(()) } else { Err(format!("wrote {want:?}, read {got:?}")) }
 }
 
-#[hegel::composite]
-fn kinds(tc: &TestCase) -> Kinds {
+fn kinds(tape: &Tape) -> Kinds {
     Kinds {
-        flag: tc.draw(gs::booleans()),
-        amount: tc.draw(gs::integers::<i64>()),
-        ratio: tc.draw(gs::floats::<f64>().allow_nan(false).allow_infinity(false)),
-        label: tc.draw(gs::text().max_size(64)),
-        data: tc.draw(gs::binary().max_size(64)),
+        flag: tape.bool("flag"),
+        amount: tape.int("amount"),
+        ratio: tape.f64_finite("ratio"),
+        label: tape.text(0..=64, "label"),
+        data: tape.bytes(0..=64, "data"),
     }
 }
 
 /// The invariant: any `i64`, finite `f64`, string (NUL and all) and byte string, bound and
 /// stored in a STRICT table, reads back equal through `column`.
-#[hegel::test]
-fn any_value_binds_and_reads_back_equal(tc: TestCase) {
-    let row = tc.draw(kinds());
-    if let Err(difference) = reads_back(&row, None) {
-        panic!("{difference}");
-    }
+#[test]
+fn any_value_binds_and_reads_back_equal() {
+    blaze_sim::check(Config::DEFAULT, |tape| reads_back(&tape.span("row", kinds), None));
 }
 
 #[test]

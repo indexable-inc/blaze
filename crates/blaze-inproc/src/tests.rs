@@ -1,8 +1,9 @@
 //! The crate's own tests: frames and the handshake's bodies fuzzed (never a panic on any
 //! bytes), the grant's checks against an image's layout, the code memory's rules, and on
 //! Linux the real thing: a running thread's code laid over by the memory object with every
-//! byte equal at the swap, a patch one word store it sees, the executable written once per
-//! key, and the host's handshake over a real socket.
+//! byte equal at the swap, a patch one word store it sees, a launch started only from the
+//! file its build placed (refused otherwise, nothing written), and the host's handshake over
+//! a real socket.
 
 use blaze_ids::rng::SplitMix64;
 
@@ -885,6 +886,20 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
+/// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
+/// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
+/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
+/// the `host` tests of `linux` below are.
+#[cfg(feature = "host")]
+#[test]
+fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
+    let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";
+    assert_eq!(crate::host::innermost(nested), Some(2));
+    assert_eq!(crate::host::innermost("Name:\tt\nNSpid:\t4711\n"), Some(4711));
+    assert_eq!(crate::host::innermost("Name:\tt\nPid:\t4711\n"), None);
+    assert_eq!(crate::host::innermost("NSpid:\t4711\tx\n"), None);
+}
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
@@ -1372,68 +1387,56 @@ mod linux {
 
         use super::*;
         use crate::handshake::HOST_VAR;
-        use crate::host::{Executable, Host, Image, Launch, Program, Wrote};
+        use crate::host::{Host, Image, Launch, Program, StartError};
 
+        /// The invariant: a launch whose path the build's record says holds another key than
+        /// the program's memory, or holds nothing, is refused with
+        /// [`StartError::NotPlaced`] naming the path, the key placed and the key held, and the
+        /// file at the path is left as it was (the host writes no file): no fallback write.
         #[test]
-        fn an_executable_is_written_once_per_key_and_never_from_a_patched_memory() {
-            let Some(mut memory) = laid_out("write") else { return };
+        fn a_launch_from_a_path_not_holding_its_file_is_refused_naming_both_keys() {
+            use std::os::unix::fs::MetadataExt;
+            let Some(memory) = laid_out("refused") else { return };
             let page = memory.page();
             let (_held, dir) = temp_dir();
             std::fs::create_dir_all(&dir).unwrap();
-            let host = Host::new(&dir.join("host")).unwrap();
+            let host = Arc::new(Host::new(&dir.join("host")).unwrap());
+            let memory = Arc::new(Lock::new("inproc.test.memory", memory));
+            let (sessions, _got) = crossbeam_channel::unbounded();
+            let held = [7; 32];
+            let program =
+                Program::new(host, memory.clone(), Image { key: held, len: 2 * page }, sessions);
             let path = dir.join("prog");
-            let len = 2 * page - 3;
-            let write = |memory: &CodeMemory, key: u8, store: Option<&std::path::Path>| {
-                host.write_executable(
-                    memory,
-                    &Executable { path: &path, key: [key; 32], len, store },
-                )
+            std::fs::write(&path, b"another build's file").unwrap();
+            let identity = |path: &std::path::Path| {
+                let meta = std::fs::metadata(path).unwrap();
+                (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
             };
-            let want = memory.bytes(CodeRange { offset: 0, len }).unwrap().to_vec();
-
-            assert_eq!(write(&memory, 1, None), Ok(Wrote::Written));
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-            let mode = std::os::unix::fs::PermissionsExt::mode(
-                &std::fs::metadata(&path).unwrap().permissions(),
-            );
-            assert_eq!(mode & 0o777, 0o755);
-            assert_eq!(write(&memory, 1, None), Ok(Wrote::Kept));
-            assert_eq!(write(&memory, 2, None), Ok(Wrote::Written));
-            std::fs::write(&path, b"another tool's file").unwrap();
-            assert_eq!(
-                write(&memory, 2, None),
-                Ok(Wrote::Written),
-                "a file changed since is written again"
-            );
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-
-            let store = dir.join("store");
-            std::fs::write(&store, &want).unwrap();
-            let cloned = write(&memory, 3, Some(&store)).unwrap();
-            assert!(matches!(cloned, Wrote::Cloned | Wrote::Written), "{cloned:?}");
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-            std::fs::write(&store, b"not the image").unwrap();
-            match write(&memory, 4, Some(&store)) {
-                Ok(wrote) => assert_eq!(wrote, Wrote::Written, "no clones here: the bytes"),
-                Err(error) => assert!(error.what.contains("not the image"), "{error}"),
+            let before = identity(&path);
+            let command = || Command {
+                program: path.clone(),
+                args: Vec::new(),
+                env: Vec::new(),
+                dir: dir.clone(),
+                stdin: Vec::new(),
+                sandbox: Sandbox::Off,
+                memory: None,
+            };
+            for placed in [Some([8; 32]), None] {
+                let Err(error) = program.command(command(), false, placed) else {
+                    panic!("a launch from a path holding {placed:?} started");
+                };
+                assert_eq!(error, StartError::NotPlaced { path: path.clone(), placed, held });
+                let said = error.to_string();
+                assert!(said.contains(&path.display().to_string()), "{said}");
+                assert!(said.contains(&"07".repeat(32)), "{said}");
+                if placed.is_some() {
+                    assert!(said.contains(&"08".repeat(32)), "{said}");
+                }
             }
-            assert_eq!(write(&memory, 5, None), Ok(Wrote::Written));
-            assert_eq!(std::fs::read(&path).unwrap(), want);
-
-            memory.store_word(page, 1).unwrap();
-            assert_eq!(
-                write(&memory, 5, None),
-                Ok(Wrote::Kept),
-                "the file of this key is there: nothing to write"
-            );
-            let error = write(&memory, 6, None).unwrap_err();
-            assert!(error.what.contains("no longer the file the linker wrote"), "{error}");
-            let leftovers: Vec<_> = std::fs::read_dir(&dir)
-                .unwrap()
-                .filter_map(|it| it.ok())
-                .filter(|it| it.file_name().to_string_lossy().ends_with(".tmp"))
-                .collect();
-            assert!(leftovers.is_empty());
+            assert_eq!(identity(&path), before, "a refused launch changed the file at its path");
+            assert_eq!(program.starts_held(), 0);
+            assert!(memory.lock().processes.is_empty());
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1526,7 +1529,13 @@ mod linux {
             } else {
                 assert!(services.is_empty());
             }
-            assert_eq!(write.len(), 1);
+            // The host's socket is connected to by its path, given readable: a launch adds
+            // nothing writable to the run's sandbox.
+            assert!(write.is_empty(), "{write:?}");
+            if cfg!(unix) {
+                let socket = dir.join(format!("inproc-{}.sock", std::process::id()));
+                assert!(read.contains(&socket), "{read:?}");
+            }
             assert!(!network);
 
             let slide = 0x5555_0000_0000;
@@ -1624,8 +1633,11 @@ mod linux {
             let host = Arc::new(Host::new(&dir.join("host")).unwrap());
             let memory = Arc::new(Lock::new("inproc.test.memory", memory));
             let (sessions, got) = crossbeam_channel::unbounded();
-            let image = Image { key: [9; 32], len: 2 * page, store: None };
+            let key = [9; 32];
+            let image = Image { key, len: 2 * page };
             let program = Program::new(host, memory.clone(), image, sessions);
+            // The build's placement of the program's file, under the memory's key.
+            std::fs::write(dir.join("prog"), an_executable(page)).unwrap();
             let command = || Command {
                 program: dir.join("prog"),
                 args: Vec::new(),
@@ -1637,7 +1649,7 @@ mod linux {
             };
             let pid = std::process::id();
 
-            let (spawned, started) = program.command(command(), false).unwrap();
+            let (spawned, started) = program.command(command(), false, Some(key)).unwrap();
             assert_eq!(std::fs::read(dir.join("prog")).unwrap(), an_executable(page));
             let _channel = play_hook(&spawned, &own, 0);
             let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
@@ -1647,7 +1659,7 @@ mod linux {
             assert!(memory.lock().processes.is_empty());
             program.exited(started);
 
-            let (spawned, started) = program.command(command(), true).unwrap();
+            let (spawned, started) = program.command(command(), true, Some(key)).unwrap();
             program.exited(started);
             let _channel = play_hook(&spawned, &own, 0);
             let ended = got.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -1678,13 +1690,14 @@ mod linux {
             assert!(!moved);
         }
 
-        /// The control: a launch that is not told what the build placed writes the file,
-        /// and the oracle sees it moved.
+        /// The control: a second writer of the path (a launch that wrote the file as the host
+        /// once did, planted here as a write between launches) is seen by the oracle as the
+        /// file moved.
         #[test]
-        fn the_oracle_catches_a_launch_that_writes_the_placed_file() {
-            let (held, moved) = launches_leave(Planted::NotToldPlaced);
+        fn the_oracle_catches_a_second_writer_of_the_placed_file() {
+            let (held, moved) = launches_leave(Planted::Rewritten);
             assert_eq!(held, Held::default());
-            assert!(moved, "a launch told of no placement writes the executable");
+            assert!(moved, "a file written again between launches was not seen moved");
         }
 
         const LAUNCHES: usize = 24;
@@ -1693,7 +1706,8 @@ mod linux {
         enum Planted {
             Nothing,
             NeverExited,
-            NotToldPlaced,
+            /// The file at the path written again, same bytes, after the first launch.
+            Rewritten,
         }
 
         /// What launches left behind, each a count.
@@ -1714,7 +1728,7 @@ mod linux {
             let name = match planted {
                 Planted::Nothing => "placed",
                 Planted::NeverExited => "placed-kept",
-                Planted::NotToldPlaced => "placed-written",
+                Planted::Rewritten => "placed-written",
             };
             let Some(memory) = laid_out(name) else {
                 // No code memory on this platform: what the invariant's test and each
@@ -1724,7 +1738,7 @@ mod linux {
                     Planted::NeverExited => {
                         (Held { starts: LAUNCHES, processes: 1, ..Held::default() }, false)
                     }
-                    Planted::NotToldPlaced => (Held::default(), true),
+                    Planted::Rewritten => (Held::default(), true),
                 };
             };
             let page = memory.page();
@@ -1735,7 +1749,7 @@ mod linux {
             let memory = Arc::new(Lock::new("inproc.test.memory", memory));
             let (sessions, got) = crossbeam_channel::unbounded();
             let key = [7; 32];
-            let image = Image { key, len: 2 * page, store: None };
+            let image = Image { key, len: 2 * page };
             let program = Program::new(host.clone(), memory.clone(), image, sessions);
             // The build's placement: the same bytes, a file of the build's own making.
             let path = dir.join("prog");
@@ -1745,11 +1759,7 @@ mod linux {
                 (meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), std::fs::read(path).unwrap())
             };
             let before = identity(&path);
-            let placed = match planted {
-                Planted::NotToldPlaced => None,
-                _ => Some(key),
-            };
-            for _ in 0..LAUNCHES {
+            for at in 0..LAUNCHES {
                 let command = Command {
                     program: path.clone(),
                     args: Vec::new(),
@@ -1759,11 +1769,12 @@ mod linux {
                     sandbox: Sandbox::Off,
                     memory: None,
                 };
-                let (spawned, started, wrote) =
-                    program.command_placed(command, false, placed).unwrap();
-                match planted {
-                    Planted::NotToldPlaced => assert_ne!(wrote, Wrote::Placed),
-                    _ => assert_eq!(wrote, Wrote::Placed),
+                let (spawned, started) = program.command(command, false, Some(key)).unwrap();
+                if planted == Planted::Rewritten && at == 0 {
+                    // A second writer: the same bytes, a new file renamed over the path.
+                    let again = dir.join("prog.again");
+                    std::fs::write(&again, an_executable(page)).unwrap();
+                    std::fs::rename(&again, &path).unwrap();
                 }
                 let (channel, ..) = play_hook(&spawned, &own, 0);
                 let session = got.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();

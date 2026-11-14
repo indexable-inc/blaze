@@ -96,6 +96,16 @@ hash_twice = "deny"
 A group applies before the single lints the table names, so `hash_twice = "deny"` wins over
 `general = "allow"`. A rustc-style flag (`--allow=blaze::general`) does the same.
 
+An `#[expect]` that no finding fulfils is itself reported (`unfulfilled_lint_expectations`).
+`blaze check --all-targets` lints a library twice, plain and built with `--test`, and many lints
+judge a test build's production code differently (or not at all), so every expectation has one
+judge: the plain build judges each one it has, and the test build of a library, binary or example
+judges only the ones it alone has (in `#[cfg(test)]` code, on or in a `#[test]` function, or
+written under `cfg_attr(test, ..)`). A stale expectation on production code is therefore reported
+by a run that lints the plain build, not by `--tests` alone; and a lint that fires on production
+code only in the test build cannot be expected on the production item (change what the test
+does, or give the code the typed form the lint asks for).
+
 ## Workspace levels and the ratchet
 
 blaze's own workspace denies every lint of blaze's in every crate, and lets a crate that
@@ -3836,7 +3846,8 @@ machine fix.
 
 "these 3 tests are one test over a table of 3 rows of 2 values": tests whose bodies are equal
 with each literal replaced by its kind, found by that hash, reported once at the first. Help:
-one test over a table, or a Hegel property where the expected value can be computed.
+one test over a table, or a property test over generated inputs where the expected value can
+be computed (blaze's own form: `blaze_sim::check(Config::cases(200), |tape| ..)`).
 
 ## `impls_differ_by_type`
 
@@ -4002,8 +4013,11 @@ places)". Matching only `Ok`, or `is_err`, does not count; `assert_eq!(f(bad), E
 
 ## `property_over_examples`
 
-"`encode` and its inverse `decode` are tested only by examples". Quiet once a test draws a
-value (Hegel, proptest, quickcheck) and passes it through either function.
+"`encode` and its inverse `decode` are tested only by examples". Quiet once a property test
+draws a value and passes it through either function: a test is one by its call into a property
+crate, never by its attribute (`blaze_sim`, as in blaze's own `#[test] fn round_trip() {
+blaze_sim::check(Config::cases(200), |tape| ..) }`, or Hegel, proptest and quickcheck in other
+projects). Help: add that property test of the round trip.
 
 ## Structural
 

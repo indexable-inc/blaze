@@ -87,6 +87,13 @@ fn list(items: &[String]) -> String {
     format!("[{}]", items.join(", "))
 }
 
+/// The type blaze's MIR reads every discriminant as: hir-ty-mir's lowering puts each
+/// `Rvalue::Discriminant` into an `i128` temporary (`discr_temp_place`, and the other reads in
+/// `mir/lower.rs`), whatever the enum's `repr`, where rustc reads it as the enum's own
+/// discriminant type. Every declaration says so (`AdtDecl.discr`), and a read into anything
+/// else is refused: the lowering changed, and so must this.
+const DISCRIMINANT_READ: IntTy = IntTy::I128;
+
 fn scalar(ty: IntTy) -> String {
     format!("ScalarTy.{}", ty.lean())
 }
@@ -121,8 +128,9 @@ impl Program {
             .map(|(discriminant, fields)| format!("({}, {})", discriminant, list(&fields)))
             .collect();
         let decl = format!(
-            "{{ name := \"{}\", discr := ScalarTy.Isize, variants := {} }}",
+            "{{ name := \"{}\", discr := {}, variants := {} }}",
             key.replace('\\', "\\\\").replace('"', "\\\""),
+            scalar(DISCRIMINANT_READ),
             list(&variants)
         );
         self.adts.push((key, decl));
@@ -155,7 +163,17 @@ impl<'db> Writer<'_, 'db> {
             Ty::Ref(inner) => format!("&{}", Self::key(inner)),
             Ty::RefMut(inner) => format!("&mut {}", Self::key(inner)),
             Ty::Slice(elem) => format!("[{}]", Self::key(elem)),
+            Ty::Vec(elem) => format!("Vec<{}>", Self::key(elem)),
             Ty::Array(elem, len) => format!("[{}; {len}]", Self::key(elem)),
+            Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+            Ty::PhantomData => "core::marker::PhantomData".to_owned(),
+            Ty::Duration => "core::time::Duration".to_owned(),
+            Ty::Ordering => "core::cmp::Ordering".to_owned(),
+            Ty::Range { elem, inclusive: false } => format!("core::ops::Range<{}>", Self::key(elem)),
+            Ty::Range { elem, inclusive: true } => format!("core::ops::RangeInclusive<{}>", Self::key(elem)),
+            Ty::Str => "str".to_owned(),
+            Ty::Opaque(opaque) => opaque.rust().to_owned(),
+            Ty::Shared(shared) => shared.rust(),
         }
     }
 
@@ -222,6 +240,22 @@ impl<'db> Writer<'_, 'db> {
             Ty::RefMut(inner) => format!("Ty.ref true {}", arg(&self.ty(inner, at)?)),
             Ty::Slice(elem) => format!("Ty.slice {}", arg(&self.ty(elem, at)?)),
             Ty::Array(elem, len) => format!("Ty.array {} {len}", arg(&self.ty(elem, at)?)),
+            Ty::Vec(_) => {
+                return Err(self.cx.refuse("the type `Vec`, which the MIR semantics has no model of", at));
+            }
+            Ty::TryFromIntError => {
+                return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
+            }
+            Ty::PhantomData
+            | Ty::Duration
+            | Ty::Ordering
+            | Ty::Range { .. }
+            | Ty::Str
+            | Ty::Opaque(_)
+            | Ty::Shared(_) => {
+                let key = Self::key(ty);
+                return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
+            }
         })
     }
 
@@ -269,6 +303,16 @@ impl<'db> Writer<'_, 'db> {
                     Operand::Unit => "Const.unit".to_owned(),
                     Operand::Place(_) => {
                         return Err(self.cx.refuse("a constant that is a place", at));
+                    }
+                    Operand::Str(_)
+                    | Operand::PhantomData
+                    | Operand::Duration { .. }
+                    | Operand::Ordering(_)
+                    | Operand::Variant { .. } => {
+                        return Err(self.cx.refuse(
+                            format!("a constant of type `{}`, which the MIR model has no declaration of", Self::key(&ty)),
+                            at,
+                        ));
                     }
                 };
                 Ok((format!("Operand.const {}", arg(&constant)), ty))
@@ -380,9 +424,12 @@ impl<'db> Writer<'_, 'db> {
                 if self.cx.variants(&ty).is_none() {
                     return Err(self.cx.refuse(format!("the discriminant of a `{ty:?}`"), at));
                 }
-                if *dest != Ty::Int(IntTy::Isize) {
+                if *dest != Ty::Int(DISCRIMINANT_READ) {
                     return Err(self.cx.refuse(
-                        format!("a discriminant read as `{dest:?}` (an enum with a `repr`)"),
+                        format!(
+                            "a discriminant read as `{dest:?}`, where blaze's MIR reads every \
+                             discriminant as `{DISCRIMINANT_READ:?}`"
+                        ),
                         at,
                     ));
                 }
@@ -598,12 +645,15 @@ impl<'db> Writer<'_, 'db> {
     }
 }
 
-/// `func`'s body `mir` (its built MIR when `None`) as a Lean `Body`, 6 columns in.
+/// `func`'s body `mir` (its built MIR when `None`) as a Lean `Body`, 6 columns in. With a
+/// `layout`, the blocks written are those `layout` reaches, in its numbering, each with
+/// `mir`'s contents: the body after a pass laid out as the body before it.
 fn body<'db>(
     db: &'db Db,
     program: &mut Program,
     func: FunctionId,
     mir: Option<&m::MirBody<'db>>,
+    layout: Option<&m::MirBody<'db>>,
 ) -> Refused<String> {
     let display = function_path(db, func).join("::");
     let fn_text = format!("fn {display}");
@@ -634,6 +684,7 @@ fn body<'db>(
         Err(err) => return Err(refuse(format!("the body, which has no MIR ({err:?})"))),
     };
     let mir = mir.unwrap_or(built);
+    let layout = layout.unwrap_or(mir);
     if !mir.closures.is_empty() {
         return Err(refuse("a closure".to_owned()));
     }
@@ -647,6 +698,7 @@ fn body<'db>(
     let store = ExpressionStore::of(db, built.owner.expression_store_owner(db));
     let cx = Cx {
         db,
+        env: ParamEnvAndCrate { param_env: db.trait_environment(built.owner.generic_def(db)), krate },
         interner: DbInterner::new_with(db, krate),
         display: display.clone(),
         // Spans are read through the built body's owner, which every phase shares.
@@ -657,6 +709,15 @@ fn body<'db>(
         adts: Vec::new(),
         callees: Vec::new(),
         checks_overflow,
+        // The embedding types every local where it is declared, and refuses there.
+        unusable: BTreeMap::new(),
+        duration: None,
+        derives: BTreeSet::new(),
+        orders: BTreeSet::new(),
+        envs: BTreeMap::new(),
+        lent: BTreeMap::new(),
+        opaques: Vec::new(),
+        builders: BTreeMap::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());
@@ -674,11 +735,11 @@ fn body<'db>(
     // The blocks reached without unwinding, in the order first reached.
     let mut numbers: BTreeMap<u32, usize> = BTreeMap::new();
     let mut reached = Vec::new();
-    let mut queue = VecDeque::from([mir.start_block]);
-    numbers.insert(mir.start_block.into_raw().into_u32(), 0);
+    let mut queue = VecDeque::from([layout.start_block]);
+    numbers.insert(layout.start_block.into_raw().into_u32(), 0);
     while let Some(block) = queue.pop_front() {
         reached.push(block);
-        let Some(terminator) = &mir.basic_blocks[block].terminator else {
+        let Some(terminator) = &layout.basic_blocks[block].terminator else {
             return Err(refuse("a block without a terminator".to_owned()));
         };
         for next in normal_successors(&terminator.kind) {
@@ -687,6 +748,22 @@ fn body<'db>(
                 numbers.insert(raw, numbers.len());
                 queue.push_back(next);
             }
+        }
+    }
+    // Every block written ends in a terminator whose targets are written too. Under its own
+    // layout the walk above has shown both; under another body's it is checked here.
+    for &block in &reached {
+        if block.into_raw().into_u32() as usize >= mir.basic_blocks.len() {
+            return Err(refuse("a block of the layout that the body does not have".to_owned()));
+        }
+        let Some(terminator) = &mir.basic_blocks[block].terminator else {
+            return Err(refuse("a block without a terminator".to_owned()));
+        };
+        if normal_successors(&terminator.kind)
+            .iter()
+            .any(|next| !numbers.contains_key(&next.into_raw().into_u32()))
+        {
+            return Err(refuse("a jump to a block the layout does not reach".to_owned()));
         }
     }
     let to = |block: m::BasicBlockId| numbers[&block.into_raw().into_u32()];
@@ -716,20 +793,22 @@ fn body<'db>(
     ))
 }
 
-/// The program of `func`, whose own body is `mir` (its built MIR when `None`), then each
-/// function it calls: a `Blaze.Mir.Program`, 2 columns in.
+/// The program of `func`, whose own body is `mir` (its built MIR when `None`, laid out as
+/// `layout` when there is one: see [`body`]), then each function it calls: a
+/// `Blaze.Mir.Program`, 2 columns in.
 pub(crate) fn program<'db>(
     db: &'db Db,
     func: FunctionId,
     mir: Option<&m::MirBody<'db>>,
+    layout: Option<&m::MirBody<'db>>,
 ) -> Refused<String> {
     let mut program = Program { adts: Vec::new(), functions: vec![func] };
-    let mut bodies = vec![body(db, &mut program, func, mir)?];
+    let mut bodies = vec![body(db, &mut program, func, mir, layout)?];
     // Each body may add functions; the list only grows, and a program's functions bound it.
     let mut at = 1;
     while at < program.functions.len() {
         let callee = program.functions[at];
-        bodies.push(body(db, &mut program, callee, None)?);
+        bodies.push(body(db, &mut program, callee, None, None)?);
         at += 1;
     }
     let adts: Vec<String> = program.adts.iter().map(|(_, decl)| decl.clone()).collect();

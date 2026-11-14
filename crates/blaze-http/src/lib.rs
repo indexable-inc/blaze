@@ -1,8 +1,10 @@
 //! blaze's HTTP, sans-IO: the HTTP/1.1 client, a synchronous state machine ([`Client`]) that
-//! owns no socket, runtime, thread, timer or clock, and drivers that do the IO for it
-//! (`tokio_driver` today; an io_uring driver, or one on `blaze-core`'s effects, later, with no
-//! change here); and HTTP/3 with WebTransport ([`h3`]), a core of the same shape over
-//! quinn-proto with its own driver contract and tokio driver (`h3::tokio_driver`).
+//! owns no socket, runtime, thread, timer or clock, and its driver on blaze-core's effects
+//! ([`driver`]), which does the IO for it on the native driver (io_uring, kqueue) or the
+//! simulation; and HTTP/3 with WebTransport ([`h3`]), a core of the same shape over
+//! quinn-proto with its own driver contract and driver on the same effects ([`h3::driver`]).
+//! No runtime is under either: a caller's executor polls the handles' futures, or
+//! [`mailbox::block_on`] does on the calling thread.
 //!
 //! # The core
 //!
@@ -18,8 +20,8 @@
 //!
 //! # The driver contract
 //!
-//! This is the seam another driver (io_uring on Linux, `blaze-core`'s `Effect`s) is written
-//! against; `tokio_driver` (the `tokio` feature) is the reference.
+//! This is the seam a driver is written against; [`driver`] (on blaze-core's `Effect`s) is
+//! the one in the tree.
 //!
 //! 1. **Clock.** Before handing the core anything, and whenever [`Client::next_deadline`]
 //!    passes, call [`Client::advance_clock`] with the time since the driver started, from a
@@ -39,8 +41,8 @@
 //!      by its address (`socks4://`, `socks5://`); the connection's [`Io::Connect`] follows.
 //!    - [`Io::Send`]: write all of the bytes, then [`Completion::Sent`] or
 //!      [`Completion::Broken`]. At most one send per connection is in flight.
-//!    - [`Io::Recv`]: read what the peer sent, up to any amount the driver picks (the tokio
-//!      driver reads at most `tokio_driver::RECV_MOST`), then [`Completion::Received`] (empty
+//!    - [`Io::Recv`]: read what the peer sent, up to any amount the driver picks ([`driver`]
+//!      reads at most [`driver::RECV_MOST`]), then [`Completion::Received`] (empty
 //!      when the peer closed) or [`Completion::Broken`]. At most one receive per connection is
 //!      in flight. The core keeps one asked of every idle connection, so it hears when a
 //!      server closes one.
@@ -53,10 +55,9 @@
 //! 5. **Waits.** Sleep until the next completion, ask or [`Client::next_deadline`], whichever
 //!    is first. Every request ends by its deadline, so no wait of the asker's is open.
 //!
-//! The core has no recorder: the waits a driver does (a connect, a receive, the asker's wait
-//! for its next event) open no span yet. When `blaze-trace` lands
-//! (docs/v2/plan/design/no-tracing.md), the driver opens one per wait, named by the
-//! connection's origin and the request (every-wait-says-what).
+//! The core has no recorder. The driver's waits go through blaze-core: its loop's poll of the
+//! driver, and an asker's park in [`mailbox::block_on`], named by what it waits for
+//! (every-wait-says-what).
 //!
 //! # What the core reads that is not its input
 //!
@@ -66,20 +67,20 @@
 //! [`roots`] reads the machine's root certificates, outside the core, once per client;
 //! [`proxy_env`] the proxy variables, the same way.
 
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(register_tool, custom_inner_attributes, allocator_api, btreemap_alloc)]
 #![register_tool(blaze)]
 
 pub mod client;
+pub mod driver;
 mod gzip;
 pub mod h1;
 pub mod h3;
+pub mod mailbox;
 mod pool;
 pub mod proxy;
 pub mod proxy_env;
 pub mod roots;
 mod tls;
-#[cfg(feature = "tokio")]
-pub mod tokio_driver;
 
 #[cfg(test)]
 mod tests;

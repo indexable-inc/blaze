@@ -191,7 +191,7 @@ a TypeScript copy.
 ## To do
 
 Each slice ends with a measurement on the exact tree it ran on (measure-the-exact-tree).
-Durability and deletion changes are proven before merge by a Hegel deterministic simulation
+Durability and deletion changes are proven before merge by a blaze-sim deterministic simulation
 test whose oracle checks the invariant (dst-not-review, the `testing` skill), not by a review.
 
 ### Slice 1: wire core and Worker skeleton

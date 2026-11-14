@@ -1,0 +1,14 @@
+{
+ "id": "instances-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane instances (V15) under proofs-1113",
+ "where": "crates/hir-ty-lean/src/tests.rs fixtures (minicore)",
+ "what": "A fixture coercing `&S` to `&dyn Shape` is refused as `a function that does not type-check`, not by the translator, because minicore without `unsize, coerce_unsized` cannot type the coercion; the dyn refusal had to be tested with `g::<dyn Shape>()`. The `if_pos`/`if_neg` deprecation trap of stdmodels-1 cost a lake round again.",
+ "cost": "two VM rounds",
+ "cause": "a refusal test whose fixture fails before the translator gives a refusal that names the fixture, not the rule",
+ "whys": "refused() accepts any NotTranslated; type-check and borrow-check refusals share the type with translator ones; nothing flags a refusal test that stopped before the translator",
+ "class": "refusal tests that pass or fail for a reason other than the rule they test",
+ "prevention": "not done: have refused() reject the `does not type-check` and `borrow checker did not accept` outcomes so a fixture error fails loudly",
+ "workaround": "read the refusal text of each new case once",
+ "state": "open"
+}

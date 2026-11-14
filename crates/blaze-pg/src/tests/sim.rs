@@ -1,4 +1,4 @@
-//! The connection against a scripted Postgres. Hegel draws:
+//! The connection against a scripted Postgres. The tape draws:
 //!
 //! - how the server authenticates;
 //! - the statements: their parameters' types and expected columns, and how the server describes
@@ -15,15 +15,13 @@
 //! message to it: a `Bind` must name a statement it parsed whose description was the one
 //! expected.
 
-use std::cell::Cell;
 use std::format;
 use std::string::{String, ToString};
 use std::vec::Vec;
 
 use alloc::alloc::Global;
 use blaze_sql::desc::{Storage, ValueRef};
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Broke, Tape};
 
 use super::server::{
     Body, Frontend, ScramServer, authentication, command_complete, data_row, message,
@@ -46,13 +44,6 @@ const STEPS_MOST: usize = 300;
 const ROUNDS_MOST: usize = 10_000;
 const STATEMENTS_MOST: usize = 6;
 const EXECUTIONS_MOST: usize = 3;
-
-/// Why a run broke: the core did something the plan forbids, or the test itself went wrong.
-#[derive(Debug)]
-enum Broke {
-    Oracle(String),
-    Harness(String),
-}
 
 macro_rules! oracle {
     ($($arg:tt)*) => { return Err(Broke::Oracle(format!($($arg)*))) };
@@ -166,45 +157,46 @@ struct Plan {
     statements: Vec<Planned>,
 }
 
-fn draw_plan(tc: &TestCase) -> Plan {
-    let auth = match tc.draw(gs::integers::<u8>().max_value(2)) {
+fn draw_plan(tape: &Tape) -> Plan {
+    let auth = match tape.int_in(0..=2u8, "auth") {
         0 => AuthPlan::Trust,
         1 => AuthPlan::Cleartext,
         _ => AuthPlan::Scram {
-            iterations: tc.draw(gs::integers::<u32>().min_value(1).max_value(8)),
-            plus: tc.draw(gs::booleans()),
+            iterations: tape.int_in(1..=8u32, "scram iterations"),
+            plus: tape.bool("scram plus"),
         },
     };
-    let startup_deadline = tc.draw(gs::integers::<u64>().min_value(1).max_value(100_000));
-    let count = tc.draw(gs::integers::<usize>().max_value(STATEMENTS_MOST));
-    let statements = (0..count).map(|index| draw_statement(tc, index)).collect();
+    let startup_deadline = tape.int_in(1..=100_000u64, "startup deadline");
+    let count = tape.int_in(0..=STATEMENTS_MOST, "statements");
+    let statements =
+        (0..count).map(|index| tape.span("statement", |tape| draw_statement(tape, index))).collect();
     Plan { auth, startup_deadline, statements }
 }
 
 /// A cut: mostly whole.
-fn draw_cut(tc: &TestCase) -> Cut {
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
-        0 => Cut::CloseAt(tc.draw(gs::integers::<usize>().max_value(4096))),
+fn draw_cut(tape: &Tape) -> Cut {
+    match tape.int_in(0..=9u8, "cut") {
+        0 => Cut::CloseAt(tape.int_in(0..=4096usize, "close at")),
         1 => Cut::Silent,
         _ => Cut::Whole,
     }
 }
 
-fn draw_statement(tc: &TestCase, index: usize) -> Planned {
-    let param_count = tc.draw(gs::integers::<usize>().max_value(3));
+fn draw_statement(tape: &Tape, index: usize) -> Planned {
+    let param_count = tape.int_in(0..=3usize, "params");
     let params: Vec<ParamType> = (0..param_count)
         .map(|_| {
-            let storage = storage(tc);
-            if tc.draw(gs::booleans()) {
+            let storage = storage(tape);
+            if tape.bool("scalar param") {
                 ParamType::Scalar(storage)
             } else {
                 ParamType::Array(storage)
             }
         })
         .collect();
-    let columns: Option<Vec<(String, Storage)>> = if tc.draw(gs::booleans()) {
-        let width = tc.draw(gs::integers::<usize>().max_value(3));
-        Some((0..width).map(|at| (format!("c{at}"), storage(tc))).collect())
+    let columns: Option<Vec<(String, Storage)>> = if tape.bool("returns rows") {
+        let width = tape.int_in(0..=3usize, "width");
+        Some((0..width).map(|at| (format!("c{at}"), storage(tape))).collect())
     } else {
         None
     };
@@ -223,8 +215,8 @@ fn draw_statement(tc: &TestCase, index: usize) -> Planned {
         None => kinds.push(6),
     }
     let width = columns.as_ref().map_or(0, Vec::len);
-    let at = |len: usize| tc.draw(gs::integers::<usize>().max_value(len.saturating_sub(1)));
-    let describe = match tc.draw(gs::sampled_from(kinds)) {
+    let at = |len: usize| tape.int_in(0..=len.saturating_sub(1), "wrong at");
+    let describe = match *tape.one_of(&kinds, "describe") {
         0 => Describe::Right,
         1 => Describe::Error,
         2 => Describe::WrongParam(at(params.len())),
@@ -233,60 +225,62 @@ fn draw_statement(tc: &TestCase, index: usize) -> Planned {
         5 => Describe::WrongCount,
         _ => Describe::WrongReturns,
     };
-    let runs = tc.draw(gs::integers::<usize>().max_value(EXECUTIONS_MOST));
-    let executions = (0..runs).map(|_| draw_execution(tc, &params, columns.as_deref())).collect();
+    let runs = tape.int_in(0..=EXECUTIONS_MOST, "executions");
+    let executions = (0..runs)
+        .map(|_| tape.span("execution", |tape| draw_execution(tape, &params, columns.as_deref())))
+        .collect();
     Planned {
         text: format!("select {index}"),
         params,
         columns,
         describe,
-        cut: draw_cut(tc),
-        notice: tc.draw(gs::booleans()),
+        cut: draw_cut(tape),
+        notice: tape.bool("notice"),
         executions,
-        close: tc.draw(gs::booleans()),
+        close: tape.bool("close"),
     }
 }
 
 fn draw_execution(
-    tc: &TestCase,
+    tape: &Tape,
     params: &[ParamType],
     columns: Option<&[(String, Storage)]>,
 ) -> Execution {
     let values = params
         .iter()
         .map(|param| match *param {
-            ParamType::Scalar(storage) => Value::Of(value(tc, storage, true)),
+            ParamType::Scalar(storage) => Value::Of(value(tape, storage, true)),
             ParamType::Array(storage) => {
-                if tc.draw(gs::integers::<u8>().max_value(4)) == 0 {
+                if tape.int_in(0..=4u8, "null array") == 0 {
                     Value::Of(Owned::Null)
                 } else {
-                    let len = tc.draw(gs::integers::<usize>().max_value(3));
-                    Value::Array((0..len).map(|_| value(tc, storage, true)).collect())
+                    let len = tape.int_in(0..=3usize, "array length");
+                    Value::Array((0..len).map(|_| value(tape, storage, true)).collect())
                 }
             }
         })
         .collect();
     let rows: Vec<Vec<Owned>> = match columns {
         Some(columns) => {
-            let height = tc.draw(gs::integers::<usize>().max_value(4));
+            let height = tape.int_in(0..=4usize, "rows");
             (0..height)
-                .map(|_| columns.iter().map(|(_, storage)| value(tc, *storage, true)).collect())
+                .map(|_| columns.iter().map(|(_, storage)| value(tape, *storage, true)).collect())
                 .collect()
         }
         None => Vec::new(),
     };
-    let answer = match tc.draw(gs::integers::<u8>().max_value(5)) {
-        0 => Answer::ErrorAt(tc.draw(gs::integers::<usize>().max_value(rows.len()))),
+    let answer = match tape.int_in(0..=5u8, "answer") {
+        0 => Answer::ErrorAt(tape.int_in(0..=rows.len(), "error at")),
         1 => Answer::CommitFails,
         _ => Answer::Rows,
     };
     Execution {
         values,
         rows,
-        count: tc.draw(gs::integers::<u32>()),
+        count: tape.int("count"),
         answer,
-        cut: draw_cut(tc),
-        notice: tc.draw(gs::booleans()),
+        cut: draw_cut(tape),
+        notice: tape.bool("notice"),
     }
 }
 
@@ -837,7 +831,7 @@ struct Seen {
 
 /// One run of the plan; the draws pick its steps.
 struct Run<'p> {
-    tc: &'p TestCase,
+    tape: &'p Tape,
     plan: &'p Plan,
     peer: Peer<'p>,
     connection: Connection<Global>,
@@ -911,7 +905,14 @@ impl<'p> Run<'p> {
                     Said::Prepared(statement, end_of(&error))
                 }
                 Event::Row { id, columns } => {
-                    Said::Row(id, columns.iter().map(Owned::of).collect())
+                    let mut values = Vec::with_capacity(columns.len());
+                    for value in columns.iter() {
+                        match value {
+                            Ok(value) => values.push(Owned::of(value)),
+                            Err(error) => oracle!("a value of {id}'s row does not decode: {error}"),
+                        }
+                    }
+                    Said::Row(id, values)
                 }
                 Event::Done { id, changed } => Said::Ended(id, End::Done(changed)),
                 Event::Failed { id, error } => Said::Ended(id, end_of(&error)),
@@ -988,7 +989,7 @@ impl<'p> Run<'p> {
         let n = if all {
             len
         } else {
-            self.tc.draw(gs::integers::<usize>().min_value(1).max_value(len))
+            self.tape.int_in(1..=len, "socket takes")
         };
         let chunk = bytes.get(..n).unwrap_or(bytes).to_vec();
         self.connection.sent(n);
@@ -1004,7 +1005,7 @@ impl<'p> Run<'p> {
             let n = if all {
                 avail
             } else {
-                self.tc.draw(gs::integers::<usize>().min_value(1).max_value(avail))
+                self.tape.int_in(1..=avail, "delivered")
             };
             let chunk = &self.peer.out[self.delivered..self.delivered + n];
             self.connection.received(chunk);
@@ -1061,8 +1062,7 @@ impl<'p> Run<'p> {
         match ask {
             Ask::Prepare(k) => {
                 let planned = &plan.statements[k];
-                let deadline =
-                    self.now + self.tc.draw(gs::integers::<u64>().min_value(1).max_value(5_000));
+                let deadline = self.now + self.tape.int_in(1..=5_000u64, "prepare deadline");
                 let columns: Vec<(&str, Storage)> = planned
                     .columns
                     .iter()
@@ -1095,8 +1095,7 @@ impl<'p> Run<'p> {
                 let planned = &plan.statements[k];
                 let j = self.asked[k].queries;
                 let execution = &planned.executions[j];
-                let deadline =
-                    self.now + self.tc.draw(gs::integers::<u64>().min_value(1).max_value(5_000));
+                let deadline = self.now + self.tape.int_in(1..=5_000u64, "query deadline");
                 let arrays: Vec<Vec<ValueRef<'_>>> = execution
                     .values
                     .iter()
@@ -1165,7 +1164,7 @@ impl<'p> Run<'p> {
         if asks.is_empty() {
             return Ok(false);
         }
-        let pick = self.tc.draw(gs::integers::<usize>().max_value(asks.len() - 1));
+        let pick = self.tape.index(asks.len(), "ask");
         self.ask(asks[pick])?;
         Ok(true)
     }
@@ -1173,8 +1172,8 @@ impl<'p> Run<'p> {
 
 /// One run: the drawn steps, then everything asked, sent and delivered, then the clock past
 /// every deadline; then the ends are held to the plan.
-fn run(tc: &TestCase, plant: Option<Plant>) -> Result<(), Broke> {
-    let plan = draw_plan(tc);
+fn run(tape: &Tape, plant: Option<Plant>) -> Result<(), Broke> {
+    let plan = tape.span("plan", draw_plan);
     let config = Config {
         user: USER,
         database: DATABASE,
@@ -1187,7 +1186,7 @@ fn run(tc: &TestCase, plant: Option<Plant>) -> Result<(), Broke> {
         connection.plant(plant);
     }
     let mut run = Run {
-        tc,
+        tape,
         plan: &plan,
         peer: Peer::new(&plan),
         connection,
@@ -1199,9 +1198,9 @@ fn run(tc: &TestCase, plant: Option<Plant>) -> Result<(), Broke> {
     };
     run.drain()?;
 
-    let steps = tc.draw(gs::integers::<usize>().max_value(STEPS_MOST));
+    let steps = tape.int_in(0..=STEPS_MOST, "steps");
     for _ in 0..steps {
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
+        match tape.int_in(0..=3u8, "step") {
             0 => {
                 run.ack(false)?;
             }
@@ -1209,7 +1208,7 @@ fn run(tc: &TestCase, plant: Option<Plant>) -> Result<(), Broke> {
                 run.deliver(false)?;
             }
             2 => {
-                let step = tc.draw(gs::integers::<u64>().max_value(400));
+                let step = tape.int_in(0..=400u64, "clock step");
                 run.tick(run.now + step)?;
             }
             _ => {
@@ -1289,12 +1288,6 @@ fn check_ends(run: &Run<'_>) -> Result<(), Broke> {
     Ok(())
 }
 
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: every prepare and query the connection took ends in exactly one outcome
 /// (`Prepared` or `PrepareFailed`; `Done` or `Failed`); a round whose whole answer arrived ends
 /// as the server answered it, a query with exactly its own rows in order (so after a failed
@@ -1302,30 +1295,23 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// of its own rows; a statement whose description differs is never executed: the scripted
 /// server sees no `Bind` for it, and a query on it, or on one still preparing, is refused by
 /// name; nothing is said after `Close`, which an honest server causes only by closing or by a
-/// deadline passing; and no round outlives its deadline. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// deadline passing; and no round outlives its deadline. `BLAZE_SIM_SEEDS` runs it over more
+/// seeds.
 #[test]
 fn every_round_ends_once_with_its_own_rows() {
-    run_cases(300, |tc| {
-        if let Err(broke) = run(&tc, None) {
-            panic!("{broke:?}");
-        }
-    });
+    blaze_sim::check(blaze_sim::Config::cases(300), |tape| run(tape, None));
 }
 
 /// The planted-bug control: a core that ends a failed round at its error, instead of skipping
 /// what the server sends for it up to its `ReadyForQuery`, reads the rest of that answer as the
-/// next round's. The oracle must see it.
+/// next round's. The oracle must see it, and the same cases with the honest core must pass.
 #[test]
 fn the_oracle_catches_a_core_that_does_not_skip_to_ready() {
-    let caught: Cell<Option<String>> = Cell::new(None);
-    run_cases(600, |tc| match run(&tc, Some(Plant::NoSkipToReady)) {
-        Ok(()) => {}
-        Err(Broke::Oracle(why)) => caught.set(Some(why)),
-        Err(broke @ Broke::Harness(_)) => panic!("{broke:?}"),
-    });
-    let caught = caught.take();
-    assert!(
-        caught.is_some(),
-        "the oracle did not catch a core that does not skip to ReadyForQuery"
+    blaze_sim::control(
+        blaze_sim::Config::cases(600),
+        None,
+        Some(Plant::NoSkipToReady),
+        "",
+        run,
     );
 }

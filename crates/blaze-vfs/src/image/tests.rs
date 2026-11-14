@@ -583,7 +583,7 @@ fn a_file_the_store_lacks_is_named_by_its_id_and_mended_by_writing_it_again() {
     assert!(held.has(&id), "the next image's write puts the text it names");
 }
 
-/// The invariant (persisted-state-round-trips): every file read from a restore of an image is,
+/// The invariant (rule persisted-state-round-trips): every file read from a restore of an image is,
 /// byte for byte, the file the tree that wrote it reads, and the image holds none of their
 /// bytes. The control: an image whose tree names an ID the store lacks fails that read,
 /// naming the ID.
@@ -705,7 +705,7 @@ fn an_image_waits_for_its_texts_to_be_durable() {
     assert!(image_in(&mut vfs, &held).is_ok(), "the control: durable texts, an image");
 }
 
-/// The invariant (persisted-state-round-trips): an image of the layout before (tree 2, whose
+/// The invariant (rule persisted-state-round-trips): an image of the layout before (tree 2, whose
 /// files were ranges of a blobs section) is a named miss, refused by its schema, and the
 /// journal is loaded alone, as `Vfs::recover` loads it; never a tree read as this layout. The
 /// control: the same section under this layout's schema is not refused by schema.

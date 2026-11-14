@@ -13,8 +13,14 @@ use blaze_registry::{
 };
 use blaze_resolve::{
     DepKind, Dependency, IndexSummary, MemRegistry, PackageId, QueryKind, Registry, SourceId,
-    block_on,
 };
+
+/// `future` to its end on this thread through blaze-core's one `block_on`: a query of an
+/// index served from memory, held to a bound a test never nears.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let within = Some(std::time::Duration::from_secs(30));
+    blaze_core::wait::block_on("a test's query of an index in memory", within, future).unwrap()
+}
 use blaze_core::lock::Lock;
 use std::alloc::Global;
 

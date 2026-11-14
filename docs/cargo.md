@@ -105,13 +105,15 @@ a build first needs it.
     blaze agents status [--json]
     blaze agents hook claude|codex vN [--strict]
     blaze doctor [--json]
+    blaze prove [-p PKG]... [--workspace] [--emit] [--subset] [--json]
     blaze --version
 
 `blaze help <command>` lists the flags a command takes: cargo's, read as cargo's clap reads them
 (`crates/blaze-cargo/src/cli/args.rs`), with clap's errors and exit code 1 for a command line
 cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global flags before
-the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
-[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`; `test`
+the command work as in cargo. `test` alone takes four flags of blaze's own
+([below](#which-tests-run)): `--run-all`, `--ub`, `--ub-seed N` and `--ub-schedules K`
+(`--reached`, which once opted into selection, is refused naming the default and `--run-all`); `test`
 and `bench` take `--no-tests fail|pass`
 ([what a run of no test is](#a-run-that-ran-no-test-is-refused)). `build`,
 `check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
@@ -304,9 +306,10 @@ failed (with what reruns each), then each test executable or doc test that never
 failure that held it back: its own compile's, or the unit it was skipped behind
 (`blaze_api::Unchecked::tests`). The exit status is then 101. `--fail-fast` stops at the first
 test executable that fails, with its exit code, as cargo does without `--no-fail-fast`.
-That runs every test, outside any sandbox, as cargo does. blaze's `--reached` runs only the
-tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
-([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
+`blaze test`'s tests run in the daemon, which reruns only a test whose executed code or reads
+changed and reports the rest cached; `--run-all` runs every one, and `--ub` runs them in
+blaze's evaluator ([below](#which-tests-run)). Doc tests, `--no-run` and `blaze bench` run as
+above. Doc tests are blaze's own build of each example (below).
 
 ### Lock files
 
@@ -466,27 +469,38 @@ A unit's record key covers all of these: its own rustflags through its plan, the
 rustflags of the crates it links in as a part of their own, and its build scripts' link
 arguments as a part of theirs.
 
-### Sandboxed tests (an experiment, opt-in)
+### Sandboxed tests
 
-Tests run in a sandbox only where the daemon runs them (`blaze test --reached`,
-[below](#which-tests-run)) and the workspace opts in, in its root manifest:
+Whether a test the daemon runs (`blaze test`, [below](#which-tests-run)) is sandboxed by
+default depends on the host, decided in one place (`tests_sandboxed_by_default` in
+`crates/blaze-units/src/load/sandbox.rs`):
 
-```toml
-[workspace.metadata.blaze]
-experimental = ["sandboxed-tests"]
-```
+| host | a test is sandboxed |
+|---|---|
+| Linux | always, with nothing to opt into, unless its package takes it out ([below](#a-package-takes-its-tests-out)) or the command says `BLAZE_SANDBOX=off` |
+| macOS | only where its package opts in (`tests = true` in its `[package.metadata.blaze.sandbox]`) or the workspace does (`experimental = ["sandboxed-tests"]`), and then the same way out applies |
 
-or where a package does, in its own manifest, with `tests = true` under
-`[package.metadata.blaze.sandbox]`. `experimental` lists, by name, the experiments a workspace
-opts into: `sandboxed-tests`, and `const-macros` (proc macros written as functions of a file of
-the package, run by blaze's const evaluator: [future/const-macros.md](future/const-macros.md)).
-Any other name, or a value that is not a list of names, is an error that names the manifest and
-the names known (`crates/blaze-units/src/load/sandbox.rs`). A test that is not sandboxed is
-never kept as passed ([below](#which-tests-run)). Build scripts run in the sandbox
-whatever the workspace says ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and
-proc macros run in blaze's own process, as WebAssembly modules.
+The two differ because of a known hole on macOS ([below](#the-daemons-socket-and-a-known-hole-on-macos)):
+a sandboxed test there can read another test binary's launch token. The difference goes when
+the channel to the daemon is a descriptor the test inherits, with no token in any environment.
 
-In a workspace that opts in, each test binary the daemon runs starts once in a sandbox of its
+The sandbox is what lets blaze keep a pass and rerun a test only when something it executed or
+read changed: it records what each test reads, and a test outside it can read anything, so
+nothing can say when it must run again. A test that is not sandboxed is never kept as passed.
+Build scripts run in the sandbox on every host
+([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and proc macros run in blaze's own
+process, as WebAssembly modules.
+
+`experimental` in `[workspace.metadata.blaze]` lists, by name, the experiments a workspace
+opts into: `const-macros` (proc macros written as functions of a file of the package, run by
+blaze's const evaluator: [future/const-macros.md](future/const-macros.md)) and
+`sandboxed-tests` (every member's tests sandboxed, on macOS). Any other name, or a value that is
+not a list of names, is an error that names the manifest and the names known
+(`crates/blaze-units/src/load/sandbox.rs`). On Linux, where tests are sandboxed anyway,
+`sandboxed-tests` does nothing, and every build says so in a note; delete it from the list once
+no macOS machine builds the workspace.
+
+Each test binary the daemon runs starts once in a sandbox of its
 own, tracing what it reads, as a fork server, and each test runs in a child forked from it
 (`crates/blaze-usercode/src/test/queue.rs`). In it the machine's files are read-only; the workspace, the target directory and
 cargo's home (`CARGO_HOME`, `~/.cargo`) are as they are, but what a test writes there is kept
@@ -518,7 +532,9 @@ v1 failed a test the sandbox denied something, whatever it ended with, naming wh
 and the way out; v2 records the refusal (`W` and `N` lines of the record) and the test ends as
 it ends.
 
-A package of a workspace that opts in takes its tests out of the sandbox in its manifest:
+#### A package takes its tests out
+
+A member of the workspace takes its tests out of the sandbox in its own manifest:
 
 ```toml
 [package.metadata.blaze.sandbox]
@@ -526,16 +542,59 @@ tests = false                                 # every test of the package runs o
 unsandboxed-tests = ["tests::writes_home"]    # or these, by libtest's names
 ```
 
-Any other key there is an error. The tests named run from a second server of the binary,
-started outside, after every sandboxed test (`crates/blaze-cargo/src/serve/unit/test.rs`);
-`-v` says which and why. `BLAZE_SANDBOX=off` in the command's environment runs every test and
-build script of the command outside, as cargo does. A test outside the sandbox runs every
-time: what it read is not known, so its pass is never kept.
+On Linux `tests = true` is the default said out loud; on macOS it is the opt-in that sandboxes
+the package's tests (with the hole [below](#the-daemons-socket-and-a-known-hole-on-macos)).
+Any other key there is an error, and a
+dependency's own table is not read. The tests named run from a second server of the binary,
+started outside, after every sandboxed test (`crates/blaze-cargo/src/serve/unit/test.rs`).
+`BLAZE_SANDBOX=off` in the command's environment runs every test and build script of the
+command outside, as cargo does. A test outside the sandbox runs every time: what it read is not
+known, so its pass is never kept. Its line says so (`(not kept: not sandboxed)`), and the run
+says, in one note before its results, how many tests run outside and the setting that put them
+there:
 
-Where no sandbox can be made for a test that is opted in, `blaze test` stops before any test runs, says why and how
-to fix it, and exits 101. It does not go on outside with a warning: a run that did would break,
-unseen, the promise that a test can't change the machine or reach the network, and a warning
-in a long log is not seen. `BLAZE_SANDBOX=off` is the explicit way to run outside.
+```text
+note: 3 tests run outside the sandbox, so they run every time: only a sandboxed run, which records what it reads, is kept as passed: 3 of `sel`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`
+```
+
+On macOS a package that does not opt in has every line `(not kept: not sandboxed)`, every run,
+and the note says the one thing to do and what it carries:
+
+```text
+note: 3 tests run outside the sandbox, so they run every time: only a sandboxed run, which records what it reads, is kept as passed: 3 of `sel`, which does not opt in. On macOS tests run outside the sandbox unless their package opts in: `tests = true` under its `[package.metadata.blaze.sandbox]` runs them sandboxed and keeps their passes, though a sandboxed test on macOS can still read the arguments and environment of the user's other processes, another test binary's launch token among them (docs/cargo.md, "Sandboxed tests")
+```
+
+Where the sandbox can't be made (or fails) for a test binary, its tests fail and `blaze test`
+stops there: no other test starts, it says once, first, how to run the tests anyway
+(`BLAZE_SANDBOX=off`, at the cost that nothing is kept and every test runs every time) and then
+why the sandbox failed, and it exits 101. It does not go on outside with a warning: a run that
+did would break, unseen, the promise that a test can't change the machine or reach the
+network, and a warning in a long log is not seen. `BLAZE_SANDBOX=off` is the explicit way to
+run outside.
+
+#### The daemon's socket, and a known hole on macOS
+
+A test binary blaze runs on its code memory (a dev test binary) connects, as it starts, to the
+daemon's socket under `BLAZE_HOME/v2/inproc`, which hands it its code. That socket, like its
+fork server's own, is given to the sandbox as readable: the test may connect to it by that exact
+path and to nothing else of the daemon's home, which it can't write. What a connection gets
+there: the daemon answers only a process of its own user whose first frame names the one-use
+token of a launch still waiting, within 30 seconds, and drops any other with nothing sent. A
+test's own token is used up by its start hook before `main`; another launch's is only in that
+process's environment, which a Linux sandbox can't read (its own PID namespace and `/proc`, or
+Landlock's scoping when confined).
+
+On macOS it can. A sandboxed test reads the arguments and environment of every other process
+of the same user (`sysctl` `KERN_PROCARGS2`), so a second test binary's launch token is
+readable while that binary waits to redeem it, and a test that wins the race takes the grant
+meant for it: its code memory, written by the daemon for that launch. No Seatbelt rule tried
+closed it: `(deny process-info*)`, `(deny sysctl-read (sysctl-name "kern.procargs2"))` and
+`(deny sysctl*)` all left the read working on macOS 27.0.1 (26A434). This hole is known and not
+closed; it is why macOS sandboxes tests only on an opt-in ([above](#sandboxed-tests)), and
+`sandbox::macos::tests::a_sandboxed_run_reads_another_processs_environment` asserts that it is
+still there. A package or workspace that opts in takes this hole with it. The end state,
+on both hosts, is a socket the test inherits per launch, with no path or token to steal; then
+that test is inverted and macOS sandboxes tests by default as Linux does.
 
 On Linux the sandbox is user, mount, network, IPC and PID namespaces: the machine bound
 read-only, overlays for the workspace and target directory, tmpfs for the empty directories, a
@@ -553,8 +612,9 @@ seccomp never sees an `io_uring` operation, so a ring would read, write and conn
 record and the socket check, and libraries fall back to plain calls); and the calls of another
 architecture's table (32-bit or x32 calls on x86-64, `ENOSYS`), which the filter's numbers
 don't name. It asks the supervisor about each `connect` and each `sendto` with an address: one
-to a Unix socket outside the overlays, the writable directories and the empty ones, with every
-link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
+to a Unix socket outside the overlays, the writable directories and the empty ones, but for a
+socket the readable entries name by its exact path (its fork server's, the daemon's code
+memory's), with every link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
 `N` line, `unix:` and the path. When the run is recorded it also notifies writes, the network
 and the harness's marks, and reads too when they are recorded (`affected`).
 
@@ -592,7 +652,10 @@ the interposer, so what it reads is not known (the test then runs every time und
 `affected`, and `-v` says so) and its writes to the workspace are refused rather than kept
 private; a test that makes raw system calls, or tampers with the interposer in its own process,
 gets past the recording and the private writes but not Seatbelt's read-only machine or its
-network rule; a sandbox inside the sandbox fails with `EPERM`.
+network rule; a sandbox inside the sandbox fails with `EPERM`; and the profile allows reading
+other processes, so a sandboxed program reads the arguments and environment of every process
+of the same user (`sysctl` `KERN_PROCARGS2`), a second test binary's launch token among them,
+which no Seatbelt rule tried closed ([above](#the-daemons-socket-and-a-known-hole-on-macos)).
 
 What it cost v1, measured with `sandboxbench.py` (since deleted) on 2026-10-26 (one sandbox per
 executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
@@ -630,7 +693,9 @@ usual daemons out of reach whatever the program names); and a `sendmsg` with an 
 asked about when the run is recorded, so a datagram to a Unix socket outside those directories
 is not refused in a run that records nothing. A test that needs `io_uring`, a 32-bit helper
 program or a terminal of its own (`/dev/tty`, or `/dev/ptmx` on macOS) runs outside
-(`unsandboxed-tests`). On macOS a test that makes raw system calls gets past the interposer's
+(`unsandboxed-tests`). On macOS a sandboxed test reads other processes' arguments and
+environments, another test binary's launch token among them (above), which is why tests are
+sandboxed there only on an opt-in; a test that makes raw system calls gets past the interposer's
 recording (above); Metal's compiler service and the log write outside on the program's behalf
 (the shader cache, the system log), as the allowed services do. The plan is
 [#257](https://github.com/indexable-inc/blaze/issues/257). Build scripts and proc macros run
@@ -689,7 +754,7 @@ registry can be named in:
 
 ```toml
 [workspace.metadata.blaze.sandbox]
-unsandboxed-build-scripts = ["hegeltest", "flecs_ecs_sys"]   # by package name
+unsandboxed-build-scripts = ["libghostty-vt-sys", "flecs_ecs_sys"]   # by package name
 build-script-link-dirs = ["/opt/vendor/lib", "${OPENSSL_DIR}/lib"]   # rustc-link-search may name
 build-script-env = ["OPENSSL_DIR"]                                   # a ${NAME} above must be listed here
 ```
@@ -750,8 +815,8 @@ supervisor refuses every address a call names that is not a Unix socket of the s
 that is not the sandbox's; the sandbox's first process reaps what the program leaves and kills
 it as the program ends. What namespaces hide and this does not: the machine's `/tmp`, `/run`
 and processes are seen (read-only), and SysV IPC and a file's mode, owner and times are not
-refused. A sandboxed test's overlays need a mount namespace, so a workspace that opted into
-sandboxed tests still needs user namespaces: where they can't be made, its tests fail saying
+refused. A sandboxed test's overlays need a mount namespace, so `blaze test` on Linux,
+where tests are sandboxed by default, still needs user namespaces: where they can't be made, its tests fail saying
 so, with the ways on (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, an
 AppArmor profile that allows `userns` for blaze; in a container `--security-opt
 seccomp=unconfined`, or on Kubernetes `securityContext.seccompProfile.type: Unconfined`) or
@@ -972,28 +1037,91 @@ reports/BSWASI.md.
 
 ### Which tests run
 
-Plain `blaze test` runs every test, as `cargo test` does ([above](#what-a-build-does)). Two
-flags of blaze's own (extensions, opt-in; `crates/blaze-cargo/src/cli/args.rs`) have the daemon
-run them instead and send each result, which the client prints in libtest's format:
+`blaze test` reruns a test only when something it executed or read changed. The daemon runs
+the tests and sends each result, which the client prints in libtest's format. Each test runs
+in a process of its own, forked from its binary's fork server, on one queue over every binary
+and every core (`crates/blaze-usercode/src/test/queue.rs`). blaze-testsel's machine
+(`crates/blaze-testsel`, [v2/plan/design/test-selection.md](v2/plan/design/test-selection.md))
+decides which run (`crates/blaze-cargo/src/serve/unit/test.rs` performs what it asks). A pass
+is kept in the store under two things: the functions the test executed, each with its bound
+code (a byte per function slot that the runtime writes on the slot's first call), and what it
+read, in the sandbox. When none of those changed, the test is not run. Its kept pass stands,
+and the client marks it cached with the time its kept run took:
 
-- `--reached` runs only the tests an edit can have changed. Each test runs in a process of
-  its own, forked from its binary's fork server, on one queue over every binary and every
-  core, the longest expected first (`crates/blaze-usercode/src/test/queue.rs`). Its pass is
-  kept in the store under the functions it executed (a byte per function slot the runtime
-  writes on the slot's first call) and, in the sandbox, what it read; a test whose executed
-  functions and reads are as they were when it passed is not run, and is reported cached with
-  its last pass (`crates/blaze-testsel`). A test that ran outside the sandbox is never kept,
-  and the client names those last, on stderr. With a JSON `--message-format` each result is a
-  `blaze-test-result` line on stdout instead of libtest's text: `name`, `binary`,
-  `executable`, `outcome`, `millis`, `outside`, `output`, and `cached` (null for a test that
-  ran; else the kept run's `basis`, `executed` or `reached`, its `why`, `millis` and
-  `outcome`), as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. The design is
-  [v2/plan/lanes/usercode/tests.md](v2/plan.md) and
-  [v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), idea 3.
-- `--ub` runs the tests picked (every one, or with `--reached` those it would run) in blaze's
-  MIR evaluator under the checker of undefined behavior (`crates/hir-ty-ub`), compiling
-  nothing; `--ub-seed N` and `--ub-schedules K` set its seed and how many thread schedules it
-  tries. `--ub` with `--no-run` is refused.
+```text
+test parse::empty ... ok <0.012s> (cached)
+test result: ok. 41 passed (38 cached); 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+```
+
+A pass is kept only when rerunning it now would give the same result, so a test that passed
+and is not kept says why, and runs again next time:
+
+- `(not kept: not sandboxed)`: it ran outside the sandbox, which only `BLAZE_SANDBOX=off`,
+  its package's manifest ([above](#a-package-takes-its-tests-out)) or, on macOS, the lack of an
+  opt-in ([above](#sandboxed-tests)) does. The run's one note
+  counts these, with the setting that put them there; it does not list them. A test outside
+  never stands on a pass kept of it inside: it runs every time, whichever setting put it there.
+- `(not kept: the sandbox did not say what it read)`: the trace is missing.
+- `(not kept: it reaches code the tracer cannot see (a process start, the network or assembly))`:
+  codegen marks it as reaching such code.
+- `(not kept: it read the wall clock)`, `(not kept: it read randomness the sandbox did not answer)`,
+  `(not kept: it used the network)` and `(not kept: it read through a descriptor the sandbox did not see opened)`.
+- `(not kept: what it read changed while it ran)`.
+- `(not kept: /w/data.txt changed after the test began, so its hash need not be what the test
+  read)`, in JSON `"kept": {"no": "moved"}`: what a test read is hashed once it ends, so a
+  file, a directory above it or a link on the way to it whose `stat` says it changed since a
+  moment before the run began (git's racy window, two seconds) leaves the hash unproven
+  (`Began::moved`, `crates/blaze-usercode/src/inputs.rs`). The line names the first such
+  read and, when the name whose stamp moved is another, that one and how it stands to the
+  read: `/w, above /w/data.txt which it read, changed ...`, `/w/l, a link on the way to
+  /w/l/f which it read, changed ...`, or `/x/f, reached through a link from /w/l/f which it
+  read, changed ...`; a read whose names can't be resolved (a relative path, one with `..`)
+  is said as such. This includes a file the test wrote itself and read back. A build script
+  run kept under no key for the same reason says it in the same words. A test's own
+  executable is never this: the build that placed it is the one writer of its path, and a
+  dev test binary starts from that file as placed, with the key the job's record holds for
+  it; blaze's code-memory host writes no file, and a launch whose path holds another key
+  is refused, naming the path and both keys.
+
+A failure is never kept: it runs every time. Doc tests are neither selected nor kept: blaze
+does not trace a doc test's run, so they run every time, after the daemon's tests, and the
+client says so in a note. A suite's index head is held in the daemon's
+memory. After a restart each test is looked up by what it executed and read, which gives the
+same answer and costs a lookup per test.
+
+`--run-all` runs every test asked and still keeps what each run learns. `--reached`, the flag
+that once opted into selection, is refused, naming the default and `--run-all`.
+
+With a JSON `--message-format` each result is a `blaze-test-result` line on stdout instead of
+libtest's text, as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. Its fields
+are `name`, `binary`, `executable`, `outcome`, `millis`, `outside` and `output`, then:
+
+- `cached`: null for a test that ran. For a cached test it holds the kept run's `basis`
+  (`executed` or `reached`), its `why`, its `millis` and its `outcome`, and the result itself
+  has outcome `passed` and `millis` 0.
+- `kept`: only for a pass that is not kept, as `{"no": "clock"}`. Its word is one of
+  `unsandboxed`, `untraced`, `foreign`, `clock`, `random`, `network`, `descriptor`, `raced`,
+  `moved` or `too-many-shapes`.
+- `ran`: always present. It is null for a test that did not run (cached, ignored) or that
+  selection did not judge. For a test that ran it is `{"why", "ask", "before", "now"}`, why no
+  kept pass held:
+  - `run-all`: `--run-all` was given.
+  - `no-head`: no pass of the suite was kept yet.
+  - `unknown-state`: the head was restored from the journal for another binary, and this daemon
+    has no image of it.
+  - `no-row`: no pass of this test was kept.
+  - `function-changed`: `ask` is `fn ID` (or `the code no slot calls`), and `before` and `now`
+    are its bound code, or `gone`.
+  - `read-changed`: `ask` is `file PATH`, `dir PATH`, `env NAME` or `env *` (the whole
+    environment), and `before` and `now` are its digests, or `absent`.
+
+  With `-v`, the libtest line ends with the same reason as a sentence:
+  `test tests::muls ... ok (ran: fn 3f2a91c04b1e changed: 81aa02c3d4e5 -> 0c9d17e2b3f4)`.
+
+`--ub` runs the tests picked (every one) in blaze's MIR evaluator under the checker of
+undefined behavior (`crates/hir-ty-ub`), compiling nothing. `--ub-seed N` and
+`--ub-schedules K` set its seed and how many thread schedules it tries. `--ub` with `--no-run`
+is refused.
 
 ### A run that ran no test is refused
 
@@ -1006,22 +1134,23 @@ and, when a name filter left every test out, the nearest tests that exist:
 error: no test ran: `blaze test adds_wrng` matched none of the 20 tests in 4 test executables
 note: the nearest that exist: tests::adds_wrong
 note: a run of no test is refused; `--no-tests pass` allows one, as cargo does
-blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 unreached=0 binaries=4 unbuilt=0 elapsed_ms=412 why="no test ran"
+blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 cached=0 binaries=4 unbuilt=0 elapsed_ms=412 why="no test ran"
 ```
 
 The rule is one function over the run's counts (`refusal` in
 `crates/blaze-cargo/src/cli/test.rs`), the same on a terminal, off one and for the daemon's
 runs. Not refused: `--no-run` and libtest's `--list` and `--help`, which are meant to run
-nothing; under `--reached` a run whose tests were selected and not reached, which is that
-flag's answer; and `--no-tests pass` (`fail` is the default), which is cargo's behaviour, for a
+nothing; a run whose tests were all cached, whose kept passes stand; and `--no-tests pass`
+(`fail` is the default), which is cargo's behaviour, for a
 script that runs one filter over many packages, or `--doc` over packages without doc tests,
 and expects 0 where nothing matched. A test executable without libtest's harness that prints
 no `test result` line is one test, its exit status the verdict.
 
 Every run that runs tests ends by saying its counts, so a pass says what it is a pass of: on a
 terminal `8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered` ([terminal.md](terminal.md));
-off one a `blaze: tests ok|failed` line on stderr with `selected` (passed, failed, measured,
-ignored and unreached), `ran` (passed, failed and measured), each count, `binaries`, `unbuilt`
+off one a `blaze: tests ok|failed` line on stderr with `selected` (passed, failed, measured
+and ignored), `ran` (failed, measured and the passed that were not cached), each count
+(`cached`: the passed whose kept pass stood), `binaries`, `unbuilt`
 and `elapsed_ms`; and with a JSON `--message-format` a `blaze-test-summary` line on stdout with
 the same fields, `ok` and `why` (`test_summary` in `crates/blaze-cargo/src/cli/json.rs`). Off
 a terminal each test executable's stdout comes through blaze, which writes it on unchanged and
@@ -1370,6 +1499,90 @@ The store is always on: one per daemon, in `$BLAZE_HOME/v2/store`, the user's al
 daemon refuses one another user owns or others may write to;
 [v2/plan/lanes/store.md](v2/plan/design/store.md)).
 
+## blaze prove
+
+`blaze prove` checks the proofs of a crate's theorem functions with Lean
+([v2/plan/design/proofs-for-sans-io.md](v2/plan/design/proofs-for-sans-io.md), section 5;
+`crates/blaze-cargo/src/cli/prove.rs`, `crates/blaze-cargo/src/serve/unit/prove.rs`). It takes
+the package and target flags of `blaze check` and proves the library crates that check would
+check, without `cfg(test)`. Nothing is compiled: the daemon builds only the proc macros and
+build scripts' runs the front end applies, as `blaze reach` does.
+
+For each function marked `#[blaze::theorem]` (a `fn` returning `bool`, in a crate with
+`#![register_tool(blaze)]`), in the order of its path, blaze translates it to Lean
+(`crates/hir-ty-lean`): a model of it and of what it calls, and the statement
+`<name>.spec.statement`, that it returns `true` for every argument. Lean then checks the
+crate's proof of it: `<name>.spec.proof` in the proof file for its module, under `lean/` beside
+the crate's `Cargo.toml` (`blaze_graph::ledger::f` is proved in `lean/BlazeGraph/Ledger.lean`,
+a crate's root module in `Lib`). One proof file may prove many theorems and import the
+crate's other files under `lean/`, the models of its theorems and of what they call, blaze's
+library (`Blaze.Auto` has the tactic to try first, `blaze_auto`) and Lean's own. The models,
+a copy of the proof files and Lean's outputs are written under `lean/` in the workspace's
+build directory, never in the checkout. Each theorem is one line:
+
+- `proved F: THEOREM (axioms: ...)`: Lean's kernel accepted the proof, with no `sorry` and no
+  axiom but Lean's three.
+- `open F: PROOF_FILE`, then Lean's whole message indented: there is no proof file, or Lean
+  refused it. The remaining goals are in the message; edit the proof file and run it again.
+- `model broken F: ..`, then Lean's first error with its file and line: the Lean model blaze
+  generated for the function does not build. That is a bug in blaze's translator, which no
+  proof file can fix. A theorem's model is compiled whether or not it has a proof file, so
+  `open` always means a model that builds and a proof still to write.
+- `refused F: WHAT at `WHERE``: the translator does not take a construct in it.
+
+The last line counts them: `N proved, N open, N model broken, N refused`. Lean is the executable
+`BLAZE_LEAN_PROVER` names, an absolute path, of the release `lean/lean-toolchain` pins: unset,
+or another version, the command fails, naming the variable and the version, and checks
+nothing.
+
+Lean runs in blaze's sandbox, as a build script does: a proof file's tactics can do IO, so it
+reads its own release and the build directory's `lean/`, writes there alone, and has no
+network (`BLAZE_SANDBOX=off` turns the sandbox off, as for build scripts). It is given a copy
+of the proof files as the daemon read them, never the checkout. One run of Lean a module (the
+library's, each model, each proof file, each theorem's check), those that import nothing of
+each other at once; a run that has not ended in ten minutes is stopped and its theorems are
+open, naming the module. A module Lean accepted is not run again while its text and what it
+imports stay the same: a second `blaze prove` of an unchanged tree runs Lean not at all, and
+after an edit it runs the modules the edit reaches.
+
+What a theorem's function may be, with a worked one of each kind in blaze-core:
+
+- A property of a pure function or of one step of a state machine, for every state:
+  `crates/blaze-core/src/busy.rs`, `wait/retry.rs` (`a_retry_waits_what_is_left`).
+- A crash: the function takes the crash's witness as an argument and returns `true` where the
+  disk's world does not allow it (`world/disk.rs`, three theorems; with effects in flight,
+  `world/asks.rs`).
+- A whole loop against everything a kernel may answer: the loop takes its kernel as one value,
+  and the theorem's function runs the real loop on a kernel that answers from a list
+  (`wait/retry.rs`, `a_wait_ends_by_its_deadline`; `agents/howto/H-prove-a-loop-against-a-world.json`).
+- Two threads that share atomics, on every interleaving: the function takes a schedule and
+  runs the two with `blaze_core::world::threads::two` (`wait/parking.rs`, `no_unpark_is_lost`;
+  `agents/howto/H-prove-two-threads.json`). A function that reaches an atomic operation is
+  translated as a program over shared cells, and the statement is that the program's value is
+  `true`. Orderings weaker than `SeqCst` are modelled on one cell; over more, the run belongs
+  to the weak world (`lean/Blaze/ThreadsWeak.lean`), which blaze-core's `two` does not run yet.
+
+Each has a test that runs the function on drawn arguments where it is stated, and a control: a
+planted bug the function must be `false` of.
+
+- `--emit` translates and writes the models and stops: one `emitted F: STATEMENT (MODEL)` line
+  each, and no Lean is needed.
+- `--subset` also counts every function in a `#![blaze::sans_io]` module of those crates, in
+  one line, `subset: N functions in sans-IO modules, N translated, N generic (translated by
+  instance), N refused`: a generic function is translated at each instance a theorem reaches
+  and alone at none, so it is counted apart, not refused. Then each refusal, `    N refused
+  for WHAT`, most first; a function is counted under the first refusal the translator meets.
+- `--functions` (with `--subset` only; alone it is refused) adds one line a function of the
+  subset, by path: `translated PATH`, `generic PATH` or `refused PATH: WHAT`.
+- `--json` prints one object: `records`, each with `outcome` (`Proved`, `Open`, `ModelBroken`,
+  `Emitted`, `Refused`) and the record's fields; `subset` (`functions`, `translated`, `generic`,
+  `refused` as `{what, count}`, and `outcomes`, every function by path with its `outcome`,
+  `Translated`, `Generic` or `Refused` with its `what`), with or without `--functions`; and
+  `failed` (why no proof was checked, when none could be).
+
+It exits 0 when every theorem is proved (with `--emit`, translated), or there is none (it says
+so), and 1 otherwise. The same tree gives the same output, byte for byte.
+
 ## blaze doctor
 
 `blaze doctor` checks the whole installation without changing anything and without the network
@@ -1491,7 +1704,7 @@ it, for that request alone:
 |---|---|---|
 | `CI`, `TF_BUILD` | `CI` not empty, `false` or `0`, or `TF_BUILD` set: a build may not change `Cargo.lock` or `blaze.lock` (`--no-locked` lets it; [Lock files](#lock-files)) | unset: a build writes them and says so |
 | `BLAZE_LOCK` | `write`: builds may change `Cargo.lock` and `blaze.lock` whatever `CI` or `lock = "required"` says, unless `--locked` or `--frozen` is typed (for harnesses of throwaway workspaces; [Lock files](#lock-files)); any other value is an error | unset |
-| `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
+| `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts, proc macros and tests outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |
 | `BLAZE_SCRIPT_CACHE` | `check` runs again each build script run the store kept and compares, failing the build where they differ; a result another checkout verified that differs is recorded as depending on where its roots are, so no checkout is given it again; any other value is an error | unset: a kept run is used |
@@ -1501,6 +1714,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 
 | Variable | Meaning | Default |
 |---|---|---|
+| `BLAZE_LEAN_PROVER` | the `lean` executable `blaze prove` checks proofs with, an absolute path, of the Lean `lean/lean-toolchain` pins; read by the client and sent with the request ([blaze prove](#blaze-prove)) | unset: `blaze prove` fails unless `--emit` |
 | `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Files](#files), [Install](#install)) | see there |
 | `BLAZE_TOOLCHAINS` | the directory blaze keeps the Rust it builds with in, shared by every `BLAZE_HOME` ([toolchain.md](toolchain.md)) | `.blaze/toolchains` in the user's home (`HOME`, else the system's record of the user) |
 | `BLAZE_RUST_DIST` | where the pinned nightly's components come from: a URL, or a directory of them ([Install](#install)) | rust-lang's dist server, at the pinned date |
@@ -1628,7 +1842,7 @@ any other fails with status 101 and does nothing:
 
     error: no such command: `vendor`
 
-    help: blaze's commands are build, check, run, test, bench, doc, lock, clean, cache, gc, store, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach, slow, diagnostics, doctor, agents, pprof and perf
+    help: blaze's commands are build, check, run, test, bench, doc, lock, clean, cache, gc, store, fmt, new, init, tree, metadata, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables, explore, debug, explain, why, reach, prove, slow, diagnostics, doctor, audit, agents, pprof and perf
 
 The table below is a record of what v1 had (as of 2026-10-30): the crates it names
 (blaze-metadata, blaze-fmt, blaze-lints, ...) are still in the tree, and a command comes back

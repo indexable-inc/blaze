@@ -12,9 +12,12 @@
 //! own scan is checked against.
 //!
 //! A record is whole only when the runtime armed every slot and the child exited: anything
-//! else is [`Record::Incomplete`], which no pass is ever kept by as executed.
+//! else is [`Record::Incomplete`], which no pass is ever kept by as executed. A whole record
+//! names the jump table its slots are of ([`Table`], what the runtime said once to the
+//! server), which a binary's table is checked against by identity, never by count
+//! ([`crate::Image::executed`]).
 
-pub use blaze_usercode::test::wire::{HEADER, MAGIC, header};
+pub use blaze_usercode::test::wire::{HEADER, MAGIC, Table, header};
 
 /// What a runtime that armed every slot of `region` writes. `false` when the region's header
 /// is not one.
@@ -31,9 +34,10 @@ pub fn mark_armed(region: &mut [u8]) -> bool {
 /// A test process's record of what it executed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Record {
-    /// Every slot was armed and the process ended as it should: `hits` are the slots called,
-    /// strictly increasing, each below `slots`.
-    Complete { slots: u32, hits: Vec<u32> },
+    /// Every slot was armed and the process ended as it should: `table` is the jump table the
+    /// slots are of, and `hits` the slots called, strictly increasing, each below
+    /// `table.slots`.
+    Complete { table: Table, hits: Vec<u32> },
     /// Not whole, and why: the binary keeps no record, the runtime did not arm, the process
     /// was killed or crashed, the record was cut.
     Incomplete { why: String },
@@ -44,9 +48,10 @@ impl Record {
         Record::Incomplete { why: why.into() }
     }
 
-    /// The record a server sent: its hits must be strictly increasing and below `slots`,
-    /// or the record is not one.
-    pub fn of_hits(slots: u32, hits: Vec<u32>) -> Record {
+    /// The record a server sent of the slots of `table`: its hits must be strictly increasing
+    /// and below `table.slots`, or the record is not one.
+    pub fn of_hits(table: Table, hits: Vec<u32>) -> Record {
+        let slots = table.slots;
         let mut last: Option<u32> = None;
         for &hit in &hits {
             if hit >= slots {
@@ -63,12 +68,14 @@ impl Record {
             }
             last = Some(hit);
         }
-        Record::Complete { slots, hits }
+        Record::Complete { table, hits }
     }
 
-    /// `region` as a server reads it once the child has ended; `ended` is `Err` with why when
-    /// it did not exit (a signal, a kill, a timeout).
-    pub fn of_region(region: &[u8], ended: Result<(), &str>) -> Record {
+    /// `region` as a server reads it once the child has ended, the runtime having named its
+    /// jump table `table`; `ended` is `Err` with why when it did not exit (a signal, a kill, a
+    /// timeout). The record's table is `table` with the slot count the region's header says,
+    /// as the server sends it.
+    pub fn of_region(region: &[u8], table: Table, ended: Result<(), &str>) -> Record {
         if let Err(why) = ended {
             // alloc: error path, the reason the record keeps
             return Record::incomplete(format!("its execution record is not whole: {why}"));
@@ -94,7 +101,7 @@ impl Record {
         // alloc: once per run, the hits the record owns
         let mut hits = Vec::new();
         hits_of(map, &mut hits);
-        Record::Complete { slots, hits }
+        Record::Complete { table: Table { slots, ..table }, hits }
     }
 
     /// Why it is not whole, for one that is not.

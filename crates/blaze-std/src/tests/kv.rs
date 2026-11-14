@@ -10,9 +10,9 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use blaze_core::sim::Faults;
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::ReadWrite,
@@ -38,15 +38,15 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 50, 2_000]);
-    let acts = (0..d.int(1, 32))
-        .map(|_| match d.int(0, 9) {
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 50, 2_000], "latency us");
+    let acts = (0..tape.int_in(1..=32u64, "acts"))
+        .map(|_| match tape.int_in(0..=9u64, "act") {
             // "never" is never put: a key the store has not.
-            0..=3 => Act::Put(d.int(0, 2) as usize, d.int(1, 64) as usize),
-            4 => Act::Delete(d.int(0, 3) as usize),
-            5 | 6 => Act::Get(d.int(0, 3) as usize),
+            0..=3 => Act::Put(tape.int_in(0..=2u64, "key") as usize, tape.int_in(1..=64u64, "len") as usize),
+            4 => Act::Delete(tape.int_in(0..=3u64, "key") as usize),
+            5 | 6 => Act::Get(tape.int_in(0..=3u64, "key") as usize),
             7 => Act::List,
             _ => Act::Crash,
         })
@@ -137,12 +137,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: `Kv` agrees with a model map through crashes. A get gives exactly what the
 /// model holds and a list exactly its keys; a `put_synced` or a `delete_synced` that returned
 /// is kept by a crash, whole: never a part of a value, never an older one.
-#[hegel::test(test_cases = 150)]
-fn kv_agrees_with_a_model_through_crashes(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn kv_agrees_with_a_model_through_crashes() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_put_without_a_sync() {
-    control(Plant::KvPutUnsynced, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::KvPutUnsynced, plan, run);
 }

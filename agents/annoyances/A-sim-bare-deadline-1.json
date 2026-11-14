@@ -1,0 +1,12 @@
+{
+ "id": "A-sim-bare-deadline-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane T2 (tokio out of ix-prof and blaze-explore)",
+ "where": "crates/blaze-core/src/sim.rs, under crates/ix-prof/src/explore/serving.rs and crates/blaze-explore/src/probe/tests.rs",
+ "what": "blaze-core's Sim does not move its virtual clock to the deadline passed to `poll`: a machine whose only wait is its deadline never wakes under simulation, though the native driver wakes it. Every sans-IO machine has to arm an `Effect::Timer` for its deadline as well as report `deadline()`, which is the same fact said twice.",
+ "cost": "reading sim.rs's poll and redesigning the serving core's timer (one armed timer, a NoRearm control) before any test could pass",
+ "cause": "the two drivers disagree on what a poll's deadline means",
+ "workaround": "arm an Effect::Timer at the machine's deadline and route its Fired completion back",
+ "fix": "Sim::poll advances to the deadline it is given when nothing else is due, as native does; then the machines' timers go",
+ "state": "open"
+}

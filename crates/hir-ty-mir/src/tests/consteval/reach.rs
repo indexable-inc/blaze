@@ -7,7 +7,7 @@
 //! A cleared type is `GOAL == true`; a refusal is the panic whose message is the path, which a
 //! `where const` bound shows (`hir-ty/src/tests/where_const.rs`).
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -519,9 +519,10 @@ fn walk_says(walk: &str, structs: &[Vec<Ty>], root: usize) -> Option<bool> {
 /// A type for a field of `S{of}` among `count` structs. In place (`behind` false) only a
 /// later struct may be named, so no generated struct holds itself by value; behind a pointer
 /// any may.
-fn draw_ty(tc: &TestCase, of: usize, count: usize, behind: bool, depth: u8) -> Ty {
-    let pick = tc.draw(gs::integers::<u8>().max_value(if depth == 0 { 1 } else { 8 }));
-    let inner = |behind: bool| Box::new(draw_ty(tc, of, count, behind, depth - 1));
+fn draw_ty(tape: &Tape, of: usize, count: usize, behind: bool, depth: u8) -> Ty {
+    let most: u8 = if depth == 0 { 1 } else { 8 };
+    let pick = tape.int_in(0..=most, "ty");
+    let inner = |behind: bool| Box::new(draw_ty(tape, of, count, behind, depth - 1));
     match pick {
         0 => Ty::Byte,
         1 => {
@@ -529,7 +530,7 @@ fn draw_ty(tc: &TestCase, of: usize, count: usize, behind: bool, depth: u8) -> T
             if first >= count {
                 return Ty::Byte;
             }
-            let at = tc.draw(gs::integers::<usize>().max_value(count - 1 - first));
+            let at = tape.int_in(0..=count - 1 - first, "struct");
             Ty::S(first + at)
         }
         2 => Ty::Opt(inner(behind)),
@@ -542,12 +543,12 @@ fn draw_ty(tc: &TestCase, of: usize, count: usize, behind: bool, depth: u8) -> T
     }
 }
 
-fn draw_structs(tc: &TestCase) -> Vec<Vec<Ty>> {
-    let count = 1 + tc.draw(gs::integers::<usize>().max_value(3));
+fn draw_structs(tape: &Tape) -> Vec<Vec<Ty>> {
+    let count = 1 + tape.int_in(0..=3usize, "structs");
     (0..count)
         .map(|of| {
-            let fields = tc.draw(gs::integers::<usize>().max_value(3));
-            (0..fields).map(|_| draw_ty(tc, of, count, false, 3)).collect()
+            let fields = tape.int_in(0..=3usize, "fields");
+            (0..fields).map(|_| draw_ty(tape, of, count, false, 3)).collect()
         })
         .collect()
 }
@@ -556,13 +557,15 @@ fn draw_structs(tc: &TestCase) -> Vec<Vec<Ty>> {
 /// behind a counted or weak pointer, in a cell or in a generic struct, in any nesting and
 /// recursion, the walk clears a struct for the cycle question exactly when the reference
 /// model ([`model_is_acyclic`]) finds no way for a value of it to own itself.
-#[hegel::test(test_cases = 40)]
-fn the_walk_agrees_with_the_reference_model(tc: TestCase) {
-    let structs = draw_structs(&tc);
-    let root = tc.draw(gs::integers::<usize>().max_value(structs.len() - 1));
-    let model = model_is_acyclic(&structs, root);
-    let walk = walk_says(WALK, &structs, root);
-    assert_eq!(walk, Some(model), "S{root} of\n{}", program(&structs));
+#[test]
+fn the_walk_agrees_with_the_reference_model() {
+    blaze_sim::check(Config::cases(40), |tape| {
+        let structs = draw_structs(tape);
+        let root = tape.index(structs.len(), "root");
+        let model = model_is_acyclic(&structs, root);
+        let walk = walk_says(WALK, &structs, root);
+        assert_eq!(walk, Some(model), "S{root} of\n{}", program(&structs));
+    })
 }
 
 /// The walk with one line replaced, which must be there to replace.

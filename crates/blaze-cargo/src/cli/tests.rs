@@ -72,15 +72,24 @@ fn each_command_its_request() {
     assert_eq!(targets.features, ["a", "b"]);
     assert_eq!(targets.profile, "dev");
 
+    // `test` runs in the daemon, which reruns only the tests whose executed code or reads
+    // changed: selection is the default.
     let test = request_of(&invocation(words(os(&["blaze", "t", "parse", "--", "--exact"]))));
-    let Request::Build { targets, .. } = test else { panic!("{test:?}") };
-    assert_eq!(targets.profile, "test");
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached", "parse"]))));
-    let Request::Test { filter, all, targets, .. } = reached else { panic!("{reached:?}") };
+    let Request::Test { filter, all, args, targets, .. } = test else { panic!("{test:?}") };
     assert_eq!((filter, all), (vec!["parse".to_owned()], false));
-    // `--reached` is blaze's: cargo's command line does not have it.
+    assert_eq!((args, targets.profile.as_str()), (vec!["--exact".to_owned()], "test"));
+
+    let run_all = request_of(&invocation(words(os(&["blaze", "test", "--run-all", "parse"]))));
+    let Request::Test { filter, all, targets, .. } = run_all else { panic!("{run_all:?}") };
+    assert_eq!((filter, all), (vec!["parse".to_owned()], true));
+    // `--run-all` is blaze's: cargo's command line does not have it.
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+
+    // What the daemon does not run stays the CLI's: listing the binaries, and the doc tests.
+    let no_run = request_of(&invocation(words(os(&["blaze", "test", "--no-run"]))));
+    assert!(matches!(no_run, Request::Build { .. }), "{no_run:?}");
+    let doc = request_of(&invocation(words(os(&["blaze", "test", "--doc"]))));
+    assert!(matches!(doc, Request::Build { .. }), "{doc:?}");
 
     let check =
         request_of(&invocation(words(os(&["blaze", "check", "--baselines", "b", "--fix"]))));
@@ -112,13 +121,9 @@ fn ub_runs_every_selected_test_in_the_daemon() {
     assert_eq!(ub, Some(Ub { seed: Some(7), schedules: None }));
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
 
-    let both = request_of(&invocation(words(os(&["blaze", "test", "--ub", "--reached"]))));
-    let Request::Test { all, ub, .. } = both else { panic!("{both:?}") };
-    assert_eq!((all, ub), (false, Some(Ub { seed: None, schedules: None })));
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached"]))));
-    let Request::Test { ub, .. } = reached else { panic!("{reached:?}") };
-    assert_eq!(ub, None, "opt-in");
+    let selected = request_of(&invocation(words(os(&["blaze", "test"]))));
+    let Request::Test { all, ub, .. } = selected else { panic!("{selected:?}") };
+    assert_eq!((all, ub), (false, None), "`--ub` is opt-in");
 
     let asked = invocation(words(os(&["blaze", "test", "--ub", "--no-run"])));
     let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false, None).unwrap();
@@ -128,6 +133,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
 #[test]
 fn ub_results_print_as_libtest_prints_them() {
     let failed = TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: "tests::aliasing".to_owned(),
         outcome: TestOutcome::Failed,
@@ -136,6 +142,7 @@ fn ub_results_print_as_libtest_prints_them() {
                 .to_vec(),
         millis: 0,
         cached: None,
+        not_kept: None,
         outside: false,
         executable: 0,
     };
@@ -159,14 +166,16 @@ fn ub_results_print_as_libtest_prints_them() {
 }
 
 #[test]
-fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
+fn the_client_names_no_test_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: name.to_owned(),
         outcome: TestOutcome::Passed,
         output: Vec::new(),
         millis: 1,
         cached: None,
+        not_kept: None,
         outside,
         executable: 0,
     };
@@ -178,30 +187,27 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     ];
     let (then, out, err) = driven(
         &mut FakeApi::answering(responses.clone()),
-        &["blaze", "test", "--reached"],
+        &["blaze", "test"],
         &mut Fake::default(),
     );
     assert_eq!(then, Then::Exit(0));
     assert!(out.contains("test tests::writes_home ... ok\n"), "{out}");
-    assert!(
-        err.contains(
-            "note: 2 tests ran outside the sandbox, so they run every time and their passes are never kept: \
-             tests::writes_home, tests::dials\n"
-        ),
-        "{err}"
-    );
+    // How many ran outside, and why, is the daemon's one counted note
+    // (`serve::unit::test::outside_note`), sent as a diagnostic: the client lists no names.
+    assert!(!err.contains("outside the sandbox"), "{err}");
+    assert!(!err.contains("tests::writes_home") && !err.contains("tests::dials"), "{err}");
     // The run's last line: its counts, from the results the daemon sent.
     let last = err.lines().last().unwrap();
     assert!(
         last.starts_with(
             "blaze: tests ok selected=3 ran=3 passed=3 failed=0 ignored=0 measured=0 filtered_out=0 \
-             unreached=0 binaries=1 unbuilt=0 elapsed_ms="
+             cached=0 binaries=1 unbuilt=0 elapsed_ms="
         ),
         "{err}"
     );
     let (_, _, quiet) = driven(
         &mut FakeApi::answering(responses),
-        &["blaze", "test", "--reached", "-q"],
+        &["blaze", "test", "-q"],
         &mut Fake::default(),
     );
     assert!(!quiet.contains("note:"), "cargo's notes are silent under -q: {quiet}");
@@ -327,6 +333,19 @@ fn tests_built() -> Vec<Response> {
     ]
 }
 
+/// What a `blaze test --doc` build answers: as [`tests_built`], its artifacts the doc tests
+/// alone, as cargo's `--doc` builds no test executable.
+fn docs_built() -> Vec<Response> {
+    let mut responses = tests_built();
+    for response in &mut responses {
+        if let Response::Built { artifacts, .. } = response {
+            artifacts.retain(|it| it.kind == blaze_api::ArtifactKind::Doctest);
+            assert_eq!(artifacts.len(), 1, "the fixture has one doc test target");
+        }
+    }
+    responses
+}
+
 fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, String, String) {
     let asked = invocation(self::words(os(words)));
     let request = request_of(&asked);
@@ -351,62 +370,106 @@ fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, Stri
     (then, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
 }
 
+/// A test the daemon ran, of the lib's test executable, which passed or failed.
+fn daemon_result(name: &str, passed: bool) -> Response {
+    Response::TestResult(TestResult {
+        ran: None,
+        binary: "/w/target/debug/deps/foo-0123abcd".to_owned(),
+        name: name.to_owned(),
+        outcome: if passed { TestOutcome::Passed } else { TestOutcome::Failed },
+        output: if passed { Vec::new() } else { b"assertion failed".to_vec() },
+        millis: 1,
+        cached: None,
+        not_kept: None,
+        outside: false,
+        executable: 0,
+    })
+}
+
+/// `tests_built`'s build with `results` the daemon ran, before its `Done`.
+fn tests_ran(results: Vec<Response>) -> Vec<Response> {
+    let mut responses = tests_built();
+    let done = responses.pop();
+    responses.extend(results);
+    responses.extend(done);
+    responses
+}
+
+/// `blaze test` runs its test executables in the daemon (one `Test` request) and the doc tests
+/// after its results, in the CLI: under `--fail-fast` a failed daemon test stops the run before
+/// them, and under `--no-fail-fast` they run past it and the run still fails.
 #[test]
-fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
-    let mut api = FakeApi::answering(tests_built());
-    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+fn under_fail_fast_a_failing_test_stops_the_tests() {
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", false)]));
+    let mut programs = Fake::default();
     let (then, out, err) = driven(&mut api, &["blaze", "test", "--fail-fast"], &mut programs);
-    assert_eq!(then, Then::Exit(101));
-    assert_eq!(out, "");
-    let lines: Vec<&str> = err.lines().collect();
-    assert!(lines[0].starts_with("blaze: ok built=0 cached=0 warnings=0 elapsed_ms=0"), "{err}");
-    assert_eq!(
-        &lines[1..3],
-        [
-            "     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)",
-            "error: test failed, to rerun pass `--lib`",
-        ]
-    );
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
+    assert!(out.contains("test tests::parses ... FAILED\n"), "{out}");
+    assert!(programs.ran.is_empty(), "no doc test runs past a failure under --fail-fast: {err}");
+    assert!(!err.contains("Doc-tests"), "{err}");
     assert!(
-        lines[3].starts_with(
-            "blaze: tests failed selected=1 ran=1 passed=0 failed=1 ignored=0 measured=0 filtered_out=0 \
-             unreached=0 binaries=1 unbuilt=0 elapsed_ms="
-        ),
+        err.lines().last().unwrap().starts_with("blaze: tests failed selected=1 ran=1 passed=0 failed=1 "),
         "{err}"
     );
-    assert_eq!(lines.len(), 4, "{err}");
-    assert_eq!(programs.ran.len(), 1);
-    assert!(matches!(api.asked.as_slice(), [Request::Build { .. }]));
+    assert!(matches!(api.asked.as_slice(), [Request::Test { .. }]), "the daemon runs the tests");
 
-    let mut programs = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", false)]));
+    let mut programs = Fake::default();
     let (then, _, err) = driven(&mut api, &["blaze", "test", "--no-fail-fast"], &mut programs);
-    assert_eq!(then, Then::Exit(101));
-    assert_eq!(programs.ran.len(), 4);
-    assert!(err.contains("   Doc-tests foo\nerror: 1 target failed:\n    `--lib`\n"), "{err}");
+    assert_eq!(then, Then::Exit(Exit::Failed.code()));
+    assert_eq!(programs.ran.len(), 1, "the doc tests run past the failure: {err}");
+    assert!(err.contains("   Doc-tests foo\n"), "{err}");
     assert!(
-        err.lines().last().unwrap().starts_with("blaze: tests failed selected=4 ran=4 passed=3 failed=1 "),
+        err.lines().last().unwrap().starts_with("blaze: tests failed selected=2 ran=2 passed=1 failed=1 "),
         "{err}"
     );
 }
 
+/// A doc test is neither selected nor kept: after the daemon's results, the doc tests run every
+/// time, and the run says so once (not under `-q`). A failing doc test fails the run whose
+/// daemon tests all passed.
+#[test]
+fn doc_tests_run_every_time_after_the_daemons_results_and_say_so() {
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", true)]));
+    let mut programs = Fake::default();
+    let (then, out, err) = driven(&mut api, &["blaze", "test"], &mut programs);
+    assert_eq!(then, Then::Exit(0), "{err}");
+    assert!(out.contains("test tests::parses ... ok\n"), "{out}");
+    assert_eq!(programs.ran.len(), 1, "the doc tests, run here: {err}");
+    assert!(err.contains(&format!("note: {}\n", super::test::DOC_TESTS_NOT_KEPT)), "{err}");
+    assert!(err.contains("   Doc-tests foo\n"), "{err}");
+    assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=2 ran=2 passed=2 failed=0 "), "{err}");
+
+    let mut api = FakeApi::answering(tests_ran(vec![daemon_result("tests::parses", true)]));
+    let mut programs = Fake { ends: vec![("foo-doctests", Ended::Code(101))], ..Fake::default() };
+    let (then, _, err) = driven(&mut api, &["blaze", "test", "-q"], &mut programs);
+    assert_eq!(then, Then::Exit(Exit::Failed.code()), "{err}");
+    assert!(!err.contains("note:"), "cargo's notes are silent under -q: {err}");
+    assert!(err.contains("error: 1 target failed:\n    `--doc`\n"), "{err}");
+}
+
 /// The instance (agents.json A39) through the whole command, off a terminal: the build passes,
-/// every test executable says its filter left out all it has and exits 0, and the command is
-/// refused with blaze's code for a run of none; `--no-tests pass` is cargo's exit 0.
+/// every test executable the CLI runs (the doc tests, under `--doc`) says its filter left out
+/// all it has and exits 0, and the command is refused with blaze's code for a run of none,
+/// naming the nearest tests; `--no-tests pass` is cargo's exit 0.
 #[test]
 fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
     let nothing = blaze_screen::Tally { filtered_out: 6, ..blaze_screen::Tally::default() };
     let mut programs = Fake { counts: Some(nothing), names: vec!["tests::parses"], ..Fake::default() };
     let (then, out, err) =
-        driven(&mut FakeApi::answering(tests_built()), &["blaze", "test", "parsse"], &mut programs);
+        driven(&mut FakeApi::answering(docs_built()), &["blaze", "test", "--doc", "parsse"], &mut programs);
     assert_eq!(then, Then::Exit(Exit::NoTests.code()));
     assert_eq!(out, "");
+    // The doc tests alone ran, and nothing lists a doc test's names: no nearest is said (the
+    // daemon's runs below name the nearest, from what it said of each executable).
     assert!(
         err.contains(
-            "error: no test ran: `blaze test parsse` matched none of the 24 tests in 4 test executables\n\
-             note: the nearest that exist: tests::parses\n"
+            "error: no test ran: `blaze test --doc parsse` matched none of the 6 tests in 1 test executable\n\
+             note: a run of no test is refused"
         ),
         "{err}"
     );
+    assert!(!err.contains("     Running "), "under `--doc` no test executable runs: {err}");
     assert!(
         err.lines().last().unwrap().starts_with("blaze: tests failed selected=0 ran=0 passed=0 failed=0 "),
         "{err}"
@@ -414,17 +477,46 @@ fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
     assert!(err.ends_with(" why=\"no test ran\"\n"), "{err}");
 
     let mut programs = Fake { counts: Some(nothing), ..Fake::default() };
-    let words = ["blaze", "test", "parsse", "--no-tests", "pass"];
-    let (then, _, err) = driven(&mut FakeApi::answering(tests_built()), &words, &mut programs);
+    let words = ["blaze", "test", "--doc", "parsse", "--no-tests", "pass"];
+    let (then, _, err) = driven(&mut FakeApi::answering(docs_built()), &words, &mut programs);
     assert_eq!(then, Then::Exit(0), "{err}");
     assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=0 ran=0 "), "{err}");
 
-    // The daemon's own runs (`--reached`, `--ub`): no result at all is a run of none too.
+    // The daemon's run of `blaze test`: no result, and doc tests that ran none, is a run of
+    // none.
+    let mut programs = Fake { counts: Some(nothing), ..Fake::default() };
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(tests_built()), &["blaze", "test", "parsse"], &mut programs);
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(err.contains("error: no test ran: `blaze test parsse`"), "{err}");
+
+    // The daemon's own runs (`blaze test`, `--ub`): no result at all is a run of none too.
     let none = vec![Response::Done { ok: true }];
     let (then, _, err) =
         driven(&mut FakeApi::answering(none.clone()), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
     assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
     assert!(err.contains("error: no test ran: `blaze test parsse` selected no test executable\n"), "{err}");
+    // What the daemon said of each executable it filtered: the counts and the nearest names.
+    let said = vec![
+        Response::TestsOf(blaze_api::TestsOf {
+            tests: 6,
+            binary: "foo".to_owned(),
+            nearest: vec![blaze_api::Near { name: "tests::parses".to_owned(), distance: 1 }],
+            executable: 0,
+            filtered_out: 6,
+        }),
+        Response::Done { ok: true },
+    ];
+    let (then, _, err) =
+        driven(&mut FakeApi::answering(said), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(Exit::NoTests.code()), "{err}");
+    assert!(
+        err.contains(
+            "error: no test ran: `blaze test parsse` matched none of the 6 tests in 1 test executable\n\
+             note: the nearest that exist: tests::parses\n"
+        ),
+        "{err}"
+    );
     let (then, _, _) = driven(
         &mut FakeApi::answering(none),
         &["blaze", "test", "--ub", "parsse", "--no-tests=pass"],
@@ -513,16 +605,16 @@ fn by_default_the_tests_that_built_run_past_a_failed_unit() {
             })
             .collect()
     };
+    // The daemon ran the tests that built and sent their results: they are shown, the doc
+    // tests run after them here, and the run fails.
     for words in [&["blaze", "test"][..], &["blaze", "test", "--keep-going"]] {
-        let mut api = FakeApi::answering(failed(tests_built()));
+        let mut api = FakeApi::answering(failed(tests_ran(vec![daemon_result("tests::parses", true)])));
         let mut programs = Fake::default();
-        let (then, _, err) = driven(&mut api, words, &mut programs);
+        let (then, out, err) = driven(&mut api, words, &mut programs);
         assert_eq!(then, Then::Exit(101), "{words:?}");
-        assert_eq!(programs.ran.len(), 4, "{words:?}: {err}");
-        assert!(
-            err.contains("     Running unittests src/lib.rs (target/debug/deps/foo-0123abcd)"),
-            "{err}"
-        );
+        assert!(out.contains("test tests::parses ... ok\n"), "{words:?}: {out}");
+        assert_eq!(programs.ran.len(), 1, "{words:?}: the doc tests: {err}");
+        assert!(err.contains("   Doc-tests foo\n"), "{err}");
     }
 
     // Under `--fail-fast` nothing runs.

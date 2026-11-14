@@ -16,14 +16,14 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 38;
-const RESPONSES: usize = 46;
+const REQUESTS: usize = 39;
+const RESPONSES: usize = 48;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -103,11 +103,10 @@ impl Gen {
     }
 
     fn outcome(&mut self) -> TestOutcome {
-        match self.below(4) {
+        match self.below(3) {
             0 => TestOutcome::Passed,
             1 => TestOutcome::Failed,
-            2 => TestOutcome::Ignored,
-            _ => TestOutcome::Unreached,
+            _ => TestOutcome::Ignored,
         }
     }
 
@@ -359,7 +358,14 @@ impl Gen {
                 targets: self.targets(),
                 wait_ms: self.wide(),
             },
-            37 => Request::Query { view: self.view(0), rules: self.text() },
+            37 => Request::Prove {
+                emit: self.yes(),
+                lean: self.maybe_text(),
+                view: self.view(0),
+                subset: self.yes(),
+                targets: self.targets(),
+            },
+            38 => Request::Query { view: self.view(0), rules: self.text() },
             _ => Request::Stop,
         }
     }
@@ -643,6 +649,13 @@ impl Gen {
                 }),
             }),
             8 => Response::TestResult(TestResult {
+                ran: self.maybe(|g| RanWhy {
+                    ask: g.maybe_text(),
+                    now: g.maybe_text(),
+                    why: g.text(),
+                    said: g.text(),
+                    before: g.maybe_text(),
+                }),
                 name: self.text(),
                 binary: self.text(),
                 cached: self.maybe(|g| Cached {
@@ -658,6 +671,7 @@ impl Gen {
                 outcome: self.outcome(),
                 outside: self.yes(),
                 executable: self.u32(),
+                not_kept: self.maybe(|g| NotKept { no: g.text(), why: g.text() }),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),
@@ -873,7 +887,59 @@ impl Gen {
                 failed: self.maybe(|g| ApiError::from(g.report(depth))),
                 unchanged: self.many(depth, Gen::found),
             }),
-            44 => Response::Rows(crate::query::Rows {
+            44 => Response::Proven(crate::Proven {
+                failed: self.maybe(|g| g.text()),
+                subset: self.maybe(|g| crate::Subset {
+                    generic: g.u32(),
+                    refused: g.many(depth, |g| crate::SubsetRefusal { what: g.text(), count: g.u32() }),
+                    outcomes: g.many(depth, |g| crate::SubsetFunction {
+                        path: g.text(),
+                        outcome: match g.below(3) {
+                            0 => crate::SubsetOutcome::Translated,
+                            1 => crate::SubsetOutcome::Generic,
+                            _ => crate::SubsetOutcome::Refused { what: g.text() },
+                        },
+                    }),
+                    functions: g.u32(),
+                    translated: g.u32(),
+                }),
+                records: self.many(depth, |g| match g.below(5) {
+                    0 => crate::ProofRecord::Open {
+                        why: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                        proof_file: g.text(),
+                    },
+                    1 => crate::ProofRecord::Proved {
+                        key: g.id(),
+                        model: g.text(),
+                        axioms: g.texts(depth),
+                        theorem: g.text(),
+                        function: g.text(),
+                    },
+                    2 => crate::ProofRecord::Emitted {
+                        path: g.text(),
+                        module: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                    },
+                    3 => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
+                    _ => crate::ProofRecord::ModelBroken {
+                        at: g.text(),
+                        error: g.text(),
+                        module: g.text(),
+                        function: g.text(),
+                    },
+                }),
+            }),
+            45 => Response::TestsOf(crate::TestsOf {
+                tests: self.u32(),
+                binary: self.text(),
+                nearest: self.many(depth, |g| crate::Near { name: g.text(), distance: g.u32() }),
+                executable: self.u32(),
+                filtered_out: self.u32(),
+            }),
+            46 => Response::Rows(crate::query::Rows {
                 findings: self.many(depth, |g| crate::query::Finding {
                     at: g.maybe(Gen::cell),
                     message: g.text(),
@@ -1124,7 +1190,8 @@ fn request_index(request: &Request) -> usize {
         Request::Stop => 34,
         Request::Store { .. } => 35,
         Request::Diagnostics { .. } => 36,
-        Request::Query { .. } => 37,
+        Request::Prove { .. } => 37,
+        Request::Query { .. } => 38,
     }
 }
 
@@ -1175,8 +1242,10 @@ fn response_index(response: &Response) -> usize {
         Response::Report { .. } => 41,
         Response::Doing(_) => 42,
         Response::Diagnostics(_) => 43,
-        Response::Rows(_) => 44,
-        Response::Of { .. } => 45,
+        Response::Proven(_) => 44,
+        Response::TestsOf(_) => 45,
+        Response::Rows(_) => 46,
+        Response::Of { .. } => 47,
     }
 }
 

@@ -432,7 +432,7 @@ fn a_key_covers_every_input() {
 #[test]
 fn an_image_reads_back_its_parts() {
     let key = ContentId([1; 32]);
-    let parts: [&[u8]; 2] = [b"", &[9; 33]];
+    let parts: [&[u8]; 3] = [b"", &[9; 33], b"diagnostic"];
     let bytes = Aligned::copy_from(&write_image(key, parts));
     let image = ImageRef::open(&bytes, key).unwrap();
     for (part, bytes) in Part::ALL.into_iter().zip(parts) {
@@ -444,7 +444,7 @@ fn an_image_reads_back_its_parts() {
 
 #[test]
 fn an_image_under_another_key_does_not_read() {
-    let bytes = Aligned::copy_from(&write_image(ContentId([1; 32]), [b"a", b"b"]));
+    let bytes = Aligned::copy_from(&write_image(ContentId([1; 32]), [b"a", b"b", b"c"]));
     assert_eq!(
         ImageRef::open(&bytes, ContentId([2; 32])).err(),
         Some(ImageError::Key { found: ContentId([1; 32]), wanted: ContentId([2; 32]) })
@@ -456,7 +456,7 @@ fn an_image_under_another_key_does_not_read() {
 #[test]
 fn damaged_images_read_within_bounds_or_not_at_all() {
     let key = ContentId([1; 32]);
-    let written = write_image(key, [b"lang", b"signatures"]);
+    let written = write_image(key, [b"lang", b"signatures", b"diagnostic"]);
     let mut read = 0;
     for at in 0..written.len() {
         let mut bytes = written.clone();
@@ -625,6 +625,12 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
                 frozen::encode_lang_items(&fresh, live),
                 "{name} {mode:?}"
             );
+            assert_eq!(
+                frozen::encode_diagnostic_items(&db, krate),
+                frozen::encode_diagnostic_items(&fresh, live),
+                "{name} {mode:?}"
+            );
+            frozen::check_diagnostic_items(&db, krate);
         }
         assert_eq!(frozen::differences(), Vec::<String>::new(), "{mode:?}");
     }
@@ -703,7 +709,7 @@ fn an_image_written_under_another_key_is_an_error() {
     memory
         .images
         .lock()
-        .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b""]))));
+        .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b"", b""]))));
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
@@ -2544,4 +2550,172 @@ fn a_build_end_store_writes_no_member() {
 fn the_oracle_catches_a_build_end_store_that_writes_a_member() {
     let _turn = TURN.lock();
     assert_ne!(written_by(Which::All)[0], ["core", "lib"]);
+}
+
+/// A library with a diagnostic item on a function, a struct, a trait and its method, an
+/// inherent impl's method, an exported `macro_rules!` and a module, and one name given twice.
+const DIAGNOSTIC_ITEMS: &str = r#"
+//- /main.rs crate:main deps:lib new_source_root:local
+fn main() {}
+
+//- /lib.rs crate:lib deps:core new_source_root:library
+#![feature(rustc_attrs)]
+#[rustc_diagnostic_item = "lib_fn"]
+pub fn f() {}
+#[rustc_diagnostic_item = "LibStruct"]
+pub struct S;
+#[rustc_diagnostic_item = "LibTrait"]
+pub trait T {
+    #[rustc_diagnostic_item = "lib_trait_method"]
+    fn m(&self);
+}
+impl S {
+    #[rustc_diagnostic_item = "lib_impl_method"]
+    pub fn new() -> S { S }
+}
+#[macro_export]
+#[rustc_diagnostic_item = "lib_macro"]
+macro_rules! made { () => {} }
+#[rustc_diagnostic_item = "lib_mod"]
+pub mod inner {
+    #[rustc_diagnostic_item = "Twice"]
+    pub fn first() {}
+    #[rustc_diagnostic_item = "Twice"]
+    pub fn second() {}
+}
+
+//- /core.rs crate:core new_source_root:library
+#[lang = "sized"]
+pub trait Sized {}
+#[rustc_builtin_macro]
+pub macro derive {}
+pub mod prelude { pub mod rust_2018 { pub use crate::derive; } }
+"#;
+
+/// The queries that read a page of a served crate's def map past its head (a module's scope,
+/// a name, its traits, a textual macro), and the one that reads an item's
+/// `#[rustc_diagnostic_item]`: what a walk of the crate runs.
+fn diagnostic_item_page_reads(ran: &[String]) -> usize {
+    let read = ["scope_memo", "name_memo", "traits_memo", "legacy_macro_memo", "diagnostic_item"];
+    ran.iter().filter(|it| read.contains(&it.as_str())).count()
+}
+
+/// The invariant: a crate served from its image answers `crate_diagnostic_items` from the
+/// image's diagnostic items part, reading no page of its def map past its head and no item's
+/// attributes, and the answer is the walk's: equal, item for item, to the walk of the same
+/// crate in the same database (the same ids), and written as the same bytes as the crate's
+/// diagnostic items resolved from source in another database (each item named by its path,
+/// [`frozen::Enc::attr_owner`]). The control: with the part taken away, the same question walks
+/// the crate's pages, which the count sees.
+#[test]
+fn diagnostic_items_of_a_served_crate_are_read_from_its_image_and_equal_the_walk() {
+    use crate::{AdtId, AttrDefId, MacroId, diagnostic_item::crate_diagnostic_items, test_db::TestDBExt};
+    let _turn = TURN.lock();
+    let (memory, stored) = stored(DIAGNOSTIC_ITEMS);
+    assert_eq!(stored.refused, Vec::new());
+    let fresh = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let from_source = frozen::encode_diagnostic_items(&fresh, crate_named(&fresh, "lib")).unwrap();
+
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    let lib = crate_named(&db, "lib");
+    // The head of `lib`'s pages, which a dependent reads first: read before the count.
+    _ = crate::nameres::crate_def_map(&db, lib).crate_root(&db);
+    assert_eq!(
+        image(&db, lib).unwrap().part(Part::DiagnosticItems),
+        from_source.as_slice(),
+        "the part is the crate's diagnostic items as resolved from source"
+    );
+    let mut read = None;
+    let ran = db.executed_in_read_order(|| read = Some(crate_diagnostic_items(&db, lib).clone()));
+    let read = read.unwrap();
+    assert!(ran.iter().any(|it| it == "crate_diagnostic_items"), "premise: the query ran: {ran:?}");
+    assert_eq!(diagnostic_item_page_reads(&ran), 0, "a served crate's pages were walked: {ran:?}");
+    assert_eq!(frozen::encode_diagnostic_items(&db, lib).unwrap(), from_source);
+
+    let mut by_name: Vec<&str> = read.by_name.keys().map(|it| it.as_str()).collect();
+    by_name.sort_unstable();
+    assert_eq!(
+        by_name,
+        [
+            "LibStruct",
+            "LibTrait",
+            "Twice",
+            "lib_fn",
+            "lib_impl_method",
+            "lib_macro",
+            "lib_mod",
+            "lib_trait_method"
+        ]
+    );
+    let get = |name: &str| read.get(&intern::Symbol::intern(name)).unwrap();
+    assert!(matches!(get("lib_fn"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("LibStruct"), AttrDefId::AdtId(AdtId::StructId(_))));
+    assert!(matches!(get("LibTrait"), AttrDefId::TraitId(_)));
+    assert!(matches!(get("lib_trait_method"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("lib_impl_method"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("lib_macro"), AttrDefId::MacroId(MacroId::MacroRulesId(_))));
+    assert!(matches!(get("lib_mod"), AttrDefId::ModuleId(_)));
+    assert_eq!(read.duplicates.len(), 1, "{:?}", read.duplicates);
+    assert_eq!(read.duplicates[0].0.as_str(), "Twice");
+
+    // The control: the part taken away, the same question walks `lib`'s pages, in the same
+    // database, so its items are the same ids.
+    frozen::give_diagnostic_items(&mut db, lib, None);
+    let mut walked = None;
+    let ran = db.executed_in_read_order(|| walked = Some(crate_diagnostic_items(&db, lib).clone()));
+    assert!(diagnostic_item_page_reads(&ran) > 0, "the count does not see a walk of the pages: {ran:?}");
+    assert_eq!(walked.unwrap(), read, "the image's answer is not the walk's");
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+/// The invariant: two databases write a crate's diagnostic items as the same bytes (the rows
+/// in the order of their names, never a hash map's); and an image without the part (version
+/// 3's schema, or this schema with two parts) is refused when opened, and a serve that finds
+/// one under a crate's key is an error naming the crate: never an image whose crate has no
+/// diagnostic items. Bytes of the part that do not decode stop the query with
+/// [`frozen::Unreadable`] naming the crate and the part, never a walk in their place.
+#[test]
+fn diagnostic_items_are_the_same_bytes_and_an_image_without_them_is_refused() {
+    let _turn = TURN.lock();
+    let [a, b] = [(); 2].map(|()| {
+        let db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+        frozen::encode_diagnostic_items(&db, crate_named(&db, "lib")).unwrap()
+    });
+    assert_eq!(a, b);
+    assert!(a.len() > 8, "the part holds the table: {} bytes", a.len());
+
+    let key = ContentId([1; 32]);
+    let old = Aligned::copy_from(&super::image::write_two_part_image(key, [b"lang", b"sig"], true));
+    assert!(matches!(ImageRef::open(&old, key), Err(ImageError::Format(_))), "version 3 read");
+    let short = Aligned::copy_from(&super::image::write_two_part_image(key, [b"lang", b"sig"], false));
+    assert!(matches!(ImageRef::open(&short, key), Err(ImageError::Parts(_))), "two parts read");
+
+    let (memory, stored) = stored(DIAGNOSTIC_ITEMS);
+    let db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let lib = crate_named(&db, "lib");
+    let filed = stored.filed[&lib];
+    let two = super::image::write_two_part_image(filed, [b"", b""], false);
+    memory.images.lock().insert(filed, Arc::new(Aligned::copy_from(&two)));
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let crates = all(&db);
+    let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
+    assert!(error.contains("the image of crate lib"), "{error}");
+
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let lib = crate_named(&db, "lib");
+    let mut damaged = a.clone();
+    damaged.truncate(a.len() - 1);
+    let frozen = frozen::Frozen { bytes: PartBytes::from(damaged), mode: Mode::Serve };
+    frozen::give_diagnostic_items(&mut db, lib, Some(frozen));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        _ = crate::diagnostic_item::crate_diagnostic_items(&db, lib);
+    }));
+    let Err(payload) = caught else { panic!("a damaged part was answered") };
+    let Some(stop) = frozen::Unreadable::of_payload(&*payload) else {
+        panic!("the refusal unwound with another payload than `frozen::Unreadable`")
+    };
+    assert_eq!((stop.krate, stop.kind), (lib, "diagnostic items"));
 }

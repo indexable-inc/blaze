@@ -880,6 +880,11 @@ enum PlacedFile {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlacePlant {
     None,
+    /// A key a place let go of whose value is a file of its own is asked to be forgotten
+    /// ([`Store::forget`]) as the path is placed from another value, as before 2026-11-14:
+    /// the value a unit record names is gone after another request placed over it
+    /// (`tests::a_value_placed_over_is_kept_while_nothing_but_its_path_let_go_of_it`).
+    ForgetsOnOverwrite,
     /// The names of the whole files kept as a set ([`whole::Names::plant_one_name`]): the
     /// file a path is placed from again goes although a second path still names it
     /// (`tests::place_crash`'s oracle `bounded`).
@@ -900,6 +905,10 @@ pub(crate) enum PlacePlant {
     RenameBeforeRanges,
     /// A derive leaves out its last range.
     SkipsARange,
+    /// A place of a derived value names only its nearest base's whole file, as before
+    /// 2026-11-13: a base further down the chain that the place made is left in `placed/`
+    /// with nothing naming it (`tests::place_crash`'s oracle `bounded`).
+    NamesNearestBaseOnly,
     /// A derived value's whole file left by an earlier run is kept as the store opens and
     /// cloned from as it is.
     KeepsDerived,
@@ -1047,14 +1056,39 @@ struct Whole {
 
 /// What a place in flight names ([`whole::Names`]), applied at its answer: `file`, the whole
 /// file of `placed/` it is made from (none: it is made from no whole file, so its path names
-/// none once it is answered); `base`, a derived value's base's whole file, named while the
-/// place is in flight; `key`, the key placed ([`Store::place`]; none for a maker's runs, a
-/// patch or a second path).
-#[derive(Clone, Copy, Debug)]
+/// none once it is answered); `base`, a derived value's chain of bases' whole files, nearest
+/// first ([`base_chain`]), each named while the place is in flight and let go of at its
+/// answer (empty for any other place); `key`, the key placed ([`Store::place`]; none for a
+/// maker's runs, a patch or a second path).
+#[derive(Clone, Debug)]
 struct Naming {
     file: Option<ContentId>,
-    base: Option<ContentId>,
+    base: Vec<ContentId>,
     key: Option<Key>,
+}
+
+/// The whole files of the chain of bases a derived value made from `base` is made from,
+/// nearest first: `base`'s, and while that is a derived value's, its base's in turn, down to
+/// the first that is no derived value's, or to a base the store keeps no whole file of.
+/// What a place of the derived value may make ([`Store::derive_file`] makes a base not there
+/// from its own base), so what it names. Bounded by [`derived::CHAIN_MOST`] (a longer chain is
+/// refused by the derive) and by a file met twice (a chain that loops, refused the same way).
+fn base_chain(look: Look<'_>, base: &Key) -> Vec<ContentId> {
+    // alloc: a few ids, once per derived value's place
+    let mut chain = Vec::new_in(Global);
+    let mut at = *base;
+    for _ in 0..=derived::CHAIN_MOST {
+        let Ok(Ok(whole)) = whole_of(look, &at) else { break };
+        if chain.contains(&whole.id) {
+            break;
+        }
+        chain.push(whole.id);
+        match whole.base {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    chain
 }
 
 /// The write of the listing of the store's names (`placed/names`, [`Store::names_step`]).
@@ -3870,9 +3904,10 @@ impl Store {
         enum Plan {
             Clone(FileName, u64, ContentId),
             File(ContentId, u64),
-            /// The file a recipe gives, of this length, and its base's whole file, where the
-            /// store keeps one ([`Kind::Derived`]).
-            Derived(u64, Option<ContentId>),
+            /// The file a recipe gives, of this length, and the whole files of its chain of
+            /// bases, nearest first, down to the first that is no derived value's
+            /// ([`Kind::Derived`], [`base_chain`]).
+            Derived(u64, Vec<ContentId>),
             Write(Vec<u8>),
             Refused(String),
         }
@@ -3918,10 +3953,7 @@ impl Store {
             // A recipe is never placed as its own bytes: what is placed is the file it gives.
             Some(Ok((found, header))) if header.kind == Kind::Derived => {
                 match look.read(found, key).map(|entry| derived::decode(entry.bytes)) {
-                    Ok(Ok(recipe)) => Plan::Derived(
-                        recipe.len,
-                        whole_of(look, &recipe.base).ok().and_then(Result::ok).map(|it| it.id),
-                    ),
+                    Ok(Ok(recipe)) => Plan::Derived(recipe.len, base_chain(look, &recipe.base)),
                     // alloc: the error of a value that is no recipe
                     Ok(Err(why)) => Plan::Refused(format!("the derived value {key:?} holds {why}")),
                     // alloc: the error of a corrupt value
@@ -3953,11 +3985,24 @@ impl Store {
             self.plant_linked.insert(to.clone(), file);
         }
         let tag = held.unwrap_or_else(|| self.tags.fresh());
-        // The base's whole file a derived value's place clones is named while it is in flight.
-        let mut base = None;
+        // The whole files of a derived value's chain of bases, each of which its place may
+        // make (`Store::derive_file` makes a base that is not there from its own base, down
+        // the chain), are named while it is in flight and let go of at its answer, so none
+        // is left in `placed/` with nothing naming it.
+        // alloc: empty, allocates nothing but for a derived value's place
+        let mut base = Vec::new_in(Global);
         let plan = match plan {
-            Plan::Derived(len, of) => {
-                base = of;
+            Plan::Derived(len, chain) => {
+                // The planted bug: only the nearest base is named, as before 2026-11-13.
+                #[cfg(test)]
+                let chain = {
+                    let mut chain = chain;
+                    if self.plant == PlacePlant::NamesNearestBaseOnly {
+                        chain.truncate(1);
+                    }
+                    chain
+                };
+                base = chain;
                 self.derived.insert(key.0, len);
                 Plan::File(key.0, len)
             }
@@ -4040,7 +4085,7 @@ impl Store {
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
         self.place_spans.insert(tag, Self::place_span(&to));
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         self.publish(tag, to, Content::Sparse(file), 0, effects);
         self.names_step(effects);
         tag
@@ -4078,7 +4123,7 @@ impl Store {
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
         self.place_spans.insert(tag, Self::place_span(&to));
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         self.starts(&to, started);
         if self.place_by.is_none() && self.broken.is_none() {
             self.waiting_for_look();
@@ -4114,7 +4159,7 @@ impl Store {
         span.record("how", "link");
         self.place_spans.insert(tag, span);
         // Another name of a file made from runs: its path names no whole file once answered.
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         if let Some(writing) = self.writing.get(&first) {
             if let Some(was) = &writing.also {
                 // alloc: an error, once per place refused
@@ -4222,7 +4267,7 @@ impl Store {
     }
 
     /// The place `tag` begun, naming what [`Naming`] says until its answer: its whole file
-    /// and its base's are named by a place in flight ([`whole::Names::making`]), so nothing
+    /// and each of its chain of bases' are named by a place in flight ([`whole::Names::making`]), so nothing
     /// removes them meanwhile.
     fn begin_naming(&mut self, tag: Tag, naming: Naming) {
         for file in naming.file.iter().chain(&naming.base) {
@@ -4252,13 +4297,16 @@ impl Store {
         }
         // alloc: the whole files a step's places let go of, a few
         let mut let_go: Vec<ContentId> = Vec::new();
-        // alloc: the keys a step's places stopped holding, a few
-        let mut unrooted: Vec<Key> = Vec::new();
+        // The keys a step's places stopped holding, for the planted bug alone (below).
+        #[cfg(test)]
+        let mut unrooted: Vec<Key> = Vec::new_in(Global);
         for (to, Naming { file, base, key }, made) in std::mem::take(&mut self.renamed) {
             // A naming exists only as `begin_naming` counted it, so neither fails; were the
             // books to disagree, the store stops naming the path and the file.
             let not_begun = |it: whole::NotBegun| format!("the place of {to}: {it}");
-            if let Some(base) = base {
+            // Each base of a derived value's chain, as `begin_naming` counted it: let go of
+            // once, whether the place made it or found it there.
+            for base in base {
                 if let Err(it) = self.names.made_from(base) {
                     // clone: the error that breaks the store
                     let dir = self.tiers[0].dir.clone();
@@ -4287,7 +4335,12 @@ impl Store {
                     // The mark made before does not hold the key the path holds now.
                     self.collecting.rooted();
                 }
+                // The key the path held before is kept (below): what it returns is the
+                // planted bug's alone.
+                #[cfg(test)]
                 unrooted.extend(self.names.hold(to.as_str(), key));
+                #[cfg(not(test))]
+                let _ = self.names.hold(to.as_str(), key);
             }
         }
         // The listing is written when a path's name moved: a step whose places named nothing
@@ -4300,33 +4353,40 @@ impl Store {
         let ended = let_go.clone();
         for content in self.names.doomed(let_go) {
             // A value that is a file of its own goes with its record, never by its file
-            // alone: the record is forgotten (below), and the file is removed once the head
-            // that says so is durable ([`forget`]).
+            // alone: the record is forgotten by the collector, or asked to be
+            // ([`Store::forget`]), and the file is removed once the head that says so is
+            // durable ([`forget`]).
             if self.tiers[0].externals.contains_key(&content) {
                 continue;
             }
             self.let_go(content, effects);
         }
-        // A key no path holds any more whose value is a file of its own: its record is asked
-        // to be forgotten, which happens once no root names it either ([`Store::forget_due`]):
-        // the file is the record's one home, and a home holds the current program's, not
-        // every build's. Whatever else names the file: a path placed from another key of the
-        // same bytes holds that key's record, which keeps the file. (Until 2026-11-13 it was
-        // asked only when nothing named the file, so a key let go of while a path of another
-        // key named its file was never asked again, and its record kept the file for good.)
-        for key in unrooted {
-            if self.names.holds(&key) {
-                continue;
-            }
-            let look = self.look();
-            let external = match look.find(&key) {
-                Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
-                    look.record(found, &key).ok().map(|(header, _)| header.content)
+        // A key no path holds any more is kept: another value placed at a path is no reason
+        // to let go of the last one (D45, "what an output path holds"). Two requests that
+        // share a path (`run`'s launcher and `build`'s live image) each have a unit record
+        // that names its value, and the next switch clones that value back; a record whose
+        // value were gone would be replayed into "the store has nothing under .. to place"
+        // (measured on macOS 2026-11-14: run, build, run, build, then every `run` failed so,
+        // across restarts). What lets a value go is the collector by budget, under its own
+        // rule of roots and use ([`crate::collect`]), never a place over it. Until 2026-11-14
+        // a key a place let go of whose value was a file of its own was asked to be forgotten
+        // here: the planted bug of the controls ([`PlacePlant::ForgetsOnOverwrite`]).
+        #[cfg(test)]
+        if self.plant == PlacePlant::ForgetsOnOverwrite {
+            for key in unrooted {
+                if self.names.holds(&key) {
+                    continue;
                 }
-                _ => None,
-            };
-            if external.is_some() {
-                self.forget(key);
+                let look = self.look();
+                let external = match look.find(&key) {
+                    Some(Ok(found)) if found.tier == 0 && found.place.form() == Form::External => {
+                        look.record(found, &key).ok().map(|(header, _)| header.content)
+                    }
+                    _ => None,
+                };
+                if external.is_some() {
+                    self.forget(key);
+                }
             }
         }
         for content in ended {

@@ -13,16 +13,12 @@
 
 use std::fmt;
 
-use blaze_core::sim::Rng;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 use super::*;
 
-/// Seeds a control searches for a plan its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
-
-/// The seed [`replay_one_seed`] runs, and its bug: set them to what a failure names.
-const REPLAY: (u64, Bug) = (0, Bug::None);
+/// The cases a control searches for a plan its plant breaks.
+const CONTROL: Config = Config::cases(256);
 
 /// Most acts a plan draws.
 const MOST_ACTS: u64 = 60;
@@ -83,63 +79,40 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-trait Draw {
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn below(&mut self, n: usize) -> usize {
-        self.int(0, n as u64 - 1) as usize
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + Rng::below(self, n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn plan(d: &mut impl Draw) -> Plan {
-    let threads = d.int(1, 4) as usize;
-    let fibers = d.int(1, 4) as usize;
-    let cap = [8, 16, 64, 1 << 20][d.below(4)];
-    let gen_rows = [4, 8, 32, GEN_ROWS][d.below(4)];
-    let index_max = [3, 4, 8, INDEX_MAX][d.below(4)];
-    let n = d.int(1, MOST_ACTS);
+fn plan(tape: &Tape) -> Plan {
+    let threads = tape.int_in(1..=4usize, "threads");
+    let fibers = tape.int_in(1..=4usize, "fibers");
+    let cap = [8, 16, 64, 1 << 20][tape.index(4, "ring cap")];
+    let gen_rows = [4, 8, 32, GEN_ROWS][tape.index(4, "gen rows")];
+    let index_max = [3, 4, 8, INDEX_MAX][tape.index(4, "index max")];
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     let texts = texts().len();
     // alloc: a plan, once a case
     let acts = (0..n)
         .map(|_| {
-            let fiber = d.below(fibers);
-            match d.int(0, 99) {
-                0..30 => Act::Name { fiber, text: d.below(texts) },
-                30..60 => {
-                    let len = d.int(1, 3) as usize;
-                    // alloc: a plan's act
-                    Act::Record { fiber, picks: (0..len).map(|_| d.below(CARRIED)).collect() }
+            tape.span("act", |tape| {
+                let fiber = tape.index(fibers, "fiber");
+                match tape.int_in(0..=99u64, "act") {
+                    0..30 => Act::Name { fiber, text: tape.index(texts, "text") },
+                    30..60 => {
+                        let len = tape.int_in(1..=3usize, "names in the row");
+                        // alloc: a plan's act
+                        Act::Record { fiber, picks: (0..len).map(|_| tape.index(CARRIED, "pick")).collect() }
+                    }
+                    60..72 => Act::Move { fiber, thread: tape.index(threads, "to thread") },
+                    72..77 => Act::Burst {
+                        fiber,
+                        n: tape.int_in(1..=1500u64, "burst"),
+                        salt: tape.int_in(1..=97u64, "salt"),
+                    },
+                    77..81 => Act::Respawn { thread: tape.index(threads, "respawned thread") },
+                    81..96 => Act::Drain,
+                    _ => Act::Crash,
                 }
-                60..72 => Act::Move { fiber, thread: d.below(threads) },
-                72..77 => Act::Burst { fiber, n: d.int(1, 1500), salt: d.int(1, 97) },
-                77..81 => Act::Respawn { thread: d.below(threads) },
-                81..96 => Act::Drain,
-                _ => Act::Crash,
-            }
+            })
         })
         .collect();
     Plan { threads, fibers, cap, gen_rows, index_max, acts }
-}
-
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 // --- The model --------------------------------------------------------------------------
@@ -517,27 +490,21 @@ impl fmt::Display for Seen {
 
 /// The invariant: every name a row holds reads back as the text recorded or is counted as
 /// forgotten, never as another text; and nothing is forgotten in a run that lost no row.
-#[hegel::test(test_cases = 200)]
-fn every_name_reads_back_as_recorded_or_is_counted_forgotten(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(why) = run(&plan, Bug::None) {
-        panic!("{why}\nplan {plan:?}");
-    }
+#[test]
+fn every_name_reads_back_as_recorded_or_is_counted_forgotten() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let plan = plan(tape);
+        run(&plan, Bug::None).map(|_| ()).map_err(|why| format!("{why}\nplan {plan:?}"))
+    });
 }
 
-/// A bug the oracle must catch at one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on the
-/// test itself).
+/// A bug the oracle must catch in one of [`CONTROL`]'s plans (test-the-cause on the test
+/// itself); any of the oracle's findings is the catch, as each control asked before.
 fn control(bug: Bug) {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan_of(seed);
-        if let Err(why) = run(&plan, bug) {
-            eprintln!("{bug:?} caught at seed {seed} (REPLAY = ({seed}, Bug::{bug:?})): {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught {bug:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+    blaze_sim::control(CONTROL, Bug::None, bug, "", |tape, bug| {
+        let plan = plan(tape);
+        run(&plan, bug).map(|_| ()).map_err(|why| Broke::Oracle(format!("{why}\nplan {plan:?}")))
+    });
 }
 
 #[test]
@@ -560,26 +527,13 @@ fn the_oracle_catches_a_table_kept_across_a_park() {
     control(Bug::KeepLocalAcrossPark);
 }
 
-/// Seeded plans with no bug: the seeds the controls search pass clean.
+/// Plans with no bug: the cases the controls search pass clean.
 #[test]
 fn the_seeds_the_controls_search_pass_with_no_bug() {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan_of(seed);
-        if let Err(why) = run(&plan, Bug::None) {
-            panic!("seed {seed}: {why}\nplan {plan:?}");
-        }
-    }
-}
-
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, bug) = REPLAY;
-    let plan = plan_of(seed);
-    match run(&plan, bug) {
-        Ok(seen) => eprintln!("seed {seed}, {bug:?}: {seen}"),
-        Err(why) => panic!("seed {seed}, {bug:?}: {why}\nplan {plan:?}"),
-    }
+    blaze_sim::check(CONTROL, |tape| {
+        let plan = plan(tape);
+        run(&plan, Bug::None).map(|_| ()).map_err(|why| format!("{why}\nplan {plan:?}"))
+    });
 }
 
 /// A name a long span took as it opened, written as a link when it closes on another thread

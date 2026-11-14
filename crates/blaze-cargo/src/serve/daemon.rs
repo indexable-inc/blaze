@@ -1925,6 +1925,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // The launched programs' start images the journal marks: each is restored when
             // first asked for, with no build ([`launch`]).
             steps.launch_marked(store.reader(), driver.waker(), launch::marked(&mut vfs));
+            // Each test suite's index head the journal marks: its next run takes it
+            // ([`super::job::Jobs::test_heads`]).
+            steps.test_heads_marked(super::job::test_heads_marked(&mut vfs));
         }
         // The system's memory pressure, watched for the daemon's life: it fails at once where
         // there is no source ([`Daemon::pressure`]).
@@ -2208,6 +2211,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     #[cfg(test)]
     pub(super) fn store_deadline(&self) -> Option<Duration> {
         self.jobs.next_deadline()
+    }
+
+    /// The key the jobs' record holds for the output at `path` ([`super::job::Jobs::placed_key`]).
+    #[cfg(test)]
+    pub(super) fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        self.jobs.placed_key(path)
     }
 
     /// Asks the store to place `key` at `to` as a build would: store traffic that is no step of
@@ -3479,8 +3488,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                         }
                     }
                 }
-                // `blaze run` of a dev executable: the programs are the steps' (review: the
-                // file it may write is the launch's, once per run).
+                // `blaze run` of a dev executable: the programs are the steps'. The launch
+                // writes no file: it starts the one the build placed, with the key the jobs'
+                // record holds for its path, or is refused naming the path and both keys.
                 Out::Pass(Arrived::Request { from, request: Request::Launch { program, pid } }) => {
                     let placed = self.jobs.placed_key(&program);
                     let (response, ok) = match self.steps.launch(&program, pid, placed) {

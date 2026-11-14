@@ -23,7 +23,7 @@ blaze-vfs.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

@@ -399,6 +399,17 @@ def kept_passes(report):
     return [test["name"] for test in map(json.loads, filter(None, lines)) if test.get("result") == "cached"]
 
 
+def run_all(args):
+    """A `blaze test`'s `args` with `--run-all` before any `--`: every test asked runs and none
+    is reported cached (docs/cargo.md, "Which tests run"), so two runs compared are each one's
+    own results, never a pass one kept for the other."""
+    args = list(args)
+    if "--run-all" in args:
+        return args
+    at = args.index("--") if "--" in args else len(args)
+    return [*args[:at], "--run-all", *args[at:]]
+
+
 def test_results(ran):
     """The outcome of each test, the totals of the test executables, and the exit status.
     `blaze test` does not run a test that passed as it is now, and lists it on stderr only
@@ -606,13 +617,14 @@ def project(name, spec, work, mode):
     runs("cold run")
     step("warm build", "build", build, status)
     runs("warm run")
-    step("cold test", "test", test, test_results)
-    step("warm test", "test", test, test_results)
+    # Compared with a run from nothing: each side's own run of every test (`run_all`).
+    step("cold test", "test", run_all(test), test_results)
+    step("warm test", "test", run_all(test), test_results)
     for file, old, new in spec["edits"]:
         rewrite(os.path.join(ws, file), old, new)
     step("edit build", "build", build, status)
     runs("edit run")
-    step("edit test", "test", test, test_results)
+    step("edit test", "test", run_all(test), test_results)
     path = os.path.join(ws, spec.get("broken") or spec["edits"][0][0])
     edited = open(path).read()
     open(path, "w").write(edited + '\nfn blaze_type_error() -> u32 {\n    "not a number"\n}\n')

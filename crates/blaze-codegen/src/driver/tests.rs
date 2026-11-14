@@ -2511,7 +2511,8 @@ fn one_instance_asked_for_by_two_origins_is_two_functions_of_its_test_binary() {
         live(dependency),
         "two functions across edits: each its own live slot"
     );
-    crate::ExecTable::new(&built, &[], 0, |_| None, ContentId::default(), std::iter::empty())
+    let jump = crate::JumpTable::default();
+    crate::ExecTable::new(&built, &[], jump, |_| None, ContentId::default(), std::iter::empty())
         .unwrap_or_else(|why| panic!("{}", why.describe(&built)));
 }
 
@@ -2595,14 +2596,13 @@ fn refilled_and_called_directly(before: &Built, after: &Built) -> Option<String>
 /// those after it; each other one a member's, another crate's generic a member instantiates
 /// (over a workspace type or not) or a dependency's; and up to 3 edits, each of one
 /// function's body (applied to a member's own function only: no edit reaches another's).
-fn drawn(tc: &hegel::TestCase) -> (Program, Vec<u32>) {
-    use hegel::generators as gs;
-    let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(8));
+fn drawn(tape: &blaze_sim::Tape) -> (Program, Vec<u32>) {
+    let count: u32 = tape.int_in(3..=8u32, "functions");
     let mut program = Program::default();
     for id in 1..=count {
         let mut calls: Vec<u32> = Vec::new();
         for callee in id + 1..=count {
-            if callee == id + 1 || tc.draw(gs::integers::<u8>().max_value(2)) == 0 {
+            if callee == id + 1 || tape.int_in(0..=2u8, "skips a call") == 0 {
                 calls.push(callee);
             }
         }
@@ -2611,15 +2611,14 @@ fn drawn(tc: &hegel::TestCase) -> (Program, Vec<u32>) {
             function.symbol = Some("main".to_owned());
             continue;
         }
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
+        match tape.int_in(0..=3u8, "origin") {
             0 => {}
             1 => (function.foreign, function.over_editable) = (true, true),
             2 => function.foreign = true,
             _ => function.origin = Origin::Dependency(Package::new("dep")),
         }
     }
-    let edits: Vec<u32> =
-        tc.draw(gs::vecs(gs::integers::<u32>().min_value(1).max_value(count)).max_size(3));
+    let edits: Vec<u32> = tape.vec(0..=3, "edits", |tape| tape.int_in(1..=count, "edited"));
     (program, edits)
 }
 
@@ -2645,12 +2644,14 @@ fn first_finding(mut program: Program, edits: &[u32], planted: bool) -> Option<S
 /// The invariant: in a build that reaches edited code through slots, every function an edit
 /// fills again under its own key is reached through its slot by every caller, so no caller a
 /// splice keeps in place holds a direct branch to code the splice replaced.
-#[hegel::test(test_cases = 64)]
-fn rebound_functions_are_reached_through_their_slots(tc: hegel::TestCase) {
-    let (program, edits) = drawn(&tc);
-    if let Some(found) = first_finding(program, &edits, false) {
-        panic!("{found}");
-    }
+#[test]
+fn rebound_functions_are_reached_through_their_slots() {
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| {
+        let (program, edits) = drawn(tape);
+        if let Some(found) = first_finding(program, &edits, false) {
+            panic!("{found}");
+        }
+    })
 }
 
 /// `main` (1) calls a dependency's function (2), which calls another crate's generic (3)

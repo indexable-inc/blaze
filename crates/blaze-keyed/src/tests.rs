@@ -1,24 +1,29 @@
-//! The driver under deterministic simulation (rule 43, 64): a model of three crates whose items
-//! call each other by name, edited at random; every request runs the real driver, the real key
-//! functions, the real text graph, the real outside machine and the real record formats, with the
-//! host's answers delivered in an order drawn from the case's tape and the process killed at
-//! drawn points.
+//! The driver under deterministic simulation (rule 43, 64), on blaze-sim: three crates of four
+//! items in two files each, edited as the tape chooses; every request runs the real driver, the
+//! real record formats, the real [`Universe::answer`] and the real outside machine, with the
+//! host's answers delivered in an order the tape chooses (a [`Flight`]), puts landing when
+//! delivered, and the process killed at points the tape chooses.
 //!
-//! The oracle:
-//! - Keys: every key the model computes maps to one meaning for the whole run (two meanings
-//!   under one key is a key that misses an input).
-//! - Hits: a record the store answers is the meaning of its key; a manifest hit names only
-//!   records the store holds.
-//! - Reuse: a record filed under a moved key (its read list verified) is the meaning of the new
-//!   key, which a fresh build computes from scratch.
-//! - Verify once (decision 18), per request: no item is looked up twice or verified twice; no
-//!   item is checked after its hit; nothing a held manifest names is looked up; no record of a
-//!   unit whose own text and dependencies' surfaces are unchanged is examined; the driver's
-//!   `rechecks` counter is zero.
-//! - Work: no task runs for a record the store holds; at most `max(workers, 1)` tasks run.
-//! - Ends: a built request filed the certificate, naming the fresh manifests, at the address of
-//!   the tree; a request after it with no edit is certified; nothing fails or stalls.
+//! The model's tasks read what they are handed and ask by value-dependent shapes: a surface asks
+//! a dependency's second signature when its first one's digest is odd, a body asks a second
+//! signature of its own unit when the first one's is; bodies read their own unit's surface, a
+//! dependency's, an absent export, what the asking unit sees, a const another body of the unit
+//! makes, a const a dependency's body makes and a late variable.
+//!
+//! The oracle, after every request that finished:
+//! - From scratch: an independent interpreter computes every record by value (it answers each
+//!   ask from the model's values, never from a record or the store); every unit's manifest the
+//!   certificate names holds, for its surface and every item, a record whose result is the
+//!   fresh one's, and every read in it and every row of its dictionary is true now; its made
+//!   table is the fresh one's.
+//! - The store holds everything a certificate, a mark or a manifest names.
+//! - No check after a proof (`rechecks` is zero); at most `max(workers, 1)` tasks run.
+//! - A request after an answer with no edit is certified.
+//! - Under [`Audit`], nothing faults without a plant.
 //! - Refinement: `Resident` gives the same outcomes and leaves the same store as `RecordsOnly`.
+//!
+//! Every plant has a control that the oracle refuses by name, and `every_case_is_reached`
+//! fails by name for a case no run reaches.
 
 use std::{
     alloc::Global,
@@ -32,548 +37,475 @@ use blaze_sim::{Broke, Config, Flight, Nanos, Tape};
 
 use crate::{
     PLANT, Plant,
-    driver::{Done, Driver, Effect, Input, NO_UNIT, Outcome, Plan, Ran, SURFACE_ITEM, Step, Task, UnitPlan},
+    driver::{Done, Driver, Effect, Filed, Input, Outcome, Plan, Ran, Step, TableRef, Task, UnitPlan},
     exec::Local,
+    front::{FileItems, Table, Universe},
     kind::{
-        Body, BodyInputs, Certificate, CertificateInputs, FileImage, FileInputs, Key, Kind, Late, LateRead, NameRead,
-        Namespace, Settings, Surface, SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
+        Body, BodyInputs, Certificate, CertificateInputs, FileImage, FileInputs, Key, Kind, Late, LateRead, Namespace,
+        Settings, Surface, SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
     },
-    memo::{Memo, RecordsOnly, Resident},
+    memo::{Audit, Memo, RecordsOnly, Resident},
     outside, planted,
     pool::Ticket,
     proof::{self, Checks, Snapshot},
-    record::{self, Entry, Fact, FactKind, StableId, Traced},
+    record::{self, ChunkRoot, Fact, FactKind, ManifestRoot, Owner, Route, StableId, Traced},
     store::Put,
-    text::{CrateNodes, Graph, NameHash, Node, name_of},
 };
 
-const NAMES: [&str; 5] = ["new", "a", "b", "from", "run"];
-const VARS: [&str; 2] = ["MODEL_A", "MODEL_B"];
-const DEPS: [&[u32]; 3] = [&[], &[0], &[0, 1]];
+const UNITS: usize = 3;
+const ITEMS: usize = 4;
+const DEPS: [&[u32]; UNITS] = [&[], &[0], &[0, 1]];
 const WORKERS: u32 = 2;
 /// The request's one outside ask, in the model's encoding: the whole tree.
 const SHAPE: &[u8] = b"the model's tree";
-
-struct Spec {
-    name: usize,
-    calls: &'static [usize],
-    env: Option<usize>,
-    inline: bool,
-}
-
-const fn spec(name: usize, calls: &'static [usize], env: Option<usize>, inline: bool) -> Spec {
-    Spec { name, calls, env, inline }
-}
-
-const SPECS: [[Spec; 3]; 3] = [
-    [spec(0, &[], None, true), spec(1, &[0], None, false), spec(3, &[1], Some(0), false)],
-    [spec(2, &[0], None, false), spec(4, &[2, 1], None, false), spec(0, &[], None, true)],
-    [spec(4, &[2, 3], None, false), spec(1, &[4], None, false), spec(2, &[0], Some(1), false)],
-];
+const VARS: [&[u8]; 2] = [b"MODEL_A", b"MODEL_B"];
 
 const TOOL: ToolId = ToolId { tool: ContentId([1; 32]), target: ContentId([4; 32]), namespace: Namespace::PUBLIC };
 const SETTINGS: Settings = Settings(ContentId([2; 32]));
-const SYSROOT: ContentId = ContentId([3; 32]);
 
 fn certificate() -> Key<Certificate> {
     Certificate::key(&CertificateInputs { tool: TOOL, base: ContentId([5; 32]), of: PhantomData })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Item {
-    present: bool,
-    sig: u8,
-    param: u8,
-    body: u8,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Op {
-    Body(usize, usize, u8),
-    Sig(usize, usize, u8),
-    Param(usize, usize, u8),
-    Toggle(usize, usize),
-    Env(usize, Option<u8>),
-    Request { kill: Option<u32> },
-    /// A new process: the resident memo starts empty.
-    Restart,
-}
-
-const REQUEST: Op = Op::Request { kill: None };
-
-/// What the oracle above saw broken.
-fn oracle(why: impl Into<String>) -> Broke {
-    Broke::Oracle(why.into())
-}
-
-/// The model's own trouble: its from-scratch build could not be made.
-fn harness(why: impl Into<String>) -> Broke {
-    Broke::Harness(why.into())
 }
 
 fn digest(bytes: &[u8]) -> ContentId {
     record::digest(bytes)
 }
 
-fn aligned(bytes: Vec<u8>) -> Aligned {
-    Aligned::copy_from(&bytes)
+fn unit_id(c: usize) -> ContentId {
+    ContentId([0x10 + c as u8; 32])
+}
+
+fn owner(c: usize) -> Owner {
+    Owner([0x10 + c as u8; 8])
+}
+
+fn unit_of(owner: Owner) -> Option<usize> {
+    (0..UNITS).find(|&c| self::owner(c) == owner)
 }
 
 fn stable(c: usize, i: usize) -> StableId {
-    StableId::of(format!("c{c}::{}", NAMES[SPECS[c][i].name]).as_bytes(), 1)
+    StableId::of(format!("c{c}::item{i}").as_bytes(), 1)
 }
 
-fn surface_stable(c: usize) -> StableId {
-    StableId::of(format!("c{c}").as_bytes(), 2)
+fn sig_fact(c: usize, i: usize) -> ContentId {
+    record::fact(FactKind::Signature, owner(c), 1, &stable(c, i), b"")
 }
 
-/// What a record of `tag` means, apart from its key and read list.
-fn meaning(tag: Tag, bytes: &[u8]) -> Result<ContentId, String> {
-    if tag == Body::TAG || tag == Surface::TAG {
-        let root = blaze_format::open::<Traced>(bytes).map_err(|error| format!("{error}"))?;
-        return record::result_digest(root, bytes).map_err(|error| format!("{error}"));
+/// An export a unit has only while its first item's signature is 2: absent otherwise.
+fn extra_fact(c: usize) -> ContentId {
+    record::fact(FactKind::Signature, owner(c), 1, &StableId::of(format!("c{c}::extra").as_bytes(), 1), b"")
+}
+
+/// The const item 3 of unit `c` makes.
+fn made_fact(c: usize) -> ContentId {
+    record::fact(FactKind::ConstValue, owner(c), 2, &stable(c, 3), b"")
+}
+
+/// What the asking unit sees as a whole: no surface has its row, so its seen row answers it.
+fn asker_fact() -> ContentId {
+    record::fact(FactKind::WholeScope, Owner::ASKER, 3, &StableId(ContentId([9; 32])), b"")
+}
+
+fn late_fact(var: usize) -> ContentId {
+    record::late_id(Late::Env as u8, VARS[var])
+}
+
+/// The late read of unit `c`: (the item that reads it, the variable).
+fn late_of(c: usize) -> Option<(usize, usize)> {
+    match c {
+        1 => Some((0, 1)),
+        2 => Some((1, 0)),
+        _ => None,
     }
-    Ok(ContentId::of("blaze-keyed model meaning", bytes))
 }
 
-struct FreshUnit {
-    manifest: Key<UnitManifest>,
-    manifest_bytes: Vec<u8>,
-    surface: Key<Surface>,
-    surface_bytes: Vec<u8>,
-    /// (item index, stable id, key, record).
-    bodies: Vec<(usize, StableId, Key<Body>, Vec<u8>)>,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Item {
+    sig: u8,
+    body: u8,
 }
 
-impl FreshUnit {
-    fn key_of(&self, item: StableId) -> Option<ContentId> {
-        if item == SURFACE_ITEM {
-            return Some(self.surface.id());
-        }
-        self.bodies.iter().find(|(_, id, ..)| *id == item).map(|(_, _, key, _)| key.id())
-    }
-}
-
-#[derive(Default)]
-struct Disk {
-    records: BTreeMap<(u16, [u8; 32]), Aligned>,
-    last: Vec<Key<UnitManifest>>,
-}
-
-/// What one request has looked at so far: the verify-once oracle's state.
-#[derive(Default)]
-struct Seen {
-    gets: BTreeSet<(u32, u16, [u8; 32], [u8; 32])>,
-    verifies: BTreeSet<(u32, [u8; 32])>,
-    /// Items proved in this request: by a key hit or a verified read list.
-    proved: BTreeSet<(u32, [u8; 32])>,
-    /// Units whose manifest held.
-    settled: BTreeSet<u32>,
-    /// Per unit: its own text and its dependencies' surfaces are as the last answer had them.
-    unchanged: Vec<bool>,
-}
-
-struct Model {
-    items: [[Item; 3]; 3],
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct World {
+    items: [[Item; ITEMS]; UNITS],
     env: [Option<u8>; 2],
-    disk: Disk,
-    meanings: BTreeMap<(u16, [u8; 32]), ContentId>,
-    in_flight: u32,
-    seen: Seen,
-    last_own: Vec<ContentId>,
-    last_surfaces: Vec<Key<Surface>>,
+}
+
+impl World {
+    fn new() -> World {
+        World { items: [[Item { sig: 0, body: 0 }; ITEMS]; UNITS], env: [None; 2] }
+    }
+
+    fn digest(&self) -> ContentId {
+        let mut bytes = Vec::new();
+        for unit in &self.items {
+            for item in unit {
+                bytes.extend_from_slice(&[item.sig, item.body]);
+            }
+        }
+        for var in self.env {
+            bytes.extend_from_slice(&[var.is_some() as u8, var.unwrap_or(0)]);
+        }
+        digest(&bytes)
+    }
+
+    fn sig_digest(&self, c: usize, i: usize) -> ContentId {
+        digest(&[b's', self.items[c][i].sig])
+    }
+
+    fn made_value(&self, c: usize) -> ContentId {
+        let item = self.items[c][3];
+        digest(&[b'm', (item.sig + item.body) % 3])
+    }
+
+    fn env_value(&self, var: usize) -> Option<ContentId> {
+        self.env[var].map(|v| digest(&[b'e', v]))
+    }
+
+    fn late_answer(&self, var: usize) -> ContentId {
+        self.env_value(var).unwrap_or_else(|| digest(b"unset"))
+    }
+
+    /// Unit `c`'s surface rows, sorted by id.
+    fn rows(&self, c: usize) -> Vec<Fact> {
+        let mut rows: Vec<Fact> = (0..ITEMS).map(|i| Fact { id: sig_fact(c, i), digest: self.sig_digest(c, i) }).collect();
+        if self.items[c][0].sig == 2 {
+            rows.push(Fact { id: extra_fact(c), digest: digest(b"extra") });
+        }
+        let mut seen = vec![c as u8];
+        seen.extend(self.items[c].iter().map(|item| item.sig));
+        rows.push(Fact { id: record::seen_id(), digest: digest(&seen) });
+        rows.sort_by_key(|fact| fact.id);
+        rows
+    }
+
+    /// What unit `c`'s bodies make, sorted by id.
+    fn made(&self, c: usize) -> Vec<Fact> {
+        vec![Fact { id: made_fact(c), digest: self.made_value(c) }]
+    }
+
+    /// The answer now of `id` asked by unit `asker`'s surface (`body` false: its dependencies
+    /// only) or a body: by value, from the model.
+    fn value(&self, asker: usize, body: bool, id: &ContentId) -> Result<ContentId, String> {
+        let visible = |d: usize| DEPS[asker].contains(&(d as u32)) || (body && d == asker);
+        let route = record::route(id).map_err(|unrouted| format!("an unrouted ask {unrouted:?}"))?;
+        Ok(match route {
+            Route::Outside => match (0..2).find(|&var| late_fact(var) == *id) {
+                Some(var) => self.late_answer(var),
+                None => return Err("an outside ask of no variable".into()),
+            },
+            Route::Asker if !body => return Err("an ask of what the asker sees by a surface".into()),
+            Route::Asker => {
+                let rows = self.rows(asker);
+                match rows.iter().find(|row| row.id == *id).or_else(|| rows.iter().find(|row| row.id == record::seen_id())) {
+                    Some(row) => row.digest,
+                    None => record::absent(id),
+                }
+            }
+            Route::Surface(owner) => match unit_of(owner).filter(|&d| visible(d)) {
+                Some(d) => self.rows(d).iter().find(|row| row.id == *id).map_or_else(|| record::absent(id), |row| row.digest),
+                None => record::GONE,
+            },
+            Route::Made(owner) => match unit_of(owner).filter(|&d| visible(d)) {
+                Some(d) => self.made(d).iter().find(|row| row.id == *id).map_or_else(|| record::absent(id), |row| row.digest),
+                None => record::GONE,
+            },
+        })
+    }
+
+    fn body_key(&self, c: usize, i: usize) -> Key<Body> {
+        let item = self.items[c][i];
+        Body::key(&BodyInputs { tool: TOOL, settings: SETTINGS, unit: unit_id(c), item: stable(c, i), text: digest(&[b't', item.sig, item.body]) })
+    }
+
+    fn surface_key(&self, c: usize) -> Key<Surface> {
+        let pieces: Vec<ContentId> = (0..ITEMS).map(|i| digest(&[b'p', i as u8, self.items[c][i].sig])).collect();
+        Surface::key(&SurfaceInputs { tool: TOOL, settings: SETTINGS, unit: unit_id(c), pieces: &pieces })
+    }
+
+    fn file_key(&self, c: usize, f: usize) -> Key<FileImage> {
+        let (a, b) = (self.items[c][2 * f], self.items[c][2 * f + 1]);
+        FileImage::key(&FileInputs { tool: TOOL, edition: 2021, bytes: &[c as u8, f as u8, a.sig, a.body, b.sig, b.body] })
+    }
+
+    fn text_key(&self, c: usize) -> Key<UnitManifest> {
+        let files = [self.file_key(c, 0), self.file_key(c, 1)];
+        let late: Vec<LateRead<'_>> =
+            late_of(c).map(|(_, var)| LateRead { late: Late::Env, name: VARS[var], value: self.env_value(var) }).into_iter().collect();
+        UnitManifest::key(&UnitInputs { tool: TOOL, settings: SETTINGS, unit: unit_id(c), files: &files, late: &late })
+    }
+
+    /// Unit `c`'s files with their items, each file's in stable-id order.
+    fn keyed(&self, c: usize) -> (Vec<FileItems>, Vec<(StableId, Key<Body>)>) {
+        let mut files = Vec::new();
+        let mut items = Vec::new();
+        for f in 0..2 {
+            let mut of: Vec<(StableId, Key<Body>)> = (2 * f..2 * f + 2).map(|i| (stable(c, i), self.body_key(c, i))).collect();
+            of.sort_by_key(|(item, _)| *item);
+            files.push(FileItems { image: self.file_key(c, f), at: items.len() as u32, len: of.len() as u32 });
+            items.extend(of);
+        }
+        (files, items)
+    }
+
+    /// The late reads every task may ask, sorted by id.
+    fn late(&self) -> Vec<Fact> {
+        let mut late: Vec<Fact> = (0..2).map(|var| Fact { id: late_fact(var), digest: self.late_answer(var) }).collect();
+        late.sort_by_key(|fact| fact.id);
+        late
+    }
+}
+
+type Ask<'a> = dyn FnMut(&ContentId) -> Result<ContentId, String> + 'a;
+
+/// The reads a task asked, and the answers in the order asked.
+#[derive(Default)]
+struct Asked {
+    reads: BTreeMap<ContentId, ContentId>,
+    order: Vec<ContentId>,
+    last: Option<ContentId>,
+}
+
+impl Asked {
+    fn ask(&mut self, ask: &mut Ask<'_>, id: ContentId) -> Result<ContentId, String> {
+        let answer = ask(&id)?;
+        self.reads.insert(id, answer);
+        self.order.push(answer);
+        self.last = Some(id);
+        Ok(answer)
+    }
+
+    /// The reads written, with the planted bugs of the driver-side tasks.
+    fn reads(&self, plants: bool) -> Vec<Fact> {
+        let mut reads: Vec<Fact> = self.reads.iter().map(|(id, digest)| Fact { id: *id, digest: *digest }).collect();
+        if plants && planted(Plant::ReadDropped) {
+            reads.retain(|read| Some(read.id) != self.last);
+        }
+        if plants && planted(Plant::AbsenceDropped) {
+            reads.retain(|read| read.digest != record::absent(&read.id));
+        }
+        if plants && planted(Plant::MadeNotAsked) {
+            reads.retain(|read| !matches!(record::route(&read.id), Ok(Route::Made(_))));
+        }
+        reads
+    }
+
+    /// `earlier`: the requests begun before the one this task runs in. Under
+    /// [`Plant::TwoValuesUnderAddress`] the work is not a function of its key and reads: a run
+    /// in any request but the first adds that count to its payload, so the first request files
+    /// what a fresh build files and a later run of the same work makes other bytes at the same
+    /// address (what only the audit's redo of a hit sees).
+    fn payload(&self, own: &[u8], earlier: u32, plants: bool) -> Vec<u8> {
+        let mut bytes = own.to_vec();
+        self.order.iter().for_each(|answer| bytes.extend_from_slice(&answer.0));
+        if plants && planted(Plant::TwoValuesUnderAddress) && earlier > 0 {
+            bytes.extend_from_slice(&earlier.to_le_bytes());
+        }
+        digest(&bytes).0.to_vec()
+    }
+}
+
+fn odd(answer: ContentId) -> bool {
+    answer.0[0] & 1 == 1
+}
+
+/// Unit `c`'s surface, asking through `ask`.
+fn surface_task(world: &World, c: usize, plants: bool, earlier: u32, ask: &mut Ask<'_>) -> Result<Vec<u8>, String> {
+    let mut asked = Asked::default();
+    for &d in DEPS[c] {
+        if odd(asked.ask(ask, sig_fact(d as usize, 0))?) {
+            asked.ask(ask, sig_fact(d as usize, 1))?;
+        }
+    }
+    let mut own = vec![c as u8];
+    own.extend(world.items[c].iter().map(|item| item.sig));
+    let payload = asked.payload(&own, earlier, plants);
+    Ok(record::write_read::<Surface>(world.surface_key(c), &asked.reads(plants), &world.rows(c), &payload).1)
+}
+
+/// Item `i` of unit `c`'s body, asking through `ask`.
+fn body_task(world: &World, c: usize, i: usize, plants: bool, earlier: u32, ask: &mut Ask<'_>) -> Result<Vec<u8>, String> {
+    let mut asked = Asked::default();
+    if odd(asked.ask(ask, sig_fact(c, (i + 1) % ITEMS))?) {
+        asked.ask(ask, sig_fact(c, (i + 2) % ITEMS))?;
+    }
+    if c > 0 && i < 3 {
+        asked.ask(ask, sig_fact(DEPS[c][0] as usize, i))?;
+    }
+    asked.ask(ask, extra_fact(c))?;
+    if i == 0 {
+        asked.ask(ask, asker_fact())?;
+    }
+    if i == 2 {
+        asked.ask(ask, made_fact(c))?;
+    }
+    if c == 1 && i == 3 {
+        asked.ask(ask, made_fact(0))?;
+    }
+    if let Some((reader, var)) = late_of(c)
+        && reader == i
+    {
+        asked.ask(ask, late_fact(var))?;
+    }
+    let item = world.items[c][i];
+    let facts = if i == 3 { world.made(c) } else { Vec::new() };
+    let payload = asked.payload(&[c as u8, i as u8, item.sig, item.body], earlier, plants);
+    Ok(record::write_read::<Body>(world.body_key(c, i), &asked.reads(plants), &facts, &payload).1)
+}
+
+fn result_of(bytes: &[u8]) -> Result<ContentId, String> {
+    let root = blaze_format::open::<Traced>(bytes).map_err(|error| format!("{error}"))?;
+    record::result_digest(root, bytes).map_err(|error| format!("{error}"))
+}
+
+/// What a from-scratch build makes of one unit: by value.
+struct Fresh {
+    text: Key<UnitManifest>,
+    surface: ContentId,
+    /// By stable id: (key, result).
+    bodies: BTreeMap<StableId, (Key<Body>, ContentId)>,
+    made: Vec<Fact>,
+}
+
+fn fresh(world: &World) -> Result<Vec<Fresh>, String> {
+    (0..UNITS)
+        .map(|c| {
+            let surface = surface_task(world, c, false, 0, &mut |id: &ContentId| world.value(c, false, id))?;
+            let mut bodies = BTreeMap::new();
+            for i in 0..ITEMS {
+                let bytes = body_task(world, c, i, false, 0, &mut |id: &ContentId| world.value(c, true, id))?;
+                bodies.insert(stable(c, i), (world.body_key(c, i), result_of(&bytes)?));
+            }
+            Ok(Fresh { text: world.text_key(c), surface: result_of(&surface)?, bodies, made: world.made(c) })
+        })
+        .collect()
 }
 
 enum Answer {
     Got(Ticket, Option<Aligned>),
     Answers(Ticket, Vec<ContentId>),
-    Now(Ticket, Vec<Option<ContentId>>),
-    Keyed(Ticket, Key<UnitManifest>, Key<Surface>, Vec<(StableId, Key<Body>)>),
+    Keyed(Ticket, Key<UnitManifest>, Key<Surface>, Vec<FileItems>, Vec<(StableId, Key<Body>)>),
     Wrote(Ticket, Aligned),
-    Put(Ticket, Put),
-    Reads(Ticket, ContentId),
+    Put(Ticket, Tag, ContentId, Aligned),
+    Reads(Ticket),
 }
 
-impl Model {
-    fn new() -> Model {
-        let item = Item { present: true, sig: 0, param: 0, body: 0 };
-        Model {
-            items: [[item; 3]; 3],
-            env: [None; 2],
-            disk: Disk::default(),
-            meanings: BTreeMap::new(),
-            in_flight: 0,
-            seen: Seen::default(),
-            last_own: Vec::new(),
-            last_surfaces: Vec::new(),
-        }
+type Disk = BTreeMap<(u16, ContentId), Aligned>;
+
+struct Sim {
+    world: World,
+    disk: Disk,
+    /// The manifests the last finished request's certificate names.
+    last: [Option<Key<UnitManifest>>; UNITS],
+    in_flight: u32,
+    /// Requests begun, killed ones included.
+    requests: u32,
+}
+
+impl Sim {
+    fn new() -> Sim {
+        Sim { world: World::new(), disk: Disk::new(), last: [None; UNITS], in_flight: 0, requests: 0 }
     }
 
-    fn apply(&mut self, op: Op) {
-        match op {
-            Op::Body(c, i, v) => self.items[c][i].body = v,
-            Op::Sig(c, i, v) => self.items[c][i].sig = v,
-            Op::Param(c, i, v) => self.items[c][i].param = v,
-            Op::Toggle(c, i) => self.items[c][i].present = !self.items[c][i].present,
-            Op::Env(v, value) => self.env[v] = value,
-            Op::Request { .. } | Op::Restart => {}
-        }
+    fn get(&self, tag: Tag, key: ContentId) -> Option<&Aligned> {
+        self.disk.get(&(tag.0, key))
     }
 
-    fn world(&self) -> ContentId {
-        let mut bytes = Vec::new();
-        for c in 0..3 {
-            bytes.extend(self.file_bytes(c));
-        }
-        bytes.extend(self.env.iter().map(|value| value.map_or(0, |v| v + 1)));
-        digest(&bytes)
-    }
-
-    fn file_bytes(&self, c: usize) -> Vec<u8> {
-        self.items[c].iter().flat_map(|item| [item.present as u8, item.sig, item.param, item.body]).collect()
-    }
-
-    /// Unit `c`'s own inputs: its file and the variables its present items read.
-    fn own(&self, c: usize) -> ContentId {
-        let mut bytes = self.file_bytes(c);
-        for i in (0..3).filter(|&i| self.items[c][i].present) {
-            if let Some(v) = SPECS[c][i].env {
-                bytes.push(self.env[v].map_or(0, |value| value + 1));
-            }
-        }
-        digest(&bytes)
-    }
-
-    fn unchanged(&self, c: usize, fresh: &[FreshUnit]) -> bool {
-        self.last_own.get(c) == Some(&self.own(c))
-            && DEPS[c].iter().all(|&d| self.last_surfaces.get(d as usize) == Some(&fresh[d as usize].surface))
-    }
-
-    fn resolve(&self, c: usize, name: usize) -> Option<(usize, usize)> {
-        let find = |d: usize| (0..3).find(|&i| self.items[d][i].present && SPECS[d][i].name == name).map(|i| (d, i));
-        find(c).or_else(|| DEPS[c].iter().find_map(|&d| find(d as usize)))
-    }
-
-    fn piece(&self, c: usize, i: usize) -> Vec<u8> {
-        let (item, spec) = (self.items[c][i], &SPECS[c][i]);
-        let mut piece = vec![spec.name as u8, item.sig, item.param, spec.inline as u8];
-        if spec.inline {
-            piece.push(item.body);
-            piece.extend(spec.calls.iter().map(|&n| n as u8));
-        }
-        piece
-    }
-
-    fn env_value(&self, v: usize) -> Option<ContentId> {
-        self.env[v].map(|value| digest(&[value]))
-    }
-
-    fn surface_own(&self, c: usize) -> ContentId {
-        let mut bytes = Vec::new();
-        for i in (0..3).filter(|&i| self.items[c][i].present) {
-            bytes.extend(digest(&self.piece(c, i)).0);
-        }
-        digest(&bytes)
-    }
-
-    /// Every fact of unit `c` now: what a read list is checked against.
-    fn facts_now(&self, c: usize) -> Vec<Fact> {
-        let mut facts = vec![Fact {
-            id: record::fact_id(FactKind::Own, &surface_stable(c), b""),
-            digest: self.surface_own(c),
-        }];
-        for i in (0..3).filter(|&i| self.items[c][i].present) {
-            facts.extend(self.body_reads(c, i));
-        }
-        facts
-    }
-
-    fn body_reads(&self, c: usize, i: usize) -> Vec<Fact> {
-        let (item, spec, id) = (self.items[c][i], &SPECS[c][i], stable(c, i));
-        let own = digest(&[c as u8, i as u8, item.sig, item.param, item.body, spec.inline as u8]);
-        let mut reads = vec![Fact { id: record::fact_id(FactKind::Own, &id, b""), digest: own }];
-        if let Some(v) = spec.env {
-            let value = self.env[v].map_or(0, |value| value + 1);
-            reads.push(Fact { id: record::fact_id(FactKind::Late, &id, VARS[v].as_bytes()), digest: digest(&[value]) });
-        }
-        for &n in spec.calls {
-            let bound = match self.resolve(c, n) {
-                Some((d, j)) => digest(&[1, d as u8, j as u8, self.items[d][j].sig]),
-                None => digest(&[0]),
+    /// Runs `f` over the universe `refs` and `made` name, its tables read from the store.
+    /// What goes wrong is the driver's (a table it names, the order it gives): the oracle's.
+    fn with_universe<R>(&self, asker: u32, refs: &[TableRef], made: &[Fact], f: impl FnOnce(Universe<'_>) -> R) -> Result<R, Broke> {
+        let mut held: Vec<(u32, Owner, Aligned, Vec<Fact>)> = Vec::new();
+        for table in refs {
+            // A table with no surface yet (the asker's own, before its surface settles) is
+            // not in the universe.
+            let Some(surface) = table.surface else { continue };
+            let Some(bytes) = self.get(Surface::TAG, surface.id()) else {
+                return Err(Broke::Oracle(format!("unit {}'s table names a surface the store does not hold", table.unit)));
             };
-            reads.push(Fact { id: record::fact_id(FactKind::Binding, &id, NAMES[n].as_bytes()), digest: bound });
-        }
-        reads
-    }
-
-    fn body_record(&self, c: usize, i: usize, key: &Key<Body>, drop_read: bool) -> Vec<u8> {
-        let reads = self.body_reads(c, i);
-        let mut value = Vec::new();
-        reads.iter().for_each(|read| value.extend(read.digest.0));
-        let payload = ContentId::of("blaze-keyed model body", &value).0;
-        let kept = match drop_read && !SPECS[c][i].calls.is_empty() {
-            true => &reads[..reads.len() - 1],
-            false => &reads[..],
-        };
-        record::write_traced(key, kept, &[], &payload)
-    }
-
-    /// Every key and record a from-scratch build makes now.
-    fn fresh(&self) -> Result<Vec<FreshUnit>, Broke> {
-        let present = |c: usize| (0..3).filter(move |&i| self.items[c][i].present);
-        let pieces: Vec<Vec<Vec<u8>>> = (0..3).map(|c| present(c).map(|i| self.piece(c, i)).collect()).collect();
-        let names: Vec<Vec<Vec<NameHash>>> = (0..3)
-            .map(|c| {
-                present(c)
-                    .map(|i| match SPECS[c][i].inline {
-                        true => SPECS[c][i].calls.iter().map(|&n| name_of(NAMES[n].as_bytes())).collect(),
-                        false => Vec::new(),
-                    })
-                    .collect()
-            })
-            .collect();
-        let keys: Vec<Vec<[NameHash; 1]>> =
-            (0..3).map(|c| present(c).map(|i| [name_of(NAMES[SPECS[c][i].name].as_bytes())]).collect()).collect();
-        let nodes: Vec<Vec<Node<'_>>> = (0..3)
-            .map(|c| {
-                (0..pieces[c].len())
-                    .map(|n| Node { piece: &pieces[c][n], names: &names[c][n], keys: &keys[c][n], always: false, coarse: false })
-                    .collect()
-            })
-            .collect();
-        let crates: Vec<CrateNodes<'_>> = (0..3)
-            .map(|c| CrateNodes { identity: ContentId([10 + c as u8; 32]), nodes: &nodes[c], deps: DEPS[c] })
-            .collect();
-        let graph = Graph::build(&crates, Global).map_err(|error| harness(error.to_string()))?;
-        let mut scratch = Vec::new_in(Global);
-        let mut units: Vec<FreshUnit> = Vec::new();
-        for c in 0..3 {
-            let piece_ids: Vec<ContentId> = pieces[c].iter().map(|piece| digest(piece)).collect();
-            let dep_surfaces: Vec<Key<Surface>> = DEPS[c].iter().map(|&d| units[d as usize].surface).collect();
-            let surface = Surface::key(&SurfaceInputs {
-                tool: TOOL,
-                settings: SETTINGS,
-                pieces: &piece_ids,
-                deps: &dep_surfaces,
-                late: &[],
-            });
-            let own = Fact { id: record::fact_id(FactKind::Own, &surface_stable(c), b""), digest: self.surface_own(c) };
-            let exports: Vec<Fact> = present(c)
-                .map(|i| Fact {
-                    id: record::fact_id(FactKind::Signature, &stable(c, i), b""),
-                    digest: digest(&[self.items[c][i].sig]),
-                })
-                .collect();
-            let surface_bytes = record::write_traced(&surface, &[own], &exports, &[]);
-            let always = graph.always(c as u32).map_err(|error| harness(error.to_string()))?;
-            let mut bodies = Vec::new();
-            let mut late_all = Vec::new();
-            for i in present(c) {
-                let spec = &SPECS[c][i];
-                let mut calls: Vec<usize> = spec.calls.to_vec();
-                calls.sort_by_key(|&n| name_of(NAMES[n].as_bytes()));
-                calls.dedup();
-                let mut reads = Vec::new();
-                for n in calls {
-                    let name = name_of(NAMES[n].as_bytes());
-                    let closure =
-                        graph.name_closure(c as u32, name, &mut scratch).map_err(|error| harness(error.to_string()))?;
-                    reads.push(NameRead { name, closure });
+            let made = match table.manifest {
+                None => made.to_vec(),
+                Some(manifest) => {
+                    let Some(root) = self.get(UnitManifest::TAG, manifest.id()) else {
+                        return Err(Broke::Oracle(format!("unit {}'s table names a manifest the store does not hold", table.unit)));
+                    };
+                    let opened: &ManifestRoot = record::open::<UnitManifest>(root, &manifest).map_err(|e| Broke::Oracle(e.to_string()))?;
+                    opened.made.follow(root).map_err(|e| Broke::Oracle(e.to_string()))?.to_vec()
                 }
-                let late: Vec<LateRead<'_>> = spec
-                    .env
-                    .map(|v| LateRead { late: Late::Env, name: VARS[v].as_bytes(), value: self.env_value(v) })
-                    .into_iter()
-                    .collect();
-                late_all.extend(late.iter().copied());
-                let item = self.items[c][i];
-                let text = digest(&[c as u8, i as u8, item.sig, item.param, item.body, spec.inline as u8]);
-                let key = Body::key(&BodyInputs {
-                    tool: TOOL,
-                    settings: SETTINGS,
-                    sysroot: SYSROOT,
-                    text,
-                    names: &reads,
-                    always,
-                    late: &late,
-                    expansions: &[],
-                });
-                bodies.push((i, stable(c, i), key, self.body_record(c, i, &key, false)));
-            }
-            let bytes = self.file_bytes(c);
-            let file = FileImage::key(&FileInputs { tool: TOOL, edition: 2024, bytes: &bytes });
-            // The firewall: dependencies by surface; the plant keys them by manifest instead.
-            let deps: Vec<Key<Surface>> = match planted(Plant::UnitKeyedByDepManifests) {
-                true => DEPS[c].iter().map(|&d| Key::from_id(units[d as usize].manifest.id())).collect(),
-                false => dep_surfaces.clone(),
             };
-            let manifest = UnitManifest::key(&UnitInputs {
-                tool: TOOL,
-                settings: SETTINGS,
-                files: &[file],
-                late: &late_all,
-                deps: &deps,
-            });
-            let mut entries = vec![Entry { item: SURFACE_ITEM.0, key: surface.id(), tag: Surface::TAG.0, pad: 0 }];
-            entries.extend(bodies.iter().map(|(_, item, key, _)| Entry { item: item.0, key: key.id(), tag: Body::TAG.0, pad: 0 }));
-            let manifest_bytes = record::write_manifest(&manifest, &entries);
-            units.push(FreshUnit { manifest, manifest_bytes, surface, surface_bytes, bodies });
+            held.push((table.unit, table.owner, bytes.clone(), made));
         }
-        Ok(units)
+        let mut tables = Vec::new();
+        for (unit, owner, surface, made) in &held {
+            tables.push(Table::of(*unit, *owner, surface, made).map_err(|why| Broke::Oracle(format!("{why:?}")))?);
+        }
+        if tables.windows(2).any(|pair| pair[0].owner >= pair[1].owner) {
+            return Err(Broke::Oracle("a universe not sorted by owner".into()));
+        }
+        let late = self.world.late();
+        Ok(f(Universe { asker, tables: &tables, outside: &late }))
     }
 
-    /// Files every key a fresh build makes under its meaning; a second meaning is a key that
-    /// misses an input.
-    fn register(&mut self, fresh: &[FreshUnit]) -> Result<(), Broke> {
-        let mut file = |tag: Tag, key: ContentId, bytes: &[u8]| -> Result<(), Broke> {
-            // A record of the model's own fresh build that does not read is the model's fault.
-            let means = meaning(tag, &aligned(bytes.to_vec())).map_err(harness)?;
-            match self.meanings.insert((tag.0, key.0), means) {
-                Some(before) if before != means => {
-                    Err(oracle(format!("two values under one key of kind {}: a key that misses an input", tag.0)))
-                }
-                _ => Ok(()),
-            }
-        };
-        for unit in fresh {
-            file(UnitManifest::TAG, unit.manifest.id(), &unit.manifest_bytes)?;
-            file(Surface::TAG, unit.surface.id(), &unit.surface_bytes)?;
-            for (_, _, key, bytes) in &unit.bodies {
-                file(Body::TAG, key.id(), bytes)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn check_meaning(&self, tag: Tag, key: ContentId, bytes: &[u8], what: &str) -> Result<(), Broke> {
-        // These bytes are the driver's (a hit or a put): one that does not read is a finding.
-        let means = meaning(tag, bytes).map_err(oracle)?;
-        match self.meanings.get(&(tag.0, key.0)) {
-            Some(fresh) if *fresh == means => Ok(()),
-            Some(_) => Err(oracle(format!("{what} of kind {} is not what a fresh build files under its key", tag.0))),
-            None => Err(oracle(format!("{what} of kind {} under a key no fresh build made", tag.0))),
-        }
-    }
-
-    /// The verify-once oracle for a look at item `item` of unit `unit`.
-    fn examine(&self, unit: u32, item: StableId) -> Result<(), Broke> {
-        if self.seen.settled.contains(&unit) {
-            return Err(oracle(format!("a lookup under a held manifest: unit {unit}")));
-        }
-        if self.seen.unchanged.get(unit as usize) == Some(&true) {
-            return Err(oracle(format!("a dependent of an unchanged surface was examined: unit {unit}")));
-        }
-        if self.seen.proved.contains(&(unit, item.0.0)) {
-            return Err(oracle(format!("a check after a hit: unit {unit}")));
-        }
-        Ok(())
-    }
-
-    fn perform(&mut self, effect: &Effect<'_>, fresh: &[FreshUnit]) -> Result<Answer, Broke> {
+    /// What goes wrong is the driver's (a task it starts, a universe it hands out): the
+    /// oracle's.
+    fn perform(&mut self, effect: &Effect<'_>) -> Result<Answer, Broke> {
         Ok(match *effect {
-            Effect::Get { ticket, unit, item, tag, key, .. } => {
-                let record = self.disk.records.get(&(tag.0, key.0)).cloned();
-                if unit != NO_UNIT {
-                    if !self.seen.gets.insert((unit, tag.0, item.0.0, key.0)) {
-                        return Err(oracle(format!("an item looked up twice in one snapshot: unit {unit}, kind {}", tag.0)));
-                    }
-                    let fresh_unit = &fresh[unit as usize];
-                    if tag == UnitManifest::TAG {
-                        if record.is_some() && key == fresh_unit.manifest.id() {
-                            self.seen.settled.insert(unit);
-                        }
-                    } else {
-                        self.examine(unit, item)?;
-                        if record.is_some() && fresh_unit.key_of(item) == Some(key) {
-                            self.seen.proved.insert((unit, item.0.0));
-                        }
-                    }
-                }
-                if let Some(bytes) = record.as_ref().filter(|_| tag != Certificate::TAG) {
-                    self.check_meaning(tag, key, bytes, "a hit")?;
-                    if tag == UnitManifest::TAG {
-                        let root =
-                            record::open::<UnitManifest>(bytes, &Key::from_id(key)).map_err(|e| oracle(e.to_string()))?;
-                        for entry in root.entries.follow(bytes).map_err(|e| oracle(e.to_string()))? {
-                            if !self.disk.records.contains_key(&(entry.tag, entry.key.0)) {
-                                return Err(oracle("a manifest hit names a record the store lacks"));
-                            }
-                        }
-                    }
-                }
-                Answer::Got(ticket, record)
+            Effect::Get { ticket, tag, key, .. } => Answer::Got(ticket, self.get(tag, key).cloned()),
+            Effect::Outside { ticket, .. } => Answer::Answers(ticket, vec![self.world.digest()]),
+            Effect::Answer { ticket, unit, asks, universe, made } => {
+                let answers = self.with_universe(unit, universe, made, |universe| {
+                    asks.iter()
+                        .map(|id| universe.answer(id).map_err(|why| format!("an ask the universe refuses: {why:?}")))
+                        .collect::<Result<Vec<ContentId>, String>>()
+                })?;
+                Answer::Answers(ticket, answers.map_err(Broke::Oracle)?)
             }
-            Effect::Answer { ticket, tag, shape, .. } => {
-                if tag != Certificate::TAG || shape != SHAPE {
-                    return Err(oracle("an answer asked of a shape the model never filed"));
-                }
-                Answer::Answers(ticket, vec![self.world()])
-            }
-            Effect::Verify { ticket, unit, item, reads } => {
-                if !self.seen.verifies.insert((unit, item.0.0)) {
-                    return Err(oracle(format!("an item verified twice in one snapshot: unit {unit}")));
-                }
-                self.examine(unit, item)?;
-                let facts = self.facts_now(unit as usize);
-                let now: Vec<Option<ContentId>> =
-                    reads.iter().map(|read| facts.iter().find(|fact| fact.id == read.id).map(|fact| fact.digest)).collect();
-                if reads.iter().zip(&now).all(|(read, now)| *now == Some(read.digest)) {
-                    self.seen.proved.insert((unit, item.0.0));
-                }
-                Answer::Now(ticket, now)
-            }
-            Effect::Run { ticket, task, .. } => {
+            Effect::Run { ticket, task, universe, made, .. } => {
                 self.in_flight += 1;
-                if self.in_flight > WORKERS.max(1) {
-                    return Err(oracle(format!("{} tasks run at once on {WORKERS} workers", self.in_flight)));
+                if self.in_flight > WORKERS {
+                    return Err(Broke::Oracle(format!("{} tasks at once: more tasks than workers", self.in_flight)));
                 }
+                let (world, earlier) = (self.world, self.requests.saturating_sub(1));
                 match task {
                     Task::Key { unit } => {
-                        let unit_fresh = &fresh[unit as usize];
-                        let bodies = unit_fresh.bodies.iter().map(|(_, item, key, _)| (*item, *key)).collect();
-                        Answer::Keyed(ticket, unit_fresh.manifest, unit_fresh.surface, bodies)
+                        let c = unit as usize;
+                        let (files, items) = world.keyed(c);
+                        Answer::Keyed(ticket, world.text_key(c), world.surface_key(c), files, items)
                     }
                     Task::Surface { unit, key } => {
-                        if self.disk.records.contains_key(&(Surface::TAG.0, key.id().0)) {
-                            return Err(oracle("a surface task ran for a record the store holds"));
+                        let c = unit as usize;
+                        if key != world.surface_key(c) {
+                            return Err(Broke::Oracle(format!("unit {c}'s surface asked under another key")));
                         }
-                        Answer::Wrote(ticket, aligned(fresh[unit as usize].surface_bytes.clone()))
+                        let bytes = self
+                            .with_universe(unit, universe, made, |universe| {
+                                surface_task(&world, c, true, earlier, &mut |id: &ContentId| {
+                                    universe.answer(id).map_err(|why| format!("{why:?}"))
+                                })
+                            })?
+                            .map_err(Broke::Oracle)?;
+                        Answer::Wrote(ticket, Aligned::copy_from(&bytes))
                     }
                     Task::Body { unit, item, key } => {
-                        if self.disk.records.contains_key(&(Body::TAG.0, key.id().0)) {
-                            return Err(oracle("a body task ran for a record the store holds"));
-                        }
                         let c = unit as usize;
-                        let Some(&(i, ..)) = fresh[c].bodies.iter().find(|(_, id, ..)| *id == item) else {
-                            return Err(oracle("a body task for an item the unit lacks"));
+                        let Some(i) = (0..ITEMS).find(|&i| stable(c, i) == item) else {
+                            return Err(Broke::Oracle(format!("a body task for no item of unit {c}")));
                         };
-                        Answer::Wrote(ticket, aligned(self.body_record(c, i, &key, planted(Plant::ReadDropped))))
+                        if key != world.body_key(c, i) {
+                            return Err(Broke::Oracle(format!("unit {c} item {i}'s body asked under another key")));
+                        }
+                        let bytes = self
+                            .with_universe(unit, universe, made, |universe| {
+                                body_task(&world, c, i, true, earlier, &mut |id: &ContentId| {
+                                    universe.answer(id).map_err(|why| format!("{why:?}"))
+                                })
+                            })?
+                            .map_err(Broke::Oracle)?;
+                        Answer::Wrote(ticket, Aligned::copy_from(&bytes))
                     }
                 }
             }
-            Effect::Put { ticket, tag, key, namespace, bytes } => {
-                // The simulated machine is no trusted writer: everything is filed in its own
-                // namespace, as the plan named it.
-                if namespace != Namespace::LOCAL {
-                    return Err(oracle(format!(
-                        "a put of kind {} key {key:?} in namespace {:016x}, on a machine that is no trusted writer",
-                        tag.0, namespace.0
-                    )));
-                }
-                if tag != Certificate::TAG {
-                    self.check_meaning(tag, key, bytes, "a put")?;
-                }
-                let put = match self.disk.records.get(&(tag.0, key.0)).map(|held| **held == *bytes) {
-                    Some(true) => Put::Same,
-                    Some(false) => Put::Other,
-                    None => {
-                        self.disk.records.insert((tag.0, key.0), Aligned::copy_from(bytes));
-                        Put::Written
-                    }
-                };
-                Answer::Put(ticket, put)
-            }
-            Effect::Reads { ticket } => Answer::Reads(ticket, self.world()),
+            Effect::Put { ticket, tag, key, bytes, .. } => Answer::Put(ticket, tag, key, Aligned::copy_from(bytes)),
+            Effect::Reads { ticket } => Answer::Reads(ticket),
         })
     }
 
@@ -581,61 +513,60 @@ impl Model {
         match answer {
             Answer::Got(ticket, record) => driver.give(Input::Got { ticket, record: record.as_deref() }),
             Answer::Answers(ticket, now) => driver.give(Input::Answers { ticket, now: &now }),
-            Answer::Now(ticket, now) => driver.give(Input::Now { ticket, now: &now }),
-            Answer::Keyed(ticket, manifest, surface, bodies) => {
+            Answer::Keyed(ticket, manifest, surface, files, items) => {
                 self.in_flight -= 1;
-                let outcome = Ok(Done::Keyed { manifest, surface, bodies: &bodies });
+                let outcome = Ok(Done::Keyed { manifest, surface, files: &files, items: &items });
                 driver.give(Input::Ran { ticket, outcome });
             }
             Answer::Wrote(ticket, record) => {
                 self.in_flight -= 1;
                 driver.give(Input::Ran { ticket, outcome: Ok(Done::Wrote { record: &record }) });
             }
-            Answer::Put(ticket, put) => driver.give(Input::Put { ticket, put: Ok(put) }),
-            Answer::Reads(ticket, world) => {
+            Answer::Put(ticket, tag, key, bytes) => {
+                // A put lands when it is answered: a kill before drops it.
+                let put = match self.disk.get(&(tag.0, key)) {
+                    Some(held) if **held == *bytes => Put::Same,
+                    Some(_) => Put::Other,
+                    None => {
+                        self.disk.insert((tag.0, key), bytes);
+                        Put::Written
+                    }
+                };
+                driver.give(Input::Put { ticket, put: Ok(put) });
+            }
+            Answer::Reads(ticket) => {
+                let world = self.world.digest();
                 driver.give(Input::Reads { ticket, shape: SHAPE, then: &[world], now: &[world] });
             }
         }
     }
 
-    /// One request, to its outcome; `None` when it was killed.
+    /// One request, to its outcome and what it ran; `None` when it was killed.
     fn request<M: Memo>(&mut self, memo: &mut M, tape: &Tape, kill: Option<u32>) -> Result<Option<Outcome>, Broke> {
-        let fresh = self.fresh()?;
-        self.register(&fresh)?;
         self.in_flight = 0;
-        self.seen = Seen { unchanged: (0..3).map(|c| self.unchanged(c, &fresh)).collect(), ..Seen::default() };
+        self.requests += 1;
         let plans: Vec<UnitPlan<'static>> =
-            (0..3).map(|c| UnitPlan { deps: DEPS[c], last: self.disk.last.get(c).copied(), namespace: Namespace::LOCAL }).collect();
-        let outcome = proof::scope(|snap| self.drive(snap, memo, tape, kill, &fresh, &plans))?;
+            (0..UNITS).map(|c| UnitPlan { deps: DEPS[c], last: self.last[c], namespace: Namespace::LOCAL, owner: owner(c) }).collect();
+        let outcome = proof::scope(|snap| self.drive(snap, memo, tape, kill, &plans))?;
         if let Some(outcome) = &outcome {
-            self.check_end(outcome, &fresh)?;
-            self.disk.last = fresh.iter().map(|unit| unit.manifest).collect();
-            self.last_own = (0..3).map(|c| self.own(c)).collect();
-            self.last_surfaces = fresh.iter().map(|unit| unit.surface).collect();
+            self.last = self.check_end(outcome, M::AUDIT)?.map(Some);
         }
         Ok(outcome)
     }
 
-    fn drive<M: Memo>(
-        &mut self,
-        snap: Snapshot<'_>,
-        memo: &mut M,
-        tape: &Tape,
-        kill: Option<u32>,
-        fresh: &[FreshUnit],
-        plans: &[UnitPlan<'_>],
-    ) -> Result<Option<Outcome>, Broke> {
+    /// The host's answers are a [`Flight`]: each step the tape chooses whether one is delivered
+    /// before the driver is asked again, and which; calm asks the driver first and delivers the
+    /// oldest when it waits.
+    fn drive<M: Memo>(&mut self, snap: Snapshot<'_>, memo: &mut M, tape: &Tape, kill: Option<u32>, plans: &[UnitPlan<'_>]) -> Result<Option<Outcome>, Broke> {
         let plan = Plan { certificate: certificate(), namespace: Namespace::LOCAL, units: plans };
         let mut driver =
-            Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| oracle(format!("{error:?}")))?;
-        // The host's answers, each due at once: which comes next is the tape's choice.
+            Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| Broke::Harness(format!("{error:?}")))?;
         let mut flight: Flight<Answer> = Flight::new();
         let mut performed = 0u32;
-        for _ in 0..20_000 {
+        for _ in 0..50_000 {
             if !flight.is_empty() && tape.coin("deliver early") {
-                // Every answer is asked due at once, so one is due whenever any is in flight.
                 let Some(answer) = flight.deliver(tape, Nanos(0)) else {
-                    return Err(harness("answers in flight and none due at time 0"));
+                    return Err(Broke::Harness("answers are in flight, yet none is due".into()));
                 };
                 self.deliver(&mut driver, answer);
                 continue;
@@ -650,10 +581,11 @@ impl Model {
                 Step::Do(effect) => {
                     performed += 1;
                     if kill == Some(performed) {
+                        // A kill: what was in flight is gone, unanswered puts with it.
                         flight.kill();
                         return Ok(None);
                     }
-                    Act::Asked(self.perform(&effect, fresh)?)
+                    Act::Asked(self.perform(&effect)?)
                 }
                 Step::Wait(_) => Act::Wait,
             };
@@ -662,114 +594,209 @@ impl Model {
                     if let Outcome::Certified { .. } = outcome
                         && driver.certified().is_none()
                     {
-                        return Err(oracle("a certified outcome with no certificate proof"));
+                        return Err(Broke::Oracle("a certified outcome with no certificate proof".into()));
                     }
                     return Ok(Some(outcome));
                 }
                 Act::Asked(answer) => flight.ask(answer),
-                Act::Wait => match flight.deliver(tape, Nanos(0)) {
-                    Some(answer) => self.deliver(&mut driver, answer),
-                    // A stall: the oracle's "nothing stalls".
-                    None => return Err(oracle("the driver waits with nothing asked")),
-                },
+                Act::Wait => {
+                    let Some(answer) = flight.deliver(tape, Nanos(0)) else {
+                        return Err(Broke::Oracle("the driver waits with nothing asked".into()));
+                    };
+                    self.deliver(&mut driver, answer);
+                }
             }
         }
-        // A stall too; the bound is far above any request of the model.
-        Err(oracle("no outcome in 20000 steps"))
+        Err(Broke::Harness("no outcome in 50000 steps".into()))
     }
 
-    fn check_end(&self, outcome: &Outcome, fresh: &[FreshUnit]) -> Result<(), Broke> {
+    /// The oracle at a request's end: the manifests the certificate names, each checked
+    /// against a from-scratch build.
+    fn check_end(&self, outcome: &Outcome, audit: bool) -> Result<[Key<UnitManifest>; UNITS], Broke> {
         let checks: Checks = match outcome {
-            Outcome::Built { ran } => ran.checks,
             Outcome::Certified { checks } => *checks,
-            other => return Err(oracle(format!("the request ended {other:?}"))),
+            Outcome::Built { ran, filed: Filed::Certificate } => ran.checks,
+            Outcome::Built { ran, filed: Filed::Audited } if audit => ran.checks,
+            other => return Err(Broke::Oracle(format!("the request ended {other:?}"))),
         };
         if checks.rechecks != 0 {
-            return Err(oracle(format!("{} checks of an item already proved in this snapshot", checks.rechecks)));
+            return Err(Broke::Oracle(format!("{} checks of an item already proved: a check after a proof", checks.rechecks)));
         }
-        let address = outside::address(certificate(), SHAPE, &[self.world()]);
-        let Some(bytes) = self.disk.records.get(&(Certificate::TAG.0, address.id().0)) else {
-            return Err(oracle("an answer with no certificate of the tree"));
+        let address = outside::address(certificate(), SHAPE, &[self.world.digest()]);
+        let Some(bytes) = self.get(Certificate::TAG, address.id()) else {
+            return Err(Broke::Oracle("an answer whose certificate the store does not hold".into()));
         };
-        let root = record::open::<Certificate>(bytes, &address).map_err(|e| oracle(e.to_string()))?;
-        let payload = root.payload.follow(bytes).map_err(|e| oracle(e.to_string()))?;
-        let manifests: Vec<u8> = fresh.iter().flat_map(|unit| unit.manifest.id().0).collect();
-        if payload != &manifests[..] {
-            return Err(oracle("the certificate names other manifests than a fresh build's"));
+        let root = record::open::<Certificate>(bytes, &address).map_err(|e| Broke::Oracle(e.to_string()))?;
+        let payload = root.payload.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))?;
+        if payload.len() != 32 * UNITS {
+            return Err(Broke::Oracle("a certificate naming another number of manifests".into()));
         }
-        for (c, unit) in fresh.iter().enumerate() {
-            if !self.disk.records.contains_key(&(UnitManifest::TAG.0, unit.manifest.id().0)) {
-                return Err(oracle(format!("unit {c}'s manifest is not in the store")));
+        let fresh = fresh(&self.world).map_err(Broke::Harness)?;
+        let mut manifests = [Key::from_id(ContentId([0; 32])); UNITS];
+        for c in 0..UNITS {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&payload[32 * c..32 * c + 32]);
+            manifests[c] = Key::from_id(ContentId(id));
+            self.check_unit(c, manifests[c], &fresh[c])?;
+        }
+        Ok(manifests)
+    }
+
+    /// A read the model cannot answer is the harness's; one not true now, the oracle's.
+    fn true_now(&self, c: usize, body: bool, reads: &[Fact], what: &str) -> Result<(), Broke> {
+        for read in reads {
+            if self.world.value(c, body, &read.id).map_err(Broke::Harness)? != read.digest {
+                return Err(Broke::Oracle(format!("unit {c}'s {what} holds a read that is not true now: not what a fresh build files")));
             }
         }
         Ok(())
     }
+
+    fn check_unit(&self, c: usize, manifest: Key<UnitManifest>, fresh: &Fresh) -> Result<(), Broke> {
+        let Some(bytes) = self.get(UnitManifest::TAG, manifest.id()) else {
+            return Err(Broke::Oracle(format!("unit {c}'s manifest is named but the store does not hold it")));
+        };
+        let root: &ManifestRoot = record::open::<UnitManifest>(bytes, &manifest).map_err(|e| Broke::Oracle(e.to_string()))?;
+        if root.key != fresh.text.id() {
+            return Err(Broke::Oracle(format!("unit {c}'s manifest is of another text: not what a fresh build files")));
+        }
+        let Some(surface) = self.get(Surface::TAG, root.surface) else {
+            return Err(Broke::Oracle(format!("unit {c}'s surface is named but the store does not hold it")));
+        };
+        if result_of(surface).map_err(Broke::Oracle)? != fresh.surface || root.surface_result != fresh.surface {
+            return Err(Broke::Oracle(format!("unit {c}'s surface is not what a fresh build files")));
+        }
+        let surface_root = blaze_format::open::<Traced>(surface).map_err(|e| Broke::Oracle(e.to_string()))?;
+        self.true_now(c, false, surface_root.reads.follow(surface).map_err(|e| Broke::Oracle(e.to_string()))?, "surface")?;
+        let dictionary = root.dictionary.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))?;
+        self.true_now(c, true, dictionary, "dictionary")?;
+        if root.made.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))? != &fresh.made[..] {
+            return Err(Broke::Oracle(format!("unit {c}'s made table is not what a fresh build files")));
+        }
+        let mut items = BTreeSet::new();
+        for file in root.files.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))? {
+            let Some(chunk) = self.get(crate::kind::UnitChunk::TAG, file.chunk) else {
+                return Err(Broke::Oracle(format!("unit {c}'s chunk is named but the store does not hold it")));
+            };
+            let chunk_root: &ChunkRoot =
+                record::open::<crate::kind::UnitChunk>(chunk, &Key::from_id(file.chunk)).map_err(|e| Broke::Oracle(e.to_string()))?;
+            for entry in chunk_root.entries.follow(chunk).map_err(|e| Broke::Oracle(e.to_string()))? {
+                let item = StableId(entry.item);
+                let Some((key, result)) = fresh.bodies.get(&item) else {
+                    return Err(Broke::Oracle(format!("unit {c}'s manifest names an item it does not have")));
+                };
+                if entry.key != key.id() {
+                    return Err(Broke::Oracle(format!("unit {c}'s entry is under another key: not what a fresh build files")));
+                }
+                let Some(record) = self.get(Body::TAG, entry.address) else {
+                    return Err(Broke::Oracle(format!("unit {c}'s body is named but the store does not hold it")));
+                };
+                if result_of(record).map_err(Broke::Oracle)? != *result || entry.result != *result {
+                    return Err(Broke::Oracle(format!("unit {c}'s body is not what a fresh build files")));
+                }
+                let body_root = blaze_format::open::<Traced>(record).map_err(|e| Broke::Oracle(e.to_string()))?;
+                self.true_now(c, true, body_root.reads.follow(record).map_err(|e| Broke::Oracle(e.to_string()))?, "body")?;
+                items.insert(item);
+            }
+        }
+        if items.len() != ITEMS {
+            return Err(Broke::Oracle(format!("unit {c}'s manifest names {} items of {ITEMS}", items.len())));
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, op: Op) {
+        match op {
+            Op::Body(c, i, v) => self.world.items[c][i].body = v,
+            Op::Sig(c, i, v) => self.world.items[c][i].sig = v,
+            Op::Env(var, value) => self.world.env[var] = value,
+            Op::Request { .. } | Op::Restart => {}
+        }
+    }
+
+    /// The fresh records the store does not hold: (surfaces, bodies) a request must run.
+    fn missing(&self) -> Result<(u32, u32), String> {
+        let (mut surfaces, mut bodies) = (0, 0);
+        for c in 0..UNITS {
+            let surface = surface_task(&self.world, c, false, 0, &mut |id: &ContentId| self.world.value(c, false, id))?;
+            let root = blaze_format::open::<Traced>(&surface).map_err(|e| e.to_string())?;
+            surfaces += u32::from(self.get(Surface::TAG, root.head.key).is_none());
+            for i in 0..ITEMS {
+                let body = body_task(&self.world, c, i, false, 0, &mut |id: &ContentId| self.world.value(c, true, id))?;
+                let root = blaze_format::open::<Traced>(&body).map_err(|e| e.to_string())?;
+                bodies += u32::from(self.get(Body::TAG, root.head.key).is_none());
+            }
+        }
+        Ok((surfaces, bodies))
+    }
 }
 
-/// Runs `ops` from an empty store, each process with a memo from `make`, the host's answers
-/// delivered in the order `tape` chooses; the outcomes of the requests that finished.
-fn run<M: Memo>(
-    ops: &[Op],
-    tape: &Tape,
-    plant: Plant,
-    kills: bool,
-    make: impl Fn() -> M,
-) -> Result<(Vec<Outcome>, Model), Broke> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Op {
+    Body(usize, usize, u8),
+    Sig(usize, usize, u8),
+    Env(usize, Option<u8>),
+    Request { kill: Option<u32> },
+    /// A new process: the resident memo starts empty.
+    Restart,
+}
+
+const REQUEST: Op = Op::Request { kill: None };
+
+/// Runs `ops` from an empty store, each process with a memo from `make`, the host's schedule
+/// drawn from `tape`: the outcomes of the requests that finished, and the simulation.
+fn run<M: Memo>(ops: &[Op], tape: &Tape, plant: Plant, kills: bool, make: impl Fn() -> M) -> Result<(Vec<Outcome>, Sim), Broke> {
     PLANT.set(plant);
     let result = (|| {
-        let mut model = Model::new();
+        let mut sim = Sim::new();
         let mut memo = make();
         let mut outcomes = Vec::new();
-        let mut last_built = false;
+        let mut answered = false;
         for &op in ops {
             match op {
-                Op::Request { kill } => {
-                    let kill = kill.filter(|_| kills);
-                    match model.request(&mut memo, tape, kill)? {
-                        Some(outcome) => {
-                            if last_built && !matches!(outcome, Outcome::Certified { .. }) {
-                                return Err(oracle(format!("a request with no edit after an answer ended {outcome:?}")));
-                            }
-                            last_built = true;
-                            outcomes.push(outcome);
+                Op::Request { kill } => match sim.request(&mut memo, tape, kill.filter(|_| kills))? {
+                    Some(outcome) => {
+                        let settled = matches!(outcome, Outcome::Certified { .. })
+                            || (M::AUDIT && matches!(outcome, Outcome::Built { filed: Filed::Audited, .. }));
+                        if answered && !settled {
+                            return Err(Broke::Oracle(format!("a request with no edit after an answer ended {outcome:?}")));
                         }
-                        None => {
-                            last_built = false;
-                            memo = make();
-                        }
+                        answered = true;
+                        outcomes.push(outcome);
                     }
-                }
+                    None => {
+                        answered = false;
+                        memo = make();
+                    }
+                },
                 Op::Restart => memo = make(),
                 edit => {
-                    model.apply(edit);
-                    last_built = false;
+                    sim.apply(edit);
+                    answered = false;
                 }
             }
         }
-        Ok((outcomes, model))
+        Ok((outcomes, sim))
     })();
     PLANT.set(Plant::None);
     result
 }
 
-/// One edit, restart or request. Calm (every draw 0) is a request that is not killed.
 fn op(tape: &Tape) -> Op {
     let c = tape.int_in(0..=2u8, "unit") as usize;
-    let i = tape.int_in(0..=2u8, "item") as usize;
-    let v = tape.int_in(0..=2u8, "value");
-    // Ten kinds, a plain request three of them, as before; it is at 0 so the calm op is quiet.
-    match tape.int_in(0..=9u8, "op") {
-        0..=2 => REQUEST,
-        3 => Op::Body(c, i, v),
-        4 => Op::Sig(c, i, v),
-        5 => Op::Param(c, i, v),
-        6 => Op::Toggle(c, i),
-        7 => Op::Env(i % 2, (v > 0).then_some(v)),
-        8 => Op::Restart,
-        _ => Op::Request { kill: Some(u32::from(tape.int_in(0..=60u8, "kill at")) + 1) },
+    let i = tape.int_in(0..=3u8, "item") as usize;
+    let v = tape.int_in(0..=3u8, "value");
+    match tape.int_in(0..=8u8, "op") {
+        0 | 1 => Op::Body(c, i, v),
+        2 | 3 => Op::Sig(c, i, v),
+        4 => Op::Env(i % 2, (v > 0).then_some(v)),
+        5 => Op::Restart,
+        6 => Op::Request { kill: Some(u32::from(tape.int_in(0..=120u8, "kill at")) + 1) },
+        _ => REQUEST,
     }
 }
 
+/// Up to 30 ops, each its own span.
 fn ops(tape: &Tape) -> Vec<Op> {
     tape.vec(0..=30, "ops", op)
 }
@@ -777,11 +804,11 @@ fn ops(tape: &Tape) -> Vec<Op> {
 const CAP: u64 = 1 << 20;
 
 /// The invariant: under `RecordsOnly`, for any edits, restarts and kills in any order of the
-/// host's answers, every hit and every reuse is what a fresh build files, every check is made
-/// once per request and none after a proof, no task runs for a record the store holds, at most
-/// `max(workers, 1)` run, and a request after an answer with no edit is certified.
+/// host's answers, every unit's manifest a finished request names holds what a from-scratch
+/// build by value makes, the store holds all it names, no check follows a proof, at most
+/// `max(workers, 1)` tasks run, and a request after an answer with no edit is certified.
 #[test]
-fn a_hit_is_only_what_a_fresh_build_files() {
+fn the_driver_builds_what_a_fresh_build_builds() {
     blaze_sim::check(Config::cases(200), |tape| {
         let ops = ops(tape);
         run(&ops, tape, Plant::None, true, || RecordsOnly).map(|_| ())
@@ -790,189 +817,327 @@ fn a_hit_is_only_what_a_fresh_build_files() {
 
 /// The invariant: the same under `Resident`, a memo kept across requests of one process.
 #[test]
-fn a_resident_hit_is_only_what_a_fresh_build_files() {
+fn a_resident_driver_builds_what_a_fresh_build_builds() {
     blaze_sim::check(Config::cases(200), |tape| {
         let ops = ops(tape);
         run(&ops, tape, Plant::None, true, || Resident::new(CAP)).map(|_| ())
     });
 }
 
-/// The two memos run `ops` under one schedule. The schedule stays one seed drawn from the case's
-/// tape: the two runs must make the same choices in the same order, and a tape hands each choice
-/// out once, so each run reads its own `Tape::seeded` of that seed.
-fn refines(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let seed = tape.next_u64("schedule seed");
-    let (plain, plain_model) = run(ops, &Tape::seeded(seed), plant, false, || RecordsOnly)?;
-    let (resident, resident_model) = run(ops, &Tape::seeded(seed), plant, false, || Resident::new(CAP))?;
+/// The invariant: `Audit`, which redoes every hit and compares bytes, never faults without a
+/// plant: every record found at an address is the one its work makes again.
+#[test]
+fn audit_never_faults_without_a_plant() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || Audit).map(|_| ())
+    });
+}
+
+/// Both memos run `ops` on the same schedule: each on its own tape of `seed`.
+fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), Broke> {
+    let (plain, plain_sim) = run(ops, &Tape::seeded(seed), plant, false, || RecordsOnly)?;
+    let (resident, resident_sim) = run(ops, &Tape::seeded(seed), plant, false, || Resident::new(CAP))?;
     if plain != resident {
-        return Err(oracle(format!("outcomes differ: records-only {plain:?}, resident {resident:?}")));
+        return Err(Broke::Oracle(format!("outcomes differ: records-only {plain:?}, resident {resident:?}")));
     }
-    let bytes = |model: &Model| model.disk.records.iter().map(|(key, bytes)| (*key, bytes.to_vec())).collect::<Vec<_>>();
-    if bytes(&plain_model) != bytes(&resident_model) {
-        return Err(oracle("the stores differ between records-only and resident"));
+    let bytes = |sim: &Sim| sim.disk.iter().map(|(key, bytes)| (*key, bytes.to_vec())).collect::<Vec<_>>();
+    if bytes(&plain_sim) != bytes(&resident_sim) {
+        return Err(Broke::Oracle("the stores differ between records-only and resident".into()));
     }
     Ok(())
 }
 
-/// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes (the
-/// check counters included), the same tasks run and the same records written, for any edits and
+/// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes (what
+/// ran and the check counters included) and the same records written, for any edits and
 /// restarts.
 #[test]
 fn resident_refines_records_only() {
     blaze_sim::check(Config::cases(200), |tape| {
         let ops = ops(tape);
-        refines(&ops, tape, Plant::None)
+        let seed = tape.next_u64("schedule seed");
+        refines(&ops, seed, Plant::None)
     });
 }
 
-/// A control's cases: the 16 seeds each control looped by hand before, now schedules on the tape.
-const CONTROL: Config = Config::cases(16);
+/// What a finding in one of a control's words is marked with, so one string names them all.
+const SAID: &str = "in the control's words: ";
+
+/// `ops` pass in every case as the code is, and with `plant` some case is refused by the oracle
+/// saying one of `says`: [`blaze_sim::control`] over 16 schedules, as many as the seeds the
+/// loop it replaced ran.
+#[track_caller]
+fn caught(ops: &[Op], plant: Plant, says: &[&str], check: impl Fn(&[Op], &Tape, Plant) -> Result<(), Broke>) {
+    blaze_sim::control(Config::cases(16), Plant::None, plant, SAID, |tape, plant| match check(ops, tape, plant) {
+        Err(Broke::Oracle(why)) if says.iter().any(|says| why.contains(says)) => Err(Broke::Oracle(format!("{SAID}{why}"))),
+        ran => ran,
+    });
+}
 
 fn plain(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
     run(ops, tape, plant, true, || RecordsOnly).map(|_| ())
 }
 
-#[test]
-fn the_oracle_catches_a_key_that_leaves_out_a_name() {
-    let ops = [REQUEST, Op::Sig(1, 2, 1), REQUEST];
-    blaze_sim::control(CONTROL, Plant::None, Plant::KeyLeavesOutNames, "a key that misses an input", |tape, plant| {
-        plain(&ops, tape, plant)
-    });
+fn audited(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || Audit).map(|_| ())
 }
+
+fn resident(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || Resident::new(CAP)).map(|_| ())
+}
+
+/// Every edit of every item, each followed by a request: what most controls run.
+fn every_edit() -> Vec<Op> {
+    let mut ops = vec![REQUEST];
+    for c in 0..UNITS {
+        for i in 0..ITEMS {
+            for v in [1, 2, 0] {
+                ops.extend([Op::Sig(c, i, v), REQUEST, Op::Body(c, i, v), REQUEST]);
+            }
+        }
+    }
+    ops.extend([Op::Env(0, Some(1)), REQUEST, Op::Env(1, Some(2)), REQUEST, Op::Env(0, None), REQUEST]);
+    ops
+}
+
+/// A stale record settled: the from-scratch comparison refuses it.
+const STALE: &[&str] = &["not what a fresh build files"];
+/// A stale record settled, or one the driver's own checks refuse first (a record whose head is
+/// not the address its key and reads make).
+const STALE_OR_REFUSED: &[&str] = &["not what a fresh build files", "the request ended"];
 
 #[test]
 fn the_oracle_catches_a_manifest_key_that_leaves_out_late_inputs() {
-    let ops = [REQUEST, Op::Env(0, Some(1)), REQUEST];
-    blaze_sim::control(CONTROL, Plant::None, Plant::KeyLeavesOutLateInputs, "a key that misses an input", |tape, plant| {
-        plain(&ops, tape, plant)
-    });
+    let ops = [REQUEST, Op::Env(0, Some(1)), REQUEST, Op::Env(1, Some(1)), REQUEST];
+    caught(&ops, Plant::KeyLeavesOutLateInputs, STALE, plain);
 }
 
 #[test]
 fn the_oracle_catches_a_dropped_read() {
-    let ops = [REQUEST, Op::Sig(1, 2, 1), REQUEST];
-    blaze_sim::control(CONTROL, Plant::None, Plant::ReadDropped, "not what a fresh build files", |tape, plant| {
-        plain(&ops, tape, plant)
-    });
+    caught(&every_edit(), Plant::ReadDropped, STALE, plain);
+}
+
+#[test]
+fn the_oracle_catches_a_dropped_absence() {
+    caught(&every_edit(), Plant::AbsenceDropped, STALE, plain);
+}
+
+#[test]
+fn the_oracle_catches_a_shared_cache_hit_that_does_not_replay_its_reads() {
+    caught(&every_edit(), Plant::CacheHitNoReplay, STALE_OR_REFUSED, plain);
+}
+
+#[test]
+fn the_oracle_catches_a_made_fact_not_asked() {
+    caught(&every_edit(), Plant::MadeNotAsked, STALE, plain);
+}
+
+#[test]
+fn the_oracle_catches_a_dictionary_that_misses_a_fact() {
+    caught(&every_edit(), Plant::DictionaryMissesFact, STALE_OR_REFUSED, plain);
+}
+
+#[test]
+fn the_oracle_catches_a_maker_settled_after_its_reader() {
+    caught(&every_edit(), Plant::MakerAfterReader, STALE, plain);
 }
 
 #[test]
 fn the_oracle_catches_an_overcommitted_pool() {
-    blaze_sim::control(CONTROL, Plant::None, Plant::OverCommitsPool, "tasks run at once", |tape, plant| {
-        plain(&[REQUEST], tape, plant)
-    });
+    caught(&[REQUEST], Plant::OverCommitsPool, &["more tasks than workers"], plain);
 }
 
-/// The kill points of before (after effect 1 to 79 of the first request), drawn from the tape;
-/// its 316 cases are the 79 kill points times the 4 seeds each was run under by hand.
+#[test]
+fn the_audit_catches_two_values_under_one_address() {
+    let ops = [REQUEST, Op::Body(0, 0, 1), REQUEST, Op::Body(0, 0, 0), REQUEST];
+    caught(&ops, Plant::TwoValuesUnderAddress, &["Audit {"], audited);
+}
+
 #[test]
 fn the_oracle_catches_a_manifest_filed_before_its_records() {
-    blaze_sim::control(Config::cases(79 * 4), Plant::None, Plant::ManifestBeforeRecords, "lacks", |tape, plant| {
-        let kill = tape.int_in(1..=79u32, "kill at");
-        plain(&[Op::Request { kill: Some(kill) }, REQUEST], tape, plant)
-    });
+    let mut ops = vec![];
+    for kill in (4..80).step_by(3) {
+        ops.push(Op::Request { kill: Some(kill) });
+    }
+    ops.extend([REQUEST, Op::Body(0, 3, 1), REQUEST]);
+    caught(&ops, Plant::ManifestBeforeRecords, &["the store does not hold"], plain);
 }
 
 #[test]
 fn the_oracle_catches_a_stale_resident_entry() {
-    let ops = [REQUEST, Op::Env(0, Some(1)), REQUEST];
-    blaze_sim::control(CONTROL, Plant::None, Plant::StaleResident, "", |tape, plant| refines(&ops, tape, plant));
-}
-
-/// Body 1 of unit 2 is edited away and back while body 0 moves: its key hits the record of the
-/// first request while the last manifest names another; the planted driver still fetches and
-/// verifies that one.
-#[test]
-fn the_oracle_catches_a_check_after_a_hit() {
-    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), Op::Body(2, 0, 1), REQUEST];
-    blaze_sim::control(CONTROL, Plant::None, Plant::ChecksAfterHit, "a check after a hit", |tape, plant| {
-        plain(&ops, tape, plant)
-    });
+    // The stale mark is refused by the driver's key check (its head is another key), or, had
+    // it the key, by the from-scratch comparison.
+    let ops = [REQUEST, Op::Body(0, 0, 1), REQUEST, Op::Sig(1, 0, 1), REQUEST, Op::Env(0, Some(1)), REQUEST];
+    caught(&ops, Plant::StaleResident, STALE_OR_REFUSED, resident);
 }
 
 #[test]
-fn the_oracle_catches_a_lookup_under_a_held_manifest() {
-    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST];
-    blaze_sim::control(
-        CONTROL,
-        Plant::None,
-        Plant::LooksUpUnderHeldManifest,
-        "a lookup under a held manifest",
-        |tape, plant| plain(&ops, tape, plant),
-    );
+fn the_oracle_catches_a_lookup_under_a_held_mark() {
+    // Units 0 and 1, below the edit, settle by their marks.
+    let ops = [REQUEST, Op::Sig(2, 0, 1), REQUEST];
+    caught(&ops, Plant::LooksUpUnderMark, &["a check after a proof"], plain);
 }
 
-/// A private body edit in unit 0 leaves its surface equal; keyed by unit 0's manifest, its
-/// dependents' manifests move and their records are examined.
-#[test]
-fn the_oracle_catches_a_dependent_examined_under_an_unchanged_surface() {
-    let ops = [REQUEST, Op::Body(0, 1, 5), REQUEST];
-    blaze_sim::control(
-        CONTROL,
-        Plant::None,
-        Plant::UnitKeyedByDepManifests,
-        "a dependent of an unchanged surface was examined",
-        |tape, plant| plain(&ops, tape, plant),
-    );
+/// Runs `ops` under `RecordsOnly` with no kill, and the last request alone: what it ran, and
+/// the (surfaces, bodies) whose fresh records the store did not hold before it.
+fn last_request(ops: &[Op], before_last: impl FnOnce(&mut Sim)) -> (Outcome, (u32, u32)) {
+    let (init, last) = ops.split_at(ops.len() - 1);
+    assert_eq!(last, [REQUEST]);
+    let (_, mut sim) = run(init, &Tape::seeded(7), Plant::None, false, || RecordsOnly).unwrap();
+    before_last(&mut sim);
+    let missing = sim.missing().unwrap();
+    let mut memo = RecordsOnly;
+    let outcome = sim.request(&mut memo, &Tape::seeded(11), None).unwrap().unwrap();
+    (outcome, missing)
 }
 
-fn ran_of(ops: &[Op]) -> Ran {
-    let (outcomes, _) = run(ops, &Tape::seeded(7), Plant::None, false, || RecordsOnly).unwrap();
-    match outcomes.last() {
-        Some(Outcome::Built { ran }) => *ran,
-        other => panic!("the last request ended {other:?}"),
+fn built(outcome: &Outcome) -> Ran {
+    match outcome {
+        Outcome::Built { ran, filed: Filed::Certificate } => *ran,
+        other => panic!("not built: {other:?}"),
     }
 }
 
+/// A no-op is one certificate lookup.
 #[test]
 fn a_no_op_runs_no_task() {
-    let (outcomes, _) = run(&[REQUEST, REQUEST], &Tape::seeded(1), Plant::None, false, || RecordsOnly).unwrap();
-    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
-    let (outcomes, _) =
-        run(&[REQUEST, Op::Restart, REQUEST], &Tape::seeded(1), Plant::None, false, || RecordsOnly).unwrap();
-    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
+    let (outcome, _) = last_request(&[REQUEST, REQUEST], |_| {});
+    assert!(matches!(outcome, Outcome::Certified { .. }), "{outcome:?}");
 }
 
-/// An edit undone finds its old certificate at the old address: certified, nothing run.
+/// A dependency fact nobody read moves its unit's universe: the dependents miss their marks,
+/// answer their dictionaries and file a mark each, nothing else.
 #[test]
-fn an_undone_edit_is_certified() {
-    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), REQUEST];
-    let (outcomes, _) = run(&ops, &Tape::seeded(3), Plant::None, false, || RecordsOnly).unwrap();
-    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
+fn an_unrelated_edit_files_only_marks() {
+    // Unit 0's fourth signature: read by unit 0's own bodies only; its const stays equal.
+    let (outcome, missing) = last_request(&[REQUEST, Op::Sig(0, 3, 3), REQUEST], |_| {});
+    let ran = built(&outcome);
+    assert_eq!((ran.surfaces, ran.bodies), missing, "{ran:?}");
+    assert_eq!((ran.stood, ran.manifests, ran.marked), (2, 1, 0), "{ran:?}");
 }
 
-/// A private body edit redoes that body alone: no surface, nothing reused, no other body.
+/// A signature edit runs exactly the records whose address moved: the readers the postings
+/// name, whose answers changed.
 #[test]
-fn a_private_body_edit_redoes_one_body() {
-    let ran = ran_of(&[REQUEST, Op::Body(2, 1, 5), REQUEST]);
-    assert_eq!((ran.bodies, ran.surfaces, ran.reused), (1, 0, 0), "{ran:?}");
+fn a_signature_edit_redoes_exactly_its_readers() {
+    for (c, i) in [(0, 1), (0, 0), (1, 2), (2, 3)] {
+        let (outcome, missing) = last_request(&[REQUEST, Op::Sig(c, i, 1), REQUEST], |_| {});
+        let ran = built(&outcome);
+        assert_eq!((ran.surfaces, ran.bodies), missing, "unit {c} item {i}: {ran:?}");
+        assert!(ran.bodies > 0, "unit {c} item {i}: {ran:?}");
+    }
 }
 
-/// A private body edit in the bottom unit examines no dependent: the certificate's shape, its
-/// address and the next empty slot (3 lookups); unit 0's manifest, its last manifest, its four
-/// records and the edited body's old record (7); one manifest hit for each dependent (2). One
-/// read list per stage: the certificate's answers, the edited body's (which differs at its first
-/// fact), the request's settle.
+/// A body edit runs that body, and a body that reads the const it makes when the const moved.
 #[test]
-fn a_private_body_edit_below_examines_no_dependent() {
-    let ran = ran_of(&[REQUEST, Op::Body(0, 1, 5), REQUEST]);
-    assert_eq!((ran.bodies, ran.surfaces, ran.manifests), (1, 0, 1), "{ran:?}");
-    let checks = ran.checks;
-    assert_eq!((checks.key_lookups, checks.read_lists, checks.facts_compared), (12, 3, 3), "{ran:?}");
-    assert_eq!((checks.records_run, checks.rechecks), (1, 0), "{ran:?}");
+fn a_body_edit_runs_its_body() {
+    let (outcome, missing) = last_request(&[REQUEST, Op::Body(1, 1, 1), REQUEST], |_| {});
+    let ran = built(&outcome);
+    assert_eq!((ran.surfaces, ran.bodies), (0, 1), "{ran:?}");
+    assert_eq!(missing, (0, 1));
+    // Unit 0, below the edit, and unit 2, whose view is unchanged (unit 1's surface and made
+    // table are equal), settle by their marks.
+    assert_eq!(ran.marked, 2, "{ran:?}");
 }
 
-/// A parameter rename of an inline fn moves its callers' keys, and their read lists, which read
-/// only its signature, file the old results under the new keys.
+/// An undone edit finds its old certificate at its old address.
 #[test]
-fn a_parameter_rename_reuses_its_callers() {
-    let ran = ran_of(&[REQUEST, Op::Param(0, 0, 3), REQUEST]);
-    assert_eq!(ran.bodies, 1, "{ran:?}");
-    assert!(ran.reused >= 3, "{ran:?}");
+fn an_undo_files_nothing() {
+    let (outcome, _) = last_request(&[REQUEST, Op::Body(0, 0, 1), REQUEST, Op::Body(0, 0, 0), REQUEST], |_| {});
+    assert!(matches!(outcome, Outcome::Certified { .. }), "{outcome:?}");
 }
 
-/// The outside form: a changed answer is a new address, the old one's value stays filed, and a
-/// filing after a miss reads no slot the lookup read.
+/// Another machine's store, with no certificate: every unit is settled by its mark.
+#[test]
+fn a_store_with_no_certificate_settles_through_marks() {
+    let (outcome, _) = last_request(&[REQUEST, REQUEST], |sim| sim.disk.retain(|(tag, _), _| *tag != Certificate::TAG.0));
+    let ran = built(&outcome);
+    assert_eq!((ran.marked, ran.surfaces, ran.bodies, ran.manifests), (3, 0, 0, 0), "{ran:?}");
+}
+
+/// An undone edit with no certificate and no mark of the old tree: every record is found at
+/// its old address, nothing runs.
+#[test]
+fn an_undo_finds_its_records_by_address() {
+    let ops = [REQUEST, Op::Body(0, 2, 1), Op::Sig(1, 1, 2), REQUEST, Op::Body(0, 2, 0), Op::Sig(1, 1, 0), REQUEST];
+    let (outcome, missing) = last_request(&ops, |sim| {
+        sim.disk.retain(|(tag, _), _| *tag != Certificate::TAG.0 && *tag != crate::kind::Mark::TAG.0)
+    });
+    let ran = built(&outcome);
+    assert_eq!(missing, (0, 0));
+    assert_eq!((ran.surfaces, ran.bodies), (0, 0), "{ran:?}");
+    assert!(ran.found > 0, "{ran:?}");
+}
+
+/// Every case the oracle is meant to see is reached by the seeded runs below; a case no run
+/// reaches fails by name.
+#[test]
+fn every_case_is_reached() {
+    let mut cases: BTreeMap<&'static str, u32> = BTreeMap::new();
+    for name in [
+        "certified",
+        "built",
+        "killed",
+        "marked",
+        "stood",
+        "found by address",
+        "walked past a root",
+        "made redone",
+        "chunk reused",
+        "manifest rebuilt",
+        "late read moved",
+    ] {
+        cases.insert(name, 0);
+    }
+    // The plans of every run, from one tape; each run's schedule from a tape of its own seed.
+    let plans = Tape::seeded(3);
+    for seed in 0..48 {
+        let mut ops = vec![REQUEST];
+        for _ in 0..24 {
+            let (c, i, v) = (plans.index(UNITS, "unit"), plans.index(ITEMS, "item"), plans.below(4, "value") as u8);
+            ops.push(match plans.below(10, "op") {
+                0..=3 => Op::Body(c, i, v),
+                4..=6 => Op::Sig(c, i, v),
+                7 => Op::Env(i % 2, (v > 0).then_some(v)),
+                8 => Op::Request { kill: Some(plans.below(60, "kill at") as u32 + 1) },
+                _ => REQUEST,
+            });
+            if matches!(ops.last(), Some(Op::Env(..))) {
+                *cases.get_mut("late read moved").unwrap() += 1;
+            }
+            ops.push(REQUEST);
+        }
+        let (outcomes, _) =
+            run(&ops, &Tape::seeded(seed), Plant::None, true, || RecordsOnly).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        let requests = ops.iter().filter(|op| matches!(op, Op::Request { .. })).count();
+        *cases.get_mut("killed").unwrap() += (requests - outcomes.len()) as u32;
+        for outcome in outcomes {
+            let ran = match outcome {
+                Outcome::Certified { .. } => {
+                    *cases.get_mut("certified").unwrap() += 1;
+                    continue;
+                }
+                Outcome::Built { ran, .. } => ran,
+                other => panic!("seed {seed}: {other:?}"),
+            };
+            for (name, count) in [
+                ("built", 1),
+                ("marked", ran.marked),
+                ("stood", ran.stood),
+                ("found by address", ran.found),
+                ("walked past a root", ran.walked),
+                ("made redone", ran.redone),
+                ("chunk reused", (ran.manifests * 2).saturating_sub(ran.chunks)),
+                ("manifest rebuilt", ran.manifests),
+            ] {
+                *cases.get_mut(name).unwrap() += count;
+            }
+        }
+    }
+    let unreached: Vec<&str> = cases.iter().filter(|(_, count)| **count == 0).map(|(name, _)| *name).collect();
+    assert!(unreached.is_empty(), "cases no run reached: {unreached:?} (counts {cases:?})");
+}
+
 #[test]
 fn an_outside_value_moves_with_its_answers() {
     proof::scope(|snap| {
@@ -993,41 +1158,31 @@ fn an_outside_value_moves_with_its_answers() {
     });
 }
 
-fn first_closure(identity: ContentId, nodes: &[Node<'_>]) -> ContentId {
-    let graph = Graph::build(&[CrateNodes { identity, nodes, deps: &[] }], Global).unwrap();
-    graph.closure(0, 0).unwrap()
+/// The invariant: a record's address is its key and the answers to its shape: equal answers
+/// give the address back (an undo), a moved answer or an added read gives another.
+#[test]
+fn an_address_is_its_key_and_its_answers() {
+    let key = Key::<Body>::from_id(ContentId([3; 32]));
+    let read = |digest: u8| Fact { id: sig_fact(0, 0), digest: ContentId([digest; 32]) };
+    let a = record::address(key, &[read(1)]);
+    assert_eq!(a, record::address(key, &[read(1)]));
+    assert_ne!(a, record::address(key, &[read(2)]));
+    assert_ne!(a, record::address(key, &[read(1), Fact { id: sig_fact(0, 1), digest: ContentId([1; 32]) }]));
+    let (at, bytes) = record::write_read::<Body>(key, &[read(1)], &[], b"payload");
+    assert_eq!(at, a);
+    assert_eq!(record::check_read::<Body>(&Aligned::copy_from(&bytes), key).map(|(at, _)| at), Ok(a));
 }
 
-/// The invariant: a name that appears under a body's reach moves the body's key.
+/// The invariant: every fact id routes to the one table that answers it, from its bytes.
 #[test]
-fn an_added_name_moves_the_key() {
-    let identity = ContentId([9; 32]);
-    let a = [name_of(b"a")];
-    let b = [name_of(b"b")];
-    let user = Node { piece: b"fn user", names: &b, keys: &a, always: false, coarse: false };
-    let other = Node { piece: b"fn b", names: &[], keys: &b, always: false, coarse: false };
-    let alone = [user];
-    let both = [user, other];
-    assert_ne!(first_closure(identity, &alone), first_closure(identity, &both));
-}
-
-/// The invariant: the members of a cycle share one closure, and an edit to either moves both.
-#[test]
-fn a_cycle_is_one_component() {
-    let identity = ContentId([9; 32]);
-    let (a, b) = ([name_of(b"a")], [name_of(b"b")]);
-    let closures = |text: &'static [u8]| {
-        let nodes = [
-            Node { piece: b"fn a", names: &b, keys: &a, always: false, coarse: false },
-            Node { piece: text, names: &a, keys: &b, always: false, coarse: false },
-        ];
-        let graph = Graph::build(&[CrateNodes { identity, nodes: &nodes, deps: &[] }], Global).unwrap();
-        (graph.closure(0, 0).unwrap(), graph.closure(0, 1).unwrap())
-    };
-    let (a1, b1) = closures(b"fn b");
-    let (a2, _) = closures(b"fn b2");
-    assert_eq!(a1, b1);
-    assert_ne!(a1, a2);
+fn a_fact_routes_by_its_owner_and_kind() {
+    assert_eq!(record::route(&sig_fact(1, 0)), Ok(Route::Surface(owner(1))));
+    assert_eq!(record::route(&made_fact(2)), Ok(Route::Made(owner(2))));
+    assert_eq!(record::route(&asker_fact()), Ok(Route::Asker));
+    assert_eq!(record::route(&late_fact(0)), Ok(Route::Outside));
+    let mut unrouted = sig_fact(0, 0);
+    unrouted.0[10] = 0;
+    assert!(record::route(&unrouted).is_err());
 }
 
 fn drawn_id(tape: &Tape) -> ContentId {
@@ -1047,8 +1202,8 @@ fn a_segment_ref_round_trips() {
 
     blaze_sim::check(Config::cases(200), |tape| {
         let digest = SegmentId(drawn_id(tape));
-        let index_at = tape.int_in(HEADER as u64 / ALIGN..=1 << 24, "index at") * ALIGN;
-        let count = tape.int_in(0..=1u32 << 20, "count");
+        let index_at = tape.int_in(HEADER as u64 / ALIGN..=(1u64 << 24), "index at") * ALIGN;
+        let count = tape.int_in(0..=(1u32 << 20), "count");
         let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
         let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
         let row = made.encode();
@@ -1106,10 +1261,7 @@ fn a_statement_round_trips() {
         let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
         extended.extend_from_slice(&bytes);
         extended.push(0);
-        assert_eq!(
-            Statement::decode(&extended),
-            Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN })
-        );
+        assert_eq!(Statement::decode(&extended), Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN }));
         let mut tier = bytes;
         tier[92] = 2;
         assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
@@ -1152,4 +1304,7 @@ fn tags_has_no_duplicate() {
     let names: BTreeSet<&str> = TAGS.iter().map(|(_, name)| *name).collect();
     assert_eq!((tags.len(), names.len()), (TAGS.len(), TAGS.len()), "a tag or a name listed twice in `TAGS`");
     assert!(!tags.contains(&0), "no kind is at tag 0");
+    let mut sorted: Vec<u16> = tags.into_iter().collect();
+    sorted.dedup();
+    assert!(sorted.windows(2).all(|pair| pair[1] == pair[0] + 1), "the tags are not contiguous: {sorted:?}");
 }

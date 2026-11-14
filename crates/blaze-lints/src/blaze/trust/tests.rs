@@ -107,6 +107,54 @@ fn an_unsafe_block_is_denied() {
     assert!(out.contains("`left_pad::hidden` has an `unsafe` block"), "{out}");
 }
 
+/// What blaze appends to a proc-macro crate it builds for wasm (the module
+/// `hir_expand::proc_macro::GLUE_MODULE`: the list of its macros and the bridge's foreign
+/// functions) is not the crate's `unsafe` code: a proc-macro crate with none of its own is not
+/// told it has some. (The controls: the same items in a module of another name, and the same
+/// module in a crate that is no proc macro, are the crate's own.) Found on blaze-serde-derive:
+/// `declares the foreign function ..::__blaze_proc_macros::__blaze_wasm_entry::dispatch`.
+#[test]
+fn what_blaze_appends_to_a_proc_macro_crate_is_not_its_unsafe() {
+    let flags = format!("{} -W blaze::workspace_unsafe", flags());
+    let said = "of the workspace runs `unsafe` code";
+    let glue = |module: &str| {
+        format!(
+            "pub fn derive() -> u32 {{ 1 }}\npub mod {module} {{\n    pub mod __blaze_wasm_entry {{\n        \
+             unsafe extern \"C\" {{ pub fn dispatch(index: u32) -> u32; }}\n        \
+             pub fn enter(index: u32) -> u32 {{ unsafe {{ dispatch(index) }} }}\n    }}\n}}\n"
+        )
+    };
+    let fixture = |kind: &str, module: &str| {
+        format!("{MINICORE}{STD}//- /src/lib.rs crate:{kind}main deps:std\n{}", glue(module))
+    };
+    let out = lint_with(&fixture("proc-macro:", "__blaze_proc_macros"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 0, "{out}");
+    let out = lint_with(&fixture("proc-macro:", "its_own"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 1, "{out}");
+    let out = lint_with(&fixture("", "__blaze_proc_macros"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 1, "{out}");
+}
+
+/// Formatting a string is not `unsafe` code: lowering `format_args!` makes an `unsafe` block
+/// nobody wrote (around `fmt::Arguments::new`), and a dependency that only formats is not
+/// denied for it. (The control: the same dependency with a block someone wrote is.) Found on
+/// blaze-serde-derive, which has no `unsafe` in its source and was refused as having some, so
+/// no crate that derives `Serialize` could be asked anything that needs its proc macros built.
+#[test]
+fn a_format_is_not_an_unsafe_block() {
+    // With `fmt`, so `format_args!` lowers as it does in a real crate.
+    let minicore = "//- minicore: sized, copy, clone, fn, option, result, fmt\n";
+    let main = "pub fn go() -> u32 { left_pad::pad(1) }";
+    let formats = "pub fn pad(n: u32) -> u32 { let _said = format_args!(\"{n:>4} of {}\", n + 1); n }";
+    let out = run_over(minicore, formats, main, "", &table(""));
+    assert_eq!(lines(&out, "runs `unsafe` code (`unsafe`)"), Vec::<&str>::new(), "{out}");
+    assert!(!out.contains("has an `unsafe` block"), "{out}");
+    let written = "pub fn pad(n: u32) -> u32 { let _said = format_args!(\"{n}\"); unsafe { n } }";
+    let out = run_over(minicore, written, main, "", &table(""));
+    assert_eq!(lines(&out, "runs `unsafe` code (`unsafe`)").len(), 1, "{out}");
+    assert!(out.contains("`left_pad::pad` has an `unsafe` block"), "{out}");
+}
+
 /// A dependency's file read that the workspace does not reach is a warning of its own, not a
 /// denial; reached, it is the denial. (The second run is the control.)
 #[test]
@@ -330,16 +378,18 @@ const NODES: u32 = 12;
 const CALLS: usize = 4;
 const USES: usize = 2;
 
-fn graph_of(tc: &hegel::TestCase) -> Graph {
-    use hegel::generators as gs;
-    let members: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(CRATES as usize).max_size(CRATES as usize));
-    let count: u32 = tc.draw(gs::integers().min_value(1).max_value(NODES));
-    let roots: u32 = tc.draw(gs::integers().min_value(1).max_value(count));
+fn graph_of(tape: &blaze_sim::Tape) -> Graph {
+    let crates = CRATES as usize;
+    let members: Vec<bool> = tape.vec(crates..=crates, "members", |tape| tape.bool("a workspace member"));
+    let count: u32 = tape.int_in(1..=NODES, "nodes");
+    let roots: u32 = tape.int_in(1..=count, "roots");
     let mut nodes: Vec<Node> = Vec::with_capacity_in(count as usize, Global);
     for _ in 0..count {
-        let krate: u32 = tc.draw(gs::integers().max_value(CRATES - 1));
-        let calls: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(count - 1)).max_size(CALLS));
-        let uses: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(Capability::ALL.len() as u8 - 1)).max_size(USES));
+        let krate: u32 = tape.int_in(0..=CRATES - 1, "crate");
+        let calls: Vec<u32> = tape.vec(0..=CALLS, "calls", |tape| tape.int_in(0..=count - 1, "callee"));
+        let uses: Vec<u8> = tape.vec(0..=USES, "uses", |tape| {
+            tape.int_in(0..=Capability::ALL.len() as u8 - 1, "capability")
+        });
         let uses: Vec<(Capability, Box<str>)> =
             uses.into_iter().map(|it| (Capability::ALL[it as usize], "does it".into())).collect();
         nodes.push(Node { krate, uses: uses.into_boxed_slice(), calls: calls.into_boxed_slice() });
@@ -350,12 +400,14 @@ fn graph_of(tc: &hegel::TestCase) -> Graph {
 /// The invariant: a capability a reached node uses is its own crate's, never its caller's,
 /// once per (crate, capability) of a crate outside the workspace, with a witness that is a
 /// real chain of calls from a root and the shortest there is.
-#[hegel::test]
-fn attribution_is_the_models(tc: hegel::TestCase) {
-    let graph = graph_of(&tc);
-    if let Err(why) = agrees(&graph) {
-        panic!("{why}: {graph:?}");
-    }
+#[test]
+fn attribution_is_the_models() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let graph = graph_of(tape);
+        if let Err(why) = agrees(&graph) {
+            panic!("{why}: {graph:?}");
+        }
+    });
 }
 
 /// The control: with the bug planted (a capability attributed to the caller's crate), the

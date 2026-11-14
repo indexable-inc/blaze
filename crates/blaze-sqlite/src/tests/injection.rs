@@ -9,13 +9,11 @@
 //! positional parameter form, so no such text reaches `prepare`, which takes only a `Checked`.
 
 use std::alloc::Global;
-use std::cell::Cell;
 use std::fmt::Write as _;
 
+use blaze_sim::{Broke, Config, Tape};
 use blaze_sql::desc::{Param, Slot, Storage, ValueRef};
 use blaze_sql::schema::{Column, Schema, Table};
-use hegel::generators as gs;
-use hegel::{HealthCheck, Hegel, Settings, TestCase};
 
 use crate::{Connection, Statement, Step};
 
@@ -59,7 +57,7 @@ const HOSTILE_BYTES: [&[u8]; 8] =
     [b"'", b"\0", b"'); drop table note; --", b"--", b"/*", b"\\", b"\xff\xfe\x00", b"x'00'"];
 
 const MAX_STEPS: u32 = 4096;
-const CONTROL_CASES: u64 = 100;
+const CONTROL_CASES: u32 = 100;
 
 /// `note (id integer primary key, name text not null, data blob not null)`.
 fn note_columns() -> [Column<'static>; 3] {
@@ -118,51 +116,50 @@ enum Insertion {
     Spliced,
 }
 
-fn draw_text(tc: &TestCase, earlier: &[String]) -> String {
-    let roll = tc.draw_silent(gs::integers::<u8>().max_value(9));
+fn draw_text(tape: &Tape, earlier: &[String]) -> String {
+    let roll = tape.int_in(0..=9u8, "text kind");
     if roll <= 2 && !earlier.is_empty() {
-        let at = tc.draw_silent(gs::integers::<usize>().max_value(earlier.len() - 1));
-        return earlier[at].clone();
+        return earlier[tape.index(earlier.len(), "earlier text")].clone();
     }
     if roll <= 6 {
-        let mut text = tc.draw_silent(gs::sampled_from(&HOSTILE_TEXT[..])).to_owned();
-        if tc.draw_silent(gs::weighted_booleans(0.3)) {
-            text.push_str(tc.draw_silent(gs::sampled_from(&HOSTILE_TEXT[..])));
+        let mut text = (*tape.one_of(&HOSTILE_TEXT, "hostile text")).to_owned();
+        if tape.chance(0.3, "second hostile text") {
+            text.push_str(tape.one_of(&HOSTILE_TEXT, "hostile text"));
         }
         return text;
     }
-    tc.draw_silent(gs::text().max_size(12))
+    tape.text(0..=12, "text")
 }
 
-fn draw_blob(tc: &TestCase) -> Vec<u8> {
-    if tc.draw_silent(gs::weighted_booleans(0.5)) {
-        tc.draw_silent(gs::sampled_from(&HOSTILE_BYTES[..])).to_vec()
+fn draw_blob(tape: &Tape) -> Vec<u8> {
+    if tape.chance(0.5, "hostile blob") {
+        tape.one_of(&HOSTILE_BYTES, "hostile blob").to_vec()
     } else {
-        tc.draw_silent(gs::binary().max_size(12))
+        tape.bytes(0..=12, "blob")
     }
 }
 
-fn draw_ops(tc: &TestCase) -> Vec<Op> {
-    let count = tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(12));
+fn draw_ops(tape: &Tape) -> Vec<Op> {
+    let count = tape.int_in(1..=12usize, "ops");
     let mut names: Vec<String> = Vec::new();
     let mut ops = Vec::new();
     for _ in 0..count {
-        let op = match tc.draw_silent(gs::integers::<u8>().max_value(9)) {
-            0..=3 => Op::Insert { name: draw_text(tc, &names), data: draw_blob(tc) },
+        let op = tape.span("op", |tape| match tape.int_in(0..=9u8, "op") {
+            0..=3 => Op::Insert { name: draw_text(tape, &names), data: draw_blob(tape) },
             4 | 5 => Op::Update {
-                find: draw_text(tc, &names),
-                name: draw_text(tc, &names),
-                data: draw_blob(tc),
+                find: draw_text(tape, &names),
+                name: draw_text(tape, &names),
+                data: draw_blob(tape),
             },
-            6 | 7 => Op::Find { find: draw_text(tc, &names) },
-            _ => Op::Delete { find: draw_text(tc, &names) },
-        };
+            6 | 7 => Op::Find { find: draw_text(tape, &names) },
+            _ => Op::Delete { find: draw_text(tape, &names) },
+        });
         if let Op::Insert { name, .. } | Op::Update { name, .. } = &op {
             names.push(name.clone());
         }
         ops.push(op);
     }
-    tc.note(&format!("ops: {ops:?}"));
+    tape.note(format_args!("ops: {ops:?}"));
     ops
 }
 
@@ -366,12 +363,11 @@ fn runs_as_the_model_does(ops: &[Op], insertion: Insertion) -> Result<(), String
 /// the one written: after every insert, update, select and delete the table's rows equal a
 /// model's that treats each value as data, the table still exists with its schema, and each
 /// value read back is byte-equal to the one bound.
-#[hegel::test(test_cases = 300, suppress_health_check = [HealthCheck::TooSlow])]
-fn a_parameter_is_data_whatever_its_bytes(tc: TestCase) {
-    let ops = draw_ops(&tc);
-    if let Err(why) = runs_as_the_model_does(&ops, Insertion::Bound) {
-        panic!("{why}");
-    }
+#[test]
+fn a_parameter_is_data_whatever_its_bytes() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        runs_as_the_model_does(&draw_ops(tape), Insertion::Bound)
+    });
 }
 
 /// An insert that splices its value between quotes into the text runs another statement for
@@ -389,26 +385,20 @@ fn the_oracle_catches_a_value_spliced_into_the_text() {
         "the oracle missed a value spliced into the text"
     );
 
-    let caught = Cell::new(0u64);
-    Hegel::new(|tc: TestCase| {
-        let ops = draw_ops(&tc);
-        if let Err(why) = runs_as_the_model_does(&ops, Insertion::Bound) {
-            panic!("bound: {why}");
-        }
-        if runs_as_the_model_does(&ops, Insertion::Spliced).is_err() {
-            caught.set(caught.get() + 1);
-        }
-    })
-    .settings(
-        Settings::new()
-            .test_cases(CONTROL_CASES)
-            .database(None)
-            .suppress_health_check([HealthCheck::TooSlow]),
-    )
-    .run();
-    assert!(
-        caught.get() > 0,
-        "no drawn value in {CONTROL_CASES} cases made the spliced insert diverge"
+    // Each case runs bound first, which must pass, then spliced with the same ops; the
+    // control passes once the oracle refuses a spliced run, and panics naming the plant when
+    // no drawn value in `CONTROL_CASES` cases made the spliced insert diverge.
+    blaze_sim::control(
+        Config::cases(CONTROL_CASES),
+        Insertion::Bound,
+        Insertion::Spliced,
+        "",
+        |tape, insertion| {
+            let ops = draw_ops(tape);
+            runs_as_the_model_does(&ops, Insertion::Bound)
+                .map_err(|why| Broke::Harness(format!("bound: {why}")))?;
+            runs_as_the_model_does(&ops, insertion).map_err(Broke::Oracle)
+        },
     );
 }
 

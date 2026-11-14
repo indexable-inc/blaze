@@ -9,7 +9,7 @@ mod exec {
     use self::std::prelude::rust_2021::*;
     #[allow(unused_imports)]
     use self::std::{eprintln, format, vec};
-    use super::{End, UNRECORDED};
+    use super::{End, Table, UNRECORDED};
     use self::std::borrow::Cow;
 
     pub struct Exec;
@@ -37,7 +37,7 @@ mod exec {
             0
         }
 
-        pub fn read(&self, _end: &End, hits: &mut Vec<u8>) -> Result<u32, Cow<'static, str>> {
+        pub fn read(&self, _end: &End, hits: &mut Vec<u8>) -> Result<Table, Cow<'static, str>> {
             hits.clear();
             Err(Cow::Borrowed(UNRECORDED))
         }

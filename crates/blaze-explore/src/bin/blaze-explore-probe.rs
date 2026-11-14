@@ -6,24 +6,36 @@
 //! datagram. It prints what each session's CONNECT carried (path, Origin, User-Agent), so a run
 //! also says what Origin each browser sends.
 //!
+//! The echo is [`blaze_explore::probe::Echo`], a sans-IO machine; this program is its thin
+//! driver: blaze-http's HTTP/3 driver loop on one blaze-core native driver, one poll a step.
+//!
 //! Its input is one optional JSON value (inline, a file's path, or `-` for stdin):
-//! `{"page": "<the probe page's URL>", "port": <0 for any>}`. Ctrl-C stops it.
+//! `{"page": "<the probe page's URL>", "port": <0 for any>, "sessions": <n>}`. With `sessions`,
+//! it stops once that many sessions ended, and exits nonzero naming each part (bidirectional,
+//! unidirectional, datagrams) of each session that failed; without, Ctrl-C stops it.
+
+#![feature(allocator_api)]
 
 use std::{
+    alloc::Global,
     io::Read as _,
     net::{Ipv4Addr, SocketAddr},
+    path::Path,
     process::ExitCode,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use blaze_core::{Driver as _, wait::Deadline};
+use blaze_explore::probe::{Echo, Ended};
+use blaze_http::h3::{Endpoint, ServerConfig, Transport, driver::Loop};
 use ix_prof::explore::cert::{Cert, Validity};
-use blaze_http::h3::{
-    Identity, ServerConfig, Transport,
-    tokio_driver::{Driver, RecvStream, Request, SendStream, Session},
-};
 
 /// Where the probe page is published: indexable-inc/ix serves `probe/index.html` there.
 const PAGE: &str = "https://ix.dev/explore/probe";
+/// How long the socket may take to bind.
+const START_WAIT: Duration = Duration::from_secs(10);
+/// The longest one poll waits with nothing due, so a wait never goes unbounded.
+const POLL_MOST: Duration = Duration::from_secs(30);
 
 #[derive(Debug, serde_derive::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +44,9 @@ struct Input {
     page: String,
     #[serde(default)]
     port: u16,
+    /// Stop after this many sessions ended; none runs until Ctrl-C.
+    #[serde(default)]
+    sessions: Option<u32>,
 }
 
 fn page() -> String {
@@ -66,7 +81,7 @@ fn input() -> Result<Input, String> {
         }
     };
     serde_json::from_str(&text)
-        .map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\"}}: {why}"))
+        .map_err(|why| format!("the input `{text}` is not {{\"page\", \"port\", \"sessions\"}}: {why}"))
 }
 
 fn run() -> Result<(), String> {
@@ -84,100 +99,101 @@ fn run() -> Result<(), String> {
     let cert = Cert::make(Validity::starting(now), blaze_explore::NAME)
         .map_err(|why| why.to_string())?;
     let identity = cert.identity().map_err(|why| why.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|why| format!("the tokio runtime: {why}"))?;
-    runtime.block_on(serve(&input, identity, &cert))
-}
-
-async fn serve(input: &Input, identity: Identity, cert: &Cert) -> Result<(), String> {
-    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, input.port)))
-        .map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
     let config = ServerConfig {
         identity,
-        transport: Transport {
-            idle: Duration::from_secs(30),
-            keep_alive: Some(Duration::from_secs(5)),
-        },
+        transport: Transport { idle: Duration::from_secs(30), keep_alive: Some(Duration::from_secs(5)) },
+        requests: false,
     };
-    let (driver, mut incoming) =
-        Driver::spawn(&tokio::runtime::Handle::current(), socket, Some(config), None)
-            .map_err(|why| why.to_string())?;
-    let port = driver.local_addr().port();
-    println!("{}#127.0.0.1:{port}/{}", input.page, cert.hash);
-    println!(
-        "certificate valid until {} (Unix seconds); Ctrl-C stops the probe",
-        cert.validity.not_after_s
-    );
-    while let Some(request) = incoming.recv().await {
-        tokio::spawn(echo(request));
-    }
-    Err("the HTTP/3 driver stopped".to_owned())
-}
-
-async fn echo(request: Request) {
-    println!(
-        "CONNECT {} from {}: Origin {:?}, User-Agent {:?}",
-        request.path(),
-        request.peer(),
-        request.origin(),
-        request.user_agent()
-    );
-    let connection = match request.accept().await {
-        Ok(it) => it,
-        Err(why) => {
-            println!("the session did not open: {why}");
-            return;
+    // No file effect is asked: the root is never read.
+    let mut driver = blaze_core::native(Path::new("/"), 1)
+        .map_err(|why| format!("blaze-core's native driver: {why}"))?;
+    // quinn-proto's clock is an `Instant`: the epoch is read once, right after the native
+    // driver whose clock (`Driver::now`, from its start) it stands for.
+    let epoch = Instant::now();
+    let endpoint = Endpoint::new(epoch, Some(config), None).map_err(|why| why.to_string())?;
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, input.port));
+    let mut core = Loop::new(endpoint, 0, at);
+    let mut effects = Vec::new_in(Global);
+    let mut done = Vec::new_in(Global);
+    // Bounded by START_WAIT on the driver's clock.
+    let local = loop {
+        if let Some(local) = core.local() {
+            break local;
+        }
+        if let Some(error) = core.failed() {
+            return Err(format!("binding the UDP socket at {at}: {error}"));
+        }
+        if driver.now() > START_WAIT {
+            return Err(format!("binding the UDP socket at {at}: not bound in {START_WAIT:?}"));
+        }
+        core.step(driver.now(), &mut effects);
+        driver.submit(&mut effects);
+        {
+            let _wait = tracing::info_span!(target: "blaze::explore", "bind the probe's socket", wait = "driver").entered();
+            driver.poll(&mut done, Deadline::after(driver.now(), START_WAIT));
+        }
+        for completion in done.drain(..) {
+            core.complete(completion);
         }
     };
-    // clone: handles (`Arc`s) of the session's connection
-    tokio::join!(bidi(connection.clone()), uni(connection.clone()), datagrams(connection.clone()));
-    println!("session ended: {}", connection.closed().await);
-}
-
-async fn bidi(connection: Session) {
-    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-        tokio::spawn(async move {
-            let echoed = copy(&mut recv, &mut send).await;
-            send.finish();
-            println!("bidirectional stream: {echoed} bytes echoed");
-        });
-    }
-}
-
-async fn uni(connection: Session) {
-    while let Ok(mut recv) = connection.accept_uni().await {
-        // clone: a handle (an `Arc`) of the session
-        let connection = connection.clone();
-        tokio::spawn(async move {
-            let Ok(mut send) = connection.open_uni().await else { return };
-            let echoed = copy(&mut recv, &mut send).await;
-            send.finish();
-            println!("unidirectional stream: {echoed} bytes echoed on one the probe opened");
-        });
-    }
-}
-
-async fn datagrams(connection: Session) {
-    while let Ok(payload) = connection.receive_datagram().await {
-        match connection.send_datagram(&payload).await {
-            Ok(()) => println!("datagram: {} bytes echoed", payload.len()),
-            Err(why) => println!("datagram of {} bytes not echoed: {why}", payload.len()),
+    println!("{}#127.0.0.1:{}/{}", input.page, local.port(), cert.hash);
+    println!(
+        "certificate valid until {} (Unix seconds); {}",
+        cert.validity.not_after_s,
+        match input.sessions {
+            Some(n) => format!("the probe stops after {n} sessions"),
+            None => "Ctrl-C stops the probe".to_owned(),
+        }
+    );
+    let mut echo = Echo::new();
+    let mut said = Vec::new_in(Global);
+    let mut ended: Vec<Ended> = Vec::new_in(Global);
+    // Each turn's wait is bounded by POLL_MOST; the loop ends when `sessions` ended, the socket
+    // fails, or Ctrl-C ends the process.
+    loop {
+        let now = driver.now();
+        core.endpoint().advance_clock(now);
+        echo.step(core.endpoint());
+        echo.take_said(&mut said);
+        for line in said.drain(..) {
+            println!("{line}");
+        }
+        echo.take_ended(&mut ended);
+        if input.sessions.is_some_and(|n| ended.len() >= n as usize) {
+            return verdict(&ended);
+        }
+        if let Some(error) = core.failed() {
+            return Err(format!("the probe's socket at {local}: {error}"));
+        }
+        core.step(now, &mut effects);
+        driver.submit(&mut effects);
+        {
+            let _wait = tracing::info_span!(target: "blaze::explore", "wait for the probe's socket and timers", wait = "driver").entered();
+            driver.poll(&mut done, core.deadline().min(Deadline::after(now, POLL_MOST)));
+        }
+        // What came is received at the time it came, not at the time the poll began.
+        core.endpoint().advance_clock(driver.now());
+        for completion in done.drain(..) {
+            core.complete(completion);
         }
     }
 }
 
-/// Copies `recv` to `send` until `recv` ends: the bytes copied.
-async fn copy(recv: &mut RecvStream, send: &mut SendStream) -> usize {
-    // alloc: once a stream
-    let mut chunk = vec![0u8; 64 * 1024];
-    let mut copied = 0;
-    while let Ok(Some(n)) = recv.read(&mut chunk).await {
-        if send.write_all(&chunk[..n]).await.is_err() {
-            break;
+/// Every session's parts that failed, named; none is a pass.
+fn verdict(ended: &[Ended]) -> Result<(), String> {
+    let mut failed = Vec::new_in(Global);
+    for session in ended {
+        for (part, tally) in session.failed() {
+            failed.push(format!(
+                "session from {} ({}): {part}: {} failed, {} echoed",
+                session.peer, session.closed, tally.failed, tally.echoed
+            ));
         }
-        copied += n;
     }
-    copied
+    if failed.is_empty() {
+        println!("{} sessions ended, every echo whole", ended.len());
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
 }

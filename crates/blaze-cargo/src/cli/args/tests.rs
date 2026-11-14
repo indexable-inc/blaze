@@ -401,9 +401,9 @@ fn test_names_its_filter_and_the_harness_args() {
     assert_eq!(bench.test_args(), os(&["fast", "--bench"]));
     assert_eq!(bench.profile(), "bench");
 
-    let reached = cargo(&["test", "--reached"]);
-    assert!(reached.flags.reached);
-    assert!(reached.args.is_empty());
+    let run_all = cargo(&["test", "--run-all"]);
+    assert!(run_all.flags.run_all && !cargo(&["test"]).flags.run_all);
+    assert!(run_all.args.is_empty(), "cargo never sees `--run-all`");
 }
 
 #[test]
@@ -521,8 +521,8 @@ fn an_unknown_flag() {
         "error: unexpected argument 'b' found\n\nUsage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor \
          more information, try '--help'.\n"
     );
-    // `--doc` and `--reached` are `test`'s alone.
-    assert!(parse(os(&["build", "--reached"])).is_err());
+    // `--doc` and `--run-all` are `test`'s alone.
+    assert!(parse(os(&["build", "--run-all"])).is_err());
     assert!(parse(os(&["build", "--", "x"])).is_err());
 }
 
@@ -559,6 +559,14 @@ fn hidden_flags_that_point_elsewhere() {
     tip(&["build", "-s"], "--silent", &similar("--quiet"), "cargo build [OPTIONS]");
     tip(&["run", "--silent"], "--silent", &similar("--quiet"), "cargo run [OPTIONS] [ARGS]...");
     tip(&["build", "-t", "x"], "-t", &similar("--target"), "cargo build [OPTIONS]");
+    // Selection is the default: the flag that opted into it is refused, naming the default and
+    // `--run-all`, never accepted and ignored.
+    tip(
+        &["test", "--reached"],
+        "--reached",
+        super::REACHED_GONE,
+        "cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]",
+    );
     tip(&["build", "--path", "x"], "--path", &similar("--manifest-path"), "cargo build [OPTIONS]");
     tip(
         &["build", "--out-dir", "x"],
