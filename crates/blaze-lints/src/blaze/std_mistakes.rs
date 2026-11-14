@@ -135,7 +135,7 @@ pub(super) fn report<'t>(
 /// the rule `untyped_error`, `print_in_lib` and `process_exit` share.
 pub(crate) fn library_code(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
     let db = cx.db();
-    match cx.krate().target_kind(db) {
+    match test_code::target_of(db, cx.krate()) {
         base_db::TargetKind::Lib { .. } => true,
         base_db::TargetKind::Bin | base_db::TargetKind::Example => !module.is_crate_root(db),
         _ => false,

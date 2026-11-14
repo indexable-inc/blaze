@@ -1,7 +1,7 @@
 //! The correct-by-construction lints: per lint, a case where it fires and a near miss where it
 //! does not; for `proof_forgotten`, its fix made and the made file linted clean.
 
-use crate::tests::{lint, offered_in};
+use crate::tests::{lint, lint_both_builds, offered_in};
 
 const MINICORE: &str = "//- minicore: sized, copy, clone, drop, option, result, fn, panic, index, slice, builtin_impls, allocator_api, range, iterator, non_zero, reach\n";
 
@@ -259,6 +259,64 @@ impl People {
 }
 "#,
     );
+}
+
+/// The invariant: a library's `--test` build judges its production code as its plain build
+/// does, so an `#[expect]` on a function that silences a finding on a statement inside it is
+/// fulfilled in both builds, and one on a function the lint does not fire in is unfulfilled in
+/// both. The `--test` build once took all of a library for test code and ran no body lint of
+/// this module, and said the expectation its plain build had met unfulfilled.
+#[test]
+fn an_expected_parallel_collections_is_fulfilled_in_the_test_build_too() {
+    let flags = flags("parallel_collections");
+    let built = |main: &str| lint_both_builds(&format!("{}{}", header(), main.trim_start_matches('\n')), &flags);
+    let fires = r#"
+use std::vec::Vec;
+pub struct People { names: Vec<u32>, ages: Vec<u32> }
+impl People {
+    pub fn add(&mut self, n: u32, a: u32) {
+        self.names.push(n);
+        self.ages.push(a);
+    }
+}
+"#;
+    let expected = r#"
+use std::vec::Vec;
+pub struct People { names: Vec<u32>, ages: Vec<u32> }
+impl People {
+    #[expect(
+        blaze::parallel_collections,
+        reason = "the two are read apart"
+    )]
+    pub fn add(&mut self, n: u32, a: u32) {
+        self.names.push(n);
+        self.ages.push(a);
+    }
+}
+"#;
+    let missed = r#"
+use std::vec::Vec;
+pub struct People { names: Vec<u32>, ages: Vec<u32> }
+impl People {
+    #[expect(
+        blaze::parallel_collections,
+        reason = "the two are read apart"
+    )]
+    pub fn add(&mut self, n: u32) {
+        self.names.push(n);
+    }
+}
+"#;
+    for out in built(fires) {
+        assert_eq!(out.matches("kept the same length by convention").count(), 1, "{out}");
+    }
+    for out in built(expected) {
+        assert!(!out.contains("kept the same length by convention"), "{out}");
+        assert!(!out.contains("lint expectation is unfulfilled"), "the expectation is met:\n{out}");
+    }
+    for out in built(missed) {
+        assert_eq!(out.matches("lint expectation is unfulfilled").count(), 1, "{out}");
+    }
 }
 
 #[test]

@@ -353,10 +353,9 @@ fn bound_rows(db: &Db, adt: AdtId, fold: &mut Fold) {
 pub(crate) fn role(db: &Db, def: DefWithBodyId) -> Role {
     let module = def.module(db);
     let krate = hir::Crate::from(def.krate(db));
-    if matches!(
-        krate.target_kind(db),
-        base_db::TargetKind::Test | base_db::TargetKind::Bench | base_db::TargetKind::Example
-    ) {
+    // By the manifest's target: a library's production bodies are `Plain` in its `--test`
+    // build too, as in its plain build.
+    if crate::blaze::test_code::is_test_target(db, krate) {
         return Role::Test;
     }
     let container = match def {
