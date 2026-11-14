@@ -9,8 +9,9 @@
 //! page stops (`STOP_SENDING`, a reset) is dropped where it waits and its [`Stop`] set, so the
 //! source's work on the blocking pool ends with it and is thrown away.
 //!
-//! The transport is blaze-http's HTTP/3 core (`blaze_http::h3`) under its tokio driver, which
-//! owns the UDP socket and the timers.
+//! The transport is blaze-http's HTTP/3 core (`blaze_http::h3`) under its driver on blaze-core's
+//! effects (`blaze_http::h3::driver`, a thread of its own), which owns the UDP socket and the
+//! timers; this module's tokio runtime only polls the driver's handles' futures and its own.
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -21,13 +22,13 @@ use std::{
 
 use blaze_http::h3::{
     self, Identity, ServerConfig, Transport,
-    tokio_driver::{Driver, RecvStream, Request as Incoming, SendStream, Session},
+    driver::{Driver, RecvStream, Request as Incoming, Requests, SendStream, Session},
 };
 use blaze_core::lock::Lock;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{oneshot, watch},
     time::MissedTickBehavior,
 };
 
@@ -168,13 +169,11 @@ pub fn serve(config: Config) -> Result<Explorer, StartError> {
                 }
             };
             runtime.block_on(async move {
-                let bound = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                    .map_err(StartError::Bind)
-                    .and_then(|socket| {
-                        let runtime = tokio::runtime::Handle::current();
-                        Driver::spawn(&runtime, socket, Some(server_config(identity)), None)
-                            .map_err(StartError::Config)
-                    })
+                // The driver binds the socket; a bind that fails is its `Config` error, naming
+                // the address.
+                let at = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+                let bound = Driver::spawn(at, Some(server_config(identity)), None)
+                    .map_err(StartError::Config)
                     .map(|(driver, incoming)| {
                         let port = driver.local_addr().port();
                         ((driver, incoming), port)
@@ -237,7 +236,7 @@ fn server_config(identity: Identity) -> ServerConfig {
 }
 
 async fn run(
-    (driver, mut incoming): (Driver, mpsc::UnboundedReceiver<Incoming>),
+    (driver, incoming): (Driver, Requests),
     shared: Arc<Shared>,
     mut rotation: Rotation,
     mut stop: oneshot::Receiver<()>,

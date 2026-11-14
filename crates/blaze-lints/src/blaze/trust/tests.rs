@@ -13,7 +13,7 @@ use super::{
     table::grants,
 };
 use crate::{
-    Conf,
+    conf::Conf,
     blaze::{
         Lint,
         effects_tests::{MINICORE, minicore_with_dyn},
@@ -103,7 +103,7 @@ fn an_unsafe_block_is_denied() {
     let denied = lines(&out, "runs `unsafe` code (`unsafe`)");
     assert_eq!(denied.len(), 1, "{out}");
     assert!(denied[0].starts_with("error"), "{out}");
-    assert!(out.contains("blaze::dependency_unsafe"), "{out}");
+    assert!(out.contains("lints.md#dependency_unsafe"), "{out}");
     assert!(out.contains("`left_pad::hidden` has an `unsafe` block"), "{out}");
 }
 

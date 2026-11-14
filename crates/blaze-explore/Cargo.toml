@@ -35,9 +35,10 @@ ix-prof = { workspace = true, features = ["explore"] }
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
-# The probe's echo server: blaze-http's sans-IO HTTP/3 core and its tokio driver.
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
-blaze-http = { workspace = true, features = ["tokio"] }
+# The probe's echo server: blaze-http's sans-IO HTTP/3 core and its driver on blaze-core's
+# effects; tokio is the runtime that polls the probe's own tasks (each session's echo).
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+blaze-http.workspace = true
 
 [dev-dependencies]
 blaze-rng.workspace = true

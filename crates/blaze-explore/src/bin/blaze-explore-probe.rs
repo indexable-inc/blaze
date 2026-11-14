@@ -19,7 +19,7 @@ use std::{
 use ix_prof::explore::cert::{Cert, Validity};
 use blaze_http::h3::{
     Identity, ServerConfig, Transport,
-    tokio_driver::{Driver, RecvStream, Request, SendStream, Session},
+    driver::{Driver, RecvStream, Request, SendStream, Session},
 };
 
 /// Where the probe page is published: indexable-inc/ix serves `probe/index.html` there.
@@ -92,18 +92,17 @@ fn run() -> Result<(), String> {
 }
 
 async fn serve(input: &Input, identity: Identity, cert: &Cert) -> Result<(), String> {
-    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, input.port)))
-        .map_err(|why| format!("listening on 127.0.0.1:{}: {why}", input.port))?;
     let config = ServerConfig {
         identity,
         transport: Transport {
             idle: Duration::from_secs(30),
             keep_alive: Some(Duration::from_secs(5)),
         },
+        requests: false,
     };
-    let (driver, mut incoming) =
-        Driver::spawn(&tokio::runtime::Handle::current(), socket, Some(config), None)
-            .map_err(|why| why.to_string())?;
+    // The driver binds the socket on a thread of its own; a bind that fails names the address.
+    let at = SocketAddr::from((Ipv4Addr::LOCALHOST, input.port));
+    let (driver, incoming) = Driver::spawn(at, Some(config), None).map_err(|why| why.to_string())?;
     let port = driver.local_addr().port();
     println!("{}#127.0.0.1:{port}/{}", input.page, cert.hash);
     println!(

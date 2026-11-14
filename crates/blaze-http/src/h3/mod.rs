@@ -1,6 +1,6 @@
 //! HTTP/3 and WebTransport, sans-IO: [`Endpoint`], a synchronous state machine over
-//! quinn-proto's QUIC core, and drivers that own the UDP socket and the timers (`tokio_driver`
-//! today; io_uring later, with no change here). The design is
+//! quinn-proto's QUIC core, and its driver on blaze-core's effects ([`driver`]: datagram
+//! batches and a timer, on io_uring, kqueue or the simulation). The design is
 //! docs/v2/plan/design/http3-sans-io.md.
 //!
 //! # The core
@@ -22,8 +22,7 @@
 //!
 //! # The driver contract
 //!
-//! This is the seam another driver is written against; `tokio_driver` (the `tokio` feature) is
-//! the reference.
+//! This is the seam a driver is written against; [`driver`] is the one in the tree.
 //!
 //! 1. **Clock.** [`Endpoint::new`] takes the instant the driver's clock counts from. Before
 //!    handing the core anything, and whenever [`Endpoint::next_deadline`] passes, call
@@ -56,9 +55,9 @@
 //! A caller that runs the core inside its own state machine needs only datagrams and a clock
 //! from its driver: the [`Wire`] trait is that seam, and the caller does the steps above.
 //!
-//! The waits a driver does open no span yet: blaze-trace is not in the graph
-//! (docs/v2/plan/design/no-tracing.md). When it lands, the driver opens one per wait, named
-//! by the peer and the session or stream (every-wait-says-what).
+//! [`driver`]'s one wait is its poll of blaze-core's driver, to the endpoint's next deadline
+//! (armed as a timer); a caller blocking on a handle's future parks in
+//! [`crate::mailbox::block_on`], named by what it waits for (every-wait-says-what).
 //!
 //! # What the core reads that is not its input
 //!
@@ -72,16 +71,15 @@
 // Each core module (`endpoint` and its `requests`, `request`, `frame`, `qpack`, `huffman`,
 // `varint`, `config`) is marked
 // `#![blaze::sans_io]` itself: this module is not, since its children are part of a marked module
-// and `tokio_driver` is the driver.
+// and `driver` is the driver.
 
 mod config;
+pub mod driver;
 mod endpoint;
 mod frame;
 mod huffman;
 mod qpack;
 pub mod request;
-#[cfg(feature = "tokio")]
-pub mod tokio_driver;
 mod varint;
 
 #[cfg(test)]

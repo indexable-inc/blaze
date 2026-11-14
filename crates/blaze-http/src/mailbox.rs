@@ -232,6 +232,31 @@ impl<T: Clone> Latch<T> {
     }
 }
 
+/// A driver thread's inbox: askers on any thread post to it under its lock, then wake the
+/// thread's blaze-core driver; the thread takes everything posted at the top of each turn.
+pub struct Inbox<M> {
+    messages: Lock<Vec<M, Global>>,
+    waker: blaze_core::Waker,
+}
+
+impl<M> Inbox<M> {
+    /// An inbox whose posts wake the driver `waker` is of ([`blaze_core::Driver::waker`]).
+    pub fn new(waker: blaze_core::Waker) -> Inbox<M> {
+        Inbox { messages: Lock::new("http.mailbox.inbox", Vec::new_in(Global)), waker }
+    }
+
+    /// Posts `message`, then wakes the driver: the order that loses no wake.
+    pub fn post(&self, message: M) {
+        self.messages.lock().push(message);
+        self.waker.wake();
+    }
+
+    /// Moves everything posted into `into`, which should be empty.
+    pub fn take(&self, into: &mut Vec<M, Global>) {
+        std::mem::swap(into, &mut *self.messages.lock());
+    }
+}
+
 /// What [`block_on`]'s waker does: unparks the thread polling.
 struct Unpark {
     parker: Parker,

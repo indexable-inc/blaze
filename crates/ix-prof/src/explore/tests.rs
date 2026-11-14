@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
 use blaze_http::h3::{
     ClientConfig, Closed, Transport, Trust,
-    tokio_driver::{Driver, Session as Connection},
+    driver::{Driver, Session as Connection},
 };
 use serde_json::Value;
 
@@ -371,14 +371,13 @@ fn explorer(dev_origin: bool) -> Explorer {
     .unwrap()
 }
 
-/// A client pinning the explorer's certificate, as the page does; on the runtime it is
-/// called on.
+/// A client pinning the explorer's certificate, as the page does, on a driver thread of its
+/// own; its handles' futures are polled by the runtime the test awaits them on.
 fn client(explorer: &Explorer) -> Driver {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
     let config =
         ClientConfig { trust: Trust::Pinned(vec![raw.try_into().unwrap()]), transport: Transport::default() };
-    let socket = std::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-    Driver::spawn(&tokio::runtime::Handle::current(), socket, None, Some(config)).unwrap().0
+    Driver::spawn(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), None, Some(config)).unwrap().0
 }
 
 async fn connect(

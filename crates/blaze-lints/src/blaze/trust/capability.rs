@@ -8,7 +8,9 @@
 //! through a foreign function, or a toolchain call outside those modules that does IO below,
 //! `Iterator::for_each` over a closure std calls back) is all three, said as not split.
 
-use hir_ty_pure::{EffectSet, Rule, trust::Done};
+#[cfg(test)]
+use hir_ty_pure::EffectSet;
+use hir_ty_pure::{Rule, trust::Done};
 
 /// A capability: what a dependency may do only when the workspace grants it by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

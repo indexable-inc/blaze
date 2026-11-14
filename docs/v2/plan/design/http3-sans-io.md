@@ -55,10 +55,11 @@ days). No other part of blaze speaks QUIC, and none should until it needs to.
     unknown capsules skipped.
   - Error codes mapped between WebTransport's 32-bit space and HTTP/3's
     (`0x52e4a40fa8db + n + n / 0x1e`), as the draft says.
-- **One tokio driver** (`blaze_http::h3::tokio_driver`, feature `tokio`) owns the UDP socket
-  and the one timer, and drives the core. On top of it sits a small async surface (sessions,
-  streams, datagrams) that the explorer and the probe use, as `Driver::ask -> Answer` is for
-  HTTP/1.
+- **One driver on blaze-core's effects** (`blaze_http::h3::driver`; the tokio driver it
+  replaced was deleted 2026-11-13) owns the UDP socket (batched `Effect::SendTo` and
+  `Effect::RecvFrom`) and the one timer, and drives the core; it runs on io_uring, kqueue or
+  the simulation. On top of it sits a small async surface (sessions, streams, datagrams) that
+  the explorer and the probe use, as `Handle::ask -> Answer` is for HTTP/1.
 - **quinn, quinn-udp, wtransport and wtransport-proto leave the graph.** Their vendor copies,
   patch series and `[patch]` entries are deleted. `vendor/quinn-proto` is the one copy left,
   and `tools/vendor/sync.py` keeps working for it (and for `ra-ap-rustc_pattern_analysis`).
@@ -192,7 +193,7 @@ One change, whole port (rule 23):
 
 1. `crates/blaze-http/src/h3/`: the core (`endpoint.rs`), `qpack.rs`, `huffman.rs`,
    `frame.rs`, `varint.rs`, `config.rs` (rustls and quinn-proto configs, the certificate pin
-   verifier, a minimal DER reader for its checks) and `tokio_driver.rs`.
+   verifier, a minimal DER reader for its checks) and `driver.rs` (on blaze-core's effects).
 2. blaze-explore's `server.rs`, `cert.rs` and the probe move onto `blaze_http::h3`. Their public
    surface stays (`start`, `Config`, `Explorer`, `StartError`, the constants, `Cert`); the one
    type that changes is `StartError::Config`, which carries `blaze_http::h3::Error` instead of

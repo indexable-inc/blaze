@@ -570,8 +570,9 @@ it on every toolchain bump; `vendor/charon/blaze.diff` takes charon's, including
 blaze-registry's `HyperHttp` (`crates/blaze-registry/src/http/client.rs`) is the only user of
 hyper-util's `client::legacy::Client`, of hyper-rustls, and of hyper itself. It moves onto a new
 crate, `crates/blaze-http`: a sans-IO HTTP/1.1 client core (`blaze_http::Client`, a synchronous
-state machine on an injected clock that owns no socket, runtime or timer) and a thin tokio driver
-(`blaze_http::tokio_driver`, sockets, DNS and timers only). The core writes requests, parses
+state machine on an injected clock that owns no socket, runtime or timer) and a thin driver
+(`blaze_http::driver`, on blaze-core's effects: sockets, DNS and timers only; it replaced the
+first tokio driver on 2026-11-13). The core writes requests, parses
 answers with `httparse` (`Content-Length`, `chunked`, read to close), keeps connections between
 requests in a pool keyed by (scheme, host, port) with hyper-util's limits (64 idle, 90 seconds),
 follows at most 10 redirects, decodes gzip with `flate2`, holds bodies to their bound, speaks TLS

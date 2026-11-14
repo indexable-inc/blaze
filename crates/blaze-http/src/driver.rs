@@ -59,7 +59,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::{self as effects, Address, Conn, Done, Driver, Effect, Tag, lock::Lock};
+use blaze_core::{self as effects, Address, Conn, Done, Driver, Effect, Tag};
 
 use crate::{
     Client, Completion, ConnId, Error, Event, Io, Kind, Request, RequestId,
@@ -566,18 +566,7 @@ enum Message {
     Stop,
 }
 
-/// The thread's inbox: posted to under its lock, then its driver woken.
-struct Inbox {
-    messages: Lock<Vec<Message, Global>>,
-    waker: effects::Waker,
-}
-
-impl Inbox {
-    fn post(&self, message: Message) {
-        self.messages.lock().push(message);
-        self.waker.wake();
-    }
-}
+type Inbox = mailbox::Inbox<Message>;
 
 /// The askers' side of a [`Handle`]; its drop stops the thread.
 struct Owner {
@@ -615,7 +604,7 @@ impl Handle {
                 _ = ready_to.send(Err(std::io::Error::other("blaze-core's native driver gives no waker: an asker could not end its wait")));
                 return;
             };
-            let inbox = Arc::new_in(Inbox { messages: Lock::new("http.driver.inbox", Vec::new_in(Global)), waker }, Global);
+            let inbox = Arc::new_in(Inbox::new(waker), Global);
             if ready_to.send(Ok(Arc::clone(&inbox))).is_err() {
                 return;
             }
@@ -714,7 +703,7 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
     let mut effects = Vec::new_in(Global);
     let mut done = Vec::new_in(Global);
     loop {
-        std::mem::swap(&mut messages, &mut *inbox.messages.lock());
+        inbox.take(&mut messages);
         for message in messages.drain(..) {
             match message {
                 Message::Ask { id, request, within, asker } => {
