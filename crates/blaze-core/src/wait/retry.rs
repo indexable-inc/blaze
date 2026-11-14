@@ -166,6 +166,9 @@ pub(crate) enum Plant {
     /// Every call is given the time left at the first: the bug of 0.20261105.0's
     /// `Ring::enter`, a relative timeout entered again whole after each interruption.
     SameTimeout,
+    /// The calls that return with the clock where it was are not counted: a wait whose
+    /// clock stopped goes on for ever.
+    NeverStuck,
 }
 
 /// The state of one wait between its calls.
@@ -215,7 +218,7 @@ impl Retry {
         let left = self.deadline.map(|it| it.left(self.at));
         #[cfg(test)]
         let left = match self.plant {
-            Plant::None => left,
+            Plant::None | Plant::NeverStuck => left,
             Plant::SameTimeout => *self.first.get_or_insert(left),
         };
         left
@@ -231,6 +234,10 @@ impl Retry {
             true => 0,
             false => self.still + 1,
         };
+        #[cfg(test)]
+        if self.plant == Plant::NeverStuck {
+            self.still = 0;
+        }
         if self.still >= FUEL {
             return Err(WaitError {
                 what: self.what,
@@ -239,6 +246,157 @@ impl Retry {
         }
         self.at = now;
         Ok(Next::Again)
+    }
+}
+
+/// Whether `left`, the time a wait's next call is given, is what is left of `deadline` at
+/// `now`: no limit for no deadline, and never a time left at an earlier reading.
+fn left_at(left: Option<Duration>, deadline: Option<Deadline>, now: Duration) -> bool {
+    match (left, deadline) {
+        (None, None) => true,
+        (Some(left), Some(deadline)) => left == deadline.left(now),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+/// What a wait `retry`, for `deadline`, whose last reading was `at` after `still` calls with
+/// the clock not moved, does after a call that returned not ready at `now`: it ends exactly
+/// when the deadline has passed at `now`; where it goes on, the next call is given what is
+/// left at `now` ([`left_at`]) and fewer than [`FUEL`] calls stand counted; and it fails only
+/// when the clock has not moved for the [`FUEL`]th call in a row.
+fn steps(
+    mut retry: Retry,
+    deadline: Option<Deadline>,
+    at: Duration,
+    still: u32,
+    now: Duration,
+) -> bool {
+    let passed = match deadline {
+        Some(deadline) => deadline.passed(now),
+        None => false,
+    };
+    match retry.after(now) {
+        Ok(Next::Deadline) => passed,
+        Ok(Next::Again) => !passed && retry.still < FUEL && left_at(retry.left(), deadline, now),
+        Err(_) => !passed && now <= at && still + 1 >= FUEL,
+    }
+}
+
+/// Whether [`FUEL`] calls in a row that return not ready at `now` end the wait `retry`: one
+/// of them says the deadline passed or fails, and they do not all say "again".
+fn ends(mut retry: Retry, now: Duration) -> bool {
+    let mut calls = 0;
+    while calls < FUEL {
+        match retry.after(now) {
+            Ok(Next::Again) => {}
+            Ok(Next::Deadline) | Err(_) => return true,
+        }
+        calls += 1;
+    }
+    false
+}
+
+/// The invariant: a retry waits what is left. From every state of a wait (any deadline or
+/// none, any last reading, any count below [`FUEL`]) and every reading of the clock after a
+/// call that was not ready: the wait ends exactly when its deadline has passed at that
+/// reading, and where it goes on the next call is given what is left of the deadline at that
+/// reading, never the time left at an earlier one, so no interruption restarts a wait
+/// ([`steps`]). Proved of one step for every state, where the simulation test in
+/// `wait/tests.rs` follows drawn runs of the loop. Its control is
+/// `the_oracle_catches_a_retry_given_its_first_timeout_again`.
+#[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
+pub(crate) fn a_retry_waits_what_is_left(
+    deadline: Option<Deadline>,
+    at: Duration,
+    still: u32,
+    now: Duration,
+) -> bool {
+    if still >= FUEL {
+        return true;
+    }
+    let mut retry = Retry::new("a wait", deadline, at);
+    retry.still = still;
+    steps(retry, deadline, at, still, now)
+}
+
+/// The invariant: a stopped clock ends the wait (rule bounded-progress). From every state of
+/// a wait, [`FUEL`] calls in a row that return not ready with the clock at or before the
+/// wait's last reading do not all say "again": the deadline passes or the wait fails, naming
+/// the clock ([`ends`]). Its control is `the_oracle_catches_a_wait_that_never_gives_up`.
+#[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
+pub(crate) fn a_stopped_clock_ends_the_wait(
+    deadline: Option<Deadline>,
+    at: Duration,
+    still: u32,
+    now: Duration,
+) -> bool {
+    if still >= FUEL || now > at {
+        return true;
+    }
+    let mut retry = Retry::new("a wait", deadline, at);
+    retry.still = still;
+    ends(retry, now)
+}
+
+#[cfg(test)]
+mod theorems {
+    use super::*;
+
+    fn ns(n: u64) -> Duration {
+        Duration::from_nanos(n)
+    }
+
+    /// The theorem functions hold where they are run: on the edges of the deadline, the
+    /// clock and the count. What Lean is to prove of their models for every state.
+    #[test]
+    fn the_theorems_hold_where_they_are_run() {
+        let times = [0, 1, 2, 999, 1_000, 1_001, u64::MAX];
+        let deadlines = [None, Some(0), Some(1), Some(1_000), Some(u64::MAX)];
+        for deadline in deadlines {
+            let deadline = deadline.map(|it| Deadline::at(ns(it)));
+            for at in times {
+                for now in times {
+                    for still in [0, 1, FUEL - 2, FUEL - 1, FUEL, u32::MAX] {
+                        assert!(
+                            a_retry_waits_what_is_left(deadline, ns(at), still, ns(now)),
+                            "{deadline:?} at {at} still {still} now {now}"
+                        );
+                    }
+                    for still in [0, FUEL - 1, FUEL] {
+                        assert!(
+                            a_stopped_clock_ends_the_wait(deadline, ns(at), still, ns(now)),
+                            "{deadline:?} at {at} still {still} now {now}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The planted bug of 0.20261105.0: every call is given the time left at the first.
+    /// After a call that returned 400 ns into a wait of 1,000, the next is given 1,000 again,
+    /// which [`steps`] refuses.
+    #[test]
+    fn the_oracle_catches_a_retry_given_its_first_timeout_again() {
+        let deadline = Some(Deadline::at(ns(1_000)));
+        let retry = |plant| {
+            let mut retry = Retry::new("a wait", deadline, ns(0)).planted(plant);
+            _ = retry.left();
+            retry
+        };
+        assert!(steps(retry(Plant::None), deadline, ns(0), 0, ns(400)));
+        assert!(!steps(retry(Plant::SameTimeout), deadline, ns(0), 0, ns(400)));
+    }
+
+    /// The planted bug: calls with the clock where it was are not counted. A wait with no
+    /// deadline at a stopped clock then says "again" [`FUEL`] times, which [`ends`] refuses.
+    #[test]
+    fn the_oracle_catches_a_wait_that_never_gives_up() {
+        let retry = |plant| Retry::new("a wait", None, ns(7)).planted(plant);
+        assert!(ends(retry(Plant::None), ns(7)));
+        assert!(!ends(retry(Plant::NeverStuck), ns(7)));
     }
 }
 
