@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-111 theorems: 98 in `lean`, 13 in `lean/analysis`.
+112 theorems: 99 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1081,4 +1081,10 @@ theorem no_unpark_is_lost (timed : Bool) (schedule : List Step) :
           (took = true ∧ last.val = EMPTY.val) ∨ (took = false ∧ timed = true ∧ last.val = NOTIFIED.val)) ∧
       -- a park with no time limit returns only with a token
       (∀ took, parked = .Done took → timed = false → took = true)
+```
+
+**`atomics.two_adds_make_two.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function two_adds_make_two holds of its model, a program over shared cells: two SeqCst fetch_add(1) on a new AtomicU32 and then a load give 2 (the first theorem whose model is a Threads.Prog, by evaluation).
+
+```lean
+theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
 ```
