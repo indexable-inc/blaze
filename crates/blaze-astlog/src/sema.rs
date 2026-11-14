@@ -1177,6 +1177,39 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     out.push(vec![node(self.syn(at))]);
                 }
             }
+            Atom::MatchArm => {
+                let arms: Vec<ast::Node<'a>> = match (&inputs[0], &inputs[1]) {
+                    (_, Some(_)) => vec![self.need_syn(&inputs[1], "match-arm", line)?],
+                    (Some(_), None) => {
+                        let at = self.need_syn(&inputs[0], "match-arm", line)?;
+                        at.children()
+                            .filter(|it| it.kind() == SyntaxKind::MATCH_ARM_LIST)
+                            .flat_map(|list| list.children())
+                            .collect()
+                    }
+                    (None, None) => self
+                        .searched(None)
+                        .into_iter()
+                        .flat_map(|tree| self.tree_at(tree).root.descendants())
+                        .filter(|it| it.kind() == SyntaxKind::MATCH_ARM)
+                        .collect(),
+                };
+                for arm in arms.into_iter().filter_map(ast::MatchArm::cast) {
+                    let list = arm.syntax().parent();
+                    let Some(at) = list.and_then(|it| it.parent()).filter(|it| it.kind() == SyntaxKind::MATCH_EXPR)
+                    else {
+                        continue;
+                    };
+                    // An arm the parser recovered without a pattern or an expression makes no row.
+                    let (Some(pat), Some(expr)) = (arm.pat(), arm.expr()) else { continue };
+                    out.push(vec![
+                        node(self.syn(at)),
+                        node(self.syn(arm.syntax())),
+                        node(self.syn(pat.syntax())),
+                        node(self.syn(expr.syntax())),
+                    ]);
+                }
+            }
         }
         Ok(())
     }

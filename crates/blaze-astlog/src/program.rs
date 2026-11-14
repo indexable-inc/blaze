@@ -60,6 +60,8 @@ pub enum Atom {
     Defines,
     References,
     Filter(Filter),
+    /// `(match-arm m a p b)`: a `match`, one of its arms, the arm's pattern and its expression.
+    MatchArm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +117,7 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "visibility" => (Atom::Visibility, 2, all0),
         "defines" => (Atom::Defines, 2, Needs::Any(&[0, 1])),
         "references" => (Atom::References, 2, all0),
+        "match-arm" => (Atom::MatchArm, 4, Needs::Nothing),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

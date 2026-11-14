@@ -399,3 +399,35 @@ fn add_use_imports_the_path_once_into_the_nodes_module() {
     let module = text.find("pub mod outer {").expect("outer");
     assert!(text.find("use dep::helper;").is_some_and(|at| at < module), "into the crate root, not outer: {text}");
 }
+
+const ARMS: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub enum E { A, B(u8) }
+pub fn pick(n: u8) -> E {
+    match n {
+        0 => E::A,
+        k if k > 9 => E::B(k),
+        _ => E::B(1),
+    }
+}
+pub fn other(n: u8) -> u8 { match n { 7 => 1, _ => 2 } }
+"#;
+
+/// `match-arm` gives each arm's match, pattern and expression from the match, from the arm, or
+/// from neither; its guard is no part of the pattern.
+#[test]
+fn match_arm_gives_each_arms_match_pattern_and_expression_from_either_end() {
+    let (db, files) = view(ARMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (every p b) (match-arm m a p b))
+        (rule (of-match p b) (syntax m "MATCH_EXPR") (text-match m "^match n [{] 7") (match-arm m a p b))
+        (rule (of-arm m) (syntax a "MATCH_ARM") (text-match a "^k if") (match-arm m a p b))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let every = [["0", "E::A"], ["k", "E::B(k)"], ["_", "E::B(1)"], ["7", "1"], ["_", "2"]];
+    assert_eq!(texts(&outcome, "every"), every);
+    assert_eq!(texts(&outcome, "of-match"), [["7", "1"], ["_", "2"]]);
+    let of_arm = texts(&outcome, "of-arm");
+    assert_eq!(of_arm.len(), 1, "{of_arm:?}");
+    assert!(of_arm[0][0].starts_with("match n {\n        0 => E::A,"), "{of_arm:?}");
+}
