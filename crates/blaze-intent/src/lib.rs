@@ -124,10 +124,34 @@ pub(crate) struct Edits<'a, F: Files> {
     pub moves: Vec<Op>,
 }
 
+/// One text edit a rule made, at a range of the file's text as the view has it, before any edit
+/// of the request: astlog's rewrites (`blaze-astlog`), which find their ranges in the view.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TextEdit {
+    /// The file's path in the view.
+    pub path: String,
+    pub range: syntax::TextRange,
+    pub text: String,
+    /// What made it, for an error that it overlaps another edit: the rule's name and line.
+    pub by: String,
+}
+
 /// Makes `edits`, in order, in the view whose front end is `db` and whose files are `files`.
 /// A rename or a replace resolves in the view as it is, so each comes before the request's
 /// other edits. The request's replaces are made together, in one pass at the first of them.
 pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, ApiError> {
+    apply_with_text(db, files, edits, &[])
+}
+
+/// [`apply`]'s `edits`, then `text`, each moved past the edits before it. A text edit whose
+/// range an earlier edit replaced any of is an error naming both, and so is a file the text
+/// edits leave with a syntax error the view's file did not have: nothing is made.
+pub fn apply_with_text<F: Files>(
+    db: &Db,
+    files: &F,
+    edits: &[Edit],
+    text: &[TextEdit],
+) -> Result<Applied, ApiError> {
     let mut cx = Edits {
         db,
         sema: Semantics::new(db),
@@ -197,10 +221,69 @@ pub fn apply<F: Files>(db: &Db, files: &F, edits: &[Edit]) -> Result<Applied, Ap
             }
         }
     }
+    if !text.is_empty() {
+        cx.splice_text(text)?;
+    }
     Ok(cx.finish())
 }
 
 impl<F: Files> Edits<'_, F> {
+    /// Makes `text`, last first within a file so each range is the view's, then refuses a file
+    /// they broke.
+    fn splice_text(&mut self, text: &[TextEdit]) -> Result<(), ApiError> {
+        // alloc: the text edits in splice order, once a request
+        let mut order: Vec<&TextEdit> = text.iter().collect();
+        order.sort_by(|a, b| {
+            (&a.path, b.range.start(), b.range.end()).cmp(&(&b.path, a.range.start(), a.range.end()))
+        });
+        let mut changed = Vec::new(); // alloc: the files the text edits open, a few
+        for edit in order {
+            let at = self.open(&edit.path).map_err(|what| ApiError::new(what, Some(edit.path.clone())))?;
+            let file = &self.working[at as usize];
+            let line = |offset: syntax::TextSize| {
+                let bytes = &file.base().file().text().as_bytes()[..usize::from(offset)];
+                memchr::memchr_iter(b'\n', bytes).count() + 1
+            };
+            let place = format!("{}:{}", edit.path, line(edit.range.start()));
+            let now = file.to_now(edit.range).ok_or_else(|| {
+                ApiError::new(
+                    format!(
+                        "{place}: {} edits text another edit of this request already replaced",
+                        edit.by
+                    ),
+                    Some(place.clone()),
+                )
+            })?;
+            let token = self.roots[at as usize].token_at_offset(edit.range.start()).right_biased();
+            let file = &mut self.working[at as usize];
+            file.splice(now, edit.text.clone()) // clone: the splice owns its text
+                .map_err(|what| ApiError::new(what, Some(place.clone())))?;
+            if let Some(token) = token {
+                self.touches.push(rename::touch_of(at, token));
+            }
+            if !changed.contains(&at) {
+                changed.push(at);
+            }
+        }
+        for at in changed {
+            let file = &self.working[at as usize];
+            let before = file.base.errors_with_bodies().len();
+            let after = file.parse.errors_with_bodies();
+            if after.len() > before
+                && let Some(first) = after.first()
+            {
+                let offset = usize::from(first.range().start());
+                let line = memchr::memchr_iter(b'\n', &file.text().as_bytes()[..offset]).count() + 1;
+                let place = format!("{}:{line}", file.path);
+                return Err(ApiError::new(
+                    format!("{place}: the rules' edits leave the file unparsable: {first}"),
+                    Some(place),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The working copy of the view's file at `path`, opened on first use.
     pub fn open(&mut self, path: &str) -> Result<u32, String> {
         if let Some(&at) = self.by_path.get(path) {

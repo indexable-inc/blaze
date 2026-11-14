@@ -492,6 +492,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-astlog"
+version = "0.0.0"
+dependencies = [
+ "astlog-engine",
+ "base-db",
+ "blaze-api",
+ "blaze-hash",
+ "blaze-intent",
+ "blaze-query",
+ "blaze-vfs",
+ "either",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "memchr",
+ "snafu",
+ "syntax",
+]
+
+[[package]]
 name = "blaze-bench"
 version = "0.0.0"
 dependencies = [

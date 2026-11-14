@@ -604,6 +604,7 @@ blaze-program = { path = "crates/blaze-program" }
 blaze-mutants = { path = "crates/blaze-mutants" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
+blaze-astlog = { path = "crates/blaze-astlog" }
 blaze-lints = { path = "crates/blaze-lints" }
 blaze-lazy = { path = "crates/blaze-lazy", default-features = false }
 blaze-stencil = { path = "crates/blaze-stencil", default-features = false }

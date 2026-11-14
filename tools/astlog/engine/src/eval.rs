@@ -221,6 +221,7 @@ enum Step<'p, A, N> {
     Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
     Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>>, regex: Option<regex::Regex> },
     Source { atom: &'p A, line: usize, args: Vec<Arg<N>> },
+    NotSource { atom: &'p A, line: usize, args: Vec<Arg<N>> },
 }
 
 /// A body compiled to steps over variable slots.
@@ -308,6 +309,11 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     atom: &source.value,
                     line: source.line,
                     args: args(&mut names, &source.args, true),
+                },
+                BodyAtom::NegatedSource(source) => Step::NotSource {
+                    atom: &source.value,
+                    line: source.line,
+                    args: args(&mut names, &source.args, false),
                 },
                 BodyAtom::App(app) => match Builtin::of(&app.name) {
                     Some(builtin) => {
@@ -513,6 +519,18 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                         self.solve(body, at + 1, windows, env, emit)?;
                         clear(env, &set);
                     }
+                }
+            }
+            Step::NotSource { atom, line, args } => {
+                let inputs: Vec<Option<Value<F::Node>>> =
+                    args.iter().map(|arg| input(arg, env)).collect();
+                let mut rows = Vec::new();
+                self.facts.solve(atom, *line, &inputs, &mut rows)?;
+                let any = rows.iter().any(|row| {
+                    row.iter().zip(&inputs).all(|(value, input)| input.as_ref().is_none_or(|it| it == value))
+                });
+                if !any {
+                    self.solve(body, at + 1, windows, env, emit)?;
                 }
             }
             Step::Builtin { builtin, app, args, regex } => {

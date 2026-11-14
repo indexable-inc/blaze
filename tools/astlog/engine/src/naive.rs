@@ -99,6 +99,17 @@ fn solve<F: Facts>(
                 solve(facts, db, rest, env, out);
             }
         }
+        BodyAtom::NegatedSource(source) => {
+            let inputs: Vec<Option<Value<F::Node>>> =
+                source.args.iter().map(|term| bound(term, &env)).collect();
+            let mut rows = Vec::new();
+            facts
+                .solve(&source.value, source.line, &inputs, &mut rows)
+                .unwrap_or_else(|error| panic!("source atom failed: {error}"));
+            if !rows.iter().any(|row| unify_all(&env, &source.args, row).is_some()) {
+                solve(facts, db, rest, env, out);
+            }
+        }
         BodyAtom::Count(count) => {
             let n = matches(db, &count.inner, &env).count();
             let n = Value::Int(i64::try_from(n).unwrap_or(i64::MAX));

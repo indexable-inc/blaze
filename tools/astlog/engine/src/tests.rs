@@ -142,8 +142,12 @@ fn rule(tc: &hegel::TestCase, head: usize) -> String {
     let mut body = Vec::new();
     let atoms = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     for at in 0..atoms {
-        let pick = tc.draw(gs::integers::<u8>().max_value(4));
-        if at > 0 && pick == 3 && head > 0 && !bound.is_empty() {
+        let pick = tc.draw(gs::integers::<u8>().max_value(5));
+        if at > 0 && pick == 5 && !bound.is_empty() {
+            let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+            let y = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
+            body.push(format!("(not (edge {x} {y}))"));
+        } else if at > 0 && pick == 3 && head > 0 && !bound.is_empty() {
             let rel = tc.draw(gs::integers::<usize>().max_value(head - 1));
             let x = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
             let y = bound[tc.draw(gs::integers::<usize>().max_value(bound.len() - 1))];
@@ -231,6 +235,22 @@ fn negation_reads_the_final_lower_stratum() -> Result<(), Error<GraphError>> {
     let sets = semi_naive(&program, &edges)?;
     assert_eq!(rows(&sets, "unreached"), [["0"], ["5"], ["6"]]);
     Ok(())
+}
+
+#[test]
+fn a_negated_source_atom_filters_bound_rows() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (one-way a b) (edge a b) (not (edge b a)))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (2, 1), (2, 3)]))?;
+    assert_eq!(rows(&sets, "one-way"), [["2", "3"]]);
+    Ok(())
+}
+
+#[test]
+fn a_negated_source_atom_with_an_unbound_variable_is_refused() {
+    let error = Program::<Graph>::parse("(rule (r a) (edge a a) (not (edge a b)))").unwrap_err();
+    assert!(matches!(error, Error::UnsafeNegation { ref var, .. } if var == "b"), "{error}");
 }
 
 #[test]

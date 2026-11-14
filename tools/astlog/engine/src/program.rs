@@ -155,6 +155,9 @@ pub enum BodyAtom<A> {
     /// unifies with it. Stratified: the negated relation is computed in a lower stratum, so its
     /// rows are final before the negation runs.
     Negation(AppAtom),
+    /// `(not (source-atom args...))`: succeeds for a binding iff the source gives no row for
+    /// it. Every argument is bound by then, so it is a filter and needs no stratum.
+    NegatedSource(SourceAtom<A>),
     Count(CountAtom),
 }
 
@@ -411,7 +414,7 @@ impl<L: Language> Program<L> {
                     }
                     BodyAtom::Negation(neg) => edges.push((&rule.name, &neg.name, true)),
                     BodyAtom::Count(count) => edges.push((&rule.name, &count.inner.name, true)),
-                    BodyAtom::App(_) | BodyAtom::Source(_) => {}
+                    BodyAtom::App(_) | BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => {}
                 }
             }
         }
@@ -492,7 +495,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
         let (relation, filter) = match atom {
             BodyAtom::Negation(neg) => (neg, "(not ...)"),
             BodyAtom::Count(count) => (&count.inner, "(count ...)"),
-            BodyAtom::Source(_) => continue,
+            BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => continue,
             BodyAtom::App(app) => {
                 if let Some((arity, _)) = builtin(&app.name) {
                     check_arity(app, arity, true)?;
@@ -625,6 +628,14 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     }
                 }
             }
+            BodyAtom::NegatedSource(source) => {
+                for var in vars(&source.args) {
+                    if !bound.contains(var) {
+                        return UnsafeNegationSnafu { var: var.to_owned(), line: source.line }
+                            .fail();
+                    }
+                }
+            }
             BodyAtom::Count(count) => {
                 // Unbound inner variables are local to the count; one mentioned again after it
                 // would read as a join with nothing it can join.
@@ -651,7 +662,7 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
 fn mentioned<A>(body: &[BodyAtom<A>], var: &str) -> bool {
     body.iter().any(|atom| {
         let args: &[Term] = match atom {
-            BodyAtom::Source(source) => &source.args,
+            BodyAtom::Source(source) | BodyAtom::NegatedSource(source) => &source.args,
             BodyAtom::App(app) | BodyAtom::Negation(app) => &app.args,
             BodyAtom::Count(count) => {
                 return count.result == Term::Var(var.to_owned())
@@ -848,14 +859,15 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
             }
             .fail();
         };
-        let BodyAtom::App(app) = parse_body_atom::<L>(inner)? else {
-            return DslSnafu {
+        return match parse_body_atom::<L>(inner)? {
+            BodyAtom::App(app) => Ok(BodyAtom::Negation(app)),
+            BodyAtom::Source(source) => Ok(BodyAtom::NegatedSource(source)),
+            _ => DslSnafu {
                 line: form.line(),
-                message: "(not ...) may only negate a relation atom".to_owned(),
+                message: "(not ...) may only negate a relation or a source atom".to_owned(),
             }
-            .fail();
+            .fail(),
         };
-        return Ok(BodyAtom::Negation(app));
     }
     if name == "count" {
         let [result, inner] = args else {
