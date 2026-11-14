@@ -14,6 +14,12 @@ use triomphe::Arc;
 
 use crate::{ExpandError, ExpandErrorKind, ExpandResult, tt};
 
+/// The module blaze appends to the root of a proc-macro crate it builds for wasm: the list of
+/// the crate's macros and its wasm module's glue (`blaze_macro_eval::wasm_glue` writes it).
+/// Nobody wrote it and it is not in the file on disk, so what reads a crate's own code (a lint
+/// of what the crate declares) passes it by.
+pub const GLUE_MODULE: &str = "__blaze_proc_macros";
+
 #[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Debug, Hash)]
 pub enum ProcMacroKind {
     CustomDerive,

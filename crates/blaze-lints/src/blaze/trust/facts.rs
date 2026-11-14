@@ -30,6 +30,7 @@ use hir_def::{
         TraitSignature,
     },
 };
+use hir_expand::proc_macro::GLUE_MODULE;
 use hir_ty_pure::trust::{Done, Reach, function_path, reach, toolchain_crate};
 use syntax::SyntaxKind;
 
@@ -367,7 +368,30 @@ fn functions_of(db: &Db, krate: Crate) -> Vec<FunctionId, Global> {
 fn bodies(db: &Db, krate: Crate) -> (Vec<DefWithBodyId, Global>, Vec<&hir_def::item_scope::ItemScope, Global>) {
     let mut defs: Vec<DefWithBodyId> = Vec::new_in(Global);
     let mut scopes = Vec::new_in(Global);
-    for (_, module) in crate_def_map(db, krate).modules(db) {
+    let map = crate_def_map(db, krate);
+    // What blaze appended to a proc-macro crate (the list of its macros and its wasm module's
+    // glue, with the foreign functions of the bridge) is blaze's, not the crate's: nobody
+    // wrote it, and a crate is not told it declares what it never did.
+    let glue = match krate.data(db).target_kind.is_proc_macro() {
+        true => map.modules(db).find_map(|(id, module)| {
+            let named = id.name(db).is_some_and(|it| it.as_str() == GLUE_MODULE);
+            (named && module.parent == Some(map.root_module_id())).then_some(id)
+        }),
+        false => None,
+    };
+    for (id, module) in map.modules(db) {
+        let mut at = Some(id);
+        let mut appended = false;
+        while let Some(it) = at {
+            if Some(it) == glue {
+                appended = true;
+                break;
+            }
+            at = map.modules(db).find(|(other, _)| *other == it).and_then(|(_, data)| data.parent);
+        }
+        if appended {
+            continue;
+        }
         check::bodies_of(db, module.scope(db), &mut defs);
         scopes.push(module.scope(db));
     }

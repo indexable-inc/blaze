@@ -107,6 +107,34 @@ fn an_unsafe_block_is_denied() {
     assert!(out.contains("`left_pad::hidden` has an `unsafe` block"), "{out}");
 }
 
+/// What blaze appends to a proc-macro crate it builds for wasm (the module
+/// `hir_expand::proc_macro::GLUE_MODULE`: the list of its macros and the bridge's foreign
+/// functions) is not the crate's `unsafe` code: a proc-macro crate with none of its own is not
+/// told it has some. (The controls: the same items in a module of another name, and the same
+/// module in a crate that is no proc macro, are the crate's own.) Found on blaze-serde-derive:
+/// `declares the foreign function ..::__blaze_proc_macros::__blaze_wasm_entry::dispatch`.
+#[test]
+fn what_blaze_appends_to_a_proc_macro_crate_is_not_its_unsafe() {
+    let flags = format!("{} -W blaze::workspace_unsafe", flags());
+    let said = "of the workspace runs `unsafe` code";
+    let glue = |module: &str| {
+        format!(
+            "pub fn derive() -> u32 {{ 1 }}\npub mod {module} {{\n    pub mod __blaze_wasm_entry {{\n        \
+             unsafe extern \"C\" {{ pub fn dispatch(index: u32) -> u32; }}\n        \
+             pub fn enter(index: u32) -> u32 {{ unsafe {{ dispatch(index) }} }}\n    }}\n}}\n"
+        )
+    };
+    let fixture = |kind: &str, module: &str| {
+        format!("{MINICORE}{STD}//- /src/lib.rs crate:{kind}main deps:std\n{}", glue(module))
+    };
+    let out = lint_with(&fixture("proc-macro:", "__blaze_proc_macros"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 0, "{out}");
+    let out = lint_with(&fixture("proc-macro:", "its_own"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 1, "{out}");
+    let out = lint_with(&fixture("", "__blaze_proc_macros"), &flags, Conf::default());
+    assert_eq!(lines(&out, said).len(), 1, "{out}");
+}
+
 /// Formatting a string is not `unsafe` code: lowering `format_args!` makes an `unsafe` block
 /// nobody wrote (around `fmt::Arguments::new`), and a dependency that only formats is not
 /// denied for it. (The control: the same dependency with a block someone wrote is.) Found on
