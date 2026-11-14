@@ -2754,14 +2754,15 @@ impl Runs<Real> for UnitRuns {
         &mut self,
         store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         match self {
-            UnitRuns::Script(it) => it.start(store, writer, effects, out),
-            UnitRuns::Tests(it) => it.start(store, writer, effects, out),
-            UnitRuns::Program(it) => it.start(store, writer, effects, out),
-            UnitRuns::Proofs(it) => it.start(store, writer, effects, out),
+            UnitRuns::Script(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Tests(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Program(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Proofs(it) => it.start(store, writer, placed, effects, out),
         }
     }
 

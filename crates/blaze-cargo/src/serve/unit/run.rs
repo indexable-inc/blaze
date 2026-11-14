@@ -196,8 +196,12 @@ pub(crate) struct Program {
     command: Option<Command>,
     tag: Tag,
     running: bool,
-    /// A dev executable's run ([`Launch::InProcess`]): its code memory and the start, told
-    /// when the process has ended so no fence waits for it.
+    /// A dev executable's code memory ([`Launch::InProcess`]), until the run starts: its
+    /// command is made then, from the file its build placed and the key the job's record
+    /// holds for that path ([`Runs::start`]'s `placed`).
+    dev: Option<Arc<inproc::Loaded>>,
+    /// A dev executable's run once started: its code memory and the start, told when the
+    /// process has ended so no fence waits for it.
     loaded: Option<(Arc<inproc::Loaded>, blaze_inproc::host::Started)>,
 }
 
@@ -301,33 +305,47 @@ pub(crate) fn start(
         sandbox,
         memory: None,
     };
-    let (command, loaded) = match launch {
-        Launch::File => (command, None),
-        // The file is written from the code memory when it is not its file yet, and the start
-        // hook's variable is set (`Program::command`).
-        Launch::InProcess => {
-            let loaded = job
-                .shared
+    let dev = match launch {
+        Launch::File => None,
+        // Its command is made as the run starts, once the job's placements have ended
+        // (`Runs::start`): from the file the build placed, never one written here.
+        Launch::InProcess => Some(
+            job.shared
                 .dev_runs
                 .loaded(&command.program.to_string_lossy())
-                .map_err(|what| ApiError::new(what, None))?;
-            let (command, started) =
-                loaded.command(command, false).map_err(|what| ApiError::new(what, None))?;
-            (command, Some((loaded, started)))
-        }
+                .map_err(|what| ApiError::new(what, None))?,
+        ),
     };
-    Ok(Program { command: Some(command), tag: Tag(tags), running: false, loaded })
+    Ok(Program { command: Some(command), tag: Tag(tags), running: false, dev, loaded: None })
 }
 
 impl Runs<Real> for Program {
+    /// A dev executable is started from the file its build placed at its path, with the key
+    /// the job's record holds there (`placed`), and the start hook's variable set
+    /// ([`inproc::Loaded::command`]); a path whose record is another key or none is refused,
+    /// the run ending not ok with the refusal, naming the path and both keys, as its stderr.
     fn start(
         &mut self,
         _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
-        _out: &mut Vec<Response>,
+        out: &mut Vec<Response>,
     ) -> Option<bool> {
-        let command = self.command.take()?;
+        let mut command = self.command.take()?;
+        if let Some(dev) = self.dev.take() {
+            let key = placed(&command.program.to_string_lossy());
+            match dev.command(command, false, key) {
+                Ok((it, started)) => {
+                    command = it;
+                    self.loaded = Some((dev, started));
+                }
+                Err(why) => {
+                    out.push(Response::Ran { code: None, stdout: Vec::new(), stderr: why.into_bytes() });
+                    return Some(false);
+                }
+            }
+        }
         blaze_core::reaped::label(self.tag, "run", Some(&command.program.to_string_lossy()));
         effects.push(Effect::Spawn { command: Box::new(command), tag: self.tag });
         self.running = true;
@@ -377,6 +395,7 @@ impl Runs<Real> for Program {
             }
             false => {
                 self.command = None;
+                self.dev = None;
                 self.ended();
                 Some(false)
             }
