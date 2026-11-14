@@ -134,6 +134,24 @@ fn a_rewrite_that_leaves_a_file_unparsable_fails_the_request() {
 }
 
 #[test]
+fn a_text_rewrite_of_a_file_that_already_has_a_syntax_error_is_refused_naming_it() {
+    let fixture = format!("{LIB}pub fn broken() -> u32 {{ let y = ; 2 }}\npub fn other() -> u32 {{ new(5) }}\n");
+    let (db, files) = view(&fixture, 0, &["lib.rs"]);
+    // One rewrite mends the file's own error and another makes a new one: as many errors as
+    // before, and still a broken file.
+    let rules = r#"
+        (rule (bad s) (syntax s "LET_STMT") (enclosing-fn s f) (def-path f "lib::broken"))
+        (rule (new-path p) (path p "lib::new"))
+        (rewrite mended (bad s) (replace s "let y = 1;"))
+        (rewrite broke (new-path p) (replace p "new("))
+    "#;
+    let error = refused(edit(&db, &files, rules, &[]));
+    let line = fixture.lines().position(|it| it.contains("pub fn broken")).unwrap() - 1;
+    assert!(error.starts_with(&format!("lib.rs:{line}:")), "{error}");
+    assert!(error.contains("already has a syntax error"), "{error}");
+}
+
+#[test]
 fn a_template_that_is_no_expression_where_it_replaces_one_is_refused_naming_its_rule() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);
     let rules = r#"
