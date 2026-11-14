@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Function contracts (nightly's `#![feature(contracts)]`) in blaze — the same as the pinned nightly first, then checked by default in dev and test profiles, tested by Hegel-generated property tests, proved in Lean (formal-verification.md; the Z3 tier was retired on 2026-11-10), and used by the optimizer only once proved.
+summary: Function contracts (nightly's `#![feature(contracts)]`) in blaze — the same as the pinned nightly first, then checked by default in dev and test profiles, tested by generated blaze-sim property tests, proved in Lean (formal-verification.md; the Z3 tier was retired on 2026-11-10), and used by the optimizer only once proved.
 date: 2026-11-02
 ---
 # Contracts: checked, generated, proved, used
@@ -34,7 +34,8 @@ The parts:
    extension.
 1. **Checked in debug.** A dev or test profile checks native clauses by default, with an
    opt-out per profile.
-2. **Tested by generation.** A function with native clauses gets a Hegel property test.
+2. **Tested by generation.** A function with native clauses gets a property test on blaze-sim
+   ([sim.md](sim.md)).
 3. **Used by the optimizer, once proved.** A fact is used only when a proof stands behind it.
 4. **Proved.** Lean checks a proof of `ensures` from `requires` and the model of the body
    ([formal-verification.md](formal-verification.md)); the Z3 tier that proved it with no
@@ -263,19 +264,18 @@ How they are made:
     every crate that uses contracts.
   - Once lane pure's check is in, a crate-wide default for pure functions is the next step.
 - **The test.** For each opted-in function with contracts, the front end synthesizes a test
-  item in a `#[cfg(test)]` module, as `#[test]`'s expansion makes one. It is
-  `#[hegel::test]`-shaped and runs under `blaze test` with the crate's other tests. Each case:
-  1. draws each argument with `hegel::generators` for its type: integers, `bool`, `char`,
-     `String`, `Vec<T>`, slices by reference, tuples, arrays, `Option` and `Result`, and
-     `#[derive(blaze::Arbitrary)]` types; a type with no generator makes the generation an
-     error naming the argument and its type;
-  2. calls `requires` as a predicate on the drawn inputs and rejects the case if it is false
-     (`tc.assume`). A `requires` of a supported form (`a < b`, `a <= b`, `!x.is_empty()`,
-     `i < xs.len()`, conjunctions) narrows the generator itself, so few cases are thrown away;
+  item in a `#[cfg(test)]` module, as `#[test]`'s expansion makes one. It is a
+  `blaze_sim::check` and runs under `blaze test` with the crate's other tests. Each case:
+  1. draws each argument from the tape by its type's `blaze_sim::Any`: integers, `bool`,
+     `char`, floats, `String`, `Vec<T>`, slices by reference, tuples, arrays, `Option` and
+     `Box`; a type with no draw makes the generation an error naming the argument and its type;
+  2. calls `requires` as a predicate on the drawn inputs and discards the case if it is false
+     (`tape.assume`). A `requires` of a supported form (`a < b`, `a <= b`, `!x.is_empty()`,
+     `i < xs.len()`, conjunctions) narrows the draw itself, so few cases are thrown away;
   3. calls the function and checks `ensures` on the result.
-- **A failure** shrinks (Hegel's shrinker) to a minimal case. It prints a plain `#[test]` with
-  the shrunk arguments as literals, ready to paste and keep, and names the function and the
-  clause.
+- **A failure** shrinks (blaze-sim's shrinker) to the least tape. Its report names the function
+  and the clause and prints a plain `#[test]` with the least case's arguments as literals,
+  ready to paste and keep.
 - **The predicates.** The same front-end lowering that makes the runtime check gives each
   function two synthesized predicates, `requires(&args) -> bool` and
   `ensures(&args, &ret) -> bool`. The generated test, the caller-side check (part 1) and the
@@ -292,32 +292,34 @@ How they are made:
   dependency. It is a macro, not a synthesis in `hir-def`, because the test is ordinary syntax:
   name resolution, inference, diagnostics, the IDE and `blaze test`'s harness see it as any
   `#[test]`, and its spans are the function's own, so an error in a clause points at the clause.
-- **The expansion.** The function as written, then `#[cfg(test)] #[test] fn <f>_contract()`.
-  Each argument is drawn with `hegel::generators::default::<T>()`; `&T` is lent from a drawn
-  `<T as ToOwned>::Owned` (`&str` from a `String`). Owned arguments are passed as clones, so the
-  drawn values stay for the `ensures` and the report: they must be `Clone`, and every argument
-  `Debug`. Each missing capability (a Hegel default generator, `Debug`, `Clone`, `ToOwned`) is a
-  compile error from a per-argument trait whose `on_unimplemented` names the function, the
-  argument and the type. The `requires` are `tc.assume`d, the call runs under `catch_unwind`
-  (a panic fails the case, named as the function's), and each `ensures` is checked with the
-  named return bound to the result. A failure, on Hegel's last replay of the shrunk case,
-  panics with ``#[blaze::contract_test] on `f`: `ensures r > x` does not hold`` and a plain
-  `#[test] fn f_contract_case()` with the arguments as literals (their `Debug`, with
-  `String::from(..)` and `vec!` around a `String` or `Vec`).
+- **The expansion.** The function as written, then `#[cfg(test)] #[test] fn <f>_contract()`,
+  whose body is `blaze_sim::check(Config::DEFAULT, |tape| ..)`. Each argument is drawn with
+  `tape.any::<T>("<the argument's name>")`; `&T` is lent from a drawn `<T as ToOwned>::Owned`
+  (`&str` from a `String`). Owned arguments are passed as clones, so the drawn values stay for
+  the `ensures` and the report: they must be `Clone`, and every argument `Debug`. Each missing
+  capability (`blaze_sim::Any`, `Debug`, `Clone`, `ToOwned`) is a compile error from a
+  per-argument trait whose `on_unimplemented` names the function, the argument and the type.
+  The `requires` are `tape.assume`d, the call runs under `catch_unwind` (a panic fails the
+  case, named as the function's), and each `ensures` is checked with the named return bound to
+  the result. A failing case notes itself (`tape.note`) as a plain `#[test] fn f_contract_case()`
+  with the arguments as literals (their `Debug`, with `String::from(..)` and `vec!` around a
+  `String` or `Vec`) and panics with ``#[blaze::contract_test] on `f`: `ensures r > x` does not
+  hold``; blaze-sim's report gives that message and, under `notes:`, the case of the least tape.
 - **Refused, naming the function and why:** generic, `async`, `gen` and `unsafe` functions,
-  methods and associated functions, a function inside a block, `&mut`, `impl Trait` and
-  pattern arguments, a function without `requires` or `ensures`, an argument to the attribute
-  other than `skip`, and a crate built with `cfg(test)` without a `hegel` dependency. On a
-  refusal the function is kept as written. `recommends` and `decreases` are not checked.
+  methods and associated functions, a function inside a block, a function without arguments
+  (every case is the same call), `&mut`, `impl Trait` and pattern arguments, a function
+  without `requires` or `ensures`, an argument to the attribute other than `skip`, and a crate
+  built with `cfg(test)` without a `blaze_sim` dependency. On a refusal the function is kept as
+  written. `recommends` and `decreases` are not checked.
 - **Not yet:** the crate-wide `#![blaze::contract_tests]`, generators narrowed by a `requires`,
   and the shared predicates above (the test splices the clauses' own tokens).
 - **Contract checks abort.** Part 1's checks (on in the dev and test profiles) call
   `panic_nounwind`, so a broken `ensures` aborts the test process (exit 134) inside the callee
-  before the test sees the result, and Hegel never shrinks it. Until part 3's unchecked entry
-  exists, a crate with generated tests sets `[profile.test] contract-checks = false`.
+  before the test sees the result, and blaze-sim never shrinks it. Until part 3's unchecked
+  entry exists, a crate with generated tests sets `[profile.test] contract-checks = false`.
 - **Using it.** `#![feature(blaze_verify)]`, the attribute on the function, and
-  `hegeltest = { version or path, default-features = false, features = ["static-engine"] }`
-  under `[dev-dependencies]` (its library is `hegel`).
+  `blaze-sim` under `[dev-dependencies]`, by path to blaze's `crates/blaze-sim` (its library
+  is `blaze_sim`).
 
 ## 3. Used by the optimizer, once proved
 
@@ -389,7 +391,7 @@ The interface between the two is one fact each way.
   `NotProved` names the function, the clause and why: no proof file, a construct v0 does not
   translate, a generic function, a `requires` (proved at call sites, which v0 does not lower),
   Lean refusing the proof, an axiom that is not allowed. It is never a pass.
-- **Hegel stays the cheap first pass.** Part 2's generated test runs first, and a counterexample
+- **The generated test stays the cheap first pass.** Part 2's blaze-sim test runs first, and a counterexample
   it finds is reported before a proof is tried. It is now the only source of counterexamples.
 
 ### Prior art
