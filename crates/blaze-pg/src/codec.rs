@@ -21,7 +21,7 @@ use core::fmt;
 
 use blaze_sql::desc::{Storage, ValueRef};
 
-use crate::proto::{MESSAGE_MOST, put_i32, put_u32};
+use crate::proto::{INT32_BYTES, MESSAGE_MOST, put_i32, put_u32};
 
 pub const BOOL: u32 = 16;
 pub const BYTEA: u32 = 17;
@@ -34,7 +34,30 @@ pub const TEXT_ARRAY: u32 = 1009;
 pub const INT8_ARRAY: u32 = 1016;
 pub const FLOAT8_ARRAY: u32 = 1022;
 
+/// The bytes of a `bigint` or a `double precision`: a 64-bit word.
+const WIDE: usize = size_of::<u64>();
+
+/// Postgres's name of the type a [`Storage::Boolean`] is sent as, written once for the OID's
+/// name and the storage's.
+const BOOLEAN_NAME: &str = "boolean";
+
+/// Postgres's name of the type a [`Storage::Integer`] is sent as.
+const BIGINT_NAME: &str = "bigint";
+
+/// Postgres's name of the type a [`Storage::Real`] is sent as.
+const DOUBLE_NAME: &str = "double precision";
+
+/// Postgres's name of the type a [`Storage::Text`] is sent as.
+const TEXT_NAME: &str = "text";
+
+/// Postgres's name of the type a [`Storage::Blob`] is sent as.
+const BYTEA_NAME: &str = "bytea";
+
 /// The OID of a value of `storage`.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn scalar_oid(storage: Storage) -> u32 {
     match storage {
         Storage::Boolean => BOOL,
@@ -46,6 +69,10 @@ pub fn scalar_oid(storage: Storage) -> u32 {
 }
 
 /// The OID of a one-dimensional array of `storage`.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn array_oid(storage: Storage) -> u32 {
     match storage {
         Storage::Boolean => BOOL_ARRAY,
@@ -58,13 +85,17 @@ pub fn array_oid(storage: Storage) -> u32 {
 
 /// A type's name for messages; OIDs this crate does not speak are named by number by the
 /// caller.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn type_name(oid: u32) -> Option<&'static str> {
     Some(match oid {
-        BOOL => "boolean",
-        BYTEA => "bytea",
-        INT8 => "bigint",
-        TEXT => "text",
-        FLOAT8 => "double precision",
+        BOOL => BOOLEAN_NAME,
+        BYTEA => BYTEA_NAME,
+        INT8 => BIGINT_NAME,
+        TEXT => TEXT_NAME,
+        FLOAT8 => DOUBLE_NAME,
         BOOL_ARRAY => "boolean[]",
         BYTEA_ARRAY => "bytea[]",
         TEXT_ARRAY => "text[]",
@@ -95,11 +126,11 @@ impl fmt::Display for Oid {
 
 fn storage_name(storage: Storage) -> &'static str {
     match storage {
-        Storage::Boolean => "boolean",
-        Storage::Integer => "bigint",
-        Storage::Real => "double precision",
-        Storage::Text => "text",
-        Storage::Blob => "bytea",
+        Storage::Boolean => BOOLEAN_NAME,
+        Storage::Integer => BIGINT_NAME,
+        Storage::Real => DOUBLE_NAME,
+        Storage::Text => TEXT_NAME,
+        Storage::Blob => BYTEA_NAME,
     }
 }
 
@@ -123,7 +154,21 @@ impl fmt::Display for EncodeError {
             EncodeError::TextHasNul { at } => {
                 write!(f, "its text has a NUL at byte {at}, which Postgres text cannot hold")
             }
-            EncodeError::ElementStorage { index, expected, got } => write!(
+            EncodeError::ElementStorage {
+                index,
+                expected:
+                    expected @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+                got:
+                    got @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+            } => write!(
                 f,
                 "element {index} of an array of {} is a {} value",
                 storage_name(expected),
@@ -165,7 +210,15 @@ pub enum ValueError {
 impl fmt::Display for ValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ValueError::Length { storage, len } => {
+            ValueError::Length {
+                storage:
+                    storage @ (Storage::Boolean
+                    | Storage::Integer
+                    | Storage::Real
+                    | Storage::Text
+                    | Storage::Blob),
+                len,
+            } => {
                 let want = match storage {
                     Storage::Boolean => "1 byte",
                     Storage::Integer | Storage::Real => "8 bytes",
@@ -210,7 +263,7 @@ impl fmt::Display for ValueError {
 /// The bytes of a non-null `value`, without a length. Text is checked for NUL.
 fn body<'v>(
     value: &ValueRef<'v>,
-    scratch: &'v mut [u8; 8],
+    scratch: &'v mut [u8; WIDE],
 ) -> Result<Option<&'v [u8]>, EncodeError> {
     Ok(Some(match *value {
         ValueRef::Null => return Ok(None),
@@ -241,15 +294,21 @@ fn put_len<A: Allocator>(out: &mut Vec<u8, A>, len: usize) -> Result<(), EncodeE
     if len > MESSAGE_MOST {
         return Err(EncodeError::TooLong { len });
     }
-    // At most `MESSAGE_MOST`, below `i32::MAX`.
-    put_i32(out, len as i32);
+    // At most `MESSAGE_MOST`, below `i32::MAX`, so this refuses nothing more.
+    let Ok(field) = i32::try_from(len) else {
+        return Err(EncodeError::TooLong { len });
+    };
+    put_i32(out, field);
     Ok(())
 }
 
 /// Writes `value` as a bind parameter or a column: its `int32` length (-1 for null), then its
 /// binary bytes.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn encode<A: Allocator>(value: ValueRef<'_>, out: &mut Vec<u8, A>) -> Result<(), EncodeError> {
-    let mut scratch = [0u8; 8];
+    let mut scratch = [0u8; WIDE];
     match body(&value, &mut scratch)? {
         None => put_i32(out, -1),
         Some(bytes) => {
@@ -262,6 +321,9 @@ pub fn encode<A: Allocator>(value: ValueRef<'_>, out: &mut Vec<u8, A>) -> Result
 
 /// Writes a one-dimensional array of `storage` holding `items` (nulls allowed), with its
 /// `int32` length first, as a bind parameter.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn encode_array<A: Allocator>(
     storage: Storage,
     items: &[ValueRef<'_>],
@@ -271,44 +333,60 @@ pub fn encode_array<A: Allocator>(
     put_i32(out, 0);
     let start = out.len();
     let has_null = items.iter().any(|it| matches!(it, ValueRef::Null));
-    if items.len() > MESSAGE_MOST / 4 {
-        return Err(EncodeError::TooLong { len: items.len().saturating_mul(4) });
+    // Each element takes at least its `int32` length.
+    let too_many = EncodeError::TooLong { len: items.len().saturating_mul(INT32_BYTES) };
+    if items.len() > MESSAGE_MOST / INT32_BYTES {
+        return Err(too_many);
     }
+    // At most `MESSAGE_MOST / INT32_BYTES`, checked above, so this refuses nothing more.
+    let Ok(count) = i32::try_from(items.len()) else {
+        return Err(too_many);
+    };
     put_i32(out, i32::from(!items.is_empty()));
     put_i32(out, i32::from(has_null));
     put_u32(out, scalar_oid(storage));
     if !items.is_empty() {
-        // At most `MESSAGE_MOST / 4`, checked above.
-        put_i32(out, items.len() as i32);
+        put_i32(out, count);
         put_i32(out, 1);
     }
     for (index, item) in items.iter().enumerate() {
-        match item.storage() {
-            None => {}
-            Some(got) if got == storage => {}
-            Some(got) => return Err(EncodeError::ElementStorage { index, expected: storage, got }),
+        // A null is an element of any array.
+        if let Some(got) = item.storage()
+            && got != storage
+        {
+            return Err(EncodeError::ElementStorage { index, expected: storage, got });
         }
         encode(*item, out)?;
-        if out.len() - start > MESSAGE_MOST {
-            return Err(EncodeError::TooLong { len: out.len() - start });
+        let len = out.len().saturating_sub(start);
+        if len > MESSAGE_MOST {
+            return Err(EncodeError::TooLong { len });
         }
     }
-    let len = out.len() - start;
-    // Checked against `MESSAGE_MOST` after each element, below `i32::MAX`.
-    let field = (len as i32).to_be_bytes();
+    let len = out.len().saturating_sub(start);
+    // Checked against `MESSAGE_MOST` after each element, below `i32::MAX`, so this refuses
+    // nothing more.
+    let Ok(field) = i32::try_from(len) else {
+        return Err(EncodeError::TooLong { len });
+    };
     if let Some(slot) = out.get_mut(length_at..start) {
-        slot.copy_from_slice(&field);
+        slot.copy_from_slice(&field.to_be_bytes());
     }
     Ok(())
 }
 
 /// The value of `storage` in `bytes` (`None` is the null).
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn decode(storage: Storage, bytes: Option<&[u8]>) -> Result<ValueRef<'_>, ValueError> {
     let Some(bytes) = bytes else {
         return Ok(ValueRef::Null);
     };
-    let eight = |bytes: &[u8]| -> Result<[u8; 8], ValueError> {
-        bytes.try_into().map_err(|_| ValueError::Length { storage, len: bytes.len() })
+    let eight = |bytes: &[u8]| -> Result<[u8; WIDE], ValueError> {
+        let Ok(word) = <[u8; WIDE]>::try_from(bytes) else {
+            return Err(ValueError::Length { storage, len: bytes.len() });
+        };
+        Ok(word)
     };
     Ok(match storage {
         Storage::Boolean => match *bytes {
@@ -329,11 +407,15 @@ pub fn decode(storage: Storage, bytes: Option<&[u8]>) -> Result<ValueRef<'_>, Va
 
 /// Splits one length-prefixed value off `bytes`: `None` for the null. `field` names it in
 /// errors.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub(crate) fn split_value<'a>(
     bytes: &mut &'a [u8],
     field: &'static str,
 ) -> Result<Option<&'a [u8]>, ValueError> {
-    let Some((len, rest)) = bytes.split_first_chunk::<4>() else {
+    let Some((len, rest)) = bytes.split_first_chunk::<INT32_BYTES>() else {
         return Err(ValueError::Truncated { field });
     };
     let len = i32::from_be_bytes(*len);
@@ -353,10 +435,14 @@ pub(crate) fn split_value<'a>(
 
 /// The elements of a one-dimensional array of `storage` whose binary bytes are `bytes`
 /// (without the value's own length). The header is checked here, each element as it is read.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn decode_array(storage: Storage, bytes: &[u8]) -> Result<Elements<'_>, ValueError> {
     let mut rest = bytes;
     let mut int = |field: &'static str| -> Result<i32, ValueError> {
-        let Some((word, after)) = rest.split_first_chunk::<4>() else {
+        let Some((word, after)) = rest.split_first_chunk::<INT32_BYTES>() else {
             return Err(ValueError::Truncated { field });
         };
         rest = after;
@@ -364,7 +450,8 @@ pub fn decode_array(storage: Storage, bytes: &[u8]) -> Result<Elements<'_>, Valu
     };
     let dimensions = int("array's dimensions")?;
     let flag = int("array's has-null flag")?;
-    let element = int("array's element OID")? as u32;
+    // An OID is unsigned; the header writes it in an `int32`'s bits.
+    let element = int("array's element OID")?.cast_unsigned();
     if !(0..=1).contains(&flag) {
         return Err(ValueError::NullFlag { flag });
     }
@@ -401,11 +488,19 @@ pub struct Elements<'a> {
 
 impl<'a> Elements<'a> {
     /// How many elements are still to come, as the header says.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn left(&self) -> u32 {
         self.left
     }
 
     /// After the last element: the array's bytes are used up.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn finish(&self) -> Result<(), ValueError> {
         match (self.left, self.rest.len()) {
             (0, 0) => Ok(()),
@@ -418,6 +513,15 @@ impl<'a> Elements<'a> {
 impl<'a> Iterator for Elements<'a> {
     type Item = Result<ValueRef<'a>, ValueError>;
 
+    /// At most the elements the header counts; at least one while any is left, as an error
+    /// ends the array after itself.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (usize::from(self.left > 0), Some(blaze_cast::usize_from_u32(self.left)))
+    }
+
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn next(&mut self) -> Option<Self::Item> {
         if self.left == 0 {
             return None;

@@ -15,6 +15,8 @@ doctest = false
 
 [dependencies]
 base64.workspace = true
+# Named casts (`usize_from_u32`, `u64_from_usize`), the fix `blaze::as_cast` asks for.
+blaze-cast = { path = "../blaze-cast" }
 blaze-sha256.workspace = true
 blaze-sql.workspace = true
 

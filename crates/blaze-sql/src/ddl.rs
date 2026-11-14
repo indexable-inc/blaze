@@ -18,8 +18,11 @@ use crate::desc::{Backend, Storage};
 use crate::schema::{Column, Table};
 
 /// Writes `create table` for `table` as `backend`'s text, without a trailing `;`.
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn create_table(table: &Table<'_>, backend: Backend, out: &mut impl fmt::Write) -> fmt::Result {
     let keys = table.columns.iter().filter(|column| column.primary_key).count();
+    let key_place = if keys > 1 { KeyPlace::Table } else { KeyPlace::Column };
     out.write_str("create table ")?;
     quoted(table.name, out)?;
     out.write_str(" (")?;
@@ -27,7 +30,7 @@ pub fn create_table(table: &Table<'_>, backend: Backend, out: &mut impl fmt::Wri
         if index > 0 {
             out.write_str(", ")?;
         }
-        column_definition(column, keys == 1, backend, out)?;
+        column_definition(column, key_place, backend, out)?;
     }
     if keys > 1 {
         out.write_str(", primary key (")?;
@@ -48,18 +51,28 @@ pub fn create_table(table: &Table<'_>, backend: Backend, out: &mut impl fmt::Wri
     Ok(())
 }
 
-/// `"col" type [not null] [primary key] [check ..]`. `lone_key`: the table has exactly one
-/// primary-key column, which then carries `primary key` itself.
+/// Where a table's `primary key` is written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyPlace {
+    /// On the one primary-key column itself (`"id" integer not null primary key`); also the
+    /// place for a table with none, where no column carries it.
+    Column,
+    /// As a table constraint after the columns (`primary key ("a", "b")`): two or more.
+    Table,
+}
+
+/// `"col" type [not null] [primary key] [check ..]`; `primary key` on the column only when
+/// `key_place` is [`KeyPlace::Column`] and the column is in the key.
 fn column_definition(
     column: &Column<'_>,
-    lone_key: bool,
+    key_place: KeyPlace,
     backend: Backend,
     out: &mut impl fmt::Write,
 ) -> fmt::Result {
     quoted(column.name, out)?;
     out.write_char(' ')?;
     out.write_str(type_name(column.storage, backend))?;
-    let own_key = lone_key && column.primary_key;
+    let own_key = key_place == KeyPlace::Column && column.primary_key;
     if backend == Backend::Postgres && own_key && column.storage == Storage::Integer {
         // An identity column is never null, and Postgres numbers it when an insert leaves it
         // out, as SQLite does for an `integer primary key`.
@@ -79,17 +92,36 @@ fn column_definition(
     Ok(())
 }
 
-fn type_name(storage: Storage, backend: Backend) -> &'static str {
+/// SQLite's name of the type that stores an integer, and a Boolean (an integer 0 or 1): the
+/// one STRICT tables take for 64-bit integers.
+pub const SQLITE_INTEGER: &str = "integer";
+/// SQLite's name of the type that stores an 8-byte IEEE float.
+pub const SQLITE_REAL: &str = "real";
+/// The name of the type that stores UTF-8 text, the same on SQLite and Postgres.
+pub const TEXT: &str = "text";
+/// SQLite's name of the type that stores bytes as given.
+pub const SQLITE_BLOB: &str = "blob";
+/// Postgres's own Boolean type.
+pub const POSTGRES_BOOLEAN: &str = "boolean";
+/// Postgres's 64-bit integer type, the width of SQLite's integer and of `i64`.
+pub const POSTGRES_INTEGER: &str = "bigint";
+/// Postgres's 8-byte IEEE float type, the width of SQLite's real and of `f64`.
+pub const POSTGRES_REAL: &str = "double precision";
+/// Postgres's type of bytes as given.
+pub const POSTGRES_BLOB: &str = "bytea";
+
+/// The name `backend` declares a column (and casts a value) of `storage` by: the one home of
+/// these spellings, for `create table` here and for `cast` and the drivers elsewhere.
+pub fn type_name(storage: Storage, backend: Backend) -> &'static str {
     match (backend, storage) {
-        (Backend::Sqlite, Storage::Boolean | Storage::Integer) => "integer",
-        (Backend::Sqlite, Storage::Real) => "real",
-        (Backend::Sqlite, Storage::Text) => "text",
-        (Backend::Sqlite, Storage::Blob) => "blob",
-        (Backend::Postgres, Storage::Boolean) => "boolean",
-        (Backend::Postgres, Storage::Integer) => "bigint",
-        (Backend::Postgres, Storage::Real) => "double precision",
-        (Backend::Postgres, Storage::Text) => "text",
-        (Backend::Postgres, Storage::Blob) => "bytea",
+        (Backend::Sqlite, Storage::Boolean | Storage::Integer) => SQLITE_INTEGER,
+        (Backend::Sqlite, Storage::Real) => SQLITE_REAL,
+        (Backend::Sqlite | Backend::Postgres, Storage::Text) => TEXT,
+        (Backend::Sqlite, Storage::Blob) => SQLITE_BLOB,
+        (Backend::Postgres, Storage::Boolean) => POSTGRES_BOOLEAN,
+        (Backend::Postgres, Storage::Integer) => POSTGRES_INTEGER,
+        (Backend::Postgres, Storage::Real) => POSTGRES_REAL,
+        (Backend::Postgres, Storage::Blob) => POSTGRES_BLOB,
     }
 }
 

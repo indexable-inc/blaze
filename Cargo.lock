@@ -1852,6 +1852,7 @@ name = "blaze-pg"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "blaze-cast",
  "blaze-sha256",
  "blaze-sql",
  "hegeltest",
@@ -2217,6 +2218,7 @@ dependencies = [
 name = "blaze-sqlite"
 version = "0.0.0"
 dependencies = [
+ "blaze-cast",
  "blaze-sql",
  "hegeltest",
  "libsqlite3-sys",
