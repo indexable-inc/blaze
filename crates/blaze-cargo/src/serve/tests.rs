@@ -125,6 +125,14 @@ thread_local! {
     /// How many lowerings were given the head's last front end, and how many lowered anew.
     static INTO_KEPT: Cell<usize> = const { Cell::new(0) };
     static ANEW: Cell<usize> = const { Cell::new(0) };
+    /// Each lowering's view, the root it was asked for, in order.
+    static LOWERED_AT: RefCell<Vec<ContentId>> = const { RefCell::new(Vec::new()) };
+    /// Each query's view as its front end held it ([`FakeInputs::view`]), in order: what its
+    /// answer was read from.
+    static QUERIED_AT: RefCell<Vec<ContentId>> = const { RefCell::new(Vec::new()) };
+    /// The planted bug of the stale-front-end control: a lowering into the root's kept front end
+    /// leaves it at the view it was kept at, as a refresh that read nothing again would.
+    static STALE_INTO_KEPT: Cell<bool> = const { Cell::new(false) };
     /// How many kept front ends were stored ([`Steps::store_kept`]).
     static STORES: Cell<usize> = const { Cell::new(0) };
     /// How many kept front ends' members were stored, the second store of one
@@ -848,9 +856,15 @@ impl Steps for Fake {
                 None,
             )));
         }
+        LOWERED_AT.with_borrow_mut(|it| it.push(job.root));
         let inputs = match kept {
-            Some(inputs) => {
+            Some(mut inputs) => {
                 INTO_KEPT.set(INTO_KEPT.get() + 1);
+                // A real lowering into a kept front end moves it to the job's view, reading
+                // again what changed (`Lowered::refresh`).
+                if !STALE_INTO_KEPT.get() {
+                    inputs.view = Some(job.root);
+                }
                 inputs
             }
             None => {
@@ -878,7 +892,7 @@ impl Steps for Fake {
                 // The home's look reads the machine's layer live (`Store::read_live`): a
                 // sealed crate's record another home put there is found through it.
                 SEALED_FOUND.set(holds(&sealed_key(), SEALED_RECORD));
-                FakeInputs { checkout, ..FakeInputs::default() }
+                FakeInputs { checkout, view: Some(job.root), ..FakeInputs::default() }
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
@@ -960,6 +974,8 @@ pub(super) struct FakeInputs {
     /// Whether its second store, of its members, was made since it was last kept.
     members: bool,
     checkout: String,
+    /// The view it was lowered at or last moved to: what a query of it reads.
+    view: Option<ContentId>,
 }
 
 /// The fakes' front end has no database: their images store no library trees.
@@ -1790,6 +1806,9 @@ impl Front<Fake> for FakeFront {
         _: &str,
     ) -> Result<blaze_api::query::Rows, Failed> {
         EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
+        if let Some(view) = read.view {
+            QUERIED_AT.with_borrow_mut(|it| it.push(view));
+        }
         Ok(blaze_api::query::Rows { findings: Vec::new(), relations: Vec::new() })
     }
 
@@ -5707,6 +5726,315 @@ fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds()
         }
     }
     assert_eq!(stalled, vec![2, 13], "the seeds whose held tasks fill every thread");
+}
+
+/// A query of the head `/w`, its responses; it ended ok.
+fn query_ok(client: &mut Client, daemon: &mut SimDaemon) -> Vec<Response> {
+    let id = client
+        .send(daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+    let got = client.wait(daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    got
+}
+
+/// A check of the head `/w`, its responses; it ended ok.
+fn check_ok(client: &mut Client, daemon: &mut SimDaemon) -> Vec<Response> {
+    let id = client
+        .send(daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(daemon, id);
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    got
+}
+
+/// The lowerings since `before`, as (anew, into the root's kept front end).
+fn lowerings_since(before: (usize, usize)) -> (usize, usize) {
+    (ANEW.get() - before.0, INTO_KEPT.get() - before.1)
+}
+
+fn lowerings_now() -> (usize, usize) {
+    (ANEW.get(), INTO_KEPT.get())
+}
+
+/// Two queries of one unchanged checkout under `seed`, the planted bug set or not: each
+/// query's lowerings, as (anew, into the kept front end).
+fn two_queries(seed: u64, plant: bool) -> ((usize, usize), (usize, usize)) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let first = lowerings_since(before);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let second = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (first, second)
+}
+
+/// The invariant: a query hands the front end it lowered back to its root
+/// (`Jobs::keep_queried`), so a second query of an unchanged view lowers nothing anew: it
+/// lowers into the first's front end, stored first, as a check after a check does. Sent at
+/// once after the first answered, so the second's lowering meets the first's store under way
+/// in some seeds and waits for it (`Jobs::lower_or_wait`). Until 2026-11-14 each query lowered
+/// the root anew (ripgrep: 2.1 million rows run as first again, 36.6 s a query). The control:
+/// [`the_oracle_catches_a_query_that_drops_its_front_end`].
+#[test]
+fn a_second_query_of_an_unchanged_view_lowers_nothing_anew_over_many_seeds() {
+    for seed in 0..16 {
+        let (first, second) = two_queries(seed, false);
+        assert_eq!(first, (1, 0), "seed {seed}: the first query of a fresh daemon lowers anew");
+        assert_eq!(second, (0, 1), "seed {seed}: the second lowers into the first's front end");
+    }
+}
+
+/// The control of [`a_second_query_of_an_unchanged_view_lowers_nothing_anew_over_many_seeds`]:
+/// a query that drops its front end (`job::PLANT_QUERY_DROPS_FRONT`, the code before
+/// 2026-11-14) leaves the second query to lower anew, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_query_that_drops_its_front_end() {
+    let (_, second) = two_queries(3, true);
+    assert_eq!(second, (1, 0), "the planted bug's second query lowered into a kept front end");
+}
+
+/// A query, an edit of the view's `src/main.rs`, and a query, under `seed`, the planted stale
+/// lowering set or not: the views the two queries' lowerings were asked for, and the views
+/// their front ends held as they answered.
+fn query_edit_query(seed: u64, stale: bool) -> (Vec<ContentId>, Vec<ContentId>, (usize, usize)) {
+    STALE_INTO_KEPT.set(stale);
+    LOWERED_AT.with(|it| it.borrow_mut().clear());
+    QUERIED_AT.with(|it| it.borrow_mut().clear());
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    query_ok(&mut client, &mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let second = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    STALE_INTO_KEPT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (LOWERED_AT.with(|it| it.take()), QUERIED_AT.with(|it| it.take()), second)
+}
+
+/// The invariant: a front end handed back by a query is never read stale. A query after an
+/// edit of its view lowers again (into the first query's front end, which moves to the new
+/// view), and its answer is read from the edited view: each query reads the view its own
+/// lowering was asked for, and the second's is not the first's. The control:
+/// [`the_oracle_catches_a_stale_front_end_handed_back`].
+#[test]
+fn a_query_after_an_edit_lowers_again_and_reads_the_edited_view_over_many_seeds() {
+    for seed in 0..16 {
+        let (lowered, queried, second) = query_edit_query(seed, false);
+        assert_eq!(second, (0, 1), "seed {seed}: the second query lowers into the first's front end");
+        assert_eq!(lowered.len(), 2, "seed {seed}: one lowering a query");
+        assert_ne!(lowered[0], lowered[1], "seed {seed}: the edit moved the view");
+        assert_eq!(queried, lowered, "seed {seed}: each query read the view it was lowered for");
+    }
+}
+
+/// The control of [`a_query_after_an_edit_lowers_again_and_reads_the_edited_view_over_many_seeds`]:
+/// a lowering into the kept front end that leaves it at the view it was kept at
+/// ([`STALE_INTO_KEPT`]) answers the second query from the first's view, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_stale_front_end_handed_back() {
+    let (lowered, queried, _) = query_edit_query(5, true);
+    assert_ne!(queried, lowered, "the planted stale front end's answer went unseen");
+    assert_eq!(queried[1], lowered[0], "the planted bug read the first query's view");
+}
+
+/// A check, a check, a query and a check of one unchanged checkout under `seed`, the
+/// planted bug set or not: the query's lowerings and the last check's.
+fn check_query_check(seed: u64, plant: bool) -> ((usize, usize), (usize, usize)) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    // The first check writes the lock file into the checkout, so the second's view is another:
+    // the second is the one the last check repeats.
+    check_ok(&mut client, &mut daemon);
+    check_ok(&mut client, &mut daemon);
+    let before = lowerings_now();
+    query_ok(&mut client, &mut daemon);
+    let query = lowerings_since(before);
+    let before = lowerings_now();
+    check_ok(&mut client, &mut daemon);
+    let check = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    (query, check)
+}
+
+/// Four checks of one unchanged checkout under `seed`: the last one's lowerings, what a check
+/// after a check of an unchanged view costs.
+fn fourth_check(seed: u64) -> (usize, usize) {
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    for _ in 0..3 {
+        check_ok(&mut client, &mut daemon);
+    }
+    let before = lowerings_now();
+    check_ok(&mut client, &mut daemon);
+    let check = lowerings_since(before);
+    settle(&mut daemon, &mut client);
+    check
+}
+
+/// The invariant: a query between two checks of an unchanged view costs the second check
+/// nothing: it lowers exactly as a check after a check does (in the fakes, into the kept front
+/// end, or nothing at all where its certificate answers), never anew. The query itself lowers
+/// into the check's front end. Until 2026-11-14 the query took the check's front end and
+/// dropped it, so the check after it lowered the root anew. The control:
+/// [`the_oracle_catches_a_query_that_leaves_the_next_check_to_lower_anew`].
+#[test]
+fn a_check_after_a_query_of_an_unchanged_view_lowers_as_after_a_check_over_many_seeds() {
+    for seed in 0..16 {
+        let (query, check) = check_query_check(seed, false);
+        assert_eq!(query, (0, 1), "seed {seed}: the query lowers into the check's front end");
+        assert_eq!(check.0, 0, "seed {seed}: the check after the query lowers nothing anew");
+        assert_eq!(check, fourth_check(seed), "seed {seed}: the check lowers as one after a check");
+    }
+}
+
+/// The control of [`a_check_after_a_query_of_an_unchanged_view_lowers_as_after_a_check_over_many_seeds`]:
+/// a query that drops its front end (`job::PLANT_QUERY_DROPS_FRONT`) leaves the check after it
+/// to lower anew, which the oracle sees.
+#[test]
+fn the_oracle_catches_a_query_that_leaves_the_next_check_to_lower_anew() {
+    let (_, check) = check_query_check(0, true);
+    assert_eq!(check, (1, 0), "the planted bug's check did not lower anew");
+}
+
+/// Two queries of a checkout with a proc macro and a build script under `seed`: the second
+/// query's lowerings and the runs each query read, or the stall the run ended in.
+fn two_applying_queries(seed: u64, plant: bool) -> Result<((usize, usize), Vec<Vec<usize>>), String> {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let ended = two_applying_queries_planted(seed);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    ended
+}
+
+fn two_applying_queries_planted(seed: u64) -> Result<((usize, usize), Vec<Vec<usize>>), String> {
+    EDITED.with(|it| it.borrow_mut().clear());
+    LOOP_APPLIES.set(0);
+    FRAMELESS_APPLIES.set(0);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let stalled = |got: &[Response]| {
+        got.iter().find_map(|it| match it {
+            // clone: a test's record
+            Response::Error(error) if error.what.starts_with("blaze stalled") => Some(error.what.clone()),
+            _ => None,
+        })
+    };
+    let mut second = (0, 0);
+    for at in 0..2 {
+        let before = lowerings_now();
+        let id = client
+            .send(&mut daemon, Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() });
+        let got = client.wait(&mut daemon, id);
+        if let Some(stall) = stalled(&got) {
+            return Err(format!("query {at}: {stall}"));
+        }
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+        if at == 1 {
+            second = lowerings_since(before);
+        }
+    }
+    settle(&mut daemon, &mut client);
+    assert!(daemon.lost().is_empty(), "seed {seed}: {:#?}", daemon.lost());
+    assert_eq!(LOOP_APPLIES.get(), 0, "seed {seed}: an apply ran on the loop");
+    assert_eq!(FRAMELESS_APPLIES.get(), 0, "seed {seed}: an apply ran in no frame");
+    Ok((second, EDITED.with(|it| it.take())))
+}
+
+/// The invariant: a query whose view's proc macros and build scripts are built and applied
+/// first (`Jobs::units_applied`, its last write on a write's task) still hands its front end
+/// back: the second query lowers into it, and reads the build script's run applied.
+///
+/// The seeds that stall are pinned as in
+/// [`a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`], so the pin
+/// fails the day they stop. It is the same stall, the job's write waiting on its held reading
+/// tasks, which hold the plane's two threads: seeds 2 and 13 in the first query, as there, and
+/// 1, 3, 24 and 27 in the second. It is not this change's: with the front end dropped
+/// (`job::PLANT_QUERY_DROPS_FRONT`, the code before) the second query stalls the same way, in
+/// seeds 7, 16, 22 and 24 (2026-11-14), a lowering anew giving another schedule.
+#[test]
+fn a_query_that_applies_its_views_units_still_hands_its_front_end_back_over_many_seeds() {
+    let mut stalled = Vec::new(); // alloc: a test's record
+    for seed in 0..32 {
+        match two_applying_queries(seed, false) {
+            Ok((second, read)) => {
+                assert_eq!(second, (0, 1), "seed {seed}: the second query lowers into the first's front end");
+                assert_eq!(read.len(), 2, "seed {seed}: two queries read the front end");
+                assert!(
+                    read.iter().all(|it| it.contains(&3)),
+                    "seed {seed}: each query read the build script's run applied: {read:?}"
+                );
+            }
+            Err(stall) => {
+                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
+                stalled.push(seed);
+            }
+        }
+    }
+    assert_eq!(stalled, vec![1, 2, 3, 13, 24, 27], "the seeds whose held tasks fill every thread");
+    // The control: with the front end dropped, the second query lowers anew.
+    let planted = two_applying_queries(0, true).map(|it| it.0);
+    assert_eq!(planted, Ok((1, 0)), "the planted bug's second query lowered into a kept front end");
+}
+
+/// A query, a stop as `blaze stop` makes, an edit, and a query, under `seed`, the planted bug
+/// set or not: whether the restarted daemon's query lowered anew, and whether that lowering
+/// found in the store what the first query's front end left there.
+fn query_restart_query(seed: u64, plant: bool) -> (usize, bool) {
+    super::job::PLANT_QUERY_DROPS_FRONT.set(plant);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    query_ok(&mut client, &mut daemon);
+    let mut daemon = restart(daemon, &steps, seed + 1000);
+    let mut client = dial(&mut daemon);
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { let _ = 1; }\n");
+    let (before, reads) = (lowerings_now(), KEPT_READS.get());
+    query_ok(&mut client, &mut daemon);
+    super::job::PLANT_QUERY_DROPS_FRONT.set(false);
+    (lowerings_since(before).0, KEPT_READS.get() == reads + 1)
+}
+
+/// What a restart promises of a query's front end: the front end itself is memory and does not
+/// survive a stop (the restarted daemon's first query lowers anew), but what the query's front
+/// end left for the store does, as a build's does (`Steps::store_kept`, written before the stop
+/// ends): the restarted lowering reads it rather than working it out again. The control: a
+/// query that drops its front end stores nothing, and the restarted lowering finds nothing.
+#[test]
+fn after_a_restart_a_querys_lowering_reads_what_the_last_query_stored() {
+    for seed in [181, 182, 183] {
+        let (anew, found) = query_restart_query(seed, false);
+        assert_eq!(anew, 1, "seed {seed}: a restarted daemon lowers anew");
+        assert!(found, "seed {seed}: and reads what the last query's front end stored");
+    }
+    let (anew, found) = query_restart_query(181, true);
+    assert_eq!(anew, 1, "the planted bug's restarted daemon lowers anew too");
+    assert!(!found, "the planted bug stored nothing, and the oracle saw the lowering find it");
 }
 
 #[test]

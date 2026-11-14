@@ -70,6 +70,10 @@ thread_local! {
     /// The planted bug of `serve::tests`' write-on-a-task control: [`Jobs::apply_writes`]
     /// applies a job's write on the loop, in its turn, as before 2026-11-13.
     pub(super) static PLANT_WRITE_ON_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of `serve::tests`' query controls: a query drops the front end it
+    /// lowered as it answers ([`Jobs::keep_queried`] does nothing), as before 2026-11-14, so
+    /// every query of a root lowers it anew.
+    pub(super) static PLANT_QUERY_DROPS_FRONT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The command line of each build a row of the history was made for ([`Job::ended`]), on
     /// the loop's thread: one a job's plane request, as a test counts them.
     pub(super) static ENDED_ROWS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -6900,6 +6904,7 @@ impl<S: Steps> Jobs<S> {
             Stage::Answer(at) if at == node => match job.take_value(node) {
                 Some(Value::Answer(Ok(response))) => {
                     w.said.push(Said::Report(id, response));
+                    self.keep_queried(w, id);
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
@@ -7701,6 +7706,59 @@ impl<S: Steps> Jobs<S> {
         // store is a loss said beside it, never its error.
         if let Some((command, checkout, what)) = refused {
             self.lose(id, &command, Some(&checkout), what);
+        }
+    }
+
+    /// Query `id`'s front end handed back to its root as its answer is said, the way a build's
+    /// end hands back its own ([`Jobs::plane_finished`]): kept ([`Writer::keep`]) and stored by
+    /// an idle request ([`Jobs::store_kept`]), so it is the root's again once stored
+    /// ([`Jobs::stored_kept`]) and the root's next job lowers into it. Until 2026-11-14 a query
+    /// dropped it, so every query of a root lowered the root anew (ripgrep: 2.1 million rows a
+    /// query, 36.6 s).
+    ///
+    /// It goes back only through the store. A front end kept is not stored yet
+    /// (`unit::Stored::No`), whether the query lowered it anew or into the root's last one,
+    /// and [`Steps::lower`] refuses one that is not: a query's lowering and the proc macros and
+    /// build scripts it applied may have served dependencies and checked crates whose records
+    /// only the store writes. The view it is of is the query's: the next job's lowering moves
+    /// it to that job's view as it moves a build's, reading again what changed.
+    ///
+    /// A front end that can't be kept is a loss ([`Jobs::lose`]), never the query's error: the
+    /// answer is said already, and the root's next job lowers anew. A cancelled query, one
+    /// that failed, and one of a view of no root keep nothing, as such a build does not.
+    fn keep_queried(&mut self, w: &mut World<'_, S>, id: JobId) {
+        #[cfg(test)]
+        if PLANT_QUERY_DROPS_FRONT.get() {
+            return;
+        }
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if !matches!(job.work, Work::Query(_)) || job.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(request) = job.request else { return };
+        let Some(Ready { input, root: Some(root), writer: Some(writer), .. }) = job.ready.pop()
+        else {
+            return;
+        };
+        let command = command_line(&job.work);
+        let kept = tracing::info_span!(target: "blaze", "loop: the query's front end kept")
+            .in_scope(|| writer.keep());
+        // clone: the checkout's path, once per query
+        let checkout = input.config.invocation.root.clone();
+        match kept {
+            // The run log is named by the store's task, after the answer, as a build's is: a
+            // query's end names none ([`Job::ended`] names a build's units alone).
+            Ok(kept) => {
+                self.store_kept(w, id, root, checkout, kept, u64::from(request.0), true, &input);
+            }
+            Err(error) => {
+                // alloc: a loss, once
+                let what = format!(
+                    "the query's front end is not kept, and the checkout's next job lowers anew: {}",
+                    error.what
+                );
+                self.lose(id, &command, Some(&checkout), what);
+            }
         }
     }
 

@@ -825,7 +825,7 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// [`super::job::lease_build_dirs`]). The leases are held until the job is dropped.
     fn lease(&self, units: &Units, checkout: &str, builds: &str) -> Leased;
     /// On a worker: the job's units lowered into the front end. `kept` is the front end of
-    /// the head's last build ([`Writer::keep`]): built from the same units and config, it is
+    /// the head's last build or query ([`Writer::keep`]), stored: built from the same units and config, it is
     /// moved to the job's view, its memos kept, and what changed alone read again; else it
     /// is dropped and the units lowered anew.
     fn lower(
