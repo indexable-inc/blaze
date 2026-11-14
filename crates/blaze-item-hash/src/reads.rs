@@ -78,9 +78,16 @@ pub(crate) enum Rule {
     /// through for the lowering step of the body itself; refused for any other step and any other body: a position reaching
     /// an answer is what no fact covers.
     LowerOnly,
-    /// A field of the `Crate` input: covered for the body's crate (the identity hashes its
-    /// inputs), another crate's `Crate` fact.
+    /// A field of the `Crate` input not in its content ID (`slots`): covered for the body's
+    /// crate (the identity hashes its inputs), another crate's `Crate` fact.
     CrateInput,
+    /// A field of the `Crate` input its content ID hashes (`data`, `extra_data`,
+    /// `cfg_options`, `workspace_data`): covered for the body's crate, whose identity hashes
+    /// its inputs; another crate's `CrateSettings` fact, valued by that content ID
+    /// (`values::kinds::CRATE_SETTINGS`), so an edit of the other crate's sources moves it not.
+    /// Its `Crate` fact here hashed every file of it, and a private body's edit of a
+    /// dependency reran every dependent body that read its edition or origin.
+    CrateSettings,
     /// Keyed by a crate: covered for the body's crate, whose identity hashes it
     /// (`identity::crate_inputs`); for another crate, what `Else` says.
     OwnCrate(Else),
@@ -372,6 +379,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("anon_const_eval_query", "hir-ty/src/consteval.rs", Rule::Through),
     ("assoc_item_key", "hir-def/src/nameres/def_site.rs", Rule::AssocKey),
     ("auto_trait_depth", "hir-ty/src/next_solver/global_goals/shape.rs", Rule::Through),
+    // A dependency's variant's row of its crate's field types batch, read by the variant: the
+    // `Signature` fact of its ADT, as `field_types_of_variant` is. The batch itself
+    // (`crate_field_types`) is read inside it, never by a step.
+    ("batched_field_types", "hir-ty/src/lower.rs", Rule::Items),
     ("bit_width_of", "hir-ty/src/layout/bits.rs", Rule::Through),
     ("bits_layout_query", "hir-ty/src/layout/bits.rs", Rule::Through),
     ("blaze_bits", "hir-def/src/attrs.rs", Rule::Attrs(Of::AttrOwner)),
@@ -381,7 +392,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // setting, a fact of its own, so a verdict kept without it is checked again, and printed,
     // with it.
     ("borrowck_debug", "base-db/src/settings.rs", Rule::Setting),
-    ("cfg_options", "base-db/src/input.rs", Rule::CrateInput),
+    ("cfg_options", "base-db/src/input.rs", Rule::CrateSettings),
     // `RA_CHECK_RELATIVE_BODIES`: a body's tree is parsed again, not taken from the thread's
     // cache, and checked against its file's. No answer depends on it (it checks, or stops the
     // build), but a step reads it (`BodySyntax::tree`, through `body_syntax`), so it is the
@@ -416,7 +427,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("crate_shadows_primitive_type", "hir-def/src/nameres.rs", Rule::Names),
     ("crates_containing_incoherent_inherent_impls", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("ctor_variances_query", "hir-ty/src/variance.rs", Rule::Items),
-    ("data", "base-db/src/input.rs", Rule::CrateInput),
+    ("data", "base-db/src/input.rs", Rule::CrateSettings),
     ("def_map", "hir-def/src/nameres.rs", Rule::Names),
     ("destructor", "hir-ty/src/drop.rs", Rule::DropCheck),
     ("diagnostic_items", "hir-def/src/diagnostic_item.rs", Rule::WholeCrate),
@@ -441,7 +452,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // header, which its signature hashes (as `generic_predicates_of` and `supertraits_info`).
     ("explicit_implied_clauses_of", "hir-ty/src/lower.rs", Rule::Signature(Of::Trait)),
     ("explicit_super_clauses_of", "hir-ty/src/lower.rs", Rule::Signature(Of::Trait)),
-    ("extra_data", "base-db/src/input.rs", Rule::CrateInput),
+    ("extra_data", "base-db/src/input.rs", Rule::CrateSettings),
     ("fact_value", "blaze-items/src/goals.rs", Rule::FactValue),
     ("failed_expansion", "hir-ty-mir/src/mir/lower.rs", Rule::OwnBody),
     ("field_ranks", "hir-ty/src/layout/field_order.rs", Rule::Through),
@@ -586,7 +597,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("unstable_feature", "hir-def/src/attrs.rs", Rule::Attrs(Of::AttrOwner)),
     ("variances_of_query", "hir-ty/src/variance.rs", Rule::Items),
     ("variant_field_ids", "hir-ty/src/layout.rs", Rule::Fields(Of::Variant)),
-    ("workspace_data", "base-db/src/input.rs", Rule::CrateInput),
+    ("workspace_data", "base-db/src/input.rs", Rule::CrateSettings),
 ];
 
 /// What `read`, made by `step` of `def`, stands for: covered by the body's key, a fact, read
@@ -740,6 +751,11 @@ fn apply(
                 Else::WholeCrate => Some(whole_crate(db, krate)),
                 Else::Items => Goals.fact_of(db, Some(def.krate(db)), read, name),
             },
+            None => None,
+        },
+        Rule::CrateSettings => match arg::<Crate>(db, key) {
+            Some(krate) if krate == def.krate(db) => return Classified::Covered,
+            Some(krate) => Some(values::crate_settings(db, krate)),
             None => None,
         },
         Rule::CrateRoot => arg::<Crate>(db, key).map(|krate| values::crate_root(db, krate)),

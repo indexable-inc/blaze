@@ -1949,6 +1949,38 @@ fn private() -> u32 { 1 }
     );
 }
 
+/// The invariant of `CrateSettings`: a dependency's settings fact (what a read of its `data`,
+/// `extra_data`, `cfg_options` or `workspace_data` stands for) stays across an edit of a
+/// private body of it and moves with its edition. The control is the edition: a value made of
+/// nothing of the crate would stay there too.
+#[test]
+fn a_crates_settings_fact_moves_with_its_settings_and_not_its_bodies() {
+    let source = |dep_header: &str, body: &str| {
+        format!(
+            "//- /main.rs crate:main deps:dep\npub fn f() -> u32 {{ dep::g() }}\n\
+             //- /dep.rs {dep_header}\npub fn g() -> u32 {{ 1 }}\nfn private() -> u32 {{ {body} }}\n"
+        ) // alloc: a test's text
+    };
+    let settings = |text: &str| {
+        let db = super::perturb::db(text);
+        let main = super::perturb::body(&db, "f").module(&db).krate(&db);
+        let dep = super::perturb::body(&db, "private").module(&db).krate(&db);
+        values::value(&db, main, values::crate_settings(&db, dep))
+            .expect("a dependency's settings fact has a value")
+    };
+    let base = settings(&source("crate:dep", "1"));
+    assert_eq!(
+        base,
+        settings(&source("crate:dep", "2")),
+        "a private body's edit moved its crate's settings fact"
+    );
+    assert_ne!(
+        base,
+        settings(&source("crate:dep edition:2015", "1")),
+        "the edition of a crate left its settings fact"
+    );
+}
+
 /// The invariant: a borrow-check trace kept under its solver queries' facts is not reused
 /// after a change one of those queries sees (a new `impl Copy`, a new `Drop` impl, an impl's
 /// where clause the goal was proved by, an associated type or its impl), and is reused after

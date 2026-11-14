@@ -1498,6 +1498,8 @@ pub mod kinds {
         // A record function's parameter defaults (`lower/record`).
         RECORD_PARAM_DEFAULTS = 0x2513, "record_param_defaults";
         RECORD_PARAM_DEFAULT = 0x2514, "record_param_default";
+        // A dependency's variant's row of its crate's field types batch.
+        BATCHED_FIELD_TYPES = 0x2515, "batched_field_types";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";

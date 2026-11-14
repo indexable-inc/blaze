@@ -37,6 +37,11 @@ use crate::{
 /// allocations per item. A workspace crate is edited, so its items keep a query each. An edited
 /// path dependency is a library too: it recomputes its batch, a crate's worth of signatures, on
 /// each edit of one of them.
+///
+/// A variant's field types are read through a query of the variant that copies its row out
+/// (`lower::batched_field_types`), so a reader depends on that row alone and the item store
+/// keeps a body that read it under the variant's ADT, not the crate: one memo per variant
+/// read, not per variant of the crate.
 pub(crate) fn batched_crate(db: &Db, module: ModuleId) -> Option<Crate> {
     if module.block(db).is_some() {
         return None;

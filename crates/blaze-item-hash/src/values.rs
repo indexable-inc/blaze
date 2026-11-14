@@ -98,6 +98,10 @@ pub mod kinds {
     /// A body's own lowering, as each other step of it reads it: valued by the digest of
     /// what the lowering read (`hir_ty::body_store::Lowered::value`), not by its answer.
     pub const STEP_LOWER: QueryKind = QueryKind(0x180c);
+    /// Another crate's settings, as a read of a field of its `Crate` input (`data`,
+    /// `extra_data`, `cfg_options`, `workspace_data`) stands for them: its content ID
+    /// (`base_db::Crate::content`), never its sources, so a body edit in it moves nothing.
+    pub const CRATE_SETTINGS: QueryKind = QueryKind(0x180d);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -111,6 +115,7 @@ const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
 const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
 const INHERENT_ASSOC_TYPES_DOMAIN: &str = "blaze v2 item-hash inherent assoc types 1";
+const CRATE_SETTINGS_DOMAIN: &str = "blaze v2 item-hash crate settings 1";
 
 /// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
 /// no key is. The settings are one for the build, so the fact names nothing else.
@@ -175,6 +180,13 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
         match key::resolve_crate(db, &fact.subject) {
             None => Some(absent(kind)),
             Some(krate) => Some(crate_root_of(db, krate)),
+        }
+    } else if kind == kinds::CRATE_SETTINGS {
+        match key::resolve_crate(db, &fact.subject) {
+            None => Some(absent(kind)),
+            Some(krate) => {
+                Some(Hasher::new(CRATE_SETTINGS_DOMAIN).id(&krate.content(db)).finish())
+            }
         }
     } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR || kind == kinds::STEP_LOWER {
         let step = if kind == kinds::STEP_INFER {
@@ -521,6 +533,16 @@ pub fn attrs(db: &Db, owner: AttrDefId) -> Option<FactRef> {
 pub fn crate_root(db: &Db, krate: Crate) -> FactRef {
     FactRef {
         kind: kinds::CRATE_ROOT,
+        subject: key::crate_key(db, krate),
+        object: FactObject::None,
+    }
+}
+
+/// The `CrateSettings` fact of `krate`: what a read of a field of its `Crate` input stands
+/// for, from a body of another crate.
+pub fn crate_settings(db: &Db, krate: Crate) -> FactRef {
+    FactRef {
+        kind: kinds::CRATE_SETTINGS,
         subject: key::crate_key(db, krate),
         object: FactObject::None,
     }

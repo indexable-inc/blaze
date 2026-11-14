@@ -1783,9 +1783,29 @@ impl ImageStore for Images {
         self.macros.keeps().reads_now(env, shape)
     }
 
+    /// Where the tasks run is where their store reads can run ([`crate::serve::direct::Reads`]):
+    /// on the pool where each worker reads on a native driver of its own (`blaze serve`), and
+    /// in line on this thread where the reads run on the loop's driver lent to it (the
+    /// simulation), which no worker holds: a task fanned out to the pool there read with no
+    /// driver lent and failed its job (`direct.rs`'s `Reads::Lent` panic, since the direct
+    /// reads of f25aa5be3c). `ImageStore::for_each` says in order on one thread gives the same
+    /// result.
     // dyn: as `ImageStore::for_each`, one call per batch of crates
     fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
-        on_pool(count, task);
+        match self.stores.reads() {
+            crate::serve::direct::Reads::Native { .. } => on_pool(count, task),
+            crate::serve::direct::Reads::Lent => in_line(count, task),
+        }
+    }
+}
+
+/// `task(at)` for each `at` in `0..count` in order on this thread, each in a frame of its own
+/// as [`on_pool`] gives it: the batch where the store reads run on a driver lent to this
+/// thread alone ([`crate::serve::direct::Reads::Lent`]).
+// dyn: as `ImageStore::for_each`
+fn in_line(count: usize, task: &(dyn Fn(usize) + Sync)) {
+    for at in 0..count {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |_| task(at));
     }
 }
 

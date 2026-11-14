@@ -159,7 +159,7 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
             signature(ItemId::Adt(AdtId::UnionId(arg(db, key)?)))
         }
         "representability" => signature(ItemId::Adt(arg(db, key)?)),
-        "field_types_of_variant" | "ctor_variances_query" => {
+        "field_types_of_variant" | "batched_field_types" | "ctor_variances_query" => {
             signature(ItemId::Adt(arg::<VariantId>(db, key)?.adt_id(db)))
         }
         "fn_sig_for_enum_variant_constructor" => {

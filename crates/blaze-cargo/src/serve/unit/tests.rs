@@ -3788,6 +3788,20 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     if first.session != Opened::New {
         return Err(format!("the first serve had a session already: {first:?}"));
     }
+    // The premise of the test and of its control (`bodies::CLEAN_IDENTITIES`), not part of
+    // the oracle, so a panic and never an `Err` the control would count as caught: every step
+    // of every body, `uses` the edit moves among them, is served from the build's entries, so
+    // the edited body's rows are posted when the carry is told its identity did not move. A
+    // step missed here runs fresh at the second serve whatever the carry says, and `uses`'s
+    // inference is the same for `bump(1)` and `bump(2)`: only its MIR differs, so a missed
+    // MIR of `uses` let the planted driver pass unseen.
+    assert_eq!(
+        first.missed,
+        0,
+        "the first serve missed a body's step the build ran, so the carry's posted rows do not \
+         cover every body: {first:?}; refused, by why (count, first step refused): {:#?}",
+        crate::serve::front_carry::bodies::take_refused()
+    );
     // The serve's puts, its session's save among them, put as the loop puts a unit's
     // `Compiled::puts`: a saved session keeps none of its nodes in memory
     // (`blaze_kernel::Session::save`), so the carry reads them from the store.
@@ -3929,7 +3943,8 @@ fn the_oracle_catches_a_session_put_back_without_its_puts() {
 #[test]
 fn the_oracle_catches_a_driver_that_says_identities_unchanged() {
     let _planted = Planted::set(&bodies::CLEAN_IDENTITIES);
-    assert!(carried_serve(8).is_err(), "the oracle passed a carry told no identity moved");
+    let carried = carried_serve(8);
+    assert!(carried.is_err(), "the oracle passed a carry told no identity moved: {carried:?}");
 }
 
 /// A callee's signature edited to name another nominal type of the same shape, its caller's

@@ -1233,7 +1233,7 @@ pub(crate) mod bodies {
     pub(crate) fn kind_name(kind: ReadKind) -> &'static str {
         use blaze_item_hash::values::kinds as hashed;
         use blaze_items::kinds as items;
-        const FACTS: [(blaze_query::QueryKind, &str); 39] = [
+        const FACTS: [(blaze_query::QueryKind, &str); 40] = [
             (items::SIGNATURE, "signature"),
             (items::LAYOUT, "layout"),
             (items::FIELD, "field"),
@@ -1273,6 +1273,7 @@ pub(crate) mod bodies {
             (hashed::CRATE_NAMES, "crate names"),
             (hashed::FIELD_ORDER, "field order"),
             (hashed::SETTING, "setting"),
+            (hashed::CRATE_SETTINGS, "crate settings"),
         ];
         if kind == reads::FILE {
             return "file";

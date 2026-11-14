@@ -177,6 +177,7 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
         "StructSignature::served",
         "StructSignature::lowered",
         "field_types_of_variant",
+        "batched_field_types",
         "variances_of_query",
     ] {
         assert_eq!(read(name, struct_.as_id()), signature(ItemId::Adt(s)), "{name}");
