@@ -147,8 +147,8 @@ pub(super) fn report_one<'c>(
 }
 
 /// Adds a finding of `lint` at `range` to `found`, once per lint and range.
-pub(super) fn push(
-    found: &mut Vec<Finding>,
+pub(super) fn push<A: std::alloc::Allocator>(
+    found: &mut Vec<Finding, A>,
     lint: Lint,
     range: TextRange,
     message: String,

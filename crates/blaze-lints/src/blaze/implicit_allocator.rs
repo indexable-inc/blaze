@@ -10,8 +10,11 @@
 //! `vec![..]` of elements; the iterator itself for `collect()`), then the allocator to name.
 //!
 //! A machine-applicable fix rewrites a constructor to its `_in` form with `Global`
-//! ([`explicit_fix`]): it keeps the meaning, as `Vec<T>` is `Vec<T, Global>`, so no
-//! signature changes; not allocating, or a frame, is the better change, made by hand.
+//! ([`explicit_fix`]): it keeps the meaning, as `Vec<T>` is `Vec<T, Global>`; not allocating,
+//! or a frame, is the better change, made by hand. Not where the value is what the function
+//! returns: its lifetime is the caller's, so `Global` there would be chosen for every caller
+//! and then written into the signature. That finding has no fix, and its note says to make the
+//! function generic over `A: Allocator + Clone` and take `alloc: A` from the caller.
 //!
 //! A dependency's type with no allocator parameter is judged by its fields, walked
 //! transitively and cached per type (`CString`, `BufWriter`, `Command`, channels, `Regex`):
@@ -49,6 +52,17 @@
 //!
 //! No machine-applicable fix: `blaze_mem::frame::current` lends the frame to a closure, so
 //! `Vec::new()` has no rewrite in place that is sound at every call.
+//!
+//! This is also the home of `unwritten_allocator` ([`check_unwritten`]), the same concept at an
+//! item's interface: a type with an allocator parameter written without it (`Vec<T>`, `Box<T>`,
+//! `Arc<T>`) in a function's parameter or return type, a field, a type alias or an associated
+//! type, where `implicit_allocator` judges the value and leaves a defaulted parameter alone
+//! (`Walk::Declared`); and `Global` written into a function's signature (`-> Vec<T, Global>`).
+//! A function's signature says whose allocator by being generic over `A: Allocator + Clone`
+//! and taking `alloc: A`; a field, alias or associated type names a parameter of its owner or
+//! `Global`. It is its own lint id only while its findings across the tree are counted down at
+//! `warn` (the ratchet refuses a rise in `implicit_allocator`'s counts); it folds into
+//! `implicit_allocator` when they reach none.
 
 use std::{cell::RefCell, ops::ControlFlow};
 
@@ -65,7 +79,7 @@ use rustc_type_ir::{
 use std::alloc::Global;
 use syntax::{SyntaxKind as K, TextRange, WalkEvent, view as ast};
 
-use ast::{AstNode as _, HasName as _};
+use ast::{AstNode as _, HasGenericArgs as _, HasName as _};
 
 use super::{Known, Lint, exempt};
 use crate::check::Cx;
@@ -291,21 +305,24 @@ impl Allocators {
         if let Some(known) = self.params.borrow().get(&adt) {
             return known.clone(); // clone: an interned name
         }
-        let params = hir::GenericDef::from(hir::Adt::from(adt)).type_or_const_params(db);
-        let found = params.into_iter().filter_map(|it| it.as_type_param(db)).enumerate().find_map(
-            |(at, param)| {
-                let to_global = param
-                    .default(db)
-                    .and_then(|it| it.as_adt())
-                    .is_some_and(|it| Some(AdtId::from(it)) == self.global);
-                let bounded = self
-                    .allocator
-                    .is_some_and(|allocator| param.trait_bounds(db).contains(&allocator));
-                (to_global || bounded).then(|| (at, param.name(db)))
-            },
-        );
+        let found = self.allocator_param_of(db, hir::GenericDef::from(hir::Adt::from(adt)));
         self.params.borrow_mut().insert(adt, found.clone()); // clone: an interned name
         found
+    }
+
+    /// [`Allocators::allocator_param`] of any item with type parameters: an ADT, or a type
+    /// alias that hands its parameter on (`type Map<K, V, A = Global> = ..`).
+    fn allocator_param_of(&self, db: &Db, def: hir::GenericDef) -> Option<(usize, hir::Name)> {
+        let params = def.type_or_const_params(db);
+        params.into_iter().filter_map(|it| it.as_type_param(db)).enumerate().find_map(|(at, param)| {
+            let to_global = param
+                .default(db)
+                .and_then(|it| it.as_adt())
+                .is_some_and(|it| Some(AdtId::from(it)) == self.global);
+            let bounded =
+                self.allocator.is_some_and(|allocator| param.trait_bounds(db).contains(&allocator));
+            (to_global || bounded).then(|| (at, param.name(db)))
+        })
     }
 
     /// Why `ty` itself (not what it holds) is implicit, if it is. An allocator parameter is
@@ -503,6 +520,193 @@ pub(super) fn check_type<'t>(cx: &mut Cx<'_, 't>, ty: ast::Type<'t>) {
         .help(format!("for further information visit {}", Lint::ImplicitAllocator.docs_url()));
 }
 
+/// `unwritten_allocator`'s findings of the written path type `ty`, a type with an allocator
+/// parameter (bounded by `Allocator` or defaulting to `Global`, by what it is, never its name:
+/// `Vec`, `VecDeque`, `Box`, `BTreeMap`, `BTreeSet`, `BinaryHeap`, `Rc`, `Arc`, `LinkedList`,
+/// blaze_hash's maps, and an alias that hands the parameter on), where it is an item's
+/// interface: a function's parameter or return type, a struct's, enum's or union's field, a
+/// type alias and an associated type. Every type at any depth is its own finding: a generic
+/// argument of `Result` or `Option`, in a tuple, behind a reference, in a slice or array, an
+/// argument of `impl Trait<..>` or `dyn Trait<..>`, a function pointer's parameter or return
+/// (`Result<Option<Arc<dyn PageSource>>, E>` is a finding at the `Arc`). A `let`'s type, a
+/// turbofish and a cast are the body's, which `implicit_allocator` judges at the call.
+///
+/// Two findings:
+/// - the allocator left to its default (`Vec<T>`), anywhere at the interface;
+/// - `Global` given as the allocator in a function's signature (`-> Vec<T, Global>`): the
+///   function does not own its value's lifetime, its caller does.
+///
+/// In a function's signature the one accepted form is the function generic over its allocator
+/// and handed it, by the tree's `_in` convention: `fn f<A: Allocator + Clone>(.., alloc: A) ->
+/// Vec<T, A>`; `Global` is named where the lifetime is decided, in the caller's expression
+/// (`f(.., Global)`). A field, an alias or an associated type may name `Global` for now, or a
+/// parameter of its owner. A method of any trait impl is left alone, whether the trait is the
+/// crate's or another's: its signature is the trait's, so the finding is at the trait's
+/// declaration when the crate defines it (one finding per cause, fixed once) and nowhere when
+/// it does not.
+///
+/// `String`, `PathBuf` and `OsString` take no allocator parameter: `implicit_allocator` finds
+/// them where they are written (`blaze_mem::String<A>` is the allocator-aware text; an error is
+/// a typed enum, `blaze::untyped_error`'s).
+pub(super) fn check_unwritten<'t>(cx: &mut Cx<'_, 't>, ty: ast::Type<'t>) {
+    const LINT: Lint = Lint::UnwrittenAllocator;
+    if !cx.on_blaze(LINT) {
+        return;
+    }
+    let ast::Type::PathType(path_ty) = ty else { return };
+    let node = ty.syntax();
+    if cx.expansion().is_some() || !cx.is_written(node) || cx.source_of(node) == "Self" {
+        return;
+    }
+    let Some(path) = path_ty.path() else { return };
+    let Some(segment) = path.segment() else { return };
+    // The outermost type this one is part of (through generic arguments, a bound's trait,
+    // `impl Trait`, a function pointer's parameters and return), whose place is the item's
+    // interface or not.
+    let mut outer = node;
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        match parent.kind() {
+            K::TYPE_ARG
+            | K::GENERIC_ARG_LIST
+            | K::PATH_SEGMENT
+            | K::PATH
+            | K::ASSOC_TYPE_ARG
+            | K::TYPE_BOUND
+            | K::TYPE_BOUND_LIST
+            | K::PARENTHESIZED_ARG_LIST
+            | K::PARAM
+            | K::PARAM_LIST
+            | K::RET_TYPE => {}
+            kind if ast::Type::can_cast(kind) => {
+                if !is_trait_path(parent) {
+                    outer = parent;
+                }
+            }
+            _ => break,
+        }
+        at = parent.parent();
+    }
+    let Some(Place { holder, via }) = place(outer) else { return };
+    let signature = match holder.kind() {
+        K::FN if via.is_some() => true,
+        K::RECORD_FIELD | K::TUPLE_FIELD | K::TYPE_ALIAS => false,
+        _ => return,
+    };
+    if signature && of_trait_impl(cx, holder) {
+        return;
+    }
+    let def = match cx.path(path) {
+        Some(hir::PathResolution::Def(hir::ModuleDef::Adt(adt))) => hir::GenericDef::from(adt),
+        Some(hir::PathResolution::Def(hir::ModuleDef::TypeAlias(alias))) => hir::GenericDef::from(alias),
+        _ => return,
+    };
+    let db = cx.db();
+    let allocators = Allocators::new(cx);
+    let Some((param_at, param)) = allocators.allocator_param_of(db, def) else { return };
+    let args = segment.generic_arg_list();
+    let written = args.map_or(0, |list| {
+        list.generic_args().filter(|it| matches!(it, ast::GenericArg::TypeArg(_))).count()
+    });
+    // The allocator argument as written, when there is one: `Global` there is the second
+    // finding, in a signature only; any other allocator (a parameter, `&Frame`) is named.
+    let global_given = written > param_at && signature && {
+        let given = args.and_then(|list| {
+            list.generic_args()
+                .filter_map(|it| match it {
+                    ast::GenericArg::TypeArg(arg) => arg.ty(),
+                    _ => None,
+                })
+                .nth(param_at)
+        });
+        let resolved = match given {
+            Some(ast::Type::PathType(it)) => it.path().and_then(|it| cx.path(it)),
+            _ => None,
+        };
+        matches!(
+            resolved,
+            Some(hir::PathResolution::Def(hir::ModuleDef::Adt(it)))
+                if Some(AdtId::from(it)) == allocators.global
+        )
+    };
+    if written > param_at && !global_given {
+        return;
+    }
+    let Some(range) = cx.range(node) else { return };
+    if exempt::exempt(cx.text(), range, LINT) {
+        return;
+    }
+    let shown = cx.snippet(range);
+    let item = describe(cx, Place { holder, via });
+    let a = param.as_str();
+    let message = match (signature, global_given) {
+        (true, true) => format!(
+            "`{shown}` in {item} chooses the global heap for every caller: make `{}` generic over \
+             `{a}: Allocator + Clone`, take `alloc: {a}` from its caller and write `{a}` here; the caller names \
+             `Global` where the lifetime is decided",
+            owner_path(cx, holder)
+        ),
+        (true, false) => format!(
+            "`{shown}` in {item} leaves its allocator `{a}` to its default: make `{}` generic over \
+             `{a}: Allocator + Clone`, take `alloc: {a}` from its caller and write `{a}` here",
+            owner_path(cx, holder)
+        ),
+        (false, _) => format!(
+            "`{shown}` in {item} leaves its allocator `{a}` to its default: name it, a parameter `{a}: Allocator` \
+             of its owner, or `Global` written out"
+        ),
+    };
+    let note = "bump-allocate (AGENTS.md rule 11): allocate by lifetime and name the allocator; a function \
+                does not own the lifetime of what it returns or takes, its caller does, so a signature that \
+                fixes the allocator (left to the default, or `Global`) keeps a caller with a frame from \
+                handing it in";
+    // The mechanical fix only where it keeps every caller compiling: `Global` written out in a
+    // field, alias or associated type, where it is the next argument (a parameter between, a
+    // hasher, would take it in its place). In a signature none is sound in place: the type
+    // parameter and `alloc: A` change every call, made by hand.
+    let fix = (!signature && written == param_at).then(|| {
+        let (at, text) = match args.and_then(|it| it.r_angle_token()) {
+            Some(close) => (close.text_range().start(), ", std::alloc::Global"),
+            None => (segment.syntax().text_range().end(), "<std::alloc::Global>"),
+        };
+        (TextRange::empty(at), text)
+    });
+    let span = cx.span(range);
+    // The node is written (no expansion), so its syntax ranges are the file's.
+    let fix = fix.map(|(at, text)| (cx.span(at), text.to_owned()));
+    let diagnostic = cx.blaze(LINT, node, span, message);
+    diagnostic.note(note);
+    if let Some(part) = fix {
+        let mut parts = Vec::new_in(Global);
+        parts.push(part);
+        // `MaybeIncorrect`: `Global` written out needs `allocator_api` in the crate, and an
+        // owner generic over its allocator is the better change, made by hand.
+        diagnostic.multipart_suggestion("write the global heap out", parts, crate::diag::Applicability::MaybeIncorrect);
+    }
+    diagnostic.help(LINT.help()).help(format!("for further information visit {}", LINT.docs_url()));
+}
+
+/// Whether the function `holder` is a method of a trait impl, whichever crate defines the
+/// trait: its signature is the trait's, so its finding is at the trait's declaration (once, in
+/// the crate that can change it) and never at an impl.
+///
+/// Decided by the function's definition, not by the syntax above it: a function with a body is
+/// linted in its body's query, whose tree is that function alone (its root, with no impl
+/// above it to read), so only a bodiless one has its `impl` as a syntax parent. The syntax
+/// is read too, for a function the definitions do not name (one in another body's tree).
+fn of_trait_impl<'t>(cx: &Cx<'_, 't>, holder: ast::Node<'t>) -> bool {
+    let db = cx.db();
+    let func = match cx.body_def() {
+        Some(hir_def::DefWithBodyId::FunctionId(it)) if holder == cx.root() => Some(hir::Function::from(it)),
+        _ => ast::Fn::cast(holder).and_then(|f| cx.fn_def(f)),
+    };
+    if func.is_some_and(|f| hir::AsAssocItem::as_assoc_item(f, db).is_some_and(|it| it.implemented_trait(db).is_some())) {
+        return true;
+    }
+    let Some(list) = holder.parent().filter(|it| it.kind() == K::ASSOC_ITEM_LIST) else { return false };
+    list.parent().and_then(ast::Impl::cast).is_some_and(|it| it.trait_().is_some())
+}
+
 /// The findings of the body walked: its calls and its `let`s, each once, the outermost kept.
 pub(super) fn check_body<'db, 't>(
     cx: &Cx<'db, 't>,
@@ -516,6 +720,11 @@ pub(super) fn check_body<'db, 't>(
     let body = analysis.body();
     let infer = analysis.infer();
     let owner = owner_path(cx, cx.root());
+    // What the function returns: a value of it made here is its caller's.
+    let returns = match analysis.def() {
+        hir::DefWithBody::Function(f) => Some(f.ret_type(db).to_next_solver()),
+        _ => None,
+    };
     // alloc: one body's findings, before they are reported
     let mut calls: Vec<(TextRange, Ty<'db>, Implicit, String, String)> = Vec::new();
     for (id, expr) in body.exprs() {
@@ -557,13 +766,18 @@ pub(super) fn check_body<'db, 't>(
             continue;
         };
         let Some(range) = analysis.expr_range(id) else { continue };
-        let fixed = match explicit_fix(cx, analysis, allocators, callee, &what, range) {
-            Some(fix) => {
-                fixes.push((range, fix));
-                true
-            }
-            None => false,
-        };
+        // A value of the type the function returns is the caller's, whose lifetime the caller
+        // decides: `Global` here would fix it for every caller, so no fix writes it, and the
+        // note says to take the allocator from the caller.
+        let returned = returns.is_some_and(|ret| holds(ret, ty));
+        let fixed = !returned
+            && match explicit_fix(cx, analysis, allocators, callee, &what, range) {
+                Some(fix) => {
+                    fixes.push((range, fix));
+                    true
+                }
+                None => false,
+            };
         let called = super::macro_name(cx.snippet(range));
         let item = match called {
             Some(called) => format!("this `{called}!` in `{owner}`"),
@@ -572,7 +786,15 @@ pub(super) fn check_body<'db, 't>(
         let shown = ty.display(db, k.target).to_string();
         let message = message(db, &what, &item, "makes", &shown);
         let lead = no_allocation(called, function.name(db).as_str(), cx.snippet(range));
-        let note = site_note(lead, &what, fixed);
+        let mut note = site_note(lead, &what, fixed);
+        if returned && matches!(what, Implicit::Default { .. }) {
+            note = format!(
+                "{note}; this value is what `{owner}` returns, so its lifetime is the caller's: make `{owner}` \
+                 generic over `A: Allocator + Clone`, take `alloc: A` from its caller, return `{shown}` with `A` \
+                 for its allocator and build it with `new_in(alloc)`; `Global` is named by the caller that \
+                 owns the lifetime, never in the signature"
+            );
+        }
         calls.push((range, ty, what, message, note));
     }
 
@@ -625,7 +847,8 @@ pub(super) fn check_body<'db, 't>(
 /// parameter defaults to `Global` and which has the `_in` constructor in an inherent impl
 /// (`Vec`, `VecDeque`, `Box::new(x)` to `Box::new_in(x, Global)`, blaze_hash's maps,
 /// blaze-mem's `String`, `PathBuf` and `OsString`), and an empty `vec![]` to
-/// `Vec::new_in(Global)`. `Vec<T>` is `Vec<T, Global>`, so no signature changes with it.
+/// `Vec::new_in(Global)`. `Vec<T>` is `Vec<T, Global>`, so no signature changes with it. Its
+/// caller offers none for a value the function returns (the caller's lifetime, not this code's).
 ///
 /// `Global` is written as it resolves at the call: by its name when that name is std's
 /// `Global` there, by its path from the module when the name is something else, and by its
@@ -973,7 +1196,9 @@ fn note(what: &Implicit) -> String {
             "use `blaze_mem::String<A>`, a growable string in the allocator you name: \
              `blaze_mem::String<&Frame>` from `String::new_in(frame)`, `blaze_mem::frame::string(frame, text)` \
              or `blaze_mem::format_in!(frame, ..)`; finished text that won't grow goes in the frame with \
-             `Frame::alloc_str` (a request's `ArenaLocal::alloc_str`)"
+             `Frame::alloc_str` (a request's `ArenaLocal::alloc_str`); as a `Result`'s error, a typed error \
+             enum the crate defines, as `blaze_host::HostError` and `blaze_keyed::StoreError` are, in place of \
+             text"
         }
         Implicit::Heap { heap: Heap::PathBuf, .. } => {
             "use `blaze_mem::PathBuf<A>` (unix), a path in the allocator you name: \
