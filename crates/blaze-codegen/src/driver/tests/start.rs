@@ -45,22 +45,21 @@ fn plain_static(value: &Static, merged: &BTreeMap<InstanceKey, InstanceKey>) -> 
 /// A program of [`super::near::drawn`]'s, with perhaps its function 2 defined weakly under a
 /// name (when nothing builds it in) and perhaps a static in `.init_array` naming one of its
 /// functions, a root. Gives the program and its static roots.
-fn drawn(tc: &hegel::TestCase) -> (Program, Vec<u32>) {
-    use hegel::generators as gs;
-    let mut program = super::near::drawn(tc);
+fn drawn(tape: &blaze_sim::Tape) -> (Program, Vec<u32>) {
+    let mut program = super::near::drawn(tape);
     let count = program.functions.len() as u32;
     let built_in_two = program
         .functions
         .values()
         .any(|it| it.built_in.iter().any(|place| it.calls[*place as usize] == 2));
-    if !built_in_two && tc.draw(gs::integers::<u8>().max_value(1)) == 0 {
+    if !built_in_two && tape.int_in(0..=1u8, "two not weak") == 0 {
         let two = program.functions.get_mut(&2).unwrap();
         two.symbol = Some("weak_two".to_owned());
         two.linkage = crate::Linkage::Weak;
     }
     let mut static_roots = Vec::new();
-    if tc.draw(gs::integers::<u8>().max_value(1)) == 0 {
-        let named = tc.draw(gs::integers::<u32>().min_value(2).max_value(count));
+    if tape.int_in(0..=1u8, "no init_array static") == 0 {
+        let named = tape.int_in(2..=count, "init_array names");
         program.statics.insert(9, (0x99, Some(".init_array".to_owned())));
         program.static_calls.insert(9, vec![named]);
         static_roots.push(9);
@@ -227,13 +226,15 @@ fn differs(
 /// an equal [`Static`]; each function's items are the whole walk's for it (its own and those of
 /// what it builds in); they make exactly what the whole build reaches, and describe nothing the
 /// whole walk does not.
-#[hegel::test]
-fn a_start_and_its_first_calls_make_the_whole_builds_code(tc: hegel::TestCase) {
-    let (mut program, static_roots) = drawn(&tc);
-    let mut walked = program.copy();
-    if let Some(why) = differs(&mut program, &mut walked, &static_roots, None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_start_and_its_first_calls_make_the_whole_builds_code() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let (mut program, static_roots) = drawn(tape);
+        let mut walked = program.copy();
+        if let Some(why) = differs(&mut program, &mut walked, &static_roots, None) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// `main` (1) calls 2 and 3, 2 is defined weakly as `weak_two`, 2 calls 4, 3 calls 5.
