@@ -42,7 +42,11 @@ pub const SECTOR: usize = 512;
 /// under what a `usize` holds (a file is at most `MOST_BYTES + MOST_CHANGES * 2 * MOST_BYTES`
 /// long, under 2^58), so no length the world computes overflows.
 pub const MOST_BYTES: usize = 1 << 40;
-/// See [`MOST_BYTES`].
+/// The most changes not synced a file may have, the most barriers no sync has covered, and
+/// the most files a disk may have, where the theorems below speak of it: no list the world
+/// adds to is ever full. The barriers' bound was missing at first; the proof of
+/// `a_crash_keeps_what_a_barrier_ordered` found that the theorem was false without it (a
+/// file with `usize::MAX` barriers, on which one more barrier panics), which no run could.
 pub const MOST_CHANGES: usize = 1 << 16;
 
 /// A change to a file's bytes.
@@ -414,9 +418,12 @@ impl File {
     }
 
     /// Whether its durable bytes, each change and each offset are at most [`MOST_BYTES`], and
-    /// its changes not synced at most [`MOST_CHANGES`].
+    /// its changes not synced and its barriers at most [`MOST_CHANGES`] each.
     fn small(&self) -> bool {
-        if self.durable.len() > MOST_BYTES || self.changes.len() > MOST_CHANGES {
+        if self.durable.len() > MOST_BYTES
+            || self.changes.len() > MOST_CHANGES
+            || self.barriers.len() > MOST_CHANGES
+        {
             return false;
         }
         let mut i = 0;
@@ -814,7 +821,8 @@ impl Default for Disk {
     }
 }
 
-/// The invariant: a crash keeps a synced file. From every well-formed disk within the bounds,
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a crash keeps a
+/// synced file. From every well-formed disk within the bounds,
 /// once a sync of `file` that covers all its changes has completed, whatever cut a crash is
 /// allowed to make, `file` is there after it and reads as it did before ([`kept`]): no change
 /// of it is lost or torn, no write or rename of another file that is undone takes its name,
@@ -837,7 +845,8 @@ pub fn a_crash_keeps_a_synced_file(disk: Disk, file: u64, cut: Vec<Kept>) -> boo
     kept(&read, &disk.contents(file))
 }
 
-/// The invariant: a crash cuts an appended file to a prefix. From every well-formed disk
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a crash cuts an
+/// appended file to a prefix. From every well-formed disk
 /// within the bounds, for a file whose changes not synced are all appends and that no crash
 /// may undo, whatever cut a crash is allowed to make, the file is there after it, begins with
 /// all its durable bytes and is a prefix of what it read as before ([`cut_to_a_prefix`]). So
@@ -862,7 +871,8 @@ pub fn a_crash_cuts_an_appended_file_to_a_prefix(disk: Disk, file: u64, cut: Vec
     cut_to_a_prefix(&durable, &read, &disk.contents(file))
 }
 
-/// The invariant: a barrier orders. From every well-formed disk within the bounds, once a
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a barrier
+/// orders. From every well-formed disk within the bounds, once a
 /// barrier of `file` that covers all its changes has completed and `bytes` were then appended
 /// to `later` (any file, `file` itself too), a cut a crash is allowed to make that keeps any
 /// part of that append keeps whole every change the barrier covered. So a commit record

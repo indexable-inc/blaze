@@ -15,9 +15,6 @@ use std::sync::{Arc, TryLockError};
 
 use blaze_rng::SplitMix64;
 
-#[cfg(test)]
-mod tests;
-
 /// One choice a case made, in canonical form.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Choice {
@@ -32,6 +29,10 @@ pub struct Choice {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub label: &'static str,
+    #[expect(
+        blaze::untyped_index,
+        reason = "a span's ends are counts of choices drawn, which the shrinker deletes by and other crates' tests read as numbers: a public field's type stays"
+    )]
     pub start: u32,
     pub end: u32,
 }
@@ -73,6 +74,9 @@ pub struct Record {
 
 impl Record {
     /// Empty, allocating nothing.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::nonblocking]
     pub fn new() -> Record {
         Record {
             choices: Vec::new_in(Global),
@@ -87,14 +91,20 @@ impl Record {
     }
 
     /// The values of `choices`, trailing zeros cut, into `out` (cleared first).
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn values_into(&self, out: &mut Vec<u64>) {
         out.clear();
-        let kept = self.choices.iter().rposition(|choice| choice.value != 0).map_or(0, |last| last + 1);
+        let kept =
+            self.choices.iter().rposition(|choice| choice.value != 0).map_or(0, |last| last + 1);
         out.extend(self.choices[..kept].iter().map(|choice| choice.value));
     }
 }
 
 impl Default for Record {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::nonblocking]
     fn default() -> Record {
         Record::new()
     }
@@ -118,11 +128,63 @@ pub(crate) enum Plant {
     ShuffleSwapsWithValue,
 }
 
+/// A prefix value as `Tape::draw` hands it out under `plant`: a flag turned round under
+/// `Plant::ReplayFlipsFlags`, else the value itself.
+#[cfg(test)]
+fn planted_given(plant: Plant, most: u64, value: u64) -> u64 {
+    if plant == Plant::ReplayFlipsFlags && most == 1 { 1 - value } else { value }
+}
+
+/// Whether a tape keeps what a case drew (choices, spans, notes, reach points) and holds its
+/// bound on choices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Recording {
+    /// Kept and bounded: a tape of a check.
+    Kept,
+    /// Nothing kept and no bound: `Tape::seeded`, a tape outside a check.
+    Skipped,
+}
+
+/// The names the tape's own operations hold its lock under, which a refusal of two holders at
+/// once prints in place of a draw's label: each the operation's method.
+const RESET: &str = "reset";
+/// See [`RESET`].
+const FINISH: &str = "finish";
+/// See [`RESET`].
+const NOTE: &str = "note";
+/// See [`RESET`].
+const DISCARD: &str = "discard";
+
+/// `SplitMix64::unit_f64`'s precision: the bits of a draw it keeps, as many as an `f64`'s
+/// significand holds, so each value is exact.
+const UNIT_BITS: u32 = f64::MANTISSA_DIGITS;
+
+/// How far a draw is shifted right to keep its high `UNIT_BITS` bits.
+const UNIT_SHIFT: u32 = u64::BITS - UNIT_BITS;
+
+/// The widest range `int_in` draws uniformly: one of at most 256 values (a `u8`'s worth), where
+/// every value is common enough to reach.
+const UNIFORM_VALUES: u64 = 256;
+
+/// The kinds a wider range's draw in `int_in` is one of, each one in eight: kinds
+/// `0..SMALL_FROM_END`, a small offset from the start; [`SMALL_FROM_END`], a small offset back
+/// from the end; [`UNIFORM_FROM`] on, uniform over the range.
+const INT_KINDS: u64 = 8;
+
+/// The kind of `int_in`'s draw that is a small offset back from the range's end (one in eight).
+const SMALL_FROM_END: u64 = 5;
+
+/// The first kind of `int_in`'s draw that is uniform over the whole range (two in eight).
+const UNIFORM_FROM: u64 = 6;
+
+/// The least chance a list in `Tape::vec` ends at each element past its least size: one in 16
+/// at most, so a seeded list is short more often than long whatever its sizes allow.
+const MOST_STOP_ONE_IN: u64 = 16;
+
 /// The tape's state behind its lock.
 struct State {
+    /// The prefix values not yet handed out, in reverse: the next is the last, popped as drawn.
     prefix: Vec<u64>,
-    /// The next prefix value to hand out.
-    at: usize,
     tail: Tail,
     most_choices: u32,
     choices: Vec<Choice>,
@@ -137,15 +199,15 @@ struct State {
 }
 
 impl State {
-    /// Choices drawn so far; never more than `most_choices`, so it fits a `u32`.
+    /// Choices drawn so far; never more than `most_choices`, so it fits a `u32` (and saturates
+    /// if it did not).
     fn drawn(&self) -> u32 {
-        self.choices.len() as u32
+        count(self.choices.len())
     }
 
     fn start(&mut self, prefix: &[u64], tail: Tail) {
         self.prefix.clear();
-        self.prefix.extend_from_slice(prefix);
-        self.at = 0;
+        self.prefix.extend(prefix.iter().rev());
         self.tail = tail;
         self.choices.clear();
         self.spans.clear();
@@ -156,6 +218,31 @@ impl State {
         self.overran = false;
         self.clamped = 0;
     }
+
+    /// The next prefix value lowered to `most` (a lowered one counted in `clamped`), or `None`
+    /// past the prefix.
+    fn next_given(&mut self, most: u64) -> Option<u64> {
+        let given = self.prefix.pop()?;
+        if given > most {
+            self.clamped += 1;
+            Some(most)
+        } else {
+            Some(given)
+        }
+    }
+}
+
+/// A length as a `u32` count, saturating.
+#[blaze::pure]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+#[expect(
+    blaze::dropped_error,
+    reason = "the only failure is a length past `u32::MAX`, which saturates: the bound on a case's choices, a `u32`, is met long before"
+)]
+fn count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 /// The lock a tape's handles share. It is only ever tried: a second draw while one is under way
@@ -170,22 +257,26 @@ type Shared = Arc<std::sync::Mutex<State>, Global>;
 #[derive(Clone)]
 pub struct Tape {
     state: Shared,
-    /// Whether choices, spans, notes, reach points and the bound are kept: false only for
+    /// Whether choices, spans, notes, reach points and the bound are kept: skipped only for
     /// `Tape::seeded`. Fixed for the tape's life, so it is read without the lock.
-    recorded: bool,
+    recording: Recording,
     #[cfg(test)]
     plant: Plant,
 }
 
 impl core::fmt::Debug for Tape {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Tape").field("recorded", &self.recorded).finish_non_exhaustive()
+        f.debug_tuple(core::any::type_name::<Self>()).field(&self.recording).finish_non_exhaustive()
     }
 }
 
-/// `SplitMix64::unit_f64`'s scale: the high 53 bits of a draw over `2^53`.
+/// `SplitMix64::unit_f64`'s scale: the high `UNIT_BITS` bits of a draw over `2^UNIT_BITS`.
+#[expect(
+    blaze::as_cast,
+    reason = "the cast is the operation: an integer below 2^53, and 2^53 itself, made into the `f64` of the same value, which is exact"
+)]
 fn unit(bits: u64) -> f64 {
-    bits as f64 * (1.0 / (1u64 << 53) as f64)
+    bits as f64 * (1.0 / (1u64 << UNIT_BITS) as f64)
 }
 
 impl Tape {
@@ -196,10 +287,13 @@ impl Tape {
         clippy::disallowed_types,
         reason = "blaze-sim sits below blaze-core and cannot name blaze_core::lock; the lock is only ever tried, never waited for"
     )]
-    fn make(prefix: &[u64], tail: Tail, most_choices: u32, recorded: bool) -> Tape {
+    #[expect(
+        blaze::std_use,
+        reason = "bstd's named `Lock` is not in this tree and blaze-sim sits below blaze-core; the lock is only ever tried, never waited for, so it neither blocks nor needs a deadline"
+    )]
+    fn make(prefix: &[u64], tail: Tail, most_choices: u32, recording: Recording) -> Tape {
         let mut state = State {
             prefix: Vec::with_capacity_in(prefix.len(), Global),
-            at: 0,
             tail: Tail::Calm,
             most_choices,
             choices: Vec::new_in(Global),
@@ -214,7 +308,7 @@ impl Tape {
         state.start(prefix, tail);
         Tape {
             state: Arc::new_in(std::sync::Mutex::new(state), Global),
-            recorded,
+            recording,
             #[cfg(test)]
             plant: Plant::None,
         }
@@ -223,22 +317,34 @@ impl Tape {
     /// A recorded tape: hands out `prefix` (each value lowered to fit its draw), then `tail`.
     /// The draw after `most_choices` choices sets `overran` and panics, naming the bound and the
     /// label.
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    #[expect(
+        blaze::constant_argument,
+        reason = "the general constructor of a recorded tape: tests build recorded seeded tapes with it (`Tail::Seeded`), and the driver gives each case its tail through `reset`, so the crate's own non-test callers all pass `Tail::Calm`"
+    )]
     pub fn new(prefix: &[u64], tail: Tail, most_choices: u32) -> Tape {
-        Tape::make(prefix, tail, most_choices, true)
+        Tape::make(prefix, tail, most_choices, Recording::Kept)
     }
 
     /// A tape outside a check: the seed's stream, exactly `SplitMix64::new(seed)`'s, and not
     /// recorded (no choices, spans, notes or bound are kept).
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn seeded(seed: u64) -> Tape {
-        Tape::make(&[], Tail::Seeded(SplitMix64::new(seed)), u32::MAX, false)
+        Tape::make(&[], Tail::Seeded(SplitMix64::new(seed)), u32::MAX, Recording::Skipped)
     }
 
     /// Recorded, every draw calm: `new(&[], Tail::Calm, MOST_CHOICES)`.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn calm() -> Tape {
         Tape::new(&[], Tail::Calm, Tape::MOST_CHOICES)
     }
 
     /// Recorded: `new(values, Tail::Calm, MOST_CHOICES)`.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn replay(values: &[u64]) -> Tape {
         Tape::new(values, Tail::Calm, Tape::MOST_CHOICES)
     }
@@ -254,6 +360,10 @@ impl Tape {
     /// Runs `body` on the state under the lock. A lock already held is two draws at once, which
     /// is refused; a poisoned one is taken anyway, since every hold is short and leaves the state
     /// whole.
+    #[expect(
+        blaze::std_use,
+        reason = "bstd's named `Lock` is not in this tree and blaze-sim sits below blaze-core; `try_lock` never waits, and a poisoned hold is taken since every hold leaves the state whole"
+    )]
     fn with<R>(&self, label: &'static str, body: impl FnOnce(&mut State) -> R) -> R {
         let mut guard = match self.state.try_lock() {
             Ok(guard) => guard,
@@ -270,25 +380,18 @@ impl Tape {
     /// of one raw `SplitMix64` draw on a seeded one. A recorded tape holds its bound first and
     /// records the choice. The overrun panics after the lock is let go.
     fn draw(&self, label: &'static str, most: u64, canonical: impl FnOnce(u64) -> u64) -> u64 {
-        let recorded = self.recorded;
+        let recording = self.recording;
         #[cfg(test)]
         let plant = self.plant;
         let drawn = self.with(label, |state| {
-            if recorded && state.drawn() >= state.most_choices {
+            if recording == Recording::Kept && state.drawn() >= state.most_choices {
                 state.overran = true;
                 return Err(state.most_choices);
             }
-            let value = match state.prefix.get(state.at) {
-                Some(&given) => {
-                    state.at += 1;
-                    let value = if given > most {
-                        state.clamped += 1;
-                        most
-                    } else {
-                        given
-                    };
+            let value = match state.next_given(most) {
+                Some(value) => {
                     #[cfg(test)]
-                    let value = if plant == Plant::ReplayFlipsFlags && most == 1 { 1 - value } else { value };
+                    let value = planted_given(plant, most, value);
                     value
                 }
                 None => match &mut state.tail {
@@ -296,7 +399,7 @@ impl Tape {
                     Tail::Seeded(rng) => canonical(rng.next_u64()),
                 },
             };
-            if recorded {
+            if recording == Recording::Kept {
                 state.choices.push(Choice { value, most, label });
             }
             Ok(value)
@@ -309,13 +412,13 @@ impl Tape {
 
     /// Back to the start with a new prefix and tail, keeping the buffers.
     pub fn reset(&self, prefix: &[u64], tail: Tail) {
-        self.with("reset", |state| state.start(prefix, tail));
+        self.with(RESET, |state| state.start(prefix, tail));
     }
 
     /// What the case drew, copied into `into` (its buffers reused); closes open spans, counts
     /// `unused`.
     pub fn finish(&self, into: &mut Record) {
-        self.with("finish", |state| {
+        self.with(FINISH, |state| {
             let end = state.drawn();
             for &open in &state.open {
                 state.spans[open].end = end;
@@ -332,7 +435,9 @@ impl Tape {
             into.discarded = state.discarded;
             into.overran = state.overran;
             into.clamped = state.clamped;
-            into.unused = (state.prefix.len() - state.at) as u32;
+            // What is left of the prefix is what the case never drew; a prefix past `u32::MAX`
+            // values saturates.
+            into.unused = count(state.prefix.len());
         });
     }
 
@@ -342,8 +447,14 @@ impl Tape {
     }
 
     /// The high half of a draw: `SplitMix64::next_u32`.
+    #[expect(
+        blaze::dropped_error,
+        reason = "the high half of a `u64` always fits a `u32`: there is no error to drop"
+    )]
     pub fn next_u32(&self, label: &'static str) -> u32 {
-        self.draw(label, u64::from(u32::MAX), |r| r >> 32) as u32
+        let high = self.draw(label, u64::from(u32::MAX), |r| r >> u32::BITS);
+        // The draw's bound is `u32::MAX`, so it always fits and nothing is clamped.
+        u32::try_from(high).unwrap_or(u32::MAX)
     }
 
     /// Below `n`, 0 when `n` is 0 (which still draws, as `SplitMix64::below` does); calm is 0.
@@ -352,6 +463,10 @@ impl Tape {
     }
 
     /// `below` for an index into something `len` long; calm is 0.
+    #[expect(
+        blaze::as_cast,
+        reason = "a length widened from `usize` to `u64` for the draw, and the draw, below that length, back to `usize`, where it fits"
+    )]
     pub fn index(&self, len: usize, label: &'static str) -> usize {
         self.below(len as u64, label) as usize
     }
@@ -383,7 +498,7 @@ impl Tape {
         } else if p >= 1.0 {
             true
         } else {
-            self.draw(label, 1, |r| u64::from(unit(r >> 11) < p)) != 0
+            self.draw(label, 1, |r| u64::from(unit(r >> UNIT_SHIFT) < p)) != 0
         }
     }
 
@@ -394,7 +509,7 @@ impl Tape {
 
     /// Uniform in `[0, 1)`, from the high 53 bits of a draw; calm is 0.0.
     pub fn unit_f64(&self, label: &'static str) -> f64 {
-        unit(self.draw(label, (1 << 53) - 1, |r| r >> 11))
+        unit(self.draw(label, (1 << UNIT_BITS) - 1, |r| r >> UNIT_SHIFT))
     }
 
     /// One of `items`, `None` (and no draw) when it is empty; calm is the first.
@@ -407,21 +522,28 @@ impl Tape {
 
     /// `out` filled with draws, each little-endian, the last cut to fit; calm is zeros.
     pub fn fill(&self, out: &mut [u8], label: &'static str) {
-        let mut chunks = out.chunks_exact_mut(8);
+        const WORD: usize = size_of::<u64>();
+        let mut chunks = out.chunks_exact_mut(WORD);
         for chunk in &mut chunks {
             chunk.copy_from_slice(&self.draw(label, u64::MAX, |r| r).to_le_bytes());
         }
         let rest = chunks.into_remainder();
         if !rest.is_empty() {
             let len = rest.len();
-            // Under 8 bytes, so the shift is under 64.
-            let mask = (1u64 << (8 * len)) - 1;
+            // The low `len` bytes all ones: the most a draw of `len` bytes is.
+            let mut ones = [0u8; WORD];
+            ones[..len].fill(u8::MAX);
+            let mask = u64::from_le_bytes(ones);
             rest.copy_from_slice(&self.draw(label, mask, |r| r & mask).to_le_bytes()[..len]);
         }
     }
 
     /// `items` in an order of the tape's (Fisher-Yates, from the back). Each choice is how far
     /// the element at `at` moves, so calm leaves the order alone.
+    #[expect(
+        blaze::as_cast,
+        reason = "an index widened from `usize` to `u64` for the draw, and the draw, at most that index, back to `usize`, where it fits"
+    )]
     pub fn shuffle<T>(&self, items: &mut [T], label: &'static str) {
         #[cfg(test)]
         {
@@ -439,15 +561,20 @@ impl Tape {
             let moved = self.draw(label, reach, |r| reach - r % (reach + 1));
             let other = at - moved as usize;
             #[cfg(test)]
-            let other = if self.plant == Plant::ShuffleSwapsWithValue { moved as usize } else { other };
+            let other =
+                if self.plant == Plant::ShuffleSwapsWithValue { moved as usize } else { other };
             items.swap(at, other);
         }
     }
 
     /// `body`'s draws as one span. The lock is held only to note the start and the end, never
     /// while `body` runs; a span `body` leaves by a panic stays open until `finish` closes it.
+    #[expect(
+        blaze::parallel_collections,
+        reason = "`open` is not kept the length of `spans`: it is the stack of the spans still open, each an index into `spans`, pushed as a span opens and popped as it closes"
+    )]
     pub fn span<R>(&self, label: &'static str, body: impl FnOnce(&Tape) -> R) -> R {
-        if !self.recorded {
+        if self.recording == Recording::Skipped {
             return body(self);
         }
         self.with(label, |state| {
@@ -486,7 +613,11 @@ impl Tape {
     ) -> Vec<T> {
         let (min, max) = (*sizes.start(), *sizes.end());
         assert!(min <= max, "the list `{label}` has no size: {min}..={max} is empty");
-        let stop = (((max - min) / 2 + 1) as u64).min(16);
+        #[expect(
+            blaze::as_cast,
+            reason = "a count of elements, `usize` to `u64`, widens on every target blaze builds"
+        )]
+        let stop = (((max - min) / 2 + 1) as u64).min(MOST_STOP_ONE_IN);
         let mut out = Vec::with_capacity_in(min, Global);
         // Bounded by `max`, and past `min` each turn draws, so a recorded tape's bound holds it.
         while out.len() < max {
@@ -499,6 +630,9 @@ impl Tape {
     }
 
     /// Any `T`, small values and the ends more often than a uniform draw gives; calm is 0.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn int<T: Int>(&self, label: &'static str) -> T {
         T::draw_int(self, label)
     }
@@ -509,30 +643,39 @@ impl Tape {
         let (lo, hi) = (range.start().to_ordered(), range.end().to_ordered());
         assert!(lo <= hi, "the range of `{label}` is empty");
         let width = hi - lo;
-        if width < 256 {
+        if width < UNIFORM_VALUES {
             return T::from_ordered(lo + self.below(width + 1, label));
         }
-        let kind = self.below(8, label);
-        if kind >= 6 {
-            let offset = if width == u64::MAX { self.next_u64(label) } else { self.below(width + 1, label) };
+        let kind = self.below(INT_KINDS, label);
+        if kind >= UNIFORM_FROM {
+            // A width of `u64::MAX` is the whole `u64` range, one raw draw.
+            let offset = match width.checked_add(1) {
+                Some(values) => self.below(values, label),
+                None => self.next_u64(label),
+            };
             return T::from_ordered(lo + offset);
         }
         // The bit length of `width`, at least 9 here.
         let length = u64::from(u64::BITS - width.leading_zeros());
         let bits = self.below(length + 1, label);
-        let offset = if bits == 64 { self.next_u64(label) } else { self.below(1 << bits, label) };
+        // An offset of `u64::BITS` bits is any `u64`, one raw draw.
+        let offset = if bits == u64::from(u64::BITS) {
+            self.next_u64(label)
+        } else {
+            self.below(1 << bits, label)
+        };
         let offset = offset.min(width);
-        T::from_ordered(if kind == 5 { hi - offset } else { lo + offset })
+        T::from_ordered(if kind == SMALL_FROM_END { hi - offset } else { lo + offset })
     }
 
     /// Notes a line for the report, at the number of choices drawn so far.
     pub fn note(&self, text: core::fmt::Arguments<'_>) {
-        if !self.recorded {
+        if self.recording == Recording::Skipped {
             return;
         }
         // Formatted before the lock is taken: a `Display` may be anything.
         let text = std::fmt::format(text);
-        self.with("note", |state| {
+        self.with(NOTE, |state| {
             let at = state.drawn();
             state.notes.push(Note { at, text });
         });
@@ -540,7 +683,7 @@ impl Tape {
 
     /// Notes that the case got to `what`; each point is kept once, in the order first reached.
     pub fn reached(&self, what: &'static str) {
-        if !self.recorded {
+        if self.recording == Recording::Skipped {
             return;
         }
         self.with(what, |state| {
@@ -551,12 +694,18 @@ impl Tape {
     }
 
     /// Ends the case as not counted: sets `discarded` and panics.
+    #[blaze::noalloc]
     pub fn discard(&self) -> ! {
-        self.with("discard", |state| state.discarded = true);
+        self.with(DISCARD, |state| state.discarded = true);
         panic!("discarded")
     }
 
     /// `discard` unless `holds`.
+    #[blaze::noalloc]
+    #[expect(
+        blaze::bool_param,
+        reason = "the bool is the condition a case assumes, written at the call (`tape.assume(x < 10)`), as every property-testing library takes it; public, called by many crates' tests"
+    )]
     pub fn assume(&self, holds: bool) {
         if !holds {
             self.discard();

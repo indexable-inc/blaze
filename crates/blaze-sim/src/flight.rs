@@ -12,6 +12,9 @@ use crate::tape::Tape;
 #[cfg(test)]
 mod tests;
 
+/// The label of `Flight::deliver`'s draw, which a failing case's report shows beside the choice.
+const DELIVER: &str = "deliver";
+
 /// Virtual nanoseconds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Nanos(pub u64);
@@ -36,6 +39,10 @@ pub struct Flight<T> {
 }
 
 impl<T> Flight<T> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn new() -> Flight<T> {
         Flight {
             waiting: Vec::new_in(Global),
@@ -51,24 +58,36 @@ impl<T> Flight<T> {
     }
 
     /// Due at once.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn ask(&mut self, answer: T) {
         self.ask_at(Nanos(0), answer);
     }
 
     /// Due at `due`: not delivered before it.
+    #[blaze::pure]
+    #[blaze::nonblocking]
     pub fn ask_at(&mut self, due: Nanos, answer: T) {
         self.waiting.push((due, answer));
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn len(&self) -> usize {
         self.waiting.len()
     }
 
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
         self.waiting.is_empty()
     }
 
     /// The earliest time an answer is due.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn earliest(&self) -> Option<Nanos> {
         self.waiting.iter().map(|&(due, _)| due).min()
     }
@@ -80,7 +99,7 @@ impl<T> Flight<T> {
         if due == 0 {
             return None;
         }
-        let nth = tape.index(due, "deliver");
+        let nth = tape.index(due, DELIVER);
         let (place, _) = self
             .waiting
             .iter()
@@ -99,6 +118,10 @@ impl<T> Flight<T> {
     }
 
     /// A kill: everything in flight is gone. How many were.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn kill(&mut self) -> usize {
         let gone = self.waiting.len();
         self.waiting.clear();
@@ -107,6 +130,10 @@ impl<T> Flight<T> {
 }
 
 impl<T> Default for Flight<T> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     fn default() -> Flight<T> {
         Flight::new()
     }
