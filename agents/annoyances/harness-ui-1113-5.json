@@ -1,0 +1,14 @@
+{
+  "id": "harness-ui-1113-5",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Harness sidebar density and question-tool usage",
+  "what": "Andrew requested one-line tabs after seeing two-line agent rows, and showed a casual question rendered as plain assistant text rather than the question UI.",
+  "cost": "Rows consumed too much vertical space, and a working question API was not used in casual conversation.",
+  "cause": "The layout added a second line to fit metadata, and the prompt scoped ask guidance to task clarification rather than every question expecting an answer.",
+  "class": "A presentation or tool-use policy misses the actual interaction preference or a common use case.",
+  "prevention": "One-line rows use compact controls and put numeric context details in the tooltip/popover. The always-on goals note explicitly requires await ask for casual questions, follow-ups and requests to ask a question, with a free-text example; API discovery repeats that policy.",
+  "workaround": "Existing provider processes must resume under the updated daemon prompt to receive the instruction.",
+  "fix": "Restored fixed-height one-line rows and compact context rings; strengthened the common launch note and ask help. Native scene tests, offscreen rendering and kernel ask-wait checks validate the controls/API; model compliance remains a prompt policy.",
+  "state": "fixed in this change"
+}

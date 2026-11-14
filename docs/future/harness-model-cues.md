@@ -14,8 +14,8 @@ capability tier before provider order. One UI policy classifies known model fami
 Advanced, Balanced or Light; these are curated categories, not benchmark scores. Unknown families keep their
 provider order and receive no guessed tier. Versions remain numeric, with older versions folded.
 
-Chat sidebar rows keep the task title and mood on the first line, with the model family name,
-thinking effort meter and context on a compact second line. Their tooltip
+Chat sidebar rows keep the task title, mood, model family name, thinking effort and context ring on
+one line. The compact ring moves percentage and exact counts into its tooltip and breakdown. Their tooltip
 names the model and spells out its effort; missing information stays absent. The picker and sidebar
 read the same policy and the same transcript/daemon choice. The daemon's session list carries an optional
 compact context summary, so every row can show usage without subscribing to every transcript. Older

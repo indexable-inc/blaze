@@ -42,7 +42,8 @@ refuses to read.
 
 Every agent's note starts with the goal-understanding policy: recover the root objective, concrete constraints and
 success criteria, and ranked priorities from context; use the existing `ask()` UI for material gaps and challenge
-misaligned proxy metrics with evidence. Clear small requests stay autonomous.
+misaligned proxy metrics with evidence. Every question addressed to the person, including casual questions,
+uses `await ask(...)` rather than a question in plain chat text. Clear small requests stay autonomous.
 
 An agent's system note carries what every turn needs (`harness/src/system_note/`) and ends with an index of skills,
 one line each (name and description), generated from the skill files at each launch. The full text of a skill loads

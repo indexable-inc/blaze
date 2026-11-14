@@ -142,7 +142,6 @@ export const disclose_w = 18
 // the Archive button's glyph box. Folded with work under it, a session's row shows a faint dot (tree_under_dot)
 // tree_under_gap before how many.
 export const tree_row_h = 28
-export const tree_agent_h = 50
 export const tree_run_h = 22
 export const tree_gutter = 12
 export const tree_icon = 16

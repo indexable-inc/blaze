@@ -380,10 +380,7 @@ impl App {
             meter(v, context.map_or((0, 1), |c| (c.used, c.window)), tone(w, "ink"));
             breathe(v, working);
             v.action(&format!("chat:ctx:{sid}"));
-            if let Some(percent) = v.part("percent") {
-                percent.text(&context.map_or_else(String::new, |c| format!("{:.0}%", c.used as f64 * 100.0 / c.window as f64)));
-            }
-            let tip = context.map_or_else(|| "Context usage has not arrived yet".to_owned(), |c| format!("Context · {} / {} tokens\nClick for this agent's breakdown", tokens(c.used), tokens(c.window)));
+            let tip = context.map_or_else(|| "Context usage has not arrived yet".to_owned(), |c| format!("Context · {:.0}% · {} / {} tokens\nClick for this agent's breakdown", c.used as f64 * 100.0 / c.window as f64, tokens(c.used), tokens(c.window)));
             v.set(Tooltip { text: tip.as_str().into() });
         });
         let (open, menu) = self.chat.borrow().get(&sid).map_or((false, false), |s| (s.ctx_open, s.pick.is_some()));

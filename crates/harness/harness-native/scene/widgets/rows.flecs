@@ -36,13 +36,8 @@ hn {
     prop profile_tip: string = ""
     (IsA, hn.TreeRowLook)
     Action: {name: "select:{obj}"}
-    if $profile != "" {
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_agent_h, min: 0, max: 0}}
-      Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: $chat_pick_h}
-    } else {
-      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
-      Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
-    }
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+    Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     // A mark only when there is something to say, tree_kind across before its title (src/app.rs sync_view sets it,
     // outside the template's reactive inputs): a dot in the strong ink while its agent works, the same dot in the error
@@ -85,11 +80,9 @@ hn {
         }
       }
     }
-    // The controls share a second line, leaving the task title readable at the narrowest sidebar width.
-    // Names stay direct children so hit testing, rename and picker anchors share the existing row contract.
+    // One line: compact controls leave the task title the main element; full values live in tooltips and popovers.
     profile : ui.Row {
-      Overlay
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
+      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
       Tooltip: {text: $profile_tip}
       label : hn.tree.ProfileControl {
         icon : hn.ModelIconSlot {}
@@ -99,8 +92,8 @@ hn {
       context : ui.Row {}
       context_pop : ui.Node { Overlay }
       if $profile != "" {
-        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
-        Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: $tree_row_h - 2, b: 2}
+        Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+        Padding: {l: 0, r: 0, t: 0, b: 0}
       } else {
         Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 0, r: 0, t: 0, b: 0}

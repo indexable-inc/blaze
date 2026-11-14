@@ -269,14 +269,9 @@ hn {
     warn { Fill: $tone_ink_strong }
     full { Fill: $tone_error }
   }
-  // Context belongs to the agent row: a small ring and a quiet percentage, still the same context control.
+  // A compact inline ring; percentage and exact counts live in its tooltip and breakdown.
   prefab SidebarContext : ChatContext {
-    Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Center, wrap: false}
-    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
-    Padding: {l: $chat_pick_gap, r: $chat_pick_gap, t: 0, b: 0}
-    percent : ui.Line, Faint {
-      TextStyle: {size: $size_caption, line: $line_chrome, role: 0, bold: 0}
-    }
+    Size: {w: {kind: Fixed, value: $chat_ring + 4, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
   }
 
   // How much of the person's plan is used (src/app/chat/plan.rs), after the context meter in the status bar: the window
