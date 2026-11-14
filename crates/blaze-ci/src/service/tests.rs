@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use blaze_api::{ApiError, FactRead, Span};
+use blaze_api::{ApiError, Basis, Cached, FactRead, Span};
 use blaze_ids::{Fingerprint, rng::SplitMix64};
 
 use super::*;
@@ -172,6 +172,22 @@ fn test_result(name: &str, outcome: TestOutcome, output: &str) -> Response {
         millis: 12,
         outside: false,
         executable: 0,
+        not_kept: None,
+    })
+}
+
+/// A test not run whose kept pass stands.
+fn cached_result(name: &str) -> Response {
+    Response::TestResult(TestResult {
+        binary: "blaze_ci".to_owned(),
+        name: name.to_owned(),
+        cached: Some(Cached { basis: Basis::Executed, millis: 12, outcome: TestOutcome::Passed }),
+        outcome: TestOutcome::Passed,
+        output: Vec::new(),
+        millis: 0,
+        outside: false,
+        executable: 0,
+        not_kept: None,
     })
 }
 
@@ -237,11 +253,11 @@ fn a_push_end_to_end() {
     sim.step(Input::Response {
         job,
         run: test_run,
-        response: test_result("b", TestOutcome::Unreached, ""),
+        response: cached_result("b"),
     });
     let out = sim.step(Input::Ended { job, run: test_run, ok: true });
     assert_eq!(sim.status(test_run), CheckStatus::Success);
-    assert!(sim.posted[&test_run].summary.contains("1 passed, 0 failed, 0 ignored, 1 not reached"));
+    assert!(sim.posted[&test_run].summary.contains("2 passed (1 cached: their kept passes stand), 0 failed, 0 ignored"));
     assert!(out.contains(&Output::EndJob { job }));
     let Some(Output::Snapshot { name }) =
         out.iter().find(|it| matches!(it, Output::Snapshot { .. }))
@@ -921,7 +937,7 @@ struct OldReport {
     passed: usize,
     failed: usize,
     ignored: usize,
-    unreached: usize,
+    cached: usize,
     failures: Vec<String>,
     artifacts: usize,
     said: Vec<String>,
@@ -944,9 +960,11 @@ impl OldReport {
                 Level::Note | Level::Help | Level::FailureNote => {}
             },
             Response::TestResult(test) => match test.outcome {
-                TestOutcome::Passed => self.passed += 1,
+                TestOutcome::Passed => {
+                    self.passed += 1;
+                    self.cached += usize::from(test.cached.is_some());
+                }
                 TestOutcome::Ignored => self.ignored += 1,
-                TestOutcome::Unreached => self.unreached += 1,
                 TestOutcome::Failed => {
                     self.failed += 1;
                     if self.failures.len() < MOST_LISTED {
@@ -994,9 +1012,8 @@ impl OldReport {
         match kind {
             CheckKind::Test => {
                 text += &format!(
-                    "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
-                 last results stand)",
-                    self.passed, self.failed, self.ignored, self.unreached
+                    "; tests: {} passed ({} cached: their kept passes stand), {} failed, {} ignored",
+                    self.passed, self.cached, self.failed, self.ignored
                 )
             }
             CheckKind::Build => text += &format!("; {} artifacts built", self.artifacts),
@@ -1065,22 +1082,26 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                     explanation: None,
                 }),
                 3 | 4 => {
-                    let outcome = [
-                        TestOutcome::Passed,
-                        TestOutcome::Failed,
-                        TestOutcome::Ignored,
-                        TestOutcome::Unreached,
-                    ][rng.index(4)];
+                    // The fourth is a cached pass.
+                    let pick = rng.index(4);
+                    let outcome =
+                        [TestOutcome::Passed, TestOutcome::Failed, TestOutcome::Ignored, TestOutcome::Passed][pick];
+                    let cached = (pick == 3).then(|| Cached {
+                        basis: Basis::Executed,
+                        millis: at as u64,
+                        outcome: TestOutcome::Passed,
+                    });
                     let output = outputs[rng.index(outputs.len())].repeat(1 + rng.index(40));
                     Response::TestResult(TestResult {
                         binary: "blaze_ci".to_owned(),
                         name: format!("t{at}"),
-                        cached: None,
+                        cached,
                         outcome,
                         output: output.into_bytes(),
                         millis: at as u64,
                         outside: false,
                         executable: 0,
+                        not_kept: None,
                     })
                 }
                 5 => Response::Error(ApiError::new(
@@ -1131,7 +1152,7 @@ fn a_warm_service_step_allocates_only_what_it_posts() {
     for (what, response) in [
         ("a passed test", test_result("a", TestOutcome::Passed, "")),
         ("an ignored test", test_result("b", TestOutcome::Ignored, "")),
-        ("a test the change did not reach", test_result("c", TestOutcome::Unreached, "")),
+        ("a test whose kept pass stands", cached_result("c")),
     ] {
         let input = Input::Response { job, run: test_run, response };
         blaze_alloc_count::assert_at_most(0, what, || step(&mut sim.service, input, &mut out));

@@ -16,7 +16,7 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
@@ -103,11 +103,10 @@ impl Gen {
     }
 
     fn outcome(&mut self) -> TestOutcome {
-        match self.below(4) {
+        match self.below(3) {
             0 => TestOutcome::Passed,
             1 => TestOutcome::Failed,
-            2 => TestOutcome::Ignored,
-            _ => TestOutcome::Unreached,
+            _ => TestOutcome::Ignored,
         }
     }
 
@@ -652,6 +651,7 @@ impl Gen {
                 outcome: self.outcome(),
                 outside: self.yes(),
                 executable: self.u32(),
+                not_kept: self.maybe(|g| NotKept { no: g.text(), why: g.text() }),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),

@@ -331,29 +331,41 @@ fn of(lines: &[(Seen, String)]) -> Lines {
     lines.iter().map(|it| (it.0, it.1.as_str())).collect()
 }
 
+/// What a test of [`Common`] says moved: any path read whose name is of odd length. A
+/// question of each path alone, as `Began::moved`'s is, so asking it of the shared and the own
+/// part apart answers as asking it of the whole.
+fn odd_moved(traced: &Traced) -> bool {
+    let odd = |path: &std::path::Path| path.as_os_str().len() % 2 == 1;
+    traced.files.iter().any(|it| odd(&it.0)) || traced.dirs.iter().any(|it| odd(&it.0))
+}
+
 /// Through the cache, every kind of trace is what [`Trace::traced`] says it is, result after
-/// result.
+/// result, and moved exactly when the whole of it is.
 #[test]
 fn a_result_is_traced_as_its_trace_says() {
     let mut rng = Rng::new(11);
     let mut common = Common::default();
     let mut world = World::new();
+    let both = |it: Option<&Traced>, moved: bool| (it.cloned(), moved);
     for _ in 0..200 {
         let count = rng.below(32);
         let all = lines(&mut rng, count);
         let Ok(expected) = Trace::Lines(of(&all)).traced(&mut world);
-        let Ok(got) = common.traced(Trace::Lines(of(&all)), &mut world, |it| it.cloned());
-        assert_eq!(got, expected, "{all:?}");
+        let moved = expected.as_ref().is_some_and(odd_moved);
+        let Ok(got) = common.traced(Trace::Lines(of(&all)), &mut world, odd_moved, both);
+        assert_eq!(got, (expected, moved), "{all:?}");
     }
     let whole = assembled(&lines(&mut rng, 20));
-    let Ok(got) = common.traced(Trace::Whole(whole.clone()), &mut world, |it| it.cloned());
-    assert_eq!(got, Some(whole));
+    let moved = odd_moved(&whole);
+    let Ok(got) = common.traced(Trace::Whole(whole.clone()), &mut world, odd_moved, both);
+    assert_eq!(got, (Some(whole), moved));
     let Ok(got) = common.traced(
         Trace::Unknown("the sandbox's record was cut".to_owned()),
         &mut world,
-        |it| it.cloned(),
+        odd_moved,
+        both,
     );
-    assert_eq!(got, None);
+    assert_eq!(got, (None, false));
 }
 
 /// Keep-going (`each`): a test run whose binaries are `edition`'s, refused as a dev test binary

@@ -1449,10 +1449,11 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
 /// build script's is given what asks its job's [`Writer`] to apply its run ([`Asks`]); tests
 /// and runs, none.
 pub trait Runs<S: Steps>: Send + 'static {
-    /// Asks for what it runs first; it may end at once (a result the store kept).
+    /// Asks for what it runs first; it may end at once (a result the store kept). `store` is
+    /// mutable as `complete`'s: a test run reads kept results through it and puts what it learns.
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,

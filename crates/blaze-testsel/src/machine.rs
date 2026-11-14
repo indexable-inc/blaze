@@ -147,6 +147,9 @@ pub struct Ran<'a> {
     /// Codegen marks the test as reaching code the tracer cannot see (a process start, the
     /// network, assembly: `TestOf::outside`).
     pub foreign: bool,
+    /// Something it read can have changed after it began and before `reads` were hashed (the
+    /// runner hashes them once the run ends): `reads` need not be what it read.
+    pub moved: bool,
 }
 
 /// What a run executed, each function with its bound code when it ran.
@@ -217,6 +220,8 @@ pub enum NotKept {
     Untraced,
     /// It reaches code the tracer cannot see, as codegen marks it.
     Foreign,
+    /// Something it read can have changed between its read and the hash of it ([`Ran::moved`]).
+    Moved,
 }
 
 impl NotKept {
@@ -232,6 +237,7 @@ impl NotKept {
             NotKept::Untraceable(Untraceable::Network) => "it used the network",
             NotKept::Untraceable(Untraceable::Descriptor) => "it read through a descriptor the sandbox did not see opened",
             NotKept::Raced { .. } => "what it read changed while it ran",
+            NotKept::Moved => "a file it read changed after it began, so its hash need not be what it read",
             NotKept::TooManyShapes => "it has too many shapes",
         }
     }
@@ -248,6 +254,7 @@ impl NotKept {
             NotKept::Untraceable(Untraceable::Network) => "network",
             NotKept::Untraceable(Untraceable::Descriptor) => "descriptor",
             NotKept::Raced { .. } => "raced",
+            NotKept::Moved => "moved",
             NotKept::TooManyShapes => "too-many-shapes",
         }
     }
@@ -640,6 +647,14 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
     /// rather than at the request's end. The report's verdicts are these.
     pub fn verdict(&self, at: u32) -> Option<Verdict> {
         self.tests.get(at as usize).and_then(|test| test.verdict)
+    }
+
+    /// How long test `at`'s last kept run took, from its row in the head the selection read:
+    /// what a runner orders the runs it is asked for by, the longest first. `None` for a test
+    /// with no row (new, or last not kept, as a failure never is).
+    pub fn last_micros(&self, at: u32) -> Option<u64> {
+        let row = self.tests.get(at as usize)?.row?;
+        self.head_view().map(|head| head.row(row).micros)
     }
 
     /// The snapshot records are checked under, while the selection has one.
@@ -1182,6 +1197,10 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         }
         if let Some(untraceable) = ran.untraceable.iter().min() {
             self.not_kept(at, true, NotKept::Untraceable(*untraceable));
+            return Ok(());
+        }
+        if ran.moved {
+            self.not_kept(at, true, NotKept::Moved);
             return Ok(());
         }
         let (basis, functions) = match ran.executed {

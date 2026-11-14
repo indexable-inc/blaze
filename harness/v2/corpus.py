@@ -430,8 +430,8 @@ def step_of(eng: engine.Engine, program: Program, step: Step, ws: Path, scratch:
         ours = eng.build(name, ws, ours_env, step.args, command=step.command)
         who = eng.not_blazes(ours)
         if step.command == "test":
-            # Plain `blaze test` runs every test: v2 keeps no pass without `--reached` and writes
-            # no `tests.ndjson` (docs/cargo.md, "Which tests run").
+            # `blaze test` writes no `tests.ndjson`: a test whose kept pass stands is reported
+            # passed and marked cached (docs/cargo.md, "Which tests run").
             kept: list[str] = []
             mine = blaze_cli.test_results(Tested(ours.returncode, ours.stdout, kept))
         elif step.command == "run":

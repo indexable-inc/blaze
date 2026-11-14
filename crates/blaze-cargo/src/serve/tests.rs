@@ -1068,7 +1068,7 @@ pub(super) enum FakeRuns {
 impl Runs<Fake> for FakeRuns {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
@@ -1136,7 +1136,7 @@ pub(super) struct Script(usize);
 impl Runs<Fake> for Script {
     fn start(
         &mut self,
-        _: &Store,
+        _: &mut Store,
         writer: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
@@ -1180,7 +1180,7 @@ pub(super) struct Slow {
 impl Runs<Fake> for Slow {
     fn start(
         &mut self,
-        _: &Store,
+        _: &mut Store,
         _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
@@ -1223,7 +1223,7 @@ pub(super) struct Lost;
 impl Runs<Fake> for Lost {
     fn start(
         &mut self,
-        _: &Store,
+        _: &mut Store,
         _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
@@ -1275,7 +1275,7 @@ pub(super) struct Keeps {
 impl Runs<Fake> for Keeps {
     fn start(
         &mut self,
-        _: &Store,
+        _: &mut Store,
         _: Option<&mut dyn Asks>,
         effects: &mut Vec<Effect>,
         _: &mut Vec<Response>,
@@ -1332,7 +1332,7 @@ pub(super) struct Over(Vec<Response>);
 impl Runs<Fake> for Over {
     fn start(
         &mut self,
-        _: &Store,
+        _: &mut Store,
         _: Option<&mut dyn Asks>,
         _: &mut Vec<Effect>,
         out: &mut Vec<Response>,
@@ -1559,6 +1559,7 @@ impl Front<Fake> for FakeFront {
             outcome,
             cached: None,
             outside: false,
+            not_kept: None,
         })
     }
 

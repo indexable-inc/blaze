@@ -120,7 +120,9 @@ use serde::{Deserialize, Serialize};
 /// 56: [`Request::Diagnostics`] and [`Response::Diagnostics`] ([`Seen`]): a check's errors and
 /// warnings against what the client was last told, as new, fixed and unchanged, by stable id
 /// (`blaze diagnostics --since`, `blaze agents hook`).
-pub const SCHEMA: u32 = 56;
+/// 57: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
+/// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0.
+pub const SCHEMA: u32 = 57;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1741,8 +1743,8 @@ pub struct TestResult {
     pub name: String,
     /// The test executable, as cargo's `Running` line names it.
     pub binary: String,
-    /// Not run: the result that stands, and what it was kept by. A cached result is
-    /// `Unreached` with `millis` 0.
+    /// Not run: the pass that stands, and what it was kept by. A cached result is
+    /// [`TestOutcome::Passed`] with `millis` 0; only a pass is ever kept.
     pub cached: Option<Cached>,
     pub millis: u64,
     #[serde(with = "blaze_protocol::bytes")]
@@ -1754,6 +1756,17 @@ pub struct TestResult {
     /// The daemon's index of `binary` among the request's test executables: dense from 0, the
     /// same for every result of one executable, so a client groups results by it.
     pub executable: u32,
+    /// A pass that ran and was not kept, so the test runs again next time: why. `None` for a
+    /// failure (never kept), a cached result and a pass that was kept.
+    pub not_kept: Option<NotKept>,
+}
+
+/// Why a pass was not kept (blaze-testsel's `machine::NotKept`): `no` is the stable word a
+/// tool matches on (`clock`, `unsandboxed`, `doctest`, ...), `why` the sentence a person reads.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct NotKept {
+    pub no: String,
+    pub why: String,
 }
 
 /// The run that stands for a test not run.
@@ -1779,8 +1792,6 @@ pub enum TestOutcome {
     Passed,
     Failed,
     Ignored,
-    /// Not run: the edit reached none of its code; its last result stands.
-    Unreached,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

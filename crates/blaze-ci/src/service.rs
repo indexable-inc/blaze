@@ -986,7 +986,8 @@ struct Report {
     passed: usize,
     failed: usize,
     ignored: usize,
-    unreached: usize,
+    /// Of `passed`, the ones not run whose kept pass stood.
+    cached: usize,
     /// Each failed test as `\n<failure>\n`.
     failures: String,
     failures_count: usize,
@@ -1023,9 +1024,11 @@ impl Report {
                 Level::Note | Level::Help | Level::FailureNote => {}
             },
             Response::TestResult(test) => match test.outcome {
-                TestOutcome::Passed => self.passed += 1,
+                TestOutcome::Passed => {
+                    self.passed += 1;
+                    self.cached += usize::from(test.cached.is_some());
+                }
                 TestOutcome::Ignored => self.ignored += 1,
-                TestOutcome::Unreached => self.unreached += 1,
                 TestOutcome::Failed => {
                     self.failed += 1;
                     if self.failures_count < MOST_LISTED {
@@ -1098,9 +1101,8 @@ impl Report {
             CheckKind::Test => {
                 let _ = write!(
                     text,
-                    "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
-                     last results stand)",
-                    self.passed, self.failed, self.ignored, self.unreached
+                    "; tests: {} passed ({} cached: their kept passes stand), {} failed, {} ignored",
+                    self.passed, self.cached, self.failed, self.ignored
                 );
             }
             CheckKind::Build => {

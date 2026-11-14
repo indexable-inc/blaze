@@ -164,6 +164,9 @@ pub struct Ended<'a> {
     pub sandboxed: bool,
     /// Codegen marks it as reaching code the tracer cannot see.
     pub foreign: bool,
+    /// Something `traced` names can have changed since the run began, so its hashes, taken
+    /// as the trace is assembled, need not be what it read ([`Ran::moved`]).
+    pub moved: bool,
 }
 
 /// What a run whose record is not whole says, as the machine names it: the binary has no slot
@@ -263,6 +266,7 @@ impl Driver {
         let keepable = ended.passed
             && ended.sandboxed
             && !ended.foreign
+            && !ended.moved
             && ended.traced.is_some_and(|traced| traced.untraceable.is_empty());
         if keepable {
             let set = match ended.record {
@@ -299,6 +303,7 @@ impl Driver {
             sandboxed: ended.sandboxed,
             traced: ended.traced.is_some(),
             foreign: ended.foreign,
+            moved: ended.moved,
         };
         selection.give(Input::Ran { ticket: ended.ticket, ran });
         match selection.outcome() {

@@ -235,6 +235,7 @@ fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Re
             traced: Some(&traced),
             sandboxed: true,
             foreign: false,
+            moved: false,
         };
         driver.ran(&mut selection, &image, &ended).map_err(harness)?;
         drove = driver.drive(&mut selection, &mut runner.store, program, &mut disk, &mut runs).map_err(harness)?;

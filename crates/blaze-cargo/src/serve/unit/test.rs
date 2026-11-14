@@ -478,6 +478,9 @@ struct Suited {
     /// The machine's files and the binary's environment, as what a test read is checked
     /// against: made once per binary.
     disk: blaze_usercode::inputs::Disk,
+    /// Read before any of its tests ran: what a test read must not have moved since for its
+    /// hashes, taken once it ends, to stand for what it read ([`NotKept::Moved`]).
+    began: blaze_usercode::inputs::Began,
     /// What the tests of its server all read, hashed once per buffer of it.
     common: traced::Common,
 }
@@ -614,10 +617,10 @@ impl Suited {
         };
         let (micros, sandboxed) =
             (u64::try_from(took.as_micros()).unwrap_or(u64::MAX), self.inside[n] && !outside);
-        let driver = &mut self.driver;
+        let (driver, began) = (&mut self.driver, self.began);
         let given = self
             .common
-            .traced(trace, &mut self.disk, |traced| {
+            .traced(trace, &mut self.disk, |traced| began.moved(traced), |traced, moved| {
                 let ended = Ended {
                     ticket,
                     name,
@@ -628,6 +631,7 @@ impl Suited {
                     traced,
                     sandboxed,
                     foreign: tests[n].outside,
+                    moved,
                 };
                 driver.ran(&mut *selection, &taken.now, &ended)
             })
@@ -928,6 +932,7 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         outside_why,
         unsandboxed,
         disk,
+        began: blaze_usercode::inputs::Began::now(),
         common: traced::Common::default(),
     }))
 }
@@ -1136,6 +1141,9 @@ impl Runs<Real> for TestRun {
                         };
                         *ticket = Some(run.ticket);
                         let n = *n as usize;
+                        // The queue runs the longest first: a test's last kept run's time from
+                        // its head row; one with no row (new, or last failed) has none.
+                        let last = suite.selection.as_ref().and_then(|it| it.last_micros(run.test));
                         let binary = match (suite.inside[n], &mut outside) {
                             (false, Some(outside)) => outside,
                             _ => &mut binary,
@@ -1144,7 +1152,7 @@ impl Runs<Real> for TestRun {
                             // clone: the queue owns its jobs' names, once per test run
                             name: tests[n].name.clone(),
                             ignore: false,
-                            expected: Duration::ZERO,
+                            expected: Duration::from_micros(last.unwrap_or(0)),
                             timeout: TIMEOUT,
                             retries: 0,
                         });

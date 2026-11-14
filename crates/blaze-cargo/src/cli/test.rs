@@ -15,6 +15,7 @@
 //! runner reads libtest's JSON (`cli::live`).
 
 use std::{
+    alloc::Global,
     ffi::OsString,
     fmt::Write as _,
     io::{self, IsTerminal as _, Read as _, Write},
@@ -403,32 +404,8 @@ pub fn run(
             }
         }
     }
-    if !bench {
-        for doc in &docs {
-            let exec = exec_of(doc, asked, speaking);
-            let shown = exec.shown_at(speaking.verbose);
-            speaking.status(err, "Doc-tests", &doc.target.name)?;
-            if speaking.verbose > 0 {
-                speaking.status(err, "Running", &shown)?;
-            }
-            if let Some(failure) = ran(
-                doc,
-                Kind::Doctest,
-                &exec,
-                &shown,
-                asked,
-                spec_flag,
-                speaking,
-                err,
-                programs,
-                tally,
-            )? {
-                failed.push(failure);
-                if asked.flags.fail_fast {
-                    return Ok(failed[0].code.unwrap_or(Exit::Failed.code()));
-                }
-            }
-        }
+    if !bench && let Some(code) = docs_ran(&docs, asked, spec_flag, speaking, err, programs, tally, &mut failed)? {
+        return Ok(code);
     }
     // cargo's `no_fail_fast_err`: without `--fail-fast` any failure is its own error, code 101.
     if failed.is_empty() && unbuilt.is_empty() {
@@ -437,6 +414,77 @@ pub fn run(
     let said = failed_summary(&failed, unbuilt);
     err.write_all(say::error(&said, speaking.color).as_bytes())?;
     Ok(Exit::Failed.code())
+}
+
+/// What a doc test's pass is not kept by: the daemon neither runs nor traces a doc test's
+/// examples, so each runs every time (docs/cargo.md, "Which tests run").
+pub const DOC_TESTS_NOT_KEPT: &str =
+    "doc tests run every time: blaze does not trace a doc test's run, so its pass is not kept";
+
+/// The doc tests of a `test` whose other tests the daemon ran ([`from_daemon`]), once its
+/// results are said, as cargo runs them after the test executables: each runs, none is
+/// selected or kept, and a note says so once before the first. Cargo's exit code of them
+/// alone; their counts go into `tally`.
+pub fn doc_tests(
+    asked: &Invocation,
+    artifacts: &[Artifact],
+    members: u32,
+    speaking: Speaking<'_>,
+    err: &mut dyn Write, // dyn: the CLI's output writer, a few writes per doc test run.
+    programs: &mut impl Programs,
+    tally: &mut Tally,
+) -> io::Result<i32> {
+    let (_, docs) = executables(artifacts);
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    if !speaking.quiet {
+        let mut said = String::new(); // alloc: one note, once a run with doc tests
+        say::note_into(&mut said, DOC_TESTS_NOT_KEPT, speaking.color);
+        err.write_all(said.as_bytes())?;
+    }
+    let spec_flag = needs_spec_flag(asked, members);
+    let mut failed = Vec::new_in(Global);
+    if let Some(code) = docs_ran(&docs, asked, spec_flag, speaking, err, programs, tally, &mut failed)? {
+        return Ok(code);
+    }
+    if failed.is_empty() {
+        return Ok(0);
+    }
+    let said = failed_summary(&failed, &[]);
+    err.write_all(say::error(&said, speaking.color).as_bytes())?;
+    Ok(Exit::Failed.code())
+}
+
+/// Runs each of `docs` as cargo's `Doc-tests`, each failure pushed to `failed`; `Some(code)`
+/// when `--fail-fast` stops at one.
+fn docs_ran(
+    docs: &[&Artifact],
+    asked: &Invocation,
+    spec_flag: bool,
+    speaking: Speaking<'_>,
+    err: &mut dyn Write, // dyn: the CLI's output writer, a few writes per doc test run.
+    programs: &mut impl Programs,
+    tally: &mut Tally,
+    failed: &mut Vec<Failed>,
+) -> io::Result<Option<i32>> {
+    for doc in docs {
+        let exec = exec_of(doc, asked, speaking);
+        let shown = exec.shown_at(speaking.verbose);
+        speaking.status(err, "Doc-tests", &doc.target.name)?;
+        if speaking.verbose > 0 {
+            speaking.status(err, "Running", &shown)?;
+        }
+        if let Some(failure) =
+            ran(doc, Kind::Doctest, &exec, &shown, asked, spec_flag, speaking, err, programs, tally)?
+        {
+            failed.push(failure);
+            if asked.flags.fail_fast {
+                return Ok(Some(failed[0].code.unwrap_or(Exit::Failed.code())));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The end of a run that failed: each target that failed, with what reruns it, then each test

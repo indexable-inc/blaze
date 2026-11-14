@@ -2034,7 +2034,7 @@ impl Writing {
 impl Runs<Real> for ScriptRun {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,

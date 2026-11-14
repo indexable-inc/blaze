@@ -1001,8 +1001,16 @@ and is not kept says why, and runs again next time:
 - `(not kept: it read the wall clock)`, `(not kept: it read randomness the sandbox did not answer)`,
   `(not kept: it used the network)` and `(not kept: it read through a descriptor the sandbox did not see opened)`.
 - `(not kept: what it read changed while it ran)`.
+- `(not kept: a file it read changed after it began, so its hash need not be what it read)`:
+  what a test read is hashed once it ends, so a file, a directory above it or a link on the
+  way to it whose `stat` says it changed since a moment before the run began (git's racy
+  window, two seconds) leaves the hash unproven (`Began::moved`,
+  `crates/blaze-usercode/src/inputs.rs`). This includes a file the test wrote itself and
+  read back.
 
-A failure is never kept: it runs every time. A suite's index head is held in the daemon's
+A failure is never kept: it runs every time. Doc tests are neither selected nor kept: blaze
+does not trace a doc test's run, so they run every time, after the daemon's tests, and the
+client says so in a note. A suite's index head is held in the daemon's
 memory. After a restart each test is looked up by what it executed and read, which gives the
 same answer and costs a lookup per test.
 
@@ -1017,8 +1025,8 @@ are `name`, `binary`, `executable`, `outcome`, `millis`, `outside` and `output`,
   (`executed` or `reached`), its `why`, its `millis` and its `outcome`, and the result itself
   has outcome `passed` and `millis` 0.
 - `kept`: only for a pass that is not kept, as `{"no": "clock"}`. Its word is one of
-  `unsandboxed`, `untraced`, `foreign`, `clock`, `random`, `network`, `descriptor`, `raced` or
-  `too-many-shapes`.
+  `unsandboxed`, `untraced`, `foreign`, `clock`, `random`, `network`, `descriptor`, `raced`,
+  `moved` or `too-many-shapes`.
 
 `--ub` runs the tests picked (every one) in blaze's MIR evaluator under the checker of
 undefined behavior (`crates/hir-ty-ub`), compiling nothing. `--ub-seed N` and

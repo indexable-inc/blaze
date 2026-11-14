@@ -2732,7 +2732,7 @@ pub enum UnitRuns {
 impl Runs<Real> for UnitRuns {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,

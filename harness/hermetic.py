@@ -6,14 +6,14 @@ outside, says so, and runs every time, never stood in for by an old pass. Linux 
 usage: hermetic.py    (BLAZE_BIN names the blaze engine built; `blaze` is found next to it)
 
 What blaze promises (docs/cargo.md, "Sandboxed tests" and "Which tests run"): under
-`blaze test --reached` a test of a package that opts in (`tests = true` under
+`blaze test` a test of a package that opts in (`tests = true` under
 `[package.metadata.blaze.sandbox]`) runs in the sandbox, which records what it reads, and its
 pass is kept by the functions it executed and what it read (files, the environment); a test
 whose executed functions and reads are as they were is reported cached. A test the package's
 `unsandboxed-tests` names, and every test of a package that does not opt in, runs outside: what
 it reads is not known, so it is reported `outside` and runs every time.
 
-The harness reads each result from `blaze test --reached --message-format=json`'s
+The harness reads each result from `blaze test --message-format=json`'s
 `blaze-test-result` lines (crates/blaze-cargo/src/cli/json.rs, `test_result`; storelib's
 `test_results`), never libtest's text. A workspace of two packages: `kept` opts in, with a pure
 test (three calls deep), one that reads a file of the package, one that reads an environment
@@ -181,7 +181,7 @@ def verdict(step: Step, ran: Ran, lines: list[TestLine], first: bool) -> str:
                 wrong.append(f"{name}: {line.outcome.upper()}\n{line.output[-1500:]}")
         elif stood is None:
             wrong.append(f"{name}: RAN AGAIN ({line.outcome}), SHOULD HAVE BEEN KEPT")
-        elif stood.outcome != "passed" or line.outcome != "unreached":
+        elif stood.outcome != "passed" or line.outcome != "passed":
             wrong.append(f"{name}: CACHED AS {stood.outcome}, REPORTED {line.outcome}")
         elif stood.basis != "executed":
             wrong.append(f"{name}: KEPT BY {stood.basis}, NOT BY WHAT IT EXECUTED: {stood.why}")
@@ -225,7 +225,7 @@ def main() -> None:
     results: list[bool] = []
 
     def run(step: Step, first: bool = False, env: Mapping[str, str | None] | None = None) -> None:
-        ran = daemon.command(ws, "test", "--reached", "--message-format=json", env=env, timeout=TIMEOUT)
+        ran = daemon.command(ws, "test", "--message-format=json", env=env, timeout=TIMEOUT)
         said = verdict(step, ran, test_results(ran.stdout), first)
         results.append(said == "ok")
         print(f"{step.what:58} {said}", flush=True)

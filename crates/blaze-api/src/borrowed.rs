@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Ranked,
+    Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, NotKept, Ranked,
     Reach, Rebuilt, Report, Response, Seen, Span, Status, Table, TargetKind, TestOutcome, TestResult,
     Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb, Worked,
 };
@@ -281,6 +281,15 @@ pub struct TestResultRef<'a> {
     pub outcome: TestOutcome,
     pub outside: bool,
     pub executable: u32,
+    #[serde(borrow)]
+    pub not_kept: Option<NotKeptRef<'a>>,
+}
+
+/// [`NotKept`], read where it lies.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotKeptRef<'a> {
+    pub no: &'a str,
+    pub why: &'a str,
 }
 
 /// [`Cached`], read where it lies.
@@ -490,6 +499,7 @@ impl TestResultRef<'_> {
             outcome: self.outcome,
             outside: self.outside,
             executable: self.executable,
+            not_kept: self.not_kept.map(|it| NotKept { no: owned(it.no), why: owned(it.why) }),
         }
     }
 }

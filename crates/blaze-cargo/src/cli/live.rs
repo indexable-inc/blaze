@@ -68,7 +68,8 @@ const PLAIN_ARGS: [&str; 9] = [
 
 /// Whether the command's tests are run under the screen: a `test` on a terminal the screen
 /// redraws (`caps`), printed for a person (not `-q` or `-v`), that runs its tests (not
-/// `--no-run`, `--reached`, `--ub`, `blaze lock`) with libtest's own output left as the screen
+/// `--no-run`, nor in the daemon, which runs every `test` but `--doc`, `--no-run` and `--ub`
+/// ([`super::in_daemon`]), nor `blaze lock`) with libtest's own output left as the screen
 /// reads it.
 pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
     if asked.command() != Command::Test || asked.lock || !caps.live || shown.quiet || shown.verbose > 0 {
@@ -78,7 +79,7 @@ pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
         let arg = arg.to_string_lossy();
         !PLAIN_ARGS.iter().any(|plain| arg == *plain || arg.starts_with(&format!("{plain}=")))
     });
-    !asked.flags.no_run && !asked.flags.reached && !asked.flags.ub && reads_args
+    !asked.flags.no_run && !super::in_daemon(asked) && reads_args
 }
 
 /// What the runner is sent.

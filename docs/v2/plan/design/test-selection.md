@@ -140,6 +140,20 @@ codegen marked the test as reaching code the tracer cannot see (`foreign`).
 Not given yet, so a pass is refused or costs more rather than kept wrongly: writes outside the
 sandbox's private overlay (not built, so a test that writes outside is not refused for it);
 a raw syscall or the vDSO as `foreign` (codegen marks only what it sees); a head after a daemon
-restart (every test is then looked up by its answers, the same verdict at a lookup per test);
-the expected-duration hint for the queue (every test is queued at zero). File digests are taken
-when the trace is assembled, not at the moment each file was read.
+restart (every test is then looked up by its answers, the same verdict at a lookup per test).
+A durable head needs three pieces the tree does not have together: a journal mark of the head
+key per suite (`serve/local.rs` marks are the home, written once the head's puts are durable,
+as `Jobs::body_sessions` writes its marks), a store pin over the head and its postings (the
+collector forgets a record unused for two periods, and a missing head is `MissingIndex`, which
+today's in-memory head can hit after a long idle too), and the image the head was filed at, or
+the program state in the mark so a head is used only when the binary's state is the same
+(`host::changes` refuses a head whose state it has no image of).
+
+The queue orders each test by its head row's last run (`Selection::last_micros`); a test with no
+row has no expected duration. File digests are taken when the trace is assembled, not at the
+moment each file was read: a pass is kept only when nothing it read (each name the answer rests
+on, and each directory above it) changed since a moment before the run began
+(`blaze_usercode::inputs::Began::moved`, git's racy window), else it is not kept,
+`NotKept::Moved`; what changes after the assembly the settle's second answers find. Doc tests
+are neither selected nor kept: the CLI runs them after the daemon's results, every time, and
+says so.
