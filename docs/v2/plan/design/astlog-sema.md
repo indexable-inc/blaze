@@ -178,6 +178,10 @@ cycle. The old naive evaluator stays as the reference model for a property test 
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
 - Rules across checkouts: the target is the daemon's view of one workspace.
+- Build selection for a rules file. `--query`, `--rules` and `--replace` read the daemon's view
+  of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the
+  other selection flags by name. The end state is a query that carries `Targets`, as
+  `Request::Trace` does, so the view is the selected build's.
 - Prelude resolution of single-segment names in code patterns; they match by text. Type
   patterns resolve them (see Type patterns).
 - A `use` added for a template path `find_path` can only spell through an import; it is written
