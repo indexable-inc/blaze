@@ -41,6 +41,7 @@ mod construct;
 mod correctness_general_tests;
 mod deep_drop_at_exit;
 mod default_policy;
+mod default_refuses;
 mod dup;
 mod dispatch;
 mod dos_hasher_on_input;
@@ -111,6 +112,7 @@ mod missing_size_hint;
 mod mut_ref;
 mod narrowed_len;
 mod native_contracts;
+mod one_at_a_time;
 #[cfg(test)]
 mod opaque_tests;
 mod open_wait_loop;
@@ -189,6 +191,8 @@ mod untied_child;
 mod untyped_error;
 mod unwind_across_ffi;
 mod unwired;
+#[cfg(test)]
+mod unwritten_allocator_tests;
 #[cfg(test)]
 mod waits_tests;
 mod weight;
@@ -507,6 +511,13 @@ pub enum Lint {
     WorkspaceUnsafe,
     // A hand-written state machine nightly's `#[loop_match]` could turn into direct jumps.
     LoopMatchCandidate,
+    // A trait default that answers nothing, inherited without a word (`default_refuses`).
+    DefaultRefuses,
+    // A configured single-record read called once per item of a loop (`one_at_a_time`).
+    OneAtATime,
+    // A type with an allocator parameter written without it at an item's interface
+    // (`unwritten_allocator`, in `implicit_allocator`'s home).
+    UnwrittenAllocator,
 }
 
 /// Which workspaces a lint is for.
@@ -930,6 +941,9 @@ impl Lint {
         Lint::DependencyCapabilityUnreached,
         Lint::WorkspaceUnsafe,
         Lint::LoopMatchCandidate,
+        Lint::DefaultRefuses,
+        Lint::OneAtATime,
+        Lint::UnwrittenAllocator,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -1113,6 +1127,13 @@ impl Lint {
             | Lint::TmpPath
             | Lint::NarrowedLen
             | Lint::ProcessStatic
+            // A trait default that refuses for every implementor that forgot it, and a store
+            // read one record at a time where a batched read is named (2026-11-14).
+            | Lint::DefaultRefuses
+            | Lint::OneAtATime
+            // A collection type at an item's interface that leaves its allocator to the
+            // default (2026-11-14, the owner's bump-allocate at signatures).
+            | Lint::UnwrittenAllocator
             // The wrapping operations `as_cast`'s fix writes: a list of places to decide,
             // allowed in blaze's ratchet too.
             | Lint::TruncatingCast
@@ -1522,6 +1543,9 @@ impl Lint {
             Lint::DependencyCapabilityUnreached => "dependency_capability_unreached",
             Lint::WorkspaceUnsafe => "workspace_unsafe",
             Lint::LoopMatchCandidate => "loop_match_candidate",
+            Lint::DefaultRefuses => "default_refuses",
+            Lint::OneAtATime => "one_at_a_time",
+            Lint::UnwrittenAllocator => "unwritten_allocator",
         }
     }
 
@@ -1760,6 +1784,9 @@ impl Lint {
             Lint::CouldHaveInvariant => concat!(docs!(), "#could_have_invariant"),
             Lint::SameBehaviour => concat!(docs!(), "#same_behaviour"),
             Lint::LoopMatchCandidate => concat!(general_docs!(), "#loop_match_candidate"),
+            Lint::DefaultRefuses => concat!(docs!(), "#default_refuses"),
+            Lint::OneAtATime => concat!(docs!(), "#one_at_a_time"),
+            Lint::UnwrittenAllocator => concat!(docs!(), "#unwritten_allocator"),
             Lint::HandWrittenDerivable => concat!(docs!(), "#hand_written_derivable"),
             Lint::ImplMissesField => concat!(docs!(), "#impl_misses_field"),
             Lint::HandKeptVariantList | Lint::VariantListDrift => {
@@ -2250,7 +2277,7 @@ impl Lint {
                 "name `target: \"blaze\"` (`target = \"blaze\"` in `#[instrument]`), or make the span or event `debug` where it runs too often to record"
             }
             Lint::ImplicitAllocator => {
-                "first, don't allocate: borrow, use a fixed buffer, or write into the caller's buffer; where an allocation is needed, name the allocator: the frame from `blaze_mem::frame::current(|frame| ..)`, the request's `ArenaLocal`, or `Global` written out (`Vec::new_in(Global)`) where the global heap is the value's lifetime; no comment keeps a finding, `#[expect(blaze::implicit_allocator, reason = \"..\")]` does and is counted"
+                "first, don't allocate: borrow, use a fixed buffer, or write into the caller's buffer; where an allocation is needed, name the allocator: the frame from `blaze_mem::frame::current(|frame| ..)`, the request's `ArenaLocal`, or `Global` written out (`Vec::new_in(Global)`) where the global heap is the value's lifetime and this code decides it; a value a function returns is its caller's, so the function is generic over `A: Allocator + Clone` and takes `alloc: A`, never `Global` in its signature; no comment keeps a finding, `#[expect(blaze::implicit_allocator, reason = \"..\")]` does and is counted"
             }
             Lint::FixedKeyLookup => {
                 "put the keys in `const KEYS: &[&str]` and declare `blaze_phf::phf_table!(static TABLE = KEYS;)`; `TABLE.get(key)` (`TABLE.index(bytes)` for bytes) is the key's index into a const array of values. Or say why it stays with `#[expect(blaze::fixed_key_lookup, reason = \"..\")]`"
@@ -2389,6 +2416,15 @@ impl Lint {
             }
             Lint::LoopMatchCandidate => {
                 "on nightly, `#[loop_match]` on the loop and `#[const_continue]` on each constant transition; or say why with `#[expect(blaze::loop_match_candidate, reason = \"..\")]`"
+            }
+            Lint::DefaultRefuses => {
+                "make the method required (`fn m(&self) -> T;`) so each implementor says what it answers, or say why every implementor may inherit it in a doc line starting `/// The default:`"
+            }
+            Lint::OneAtATime => {
+                "read the items in one call of the batched form the configuration names, or say why one at a time is right with `#[expect(blaze::one_at_a_time, reason = \"..\")]`"
+            }
+            Lint::UnwrittenAllocator => {
+                "in a function's signature, make the function generic over `A: Allocator + Clone`, take `alloc: A` from its caller and write `Vec<T, A>`; the caller names `Global` where the lifetime is decided (`f(.., Global)`); a field, alias or associated type names a parameter of its owner or `Global`"
             }
             Lint::DynFnParam => {
                 "take the closure as `impl Fn(..)` (a type parameter), so the call is direct and inlinable"
@@ -2597,6 +2633,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     {
         implicit_allocator::check_type(cx, ty);
     }
+    if let Some(ty) = ast::Type::cast(node) {
+        implicit_allocator::check_unwritten(cx, ty);
+    }
     if let Some(adt) = ast::Adt::cast(node) {
         error_debug::check_attrs(cx, adt);
         lenient_deserialize::check(cx, adt);
@@ -2732,6 +2771,8 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         borrow_workaround::check(cx);
         syscall_in_loop::check(cx);
         query_in_loop::check(cx);
+        one_at_a_time::check(cx);
+        default_refuses::check_body(cx);
         string_key::check(cx);
         magic::check(cx);
         outline_generic_body::check(cx);
