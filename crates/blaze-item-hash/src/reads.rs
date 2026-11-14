@@ -169,6 +169,14 @@ pub(crate) enum Rule {
     /// ([`values::inherent_assoc_types`]), whose value is the query's whole result by item
     /// key. Not read through: the query iterates every module of the ADT's crate.
     InherentAssocTypes,
+    /// `assoc_item_key(item)`: the hygiene key of the name of an associated item, `None` for a
+    /// name a real file or a `macro_rules!` (or a derive or an attribute macro without
+    /// def-site spans) writes, and only then a fact: the `Fields` fact of the item's impl or
+    /// trait, whose value spells for each member whether its name is keyed
+    /// (`values::member_names`), so a name that comes to be keyed in another database moves
+    /// it. A read whose answer is a context (a `macro` 2.0 name, a proc macro's
+    /// `Span::def_site`) is refused by name: no fact spells a context stably yet.
+    AssocKey,
     /// `match_check(def)` of the body itself, which the borrow check reads to skip a body
     /// whose patterns failed: its `MatchCheck` fact. Refused for another body's.
     OwnMatchCheck,
@@ -362,6 +370,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // and refused when it is another body's or a signature's ([`Rule::OwnStep`]), and what the
     // interpreter reads (callees' MIR, another body's step fact; layouts and goals, through).
     ("anon_const_eval_query", "hir-ty/src/consteval.rs", Rule::Through),
+    ("assoc_item_key", "hir-def/src/nameres/def_site.rs", Rule::AssocKey),
     ("auto_trait_depth", "hir-ty/src/next_solver/global_goals/shape.rs", Rule::Through),
     ("bit_width_of", "hir-ty/src/layout/bits.rs", Rule::Through),
     ("bits_layout_query", "hir-ty/src/layout/bits.rs", Rule::Through),
@@ -821,6 +830,21 @@ fn apply(
         Rule::InherentAssocTypes => {
             arg::<AdtId>(db, key).map(|adt| values::inherent_assoc_types(db, adt))
         }
+        Rule::AssocKey => match arg::<AssocItemId>(db, key) {
+            Some(item) if hir_def::nameres::assoc_item_key(db, item).is_none() => {
+                let container = match item {
+                    AssocItemId::FunctionId(it) => it.lookup(db).container,
+                    AssocItemId::ConstId(it) => it.lookup(db).container,
+                    AssocItemId::TypeAliasId(it) => it.lookup(db).container,
+                };
+                match container {
+                    ItemContainerId::ImplId(it) => Some(values::fields(db, ItemId::Impl(it))),
+                    ItemContainerId::TraitId(it) => Some(values::fields(db, ItemId::Trait(it))),
+                    ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => None,
+                }
+            }
+            _ => None,
+        },
         Rule::OwnMatchCheck => match arg::<DefWithBodyId>(db, key) {
             Some(body) if body == def => Some(values::match_check()),
             _ => None,

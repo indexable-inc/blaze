@@ -748,6 +748,13 @@ pub fn impl_expansion(db: &Db, id: crate::ImplId) -> Option<MacroCallId> {
 
 /// The key the name of the associated item `item` binds among its impl's or trait's items, as
 /// [`def_binding_key`]: `None` for every item a real file or a `macro_rules!` names.
+///
+/// A query of its own, keyed by the item, so that a body's steps read it by the item it is of
+/// and not as [`expanded_item_key`] of an expansion and a syntax id: blaze-item-hash's read
+/// rule makes the read the `Fields` fact of the item's impl or trait, whose value spells
+/// whether each member's name is keyed (`values::member_names`), and refuses a read whose
+/// answer is a context (a macros 2.0 name), which no fact spells.
+#[blaze_query::tracked(returns(copy))]
 pub fn assoc_item_key(db: &Db, item: crate::AssocItemId) -> Option<SyntaxContext> {
     match item {
         crate::AssocItemId::FunctionId(it) => def_binding_key(db, it.into()),

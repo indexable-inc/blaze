@@ -4121,8 +4121,20 @@ fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -
         if read[infer].hits == 0 {
             return Err(format!("the control: no inference was served, so the edit proves nothing: {read:?}"));
         }
-        if !renamed && !carried && (read[infer].hits as usize, read[infer].ran) != (bodies, 0) {
-            return Err(format!("a private body's edit of `dep` left `app` not served whole: {read:?}"));
+        // The counts are of `app`'s bodies alone: `ask_bodies_steps` asks unit 0's, and `dep`'s
+        // bodies are neither served nor asked here, so a run is a body of `app` that missed.
+        // Of the five steps, `Const` (`app` has no `const` item) and `Lower` (the body's
+        // lowering facts) are not compared.
+        if !renamed && !carried {
+            for step in BODY_STEPS {
+                if (read[step].hits as usize, read[step].ran) != (bodies, 0) {
+                    return Err(format!(
+                        "a private body's edit of `dep`, which changes nothing `app` reads, missed \
+                         a body of `app`: step {step}, {} of `app`'s {bodies} bodies served and {} run: {read:?}",
+                        read[step].hits, read[step].ran
+                    ));
+                }
+            }
         }
         if carried {
             for it in puts.puts {

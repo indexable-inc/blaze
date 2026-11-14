@@ -570,15 +570,8 @@ const UNRULED: &[(&str, &str, &str)] = &[
     // [`REFUSALS`]; `source_map` lowers again only for a body with no file) and `modules` of
     // `nameres/delta/publish.rs` (a module is read through `CrateResolution::module`, covered).
     // A step that reads one again fails `every_tracked_query_a_step_reads_is_named_by_a_rule`.
-    // The hygiene context of an item's name written by a macro, keyed by the expansion and the
-    // item's syntax id, not by an item: what a body's method and associated-item lookups compare
-    // names under (`def_site::assoc_item_key`). No fact names it yet; it becomes the item's
-    // `Signature` once the signature form writes its name's key.
-    (
-        "expanded_item_key",
-        "hir-def/src/nameres/def_site.rs",
-        "the hygiene key of a name a macro wrote: no fact names it yet",
-    ),
+    // So is `expanded_item_key`: the steps read the hygiene key of an associated item's name
+    // through `assoc_item_key`, a query keyed by the item, whose rule is `Rule::AssocKey`.
 ];
 
 /// Whether `read`, of `name`, is of a query [`UNRULED`] lists.
@@ -1830,6 +1823,52 @@ fn a_clean_bodys_borrow_check_reads_no_refused_row() {
                  synthesized expressions: {reads:#?}"
             );
         }
+    });
+}
+
+/// The invariant: a body's read of the hygiene key of an associated item's name
+/// (`assoc_item_key`) is the `Fields` fact of the item's impl where a `macro_rules!` wrote the
+/// name (its answer is no context), and is refused by its own name where a `macro` 2.0 wrote
+/// it (its answer is a context, which no fact spells). The control is the refusal: a rule that
+/// answered every read with the `Fields` fact would keep the `macro` body too.
+#[test]
+fn an_assoc_items_hygiene_key_is_its_containers_fields_or_refused() {
+    let db = db_of(
+        r#"
+//- minicore: sized
+#![feature(decl_macro)]
+pub trait Tr { fn m(&self) -> u8; }
+pub struct S;
+pub struct T;
+macro_rules! by_rules { ($t:ty) => { impl Tr for $t { fn m(&self) -> u8 { 1 } } } }
+by_rules!(S);
+macro by_macro($t:ty) { impl Tr for $t { fn m(&self) -> u8 { 2 } } }
+by_macro!(T);
+pub fn rules(s: S) -> u8 { s.m() }
+pub fn macros(t: T) -> u8 { t.m() }
+"#,
+    );
+    with_steps_run(&db, false, |seen| {
+        let reads = |name: &str| -> Vec<Classified> {
+            let def = body_named(&db, name);
+            seen.iter()
+                .filter(|it| it.def == def && it.name == "assoc_item_key")
+                .map(|it| it.class)
+                .collect() // alloc: test
+        };
+        let rules = reads("rules");
+        assert!(!rules.is_empty(), "`rules` read no `assoc_item_key`: the fixture misses the path");
+        for class in &rules {
+            assert!(
+                matches!(class, Classified::Fact(fact) if fact.kind == values::kinds::FIELDS),
+                "`rules`: a `macro_rules!` name's key read as {class:?}, not its impl's `Fields`"
+            );
+        }
+        let macros = reads("macros");
+        assert!(
+            macros.iter().any(|it| *it == Classified::Refused),
+            "`macros`: a `macro` 2.0 name's key was not refused: {macros:?}"
+        );
     });
 }
 

@@ -147,8 +147,10 @@ fn the_code_is_of_the_contents_alone() {
         a.crates,
         [
             "blaze_codegen_code",
+            "blaze_inproc_rt",
             "blaze_item_hash",
             "blaze_macro_eval",
+            "blaze_usercode",
             "front",
             "hir_def",
             "hir_ty",
