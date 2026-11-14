@@ -107,6 +107,26 @@ fn an_unsafe_block_is_denied() {
     assert!(out.contains("`left_pad::hidden` has an `unsafe` block"), "{out}");
 }
 
+/// Formatting a string is not `unsafe` code: lowering `format_args!` makes an `unsafe` block
+/// nobody wrote (around `fmt::Arguments::new`), and a dependency that only formats is not
+/// denied for it. (The control: the same dependency with a block someone wrote is.) Found on
+/// blaze-serde-derive, which has no `unsafe` in its source and was refused as having some, so
+/// no crate that derives `Serialize` could be asked anything that needs its proc macros built.
+#[test]
+fn a_format_is_not_an_unsafe_block() {
+    // With `fmt`, so `format_args!` lowers as it does in a real crate.
+    let minicore = "//- minicore: sized, copy, clone, fn, option, result, fmt\n";
+    let main = "pub fn go() -> u32 { left_pad::pad(1) }";
+    let formats = "pub fn pad(n: u32) -> u32 { let _said = format_args!(\"{n:>4} of {}\", n + 1); n }";
+    let out = run_over(minicore, formats, main, "", &table(""));
+    assert_eq!(lines(&out, "runs `unsafe` code (`unsafe`)"), Vec::<&str>::new(), "{out}");
+    assert!(!out.contains("has an `unsafe` block"), "{out}");
+    let written = "pub fn pad(n: u32) -> u32 { let _said = format_args!(\"{n}\"); unsafe { n } }";
+    let out = run_over(minicore, written, main, "", &table(""));
+    assert_eq!(lines(&out, "runs `unsafe` code (`unsafe`)").len(), 1, "{out}");
+    assert!(out.contains("`left_pad::pad` has an `unsafe` block"), "{out}");
+}
+
 /// A dependency's file read that the workspace does not reach is a warning of its own, not a
 /// denial; reached, it is the denial. (The second run is the control.)
 #[test]

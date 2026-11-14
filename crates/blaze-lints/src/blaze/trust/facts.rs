@@ -31,6 +31,7 @@ use hir_def::{
     },
 };
 use hir_ty_pure::trust::{Done, Reach, function_path, reach, toolchain_crate};
+use syntax::SyntaxKind;
 
 use super::{
     attribute::{Graph, Node, attribute},
@@ -444,10 +445,20 @@ pub(crate) fn anywhere(db: &Db, krate: Crate) -> Box<[(Capability, Box<str>)]> {
         if !has_body(db, def) {
             continue;
         }
-        let body = Body::of(db, def);
-        for (_, expr) in body.exprs() {
+        let (body, source_map) = Body::with_source_map(db, def);
+        for (id, expr) in body.exprs() {
             match expr {
                 Expr::Block { unsafe_: Unsafe::Yes, .. } => {
+                    // Lowering `format_args!` wraps its call of `fmt::Arguments::new` in an
+                    // `unsafe` block of its own, which maps back to the macro call: nobody
+                    // wrote it, and a crate that formats a string runs no `unsafe` code of
+                    // its own for it. Only a block someone wrote counts.
+                    let lowered = source_map
+                        .expr_syntax(id)
+                        .is_ok_and(|it| it.value.kind() == SyntaxKind::FORMAT_ARGS_EXPR);
+                    if lowered {
+                        continue;
+                    }
                     say(Capability::Unsafe, format!("{} has an `unsafe` block", owner_name(db, def)));
                 }
                 Expr::InlineAsm(_) => {
