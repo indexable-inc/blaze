@@ -5,21 +5,24 @@ import Blaze
 open Blaze
 set_option linter.unusedVariables false
 
+def atomics.add_until_done.loop_0.at_1 (loop_0 : core.sync.atomic.Atomic .U32 → U32 → U32 → Threads.Prog U32) (n : core.sync.atomic.Atomic .U32) («by» : U32) (t0 : core.result.Result U32 U32) : Threads.Prog U32 :=
+  match t0 with
+  | core.result.Result.Ok v0 => Threads.Prog.done (Result.ok v0)
+  | core.result.Result.Err v1 =>
+    let now := v1
+    let seen := now
+    loop_0 n «by» seen
+
 def atomics.add_until_done.loop_0 (fuel : Nat) (n : core.sync.atomic.Atomic .U32) («by» : U32) (seen : U32) : Threads.Prog U32 :=
   match fuel with
   | 0 => Threads.Prog.done Result.div
   | fuel + 1 => do
-    let t0 := n
-    let t1 := seen
-    let t2 ← Scalar.add seen «by»
-    let t3 ←
-      core.sync.atomic.Atomic.compare_exchange_weak t0 t1 t2 (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering) (core.sync.atomic.Ordering.Relaxed : core.sync.atomic.Ordering)
-    match t3 with
-    | core.result.Result.Ok v0 => Threads.Prog.done (Result.ok v0)
-    | core.result.Result.Err v1 =>
-      let now := v1
-      let seen := now
-      atomics.add_until_done.loop_0 fuel n «by» seen
+    let t1 := n
+    let t2 := seen
+    let t3 ← Scalar.add seen «by»
+    let t0 ←
+      core.sync.atomic.Atomic.compare_exchange_weak t1 t2 t3 (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering) (core.sync.atomic.Ordering.Relaxed : core.sync.atomic.Ordering)
+    atomics.add_until_done.loop_0.at_1 (atomics.add_until_done.loop_0 fuel) n «by» t0
 
 def atomics.add_until_done (fuel : Nat) (n : core.sync.atomic.Atomic .U32) («by» : U32) : Threads.Prog U32 := do
   let seen ←

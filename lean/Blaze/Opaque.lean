@@ -20,6 +20,28 @@ for every meaning of it.
   arguments: `OPAQUE_FUNCTIONS` says, for each, why the Rust function is a function of them.
 -/
 
+/-!
+## What is trusted: the assumption of formatting
+
+The opaque items of formatting (a `Formatter`'s builders `DebugStruct` and `DebugTuple`, a
+`&dyn Debug`, an `Argument` of `format_args!`, and the functions over them) rest on one
+assumption, which blaze does not check yet:
+
+> The output of a `fmt` (`Debug`, `Display`) is a function of the value formatted and the
+> formatter's state.
+
+It is true of every derived impl whose fields' impls have it and of the standard library's; a
+hand-written impl that reads anything else (a global, the clock) is outside the model. It is the
+same assumption `write_fmt`'s entry already makes. The purity analysis could check it, by proving
+that each `fmt` a model reaches reads only its arguments; until it does, it is listed here.
+
+A builder is used linearly: after each call of it, the formatter it writes to is
+`<builder>.formatter` of the builder, an opaque function of the builder alone, so no state of the
+formatter is read but as one the builder's calls made. A `&T` becomes a `&dyn Debug` by
+`core.fmt.Debug.dyn.<T>`, one opaque function per type. Each entry's `why` in
+crates/hir-ty-lean/src/body.rs (`OPAQUE_TYPES`, `OPAQUE_FUNCTIONS`, `OPAQUE_STEPS`) says it again.
+-/
+
 namespace Blaze
 
 /-- What Lean's `opaque` needs of an opaque function's type, `A → .. → Result R`: a `Result` of
@@ -44,5 +66,17 @@ opaque core.panic.location.Location : Type
 
 /-- `alloc::string::String`, carried only: it gets a model of its bytes later (step d). -/
 opaque alloc.string.String : Type
+
+/-- `core::fmt::builders::DebugStruct`: the formatter's state and what the builder has written. -/
+opaque core.fmt.builders.DebugStruct : Type
+
+/-- `core::fmt::builders::DebugTuple`: the formatter's state and what the builder has written. -/
+opaque core.fmt.builders.DebugTuple : Type
+
+/-- A `&dyn core::fmt::Debug`: what its `fmt` writes. -/
+opaque core.fmt.DynDebug : Type
+
+/-- `core::fmt::rt::Argument`, one argument of `format_args!`: what its `fmt` writes. -/
+opaque core.fmt.rt.Argument : Type
 
 end Blaze

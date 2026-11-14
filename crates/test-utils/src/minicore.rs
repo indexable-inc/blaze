@@ -1726,6 +1726,24 @@ pub mod cmp {
             Ord::cmp(*self, *other)
         }
     }
+    // Arrays' comparisons (`library/core/src/array/mod.rs:409`, `:445`): the elements', in
+    // order. Bodies are stubs, as `max` and `min`'s are.
+    impl<T: PartialEq, const N: usize> PartialEq for [T; N] {
+        fn eq(&self, _other: &[T; N]) -> bool {
+            true
+        }
+    }
+    impl<T: Eq, const N: usize> Eq for [T; N] {}
+    impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
+        fn partial_cmp(&self, _other: &[T; N]) -> Option<Ordering> {
+            None
+        }
+    }
+    impl<T: Ord, const N: usize> Ord for [T; N] {
+        fn cmp(&self, _other: &[T; N]) -> Ordering {
+            Ordering::Equal
+        }
+    }
 
     // endregion:ord
 }

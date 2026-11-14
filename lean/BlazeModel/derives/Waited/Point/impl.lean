@@ -7,4 +7,6 @@ import BlazeModel.derives.Point.impl
 open Blaze
 set_option linter.unusedVariables false
 
+namespace derives.Waited.Point
 deriving instance DecidableEq for derives.Waited.Point
+end derives.Waited.Point

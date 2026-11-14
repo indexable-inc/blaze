@@ -6,6 +6,7 @@ import Blaze.Vec
 import Blaze.ScalarOps
 import Blaze.Ordering
 import Blaze.Duration
+import Blaze.Order
 import Blaze.Str
 import Blaze.Machine
 import Blaze.Opaque

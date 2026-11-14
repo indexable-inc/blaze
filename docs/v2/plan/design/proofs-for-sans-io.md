@@ -374,10 +374,35 @@ atomics and so never tried a park's step between the unpark's swap and its wake;
 for what the theorem does not state, that a park ends by its deadline and promptly after its
 wake on a clock that moves.
 
-Next: a clock in the threads world and that promptness theorem; models that name a thread's
-program points, so a proof does not copy the model's continuations
-(agents/annoyances/proofs-1113-11.json); a multi-cell structure against the weak world.
-How-to: `agents/howto/H-prove-two-threads.json`.
+Next: the clock below; models that name a thread's program points, so a proof does not copy
+the model's continuations (agents/annoyances/proofs-1113-11.json); a multi-cell structure
+against the weak world. How-to: `agents/howto/H-prove-two-threads.json`.
+
+**A clock for the threads world** (to build; it is what the park's simulation test still
+states and the theorem does not: that a park ends by its deadline, and promptly after its
+wake).
+
+- The world gets a clock and a script of readings. `threads::clock(&readings)` installs the
+  script before a run; `threads::now()` is one operation: the clock becomes the later of
+  itself and the script's next reading, and that is the answer; `threads::time()` reads the
+  clock without moving it (for a theorem's function to ask after a run). Time moves only
+  where someone looks, which loses nothing: a run's observations are its readings, in order,
+  and any nondecreasing sequence of them is a script.
+- `threads::wait_until(word, expected, deadline)` is the wait with a deadline on that clock:
+  the kernel may say the time ran out only where there is a deadline, and saying so moves
+  the clock to at least the deadline (it said so at or after it); a thread asleep in such a
+  wait whose deadline the clock has reached does not stay asleep (its next look returns
+  timed out, whatever the pick), and is not `Asleep` when a schedule ends.
+- The theorems, of the real `park` on a kernel whose wait is `wait_until` and whose clock is
+  `now`: (1) a park that says its deadline passed says so only with the clock at or past it;
+  (2) with the clock at or past its deadline, no schedule ends with the park asleep; (3)
+  left alone for eight of its own steps with the kernel quiet (pick 0), a park has returned
+  or sleeps, from every state a schedule reaches. With `no_unpark_is_lost`, (2) and (3) say
+  what the simulation test's "promptly" and "by its deadline" say, in steps, and (1) its
+  "never before". The test's simulated latencies have no counterpart: a step is a step.
+- Built as the first slice was: the Lean world and its examples by evaluation; the Rust `two`
+  to match; three entries in the translator's table; the theorems stated and run on drawn
+  schedules and readings; the proofs by a port of the park's.
 
 ## Costs
 

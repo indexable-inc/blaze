@@ -56,6 +56,12 @@ glued, after the first one from there on that is not (the newest never is).
   woken joins `futex`'s entry for the cell into the thread's view. Where the thread is woken or
   asleep the pick keeps its meaning of the sequentially consistent world (1 for nothing, 2 its
   time ran out). `two`'s `ended` asks `asleep` with pick 0: the newest.
+- `wait_until` and `asleep_until` are `wait` and `asleep` with the sequentially consistent
+  world's deadline rules added the same way: a sleeper whose deadline the clock has reached
+  returns timed out whatever the pick; pick 2 tells a sleeper with a deadline its time ran out
+  and moves the clock to the deadline; a thread neither woken nor asleep reads by the pick and,
+  where the message holds `expected` and the deadline has passed, returns timed out at once.
+- `clock` and `now` are the sequentially consistent world's: the clock is not a cell.
 - A wake makes `futex`'s entry for the cell the newer of itself and the waker's view of the
   cell, then wakes as the sequentially consistent world does.
 - Rule R1: a write that does not release by a thread other than 0 to a cell `y` is refused
@@ -179,12 +185,16 @@ structure World where
   asleep : List (Nat × Nat)
   /-- (thread, cell): woken by a wake, its wait not yet returned. -/
   woken : List (Nat × Nat)
+  /-- The clock's last reading, in nanoseconds. -/
+  clock : Int := 0
+  /-- The clock's script: the readings still to come. -/
+  readings : List Int := []
   deriving Repr, DecidableEq
 
 namespace World
 
 /-- Nothing shared yet. -/
-def new : World := ⟨[], [], 0, [], [], [], []⟩
+def new : World := ⟨[], [], 0, [], [], [], [], 0, []⟩
 
 /-- Thread `who`'s view: thread 0's where it has none yet. -/
 def viewOf (w : World) (who : Nat) : View :=
@@ -337,6 +347,58 @@ def step (who pick : Nat) (o : Op) (w : World) : Option (Got × World) :=
       | some m =>
         some (⟨0, !w.woken.contains (who, cell)
           && (w.asleep.contains (who, cell) || m.value == expected)⟩, w)
+  | .clock readings => some (⟨0, true⟩, { w with readings := readings })
+  | .now move =>
+    if move then
+      match w.readings with
+      | [] => some (⟨w.clock, true⟩, w)
+      | r :: rest =>
+        let c := if w.clock < r then r else w.clock
+        some (⟨c, true⟩, { w with clock := c, readings := rest })
+    else some (⟨w.clock, true⟩, w)
+  | .wait_until cell expected deadline =>
+    match w.cells[cell]? with
+    | none => none
+    | some msgs =>
+      if w.woken.contains (who, cell) then
+        let v := match getAt w.futex cell with
+          | some id => joinView w.cells (w.viewOf who) [(cell, id)]
+          | none => w.viewOf who
+        some (⟨Threads.World.woken_code, true⟩,
+          { w with woken := w.woken.erase (who, cell), views := putAt w.views who v })
+      else if w.asleep.contains (who, cell) then
+        if Threads.passed w.clock deadline then
+          some (⟨Threads.World.timed_out_code, true⟩,
+            { w with asleep := w.asleep.erase (who, cell) })
+        else if pick == 1 then
+          some (⟨Threads.World.spurious_code, true⟩, { w with asleep := w.asleep.erase (who, cell) })
+        else
+          match deadline with
+          | some d =>
+            if pick == 2 then
+              some (⟨Threads.World.timed_out_code, true⟩,
+                { w with asleep := w.asleep.erase (who, cell), clock := d })
+            else some (⟨0, false⟩, w)
+          | none => some (⟨0, false⟩, w)
+      else
+        match w.look who cell pick msgs with
+        | none => none
+        | some m =>
+          let w := { w with views := putAt w.views who (putAt (w.viewOf who) cell m.id) }
+          if m.value != expected then some (⟨Threads.World.changed_code, true⟩, w)
+          else if Threads.passed w.clock deadline then
+            some (⟨Threads.World.timed_out_code, true⟩, w)
+          else some (⟨0, false⟩, { w with asleep := (who, cell) :: w.asleep })
+  | .asleep_until cell expected deadline =>
+    match w.cells[cell]? with
+    | none => none
+    | some msgs =>
+      match w.look who cell pick msgs with
+      | none => none
+      | some m =>
+        some (⟨0, !w.woken.contains (who, cell)
+          && (w.asleep.contains (who, cell) || m.value == expected)
+          && !Threads.passed w.clock deadline⟩, w)
 
 end World
 

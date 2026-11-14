@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-120 theorems: 107 in `lean`, 13 in `lean/analysis`.
+127 theorems: 114 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1036,6 +1036,45 @@ theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
 theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
 ```
 
+**`derives.tagged_eq_is_its_id.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function tagged_eq_is_its_id holds of its model: a struct with a PhantomData field is equal, copied and cloned by its other fields; the marker is one value.
+
+```lean
+theorem derives.tagged_eq_is_its_id.spec.proof : derives.tagged_eq_is_its_id.spec.statement
+```
+
+**`derives.point_and_tag_eq.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function point_and_tag_eq holds of its model: two types whose names end alike have each their own derived equality (their instances are named apart) and one model uses both.
+
+```lean
+theorem derives.point_and_tag_eq.spec.proof : derives.point_and_tag_eq.spec.statement
+```
+
+**`orders.pair_order_is_lexicographic.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function pair_order_is_lexicographic holds of its model: the derived order of a struct of two fields compares the first field, then the second.
+
+```lean
+theorem orders.pair_order_is_lexicographic.spec.proof :
+    orders.pair_order_is_lexicographic.spec.statement
+```
+
+**`orders.key_order_is_by_variant_then_fields.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function key_order_is_by_variant_then_fields holds of its model: the derived order of an enum compares discriminants (a signed repr's too), then the fields of one variant in order.
+
+```lean
+theorem orders.key_order_is_by_variant_then_fields.spec.proof :
+    orders.key_order_is_by_variant_then_fields.spec.statement
+```
+
+**`orders.id_order_is_by_bytes.spec.proof`** (`BlazeModel.orders.proved`, `lean`): The statement blaze generates from the fixture's theorem function id_order_is_by_bytes holds of its model: the derived order of a struct over an array is the array's lexicographic order.
+
+```lean
+theorem orders.id_order_is_by_bytes.spec.proof : orders.id_order_is_by_bytes.spec.statement
+```
+
+**`consts.constants_are_their_values.spec.proof`** (`BlazeModel.consts.proved`, `lean`): The statement blaze generates from the fixture's theorem function constants_are_their_values holds of its model: a trait's associated constant at its implementor (its own value or the trait's default), an inherent constant, an anonymous constant and an array length given by an expression are the values blaze's evaluator gives.
+
+```lean
+theorem consts.constants_are_their_values.spec.proof :
+    consts.constants_are_their_values.spec.statement
+```
+
 **`derives.waited_eq_is_the_values.spec.proof`** (`BlazeModel.derives.proved`, `lean`): The statement blaze generates from the fixture's theorem function waited_eq_is_the_values holds of its model: the derived ==, != and clone of a generic enum at its instances (Waited<()>, Waited<u32>, Waited<Point>) are the values' own.
 
 ```lean
@@ -1127,6 +1166,12 @@ theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
 
 ```lean
 theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
+```
+
+**`atomics.parks_once.spec.proof`** (`BlazeModel.atomics.parks`, `lean`): The statement blaze generates from the fixture's theorem function parks_once holds of the park and unpark it translates (an AtomicU32 token word: two compare-exchanges, a futex wait loop, a swap and a wake): for every schedule of the two threads and every pick of the world's, no run ends with the unpark returned and the park asleep; where both returned the token was taken and the word is empty, or a timed park left first and the token is still there; and an untimed park returns only with a token. Proved over the program points the translator names (park.at_n, park_loop.loop_0.at_n, unpark.at_1), with no model text copied.
+
+```lean
+theorem atomics.parks_once.spec.proof : atomics.parks_once.spec.statement
 ```
 
 **`atomics.adds_until_done.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function adds_until_done holds of its model, a program over shared cells: a compare-exchange loop that returns its Ok value returns what the cell held and leaves the sum.
