@@ -169,6 +169,7 @@ impl<'db> Writer<'_, 'db> {
             Ty::Duration => "core::time::Duration".to_owned(),
             Ty::Ordering => "core::cmp::Ordering".to_owned(),
             Ty::Str => "str".to_owned(),
+            Ty::Opaque(opaque) => opaque.rust().to_owned(),
         }
     }
 
@@ -241,7 +242,7 @@ impl<'db> Writer<'_, 'db> {
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }
-            Ty::Duration | Ty::Ordering | Ty::Str => {
+            Ty::Duration | Ty::Ordering | Ty::Str | Ty::Opaque(_) => {
                 let key = Self::key(ty);
                 return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
             }
@@ -700,6 +701,7 @@ fn body<'db>(
         derives: BTreeSet::new(),
         envs: BTreeMap::new(),
         lent: BTreeMap::new(),
+        opaques: Vec::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());

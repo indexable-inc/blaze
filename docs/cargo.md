@@ -1415,12 +1415,18 @@ after an edit it runs the modules the edit reaches.
 
 - `--emit` translates and writes the models and stops: one `emitted F: STATEMENT (MODEL)` line
   each, and no Lean is needed.
-- `--subset` also counts every function in a `#![blaze::sans_io]` module of those crates: how
-  many the translator takes, and for the rest each refusal with the number of functions it
-  stopped, most first. A function is counted under the first refusal the translator meets.
+- `--subset` also counts every function in a `#![blaze::sans_io]` module of those crates, in
+  one line, `subset: N functions in sans-IO modules, N translated, N generic (translated by
+  instance), N refused`: a generic function is translated at each instance a theorem reaches
+  and alone at none, so it is counted apart, not refused. Then each refusal, `    N refused
+  for WHAT`, most first; a function is counted under the first refusal the translator meets.
+- `--functions` (with `--subset` only; alone it is refused) adds one line a function of the
+  subset, by path: `translated PATH`, `generic PATH` or `refused PATH: WHAT`.
 - `--json` prints one object: `records`, each with `outcome` (`Proved`, `Open`, `Emitted`,
-  `Refused`) and the record's fields, `subset`, and `failed` (why no proof was checked, when
-  none could be).
+  `Refused`) and the record's fields; `subset` (`functions`, `translated`, `generic`,
+  `refused` as `{what, count}`, and `outcomes`, every function by path with its `outcome`,
+  `Translated`, `Generic` or `Refused` with its `what`), with or without `--functions`; and
+  `failed` (why no proof was checked, when none could be).
 
 It exits 0 when every theorem is proved (with `--emit`, translated), or there is none (it says
 so), and 1 otherwise. The same tree gives the same output, byte for byte.
