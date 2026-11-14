@@ -20,7 +20,13 @@
 //! an expanded path, at the range it maps to). What the rewrite can't place is an error naming
 //! where it is: a comment inside a use tree it rewrites.
 
+use blaze_mem::text;
 use hir::{Module, ModuleDef, PathResolution, ScopeDef, view::Semantics};
+use snafu::Snafu;
+use std::{
+    alloc::{Allocator, Global},
+    ops::Deref,
+};
 use syntax::{
     SyntaxKind, TextRange, WalkEvent,
     view::{self as ast, AstNode as _},
@@ -146,7 +152,7 @@ impl<'t> Retarget<'_, 't> {
             for child in list.use_trees() {
                 kept.extend(self.keep(child, root, moved)?);
             }
-            return Ok(joined(prefix, &kept));
+            return Ok(joined(prefix, &kept, Global).map(|it| it.as_str().to_owned()));
         }
         let written = tree.syntax().text().to_owned();
         if tree.star_token().is_some() {
@@ -224,26 +230,69 @@ impl<'t> Retarget<'_, 't> {
     }
 }
 
-/// A use tree with the prefix `prefix` and the leaves `kept`, as written: `None` when none stays.
-fn joined(prefix: Option<&str>, kept: &[String]) -> Option<String> {
-    match (prefix, kept) {
-        (_, []) => None,
-        (Some(prefix), [one]) if one != "self" && !one.starts_with('{') => {
-            Some(format!("{prefix}::{one}"))
-        }
-        (Some(prefix), _) => Some(format!("{prefix}::{{{}}}", kept.join(", "))),
-        (None, _) => Some(format!("{{{}}}", kept.join(", "))),
+/// A use tree with the prefix `prefix` and the leaves `kept`, as written, in `alloc`: `None` when
+/// none stays.
+fn joined<A: Allocator, S: Deref<Target = str>>(
+    prefix: Option<&str>,
+    kept: &[S],
+    alloc: A,
+) -> Option<text::String<A>> {
+    let mut out = text::String::new_in(alloc);
+    let braced = match (prefix, kept) {
+        (_, []) => return None,
+        (Some(_), [one]) => &**one == "self" || one.starts_with('{'),
+        (Some(_) | None, _) => true,
+    };
+    if let Some(prefix) = prefix {
+        out.push_str(prefix);
+        out.push_str("::");
     }
+    if braced {
+        out.push_str("{");
+    }
+    for (at, leaf) in kept.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(leaf);
+    }
+    if braced {
+        out.push_str("}");
+    }
+    Some(out)
 }
 
-/// `tree` as written without `leaf`, one of its leaves; `None` when nothing of it stays.
-fn without(tree: ast::UseTree<'_>, leaf: ast::UseTree<'_>) -> Option<String> {
+/// `tree` as written without `leaf`, one of its leaves, in `alloc`; `None` when nothing of it
+/// stays.
+fn without<A: Allocator + Clone>(
+    tree: ast::UseTree<'_>,
+    leaf: ast::UseTree<'_>,
+    alloc: A,
+) -> Option<text::String<A>> {
     if tree == leaf {
         return None;
     }
-    let Some(list) = tree.use_tree_list() else { return Some(tree.syntax().text().to_owned()) };
-    let kept: Vec<String> = list.use_trees().filter_map(|child| without(child, leaf)).collect();
-    joined(tree.path().map(|it| it.syntax().text()), &kept)
+    let Some(list) = tree.use_tree_list() else {
+        return Some(text::String::from_str_in(tree.syntax().text(), alloc));
+    };
+    let mut kept = Vec::new_in(alloc.clone());
+    kept.extend(list.use_trees().filter_map(|child| without(child, leaf, alloc.clone())));
+    joined(tree.path().map(|it| it.syntax().text()), &kept, alloc)
+}
+
+/// Why [`reimport`] can't rewrite a `use` item.
+#[derive(Debug, Snafu)]
+pub enum Reimport<'t> {
+    #[snafu(display("a `use` item without a tree"))]
+    NoTree,
+    #[snafu(display("a `use` item without `use`"))]
+    NoUse,
+    /// A comment inside the tree, which taking a leaf out would drop.
+    #[snafu(display(
+        "`{item}` has a comment inside its tree, which taking an import out would drop: move it \
+         out of the braces"
+    ))]
+    Comment { item: &'t str },
 }
 
 /// `item`, a `use` of the file `root`, with `dropped`, one leaf of its tree, taken out and a
@@ -252,32 +301,30 @@ fn without(tree: ast::UseTree<'_>, leaf: ast::UseTree<'_>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// A comment inside the tree, which taking a leaf out would drop.
-pub fn reimport<'t>(
+/// [`Reimport`]: a `use` item with no tree, or a comment inside the tree.
+pub fn reimport<'t, S: Deref<Target = str>>(
     item: ast::Use<'t>,
     root: ast::Node<'t>,
     dropped: Option<ast::UseTree<'t>>,
-    imports: &[String],
-) -> Result<Rewrite, String> {
-    let Some(tree) = item.use_tree() else { return Err("a `use` item without a tree".to_owned()) };
+    imports: &[S],
+) -> Result<Rewrite, Reimport<'t>> {
+    let Some(tree) = item.use_tree() else { return Err(Reimport::NoTree) };
     if dropped.is_some()
         && tree.syntax().descendants_with_tokens().any(|it| it.kind() == SyntaxKind::COMMENT)
     {
-        return Err(format!(
-            "`{}` has a comment inside its tree, which taking an import out would drop: move it \
-             out of the braces",
-            item.syntax().text()
-        ));
+        return Err(Reimport::Comment { item: item.syntax().text() });
     }
-    let use_token = item.use_token().ok_or("a `use` item without `use`")?;
+    let use_token = item.use_token().ok_or(Reimport::NoUse)?;
     let range = item.syntax().text_range();
     let head = &item.syntax().text()[..usize::from(use_token.text_range().start() - range.start())];
-    let mut lines = Vec::new();
+    let mut lines = Vec::new_in(Global);
     match dropped {
         None => lines.push(item.syntax().text().to_owned()),
-        Some(leaf) => lines.extend(without(tree, leaf).map(|kept| format!("{head}use {kept};"))),
+        Some(leaf) => {
+            lines.extend(without(tree, leaf, Global).map(|kept| format!("{head}use {kept};")));
+        }
     }
-    lines.extend(imports.iter().map(|path| format!("{head}use {path};")));
+    lines.extend(imports.iter().map(|path| format!("{head}use {};", &**path)));
     if lines.is_empty() {
         return Ok(Rewrite { range: with_line(root, range), text: String::new() });
     }

@@ -9,7 +9,7 @@
 //! (`::std::sync::Arc`) is a def path, written as the edited node's module names that item
 //! (`Module::find_path`), so the code resolves where it lands.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -593,12 +593,12 @@ fn source_edit<'a, 'p, F: Files>(
 /// `(add-param d ...)`, `(remove-param d ...)` or `(reorder-params d ...)` as the fn's new
 /// parameter list, each kept parameter by its pattern as written: one [`Edit::Params`], made
 /// once however many rows ask for it.
-fn params_edit<F: Files>(
+fn params_edit<F: Files, A: Allocator>(
     facts: &Sema<'_, F>,
     by: Origin<'_>,
     action: Action,
     args: &[Value<Node>],
-    edits: &mut Vec<Edit>,
+    edits: &mut Vec<Edit, A>,
 ) -> Res<()> {
     let rules = || "(rules)".to_owned();
     let Some((Value::Node(target), rest)) = args.split_first() else {

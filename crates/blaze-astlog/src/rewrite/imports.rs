@@ -13,7 +13,11 @@
 use blaze_api::Edit;
 use blaze_intent::retarget::{Names, names_in, reimport};
 use blaze_intent::{Files, TextEdit};
-use hir::{FindPathConfig, ModuleDef, ScopeDef};
+use hir::{FindPathConfig, ModPath, ModuleDef, ScopeDef};
+use std::{
+    alloc::{Allocator, Global},
+    ops::Deref,
+};
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
     view::{self as ast, AstNode as _},
@@ -104,8 +108,8 @@ struct Group<'a, 'p> {
 }
 
 /// The group of `key`, made when it is the first of it.
-fn group_of<'g, 'a, 'p>(
-    groups: &'g mut Vec<Group<'a, 'p>>,
+fn group_of<'g, 'a, 'p, A: Allocator>(
+    groups: &'g mut Vec<Group<'a, 'p>, A>,
     key: Key<'a>,
     file: &str,
     by: Origin<'p>,
@@ -123,13 +127,13 @@ fn group_of<'g, 'a, 'p>(
 
 /// The imports `moved` asks for, as text edits of the `use`s beside an old import and as
 /// `Edit::AddUse`s of a module.
-pub(super) fn finish<'a, 'p, F: Files>(
+pub(super) fn finish<'a, 'p, F: Files, A: Allocator, B: Allocator>(
     facts: &Sema<'a, F>,
     moved: Moved<'a, 'p>,
-    text: &mut Vec<Made<'p>>,
-    edits: &mut Vec<Edit>,
+    text: &mut Vec<Made<'p>, A>,
+    edits: &mut Vec<Edit, B>,
 ) -> Res<()> {
-    let mut groups: Vec<Group<'a, 'p>> = Vec::new();
+    let mut groups = Vec::new_in(Global);
     for bare in &moved.bare {
         let old = names_of(facts, bare.path);
         let in_file = in_file(facts, bare.path);
@@ -143,7 +147,10 @@ pub(super) fn finish<'a, 'p, F: Files>(
             }
         };
         let import = match bare.import {
-            true => Some((import_path(facts, bare.by, bare.path, bare.to)?, bare.to)),
+            true => {
+                let import = import_path(facts, bare.by, bare.path, bare.to)?;
+                Some((import.text(facts.db).to_string(), bare.to))
+            }
             false => None,
         };
         let group = group_of(&mut groups, key, &file, bare.by);
@@ -155,7 +162,7 @@ pub(super) fn finish<'a, 'p, F: Files>(
     for &(leaf, to, by) in &moved.leaves {
         let (file, _) = locate(facts, leaf.syntax())
             .map_err(|call| unplaceable(by, call, "retargets an import a macro made"))?;
-        let import = (import_path(facts, by, leaf.syntax(), to)?, to);
+        let import = (import_path(facts, by, leaf.syntax(), to)?.text(facts.db).to_string(), to);
         let path = leaf.path().map_or(leaf.syntax(), |it| it.syntax());
         let old = names_of(facts, path);
         let group = group_of(&mut groups, Key::Leaf(leaf), &file, by);
@@ -170,19 +177,19 @@ pub(super) fn finish<'a, 'p, F: Files>(
 }
 
 /// `item` pushed to `list` unless it is there.
-fn add<T: PartialEq>(list: &mut Vec<T>, item: T) {
+fn add<T: PartialEq, A: Allocator>(list: &mut Vec<T, A>, item: T) {
     if !list.contains(&item) {
         list.push(item);
     }
 }
 
 /// One group's imports, made: the leaf's `use` rewritten, or the module's `use`s added.
-fn place_group<'a, 'p, F: Files>(
+fn place_group<'a, 'p, F: Files, S: Deref<Target = str>, A: Allocator, B: Allocator>(
     facts: &Sema<'a, F>,
-    covered: &[(String, TextRange)],
+    covered: &[(S, TextRange)],
     group: Group<'a, 'p>,
-    text: &mut Vec<Made<'p>>,
-    edits: &mut Vec<Edit>,
+    text: &mut Vec<Made<'p>, A>,
+    edits: &mut Vec<Edit, B>,
 ) -> Res<()> {
     let Group { key, file, by, imports, needs, retargeted } = group;
     for (at, (path, def)) in imports.iter().enumerate() {
@@ -213,7 +220,7 @@ fn place_group<'a, 'p, F: Files>(
     };
     let name = imported_name(leaf);
     let old = leaf.path().map_or([None, None, None], |it| names_of(facts, it.syntax()));
-    let read = match (item.syntax().parent(), &name) {
+    let read = match (item.syntax().parent(), name) {
         (Some(scope), Some(name)) => first_read(facts, scope, leaf, name, &old, (&file, covered)),
         _ => None,
     };
@@ -225,7 +232,7 @@ fn place_group<'a, 'p, F: Files>(
                 "retargets the import `{}`, which `{}` at {} still reads, and no rule retargets \
                  that",
                 leaf.syntax().text(),
-                name.as_deref().unwrap_or_default(),
+                name.unwrap_or_default(),
                 place(facts.files, &file, read.start())
             ),
         ));
@@ -237,10 +244,11 @@ fn place_group<'a, 'p, F: Files>(
     if !dropped && imports.is_empty() {
         return Ok(());
     }
-    let paths: Vec<String> = imports.into_iter().map(|(path, _)| path).collect();
+    let mut paths = Vec::new_in(Global);
+    paths.extend(imports.into_iter().map(|(path, _)| path));
     let root = item.syntax().ancestors().last().unwrap_or(item.syntax());
     let rewrite = reimport(item, root, dropped.then_some(leaf), &paths)
-        .map_err(|message| unplaceable(by, at.clone(), message))?;
+        .map_err(|why| unplaceable(by, at.clone(), why.to_string()))?;
     let edit = TextEdit { path: file, range: rewrite.range, text: rewrite.text, by: by.by() };
     text.push(Made { edit, by });
     Ok(())
@@ -274,10 +282,10 @@ fn is_pub(item: ast::Use<'_>) -> bool {
 }
 
 /// The name a `use` leaf imports: its rename, or its path's last segment; `None` for `_`.
-fn imported_name(leaf: ast::UseTree<'_>) -> Option<String> {
+fn imported_name(leaf: ast::UseTree<'_>) -> Option<&str> {
     let name = match leaf.rename() {
-        Some(rename) => rename.syntax().text().trim_start_matches("as").trim().to_owned(),
-        None => leaf.path()?.segment()?.name_ref()?.syntax().text().to_owned(),
+        Some(rename) => rename.syntax().text().trim_start_matches("as").trim(),
+        None => leaf.path()?.segment()?.name_ref()?.syntax().text(),
     };
     (name != "_").then_some(name)
 }
@@ -298,7 +306,7 @@ fn leaf_of<'a, F: Files>(
             let found = item.syntax().descendants().filter_map(ast::UseTree::cast).find(|leaf| {
                 leaf.use_tree_list().is_none()
                     && leaf.star_token().is_none()
-                    && imported_name(*leaf).as_deref() == Some(name)
+                    && imported_name(*leaf) == Some(name)
                     && leaf.path().is_some_and(|it| meets(&names_of(facts, it.syntax()), old))
             });
             if found.is_some() {
@@ -311,13 +319,13 @@ fn leaf_of<'a, F: Files>(
 
 /// The first read in `scope` of `name`, which `leaf` imports as an item of `old`, that no
 /// retarget of the request rewrote (`covered`, in `file`).
-fn first_read<'a, F: Files>(
+fn first_read<'a, F: Files, S: Deref<Target = str>>(
     facts: &Sema<'a, F>,
     scope: ast::Node<'a>,
     leaf: ast::UseTree<'a>,
     name: &str,
     old: &Names,
-    (file, covered): (&str, &[(String, TextRange)]),
+    (file, covered): (&str, &[(S, TextRange)]),
 ) -> Option<TextRange> {
     let own = leaf.syntax().text_range();
     scope.descendants_with_tokens().find_map(|it| {
@@ -326,7 +334,7 @@ fn first_read<'a, F: Files>(
         if token.kind() != SyntaxKind::IDENT || token.text() != name || own.contains_range(range) {
             return None;
         }
-        if covered.iter().any(|(path, it)| path == file && it.contains_range(range)) {
+        if covered.iter().any(|(path, it)| &**path == file && it.contains_range(range)) {
             return None;
         }
         let parent = token.parent()?;
@@ -349,13 +357,25 @@ fn first_read<'a, F: Files>(
     })
 }
 
+/// A path to import, and the crate it is written in, whose edition spells it.
+struct Import {
+    path: ModPath,
+    krate: hir::Crate,
+}
+
+impl Import {
+    fn text<'d>(&'d self, db: &'d base_db::Db) -> impl std::fmt::Display + 'd {
+        self.path.display(db, self.krate.edition(db))
+    }
+}
+
 /// The new item's path to import from where `node` is: from its crate's root, or its crate.
 fn import_path<'a, F: Files>(
     facts: &Sema<'a, F>,
     by: Origin<'_>,
     node: ast::Node<'a>,
     to: ModuleDef,
-) -> Res<String> {
+) -> Res<Import> {
     let at = || match locate(facts, node) {
         Ok((path, range)) => place(facts.files, &path, range.start()),
         Err(call) => call,
@@ -373,7 +393,7 @@ fn import_path<'a, F: Files>(
         let name = facts.def_path(Def::Item(to)).unwrap_or_default();
         return Err(unplaceable(by, at(), format!("this module can import no path to `{name}`")));
     };
-    Ok(path.display(facts.db, scope.krate().edition(facts.db)).to_string())
+    Ok(Import { path, krate: scope.krate() })
 }
 
 /// An error when `to`'s name, imported where `path` is, would clash with or shadow what the

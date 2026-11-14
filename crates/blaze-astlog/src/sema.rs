@@ -18,7 +18,7 @@ use hir::{
     HirDisplay as _, HirFileId, ModuleDef, PathResolution, Type, Visibility, view::Semantics,
 };
 use memchr::memmem::Finder;
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use syntax::{
     SyntaxKind,
     view::{self as ast, AstNode as _, NodeId},
@@ -636,37 +636,34 @@ impl<'a, F: Files> Sema<'a, F> {
     }
 
     /// The defs `owner` owns, each one whose [`Self::def_parent`] is `owner`.
-    fn def_children(&self, owner: Def) -> Vec<Def> {
-        let db = self.db;
-        let assoc = |items: Vec<hir::AssocItem>| -> Vec<Def> {
-            items
-                .into_iter()
-                .map(|it| {
+    fn def_children<A: Allocator>(&self, owner: Def, out: &mut Vec<Def, A>) {
+            let db = self.db;
+            let assoc = |items: Vec<hir::AssocItem>, out: &mut Vec<Def, A>| {
+                out.extend(items.into_iter().map(|it| {
                     Def::Item(match it {
                         hir::AssocItem::Function(it) => ModuleDef::Function(it),
                         hir::AssocItem::Const(it) => ModuleDef::Const(it),
                         hir::AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
                     })
-                })
-                .collect()
-        };
-        match owner {
-            Def::Item(ModuleDef::Module(it)) => {
-                let mut out: Vec<Def> = it.declarations(db).into_iter().map(Def::Item).collect();
-                out.extend(it.impl_defs(db).into_iter().map(Def::Impl));
-                out
+                }));
+            };
+            match owner {
+                Def::Item(ModuleDef::Module(it)) => {
+                    out.extend(it.declarations(db).into_iter().map(Def::Item));
+                    out.extend(it.impl_defs(db).into_iter().map(Def::Impl));
+                }
+                Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) => {
+                    out.extend(it.variants(db).into_iter().map(|it| Def::Item(ModuleDef::EnumVariant(it))));
+                }
+                Def::Item(ModuleDef::Adt(hir::Adt::Struct(it))) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::Adt(hir::Adt::Union(it))) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::EnumVariant(it)) => out.extend(it.fields(db).into_iter().map(Def::Field)),
+                Def::Item(ModuleDef::Trait(it)) => assoc(it.items(db), out),
+                Def::Impl(it) => assoc(it.items(db), out),
+                Def::Item(_) | Def::Field(_) => {}
             }
-            Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) => {
-                it.variants(db).into_iter().map(|it| Def::Item(ModuleDef::EnumVariant(it))).collect()
-            }
-            Def::Item(ModuleDef::Adt(hir::Adt::Struct(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
-            Def::Item(ModuleDef::Adt(hir::Adt::Union(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
-            Def::Item(ModuleDef::EnumVariant(it)) => it.fields(db).into_iter().map(Def::Field).collect(),
-            Def::Item(ModuleDef::Trait(it)) => assoc(it.items(db)),
-            Def::Impl(it) => assoc(it.items(db)),
-            Def::Item(_) | Def::Field(_) => Vec::new(),
         }
-    }
+    
 
     /// An impl's last segment, as rustc's paths show one: `<impl Type>` or
     /// `<impl Trait<Args> for Type>`. It names the impl and resolves to nothing
@@ -1375,9 +1372,10 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                     };
                     let Some(owner) = owner else { return Ok(()) };
                     let p = node(self.def(owner));
-                    for def in self.def_children(owner) {
-                        out.push(vec![node(self.def(def)), p.clone()]);
-                    }
+                    let mut children = Vec::new_in(Global);
+                                        self.def_children(owner, &mut children);
+                                        for def in children { out.push(vec![node(self.def(def)), p.clone()]); }
+                    
                 }
             },
             Atom::VariantCount => {
