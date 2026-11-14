@@ -897,7 +897,7 @@ impl Gen {
                     functions: g.u32(),
                     translated: g.u32(),
                 }),
-                records: self.many(depth, |g| match g.below(4) {
+                records: self.many(depth, |g| match g.below(5) {
                     0 => crate::ProofRecord::Open {
                         why: g.text(),
                         function: g.text(),
@@ -917,7 +917,13 @@ impl Gen {
                         function: g.text(),
                         statement: g.text(),
                     },
-                    _ => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
+                    3 => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
+                    _ => crate::ProofRecord::ModelBroken {
+                        at: g.text(),
+                        error: g.text(),
+                        module: g.text(),
+                        function: g.text(),
+                    },
                 }),
             }),
             45 => Response::TestsOf(crate::TestsOf {

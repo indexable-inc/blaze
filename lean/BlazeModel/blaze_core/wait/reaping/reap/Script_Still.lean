@@ -15,6 +15,7 @@ import BlazeModel.blaze_core.wait.reaping.reap.Script_Still.closure0.type
 import BlazeModel.blaze_core.wait.retry.Waited.unit.type
 import BlazeModel.core.ops.control_flow.ControlFlow.Result_never_WaitError_Waited_unit.type
 import BlazeModel.blaze_core.wait.reaping.reap.Script_Still.closure1.type
+import BlazeModel.blaze_core.wait.reaping.ReapPlant.impl
 import BlazeModel.blaze_core.world.children.NoChild.type
 import BlazeModel.blaze_core.world.children.Child.reap_now
 import BlazeModel.core.io.error.Error.other.ref_str
@@ -26,7 +27,6 @@ import BlazeModel.core.result.Result.Option_i32_Error.map_err.WaitError_closure0
 import BlazeModel.core.result.Result.Option_i32_WaitError.Try.branch
 import BlazeModel.blaze_core.wait.retry.WaitError.From.«from»
 import BlazeModel.core.result.Result.Waited_i32_WaitError.FromResidual.Result_never_WaitError.from_residual
-import BlazeModel.blaze_core.wait.reaping.ReapPlant.PartialEq.eq
 import BlazeModel.blaze_core.world.children.Child.exit
 import BlazeModel.blaze_core.world.children.Child.waited
 import BlazeModel.blaze_core.wait.reaping.Script.looked
@@ -49,7 +49,7 @@ def blaze_core.wait.reaping.reap.Script_Still (what : Str) (kernel : blaze_core.
       Result.ok ((core.result.Result.Ok (blaze_core.wait.retry.Waited.i32.Ready reaped : blaze_core.wait.retry.Waited.i32) : core.result.Result blaze_core.wait.retry.Waited.i32 blaze_core.wait.retry.WaitError), kernel)
     | Option.none => do
       let keep :=
-        blaze_core.wait.reaping.ReapPlant.PartialEq.eq plant (blaze_core.wait.reaping.ReapPlant.None : blaze_core.wait.reaping.ReapPlant)
+        core.cmp.PartialEq.eq plant (blaze_core.wait.reaping.ReapPlant.None : blaze_core.wait.reaping.ReapPlant)
       let (t1, kernel) ←
         blaze_core.wait.reaping.Script.Children.exited.Still kernel what pid keep deadline clock
       match core.result.Result.Waited_unit_WaitError.Try.branch t1 with
