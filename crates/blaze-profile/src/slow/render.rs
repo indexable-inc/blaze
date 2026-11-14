@@ -335,6 +335,8 @@ pub fn thread_line(thread: &DiedThread) -> String {
         unit: None,
         awaits: it.awaits.as_deref(),
         owner: it.owner,
+        // A dead daemon's reading keeps no span's loose fields (`DiedSpan`): not said.
+        fields: None,
         for_ns: it.for_ns,
     });
     // alloc: a line

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-132 theorems: 119 in `lean`, 13 in `lean/analysis`.
+133 theorems: 120 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1217,4 +1217,11 @@ theorem blaze_core.wait.parking.a_park_left_alone_returns_or_sleeps.spec.proof :
 ```lean
 theorem blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof :
     blaze_core.wait.parking.a_park_keeps_its_deadline.spec.statement
+```
+
+**`blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof`** (`BlazeCore.Wait.ParkingToken`, `lean`): The statement blaze generates from the theorem function a_park_is_ready_exactly_for_a_token holds of the models of the real park and unpark on the timed kernel and the world's clock: for every schedule, script of clock readings, choice of the kernel's and deadline, a token waiting as the park begins is taken (the park is never asleep, and where it returned it said Ready), and a park with no token and no step of the unpark's never says Ready.
+
+```lean
+theorem blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof :
+    blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.statement
 ```
