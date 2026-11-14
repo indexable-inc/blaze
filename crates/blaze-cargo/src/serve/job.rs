@@ -6044,8 +6044,11 @@ impl<S: Steps> Jobs<S> {
     }
 
     /// Job `id`'s write, its readers all gone, posted as a task of a plane request of its own
-    /// holding the writer ([`Does::Write`]), as a kept front end's store is;
-    /// pushed free of admission, since every reading task of the job waits for it. Its value
+    /// holding the writer ([`Does::Write`]), as a kept front end's store is. The plane admits
+    /// it by threads as any task: the job's held tasks (`Build::held`) are Running to the plane
+    /// and hold threads, so when they hold every one the write never starts and the build
+    /// stalls (open, 2026-11-13; `a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds`
+    /// pins the seeds). Its value
     /// comes back to [`Jobs::wrote`]. A task the plane refuses gives the writer back, and the
     /// job fails naming the refusal.
     fn send_write(&mut self, w: &mut World<'_, S>, id: JobId) {
@@ -9734,8 +9737,22 @@ impl<S: Steps> Jobs<S> {
             build.after_write = Some(AfterWrite::Applied { ok });
             return;
         }
+        // A write still waits (the last unit's run or load asked it in this very turn): it is
+        // sent to a write's task, as [`Jobs::apply_writes`] sends every other, and the build
+        // ends as the writer comes back. The loop applies no write itself: an apply serves
+        // dependencies from the store, which reads in the running task's frame, and on the
+        // loop there is none (`frame::current outside any frame::task`, 2026-11-13). Sent
+        // whether or not a reader is alive, so a reader that outlived the build fails the job
+        // through [`Jobs::wrote`] rather than leaving it waiting for an idle writer.
+        if let Stage::Units(build) = &mut job.stage
+            && build.writer.here().is_some_and(|it| it.waiting())
+        {
+            build.after_write = Some(AfterWrite::Applied { ok });
+            self.send_write(w, id);
+            return;
+        }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, writer, root, units, .. } = *build;
+        let Build { input, front, writer, root, units, refused, .. } = *build;
         let Some(mut writer) = writer.into_here() else {
             let error = ApiError::new(
                 "the build's front end was lost to a write that failed, so its end reads none",
@@ -9755,7 +9772,11 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        self.applied(w, id, ok, Ready { input, root, front: Some(front), writer: Some(writer) });
+        // A write that broke on its task ([`Jobs::after_write`]) refused the units after it:
+        // the view did not get everything its front end applies.
+        let broke = refused.and_then(|it| it.whys.into_iter().next());
+        let ready = Ready { input, root, front: Some(front), writer: Some(writer) };
+        self.applied(w, id, ok, broke, ready);
     }
 
     /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
@@ -9764,7 +9785,14 @@ impl<S: Steps> Jobs<S> {
     /// A unit that did not build, or a write of one that did not apply, fails the job naming the
     /// view: its answer would read what a macro that never ran left out, or a crate without its
     /// build script's output.
-    fn applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool, mut ready: Ready<S>) {
+    fn applied(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        ok: bool,
+        broke: Option<String>,
+        mut ready: Ready<S>,
+    ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.applying = None;
         let work = work_word(&job.work);
@@ -9779,6 +9807,8 @@ impl<S: Steps> Jobs<S> {
         };
         let error = match ready.writer.as_mut() {
             _ if !ok => Some(refused("did not all build".to_owned())), // alloc: an error, once
+            // alloc: an error, once
+            _ if let Some(broke) = broke.as_deref() => Some(refused(format!("did not apply: {broke}"))),
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
                 Err(error) => Some(refused(format!("did not apply: {}", error.what))),

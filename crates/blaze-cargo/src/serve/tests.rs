@@ -86,6 +86,8 @@ thread_local! {
     /// How many of a writer's applies ran outside a write's task (`job::IN_WRITE_TASK`): on
     /// the loop, in its turn.
     static LOOP_APPLIES: Cell<usize> = const { Cell::new(0) };
+    /// How many of a writer's applies with something to apply ran in no `blaze_mem` frame.
+    static FRAMELESS_APPLIES: Cell<usize> = const { Cell::new(0) };
     /// The build script's run whose write panics as it is applied, as a maintainer's would.
     static PANICS_RUN: Cell<Option<usize>> = const { Cell::new(None) };
     /// The build script's run whose write fails with an error as it is applied, as a real
@@ -993,6 +995,11 @@ impl Writer<Fake> for FakeWriter {
         // A write with something to apply, as `UnitWriter::apply` does only then.
         if !super::job::IN_WRITE_TASK.get() {
             LOOP_APPLIES.with(|it| it.set(it.get() + 1));
+        }
+        // A real apply serves dependencies from the store, which reads in the running task's
+        // frame (`blaze_mem::frame::current`) and panics outside one.
+        if !blaze_mem::frame::in_task() {
+            FRAMELESS_APPLIES.with(|it| it.set(it.get() + 1));
         }
         if FAILS_APPLY.get() {
             return Err(ApiError::new(
@@ -5444,6 +5451,77 @@ fn the_loop_applies_no_front_end_write_over_many_seeds() {
     }
     let (on_loop, _) = wave_applies(3, SCRIPTS, true);
     assert!(on_loop > 0, "the planted bug's applies on the loop went unseen");
+}
+
+/// One query of a checkout with a proc macro and a build script under `seed`: how many of the
+/// writer's applies ran on the loop and how many in no frame, and the runs the query read, or
+/// the stall it ended in.
+fn query_applies(seed: u64) -> (usize, usize, Result<Vec<Vec<usize>>, String>) {
+    EDITED.with(|it| it.borrow_mut().clear());
+    LOOP_APPLIES.set(0);
+    FRAMELESS_APPLIES.set(0);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "proc macro\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let id = client.send(
+        &mut daemon,
+        Request::Query { view: ViewRef::Head("/w".into()), rules: String::new() },
+    );
+    let got = client.wait(&mut daemon, id);
+    let stall = got.iter().find_map(|it| match it {
+        // clone: a test's record
+        Response::Error(error) if error.what.starts_with("blaze stalled") => Some(error.what.clone()),
+        _ => None,
+    });
+    let read = EDITED.with(|it| it.take());
+    let ended = match stall {
+        Some(stall) => Err(stall),
+        None => {
+            assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: {got:#?}");
+            Ok(read)
+        }
+    };
+    (LOOP_APPLIES.get(), FRAMELESS_APPLIES.get(), ended)
+}
+
+/// A job that reads its view's front end unbuilt (a query, an edit, a reach) first builds the
+/// proc macros and build scripts that front end applies, and their writes are applied on a
+/// write's task, in a frame, never on the loop. Until 2026-11-13 the last of them was applied
+/// on the loop as the build ended (`Jobs::applied`), where serving a dependency's record that
+/// is read, not mapped, asks for the running task's frame and the daemon panicked
+/// (`frame::current outside any frame::task`, deps.rs). The control is this test with
+/// `Jobs::units_applied`'s send of a waiting write removed: seeds 12, 21 and 26 then apply
+/// on the loop, in no frame.
+///
+/// Seeds 2 and 13 stall, with or without this fix, and are pinned here so the pin fails the
+/// day they stop: the job's reading tasks held while its write waits (`Build::held`) are
+/// Running to the plane, so they hold its threads (2 in these tests), and the write's own task
+/// is admitted by threads like any other, so it never starts (the stall's line `2 tasks held,
+/// applying on node 21`). `a_reach_builds_its_views_proc_macros_and_build_scripts_before_it_reads_them`
+/// fails on the same stall at this commit's base. A stalled seed still applies nothing on the
+/// loop.
+#[test]
+fn a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds() {
+    let mut stalled = Vec::new(); // alloc: a test's record
+    for seed in 0..32 {
+        let (on_loop, frameless, ended) = query_applies(seed);
+        assert_eq!(on_loop, 0, "seed {seed}: an apply ran on the loop");
+        assert_eq!(frameless, 0, "seed {seed}: an apply ran in no frame");
+        match ended {
+            Ok(read) => assert_eq!(
+                read,
+                vec![vec![3]],
+                "seed {seed}: the query read the build script's run applied"
+            ),
+            Err(stall) => {
+                assert!(stall.contains("tasks held"), "seed {seed}: another stall: {stall}");
+                stalled.push(seed);
+            }
+        }
+    }
+    assert_eq!(stalled, vec![2, 13], "the seeds whose held tasks fill every thread");
 }
 
 #[test]
