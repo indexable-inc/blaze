@@ -41,7 +41,7 @@ use blaze_sim::{Broke, Config, Tape};
 
 use super::{
     Awaits, Lock, LockGuard, LockWait, Mode, Probe, Queued, graph, set_thread_mark,
-    stall::{self, Blocked, Snapshot, Stall},
+    stall::{self, Blocked, Snapshot, Stall, WaitRow},
 };
 use crate::{
     Driver,
@@ -703,6 +703,89 @@ fn a_stalled_holder_with_waiters(tape: &Tape) {
     }
     assert_eq!(probe.began.load(Ordering::Relaxed), n);
     assert_eq!(probe.ended.load(Ordering::Relaxed), n);
+}
+
+const ORDER: &str = "dst.stall.order";
+
+/// One snapshot's rows, built by hand and in no registry: the head ([`HEAD`], itself in IO)
+/// holds [`ORDER`] with three waiters behind it, 2 and 3 queued at the same instant and before
+/// 1; and threads 20 and 21 each wait on a lock the other holds.
+fn order_rows() -> Vec<WaitRow> {
+    let lock = |name: &'static str, at: usize| Blocked::Lock { name, mode: Mode::Lock, at };
+    let row = |thread: u64, since_ns: u64, on: Blocked, holder: Option<u64>| WaitRow {
+        thread,
+        span: span_of(thread),
+        since_ns,
+        deadline_ns: None,
+        on,
+        holder,
+        site: None,
+    };
+    vec![
+        row(HEAD, 1, Blocked::Wait("dst.stall.order.io"), None),
+        row(1, 9, lock(ORDER, 0x1000), Some(HEAD)),
+        row(2, 5, lock(ORDER, 0x1000), Some(HEAD)),
+        row(3, 5, lock(ORDER, 0x1000), Some(HEAD)),
+        row(20, 7, lock("dst.stall.order.b", 0x3000), Some(21)),
+        row(21, 8, lock("dst.stall.order.a", 0x2000), Some(20)),
+    ] // alloc: a test's rows
+}
+
+/// The invariant: analyze's answer is the same for every order of the snapshot's rows.
+///
+/// The rows in a drawn order give what they give sorted by thread, and that answer is the
+/// deadlock from its least thread, then the convoy whose oldest is thread 2, the lesser of the
+/// two queued at the same instant.
+#[test]
+fn analyze_is_the_same_for_every_order_of_the_rows() {
+    blaze_sim::check(Config::cases(100), |tape| {
+        let (now, threshold) = (1_000, 100);
+        let mut sorted = order_rows();
+        sorted.sort_unstable_by_key(|row| row.thread);
+        let mut drawn = sorted.clone(); // alloc: a test's rows
+        tape.shuffle(&mut drawn, "row order");
+        let want = stall::analyze(&Snapshot { waits: sorted }, now, threshold);
+        let got = stall::analyze(&Snapshot { waits: drawn.clone() }, now, threshold);
+        assert_eq!(got, want, "rows in the order {drawn:?}");
+        let [Stall::Deadlock { cycle }, convoy] = want.as_slice() else {
+            panic!("not one deadlock, then one stall: {want:?}");
+        };
+        let Stall::Convoy { head, head_wait, holds, waiters, oldest } = convoy else {
+            panic!("not a convoy after the deadlock: {want:?}");
+        };
+        // alloc: a test's check
+        let threads: Vec<u64> = cycle.iter().map(|it| it.thread).collect();
+        assert_eq!(threads, [20, 21], "{cycle:?}");
+        assert_eq!((*head, *waiters, oldest.thread), (HEAD, 3, 2), "{want:?}");
+        assert_eq!(head_wait.map(|it| it.thread), Some(HEAD), "{want:?}");
+        assert!(matches!(holds, Blocked::Lock { name: ORDER, .. }), "{holds:?}");
+    });
+}
+
+/// The old rule, kept for the control: over the rows as given, a row replaces the oldest only
+/// when its `since_ns` is strictly less, so a tie goes to whichever row comes first.
+fn oldest_in_row_order(rows: &[WaitRow]) -> u64 {
+    let mut oldest = rows[0];
+    for row in &rows[1..] {
+        if row.since_ns < oldest.since_ns {
+            oldest = *row;
+        }
+    }
+    oldest.thread
+}
+
+/// The control for [`analyze_is_the_same_for_every_order_of_the_rows`]: the old rule names a
+/// different oldest for two orders of the same waiters, so that test's comparison catches it.
+#[test]
+fn the_oracle_catches_an_oldest_that_follows_the_row_order() {
+    // alloc: a test's rows
+    let waiters: Vec<WaitRow> =
+        order_rows().into_iter().filter(|row| row.holder == Some(HEAD)).collect();
+    let mut reversed = waiters.clone(); // alloc: a test's rows
+    reversed.reverse();
+    let (forward, backward) = (oldest_in_row_order(&waiters), oldest_in_row_order(&reversed));
+    assert_ne!(forward, backward, "the old rule named thread {forward} for both orders");
+    assert_eq!((forward, backward), (2, 3));
 }
 
 const HEALTHY: &str = "dst.graph.healthy";
