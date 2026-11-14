@@ -668,17 +668,71 @@ fn case(tape: &Tape) -> Case {
 /// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_place_gives_its_values_bytes_whole_through_any_crash() {
-    blaze_sim::check(SimConfig::cases(96), |tape| {
-        let case = case(tape);
-        match forced(&case, PlacePlant::None) {
-            Err(why) => panic!("{case:?}: {why}"),
-            Ok(0) => {}
-            Ok(forced) => panic!(
-                "{case:?}: its clones forced {forced} bytes out of their sources: a file was \
-                 cloned from before its write-back completed"
-            ),
+    blaze_sim::check(SimConfig::cases(96), gives_its_values_bytes_whole);
+}
+
+/// The property's body: a drawn case, run with no bug planted. The reason comes first and the
+/// case after it, so a report cut short still says why.
+fn gives_its_values_bytes_whole(tape: &Tape) {
+    let case = case(tape);
+    match forced(&case, PlacePlant::None) {
+        Err(why) => panic!("{why}\ncase: {case:?}"),
+        Ok(0) => {}
+        Ok(forced) => panic!(
+            "its clones forced {forced} bytes out of their sources: a file was cloned from \
+             before its write-back completed\ncase: {case:?}"
+        ),
+    }
+}
+
+/// The case the search found (seed 31 of the property, shrunk): an output, then a value derived
+/// from it and one derived from that, and a place of the last. Before 2026-11-13 the place made
+/// the output's whole file to derive the middle value's from and named it nowhere, so it was
+/// left in `placed/` with no path's value placed from it.
+#[test]
+fn a_place_gives_its_values_bytes_whole_in_the_found_case() {
+    gives_its_values_bytes_whole(&Tape::replay(&[
+        0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,
+        1, 6, 0, 1, 2, 0, 6, 0, 0, 0, 1, 2, 3, 6, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 1, 5, 75,
+    ]));
+}
+
+/// A chain of derived values `depth` long over one output, and a place of the last at
+/// `one/build/a`: each value derived from the one before ([`Op::Derived`]'s `base` picks among
+/// the values kept as whole files, which are all of them here).
+fn chain(depth: u8) -> Vec<Op> {
+    let mut ops = vec![whole(6)];
+    for n in 0..depth {
+        ops.push(Op::Derived { base: n, seed: 13 + u64::from(n), ranges: 2, len: Len::Same });
+    }
+    ops.push(place(depth, 0));
+    ops
+}
+
+/// A place of a value derived from a derived value makes each base's whole file down the
+/// chain that is not there (`Store::derive_file`), and names every one of them while it is in
+/// flight, so each goes at its answer: `placed/` then holds only the file the path names
+/// (the oracle `bounded`). Two deep and three deep.
+#[test]
+fn a_place_of_a_value_derived_from_a_derived_value_leaves_no_base_behind() {
+    for depth in [2, 3] {
+        for seed in 0..8 {
+            let case = Case { seed, latency_us: 300, ops: chain(depth) };
+            if let Err(why) = run(&case, PlacePlant::None) {
+                panic!("a chain {depth} deep, seed {seed}: {why}");
+            }
         }
-    });
+    }
+}
+
+/// The planted-bug control: a place of a derived value names only its nearest base's whole
+/// file, as before 2026-11-13, so the output's file it made for the middle value's is left in
+/// `placed/` with nothing naming it, and the bound's oracle says so.
+#[test]
+fn the_oracle_catches_a_deeper_base_left_in_placed() {
+    let (seed, why) = caught(&chain(2), 0..8, PlacePlant::NamesNearestBaseOnly)
+        .expect("the oracle missed a deeper base's whole file left in placed/");
+    assert!(why.contains("is in placed/ and no path's value is placed from it"), "seed {seed}: {why}");
 }
 
 /// A whole output, long enough to be cloned from a whole file.
