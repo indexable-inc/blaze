@@ -374,13 +374,18 @@ atomics and so never tried a park's step between the unpark's swap and its wake;
 for what the theorem does not state, that a park ends by its deadline and promptly after its
 wake on a clock that moves.
 
-Next: the clock below; models that name a thread's program points, so a proof does not copy
-the model's continuations (agents/annoyances/proofs-1113-11.json); a multi-cell structure
-against the weak world. How-to: `agents/howto/H-prove-two-threads.json`.
+A model names its thread's program points (built 2026-11-14): the code after the n-th
+operation of `f` is the definition `f.at_n`, and inside its k-th loop `f.loop_k.at_n`, with
+the loop itself a parameter; a tail two branches share is one definition, and a loop is
+written once. A proof states its points as these names and does not copy the model's
+continuations (the park's proof was ported to them; agents/annoyances/proofs-1113-11.json).
 
-**A clock for the threads world** (to build; it is what the park's simulation test still
-states and the theorem does not: that a park ends by its deadline, and promptly after its
-wake).
+Next: the proofs of the clock's three statements below; a multi-cell structure against the
+weak world. How-to: `agents/howto/H-prove-two-threads.json`.
+
+**A clock for the threads world** (built 2026-11-14, its theorems stated and run, not yet
+proved; it is what the park's simulation test still states and `no_unpark_is_lost` does not:
+that a park ends by its deadline, and promptly after its wake).
 
 - The world gets a clock and a script of readings. `threads::clock(&readings)` installs the
   script before a run; `threads::now()` is one operation: the clock becomes the later of
@@ -400,9 +405,16 @@ wake).
   or sleeps, from every state a schedule reaches. With `no_unpark_is_lost`, (2) and (3) say
   what the simulation test's "promptly" and "by its deadline" say, in steps, and (1) its
   "never before". The test's simulated latencies have no counterpart: a step is a step.
-- Built as the first slice was: the Lean world and its examples by evaluation; the Rust `two`
-  to match; three entries in the translator's table; the theorems stated and run on drawn
-  schedules and readings; the proofs by a port of the park's.
+- Built as the first slice was: the Lean world (`Op.clock`, `Op.now`, `Op.wait_until` in
+  `lean/Blaze/Threads.lean`) and its examples by evaluation (`lean/Blaze/Tests/ThreadsClock.lean`);
+  the Rust `two` to match (`threads::{clock, now, time, wait_until}`, a reading in whole
+  nanoseconds, exact); their entries in the translator's table; the statements
+  (`a_park_keeps_its_deadline` for (1) and (2), `a_park_left_alone_returns_or_sleeps` for (3),
+  in `wait/parking.rs`), run on drawn schedules and readings with a planted kernel for each
+  (one that says a deadline early, one whose wait has no deadline, one that never sleeps).
+  Their proofs (`BlazeCore/Wait/ParkingTime.lean`) are a port of the park's to a kernel and a
+  clock that are operations of the run; until they are checked the park's simulation test
+  stays.
 
 ## Costs
 

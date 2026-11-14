@@ -367,9 +367,10 @@ fn settles<K: Futex + Sync>(
 /// ([`keeps`]). Run on drawn schedules and readings below; not yet proved. Its controls are
 /// `the_oracle_catches_a_deadline_said_early` and
 /// `the_oracle_catches_a_park_asleep_past_its_deadline`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: `#[blaze::theorem]`
-// here, and "(proved: that file)" in the first line above.
+// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: "(proved: that
+// file)" in the first line above.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
 pub(crate) fn a_park_keeps_its_deadline(
     schedule: Vec<Step>,
     readings: Vec<Duration>,
@@ -389,9 +390,10 @@ pub(crate) fn a_park_keeps_its_deadline(
 /// unpark returned) and [`a_park_keeps_its_deadline`] (not asleep past its deadline), that is
 /// the simulation test's "promptly" and "by its deadline", in steps. Run on drawn schedules
 /// below; not yet proved. Its control is `the_oracle_catches_a_park_that_spins`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: `#[blaze::theorem]`
-// here, and "(proved: that file)" in the first line above.
+// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: "(proved: that
+// file)" in the first line above.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
+#[blaze::theorem]
 pub(crate) fn a_park_left_alone_returns_or_sleeps(
     schedule: Vec<Step>,
     readings: Vec<Duration>,
