@@ -160,6 +160,11 @@ thread_local! {
     /// Whether the fakes' tests are a launch of the program at [`APP_AT`] as the code memory's
     /// host starts it ([`Launches`]), on a memory whose file is this key.
     static TESTS_LAUNCH: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    /// Whether a run's compile of the program gives [`RUN_APP`] at [`APP_AT`] in place of
+    /// [`APP`] (another image of the same unit at the same path, as `blaze run`'s launcher's
+    /// program is beside `blaze build`'s live image on aarch64), and a run is a launch of it
+    /// ([`Launches`], on a memory whose file is [`RUN_APP`]'s).
+    static RUN_IMAGE: Cell<bool> = const { Cell::new(false) };
     /// Each launch [`Launches`] made: the key the job's record held for [`APP_AT`], and the
     /// refusal, if it was one.
     static LAUNCHES: RefCell<Vec<(Option<[u8; 32]>, Option<String>)>> = const { RefCell::new(Vec::new()) };
@@ -309,6 +314,9 @@ const SCRIPT_AT: &str = "/w/target/debug/build/app-b/build-script-build";
 
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
+/// The program as a run's compile gives it under [`RUN_IMAGE`]: another image of the same unit,
+/// at [`APP_AT`] too.
+const RUN_APP: &[u8] = b"\x7fELF the program as a run links it\n";
 
 const SIDE: &[u8] = b"\x7fELF the program, under the name with its hash\n";
 const SIDE_AT: &str = "/w/target/debug/deps/app-0123";
@@ -1518,8 +1526,12 @@ impl Front<Fake> for FakeFront {
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
-            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
-            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
+            let app = match RUN_IMAGE.get() && self.kind == JobKind::Run {
+                true => RUN_APP,
+                false => APP,
+            };
+            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", app));
+            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: app.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && SIDE_OUTPUT.get() {
@@ -1681,6 +1693,9 @@ impl Front<Fake> for FakeFront {
         _: &[String],
         _: u64,
     ) -> Result<FakeRuns, ApiError> {
+        if RUN_IMAGE.get() {
+            return Ok(FakeRuns::Launches(Launches { held: run_app_key() }));
+        }
         Ok(FakeRuns::Over(Over(vec![Response::Ran {
             code: Some(0),
             stdout: b"hi\n".to_vec(),
@@ -5639,6 +5654,102 @@ fn the_oracle_catches_an_output_placed_over_its_own_value() {
 /// holds it.
 fn app_key() -> [u8; 32] {
     ContentId::of("blaze serve tests output", APP).0
+}
+
+/// The key the fakes' compile files [`RUN_APP`] under.
+fn run_app_key() -> [u8; 32] {
+    ContentId::of("blaze serve tests output", RUN_APP).0
+}
+
+/// The invariant: two commands whose outputs share a path (a run's image of the program and a
+/// build's, both at [`APP_AT`]): after one placed its value there, the other's next request
+/// places its own again before it answers, and its launch starts that file with that key;
+/// nothing else is placed (one placement of one file each time the command changes). Over
+/// run, build, run, build, test, run, under several seeds.
+#[test]
+fn two_commands_sharing_an_output_path_each_place_their_own_before_answering() {
+    for seed in 320..326 {
+        let steps = alternate(seed, false);
+        for (at, (request, contents, placed, launched)) in steps.iter().enumerate() {
+            let own = image_of(request);
+            assert_eq!(&contents[..], own, "seed {seed}: step {at} ({request}) answered with another's file at {APP_AT}");
+            // The floor: one placement where the command before made the other image, none
+            // where it made this one.
+            if at > 0 {
+                let changed = image_of(steps[at - 1].0) != own;
+                assert_eq!(*placed, usize::from(changed), "seed {seed}: step {at} ({request}) placed {APP_AT} {placed} times");
+            }
+            let key = ContentId::of("blaze serve tests output", own).0;
+            for (with, refused) in launched {
+                assert_eq!((*with, refused.as_deref()), (Some(key), None), "seed {seed}: step {at} ({request})");
+            }
+        }
+    }
+}
+
+/// The planted-bug control: a path with any record taken to hold the job's value
+/// ([`super::job::PLANT_VOUCH_ANY_KEY`], a shortcut that vouches without the record's key) is
+/// seen by the oracle: a step answers with the other command's file there.
+#[test]
+fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
+    let steps = alternate(320, true);
+    let caught = steps.iter().any(|(request, contents, _, _)| &contents[..] != image_of(request));
+    assert!(caught, "the planted bug's steps went unseen: {:?}", steps.iter().map(|it| it.0).collect::<Vec<_>>());
+}
+
+/// The image a command's request makes of the program at [`APP_AT`] under [`RUN_IMAGE`].
+fn image_of(request: &str) -> &'static [u8] {
+    match request {
+        "run" => RUN_APP,
+        _ => APP,
+    }
+}
+
+/// One step of [`alternate`]: the request's command, the file at [`APP_AT`] once it answered,
+/// how many times it placed that path, and its launches.
+type Alternated = (&'static str, Vec<u8>, usize, Vec<(Option<[u8; 32]>, Option<String>)>);
+
+/// Run, build, run, build, test, run of one checkout on one daemon, a run's image of the
+/// program another value than a build's or a test's at the same path ([`RUN_IMAGE`]), a test
+/// a launch of the build's image. `plant`: [`super::job::PLANT_VOUCH_ANY_KEY`] after the
+/// first step.
+fn alternate(seed: u64, plant: bool) -> Vec<Alternated> {
+    use super::job::{PLACED_PATHS, PLANT_VOUCH_ANY_KEY};
+    OUTPUT.set(true);
+    RUN_IMAGE.set(true);
+    TESTS_LAUNCH.set(Some(app_key()));
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let view = || ViewRef::Head("/w".into());
+    let mut out = Vec::new();
+    for (at, request) in ["run", "build", "run", "build", "test", "run"].into_iter().enumerate() {
+        PLACED_PATHS.with_borrow_mut(Vec::clear);
+        LAUNCHES.with_borrow_mut(Vec::clear);
+        PLANT_VOUCH_ANY_KEY.set(plant && at > 0);
+        let asked = match request {
+            "run" => Request::Run { view: view(), targets: agent(), bin: None, args: Vec::new() },
+            "build" => Request::Build { view: view(), targets: agent() },
+            _ => Request::Test { view: view(), targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
+        };
+        let id = client.send(&mut daemon, asked);
+        let got = client.wait(&mut daemon, id);
+        let launched = LAUNCHES.with_borrow_mut(std::mem::take);
+        let started = launched.iter().all(|(_, refused)| refused.is_none());
+        if !plant {
+            assert_eq!(got.last(), Some(&Response::Done { ok: started }), "seed {seed}: {request}: {got:#?}");
+        }
+        let placed = PLACED_PATHS.with_borrow(|it| it.iter().filter(|it| *it == APP_AT).count());
+        out.push((request, daemon.driver().contents(&app), placed, launched));
+    }
+    PLANT_VOUCH_ANY_KEY.set(false);
+    TESTS_LAUNCH.set(None);
+    RUN_IMAGE.set(false);
+    OUTPUT.set(false);
+    out
 }
 
 /// The invariant: an output path has one writer, its job's placement. A job that runs tests

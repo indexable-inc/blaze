@@ -225,8 +225,13 @@ impl DevRuns {
             adopted = false,
         )
         .entered();
+        // The program held under `path` is the path's only while the path holds its file
+        // ([`is_the_paths`]): a job that placed another value there since (a `blaze run`'s
+        // launcher's program over a `blaze build`'s live image, on one path) left it holding
+        // a program that is not at `path`, and the launch is of what is.
         // clone: a count, once per launch, so no guard of the table is held while it writes
-        let loaded = self.programs.pin().get(path).cloned();
+        let loaded =
+            self.programs.pin().get(path).filter(|it| is_the_paths(it.program.file(), placed)).cloned();
         let loaded = match loaded {
             Some(it) => it,
             None => {
@@ -660,6 +665,21 @@ enum Unheld {
     File,
     Adopt(Key),
     Refused,
+}
+
+/// Whether a program held under a path, whose memory's file is `held`, is the program at that
+/// path, which the jobs' record says holds `placed` ([`DevRuns::launch`]). A path holds one
+/// value at a time, and the jobs' placement is its one writer: where the record names another
+/// key, the path holds another job's value (two commands' images of one unit share a path:
+/// `blaze build`'s live image and `blaze run`'s launcher's program on aarch64), and the held
+/// program is not the one to launch; the launch is of what the path holds, as for a path no
+/// program is held under. With no record (`None`) it is the held one, whose start then
+/// refuses naming the path and its key ([`host::StartError::NotPlaced`]).
+///
+/// The invariant (`tests`): a held program is taken for a path only where the record names
+/// its file or nothing.
+fn is_the_paths(held: [u8; 32], placed: Option<[u8; 32]>) -> bool {
+    placed.is_none_or(|placed| placed == held)
 }
 
 /// [`Unheld`] for a file that `reserves` a code memory's arena or not, and `placed`, the key

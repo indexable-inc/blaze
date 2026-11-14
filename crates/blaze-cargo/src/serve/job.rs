@@ -109,6 +109,10 @@ thread_local! {
     /// before launches read the job's record: what starts a program from its path must then
     /// write the file itself.
     pub(super) static PLANT_LAUNCH_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a path with any record is taken to hold the job's value and nothing is
+    /// placed or looked at ([`Jobs::place_now`]), as a shortcut that vouches for a path without
+    /// the record's key would: another command's value at a shared path stays there.
+    pub(super) static PLANT_VOUCH_ANY_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
     /// its message. What a test reads of a table only the history's thread writes.
     pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -8864,6 +8868,10 @@ impl<S: Steps> Jobs<S> {
         let placed = self.paths.placed[path as usize]
             .as_ref()
             .is_some_and(|it| it.key == key && it.executable == executable && it.meta.is_some());
+        #[cfg(test)]
+        if PLANT_VOUCH_ANY_KEY.get() && self.paths.placed[path as usize].as_ref().is_some_and(|it| it.meta.is_some()) {
+            return;
+        }
         if !placed || planted {
             self.place(w, id, path, key, executable);
             return;
