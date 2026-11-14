@@ -249,6 +249,20 @@ theorem step_now_cons {r : Int} {rest : List Int} (hr : w.readings = r :: rest) 
 /-- `time`: the clock, and nothing changes. -/
 theorem step_now_stay : w.step who pick (.now false) = some (⟨w.clock, true⟩, w) := rfl
 
+/-- `now`, whatever the script holds: some reading `c`, which the clock becomes, and the script
+loses its head; nothing else changes. -/
+theorem step_now_move : ∃ c, w.step who pick (.now true) =
+    some (⟨c, true⟩, { w with clock := c, readings := w.readings.tail }) := by
+  cases hr : w.readings with
+  | nil =>
+    refine ⟨w.clock, ?_⟩
+    rw [step_now_nil hr]
+    cases w
+    simp only at hr
+    subst hr
+    rfl
+  | cons r rest => exact ⟨if w.clock < r then r else w.clock, step_now_cons hr⟩
+
 /-! A wait with a deadline. -/
 
 theorem step_wait_until_woken {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
@@ -483,6 +497,68 @@ theorem two_exec {α β : Type} (Inv : Nat → Prog α → Prog β → World →
         simp only [turn, bne_self_eq_false, Bool.false_eq_true, ite_false]
         rw [Prog.exec_op (by decide) hs]
         exact he
+
+/-- `two_exec` for a schedule followed by more: the run of `two (schedule ++ rest)` is the run
+of `two rest` from where `schedule` leaves the threads, in `Inv 0`. -/
+theorem two_exec_append {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop)
+    (first : ∀ n a b w pick, Inv (n + 1) a b w → Advance 1 pick a w (fun a' w' => Inv n a' b w'))
+    (second : ∀ n a b w pick, Inv (n + 1) a b w → Advance 2 pick b w (fun b' w' => Inv n a b' w')) :
+    ∀ (schedule rest : List Step) (a : Prog α) (b : Prog β) (w : World),
+      Inv schedule.length a b w →
+      ∃ a' b' w', Inv 0 a' b' w' ∧ (two (schedule ++ rest) a b).exec w = (two rest a' b').exec w' := by
+  intro schedule rest
+  induction schedule with
+  | nil => intro a b w h; exact ⟨a, b, w, h, rfl⟩
+  | cons step more ih =>
+    intro a b w h
+    simp only [List.length_cons] at h
+    simp only [List.cons_append, two]
+    split
+    · have hb := second more.length a b w step.pick.val.toNat h
+      cases b with
+      | done r => exact ih a (.done r) w hb
+      | op tg k o next =>
+        obtain ⟨rfl, got, w', hs, hP⟩ := hb
+        obtain ⟨a', b', w'', hI, he⟩ := ih _ _ _ hP
+        refine ⟨a', b', w'', hI, ?_⟩
+        simp only [turn, bne_self_eq_false, Bool.false_eq_true, ite_false]
+        rw [Prog.exec_op (by decide) hs]
+        exact he
+    · have ha := first more.length a b w step.pick.val.toNat h
+      cases a with
+      | done r => exact ih (.done r) b w ha
+      | op tg k o next =>
+        obtain ⟨rfl, got, w', hs, hP⟩ := ha
+        obtain ⟨a', b', w'', hI, he⟩ := ih _ _ _ hP
+        refine ⟨a', b', w'', hI, ?_⟩
+        simp only [turn, bne_self_eq_false, Bool.false_eq_true, ite_false]
+        rw [Prog.exec_op (by decide) hs]
+        exact he
+
+/-- The first thread alone for `n` steps, each with the world's `pick`: only its steps need keep
+`Inv`. -/
+theorem two_exec_alone {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop) (pick : U8)
+    (first : ∀ n a b w, Inv (n + 1) a b w →
+      Advance 1 pick.val.toNat a w (fun a' w' => Inv n a' b w')) :
+    ∀ (n : Nat) (a : Prog α) (b : Prog β) (w : World), Inv n a b w →
+      ∃ a' b' w', Inv 0 a' b' w' ∧
+        (two (List.replicate n ⟨false, pick⟩) a b).exec w = (two [] a' b').exec w' := by
+  intro n
+  induction n with
+  | zero => intro a b w h; exact ⟨a, b, w, h, rfl⟩
+  | succ m ih =>
+    intro a b w h
+    have ha := first m a b w h
+    simp only [List.replicate_succ, two, Bool.false_eq_true, ite_false]
+    cases a with
+    | done r => exact ih (.done r) b w ha
+    | op tg k o next =>
+      obtain ⟨rfl, got, w', hs, hP⟩ := ha
+      obtain ⟨a', b', w'', hI, he⟩ := ih _ _ _ hP
+      refine ⟨a', b', w'', hI, ?_⟩
+      simp only [turn, bne_self_eq_false, Bool.false_eq_true, ite_false]
+      rw [Prog.exec_op (by decide) hs]
+      exact he
 
 /-- For every schedule: with `Inv` kept by each thread's step (`first`, `second`) and every end
 in `Inv 0` satisfying `Post` (`last`), the run of `two schedule a b` from `Inv` ends, and how

@@ -387,15 +387,16 @@ pub(crate) fn a_park_keeps_its_deadline(
     keeps(&Timed, &schedule, &readings, deadline)
 }
 
-/// The invariant: a park left alone returns or sleeps. From every state a schedule of a park
-/// and an unpark reaches (the word empty or holding a token, any script of readings, any
-/// deadline), [`ALONE`] more steps of the park with the kernel quiet leave it returned or
-/// asleep ([`settles`]): it does not spin. With [`no_unpark_is_lost`] (not asleep once the
-/// unpark returned) and [`a_park_keeps_its_deadline`] (not asleep past its deadline), that is
-/// the simulation test's "promptly" and "by its deadline", in steps. Run on drawn schedules
-/// below; not yet proved. Its control is `the_oracle_catches_a_park_that_spins`.
-// when its proof (crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean) lands: "(proved: that
-// file)" in the first line above.
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/ParkingTime.lean): a park left
+/// alone returns or sleeps. From every state a schedule of a park and an unpark reaches (the
+/// word empty or holding a token, any script of readings, any deadline), [`ALONE`] more steps
+/// of the park with the kernel quiet leave it returned or asleep ([`settles`]): it does not
+/// spin. The proof's count of the longest such run is six: two compares, the reading, a wait
+/// told at once that its time ran out, the compare after it and the swap it leaves with. With
+/// [`no_unpark_is_lost`] (not asleep once the unpark returned) and
+/// [`a_park_keeps_its_deadline`] (not asleep past its deadline), that is the simulation test's
+/// "promptly" and "by its deadline", in steps. Run on drawn schedules below too. Its control
+/// is `the_oracle_catches_a_park_that_spins`.
 #[cfg_attr(not(test), expect(dead_code, reason = "a theorem function: `blaze prove` reads it"))]
 #[blaze::theorem]
 pub(crate) fn a_park_left_alone_returns_or_sleeps(
