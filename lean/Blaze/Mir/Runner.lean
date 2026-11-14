@@ -91,6 +91,7 @@ def renderError : Error → String
   | Error.arithmetic => "arithmetic"
   | Error.bounds => "bounds"
   | Error.unreachable => "unreachable"
+  | Error.unmodelled => "unmodelled"
 
 def renderUndefined : Undefined → String
   | Undefined.uninit => "uninit"

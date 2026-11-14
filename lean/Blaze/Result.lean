@@ -16,6 +16,9 @@ inductive Error where
   | bounds
   /-- MIR's `Unreachable` was reached. -/
   | unreachable
+  /-- Not a panic of the program: a run the world it was given is not the meaning of
+  (`Blaze.Threads.World.fits`), so nothing is proved of it. -/
+  | unmodelled
   deriving Repr, DecidableEq
 
 inductive Result (α : Type) : Type where

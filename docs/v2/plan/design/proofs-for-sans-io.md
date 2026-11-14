@@ -258,22 +258,62 @@ A proof cannot be blind the way a test can, but a statement can be empty. Each p
 invariant keeps one control: a planted bug and one input on which the theorem function,
 run on the planted core, is `false`. It is a unit test, or a Lean `example` by evaluation.
 
-### 8. Atomics and weak memory
+### 8. Atomics and threads
 
-The same idea one level down. A function that uses atomics is translated into a monad whose
-atomic operations are effects; a memory world (`Atomics`) says which value a load may see,
-and which thread steps is an answer like any other. A theorem about a ring is then "for all
-schedules and all allowed reads".
+A function that touches an atomic is not a function of its arguments: what it does next
+depends on what other threads did to the word meanwhile. So its model is not a `Result` but a
+program (`Blaze.Threads.Prog`, `lean/Blaze/Threads.lean`): a tree that ends with a `Result`,
+or does one operation on what is shared and goes on with the answer. What a thread does
+between two operations is its own and is not a step, which is sound for safe code: nothing
+else of it can be seen by another thread.
 
-- **The world must allow everything the hardware and the compiler do.** RC11 forbids load
-  buffering, which ARM allows for relaxed accesses, so a proof under RC11 says nothing of a
-  `Relaxed` load on the Mac. Sequentially consistent and release-acquire code gets the
-  view-based model; `Relaxed` is refused until the world has promises (the promising
-  semantics).
-- **Stepping only at atomic operations** is sound for safe code, whose other accesses cannot
-  race; unsafe code needs a race check with it.
+- **Operations.** A new cell, a load, a store, a read-modify-write (a swap, a
+  compare-and-swap, weak or not, and every `fetch_*` are each one), a futex wait and a wake.
+- **The world** (`Threads.World`) is what is shared: the cells, and who sleeps in a wait of
+  which. One step is one operation by one thread, with the world's free choice at that step
+  (whether a weak compare-and-swap fails for nothing, whether a sleeper returns for nothing or
+  is told its time ran out, which sleeper a wake takes). A wait compares and goes to sleep in
+  one step, and a wake finds every sleeper.
+- **Two threads.** `blaze_core::world::threads::two(schedule, first, second)` runs two
+  closures as threads, one operation at a time in the order `schedule` gives (each entry: who
+  goes, and the world's pick), and says how each stood when the schedule ended: returned,
+  able to go on, or asleep with no wake coming. It is an ordinary function, so a theorem about
+  two threads is an ordinary theorem function that takes the schedule as an argument; proved
+  for every schedule, it is every interleaving. In Rust `two` runs real threads that hand a
+  baton at each operation, so the theorem's function runs where it is stated, and a drawn
+  schedule is a simulation test of the same statement. In Lean it is `Threads.two`, itself a
+  program.
+- **Lost wakeups are a safety property here.** "The waker returned and the sleeper is asleep
+  with no wake coming" is a state `two` reports, so "no wakeup is lost" is "no schedule ends
+  there".
 
-Not started. The first target is formal-verification.md's (the flight recorder's ring move).
+**Which memory.** The world is sequentially consistent: an operation sees the last value
+written, whatever its `Ordering`. That is what a run means only where its orderings cannot be
+told from `SeqCst`, and the world checks that at every step and refuses the run otherwise
+(`Error.unmodelled`), never reading a weaker ordering as `SeqCst`:
+
+- every operation of the run's threads is `SeqCst`; or
+- the threads touch one cell. Every memory model blaze's targets and Rust have gives the
+  writes to one cell a single order that every thread's reads and writes of it respect, so a
+  run over one cell is a sequentially consistent run. This covers a park, a once, a flag, a
+  counter, a lock word.
+
+What is refused today is what needs the weak world: two or more cells with an ordering
+weaker than `SeqCst` on any (a ring's head and tail). That world is the same `World` with
+views: per cell the messages written, per thread the newest it has seen of each, the world's
+pick choosing which a load reads; release and acquire carry views, `SeqCst` a global one.
+Without promises it forbids load buffering, which ARM allows for plain loads and stores, so
+`Relaxed` on more than one cell stays refused until the world has promises.
+
+**Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
+sleeper; that blaze compiles each atomic operation to one whose effect is its `Ordering`'s
+or stronger; that safe code shares nothing but atomics.
+
+Built: the Lean library, on 2026-11-14. Next in order: the translator (a function that
+reaches an atomic operation is emitted as a `Prog`), the Rust `two`, then the first proof,
+the park (`wait/parking.rs`: one word and its futex), whose simulation test runs an unpark
+whole between two of the park's atomics and so never tried a park's step between the
+unpark's swap and its wake.
 
 ## Costs
 
