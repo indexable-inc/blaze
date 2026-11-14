@@ -162,7 +162,8 @@ impl From<WaitError> for io::Error {
 /// stopped (or a `once` that never waits) reaches it.
 pub(crate) const FUEL: u32 = 1 << 16;
 
-/// A safeguard of the loop the DST removes, to see that it catches the removal.
+/// A safeguard of the loop a theorem's control removes, to see that the theorem's function
+/// catches the removal.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Plant {

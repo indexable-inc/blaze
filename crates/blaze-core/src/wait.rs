@@ -43,8 +43,6 @@ mod parking;
 mod reaping;
 mod retry;
 
-#[cfg(test)]
-pub(crate) use self::retry::Plant;
 pub use self::{
     choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
     retry::{Clock, Deadline, Once, WaitError, Waited},

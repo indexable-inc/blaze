@@ -1,27 +1,16 @@
-//! The deadline wait under a simulated kernel (`testing` skill, dst-not-review): one test draws,
-//! from its case's tape, a sequence of waits (a deadline or none, and when the awaited event arrives: before,
-//! at or after the deadline, or never), and a swarm of kernel faults (an EINTR at random, a
-//! train of them at a fixed period as the profile's sampler sent, spurious wakeups, a timeout
-//! returned early, and each call's latency), runs the real retry loop ([`retry::drive`])
-//! against a kernel on a virtual clock, which draws which call a fault hits, where, and each
-//! call's latency from the same tape, and checks at every wait:
+//! The blocking wait's parts that share state between threads or with the kernel, under
+//! simulated kernels (`testing` skill, dst-not-review).
 //!
-//! - it ends by its deadline: the clock at its return is at most the deadline plus one call's
-//!   latency;
-//! - it never says [`Waited::Deadline`] before the deadline;
-//! - it says [`Waited::Ready`] whenever the event arrived first: by the deadline less one
-//!   call's latency (a call interrupted just before the deadline may return past it with the
-//!   event arriving meanwhile, which is a deadline, not a lost event), and always for a wait
-//!   with no deadline.
-//!
-//! A wait with no deadline is drawn only with an event that arrives: one that never came would
-//! wait forever, as it should. The fuel that ends a wait whose clock does not move has its own
-//! test, [`a_clock_that_does_not_move_ends_the_wait`].
-//!
-//! The planted bug ([`Plant::SameTimeout`]) gives every call the time left at the first, as
-//! `Ring::enter` did on 0.20261105.0; [`the_oracle_catches_a_retry_with_the_first_timeout`]
-//! must find a case it breaks. Then [`Sim`] waits through the same loop under its own
-//! interruptions ([`a_sim_under_interruption_delivers_everything_by_each_deadline`]).
+//! The retry loop itself has no simulation test: that every wait ends by its deadline, never
+//! says it passed before it did, and is ready whenever its event came first, whatever
+//! interrupts it, is proved in Lean of the real loop against every run of answers the
+//! blocking call's world allows (`retry::a_wait_ends_by_its_deadline`,
+//! `crates/blaze-core/lean/BlazeCore/Wait/Retry.lean`; the world is
+//! `crate::world::blocking`), with the planted first-timeout bug as that theorem's control.
+//! Here stay the loop's two edges as examples ([`a_clock_that_does_not_move_ends_the_wait`],
+//! [`a_passed_deadline_makes_exactly_one_call`]), and [`Sim`] waiting through the same loop
+//! under its own interruptions
+//! ([`a_sim_under_interruption_delivers_everything_by_each_deadline`]).
 //!
 //! The park ([`parking`], a pool worker's idle wait, a futex on its thread's ring on Linux):
 //! a simulated futex on the virtual clock runs a drawn unpark between any two of the park's
@@ -62,10 +51,10 @@ use blaze_sim::{Broke, Config, Tape};
 #[cfg(target_os = "linux")]
 use super::direct::{ChildCalls, Direct, FutexCalls};
 use super::{
-    Clock, Deadline, Once, Plant, WaitError, Waited,
+    Clock, Deadline, Once, WaitError, Waited,
     parking::{self, Futex, ParkPlant},
     reaping::{self, Children, ReapPlant},
-    retry::{self, FUEL, Retry},
+    retry::FUEL,
     until,
 };
 use crate::{
@@ -103,45 +92,7 @@ impl Clock for Virtual<'_> {
     }
 }
 
-// --- The plan ------------------------------------------------------------------------------
-
-/// The kernel's faults a case turns on: a swarm, so a rare class is not drowned by a common one.
-#[derive(Debug, Clone, Copy)]
-struct KernelFaults {
-    /// A call is interrupted at a random point of its wait once in this many (0: never).
-    eintr_one_in: u64,
-    /// An EINTR at every multiple of `period` past `phase`, on the absolute clock: the
-    /// sampler's signal train.
-    train: Option<(Duration, Duration)>,
-    /// A call wakes with nothing once in this many (0: never).
-    spurious_one_in: u64,
-    /// A timeout ends early once in this many (0: never).
-    early_one_in: u64,
-    /// Each call returns up to this long after it ended, and at least a nanosecond.
-    max_latency: Duration,
-}
-
-impl KernelFaults {
-    /// The longest one call's return can take.
-    fn latency_bound(&self) -> Duration {
-        self.max_latency + Duration::from_nanos(1)
-    }
-}
-
-/// One wait: its deadline and when its event arrives, both after the wait begins.
-#[derive(Debug, Clone, Copy)]
-struct Wait {
-    deadline: Option<Duration>,
-    event: Option<Duration>,
-}
-
-/// The kernel's choices (which call a fault hits, where, and each call's latency) are drawn
-/// from the case's tape as the run goes.
-#[derive(Debug)]
-struct Plan {
-    faults: KernelFaults,
-    waits: Vec<Wait>,
-}
+// --- What the plans draw with ---------------------------------------------------------
 
 fn us(n: u64) -> Duration {
     Duration::from_micros(n)
@@ -155,177 +106,7 @@ fn sometimes(tape: &Tape, label: &'static str) -> u64 {
     }
 }
 
-fn plan(tape: &Tape) -> Plan {
-    let eintr_one_in = sometimes(tape, "eintr one in");
-    let spurious_one_in = sometimes(tape, "spurious one in");
-    let early_one_in = sometimes(tape, "early one in");
-    // The sampler's shape: a period of 1 to 30 ms against waits of up to 200 ms.
-    let train = match tape.coin("a train of eintr") {
-        false => None,
-        true => {
-            let period = us(tape.int_in(1_000..=30_000u64, "train period us"));
-            Some((period, us(tape.int_in(0..=period.as_micros() as u64, "train phase us"))))
-        }
-    };
-    let max_latency = match tape.coin("latency") {
-        false => Duration::ZERO,
-        true => us(tape.int_in(0..=2_000u64, "max latency us")),
-    };
-    let faults = KernelFaults { eintr_one_in, train, spurious_one_in, early_one_in, max_latency };
-    let n = tape.int_in(1..=MOST_WAITS, "waits");
-    let waits = (0..n)
-        .map(|_| {
-            let deadline = match tape.int_in(0..=5u64, "deadline kind") {
-                0 => None,
-                _ => Some(us(tape.int_in(0..=200_000u64, "deadline us"))),
-            };
-            let event = match deadline {
-                None => Some(us(tape.int_in(0..=500_000u64, "event us"))),
-                Some(deadline) => match tape.int_in(0..=3u64, "event kind") {
-                    0 => Some(us(tape.int_in(0..=deadline.as_micros() as u64, "event us"))),
-                    1 => Some(deadline),
-                    2 => Some(deadline + us(tape.int_in(1..=100_000u64, "event after us"))),
-                    _ => None,
-                },
-            };
-            Wait { deadline, event }
-        })
-        .collect(); // alloc: a test's plan
-    Plan { faults, waits }
-}
-
-// --- The simulated kernel ------------------------------------------------------------------
-
-/// A point drawn from `tape` in `[from, to)`, or `None` (and no draw) where that is empty.
-fn within(tape: &Tape, from: Duration, to: Duration, label: &'static str) -> Option<Duration> {
-    let span = to.saturating_sub(from).as_nanos() as u64;
-    (span > 0).then(|| from + Duration::from_nanos(tape.below(span, label)))
-}
-
-/// One blocking call at the clock's now, given `left` (`None`: no limit), for an event at
-/// `event`: it blocks until the event or its timeout, unless a fault drawn from `tape` ends it
-/// first, and returns a drawn latency after.
-fn call(
-    now: &Cell<Duration>,
-    tape: &Tape,
-    faults: &KernelFaults,
-    event: Option<Duration>,
-    left: Option<Duration>,
-) -> io::Result<Once<()>> {
-    let t0 = now.get();
-    let latency = Duration::from_nanos(1 + tape.below(faults.max_latency.as_nanos() as u64 + 1, "latency ns"));
-    if event.is_some_and(|it| it <= t0) {
-        now.set(t0 + latency);
-        return Ok(Once::Ready(()));
-    }
-    let timeout = left.map(|it| t0.saturating_add(it));
-    let wake = match (event, timeout) {
-        (Some(event), Some(timeout)) => event.min(timeout),
-        (event, timeout) => event.or(timeout).ok_or_else(|| {
-            io::Error::other("a wait with no deadline and no event: the plan drew one")
-        })?,
-    };
-    let mut end = match event.is_some_and(|it| it <= wake) {
-        true => (wake, Once::Ready(())),
-        false => (wake, Once::TimedOut),
-    };
-    if let Some((period, phase)) = faults.train {
-        let (period, phase) = (period.as_nanos(), phase.as_nanos());
-        let t = t0.as_nanos();
-        let tick = match t < phase {
-            true => phase,
-            false => phase + period * ((t - phase) / period + 1),
-        };
-        let tick = Duration::from_nanos(tick as u64);
-        if tick < end.0 {
-            end = (tick, Once::Interrupted);
-        }
-    }
-    if tape.one_in(faults.eintr_one_in, "eintr")
-        && let Some(at) = within(tape, t0, end.0, "eintr at")
-    {
-        end = (at, Once::Interrupted);
-    }
-    if tape.one_in(faults.spurious_one_in, "spurious")
-        && let Some(at) = within(tape, t0, end.0, "spurious at")
-    {
-        end = (at, Once::Spurious);
-    }
-    if tape.one_in(faults.early_one_in, "early timeout")
-        && end.1 == Once::TimedOut
-        && let Some(at) = within(tape, t0, end.0, "early timeout at")
-    {
-        end = (at, Once::TimedOut);
-    }
-    now.set(end.0 + latency);
-    Ok(end.1)
-}
-
-// --- A run and its oracle ------------------------------------------------------------------
-
-/// `plan`'s waits one after another on one clock, with `plant`, the kernel drawing from
-/// `tape`: the first broken rule.
-fn run(tape: &Tape, plan: &Plan, plant: Plant) -> Result<(), String> {
-    let now = Cell::new(Duration::ZERO);
-    let clock = Virtual(&now);
-    let faults = plan.faults;
-    let bound = faults.latency_bound();
-    for (n, wait) in plan.waits.iter().enumerate() {
-        let start = now.get();
-        let deadline = wait.deadline.map(|it| Deadline::after(start, it));
-        let event = wait.event.map(|it| start + it);
-        let retry = Retry::new("a simulated event", deadline, start).planted(plant);
-        let waited = retry::drive(retry, &mut (&clock, |left| call(&now, tape, &faults, event, left)));
-        let end = now.get();
-        let waited = waited.map_err(|error| format!("wait {n}: {error}"))?;
-        let said = |what: &str| {
-            format!(
-                "wait {n} (began {start:?}, deadline {deadline:?}, event {event:?}) said \
-                 {waited:?} at {end:?}: {what}"
-            )
-        };
-        let Some(deadline) = deadline else {
-            if waited != Waited::Ready(()) {
-                return Err(said("a wait with no deadline ends only when its event comes"));
-            }
-            continue;
-        };
-        if end > deadline.get() + bound {
-            return Err(said(&format!("past its deadline by more than one call's {bound:?}")));
-        }
-        if waited == Waited::Deadline && end < deadline.get() {
-            return Err(said("its deadline had not passed"));
-        }
-        if waited == Waited::Deadline && event.is_some_and(|it| it + bound <= deadline.get()) {
-            return Err(said("the event came before the deadline"));
-        }
-    }
-    Ok(())
-}
-
-// --- The tests -----------------------------------------------------------------------------
-
-/// The invariant: whatever interrupts it, every wait ends by its deadline, never says it
-/// passed before it did, and is ready whenever its event came first.
-#[test]
-fn every_wait_ends_by_its_deadline_under_interruption() {
-    blaze_sim::check(Config::cases(400), |tape| drawn_run(tape, Plant::None));
-}
-
-/// The case of `tape`: its plan drawn, noted for the report, and run with `plant`.
-fn drawn_run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let plan = plan(tape);
-    tape.note(format_args!("plan {plan:?}"));
-    run(tape, &plan, plant).map_err(Broke::Oracle)
-}
-
-/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] cases (test-the-cause on the
-/// test itself): a retry with the first relative timeout overruns a deadline under a train of
-/// interruptions.
-#[test]
-fn the_oracle_catches_a_retry_with_the_first_timeout() {
-    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::SameTimeout, "past its deadline", drawn_run);
-}
+// --- The loop on its edges --------------------------------------------------------------
 
 /// A wait whose clock never moves ends with an error naming it once its fuel is spent, not a
 /// spin (bounded-progress).
