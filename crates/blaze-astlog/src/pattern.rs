@@ -231,6 +231,53 @@ fn def_path(path: ast::Node<'_>) -> Option<String> {
     Some(segments.join("::"))
 }
 
+/// The most non-trivia tokens a pattern or a template may have. The front end's parser
+/// recurses with the text's nesting: on a 2 MiB thread (a test thread, a tokio worker) a
+/// debug build overflows on `V<V<..u8..>>` at about 1900 levels, 5700 tokens, while 127000
+/// nested `-` or `{` parse. 2048 tokens of the worst shape stay under 700 levels.
+const MAX_TOKENS: usize = 2048;
+
+/// The deepest a pattern may make the matcher recurse ([`recursion_depth`]). On a 2 MiB
+/// thread a debug build overflows between depth 690 and 710 for each of 28 nesting shapes
+/// measured (parens, calls, blocks, `if`/`else`, generic arguments, refs, closures and
+/// others), so 128 leaves the caller over 1.5 MiB.
+const MAX_DEPTH: usize = 128;
+
+/// The non-trivia tokens `text` lexes as.
+fn token_count(text: &str) -> usize {
+    let lexed = syntax::LexedStr::new(Edition::CURRENT, text);
+    (0..lexed.len()).filter(|&at| !lexed.kind(at).is_trivia()).count()
+}
+
+/// The refusal of a text with more than [`MAX_TOKENS`] tokens.
+pub(crate) fn too_many_tokens(text: &str) -> Option<String> {
+    let tokens = token_count(text);
+    (tokens > MAX_TOKENS).then(|| {
+        format!("has {tokens} tokens, and the parser takes at most {MAX_TOKENS}: split it into smaller rules")
+    })
+}
+
+/// How deep [`Cx::node`] recurses to match the pattern under `root`: one frame pair a level
+/// down the tree, and one more for each run metavariable before a node among its siblings,
+/// since each run backtracks in a frame of its own.
+fn recursion_depth(root: ast::Node<'_>, marks: &HashMap<NodeId, Mark, Global>, vars: &[Var]) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(root, 1)]; // alloc: one pattern's open nodes, once a load
+    while let Some((node, depth)) = stack.pop() {
+        deepest = deepest.max(depth);
+        let mut runs = 0;
+        for child in node.children() {
+            stack.push((child, depth + 1 + runs));
+            if let Some(Mark::Var(var)) = marks.get(&child.id())
+                && vars[*var].many
+            {
+                runs += 1;
+            }
+        }
+    }
+    deepest
+}
+
 fn placeholder_in(text: &str) -> bool {
     text.contains(ONE) || text.contains(MANY)
 }
@@ -243,13 +290,16 @@ impl Pattern {
     /// A pattern that is not that form of Rust, holds a stray `$`, or is nothing but one
     /// metavariable.
     pub fn parse(form: Form, text: &str, line: usize) -> Result<Pattern, Error> {
+        let shape = |message: String| -> Error {
+            PatternShapeSnafu { line, form: form.name(), text, message }.build().into()
+        };
+        if let Some(message) = too_many_tokens(text) {
+            return Err(shape(message));
+        }
         let (body, vars) = placeholders(text.trim(), form, line)?;
         let (before, after) = form.wrap();
         let source = format!("{before}{body}{after}");
         let parse = SourceFile::parse(&source, Edition::CURRENT);
-        let shape = |message: String| -> Error {
-            PatternShapeSnafu { line, form: form.name(), text, message }.build().into()
-        };
         if let Some(error) = parse.errors_with_bodies().first() {
             return PatternParseSnafu { line, form: form.name(), text, error: error.to_string() }
                 .fail()
@@ -317,6 +367,13 @@ impl Pattern {
                     }
                 }
             }
+        }
+        let depth = recursion_depth(root, &marks, &vars);
+        if depth > MAX_DEPTH {
+            return Err(shape(format!(
+                "nests {depth} levels deep, and the matcher takes at most {MAX_DEPTH}: write an inner part \
+                 as `$x` and match `x` with a pattern of its own"
+            )));
         }
         let tree = |parse: &Parse<SourceFile>| -> Vec<SyntaxKind> {
             // alloc: one pattern's kinds, once an edition a load
@@ -448,51 +505,56 @@ impl<'t> Cx<'_, '_, 't> {
         self.seq(target, &want, &have, bound)
     }
 
+    /// `want` against `have`, sibling by sibling. Siblings are a loop and only a run
+    /// metavariable recurses, so the stack grows with the pattern's
+    /// [`recursion_depth`], never with a sibling list's length.
     fn seq(
         &mut self,
         parent: ast::Node<'t>,
-        want: &[ast::Element<'_>],
-        have: &[ast::Element<'t>],
+        mut want: &[ast::Element<'_>],
+        mut have: &[ast::Element<'t>],
         bound: &mut Bindings<'t>,
     ) -> Result<bool, Error> {
-        let Some((first, rest)) = want.split_first() else { return Ok(have.is_empty()) };
-        if let syntax::NodeOrToken::Node(node) = first
-            && let Some(Mark::Var(var)) = self.pattern.marks.get(&node.id()).copied()
-            && self.pattern.vars[var].many
-        {
-            for take in 0..=have.len() {
-                let range = match (have.first(), take) {
-                    (Some(start), 1..) => {
-                        TextRange::new(start.text_range().start(), have[take - 1].text_range().end())
+        loop {
+            let Some((first, rest)) = want.split_first() else { return Ok(have.is_empty()) };
+            if let syntax::NodeOrToken::Node(node) = first
+                && let Some(Mark::Var(var)) = self.pattern.marks.get(&node.id()).copied()
+                && self.pattern.vars[var].many
+            {
+                for take in 0..=have.len() {
+                    let range = match (have.first(), take) {
+                        (Some(start), 1..) => {
+                            TextRange::new(start.text_range().start(), have[take - 1].text_range().end())
+                        }
+                        _ => TextRange::empty(
+                            have.first().map_or(parent.text_range().end(), |it| it.text_range().start()),
+                        ),
+                    };
+                    let mut tried = bound.clone(); // clone: one branch of a run's backtracking
+                    if self.bind(var, Bound::Run(parent, range), &mut tried)
+                        && self.seq(parent, rest, &have[take..], &mut tried)?
+                    {
+                        *bound = tried;
+                        return Ok(true);
                     }
-                    _ => TextRange::empty(
-                        have.first().map_or(parent.text_range().end(), |it| it.text_range().start()),
-                    ),
-                };
-                let mut tried = bound.clone(); // clone: one branch of a run's backtracking
-                if self.bind(var, Bound::Run(parent, range), &mut tried)
-                    && self.seq(parent, rest, &have[take..], &mut tried)?
-                {
-                    *bound = tried;
-                    return Ok(true);
                 }
+                return Ok(false);
             }
-            return Ok(false);
+            let Some((next, left)) = have.split_first() else { return Ok(false) };
+            let matched = match (first, next) {
+                (syntax::NodeOrToken::Node(want), syntax::NodeOrToken::Node(have)) => {
+                    self.node(*want, *have, bound)?
+                }
+                (syntax::NodeOrToken::Token(want), syntax::NodeOrToken::Token(have)) => {
+                    want.kind() == have.kind() && want.text() == have.text()
+                }
+                _ => false,
+            };
+            if !matched {
+                return Ok(false);
+            }
+            (want, have) = (rest, left);
         }
-        let Some((next, left)) = have.split_first() else { return Ok(false) };
-        let matched = match (first, next) {
-            (syntax::NodeOrToken::Node(want), syntax::NodeOrToken::Node(have)) => {
-                self.node(*want, *have, bound)?
-            }
-            (syntax::NodeOrToken::Token(want), syntax::NodeOrToken::Token(have)) => {
-                want.kind() == have.kind() && want.text() == have.text()
-            }
-            _ => false,
-        };
-        if !matched {
-            return Ok(false);
-        }
-        self.seq(parent, rest, left, bound)
     }
 }
 

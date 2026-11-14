@@ -216,3 +216,72 @@ fn without_negation_the_called_functions_come_back() {
     let outcome = query(&db, &files, CALL_RULES).unwrap();
     assert_eq!(texts(&outcome, "fns").len(), 8, "every fn, called or not");
 }
+
+/// A test thread's and a tokio worker's stack.
+const SMALL_STACK: usize = 2 << 20;
+
+/// Whether the `form` pattern `text` matches the same text as code, matched on a thread with a
+/// [`SMALL_STACK`]. A stack overflow aborts the test binary.
+fn matches_itself_on_a_small_stack(form: crate::pattern::Form, text: String) -> bool {
+    let code = match form {
+        crate::pattern::Form::Type => format!("type T = {text};"),
+        _ => format!("const C: () = {text};"),
+    };
+    std::thread::Builder::new()
+        .stack_size(SMALL_STACK)
+        .spawn(move || {
+            let pattern = crate::pattern::Pattern::parse(form, &text, 1).unwrap();
+            let file = syntax::SourceFile::parse(&code, syntax::Edition::CURRENT);
+            let target = file
+                .root()
+                .descendants()
+                .find(|it| it.kind() == pattern.root_kind && it.text() == text)
+                .expect("the pattern's text as code");
+            let mut resolves = |_: usize, _: syntax::view::Node<'_>| -> Result<bool, crate::Error> { Ok(false) };
+            pattern.matches(target, &mut resolves).unwrap().is_some()
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn the_deepest_pattern_the_cap_admits_matches_on_a_small_stack_and_one_deeper_is_refused() {
+    use crate::pattern::Form;
+    // The shapes that nest deepest per token, measured: generic arguments, calls, blocks,
+    // `else if`.
+    let shapes: [(Form, fn(usize) -> String); 4] = [
+        (Form::Type, |n| format!("{}u8{}", "V<".repeat(n), ">".repeat(n))),
+        (Form::Expr, |n| format!("{}1{}", "f(".repeat(n), ")".repeat(n))),
+        (Form::Expr, |n| format!("{}1{}", "{".repeat(n), "}".repeat(n))),
+        (Form::Expr, |n| format!("{}{{}}", "if a {} else ".repeat(n))),
+    ];
+    for (form, shape) in shapes {
+        let deepest = (1..1000)
+            .take_while(|n| crate::pattern::Pattern::parse(form, &shape(*n), 1).is_ok())
+            .last()
+            .expect("one level is admitted");
+        let error = crate::pattern::Pattern::parse(form, &shape(deepest + 1), 1).unwrap_err().to_string();
+        assert!(error.starts_with("rules:1:") && error.contains("levels deep"), "{error}");
+        assert!(matches_itself_on_a_small_stack(form, shape(deepest)), "{}", shape(deepest));
+    }
+}
+
+#[test]
+fn a_long_list_of_siblings_matches_on_a_small_stack() {
+    // 1000 arguments, 2002 tokens: one stack frame a sibling overflowed at about 590.
+    let call = format!("f({}1)", "1, ".repeat(999));
+    assert!(matches_itself_on_a_small_stack(crate::pattern::Form::Expr, call));
+}
+
+#[test]
+fn a_pattern_past_the_token_cap_is_refused_naming_its_rule() {
+    let (db, files) = view(CALLS, 0, &["lib.rs"]);
+    // 1024 arguments: 2050 tokens, two past the cap.
+    let rules = format!("(rule (big e) (expr e \"f({}1)\"))", "1, ".repeat(1023));
+    let error = match query(&db, &files, &rules) {
+        Ok(_) => panic!("a pattern of 2050 tokens loaded"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.starts_with("rules:1:") && error.contains("has 2050 tokens"), "{error}");
+}

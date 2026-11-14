@@ -164,6 +164,19 @@ fn a_template_that_is_no_expression_where_it_replaces_one_is_refused_naming_its_
 }
 
 #[test]
+fn a_template_past_the_token_cap_is_refused_naming_its_rule() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `old($x, ` and 1023 more arguments: 2050 tokens.
+    let rules = format!(
+        "(rule (call e x) (expr e \"lib::old($x)\"))\n\
+         (rewrite big (call e x) (not (in-macro-expansion e)) (replace e \"old($x, {}1)\"))",
+        "1, ".repeat(1022)
+    );
+    let error = refused(edit(&db, &files, &rules, &[]));
+    assert!(error.contains("`big` (rules:2)") && error.contains("has 2050 tokens"), "{error}");
+}
+
+#[test]
 fn a_template_path_from_a_crate_that_names_nothing_is_an_error() {
     let (db, files) = view(LIB, 0, &["lib.rs"]);
     let rules = r#"

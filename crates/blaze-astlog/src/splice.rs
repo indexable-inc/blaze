@@ -103,6 +103,9 @@ pub(crate) fn render<'a, F: Files>(
             }
         }
     }
+    if let Some(message) = crate::pattern::too_many_tokens(&holed) {
+        return Err(format!("the template {message}"));
+    }
     let (before, after) = form.wrap();
     let source = format!("{before}{holed}{after}");
     let parse = SourceFile::parse(&source, Edition::CURRENT);
