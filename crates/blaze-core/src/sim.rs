@@ -2884,8 +2884,9 @@ impl Driver for Sim {
 const POLL_TURNS_MOST: u32 = 1 << 20;
 
 impl Sim {
-    /// When the first completion is due, of what is in flight.
-    fn first_due(&self) -> Option<Duration> {
+    /// When the first completion is due, of what is in flight. (`&mut`: the timers' next
+    /// deadline settles their heap as it is read.)
+    fn first_due(&mut self) -> Option<Duration> {
         let first = self.pending.next_deadline().map(Duration::from_nanos);
         first.into_iter().chain(self.first_landing()).chain(self.told.iter().map(|it| it.at)).min()
     }
