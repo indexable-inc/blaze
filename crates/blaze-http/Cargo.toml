@@ -41,6 +41,8 @@ url.workspace = true
 [dev-dependencies]
 # The certificates of the in-memory rustls server the TLS test speaks to and of the h3 pair.
 rcgen.workspace = true
+# The driver loop's simulation under scheduled wakes (`driver/tests.rs`).
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

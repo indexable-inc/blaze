@@ -92,6 +92,10 @@ pub(crate) enum Plant {
     DropCompletion { nth: u64 },
     /// The client's deadline is never armed: no timer is asked, and the loop's wait has none.
     NoDeadline,
+    /// The order before the fix of `agents/annoyances/uring-waker-lost-without-offloaded-work.json`:
+    /// [`Loop::ask`] starts the request in the client at once, on the client's clock as the
+    /// last step left it, and [`serve`] does not advance the loop as each wait ends.
+    StaleClock,
 }
 
 /// What an effect in flight was asked for.
@@ -227,6 +231,14 @@ impl Loop {
         if self.running.contains_key(&id) || self.queued.iter().any(|(it, ..)| *it == id) {
             let error = Error { url: request.url, kind: Kind::InUse };
             self.told.push_back(Told::Event(Event::Failed { request: id, error }));
+            return;
+        }
+        #[cfg(test)]
+        if self.plant == Plant::StaleClock {
+            match self.client.request(id, request) {
+                Ok(()) => _ = self.running.insert(id, until),
+                Err(error) => self.told.push_back(Told::Event(Event::Failed { request: id, error })),
+            }
             return;
         }
         self.queued.push_back((id, request, until));
@@ -747,7 +759,13 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
         driver.poll(&mut done, core.deadline());
         // The wait just ended: what came in during it (these completions, then the messages at
         // the top of the next turn) is timed from now.
-        core.advance(driver.now());
+        #[cfg(test)]
+        let advance = core.plant != Plant::StaleClock;
+        #[cfg(not(test))]
+        let advance = true;
+        if advance {
+            core.advance(driver.now());
+        }
         for completion in done.drain(..) {
             core.complete(completion);
         }
