@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far: the translator takes methods; the base is formal-verification.md's v0. Reviewed from outside the work on 2026-11-13 (its changes are in).
+summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far (2026-11-13): the attribute, methods and theorem statements in the translator, `Blaze.Machine`, `blaze_auto`, and two theorem functions of the translator's fixture crate proved; `blaze prove` is written and not yet run; nothing of a real crate is proved. Reviewed from outside the work on 2026-11-13 (its changes are in).
 date: 2026-11-13
 ---
 # Proofs in place of simulation tests
@@ -148,6 +148,11 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 
 Proved means what formal-verification.md says: the kernel accepts it, no `sorry`, only
 Lean's three axioms.
+
+Lean runs what a proof file says (a tactic can do IO), so it runs in blaze's sandbox, with a
+deadline, like a build script (`sandbox-everything`). Today hir-ty-lean's driver spawns Lean
+itself with neither: it becomes a sans-IO core that hands back the files to write and the
+command to run, and the daemon runs it. Until then `blaze prove` is for blaze's own tree.
 
 Generated models are build outputs, keyed by the function's code identity
 (`outputs-are-records`); the tree holds the proofs and, per theorem, the hash of the
