@@ -1450,7 +1450,14 @@ impl<'a> Translate<'a> {
                 let ty = self.types(&locals);
                 let outer = std::mem::replace(&mut self.result, ty);
                 let yielded: Set = locals.iter().copied().collect();
+                // The expression is a program only where it touches the memory threads share.
+                // One that does not is a plain value: each of its arms goes on to its end in
+                // place, and none to a tail written once ([`Translate::shared_tail`]), whose
+                // call is a program's and would make the value one.
+                let shared = self.prog_level && shares(std::slice::from_ref(node), self.shapes);
+                let outer_level = std::mem::replace(&mut self.prog_level, shared);
                 let value = self.inside(node, &Then::Yield(locals.clone()), &yielded);
+                self.prog_level = outer_level;
                 self.result = outer;
                 let value = value?;
                 let pat =
@@ -1516,7 +1523,7 @@ impl<'a> Translate<'a> {
                     Some((_, which, _)) => Some(vec![*which]),
                     None => self.narrowed.iter().rev().find(|(of, _)| of == place).map(|it| it.1.clone()),
                 };
-                if let Some(possible) = possible {
+                if let Some(possible) = &possible {
                     let arm_of = |which: u32| {
                         let discriminant = variants[which as usize].discriminant;
                         arms.iter().find(|(value, _)| *value == discriminant).map_or(otherwise, |(_, arm)| arm)
@@ -1574,7 +1581,14 @@ impl<'a> Translate<'a> {
                             pat
                         }
                         _ => {
-                            let left = left.iter().map(|it| *it as u32).collect();
+                            // In the `_` arm the place is a variant no arm has, of those it
+                            // could be here: MIR tests a `match`'s arms one after another, so
+                            // an arm's test is inside the `_` arm of the test before it.
+                            let left = left
+                                .iter()
+                                .map(|it| *it as u32)
+                                .filter(|it| possible.as_ref().is_none_or(|known| known.contains(it)))
+                                .collect();
                             self.narrowed.push((place.clone(), left));
                             Pat::Wild
                         }
@@ -1960,6 +1974,16 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, level) });
     let mut params = params;
     renumber(&mut decls, &mut params, &generated_names(body, &translate.names, &translate.temps));
+    if let Some(left) = placeholder_left(&mut decls) {
+        return Err(translate.refuse(
+            format!(
+                "the translator's own error: its placeholder `{left}` is left in the model \
+                 (each is replaced before a model is emitted; a bug of hir-ty-lean, not a \
+                 construct of the function)"
+            ),
+            "",
+        ));
+    }
     Ok(Model {
         decls,
         shape: Shape { fuel: translate.uses_fuel, monadic, shared, mut_params, returns_unit },
@@ -2231,6 +2255,21 @@ const JOIN: &str = "\u{0}join";
 /// [`Points::cut`] by the call of the tail's program point, over the variables it reads.
 fn join_call(id: usize) -> M {
     M::ProgTail(name(format!("{JOIN}{id}")))
+}
+
+/// The first of the translation's own placeholders ([`JOIN`], [`POINT`]) a name in `decls`
+/// still is, without its NUL. [`Points`] replaces each before a model is emitted, so one left
+/// is the translator's error, and the model is not emitted.
+pub(crate) fn placeholder_left(decls: &mut [Decl]) -> Option<String> {
+    let mut left = None;
+    for decl in decls {
+        visit_decl(decl, &mut |it: &mut String| {
+            if left.is_none() && (it.starts_with(JOIN) || it.starts_with(POINT)) {
+                left = Some(it.trim_start_matches('\u{0}').to_owned());
+            }
+        });
+    }
+    left
 }
 
 /// The placeholder's number, where `term` is the placeholder of a tail.

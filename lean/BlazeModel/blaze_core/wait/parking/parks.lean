@@ -32,47 +32,33 @@ import BlazeModel.blaze_core.wait.parking.parks.closure1.call
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.wait.parking.parks.at_5 (v0 : core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) (both : Bool) (last : U32) : Threads.Prog Bool :=
-  match v0 with
-  | core.result.Result.Err v1 =>
-    let t0 := !both
-    if t0 then Threads.Prog.done (Result.ok t0)
-    else Threads.Prog.done (Result.ok (Scalar.eq last (1 : U32)))
-  | core.result.Result.Ok v2 => Threads.Prog.done (Result.fail Error.unreachable)
-
-def blaze_core.wait.parking.parks.at_4 (v0 : core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) (deadline : Option blaze_core.wait.retry.Deadline) (both : Bool) (last : U32) : Threads.Prog Bool :=
-  match v0 with
-  | core.result.Result.Ok v3 =>
-    match v3 with
-    | blaze_core.wait.retry.Waited.unit.Deadline =>
-      let t1 := core.option.Option.is_some deadline
-      if t1 then
-        let t2 := !both
-        if t2 then Threads.Prog.done (Result.ok t2)
-        else Threads.Prog.done (Result.ok (Scalar.eq last (1 : U32)))
-      else Threads.Prog.done (Result.ok t1)
-    | blaze_core.wait.retry.Waited.unit.Ready v4 => blaze_core.wait.parking.parks.at_5 v0 both last
-  | core.result.Result.Err v5 => blaze_core.wait.parking.parks.at_5 v0 both last
-
 def blaze_core.wait.parking.parks.at_3 (unparked : Threads.Ended Unit) (parked : Threads.Ended (core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError)) (deadline : Option blaze_core.wait.retry.Deadline) (last : U32) : Threads.Prog Bool :=
   let both :=
     match unparked with
-    | Threads.Ended.Done v6 => true
+    | Threads.Ended.Done v0 => true
     | _ => false
   match parked with
   | Threads.Ended.Asleep => Threads.Prog.done (Result.ok (!both))
   | Threads.Ended.Running => Threads.Prog.done (Result.ok true)
-  | Threads.Ended.Done v0 =>
-    match v0 with
-    | core.result.Result.Ok v7 =>
-      match v7 with
-      | blaze_core.wait.retry.Waited.unit.Ready v8 =>
-        let t3 := !both
-        if t3 then Threads.Prog.done (Result.ok t3)
+  | Threads.Ended.Done v1 =>
+    match v1 with
+    | core.result.Result.Ok v2 =>
+      match v2 with
+      | blaze_core.wait.retry.Waited.unit.Ready v3 =>
+        let t0 := !both
+        if t0 then Threads.Prog.done (Result.ok t0)
         else Threads.Prog.done (Result.ok (Scalar.eq last (0 : U32)))
       | blaze_core.wait.retry.Waited.unit.Deadline =>
-        blaze_core.wait.parking.parks.at_4 v0 deadline both last
-    | core.result.Result.Err v9 => blaze_core.wait.parking.parks.at_4 v0 deadline both last
+        let t1 := core.option.Option.is_some deadline
+        if t1 then
+          let t2 := !both
+          if t2 then Threads.Prog.done (Result.ok t2)
+          else Threads.Prog.done (Result.ok (Scalar.eq last (1 : U32)))
+        else Threads.Prog.done (Result.ok t1)
+    | core.result.Result.Err v4 =>
+      let t3 := !both
+      if t3 then Threads.Prog.done (Result.ok t3)
+      else Threads.Prog.done (Result.ok (Scalar.eq last (1 : U32)))
 
 def blaze_core.wait.parking.parks.at_2 (word : core.sync.atomic.Atomic .U32) (deadline : Option blaze_core.wait.retry.Deadline) (t4 : Threads.Ended (core.result.Result blaze_core.wait.retry.Waited.unit blaze_core.wait.retry.WaitError) × Threads.Ended Unit) : Threads.Prog Bool := do
   let parked := t4.1

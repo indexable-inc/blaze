@@ -13,6 +13,11 @@ pub enum Error<S: std::error::Error + 'static> {
     #[snafu(display("rules:{line}: {message}"))]
     Dsl { line: usize, message: String },
 
+    #[snafu(display(
+        "rules:{line}: this `(` is nested past {max} lists, the deepest a rules file may nest"
+    ))]
+    TooDeep { line: usize, max: usize },
+
     #[snafu(display("rules:{line}: invalid regex `{pattern}` in text-match"))]
     Regex { line: usize, pattern: String, source: regex::Error },
 
@@ -75,6 +80,23 @@ pub enum Error<S: std::error::Error + 'static> {
          other through `(not ...)` or `(count ...)`"
     ))]
     UnstratifiableProgram { cycle: String, line: usize },
+
+    #[snafu(display(
+        "rules:{line}: the rule for `{relation}` takes the run past {cap} rows; narrow what it \
+         joins"
+    ))]
+    TooManyRows { relation: String, line: usize, cap: usize },
+
+    #[snafu(display(
+        "rules:{line}: this source atom's answers take the run past {cap} rows; bind more of its \
+         arguments before it"
+    ))]
+    TooManySourceRows { line: usize, cap: usize },
+
+    #[snafu(display(
+        "rules:{line}: the rewrite's bindings take the run past {cap} rows; narrow its body"
+    ))]
+    TooManyBindings { line: usize, cap: usize },
 
     #[snafu(display("internal invariant broken: {what}"))]
     Internal { what: String },

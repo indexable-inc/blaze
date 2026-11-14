@@ -8,7 +8,7 @@
 //! the edits come back as a unified diff. `--query FILE` runs a rules file and writes nothing
 //! ([`Request::Query`]).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use blaze_api::{Edit, Edited, Request, ResponseRef, ViewRef, query::Rows};
 use blaze_vfs::Op;
@@ -103,32 +103,48 @@ fn opened(head: &str) -> Result<blaze_ids::ContentId, String> {
 }
 
 /// What `ops` leave the checkout's files as, in memory: each file edited, its text before and
-/// after, and each rename.
+/// after, and each rename, every path relative to the checkout.
 struct Planned<'o> {
-    files: Vec<(&'o str, Vec<u8>, Vec<u8>)>,
-    renames: Vec<(PathBuf, PathBuf)>,
+    files: Vec<FileEdit<'o>>,
+    renames: Vec<Rename<'o>>,
+}
+
+/// A file the edit changes: its text before and after, and the permissions its new text keeps.
+struct FileEdit<'o> {
+    path: &'o str,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    permissions: std::fs::Permissions,
+}
+
+/// A file the edit moves, by its paths in the checkout.
+struct Rename<'o> {
+    from: &'o str,
+    to: &'o str,
 }
 
 impl Planned<'_> {
     /// Each edited file's change as a unified diff (`a/PATH`, `b/PATH`), then each rename.
     fn diff(&self) -> String {
         let mut out = String::new();
-        for (path, before, after) in &self.files {
+        for FileEdit { path, before, after, .. } in &self.files {
             let (before, after) = (String::from_utf8_lossy(before), String::from_utf8_lossy(after));
             let diff = similar::TextDiff::from_lines(&*before, &*after);
             let shown = diff.unified_diff().header(&format!("a/{path}"), &format!("b/{path}")).to_string();
             out.push_str(&shown);
         }
-        for (from, to) in &self.renames {
-            out.push_str(&format!("rename {} -> {}\n", from.display(), to.display()));
+        for Rename { from, to } in &self.renames {
+            out.push_str(&format!("rename {from} -> {to}\n"));
         }
         out
     }
 }
 
 /// `ops`, as the VFS applies them in order, made in memory over the files under `root`: each
-/// file read once. A path that leaves `root`, or an edit past a file's end (it changed after
-/// the daemon read it), is an error.
+/// file read once. Every check [`write`] needs is made here, so a dry run refuses what a write
+/// would and a write that fails a check has written nothing: a path that leaves `root`, an
+/// edit past a file's end (it changed after the daemon read it), a file whose permissions
+/// cannot be read, and a rename of a file not there or onto one that is.
 fn plan<'o>(root: &Path, ops: &'o [Op]) -> Result<Planned<'o>, String> {
     let inside = |path: &str| {
         let ok = !path.is_empty()
@@ -140,22 +156,25 @@ fn plan<'o>(root: &Path, ops: &'o [Op]) -> Result<Planned<'o>, String> {
         }
     };
     // alloc: CLI edge, the files one fix edits
-    let mut files: Vec<(&str, Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut renames = Vec::new(); // alloc: CLI edge, a renamed module's files
+    let mut files: Vec<FileEdit<'_>> = Vec::new();
+    let mut renames: Vec<Rename<'_>> = Vec::new(); // alloc: CLI edge, a renamed module's files
     for op in ops {
         match op {
             Op::Edit { at, len, path, bytes } => {
-                let at_file = match files.iter().position(|(it, ..)| *it == path.as_str()) {
+                let at_file = match files.iter().position(|it| it.path == path.as_str()) {
                     Some(at_file) => at_file,
                     None => {
-                        let read = std::fs::read(inside(path)?)
-                            .map_err(|error| format!("{path}: {error}"))?;
+                        let file = inside(path)?;
+                        let read = |error| format!("{path}: {error}");
+                        let before = std::fs::read(&file).map_err(read)?;
+                        let permissions = std::fs::metadata(&file).map_err(read)?.permissions();
                         // clone: the text before, for a dry run's diff; CLI edge, once a file
-                        files.push((path.as_str(), read.clone(), read));
+                        let after = before.clone();
+                        files.push(FileEdit { path, before, after, permissions });
                         files.len() - 1
                     }
                 };
-                let text = &mut files[at_file].2;
+                let text = &mut files[at_file].after;
                 let start = usize::try_from(*at).ok();
                 let end =
                     start.zip(usize::try_from(*len).ok()).and_then(|(at, len)| at.checked_add(len));
@@ -170,7 +189,23 @@ fn plan<'o>(root: &Path, ops: &'o [Op]) -> Result<Planned<'o>, String> {
                     }
                 }
             }
-            Op::Rename { to, from } => renames.push((inside(from)?, inside(to)?)),
+            Op::Rename { to, from } => {
+                // Whether a path names a file once the renames before this one are made.
+                let there = |path: &str| -> Result<bool, String> {
+                    if renames.iter().any(|it| it.to == path) {
+                        return Ok(true);
+                    }
+                    let moved_away = renames.iter().any(|it| it.from == path);
+                    Ok(!moved_away && std::fs::symlink_metadata(inside(path)?).is_ok())
+                };
+                if !there(from)? {
+                    return Err(format!("{from} is not there to rename to {to}"));
+                }
+                if there(to)? {
+                    return Err(format!("{to} is there already: the rename of {from} would replace it"));
+                }
+                renames.push(Rename { from, to });
+            }
             Op::Write { path, .. } | Op::Delete { path } => {
                 return Err(format!(
                     "the daemon's edit writes or deletes {path} whole, which `--replace`, `--rules` and `--fix` do not do"
@@ -186,28 +221,21 @@ fn plan<'o>(root: &Path, ops: &'o [Op]) -> Result<Planned<'o>, String> {
 /// when the plan fails.
 pub(crate) fn write(root: &Path, ops: &[Op]) -> Result<(), String> {
     let Planned { files, renames } = plan(root, ops)?;
-    for (path, _, bytes) in &files {
+    for FileEdit { path, after, permissions, .. } in files {
         let file = root.join(path);
         let beside = file.with_file_name(format!(
             ".{}.blaze-edit",
             file.file_name().map(|it| it.to_string_lossy()).unwrap_or_default()
         ));
-        let permissions =
-            std::fs::metadata(&file).map_err(|error| format!("{path}: {error}"))?.permissions();
-        std::fs::write(&beside, bytes).map_err(|error| format!("{}: {error}", beside.display()))?;
+        std::fs::write(&beside, after).map_err(|error| format!("{}: {error}", beside.display()))?;
         std::fs::set_permissions(&beside, permissions)
             .map_err(|error| format!("{}: {error}", beside.display()))?;
         std::fs::rename(&beside, &file).map_err(|error| format!("{path}: {error}"))?;
     }
-    for (from, to) in renames {
-        if to.exists() {
-            return Err(format!(
-                "{} is there already: the rename of {} would replace it",
-                to.display(),
-                from.display()
-            ));
-        }
-        std::fs::rename(&from, &to).map_err(|error| format!("{}: {error}", from.display()))?;
+    // `plan` refused a rename onto a file; one made there since is replaced, as std's rename
+    // has no form that refuses.
+    for Rename { from, to } in renames {
+        std::fs::rename(root.join(from), root.join(to)).map_err(|error| format!("{from}: {error}"))?;
     }
     Ok(())
 }
@@ -289,6 +317,49 @@ mod tests {
              +use parking_lot::Mutex;\n fn f(_: Mutex) {}\n"
         );
         assert_eq!(std::fs::read_to_string(root.join("src/lib.rs")).unwrap(), before);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn rename(from: &str, to: &str) -> Op {
+        Op::Rename { to: to.to_owned(), from: from.to_owned() }
+    }
+
+    #[test]
+    fn a_dry_run_shows_a_renamed_module_by_its_path_in_the_checkout() {
+        let made = blaze_core::temp::TempDir::for_test("blaze-dry-rename-");
+        let root = made.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/old.rs"), "").unwrap();
+        let diff = plan(&root, &[rename("src/old.rs", "src/new.rs")]).unwrap().diff();
+        assert_eq!(diff, "rename src/old.rs -> src/new.rs\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rename_write_would_refuse_is_refused_by_the_plan_before_any_file_is_written() {
+        let made = blaze_core::temp::TempDir::for_test("blaze-rename-checks-");
+        let root = made.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let before = "fn f() {}\n";
+        std::fs::write(root.join("src/lib.rs"), before).unwrap();
+        std::fs::write(root.join("src/old.rs"), "").unwrap();
+        std::fs::write(root.join("src/taken.rs"), "").unwrap();
+        let edit =
+            Op::Edit { at: 0, len: 0, path: "src/lib.rs".to_owned(), bytes: b"// fixed\n".to_vec() };
+        let refusal = |ops: &[Op]| plan(&root, ops).err();
+        let onto = refusal(&[edit.clone(), rename("src/old.rs", "src/taken.rs")]);
+        let error = onto.expect("a rename onto a file that is there");
+        assert!(error.contains("src/taken.rs is there already"), "{error}");
+        let missing = refusal(&[rename("src/gone.rs", "src/new.rs")]);
+        assert!(missing.is_some_and(|it| it.contains("src/gone.rs")), "a rename of nothing");
+        let twice = refusal(&[rename("src/old.rs", "src/a.rs"), rename("src/lib.rs", "src/a.rs")]);
+        assert!(twice.is_some_and(|it| it.contains("src/a.rs")), "two renames onto one path");
+        assert!(write(&root, &[edit, rename("src/old.rs", "src/taken.rs")]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            before,
+            "a refused rename writes no edit either"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

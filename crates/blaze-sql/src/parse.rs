@@ -6,8 +6,9 @@
 //! `is [not] null`, `is [not] expr`, `[not] in`, `[not] between`, `[not] like`), which does not
 //! chain; `+ -`; `* / %`; `||`; prefix `-`; a primary. A run of one level's operators
 //! (`or`; `and`; `+ -`; `* / %`; `||`) is one flat [`ExprKind::Chain`], meaning the
-//! left-nested tree; parentheses keep a chain inside another. Expressions are parsed by precedence climbing in one recursive function,
-//! `expr_at`, whose calls are counted against [`MAX_NESTING`]; a tree is at most
+//! left-nested tree; parentheses keep a chain inside another. Expressions are parsed by
+//! precedence climbing in one recursive function, `expr_at`, whose calls are counted against
+//! [`MAX_NESTING`]; a tree is at most
 //! [`MAX_DEPTH`] deep. Both bounds are set so that parsing, printing, comparing and dropping
 //! a tree fit a small stack (see [`MAX_DEPTH`]).
 
@@ -20,9 +21,10 @@ use core::fmt;
 
 use crate::ast::{
     self, Assignment, CallArgs, CaseArm, ChainLink, ChainOp, CompareOp, Delete, Expr, ExprKind,
-    Insert, Join, JoinKind, Name, OrderTerm, ResultColumn, Select, Span, SqlType, Statement,
-    TableRef, UnaryOp, Update,
+    Insert, Join, JoinKind, Name, OrderTerm, ResultColumn, Select, Span, Statement, TableRef,
+    UnaryOp, Update,
 };
+use crate::desc::Storage;
 use crate::lex::{Keyword, Lexer, Punct, Tok, Token};
 
 /// The deepest expression tree the subset has: a leaf is 1 deep, and a node one more than its
@@ -105,6 +107,8 @@ pub enum SyntaxErrorKind<'s> {
     RealNotFinite(&'s str),
     /// Digits run into a name, a second `.`, or an exponent without digits (`12ab`, `1e`).
     MalformedNumber(&'s str),
+    /// A real literal of the lexer's shape that `f64`'s parser still refused, with its error.
+    RealUnreadable { text: &'s str, error: core::num::ParseFloatError },
     /// `?`
     AnonymousParameter(&'s str),
     /// `?1`
@@ -150,8 +154,9 @@ fn excerpt(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     f.write_str("...")
 }
 
-fn named(f: &mut fmt::Formatter<'_>, what: &str, token: &str, at: u32) -> fmt::Result {
-    write!(f, "{what} `{token}` at byte {at}: parameters are named, write `$name`")
+/// The end of a refusal of a text or blob literal with no closing `'`, after its excerpt.
+fn no_closing_quote(f: &mut fmt::Formatter<'_>, at: u32) -> fmt::Result {
+    write!(f, "` at byte {at} has no closing `'`")
 }
 
 impl fmt::Display for SyntaxError<'_> {
@@ -190,12 +195,12 @@ impl fmt::Display for SyntaxError<'_> {
             SyntaxErrorKind::UnterminatedText(text) => {
                 f.write_str("text literal `")?;
                 excerpt(f, text)?;
-                write!(f, "` at byte {at} has no closing `'`")
+                no_closing_quote(f, at)
             }
             SyntaxErrorKind::UnterminatedBlob(text) => {
                 f.write_str("blob literal `")?;
                 excerpt(f, text)?;
-                write!(f, "` at byte {at} has no closing `'`")
+                no_closing_quote(f, at)
             }
             SyntaxErrorKind::BlobNotHex(text) => {
                 f.write_str("blob literal `")?;
@@ -226,15 +231,17 @@ impl fmt::Display for SyntaxError<'_> {
                      and an optional exponent, followed by neither a name nor a `.`"
                 )
             }
-            SyntaxErrorKind::AnonymousParameter(token) => {
-                named(f, "positional parameter", token, at)
+            SyntaxErrorKind::RealUnreadable { text, ref error } => {
+                f.write_str("real `")?;
+                excerpt(f, text)?;
+                write!(f, "` at byte {at} does not read as a number: {error}")
             }
-            SyntaxErrorKind::NumberedQuestionParameter(token) => {
-                named(f, "positional parameter", token, at)
-            }
-            SyntaxErrorKind::NumberedDollarParameter(token) => {
-                named(f, "positional parameter", token, at)
-            }
+            SyntaxErrorKind::AnonymousParameter(token)
+            | SyntaxErrorKind::NumberedQuestionParameter(token)
+            | SyntaxErrorKind::NumberedDollarParameter(token) => write!(
+                f,
+                "positional parameter `{token}` at byte {at}: parameters are named, write `$name`"
+            ),
             SyntaxErrorKind::ColonParameter(token) => {
                 write!(
                     f,
@@ -297,6 +304,9 @@ impl fmt::Display for SyntaxError<'_> {
 }
 
 /// Parses `text` as exactly one statement of the subset.
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
 pub fn parse<'s, A: Allocator + Copy>(
     text: &'s str,
     alloc: A,
@@ -332,11 +342,9 @@ struct Node<'s, A: Allocator> {
     height: u32,
 }
 
-/// An infix operator, before its tokens are taken.
-#[derive(Clone, Copy)]
-enum Infix {
-    Chain(ChainOp),
-    Compare(Comparison),
+/// The value `key` maps to in `table`, if any.
+fn lookup<K: PartialEq + Copy, V: Copy>(table: &[(K, V)], key: K) -> Option<V> {
+    table.iter().find(|&&(it, _)| it == key).map(|&(_, value)| value)
 }
 
 /// Where a comparison starts, before its tokens are taken.
@@ -355,7 +363,17 @@ impl Comparison {
             Comparison::In { negated }
             | Comparison::Between { negated }
             | Comparison::Like { negated } => negated,
-            Comparison::Op(_) | Comparison::Is => false,
+            Comparison::Op(
+                CompareOp::Eq
+                | CompareOp::Ne
+                | CompareOp::Lt
+                | CompareOp::Le
+                | CompareOp::Gt
+                | CompareOp::Ge
+                | CompareOp::Is
+                | CompareOp::IsNot,
+            )
+            | Comparison::Is => false,
         }
     }
 }
@@ -387,7 +405,7 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     }
 
     fn source(&self, span: Span) -> &'s str {
-        self.text.get(span.start as usize..span.end as usize).unwrap_or("")
+        self.text.get(span.range()).unwrap_or("")
     }
 
     fn at_keyword(&self, keyword: Keyword) -> bool {
@@ -441,11 +459,14 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     /// An identifier, quoted or not.
     fn name(&mut self, expected: &'static str) -> Parsed<'s, Name<'s>> {
         let token = self.tok;
-        let (text, quoted) = match token.tok {
-            Tok::Ident(text) => (text, false),
-            Tok::Quoted(text) => (text, true),
-            Tok::Keyword(_) => return Err(self.reserved()),
-            _ => return Err(self.expected(expected)),
+        let (text, quoted) = if let Tok::Ident(text) = token.tok {
+            (text, false)
+        } else if let Tok::Quoted(text) = token.tok {
+            (text, true)
+        } else if token.tok.keyword().is_some() {
+            return Err(self.reserved());
+        } else {
+            return Err(self.expected(expected));
         };
         self.bump()?;
         Ok(Name { text, quoted, span: token.span })
@@ -454,12 +475,16 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     // Statements.
 
     fn statement(&mut self) -> Parsed<'s, Statement<'s, A>> {
-        match self.tok.tok {
-            Tok::Keyword(Keyword::Select) => Ok(Statement::Select(self.select()?)),
-            Tok::Keyword(Keyword::Insert) => Ok(Statement::Insert(self.insert()?)),
-            Tok::Keyword(Keyword::Update) => Ok(Statement::Update(self.update()?)),
-            Tok::Keyword(Keyword::Delete) => Ok(Statement::Delete(self.delete()?)),
-            _ => Err(self.expected("a statement: `select`, `insert`, `update` or `delete`")),
+        if self.at_keyword(Keyword::Select) {
+            Ok(Statement::Select(self.select()?))
+        } else if self.at_keyword(Keyword::Insert) {
+            Ok(Statement::Insert(self.insert()?))
+        } else if self.at_keyword(Keyword::Update) {
+            Ok(Statement::Update(self.update()?))
+        } else if self.at_keyword(Keyword::Delete) {
+            Ok(Statement::Delete(self.delete()?))
+        } else {
+            Err(self.expected("a statement: `select`, `insert`, `update` or `delete`"))
         }
     }
 
@@ -710,8 +735,8 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
         let mut below = first.height;
         let mut end = first.expr.span;
         let mut rest = Vec::new_in(self.alloc);
-        while let Some((Infix::Chain(op), power)) = self.infix()? {
-            if power != level {
+        while let Some(op) = self.chain_op() {
+            if power(op) != level {
                 break;
             }
             self.bump()?;
@@ -754,19 +779,25 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
         crate::tests::stack::touch();
         self.enter()?;
         let mut left = self.operand(min)?;
-        while let Some((infix, power)) = self.infix()? {
-            if power < min {
-                break;
-            }
-            match infix {
+        // Every turn takes at least one token, so the text's length bounds the loop.
+        loop {
+            if let Some(op) = self.chain_op() {
+                let level = power(op);
+                if level < min {
+                    break;
+                }
                 // Left associative, and flat: every operator of this level after `left`
                 // goes into one chain. Its operands bind strictly tighter, so what stops it
                 // is a looser operator, which the next turn of this loop takes.
-                Infix::Chain(_) => left = self.chain(left, power)?,
-                Infix::Compare(comparison) => {
-                    left = self.finish_comparison(left, comparison)?;
-                    self.after_comparison()?;
+                left = self.chain(left, level)?;
+            } else if let Some(comparison) = self.comparison_start()? {
+                if COMPARE < min {
+                    break;
                 }
+                left = self.finish_comparison(left, comparison)?;
+                self.after_comparison()?;
+            } else {
+                break;
             }
         }
         self.leave();
@@ -776,35 +807,38 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     /// After a comparison only a looser operator (`and`, `or`) may follow: a second
     /// comparison is a chain, and `a is null + 1` has no reading in the subset.
     fn after_comparison(&self) -> Parsed<'s, ()> {
-        match self.infix()? {
-            Some((Infix::Compare(_), _)) => {
-                let span = self.tok.span;
-                Err(error(SyntaxErrorKind::ChainedComparison(self.source(span)), span))
-            }
-            Some((Infix::Chain(_), power)) if power >= COMPARE => {
-                Err(self.expected("`and`, `or` or the end of the expression after a comparison"))
-            }
-            Some((Infix::Chain(_), _)) | None => Ok(()),
+        if self.comparison_start()?.is_some() {
+            let span = self.tok.span;
+            return Err(error(SyntaxErrorKind::ChainedComparison(self.source(span)), span));
         }
+        if self.chain_op().is_some_and(|op| power(op) >= COMPARE) {
+            return Err(
+                self.expected("`and`, `or` or the end of the expression after a comparison")
+            );
+        }
+        Ok(())
     }
 
-    /// The infix operator the current tokens start and how tightly it binds; takes nothing.
-    fn infix(&self) -> Parsed<'s, Option<(Infix, u8)>> {
-        let chain = |op: ChainOp| -> Parsed<'s, Option<(Infix, u8)>> {
-            Ok(Some((Infix::Chain(op), power(op))))
-        };
-        match self.tok.tok {
-            Tok::Keyword(Keyword::Or) => chain(ChainOp::Or),
-            Tok::Keyword(Keyword::And) => chain(ChainOp::And),
-            Tok::Punct(Punct::Plus) => chain(ChainOp::Add),
-            Tok::Punct(Punct::Minus) => chain(ChainOp::Sub),
-            Tok::Punct(Punct::Star) => chain(ChainOp::Mul),
-            Tok::Punct(Punct::Slash) => chain(ChainOp::Div),
-            Tok::Punct(Punct::Percent) => chain(ChainOp::Rem),
-            Tok::Punct(Punct::Concat) => chain(ChainOp::Concat),
-            _ => {
-                Ok(self.comparison_start()?.map(|comparison| (Infix::Compare(comparison), COMPARE)))
-            }
+    /// The chain operator the current token is, if any; takes nothing. A token is either a
+    /// chain operator or starts a comparison ([`Parser::comparison_start`]), never both.
+    fn chain_op(&self) -> Option<ChainOp> {
+        const BY_KEYWORD: [(Keyword, ChainOp); 2] =
+            [(Keyword::Or, ChainOp::Or), (Keyword::And, ChainOp::And)];
+        const BY_PUNCT: [(Punct, ChainOp); 6] = [
+            (Punct::Plus, ChainOp::Add),
+            (Punct::Minus, ChainOp::Sub),
+            (Punct::Star, ChainOp::Mul),
+            (Punct::Slash, ChainOp::Div),
+            (Punct::Percent, ChainOp::Rem),
+            (Punct::Concat, ChainOp::Concat),
+        ];
+        let tok = self.tok.tok;
+        if let Some(keyword) = tok.keyword() {
+            lookup(&BY_KEYWORD, keyword)
+        } else if let Some(punct) = tok.punct() {
+            lookup(&BY_PUNCT, punct)
+        } else {
+            None
         }
     }
 
@@ -813,31 +847,31 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     fn operand(&mut self, min: u8) -> Parsed<'s, Node<'s, A>> {
         #[cfg(test)]
         crate::tests::stack::touch();
-        let token = self.tok;
-        match token.tok {
-            // `not` binds looser than a comparison, so it starts an operand only where
-            // nothing tighter than `not` is required (`a = not b` is refused).
-            Tok::Keyword(Keyword::Not) if min <= NOT => {
-                self.bump()?;
-                let operand = self.expr_at(NOT)?;
-                self.unary(UnaryOp::Not, token.span, operand)
-            }
-            Tok::Punct(Punct::Minus) => {
-                self.bump()?;
-                let operand = self.expr_at(NEG)?;
-                self.unary(UnaryOp::Neg, token.span, operand)
-            }
-            Tok::Punct(Punct::LParen) => {
-                self.bump()?;
-                let mut inner = self.expr_at(OR)?;
-                let close = self.expect_punct(Punct::RParen, "`)`")?;
-                inner.expr.span = cover(token.span, close);
-                Ok(inner)
-            }
-            Tok::Keyword(Keyword::Case) => self.case(),
-            Tok::Keyword(Keyword::Cast) => self.cast(),
-            Tok::Ident(_) | Tok::Quoted(_) => self.column_or_call(),
-            _ => self.literal(),
+        let start = self.tok.span;
+        // `not` binds looser than a comparison, so it starts an operand only where nothing
+        // tighter than `not` is required (`a = not b` is refused).
+        if self.at_keyword(Keyword::Not) && min <= NOT {
+            self.bump()?;
+            let operand = self.expr_at(NOT)?;
+            self.unary(UnaryOp::Not, start, operand)
+        } else if self.at_punct(Punct::Minus) {
+            self.bump()?;
+            let operand = self.expr_at(NEG)?;
+            self.unary(UnaryOp::Neg, start, operand)
+        } else if self.at_punct(Punct::LParen) {
+            self.bump()?;
+            let mut inner = self.expr_at(OR)?;
+            let close = self.expect_punct(Punct::RParen, "`)`")?;
+            inner.expr.span = cover(start, close);
+            Ok(inner)
+        } else if self.at_keyword(Keyword::Case) {
+            self.case()
+        } else if self.at_keyword(Keyword::Cast) {
+            self.cast()
+        } else if self.at_name() {
+            self.column_or_call()
+        } else {
+            self.literal()
         }
     }
 
@@ -846,19 +880,27 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
         #[cfg(test)]
         crate::tests::stack::touch();
         let token = self.tok;
-        let kind = match token.tok {
-            Tok::Integer(value) => ExprKind::Integer(value),
-            Tok::Real(value) => ExprKind::Real(value),
-            Tok::Text(text) => ExprKind::Text(text),
-            Tok::Blob(digits) => ExprKind::Blob(digits),
-            Tok::Keyword(Keyword::Null) => ExprKind::Null,
-            Tok::Keyword(Keyword::True) => ExprKind::Boolean(true),
-            Tok::Keyword(Keyword::False) => ExprKind::Boolean(false),
-            Tok::Param(text) => ExprKind::Param(Name { text, quoted: false, span: token.span }),
-            Tok::Keyword(_) => return Err(self.reserved()),
-            Tok::Ident(_) | Tok::Quoted(_) | Tok::Punct(_) | Tok::End => {
-                return Err(self.expected("an expression"));
-            }
+        let tok = token.tok;
+        let kind = if let Tok::Integer(value) = tok {
+            ExprKind::Integer(value)
+        } else if let Tok::Real(value) = tok {
+            ExprKind::Real(value)
+        } else if let Tok::Text(text) = tok {
+            ExprKind::Text(text)
+        } else if let Tok::Blob(digits) = tok {
+            ExprKind::Blob(digits)
+        } else if let Tok::Param(text) = tok {
+            ExprKind::Param(Name { text, quoted: false, span: token.span })
+        } else if self.at_keyword(Keyword::Null) {
+            ExprKind::Null
+        } else if self.at_keyword(Keyword::True) {
+            ExprKind::Boolean(true)
+        } else if self.at_keyword(Keyword::False) {
+            ExprKind::Boolean(false)
+        } else if tok.keyword().is_some() {
+            return Err(self.reserved());
+        } else {
+            return Err(self.expected("an expression"));
         };
         self.bump()?;
         Ok(self.leaf(kind, token.span))
@@ -866,26 +908,37 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
 
     /// The comparison the current tokens start, if any; takes nothing.
     fn comparison_start(&self) -> Parsed<'s, Option<Comparison>> {
-        let op = |op: CompareOp| -> Parsed<'s, Option<Comparison>> { Ok(Some(Comparison::Op(op))) };
-        match self.tok.tok {
-            Tok::Punct(Punct::Eq) => op(CompareOp::Eq),
-            Tok::Punct(Punct::Ne) => op(CompareOp::Ne),
-            Tok::Punct(Punct::Lt) => op(CompareOp::Lt),
-            Tok::Punct(Punct::Le) => op(CompareOp::Le),
-            Tok::Punct(Punct::Gt) => op(CompareOp::Gt),
-            Tok::Punct(Punct::Ge) => op(CompareOp::Ge),
-            Tok::Keyword(Keyword::Is) => Ok(Some(Comparison::Is)),
-            Tok::Keyword(Keyword::In) => Ok(Some(Comparison::In { negated: false })),
-            Tok::Keyword(Keyword::Between) => Ok(Some(Comparison::Between { negated: false })),
-            Tok::Keyword(Keyword::Like) => Ok(Some(Comparison::Like { negated: false })),
-            Tok::Keyword(Keyword::Not) => Ok(match self.peek()?.tok {
-                Tok::Keyword(Keyword::In) => Some(Comparison::In { negated: true }),
-                Tok::Keyword(Keyword::Between) => Some(Comparison::Between { negated: true }),
-                Tok::Keyword(Keyword::Like) => Some(Comparison::Like { negated: true }),
-                _ => None,
-            }),
-            _ => Ok(None),
+        const BY_PUNCT: [(Punct, CompareOp); 6] = [
+            (Punct::Eq, CompareOp::Eq),
+            (Punct::Ne, CompareOp::Ne),
+            (Punct::Lt, CompareOp::Lt),
+            (Punct::Le, CompareOp::Le),
+            (Punct::Gt, CompareOp::Gt),
+            (Punct::Ge, CompareOp::Ge),
+        ];
+        const BY_KEYWORD: [(Keyword, Comparison); 4] = [
+            (Keyword::Is, Comparison::Is),
+            (Keyword::In, Comparison::In { negated: false }),
+            (Keyword::Between, Comparison::Between { negated: false }),
+            (Keyword::Like, Comparison::Like { negated: false }),
+        ];
+        // After `not`: `is` takes its `not` after it, so it is not here.
+        const AFTER_NOT: [(Keyword, Comparison); 3] = [
+            (Keyword::In, Comparison::In { negated: true }),
+            (Keyword::Between, Comparison::Between { negated: true }),
+            (Keyword::Like, Comparison::Like { negated: true }),
+        ];
+        let tok = self.tok.tok;
+        if let Some(punct) = tok.punct() {
+            return Ok(lookup(&BY_PUNCT, punct).map(Comparison::Op));
         }
+        let Some(keyword) = tok.keyword() else {
+            return Ok(None);
+        };
+        if keyword != Keyword::Not {
+            return Ok(lookup(&BY_KEYWORD, keyword));
+        }
+        Ok(self.peek()?.tok.keyword().and_then(|next| lookup(&AFTER_NOT, next)))
     }
 
     /// The rest of a comparison on `left`, from its first token. Its operands bind at the
@@ -904,7 +957,16 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
         self.bump()?;
         let start = left.expr.span;
         match comparison {
-            Comparison::Op(op) => {
+            Comparison::Op(
+                op @ (CompareOp::Eq
+                | CompareOp::Ne
+                | CompareOp::Lt
+                | CompareOp::Le
+                | CompareOp::Gt
+                | CompareOp::Ge
+                | CompareOp::Is
+                | CompareOp::IsNot),
+            ) => {
                 let right = self.expr_at(ADD)?;
                 self.compare(op, left, right)
             }
@@ -1058,18 +1120,17 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
         self.expect_punct(Punct::LParen, "`(` after `cast`")?;
         let operand = self.expr_at(OR)?;
         self.expect_keyword(Keyword::As, "`as` and a type in `cast`")?;
-        let to = match self.tok.tok {
-            Tok::Ident(name) => match cast_type(name) {
-                Some(to) => to,
-                None => return Err(error(SyntaxErrorKind::UnknownCastType(name), self.tok.span)),
-            },
-            Tok::Quoted(_) | Tok::Keyword(_) => {
-                let span = self.tok.span;
-                return Err(error(SyntaxErrorKind::UnknownCastType(self.source(span)), span));
-            }
-            _ => {
-                return Err(self.expected("a type: `boolean`, `integer`, `real`, `text` or `blob`"));
-            }
+        let span = self.tok.span;
+        let tok = self.tok.tok;
+        let to = if let Tok::Ident(name) = tok {
+            let Some(to) = Storage::named(name) else {
+                return Err(error(SyntaxErrorKind::UnknownCastType(name), span));
+            };
+            to
+        } else if matches!(tok, Tok::Quoted(_)) || tok.keyword().is_some() {
+            return Err(error(SyntaxErrorKind::UnknownCastType(self.source(span)), span));
+        } else {
+            return Err(self.expected("a type: `boolean`, `integer`, `real`, `text` or `blob`"));
         };
         self.bump()?;
         let close = self.expect_punct(Punct::RParen, "`)` to close the `cast`")?;
@@ -1087,16 +1148,4 @@ fn power(op: ChainOp) -> u8 {
         ChainOp::Mul | ChainOp::Div | ChainOp::Rem => MUL,
         ChainOp::Concat => CONCAT,
     }
-}
-
-/// The type `cast` names by `name`, without regard to ASCII case.
-fn cast_type(name: &str) -> Option<SqlType> {
-    const TYPES: [(&str, SqlType); 5] = [
-        ("boolean", SqlType::Boolean),
-        ("integer", SqlType::Integer),
-        ("real", SqlType::Real),
-        ("text", SqlType::Text),
-        ("blob", SqlType::Blob),
-    ];
-    TYPES.iter().find(|(text, _)| text.eq_ignore_ascii_case(name)).map(|&(_, to)| to)
 }

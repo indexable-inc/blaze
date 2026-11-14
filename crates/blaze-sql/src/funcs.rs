@@ -5,6 +5,8 @@
 
 use core::fmt;
 
+use crate::ast::Name;
+
 /// How many arguments a function takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arity {
@@ -14,6 +16,10 @@ pub enum Arity {
 
 impl Arity {
     /// Whether `count` arguments fit.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn admits(self, count: usize) -> bool {
         match self {
             Arity::Exactly(n) => usize::try_from(n).is_ok_and(|n| n == count),
@@ -195,9 +201,16 @@ pub static FUNCTIONS: [Function; 10] = [
 
 /// The function a call names: an unquoted name without regard to ASCII case, a quoted one
 /// exactly (so `"COUNT"` is no function, as on Postgres).
-pub fn lookup(name: &str, quoted: bool) -> Option<&'static Function> {
+#[blaze::pure]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+pub fn lookup(name: &Name<'_>) -> Option<&'static Function> {
     FUNCTIONS.iter().find(|function| {
-        if quoted { function.name == name } else { function.name.eq_ignore_ascii_case(name) }
+        if name.quoted {
+            function.name == name.text
+        } else {
+            function.name.eq_ignore_ascii_case(name.text)
+        }
     })
 }
 

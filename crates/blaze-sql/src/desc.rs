@@ -4,6 +4,7 @@
 
 #![blaze::sans_io]
 
+use alloc::alloc::Global;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::any::TypeId;
@@ -28,21 +29,63 @@ pub struct RustTy<'s> {
 }
 
 impl RustTy<'static> {
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn of<T: 'static>(name: &'static str) -> RustTy<'static> {
         RustTy { name, id: TypeId::of::<T>() }
     }
 }
 
 impl Storage {
+    /// Every storage with the name `cast` writes it by (`cast(x as integer)`), in declaration
+    /// order: the one place a storage's SQL name is spelled.
+    pub const NAMES: [(Storage, &'static str); 5] = [
+        (Storage::Boolean, "boolean"),
+        (Storage::Integer, "integer"),
+        (Storage::Real, "real"),
+        (Storage::Text, "text"),
+        (Storage::Blob, "blob"),
+    ];
+
+    /// The storage `cast` names by `name`, without regard to ASCII case.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn named(name: &str) -> Option<Storage> {
+        Storage::NAMES
+            .iter()
+            .find(|(_, text)| text.eq_ignore_ascii_case(name))
+            .map(|&(storage, _)| storage)
+    }
+
+    /// The name `cast` writes this storage by; `None` only if [`Storage::NAMES`] missed it.
+    #[blaze::pure]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn name(self) -> Option<&'static str> {
+        Storage::NAMES.iter().find(|&&(storage, _)| storage == self).map(|&(_, text)| text)
+    }
+
     /// The Rust type of a value of this storage that no column gave a type: `bool`, `i64`,
-    /// `f64`, `String`, `Vec<u8>`.
+    /// `f64`, `String`, `Vec<u8>`. Only the types' ids are taken; nothing is allocated.
+    #[expect(
+        blaze::implicit_allocator,
+        reason = "names `String`, the type a text column is read into, for its `TypeId`; no \
+                  value is made"
+    )]
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn plain(self) -> RustTy<'static> {
         match self {
             Storage::Boolean => RustTy::of::<bool>("bool"),
             Storage::Integer => RustTy::of::<i64>("i64"),
             Storage::Real => RustTy::of::<f64>("f64"),
             Storage::Text => RustTy::of::<alloc::string::String>("String"),
-            Storage::Blob => RustTy::of::<Vec<u8>>("Vec<u8>"),
+            Storage::Blob => RustTy::of::<Vec<u8, Global>>("Vec<u8>"),
         }
     }
 }
@@ -125,6 +168,10 @@ pub enum ValueRef<'a> {
 
 impl ValueRef<'_> {
     /// Its storage; `None` for null.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
     pub fn storage(&self) -> Option<Storage> {
         match self {
             ValueRef::Null => None,

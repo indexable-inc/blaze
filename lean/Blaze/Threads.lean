@@ -133,6 +133,10 @@ instance : MonadLift Result Prog := ⟨Prog.done⟩
 
 instance {α : Type} : Coe (Result α) (Prog α) := ⟨Prog.done⟩
 
+/-- A `Result` lifted into a program (a model's `let x ← r` of a value that is no program) is
+the program that ends with it. -/
+@[simp] theorem Prog.lift_done {α : Type} (x : Result α) : (liftM x : Prog α) = Prog.done x := rfl
+
 /-- One operation, by a function's model. -/
 def Prog.ask (o : Op) : Prog Got := .op 0 0 o (fun got => .done (.ok got))
 
