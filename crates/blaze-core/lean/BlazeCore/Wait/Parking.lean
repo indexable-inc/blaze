@@ -85,8 +85,8 @@ def start : World := ⟨[0], [], [], [], false, 0, []⟩
 set_option hygiene false in
 /-- After a step: the point the thread is at and the combination after it. -/
 local macro "close" : tactic => `(tactic| (
-  simp [wrap_E, wrap_N, wrap_P, u32_0, u32_1, u32_P, Op.sleeps, swapDk_N d now, swapDk_P d now,
-    swapEk_N d now, swapEk_P d now, unparkK_E, unparkK_P]
+  simp [wrap_E, wrap_N, wrap_P, u32_0, u32_1, u32_P, Op.sleeps, at6_N d now, at6_P d now,
+    at9_N d now, at9_P d now, uat1_E, uat1_P]
   unfold Inv
   refine ⟨_, _, rfl, rfl, World.OneCell.touched hu, ?_⟩
   simp [hc, hs, hk, u32_0, u32_1, u32_P]
@@ -271,7 +271,7 @@ theorem parks_true (d : Option Deadline) (now : core.time.Duration) (schedule : 
     rw [Atomic.load_eq _ rfl, Prog.exec_op_awake (World.step_load (World.get_single hc) hu.fits) rfl]
     rfl
   apply Prog.value_of_exec (w := w'.touched 0 0 [.SeqCst])
-  simp only [parks, Threads.two_of, Prog.exec_bind, hnew, he, hl]
+  simp only [parks, parks.at_1, parks.at_2, Threads.two_of, Prog.exec_bind, hnew, he, hl]
   rcases h5 with rfl | rfl | rfl | rfl | ⟨e, rfl⟩
   · rfl
   · cases eb with

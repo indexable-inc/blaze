@@ -540,3 +540,14 @@ theorem ended_exec_wait_until {α : Type} {who t k cell : Nat} {e v : Int} {dl :
   simp [Prog.exec, World.step, hv, Op.sleeps, and_assoc]
 
 end Blaze.Threads
+
+namespace Blaze.Threads.Prog
+
+/-- A program and then its own value (`let ret ← p; pure ret`, the tail a model's point gives a
+loop or a call it returns from) is the program. -/
+theorem bind_ok {α : Type} (p : Prog α) : (p >>= fun r => Prog.done (.ok r)) = p := by
+  induction p with
+  | done r => cases r <;> rfl
+  | op who pick o next ih => rw [bind_op]; exact op_ext ih
+
+end Blaze.Threads.Prog
