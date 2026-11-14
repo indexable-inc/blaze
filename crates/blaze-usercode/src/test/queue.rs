@@ -511,6 +511,9 @@ struct Server {
     /// The IDs in `names` of its socket's and its record's paths (as the record names them)
     /// and of the two variables blaze set for it: the lines that are blaze's own.
     ours: [u32; 4],
+    /// The program's own file, as its binary names it: the server's start of it (the exec, the
+    /// loader's reads of the image) is blaze's own too ([`own_start`]).
+    program: String,
     /// The tests its replicas run now, by id, in the order they started: those a lost server
     /// or replica takes end in that order.
     running: Vec<u64>,
@@ -1251,6 +1254,7 @@ impl Queue {
             scope_job: Vec::new(), // alloc: empty, allocates nothing
             names,
             ours,
+            program: self.bins[b].plan.program.to_string_lossy().into_owned(), // alloc: setup, once per server
             running: Vec::with_capacity(self.config.jobs),
             at: 0,
             partial: Vec::new(),      // alloc: empty, allocates nothing
@@ -2309,6 +2313,22 @@ fn ours(server: &Server, seen: Seen, id: u32) -> bool {
     }
 }
 
+/// Whether a line of no test's scope is the server's own start of its program: `program`, the
+/// binary's file, run or looked at before any test (the exec, and on macOS the loader's reads of
+/// the image, which the sandbox there records). The program's code is what each test's
+/// execution record is of (every function the test ran, by its code identity), so its file is
+/// no input beside it: left in, every relink would be a changed read of every test, and no
+/// pass would outlive an edit. A test that opens its own executable does so in its own scope,
+/// and that line is its read. macOS names `/tmp` and `/var` under `/private`: either spelling
+/// is the file.
+fn own_start(program: &str, seen: Seen, what: &str) -> bool {
+    const PRIVATE: &str = "/private";
+    matches!(seen, Seen::Read | Seen::Looked)
+        && (what == program
+            || what.strip_prefix(PRIVATE) == Some(program)
+            || program.strip_prefix(PRIVATE) == Some(what))
+}
+
 /// A line of the record without its line break, borrowed: the parts [`trace::Line::parse`] reads,
 /// its kind by its first byte.
 fn record_line(text: &str) -> Option<(Seen, &str, &str)> {
@@ -2356,6 +2376,9 @@ fn take_lines(server: &mut Server, text: &[u8]) -> Result<(), String> {
                 None => continue,
             },
         };
+        if job.is_none() && own_start(&server.program, seen, what) {
+            continue;
+        }
         let id = server.names.intern(what).ok_or_else(|| {
             format!("it names more than {} paths and variables, or 4 GiB of them", names::MOST)
         })?; // alloc: error path

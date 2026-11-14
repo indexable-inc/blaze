@@ -1355,6 +1355,38 @@ fn a_line_of_every_scope_is_given_once_however_often_it_comes() {
     assert_eq!(fake.result("b").trace, lines(&[common[0], common[1], (Seen::Read, "/ws/b")]));
 }
 
+/// The invariant: the server's own start of its program is no test's read. A line of no test's
+/// scope that runs or looks at the binary's own file (the exec, and on macOS the loader's reads,
+/// under either spelling of a `/private` path) is in no test's trace, so a relink is not a
+/// changed read of every test; a test that opens its own executable reads it in its own scope,
+/// and that line stays. The control is the line beside it: another file read at the start is
+/// in every test's trace.
+#[test]
+fn the_servers_start_of_its_own_program_is_no_tests_read() {
+    let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0), job("b", 0)])]);
+    // The path `binary("lib", ..)` is started from.
+    let program = String::from("/bin/lib");
+    let conn = fake.hello(0, &["a", "b"]);
+    let a = fake.run(conn, 0);
+    fake.append(
+        0,
+        &[
+            Line::new(Seen::Read, "", &program),
+            Line::new(Seen::Looked, "", &program),
+            Line::new(Seen::Read, "", &format!("/private{program}")),
+            Line::new(Seen::Read, "", "/lib/libc.so"),
+            Line::new(Seen::Read, "a", "/ws/a"),
+        ],
+    );
+    fake.end(conn, a, End::Exited(0), b"");
+    assert_eq!(fake.result("a").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, "/ws/a")]));
+    // `b` opens its own executable: its read.
+    let b = fake.run(conn, 1);
+    fake.append(0, &[Line::new(Seen::Read, "b", &program)]);
+    fake.end(conn, b, End::Exited(0), b"");
+    assert_eq!(fake.result("b").trace, lines(&[(Seen::Read, "/lib/libc.so"), (Seen::Read, program.as_str())]));
+}
+
 #[test]
 fn a_line_that_is_not_utf_8_is_read_as_the_lossy_record_has_it() {
     let mut fake = Fake::new(config(1), vec![binary("lib", vec![job("a", 0)])]);
