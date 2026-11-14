@@ -13,6 +13,7 @@ mod devirt;
 mod erase_regions;
 mod foreign;
 mod held_across_calls;
+mod loop_match;
 #[path = "../../src/mir/optimize/inline/fixtures.rs"]
 mod inline;
 mod machine;

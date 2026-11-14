@@ -1,5 +1,5 @@
 //! The memo against a reference model, one task (`Alone`), for any sequence of edits, snapshots
-//! and asks Hegel draws: a table (`BTreeSet` of the keys the memo should hold) and the recursive
+//! and asks a tape draws: a table (`BTreeSet` of the keys the memo should hold) and the recursive
 //! evaluator.
 //!
 //! The refinement: every answer is the evaluator's; an ask runs exactly the acyclic keys it
@@ -12,7 +12,7 @@ mod common;
 use std::{collections::BTreeSet, sync::Arc};
 
 use blaze_memo::{Alone, Config, Database, Gid, Memo, Plant, Reads, record};
-use hegel::generators as gs;
+use blaze_sim::Tape;
 
 use common::{CRATES, DEPTH, Db, LEAVES, Model, RING, Runs, TOTAL, VALUE, World, deps_of, new_runs};
 
@@ -46,17 +46,16 @@ enum Op {
     Record(u32, u32),
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let c = 1 + u32::from(tc.draw(gs::integers::<u8>().max_value(CRATES as u8 - 1)));
-    let l = usize::from(tc.draw(gs::integers::<u8>().max_value(LEAVES as u8 - 1)));
-    let d = u32::from(tc.draw(gs::integers::<u8>().max_value(DEPTH as u8)));
-    match tc.draw(gs::integers::<u8>().max_value(8)) {
-        0 | 1 => Op::Edit(c, l, u64::from(tc.draw(gs::integers::<u8>().max_value(9)))),
+fn op(tape: &Tape) -> Op {
+    let c = 1 + u32::from(tape.int_in(0u8..=CRATES as u8 - 1, "crate"));
+    let l = usize::from(tape.int_in(0u8..=LEAVES as u8 - 1, "leaf"));
+    let d = u32::from(tape.int_in(0u8..=DEPTH as u8, "depth"));
+    match tape.int_in(0u8..=8, "op") {
+        0 | 1 => Op::Edit(c, l, u64::from(tape.int_in(0u8..=9, "edited value"))),
         2 => Op::Next,
         3 => Op::Value(c, l),
         4 => Op::Total(c, d),
-        5 => Op::Ring(c, u32::from(tc.draw(gs::integers::<u8>().max_value(RING as u8 - 1)))),
+        5 => Op::Ring(c, u32::from(tape.int_in(0u8..=RING as u8 - 1, "ring member"))),
         6 => Op::Reach(c, l as u32),
         _ => Op::Record(c, d),
     }
@@ -174,12 +173,12 @@ fn check(ops: &[Op], plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
-#[hegel::test(test_cases = 300)]
-fn the_memo_refines_the_model(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(40));
-    if let Err(why) = check(&ops, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn the_memo_refines_the_model() {
+    blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+        let ops: Vec<Op> = tape.vec(0..=40, "ops", op);
+        check(&ops, Plant::None)
+    });
 }
 
 /// The table oracle is not vacuous: carrying a changed crate is refused.

@@ -98,6 +98,9 @@ mod lock_held_across_slow;
 mod lock_order;
 #[cfg(test)]
 mod lock_order_tests;
+mod loop_match_candidate;
+#[cfg(test)]
+mod loop_match_candidate_tests;
 mod loops;
 mod implicit_overflow;
 #[cfg(test)]
@@ -502,6 +505,8 @@ pub enum Lint {
     TrustGrantUnused,
     DependencyCapabilityUnreached,
     WorkspaceUnsafe,
+    // A hand-written state machine nightly's `#[loop_match]` could turn into direct jumps.
+    LoopMatchCandidate,
 }
 
 /// Which workspaces a lint is for.
@@ -924,6 +929,7 @@ impl Lint {
         Lint::TrustGrantUnused,
         Lint::DependencyCapabilityUnreached,
         Lint::WorkspaceUnsafe,
+        Lint::LoopMatchCandidate,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -999,9 +1005,11 @@ impl Lint {
             | Lint::NegativeEffect => Kind::General,
             // `packable`'s fix is a field with no address and a shift and mask per access,
             // and its `#[blaze::bits]` is an opt-in extension.
-            Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
-                Kind::PedanticPerf
-            }
+            Lint::DeepDropAtExit
+            | Lint::PodSerializedByField
+            | Lint::Packable
+            | Lint::SoaCandidate
+            | Lint::LoopMatchCandidate => Kind::PedanticPerf,
             // What the blaze edition removes or respells; right for any crate getting ready
             // for it.
             Lint::AsCast | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
@@ -1513,6 +1521,7 @@ impl Lint {
             Lint::TrustGrantUnused => "trust_grant_unused",
             Lint::DependencyCapabilityUnreached => "dependency_capability_unreached",
             Lint::WorkspaceUnsafe => "workspace_unsafe",
+            Lint::LoopMatchCandidate => "loop_match_candidate",
         }
     }
 
@@ -1750,6 +1759,7 @@ impl Lint {
             Lint::CouldBeLinear => concat!(docs!(), "#could_be_linear"),
             Lint::CouldHaveInvariant => concat!(docs!(), "#could_have_invariant"),
             Lint::SameBehaviour => concat!(docs!(), "#same_behaviour"),
+            Lint::LoopMatchCandidate => concat!(general_docs!(), "#loop_match_candidate"),
             Lint::HandWrittenDerivable => concat!(docs!(), "#hand_written_derivable"),
             Lint::ImplMissesField => concat!(docs!(), "#impl_misses_field"),
             Lint::HandKeptVariantList | Lint::VariantListDrift => {
@@ -2377,6 +2387,9 @@ impl Lint {
             Lint::DeepDropAtExit => {
                 "`std::mem::forget` it at the end of `main`, or flush and `std::process::exit(0)`; the operating system frees it at once"
             }
+            Lint::LoopMatchCandidate => {
+                "on nightly, `#[loop_match]` on the loop and `#[const_continue]` on each constant transition; or say why with `#[expect(blaze::loop_match_candidate, reason = \"..\")]`"
+            }
             Lint::DynFnParam => {
                 "take the closure as `impl Fn(..)` (a type parameter), so the call is direct and inlinable"
             }
@@ -2735,6 +2748,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         push_without_reserve::check(cx);
         scratch_in_loop::check(cx);
         deep_drop_at_exit::check(cx);
+        loop_match_candidate::check(cx);
         dyn_fn_param::check(cx);
         box_large_new::check(cx);
         checkfree::check(cx);

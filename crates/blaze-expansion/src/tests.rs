@@ -1,4 +1,4 @@
-//! The crate's tests: the token hash's properties (Hegel), the deterministic simulations of
+//! The crate's tests: the token hash's properties (`blaze_sim`), the deterministic simulations of
 //! macro calls, script runs, the module seam and the state chain, each with planted-bug
 //! controls, and the flat layout's round trips.
 //!

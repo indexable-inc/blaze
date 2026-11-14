@@ -546,6 +546,9 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::workspace_unsafe", Allow, "detects a workspace crate with `unsafe` code whose root does not say why with `#![blaze::trust(unsafe, reason = \"..\")]`")
         .externally_loaded(),
+    // Nightly-only speed advice, after the rest so the order stays `Lint::ALL`'s.
+    l("blaze::loop_match_candidate", Allow, "detects a `loop` over a local state that sets the next state from a `match` on it, with transitions to constant states that nightly's `#[loop_match]` would make direct jumps")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

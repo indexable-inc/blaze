@@ -278,7 +278,7 @@ impl Keyed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     /// One edit of a set.
     #[derive(Clone, Debug)]
@@ -289,20 +289,18 @@ mod tests {
 
     /// A key of a small space whose members share prefixes of every length: two bits at the
     /// top, two in the middle, two at the very end.
-    #[hegel::composite]
-    fn key(tc: &hegel::TestCase) -> Hash {
+    fn key(tape: &Tape) -> Hash {
         let mut key = [0; 32];
-        key[0] = tc.draw(gs::integers::<u8>().max_value(3)) << 6;
-        key[17] = tc.draw(gs::integers::<u8>().max_value(3)) << 3;
-        key[31] = tc.draw(gs::integers::<u8>().max_value(3));
+        key[0] = tape.int_in(0..=3u8, "top bits") << 6;
+        key[17] = tape.int_in(0..=3u8, "middle bits") << 3;
+        key[31] = tape.int_in(0..=3u8, "end bits");
         key
     }
 
-    #[hegel::composite]
-    fn op(tc: &hegel::TestCase) -> Op {
-        match tc.draw(gs::integers::<u8>().max_value(2)) {
-            0 => Op::Remove(tc.draw(key())),
-            _ => Op::Set { key: tc.draw(key()), value: tc.draw(gs::integers::<u8>().max_value(3)) },
+    fn op(tape: &Tape) -> Op {
+        match tape.int_in(0..=2u8, "op") {
+            0 => Op::Remove(key(tape)),
+            _ => Op::Set { key: key(tape), value: tape.int_in(0..=3u8, "value") },
         }
     }
 
@@ -345,12 +343,12 @@ mod tests {
     /// The refinement: after any sequence of sets and removals, the root kept by hashing
     /// only the edited entries' paths is the root of the same entries hashed whole, and so
     /// are the nodes kept.
-    #[hegel::test]
-    fn a_keyed_set_kept_by_edits_is_the_set_made_whole(tc: hegel::TestCase) {
-        let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(24));
-        if let Err(why) = kept_is_whole(&ops, false) {
-            panic!("{why}");
-        }
+    #[test]
+    fn a_keyed_set_kept_by_edits_is_the_set_made_whole() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let ops: Vec<Op> = tape.vec(0..=24, "ops", op);
+            kept_is_whole(&ops, false)
+        });
     }
 
     fn keyed(top: u8, end: u8) -> Hash {

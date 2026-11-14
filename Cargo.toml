@@ -585,6 +585,8 @@ blaze-remote = { path = "crates/blaze-remote" }
 blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
+blaze-sim = { path = "crates/blaze-sim" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-sqlite = { path = "crates/blaze-sqlite" }

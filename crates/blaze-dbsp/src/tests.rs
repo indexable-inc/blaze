@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use smallvec::smallvec;
 
 use crate::{
@@ -74,26 +73,23 @@ fn pushes_in_order_stay_consolidated() {
     assert_eq!(used.allocations, 0, "a reused Z-set allocates nothing");
 }
 
-#[hegel::test]
-fn zset_matches_a_btreemap(tc: TestCase) {
-    let rows: Vec<(u8, i32)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(15),
-            gs::integers().min_value(-3).max_value(3),
-        ))
-        .max_size(63),
-    );
-    let mut set = ZSet::new();
-    let mut model = BTreeMap::<u8, Weight>::new();
-    for &(t, w) in &rows {
-        set.push(t, w);
-        *model.entry(t).or_default() += w;
-    }
-    model.retain(|_, w| *w != 0);
-    set.consolidate();
-    let got: Vec<(u8, Weight)> = set.iter().map(|(t, w)| (*t, w)).collect();
-    let want: Vec<(u8, Weight)> = model.into_iter().collect();
-    assert_eq!(got, want);
+#[test]
+fn zset_matches_a_btreemap() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let rows: Vec<(u8, i32)> = tape
+            .vec(0..=63, "rows", |tape| (tape.int_in(0u8..=15, "row"), tape.int_in(-3i32..=3, "weight")));
+        let mut set = ZSet::new();
+        let mut model = BTreeMap::<u8, Weight>::new();
+        for &(t, w) in &rows {
+            set.push(t, w);
+            *model.entry(t).or_default() += w;
+        }
+        model.retain(|_, w| *w != 0);
+        set.consolidate();
+        let got: Vec<(u8, Weight)> = set.iter().map(|(t, w)| (*t, w)).collect();
+        let want: Vec<(u8, Weight)> = model.into_iter().collect();
+        assert_eq!(got, want);
+    });
 }
 
 #[test]
@@ -133,10 +129,15 @@ fn a_warm_diff_allocates_nothing() {
     assert_eq!(out, SeqDiff { removed: vec![100], added: vec![100] });
 }
 
-#[hegel::test]
-fn diff_is_the_multiset_difference(tc: TestCase) {
-    let old: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(7)).max_size(39));
-    let new: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(7)).max_size(39));
+#[test]
+fn diff_is_the_multiset_difference() {
+    blaze_sim::check(Config::DEFAULT, diff_case);
+}
+
+/// One case of [`diff_is_the_multiset_difference`].
+fn diff_case(tape: &Tape) {
+    let old: Vec<u8> = tape.vec(0..=39, "old", |tape| tape.int_in(0u8..=7, "old item"));
+    let new: Vec<u8> = tape.vec(0..=39, "new", |tape| tape.int_in(0u8..=7, "new item"));
     let mut out = SeqDiff::new();
     diff_seq(&old, &new, &mut out);
     assert!(out.removed.windows(2).all(|w| w[0] < w[1]));
@@ -234,22 +235,26 @@ enum IndexOp {
 }
 
 /// Adds four times as often as removes, forgets or forgets of many.
-#[hegel::composite]
-fn index_op(tc: &TestCase) -> IndexOp {
-    let pick: u8 = tc.draw(gs::integers().max_value(6));
-    let k: u8 = tc.draw(gs::integers().max_value(11));
-    let r: u8 = tc.draw(gs::integers().max_value(11));
+fn index_op(tape: &Tape) -> IndexOp {
+    let pick = tape.int_in(0u8..=6, "op");
+    let k = tape.int_in(0u8..=11, "key");
+    let r = tape.int_in(0u8..=11, "reader");
     match pick {
         0..=3 => IndexOp::Add(k, r),
         4 => IndexOp::Remove(k, r),
         5 => IndexOp::Forget(r),
-        _ => IndexOp::ForgetMany(tc.draw(gs::vecs(gs::integers().max_value(11)).max_size(8))),
+        _ => IndexOp::ForgetMany(tape.vec(0..=8, "forget many", |tape| tape.int_in(0u8..=11, "reader"))),
     }
 }
 
-#[hegel::test]
-fn read_index_matches_a_set_of_pairs(tc: TestCase) {
-    let ops: Vec<IndexOp> = tc.draw(gs::vecs(index_op()).max_size(199));
+#[test]
+fn read_index_matches_a_set_of_pairs() {
+    blaze_sim::check(Config::DEFAULT, read_index_case);
+}
+
+/// One case of [`read_index_matches_a_set_of_pairs`].
+fn read_index_case(tape: &Tape) {
+    let ops: Vec<IndexOp> = tape.vec(0..=199, "ops", index_op);
     let mut index = ReadIndex::<u8, u8>::new();
     let mut model = BTreeSet::<(u8, u8)>::new();
     for op in ops {
@@ -355,17 +360,21 @@ fn arrangement_lookups_allocate_nothing() {
     assert_eq!(used.allocations, 0, "a refilled key reuses its rows");
 }
 
-#[hegel::test]
-fn arrangement_matches_a_btreemap(tc: TestCase) {
-    let ops: Vec<(u8, u8, u8, i32)> = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers().max_value(5),
-            gs::integers().max_value(7),
-            gs::integers().max_value(3),
-            gs::integers().min_value(-2).max_value(2),
-        ))
-        .max_size(199),
-    );
+#[test]
+fn arrangement_matches_a_btreemap() {
+    blaze_sim::check(Config::DEFAULT, arrangement_case);
+}
+
+/// One case of [`arrangement_matches_a_btreemap`].
+fn arrangement_case(tape: &Tape) {
+    let ops: Vec<(u8, u8, u8, i32)> = tape.vec(0..=199, "ops", |tape| {
+        (
+            tape.int_in(0u8..=5, "key"),
+            tape.int_in(0u8..=7, "sort"),
+            tape.int_in(0u8..=3, "value"),
+            tape.int_in(-2i32..=2, "weight"),
+        )
+    });
     let mut arr = Arrangement::<u8, u8, u8>::new();
     // key -> (sort, value) -> weight.
     let mut model = BTreeMap::<u8, BTreeMap<(u8, u8), Weight>>::new();
@@ -431,13 +440,16 @@ fn a_warm_closure_allocates_nothing() {
     assert_eq!(out.len(), 999);
 }
 
-#[hegel::test]
-fn closure_matches_a_naive_bfs(tc: TestCase) {
-    let edges: Vec<(u8, u8)> = tc.draw(
-        gs::vecs(gs::tuples!(gs::integers().max_value(19), gs::integers().max_value(19),))
-            .max_size(59),
-    );
-    let seeds: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(19)).max_size(3));
+#[test]
+fn closure_matches_a_naive_bfs() {
+    blaze_sim::check(Config::DEFAULT, closure_case);
+}
+
+/// One case of [`closure_matches_a_naive_bfs`].
+fn closure_case(tape: &Tape) {
+    let edges: Vec<(u8, u8)> = tape
+        .vec(0..=59, "edges", |tape| (tape.int_in(0u8..=19, "edge from"), tape.int_in(0u8..=19, "edge to")));
+    let seeds: Vec<u8> = tape.vec(0..=3, "seeds", |tape| tape.int_in(0u8..=19, "seed"));
     let step = |n: u8, next: &mut Vec<u8>| {
         next.extend(edges.iter().filter(|e| e.0 == n).map(|e| e.1));
     };
@@ -489,10 +501,15 @@ fn a_warm_worklist_allocates_nothing() {
     assert_eq!(used.allocations, 0);
 }
 
-#[hegel::test]
-fn worklist_matches_a_naive_queue(tc: TestCase) {
+#[test]
+fn worklist_matches_a_naive_queue() {
+    blaze_sim::check(Config::DEFAULT, worklist_case);
+}
+
+/// One case of [`worklist_matches_a_naive_queue`].
+fn worklist_case(tape: &Tape) {
     let ops: Vec<Option<u8>> =
-        tc.draw(gs::vecs(gs::optional(gs::integers().max_value(9))).max_size(99));
+        tape.vec(0..=99, "ops", |tape| tape.option("push", |tape| tape.int_in(0u8..=9, "pushed")));
     let mut work = Worklist::new();
     let mut model = VecDeque::new();
     for op in ops {

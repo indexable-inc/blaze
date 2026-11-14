@@ -318,7 +318,9 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::DependencyUnsafe
         | Lint::TrustGrantUnused
         | Lint::DependencyCapabilityUnreached
-        | Lint::WorkspaceUnsafe => None,
+        | Lint::WorkspaceUnsafe
+        // Off by default; held by `#[expect(blaze::loop_match_candidate, reason = ..)]`.
+        | Lint::LoopMatchCandidate => None,
     }
 }
 

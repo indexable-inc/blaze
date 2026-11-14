@@ -326,6 +326,14 @@
    "why": "Decided by the owner, 2026-11-13 15:59 (/Volumes/Projects/blaze-int-1112-notes/target-decisions-1113.md, \"Scope, as the owner answered it\"), with his words that day: \"10% of floor should AIM for the right thing from the start! it is ok if we don't get there but think properly; just work for something you are highly proud of even on first try likely and then iterate\" and \"always make sure what you build is something you are proud of ... on first iteration even\".",
    "recommended": "Yes, as the owner's decision; recorded by claude-opus-5-5.",
    "state": "rules and AGENTS.md regenerated on fix-hello-1113 by claude-opus-5-5, not committed"
+  },
+  {
+   "id": "D37",
+   "date": "2026-11-13",
+   "decision": "blaze owns its test engine and its simulated machine (docs/v2/plan/design/sim.md, interface crate crates/blaze-sim, row V12). A test case is a function of one tape of labelled, bounded choices in which 0 is the calm choice; blaze-sim draws the tape from a seed, shrinks a failing tape, prints it and replays it from one line, and holds what the simulations copied (answers in flight, planted-bug controls, reach points). blaze stops depending on Hegel: vendor/hegeltest goes once every `#[hegel::test]`, the fresh core's hand-rolled simulations, `blaze_core::sim::Sim` and the code `#[blaze::contract_test]` generates draw from the tape. This reverses the testing skill's \"moving to Hegel's own `hegel::sim`\". Nothing is taken as a dependency from indexable-inc/hegel; its design (every choice a draw, 0 calm, a disk in three layers) is prior art.",
+   "why": "Andrew, 2026-11-13: on the plan to move the simulation into `hegel::sim`, \"reverse yea and just make dst as good as possible\"; then, told that `hegel::sim` is on the fork's main and was never pinned here, \"i think dont use indexable-inc/hegel dont depend on hegel nayrmoe jsut contro ldirectly in blaze (use opus 5.5)\". Found that day on main at e6635c9ba7: every simulation's schedule is one opaque seed that Hegel cannot shrink; `Sim`, blaze-check and the fresh core's loops are three machines that do not meet; 14 draw traits, 92 `enum Plant` and 21 control helpers are copies; the vendored engine is about 128,000 lines pinned 13 commits behind its fork, and bstd cannot depend on it.",
+   "recommended": "Yes. What it costs: a port of 354 tests in 70 crates and of the compiler's contract-test code generation, and a shrinker blaze now maintains. What is given up from Hegel: generation from a regular expression (10 uses) and its targeted search (not used here).",
+   "state": "spec and interface crate written on dst-1113 (design by claude-fable-5-2, code by claude-opus-5-5 lanes); not compiled"
   }
  ]
 }

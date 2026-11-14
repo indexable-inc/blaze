@@ -4,8 +4,6 @@ use std::cell::Cell;
 use blaze_cas::{Driven, Key, Kind, Mismatch, content_of};
 use blaze_ids::ContentId;
 use blaze_store_check::{Setting, VerifyError};
-use hegel::TestCase;
-use hegel::generators as gs;
 
 use super::*;
 
@@ -482,27 +480,29 @@ fn a_sampled_hit_is_computed_again() {
 
 /// Any sequence of edits to the world and gets: each get gives what a fresh run over the
 /// world as it is now gives, and each hit, computed again, makes the same reads and bytes.
-#[hegel::test(test_cases = 100)]
-fn any_edits_and_gets_give_what_a_fresh_run_gives(tc: TestCase) {
-    let kernel = kernel();
-    let mut store = Memory::default();
-    let mut world = Facts::default();
-    let steps: usize = tc.draw(gs::integers::<usize>().max_value(40));
-    for _ in 0..steps {
-        let key = tc.draw(gs::integers::<u8>().max_value(7));
-        match tc.draw(gs::integers::<u8>().max_value(2)) {
-            0 => {
-                world.facts.insert(key, tc.draw(gs::integers::<u8>().max_value(11)));
-            }
-            1 => {
-                world.facts.remove(&key);
-            }
-            _ => {
-                let got = kernel.get::<Chase, _>(&mut store, &world, &key, &Setting::ALL).unwrap();
-                assert_eq!(got.value(), fresh::<Chase>(&world, key));
+#[test]
+fn any_edits_and_gets_give_what_a_fresh_run_gives() {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
+        let kernel = kernel();
+        let mut store = Memory::default();
+        let mut world = Facts::default();
+        let steps = tape.int_in(0usize..=40, "steps");
+        for _ in 0..steps {
+            let key = tape.int_in(0u8..=7, "key");
+            match tape.int_in(0u8..=2, "step") {
+                0 => {
+                    world.facts.insert(key, tape.int_in(0u8..=11, "fact"));
+                }
+                1 => {
+                    world.facts.remove(&key);
+                }
+                _ => {
+                    let got = kernel.get::<Chase, _>(&mut store, &world, &key, &Setting::ALL).unwrap();
+                    assert_eq!(got.value(), fresh::<Chase>(&world, key));
+                }
             }
         }
-    }
+    });
 }
 
 /// The key a get computed and kept its entry under; a hit is a failure.
