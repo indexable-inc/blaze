@@ -1170,15 +1170,21 @@ fn the_oracle_catches_a_served_answer_used_at_another_revision() {
 }
 
 /// The served steps' lookup of the item store's own records is gone: the one record lookup
-/// left is a constant's value's (`Store::find_constant`).
+/// left is that of the steps with no kernel entry yet, a constant's value and a lowering
+/// (`Store::find_record`), called only where `Step::served` is false.
 #[test]
 fn the_served_steps_have_no_lookup_of_the_item_stores_records() {
     let source = include_str!("../../body_store.rs");
     assert_eq!(source.matches("blaze_record::lookup(").count(), 1, "one record lookup");
     let at = source.find("blaze_record::lookup(").unwrap();
-    let constant = source.find("fn find_constant(").expect("the constant's lookup");
-    let next = source[constant + 1..].find("\n    fn ").map_or(source.len(), |it| it + constant + 1);
-    assert!((constant..next).contains(&at), "the record lookup is the constant's");
+    let record = source.find("fn find_record(").expect("`Store::find_record`, the unserved lookup");
+    let next = source[record + 1..].find("\n    fn ").map_or(source.len(), |it| it + record + 1);
+    assert!((record..next).contains(&at), "the record lookup is `find_record`'s");
+    assert_eq!(source.matches("self.find_record(").count(), 1, "one call of `find_record`");
+    let call = source.find("self.find_record(").unwrap();
+    let unserved = source[..call].rfind("false => {").expect("the unserved arm of `step.served()`");
+    let served = source[..call].rfind("match step.served()").expect("the match on `step.served()`");
+    assert!(served < unserved, "`find_record` is called only in the unserved arm");
     for gone in ["fn find(", "self.find("] {
         assert!(!source.contains(gone), "`{gone}` is deleted");
     }

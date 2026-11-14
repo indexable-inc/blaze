@@ -73,15 +73,14 @@ fn h(s: &T) -> u32 { s.x }
 fn g(s: &T) -> u32 { h(s) }
 "#,
     );
-    // A renamed item keeps its own hashes (`T` names no item; `h`'s and `g`'s deep hashes name
-    // theirs by deep hash alone, what inlines), and every interface, signature and code hash
-    // that names it moves (D46): `h` and `g` name `T` in place of `S`, and `g` calls `h`.
+    // A renamed item keeps its own hashes, and every name-free hash naming it (interface, code,
+    // deep: what codegen keys a template by and what inlines) stays; every signature hash that
+    // names it moves (D46), as that is what a body's stored type check is checked by: `h` and
+    // `g` name `T` in place of `S`, and `g` calls `h`.
     assert_eq!(of(&db, "T"), s);
-    for (name, before) in [("h", f), ("g", g)] {
-        let after = of(&db, name);
-        assert_eq!(after.deep, before.deep, "{name}: the deep hash is name-free");
-        assert_ne!(after.interface, before.interface, "{name}: its interface names `T`");
-        assert_ne!(after.code, before.code, "{name}: its code names `T`");
+    assert_eq!(of(&db, "h"), f);
+    assert_eq!(of(&db, "g"), g);
+    for name in ["h", "g"] {
         let signature = |db: &TestDB, path| signature_hash(db, item(db, path)).unwrap();
         assert_ne!(signature(&db, name), sigs[usize::from(name == "g")], "{name}: its signature");
     }
@@ -184,8 +183,10 @@ fn g() -> u32 { f(1) }
 /// and rejected with `f(_: Feet)`. A body's stored inference, MIR and borrow check are checked
 /// by the callee's `Signature` fact, whose value is the signature hash
 /// (`facts::value`, `Fact::Signature`), so a signature hash that spells `Meters` and `Feet`
-/// alike serves a caller's stale result. The control: the two types' layouts are equal, which
-/// is right (a layout does not depend on a name), so codegen may share what depends only on it.
+/// alike serves a caller's stale result. A fact that spells a form (a field's type) names its
+/// items by key as well, for the same reason. The control: the interface hash and the two
+/// types' layouts are name-free, which is right (what a compiled body does depends on a shape,
+/// never a name; which item it calls is bound by key beside its code), so codegen shares them.
 #[test]
 fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() {
     let cases = [
@@ -214,12 +215,26 @@ fn a_signature_naming_another_type_of_the_same_shape_moves_its_signature_hash() 
             "`f`'s signature hash did not move when the type it names became another of the \
              same shape:\n{before}---\n{after}"
         );
-        assert_ne!(
+        assert_eq!(
             of(&db, "f").interface,
             interface,
-            "`f`'s interface hash did not move:\n{before}---\n{after}"
+            "`f`'s interface hash is name-free:\n{before}---\n{after}"
         );
     }
+    // A field's type, by its `Field` fact's value.
+    let field_value = |db: &TestDB| {
+        let AdtId::StructId(w) = adt(db, "W") else { unreachable!("`W` is a struct") };
+        let variant = hir_def::VariantId::from(w);
+        let (local, _) = variant.fields(db).fields().iter().next().expect("`W` has a field");
+        let fact = crate::facts::field(db, variant, local);
+        crate::facts::value(db, item(db, "W").krate(db), &fact)
+            .unwrap_or_else(|err| panic!("{}", err.describe(db)))
+    };
+    let types = "pub struct Meters(pub u32);\npub struct Feet(pub u32);\n";
+    let (mut db, file) = single(&format!("{types}pub struct W(pub Meters);\n"));
+    let before = field_value(&db);
+    edit(&mut db, file, &format!("{types}pub struct W(pub Feet);\n"));
+    assert_ne!(field_value(&db), before, "`W.0`'s fact names `Feet` in place of `Meters`");
     // The control: equal shapes, equal layouts.
     let (db, _) = single(cases[0].0);
     assert_eq!(

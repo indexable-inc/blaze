@@ -43,12 +43,16 @@ Prior art, and what is taken from each:
   visibility, a trait's items, layout-affecting attributes (`repr`, `align`, `packed`,
   `transparent`, `non_exhaustive`), visibility as "public, crate, or the module n levels up",
   plus what a body leaks (section 4). Computed by `blaze_items::hash::interface_hash`.
-  Its references, and the signature hash's, name each target by key as well as by hash (D46):
-  `struct Meters(u32)` and `struct Feet(u32)` have one hash, so a hash alone made `fn f(m:
-  Meters)` and `fn f(f: Feet)` one signature, and a caller's stored inference and MIR were served
-  stale after the edit. A rename keeps the item's own hashes and moves every hash that names it;
-  inside a strongly connected component a reference is the member's position and its key. The
-  layout and deep hashes stay name-free.
+  What validates a type-check result names each target by key as well as by hash (D46): the
+  signature hash, and a fact's value that spells a form (a field's type, a closure's captures, a
+  constant's type). `struct Meters(u32)` and `struct Feet(u32)` have one hash, so a hash alone
+  made `fn f(m: Meters)` and `fn f(f: Feet)` one signature, and a caller's stored inference and
+  MIR were served stale after the edit. A rename keeps the item's own hashes and moves every
+  signature hash that names it; inside a strongly connected component a reference is the
+  member's position and its key. The interface, layout, code and deep hashes stay name-free:
+  they key what codegen compiles, which depends on shapes only, and which item a compiled body
+  calls or names is bound by key beside its code (the bound hash, the instance keys), never
+  inside it.
 - **Identity** (new, `blaze_item_hash::identity`): *what a body's results are a function of*,
   known before running them. Section 3.
 

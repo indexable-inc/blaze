@@ -725,16 +725,19 @@ fn each_owner_of_a_body_has_its_own_place_and_schema() {
 
 /// Closures where the body's inference types them and where it does not: nested, in an inline
 /// `const` block (inferred inside the body), in an array length (a body of its own), an
-/// `async` closure, and an `async fn`, whose body is an `async` block.
+/// `async` closure, and an `async fn`, whose body is an `async` block. The array length is in a
+/// type annotation with no initializer, which the body's inference leaves unevaluated: a repeat
+/// count (`[0u8; { .. }]`) is evaluated during inference (`infer_array_repeat_expr`, through
+/// MIR), and this crate's own test build has no MIR (`coroutine_witness_tests`' `no_build`).
 const PLACES: &str = r#"
 //- minicore: sized, copy, fn, future, async_fn
 //- /main.rs crate:main deps:core new_source_root:local
 pub fn places() -> u32 {
     let outer = |x: u32| { let inner = move || x; inner() };
     let k = const { let f = || 3u32; 4u32 };
-    let a = [0u8; { let g = || 5usize; 6 }];
+    let _a: [u8; { let g = || 5usize; 6 }];
     let c = async |y: u32| y;
-    let _ = (a, c);
+    let _ = c;
     outer(k)
 }
 pub async fn later(n: u32) -> u32 { let h = |m: u32| m; h(n) }

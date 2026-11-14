@@ -3382,13 +3382,22 @@ impl Drop for Planted {
 /// their entries into it, as a build that checked and stored the crate leaves them: the
 /// simulation and the store, kept for the test's life, and a reader of it.
 fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Store, blaze_cas::Reader) {
+    built_and_kept_of(seed, || core_front(lib))
+}
+
+/// [`built_and_kept`] of the front end `front` makes, whose unit 0 is the crate whose bodies
+/// are asked.
+fn built_and_kept_of(
+    seed: u64,
+    front: impl FnOnce() -> blaze_lower::Lowered,
+) -> (blaze_core::sim::Sim, blaze_cas::Store, blaze_cas::Reader) {
     let mut sim = blaze_core::sim::Sim::new(seed, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
     let reader = store.reader();
     // The session's store reads run as a task's, on the simulation lent to them.
     super::deps::tests::as_task(&mut sim, || {
     let macros = super::deps::tests::no_macros();
-    let first = std::sync::Arc::new(core_front(lib));
+    let first = std::sync::Arc::new(front());
     let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&first);
     let _ = crate::serve::front_carry::bodies::take_refused();
@@ -3994,6 +4003,171 @@ fn a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller() {
         for carried in [false, true] {
             if let Err(why) = renominal_never_stale(20 + at as u64, case, carried) {
                 failed.push(format!("{} (carried: {carried}): {why}", case.what)); // alloc: as above
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`RENOMINALS`] across a crate boundary: the dependency `dep` (unit 1) before and after, and
+/// the dependent `app` (unit 0), whose text no case edits.
+struct DepRenominal {
+    what: &'static str,
+    dep_before: &'static str,
+    dep_after: &'static str,
+    app: &'static str,
+}
+
+/// The types each case's `dep` declares, and a private body the control edits.
+const DEP_TYPES: &str = "#![no_std]\npub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                         fn private() -> u32 { 1 }\n";
+
+const DEP_RENOMINALS: [DepRenominal; 3] = [
+    DepRenominal {
+        what: "a parameter that becomes another newtype of the same shape",
+        dep_before: "pub fn f(_x: Meters) {}\n",
+        dep_after: "pub fn f(_x: Feet) {}\n",
+        app: "#![no_std]\npub fn caller() { dep::f(dep::Meters(1)) }\npub fn other() -> u32 { 1 }\n",
+    },
+    DepRenominal {
+        what: "a parameter whose marker type becomes another unit struct",
+        dep_before: "pub struct A;\npub struct B;\n\
+                     pub fn f(_x: core::marker::PhantomData<A>) {}\n",
+        dep_after: "pub struct A;\npub struct B;\n\
+                    pub fn f(_x: core::marker::PhantomData<B>) {}\n",
+        app: "#![no_std]\npub fn caller() { dep::f(core::marker::PhantomData::<dep::A>) }\n\
+              pub fn other() -> u32 { 1 }\n",
+    },
+    DepRenominal {
+        what: "a return type that becomes another newtype, each with its own impl",
+        dep_before: "pub trait Tr { fn m(&self) -> u32; }\n\
+                     impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                     impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                     pub fn f() -> Meters { Meters(1) }\n",
+        dep_after: "pub trait Tr { fn m(&self) -> u32; }\n\
+                    impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                    impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                    pub fn f() -> Feet { Feet(1) }\n",
+        app: "#![no_std]\nuse dep::Tr;\npub fn caller() -> u32 { dep::f().m() }\n\
+              pub fn other() -> u32 { 1 }\n",
+    },
+];
+
+/// `dep`'s library: [`DEP_TYPES`] then `rest`.
+fn dep_lib(rest: &str) -> String {
+    format!("{DEP_TYPES}{rest}") // alloc: a test's text
+}
+
+/// The front end of `app` (unit 0, a path package) on `dep` (unit 1, a path package), both
+/// `#![no_std]` on [`core_front`]'s minicore (unit 2).
+fn two_crate_front(app: &str, dep: &str) -> blaze_lower::Lowered {
+    let mini =
+        test_utils::MiniCore::from_flags(MINI.iter().copied()).source_code(test_utils::MiniCore::RAW_SOURCE);
+    bodies_front(&[
+        MemPkg { name: "app", path: true, lib: app, deps: &[(1, "dep"), (2, "core")] },
+        MemPkg { name: "dep", path: true, lib: dep, deps: &[(2, "core")] },
+        MemPkg { name: "mini", path: false, lib: &mini, deps: &[] },
+    ])
+}
+
+/// What `app`'s narrow key holds of `dep` for a check: the key its check outcome is filed under
+/// holds `dep` by this part alone (`blaze_lower::Lowered::narrow_parts`, design section 15).
+fn dep_interface_part(lowered: &blaze_lower::Lowered) -> Result<ContentId, String> {
+    lowered
+        .narrow_parts(0)
+        .into_iter()
+        .find(|(what, _)| what.starts_with("the interface") && what.contains("of the crate dep "))
+        .map(|(_, part)| part)
+        .ok_or_else(|| format!("no interface part of `dep` in `app`'s narrow key: {:?}", lowered.narrow_parts(0)))
+}
+
+/// The cross-crate form of [`renominal_never_stale`]: `app` on `dep_before` built and kept;
+/// then `app` on `dep_after` served from those entries, as the next build (`carried` false) or
+/// as the daemon's next revision of one database (`carried` true). `app`'s `caller` must equal
+/// a database of the edited tree served nothing, the item store must find no served answer
+/// that disagrees, and `app`'s check outcome must not be replayed: the interface part of `dep`
+/// its narrow key holds moves. With `dep_after` the private body's edit alone (`renamed`
+/// false: the control), nothing of `app` may move and both its bodies are served.
+fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -> Result<(), String> {
+    let (dep_before, dep_after) = (dep_lib(case.dep_before), match renamed {
+        true => dep_lib(case.dep_after),
+        false => dep_lib(case.dep_before).replace("fn private() -> u32 { 1 }", "fn private() -> u32 { 2 }"),
+    });
+    let (mut sim, mut store, reader) = built_and_kept_of(seed, || two_crate_front(case.app, &dep_before));
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
+        let macros = super::deps::tests::no_macros();
+        let sessions = BodySessions::default();
+        let marks = no_marks();
+        let interface_before = dep_interface_part(&two_crate_front(case.app, &dep_before))?;
+        let fresh = std::sync::Arc::new(two_crate_front(case.app, &dep_after));
+        let interface_after = dep_interface_part(&fresh)?;
+        match (renamed, interface_after == interface_before) {
+            (true, true) => {
+                return Err("`app`'s check outcome is replayed: its narrow key holds the same interface of `dep`".to_owned());
+            }
+            (false, false) => {
+                return Err("a private body's edit moved the interface of `dep` `app`'s check is keyed by".to_owned());
+            }
+            _ => {}
+        }
+        let mut next = std::sync::Arc::new(two_crate_front(case.app, if carried { &dep_before } else { &dep_after }));
+        let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        let krate = next.krate(0).unwrap();
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            .map_err(|error| format!("the serve: {}", error.what))?;
+        let bodies = ask_bodies_steps(&next);
+        let [infer, _, _] = BODY_STEPS;
+        let read = served.item_steps().unwrap();
+        if read[infer].hits == 0 {
+            return Err(format!("the control: no inference was served, so the edit proves nothing: {read:?}"));
+        }
+        if !renamed && !carried && (read[infer].hits as usize, read[infer].ran) != (bodies, 0) {
+            return Err(format!("a private body's edit of `dep` left `app` not served whole: {read:?}"));
+        }
+        if carried {
+            for it in puts.puts {
+                store.put(it.key, it.kind, &it.bytes).map_err(|error| format!("the serve's put: {error:?}"))?;
+            }
+            let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
+            let root = lowered.krate(1).unwrap().data(lowered.db()).root_file_id;
+            lowered
+                .served_db()
+                .batch(base_db::Trigger::named("the test's edit of `dep`"), |db| db.set_file_text(root, &dep_after));
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+                .map_err(|error| format!("the second serve: {}", error.what))?;
+            ask_bodies_steps(&next);
+        }
+        super::deps::item_errors(&served)
+            .map_err(|error| format!("the served database's item store: {}", error.what))?;
+        let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        ask_bodies_steps(&fresh);
+        let (now, run) = (steps_of(&next, "caller"), steps_of(&fresh, "caller"));
+        match now == run {
+            true => Ok(()),
+            false => Err(format!("`caller` served stale: {now:?}, a database served nothing has {run:?}")),
+        }
+    })
+}
+
+/// A dependency's function whose signature comes to name another nominal type of the same
+/// shape reaches the dependent crate, whose text did not change: in the next build and in the
+/// daemon's next revision alike.
+///
+/// The invariant: `app`'s `caller`, served from the entries a build kept, equals a database of
+/// the edited tree served nothing; the item store finds no served answer that disagrees; and
+/// `app`'s check outcome is keyed anew (its narrow key's interface of `dep` moves), so rustc's
+/// rejection of `app` is not replayed away. The control: an edit of a private body of `dep`
+/// moves neither, and `app`'s bodies are all served.
+#[test]
+fn a_dependencys_function_that_names_another_type_of_the_same_shape_reaches_the_dependent() {
+    let mut failed: Vec<String> = Vec::new(); // alloc: a test's findings
+    for (at, case) in DEP_RENOMINALS.iter().enumerate() {
+        for carried in [false, true] {
+            for renamed in [true, false] {
+                if let Err(why) = dep_renominal(40 + at as u64, case, carried, renamed) {
+                    // alloc: as above
+                    failed.push(format!("{} (carried: {carried}, renamed: {renamed}): {why}", case.what));
+                }
             }
         }
     }

@@ -204,13 +204,16 @@ fn fields_changes_with_a_member_name_and_only_then() {
     ]);
 }
 
-/// Why `Fields` exists: lane items' signature hash names a trait's and an impl's items by
-/// place (`blaze_items::form`'s `trait_`), so it stays when one is renamed, and a lookup by
-/// name reads the name. A type's fields and variants that hash names itself (`for const` over
-/// them reads `Field::NAME` and `Variant::NAME`: `form`'s `fields`), so a renamed field changes
-/// the type's signature and its `Fields`, which is over that signature.
+/// A renamed trait item moves both the trait's signature and its `Fields`. The trait's form
+/// names its items by place (`blaze_items::form`'s `trait_`) and the signature hash fills each
+/// by its key as well (D46), so a renamed item, which is another key, moves it; `Fields` holds
+/// the names a lookup by name compares, and moves on its own account (a name a macro's context
+/// keys, which no item key spells, is `Fields`' alone). A type's fields and variants that hash
+/// names itself (`for const` over them reads `Field::NAME` and `Variant::NAME`: `form`'s
+/// `fields`), so a renamed field changes the type's signature and its `Fields`, which is over
+/// that signature.
 #[test]
-fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
+fn a_renamed_trait_item_moves_the_signature_and_the_fields() {
     let signature =
         |db: &Db, name: &str| items_fact(Fact::Signature(key::item_key(db, named(db, name))));
     let value = |db: &Db, fact: FactRef| {
@@ -224,10 +227,10 @@ fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
         db_of(&format!("{PRELUDE}pub trait T {{ fn m(&self); }} impl T for u8 {{ fn m(&self) {{}} }}")),
         db_of(&format!("{PRELUDE}pub trait T {{ fn n(&self); }} impl T for u8 {{ fn n(&self) {{}} }}")),
     );
-    assert_eq!(
+    assert_ne!(
         value(&before, signature(&before, "T")),
         value(&after, signature(&after, "T")),
-        "a trait's signature names its items by place"
+        "a trait's signature names its items by place and key"
     );
     let fields = fields_of("T");
     assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
@@ -562,15 +565,11 @@ const REFUSALS: &[(&str, &str)] = &[
 /// only with that reason; a query no rule names and not here is a gap
 /// (`every_tracked_query_a_step_reads_is_named_by_a_rule`).
 const UNRULED: &[(&str, &str, &str)] = &[
-    // Positions: the identity has no spans.
-    ("Body::source_map", "hir-def/src/expr_store/body.rs", "a source map: positions"),
-    // A walk of every module of a published crate outside `inherent_assoc_types` (which is
-    // its own fact now, `InherentAssocTypes`).
-    (
-        "modules",
-        "hir-def/src/nameres/delta/publish.rs",
-        "a walk of every module of a published crate (DefMap::table)",
-    ),
+    // Gone from this list, no longer read by the steps (2026-11-14, claude-opus-5-5):
+    // `Body::source_map` (a body written in a file maps through `Body::relative`, refused in
+    // [`REFUSALS`]; `source_map` lowers again only for a body with no file) and `modules` of
+    // `nameres/delta/publish.rs` (a module is read through `CrateResolution::module`, covered).
+    // A step that reads one again fails `every_tracked_query_a_step_reads_is_named_by_a_rule`.
     // The hygiene context of an item's name written by a macro, keyed by the expansion and the
     // item's syntax id, not by an item: what a body's method and associated-item lookups compare
     // names under (`def_site::assoc_item_key`). No fact names it yet; it becomes the item's
@@ -1751,8 +1750,12 @@ fn seen_by(kept: &KeptTrace, source: &str) -> Vec<String> {
         seen.push(String::from("the body's identity")); // alloc: test
     }
     for &(fact, value) in &kept.facts {
-        if values::value_in(&db, def, fact) != value {
-            seen.push(format!("{fact:?}")); // alloc: test
+        let now = values::value_in(&db, def, fact);
+        if now != value {
+            // The full subject and both values: a fact listed twice with two values in one
+            // trace is a value that is not a function of its fact.
+            let subject = fact.subject.0;
+            seen.push(format!("{fact:?} (subject {subject:02x?}): {value:?} then {now:?}")); // alloc: test
         }
     }
     drop(installed);
@@ -1814,9 +1817,12 @@ fn a_clean_bodys_borrow_check_reads_no_refused_row() {
             reads.sort_unstable();
             reads.dedup();
             assert!(!reads.is_empty(), "`{name}`'s borrow check read nothing: it did not run");
+            let refused: Vec<&str> = // alloc: test
+                reads.iter().filter(|(_, class)| class == "Refused").map(|&(it, _)| it).collect();
             assert!(
-                reads.iter().all(|(_, class)| class != "Refused"),
-                "`{name}`'s borrow check read a refused row, so its verdict is not kept: {reads:#?}"
+                refused.is_empty(),
+                "`{name}`'s borrow check read refused rows {refused:?}, so its verdict is not \
+                 kept; every read: {reads:#?}"
             );
             assert!(
                 reads.iter().any(|&(read, _)| reads::cmp_listed("Body::of", read).is_eq()),
