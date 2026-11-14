@@ -8,7 +8,9 @@
 //! Found, in a `loop` (not a `while` or `for`) written in the file and not in a closure or an
 //! async block, whose body is one statement or tail and nothing else:
 //!
-//! - `state = match state { .. };`, each arm's value a transition;
+//! - `state = match state { .. };`, each arm's value a transition, or the same `match` alone in
+//!   a labeled block (`state = 'next: { match state { .. } };`, the form `#[loop_match]` takes
+//!   with the attribute left off), where a trailing `break 'next VALUE` is a transition too;
 //! - `match state { A => { ..; state = B; } .. }`, each arm's trailing assignment to `state` a
 //!   transition, and no other write to `state` in the `match`.
 //!
@@ -19,7 +21,11 @@
 //! branches of an `if` are followed to their values; a `break`, `continue` or `return` leaves
 //! the machine and is no transition.
 //!
-//! Left alone: a state that is a field (`self.stage`), a type with data, a guard, a second
+//! A state whose type needs drop (an enum with a `Drop` impl) is left alone: rustc does not drop
+//! the old state inside a `#[loop_match]` and blaze does, so the rewrite would change what the
+//! loop does under one of the two.
+//!
+//! Left alone too: a state that is a field (`self.stage`), a type with data, a guard, a second
 //! statement in the loop body, a write to `state` other than a transition (`state += 1`,
 //! `&mut state`, one nested deeper), no constant transition, a loop that has `#[loop_match]`
 //! already, and a loop whose syntax node is not found.
@@ -33,8 +39,8 @@ use hir_def::{
     DefWithBodyId, ItemContainerId, Lookup as _,
     expr_store::Body,
     hir::{
-        BinaryOp, BindingId, Expr, ExprId, Literal, LoopSource, MatchArm, Pat, PatId, Statement,
-        UnaryOp, Unsafe, type_ref::Mutability,
+        BinaryOp, BindingId, Expr, ExprId, LabelId, Literal, LoopSource, MatchArm, Pat, PatId,
+        Statement, Statements, UnaryOp, Unsafe, type_ref::Mutability,
     },
     resolver::ValueNs,
 };
@@ -132,19 +138,29 @@ fn machine(db: &base_db::Db, def: DefWithBodyId, body: &Body, inner: ExprId) -> 
         },
         _ => return None,
     };
-    let (scrutinee, arms, assigned) = match body.expr(only) {
+    let (scrutinee, arms, assigned, next) = match body.expr(only) {
         Expr::Assignment { target, value } => {
-            let Expr::Match { expr, arms } = body.expr(value) else { return None };
-            (expr, arms, Some(target))
+            // `state = 'next: { match state { .. } }`: the form `#[loop_match]` takes, written
+            // and the attribute left off.
+            let (matched, next) = match body.expr(value) {
+                Expr::Block { statements, tail: Some(tail), label: Some(label), .. }
+                    if statements.is_empty() =>
+                {
+                    (tail, Some(label))
+                }
+                _ => (value, None),
+            };
+            let Expr::Match { expr, arms } = body.expr(matched) else { return None };
+            (expr, arms, Some(target), next)
         }
-        Expr::Match { expr, arms } => (expr, arms, None),
+        Expr::Match { expr, arms } => (expr, arms, None, None),
         _ => return None,
     };
     let state = local_of(db, def, body, scrutinee)?;
     if arms.iter().any(|arm| arm.guard.is_some()) {
         return None;
     }
-    let walk = Walk { db, def, body, state };
+    let walk = Walk { db, def, body, state, next };
     let mut count = Count { constant: 0, all: 0 };
     // alloc: the transitions of one loop, a few
     let mut sites = Vec::new();
@@ -180,34 +196,57 @@ struct Count {
     all: u32,
 }
 
+/// The expression a block ends in: its tail, or its last statement when it has none.
+fn trailing(statements: Statements<'_>, tail: Option<ExprId>) -> Option<ExprId> {
+    match (tail, statements.last()) {
+        (Some(tail), _) => Some(tail),
+        (None, Some(Statement::Expr { expr, .. })) => Some(expr),
+        (None, _) => None,
+    }
+}
+
 /// One body, and the state of the loop it is asked about.
 struct Walk<'a> {
     db: &'a base_db::Db,
     def: DefWithBodyId,
     body: &'a Body,
     state: BindingId,
+    /// The label of the block around the `match` in the labeled-block form, whose `break`s
+    /// carry the next state.
+    next: Option<LabelId>,
 }
 
 impl Walk<'_> {
-    /// Counts the next states the value `expr` can be: a block's tail and each branch of an `if`
-    /// followed, an exit not counted.
+    /// Counts the next states the value `expr` can be: a block's trailing expression, each
+    /// branch of an `if` and the value of a `break` to the labeled block followed, an exit not
+    /// counted.
     fn values(&self, expr: ExprId, depth: u32, count: &mut Count) {
         if self.constant(expr) {
             count.constant += 1;
             count.all += 1;
             return;
         }
-        if self.exits(expr) {
-            return;
-        }
         match self.body.expr(expr) {
-            Expr::Block { tail: Some(tail), label: None, .. } if depth > 0 => {
-                self.values(tail, depth - 1, count);
+            // `break 'next VALUE` gives the labeled block its value, and so the state.
+            Expr::Break { expr: Some(value), label: Some(label) }
+                if self.next == Some(label) && depth > 0 =>
+            {
+                self.values(value, depth - 1, count);
+            }
+            Expr::Block { statements, tail, label: None, .. } if depth > 0 => {
+                match trailing(statements, tail) {
+                    Some(last) => self.values(last, depth - 1, count),
+                    None => count.all += 1,
+                }
             }
             Expr::If { then_branch, else_branch: Some(else_branch), .. } if depth > 0 => {
                 self.values(then_branch, depth - 1, count);
                 self.values(else_branch, depth - 1, count);
             }
+            Expr::Break { .. }
+            | Expr::Continue { .. }
+            | Expr::Return { .. }
+            | Expr::Become { .. } => {}
             _ => count.all += 1,
         }
     }
@@ -229,12 +268,7 @@ impl Walk<'_> {
                 self.values(value, depth, count);
             }
             Expr::Block { statements, tail, label: None, .. } if depth > 0 => {
-                let last = match (tail, statements.last()) {
-                    (Some(tail), _) => Some(tail),
-                    (None, Some(Statement::Expr { expr, .. })) => Some(expr),
-                    (None, _) => None,
-                };
-                match last {
+                match trailing(statements, tail) {
                     Some(last) => self.transitions(last, depth - 1, count, sites),
                     None => count.all += 1,
                 }
@@ -330,8 +364,14 @@ impl Walk<'_> {
     }
 }
 
-/// Whether rustc's `loop_match` takes a state of type `ty` (`builder/expr/into.rs`).
+/// Whether rustc's `loop_match` takes a state of type `ty` (`builder/expr/into.rs`) and the
+/// rewrite keeps what the loop does: rustc does not drop the old state inside a `#[loop_match]`
+/// (on the pinned nightly a `Drop` enum prints `123.c` annotated, `1a2b3.c` plain) while blaze
+/// does, so a state that needs drop would behave differently under the two compilers.
 fn supported(db: &base_db::Db, ty: &hir::Type<'_>) -> bool {
+    if ty.drop_glue(db) != hir::DropGlue::None {
+        return false;
+    }
     if ty.is_int_or_uint() || ty.is_float() || ty.is_bool() || ty.is_char() {
         return true;
     }

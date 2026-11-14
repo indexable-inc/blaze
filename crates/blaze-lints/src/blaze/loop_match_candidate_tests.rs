@@ -4,7 +4,7 @@
 
 use crate::tests::lint;
 
-const MINICORE: &str = "//- minicore: sized, copy, clone, option, add, ord, eq, builtin_impls\n";
+const MINICORE: &str = "//- minicore: sized, copy, clone, option, add, ord, eq, builtin_impls, drop\n";
 
 const MAIN: &str = "//- /src/lib.rs crate:main\n";
 
@@ -199,8 +199,9 @@ pub fn run() {
     only_the_control(&found);
 }
 
-/// A loop that has `#[loop_match]` already is left alone. Its body keeps the first shape, not
-/// the labeled-block form, so it is the attribute that keeps the lint quiet.
+/// A loop that has `#[loop_match]` already is left alone. The same body without the attributes
+/// is found (`finds_the_labeled_block_form_without_the_attribute`), so it is the attribute that
+/// keeps the lint quiet.
 #[test]
 fn leaves_a_loop_match_loop_alone() {
     let found = only(&format!(
@@ -209,11 +210,75 @@ fn leaves_a_loop_match_loop_alone() {
 pub fn run() {
     let mut state = 0u8;
     #[loop_match]
+    'machine: loop {
+        state = 'next: {
+            match state {
+                0 => {
+                    #[const_continue]
+                    break 'next 1;
+                }
+                1 => {
+                    #[const_continue]
+                    break 'next 2;
+                }
+                _ => break 'machine,
+            }
+        };
+    }
+}
+"#
+    ));
+    only_the_control(&found);
+}
+
+/// The labeled-block form with `#[loop_match]` and `#[const_continue]` left off is found, its
+/// `break 'next VALUE`s counted as the transitions: what a person has after writing the form
+/// and forgetting the attribute.
+#[test]
+fn finds_the_labeled_block_form_without_the_attribute() {
+    let found = only(&format!(
+        "{CONTROL}{}",
+        r#"
+pub fn run() {
+    let mut state = 0u8;
+    'machine: loop {
+        state = 'next: {
+            match state {
+                0 => {
+                    break 'next 1;
+                }
+                1 => {
+                    break 'next 2;
+                }
+                _ => break 'machine,
+            }
+        };
+    }
+}
+"#
+    ));
+    assert_eq!(found.matches(FOUND).count(), 2, "{found}");
+    assert!(found.contains("over `next`"), "{found}");
+    assert!(found.contains("over `state`: 2 of its 2 transitions"), "{found}");
+}
+
+/// A state with a destructor is left alone: rustc does not drop the old state inside a
+/// `#[loop_match]` and blaze does, so the rewrite would change what the loop prints.
+#[test]
+fn leaves_a_state_that_needs_drop_alone() {
+    let found = only(&format!(
+        "{CONTROL}{}",
+        r#"
+pub enum Light { Red, Green }
+impl Drop for Light {
+    fn drop(&mut self) {}
+}
+pub fn run(mut n: u32) {
+    let mut state = Light::Red;
     loop {
         state = match state {
-            0 => 1,
-            1 => 2,
-            _ => break,
+            Light::Red => Light::Green,
+            Light::Green => { n += 1; if n > 3 { break } else { Light::Red } }
         };
     }
 }

@@ -1137,7 +1137,9 @@ In `blaze::pedantic_perf`, allowed by default.
 
 **What it catches.** A hand-written state machine: a `loop` whose whole body is one of
 
-- `state = match state { .. };`, each arm's value the next state;
+- `state = match state { .. };`, each arm's value the next state, or the same `match` alone in a
+  labeled block (`state = 'next: { match state { .. } };`, the form below with the attributes
+  left off), where a `break 'next VALUE` ending an arm is a transition too;
 - `match state { A => { ..; state = B; } .. }`, each arm ending in an assignment to `state`.
 
 `state` is a local (not a field, not a closure's capture) of a type rustc's `loop_match` takes:
@@ -1145,6 +1147,9 @@ an integer, a float, `bool`, `char`, or an enum whose variants have no fields. N
 guard, nothing else writes `state`, and at least one transition goes to a constant: a literal, a
 fieldless variant or a module's `const`. The finding counts the transitions and how many are
 constant. A loop that has `#[loop_match]` already is left alone, as is any shape it can't tell.
+A state whose type needs drop (an enum with a `Drop` impl) is left alone too: rustc does not
+drop the old state inside a `#[loop_match]` while blaze does, so the rewrite would change what
+the loop does under one of the two compilers.
 
 **Why it matters.** Each step goes back to the top of the loop and through the `match` again, an
 indirect jump or a chain of compares the branch predictor has to guess. With `#[loop_match]`,
