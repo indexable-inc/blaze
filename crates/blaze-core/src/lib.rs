@@ -1506,8 +1506,9 @@ pub trait Driver {
     /// Moves completions into `out`, waiting until `until` (on [`Driver::now`]'s clock) for
     /// the first if none is ready: [`wait::Deadline::PASSED`] only looks, and
     /// [`wait::Deadline::NEVER`] waits until one comes. An absolute deadline, never a length,
-    /// so no layer between the caller and the kernel restarts it (rule deadline-waits).
-    /// Returns how many it moved.
+    /// so no layer between the caller and the kernel restarts it (rule deadline-waits). With
+    /// nothing in flight it returns at once, unless a waker was handed out: the rule on
+    /// [`Driver::waker`]. Returns how many it moved.
     fn poll(&mut self, out: &mut Vec<Completion>, until: wait::Deadline) -> usize;
     /// How many effects were submitted and have not completed.
     fn in_flight(&self) -> usize;
@@ -1526,6 +1527,14 @@ pub trait Driver {
     /// deadline. `None` says the driver has none (the simulation, which runs no thread; a
     /// driver not yet given one): its caller then bounds its wait by a deadline of its own and
     /// says so in the wait's name.
+    ///
+    /// The rule every driver with a waker keeps, the one place it is stated (the io_uring and
+    /// kqueue drivers point here, and each has a test `a_wake_ends_a_wait_parked_in_the_kernel`):
+    /// once a waker is handed out, a poll with nothing in flight parks until a wake or its
+    /// deadline; and a wake made at any point (before the poll, before it parks, while it is
+    /// parked in the kernel) ends that poll, or the next if none is under way. A driver keeps
+    /// whatever its wake writes to (an eventfd's read, a `kqueue` trigger) armed before every
+    /// wait in the kernel, never only while some other work is out.
     fn waker(&self) -> Option<Waker> {
         None
     }

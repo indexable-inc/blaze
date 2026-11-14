@@ -2812,7 +2812,8 @@ impl Driver for Uring {
         self.fire_timers();
         out.append(&mut self.ready);
         // With nothing in flight only a waker can end the wait, so it is waited for once one
-        // has been handed out; with neither, nothing can come and the poll only looks.
+        // has been handed out; with neither, nothing can come and the poll only looks (the
+        // rule on `Driver::waker`).
         if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
             let clock = Monotonic::since(self.start);
             while out.len() == before {
@@ -3662,6 +3663,7 @@ mod tests {
         /// How long the waking thread lets the parked thread get into `io_uring_enter`.
         const SETTLE: Duration = Duration::from_millis(100);
         let root = dir("uring-wake");
+        std::fs::create_dir_all(&root).unwrap();
         let mut driver = Uring::new(&root).unwrap();
         let waker = driver.waker().expect("the ring driver has a waker");
         for timer_in_flight in [false, true] {
@@ -4308,8 +4310,10 @@ mod tests {
     }
 
     /// Each request in flight, by its handle.
+    /// The effects' requests in flight. The read of the wake's eventfd is the driver's own,
+    /// in flight across every wait once a waker is given, and no effect's: it is left out.
     fn requests(driver: &Uring) -> Vec<Id> {
-        driver.ops.iter().map(|(id, _)| id).collect()
+        driver.ops.iter().filter(|(_, hot)| hot.kind != Kind::Wake).map(|(id, _)| id).collect()
     }
 
     /// The invariant: a sync and a barrier of a file sealed read-only succeed through the
