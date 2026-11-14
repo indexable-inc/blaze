@@ -1057,3 +1057,35 @@ export const web_url_h = 26
 export const web_menu_w = 240
 export const web_popup_w = 360
 export const web_popup_h = 480
+
+// Hover help: a quiet raised plate with a strong title and wrapping support, no motion.
+export const tooltip_max_w = 340
+export const tooltip_pad_x = 12
+export const tooltip_pad_y = 10
+export const tooltip_gap = 4
+export const tooltip_offset = 14
+
+// ---- native questions: typography first, generous targets and one bounded options well -------------------------------
+export const question_gap = 16
+export const question_heading_gap = 6
+export const question_option_gap = 4
+export const question_option_pad = 12
+export const question_option_min_h = 52
+export const question_options_max_h = 320
+export const question_radius = 8
+export const question_border = 1
+export const question_title_size = 19
+export const question_title_line = 26
+export const question_label_size = 14
+export const question_label_line = 20
+export const question_detail_size = 12
+export const question_detail_line = 18
+export const question_eyebrow_size = 11
+export const question_eyebrow_line = 16
+export const question_field_h = 42
+export const question_submit_h = 36
+export const question_submit_min_w = 112
+export const question_action_gap = 10
+export const question_receipt_gap = 4
+
+export const question_max_w = 660

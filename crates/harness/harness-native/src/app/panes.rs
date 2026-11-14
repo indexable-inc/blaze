@@ -695,6 +695,9 @@ impl App {
 
     /// The pointer moved to `(x, y)` (window points).
     pub fn pointer_move(&mut self, x: f32, y: f32, m: KeyMods) {
+        if [self.pointer.x, self.pointer.y] != [x / self.zoom(), y / self.zoom()] {
+            self.tooltip_moved();
+        }
         self.set_pointer(x, y);
         self.mods = m;
         if self.drag.active() {
@@ -745,6 +748,7 @@ impl App {
 
     /// A button went down at `(x, y)`: the `clicks`th in a row.
     pub fn pointer_down(&mut self, x: f32, y: f32, b: Button, clicks: isize, m: KeyMods) {
+        self.dismiss_tooltip();
         self.set_pointer(x, y);
         self.mods = m;
         self.poke();
@@ -958,6 +962,7 @@ impl App {
     /// add up in `frac` until they make a row); a program with a mouse mode
     /// gets wheel reports, a full-screen one arrows.
     pub fn wheel(&mut self, dy: f32, precise: bool, m: KeyMods) {
+        self.dismiss_tooltip();
         let Some(t) = self.term_at().or_else(|| self.focused_term()) else { return };
         let lines = if precise { dy / self.grid.ch } else { dy };
         let input = self.input_of(t);
@@ -1030,6 +1035,7 @@ impl App {
     /// A key from the window's keyDown: its binding's action when one takes it (a selector, `copy:`, is the window's to
     /// send up the responder chain), else typing for whatever has the keyboard.
     pub fn key(&mut self, k: &term::KeyIn<'_>) -> super::Outcome {
+        self.dismiss_tooltip();
         self.poke_why("key");
         // An open row menu has the keys while it is open, as NSMenu has (row_menu.rs).
         if self.row_menu_key(k) {
