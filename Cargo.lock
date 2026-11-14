@@ -1779,6 +1779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-pg"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "blaze-sha256",
+ "blaze-sql",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-phf"
 version = "0.0.0"
 dependencies = [
@@ -2095,6 +2105,22 @@ name = "blaze-spin"
 version = "0.0.0"
 dependencies = [
  "blaze-check",
+]
+
+[[package]]
+name = "blaze-sql"
+version = "0.0.0"
+dependencies = [
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-sqlite"
+version = "0.0.0"
+dependencies = [
+ "blaze-sql",
+ "hegeltest",
+ "libsqlite3-sys",
 ]
 
 [[package]]
@@ -4860,6 +4886,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "libzstd-rs-sys"
 version = "0.0.1-prerelease.2"
 dependencies = [
@@ -7188,6 +7225,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

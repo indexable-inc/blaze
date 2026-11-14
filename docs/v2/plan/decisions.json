@@ -302,6 +302,14 @@
    "why": "Andrew, 2026-11-12 17:52: \"it needs to be better, not just 3x, but better\": Relax holds nothing between runs, so a daemon that stays loses the held row whatever it holds.",
    "recommended": "Yes. The cost: the first edit after an idle exit pays a daemon start and a restore from disk.",
    "state": "written on int-1112, not compiled"
+  },
+  {
+   "id": "D34",
+   "date": "2026-11-13",
+   "decision": "blaze gets its own typed SQL (docs/v2/plan/design/sql.md, rows Q1 to Q7): one sans-IO checker over a SQL subset with a schema made of Rust structs, drivers for C SQLite (libsqlite3-sys's amalgamation, no rusqlite) and Postgres (an own sans-IO wire protocol), SQL only as a const generic string, parameters named (`$name`) and bound by a record, row types computed with `type_of!`. Not wrapped: sqlx. Not forked: Turso. The work is on branch sql-1113 in its own worktree, because int-1112 does not compile and another session owns it.",
+   "why": "Andrew, 2026-11-13: \"make ur own sqlite thing\", \"be nice if it work for postgres too\", \"it should DENY any injection stuff i.e., should require prepared statement like things and imo should be NAMED\", and \"ok sounds good\" to the plan; executors are Opus 5.5 medium (\"doit with subagnt opus 5.5 medium not fable\").",
+   "recommended": "Yes. What it costs: it does nothing for the edit loop on reth and tempo; its use to blaze is as the first consumer of `type_of!`, records and field types.",
+   "state": "on branch sql-1113 (718b361060), not pushed: the checker, the SQLite driver and the Postgres core pass their tests under cargo (76, 24, 28); not yet run: blaze check and its lints, the workspace check, a long run of the refinement, a real Postgres; Q4 to Q9 (the typed surface and its language pieces) not started"
   }
  ]
 }
