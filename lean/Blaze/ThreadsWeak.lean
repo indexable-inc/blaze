@@ -82,10 +82,11 @@ cycle): R1 lets both through. That the kernel's futex look is as above.
 **Not modelled.** Promises, so load buffering (rule R1 refuses what could show it); what
 `SeqCst` adds over `AcqRel`; fences.
 
-**No Rust runner.** The Rust `blaze_core::world::threads::two` takes turns and does the real
+**The Rust runners.** `blaze_core::world::threads::two` takes turns and does the real
 operation, so it runs the sequentially consistent world only and panics on exactly the runs
-that world refuses: the Rust body and `Prog.value` agree wherever it runs, and `valueWeak` has
-no Rust runner yet.
+that world refuses: the Rust body and `Prog.value` agree wherever it runs. `two_weak` runs this
+world: its step is `crates/blaze-core/src/world/weak.rs`, this file operation for operation,
+held to it by the litmus runs of `Blaze/Tests/ThreadsWeak.lean` restated in Rust.
 -/
 
 namespace Blaze.Threads.Weak
