@@ -4,9 +4,9 @@
 //! Plants: [`Plant::SubdirKeepsParent`] (the subdirectory reaches its parent) and
 //! [`Plant::OpenCreates`] (a read-only open of a missing file makes it).
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
+use super::{check, control, path, root, world, write_synced};
 use crate::Plant;
 
 /// The names a call picks from: some written before, some never.
@@ -28,13 +28,13 @@ struct Plan {
     calls: Vec<(Call, &'static str, bool)>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let n = d.int(1, 24);
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let n = tape.int_in(1..=24u64, "calls");
     let calls = (0..n)
         .map(|_| {
-            let call = d.pick(&[Call::Write, Call::Create, Call::Open, Call::Stat, Call::ReadAll]);
-            (call, d.pick(&NAMES), d.coin())
+            let call = *tape.one_of(&[Call::Write, Call::Create, Call::Open, Call::Stat, Call::ReadAll], "call");
+            (call, *tape.one_of(&NAMES, "name"), tape.coin("through read-only"))
         })
         .collect();
     Plan { seed, calls }
@@ -98,17 +98,17 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 
 /// The invariant: narrowing never widens. Every file a call through `top/sub` names is beneath
 /// `top/sub`, and a call through its read-only narrowing changes nothing.
-#[hegel::test(test_cases = 100)]
-fn a_narrowed_directory_reaches_only_beneath_it(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_narrowed_directory_reaches_only_beneath_it() {
+    blaze_sim::check(Config::cases(100), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_subdir_that_keeps_its_parent() {
-    control(Plant::SubdirKeepsParent, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::SubdirKeepsParent, plan, run);
 }
 
 #[test]
 fn the_oracle_catches_a_read_only_open_that_creates() {
-    control(Plant::OpenCreates, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::OpenCreates, plan, run);
 }
