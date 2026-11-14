@@ -2,6 +2,8 @@
 #![feature(loop_match)]
 #![expect(incomplete_features)]
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 struct D(&'static str);
 
 impl Drop for D {
@@ -83,20 +85,19 @@ enum Dropping {
     C,
 }
 
+/// How many `Dropping` states have been dropped.
+static DROPS: AtomicU32 = AtomicU32::new(0);
+
 impl Drop for Dropping {
     fn drop(&mut self) {
-        // No `as` cast: rustc refuses one of an enum with `Drop`.
-        let name = match *self {
-            Dropping::A => "A",
-            Dropping::B => "B",
-            Dropping::C => "C",
-        };
-        println!("drop {name}");
+        DROPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// A state with `Drop` is accepted. Neither the jump nor the loop's own update drops the old
-/// state; only the last state drops, when `dropping` returns.
+/// A state with `Drop` is accepted, and each transition drops the state it overwrites, as the
+/// plain loop does: A on the jump to B, B on the update to C. The assert holds the case to that.
+/// nightly-2026-10-27 drops neither (it writes the state without a drop), so it fails this
+/// case; blaze differs from it on purpose (docs/v2/plan/design/loop-match.md).
 fn dropping() {
     let mut state = Dropping::A;
     #[loop_match]
@@ -104,18 +105,15 @@ fn dropping() {
         state = 'next: {
             match state {
                 Dropping::A => {
-                    println!("a");
                     #[const_continue]
                     break 'next Dropping::B;
                 }
-                Dropping::B => {
-                    println!("b");
-                    Dropping::C
-                }
+                Dropping::B => Dropping::C,
                 Dropping::C => break 'run,
             }
         }
     }
+    assert_eq!(DROPS.load(Ordering::Relaxed), 2, "A and B dropped at their transitions");
 }
 
 fn main() {

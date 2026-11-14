@@ -25,9 +25,11 @@ blaze can't resolve is an error naming it, never a plain `break` in its place.
 ## The lowering contract
 
 - The loop head keeps today's dispatch: `match state` tests the arms in order.
-- `#[const_continue] break 'blk C` lowers to: `state = C`; exactly the drops and `StorageDead`s
-  a plain `break 'blk C` runs (`exit_to` the labeled block's scope); a `goto` to the entry of
-  the arm the check picked.
+- `#[const_continue] break 'blk C` lowers to what a plain `break 'blk C` and the loop's
+  `state = ..` run, in that order: C into the labeled block's value; exactly the drops and
+  `StorageDead`s of `exit_to` the labeled block's scope; the old state dropped and C moved
+  into it as the ordinary assignment does; then a `goto` to the entry of the arm the check
+  picked.
 - The arm picked is the first arm whose pattern accepts C, decided when the check runs: C is a
   literal (negated or not), a fieldless variant path or a const item, evaluated by
   `const_eval`. Patterns are literals, ranges, const paths, variant paths, or-patterns,
@@ -36,7 +38,8 @@ blaze can't resolve is an error naming it, never a plain `break` in its place.
   joins the arm body. Its no-match edge goes to the loop head as a `continue` would. The jump
   never reaches the head's dispatch, and a wrong pick would still run the right arm.
 - Only arms some `#[const_continue]` targets get an entry; the other arms lower as before.
-- With no `#[const_continue]` and a `Copy` state, the MIR is the plain loop's. A state with drop glue (a fieldless enum with `Drop`, which rustc accepts) is written without dropping the old one, on the jump and on the loop's own `state = 'blk: { .. }`, as rustc's `ExprKind::LoopMatch` and `break_const_continuable_scope` write it. The plain loop's assignment drops it.
+- With no `#[const_continue]`, the MIR is the plain loop's.
+- blaze differs from the pinned nightly for a state with a destructor (a fieldless enum with `Drop`, which rustc's type check accepts). The nightly writes the state without dropping the old one, on the jump and on the loop's own update, so a program the plain loop runs as `1a2b3.c` prints `123.c` there. blaze drops the old state at each transition as the plain `state = ..` does, after the arm's locals, because the attributes are meant to change speed and nothing else.
 
 ## Departures from rustc
 

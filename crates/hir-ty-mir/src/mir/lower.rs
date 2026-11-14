@@ -2281,9 +2281,6 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(Some(current))
             }
             Expr::Assignment { target, value: rhs } => {
-                if self.is_loop_match_update(expr_id, rhs) {
-                    return self.lower_loop_match_update(expr_id, rhs, place, current);
-                }
                 // What the pattern takes of a place is all that is moved out of it, as a
                 // `let` of the pattern moves: `_ = place` moves nothing.
                 let Some((value, mut current)) = self.lower_expr_as_place(current, rhs, true)?

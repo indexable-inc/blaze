@@ -3,9 +3,11 @@
 //! `break_const_continuable_scope` (MIT or Apache-2.0).
 //!
 //! The loop lowers as a plain one, its head testing the arms in order. A `#[const_continue]
-//! break 'blk C` assigns `C` to the state, leaves what a `break 'blk C` leaves, and jumps to
-//! the entry of the arm [`loop_match_check`] picked for `C`: a block that tests only that arm's
-//! pattern and binds it, then joins the arm's body. The head's chain of tests is not run.
+//! break 'blk C` does what `break 'blk C` and the loop's `state = ..` do, in that order (the
+//! block's value is `C`, the arm's scopes are left, the old state is dropped and `C` written),
+//! and jumps to the entry of the arm [`loop_match_check`] picked for `C`: a block that tests
+//! only that arm's pattern and binds it, then joins the arm's body. The head's chain of tests
+//! is not run.
 //!
 //! The entry's no-match edge goes to the head as a `continue` would. The check proved it is
 //! never taken; it is there so that a wrong pick runs the arm the head would, not a wrong one.
@@ -17,8 +19,6 @@ use super::*;
 /// One `#[loop_match]` loop being lowered, with jumps to it.
 pub(super) struct LoopMatchFrame<'f> {
     loop_expr: ExprId,
-    /// `state = 'blk: { .. }`, the loop's body.
-    assignment: ExprId,
     /// The `match` on the state.
     match_expr: ExprId,
     /// The loop's head and the drop scope a `continue` of it leaves to, once the loop has
@@ -43,10 +43,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         }
     }
 
-    /// Starts `loop_expr`'s frame when it is a `#[loop_match]` loop the check accepted. Every
-    /// other loop lowers as before: one the check refused never gets here (the body is not
-    /// lowered). A loop no `#[const_continue]` jumps to still gets a frame, for its update of
-    /// the state (`lower_loop_match_update`).
+    /// Starts `loop_expr`'s frame when it is a `#[loop_match]` loop the check accepted and some
+    /// `#[const_continue]` jumps to. Every other loop lowers as before: one the check refused
+    /// never gets here (the body is not lowered), and without jumps nothing differs.
     pub(super) fn enter_loop_match(&mut self, loop_expr: ExprId) -> Result<'db, ()> {
         if !self.store.is_loop_match(loop_expr) {
             return Ok(());
@@ -55,6 +54,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         let Some(accepted) = loop_match_check(self.db, def).loop_of(loop_expr) else {
             return Ok(());
         };
+        if accepted.targets.is_empty() {
+            return Ok(());
+        }
         // alloc: in the lowering's frame, one slot per arm a jump targets
         let mut entries = Vec::with_capacity_in(accepted.targets.len(), self.frame);
         for &arm in &accepted.targets {
@@ -66,7 +68,6 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         // alloc: in the lowering's frame, one per `#[loop_match]` loop being lowered
         self.loop_matches.push(LoopMatchFrame {
             loop_expr,
-            assignment: accepted.assignment,
             match_expr: accepted.match_expr,
             head: None,
             state: None,
@@ -152,46 +153,16 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
         Ok(body)
     }
 
-    /// Whether `assignment` is the `state = 'blk: { .. }` of a loop being lowered, with a
-    /// state an ordinary assignment would drop.
-    pub(super) fn is_loop_match_update(&mut self, assignment: ExprId, rhs: ExprId) -> bool {
-        if !self.loop_matches.iter().any(|it| it.assignment == assignment) {
-            return false;
-        }
-        let ty = self.expr_ty_without_adjust(rhs);
-        !self.is_copy(ty)
-    }
-
-    /// `state = 'blk: { .. }` in a `#[loop_match]` loop: the block's value is moved into the
-    /// state, and the old state is not dropped. rustc's `ExprKind::LoopMatch` writes it with a
-    /// plain assign, as `break_const_continuable_scope` writes a jump's value, so a state
-    /// with a `Drop` impl is never dropped by the loop, on either path. Without the attribute
-    /// the same source drops it, as the ordinary assignment does.
-    pub(super) fn lower_loop_match_update(
-        &mut self,
-        assignment: ExprId,
-        rhs: ExprId,
-        place: Place<'db>,
-        current: BasicBlockId,
-    ) -> Result<'db, Option<BasicBlockId>> {
-        let span = MirSpan::from(assignment);
-        let Some((value, current)) = self.lower_expr_as_place(current, rhs, true)? else {
-            return Ok(None);
-        };
-        self.push_fake_read(current, value, span);
-        // The `match` in `rhs` set the state's place as it lowered.
-        let state = self.loop_matches.iter().rev().find(|it| it.assignment == assignment);
-        let Some(state) = state.and_then(|it| it.state.as_ref()).map(StoredPlace::as_ref) else {
-            implementation_error!("`#[loop_match]` update {assignment:?}: the state has no place");
-        };
-        let moved = Operand { kind: OperandKind::Move(value.store()), span: Some(rhs.into()) };
-        self.push_assignment(current, state, moved.into(), span);
-        self.push_assign_unit(current, place, span);
-        Ok(Some(current))
-    }
-
-    /// `#[const_continue] break 'blk value`: `state = value`, then what a `break 'blk` leaves
-    /// is left, and the jump goes to the entry of the arm the check picked.
+    /// `#[const_continue] break 'blk value`, in the plain loop's order: the value goes where a
+    /// `break 'blk value` puts it, what that break leaves is left, then `state = ..` drops the
+    /// old state and writes the new one as the ordinary assignment does, and the jump goes to
+    /// the entry of the arm the check picked.
+    ///
+    /// rustc (nightly-2026-10-27) writes the value into the state before the scopes are left
+    /// and never drops the old state, so a state with `Drop` prints otherwise there. blaze
+    /// keeps the plain loop's behaviour: the attributes change speed, not effects. A `Copy`
+    /// state goes the same way, as an arm's local whose destructor reads the state sees the
+    /// old value in the plain loop; the drop is skipped for it (`drop_assigned`).
     pub(super) fn lower_const_continue(
         &mut self,
         break_expr: ExprId,
@@ -227,17 +198,25 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 "`#[const_continue]` {break_expr:?}: arm {arm} has no entry or the state no place"
             );
         };
-        let Some(current) = self.lower_expr_to_place(value, state, current)? else {
+        let block = self.labeled_loop_blocks.get(&label).ok_or(MirLowerError::UnresolvedLabel)?;
+        // The labeled block's value, the temporary `state = 'blk: { .. }` moves from. It is
+        // outside the block's scopes, so it outlives what the break leaves.
+        let (value_place, scope) = (block.place.as_ref(), block.drop_scope_index);
+        let Some(current) = self.lower_expr_to_place(value, value_place, current)? else {
             return Ok(None);
         };
-        // What a `break 'blk` leaves: every scope inside the labeled block. The arm's entry is
-        // inside the block, so what is live there stays live, as on the head's path.
-        let scope = self
-            .labeled_loop_blocks
-            .get(&label)
-            .ok_or(MirLowerError::UnresolvedLabel)?
-            .drop_scope_index;
-        self.exit_to(scope, current, entry, break_expr.into());
+        let span = MirSpan::from(break_expr);
+        // What a `break 'blk` leaves: every scope inside the labeled block, an arm's locals
+        // first. The arm's entry is inside the block, so what is live there stays live, as on
+        // the head's path.
+        let assign = self.new_basic_block();
+        self.exit_to(scope, current, assign, span);
+        let ty = self.place_ty(&state);
+        let moved: Rvalue = Operand { kind: OperandKind::Move(value_place.store()), span: None }.into();
+        // clone: kept in the body, once on the way out of the drop if it unwinds
+        let assigned = self.drop_assigned(state, ty, assign, span, Some(moved.clone()));
+        self.push_assignment(assigned, state, moved, span);
+        self.set_goto(assigned, entry, span);
         Ok(None)
     }
 }

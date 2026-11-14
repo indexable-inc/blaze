@@ -1,7 +1,7 @@
 //! `#[loop_match]` and `#[const_continue]`: a state machine prints the same with and without
 //! the attributes, a transition's jump goes past the loop head's arm tests, an arm's locals drop
 //! before the jump as a plain `break` drops them, a jump to an arm with a binding binds the new
-//! value, a state with `Drop` is dropped where rustc drops it, and each shape rustc refuses is
+//! value, a state with `Drop` is dropped as the plain loop drops it, and each shape rustc refuses is
 //! refused with its message, unless an earlier error of rustc's stops it first. Each program runs on Linux
 //! x86-64 under [`Plain`] with minicore.
 
@@ -173,14 +173,64 @@ fn main() {
 "#
 );
 
-/// rustc's `#[loop_match]` writes the state with a plain assign on both paths, the jump's
-/// (`break_const_continuable_scope`) and the loop's own (`ExprKind::LoopMatch`), so the old
-/// state is never dropped: only the last one is, when `walk` returns. Without the attributes
-/// each `state = ..` drops the state it overwrites.
+/// [`DROPPING`] with a `Noisy` local in the arm that jumps.
+const DROPPING_WITH_A_LOCAL: &str = program!(
+    r#"
+enum State {
+    A,
+    B,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        put(match *self {
+            State::A => b'a',
+            State::B => b'b',
+        });
+    }
+}
+
+fn held() {
+    let mut state = State::A;
+    /*lm*/
+    'run: loop {
+        state = 'next: {
+            match state {
+                State::A => {
+                    let _n = Noisy(b'n');
+                    put(b'1');
+                    /*cc*/
+                    break 'next State::B;
+                }
+                State::B => {
+                    put(b'2');
+                    break 'run;
+                }
+            }
+        }
+    }
+    put(b'.');
+}
+
+fn main() {
+    held();
+}
+"#
+);
+
+/// Each `state = ..` drops the state it overwrites, a jump's too, so the attributes change no
+/// output. nightly-2026-10-27 prints `123.c` for [`DROPPING`] with them, never dropping the old
+/// state; blaze keeps the plain loop's (docs/v2/plan/design/loop-match.md).
 #[test]
-fn a_state_with_drop_is_dropped_only_where_rustc_drops_it() {
-    prints(&plain(DROPPING), "1a2b3.c");
-    prints(&attributed(DROPPING), "123.c");
+fn a_state_with_a_destructor_is_dropped_at_each_transition_as_the_plain_loop_drops_it() {
+    prints_both_ways(DROPPING, "1a2b3.c");
+}
+
+/// The jumping arm's local drops before the old state, as a `break 'next` leaves the arm
+/// before the loop's `state = ..` runs.
+#[test]
+fn an_arms_local_drops_before_the_old_state() {
+    prints_both_ways(DROPPING_WITH_A_LOCAL, "1na2.b");
 }
 
 /// From `from`, the first `SwitchInt`, through the blocks that only go on to one other.
@@ -537,14 +587,14 @@ fn f() {
     );
 }
 
-/// rustc's `require_label_in_labeled_block` runs before its `#[const_continue]` label check
-/// and returns: the break's innermost breakable is the block `'next`, so the nightly reports
-/// E0695 ("unlabeled `break` inside of a labeled block") alone, which inference reports here.
+/// The break's innermost breakable is the block `'next`, so type checking gives E0695
+/// ("unlabeled `break` inside of a labeled block", inference's here) and skips its label
+/// check. E0695 does not taint the body, so THIR building refuses the break too:
+/// nightly-2026-10-27 prints both errors.
 #[test]
-fn a_const_continue_with_no_label_in_a_labeled_block_gets_only_e0695() {
-    assert_eq!(
-        refusals(
-            r#"
+fn a_const_continue_with_no_label_in_a_labeled_block_gets_e0695_and_a_missing_label() {
+    refused(
+        r#"
 fn f() {
     let mut state: u8 = 0;
     #[loop_match]
@@ -560,9 +610,8 @@ fn f() {
         }
     }
 }
-"#
-        ),
-        Vec::<&str>::new(),
+"#,
+        "a `#[const_continue]` must break to a label with a value",
     );
 }
 

@@ -171,8 +171,6 @@ pub struct LoopMatchError {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoopMatchLoop {
     pub loop_expr: ExprId,
-    /// `state = 'blk: { .. }`, the loop's body.
-    pub assignment: ExprId,
     /// The `match` on the state, the labeled block's tail.
     pub match_expr: ExprId,
     /// The arms some `#[const_continue]` jumps to, by index, in increasing order.
@@ -252,7 +250,7 @@ pub fn loop_match_check(db: &Db, def: DefWithBodyId) -> LoopMatchCheck {
     }
     // rustc builds no THIR for a body whose type check is tainted, and none of the checks
     // after it runs; inference reports that body's errors.
-    if infer.has_errors || infer.has_type_mismatches() || infer.is_erroneous() {
+    if !builds_thir(infer) {
         return LoopMatchCheck::default();
     }
     // THIR building's checks, all fatal, over the whole body before any of MIR building's.
@@ -262,6 +260,32 @@ pub fn loop_match_check(db: &Db, def: DefWithBodyId) -> LoopMatchCheck {
     }
     checker.walk(body.root_expr(), Phase::Mir);
     checker.finish()
+}
+
+/// Whether rustc builds THIR for the body: its type check is not tainted. E0695 is
+/// `loops::check`'s, emitted before the inference context exists, so it does not taint the
+/// body in rustc (nightly-2026-10-27 goes on to THIR's `#[const_continue]` error), while blaze's
+/// inference counts it in `has_errors`. A body whose only tainting diagnostics are E0695 is
+/// read as untainted.
+///
+/// Limit: `has_errors` also holds the resolver's and the trait solver's errors, which leave
+/// no diagnostic here; one of those beside an E0695 is read as untainted too.
+fn builds_thir(infer: &InferenceResult<'_>) -> bool {
+    if infer.has_type_mismatches() || infer.is_erroneous() {
+        return false;
+    }
+    if !infer.has_errors {
+        return true;
+    }
+    let mut e0695 = false;
+    for diagnostic in infer.diagnostics() {
+        match diagnostic {
+            InferenceDiagnostic::UnlabeledJumpInLabeledBlock { .. } => e0695 = true,
+            other if other.taints_body() => return false,
+            _ => {}
+        }
+    }
+    e0695
 }
 
 /// Which of rustc's passes a walk of the body makes the checks of.
@@ -303,7 +327,6 @@ impl Checker<'_> {
                 targets.dedup();
                 LoopMatchLoop {
                     loop_expr: it.loop_expr,
-                    assignment: it.assignment,
                     match_expr: it.match_expr,
                     targets: targets.into_boxed_slice(),
                 }
@@ -394,7 +417,6 @@ struct LoopEntry {
 /// What THIR's checks find the loop's body is.
 #[derive(Clone, Copy)]
 struct Shape {
-    assignment: ExprId,
     match_expr: ExprId,
     scrutinee: ExprId,
 }
@@ -408,7 +430,6 @@ struct State {
 
 struct Accepted {
     loop_expr: ExprId,
-    assignment: ExprId,
     match_expr: ExprId,
 }
 
@@ -443,7 +464,7 @@ impl<'db> Checker<'db> {
                 Expr::Break { expr: value, label } if self.store.is_const_continue(expr) => {
                     match phase {
                         Phase::Labels => self.check_label(expr, label, body),
-                        Phase::Thir => self.check_value_given(expr, value, body),
+                        Phase::Thir => self.check_value_given(expr, label, value, body),
                         Phase::Mir => self.check_jump(expr, value, label, body),
                     }
                     body
@@ -496,7 +517,7 @@ impl<'db> Checker<'db> {
     fn check_state(&mut self, loop_expr: ExprId, body: Option<ExprId>) {
         use LoopMatchErrorKind::*;
         let Some(entry) = self.entry_of_loop(loop_expr) else { return };
-        let Some(Shape { assignment, match_expr, scrutinee }) = self.loops[entry].shape else {
+        let Some(Shape { match_expr, scrutinee }) = self.loops[entry].shape else {
             return;
         };
         let ty = self.infer.expr_ty(scrutinee);
@@ -509,7 +530,7 @@ impl<'db> Checker<'db> {
         }
         let loop_entry = &mut self.loops[entry];
         loop_entry.state = Some(State { match_expr, kind });
-        loop_entry.accepted = Some(Accepted { loop_expr, assignment, match_expr });
+        loop_entry.accepted = Some(Accepted { loop_expr, match_expr });
     }
 
     /// rustc's THIR shape checks of `loop_expr` (`thir/cx/expr.rs`, `ExprKind::Loop`).
@@ -565,7 +586,7 @@ impl<'db> Checker<'db> {
         }
         // Every shape that gets here is one `register_loop` named.
         let Some(entry) = self.entry_of_loop(loop_expr) else { return };
-        self.loops[entry].shape = Some(Shape { assignment, match_expr: tail, scrutinee });
+        self.loops[entry].shape = Some(Shape { match_expr: tail, scrutinee });
     }
 
     /// The local `expr` names, when it is a path to a binding of `body` itself: rustc's
@@ -618,7 +639,8 @@ impl<'db> Checker<'db> {
         let Some(label) = label else {
             // rustc's `require_label_in_labeled_block` comes first in the same visit: an
             // unlabeled break whose innermost breakable is a labeled block gets E0695, which is
-            // not fatal, and its `#[const_continue]` is never looked at. Inference reports that
+            // not fatal, and this check is skipped. THIR building then refuses the break
+            // (`check_value_given`); nightly-2026-10-27 prints both. Inference reports that
             // E0695 here.
             let e0695 = self.infer.diagnostics().iter().any(|it| {
                 matches!(it, InferenceDiagnostic::UnlabeledJumpInLabeledBlock { expr, .. } if *expr == break_expr)
@@ -634,10 +656,17 @@ impl<'db> Checker<'db> {
     }
 
     /// THIR building's `MissingLabelOrValue` (`thir/cx/expr.rs`): a `#[const_continue]` has a
-    /// value. rustc makes it only in a body whose type check held, so a break with no value
-    /// in a block typed other than `()` gets inference's mismatch alone.
-    fn check_value_given(&mut self, break_expr: ExprId, value: Option<ExprId>, body: Option<ExprId>) {
-        if value.is_none() {
+    /// label and a value. rustc makes it only in a body whose type check held, so a break
+    /// with no value in a block typed other than `()` gets inference's mismatch alone. An
+    /// unlabeled one gets here only with its E0695 (`check_label`), which taints nothing.
+    fn check_value_given(
+        &mut self,
+        break_expr: ExprId,
+        label: Option<LabelId>,
+        value: Option<ExprId>,
+        body: Option<ExprId>,
+    ) {
+        if label.is_none() || value.is_none() {
             self.refuse(body, LoopMatchErrorKind::MissingLabelOrValue { at: break_expr });
         }
     }
