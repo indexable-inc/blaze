@@ -9,12 +9,12 @@
 base-db	158	0	48	105
 blaze-alloc-count	0	0	0	2
 blaze-api	199	0	13	125
-blaze-astlog	19	0	14	37
+blaze-astlog	21	0	15	40
 blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
 blaze-bytes	0	0	0	3
-blaze-cargo	2323	2	198	1469
+blaze-cargo	2324	2	198	1469
 blaze-cas	817	0	158	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
@@ -23,7 +23,7 @@ blaze-client	40	0	0	24
 blaze-client-c	0	0	0	1
 blaze-codegen	516	0	62	161
 blaze-codegen-code	0	0	0	66
-blaze-core	783	0	123	213
+blaze-core	783	0	156	219
 blaze-dbsp	12	0	12	4
 blaze-diagnostics	3940	0	273	895
 blaze-diff	27	0	4	24
@@ -99,7 +99,8 @@ blaze-shader	309	0	19	57
 blaze-sim	0	0	34	27
 blaze-solo	31	0	0	28
 blaze-source	2	0	0	8
-blaze-sqlite	0	0	16	6
+blaze-sql	0	0	1	0
+blaze-sqlite	0	0	15	5
 blaze-std	129	0	0	21
 blaze-stencil	134	0	0	88
 blaze-store-check	6	0	0	3
@@ -155,7 +156,7 @@ hir-ty-codegen	1679	0	255	696
 hir-ty-coherence	5	0	0	7
 hir-ty-contracts	3	0	0	2
 hir-ty-identity	139	0	26	39
-hir-ty-lean	0	0	7	171
+hir-ty-lean	0	0	7	172
 hir-ty-linear	44	0	0	17
 hir-ty-matchck	65	0	0	22
 hir-ty-mir	694	0	77	152
