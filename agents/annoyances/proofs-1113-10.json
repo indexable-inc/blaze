@@ -14,6 +14,6 @@
  "class": "automation tuned on the goals it was written against, with no measure of which goal kinds it closes",
  "prevention": "blaze_auto opens what it needs itself; splits arguments of finite types (Bool, Option, enums of the crate) first, bounded; gets a `False`-precondition spec for each opaque function from the translator (or skips arms simp has closed); and a small corpus of the tree`s proved theorems is rerun with `blaze_auto` alone, the count of those it closes kept in the ledger (V13). Not built.",
  "workaround": "case-split by hand, then `simp` with the model`s definitions, one lemma per stage",
- "fix": "",
- "state": "open"
+ "fix": "by the lane autotac (claude-opus-5-5), 2026-11-14: blaze_auto opens what it needs, unfolds the reachable models with no list, splits Bool/Option/Result and small enums (64 cases at most, each closed on its own budget), and gives every reached opaque call a spec with precondition False. lean/Blaze/Tests/AutoCorpus.lean measures it: 23 of 27 of the tree`s theorems closed by bare `blaze_auto` (1 before as stated, 13 with hand lists). Still open, another class: `forall args, exists fuel` over a loop (it needs the fuel as a term and the invariant) and a bound on a power.",
+ "state": "fixed"
 }
