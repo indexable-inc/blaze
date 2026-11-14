@@ -204,7 +204,8 @@ jobs:
           "$BLAZE_SCRIPTS/domains" '{"root": "."}'
       # What is left of the global heap only goes down (AGENTS.md bump-allocate): per crate,
       # outside tests, the `// alloc:` lines left to convert, the `expect`s of
-      # `blaze::implicit_allocator` and the lines naming `Global` equal their crate's row of
+      # `blaze::implicit_allocator`, the lines naming `Global` and the function signatures that
+      # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text) equal their crate's row of
       # crates/blaze-lints/baselines/alloc-sites.txt, a crate with no row is held to 0, and no
       # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
       # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
