@@ -36,13 +36,20 @@ hn {
     prop profile_tip: string = ""
     (IsA, hn.TreeRowLook)
     Action: {name: "select:{obj}"}
-    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
-    Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
+    if $profile != "" {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_agent_h, min: 0, max: 0}}
+      Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: $chat_pick_h}
+    } else {
+      Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $tree_row_h, min: 0, max: 0}}
+      Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: 0, b: 0}
+    }
     hang { hn.Hang: {obj: $obj, depth: $depth, kids: $kids, open: $open, mark: $mark} }
     // A mark only when there is something to say, tree_kind across before its title (src/app.rs sync_view sets it,
     // outside the template's reactive inputs): a dot in the strong ink while its agent works, the same dot in the error
     // ink when it failed, nothing else; a shell its terminal glyph. Which agent it is ends the row's tooltip.
     kind_icon : hn.tree.Kind {}
+    // Explicit live mood reports from this agent, separate from model capability and task status.
+    emotion : ui.Row {}
     name : hn.tree.Head {
       Text: {s: $name}
       // What it is doing while it works ("Running a command: cargo test"), where it works and when it started or ended
@@ -78,17 +85,22 @@ hn {
         }
       }
     }
-    // Separate hit targets for the model and effort, always available even while this row is hovered.
+    // The controls share a second line, leaving the task title readable at the narrowest sidebar width.
+    // Names stay direct children so hit testing, rename and picker anchors share the existing row contract.
     profile : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
+      Overlay
+      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
       Tooltip: {text: $profile_tip}
       label : hn.tree.ProfileControl {
+        icon : hn.ModelIconSlot {}
         text : hn.tree.Trail { Text: {s: $profile} }
       }
       effort : hn.tree.ProfileControl {}
+      context : ui.Row {}
+      context_pop : ui.Node { Overlay }
       if $profile != "" {
-        Size: {w: {kind: Fit, value: 0, min: 0, max: $tree_trail_max}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-        Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+        Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+        Padding: {l: indent($depth, $tree_pad, $indent_step) + $tree_gutter, r: $tree_pad_r, t: $tree_row_h - 2, b: 2}
       } else {
         Size: {w: {kind: Fixed, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
         Padding: {l: 0, r: 0, t: 0, b: 0}

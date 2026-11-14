@@ -1,0 +1,54 @@
+// Provider glyphs share a fixed footprint; capability changes their structure, never thinking effort.
+@tree ChildOf
+hn {
+  prefab ModelIconSlot : ui.Row {
+    Padding: {l: 0, r: $chat_pick_gap, t: 0, b: 0}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  }
+  prefab ModelIcon : ui.Node {
+    Fill: $tone_clear
+    Size: {w: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}, h: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}}
+  }
+  prefab ModelIconClaudeLight : ModelIcon {
+    Stroke: {dark: $tone_kind_claude.dark, light: $tone_kind_claude.light}
+    Vector: {d: "M10.30 8.00 L14.50 8.00 M9.15 9.99 L11.25 13.63 M6.85 9.99 L4.75 13.63 M5.70 8.00 L1.50 8.00 M6.85 6.01 L4.75 2.37 M9.15 6.01 L11.25 2.37", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconCodexLight : ModelIcon {
+    Stroke: {dark: $tone_kind_codex.dark, light: $tone_kind_codex.light}
+    Vector: {d: "M5 2 H11 L14 5 V11 L11 14 H5 L2 11 V5 Z", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconClaudeBalanced : ModelIcon {
+    Stroke: {dark: $tone_kind_claude.dark, light: $tone_kind_claude.light}
+    Vector: {d: "M10.30 8.00 L14.50 8.00 M9.63 9.63 L12.60 12.60 M8.00 10.30 L8.00 14.50 M6.37 9.63 L3.40 12.60 M5.70 8.00 L1.50 8.00 M6.37 6.37 L3.40 3.40 M8.00 5.70 L8.00 1.50 M9.63 6.37 L12.60 3.40", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconCodexBalanced : ModelIcon {
+    Stroke: {dark: $tone_kind_codex.dark, light: $tone_kind_codex.light}
+    Vector: {d: "M5 2 H11 L14 5 V11 L11 14 H5 L2 11 V5 Z M6 5 H10 L11 6 V10 L10 11 H6 L5 10 V6 Z", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconClaudeAdvanced : ModelIcon {
+    Stroke: {dark: $tone_kind_claude.dark, light: $tone_kind_claude.light}
+    Vector: {d: "M10.30 8.00 L14.50 8.00 M9.99 9.15 L13.63 11.25 M9.15 9.99 L11.25 13.63 M8.00 10.30 L8.00 14.50 M6.85 9.99 L4.75 13.63 M6.01 9.15 L2.37 11.25 M5.70 8.00 L1.50 8.00 M6.01 6.85 L2.37 4.75 M6.85 6.01 L4.75 2.37 M8.00 5.70 L8.00 1.50 M9.15 6.01 L11.25 2.37 M9.99 6.85 L13.63 4.75", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconCodexAdvanced : ModelIcon {
+    Stroke: {dark: $tone_kind_codex.dark, light: $tone_kind_codex.light}
+    Vector: {d: "M5 2 H11 L14 5 V11 L11 14 H5 L2 11 V5 Z M6 5 H10 L11 6 V10 L10 11 H6 L5 10 V6 Z M1 6 H3 M1 10 H3 M13 6 H15 M13 10 H15 M6 1 V3 M10 1 V3 M6 13 V15 M10 13 V15", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconClaudeFrontier : ModelIcon {
+    Stroke: {dark: $tone_kind_claude.dark, light: $tone_kind_claude.light}
+    Vector: {d: "M10.30 8.00 L14.50 8.00 M10.12 8.88 L14.01 10.49 M9.63 9.63 L12.60 12.60 M8.88 10.12 L10.49 14.01 M8.00 10.30 L8.00 14.50 M7.12 10.12 L5.51 14.01 M6.37 9.63 L3.40 12.60 M5.88 8.88 L1.99 10.49 M5.70 8.00 L1.50 8.00 M5.88 7.12 L1.99 5.51 M6.37 6.37 L3.40 3.40 M7.12 5.88 L5.51 1.99 M8.00 5.70 L8.00 1.50 M8.88 5.88 L10.49 1.99 M9.63 6.37 L12.60 3.40 M10.12 7.12 L14.01 5.51", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconCodexFrontier : ModelIcon {
+    Stroke: {dark: $tone_kind_codex.dark, light: $tone_kind_codex.light}
+    Vector: {d: "M5 2 H11 L14 5 V11 L11 14 H5 L2 11 V5 Z M6 5 H10 L11 6 V10 L10 11 H6 L5 10 V6 Z M1 6 H3 M1 10 H3 M13 6 H15 M13 10 H15 M6 1 V3 M10 1 V3 M6 13 V15 M10 13 V15 M7 7 H9 V9 H7 Z M5 5 L3 3 M11 5 L13 3 M5 11 L3 13 M11 11 L13 13", view_x: 0, view_y: 0, view_w: 16, view_h: 16, stroke_w: $model_icon_stroke}
+  }
+  prefab ModelIconClaudeUnknown : ui.Icon {
+    Mark: {name: "claude"}
+    Fill: $tone_kind_claude
+    Size: {w: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}, h: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}}
+  }
+  prefab ModelIconCodexUnknown : ui.Icon {
+    Mark: {name: "openai"}
+    Fill: $tone_kind_codex
+    Size: {w: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}, h: {kind: Fixed, value: $model_icon_size, min: 0, max: 0}}
+  }
+}

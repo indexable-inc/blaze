@@ -142,6 +142,7 @@ export const disclose_w = 18
 // the Archive button's glyph box. Folded with work under it, a session's row shows a faint dot (tree_under_dot)
 // tree_under_gap before how many.
 export const tree_row_h = 28
+export const tree_agent_h = 50
 export const tree_run_h = 22
 export const tree_gutter = 12
 export const tree_icon = 16
@@ -407,8 +408,10 @@ export const spring_press_omega = 38
 export const spring_press_zeta = 0.62
 
 // A kind's icon and the brand marks (hn.Kind): ink only, so they turn with the appearance; no brand's colour.
-export mut tone_kind_claude: Fill = $tone_ink_muted
-export mut tone_kind_codex: Fill = $tone_ink_muted
+export mut tone_kind_claude: Fill = {dark: {0.88, 0.52, 0.36, 1}, light: {0.69, 0.31, 0.18, 1}}
+export mut tone_kind_codex: Fill = {dark: {0.55, 0.77, 0.68, 1}, light: {0.17, 0.46, 0.37, 1}}
+export const model_icon_size = 14
+export const model_icon_stroke = 1.25
 export mut tone_kind_cursor: Fill = $tone_ink_muted
 
 prefab Strong {

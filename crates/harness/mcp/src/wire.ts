@@ -87,6 +87,8 @@ export type SessionInfo = {
   id: number; object: string; kind: string; name: string | null; label?: string; parent: number | null; title: string; cwd: string | null;
   argv: string[]; created_ms: number | null; ended_ms: number | null; exit: number | null; status: string | null; attached: number;
   cols: number | null; rows: number | null; busy: boolean; mode: string; model: string | null; past: boolean;
+  /** Latest provider context event, carried in list summaries without attaching a transcript. */
+  context?: { used: number; window: number; updated_ms?: number };
 };
 
 /** A request's answer, tagged by `reply`; a run's or an object's answer is an open record. */

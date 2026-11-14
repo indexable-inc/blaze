@@ -269,6 +269,15 @@ hn {
     warn { Fill: $tone_ink_strong }
     full { Fill: $tone_error }
   }
+  // Context belongs to the agent row: a small ring and a quiet percentage, still the same context control.
+  prefab SidebarContext : ChatContext {
+    Flex: {axis: Row, gap: $chat_pick_gap, align: Center, justify: Center, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+    Padding: {l: $chat_pick_gap, r: $chat_pick_gap, t: 0, b: 0}
+    percent : ui.Line, Faint {
+      TextStyle: {size: $size_caption, line: $line_chrome, role: 0, bold: 0}
+    }
+  }
 
   // How much of the person's plan is used (src/app/chat/plan.rs), after the context meter in the status bar: the window
   // nearest its limit as a small bar filling (`track.fill`, the track the ink faintly, as the ring's) and quiet words

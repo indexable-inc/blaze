@@ -27,11 +27,18 @@ hn {
   // rows' chevrons; on its hover how many objects it holds (the host keeps the words shown while the daemon is offline,
   // connecting or refused, when they say so instead). No light: the words are the state.
   prefab DeviceRow : ui.Row {
-    Hoverable
-    HoverLook: {dark: $tone_clear.dark, light: $tone_clear.light, pad: 0, radius: 0}
+    Pressable
+    Action: {name: ""}
+    Cursor: {shape: Arrow}
+    HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: $radius_control}
+    Shape: {radius: $radius_control, n: 4, border: 0, feather: 0}
     Flex: {axis: Row, gap: 6, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $group_h, min: 0, max: 0}}
     Padding: {l: $label_inset, r: $tree_pad_r, t: 0, b: 0}
+    disclosure : ui.Symbol, Faint {
+      Size: {w: {kind: Fixed, value: $chevron_box, min: 0, max: 0}, h: {kind: Fixed, value: $chevron_box, min: 0, max: 0}}
+      Icon: {glyph: ""}
+    }
     // This header represents devices::local, connected through this computer's daemon socket.
     location : ui.Node {
       Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
@@ -70,11 +77,11 @@ hn {
   prefab Kind {
     claude : ui.Icon {
       Mark: {name: "claude"}
-      Fill: $tone_ink_muted
+      Fill: $tone_kind_claude
     }
     codex : ui.Icon {
       Mark: {name: "openai"}
-      Fill: $tone_ink_muted
+      Fill: $tone_kind_codex
     }
     cursor : ui.Icon {
       Mark: {name: "cursor"}

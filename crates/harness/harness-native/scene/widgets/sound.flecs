@@ -1,11 +1,11 @@
 // The app's sound (src/audio.rs, src/music.rs). Data only.
-// - cue: completion sounds, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
+// - cue: completion and explicit negative-mood sounds, each a few Sounds (harness-native-blaze's voices: Bell, Mallet, Bass,
 //   Click, Thud, Whoosh) with its Onset, Pitch, Lasts, Gain and Pan; a cue's own Gain is how loud it plays. The names
 //   are the step items a running line shows (harness-native-render block.rs: exec read edit search net build spawn wait
 //   sql think), and what the person does or what happens: `ready`, `fresh`, `send`, `copy`, `select`, `open`,
 //   `archive`, `done`, `fail`.
 // - song, mood: the music, below.
-// `hn.sound`'s Gain is the master. Only done/fail cues play; routine activity stays silent.
+// `hn.sound`'s Gain is the master. Only done/fail and negative mood transitions play; routine activity stays silent.
 // native.json `sound: false` turns it all off. Music and rain are opt-in (`music: true`, `ambient: true`).
 
 @tree ChildOf
@@ -33,6 +33,11 @@ hn {
     }
 
     cue {
+      // A changed negative work mood: one short, subdued note; repeats are deduplicated before reaching audio.
+      emotion_negative {
+        Gain: {amp: 0.22}
+        a { Sound: {voice: Mallet}; Onset: {at: 0}; Lasts: {dur: 0.35}; Pitch: {hz: 330}; Gain: {amp: 0.035} }
+      }
       // A command: two dry ticks, a prompt and its cursor.
       exec {
         Gain: {amp: 0.31}

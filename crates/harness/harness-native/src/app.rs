@@ -30,6 +30,7 @@ mod archive;
 mod browser;
 mod chat;
 mod external;
+pub(crate) mod emotion;
 mod library;
 mod floats;
 mod fold;
@@ -62,6 +63,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/parts.flecs", include_str!("../scene/widgets/parts.flecs")),
     ("scene/widgets/row.flecs", include_str!("../scene/widgets/row.flecs")),
     ("scene/widgets/tree.flecs", include_str!("../scene/widgets/tree.flecs")),
+    ("scene/widgets/model_icons.flecs", include_str!("../scene/widgets/model_icons.flecs")),
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
@@ -427,6 +429,7 @@ pub fn scene_world() -> Result<World, String> {
     harness_native_ui_prims::register(&world);
     harness_native_api::register(&world);
     model::register(&world);
+    world.component::<emotion::AgentEmotion>();
     crate::pane::register(&world);
     crate::look::register(&world);
     archive::register(&world);
@@ -967,6 +970,12 @@ impl App {
         } else {
             "connecting".to_owned()
         };
+        let collapsed = model::folded(dev);
+        device.action(&format!("device:toggle:{}", *dev.id()));
+        device.set(harness_native_ui_input_api::Tooltip { text: format!("{} {host} · {} this device's sessions and agents", if collapsed { "Expand" } else { "Collapse" }, if collapsed { "Show" } else { "Hide" }).as_str().into() });
+        if let Some(disclosure) = device.part("disclosure") {
+            disclosure.icon(if collapsed { "" } else { "" });
+        }
         if let Some(n) = device.part("name") {
             n.text(&host);
         }
@@ -1009,6 +1018,7 @@ impl App {
             }
             let model::Row { e, depth } = r;
             let o = w.entity_from_id(e);
+            me.sync_agent_emotion(row, o);
             let status = me.status_of(e);
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
             // Ended by an interrupt or a terminate (128 + SIGINT, 128 + SIGTERM): stopped on purpose, not a failure.
@@ -1138,6 +1148,18 @@ impl App {
                     .concat(),
                 );
                 if let Some(controls) = row.part("profile") {
+                    if let Some(icon) = controls.part("label").and_then(|p| p.part("icon")) {
+                        chat::model_icon(icon, &profile, kind);
+                    }
+                    if let Some(sid) = sid.filter(|_| edit.is_none() && o.has(model::ChatMode::id())) {
+                        let chats = me.chats.borrow();
+                        let empty = model::chat::Transcript::default();
+                        me.fill_sidebar_context(controls, sid, chats.get(&sid).unwrap_or(&empty), kind, busy, o.try_cloned::<&model::AgentContext>());
+                    } else {
+                        for name in ["context", "context_pop"] {
+                            if let Some(slot) = controls.part(name) { view::for_each_of(slot, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {}); }
+                        }
+                    }
                     let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
                     for (part, page, tip) in [("label", "model", "Choose model · ⌘/"), ("effort", "effort", "Thinking effort · click or swipe to change")] {
                         if let Some(control) = controls.part(part) {
@@ -2365,6 +2387,17 @@ impl App {
             {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, alt);
+            } else if let Some(id) = a.strip_prefix("device:toggle:").and_then(|s| s.parse::<u64>().ok()) {
+                let w = self.world.world_ref();
+                let dev = w.entity_from_id(id);
+                if dev.is_alive() && dev.has(model::Device::id()) {
+                    model::set_folded(w, id, !model::folded(dev));
+                    // Group folds are immediate; preserve each session's own fold and every running process.
+                    self.fold = fold::TreeFold::default();
+                    self.chat_pick_close();
+                    self.chat_ctx_close();
+                    self.row_menu_close();
+                }
             } else if a == "archive:open" {
                 self.open_archive();
             } else if a == "nav:back" {
@@ -2558,6 +2591,7 @@ impl App {
     /// clicks; the main card takes the window and the traffic lights fade out) or bring it back.
     fn toggle_sidebar(&mut self) {
         self.side_open = !self.side_open;
+        if !self.side_open { self.chat_pick_close(); self.chat_ctx_close(); }
         self.poke();
     }
 
@@ -3084,6 +3118,92 @@ mod tests {
         (sessions, runs)
     }
 
+    /// The invariant: a device fold hides every descendant, including a selected agent, without changing runtime,
+    /// selection or individual session folds. Restoring the device restores the exact row list; devices are independent.
+    #[test]
+    fn device_header_fold_hides_agents_and_restores_the_group() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        let local = w.entity_named(model::LOCAL).set(model::Device { host: "local".into(), sock: "/local.sock".into() });
+        let other = w.entity().set(model::Device { host: "server".into(), sock: "/server.sock".into() });
+        let session = w.entity().child_of(local).set(model::Object { id: 1 }).add((model::Kind::id(), model::Claude::id())).add((model::Status::id(), model::Running::id()));
+        let agent = w.entity().child_of(session).set(model::Object { id: 2 }).add((model::Kind::id(), model::Codex::id())).add((model::Status::id(), model::Running::id()));
+        model::set_folded(w, *session.id(), false);
+        model::select(w, Some(*agent.id()));
+        let rows = model::rows(w);
+        let inventory = model::tree(w);
+        assert_eq!(rows.iter().map(|r| r.e).collect::<Vec<_>>(), [*session.id(), *agent.id()]);
+        assert!(!model::folded(local) && !model::folded(other), "device groups start expanded");
+        model::set_folded(w, *local.id(), true);
+        assert!(model::rows(w).is_empty(), "the selected agent cannot escape its collapsed device");
+        assert_eq!(model::tree(w), inventory, "folding affects presentation, not inventory");
+        assert_eq!(model::selected(w).map(|e| *e.id()), Some(*agent.id()));
+        assert!(!model::folded(session), "the session's own disclosure stays open");
+        for e in [session, agent] {
+            assert!(e.is_alive() && e.target(model::Status::id(), 0).is_some_and(|s| *s.id() == *w.component_id::<model::Running>()));
+        }
+        assert!(!model::folded(other));
+        model::set_folded(w, *local.id(), false);
+        assert_eq!(model::rows(w), rows);
+        model::set_folded(w, *other.id(), true);
+        assert_eq!(model::rows(w), rows, "another device's fold leaves this group alone");
+        assert!(!model::folded(local));
+    }
+
+    /// List metadata covers all agents without attaching any transcript; a legacy daemon's absent field stays unknown.
+    #[test]
+    fn list_context_updates_every_agent_without_transcript_subscriptions() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let mail = model::Mailbox::default();
+        let (_, _, chats) = model::install(world.world_ref(), "test", "/nonexistent", mail.clone());
+        let rows = |used: u64| vec![
+            serde_json::json!({"id": 1, "kind": "claude", "mode": "chat", "status": "running", "context": {"used": used, "window": 200000, "updated_ms": 100}}),
+            serde_json::json!({"id": 2, "kind": "codex", "mode": "chat", "status": "running", "context": {"used": 30000, "window": 160000, "updated_ms": 200}}),
+        ];
+        mail.send(model::Msg::List(rows(10000)));
+        world.progress_time(1.0 / 60.0);
+        let context = |sid: u64| {
+            let mut found = None;
+            world.new_query::<&model::Object>().each_entity(|e, o| {
+                if o.id == sid { found = e.try_cloned::<&model::AgentContext>(); }
+            });
+            found
+        };
+        assert_eq!(context(1), Some(model::AgentContext { used: 10000, window: 200000, updated_ms: 100 }));
+        assert_eq!(context(2), Some(model::AgentContext { used: 30000, window: 160000, updated_ms: 200 }));
+        assert!(chats.borrow().is_empty(), "summary metadata needs no full transcript events");
+        mail.send(model::Msg::List(rows(12000)));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.used), Some(12000));
+        assert_eq!(context(2).map(|c| c.used), Some(30000));
+        // The list fingerprint must cover every field reconciliation reads, including nested context and unrelated
+        // metadata-only edits. Keep the rest identical so no other field can accidentally invalidate the cache for it.
+        let mut changed = rows(12000);
+        changed[0]["context"]["updated_ms"] = serde_json::json!(101);
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.updated_ms), Some(101));
+        changed[0]["context"]["window"] = serde_json::json!(240000);
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.window), Some(240000));
+        let mut first = None;
+        world.new_query::<&model::Object>().each_entity(|e, o| { if o.id == 1 { first = Some(*e.id()); } });
+        let first = world.entity_from_id(first.expect("the first agent remains listed"));
+        changed[0]["effort"] = serde_json::json!("high");
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(first.try_cloned::<&model::AgentModel>().map(|m| m.effort.as_str().to_owned()).as_deref(), Some("high"));
+        changed[0]["label"] = serde_json::json!("Renamed chat");
+        mail.send(model::Msg::List(changed));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(first.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).as_deref(), Some("Renamed chat"));
+        mail.send(model::Msg::List(vec![serde_json::json!({"id": 1, "kind": "claude", "mode": "chat", "status": "running"})]));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1), None, "old daemons omit usage, rather than reporting zero percent");
+        assert!(chats.borrow().is_empty());
+    }
+
     /// Property `stalled-inbox-holds-one-tree`: while no frame takes the mail (a window out of sight, so its display link
     /// stops calling), the daemon announcing a change 20 times a second for ten minutes leaves at most one `list` and
     /// one `runs` answer waiting, not one per change (each a copy of every session and the last 100 runs: what grew the
@@ -3265,6 +3385,8 @@ mod tests {
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
             "hn.chat_status.thinking", "hn.chat_status.thought", "hn.PaletteField", "hn.tree.ProfileControl", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
+            "hn.ModelIconSlot", "hn.ModelIconClaudeLight", "hn.ModelIconClaudeBalanced", "hn.ModelIconClaudeAdvanced", "hn.ModelIconClaudeFrontier", "hn.ModelIconClaudeUnknown",
+            "hn.ModelIconCodexLight", "hn.ModelIconCodexBalanced", "hn.ModelIconCodexAdvanced", "hn.ModelIconCodexFrontier", "hn.ModelIconCodexUnknown", "hn.SidebarContext",
             "hn.ChatContext", "hn.ChatPlan", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",

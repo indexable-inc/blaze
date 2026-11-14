@@ -36,6 +36,8 @@ const CONNS: usize = 16;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Call {
+    /// A live agent's work mood. Never saved or replayed; only explicit live calls can cue audio.
+    Emotion { device: String, session: u64, emotion: crate::app::emotion::Emotion, #[serde(default)] reason: String },
     /// The entities flecs query `expr` matches, with the values of its terms.
     Query { expr: String },
     /// Entity `path` whole: its tags, pairs and components with their values.
@@ -275,6 +277,9 @@ mod tests {
     fn a_call_reads_as_the_kernel_writes_it() {
         let c: Call = serde_json::from_value(json!({"op": "set", "path": "a.b", "component": "Fill", "value": {"x": 1}})).unwrap();
         assert_eq!(c, Call::Set { path: "a.b".into(), component: "Fill".into(), value: json!({"x": 1}), save: false });
+        let mood: Call = serde_json::from_value(json!({"op": "emotion", "device": "/tmp/harnessd.sock", "session": 41, "emotion": "blocked"})).unwrap();
+        assert_eq!(mood, Call::Emotion { device: "/tmp/harnessd.sock".into(), session: 41, emotion: crate::app::emotion::Emotion::Blocked, reason: String::new() });
+        assert!(serde_json::from_value::<Call>(json!({"op": "emotion", "device": "/tmp/harnessd.sock", "session": 41, "emotion": "invented"})).is_err());
         assert!(serde_json::from_value::<Call>(json!({"op": "nope"})).is_err());
     }
 }
