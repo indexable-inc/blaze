@@ -270,6 +270,15 @@ reference model for a property test only.
   of the whole checkout and refuse `-p`, `--features`, `--target`, target selection and the
   other selection flags by name. The end state is a query that carries `Targets`, as
   `Request::Trace` does, so the view is the selected build's.
+- Queries and rewrites in test configuration. A rules file runs over the view's one cfg set
+  per crate, so code only a test build compiles (`#[cfg(test)]` items, `tests/` targets,
+  dev-dependencies) is matched as syntax but, where that cfg is off, has no types or
+  resolution, and a rename or a parameter change can miss its uses. The end state:
+  `Request::Query` and `Edit::Rules` carry `Targets`, as `Request::Trace` does. The daemon
+  lowers them to the units a build would compile, each with its cfg (`test` for a test target,
+  the features, the target) and its dev-dependencies, opens one view per distinct cfg, and
+  runs the rules over each. Rows are merged; the edits two views make must agree byte for
+  byte, and a disagreement is refused, naming both units.
 - Prelude resolution of single-segment names in code patterns; they match by text. Type
   patterns resolve them (see Type patterns).
 - A `use` added for a template path `find_path` can only spell through an import; it is written
