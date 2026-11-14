@@ -138,6 +138,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::BorrowWorkaround
         | Lint::NllWorkaround
         | Lint::NativeContracts
+        | Lint::ImpliedBoundWritten
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
         // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a

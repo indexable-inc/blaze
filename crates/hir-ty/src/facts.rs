@@ -296,13 +296,19 @@ pub enum Tier {
     /// library functions are inlinable (`cross_crate_inlinable`).
     Shipped,
     /// Optimized code: LLVM above `-O0` (release, a dependency built once and kept, background
-    /// tier-up), and MIR at level 2 where no unit is asking (the interpreter's).
+    /// tier-up), and MIR at level 2 where no unit is asking (the interpreter's). The tier the
+    /// pass on facts (`SpendFacts`) is for, though for now its list does not have it (`passes_at`
+    /// says why: each callee's summary is a walk of all it reaches); its tests run it here
+    /// through `hir-ty-mir`'s `spend_facts_at`.
     Optimizing,
 }
 
 /// Whether code built at `tier` spends proofs: the one rule. Tier 0 never runs the prover to
 /// generate code (nor any pass on facts); the library as shipped runs no pass on facts; an
-/// optimizing tier spends them. The checks (`#[blaze::nopanic]`, `pure`, `noalloc`,
+/// optimizing tier spends them. The only readers of a tier's proofs are the two runs of
+/// `SpendFacts`, which no tier runs for now (`hir-ty-mir`'s `passes_at`), so no build spends a
+/// proof today; the answer stays the tier's for when the pass comes back, and its tests ask
+/// with it. The checks (`#[blaze::nopanic]`, `pure`, `noalloc`,
 /// `nonblocking`, the role lints, `blaze::unreachable`, `proved_unreachable`) are no tier: they
 /// ask with [`Proofs::Spent`], per definition and on demand.
 pub const fn proofs_at(tier: Tier) -> Proofs {
@@ -405,8 +411,9 @@ mod tests {
         assert_eq!(trusted.license(Spend::UnwindEdge), None);
     }
 
-    /// The invariant: tier 0 spends no proof and an optimizing tier does; the two modes are two
-    /// values, so no key that holds one can hold the other.
+    /// The invariant: tier 0 spends no proof and an optimizing tier does (for `SpendFacts`,
+    /// when it runs there); the two modes are two values, so no key that holds one can hold
+    /// the other.
     #[test]
     fn tier_zero_spends_no_proof() {
         assert_eq!(proofs_at(Tier::Zero), Proofs::None);

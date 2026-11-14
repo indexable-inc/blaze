@@ -18,7 +18,8 @@
 //! - `tier` says which of blaze's passes that read past the body may run ([`passes_at`], the
 //!   one declaration) and whether the facts `SpendFacts` asks of callees spend the reach prover
 //!   (`hir_ty::facts::proofs_at`). At tier 0 none runs: optimizing a body costs a pass over its
-//!   own statements and nothing that grows with its callees.
+//!   own statements and nothing that grows with its callees. `SpendFacts` runs at no tier for
+//!   now ([`passes_at`] says why); its tests run it through [`spend_facts_at`].
 //!
 //! Each pass is a port of rustc's pass of the same name; where it does less than rustc's, its
 //! module says what. Two passes rustc has none of: `HeapToStack` ([`escape`]), which moves an
@@ -109,34 +110,69 @@ pub enum Reaching {
 ///   code generator, `hir-ty-codegen` `Build::built_in`), no pass on facts: no whole-program
 ///   summary is asked to build a tier 0 body.
 /// - The library as shipped: rustc's own, `Inline` and `Specialize`, which follows it.
-/// - Optimizing: every one.
+/// - Optimizing: those and `Devirtualize`. Not `SpendFacts` (no tier runs it; its tests do,
+///   through [`spend_facts_at`]), for now: it asks every callee's summary, and a summary
+///   walks all the callee reaches and holds each instance's monomorphized body while it does. Measured on a cold build of reth's 30 packages
+///   (2026-11-13, main at e6635c9ba7 with the purity proof bounded, 128 cores): the units built
+///   optimizing (proc macros and what they depend on) ran `mir SpendFacts unwind` 3,635 times
+///   for 2,275 s in all, the longest 298.9 s, with 36,783 `sealed summary reads below HIGH`
+///   spans (9,991 s); the footprint rose about 35 GiB a minute and the daemon was killed at
+///   213 GiB, 141 GiB of it live in the global heap, the samples of the last three minutes
+///   under `walk::summarized` < `dispatch::body_once` < `monomorphized`. The pass comes back
+///   when a callee's summary is a record read in place (a body's own effects, cut before the
+///   fold over its callees), so that asking one costs a lookup and not a walk.
 pub const fn passes_at(tier: Tier) -> &'static [Reaching] {
     use Reaching::*;
     match tier {
         Tier::Zero => &[],
         Tier::Shipped => &[Inline, Specialize],
-        Tier::Optimizing => &[Inline, Devirtualize, SpendFactsUnwind, SpendFactsRepeats, Specialize],
+        Tier::Optimizing => &[Inline, Devirtualize, Specialize],
     }
 }
 
-/// Whether `tier` runs `pass` ([`passes_at`]).
-fn runs(tier: Tier, pass: Reaching) -> bool {
-    let planted = tier == Tier::Zero
-        && matches!(pass, Reaching::SpendFactsUnwind | Reaching::SpendFactsRepeats)
-        && PLANT_FACTS_AT_TIER_ZERO.with(Cell::get);
-    planted || passes_at(tier).contains(&pass)
+/// Whether a body built at `tier` on this thread runs `pass`: what [`passes_at`] lists, and
+/// both runs of `SpendFacts` where the test switch ([`spend_facts_at`]) names `tier`.
+pub fn runs(tier: Tier, pass: Reaching) -> bool {
+    let switched = matches!(pass, Reaching::SpendFactsUnwind | Reaching::SpendFactsRepeats)
+        && SPEND_FACTS_AT.with(Cell::get) == Some(tier);
+    switched || passes_at(tier).contains(&pass)
 }
 
 thread_local! {
-    /// The planted bug of the tier 0 tests (`hir-ty-pure`'s `tests::facts`): `SpendFacts`
-    /// left in tier 0's list. Off unless a test sets it.
-    static PLANT_FACTS_AT_TIER_ZERO: Cell<bool> = const { Cell::new(false) };
+    /// The tier this thread runs `SpendFacts` at beside [`passes_at`]'s lists, if any
+    /// ([`spend_facts_at`]). `None` unless a test switches it on: no build sets it.
+    static SPEND_FACTS_AT: Cell<Option<Tier>> = const { Cell::new(None) };
 }
 
-/// Plants `SpendFacts` in tier 0's list on this thread, for a test's control.
+/// While alive, this thread runs `SpendFacts` (both its runs) on every body built at the tier
+/// it names; dropped, the thread runs what it ran before. Made by [`spend_facts_at`]. Not
+/// `Send`: it is this thread's, and must not be held across a wait that may resume elsewhere.
+#[must_use = "the switch is off again as soon as it is dropped"]
+pub struct SpendFactsAt {
+    before: Option<Tier>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for SpendFactsAt {
+    fn drop(&mut self) {
+        SPEND_FACTS_AT.with(|it| it.set(self.before));
+    }
+}
+
+/// The one switch that runs `SpendFacts`, which no tier's list has for now ([`passes_at`]):
+/// on this thread, every body built at `tier` runs both its runs until the guard drops. For
+/// tests only: the pass's own tests switch it on at [`Tier::Optimizing`], and the tier 0
+/// control plants it at [`Tier::Zero`] as the bug its oracle must catch.
+///
+/// The switch is no input of the optimized MIR's key ([`super::MirOptions`] does not hold it),
+/// so a body built with it on and one built with it off are filed under the same key. A test
+/// that switches it on builds every body in a database of its own, made after the switch and
+/// dropped before it, and never asks that database for a body with the switch off: then no
+/// body made one way is served for the other (rule `keys-cover-every-input`).
 #[doc(hidden)]
-pub fn plant_facts_at_tier_zero(on: bool) {
-    PLANT_FACTS_AT_TIER_ZERO.with(|it| it.set(on));
+pub fn spend_facts_at(tier: Tier) -> SpendFactsAt {
+    let before = SPEND_FACTS_AT.with(|it| it.replace(Some(tier)));
+    SpendFactsAt { before, _thread: std::marker::PhantomData }
 }
 
 /// The passes of rustc's pipeline at `level` that this module does not run, in rustc's order.
@@ -311,7 +347,9 @@ fn passes<'db>(
     // blaze's own, at `Release`: a call of a function proved unable to panic loses its
     // unwind edge, after `Inline` so the calls the callees brought lose theirs too and before
     // the `SimplifyCfg` that removes the cleanup nothing reaches any more. Only where the tier
-    // runs it: it asks every callee's summary, which walks all the callee reaches.
+    // runs it: it asks every callee's summary, which walks all the callee reaches, so no
+    // tier's list has it for now and only a test's switch runs it ([`spend_facts_at`]). The
+    // two runs are the only readers of `proofs`.
     let proofs = proofs_at(tier);
     if release && runs(tier, Reaching::SpendFactsUnwind) {
         run!("SpendFacts unwind", |_frame| {

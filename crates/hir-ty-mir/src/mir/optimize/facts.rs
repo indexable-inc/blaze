@@ -21,10 +21,12 @@
 //! In a binary that links no analyses (a crate below `hir-ty-pure` testing itself) nothing
 //! is proved and the pass changes nothing ([`linked`]).
 //!
-//! The pass runs only at the optimizing tier (`MirOptions::tier`, `super::passes_at`): a tier
-//! 0 body and the library's as shipped ask no fact, so building them computes no effect
-//! summary. Each fact is asked with the proofs the tier spends (`hir_ty::facts::proofs_at`);
-//! the options key the body, so a body made on facts of one tier is never served for another.
+//! The pass runs at no tier for now (`super::passes_at` says why: a callee's summary walks
+//! all the callee reaches, and on reth that took the daemon past 200 GiB); it comes back when
+//! a callee's summary is a record read in place. Its tests run it through the one switch,
+//! `super::spend_facts_at`, each in a database of its own. Each fact is asked with the proofs
+//! the body's tier spends (`hir_ty::facts::proofs_at`); the options key the body, so a body
+//! made on facts of one tier is never served for another.
 
 use hir_def::{DefWithBodyId, FunctionId, ItemContainerId, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
@@ -261,12 +263,14 @@ fn repeated(
     if *returns_to != second {
         return None;
     }
-    let (OperandKind::Constant { ty: first_ty, .. }, OperandKind::Constant { ty: second_ty, .. }) =
-        (&first_func.kind, &second_func.kind)
+    // The callee however MIR building wrote it: a zero-sized allocation of the item's type
+    // (`Operand::from_fn`, what a written call is), a constant, or a whole local of that
+    // type. Matched as constants alone, no call written in a body ever merged.
+    let (Some(first_fn), Some(second_fn)) = (fn_def(body, first_func), fn_def(body, second_func))
     else {
         return None;
     };
-    if first_ty != second_ty {
+    if first_fn != second_fn {
         return None;
     }
     let result = whole_plain(body, first_into)?;

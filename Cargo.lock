@@ -2376,10 +2376,14 @@ dependencies = [
  "blaze-api",
  "blaze-cas",
  "blaze-core",
+ "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-protocol",
+ "blaze-rng",
  "blaze-usercode",
+ "hegeltest",
 ]
 
 [[package]]

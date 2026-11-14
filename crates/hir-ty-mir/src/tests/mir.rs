@@ -6,6 +6,7 @@ mod early_drop;
 mod error_unions;
 mod eval;
 mod handles;
+mod implied_bounds;
 mod lower;
 mod optimize;
 mod stabilized;

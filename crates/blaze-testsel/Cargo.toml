@@ -19,11 +19,17 @@ blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+# Keys, records, proofs and the outside form: what a test result and the suite's index are.
+blaze-keyed.workspace = true
 blaze-usercode.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `Aligned`: the simulated store's records, 16-aligned as the real store's are.
+blaze-format.workspace = true
 blaze-protocol.workspace = true
+blaze-rng.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true
