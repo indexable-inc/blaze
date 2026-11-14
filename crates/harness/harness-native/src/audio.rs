@@ -400,10 +400,10 @@ fn with_mixer(f: impl FnOnce(&mut Mixer)) {
     }
 }
 
-/// Play a completion cue (nothing before [`start`], or while it is still being rendered).
+/// Play a completion or explicit negative-mood cue (nothing before [`start`], or while it is still being rendered).
 /// Routine steps, navigation and startup are silent, including calls from other views.
 pub fn cue(name: &str) {
-    if !matches!(name, "done" | "fail") {
+    if !matches!(name, "done" | "fail" | "emotion_negative") {
         return;
     }
     let Some(buf) = CUES.get().and_then(|l| l.lock().unwrap_or_else(PoisonError::into_inner).get(name).cloned()) else { return };

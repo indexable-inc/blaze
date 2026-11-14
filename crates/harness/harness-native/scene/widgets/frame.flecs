@@ -103,30 +103,19 @@ hn {
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
   }
   // The focused chat's status bar (src/app/chat.rs and chat/pick.rs keep each slot, each only while it has something to
-  // say; empty with no chat in front): its model and effort (hn.ChatPick, its menu hanging from it), then at the end its
-  // context ring (hn.ChatContext), breathing while its agent works. Here, out of the way, not under the composer.
+  // say; empty with no chat in front): controls and context live on each chat row. This only hosts the model menu
+  // outside the clipped tree; account plan information remains at the bottom.
   prefab SideChat : ui.Row {
     Cursor: {shape: Arrow}
     Flex: {axis: Row, gap: $chat_bar_gap, align: Center, justify: Start, wrap: false}
     Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    pick : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_bar_h, min: 0, max: 0}}
-    }
     spacer : ui.Spacer {}
-    meter : ui.Row {
-      Flex: {axis: Row, gap: 0, align: Center, justify: Start, wrap: false}
-      Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-    }
     // The picker's menu while it is open: out of the row's flow, its plate placed above the control.
     menu : ui.Node {
       Overlay
     }
-    // The context meter's popover while the pointer is on the ring or on it (src/app/chat/context.rs).
-    pop : ui.Node {
-      Overlay
-    }
   }
+
   prefab SidePlan : ui.Row {
     Flex: {axis: Row, gap: 0, align: Center, justify: End, wrap: false}
     Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}

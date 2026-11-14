@@ -8,6 +8,7 @@ include widgets/frame
 include widgets/parts
 include widgets/row
 include widgets/tree
+include widgets/model_icons
 include widgets/rows
 include widgets/panes
 include widgets/archive

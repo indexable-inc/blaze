@@ -269,6 +269,8 @@ struct Store {
     details: HashMap<String, usize>,
     /// The conversation (the one reducer, harness-chat): title, model, busy, the agent's session id, tool names.
     transcript: Transcript,
+    /// Timestamp of its latest context event, recovered by the same reducer path when the existing log is replayed.
+    context_updated_ms: u64,
     adapter: Box<dyn Adapter>,
 }
 
@@ -294,6 +296,7 @@ impl Store {
             }
         }
         self.transcript.apply(ev);
+        if matches!(&ev.body, Body::Context(_)) { self.context_updated_ms = ev.ts; }
         match slot {
             Some(i) => self.replay[i] = Some(frame),
             None => self.replay.push(Some(frame)),
@@ -352,6 +355,7 @@ impl Chat {
             partials: HashMap::new(),
             details: HashMap::new(),
             transcript: Transcript::default(),
+            context_updated_ms: 0,
             adapter,
         };
         for r in &l.records {
@@ -395,6 +399,14 @@ impl Chat {
     /// The reasoning effort its agent runs with; empty when its `session` event did not say.
     pub fn effort(&self) -> String {
         self.store.lock().transcript.effort.clone()
+    }
+
+    /// The latest provider context event as fixed-size metadata for list watchers. No transcript copy or attachment.
+    pub fn context_summary(&self) -> Option<harness_proto::msg::ContextSummary> {
+        let st = self.store.lock();
+        st.transcript.context.as_ref().map(|c| harness_proto::msg::ContextSummary {
+            used: c.used, window: c.window, updated_ms: st.context_updated_ms,
+        })
     }
 
     /// The person's latest choice of model and of effort (`choice` events), each None when never chosen: what a resume
@@ -521,11 +533,12 @@ impl Chat {
     }
 
     /// Record one event: stamped, its frame appended to the log, folded into the chat's state, and the same frame sent
-    /// to the attached clients. Whether the busy state or the title changed (what `list` says of it).
+    /// to the attached clients. Whether the busy state, title or context summary changed (what `list` says of it).
     pub fn record(&self, body: Body, tx: &broadcast::Sender<Ev>) -> bool {
         let ev = Event { ts: now_ms(), body };
         let mut st = self.store.lock();
         let title = st.transcript.title.is_empty();
+        let context_changed = matches!(&ev.body, Body::Context(_));
         let frame = st.append(&self.oid, &ev);
         let retitled = title && !st.transcript.title.is_empty();
         let busy = st.transcript.busy;
@@ -533,7 +546,7 @@ impl Chat {
         let _ = tx.send(Ev::Event(Bytes::from_owner(frame)));
         drop(st);
         let flipped = self.busy.swap(busy, Ordering::Relaxed) != busy;
-        flipped || retitled
+        flipped || retitled || context_changed
     }
 
     /// The history a reattach starts with (frames), and a receiver for every event after it.
@@ -680,10 +693,13 @@ mod tests {
             json!({"ev": "tool_result", "block": "t1", "text": "3", "error": false}),
             json!({"ev": "turn_end", "ok": true, "stop": "end_turn", "duration_ms": 900, "cost_usd": 0.02, "text": "Counting."}),
             json!({"ev": "busy", "busy": false}),
+            json!({"ev": "context", "used": 12000, "window": 200000,
+                "parts": [{"id": "messages", "name": "Messages", "tokens": 10000, "of": "", "estimate": ""}]}),
             json!({"ev": "user", "text": "and tests?"}),
             json!({"ev": "busy", "busy": true}),
             json!({"ev": "block_start", "block": "m2:0", "kind": "text"}),
             json!({"ev": "delta", "block": "m2:0", "text": "Look"}),
+            json!({"ev": "context", "used": 18000, "window": 200000}),
         ]
         .iter()
         .map(|v| Event::from_json(v).expect("a test event").body)
@@ -712,6 +728,7 @@ mod tests {
         let d = dir("roundtrip");
         let (tx, mut rx) = broadcast::channel(1024);
         let chat = Chat::open("s1", &d, Box::new(Quiet)).unwrap();
+        assert_eq!(chat.context_summary(), None, "an older log without context metadata stays unknown");
         let mut live = Transcript::default();
         let mut feed = Vec::new();
         let check = |chat: &Chat, live: &Transcript, feed: &[u8]| {
@@ -726,14 +743,23 @@ mod tests {
             assert_eq!(&restored, live, "restored from the log vs fed live");
             assert_eq!(back.store.lock().transcript, *live, "the daemon's fold of the file");
             assert_eq!(chat.store.lock().transcript, *live, "the daemon's fold of the live events");
+            let summary = back.context_summary();
+            assert_eq!(summary, chat.context_summary(), "list context metadata restores from the same log events");
+            let expected = live.context.as_ref().map(|c| (c.used, c.window));
+            assert_eq!(summary.map(|c| (c.used, c.window)), expected);
+            let latest_context_ts = log::read(&log).unwrap().records.iter().filter_map(|r| match &r.event {
+                Ok(Event { ts, body: Body::Context(_), .. }) => Some(*ts), _ => None,
+            }).last();
+            assert_eq!(summary.map(|c| c.updated_ms), latest_context_ts, "freshness is the recorded event time, not restore time");
             let (again, _) = chat.history_and_subscribe(&tx);
             assert_eq!(history, again, "a reattach to the live chat sends the restore's history, byte for byte");
             back
         };
         let evs = events();
-        let (first, second) = evs.split_at(18);
+        let (first, second) = evs.split_at(19);
         for ev in first {
-            chat.record(ev.clone(), &tx);
+            let changed = chat.record(ev.clone(), &tx);
+            if matches!(ev, Body::Context(_)) { assert!(changed, "a context-only update must wake list watchers"); }
         }
         let got = drain(&mut rx);
         live.feed(&got);
@@ -741,16 +767,19 @@ mod tests {
         assert_eq!(live.items.len(), 5, "{:#?}", live.items);
         assert!(matches!(&live.items[2], Item::Text { text, .. } if text == "Counting."), "the text before the call it streamed beside");
         assert_eq!((live.title.as_str(), live.session_id.as_str(), live.busy), ("count the files", "9f2c", false));
+        assert_eq!(chat.context_summary().map(|c| (c.used, c.window)), Some((12000, 200000)));
         let back = check(&chat, &live, &feed);
         // Resumed: the restored chat takes the next events, appended to the same log.
         drop(chat);
         for ev in second {
-            back.record(ev.clone(), &tx);
+            let changed = back.record(ev.clone(), &tx);
+            if matches!(ev, Body::Context(_)) { assert!(changed, "a context-only update must wake list watchers"); }
         }
         let got = drain(&mut rx);
         live.feed(&got);
         feed.extend_from_slice(&got);
         assert!(live.busy);
+        assert_eq!(back.context_summary().map(|c| (c.used, c.window)), Some((18000, 200000)));
         check(&back, &live, &feed);
         // Without partials to replace, the replay is the live feed itself.
         let d2 = dir("whole");

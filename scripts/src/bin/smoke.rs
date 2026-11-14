@@ -790,8 +790,11 @@ fn smoke(it: &Run) -> ! {
     }
     let work = PathBuf::from(&it.work);
     match std::fs::read_dir(&work) {
-        Ok(mut listed) if listed.next().is_some() => fail(SCRIPT, &format!("the work directory {} is not empty", work.display())),
-        Ok(_) => {}
+        Ok(mut listed) => {
+            if listed.next().is_some() {
+                fail(SCRIPT, &format!("the work directory {} is not empty", work.display()));
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => fail(SCRIPT, &format!("the work directory {}: {e}", work.display())),
     }

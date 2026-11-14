@@ -1,0 +1,25 @@
+[package]
+name = "blaze-sqlite"
+description = "blaze's C SQLite driver (docs/v2/plan/design/sql.md): runs statements blaze-sql checked on the bundled amalgamation through libsqlite3-sys's raw FFI, and compares every answer SQLite gives with the checker's description"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-sql.workspace = true
+libsqlite3-sys.workspace = true
+
+[dev-dependencies]
+blaze-sql = { workspace = true, features = ["plant"] }
+hegeltest.workspace = true
+
+[lints]
+workspace = true

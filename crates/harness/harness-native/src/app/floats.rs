@@ -24,6 +24,8 @@ pub struct Float {
     pub radius: f32,
     pub plate: [f32; 4],
     pub alpha: f32,
+    /// A hover-help surface never takes the pointer from the control underneath it.
+    pub ignores_mouse: bool,
 }
 
 impl App {
@@ -55,10 +57,11 @@ impl App {
     /// do (the picker's menus, a sidebar row's menu, a cell's popovers and menus; a cell's dialog stays, as a sheet
     /// would). Whether any closed.
     pub fn close_floats(&mut self) -> bool {
+        let tip = self.dismiss_tooltip();
         let pick = self.chat_pick_close();
         let row = self.row_menu_close();
         let genui = self.genui_blur();
-        pick || row || genui
+        tip || pick || row || genui
     }
 }
 
@@ -101,7 +104,9 @@ pub(super) fn finish(w: WorldRef<'_>, floats: Vec<(u64, Draw)>, sc: f32) -> Vec<
             ([p.x - rect[0], p.y - rect[1], p.w * p.scale, p.h * p.scale], p.alpha.clamp(0.0, 1.0), p.scale)
         });
         let radius = node.try_cloned::<&harness_native_ui_look_api::Shape>().map_or(0.0, |s| s.radius) * scale;
-        out.push(Float { id, rect, draw, glass, radius, plate, alpha });
+        let help = view::prefab(w, "hn.HoverHelp").expect("the scene's hn.HoverHelp prefab");
+        let ignores_mouse = node.owns((flecs::IsA::ID, *help.id()));
+        out.push(Float { id, rect, draw, glass, radius, plate, alpha, ignores_mouse });
     }
     out
 }

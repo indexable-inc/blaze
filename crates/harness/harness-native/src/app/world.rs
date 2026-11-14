@@ -26,6 +26,10 @@ impl App {
                 Call::Set { path, component, value, .. } => Call::Set { path, component, value, save: false },
                 Call::Token { name, value, .. } => Call::Token { name, value, save: false },
                 Call::Script { code, .. } => Call::Script { code, save: false },
+                Call::Emotion { session, .. } => {
+                    eprintln!("harness-native: world journal: emotion for s{session} is live state and cannot be replayed");
+                    continue;
+                }
                 other => other,
             };
             if let Err(e) = self.world_call(edit) {
@@ -52,6 +56,14 @@ impl App {
     /// # Errors
     /// What refused it and why.
     pub fn world_call(&mut self, call: Call) -> Result<Value, String> {
+        if let Call::Emotion { device, session, emotion, reason } = call {
+            let update = super::emotion::apply(self.world.world_ref(), &device, session, emotion, &reason)?;
+            if update.cue && crate::prefs::get("emotion_sound").and_then(|v| v.as_bool()) != Some(false) {
+                crate::audio::cue("emotion_negative");
+            }
+            self.poke();
+            return Ok(update.json());
+        }
         self::call(&self.world, &mut self.world_scripts, call)
     }
 }
@@ -65,6 +77,7 @@ pub(super) fn call(world: &World, scripts: &mut u32, call: Call) -> Result<Value
     let w = world.world_ref();
     let no_var = |name: &str| format!("the scene has no variable `{name}` (scene/00-tokens.flecs)");
     match call {
+        Call::Emotion { device, session, emotion, reason } => Ok(super::emotion::apply(w, &device, session, emotion, &reason)?.json()),
         Call::Query { expr } => parse(&expr, w.query_json(&expr)?),
         Call::Get { path } => parse(&path, w.entity_json(&path)?),
         Call::Set { path, component, value, save } => {

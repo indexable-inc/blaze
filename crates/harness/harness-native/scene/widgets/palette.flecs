@@ -23,6 +23,21 @@ hn {
     Padding: {l: $overlay_pad, r: $overlay_pad, t: $overlay_pad, b: $overlay_pad}
   }
 
+  // A real single-line search field: the shared Draft editor supplies text, selection, IME and a blinking caret.
+  prefab PaletteField : ui.TextArea {
+    Pressable
+    Action: {name: "pal:focus"}
+    NoScroller
+    Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $line_row, min: 0, max: 0}}
+    text {
+      FixedSize: {h: true, v: false}
+      TextStyle: {size: $size_body, line: $line_row, role: 0, bold: 0}
+    }
+    hint_at {
+      hint { TextStyle: {size: $size_body, line: $line_row, role: 0, bold: 0} }
+    }
+  }
+
   // The command palette (cmd+K): a card near the top of the window.
   prefab Palette : hn.Scrim {
     Padding: {l: 0, r: 0, t: $palette_top, b: 0}
@@ -33,9 +48,7 @@ hn {
         Flex: {axis: Row, gap: 8, align: Center, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fixed, value: $palette_query_h, min: 0, max: 0}}
         Padding: {l: 10, r: 10, t: 0, b: 0}
-        text : ui.Words, Strong {
-          TextStyle: {size: 15, line: 20, role: 0, bold: 0}
-        }
+        field : hn.PaletteField {}
       }
       rule : ui.Divider {}
       items : ui.Column {
@@ -85,10 +98,7 @@ hn {
           Icon: {glyph: ""}
           Size: {w: {kind: Fixed, value: $icon_box, min: 0, max: 0}, h: {kind: Fixed, value: $icon_box, min: 0, max: 0}}
         }
-        text : ui.Lead, Ink {
-          Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
-          TextStyle: {size: $size_body, line: $line_row, role: 0, bold: 0}
-        }
+        field : hn.PaletteField {}
         escape : ui.Line, Faint {
           Text: {s: "esc"}
           TextStyle: {size: $size_caption, line: $line_chrome, role: 0, bold: 0}
@@ -98,8 +108,8 @@ hn {
       body : ui.Row {
         Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
         Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: $library_body_h}}
-        results : ui.Column {
-          Clip
+        results : ui.Scroll {
+          CaretScroll: {margin: $library_pad, omega: $textarea_glide_omega, zeta: $textarea_glide_zeta}
           Size: {w: {kind: Percent, value: $library_list_w / $library_w, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
           Padding: {l: $library_pad, r: $library_pad, t: $library_pad, b: $library_pad}
           items : ui.Column {
@@ -112,6 +122,7 @@ hn {
         }
         seam : hn.Seam {}
         preview : ui.Scroll {
+          CaretScroll: {margin: $library_pad, omega: $textarea_glide_omega, zeta: $textarea_glide_zeta}
           Size: {w: {kind: Grow, value: 1, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
           content : ui.Column {
             Padding: {l: $library_preview_pad, r: $library_preview_pad, t: $library_preview_pad, b: $library_preview_pad}

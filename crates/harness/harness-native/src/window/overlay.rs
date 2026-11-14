@@ -34,7 +34,7 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{CGColorSpace, kCGColorSpaceExtendedSRGB};
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize};
 use objc2_metal::MTLDevice;
 use objc2_quartz_core::{CAMetalLayer, kCAGravityTopLeft};
 
@@ -160,12 +160,10 @@ struct Panel {
     /// The glass as last set: its frame in the content view, its corner radius and its alpha (window points); None while
     /// hidden.
     corner: Option<(NSRect, f64, f64)>,
-    view: Retained<OverlayView>,
     layer: Retained<CAMetalLayer>,
     shown: bool,
     frame: NSRect,
     pixels: CGSize,
-    tip: String,
 }
 
 /// The overlay windows, by the overlay each shows.
@@ -215,6 +213,8 @@ impl Overlays {
             );
             let frame = window.convertRectToScreen(self.main.convertRect_toView(local, None));
             let p = &mut self.panels[at];
+            // Help is visually present but never a native input surface. Reused menu panels restore input here.
+            p.panel.setIgnoresMouseEvents(f.ignores_mouse);
             // The glass where the plate is drawn this frame and as faded as it is (a plain container, so up from the bottom).
             let corner = f.glass.then(|| {
                 let [x, y, w, h] = f.plate.map(|v| f64::from(v) * z);
@@ -258,9 +258,9 @@ impl Overlays {
     }
 
     /// After the frame's passes were committed: each drawn overlay's window ordered in (the first time) and its shadow
-    /// shaped again from what it now shows, each tooltip set on its view; the windows of overlays that closed ordered out,
+    /// shaped again from what it now shows; the windows of overlays that closed ordered out,
     /// and spare ones past [`SPARE`] let go.
-    pub fn shown(&mut self, window: &NSWindow, floats: &[Float], drawn: &[bool], tip: &str) {
+    pub fn shown(&mut self, window: &NSWindow, floats: &[Float], drawn: &[bool]) {
         for (f, &drawn) in floats.iter().zip(drawn) {
             let Some(p) = self.panels.iter_mut().find(|p| p.id == f.id) else { continue };
             if !drawn {
@@ -272,10 +272,6 @@ impl Overlays {
                 unsafe { window.addChildWindow_ordered(&p.panel, NSWindowOrderingMode::Above) };
             }
             p.panel.invalidateShadow();
-            if p.tip != tip {
-                p.tip = tip.to_owned(); // alloc: the tooltip's words, when they change
-                p.view.setToolTip((!tip.is_empty()).then(|| NSString::from_str(tip)).as_deref());
-            }
         }
         for p in &mut self.panels {
             if p.id == 0 && p.shown {
@@ -298,7 +294,8 @@ impl Overlays {
     /// pointer that left one of them for another is still over the app, so its hover holds.
     pub fn holds(&self, window: &NSWindow, screen: NSPoint) -> bool {
         let top = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(screen, 0, self.main.mtm());
-        top == window.windowNumber() || self.panels.iter().any(|p| p.shown && p.panel.windowNumber() == top)
+        top == window.windowNumber()
+            || self.panels.iter().any(|p| p.shown && !p.panel.ignoresMouseEvents() && p.panel.windowNumber() == top)
     }
 
     fn make(&self, mtm: MainThreadMarker, id: u64) -> Panel {
@@ -379,12 +376,10 @@ impl Overlays {
             panel,
             glass,
             corner: None,
-            view,
             layer,
             shown: false,
             frame: NSRect::ZERO,
             pixels: CGSize::new(0.0, 0.0),
-            tip: String::new(),
         }
     }
 }

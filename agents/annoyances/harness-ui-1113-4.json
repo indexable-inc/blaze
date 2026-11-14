@@ -1,0 +1,21 @@
+{
+  "id": "harness-ui-1113-4",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent",
+  "where": "Harness per-agent context metadata and live sidebar state",
+  "what": "Inline context initially appeared only on the selected agent; a new context summary also failed to update after its first list snapshot.",
+  "cost": "Rows looked stale or incomplete although the daemon knew the latest usage.",
+  "cause": "Context existed only in subscribed transcripts, and list reconciliation fingerprints omitted context, effort and label.",
+  "whys": [
+    "Only selected transcripts are subscribed.",
+    "The row depended on that rich transcript for a fixed-size counter.",
+    "SessionInfo omitted the counter.",
+    "Adding the counter did not update its reconciliation fingerprint.",
+    "Metadata ownership and invalidation were implicit instead of being checked at the list boundary."
+  ],
+  "class": "A row depends on detail subscriptions for summary data, or its reconciliation identity omits rendered metadata.",
+  "prevention": "SessionInfo owns an optional fixed-size context summary derived from the authoritative reducer. A headless test updates two agents without transcript subscriptions and isolates used, window, timestamp, effort and label changes through the real list installer. Restored logs preserve the original context timestamp.",
+  "workaround": "None.",
+  "fix": "Daemon list summaries and native AgentContext feed every row; the existing transcript supplies detail on demand. The regression test failed on the omitted fingerprint, then passed after including all rendered fields.",
+  "state": "fixed in this change"
+}

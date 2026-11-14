@@ -16,7 +16,7 @@ incremental compile short > memory use > cold compile > disk collection good and
 disk use. Machines: best on 128 cores (Graviton 5, EPYC); many people on typical Macs (8-16
 cores, 16-64 GB). One code path sized by a machine descriptor (`blaze_keyed::machine::Machine`).
 
-## Scope (the owner's answers, 2026-11-13; decision D35)
+## Scope (the owner's answers, 2026-11-13; decision D36)
 
 - No `blaze watch`, nothing builds on save: edits come in transactions whose middle states are
   invalid. A build runs when asked and may leave a helper with an expiry, for a faster next build;
