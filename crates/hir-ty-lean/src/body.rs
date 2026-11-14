@@ -568,6 +568,14 @@ fn merge_tests(
     (arms, rest)
 }
 
+/// The node `nodes` run first, under any labelled blocks they start with.
+fn first_node(nodes: &mut [Node<Stmt, Cond>]) -> Option<&mut Node<Stmt, Cond>> {
+    match nodes.first_mut()? {
+        Node::Block(body) => first_node(body),
+        first => Some(first),
+    }
+}
+
 /// Folds what runtime MIR spreads over statements back into one operation, and a discriminant
 /// read with the switch on it into a `match`: see the module.
 pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
@@ -601,7 +609,32 @@ pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
                     None => Node::Branch { on, arms, otherwise },
                 }
             }
-            Node::Block(body) => Node::Block(fold(body)),
+            // `d = discriminant(p); 'a: { switch d { .. } .. }` is a match on `p` too: the
+            // label runs nothing, and the normal form puts the read before it (an or-pattern
+            // whose alternatives all go on to one arm makes the label).
+            Node::Block(body) => {
+                let mut body = fold(body);
+                let read = match out.last() {
+                    Some(Node::Do(Stmt::Assign { place, value: Rvalue::Discriminant(of, ty), .. }))
+                        if place.elems.is_empty() =>
+                    {
+                        Some((place.local, of.clone(), ty.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((local, of, ty)) = read
+                    && let Some(Node::Branch { on, arms, otherwise }) = first_node(&mut body)
+                    && matches!(on, Cond::Operand(tested, _) if is_local(tested, local))
+                {
+                    *on = Cond::Discriminant(of, ty);
+                    let (merged, rest) =
+                        merge_tests(on, std::mem::take(arms), std::mem::take(otherwise));
+                    *arms = merged;
+                    *otherwise = rest;
+                    out.pop();
+                }
+                Node::Block(body)
+            }
             Node::Loop(body) => Node::Loop(fold(body)),
             // `t = a op? b; assert(!t.1); x = t.0` is `x = a op b`, checked.
             Node::Do(Stmt::Assign { place, value: Rvalue::Use(used), at }) => {

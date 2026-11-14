@@ -19,7 +19,6 @@ use hir_expand::fixture;
 use hir_ty_mir as _;
 
 use hir_def::{DefWithBodyId, HasModule as _};
-use rustc_type_ir::inherent::GenericArgs as _;
 use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::budget::{self, Pass};
 
@@ -1570,9 +1569,15 @@ pub fn takes(a: Option<u32>) -> (Option<u32>, Option<u32>, Option<u32>) {
 #[track_caller]
 fn golden(flags: &str, krate: &str, name: &str, source: &str) -> Emitted {
     let out = emitted(flags, krate, name, source);
-    expect_file![format!("../../../lean/{}", out.path())].assert_eq(&out.text);
-    for import in &out.imports {
-        expect_file![format!("../../../lean/{}", import.path())].assert_eq(&import.text);
+    for module in out.imports.iter().chain([&out]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean").join(module.path());
+        // `UPDATE_EXPECT` writes a new golden only where its directory is.
+        if std::env::var_os("UPDATE_EXPECT").is_some()
+            && let Some(dir) = path.parent()
+        {
+            std::fs::create_dir_all(dir).expect("the golden's directory");
+        }
+        expect_file![path].assert_eq(&module.text);
     }
     out
 }
@@ -1726,6 +1731,64 @@ fn blaze_cores_busy_models_are_its_sources() {
     // `next` has no loop and `doubling` has one: the refinement's statement is total.
     let refines = emitted(FLAGS, "blaze_core", "next_is_the_doubling_schedule", &source);
     assert!(refines.shape.fuel && refines.text.contains("∃ (fuel : Nat)"), "{}", refines.text);
+}
+
+// ---- blaze-core's worlds (docs/v2/plan/design/proofs-for-sans-io.md, section 2). ----
+
+/// What the worlds' sources use: `Vec` and its writes through an index, `Option`'s methods,
+/// the integers' saturating and bounds.
+const WORLD_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, vec, mem_take, drop, index, slice, \
+    range, option, option_methods, int_methods, int_bounds, int_cast, ord_methods";
+
+/// `crates/blaze-core/src/world/clock.rs` and `disk.rs` as the files have them, in a crate and
+/// modules of the same names (the checked-in models are named by them): each without its
+/// tests, its `sans_io` mark and its derives, which no model reads and minicore does not
+/// have, and with `Global` named where minicore has it.
+fn world_fixture() -> String {
+    let code = |file: &str| -> String {
+        let code = file.split("\n#[cfg(test)]\nmod tests {").next().expect("a file's code comes first");
+        code.lines()
+            .filter(|line| !line.starts_with("#![blaze::sans_io]") && !line.trim_start().starts_with("#[derive("))
+            .map(|line| line.replace("use std::alloc::Global;", "use core::alloc::Global;"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "pub mod world {{\npub mod clock {{\n{}\n}}\npub mod disk {{\n{}\n}}\n}}\n",
+        code(include_str!("../../blaze-core/src/world/clock.rs")),
+        code(include_str!("../../blaze-core/src/world/disk.rs")),
+    )
+}
+
+/// The models the worlds' proofs are about (`crates/blaze-core/lean/BlazeCore/World/`) are
+/// what the translator emits from blaze-core's own source today, as for `busy` above: the
+/// clock's theorem and the disk's three crash theorems, with every function of the worlds
+/// they reach. When `blaze prove` is the gate, the models are its outputs and this test goes.
+#[test]
+fn blaze_cores_world_models_are_its_sources() {
+    let source = world_fixture();
+    for (module, name) in [
+        ("clock", "a_timer_never_fires_early"),
+        ("disk", "a_crash_keeps_a_synced_file"),
+        ("disk", "a_crash_cuts_an_appended_file_to_a_prefix"),
+        ("disk", "a_crash_keeps_what_a_barrier_ordered"),
+    ] {
+        let out = emitted(WORLD_FLAGS, "blaze_core", name, &source);
+        let statement = format!("blaze_core.world.{module}.{name}.spec.statement");
+        assert_eq!(out.statement.as_deref(), Some(statement.as_str()));
+        assert_eq!(out.function, format!("blaze_core::world::{module}::{name}"));
+        for module in out.imports.iter().chain([&out]) {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean").join(module.path());
+            // A model of a type or function new to the worlds is a file in a new directory,
+            // which `UPDATE_EXPECT` writes only where the directory is.
+            if std::env::var_os("UPDATE_EXPECT").is_some()
+                && let Some(dir) = path.parent()
+            {
+                std::fs::create_dir_all(dir).expect("the model's directory");
+            }
+            expect_file![path].assert_eq(&module.text);
+        }
+    }
 }
 
 // ---- `Vec<T>` (docs/v2/plan/design/proofs-for-sans-io.md, section 3 step d). ----
@@ -1883,5 +1946,116 @@ fn a_queue_over_a_vec_states_its_theorems() {
         let out = golden(VEC_FLAGS, "queue", name, QUEUE);
         let statement = format!("queue.{name}.spec.statement");
         assert_eq!(out.statement.as_deref(), Some(statement.as_str()));
+    }
+}
+
+// ---- What the worlds are written with, one construct a function. ----
+
+/// The constructs of `crates/blaze-core/src/world/`, each alone: an or-pattern whose
+/// alternatives bind the same names, `let .. else`, an early `return` in a `while` whose
+/// condition is `&&`, a tuple returned and taken apart, `saturating_add`, `u64::MAX` and a
+/// constant made by a shift, `Option::take`, `is_none` and `is_some` of a field of a `Vec`'s
+/// element, a struct written over an element (the old one dropped), `&mut self.field` lent to a
+/// free function, a `&Vec<u8>` given as a `&[u8]`, `Vec::remove(0)` in a loop, and nested
+/// `while`s.
+const WORLD_SHAPES: &str = "pub const BIG: usize = 1 << 40;
+pub enum Change { At(usize, u32), Sectors(usize, u32), Cut(usize) }
+pub struct Slot { pub undo: Option<u32>, pub bytes: Vec<u8> }
+pub fn either(change: &Change) -> usize {
+    match change {
+        Change::At(at, more) | Change::Sectors(at, more) => *at + *more as usize,
+        Change::Cut(len) => *len,
+    }
+}
+pub fn kind(change: &Change) -> u32 {
+    match change {
+        Change::Cut(_) => 0,
+        Change::At(_, _) | Change::Sectors(_, _) => 1,
+    }
+}
+pub fn size(change: &Change) -> usize {
+    match change {
+        Change::Cut(len) => *len,
+        Change::At(at, more) | Change::Sectors(at, more) => *at + *more as usize,
+    }
+}
+pub fn first_or(v: &Vec<u32>) -> u32 {
+    let Some(x) = v.first() else { return 0 };
+    *x
+}
+pub fn position(v: &Vec<u32>, x: u32, most: usize) -> Option<usize> {
+    let mut i = 0;
+    while i < v.len() && i < most {
+        if v[i] == x { return Some(i); }
+        i += 1;
+    }
+    None
+}
+fn pair(x: u64) -> (bool, u64) { (x > 3, x.saturating_add(u64::MAX)) }
+pub fn unpair(x: u64) -> u64 {
+    let (big, y) = pair(x);
+    if big || y == u64::MAX { y } else { BIG as u64 }
+}
+pub fn slots(v: &mut Vec<Slot>, i: usize, s: Slot) -> bool {
+    let was = v[i].undo.take();
+    let none = v[i].undo.is_none();
+    v[i] = s;
+    was.is_some() && none
+}
+fn grow(bytes: &mut Vec<u8>, more: &[u8]) { bytes.extend_from_slice(more); }
+impl Slot {
+    pub fn grow(&mut self, more: &Vec<u8>) { grow(&mut self.bytes, more); }
+}
+pub fn grown(slot: Slot, more: Vec<u8>) -> Slot {
+    let mut slot = slot;
+    slot.grow(&more);
+    slot
+}
+pub fn drain(v: &mut Vec<u32>, n: usize) -> u32 {
+    let mut total = 0;
+    let mut done = 0;
+    while done < n && !v.is_empty() {
+        let x = v.remove(0);
+        let mut k = 0;
+        while k < x { total += 1; k += 1; }
+        done += 1;
+    }
+    total
+}
+";
+
+/// Each construct the worlds use becomes the model its golden holds: the or-pattern one
+/// `match` arm per alternative, each binding its own fields, one without bindings the `_`
+/// arm, and one after another arm more arms of the same match; `let .. else` a `match` whose
+/// other arm returns; the early `return` the loop function's result; the constant its value.
+#[test]
+fn the_worlds_constructs_become_their_models() {
+    let cases: [(&str, &[&str]); 9] = [
+        ("size", &["| blaze_shapes.Change.Cut v0 =>", "| blaze_shapes.Change.Sectors v3 v4 =>"]),
+        ("kind", &["| blaze_shapes.Change.Cut v0 => (0 : U32)", "| _ => (1 : U32)"]),
+        ("either", &["blaze_shapes.Change.At", "blaze_shapes.Change.Sectors", "blaze_shapes.Change.Cut"]),
+        ("first_or", &["match Slice.first v with", "| Option.none => (0 : U32)"]),
+        ("position", &["blaze_shapes.position.loop_0", "Option.some"]),
+        ("unpair", &["blaze_shapes.pair x", "Scalar.saturating_add x (18446744073709551615 : U64)", "(1099511627776 : Usize)"]),
+        ("slots", &["core.option.Option.take", "core.option.Option.is_none", "Slice.update", "core.option.Option.is_some"]),
+        ("grown", &["blaze_shapes.grow self.bytes more", "{ self with bytes := x0 }"]),
+        ("drain", &["← Vec.remove v (0 : Usize)", "blaze_shapes.drain.loop_0", "blaze_shapes.drain.loop_1"]),
+    ];
+    for (name, models) in cases {
+        let out = golden(WORLD_FLAGS, "blaze_shapes", name, WORLD_SHAPES);
+        // The function's module and those of what it calls (`pair` for `unpair`).
+        let text: String = out.imports.iter().chain([&out]).map(|it| it.text.as_str()).collect();
+        for model in models {
+            assert!(text.contains(model), "`{name}` has `{model}`:\n{text}");
+        }
+        // MIR's second test of an or-pattern, inside the arm that chose it, is gone: the
+        // variants left are known there, and no arm for one it cannot be is written.
+        if matches!(name, "kind" | "either" | "size") {
+            assert!(!text.contains("unreachable"), "`{name}`:\n{text}");
+        }
+        // The arms after the first are the outer match's own, not a second match in its `_`.
+        if name == "size" {
+            assert!(!text.contains("| _ =>"), "`{name}`:\n{text}");
+        }
     }
 }

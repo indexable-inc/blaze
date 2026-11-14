@@ -267,6 +267,39 @@ fn pat_term(pat: &Pat) -> Option<Term> {
     }
 }
 
+/// The names a pattern of names and tuples binds; `None` for any other pattern.
+fn pat_names(pat: &Pat) -> Option<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    fn walk(pat: &Pat, out: &mut BTreeSet<String>) -> bool {
+        match pat {
+            Pat::Name(it) => out.insert(it.clone()),
+            Pat::Tuple(all) => all.iter().all(|it| walk(it, out)),
+            _ => false,
+        }
+    }
+    walk(pat, &mut out).then_some(out)
+}
+
+/// Whether `m` is `let`s that bind only `names` and `temps`, then `ok` of `pat` as a term.
+fn spine_gives(m: &M, pat: &Pat, names: &BTreeSet<String>, temps: &BTreeSet<String>) -> bool {
+    match m {
+        M::Let { pat: bound, body, .. } => {
+            pat_names(bound).is_some_and(|all| all.iter().all(|it| names.contains(it) || temps.contains(it)))
+                && spine_gives(body, pat, names, temps)
+        }
+        M::Ret(term) => pat_term(pat).as_ref() == Some(term),
+        _ => false,
+    }
+}
+
+/// The `let`s of `m`, a spine [`spine_gives`] accepted, then `end` in place of its result.
+fn replace_end(m: M, end: M) -> M {
+    match m {
+        M::Let { pat, value, body } => M::Let { pat, value, body: Box::new(replace_end(*body, end)) },
+        _ => end,
+    }
+}
+
 /// The simplifications the module names; `temps` are the variables that hold no binding.
 fn simplify(m: M, temps: &BTreeSet<String>) -> M {
     match m {
@@ -302,6 +335,16 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                     return body;
                 }
             }
+            // `let (a, b) ← (let a := x; let b := y; ok (a, b)); body` is
+            // `let a := x; let b := y; body`: each name the inner `let`s bind is one of the
+            // pattern's, given its last value there, or a temporary nothing else reads.
+            if let Rhs::Sub(sub) = &value
+                && let Some(names) = pat_names(&pat)
+                && spine_gives(sub, &pat, &names, temps)
+            {
+                let Rhs::Sub(sub) = value else { unreachable!("matched above") };
+                return replace_end(*sub, body);
+            }
             // `let p ← e; ok p` is `e`.
             if let M::Ret(result) = &body
                 && pat_term(&pat).as_ref() == Some(result)
@@ -319,11 +362,56 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
             then: Box::new(simplify(*then, temps)),
             otherwise: Box::new(simplify(*otherwise, temps)),
         },
-        M::Match { on, arms } => M::Match {
-            on,
-            arms: arms.into_iter().map(|(pat, arm)| (pat, simplify(arm, temps))).collect(),
-        },
+        M::Match { on, arms } => {
+            let mut arms: Vec<(Pat, M)> =
+                arms.into_iter().map(|(pat, arm)| (pat, simplify(arm, temps))).collect();
+            // `match x with | A => a | _ => match x with | B => b | A => c` is
+            // `match x with | A => a | B => b`: the `_` arm binds nothing, so the inner `x` is
+            // the outer one, and an inner arm for a constructor an outer arm took is dead there.
+            // MIR tests an or-pattern's other alternatives again, so this is the match it
+            // wrote.
+            let heads: Option<Vec<String>> =
+                arms.split_last().and_then(|(_, before)| before.iter().map(|(pat, _)| pat_head(pat)).collect());
+            // When the inner match gives a value the rest of the `_` arm binds (an or-pattern's
+            // bindings, joined), each live inner arm gets its own copy of that rest, as any
+            // code after a join does; the arm for a constructor the outer match took goes.
+            let live = |heads: &[String], pat: &Pat| pat_head(pat).is_none_or(|it| !heads.contains(&it));
+            match (heads, arms.last()) {
+                (Some(heads), Some((Pat::Wild, M::Match { on: inner, .. }))) if *inner == on => {
+                    let Some((_, M::Match { arms: inner, .. })) = arms.pop() else {
+                        unreachable!("matched above")
+                    };
+                    arms.extend(inner.into_iter().filter(|(pat, _)| live(&heads, pat)));
+                }
+                (
+                    Some(heads),
+                    Some((Pat::Wild, M::Let { value: Rhs::Sub(sub), .. })),
+                ) if matches!(&**sub, M::Match { on: inner, arms }
+                        if *inner == on && arms.iter().any(|(pat, _)| !live(&heads, pat))) =>
+                {
+                    let Some((_, M::Let { pat: bound, value: Rhs::Sub(sub), body })) = arms.pop() else {
+                        unreachable!("matched above")
+                    };
+                    let M::Match { arms: inner, .. } = *sub else { unreachable!("matched above") };
+                    for (pat, arm) in inner.into_iter().filter(|(pat, _)| live(&heads, pat)) {
+                        let rest = M::Let { pat: bound.clone(), value: Rhs::Sub(Box::new(arm)), body: body.clone() };
+                        arms.push((pat, simplify(rest, temps)));
+                    }
+                }
+                _ => {}
+            }
+            M::Match { on, arms }
+        }
         other => other,
+    }
+}
+
+/// The constructor or literal a pattern tests, when it tests one.
+fn pat_head(pat: &Pat) -> Option<String> {
+    match pat {
+        Pat::Ctor(head, _) => Some(head.clone()),
+        Pat::Atom(head) => Some(head.clone()),
+        Pat::Wild | Pat::Name(_) | Pat::Tuple(_) => None,
     }
 }
 
@@ -437,6 +525,9 @@ struct Translate<'a> {
     fresh: usize,
     /// The fields a `match` arm in scope binds: of this variant of the enum at this place.
     bound: Vec<(Place, u32, Vec<String>)>,
+    /// The variants the enum at a place can still be, in the `_` arm of a `match` on it: those
+    /// no other arm has.
+    narrowed: Vec<(Place, Vec<u32>)>,
     uses_fuel: bool,
     /// What `return` gives: the result unless it is `()`, then each `&mut` parameter.
     returned: Vec<Local>,
@@ -714,8 +805,15 @@ impl<'a> Translate<'a> {
             lets.push((root, Rhs::Pure(whole)));
         }
         // What a `match` arm bound of the local is no longer what it holds.
-        self.bound.retain(|(of, _, _)| of.local != place.local);
+        self.forget(place.local);
         Ok(())
+    }
+
+    /// What `match` arms bound of a place that reads `local` (its root, or an index in it) is
+    /// no longer known: `local` was given a new value.
+    fn forget(&mut self, local: Local) {
+        self.bound.retain(|(of, _, _)| of.local != local && !of.indexed_by(local));
+        self.narrowed.retain(|(of, _)| of.local != local && !of.indexed_by(local));
     }
 
     fn operand(
@@ -970,13 +1068,13 @@ impl<'a> Translate<'a> {
         }
         for &param in mut_params {
             if let Some(Operand::Place(lent)) = args.get(param) {
-                self.bound.retain(|(of, _, _)| of.local != lent.local);
+                self.forget(lent.local);
             }
         }
         if returns_unit {
             self.write(dest, Rhs::Pure(atom("()")), lets, at)?;
         }
-        self.bound.retain(|(of, _, _)| of.local != dest.local);
+        self.forget(dest.local);
         Ok(())
     }
 
@@ -1139,6 +1237,28 @@ impl<'a> Translate<'a> {
                 let Some(variants) = self.body.variants(ty) else {
                     return Err(self.refuse("a `match` on a value that is not an enum", ""));
                 };
+                // Inside an arm of a `match` on the same place, nothing having written it (or
+                // an index it reads) since, the variants it can be are known: that arm's, or,
+                // in a `_` arm, those no other arm has. Where each of them takes the same arm,
+                // the test takes it. MIR tests an or-pattern twice, to choose the arm and then
+                // to bind what the alternative that matched binds, so this is the second test.
+                // Arms equal for two variants read no field of either: a field read names its
+                // variant.
+                let possible = match self.bound.iter().rev().find(|(of, _, _)| of == place) {
+                    Some((_, which, _)) => Some(vec![*which]),
+                    None => self.narrowed.iter().rev().find(|(of, _)| of == place).map(|it| it.1.clone()),
+                };
+                if let Some(possible) = possible {
+                    let arm_of = |which: u32| {
+                        let discriminant = variants[which as usize].discriminant;
+                        arms.iter().find(|(value, _)| *value == discriminant).map_or(otherwise, |(_, arm)| arm)
+                    };
+                    if let Some((&first, rest)) = possible.split_first()
+                        && rest.iter().all(|it| arm_of(*it) == arm_of(first))
+                    {
+                        return self.seq(arm_of(first), then, live);
+                    }
+                }
                 let mut lets = Vec::new();
                 let on = self.read(place, &mut lets, "")?;
                 let mut out = Vec::with_capacity(arms.len() + 1);
@@ -1172,6 +1292,7 @@ impl<'a> Translate<'a> {
                     .collect();
                 if !left.is_empty() {
                     let outer = self.bound.clone();
+                    let outer_narrowed = self.narrowed.clone();
                     let pat = match left.as_slice() {
                         [which] => {
                             let variant = &variants[*which];
@@ -1184,10 +1305,15 @@ impl<'a> Translate<'a> {
                             self.bound.push((place.clone(), *which as u32, fields));
                             pat
                         }
-                        _ => Pat::Wild,
+                        _ => {
+                            let left = left.iter().map(|it| *it as u32).collect();
+                            self.narrowed.push((place.clone(), left));
+                            Pat::Wild
+                        }
                     };
                     let rest = self.seq(otherwise, then, live);
                     self.bound = outer;
+                    self.narrowed = outer_narrowed;
                     out.push((pat, rest?));
                 }
                 Ok(Self::with(lets, M::Match { on, arms: out }))
@@ -1215,6 +1341,7 @@ impl<'a> Translate<'a> {
         let depth = self.labels.len();
         let outer_boundary = std::mem::replace(&mut self.boundary, depth);
         let outer_bound = std::mem::take(&mut self.bound);
+        let outer_narrowed = std::mem::take(&mut self.narrowed);
         self.labels.push(Label::Loop {
             name: loop_name.clone(),
             params: params.clone(),
@@ -1225,6 +1352,7 @@ impl<'a> Translate<'a> {
         self.labels.pop();
         self.boundary = outer_boundary;
         self.bound = outer_bound;
+        self.narrowed = outer_narrowed;
         let m = simplify(m?, &self.temps);
         let mut binders = vec![Binder { name: "fuel".to_owned(), ty: name("Nat") }];
         binders.extend(params.iter().map(|it| Binder {
@@ -1330,6 +1458,7 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
         loop_count: 0,
         fresh: 0,
         bound: Vec::new(),
+        narrowed: Vec::new(),
         uses_fuel: false,
         returned,
     };
