@@ -10,7 +10,9 @@ import BlazeModel.atomics.mixed_threads.closure1.call
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.mixed_threads.at_1 (t0 : Threads.Ended U32 × Threads.Ended U32) : Threads.Prog Bool :=
+def atomics.mixed_threads (schedule : Slice Threads.Step) (x : U32) : Threads.Prog Bool := do
+  let t0 ←
+    Threads.two_of schedule (Threads.Prog.done (Result.ok (atomics.mixed_threads.closure0.call ({ c0 := x } : atomics.mixed_threads.closure0)))) (Threads.Prog.done (atomics.mixed_threads.closure1.call ({ c0 := x } : atomics.mixed_threads.closure1)))
   match t0.1 with
   | Threads.Ended.Done v0 =>
     match t0.2 with
@@ -20,8 +22,3 @@ def atomics.mixed_threads.at_1 (t0 : Threads.Ended U32 × Threads.Ended U32) : T
       Threads.Prog.done (Result.ok (Scalar.eq a b))
     | _ => Threads.Prog.done (Result.ok false)
   | _ => Threads.Prog.done (Result.ok false)
-
-def atomics.mixed_threads (schedule : Slice Threads.Step) (x : U32) : Threads.Prog Bool := do
-  let t0 ←
-    Threads.two_of schedule (Threads.Prog.done (Result.ok (atomics.mixed_threads.closure0.call ({ c0 := x } : atomics.mixed_threads.closure0)))) (Threads.Prog.done (atomics.mixed_threads.closure1.call ({ c0 := x } : atomics.mixed_threads.closure1)))
-  atomics.mixed_threads.at_1 t0

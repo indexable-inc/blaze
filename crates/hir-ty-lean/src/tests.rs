@@ -3580,7 +3580,6 @@ pub mod sync {
             pub fn load(&self, order: Ordering) -> u32 { self.v }
             pub fn store(&self, v: u32, order: Ordering) {}
             pub fn fetch_add(&self, v: u32, order: Ordering) -> u32 { self.v }
-            pub fn swap(&self, v: u32, order: Ordering) -> u32 { self.v }
             pub fn compare_exchange(&self, current: u32, new: u32, success: Ordering, failure: Ordering) -> Result<u32, u32> { Ok(self.v) }
             pub fn compare_exchange_weak(&self, current: u32, new: u32, success: Ordering, failure: Ordering) -> Result<u32, u32> { Ok(self.v) }
             pub fn compare_and_swap(&self, current: u32, new: u32, order: Ordering) -> u32 { self.v }
@@ -3615,7 +3614,7 @@ pub mod world {
 /// The crate `krate`, whose source is `source`, over [`ATOMICS_STD`].
 fn atomics_fixture(krate: &str, source: &str) -> String {
     format!(
-        "//- minicore: {CLOSURE_FLAGS}, vec, drop\n//- /lib.rs crate:{krate} deps:sync_std,blaze_core cfg:overflow_checks\n{source}{ATOMICS_STD}"
+        "//- minicore: {CLOSURE_FLAGS}\n//- /lib.rs crate:{krate} deps:sync_std,blaze_core cfg:overflow_checks\n{source}{ATOMICS_STD}"
     )
 }
 
@@ -3718,85 +3717,6 @@ pub fn bump_and_wake(word: &AtomicU32) -> bool {
     word.fetch_add(1, Ordering::Release);
     threads::wake(word)
 }
-const EMPTY: u32 = 0;
-const NOTIFIED: u32 = 1;
-const PARKED: u32 = 0xffff_ffff;
-pub fn park_loop(word: &AtomicU32, timed: bool) -> bool {
-    loop {
-        let woke = threads::wait(word, PARKED, timed);
-        match word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return true,
-            Err(_) => {}
-        }
-        match woke {
-            Woke::TimedOut => return word.swap(EMPTY, Ordering::Acquire) == NOTIFIED,
-            _ => {}
-        }
-    }
-}
-pub fn park(word: &AtomicU32, timed: bool) -> bool {
-    match word.compare_exchange(NOTIFIED, EMPTY, Ordering::Acquire, Ordering::Relaxed) {
-        Ok(_) => return true,
-        Err(_) => {}
-    }
-    match word.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire) {
-        Err(_) => {
-            word.store(EMPTY, Ordering::Relaxed);
-            true
-        }
-        Ok(_) => park_loop(word, timed),
-    }
-}
-pub fn plant_then_wait(word: &AtomicU32, timed: bool, plant: bool) -> bool {
-    if plant {
-        word.store(PARKED, Ordering::Release);
-    } else {
-        match word.compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire) {
-            Err(_) => return true,
-            Ok(_) => {}
-        }
-    }
-    loop {
-        let woke = threads::wait(word, PARKED, timed);
-        if word.load(Ordering::Acquire) == NOTIFIED {
-            return true;
-        }
-        match woke {
-            Woke::TimedOut => return false,
-            _ => {}
-        }
-    }
-}
-pub fn two_ways(word: &AtomicU32, how: u32) -> u32 {
-    match how {
-        0 => return 0,
-        1 => word.store(1, Ordering::Relaxed),
-        _ => word.store(2, Ordering::Relaxed),
-    }
-    word.fetch_add(1, Ordering::SeqCst);
-    word.load(Ordering::SeqCst)
-}
-pub fn unpark(word: &AtomicU32) {
-    if word.swap(NOTIFIED, Ordering::Release) == PARKED {
-        _ = threads::wake(word);
-    }
-}
-#[blaze::theorem]
-pub fn parks_once(schedule: Vec<Step>, timed: bool) -> bool {
-    let word = AtomicU32::new(EMPTY);
-    let (parked, unparked) = threads::two(&schedule, || park(&word, timed), || unpark(&word));
-    let last = word.load(Ordering::SeqCst);
-    let both = match unparked {
-        Ended::Done(()) => true,
-        _ => false,
-    };
-    match parked {
-        Ended::Asleep => !both,
-        Ended::Running => true,
-        Ended::Done(true) => !both || last == EMPTY,
-        Ended::Done(false) => timed && (!both || last == NOTIFIED),
-    }
-}
 ";
 
 /// A function that touches the memory threads share is shared: its model is a
@@ -3808,7 +3728,7 @@ pub fn parks_once(schedule: Vec<Step>, timed: bool) -> bool {
 #[test]
 fn atomics_are_programs_over_shared_memory() {
     let fixture = atomics_fixture("atomics", ATOMICS);
-    let cases: [(&str, &[&str]); 23] = [
+    let cases: [(&str, &[&str]); 17] = [
         // A trait's provided bodies at the implementor `Real`, the required `kind` they call
         // resolved to `Real`'s.
         ("poke_twice", &["atomics.Real.Kernel.poke k word"]),
@@ -3828,16 +3748,6 @@ fn atomics_are_programs_over_shared_memory() {
         ("race", &["Threads.two_of schedule"]),
         ("mixed_threads", &["Threads.Prog.done (Result.ok", "Threads.Prog.done (atomics.mixed_threads.closure1.call"]),
         ("sleep_unless_changed", &["Threads.wait word seen false", "Threads.Woke.Changed"]),
-        // Program points: the code after each shared call is a definition of its own.
-        ("park", &["def atomics.park.at_1 ", "def atomics.park.at_2 "]),
-        ("park_loop", &["def atomics.park_loop.loop_0.at_1 (loop_0 : core.sync.atomic.Atomic .U32 → Bool → Threads.Prog Bool)"]),
-        ("unpark", &["def atomics.unpark.at_1 "]),
-        // The loop after a branch one arm returns from is written once, and both other arms
-        // go on to it.
-        ("plant_then_wait", &["def atomics.plant_then_wait.loop_0 "]),
-        // The code two arms go on to after their stores is one point both call.
-        ("two_ways", &["atomics.two_ways.at_1 word"]),
-        ("parks_once", &["Threads.two_of"]),
     ];
     let mut wrong = Vec::new();
     for (name, says) in cases {
@@ -3853,14 +3763,10 @@ fn atomics_are_programs_over_shared_memory() {
         counted.imports.iter().any(|it| it.text.contains("core.sync.atomic.Atomic.store")),
         "`Counter::double` stores through `&self`"
     );
-    let out = emitted_from(&fixture, "atomics", "plant_then_wait");
-    assert!(!out.text.contains("loop_1"), "the loop after the branch is written once:\n{}", out.text);
-    let out = emitted_from(&fixture, "atomics", "two_ways");
-    assert_eq!(out.text.matches("fetch_add").count(), 1, "the arms' tail is written once:\n{}", out.text);
     let out = golden_from(&fixture, "atomics", "bump_and_wake");
     assert!(out.text.contains("Threads.wake word"), "{}", out.text);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    for name in ["two_adds_make_two", "adds_until_done", "pokes_count", "parks_once"] {
+    for name in ["two_adds_make_two", "adds_until_done", "pokes_count"] {
         let theorem = emitted_from(&fixture, "atomics", name);
         assert_eq!(theorem.statement, Some(format!("atomics.{name}.spec.statement")));
     }

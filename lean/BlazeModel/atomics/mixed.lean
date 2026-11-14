@@ -8,10 +8,7 @@ import BlazeModel.atomics.half
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.mixed.at_1 (a : U32) : Threads.Prog U32 :=
-  let b := atomics.flip_bits a
-  Threads.Prog.done (atomics.half b)
-
 def atomics.mixed (n : core.sync.atomic.Atomic .U32) : Threads.Prog U32 := do
   let a ← atomics.bump n
-  atomics.mixed.at_1 a
+  let b := atomics.flip_bits a
+  Threads.Prog.done (atomics.half b)

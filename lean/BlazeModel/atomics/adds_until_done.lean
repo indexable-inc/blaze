@@ -6,21 +6,15 @@ import BlazeModel.atomics.add_until_done
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.adds_until_done.at_2 (n : core.sync.atomic.Atomic .U32) (t0 : U32) : Threads.Prog Bool :=
+def atomics.adds_until_done (fuel : Nat) : Threads.Prog Bool := do
+  let n ← core.sync.atomic.Atomic.new (5 : U32)
+  let t0 ← atomics.add_until_done fuel n (2 : U32)
   let t1 := Scalar.eq t0 (5 : U32)
   if t1 then do
     let t2 ←
       core.sync.atomic.Atomic.load n (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
     Threads.Prog.done (Result.ok (Scalar.eq t2 (7 : U32)))
   else Threads.Prog.done (Result.ok t1)
-
-def atomics.adds_until_done.at_1 (fuel : Nat) (n : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
-  let t0 ← atomics.add_until_done fuel n (2 : U32)
-  atomics.adds_until_done.at_2 n t0
-
-def atomics.adds_until_done (fuel : Nat) : Threads.Prog Bool := do
-  let n ← core.sync.atomic.Atomic.new (5 : U32)
-  atomics.adds_until_done.at_1 fuel n
 
 def atomics.adds_until_done.spec.statement : Prop :=
   ∃ (fuel : Nat), (atomics.adds_until_done fuel).value = Result.ok true

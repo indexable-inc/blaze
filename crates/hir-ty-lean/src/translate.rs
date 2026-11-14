@@ -564,9 +564,6 @@ enum Then<'a> {
     Seq { rest: &'a Nodes, then: Rc<Then<'a>>, live: Rc<Set>, depth: usize },
     /// The loop's body ended: the loop runs again.
     Again { name: String, params: Vec<Local> },
-    /// The tail [`Translate::joins`] holds at this index, which several arms go on to: its
-    /// placeholder ([`join_call`]).
-    Join { id: usize },
 }
 
 enum Label<'a> {
@@ -608,19 +605,6 @@ struct Translate<'a> {
     returned: Vec<Local>,
     /// The loops whose functions are shared ([`shares`]): each gives a `Threads.Prog`.
     prog_loops: BTreeSet<String>,
-    /// Each variable's Lean type: the locals' and the translation's own ([`Translate::fresh`]).
-    var_types: BTreeMap<String, Term>,
-    /// Each loop's type as a function of its parameters after `fuel`: what a program point
-    /// that goes on with the loop takes in its place ([`Points`]).
-    loop_types: BTreeMap<String, Term>,
-    /// The definition being written (the function, or the loop whose body it is) gives a
-    /// `Threads.Prog`: its program points are named, and a tail several arms go on to is
-    /// written once.
-    prog_level: bool,
-    /// The tails several arms go on to, each written once ([`Then::Join`]), by number.
-    joins: Vec<Option<M>>,
-    /// The tails a loop's program points went on to ([`Points::join`]).
-    reached: BTreeSet<usize>,
 }
 
 impl<'a> Translate<'a> {
@@ -636,14 +620,12 @@ impl<'a> Translate<'a> {
         name(self.names[local as usize].clone())
     }
 
-    /// A new variable of the translation's own, holding a value of type `ty`.
-    fn fresh(&mut self, prefix: &str, ty: &Ty) -> String {
+    fn fresh(&mut self, prefix: &str) -> String {
         loop {
             let candidate = format!("{prefix}{}", self.fresh);
             self.fresh += 1;
             if !self.names.contains(&candidate) {
                 self.temps.insert(candidate.clone());
-                self.var_types.insert(candidate.clone(), lean_ty(ty));
                 return candidate;
             }
         }
@@ -807,7 +789,7 @@ impl<'a> Translate<'a> {
                 }
                 Elem::Index(_) | Elem::ConstIndex(_) => {
                     let read = format!("{}.index", self.container(&ty));
-                    let x = self.fresh("x", &self.elem_ty(&ty, elem));
+                    let x = self.fresh("x");
                     let value = app(&read, vec![term, self.index_term(elem)]);
                     lets.push((Pat::Name(x.clone()), Rhs::Act(value)));
                     name(x)
@@ -855,12 +837,12 @@ impl<'a> Translate<'a> {
                 let value = if rest.is_empty() {
                     value
                 } else {
-                    let x = self.fresh("x", &inner_ty);
+                    let x = self.fresh("x");
                     let read = app(&format!("{kind}.index"), vec![base.clone(), by.clone()]);
                     lets.push((Pat::Name(x.clone()), Rhs::Act(read)));
                     self.updated(name(x), &inner_ty, rest, value, lets, at)?
                 };
-                let x = self.fresh("x", ty);
+                let x = self.fresh("x");
                 let write = app(&format!("{kind}.update"), vec![base, by, value]);
                 lets.push((Pat::Name(x.clone()), Rhs::Act(write)));
                 name(x)
@@ -886,7 +868,7 @@ impl<'a> Translate<'a> {
             let value = match value {
                 Rhs::Pure(term) => term,
                 other => {
-                    let x = self.fresh("x", &self.ty_of(place, place.elems.len()));
+                    let x = self.fresh("x");
                     lets.push((Pat::Name(x.clone()), other));
                     name(x)
                 }
@@ -1247,7 +1229,7 @@ impl<'a> Translate<'a> {
             if place.elems.iter().all(|it| matches!(it, Elem::Deref)) {
                 (Pat::Name(this.names[place.local as usize].clone()), None)
             } else {
-                let x = this.fresh("x", &this.ty_of(place, place.elems.len()));
+                let x = this.fresh("x");
                 (Pat::Name(x.clone()), Some(x))
             }
         };
@@ -1311,7 +1293,6 @@ impl<'a> Translate<'a> {
                 out
             }
             Then::Again { name, params } => Ok(self.call_loop(name, params)),
-            Then::Join { id } => Ok(join_call(*id)),
         }
     }
 
@@ -1388,9 +1369,6 @@ impl<'a> Translate<'a> {
                 // translated at each way out, inside the arm that binds the field, as it is
                 // when the node leaves further; never as an expression after the node, where
                 // the binding is out of scope.
-                if leaves && let Some(shared) = self.shared_tail(node, after, then, live, &live_after)? {
-                    return Ok(shared);
-                }
                 if leaves || self.reads_unbound_field(after) {
                     let then = Then::Seq {
                         rest: after,
@@ -1497,7 +1475,7 @@ impl<'a> Translate<'a> {
                     };
                     let variant = &variants[which];
                     let fields: Vec<String> =
-                        variant.fields.iter().map(|it| self.fresh("v", &it.ty)).collect();
+                        variant.fields.iter().map(|_| self.fresh("v")).collect();
                     let pat = Pat::Ctor(
                         self.constructor(ty, variant),
                         fields.iter().cloned().map(Pat::Name).collect(),
@@ -1522,7 +1500,7 @@ impl<'a> Translate<'a> {
                         [which] => {
                             let variant = &variants[*which];
                             let fields: Vec<String> =
-                                variant.fields.iter().map(|it| self.fresh("v", &it.ty)).collect();
+                                variant.fields.iter().map(|_| self.fresh("v")).collect();
                             let pat = Pat::Ctor(
                                 self.constructor(ty, variant),
                                 fields.iter().cloned().map(Pat::Name).collect(),
@@ -1546,117 +1524,6 @@ impl<'a> Translate<'a> {
             }
             _ => unreachable!("asked of a branch or a block"),
         }
-    }
-
-    /// In a program, a branch that something jumps out of, with the code after it (`after`,
-    /// then `then`) written once where its arms go on to it, not once per arm: translated before
-    /// the arms, it is a tail the arms call ([`Then::Join`]), or, where it is one call or one
-    /// end or only one arm reaches it, put in place of that call. `None` where it cannot be
-    /// written once: outside a program, or where it reads a field that only an arm's `match`
-    /// binds.
-    fn shared_tail(
-        &mut self,
-        node: &'a Node<Stmt, Cond>,
-        after: &'a Nodes,
-        then: &Then<'a>,
-        live: &Set,
-        live_after: &Set,
-    ) -> Refused<Option<M>> {
-        if !self.prog_level {
-            return Ok(None);
-        }
-        // After the branch, what an arm writes is no longer what a `match` around it bound.
-        let (bound, narrowed) = (self.bound.clone(), self.narrowed.clone());
-        let mut written = Set::new();
-        changed(std::slice::from_ref(node), &mut written);
-        for local in &written {
-            self.forget(*local);
-        }
-        if self.reads_unbound_field(after) {
-            (self.bound, self.narrowed) = (bound, narrowed);
-            return Ok(None);
-        }
-        // The tail first: a loop in an arm whose way out goes on to it makes its program points
-        // when the loop is written, from the tail.
-        let before = (self.loops.len(), self.loop_count, self.prog_loops.clone(), self.joins.len());
-        let rest = self.seq(after, then, live);
-        (self.bound, self.narrowed) = (bound.clone(), narrowed.clone());
-        let rest = simplify(rest?, &self.temps);
-        let id = self.joins.len();
-        self.joins.push(Some(rest.clone()));
-        let m = self.inside(node, &Then::Join { id }, live_after)?;
-        let calls = joins_in(&m, id);
-        if calls == 0 && !self.reached.contains(&id) {
-            // Nothing goes on: the tail is not part of the model, and the branch is written
-            // again without it, its loops numbered as if the tail had never been written.
-            let (loops, loop_count, prog_loops, joins) = before;
-            self.loops.truncate(loops);
-            self.loop_count = loop_count;
-            self.prog_loops = prog_loops;
-            self.joins.truncate(joins);
-            (self.bound, self.narrowed) = (bound, narrowed);
-            let id = self.joins.len();
-            self.joins.push(None);
-            return self.inside(node, &Then::Join { id }, live_after).map(Some);
-        }
-        // Only a loop in an arm goes on to it: the loop has the tail's point.
-        if calls == 0 {
-            return Ok(Some(m));
-        }
-        if calls == 1 || single(&rest) {
-            return Ok(Some(put_join(m, id, &rest)));
-        }
-        Ok(Some(m))
-    }
-
-    /// Every name a variable of the model can have: the locals', the translation's own, and
-    /// `fuel`.
-    fn known(&self) -> BTreeSet<String> {
-        self.var_types.keys().cloned().chain(["fuel".to_owned()]).collect()
-    }
-
-    /// The program points of the body `m` of a definition that gives a `Threads.Prog` (the
-    /// function `owner`, or its loop `owner`): `m` with the code after each call that is
-    /// itself shared made a definition of its own ([`Points`]), and those definitions, each
-    /// before those that call it. `cycle`: the loops a point takes as parameters ([`Points`]);
-    /// in `m`, which is the loop's own body, each is that loop at the body's `fuel`.
-    fn points(&mut self, m: M, owner: &str, cycle: &BTreeSet<String>) -> Refused<(M, Vec<Decl>)> {
-        let mut known = self.known();
-        let mut loops = BTreeMap::new();
-        for it in cycle {
-            let mut binder = it.rsplit('.').next().unwrap_or(it).to_owned();
-            while known.contains(&binder) {
-                binder.push('_');
-            }
-            let Some(ty) = self.loop_types.get(it) else {
-                return Err(self.refuse(
-                    format!("a program point that goes on with the loop `{it}`, whose type is not known"),
-                    "",
-                ));
-            };
-            loops.insert(it.clone(), (binder, ty.clone()));
-        }
-        let m = prepass(m, &mut self.joins);
-        let m = simplify(m, &self.temps);
-        known.extend(loops.values().map(|(binder, _)| binder.clone()));
-        let mut points = Points {
-            known,
-            loops: loops.clone(),
-            joins: &mut self.joins,
-            reached: &mut self.reached,
-            joined: BTreeMap::new(),
-            made: Vec::new(),
-        };
-        let m = points.cut(m);
-        let (mut m, decls) = match points.finish(m, owner, &self.result, &self.var_types) {
-            Ok(it) => it,
-            Err(what) => return Err(self.refuse(what, "")),
-        };
-        for (it, (binder, _)) in &loops {
-            let at = app(it, vec![name("fuel")]);
-            visit_m(&mut m, &mut |term| substitute(term, binder, &at));
-        }
-        Ok((m, decls))
     }
 
     fn with(lets: Vec<(Pat, Rhs)>, m: M) -> M {
@@ -1685,12 +1552,6 @@ impl<'a> Translate<'a> {
             true => (Eff::Prog, "Threads.Prog", done(name("Result.div"))),
             false => (Eff::Result, "Result", name("Result.div")),
         };
-        let returns = app(monad, vec![self.result.clone()]);
-        let loop_type = params.iter().rev().fold(returns.clone(), |to, it| {
-            infix(Infix::Implies, lean_ty(&self.body.locals[*it as usize].ty), to)
-        });
-        self.loop_types.insert(loop_name.clone(), loop_type);
-        let outer_level = std::mem::replace(&mut self.prog_level, shared);
         let depth = self.labels.len();
         let outer_boundary = std::mem::replace(&mut self.boundary, depth);
         let outer_bound = std::mem::take(&mut self.bound);
@@ -1706,60 +1567,17 @@ impl<'a> Translate<'a> {
         self.boundary = outer_boundary;
         self.bound = outer_bound;
         self.narrowed = outer_narrowed;
-        self.prog_level = outer_level;
         let m = simplify(m?, &self.temps);
-        let m = match shared {
-            true => {
-                // The loops a point of this one goes on with are those still being written
-                // (this one, the loops around it) and the loops written that call one of them:
-                // each is a parameter of the point, so the points call no loop that calls them
-                // back, and the loops alone recurse on their fuel.
-                let mut cycle: BTreeSet<String> = self
-                    .labels
-                    .iter()
-                    .filter_map(|it| match it {
-                        Label::Loop { name, .. } => Some(name.clone()),
-                        Label::Block { .. } => None,
-                    })
-                    .chain([loop_name.clone()])
-                    .collect();
-                loop {
-                    let reaching: Vec<String> = self
-                        .loops
-                        .iter()
-                        .filter_map(|it| match it {
-                            Decl::Def { name, body, .. }
-                                if self.loop_types.contains_key(name)
-                                    && !cycle.contains(name)
-                                    && cycle.iter().any(|it| names_in(body, it)) =>
-                            {
-                                Some(name.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    if reaching.is_empty() {
-                        break;
-                    }
-                    cycle.extend(reaching);
-                }
-                let (m, points) = self.points(m, &loop_name, &cycle)?;
-                self.loops.extend(points);
-                m
-            }
-            false => m,
-        };
         let mut binders = vec![Binder { name: "fuel".to_owned(), ty: name("Nat") }];
         binders.extend(params.iter().map(|it| Binder {
             name: self.names[*it as usize].clone(),
             ty: lean_ty(&self.body.locals[*it as usize].ty),
         }));
-        // A loop inside this one was declared while its body was translated: before it, and so
-        // were this one's program points.
+        // A loop inside this one was declared while its body was translated: before it.
         self.loops.push(Decl::Def {
             name: loop_name.clone(),
             params: binders,
-            ty: returns,
+            ty: app(monad, vec![self.result.clone()]),
             body: Term::Match(
                 Box::new(name("fuel")),
                 vec![
@@ -1865,29 +1683,13 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
         uses_fuel: false,
         returned,
         prog_loops: BTreeSet::new(),
-        var_types: BTreeMap::new(),
-        loop_types: BTreeMap::new(),
-        prog_level: false,
-        joins: Vec::new(),
-        reached: BTreeSet::new(),
     };
-    translate.var_types = body
-        .locals
-        .iter()
-        .zip(&translate.names)
-        .map(|(local, named)| (named.clone(), lean_ty(&local.ty)))
-        .collect();
-    // A shared function gives a `Threads.Prog`: it is monadic whatever is left of its body.
-    let shared = shares(&body.nodes, shapes);
-    translate.prog_level = shared;
     translate.result = translate.types(&translate.returned);
     let live: Set = translate.returned.iter().copied().collect();
     let m = translate.seq(&body.nodes, &Then::Return, &live)?;
     let m = simplify(m, &translate.temps);
-    let (m, points) = match shared {
-        true => translate.points(m, &body.name, &BTreeSet::new())?,
-        false => (m, Vec::new()),
-    };
+    // A shared function gives a `Threads.Prog`: it is monadic whatever is left of its body.
+    let shared = shares(&body.nodes, shapes);
     let monadic = shared || !is_pure(&m);
     let level = match (shared, monadic) {
         (true, _) => Eff::Prog,
@@ -1915,7 +1717,6 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     };
     // The types are not declared here: each has a module of its own, which this one imports.
     let mut decls = mutual_loops(std::mem::take(&mut translate.loops));
-    decls.extend(points);
     decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, level) });
     let mut params = params;
     renumber(&mut decls, &mut params, &generated_names(body, &translate.names, &translate.temps));
@@ -2178,552 +1979,5 @@ fn visit_term(term: &mut Term, f: &mut impl FnMut(&mut String)) {
             visit_binders(binders, f);
             visit_term(of, f);
         }
-    }
-}
-
-/// The prefix of a program point's name before it is numbered ([`Points::finish`]).
-const POINT: &str = "\u{0}point";
-/// The prefix of the name of a tail several arms go on to ([`Translate::joins`]).
-const JOIN: &str = "\u{0}join";
-
-/// The call of the tail `id`: a placeholder, which [`put_join`] replaces by the tail or
-/// [`Points::cut`] by the call of the tail's program point, over the variables it reads.
-fn join_call(id: usize) -> M {
-    M::ProgTail(name(format!("{JOIN}{id}")))
-}
-
-/// The placeholder's number, where `term` is the placeholder of a tail.
-fn join_of(term: &Term) -> Option<usize> {
-    let head = match term {
-        Term::App(head, _) => &**head,
-        other => other,
-    };
-    match head {
-        Term::Name(it) => it.strip_prefix(JOIN).and_then(|it| it.parse().ok()),
-        _ => None,
-    }
-}
-
-/// Calls `f` on each term of `m`, in the order they are printed.
-fn visit_m(m: &mut M, f: &mut impl FnMut(&mut Term)) {
-    match m {
-        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => f(term),
-        M::Fail(_) => {}
-        M::Let { value, body, .. } => {
-            match value {
-                Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term) => f(term),
-                Rhs::Sub(sub) => visit_m(sub, f),
-            }
-            visit_m(body, f);
-        }
-        M::If { cond, then, otherwise } => {
-            f(cond);
-            visit_m(then, f);
-            visit_m(otherwise, f);
-        }
-        M::Match { on, arms, .. } => {
-            f(on);
-            arms.iter_mut().for_each(|(_, arm)| visit_m(arm, f));
-        }
-    }
-}
-
-/// How many times `m` goes on to the tail `id`.
-fn joins_in(m: &M, id: usize) -> usize {
-    let mut count = 0;
-    visit_m(&mut m.clone(), &mut |term| count += usize::from(join_of(term) == Some(id)));
-    count
-}
-
-/// `m` with each call of the tail `id` replaced by the tail, `rest`: it reads the variables
-/// its call is given, which hold there what they hold where it was written.
-fn put_join(m: M, id: usize, rest: &M) -> M {
-    match m {
-        M::ProgTail(term) if join_of(&term) == Some(id) => rest.clone(),
-        M::Let { pat, value, body } => M::Let {
-            pat,
-            value: match value {
-                Rhs::Sub(sub) => Rhs::Sub(Box::new(put_join(*sub, id, rest))),
-                other => other,
-            },
-            body: Box::new(put_join(*body, id, rest)),
-        },
-        M::If { cond, then, otherwise } => M::If {
-            cond,
-            then: Box::new(put_join(*then, id, rest)),
-            otherwise: Box::new(put_join(*otherwise, id, rest)),
-        },
-        M::Match { on, arms, of } => M::Match {
-            on,
-            arms: arms.into_iter().map(|(pat, arm)| (pat, put_join(arm, id, rest))).collect(),
-            of,
-        },
-        leaf => leaf,
-    }
-}
-
-/// Whether `m` is one term: an end, or one call. The code after a shared call that is one term
-/// is not made a program point: it already has a name, or is where the program ends.
-fn single(m: &M) -> bool {
-    matches!(m, M::Ret(_) | M::Fail(_) | M::Tail(_) | M::ProgTail(_))
-}
-
-/// Whether `m` operates on the memory threads share: a call that does, or a tail that is one.
-fn in_prog(m: &M) -> bool {
-    match m {
-        M::ProgTail(_) => true,
-        M::Ret(_) | M::Tail(_) | M::Fail(_) => false,
-        M::Let { value, body, .. } => {
-            let value = match value {
-                Rhs::Prog(_) => true,
-                Rhs::Sub(sub) => in_prog(sub),
-                Rhs::Pure(_) | Rhs::Act(_) => false,
-            };
-            value || in_prog(body)
-        }
-        M::If { then, otherwise, .. } => in_prog(then) || in_prog(otherwise),
-        M::Match { arms, .. } => arms.iter().any(|(_, arm)| in_prog(arm)),
-    }
-}
-
-/// How many ways `m` ends with a value (not a failure).
-fn ends(m: &M) -> usize {
-    match m {
-        M::Ret(_) | M::Tail(_) | M::ProgTail(_) => 1,
-        M::Fail(_) => 0,
-        M::Let { body, .. } => ends(body),
-        M::If { then, otherwise, .. } => ends(then) + ends(otherwise),
-        M::Match { arms, .. } => arms.iter().map(|(_, arm)| ends(arm)).sum(),
-    }
-}
-
-/// `m`, whose value `pat` binds, then `rest`: `rest` at each end of `m`.
-fn push(m: M, pat: &Pat, rest: &M, joins: &mut Vec<Option<M>>, pushed: &mut BTreeSet<usize>) -> M {
-    let then = |value: Rhs| M::Let { pat: pat.clone(), value, body: Box::new(rest.clone()) };
-    match m {
-        // A tail the arms share takes what follows once, where it is written.
-        M::ProgTail(term) if let Some(id) = join_of(&term) => {
-            if pushed.insert(id) {
-                let Some(tail) = joins.get_mut(id).and_then(Option::take) else {
-                    unreachable!("a tail is called only from the definition it was written for")
-                };
-                let tail = push(tail, pat, rest, joins, pushed);
-                joins[id] = Some(prepass(tail, joins));
-            }
-            M::ProgTail(term)
-        }
-        M::Ret(term) => then(Rhs::Pure(term)),
-        M::Tail(term) => then(Rhs::Act(term)),
-        M::ProgTail(term) => then(Rhs::Prog(term)),
-        M::Fail(error) => M::Fail(error),
-        M::Let { pat: bound, value, body } => {
-            M::Let { pat: bound, value, body: Box::new(push(*body, pat, rest, joins, pushed)) }
-        }
-        M::If { cond, then, otherwise } => M::If {
-            cond,
-            then: Box::new(push(*then, pat, rest, joins, pushed)),
-            otherwise: Box::new(push(*otherwise, pat, rest, joins, pushed)),
-        },
-        M::Match { on, arms, of } => M::Match {
-            on,
-            arms: arms.into_iter().map(|(bound, arm)| (bound, push(arm, pat, rest, joins, pushed))).collect(),
-            of,
-        },
-    }
-}
-
-/// A program with no shared operation inside a value it binds: each branch that operates on the
-/// shared memory and gives a value (`let x ← if c then do ..; op .. else ..; rest`) takes what
-/// follows it into its arms (a join point bound in place would be where a thread stands, with
-/// no name), and a tail its arms share takes it once. What follows is copied where it is one
-/// term or only one arm reaches it, and is otherwise a tail the arms call
-/// ([`Translate::joins`]).
-fn prepass(m: M, joins: &mut Vec<Option<M>>) -> M {
-    match m {
-        M::Let { pat, value: Rhs::Sub(sub), body } if in_prog(&sub) => bind_sub(*sub, &pat, *body, joins),
-        M::Let { pat, value: Rhs::Prog(term), body } if join_of(&term).is_some() => {
-            bind_sub(M::ProgTail(term), &pat, *body, joins)
-        }
-        M::Let { pat, value, body } => M::Let { pat, value, body: Box::new(prepass(*body, joins)) },
-        M::If { cond, then, otherwise } => M::If {
-            cond,
-            then: Box::new(prepass(*then, joins)),
-            otherwise: Box::new(prepass(*otherwise, joins)),
-        },
-        M::Match { on, arms, of } => M::Match {
-            on,
-            arms: arms.into_iter().map(|(pat, arm)| (pat, prepass(arm, joins))).collect(),
-            of,
-        },
-        leaf => leaf,
-    }
-}
-
-/// `let pat ← sub; body`, `body` pushed into `sub`'s ends ([`prepass`]).
-fn bind_sub(sub: M, pat: &Pat, body: M, joins: &mut Vec<Option<M>>) -> M {
-    let body = prepass(body, joins);
-    let rest = match single(&body) || ends(&sub) <= 1 {
-        true => body,
-        false => {
-            let id = joins.len();
-            joins.push(Some(body));
-            join_call(id)
-        }
-    };
-    let sub = push(sub, pat, &rest, joins, &mut BTreeSet::new());
-    prepass(sub, joins)
-}
-
-/// The names a pattern binds, in order.
-fn pat_vars(pat: &Pat, out: &mut Vec<String>) {
-    match pat {
-        Pat::Name(it) => out.push(it.clone()),
-        Pat::Tuple(all) | Pat::Ctor(_, all) => all.iter().for_each(|it| pat_vars(it, out)),
-        Pat::Wild | Pat::Atom(_) => {}
-    }
-}
-
-/// The variables among `known` that `term` reads and does not bind, each once, in the order
-/// they are first read, `bound` being bound around it.
-fn term_vars(term: &Term, known: &BTreeSet<String>, bound: &mut Vec<String>, out: &mut Vec<String>) {
-    let scoped = |pats: &[&Pat], bound: &mut Vec<String>, inner: &mut dyn FnMut(&mut Vec<String>)| {
-        let depth = bound.len();
-        pats.iter().for_each(|it| pat_vars(it, bound));
-        inner(bound);
-        bound.truncate(depth);
-    };
-    match term {
-        Term::Name(it) => {
-            if known.contains(it) && !bound.contains(it) && !out.contains(it) {
-                out.push(it.clone());
-            }
-        }
-        Term::Atom(_) => {}
-        Term::App(head, args) => {
-            term_vars(head, known, bound, out);
-            args.iter().for_each(|it| term_vars(it, known, bound, out));
-        }
-        Term::Proj(of, _) | Term::BoolNot(of) | Term::Not(of) => term_vars(of, known, bound, out),
-        Term::Tuple(all) | Term::List(all) => all.iter().for_each(|it| term_vars(it, known, bound, out)),
-        Term::Typed(of, ty) => {
-            term_vars(of, known, bound, out);
-            term_vars(ty, known, bound, out);
-        }
-        Term::Update(of, fields) => {
-            term_vars(of, known, bound, out);
-            fields.iter().for_each(|(_, it)| term_vars(it, known, bound, out));
-        }
-        Term::Structure(fields) => fields.iter().for_each(|(_, it)| term_vars(it, known, bound, out)),
-        Term::Infix(_, left, right) => {
-            term_vars(left, known, bound, out);
-            term_vars(right, known, bound, out);
-        }
-        Term::If(test, then, otherwise) => {
-            term_vars(test, known, bound, out);
-            term_vars(then, known, bound, out);
-            term_vars(otherwise, known, bound, out);
-        }
-        Term::Match(on, arms) => {
-            term_vars(on, known, bound, out);
-            for (pat, arm) in arms {
-                scoped(&[pat], bound, &mut |bound| term_vars(arm, known, bound, out));
-            }
-        }
-        Term::Let(pat, value, rest) => {
-            term_vars(value, known, bound, out);
-            scoped(&[pat], bound, &mut |bound| term_vars(rest, known, bound, out));
-        }
-        Term::Do(elems) => {
-            let depth = bound.len();
-            for elem in elems {
-                match elem {
-                    DoElem::Bind(pat, value) | DoElem::Let(pat, value) => {
-                        term_vars(value, known, bound, out);
-                        pat_vars(pat, bound);
-                    }
-                    DoElem::Term(it) => term_vars(it, known, bound, out),
-                }
-            }
-            bound.truncate(depth);
-        }
-        Term::Forall(binders, of) | Term::Exists(binders, of) => {
-            let depth = bound.len();
-            bound.extend(binders.iter().map(|it| it.name.clone()));
-            term_vars(of, known, bound, out);
-            bound.truncate(depth);
-        }
-    }
-}
-
-/// [`term_vars`] of a computation.
-fn m_vars(m: &M, known: &BTreeSet<String>, bound: &mut Vec<String>, out: &mut Vec<String>) {
-    match m {
-        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => term_vars(term, known, bound, out),
-        M::Fail(_) => {}
-        M::Let { pat, value, body } => {
-            match value {
-                Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term) => term_vars(term, known, bound, out),
-                Rhs::Sub(sub) => m_vars(sub, known, bound, out),
-            }
-            let depth = bound.len();
-            pat_vars(pat, bound);
-            m_vars(body, known, bound, out);
-            bound.truncate(depth);
-        }
-        M::If { cond, then, otherwise } => {
-            term_vars(cond, known, bound, out);
-            m_vars(then, known, bound, out);
-            m_vars(otherwise, known, bound, out);
-        }
-        M::Match { on, arms, .. } => {
-            term_vars(on, known, bound, out);
-            for (pat, arm) in arms {
-                let depth = bound.len();
-                pat_vars(pat, bound);
-                m_vars(arm, known, bound, out);
-                bound.truncate(depth);
-            }
-        }
-    }
-}
-
-/// The variables `m` reads that it does not bind, in the order it first reads them.
-fn free_vars(m: &M, known: &BTreeSet<String>) -> Vec<String> {
-    let mut out = Vec::new();
-    m_vars(m, known, &mut Vec::new(), &mut out);
-    out
-}
-
-/// `term` with each call of a loop of `loops` at `fuel` a call of the parameter that stands for
-/// it.
-fn unloop(term: &mut Term, loops: &BTreeMap<String, (String, Term)>) {
-    if let Term::App(head, args) = term
-        && let Term::Name(callee) = &**head
-        && let Some((binder, _)) = loops.get(callee)
-        && args.first() == Some(&name("fuel"))
-    {
-        let rest: Vec<Term> = args.drain(1..).collect();
-        *term = app(binder, rest);
-    }
-    match term {
-        Term::Name(_) | Term::Atom(_) => {}
-        Term::App(head, args) => {
-            unloop(head, loops);
-            args.iter_mut().for_each(|it| unloop(it, loops));
-        }
-        Term::Proj(of, _) | Term::BoolNot(of) | Term::Not(of) => unloop(of, loops),
-        Term::Tuple(all) | Term::List(all) => all.iter_mut().for_each(|it| unloop(it, loops)),
-        Term::Typed(of, _) => unloop(of, loops),
-        Term::Update(of, fields) => {
-            unloop(of, loops);
-            fields.iter_mut().for_each(|(_, it)| unloop(it, loops));
-        }
-        Term::Structure(fields) => fields.iter_mut().for_each(|(_, it)| unloop(it, loops)),
-        Term::Infix(_, left, right) => {
-            unloop(left, loops);
-            unloop(right, loops);
-        }
-        Term::If(test, then, otherwise) => {
-            unloop(test, loops);
-            unloop(then, loops);
-            unloop(otherwise, loops);
-        }
-        Term::Match(on, arms) => {
-            unloop(on, loops);
-            arms.iter_mut().for_each(|(_, arm)| unloop(arm, loops));
-        }
-        Term::Let(_, value, rest) => {
-            unloop(value, loops);
-            unloop(rest, loops);
-        }
-        Term::Do(elems) => elems.iter_mut().for_each(|it| match it {
-            DoElem::Bind(_, value) | DoElem::Let(_, value) | DoElem::Term(value) => unloop(value, loops),
-        }),
-        Term::Forall(_, of) | Term::Exists(_, of) => unloop(of, loops),
-    }
-}
-
-/// The program points of a definition that gives a `Threads.Prog`: where a thread stands
-/// between two operations on the memory threads share, each a definition a proof about threads
-/// names (docs/v2/plan/design/proofs-for-sans-io.md, section 8).
-///
-/// The code after each call that is itself shared (an atomic operation, `Threads.wait`, `wake`,
-/// `two_of`, a call of a shared function) is a definition of its own, `<owner>.at_<n>`, over the
-/// variables it reads, in the order it first reads them (`fuel` first and the loops it goes on
-/// with next, where it reads them), then the call's result where it reads it; the call is
-/// followed by the call of that definition. Code after a shared call that is one term (an end,
-/// one call) is not a point: it already has a name. Control flow between two shared calls stays
-/// inside the point that holds it. A tail several arms go on to is a point the arms call
-/// ([`Translate::joins`]).
-///
-/// A point inside a loop's body that goes on with the loop (or with a loop that calls it back)
-/// takes that loop as a parameter, named as the loop's last component, which the loop's own body
-/// gives as the loop at its smaller `fuel`: the points call no loop, so each loop alone recurses
-/// structurally on its fuel, and the model is the same program as before, definition for
-/// definition (`f.loop_0.at_1 (f.loop_0 fuel) ..` unfolds to the code it names).
-///
-/// Points are numbered from 1 in the order a walk of the definition's text, entering each point
-/// where it is first called, meets them, and each is declared before every point that calls it.
-struct Points<'j> {
-    /// Every variable name: the locals', the translation's own, `fuel` and the loops' parameters.
-    known: BTreeSet<String>,
-    /// Each loop a point takes as a parameter: the parameter's name and type.
-    loops: BTreeMap<String, (String, Term)>,
-    joins: &'j mut Vec<Option<M>>,
-    /// The tails these points go on to, recorded for [`Translate::shared_tail`].
-    reached: &'j mut BTreeSet<usize>,
-    /// The call of each tail made a point.
-    joined: BTreeMap<usize, M>,
-    /// The points made: each one's parameters and body.
-    made: Vec<(Vec<String>, M)>,
-}
-
-impl Points<'_> {
-    fn cut(&mut self, m: M) -> M {
-        match m {
-            M::Let { pat, value: Rhs::Prog(call), body } => {
-                let body = self.cut(*body);
-                let body = if single(&body) { body } else { self.point(body, &pat) };
-                M::Let { pat, value: Rhs::Prog(call), body: Box::new(body) }
-            }
-            M::Let { pat, value, body } => M::Let { pat, value, body: Box::new(self.cut(*body)) },
-            M::If { cond, then, otherwise } => M::If {
-                cond,
-                then: Box::new(self.cut(*then)),
-                otherwise: Box::new(self.cut(*otherwise)),
-            },
-            M::Match { on, arms, of } => M::Match {
-                on,
-                arms: arms.into_iter().map(|(pat, arm)| (pat, self.cut(arm))).collect(),
-                of,
-            },
-            M::ProgTail(term) => match join_of(&term) {
-                Some(id) => self.join(id),
-                None => M::ProgTail(term),
-            },
-            leaf => leaf,
-        }
-    }
-
-    /// The call of the tail `id`: of its point, made once.
-    fn join(&mut self, id: usize) -> M {
-        if let Some(call) = self.joined.get(&id) {
-            return call.clone();
-        }
-        self.reached.insert(id);
-        // A loop in an arm that goes on to the tail has its own copy of the tail's point.
-        let Some(Some(m)) = self.joins.get(id).cloned() else {
-            unreachable!("a tail is written before the code that calls it")
-        };
-        let m = self.cut(m);
-        let call = if single(&m) { m } else { self.point(m, &Pat::Wild) };
-        self.joined.insert(id, call.clone());
-        call
-    }
-
-    /// `body` a point, after a call whose result `pat` binds: the call of the point.
-    fn point(&mut self, mut body: M, pat: &Pat) -> M {
-        visit_m(&mut body, &mut |term| unloop(term, &self.loops));
-        let used = free_vars(&body, &self.known);
-        let mut results = Vec::new();
-        pat_vars(pat, &mut results);
-        results.retain(|it| used.contains(it));
-        let binders: Vec<&String> = self.loops.values().map(|(binder, _)| binder).collect();
-        let mut params: Vec<String> = Vec::with_capacity(used.len());
-        if used.iter().any(|it| it == "fuel") {
-            params.push("fuel".to_owned());
-        }
-        params.extend(binders.iter().filter(|it| used.contains(it)).map(|it| (*it).clone()));
-        params.extend(
-            used.iter()
-                .filter(|it| *it != "fuel" && !binders.contains(it) && !results.contains(it))
-                .cloned(),
-        );
-        params.extend(results);
-        let id = self.made.len();
-        let call = app(&format!("{POINT}{id}"), params.iter().map(|it| name(it.clone())).collect());
-        self.made.push((params, body));
-        M::ProgTail(call)
-    }
-
-    /// The points in `m`, in order, each entered where first met: `number` of each, and the
-    /// order they are declared in (each after those it calls).
-    fn order(&self, m: &M, number: &mut [Option<usize>], declared: &mut Vec<usize>, next: &mut usize) {
-        let mut met = Vec::new();
-        visit_m(&mut m.clone(), &mut |term| {
-            visit_term(term, &mut |it: &mut String| {
-                if let Some(id) = it.strip_prefix(POINT).and_then(|it| it.parse::<usize>().ok()) {
-                    met.push(id);
-                }
-            });
-        });
-        for id in met {
-            if number[id].is_some() {
-                continue;
-            }
-            number[id] = Some(*next);
-            *next += 1;
-            self.order(&self.made[id].1, number, declared, next);
-            declared.push(id);
-        }
-    }
-
-    /// The points of `owner`, numbered and named, its body `m` calling them by name: `m`, and
-    /// the points' definitions, each before those that call it.
-    fn finish(
-        self,
-        mut m: M,
-        owner: &str,
-        result: &Term,
-        types: &BTreeMap<String, Term>,
-    ) -> Result<(M, Vec<Decl>), String> {
-        let mut number = vec![None; self.made.len()];
-        let mut declared = Vec::new();
-        self.order(&m, &mut number, &mut declared, &mut 1);
-        let names: Vec<Option<String>> =
-            number.iter().map(|it| it.map(|n| format!("{owner}.at_{n}"))).collect();
-        let mut rename = |term: &mut Term| {
-            visit_term(term, &mut |it: &mut String| {
-                if let Some(id) = it.strip_prefix(POINT).and_then(|it| it.parse::<usize>().ok())
-                    && let Some(Some(named)) = names.get(id)
-                {
-                    *it = named.clone();
-                }
-            });
-        };
-        visit_m(&mut m, &mut rename);
-        let mut made = self.made;
-        let mut decls = Vec::with_capacity(declared.len());
-        for id in declared {
-            let (params, body) = &mut made[id];
-            visit_m(body, &mut rename);
-            let mut binders = Vec::with_capacity(params.len());
-            for param in params.iter() {
-                let ty = match param.as_str() {
-                    "fuel" => name("Nat"),
-                    _ => match self.loops.values().find(|(binder, _)| binder == param) {
-                        Some((_, ty)) => ty.clone(),
-                        None => match types.get(param) {
-                            Some(ty) => ty.clone(),
-                            None => {
-                                return Err(format!(
-                                    "a variable `{param}` that a program point of `{owner}` reads, \
-                                     whose type is not known"
-                                ));
-                            }
-                        },
-                    },
-                };
-                binders.push(Binder { name: param.clone(), ty });
-            }
-            let Some(named) = names[id].clone() else { unreachable!("a declared point is numbered") };
-            decls.push(Decl::Def {
-                name: named,
-                params: binders,
-                ty: app("Threads.Prog", vec![result.clone()]),
-                body: emit(body, Eff::Prog),
-            });
-        }
-        Ok((m, decls))
     }
 }

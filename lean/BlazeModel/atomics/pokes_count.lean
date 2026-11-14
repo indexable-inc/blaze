@@ -10,21 +10,15 @@ import BlazeModel.atomics.poke_twice
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.pokes_count.at_2 (word : core.sync.atomic.Atomic .U32) (t0 : U32) : Threads.Prog Bool :=
+def atomics.pokes_count : Threads.Prog Bool := do
+  let word ← core.sync.atomic.Atomic.new (0 : U32)
+  let kernel := ({  } : atomics.Real)
+  let t0 ← atomics.poke_twice kernel word
   let t1 := Scalar.eq t0 (1 : U32)
   if t1 then do
     let t2 ←
       core.sync.atomic.Atomic.load word (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
     Threads.Prog.done (Result.ok (Scalar.eq t2 (2 : U32)))
   else Threads.Prog.done (Result.ok t1)
-
-def atomics.pokes_count.at_1 (word : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
-  let kernel := ({  } : atomics.Real)
-  let t0 ← atomics.poke_twice kernel word
-  atomics.pokes_count.at_2 word t0
-
-def atomics.pokes_count : Threads.Prog Bool := do
-  let word ← core.sync.atomic.Atomic.new (0 : U32)
-  atomics.pokes_count.at_1 word
 
 def atomics.pokes_count.spec.statement : Prop := atomics.pokes_count.value = Result.ok true

@@ -14,6 +14,6 @@
  "class": "generated text whose structure a proof must refer to but cannot name",
  "prevention": "in a shared function, emit the continuation after each operation on shared memory (and each loop body) as its own definition over the live variables, named by its place (`park.Shared_Still.after_3`), with the function as their composition; emit a tail shared by several arms once, as a definition the arms call. Proofs then name points the translator keeps stable. Not built.",
  "workaround": "copy the continuation`s text into the proof`s library and show it equal by `rfl`",
- "fix": "by the lane xlpoints (claude-opus-5-5), 2026-11-14: in a shared function the code after each shared call is its own definition (`f.at_n`, in a loop `f.loop_k.at_n`, the loop passed in so the recursion stays structural), a tail several arms reach is one point, and a loop is emitted once. The fixture`s park-shaped pair is proved for every schedule naming those points, no model text copied (lean/BlazeModel/atomics/parks.lean, 279 lines against 380). blaze-core`s park proof is ported to the regenerated models next.",
- "state": "fixed"
+ "fix": "",
+ "state": "open"
 }

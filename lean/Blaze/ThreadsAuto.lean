@@ -87,13 +87,6 @@ theorem op_ext {α : Type} {who pick : Nat} {o : Op} {next next' : Got → Prog 
 @[simp] theorem ask_bind {β : Type} (o : Op) (f : Got → Prog β) :
     (Prog.ask o >>= f) = Prog.op 0 0 o f := rfl
 
-/-- A program of `Unit` and then nothing (`let _ ← p; pure ()`, a closure's call or a statement
-of a function's model) is the program. -/
-theorem bind_unit (p : Prog Unit) : (p >>= fun _ => Prog.done (.ok ())) = p := by
-  induction p with
-  | done r => cases r <;> rfl
-  | op who pick o next ih => rw [bind_op]; exact op_ext ih
-
 end Prog
 
 /-! ## The world: one step of each operation -/

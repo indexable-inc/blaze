@@ -10,7 +10,10 @@ import BlazeModel.atomics.race.closure1.call
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.race.at_2 (t0 : Threads.Ended U32 × Threads.Ended U32) : Threads.Prog Bool :=
+def atomics.race (schedule : Slice Threads.Step) : Threads.Prog Bool := do
+  let n ← core.sync.atomic.Atomic.new (0 : U32)
+  let t0 ←
+    Threads.two_of schedule (atomics.race.closure0.call ({ c0 := n } : atomics.race.closure0)) (atomics.race.closure1.call ({ c0 := n } : atomics.race.closure1))
   match t0.1 with
   | Threads.Ended.Done v0 =>
     match t0.2 with
@@ -20,12 +23,3 @@ def atomics.race.at_2 (t0 : Threads.Ended U32 × Threads.Ended U32) : Threads.Pr
       Threads.Prog.done (Result.ok (Scalar.ne a b))
     | _ => Threads.Prog.done (Result.ok true)
   | _ => Threads.Prog.done (Result.ok true)
-
-def atomics.race.at_1 (schedule : Slice Threads.Step) (n : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
-  let t0 ←
-    Threads.two_of schedule (atomics.race.closure0.call ({ c0 := n } : atomics.race.closure0)) (atomics.race.closure1.call ({ c0 := n } : atomics.race.closure1))
-  atomics.race.at_2 t0
-
-def atomics.race (schedule : Slice Threads.Step) : Threads.Prog Bool := do
-  let n ← core.sync.atomic.Atomic.new (0 : U32)
-  atomics.race.at_1 schedule n
