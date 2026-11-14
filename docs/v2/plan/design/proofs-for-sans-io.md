@@ -83,9 +83,26 @@ conformance with a real driver is `allows(observed)` (objective V4).
   it owes (the changes there when it was asked and still not durable), a failed append or
   write from memory lands what it may. A crash's witness adds the sectors that writes in
   flight landed, in any order, each at most once.
+- `blocking::Blocking` (built 2026-11-14): one call that waits for an event with a time limit
+  or none. The kernel may end it for a signal, for nothing or before its limit at any moment,
+  and the caller reads the clock some time after; it never says ready before the event, never
+  anything else once the event has come, and a limited call is read at most a stated lateness
+  past its limit (one bound for the delay before the call starts and after it ends).
+- `threads` (section 8): the cells threads share and who sleeps in a futex wait of which.
 - Not built: a full disk, short reads, modes and links; a file's identity under a rename
   while a sync of its name is in flight (nothing is promised then); locks, the network,
-  processes; `Atomics` (section 8).
+  processes.
+
+**A loop is proved by running it against its world.** A core that loops until the kernel
+lets it stop (a retry loop, a state machine driven to its end) takes its world as one value:
+a trait with the calls it makes and the clock it reads. The theorem's function gives the
+real loop a kernel that answers from a list, each answer one the world allows where it is
+given, and states what holds when the loop ends; a run whose list ends first, or holds an
+answer the world refuses, is none of the theorem's. For every list is every run. The first:
+`wait/retry.rs`, `a_wait_ends_by_its_deadline`, the whole retry loop of every blocking wait
+against `Blocking`, proved 2026-11-14 by one induction on the loop's fuel over an invariant
+that ties the retry's last reading to the world's clock; its simulation test and that
+test's simulated kernel are deleted. How-to: `agents/howto/H-prove-a-loop-against-a-world.json`.
 
 **A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
 kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
@@ -217,6 +234,11 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 Proved means what formal-verification.md says: the kernel accepts it, no `sorry`, only
 Lean's three axioms.
 
+Every theorem's model is compiled, proof file or none, before anything is said of it: `Open`
+for want of a proof file means the model builds. A model Lean refuses is `ModelBroken`, never
+`Open`: blaze's translator's bug, which no proof can fix, with Lean's first error at its file
+and line; like `Open`, it makes the command fail.
+
 **How Lean is run.** The check has a sans-IO core and a driver, as everything does
 (`sans-io-cores`):
 
@@ -258,22 +280,104 @@ A proof cannot be blind the way a test can, but a statement can be empty. Each p
 invariant keeps one control: a planted bug and one input on which the theorem function,
 run on the planted core, is `false`. It is a unit test, or a Lean `example` by evaluation.
 
-### 8. Atomics and weak memory
+### 8. Atomics and threads
 
-The same idea one level down. A function that uses atomics is translated into a monad whose
-atomic operations are effects; a memory world (`Atomics`) says which value a load may see,
-and which thread steps is an answer like any other. A theorem about a ring is then "for all
-schedules and all allowed reads".
+A function that touches an atomic is not a function of its arguments: what it does next
+depends on what other threads did to the word meanwhile. So its model is not a `Result` but a
+program (`Blaze.Threads.Prog`, `lean/Blaze/Threads.lean`): a tree that ends with a `Result`,
+or does one operation on what is shared and goes on with the answer. What a thread does
+between two operations is its own and is not a step, which is sound for safe code: nothing
+else of it can be seen by another thread.
 
-- **The world must allow everything the hardware and the compiler do.** RC11 forbids load
-  buffering, which ARM allows for relaxed accesses, so a proof under RC11 says nothing of a
-  `Relaxed` load on the Mac. Sequentially consistent and release-acquire code gets the
-  view-based model; `Relaxed` is refused until the world has promises (the promising
-  semantics).
-- **Stepping only at atomic operations** is sound for safe code, whose other accesses cannot
-  race; unsafe code needs a race check with it.
+- **Operations.** A new cell, a load, a store, a read-modify-write (a swap, a
+  compare-and-swap, weak or not, and every `fetch_*` are each one), a futex wait and a wake.
+- **The world** (`Threads.World`) is what is shared: the cells, and who sleeps in a wait of
+  which. One step is one operation by one thread, with the world's free choice at that step
+  (whether a weak compare-and-swap fails for nothing, whether a sleeper returns for nothing or
+  is told its time ran out, which sleeper a wake takes). A wait compares and goes to sleep in
+  one step, and a wake finds every sleeper.
+- **Two threads.** `blaze_core::world::threads::two(schedule, first, second)` runs two
+  closures as threads, one operation at a time in the order `schedule` gives (each entry: who
+  goes, and the world's pick), and says how each stood when the schedule ended: returned,
+  able to go on, or asleep with no wake coming. It is an ordinary function, so a theorem about
+  two threads is an ordinary theorem function that takes the schedule as an argument; proved
+  for every schedule, it is every interleaving. In Rust `two` runs real threads that hand a
+  baton at each operation, so the theorem's function runs where it is stated, and a drawn
+  schedule is a simulation test of the same statement. In Lean it is `Threads.two`, itself a
+  program.
+- **Lost wakeups are a safety property here.** "The waker returned and the sleeper is asleep
+  with no wake coming" is a state `two` reports, so "no wakeup is lost" is "no schedule ends
+  there".
 
-Not started. The first target is formal-verification.md's (the flight recorder's ring move).
+**Which memory.** The world is sequentially consistent: an operation sees the last value
+written, whatever its `Ordering`. That is what a run means only where its orderings cannot be
+told from `SeqCst`, and the world checks that at every step and refuses the run otherwise
+(`Error.unmodelled`), never reading a weaker ordering as `SeqCst`:
+
+- every operation of the run's threads is `SeqCst`; or
+- the threads touch one cell. Every memory model blaze's targets and Rust have gives the
+  writes to one cell a single order that every thread's reads and writes of it respect, so a
+  run over one cell is a sequentially consistent run. This covers a park, a once, a flag, a
+  counter, a lock word.
+
+**The weak world** (`lean/Blaze/ThreadsWeak.lean`, built 2026-11-14) is what the sequentially
+consistent one refuses: two or more cells with an ordering weaker than `SeqCst` on any (a
+ring's head and tail). It runs the same programs and the same `two`. Per cell it keeps the
+messages written, oldest first; per thread a view (the newest message of each cell it has
+seen); the world's pick says which message a load reads, never older than the thread's view,
+and where a store's message goes. A release write carries its thread's view and an acquire
+read joins it, so what was written before a release is seen after the acquire that reads it.
+An update is glued to the message it read (nothing goes between) and continues its release
+sequence. A futex look sees at least what the caller of every completed wake had seen. A
+spawn gives a thread its parent's view and a join gives the parent its children's.
+`Prog.valueAny` runs a program in the sequentially consistent world where that world is its
+meaning and in this one where it refuses.
+
+- It has no promises, so it cannot show load buffering, which ARM allows of plain loads and
+  stores. A run that could show it is refused (rule R1: a write that does not release, after
+  the thread's relaxed read of another cell), not approximated.
+- `SeqCst` means `AcqRel` there, which is sound and loses what only `SeqCst` promises; a run
+  whose every operation is `SeqCst` is the sequentially consistent world's.
+- Its litmus tests are runs by evaluation (`lean/Blaze/Tests/ThreadsWeak.lean`): store
+  buffering shown with release and acquire and not with `SeqCst`; message passing kept by a
+  release and an acquire and lost without them; coherence; a weak compare-and-swap that fails
+  on a stale read.
+- The Rust `two` takes turns and makes the real operation, so it runs the sequentially
+  consistent world only and refuses the runs that world refuses; the weak world has no Rust
+  runner yet.
+
+**Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
+sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait
+that looks after it; that blaze compiles each atomic operation to one whose effect is within
+what its `Ordering` allows in the world; that an `Acquire` load is ordered before its thread's
+later stores and a `Release` store after its earlier loads (aarch64's LDAR and STLR and every
+x86-64 load and store give both; Rust's own memory model promises neither); that safe code
+shares nothing but atomics.
+
+**The method** (`lean/Blaze/ThreadsAuto.lean`): name each thread's program points (the
+continuation after each of its operations), list the reachable states (both threads' points,
+the cells, who sleeps), show each thread's step with any pick keeps the list (`two_ends`, by
+induction on the schedule), and read the theorem off the states with no step left. The first
+proof, of the park's order of atomics written by hand, has seven points for the park, three
+for the unpark and 21 reachable states (`lean/Blaze/Tests/ThreadsParkProof.lean`).
+
+Built 2026-11-14, all of it: both worlds; the method; the Rust `two` with scheduled atomics
+behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`); the
+translator (a function that reaches an atomic operation, `two`, `wait` or `wake`, or a
+function that does, is emitted as a `Threads.Prog`, and a shared theorem's statement is that
+its program's value is `ok true`); and the first proof of real lock-free code,
+`no_unpark_is_lost` (`wait/parking.rs`, `BlazeCore/Wait/Parking.lean`): the real `park` and
+`unpark` as two threads, every schedule, every choice of the kernel's, the retry's count and
+the error path of a clock that stands still: 8 kinds of park point, 3 of the unpark, 26
+reachable states. The park's simulation test ran an unpark whole between two of the park's
+atomics and so never tried a park's step between the unpark's swap and its wake; it stays
+for what the theorem does not state, that a park ends by its deadline and promptly after its
+wake on a clock that moves.
+
+Next: a clock in the threads world and that promptness theorem; models that name a thread's
+program points, so a proof does not copy the model's continuations
+(agents/annoyances/proofs-1113-11.json); a multi-cell structure against the weak world.
+How-to: `agents/howto/H-prove-two-threads.json`.
 
 ## Costs
 
@@ -320,3 +424,9 @@ Not started. The first target is formal-verification.md's (the flight recorder's
 Ledger rows V13 to V17 (objectives.json): the first proved invariant with its test deleted;
 the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
 the count of invariants at `proved`; atomics.
+
+The models under `lean/BlazeModel/blaze_core` are what the proofs in the tree were checked
+against, so they must be what `blaze prove` emits from the source today:
+`harness/v2/lean_gate.py '{"command": "models", "emitted": "<target>/lean/lib"}'` compares
+every model a run emitted with the checked-in one, byte for byte. It needs a built blaze and
+is run by hand after `blaze prove -p blaze-core` until the release train runs it.

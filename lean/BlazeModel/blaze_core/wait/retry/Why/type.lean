@@ -8,3 +8,4 @@ set_option linter.unusedVariables false
 inductive blaze_core.wait.retry.Why where
   | Io (f0 : core.io.error.Error)
   | Stuck (calls : U32) («at» : core.time.Duration)
+  | Ran (pid : I32)

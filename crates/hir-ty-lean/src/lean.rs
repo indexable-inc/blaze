@@ -156,6 +156,8 @@ pub enum Decl {
     /// `opaque name (params) : ty`: a constant of that type with no definition the kernel
     /// unfolds ([`crate::opaque_module`]).
     Opaque { name: String, params: Vec<Binder>, ty: Term },
+    /// `mutual .. end`: definitions that call each other, each before the others are declared.
+    Mutual(Vec<Decl>),
 }
 
 /// A Lean file.
@@ -484,6 +486,15 @@ impl Printer {
                 let params = binders(params);
                 let space = if params.is_empty() { "" } else { " " };
                 self.line(0, &format!("opaque {}{space}{params} : {}", ident(name), inline(ty)));
+            }
+            Decl::Mutual(decls) => {
+                self.line(0, "mutual");
+                for decl in decls {
+                    self.line(0, "");
+                    self.decl(decl);
+                }
+                self.line(0, "");
+                self.line(0, "end");
             }
         }
     }

@@ -202,13 +202,30 @@ fn a_cached_test_is_a_pass_and_a_run_not_kept_says_why() {
 
     let missed = Missed::NoRow;
     let clock = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraceable(Untraceable::Clock), missed };
-    let said = super::not_kept(clock).expect("a pass not kept says why");
+    let said = super::not_kept(clock, None).expect("a pass not kept says why");
     assert_eq!((said.no.as_str(), said.why.as_str()), ("clock", "it read the wall clock"));
     let failed = Verdict::NotKept { passed: false, micros: 5, why: NotKept::Failed, missed };
-    assert_eq!(super::not_kept(failed), None);
-    assert_eq!(super::not_kept(Verdict::Ran { micros: 5, basis: Basis::Executed, missed }), None);
+    assert_eq!(super::not_kept(failed, None), None);
+    assert_eq!(super::not_kept(Verdict::Ran { micros: 5, basis: Basis::Executed, missed }, None), None);
     let unchanged = Verdict::Cached { by: By::Unchanged, basis: Basis::Executed, micros: None };
-    assert_eq!(super::not_kept(unchanged), None);
+    assert_eq!(super::not_kept(unchanged, None), None);
+
+    // A pass not kept for a read that moved names the read and the name whose stamp says so.
+    let moved = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Moved, missed };
+    let what = blaze_usercode::inputs::Moved {
+        read: "/w/data/input.txt".into(),
+        at: "/w/data".into(),
+        why: blaze_usercode::inputs::MovedWhy::Above,
+    };
+    let said = super::not_kept(moved, Some(&what)).expect("a pass not kept says why");
+    assert_eq!(
+        (said.no.as_str(), said.why.as_str()),
+        (
+            "moved",
+            "/w/data, above /w/data/input.txt which it read, changed after the test began, so its hash \
+             need not be what the test read"
+        )
+    );
 }
 
 fn fn_id(n: u32) -> ContentId {
@@ -374,12 +391,18 @@ fn of(lines: &[(Seen, String)]) -> Lines {
     lines.iter().map(|it| (it.0, it.1.as_str())).collect()
 }
 
-/// What a test of [`Common`] says moved: any path read whose name is of odd length. A
-/// question of each path alone, as `Began::moved`'s is, so asking it of the shared and the own
-/// part apart answers as asking it of the whole.
-fn odd_moved(traced: &Traced) -> bool {
+/// What a test of [`Common`] says moved: a path read whose name is of odd length. A question
+/// of each path alone, as `Began::moved`'s is, so asking it of the shared and the own part
+/// apart finds one exactly when asking it of the whole does.
+fn odd_moved(traced: &Traced) -> Option<blaze_usercode::inputs::Moved> {
     let odd = |path: &std::path::Path| path.as_os_str().len() % 2 == 1;
-    traced.files.iter().any(|it| odd(&it.0)) || traced.dirs.iter().any(|it| odd(&it.0))
+    let files = traced.files.iter().map(|it| &it.0);
+    let path = files.chain(traced.dirs.iter().map(|it| &it.0)).find(|it| odd(it))?;
+    Some(blaze_usercode::inputs::Moved {
+        read: path.clone(),
+        at: path.clone(),
+        why: blaze_usercode::inputs::MovedWhy::Itself,
+    })
 }
 
 /// Through the cache, every kind of trace is what [`Trace::traced`] says it is, result after
@@ -389,17 +412,25 @@ fn a_result_is_traced_as_its_trace_says() {
     let mut rng = Rng::new(11);
     let mut common = Common::default();
     let mut world = World::new();
-    let both = |it: Option<&Traced>, moved: bool| (it.cloned(), moved);
+    // Which read is named can differ between the parts and the whole (the shared part's
+    // first); that one is, and that it moved, is the same.
+    let both = |it: Option<&Traced>, moved: Option<&blaze_usercode::inputs::Moved>| {
+        if let (Some(it), Some(moved)) = (it, moved) {
+            let read = |path: &std::path::PathBuf| *path == moved.read;
+            assert!(it.files.iter().any(|f| read(&f.0)) || it.dirs.iter().any(|d| read(&d.0)), "{moved:?}");
+        }
+        (it.cloned(), moved.is_some())
+    };
     for _ in 0..200 {
         let count = rng.below(32);
         let all = lines(&mut rng, count);
         let Ok(expected) = Trace::Lines(of(&all)).traced(&mut world);
-        let moved = expected.as_ref().is_some_and(odd_moved);
+        let moved = expected.as_ref().and_then(odd_moved).is_some();
         let Ok(got) = common.traced(Trace::Lines(of(&all)), &mut world, odd_moved, both);
         assert_eq!(got, (expected, moved), "{all:?}");
     }
     let whole = assembled(&lines(&mut rng, 20));
-    let moved = odd_moved(&whole);
+    let moved = odd_moved(&whole).is_some();
     let Ok(got) = common.traced(Trace::Whole(whole.clone()), &mut world, odd_moved, both);
     assert_eq!(got, (Some(whole), moved));
     let Ok(got) = common.traced(

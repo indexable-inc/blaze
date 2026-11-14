@@ -138,6 +138,9 @@ fn a_home_goes_by_its_records_forget_and_never_alone() {
     flush(&mut sim, &mut store);
     assert!(sim.exists(&file), "the control: no path names it, and it is still its record's home");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), out);
+    // A place over it asks no forget (D45): it is asked here, as the collector would.
+    assert_eq!(forgets_due(&mut sim, &mut store).forgotten, Vec::<Key>::new());
+    store.forget(key(1));
     let forgot = forgets_due(&mut sim, &mut store);
     assert_eq!(forgot.forgotten, vec![key(1)]);
     flush(&mut sim, &mut store);

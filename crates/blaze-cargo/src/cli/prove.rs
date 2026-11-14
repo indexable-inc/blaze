@@ -119,7 +119,7 @@ fn prove(words: Vec<OsString>, color: bool) -> Result<i32, (String, i32)> {
     let done = proven.records.iter().all(|it| match it {
         ProofRecord::Proved { .. } => true,
         ProofRecord::Emitted { .. } => emit,
-        ProofRecord::Open { .. } | ProofRecord::Refused { .. } => false,
+        ProofRecord::Open { .. } | ProofRecord::Refused { .. } | ProofRecord::ModelBroken { .. } => false,
     });
     Ok(if done { 0 } else { 1 })
 }
@@ -130,7 +130,7 @@ fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool, functions: bool) {
     if proven.records.is_empty() {
         let _ = writeln!(text, "no function marked `#[blaze::theorem]` in the crates selected");
     }
-    let (mut proved, mut open, mut emitted, mut refused) = (0, 0, 0, 0);
+    let (mut proved, mut open, mut emitted, mut refused, mut broken) = (0, 0, 0, 0, 0);
     for record in &proven.records {
         match record {
             ProofRecord::Proved { theorem, function, axioms, .. } => {
@@ -152,6 +152,15 @@ fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool, functions: bool) {
                 refused += 1;
                 let _ = writeln!(text, "refused {function}: {what} at `{at}`");
             }
+            ProofRecord::ModelBroken { at, error, module, function } => {
+                broken += 1;
+                let said = hir_ty_lean::plan::Verdict::model_broken_said(function, module, at, error);
+                let mut said = said.lines();
+                let _ = writeln!(text, "model broken {function}: {}", said.next().unwrap_or(""));
+                for line in said {
+                    let _ = writeln!(text, "    {line}");
+                }
+            }
         }
     }
     if let Some(subset) = &proven.subset {
@@ -159,7 +168,7 @@ fn lines(text: &mut Vec<u8>, proven: &Proven, emit: bool, functions: bool) {
     }
     let _ = match emit {
         true => writeln!(text, "{emitted} emitted, {refused} refused"),
-        false => writeln!(text, "{proved} proved, {open} open, {refused} refused"),
+        false => writeln!(text, "{proved} proved, {open} open, {broken} model broken, {refused} refused"),
     };
 }
 
@@ -207,6 +216,11 @@ fn json(proven: &Proven) -> serde_json::Value {
             }),
             ProofRecord::Refused { at, what, function } => serde_json::json!({
                 "outcome": "Refused", "function": function, "what": what, "at": at,
+            }),
+            ProofRecord::ModelBroken { at, error, module, function } => serde_json::json!({
+                "outcome": "ModelBroken", "function": function, "module": module,
+                "at": at, "error": error,
+                "why": hir_ty_lean::plan::Verdict::model_broken_said(function, module, at, error),
             }),
         });
     }
@@ -262,19 +276,44 @@ mod tests {
                       1 refused for a raw pointer (rule RawPointer)\n";
         let mut text = Vec::new_in(Global);
         super::lines(&mut text, &proven, false, false);
-        assert_eq!(String::from_utf8(text).unwrap(), format!("{counts}0 proved, 0 open, 0 refused\n"));
+        assert_eq!(String::from_utf8(text).unwrap(), format!("{counts}0 proved, 0 open, 0 model broken, 0 refused\n"));
         let mut text = Vec::new_in(Global);
         super::lines(&mut text, &proven, false, true);
         assert_eq!(
             String::from_utf8(text).unwrap(),
             format!(
                 "{counts}refused cores::addr: a raw pointer (rule RawPointer)\ntranslated cores::double\n\
-                 generic cores::first\n0 proved, 0 open, 0 refused\n"
+                 generic cores::first\n0 proved, 0 open, 0 model broken, 0 refused\n"
             )
         );
         let json = super::json(&proven);
         assert_eq!(json["subset"]["outcomes"][0]["outcome"], "Refused", "{json}");
         assert_eq!(json["subset"]["outcomes"][2]["path"], "cores::first", "{json}");
         assert_eq!(json["subset"]["generic"], 1, "{json}");
+    }
+    /// A theorem whose model Lean refuses is said apart from an open one: the function, that
+    /// its model does not build, whose bug that is, and Lean's first error at its place.
+    #[test]
+    fn a_broken_model_is_said_as_blazes_bug_not_open() {
+        let proven = Proven {
+            failed: None,
+            subset: None,
+            records: vec![blaze_api::ProofRecord::ModelBroken {
+                at: "/b/lean/lib/BlazeModel/k/m/t.lean:7:4".to_owned(),
+                error: "error(lean.redundantMatchAlt): Redundant alternative".to_owned(),
+                module: "BlazeModel.k.m.t".to_owned(),
+                function: "k::m::t".to_owned(),
+            }],
+        };
+        let mut text = Vec::new_in(Global);
+        super::lines(&mut text, &proven, false, false);
+        assert_eq!(
+            String::from_utf8(text).unwrap(),
+            "model broken k::m::t: the generated Lean model of `k::m::t` does not build: Lean 4.35.0 \
+             refused `BlazeModel.k.m.t`, a bug in blaze's translator (hir-ty-lean) that no proof file \
+             can fix:\n    /b/lean/lib/BlazeModel/k/m/t.lean:7:4: error(lean.redundantMatchAlt): Redundant alternative\n\
+             0 proved, 0 open, 1 model broken, 0 refused\n"
+        );
+        assert_eq!(super::json(&proven)["records"][0]["outcome"], "ModelBroken");
     }
 }

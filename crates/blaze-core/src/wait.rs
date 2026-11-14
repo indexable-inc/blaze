@@ -43,8 +43,6 @@ mod parking;
 mod reaping;
 mod retry;
 
-#[cfg(test)]
-pub(crate) use self::retry::Plant;
 pub use self::{
     choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
     retry::{Clock, Deadline, Once, WaitError, Waited},
@@ -181,7 +179,7 @@ pub fn until<T>(
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
+    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
     drop(registered);
     waited
 }
@@ -236,7 +234,7 @@ pub fn wake_shared(word: &std::sync::atomic::AtomicU64) {
 /// Elsewhere std's park, until that system's address wait lands. Only one thread parks on a
 /// `Parker`; nothing signals it.
 pub struct Parker {
-    word: std::sync::atomic::AtomicU32,
+    word: crate::atomic::AtomicU32,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
@@ -244,7 +242,7 @@ pub struct Parker {
 impl Parker {
     pub fn new() -> Parker {
         Parker {
-            word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
+            word: crate::atomic::AtomicU32::new(parking::EMPTY),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
@@ -385,14 +383,14 @@ struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl parking::Futex for ThreadPark<'_> {
-    fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
+    fn prepare(&self, _: &crate::atomic::AtomicU32) {
         *self.0.lock() = Some(std::thread::current());
     }
 
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &std::sync::atomic::AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
@@ -409,7 +407,7 @@ impl parking::Futex for ThreadPark<'_> {
         })
     }
 
-    fn wake(&self, _: &std::sync::atomic::AtomicU32) {
+    fn wake(&self, _: &crate::atomic::AtomicU32) {
         if let Some(thread) = self.0.lock().as_ref() {
             thread.unpark();
         }
@@ -445,9 +443,9 @@ pub(crate) fn reap(
 ) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
     let plant = reaping::ReapPlant::None;
     match choice::chosen() {
-        Waits::Ring => reaping::reap(what, &ring::Kids, pid, deadline, clock, plant),
+        Waits::Ring => reaping::reap(what, &mut ring::Kids, pid, deadline, clock, plant),
         Waits::Direct => {
-            reaping::reap(what, &direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
+            reaping::reap(what, &mut direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
         }
     }
 }

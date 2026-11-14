@@ -192,6 +192,10 @@ pub enum How {
     Changed,
     /// Its stamp moved between the two looks around its hash: it is being written now.
     Unsteady,
+    /// The daemon's record of the path (blaze-cargo's `Paths::placed_key`) names another key
+    /// than the certificate's, or a placement is in flight there: another request placed it
+    /// after this answer was certified. Found with no look at the disk (one writer, D45).
+    Placed,
 }
 
 /// Why a request is not certified. These and no other: not a restart, not another request's
@@ -239,6 +243,10 @@ impl fmt::Display for Why {
             Why::Output { path, how: How::Gone, .. } => write!(f, "the output {path} is gone"),
             Why::Output { path, how: How::Changed, .. } => write!(f, "the output {path} holds other bytes than the build left"),
             Why::Output { path, how: How::Unsteady, .. } => write!(f, "the output {path} is being written"),
+            Why::Output { path, how: How::Placed, .. } => write!(
+                f,
+                "the output {path} holds another request's placement by the daemon's record, not this answer's"
+            ),
         }
     }
 }
@@ -514,6 +522,18 @@ impl Request {
             _ => return None,
         };
         found.answer.outputs.iter().find(|it| it.base == base && it.path == path).map(|it| it.content)
+    }
+
+    /// The outputs the answer found names, while the machine looks at them; none otherwise.
+    /// What a driver holding its own record of what is placed where checks first, with no
+    /// look at the disk (blaze-cargo's `certify::placed_elsewhere`).
+    pub fn outputs(&self) -> &[Output] {
+        match &self.state {
+            State::Stamping { found } | State::Hashing { found, .. } | State::Restamping { found, .. } => {
+                &found.answer.outputs
+            }
+            _ => &[],
+        }
     }
 
     /// What the machine waits for now: the name of the driver's span around the wait

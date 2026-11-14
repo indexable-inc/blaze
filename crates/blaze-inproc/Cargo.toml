@@ -1,6 +1,6 @@
 [package]
 name = "blaze-inproc"
-description = "blaze v2's dev runs patched with one store: the executable written once per content key and started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them"
+description = "blaze v2's dev runs patched with one store: the executable its build placed started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them"
 publish = false
 
 version.workspace = true

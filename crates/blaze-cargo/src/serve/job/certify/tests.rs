@@ -447,6 +447,47 @@ fn code_of_no_named_build_leaves_no_certificate() {
     assert!(why.contains(PROGRAM) && why.contains("no build blaze can name"), "{why}");
 }
 
+/// The invariant (one writer, D45): an output another request placed since the build answered
+/// leaves no certificate, named with both keys; never an entry naming that request's file as
+/// this answer's, never one left out.
+#[test]
+fn an_output_placed_by_another_request_since_the_answer_leaves_no_certificate() {
+    let (left, holds) = (ContentId([1; 32]), ContentId([2; 32]));
+    let why = outputs_of([PROGRAM], |_| AtPath::Replaced { left, holds: Some(holds) }, |_, _| None)
+        .expect_err("a certificate named another request's file as this answer's");
+    assert!(why.contains(PROGRAM) && why.contains(&format!("{left:x}")) && why.contains(&format!("{holds:x}")), "{why}");
+    let why = outputs_of([PROGRAM], |_| AtPath::Replaced { left, holds: None }, |_, _| None)
+        .expect_err("a certificate named a path whose placement failed");
+    assert!(why.contains(PROGRAM) && why.contains("nothing"), "{why}");
+}
+
+/// The invariant (one writer, D45): a certificate's output is the answer's only where the
+/// jobs' record holds the answer's key there; another key, or a placement in flight, is
+/// another request's file, and the request goes to its job. With no record (a start, a path
+/// this daemon never placed) the disk alone is the evidence. Each case, and the planted
+/// shortcut that takes any record for the answer's.
+#[test]
+fn a_certificates_output_is_the_answers_only_where_its_record_holds_the_answers_key() {
+    use super::{Recorded, placed_elsewhere};
+    let (wanted, other) = (ContentId([1; 32]), ContentId([2; 32]));
+    let cases = [
+        (Recorded::Holds(wanted), false),
+        (Recorded::Holds(other), true),
+        (Recorded::Placing, true),
+        (Recorded::Unrecorded, false),
+    ];
+    for (recorded, elsewhere) in cases {
+        assert_eq!(placed_elsewhere(recorded, wanted), elsewhere, "{recorded:?}");
+    }
+    // The planted shortcut: it vouches whatever the record holds, and the case of another
+    // key's record is the one the oracle sees it pass.
+    let vouches_any = |_: Recorded, _: ContentId| false;
+    assert!(
+        cases.iter().any(|(recorded, elsewhere)| vouches_any(*recorded, wanted) != *elsewhere),
+        "the planted shortcut answers as the check does in every case: the cases prove nothing"
+    );
+}
+
 // A build's own looks at the disk outside the views, in its certificate: each look a read of
 // its own, at what it saw, asked again by the driver's real look ([`certify`]'s
 // `outside_now`) on a real directory.

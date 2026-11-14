@@ -1067,12 +1067,21 @@ and is not kept says why, and runs again next time:
 - `(not kept: it read the wall clock)`, `(not kept: it read randomness the sandbox did not answer)`,
   `(not kept: it used the network)` and `(not kept: it read through a descriptor the sandbox did not see opened)`.
 - `(not kept: what it read changed while it ran)`.
-- `(not kept: a file it read changed after it began, so its hash need not be what it read)`:
-  what a test read is hashed once it ends, so a file, a directory above it or a link on the
-  way to it whose `stat` says it changed since a moment before the run began (git's racy
-  window, two seconds) leaves the hash unproven (`Began::moved`,
-  `crates/blaze-usercode/src/inputs.rs`). This includes a file the test wrote itself and
-  read back.
+- `(not kept: /w/data.txt changed after the test began, so its hash need not be what the test
+  read)`, in JSON `"kept": {"no": "moved"}`: what a test read is hashed once it ends, so a
+  file, a directory above it or a link on the way to it whose `stat` says it changed since a
+  moment before the run began (git's racy window, two seconds) leaves the hash unproven
+  (`Began::moved`, `crates/blaze-usercode/src/inputs.rs`). The line names the first such
+  read and, when the name whose stamp moved is another, that one and how it stands to the
+  read: `/w, above /w/data.txt which it read, changed ...`, `/w/l, a link on the way to
+  /w/l/f which it read, changed ...`, or `/x/f, reached through a link from /w/l/f which it
+  read, changed ...`; a read whose names can't be resolved (a relative path, one with `..`)
+  is said as such. This includes a file the test wrote itself and read back. A build script
+  run kept under no key for the same reason says it in the same words. A test's own
+  executable is never this: the build that placed it is the one writer of its path, and a
+  dev test binary starts from that file as placed, with the key the job's record holds for
+  it; blaze's code-memory host writes no file, and a launch whose path holds another key
+  is refused, naming the path and both keys.
 
 A failure is never kept: it runs every time. Doc tests are neither selected nor kept: blaze
 does not trace a doc test's run, so they run every time, after the daemon's tests, and the

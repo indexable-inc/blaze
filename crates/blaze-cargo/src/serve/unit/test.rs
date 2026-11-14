@@ -474,13 +474,9 @@ pub(crate) fn unsandboxable(why: &str) -> String {
 /// run's test binaries), run outside the sandbox when `outside`, as its verdict and why it ran
 /// say: `None` for a test the machine did not judge (ignored, or a run whose keeping was
 /// refused).
-fn result(
-    report: test::Report,
-    executable: u32,
-    outside: bool,
-    verdict: Option<(Verdict, Option<blaze_api::RanWhy>)>,
-) -> TestResult {
-    let (verdict, ran) = verdict.map_or((None, None), |(verdict, ran)| (Some(verdict), ran));
+fn result(report: test::Report, executable: u32, outside: bool, verdict: Option<Judged>) -> TestResult {
+    let (verdict, ran, moved) =
+        verdict.map_or((None, None, None), |(verdict, ran, moved)| (Some(verdict), ran, moved));
     TestResult {
         ran,
         binary: report.binary,
@@ -488,7 +484,7 @@ fn result(
         outside,
         name: report.name,
         cached: None,
-        not_kept: verdict.and_then(not_kept),
+        not_kept: verdict.and_then(|it| not_kept(it, moved.as_ref())),
         outcome: match report.outcome {
             Reported::Passed => TestOutcome::Passed,
             Reported::Failed => TestOutcome::Failed,
@@ -499,11 +495,26 @@ fn result(
     }
 }
 
+/// A test's verdict as a result says it: the machine's verdict, why it ran ([`ran_why`]), and
+/// what it read that moved after it began ([`blaze_usercode::inputs::Began::moved`]).
+type Judged = (Verdict, Option<blaze_api::RanWhy>, Option<blaze_usercode::inputs::Moved>);
+
 /// Why a run that passed is not kept, as a result says it: `None` for a run kept, and for a
-/// failure (a failure runs every time; its outcome says so).
-fn not_kept(verdict: Verdict) -> Option<blaze_api::NotKept> {
+/// failure (a failure runs every time; its outcome says so). A pass not kept for a read that
+/// moved names it, from `moved`: the machine's verdict says only that one did.
+fn not_kept(verdict: Verdict, moved: Option<&blaze_usercode::inputs::Moved>) -> Option<blaze_api::NotKept> {
     match verdict {
         Verdict::NotKept { why: NotKept::Failed, .. } | Verdict::Ran { .. } | Verdict::Cached { .. } => None,
+        Verdict::NotKept { why: why @ NotKept::Moved, .. } => {
+            let said = match moved {
+                // alloc: once per test not kept, its sentence
+                Some(moved) => format!("{}, so its hash need not be what the test read", moved.said("the test")),
+                // The machine judged by a move the host did not name: never so, as the host
+                // gives `moved` exactly when it names one ([`Suited::ran`]); its own words.
+                None => why.name().to_owned(),
+            };
+            Some(blaze_api::NotKept { no: why.code().to_owned(), why: said })
+        }
         Verdict::NotKept { why, .. } => {
             // alloc: once per test not kept, its two words
             Some(blaze_api::NotKept { no: why.code().to_owned(), why: why.name().to_owned() })
@@ -775,8 +786,8 @@ impl Suited {
     }
 
     /// The run of its test `name` given to its selection, which then is driven over `records`
-    /// until it waits or ends: the test's verdict with why it ran ([`ran_why`]), and where the
-    /// drive stopped. `outside`: the trace says it ran outside the sandbox. `None` for the
+    /// until it waits or ends: the test's verdict with why it ran ([`ran_why`]) and what it
+    /// read that moved after it began, and where the drive stopped. `outside`: the trace says it ran outside the sandbox. `None` for the
     /// verdict once its selection was refused (said once, when it was).
     #[expect(clippy::too_many_arguments, reason = "one call, a finished test's parts")]
     fn ran(
@@ -789,7 +800,7 @@ impl Suited {
         executed: test::Executed,
         trace: test::Trace,
         outside: bool,
-    ) -> Result<(Option<(Verdict, Option<blaze_api::RanWhy>)>, Option<Drove>), String> {
+    ) -> Result<(Option<Judged>, Option<Drove>), String> {
         let (tests, table) = listing(job, self.unit);
         let Some(n) = self.find(tests, name) else {
             // alloc: error path
@@ -821,7 +832,9 @@ impl Suited {
         let (micros, sandboxed) =
             (u64::try_from(took.as_micros()).unwrap_or(u64::MAX), self.inside[n] && !outside);
         let (driver, began) = (&mut self.driver, self.began);
-        let given = self
+        // What moved is the host's to name: the machine judges by whether anything did, and
+        // its verdict's line says what ([`not_kept`]).
+        let (given, moved) = self
             .common
             .traced(trace, &mut self.disk, |traced| began.moved(traced), |traced, moved| {
                 let ended = Ended {
@@ -834,9 +847,10 @@ impl Suited {
                     traced,
                     sandboxed,
                     foreign: tests[n].outside,
-                    moved,
+                    moved: moved.is_some(),
                 };
-                driver.ran(&mut *selection, &taken.now, &ended)
+                // clone: once per test whose read moved, the paths its line names
+                (driver.ran(&mut *selection, &taken.now, &ended), moved.cloned())
             })
             // alloc: error path
             .map_err(|why| format!("what test `{name}` of `{suite}` read can't be told, so how it ran can't be kept: {why}"))?;
@@ -858,7 +872,7 @@ impl Suited {
             return Err(format!("the tests of `{suite}`: {}", HostError::LateRun { test: late.test }));
         }
         let why = ran_why(verdict, selection, taken);
-        Ok((Some((verdict, why)), Some(drove)))
+        Ok((Some((verdict, why, moved)), Some(drove)))
     }
 
     /// Its selection ended: the new head given to `selectors` for its next run, and to `puts`
@@ -1085,13 +1099,14 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         .map_err(|what| ApiError::new(what, None))?
     {
         super::run::Launch::File => None,
-        // Its processes start from the file its code memory writes, the start hook's variable
-        // set, and its fork server attached as one that forks (`Program::command`).
+        // Its processes start from the file its build placed, the start hook's variable set,
+        // and its fork server attached as one that forks (`Program::command`); the key the
+        // job's record holds for its path is read as the run starts (`TestRun::start`).
         super::run::Launch::InProcess => {
             let held =
                 job.shared.dev_runs.loaded(program).map_err(|what| ApiError::new(what, None))?;
             // clone: a count, once per binary
-            Some(test::Loaded(held.program().clone()))
+            Some(test::Loaded(held.program().clone(), None))
         }
     };
     let env: Vec<(OsString, OsString)> =
@@ -1298,6 +1313,7 @@ impl Runs<Real> for TestRun {
         &mut self,
         store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1393,6 +1409,13 @@ impl Runs<Real> for TestRun {
                     }
                 }
             }
+            // Its processes start from the file its build placed, with the key the job's record
+            // holds for its path, read now its placements have ended (`Runs::start`).
+            for it in std::iter::once(&mut binary).chain(outside.as_mut()) {
+                if let Some(loaded) = &mut it.loaded {
+                    loaded.1 = placed(&it.program.to_string_lossy());
+                }
+            }
             binaries.push(binary);
             self.suite_of.push(at);
             if let Some(outside) = outside {
@@ -1413,7 +1436,8 @@ impl Runs<Real> for TestRun {
         // The run's sockets and records go under the daemon's state. The queue names them to the
         // driver from its root, `/` ([`crate::serve::file_name`]), and gives its processes that
         // root joined with the name, so both see one file; a name relative to the state would be
-        // written at `/tests/..`.
+        // written at `/tests/..`. The queue removes them, and the directory, as the run ends
+        // (`Queue::finished`).
         let path = self.job.shared.state.join(format!("tests/{:016x}", self.tags)); // alloc: once per test run
         let dir = match crate::serve::file_name(&path) {
             Ok(dir) => dir,
@@ -1489,6 +1513,12 @@ impl Runs<Real> for TestRun {
                 None,
                 super::compile::drawing(&self.job).color,
             )));
+        }
+        // Its sockets and records go with the request; one it could not remove is said, by
+        // name, and fails no test.
+        if let Some(why) = queue.take_left_behind() {
+            let color = super::compile::drawing(&self.job).color;
+            out.push(Response::Diagnostic(super::say::cargo(Level::Warning, why, None, color)));
         }
         let done = queue.finished();
         self.queue = Some(queue);

@@ -6,6 +6,7 @@ the sources and the list people read to what is checked in.
     uv run --frozen python harness/v2/lean_gate.py '{"command": "check"}'
     uv run --frozen python harness/v2/lean_gate.py '{"command": "sources"}'
     uv run --frozen python harness/v2/lean_gate.py '{"command": "write"}'
+    uv run --frozen python harness/v2/lean_gate.py '{"command": "models", "emitted": "<target>/lean/lib"}'
     uv run --frozen python harness/v2/lean_gate.py selftest
 
 The input is one JSON object:
@@ -26,11 +27,18 @@ The input is one JSON object:
                        but the axioms the file allows (`propext`, `Classical.choice`,
                        `Quot.sound`). Prints the table
               write    regenerate docs/v2/plan/proofs.md
+              models   the models a `blaze prove` emitted (`emitted`: the directory that holds
+                       its `BlazeModel/`, `<target>/lean/lib`) are byte for byte the ones checked
+                       in under lean/BlazeModel, which the proofs in the tree were checked
+                       against: a model that differs, or is not checked in, is a problem. A
+                       checked-in model the run did not emit is none (a fixture's, another
+                       crate's). Needs no Lean
     root      the checkout (".")
     lake      the pinned toolchain's `lake`, an absolute path; empty for the one elan keeps for
               lean/lean-toolchain's pin (`~/.elan/toolchains/<pin>/bin/lake`). Never PATH
     packages  which packages `check` builds: `core` (lean/) and `analysis` (lean/analysis); both
     out       where the verdict goes for the ledger (scripts/src/bin/ledger.rs), when given
+    emitted   for `models`: the directory a `blaze prove` wrote its Lean library into
 
 lean/theorems.json is the one list of what blaze claims is proved:
 
@@ -112,11 +120,12 @@ class Listed:
 
 @dataclass(frozen=True)
 class Input:
-    command: Literal["sources", "check", "write"]
+    command: Literal["sources", "check", "write", "models"]
     root: str = "."
     lake: str = ""
     packages: tuple[Package, ...] = ("core", "analysis")
     out: str = ""
+    emitted: str = ""
 
 
 def without_comments(text: str) -> str:
@@ -376,8 +385,43 @@ def table(listed: Listed, said: dict[str, tuple[str, ...]]) -> str:
     return "\n".join(rows)
 
 
+def model_problems(emitted: dict[str, bytes], checked_in: dict[str, bytes]) -> list[str]:
+    """What is wrong between the models a `blaze prove` emitted and the checked-in ones, each a
+    path under `BlazeModel/` to its bytes."""
+    if not emitted:
+        return ["the run emitted no model: nothing was compared"]
+    wrong: list[str] = []
+    for path in sorted(emitted):
+        if path not in checked_in:
+            wrong.append(f"lean/{path}: `blaze prove` emits this model and it is not checked in: copy it from the run")
+        elif emitted[path] != checked_in[path]:
+            wrong.append(f"lean/{path}: the checked-in model is not what `blaze prove` emits from the source today: "
+                         "the proofs in the tree were checked against the checked-in one; copy the emitted one and rebuild them")
+    return wrong
+
+
+def models(root: Path, emitted: str) -> tuple[list[str], int]:
+    if not emitted:
+        return ["`models` needs `emitted`: the directory a `blaze prove` wrote `BlazeModel/` into"], 0
+    there = Path(emitted).resolve()
+    if not (there / "BlazeModel").is_dir():
+        return [f"{there}: holds no `BlazeModel/`: not the Lean library of a `blaze prove`"], 0
+    ran = {str(f.relative_to(there)): f.read_bytes() for f in sorted((there / "BlazeModel").rglob("*.lean"))}
+    kept = {str(f.relative_to(root / "lean")): f.read_bytes() for f in sorted((root / "lean" / "BlazeModel").rglob("*.lean"))}
+    return model_problems(ran, kept), len(ran)
+
+
 def main(it: Input) -> None:
     root = Path(it.root).resolve()
+    if it.command == "models":
+        wrong, compared = models(root, it.emitted)
+        if it.out:
+            Path(it.out).write_text(json.dumps({"outcomes": [
+                {"name": "lean-models", "verdict": "fail" if wrong else "pass", "detail": wrong[0] if wrong else ""}]}) + "\n")
+        if wrong:
+            sys.exit("\n".join(f"{SCRIPT}: {w}" for w in wrong))
+        print(f"{SCRIPT}: ok: the {compared} models the run emitted are the checked-in ones")
+        return
     listed = read_list(root)
     wrong, statements = sources(root, listed)
     if it.command == "write":
@@ -464,6 +508,11 @@ def selftest() -> None:
     text = page(listed, {"Blaze.Mir.run_mono": "theorem run_mono : True"})
     expect("## V6\n\n**`Blaze.Mir.run_mono`** (`Blaze.Mir.Run`, `lean`): a run that ends" in text and "```lean\ntheorem run_mono : True\n```" in text, text)
     expect("2 theorems: 2 in `lean`, 0 in `lean/analysis`." in text and "-- not found in its module" in text, text)
+    same = {"BlazeModel/a/f.lean": b"def f := 1\n"}
+    expect(model_problems(same, same | {"BlazeModel/fixture/g.lean": b"x"}) == [], "the same bytes, and a fixture the run did not emit, are no problem")
+    expect("is not what `blaze prove` emits" in model_problems(same, {"BlazeModel/a/f.lean": b"def f := 2\n"})[0], "a model that differs is a problem")
+    expect("is not checked in" in model_problems(same, {})[0], "a model not checked in is a problem")
+    expect("emitted no model" in model_problems({}, same)[0], "a run that emitted nothing compared nothing")
     given = parse(Input, '{"command": "check", "packages": ["core"]}', SCRIPT)
     expect(given.root == "." and given.lake == "" and given.packages == ("core",), f"the input: {given}")
     print(f"{SCRIPT} selftest: ok")

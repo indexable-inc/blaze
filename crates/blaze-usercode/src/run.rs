@@ -371,19 +371,20 @@ pub struct Completed {
 
 /// Why a run that ended well was kept under no key: its result is this build's, and a later
 /// one runs it again.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NotKept {
-    /// Something it read can have changed after it began ([`crate::inputs::Began::moved`]):
-    /// what it read is hashed as it ends, so those hashes need not be of the bytes it read,
-    /// and a result kept under them would be reused for an input it never ran on.
-    Moved,
+    /// Something it read can have changed after it began ([`crate::inputs::Began::moved`]),
+    /// the first such named: what it read is hashed as it ends, so those hashes need not be
+    /// of the bytes it read, and a result kept under them would be reused for an input it
+    /// never ran on.
+    Moved(crate::inputs::Moved),
 }
 
 impl NotKept {
     /// The reason as one word, for a profile row or a line: `moved`.
-    pub fn word(self) -> &'static str {
+    pub fn word(&self) -> &'static str {
         match self {
-            NotKept::Moved => "moved",
+            NotKept::Moved(_) => "moved",
         }
     }
 }
@@ -391,9 +392,11 @@ impl NotKept {
 impl fmt::Display for NotKept {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            NotKept::Moved => f.write_str(
-                "something it read changed after it began, so what it read is not known to be \
-                 what its trace was hashed at; its result is this build's and is kept under no key",
+            NotKept::Moved(moved) => write!(
+                f,
+                "{}, so what it read is not known to be what its trace was hashed at; its result \
+                 is this build's and is kept under no key",
+                moved.said("the run")
             ),
         }
     }
@@ -500,7 +503,7 @@ impl Run {
     /// that the run depends on where its roots are ([`verify::retraction`]), keeps its own
     /// value here, and is [`RunError::Differs`] with the record's ticket.
     ///
-    /// `moved` says whether something the trace names can have changed since the run began
+    /// `moved` names something the trace names that can have changed since the run began
     /// (the caller's [`crate::inputs::Began::moved`] of [`Run::began`]): the trace is hashed
     /// as the run ends, so such a run's hashes need not be of what it read. Its result is
     /// given for this build and kept by no key ([`NotKept::Moved`]), never compared with what
@@ -513,7 +516,7 @@ impl Run {
         inputs: &mut I,
         rule: impl FnOnce(&Exit) -> Result<CargoRule, blaze_build_script::Error>,
         keyed: impl FnOnce(&mut Traced) -> Result<(), blaze_build_script::Error>,
-        moved: impl FnOnce(&Traced) -> bool,
+        moved: impl FnOnce(&Traced) -> Option<crate::inputs::Moved>,
     ) -> Result<Completed, RunError<I::Error>>
     where
         I::Error: From<NoRoot>,
@@ -565,9 +568,12 @@ impl Run {
         let value = Value::of(exit, files);
         // A run that would be kept or compared, whose reads can have changed since it began:
         // this build's, kept under no key and compared with nothing (`moved` above).
-        if (rule.is_some() || self.kept.is_some()) && moved(&traced) {
+        if (rule.is_some() || self.kept.is_some())
+            && let Some(moved) = moved(&traced)
+        {
             let tickets = Vec::new_in(std::alloc::Global);
-            return Ok(Completed { value, traced, tickets, retracted: None, not_kept: Some(NotKept::Moved) });
+            let not_kept = Some(NotKept::Moved(moved));
+            return Ok(Completed { value, traced, tickets, retracted: None, not_kept });
         }
         // One comparison for verify mode, stderr included: the one sharing makes
         // ([`ported_differs`]), so a rerun that differs only in stderr is a difference said
@@ -1440,9 +1446,18 @@ mod tests {
             inputs,
             |_| Ok(CargoRule::default()),
             |_| Ok(()),
-            |_| moved,
+            |_| moved.then(data_moved),
         )?;
         Ok((completed.value, true, completed.not_kept))
+    }
+
+    /// What a test of a moved read says moved: the data file the script reads, itself.
+    fn data_moved() -> crate::inputs::Moved {
+        crate::inputs::Moved {
+            read: "/ws/data".into(),
+            at: "/ws/data".into(),
+            why: crate::inputs::MovedWhy::Itself,
+        }
     }
 
     /// The invariant: a run whose reads can have changed after it began (its trace is hashed
@@ -1466,7 +1481,13 @@ mod tests {
             let first =
                 go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Normal), moved).unwrap();
             assert!(first.1, "the first run runs");
-            assert_eq!(first.2, moved.then_some(NotKept::Moved), "moved: {moved}");
+            assert_eq!(first.2, moved.then(|| NotKept::Moved(data_moved())), "moved: {moved}");
+            if let Some(not_kept) = &first.2 {
+                assert!(
+                    not_kept.to_string().starts_with("/ws/data changed after the run began, so "),
+                    "a run not kept names what moved: {not_kept}"
+                );
+            }
             let again = go_with(&mut sim, &mut store, &mut inputs, spec(Mode::Normal)).unwrap();
             assert_eq!(again.1, moved, "a run kept under no key runs again; moved: {moved}");
             // Kept by the run just made in either case: one result, and a verify of a rerun
@@ -1474,7 +1495,7 @@ mod tests {
             *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
             let verified = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Verify), moved);
             match moved {
-                true => assert_eq!(verified.unwrap().2, Some(NotKept::Moved)),
+                true => assert_eq!(verified.unwrap().2, Some(NotKept::Moved(data_moved()))),
                 false => assert!(matches!(verified, Err(RunError::Differs { .. })), "{verified:?}"),
             }
         }

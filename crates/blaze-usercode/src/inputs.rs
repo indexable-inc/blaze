@@ -145,16 +145,16 @@ impl Began {
         Began { generation: blaze_vfs::outside::generation(), wall_ns: wall_ns() }
     }
 
-    /// Whether anything `traced` read can have changed since the run began, so the hashes it
-    /// was assembled with need not be what the run read. Each path is asked of by every name
-    /// its answer rests on ([`names`]): a watch that heard nothing of the name since vouches
-    /// for it with no syscall; else the name and every directory above it are `stat`ed, and
-    /// one whose last change can share a tick with the run's start or come after it
-    /// ([`Stamp::racy`]) has moved. A path whose names can't be told has moved: it is never
-    /// taken as still. Conservative: a change beside the name in its directory, or the run's
-    /// own write of what it read, counts as a move, and the pass is not kept, never a stale
-    /// one kept.
-    pub fn moved(&self, traced: &blaze_core::Traced) -> bool {
+    /// The first thing `traced` read that can have changed since the run began, so the hashes
+    /// it was assembled with need not be what the run read; `None` when nothing can have.
+    /// Each path is asked of by every name its answer rests on ([`names`]): a watch that
+    /// heard nothing of the name since vouches for it with no syscall; else the name and
+    /// every directory above it are `stat`ed, and one whose last change can share a tick
+    /// with the run's start or come after it ([`Stamp::racy`]) has moved. A path whose names
+    /// can't be told has moved: it is never taken as still. Conservative: a change beside the
+    /// name in its directory, or the run's own write of what it read, counts as a move, and
+    /// the pass is not kept, never a stale one kept.
+    pub fn moved(&self, traced: &blaze_core::Traced) -> Option<Moved> {
         // A `stat` of each name the watches can't vouch for, and of every directory above it:
         // a row naming how many paths were asked, so its time is never unnamed.
         let _span = tracing::info_span!(
@@ -166,23 +166,137 @@ impl Began {
         .entered();
         let files = traced.files.iter().map(|(path, answer)| (path, *answer));
         let dirs = traced.dirs.iter().map(|(path, _)| (path, Some(DIRECTORY)));
-        files.chain(dirs).any(|(path, answer)| self.path_moved(path, answer))
+        files.chain(dirs).find_map(|(path, answer)| self.path_moved(path, answer))
     }
 
-    fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>) -> bool {
-        let Some(names) = names(path, answer) else { return true };
+    fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>) -> Option<Moved> {
+        let Some(names) = names(path, answer) else {
+            tracing::info!(
+                target: "blaze",
+                read = %path.display(),
+                "a run's read is taken as changed since the run began: the names its answer rests on can't be told"
+            );
+            // alloc: once per run not kept, the path its line names
+            return Some(Moved { read: path.to_path_buf(), at: path.to_path_buf(), why: MovedWhy::Untold });
+        };
         let dirs = blaze_vfs::outside::dirs();
-        names.iter().any(|name| {
-            !dirs.name_unchanged_since(name, self.generation) && stamped_since(name, self.wall_ns)
+        let last = names.len() - 1; // `names` ends with the name the path leads to
+        names.iter().enumerate().find_map(|(n, name)| {
+            if dirs.name_unchanged_since(name, self.generation) {
+                return None;
+            }
+            let at = stamped_since(name, self.wall_ns)?;
+            let why = MovedWhy::of(path, name, n == last, at);
+            tracing::info!(
+                target: "blaze",
+                read = %path.display(),
+                at = %at.display(),
+                why = why.word(),
+                "a run's read is taken as changed since the run began: no watch vouches for it, and this name's stamp can share a tick with the run's start or is after it, or it can't be asked"
+            );
+            // alloc: once per run not kept, the paths its line names
+            Some(Moved { read: path.to_path_buf(), at: at.to_path_buf(), why })
         })
     }
 }
 
-/// Whether `name` (with no link in it, as [`names`] gives it) or a directory above it last
-/// changed within [`RACY_NS`] of `since_ns` or after it. A name that is not there is a name
-/// whose removal its directory's stamp says; one that can't be `stat`ed has moved.
-fn stamped_since(name: &Path, since_ns: i128) -> bool {
-    name.ancestors().any(|at| match std::fs::symlink_metadata(at) {
+/// What a run read that can have changed since it began ([`Began::moved`]): the one answer
+/// to "what moved", for a build script's run kept under no key and a test's pass not kept
+/// alike, each saying it in its own words ([`Moved::said`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Moved {
+    /// The path the run read, as its trace names it.
+    pub read: PathBuf,
+    /// The name whose stamp says it can have changed: `read` itself for [`MovedWhy::Itself`]
+    /// and [`MovedWhy::Untold`].
+    pub at: PathBuf,
+    /// How `at` stands to `read`.
+    pub why: MovedWhy,
+}
+
+/// How the name a stamp said moved stands to the path a run read ([`Moved`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MovedWhy {
+    /// The path read itself.
+    Itself,
+    /// A directory above the path read, in its own name.
+    Above,
+    /// A link the path read is named through.
+    Link,
+    /// What a link on the way to the path read leads to, or a directory above that.
+    Through,
+    /// The names the read's answer rests on can't be told (a path that is not absolute,
+    /// has `..` in it, more than [`MOST_LINKS`] links or a part that can't be read): it is
+    /// taken as changed.
+    Untold,
+}
+
+impl MovedWhy {
+    /// How `at`, the name [`stamped_since`] found of `name` (the last of [`names`] of `path`
+    /// when `last`), stands to `path`.
+    fn of(path: &Path, name: &Path, last: bool, at: &Path) -> MovedWhy {
+        if at == path {
+            MovedWhy::Itself
+        } else if !last && at == name {
+            MovedWhy::Link
+        } else if path.starts_with(at) {
+            MovedWhy::Above
+        } else {
+            MovedWhy::Through
+        }
+    }
+
+    /// As one word, for an event or a profile row.
+    pub fn word(self) -> &'static str {
+        match self {
+            MovedWhy::Itself => "itself",
+            MovedWhy::Above => "above",
+            MovedWhy::Link => "link",
+            MovedWhy::Through => "through",
+            MovedWhy::Untold => "untold",
+        }
+    }
+}
+
+impl Moved {
+    /// What moved, as a clause of a sentence about `who` (`the test`, `the run`): "/a/b,
+    /// above /a/b/c which it read, changed after the test began".
+    pub fn said<'a>(&'a self, who: &'a str) -> impl fmt::Display + 'a {
+        Said { moved: self, who }
+    }
+}
+
+struct Said<'a> {
+    moved: &'a Moved,
+    who: &'a str,
+}
+
+impl fmt::Display for Said<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Said { moved: Moved { read, at, why }, who } = self;
+        let (read, at) = (read.display(), at.display());
+        match why {
+            MovedWhy::Itself => write!(f, "{read} changed after {who} began"),
+            MovedWhy::Above => write!(f, "{at}, above {read} which it read, changed after {who} began"),
+            MovedWhy::Link => write!(f, "{at}, a link on the way to {read} which it read, changed after {who} began"),
+            MovedWhy::Through => {
+                write!(f, "{at}, reached through a link from {read} which it read, changed after {who} began")
+            }
+            MovedWhy::Untold => write!(
+                f,
+                "{read}, which it read, can't be told unchanged since {who} began: the links and \
+                 directories its name rests on can't be resolved"
+            ),
+        }
+    }
+}
+
+/// `name` (with no link in it, as [`names`] gives it) or the first directory above it that
+/// last changed within [`RACY_NS`] of `since_ns` or after it; `None` when none did. A name
+/// that is not there is a name whose removal its directory's stamp says; one that can't be
+/// `stat`ed has moved.
+fn stamped_since(name: &Path, since_ns: i128) -> Option<&Path> {
+    name.ancestors().find(|at| match std::fs::symlink_metadata(at) {
         Ok(meta) => Stamp::of(&meta).racy(since_ns),
         Err(error) => !missing(&error),
     })
@@ -1116,9 +1230,76 @@ mod tests {
         ];
         let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
         for traced in &asked {
-            assert!(began.moved(traced), "changed after the run began: {traced:?}");
-            assert!(!later.moved(traced), "the control: nothing changed after it began: {traced:?}");
+            assert!(began.moved(traced).is_some(), "changed after the run began: {traced:?}");
+            assert_eq!(later.moved(traced), None, "the control: nothing changed after it began: {traced:?}");
         }
+        drop(dir);
+    }
+
+    /// The invariant: what moved names the read and the name whose stamp says so, and how
+    /// the two stand: the file itself, a directory above it (here the parent of a missing
+    /// part, whose making that directory would hear), a link it is named through, and a path
+    /// whose names can't be told, which is taken as moved and said so. The control: a run
+    /// that began after all of it says nothing moved.
+    #[test]
+    fn what_moved_names_the_read_and_the_name_whose_stamp_says_so() {
+        let dir = TempDir::for_test("blaze-usercode-moved-said-");
+        // Canonical, so a link above the temporary directory (macOS's `/var`) is none of these.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let began = Began::now();
+        let file = root.join("file");
+        std::fs::write(&file, b"after").unwrap();
+        let read = |path: &Path, answer: Option<[u8; 32]>| blaze_core::Traced {
+            files: vec![(path.to_path_buf(), answer)],
+            ..blaze_core::Traced::default()
+        };
+        let moved = |read: &Path, at: &Path, why: MovedWhy| Moved { read: read.to_path_buf(), at: at.to_path_buf(), why };
+
+        let itself = began.moved(&read(&file, Some([1; 32])));
+        assert_eq!(itself, Some(moved(&file, &file, MovedWhy::Itself)));
+        assert_eq!(
+            itself.unwrap().said("the test").to_string(),
+            format!("{} changed after the test began", file.display())
+        );
+
+        // `root/none` is not there: its name is the one that would be made, which `root`'s
+        // stamp says, and `root` was just made.
+        let below = root.join("none/below");
+        let above = began.moved(&read(&below, None));
+        assert_eq!(above, Some(moved(&below, &root, MovedWhy::Above)));
+        assert_eq!(
+            above.unwrap().said("the test").to_string(),
+            format!("{}, above {} which it read, changed after the test began", root.display(), below.display())
+        );
+
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            let through = link.join("file");
+            assert_eq!(began.moved(&read(&through, Some([1; 32]))), Some(moved(&through, &link, MovedWhy::Link)));
+        }
+
+        for untold in [Path::new("relative/file"), Path::new("/a/../b")] {
+            let said = began.moved(&read(untold, Some([1; 32])));
+            assert_eq!(said, Some(moved(untold, untold, MovedWhy::Untold)));
+            let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+            assert_eq!(later.moved(&read(untold, Some([1; 32]))), said, "untold is never taken as still");
+        }
+
+        // How a name stands to the read, for a file that is there: a directory above it whose
+        // stamp moved while the file's did not, and what a link on its way leads to.
+        let (c, f) = (Path::new("/a/b/c"), Path::new("/a/l/f"));
+        assert_eq!(MovedWhy::of(c, c, true, Path::new("/a/b")), MovedWhy::Above);
+        assert_eq!(MovedWhy::of(c, c, true, c), MovedWhy::Itself);
+        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), false, Path::new("/a/l")), MovedWhy::Link);
+        assert_eq!(MovedWhy::of(f, Path::new("/a/l"), false, Path::new("/a")), MovedWhy::Above);
+        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x/f")), MovedWhy::Through);
+        assert_eq!(MovedWhy::of(f, Path::new("/x/f"), true, Path::new("/x")), MovedWhy::Through);
+
+        let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+        assert_eq!(later.moved(&read(&file, Some([1; 32]))), None, "the control");
+        assert_eq!(later.moved(&read(&below, None)), None, "the control");
         drop(dir);
     }
 
