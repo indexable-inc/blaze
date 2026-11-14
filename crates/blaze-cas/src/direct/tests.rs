@@ -3,8 +3,9 @@
 //! and every answer [`Direct`] gives is checked against what was put.
 //!
 //! The planted bugs ([`Plant`]) are the oracle's controls: a batch's values placed back in disk
-//! order, a record taken with no check, and a run read one byte short. Each has a directed plan
-//! the oracle must refuse.
+//! order, a record taken with no check, a run read one byte short, a chunked value's chunks put
+//! together out of order, and a file of its own put over its neighbour's place. Each has a
+//! directed plan the oracle must refuse.
 
 use std::collections::BTreeMap;
 
@@ -12,7 +13,7 @@ use blaze_core::{
     Effect, FileName, run_until_idle,
     sim::{Faults, Rng, Sim},
 };
-use blaze_sim::Config as SimConfig;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 use crate::{Config, Kind, Store};
@@ -366,16 +367,63 @@ fn map_one(sim: &mut Sim, direct: &mut Direct, model: &BTreeMap<u64, State>, n: 
     }
 }
 
+/// The property's body: a drawn seed and plan, run with no bug planted.
+fn answers_what_was_put(tape: &Tape) {
+    let seed: u64 = tape.next_u64("sim seed");
+    let ops: Vec<u16> = tape.vec(0..=80, "ops", |tape| tape.int::<u16>("op"));
+    let ops: Vec<Op> = ops.into_iter().map(Op::decode).collect();
+    if let Err(why) = run(seed, &ops, Plant::None) {
+        panic!("seed {seed}: {why}\nops: {ops:?}");
+    }
+}
+
 #[test]
 fn the_direct_reader_answers_what_was_put() {
-    blaze_sim::check(SimConfig::cases(200), |tape| {
-        let seed: u64 = tape.next_u64("sim seed");
-        let ops: Vec<u16> = tape.vec(0..=80, "ops", |tape| tape.int::<u16>("op"));
-        let ops: Vec<Op> = ops.into_iter().map(Op::decode).collect();
-        if let Err(why) = run(seed, &ops, Plant::None) {
-            panic!("seed {seed}: {why}\nops: {ops:?}");
+    blaze_sim::check(SimConfig::cases(200), answers_what_was_put);
+}
+
+/// The case the search found: keys 15 and 23, each a file of its own once flushed, read in one
+/// batch, where the first's place came to cover the second's bytes.
+#[test]
+fn the_direct_reader_answers_what_was_put_in_the_found_case() {
+    answers_what_was_put(&Tape::replay(&[
+        1, 1, 6, 12, 1, 5, 0, 0, 1, 6, 7405, 1, 6, 12, 1, 6, 44, 1, 6, 38256, 1, 6, 22640, 1, 6, 405, 1, 0, 4,
+        12,
+    ]));
+}
+
+/// Plans whose one batch holds a value kept as a file of its own (keys 7, 15 and 23) beside a
+/// neighbour: another such file, or a value of another form (key 14 short noise kept raw, key 3
+/// an output kept in chunks). A file of its own stands in the first round as a place of no
+/// bytes, at the same position as the answer after it.
+fn neighbours_of_files() -> [Vec<Op>; 6] {
+    let batch = |keys: &[u64]| {
+        let mut ops: Vec<Op> = keys.iter().map(|n| Op::Put(*n)).collect();
+        ops.push(Op::Flush);
+        ops.push(Op::ReadMany(keys.to_vec()));
+        ops
+    };
+    [batch(&[7, 15]), batch(&[7, 15, 23]), batch(&[7, 14]), batch(&[14, 7]), batch(&[7, 3]), batch(&[3, 7])]
+}
+
+/// The invariant: a batch that holds neighbouring values kept as files of their own, or such a
+/// file beside a value of another form, hands each key its own bytes, under every seed.
+#[test]
+fn a_batch_hands_each_file_of_its_own_its_own_bytes() {
+    for ops in neighbours_of_files() {
+        for seed in 0..16 {
+            if let Err(why) = run(seed, &ops, Plant::None) {
+                panic!("seed {seed}: {why}\nops: {ops:?}");
+            }
         }
-    });
+    }
+}
+
+#[test]
+fn the_oracle_catches_a_file_put_over_its_neighbour() {
+    let [files, _, file_then_raw, ..] = neighbours_of_files();
+    control(&files, Plant::StrictlyAfter);
+    control(&file_then_raw, Plant::StrictlyAfter);
 }
 
 /// Each control's plan passes with no bug planted and is refused with it, under every seed.
