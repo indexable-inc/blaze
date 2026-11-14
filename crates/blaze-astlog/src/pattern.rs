@@ -16,7 +16,7 @@ use blaze_hash::HashMap;
 use std::alloc::Global;
 use syntax::{
     Edition, Parse, SourceFile, SyntaxKind, TextRange, TextSize, WalkEvent,
-    view::{self as ast, NodeId},
+    view::{self as ast, AstNode as _, NodeId},
 };
 
 use crate::error::{Error, PatternParseSnafu, PatternShapeSnafu};
@@ -477,7 +477,8 @@ impl<'t> Cx<'_, '_, 't> {
 
 /// A type pattern for `type-matches`: `_`, `$name`, a def path with generic arguments
 /// (`core::result::Result<_, $e>`), a single name with or without them (`Vec<$a>`, `u32`,
-/// `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, a slice or an array. A single name the std
+/// `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, a slice or an array whose length is a number
+/// or `_` (any length). A single name the std
 /// prelude names is that item, resolved; a builtin type's name is that type; any other single
 /// name matches a type of that name, by text.
 pub struct TypePattern {
@@ -510,7 +511,34 @@ pub enum TypeShape<'p> {
     Ref { mutable: bool, inner: ast::Node<'p> },
     Tuple(Vec<ast::Node<'p>>),
     Slice(ast::Node<'p>),
-    Array(ast::Node<'p>),
+    Array(ast::Node<'p>, Length),
+}
+
+/// What an array pattern asks of the array's length.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Length {
+    /// `_`: any length, one the front end evaluates or not (`[T; N]` in a generic fn).
+    Any,
+    /// A number: that length, evaluated.
+    Is(u128),
+}
+
+/// The length an array pattern's `; N` asks for: `_` or an integer literal.
+fn length(arg: ast::Node<'_>) -> Option<Length> {
+    let expr = match arg.kind() {
+        SyntaxKind::CONST_ARG => arg.children().next()?,
+        _ => arg,
+    };
+    if expr.kind() == SyntaxKind::UNDERSCORE_EXPR {
+        return Some(Length::Any);
+    }
+    match ast::Literal::cast(expr)?.kind() {
+        ast::LiteralKind::IntNumber(number) => match number.value() {
+            Ok(value) => Some(Length::Is(value)),
+            Err(_) => None,
+        },
+        _ => None,
+    }
 }
 
 impl TypePattern {
@@ -543,7 +571,7 @@ impl TypePattern {
                 Ok(TypeShape::Def(_, args) | TypeShape::Named { args, .. } | TypeShape::Tuple(args)) => {
                     stack.extend(args);
                 }
-                Ok(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner)) => {
+                Ok(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner, _)) => {
                     stack.push(inner);
                 }
                 Ok(TypeShape::Wild | TypeShape::Var(_) | TypeShape::Builtin(_) | TypeShape::Never) => {}
@@ -598,10 +626,20 @@ impl TypePattern {
                 Some(inner) => Ok(TypeShape::Slice(inner)),
                 None => Err(format!("`{text}` has no element type: write `[T]`")),
             },
-            SyntaxKind::ARRAY_TYPE => match node.children().next() {
-                Some(inner) => Ok(TypeShape::Array(inner)),
-                None => Err(format!("`{text}` has no element type: write `[T; N]`")),
-            },
+            SyntaxKind::ARRAY_TYPE => {
+                let mut children = node.children();
+                let (Some(inner), Some(len)) = (children.next(), children.next()) else {
+                    return Err(format!("`{text}` has no element type or no length: write `[T; 4]` or `[T; _]`"));
+                };
+                match length(len) {
+                    Some(length) => Ok(TypeShape::Array(inner, length)),
+                    None => Err(format!(
+                        "`{}` in `{text}` is a length `type-matches` does not evaluate: write the \
+                         length as a number or `_`",
+                        len.text()
+                    )),
+                }
+            }
             SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::DYN_TRAIT_TYPE => Err(format!(
                 "`{text}` names a trait, not one type: match the type with `$t` and add \
                  `(implements t \"krate::Trait\")`"

@@ -25,7 +25,7 @@ use syntax::{
 };
 
 use crate::error::{CfgUnreadSnafu, DefPathSnafu, Error, WrongValueSnafu};
-use crate::pattern::{Bound, Pattern, TypePattern, TypeShape, node_at};
+use crate::pattern::{Bound, Length, Pattern, TypePattern, TypeShape, node_at};
 use crate::program::{Atom, Blaze, Enclosing, Filter};
 
 /// A value of blaze's rules.
@@ -639,9 +639,16 @@ impl<'a, F: Files> Sema<'a, F> {
                 Some(elem) => self.type_matches(pattern, inner, elem, out)?,
                 None => false,
             },
-            TypeShape::Array(inner) => match ty.as_array(db) {
-                Some((elem, _)) => self.type_matches(pattern, inner, elem, out)?,
+            TypeShape::Array(inner, Length::Any) => match ty.as_array_element(db) {
+                Some(elem) => self.type_matches(pattern, inner, elem, out)?,
                 None => false,
+            },
+            // A length the front end cannot evaluate (`[T; N]`) is no length a number names.
+            TypeShape::Array(inner, Length::Is(want)) => match ty.as_array(db) {
+                Some((elem, len)) if u128::try_from(len).is_ok_and(|len| len == want) => {
+                    self.type_matches(pattern, inner, elem, out)?
+                }
+                _ => false,
             },
         })
     }
