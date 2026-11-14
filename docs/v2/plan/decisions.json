@@ -326,6 +326,22 @@
    "why": "Decided by the owner, 2026-11-13 15:59 (/Volumes/Projects/blaze-int-1112-notes/target-decisions-1113.md, \"Scope, as the owner answered it\"), with his words that day: \"10% of floor should AIM for the right thing from the start! it is ok if we don't get there but think properly; just work for something you are highly proud of even on first try likely and then iterate\" and \"always make sure what you build is something you are proud of ... on first iteration even\".",
    "recommended": "Yes, as the owner's decision; recorded by claude-opus-5-5.",
    "state": "rules and AGENTS.md regenerated on fix-hello-1113 by claude-opus-5-5, not committed"
+  },
+  {
+   "id": "D37",
+   "date": "2026-11-13",
+   "decision": "For sans-IO code, a Lean proof takes the place of the deterministic-simulation test: once Lean has checked an invariant's proof in the gate, the test that stood for it is deleted. This reverses \"DST stays the requirement\" of docs/v2/plan/design/formal-verification.md for code the translator reads. What a proof does not cover keeps a test: one conformance test per world model against each real driver, and a run of each translated function as its Lean model and as built code on the same drawn inputs until the translation is proved.",
+   "why": "Decided by the owner, 2026-11-13 20:17: \"can we make a system so that we can remove these DST stuff and formally verify? ... if things are jank u can imprvoe the lean/ formal veification system this is for dog fooding ... this should be useable by anyone instead of doing dst :) for anything sans io rust\".",
+   "recommended": "Yes, as the owner's decision; recorded by claude-fable-5-2. The residual tests are my reading of what the proof leaves out, not his words.",
+   "state": "design written and reviewed from outside the work on proofs-1113 (docs/v2/plan/design/proofs-for-sans-io.md); ledger rows V12 to V16; nothing proved yet"
+  },
+  {
+   "id": "D38",
+   "date": "2026-11-13",
+   "decision": "How D37 is built. (1) A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its Lean statement is total correctness (for every argument it returns `true`, and returns). (2) A state machine is proved a step at a time over a well-formedness predicate written in Rust, and one Lean lemma gives every run. (3) A world is a Rust predicate `allows(asked, answer)` with `apply`, not a script of choices and not a kernel model written by hand in Lean. (4) Both Lean packages move from 4.20.0 to 4.35.0. (5) `blaze prove` is its own command; generated models are build outputs, and the tree holds proofs.",
+   "why": "claude-fable-5-2, main agent. (1) cargo still builds blaze's crates, so they cannot carry clause syntax, and a property test and a theorem are then one function. (1) to (3) as changed by an outside review the same evening (an Opus 5.5 advise agent given the spec and the code): a statement that let a non-returning core pass would prove less than the test it replaces; a choice script proves nothing about the answers it cannot produce; a per-step goal is what automation closes. (4) 4.35.0 ships grind, mvcgen with Std.Do, and verified maps; the move cost three String API fixes and renames.",
+   "recommended": "Yes.",
+   "state": "(4) done on proofs-1113 at 3fbdf507af (lake build of lean/ exit 0 with no warning; lean/analysis exit 0); the attribute and methods in the translator written, not landed; the rest not started"
   }
  ]
 }
