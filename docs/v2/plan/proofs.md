@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-98 theorems: 85 in `lean`, 13 in `lean/analysis`.
+100 theorems: 87 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -934,6 +934,29 @@ theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
 ```lean
 theorem blaze_core.world.clock.a_timer_never_fires_early.spec.proof :
     blaze_core.world.clock.a_timer_never_fires_early.spec.statement
+```
+
+**`BlazeCore.World.DiskAllows.allows_orders`** (`BlazeCore.World.DiskAllows`, `lean`): Of the disk world's model as the translator emits it from disk.rs: a cut `Disk::allows` accepts has one share per file, and if it keeps, whole or in part, a change of any file made after a barrier of any file completed, it keeps whole every change that barrier covers.
+
+```lean
+theorem allows_orders (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) (H : Disk.allows fuel d cut = Result.ok true) :
+    cut.val.length = d.files.val.length ∧
+      ∀ j1 (h1 : j1 < d.files.val.length) (h1c : j1 < cut.val.length)
+        j2 (h2 : j2 < d.files.val.length) (h2c : j2 < cut.val.length),
+        ∀ b ∈ (d.files.val[j1]).barriers.val,
+        ∀ c (hc : c < (d.files.val[j2]).changes.val.length),
+          c < reachOf d.files.val[j2] cut.val[j2] →
+          b.epoch.val < ((d.files.val[j2]).changes.val[c]).epoch.val →
+          b.covers.val ≤ (cut.val[j1]).whole.val
+```
+
+**`BlazeCore.World.DiskAllows.allows_total`** (`BlazeCore.World.DiskAllows`, `lean`): `Disk::allows` neither panics nor runs out of fuel, for every disk and every cut.
+
+```lean
+theorem allows_total (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) :
+    ∃ b, Disk.allows fuel d cut = Result.ok b
 ```
 
 ## V15
