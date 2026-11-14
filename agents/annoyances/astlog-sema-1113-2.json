@@ -9,6 +9,6 @@
  "class": "a read-only job that consumes kept state it did not change",
  "prevention": "a read-only job hands the front end back to its root when it ends, and a serve test counts lowerings across two queries of one unchanged view",
  "workaround": "none short of running `blaze check` before each query",
- "fix": "not yet: follow-up branch astlog-daemon-1113",
+ "fix": "not built: handing the front end back correctly needs Steps::store_kept. A query that lowered from nothing (the repeated 4.2 s case) leaves a front end whose store state is Stored::No, and Jobs::lower refuses to lower into such a one (unit.rs lower: what its build left for the store was never written, rule 3). The design for a follow-up: a Query ends as a build does after its answer, writer.keep() then Jobs::store_kept on an idle plane request, so stored_kept gives the front end back to roots.fronts; its proof is a serve test counting lowerings across two queries of one view, a test that an edit between them lowers again, and the store's durability tests, since that path is the durable one. Carrying a check's Stored::Sealed through a query without a store is not shown correct: the query's applied-units build can add outcomes and served deps (KeptParts later, seeds, deps) that only a store writes. A dry-run edit (Request::Edit with no head) reads the view without committing and could end the same way; not built.",
  "state": "open"
 }

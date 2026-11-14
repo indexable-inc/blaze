@@ -9,6 +9,6 @@
  "class": "a store read made on the loop outside the Lender",
  "prevention": "one entry point for a loop-side apply that lends the driver and the frame, and a serve test whose fake writer checks it runs in a frame when applied on the loop",
  "workaround": "run `blaze check` once on that home first",
- "fix": "not yet: follow-up branch astlog-daemon-1113",
- "state": "open"
+ "fix": "2b9f16c91c on astlog-daemon-1113: Jobs::units_applied sends a write still waiting at the build's end to a write's task (Jobs::send_write, as apply_writes sends every other) and ends the build when the writer comes back; a write that broke on its task fails the job naming the view. The loop applies nothing, so no apply runs outside a frame. The Lender (`w.reads.lend(|| writer.apply())`) was not taken: it gives a frame but keeps the apply on the loop, against the_loop_applies_no_front_end_write_over_many_seeds. Test: a_query_applies_its_views_writes_on_a_write_task_in_a_frame_over_many_seeds (32 seeds, no apply on the loop or outside a frame); control, the send removed: seeds 12, 21 and 26 apply on the loop in no frame. The real home did not reproduce on clones at another path with the base debug binary (0 of 4 requests), so the before/after on a real store is not shown.",
+ "state": "fixed"
 }
