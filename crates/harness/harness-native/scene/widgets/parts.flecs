@@ -98,3 +98,28 @@ hn {
     }
   }
 }
+
+// Hover help is drawn by Harness. Neither this plate nor its words are hover targets; the
+// source control keeps the pointer even when placement must slide the card over it.
+@tree ChildOf
+hn {
+  prefab HoverHelp : ui.Column {
+    Placed
+    Windowed
+    Clip
+    Layer: {level: Overlay}
+    Fill: $tone_raised
+    Edge: {dark: $tone_line_strong.dark, light: $tone_line_strong.light}
+    Shape: {radius: $menu_radius, n: 4, border: 1, feather: 0}
+    Side: {edge: Bottom, dx: $tooltip_offset, dy: $tooltip_offset, align: Start}
+    Flex: {axis: Column, gap: $tooltip_gap, align: Stretch, justify: Start, wrap: false}
+    Size: {w: {kind: Fit, value: 0, min: 0, max: $tooltip_max_w}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+    Padding: {l: $tooltip_pad_x, r: $tooltip_pad_x, t: $tooltip_pad_y, b: $tooltip_pad_y}
+    title : ui.Words, Strong {
+      TextStyle: {size: $size_body, line: $line_menu, role: 0, bold: 1, weight: $weight_label}
+    }
+    detail : ui.Words, Muted {
+      TextStyle: {size: $size_menu_meta, line: $line_menu, role: 0, bold: 0}
+    }
+  }
+}

@@ -45,6 +45,7 @@ mod row_menu;
 mod side_drag;
 mod sidebar;
 mod stats;
+mod tooltip;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
 mod world;
@@ -351,6 +352,8 @@ pub struct App {
     browser: browser::Browser,
     /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
     row_menu: Option<row_menu::RowMenu>,
+    /// The one themed hover-help card and its event-driven dwell (app/tooltip.rs).
+    hover_help: tooltip::HoverHelp,
 }
 
 /// The fill of the theme's role `name` (`success`: `hn.Theme.success`).
@@ -650,6 +653,7 @@ impl App {
             look,
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
+            hover_help: tooltip::HoverHelp::default(),
             maps: Vec::new(), // alloc: empty until a cell draws a Map
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
             row_menu: None,
@@ -666,17 +670,6 @@ impl App {
         };
         app.set_stats(stats);
         Ok(app)
-    }
-
-    /// The tooltip of the node under the pointer (or the nearest ancestor that has one); empty for none.
-    pub fn tooltip(&self) -> String {
-        let w = self.world.world_ref();
-        let Some(t) = w.entity_named(APP).target(Hovered::id(), 0) else { return String::new() };
-        std::iter::successors(Some(t), |n| n.parent())
-            .take(6)
-            .find_map(|n| n.try_cloned::<&harness_native_ui_input_api::Tooltip>())
-            .map(|t| t.text.as_str().to_owned())
-            .unwrap_or_default()
     }
 
     pub fn zoom(&self) -> f32 {
@@ -1160,7 +1153,7 @@ impl App {
                         }
                     }
                     let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
-                    for (part, page, tip) in [("label", "model", "Choose model · ⌘/"), ("effort", "effort", "Thinking effort · click or swipe to change")] {
+                    for (part, page) in [("label", "model"), ("effort", "effort")] {
                         if let Some(control) = controls.part(part) {
                             let active = editable && (part != "effort" || profile_effort.is_some());
                             if active {
@@ -1169,7 +1162,16 @@ impl App {
                                 control.entity().remove(harness_native_ui_input_api::Pressable::id());
                                 control.action("");
                             }
-                            control.set(harness_native_ui_input_api::Tooltip { text: if active { format!("{profile_tip}\n{tip}") } else { format!("{profile_tip}\nRead-only transcript") }.as_str().into() });
+                            let mut lines = profile_tip.lines();
+                            let model = lines.next().unwrap_or(&profile);
+                            let effort = profile_tip.lines().find(|line| line.ends_with("thinking effort"));
+                            let description = if part == "effort" {
+                                format!("{}\n{model}", effort.unwrap_or("Thinking effort"))
+                            } else {
+                                profile_tip.lines().filter(|line| !line.ends_with("thinking effort")).collect::<Vec<_>>().join("\n")
+                            };
+                            let hint = if !active { "Read-only transcript" } else if part == "effort" { "Click to choose · swipe to adjust" } else { "Choose model · ⌘/" };
+                            control.set(harness_native_ui_input_api::Tooltip { text: format!("{description}\n{hint}").as_str().into() });
                         }
                     }
                 }
@@ -2150,6 +2152,13 @@ impl App {
         }
         self.forward_clicks();
         self.actions();
+        if self.sync_tooltip(dt) {
+            // A hover card shapes only when its source changes; settle its wrapping before this frame paints it.
+            for _ in 0..3 {
+                self.typeset();
+                self.progress(0.0);
+            }
+        }
         harness_native_ui_input::end_frame(self.world.world_ref());
         self.pointer.went_down = false;
         self.pointer.went_up = false;
