@@ -61,6 +61,7 @@
 //!     int_wrapping:
 //!     int_overflow: non_zero, from, result, option, iterator
 //!     int_cast: from
+//!     int_methods: int_overflow, int_wrapping
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -70,7 +71,9 @@
 //!     non_null: pat
 //!     non_zero: pat, transmute, option, copy
 //!     option: panic
+//!     option_methods: option, result, default
 //!     ord: eq, option
+//!     ord_methods: ord
 //!     panic: fmt
 //!     panic_location: panic
 //!     pat: panic
@@ -1471,7 +1474,36 @@ pub mod cmp {
 
     pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
         fn cmp(&self, other: &Self) -> Ordering;
+        // region:ord_methods
+        fn max(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn min(self, _other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        fn clamp(self, _min: Self, _max: Self) -> Self
+        where
+            Self: Sized,
+        {
+            loop {}
+        }
+        // endregion:ord_methods
     }
+
+    // region:ord_methods
+    pub fn max<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    pub fn min<T: Ord>(_v1: T, _v2: T) -> T {
+        loop {}
+    }
+    // endregion:ord_methods
 
     pub enum Ordering {
         Less = -1,
@@ -1849,6 +1881,20 @@ pub mod option {
         pub fn and<U>(self, _optb: Option<U>) -> Option<U> {
             loop {}
         }
+        // region:option_methods
+        pub fn take(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn replace(&mut self, _value: T) -> Option<T> {
+            loop {}
+        }
+        pub fn unwrap_or_default(self) -> T
+        where
+            T: crate::default::Default,
+        {
+            loop {}
+        }
+        // endregion:option_methods
         pub fn unwrap_or(self, default: T) -> T {
             match self {
                 Some(val) => val,
@@ -1903,6 +1949,14 @@ pub mod result {
             }
         }
         // endregion:reach
+        // region:option_methods
+        pub const fn is_err(&self) -> bool {
+            loop {}
+        }
+        pub fn err(self) -> crate::option::Option<E> {
+            loop {}
+        }
+        // endregion:option_methods
         pub const fn or<F>(self, res: Result<T, F>) -> Result<T, F> {
             match self {
                 Ok(v) => Ok(v),
@@ -3092,6 +3146,86 @@ macro_rules! impl_int_abs {
 
 impl_int_abs! { isize i8 i16 i32 i64 i128 }
 // endregion:int_overflow
+
+// region:int_methods
+// The integer methods `hir-ty-lean` models, as stubs: their bodies are never read.
+macro_rules! impl_int_methods {
+    ($($t:ty, $bytes:literal;)*) => {
+        $(
+            impl $t {
+                pub const BITS: u32 = $bytes * 8;
+                pub const fn leading_zeros(self) -> u32 { loop {} }
+                pub const fn trailing_zeros(self) -> u32 { loop {} }
+                pub const fn count_ones(self) -> u32 { loop {} }
+                pub const fn count_zeros(self) -> u32 { loop {} }
+                pub const fn reverse_bits(self) -> Self { loop {} }
+                pub const fn swap_bytes(self) -> Self { loop {} }
+                pub const fn rotate_left(self, _n: u32) -> Self { loop {} }
+                pub const fn rotate_right(self, _n: u32) -> Self { loop {} }
+                pub const fn saturating_mul(self, _rhs: Self) -> Self { loop {} }
+                pub const fn saturating_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn wrapping_neg(self) -> Self { loop {} }
+                pub const fn wrapping_shl(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_shr(self, _rhs: u32) -> Self { loop {} }
+                pub const fn wrapping_div(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_rem(self, _rhs: Self) -> Self { loop {} }
+                pub const fn wrapping_pow(self, _exp: u32) -> Self { loop {} }
+                pub const fn checked_div(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_rem(self, _rhs: Self) -> crate::option::Option<Self> { loop {} }
+                pub const fn checked_pow(self, _exp: u32) -> crate::option::Option<Self> { loop {} }
+                pub const fn overflowing_sub(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn overflowing_mul(self, _rhs: Self) -> (Self, bool) { loop {} }
+                pub const fn is_multiple_of(self, _rhs: Self) -> bool { loop {} }
+                pub const fn to_le_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_be_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn to_ne_bytes(self) -> [u8; $bytes] { loop {} }
+                pub const fn from_le_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                pub const fn from_be_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // region:!int_impl
+                pub const fn from_ne_bytes(_bytes: [u8; $bytes]) -> Self { loop {} }
+                // endregion:!int_impl
+            }
+        )*
+    }
+}
+
+impl_int_methods! {
+    usize, 8; u8, 1; u16, 2; u32, 4; u64, 8; u128, 16;
+    isize, 8; i8, 1; i16, 2; i32, 4; i64, 8; i128, 16;
+}
+
+macro_rules! impl_uint_methods {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn is_power_of_two(self) -> bool { loop {} }
+                pub const fn next_power_of_two(self) -> Self { loop {} }
+                pub const fn div_ceil(self, _rhs: Self) -> Self { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_uint_methods! { usize u8 u16 u32 u64 u128 }
+
+macro_rules! impl_sint_methods {
+    ($($t:ty => $u:ty;)*) => {
+        $(
+            impl $t {
+                pub const fn unsigned_abs(self) -> $u { loop {} }
+                pub const fn abs_diff(self, _other: Self) -> $u { loop {} }
+                pub const fn signum(self) -> Self { loop {} }
+                pub const fn wrapping_abs(self) -> Self { loop {} }
+            }
+        )*
+    }
+}
+
+impl_sint_methods! {
+    isize => usize; i8 => u8; i16 => u16; i32 => u32; i64 => u64; i128 => u128;
+}
+// endregion:int_methods
 
 // region:int_bounds
 macro_rules! impl_int_bounds {

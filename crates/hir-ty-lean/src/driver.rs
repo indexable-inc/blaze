@@ -430,24 +430,7 @@ impl Proofs {
     /// per Rust module, each segment in upper camel case, `Lib` for the crate's root:
     /// `blaze_graph::ledger::fnv1a_from` is proved in `BlazeGraph.Ledger`.
     pub fn file_of(&self, path: &[String]) -> ProofFile {
-        let camel = |segment: &String| -> String {
-            segment
-                .split('_')
-                .map(|word| {
-                    let mut chars = word.chars();
-                    match chars.next() {
-                        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
-                        None => String::new(),
-                    }
-                })
-                .collect()
-        };
-        let modules = &path[..path.len().saturating_sub(1)];
-        let mut segments: Vec<String> = modules.iter().map(camel).collect();
-        if segments.len() <= 1 {
-            segments.push("Lib".to_owned());
-        }
-        ProofFile { root: self.root.clone(), module: segments.join(".") }
+        ProofFile { root: self.root.clone(), module: crate::plan::proof_module(&path.join("::")) }
     }
 }
 

@@ -149,10 +149,28 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 Proved means what formal-verification.md says: the kernel accepts it, no `sorry`, only
 Lean's three axioms.
 
-Lean runs what a proof file says (a tactic can do IO), so it runs in blaze's sandbox, with a
-deadline, like a build script (`sandbox-everything`). Today hir-ty-lean's driver spawns Lean
-itself with neither: it becomes a sans-IO core that hands back the files to write and the
-command to run, and the daemon runs it. Until then `blaze prove` is for blaze's own tree.
+**How Lean is run.** The check has a sans-IO core and a driver, as everything does
+(`sans-io-cores`):
+
+- *The plan* (`hir_ty_lean::plan`) is pure. From the theorems of one crate and the text of
+  its proof files it gives the files to write and the runs of Lean to make, each after the
+  runs it imports from, and from what each run printed it gives each theorem's verdict.
+  Each run has a key over the Lean release, its module's text and the keys of the runs it
+  imports from (`keys-cover-every-input`). One proof file may prove many theorems; the
+  library is one set of runs for every crate.
+- *The driver* is a run of the daemon's loop, as a build script's is: each step is an
+  `Effect::Spawn` of Lean in blaze's sandbox, reading the Lean toolchain and reading and
+  writing blaze's own directory, with no network, under a deadline (a timer; past it the
+  process is killed and the theorem is `Open`, naming the module). Steps that do not
+  import from each other run at once. A proof file's tactics can do IO, so nothing here
+  runs outside the sandbox (`sandbox-everything`).
+- *Lean reads what blaze keyed.* The proof files are written into blaze's directory from
+  the texts the plan was given; Lean never reads the checkout, which may have changed since.
+- *Nothing is checked twice.* The driver keeps each accepted run's output under its key; a
+  step whose key it holds is not run. The floor of `blaze prove` on an unchanged tree is to
+  run Lean not at all; its cost above that is one key lookup a step. After an edit to one
+  function it is the runs whose keys moved: that function's model, the proof files that
+  import it and their checks.
 
 Generated models are build outputs, keyed by the function's code identity
 (`outputs-are-records`); the tree holds the proofs and, per theorem, the hash of the

@@ -125,6 +125,20 @@ theorem checked_spec (x : Int) :
       (fun r => r.val = a.val * b.val) epost :=
   checked_spec _
 
+/-- `a << b` succeeds when the shift is less than the width; with the product in range no bit
+is lost and it is `a * 2 ^ b`. (A shift that drops bits is `wrap` of the product: unfold `shl`
+for it.) -/
+@[spec] theorem shl_spec {ty' : ScalarTy} (a : Scalar ty) (b : Scalar ty') :
+    Triple (shl a b)
+      ((0 ≤ b.val ∧ b.val < (ty.bits : Int)) ∧
+        ty.min ≤ a.val * 2 ^ b.val.toNat ∧ a.val * 2 ^ b.val.toNat ≤ ty.max)
+      (fun r => r.val = a.val * 2 ^ b.val.toNat) epost := by
+  constructor
+  intro h
+  unfold shl
+  rw [ite_eq_left h.1]
+  exact wrap_val ty _ h.2
+
 /-- `a / b` succeeds with the quotient toward zero when `b` is not zero and the quotient is in
 range (it is not, for `MIN / -1`). -/
 @[spec] theorem div_spec (a b : Scalar ty) :
@@ -181,6 +195,21 @@ grind_pattern val_le_max => x.val
 @[grind inj] theorem val_injective : Function.Injective (val (ty := ty)) := fun _ _ => ext
 
 end Scalar
+
+/-- A power of two is at least one; `grind` learns it from each one it sees, so a shift's
+`a * 2 ^ n` is bounded below. -/
+theorem one_le_two_pow (n : Nat) : (1 : Int) ≤ 2 ^ n := by
+  have h : (0 : Int) < 2 ^ n := Int.pow_pos (by decide)
+  omega
+grind_pattern one_le_two_pow => (2 : Int) ^ n
+
+/-- Powers of two grow with the exponent: the bound a shift by a bounded amount needs
+(`two_pow_le n 20`, with `n ≤ 20`, bounds `2 ^ n` by `2 ^ 20`). Given as a hypothesis where it
+is needed: `grind` cannot guess the larger exponent. -/
+theorem two_pow_le (n m : Nat) (h : n ≤ m) : (2 : Int) ^ n ≤ 2 ^ m := by
+  have h' : ((2 ^ n : Nat) : Int) ≤ ((2 ^ m : Nat) : Int) :=
+    Int.ofNat_le.mpr (Nat.pow_le_pow_right (by decide) h)
+  rwa [Int.natCast_pow, Int.natCast_pow] at h'
 
 /-- A quotient of naturals is a natural at most the dividend. `grind` rewrites `tdiv` to `/`
 and its linear arithmetic knows nothing of `/` by a variable, so it learns this from each `/`. -/
@@ -287,7 +316,7 @@ macro_rules
     blaze_vcs [$ls,*]
     all_goals try simp only [$ls,*] at *
     all_goals try
-      grind [ScalarTy.min, ScalarTy.max, Scalar.ofNat_val, Scalar.add, Scalar.sub, Scalar.mul,
+      grind [ScalarTy.min, ScalarTy.max, ScalarTy.bits, Scalar.ofNat_val, Scalar.add, Scalar.sub, Scalar.mul,
         Scalar.checked, List.length_pos_iff, List.head?_eq_getElem?]
     blaze_all_closed))
 

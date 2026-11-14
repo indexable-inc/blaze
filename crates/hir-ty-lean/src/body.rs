@@ -28,19 +28,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use base_db::Db;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
-    ModuleId, VariantId,
+    ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     item_tree::FieldsShape,
-    signatures::{EnumSignature, FunctionSignature, StructSignature},
+    signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
 use hir_ty::{
     db::HirDatabase as _,
     mir as m,
-    next_solver::{ConstKind, DbInterner, Ty as HTy, TyKind},
+    next_solver::{
+        AliasConstKind, ConstKind, DbInterner, FreeConstAliasId, InherentAssocConstId, Ty as HTy,
+        TyKind,
+    },
 };
 use rustc_type_ir::{
     IntTy as RIntTy, UintTy,
-    inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _},
+    inherent::{AdtDef as _, GenericArgs as _, IntoKind as _},
 };
 
 use crate::{
@@ -135,6 +138,8 @@ pub enum Ty {
     RefMut(Box<Ty>),
     Slice(Box<Ty>),
     Array(Box<Ty>, u64),
+    /// `core::num::TryFromIntError`, the error of a `TryFrom` between integers.
+    TryFromIntError,
 }
 
 impl Ty {
@@ -149,7 +154,7 @@ impl Ty {
     /// The structs and enums it names, by Lean name, into `out`.
     pub fn adts(&self, out: &mut BTreeSet<String>) {
         match self {
-            Ty::Bool | Ty::Int(_) | Ty::Unit | Ty::Never => {}
+            Ty::Bool | Ty::Int(_) | Ty::Unit | Ty::Never | Ty::TryFromIntError => {}
             Ty::Adt(name) => {
                 out.insert(name.clone());
             }
@@ -306,8 +311,12 @@ pub enum Check {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Callee {
     /// A function of the Lean library standing for one of core's (`Scalar.wrapping_mul`);
-    /// `monadic` when it gives a `Result`.
-    Model { name: &'static str, monadic: bool },
+    /// `monadic` when it gives a `Result`. `ty`, when there is one, is the integer type it
+    /// makes, its first argument (`Scalar.cast .U64 x`): the arguments do not say it.
+    /// `lends_first` when its first argument is a `&mut` the model gives back after its
+    /// result, as a translated function gives back its `&mut` parameters
+    /// (`Option::take`).
+    Model { name: &'static str, monadic: bool, ty: Option<IntTy>, lends_first: bool },
     /// A translated function, by its Lean name.
     Function { name: String },
 }
@@ -689,14 +698,136 @@ const PANICS: &[&str] = &[
     "panic_bounds_check",
 ];
 
-/// The methods of core's integers the Lean library models, all total.
-const INT_MODELS: &[(&str, &str)] = &[
-    ("wrapping_add", "Scalar.wrapping_add"),
-    ("wrapping_sub", "Scalar.wrapping_sub"),
-    ("wrapping_mul", "Scalar.wrapping_mul"),
-    ("saturating_add", "Scalar.saturating_add"),
-    ("saturating_sub", "Scalar.saturating_sub"),
+/// The inherent methods of core's integers the Lean library models (`lean/Blaze/Scalar.lean`
+/// and `lean/Blaze/ScalarOps.lean`), on every integer type that has them: the method, its
+/// model, and whether the model gives a `Result` (it panics in Rust). Recognised by the method
+/// itself, never by its body, which in `library/core` is mostly an intrinsic.
+const INT_MODELS: &[(&str, &str, bool)] = &[
+    ("wrapping_add", "Scalar.wrapping_add", false),
+    ("wrapping_sub", "Scalar.wrapping_sub", false),
+    ("wrapping_mul", "Scalar.wrapping_mul", false),
+    ("wrapping_neg", "Scalar.wrapping_neg", false),
+    ("wrapping_shl", "Scalar.wrapping_shl", false),
+    ("wrapping_shr", "Scalar.wrapping_shr", false),
+    ("wrapping_div", "Scalar.wrapping_div", true),
+    ("wrapping_rem", "Scalar.wrapping_rem", true),
+    ("wrapping_abs", "Scalar.wrapping_abs", false),
+    ("wrapping_pow", "Scalar.wrapping_pow", false),
+    ("saturating_add", "Scalar.saturating_add", false),
+    ("saturating_sub", "Scalar.saturating_sub", false),
+    ("saturating_mul", "Scalar.saturating_mul", false),
+    ("saturating_pow", "Scalar.saturating_pow", false),
+    ("checked_add", "Scalar.checked_add", false),
+    ("checked_sub", "Scalar.checked_sub", false),
+    ("checked_mul", "Scalar.checked_mul", false),
+    ("checked_div", "Scalar.checked_div", false),
+    ("checked_rem", "Scalar.checked_rem", false),
+    ("checked_neg", "Scalar.checked_neg", false),
+    ("checked_shl", "Scalar.checked_shl", false),
+    ("checked_shr", "Scalar.checked_shr", false),
+    ("checked_pow", "Scalar.checked_pow", false),
+    ("overflowing_add", "Scalar.overflowing_add", false),
+    ("overflowing_sub", "Scalar.overflowing_sub", false),
+    ("overflowing_mul", "Scalar.overflowing_mul", false),
+    ("leading_zeros", "Scalar.leading_zeros", false),
+    ("trailing_zeros", "Scalar.trailing_zeros", false),
+    ("count_ones", "Scalar.count_ones", false),
+    ("count_zeros", "Scalar.count_zeros", false),
+    ("is_power_of_two", "Scalar.is_power_of_two", false),
+    ("reverse_bits", "Scalar.reverse_bits", false),
+    ("swap_bytes", "Scalar.swap_bytes", false),
+    ("rotate_left", "Scalar.rotate_left", false),
+    ("rotate_right", "Scalar.rotate_right", false),
+    ("unsigned_abs", "Scalar.unsigned_abs", false),
+    ("abs_diff", "Scalar.abs_diff", false),
+    ("signum", "Scalar.signum", false),
+    ("is_multiple_of", "Scalar.is_multiple_of", false),
+    ("to_le_bytes", "Scalar.to_le_bytes", false),
+    ("to_be_bytes", "Scalar.to_be_bytes", false),
+    ("to_ne_bytes", "Scalar.to_ne_bytes", false),
 ];
+
+/// The integer methods whose overflow follows the calling crate's overflow checks (core marks
+/// them `#[rustc_inherit_overflow_checks]`): the method, its model with the checks on (a
+/// `Result`, failing where it panics), and its model without them (total, wrapping).
+const INT_INHERITED: &[(&str, &str, &str)] = &[
+    ("abs", "Scalar.abs", "Scalar.wrapping_abs"),
+    ("pow", "Scalar.pow", "Scalar.wrapping_pow"),
+    ("next_power_of_two", "Scalar.next_power_of_two", "Scalar.wrapping_next_power_of_two"),
+];
+
+/// The integer functions that make a value of their own type from bytes: the type is the
+/// model's first argument. `_ne_` is little-endian: every target blaze translates for is.
+const INT_FROM_BYTES: &[(&str, &str)] = &[
+    ("from_le_bytes", "Scalar.from_le_bytes"),
+    ("from_be_bytes", "Scalar.from_be_bytes"),
+    ("from_ne_bytes", "Scalar.from_ne_bytes"),
+];
+
+/// The closure-free methods of `Option` the Lean library models (`lean/Blaze/Std.lean`): the
+/// method, its model, whether the model gives a `Result`, whether it lends its first
+/// argument. `expect`'s message is dropped; `unwrap_or_default` is lowered on its own.
+const OPTION_MODELS: &[(&str, &str, bool, bool)] = &[
+    ("is_some", "core.option.Option.is_some", false, false),
+    ("is_none", "core.option.Option.is_none", false, false),
+    ("unwrap", "core.option.Option.unwrap", true, false),
+    ("expect", "core.option.Option.expect", true, false),
+    ("unwrap_or", "core.option.Option.unwrap_or", false, false),
+    ("ok_or", "core.option.Option.ok_or", false, false),
+    ("take", "core.option.Option.take", false, true),
+    ("replace", "core.option.Option.replace", false, true),
+];
+
+/// The closure-free methods of `Result` the Lean library models, as [`OPTION_MODELS`].
+const RESULT_MODELS: &[(&str, &str, bool, bool)] = &[
+    ("is_ok", "core.result.Result.is_ok", false, false),
+    ("is_err", "core.result.Result.is_err", false, false),
+    ("ok", "core.result.Result.ok", false, false),
+    ("err", "core.result.Result.err", false, false),
+    ("unwrap", "core.result.Result.unwrap", true, false),
+    ("expect", "core.result.Result.expect", true, false),
+    ("unwrap_or", "core.result.Result.unwrap_or", false, false),
+];
+
+/// Where a function of the standard library is, which tells its model.
+enum Home {
+    /// An inherent method of this integer type.
+    Int(IntTy),
+    Option,
+    Result,
+    Slice,
+    /// A method of a trait or of an impl of one: the trait's name and the module it is in,
+    /// under its crate (`["cmp"]`).
+    Trait { name: String, module: Vec<String> },
+    /// A function of a module, by the module's path under its crate.
+    Module(Vec<String>),
+    Other,
+}
+
+/// The integer type `ty` is, if it is one v0 has.
+fn int_ty(ty: HTy<'_>) -> Option<IntTy> {
+    Some(match ty.kind() {
+        TyKind::Int(int) => match int {
+            RIntTy::I8 => IntTy::I8,
+            RIntTy::I16 => IntTy::I16,
+            RIntTy::I32 => IntTy::I32,
+            RIntTy::I64 => IntTy::I64,
+            RIntTy::I128 => IntTy::I128,
+            RIntTy::Isize => IntTy::Isize,
+            RIntTy::Bits(_) => return None,
+        },
+        TyKind::Uint(uint) => match uint {
+            UintTy::U8 => IntTy::U8,
+            UintTy::U16 => IntTy::U16,
+            UintTy::U32 => IntTy::U32,
+            UintTy::U64 => IntTy::U64,
+            UintTy::U128 => IntTy::U128,
+            UintTy::Usize => IntTy::Usize,
+            UintTy::Bits(_) => return None,
+        },
+        _ => return None,
+    })
+}
 
 fn crate_name(db: &Db, krate: base_db::Crate) -> String {
     krate
@@ -819,6 +950,10 @@ struct Cx<'db> {
     adts: Vec<AdtDecl>,
     callees: Vec<(String, FunctionId)>,
     checks_overflow: bool,
+    /// The temporaries and bindings of a type outside the subset, and why: each is refused
+    /// where a place names it (with the statement or call that does), not where it is declared,
+    /// so one the model never reads (`expect`'s message) is no refusal.
+    unusable: BTreeMap<Local, String>,
 }
 
 type Refused<T> = Result<T, NotTranslated>;
@@ -918,6 +1053,7 @@ impl<'db> Cx<'db> {
                             Box::new(self.ty(args.type_at(0), false, at)?),
                             Box::new(self.ty(args.type_at(1), false, at)?),
                         )),
+                        ("TryFromIntError", 0) => Ok(Ty::TryFromIntError),
                         _ => Err(self.refuse(
                             format!(
                                 "the standard library's type `{name}`, which has no model \
@@ -1054,6 +1190,9 @@ impl<'db> Cx<'db> {
             local = target.local;
             elems = next;
         }
+        if let Some(what) = self.unusable.get(&index(local)) {
+            return Err(self.refuse(what.clone(), at));
+        }
         let mut ty = self.locals[index(local) as usize].ty.clone();
         let mut out = Vec::with_capacity(elems.len());
         let mut at_elem = 0;
@@ -1138,6 +1277,7 @@ impl<'db> Cx<'db> {
                     ConstKind::Value(value) => {
                         value.try_to_leaf().map(|leaf| leaf.to_bits_unchecked())
                     }
+                    ConstKind::Alias(_, alias) => Some(self.named_const(alias, at)?),
                     _ => None,
                 };
                 (bits, ty)
@@ -1166,6 +1306,35 @@ impl<'db> Cx<'db> {
             _ => return Err(self.refuse(format!("a constant of type `{ty:?}`"), at)),
         };
         Ok((operand, ty))
+    }
+
+    /// The bits of the named constant `alias` (`u32::MAX`, a crate's `const`), by evaluating
+    /// it in its own environment, as at most 16 little-endian bytes.
+    fn named_const(&self, alias: hir_ty::next_solver::AliasConst<'db>, at: &str) -> Refused<u128> {
+        let id = match alias.kind {
+            AliasConstKind::Free { def_id: FreeConstAliasId(id) }
+            | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } => id,
+            AliasConstKind::Projection { .. } => {
+                return Err(self.refuse("a trait's associated constant", at));
+            }
+            AliasConstKind::Anon { .. } => {
+                return Err(self.refuse("an anonymous constant (`const { .. }`)", at));
+            }
+            AliasConstKind::InherentSelf { .. } => {
+                return Err(self.refuse("an inherent constant named through `Self`", at));
+            }
+        };
+        let Ok(allocation) = self.db.const_eval(id, alias.args, None) else {
+            return Err(self.refuse("a constant that does not evaluate", at));
+        };
+        let memory: &[u8] = &allocation.memory;
+        if memory.len() > 16 {
+            return Err(self.refuse("a constant wider than 16 bytes", at));
+        }
+        // Every target blaze translates for is little-endian.
+        let mut bytes = [0u8; 16];
+        bytes[..memory.len()].copy_from_slice(memory);
+        Ok(u128::from_le_bytes(bytes))
     }
 
     fn op_ty(&self, ty: &Ty, at: &str) -> Refused<OpTy> {
@@ -1345,6 +1514,29 @@ impl<'db> Cx<'db> {
                 if place.projection.is_empty() && self.alias.contains_key(&index(place.local)) {
                     return Ok(());
                 }
+                // A constant, a closure, or a borrow of another such local, put in a local of a
+                // type outside the subset (`expect`'s message, a closure given to a method), does
+                // nothing until the local is read, which `place` refuses at the read: the call
+                // it is given to.
+                let unusable = |local: m::LocalId| self.unusable.contains_key(&index(local));
+                if place.projection.is_empty()
+                    && unusable(place.local)
+                    && match rvalue {
+                        m::Rvalue::Use(m::Operand {
+                            kind: m::OperandKind::Constant { .. } | m::OperandKind::Allocation { .. },
+                            ..
+                        })
+                        | m::Rvalue::Aggregate(m::AggregateKind::Closure(_), _) => true,
+                        m::Rvalue::Ref(_, from) | m::Rvalue::CopyForDeref(from) => unusable(from.local),
+                        m::Rvalue::Use(m::Operand {
+                            kind: m::OperandKind::Copy(from) | m::OperandKind::Move(from),
+                            ..
+                        }) => unusable(from.local),
+                        _ => false,
+                    }
+                {
+                    return Ok(());
+                }
                 let (place, ty) = self.place(place, &at)?;
                 if let Some(value) = self.rvalue(rvalue, &ty, &at)? {
                     out.push(Stmt::Assign { place, value, at });
@@ -1403,26 +1595,10 @@ impl<'db> Cx<'db> {
             if name == "catch_unwind" {
                 return Err(self.refuse("`catch_unwind` (rule CatchUnwind)", at));
             }
-            let model = match container {
-                ItemContainerId::ImplId(imp) => match db.impl_self_ty(imp).skip_binder().kind() {
-                    TyKind::Int(_) | TyKind::Uint(_) => {
-                        INT_MODELS.iter().find(|(method, _)| *method == name).map(|it| it.1)
-                    }
-                    TyKind::Slice(_) if name == "len" => Some("Slice.len"),
-                    _ => None,
-                },
-                _ => None,
-            };
-            let Some(model) = model else {
-                return Err(self.refuse(
-                    format!(
-                        "a call of the standard library's `{name}`, which has no model (rule \
-                         NoModel)"
-                    ),
-                    at,
-                ));
-            };
-            Callee::Model { name: model, monadic: false }
+            let (callee, args) = self.std_call(&name, container, args, destination, at)?;
+            let (dest, _) = self.place(destination, at)?;
+            out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
+            return self.goto(target, at);
         } else {
             if !generics.is_empty() {
                 return Err(self.refuse(format!("a call of the generic function `{name}`"), at));
@@ -1447,6 +1623,204 @@ impl<'db> Cx<'db> {
         let args = self.operands(args, at)?;
         out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
         self.goto(target, at)
+    }
+
+    /// Where the standard library's function in `container` is.
+    fn home(&self, container: ItemContainerId) -> Home {
+        let db = self.db;
+        let of_trait = |it: TraitId| Home::Trait {
+            name: TraitSignature::of(db, it).name.as_str().to_owned(),
+            module: module_path(db, it.lookup(db).container).split_off(1),
+        };
+        match container {
+            ItemContainerId::TraitId(it) => of_trait(it),
+            ItemContainerId::ImplId(imp) => {
+                if let Some(of) = db.impl_trait(imp) {
+                    return of_trait(of.skip_binder().def_id.0);
+                }
+                let ty = db.impl_self_ty(imp).skip_binder();
+                if let Some(int) = int_ty(ty) {
+                    return Home::Int(int);
+                }
+                match ty.kind() {
+                    TyKind::Slice(_) => Home::Slice,
+                    TyKind::Adt(def, _) => match def.def_id() {
+                        AdtId::EnumId(it) => match EnumSignature::of(db, it).name.as_str() {
+                            "Option" => Home::Option,
+                            "Result" => Home::Result,
+                            _ => Home::Other,
+                        },
+                        _ => Home::Other,
+                    },
+                    _ => Home::Other,
+                }
+            }
+            ItemContainerId::ModuleId(module) => Home::Module(module_path(db, module).split_off(1)),
+            ItemContainerId::ExternBlockId(_) => Home::Other,
+        }
+    }
+
+    /// The model of a call of the standard library's function `name` in `container`, and the
+    /// arguments the model takes. Each is recognised by where the callee is and its name, never
+    /// by its body; one with no model is refused by name (rule NoModel).
+    fn std_call(
+        &mut self,
+        name: &str,
+        container: ItemContainerId,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        at: &str,
+    ) -> Refused<(Callee, Vec<Operand>)> {
+        let model = |name: &'static str, monadic: bool| Callee::Model {
+            name,
+            monadic,
+            ty: None,
+            lends_first: false,
+        };
+        let no_model = |this: &Self| {
+            this.refuse(
+                format!(
+                    "a call of the standard library's `{name}`, which has no model (rule NoModel)"
+                ),
+                at,
+            )
+        };
+        // A closure or a function given to the callee is what is outside the subset, more
+        // than the callee (`Option::map`, a closure's own `call`): it is named first.
+        for arg in args {
+            if let m::OperandKind::Copy(place) | m::OperandKind::Move(place) = &arg.kind
+                && let Some(what) = self.unusable.get(&index(place.local))
+                && (what == "a closure" || what == "a function used as a value")
+            {
+                return Err(self.refuse(what.clone(), at));
+            }
+        }
+        match self.home(container) {
+            Home::Int(int) => {
+                if let Some(&(_, it, monadic)) = INT_MODELS.iter().find(|it| it.0 == name) {
+                    return Ok((model(it, monadic), self.operands(args, at)?));
+                }
+                if let Some(&(_, checked, wrapping)) = INT_INHERITED.iter().find(|it| it.0 == name)
+                {
+                    let callee = if self.checks_overflow {
+                        model(checked, true)
+                    } else {
+                        model(wrapping, false)
+                    };
+                    return Ok((callee, self.operands(args, at)?));
+                }
+                if let Some(&(_, it)) = INT_FROM_BYTES.iter().find(|it| it.0 == name) {
+                    let callee =
+                        Callee::Model { name: it, monadic: false, ty: Some(int), lends_first: false };
+                    return Ok((callee, self.operands(args, at)?));
+                }
+                // A signed `div_ceil` rounds toward positive infinity and is not modelled.
+                if name == "div_ceil" && !int.signed() {
+                    return Ok((model("Scalar.div_ceil", true), self.operands(args, at)?));
+                }
+                Err(no_model(self))
+            }
+            home @ (Home::Option | Home::Result) => {
+                let (table, unwrap_or) = match home {
+                    Home::Option => (OPTION_MODELS, "core.option.Option.unwrap_or"),
+                    _ => (RESULT_MODELS, "core.result.Result.unwrap_or"),
+                };
+                if name == "unwrap_or_default" {
+                    // `T::default()` of the integers and `bool`, which are their zero and `false`.
+                    let default = match self.place(destination, at)?.1 {
+                        Ty::Int(int) => Operand::Int(int, 0),
+                        Ty::Bool => Operand::Bool(false),
+                        other => {
+                            return Err(self.refuse(
+                                format!("`unwrap_or_default` of a `{other:?}`, whose default has no model"),
+                                at,
+                            ));
+                        }
+                    };
+                    let mut operands = self.operands(&args[..1], at)?;
+                    operands.push(default);
+                    return Ok((model(unwrap_or, false), operands));
+                }
+                let Some(&(_, it, monadic, lends_first)) = table.iter().find(|it| it.0 == name)
+                else {
+                    return Err(no_model(self));
+                };
+                // `expect`'s message is what the panic prints, which the model does not keep.
+                let args = if name == "expect" { &args[..1] } else { args };
+                let callee = Callee::Model { name: it, monadic, ty: None, lends_first };
+                Ok((callee, self.operands(args, at)?))
+            }
+            Home::Slice if name == "len" => Ok((model("Slice.len", false), self.operands(args, at)?)),
+            Home::Trait { name: of, module } => {
+                let module: Vec<&str> = module.iter().map(String::as_str).collect();
+                match (module.as_slice(), of.as_str(), name) {
+                    (["cmp"], "Ord", "max" | "min" | "clamp") => self.int_order(name, args, at),
+                    (["convert"], "From", "from") | (["convert"], "Into", "into") => {
+                        let operands = self.operands(args, at)?;
+                        let from = self.operand(&args[0], at)?.1;
+                        // A `From` between integers is lossless: the cast keeps the value.
+                        let (callee, to) = match (from.value(), self.place(destination, at)?.1) {
+                            (Ty::Int(_), Ty::Int(to)) => ("Scalar.cast", to),
+                            (Ty::Bool, Ty::Int(to)) => ("Scalar.ofBool", to),
+                            _ => return Err(no_model(self)),
+                        };
+                        let callee =
+                            Callee::Model { name: callee, monadic: false, ty: Some(to), lends_first: false };
+                        Ok((callee, operands))
+                    }
+                    (["convert"], "TryFrom", "try_from") | (["convert"], "TryInto", "try_into") => {
+                        let operands = self.operands(args, at)?;
+                        let from = self.operand(&args[0], at)?.1;
+                        let dest = self.place(destination, at)?.1;
+                        let (Ty::Int(_), Ty::Result(ok, err)) = (from.value(), &dest) else {
+                            return Err(no_model(self));
+                        };
+                        let (Ty::Int(to), Ty::TryFromIntError) = (ok.as_ref(), err.as_ref()) else {
+                            return Err(no_model(self));
+                        };
+                        let callee = Callee::Model {
+                            name: "Scalar.try_from",
+                            monadic: false,
+                            ty: Some(*to),
+                            lends_first: false,
+                        };
+                        Ok((callee, operands))
+                    }
+                    _ => Err(no_model(self)),
+                }
+            }
+            Home::Module(module) if module == ["cmp"] && matches!(name, "max" | "min") => {
+                self.int_order(name, args, at)
+            }
+            Home::Slice | Home::Module(_) | Home::Other => Err(no_model(self)),
+        }
+    }
+
+    /// `Ord::max`, `Ord::min`, `Ord::clamp`, `cmp::max` or `cmp::min` of integers.
+    fn int_order(
+        &mut self,
+        name: &str,
+        args: &[m::Operand],
+        at: &str,
+    ) -> Refused<(Callee, Vec<Operand>)> {
+        let mut operands = Vec::with_capacity(args.len());
+        for arg in args {
+            let (operand, ty) = self.operand(arg, at)?;
+            if !matches!(ty.value(), Ty::Int(_)) {
+                return Err(self.refuse(
+                    format!("a call of the standard library's `{name}` on a `{ty:?}`, which has no model (rule NoModel)"),
+                    at,
+                ));
+            }
+            operands.push(operand);
+        }
+        let (name, monadic) = match name {
+            "max" => ("Scalar.max", false),
+            "min" => ("Scalar.min", false),
+            // `clamp` panics when its least is above its most.
+            _ => ("Scalar.ord_clamp", true),
+        };
+        Ok((Callee::Model { name, monadic, ty: None, lends_first: false }, operands))
     }
 
     fn operands(&mut self, operands: &[m::Operand], at: &str) -> Refused<Vec<Operand>> {
@@ -1564,9 +1938,6 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         Ok(mir) => mir,
         Err(err) => return Err(refuse(format!("the body, which has no MIR ({err:?})"))),
     };
-    if !mir.closures.is_empty() {
-        return Err(refuse("a closure".to_owned()));
-    }
     if mir.coroutine.is_some() {
         return Err(refuse("an `async` block (rule Async)".to_owned()));
     }
@@ -1586,15 +1957,30 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         adts: Vec::new(),
         callees: Vec::new(),
         checks_overflow,
+        unusable: BTreeMap::new(),
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
         names.insert(index(local), store[binding].name.as_str().to_owned());
     }
+    let params: BTreeSet<Local> = mir.param_locals.iter().map(|it| index(*it)).collect();
     for (local, decl) in mir.locals.iter() {
-        let ty = cx.ty(decl.ty.as_ref(), true, &fn_text)?;
+        let ty = match cx.ty(decl.ty.as_ref(), true, &fn_text) {
+            Ok(ty) => ty,
+            // The return place and the parameters are the model's signature: refused here.
+            Err(err) if index(local) == 0 || params.contains(&index(local)) => return Err(err),
+            Err(err) => {
+                cx.unusable.insert(index(local), err.what);
+                // Never read: `place` refuses the local first.
+                Ty::Unit
+            }
+        };
         debug_assert_eq!(index(local) as usize, cx.locals.len());
         cx.locals.push(LocalDecl { name: names.get(&index(local)).cloned(), ty });
+    }
+    // Every closure is built into a local of its type, which `place` refuses where it is built.
+    if !mir.closures.is_empty() && !cx.unusable.values().any(|it| it == "a closure") {
+        return Err(refuse("a closure".to_owned()));
     }
     if matches!(cx.locals[0].ty, Ty::RefMut(_)) {
         return Err(refuse(
@@ -1630,11 +2016,17 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         }
         let terminator = data.terminator.as_ref().expect("checked above");
         let at = cx.at(terminator.span);
+        // A type with a destructor is refused with the locals, so a drop does nothing, except
+        // of a local whose refusal was put off to where it is named: that is refused here.
+        if let m::TerminatorKind::Drop { place, .. } = &terminator.kind
+            && let Some(what) = cx.unusable.get(&index(place.local))
+        {
+            return Err(cx.refuse(what.clone(), &at));
+        }
         let exit = match &terminator.kind {
             m::TerminatorKind::Goto { target }
             | m::TerminatorKind::FalseEdge { real_target: target, .. }
             | m::TerminatorKind::FalseUnwind { real_target: target, .. }
-            // A type with a destructor was refused with the locals, so the drop does nothing.
             | m::TerminatorKind::Drop { target, .. } => Exit::Goto(to(*target)),
             m::TerminatorKind::SwitchInt { discr, targets } => {
                 let (on, ty) = cx.operand(discr, &at)?;

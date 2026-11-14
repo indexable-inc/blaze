@@ -1382,11 +1382,272 @@ fn a_theorem_with_a_loop_states_that_it_returns() {
 #[test]
 fn a_theorem_function_that_cannot_be_one_is_refused_by_name() {
     let cases = [
-        ("#[blaze::theorem]\npub fn f() -> u32 { 0 }\n", "does not return `bool`"),
+        ("#[blaze::theorem]\npub fn f() -> u32 { 0 }\n", "returns `u32`, not `bool`"),
         ("#[blaze::theorem]\npub fn f(x: &mut u32) -> bool { *x = 0; true }\n", "`&mut` parameter"),
     ];
     for (source, what) in cases {
         let err = refused(FLAGS, "f", source);
         assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    }
+}
+
+// ---- Integer methods, conversions, and `Option`'s and `Result`'s methods. ----
+
+/// What the `ints` fixture enables: the integer methods `ScalarOps` models, their bounds,
+/// lossless `From`, `TryFrom`, and `Ord`'s and `cmp`'s `max`, `min` and `clamp`.
+const INT_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, int_methods, int_bounds, int_cast, ord_methods";
+
+/// What the `options` fixture enables: `Option`'s and `Result`'s closure-free methods.
+const OPTION_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, option_methods, expect, fmt, reach";
+
+const INTS: &str = "pub fn bits(x: u32, n: u32) -> u32 {
+    x.reverse_bits() ^ x.swap_bytes() ^ x.rotate_left(n) ^ x.rotate_right(n)
+        ^ x.leading_zeros() ^ x.trailing_zeros() ^ x.count_ones() ^ x.count_zeros()
+}
+pub fn powers(x: u64, y: u64, e: u32) -> u64 {
+    let flag = if x.is_power_of_two() && x.is_multiple_of(y) { 1 } else { 0 };
+    x.pow(e) + x.next_power_of_two() + x.div_ceil(y) + x.saturating_mul(y) + x.saturating_pow(e)
+        + x.wrapping_neg() + x.wrapping_shl(e) + x.wrapping_shr(e) + x.wrapping_div(y)
+        + x.wrapping_rem(y) + flag
+}
+pub fn signs(x: i32, y: i32) -> u32 {
+    x.unsigned_abs() + x.abs_diff(y) + (x.signum() + x.abs() + x.wrapping_abs()) as u32
+}
+pub fn checked(x: i32, y: i32, s: u32) -> [Option<i32>; 9] {
+    [
+        x.checked_add(y), x.checked_sub(y), x.checked_mul(y), x.checked_div(y),
+        x.checked_rem(y), x.checked_neg(), x.checked_shl(s), x.checked_shr(s), x.checked_pow(s),
+    ]
+}
+pub fn overflowing(x: u8, y: u8) -> ((u8, bool), (u8, bool), (u8, bool)) {
+    (x.overflowing_add(y), x.overflowing_sub(y), x.overflowing_mul(y))
+}
+pub fn order(x: u64, lo: u64, hi: u64) -> u64 {
+    x.max(lo).min(hi) + x.clamp(lo, hi) + core::cmp::max(x, lo) + core::cmp::min(x, hi)
+}
+pub fn bytes(x: u32) -> u32 {
+    u32::from_le_bytes(x.to_be_bytes()) ^ u32::from_be_bytes(x.to_le_bytes())
+        ^ u32::from_ne_bytes(x.to_ne_bytes())
+}
+pub fn convert(x: u8, b: bool, w: u64) -> u64 {
+    let a: u32 = x.into();
+    let c = u64::from(a) + u64::from(b);
+    let t: Result<u16, core::num::TryFromIntError> = w.try_into();
+    let d = match t { Ok(v) => v as u64, Err(_) => 0 };
+    match u8::try_from(w) { Ok(v) => c + d + v as u64, Err(_) => c + d }
+}
+pub fn consts() -> u64 {
+    u64::MAX - u32::MAX as u64 + u8::BITS as u64 + (i32::MIN as i64 + i64::MAX) as u64
+}
+pub mod busy {
+    // Copied from crates/blaze-core/src/busy.rs:15-32.
+    /// The first wait: about what the process holding the file takes to reach its exec.
+    pub const FIRST_NS: u64 = 50_000;
+    /// The longest single wait.
+    pub const CAP_NS: u64 = 50_000_000;
+    /// All the waits of one exec, together: past them the spawn fails.
+    pub const MOST_NS: u64 = 1_000_000_000;
+
+    /// The wait before the next exec, after `tried` waits that came to `waited` nanoseconds; `None`
+    /// once they have come to [`MOST_NS`].
+    pub const fn next(tried: u32, waited: u64) -> Option<u64> {
+        if waited >= MOST_NS {
+            return None;
+        }
+        let doubled = FIRST_NS << if tried < 20 { tried } else { 20 };
+        let wait = if doubled < CAP_NS { doubled } else { CAP_NS };
+        let left = MOST_NS - waited;
+        Some(if wait < left { wait } else { left })
+    }
+
+    #[blaze::theorem]
+    pub fn busy_next_is_bounded_and_progresses(tried: u32, waited: u64) -> bool {
+        match next(tried, waited) {
+            None => waited >= MOST_NS,
+            Some(w) => waited < MOST_NS && w > 0 && w <= CAP_NS && w <= MOST_NS - waited
+                && (w >= FIRST_NS || waited + w == MOST_NS),
+        }
+    }
+}
+pub mod history {
+    // Copied from crates/blaze-profile/src/history.rs:165, 170 and 175-177.
+    pub const CAP_MOST: u64 = 256 << 20;
+    pub const CAP_LEAST: u64 = 8 << 20;
+    pub fn cap_for(store_bytes: u64) -> u64 {
+        (store_bytes / 4).clamp(CAP_LEAST, CAP_MOST)
+    }
+
+    #[blaze::theorem]
+    pub fn cap_for_is_between_least_and_most(store_bytes: u64) -> bool {
+        let cap = cap_for(store_bytes);
+        CAP_LEAST <= cap && cap <= CAP_MOST
+    }
+}
+pub mod rebase {
+    // Copied from crates/blaze-vfs/src/rebase.rs:69-72.
+    /// Whether two ranges overlap, or meet where either is empty (two inserts at one place).
+    fn clash(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
+        if a0 == a1 || b0 == b1 { a0 <= b1 && b0 <= a1 } else { a0 < b1 && b0 < a1 }
+    }
+
+    #[blaze::theorem]
+    pub fn a_clear_edit_lies_wholly_before_or_after(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
+        a0 > a1 || b0 > b1 || clash(a0, a1, b0, b1) || (a1 <= b0 && a0 < b1) || a0 >= b1
+    }
+}
+";
+
+const OPTIONS: &str = "pub fn options(a: Option<u32>, b: Option<u32>) -> u32 {
+    let mut n = 0;
+    if a.is_some() { n += 1; }
+    if b.is_none() { n += 2; }
+    n + a.unwrap_or(7) + b.unwrap_or_default()
+}
+pub fn unwraps(a: Option<u32>, r: Result<u32, u8>, s: Result<u32, u8>) -> u32 {
+    a.unwrap() + a.expect(\"a is some\") + r.unwrap() + s.expect(\"s is ok\")
+}
+pub fn results(r: Result<u32, u8>, s: Result<u32, u8>, t: Result<u32, u8>)
+    -> (bool, bool, Option<u32>, Option<u8>, u32) {
+    (r.is_ok(), r.is_err(), r.ok(), s.err(), t.unwrap_or(3))
+}
+pub fn ok_or(a: Option<u32>) -> Result<u32, u8> {
+    a.ok_or(9)
+}
+pub fn takes(a: Option<u32>) -> (Option<u32>, Option<u32>, Option<u32>) {
+    let mut a = a;
+    let was = a.take();
+    let mut b = was;
+    let old = b.replace(5);
+    (a, b, old)
+}
+";
+
+/// `name` of `krate`, emitted from `source`, against its golden module and those of the
+/// functions it calls, under `lean/BlazeModel/<krate>/`.
+#[track_caller]
+fn golden(flags: &str, krate: &str, name: &str, source: &str) -> Emitted {
+    let out = emitted(flags, krate, name, source);
+    expect_file![format!("../../../lean/{}", out.path())].assert_eq(&out.text);
+    for import in &out.imports {
+        expect_file![format!("../../../lean/{}", import.path())].assert_eq(&import.text);
+    }
+    out
+}
+
+/// Each integer method becomes its `ScalarOps` model: the total ones pure, `pow`, `abs`,
+/// `next_power_of_two`, `div_ceil`, `wrapping_div`, `wrapping_rem` and `clamp` a `Result`.
+#[test]
+fn integer_methods_become_their_models() {
+    let cases: [(&str, &[&str]); 9] = [
+        ("bits", &[
+            "Scalar.reverse_bits x", "Scalar.swap_bytes x", "Scalar.rotate_left x n",
+            "Scalar.rotate_right x n", "Scalar.leading_zeros x", "Scalar.trailing_zeros x",
+            "Scalar.count_ones x", "Scalar.count_zeros x",
+        ]),
+        ("powers", &[
+            "← Scalar.pow x e", "← Scalar.next_power_of_two x", "← Scalar.div_ceil x y",
+            "Scalar.saturating_mul x y", "Scalar.saturating_pow x e", "Scalar.wrapping_neg x",
+            "Scalar.wrapping_shl x e", "Scalar.wrapping_shr x e", "← Scalar.wrapping_div x y",
+            "← Scalar.wrapping_rem x y", "Scalar.is_power_of_two x", "Scalar.is_multiple_of x y",
+        ]),
+        ("signs", &[
+            "Scalar.unsigned_abs x", "Scalar.abs_diff x y", "Scalar.signum x", "← Scalar.abs x",
+            "Scalar.wrapping_abs x",
+        ]),
+        ("checked", &[
+            "Scalar.checked_add x y", "Scalar.checked_sub x y", "Scalar.checked_mul x y",
+            "Scalar.checked_div x y", "Scalar.checked_rem x y", "Scalar.checked_neg x",
+            "Scalar.checked_shl x s", "Scalar.checked_shr x s", "Scalar.checked_pow x s",
+        ]),
+        ("overflowing", &[
+            "Scalar.overflowing_add x y", "Scalar.overflowing_sub x y", "Scalar.overflowing_mul x y",
+        ]),
+        ("order", &["Scalar.max x lo", "Scalar.min", "← Scalar.ord_clamp x lo hi"]),
+        ("bytes", &[
+            "Scalar.from_le_bytes .U32", "Scalar.to_be_bytes x", "Scalar.from_be_bytes .U32",
+            "Scalar.to_le_bytes x", "Scalar.from_ne_bytes .U32", "Scalar.to_ne_bytes x",
+        ]),
+        ("convert", &[
+            "Scalar.cast .U32 x", "Scalar.cast .U64", "Scalar.ofBool .U64 b",
+            "Scalar.try_from .U16 w", "Scalar.try_from .U8 w",
+        ]),
+        ("consts", &["18446744073709551615", "4294967295", "8", "-2147483648"]),
+    ];
+    for (name, models) in cases {
+        let out = golden(INT_FLAGS, "ints", name, INTS);
+        for model in models {
+            assert!(out.text.contains(model), "`{name}` calls `{model}`:\n{}", out.text);
+        }
+    }
+}
+
+/// `Option`'s and `Result`'s closure-free methods become their `Std` models; `expect`'s
+/// message is dropped, `unwrap_or_default` is `unwrap_or` of the zero, and `take` and
+/// `replace` give back the `Option` they were lent.
+#[test]
+fn option_and_result_methods_become_their_models() {
+    let cases: [(&str, &[&str]); 5] = [
+        ("options", &[
+            "core.option.Option.is_some a", "core.option.Option.is_none b",
+            "core.option.Option.unwrap_or a (7 : U32)", "core.option.Option.unwrap_or b (0 : U32)",
+        ]),
+        ("unwraps", &[
+            "← core.option.Option.unwrap a", "← core.option.Option.expect a",
+            "← core.result.Result.unwrap r", "← core.result.Result.expect s",
+        ]),
+        ("results", &[
+            "core.result.Result.is_ok r", "core.result.Result.is_err r", "core.result.Result.ok r",
+            "core.result.Result.err s", "core.result.Result.unwrap_or t (3 : U32)",
+        ]),
+        ("ok_or", &["core.option.Option.ok_or a (9 : U8)"]),
+        ("takes", &["core.option.Option.take", "core.option.Option.replace"]),
+    ];
+    for (name, models) in cases {
+        let out = golden(OPTION_FLAGS, "options", name, OPTIONS);
+        for model in models {
+            assert!(out.text.contains(model), "`{name}` calls `{model}`:\n{}", out.text);
+        }
+        assert!(!out.text.contains("is some") && !out.text.contains("is ok"), "{}", out.text);
+    }
+}
+
+/// Three functions of blaze's own, copied byte for byte, and a theorem about each: the
+/// statements are what a proof in `lean/` will name.
+#[test]
+fn blazes_own_small_functions_translate_with_their_theorems() {
+    let cases = [
+        ("busy_next_is_bounded_and_progresses", "ints.busy.busy_next_is_bounded_and_progresses"),
+        ("cap_for_is_between_least_and_most", "ints.history.cap_for_is_between_least_and_most"),
+        (
+            "a_clear_edit_lies_wholly_before_or_after",
+            "ints.rebase.a_clear_edit_lies_wholly_before_or_after",
+        ),
+    ];
+    for (name, lean) in cases {
+        let out = golden(INT_FLAGS, "ints", name, INTS);
+        assert_eq!(out.statement.as_deref(), Some(format!("{lean}.spec.statement").as_str()));
+        assert_eq!(out.imports.len(), 1, "`{name}` imports the function it states: {}", out.text);
+    }
+}
+
+/// A method that takes a closure or a function stays refused, by the construct outside the
+/// subset: the closure or the function value, named at the call it is given to.
+#[test]
+fn a_closure_taking_method_is_refused_by_name() {
+    let cases = [
+        (
+            "pub fn f(a: Option<u32>) -> Option<u32> { a.and_then(g) }\n\
+             fn g(x: u32) -> Option<u32> { Some(x) }\n",
+            "a function used as a value",
+            "and_then",
+        ),
+        ("pub fn f(a: Option<u32>) -> u32 { a.unwrap_or_else(|| 3) }\n", "a closure", "unwrap_or_else"),
+    ];
+    for (source, what, call) in cases {
+        let err = refused(OPTION_FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{call}` is refused for {what}: {err}");
+        assert!(err.at.contains(call), "the refusal is at the `{call}` call: {err}");
     }
 }

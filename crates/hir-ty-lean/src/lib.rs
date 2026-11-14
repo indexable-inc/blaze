@@ -34,6 +34,7 @@
 pub mod body;
 mod driver;
 pub mod lean;
+pub mod plan;
 mod spec;
 pub mod structured;
 #[cfg(test)]
@@ -67,8 +68,11 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Scalar", include_str!("../../../lean/Blaze/Scalar.lean")),
     ("Blaze.Slice", include_str!("../../../lean/Blaze/Slice.lean")),
     ("Blaze.Std", include_str!("../../../lean/Blaze/Std.lean")),
+    ("Blaze.ScalarOps", include_str!("../../../lean/Blaze/ScalarOps.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
+    // What a proof file imports and no model does: the tactic a statement is tried with first.
+    ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's
@@ -274,10 +278,11 @@ fn theorem_shape(body: &body::Body, model: &Model) -> Result<(), NotTranslated> 
         at: format!("fn {}", body.display),
     };
     if body.locals[0].ty != body::Ty::Bool {
-        return Err(refuse(
-            "a `#[blaze::theorem]` function that does not return `bool` (a theorem states that \
-             its function returns `true`)",
-        ));
+        return Err(refuse(&format!(
+            "a `#[blaze::theorem]` function that returns `{}`, not `bool` (a theorem states \
+             that its function returns `true`)",
+            rust_ty(&body.locals[0].ty)
+        )));
     }
     if !model.shape.mut_params.is_empty() {
         return Err(refuse(
@@ -286,6 +291,27 @@ fn theorem_shape(body: &body::Body, model: &Model) -> Result<(), NotTranslated> 
         ));
     }
     Ok(())
+}
+
+/// `ty` as Rust writes it, for a message.
+fn rust_ty(ty: &body::Ty) -> String {
+    use body::Ty;
+    let list = |all: &[Ty]| all.iter().map(rust_ty).collect::<Vec<_>>().join(", ");
+    match ty {
+        Ty::Bool => "bool".to_owned(),
+        Ty::Int(int) => format!("{int:?}").to_lowercase(),
+        Ty::Unit => "()".to_owned(),
+        Ty::Never => "!".to_owned(),
+        Ty::Tuple(all) => format!("({})", list(all)),
+        Ty::Adt(name) => name.replace('.', "::"),
+        Ty::Option(inner) => format!("Option<{}>", rust_ty(inner)),
+        Ty::Result(ok, err) => format!("Result<{}, {}>", rust_ty(ok), rust_ty(err)),
+        Ty::Ref(inner) => format!("&{}", rust_ty(inner)),
+        Ty::RefMut(inner) => format!("&mut {}", rust_ty(inner)),
+        Ty::Slice(inner) => format!("[{}]", rust_ty(inner)),
+        Ty::Array(inner, len) => format!("[{}; {len}]", rust_ty(inner)),
+        Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+    }
 }
 
 /// `def <statement> : Prop` for a theorem function: for all arguments the model gives `true`.

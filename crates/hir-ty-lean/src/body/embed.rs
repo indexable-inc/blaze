@@ -164,6 +164,7 @@ impl<'db> Writer<'_, 'db> {
             Ty::RefMut(inner) => format!("&mut {}", Self::key(inner)),
             Ty::Slice(elem) => format!("[{}]", Self::key(elem)),
             Ty::Array(elem, len) => format!("[{}; {len}]", Self::key(elem)),
+            Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
         }
     }
 
@@ -230,6 +231,9 @@ impl<'db> Writer<'_, 'db> {
             Ty::RefMut(inner) => format!("Ty.ref true {}", arg(&self.ty(inner, at)?)),
             Ty::Slice(elem) => format!("Ty.slice {}", arg(&self.ty(elem, at)?)),
             Ty::Array(elem, len) => format!("Ty.array {} {len}", arg(&self.ty(elem, at)?)),
+            Ty::TryFromIntError => {
+                return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
+            }
         })
     }
 
@@ -672,6 +676,8 @@ fn body<'db>(
         adts: Vec::new(),
         callees: Vec::new(),
         checks_overflow,
+        // The embedding types every local where it is declared, and refuses there.
+        unusable: BTreeMap::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());

@@ -34,7 +34,7 @@ use crate::{
         AdtKind, BinOp, Body, Callee, Cond, Elem, IntTy, Local, OpTy, Operand, Place,
         Rvalue, Stmt, Ty, Variant,
     },
-    lean::{self, Binder, Decl, DoElem, Infix, Pat, Term, app, atom, infix, name},
+    lean::{Binder, Decl, DoElem, Infix, Pat, Term, app, atom, infix, name},
     structured::{End, Node},
 };
 
@@ -80,6 +80,7 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Ref(inner) | Ty::RefMut(inner) => lean_ty(inner),
         Ty::Slice(elem) => app("Slice", vec![lean_ty(elem)]),
         Ty::Array(elem, len) => app("Arr", vec![lean_ty(elem), atom(len.to_string())]),
+        Ty::TryFromIntError => name("core.num.TryFromIntError"),
     }
 }
 
@@ -173,7 +174,7 @@ fn occurs(term: &Term, x: &str) -> usize {
             occurs(function, x) + args.iter().map(|it| occurs(it, x)).sum::<usize>()
         }
         Term::Proj(inner, _) | Term::BoolNot(inner) | Term::Not(inner) => occurs(inner, x),
-        Term::Tuple(all) => all.iter().map(|it| occurs(it, x)).sum(),
+        Term::Tuple(all) | Term::List(all) => all.iter().map(|it| occurs(it, x)).sum(),
         Term::Typed(value, _) => occurs(value, x),
         Term::Update(base, fields) => {
             occurs(base, x) + fields.iter().map(|(_, it)| occurs(it, x)).sum::<usize>()
@@ -201,7 +202,9 @@ fn substitute(term: &mut Term, x: &str, with: &Term) {
         Term::Proj(inner, _) | Term::BoolNot(inner) | Term::Not(inner) => {
             substitute(inner, x, with);
         }
-        Term::Tuple(all) => all.iter_mut().for_each(|it| substitute(it, x, with)),
+        Term::Tuple(all) | Term::List(all) => {
+            all.iter_mut().for_each(|it| substitute(it, x, with));
+        }
         Term::Typed(value, _) => substitute(value, x, with),
         Term::Update(base, fields) => {
             substitute(base, x, with);
@@ -838,9 +841,9 @@ impl<'a> Translate<'a> {
             Rvalue::Array(all) => {
                 let mut terms = Vec::with_capacity(all.len());
                 for of in all {
-                    terms.push(lean::inline(&self.operand(of, lets, at)?));
+                    terms.push(self.operand(of, lets, at)?);
                 }
-                Rhs::Pure(app("Arr.ofList", vec![atom(format!("[{}]", terms.join(", ")))]))
+                Rhs::Pure(app("Arr.ofList", vec![Term::List(terms)]))
             }
             Rvalue::Repeat(of, len) => Rhs::Pure(app(
                 "Arr.replicate",
@@ -867,12 +870,18 @@ impl<'a> Translate<'a> {
                 lets.push((Pat::Wild, Rhs::Act(app("massert", vec![cond]))));
                 Ok(())
             }
-            Stmt::Call { dest, callee: Callee::Model { name, monadic }, args, at } => {
-                let mut terms = Vec::with_capacity(args.len());
+            Stmt::Call { dest, callee: Callee::Model { name, monadic, ty, lends_first }, args, at } => {
+                let mut terms = Vec::with_capacity(args.len() + 1);
+                if let Some(ty) = ty {
+                    terms.push(atom(format!(".{}", ty.lean())));
+                }
                 for arg in args {
                     terms.push(self.operand(arg, lets, at)?);
                 }
                 let call = app(name, terms);
+                if *lends_first {
+                    return self.call(call, *monadic, false, &[0], dest, args, lets, at);
+                }
                 self.write(dest, if *monadic { Rhs::Act(call) } else { Rhs::Pure(call) }, lets, at)
             }
             Stmt::Call { dest, callee: Callee::Function { name: callee }, args, at } => {
@@ -888,52 +897,77 @@ impl<'a> Translate<'a> {
                 for arg in args {
                     terms.push(self.operand(arg, lets, at)?);
                 }
-                // What comes back: the result, then each `&mut` argument's new value.
-                let mut pats = Vec::new();
-                let mut writes: Vec<(&Place, String)> = Vec::new();
-                let takes = |this: &mut Self, place: &Place| -> (Pat, Option<String>) {
-                    if place.elems.iter().all(|it| matches!(it, Elem::Deref)) {
-                        (Pat::Name(this.names[place.local as usize].clone()), None)
-                    } else {
-                        let x = this.fresh("x");
-                        (Pat::Name(x.clone()), Some(x))
-                    }
-                };
-                if !shape.returns_unit {
-                    let (pat, later) = takes(self, dest);
-                    pats.push(pat);
-                    if let Some(x) = later {
-                        writes.push((dest, x));
-                    }
-                }
-                for &param in &shape.mut_params {
-                    let Some(Operand::Place(lent)) = args.get(param) else {
-                        return Err(self.refuse("a `&mut` argument that is not a place", at));
-                    };
-                    let (pat, later) = takes(self, lent);
-                    pats.push(pat);
-                    if let Some(x) = later {
-                        writes.push((lent, x));
-                    }
-                }
-                let call = app(callee, terms);
-                let value = if shape.monadic { Rhs::Act(call) } else { Rhs::Pure(call) };
-                lets.push((tuple_pat(pats), value));
-                for (place, x) in writes {
-                    self.write(place, Rhs::Pure(name(x)), lets, at)?;
-                }
-                for &param in &shape.mut_params {
-                    if let Some(Operand::Place(lent)) = args.get(param) {
-                        self.bound.retain(|(of, _, _)| of.local != lent.local);
-                    }
-                }
-                if shape.returns_unit {
-                    self.write(dest, Rhs::Pure(atom("()")), lets, at)?;
-                }
-                self.bound.retain(|(of, _, _)| of.local != dest.local);
-                Ok(())
+                self.call(
+                    app(callee, terms),
+                    shape.monadic,
+                    shape.returns_unit,
+                    &shape.mut_params,
+                    dest,
+                    args,
+                    lets,
+                    at,
+                )
             }
         }
+    }
+
+    /// Binds what `call` gives back, `Result`-wrapped when `monadic`: its result (none when it
+    /// `returns_unit`), then the new value of each `&mut` argument in `mut_params`, written to
+    /// `dest` and the places lent.
+    #[expect(clippy::too_many_arguments, reason = "one call's whole shape")]
+    fn call(
+        &mut self,
+        call: Term,
+        monadic: bool,
+        returns_unit: bool,
+        mut_params: &[usize],
+        dest: &Place,
+        args: &[Operand],
+        lets: &mut Vec<(Pat, Rhs)>,
+        at: &str,
+    ) -> Refused<()> {
+        let mut pats = Vec::new();
+        let mut writes: Vec<(&Place, String)> = Vec::new();
+        let takes = |this: &mut Self, place: &Place| -> (Pat, Option<String>) {
+            if place.elems.iter().all(|it| matches!(it, Elem::Deref)) {
+                (Pat::Name(this.names[place.local as usize].clone()), None)
+            } else {
+                let x = this.fresh("x");
+                (Pat::Name(x.clone()), Some(x))
+            }
+        };
+        if !returns_unit {
+            let (pat, later) = takes(self, dest);
+            pats.push(pat);
+            if let Some(x) = later {
+                writes.push((dest, x));
+            }
+        }
+        for &param in mut_params {
+            let Some(Operand::Place(lent)) = args.get(param) else {
+                return Err(self.refuse("a `&mut` argument that is not a place", at));
+            };
+            let (pat, later) = takes(self, lent);
+            pats.push(pat);
+            if let Some(x) = later {
+                writes.push((lent, x));
+            }
+        }
+        let value = if monadic { Rhs::Act(call) } else { Rhs::Pure(call) };
+        lets.push((tuple_pat(pats), value));
+        for (place, x) in writes {
+            self.write(place, Rhs::Pure(name(x)), lets, at)?;
+        }
+        for &param in mut_params {
+            if let Some(Operand::Place(lent)) = args.get(param) {
+                self.bound.retain(|(of, _, _)| of.local != lent.local);
+            }
+        }
+        if returns_unit {
+            self.write(dest, Rhs::Pure(atom("()")), lets, at)?;
+        }
+        self.bound.retain(|(of, _, _)| of.local != dest.local);
+        Ok(())
     }
 
     fn call_loop(&mut self, loop_name: &str, params: &[Local]) -> M {
