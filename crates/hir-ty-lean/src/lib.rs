@@ -75,6 +75,9 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Str", include_str!("../../../lean/Blaze/Str.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
     ("Blaze.Opaque", include_str!("../../../lean/Blaze/Opaque.lean")),
+    // Threads that share atomic words, and `core::sync::atomic` over them.
+    ("Blaze.Threads", include_str!("../../../lean/Blaze/Threads.lean")),
+    ("Blaze.Atomic", include_str!("../../../lean/Blaze/Atomic.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
