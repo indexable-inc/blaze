@@ -2181,6 +2181,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sim"
+version = "0.0.0"
+dependencies = [
+ "blaze-rng",
+]
+
+[[package]]
 name = "blaze-solo"
 version = "0.0.0"
 dependencies = [
