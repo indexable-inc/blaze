@@ -26,19 +26,9 @@
 
 use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
 
+use blaze_sim::Tape;
+
 use super::spec::{Action, Change, Expect, Revision, Step, Test};
-
-/// Where the draws come from: Hegel's test case, which shrinks them.
-pub trait Draw {
-    /// A number below `n` (`n` at least 1); 0 is the simplest.
-    fn below(&mut self, n: u64) -> u64;
-}
-
-impl<F: FnMut(u64) -> u64> Draw for F {
-    fn below(&mut self, n: u64) -> u64 {
-        self(n)
-    }
-}
 
 /// Which packages the workspace has beside `app`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -580,33 +570,33 @@ fn kinds(parts: Parts, library_only: bool) -> Vec<(&'static str, fn(u8) -> Edit)
 }
 
 /// The workspace's parts, drawn; none is the simplest.
-pub fn parts(draw: &mut dyn Draw) -> Parts {
-    let mut part = |name: &str| !skipped(name) && draw.below(2) == 1;
+pub fn parts(tape: &Tape) -> Parts {
+    let part = |name: &'static str| !skipped(name) && tape.below(2, name) == 1;
     let (up, made, mac) = (part("up-part"), part("made-part"), part("mac-part"));
     Parts { up, made, mac, mid: up && part("mid-part") }
 }
 
 /// One turn, drawn; the simplest is a build of what is there.
-pub fn turn(draw: &mut dyn Draw, parts: Parts, library_only: bool) -> Turn {
+pub fn turn(tape: &Tape, parts: Parts, library_only: bool) -> Turn {
     let kinds = kinds(parts, library_only);
-    let count = if kinds.is_empty() { 0 } else { [0, 1, 1, 1, 1, 1, 2, 2][draw.below(8) as usize] };
+    let count = if kinds.is_empty() { 0 } else { [0, 1, 1, 1, 1, 1, 2, 2][tape.below(8, "edits") as usize] };
     let edits = (0..count)
         .map(|_| {
-            let (_, make) = kinds[draw.below(kinds.len() as u64) as usize];
-            make(draw.below(3) as u8)
+            let (_, make) = kinds[tape.index(kinds.len(), "edit kind")];
+            make(tape.below(3, "edit value") as u8)
         })
         .collect();
-    let save = [Save::Write, Save::Rename, Save::Truncate, Save::Twice][draw.below(4) as usize];
-    let event = match draw.below(10) {
+    let save = [Save::Write, Save::Rename, Save::Truncate, Save::Twice][tape.below(4, "save") as usize];
+    let event = match tape.below(10, "event") {
         5 if !skipped("stop") => Event::Stop,
         6 if !skipped("kill") => Event::Kill,
-        7 if !skipped("cancel") => Event::Cancel(20 + 60 * draw.below(8)),
+        7 if !skipped("cancel") => Event::Cancel(20 + 60 * tape.below(8, "cancel after")),
         8 if !skipped("beside") => Event::Beside,
         9 if !skipped("build") => Event::Build,
         _ => Event::Nothing,
     };
-    let event_last = event != Event::Nothing && draw.below(2) == 1;
-    let width = match draw.below(8) {
+    let event_last = event != Event::Nothing && tape.below(2, "event last") == 1;
+    let width = match tape.below(8, "width") {
         6 if !library_only && !skipped("width") => Some(80),
         7 if !library_only && !skipped("width") => Some(200),
         _ => None,
@@ -616,24 +606,24 @@ pub fn turn(draw: &mut dyn Draw, parts: Parts, library_only: bool) -> Turn {
     let request = match library_only {
         true => Request::RUN,
         false => Request {
-            action: match draw.below(8) {
+            action: match tape.below(8, "ask") {
                 4 | 5 if !skipped("build-ask") => Ask::Build,
                 6 if !skipped("check-ask") => Ask::Check,
                 7 if !skipped("test-ask") => Ask::Test,
                 _ => Ask::Run,
             },
-            release: draw.below(8) == 7 && !skipped("release"),
-            loud: draw.below(6) == 5 && !skipped("loud-flag"),
-            short: draw.below(8) == 7 && !skipped("short"),
+            release: tape.below(8, "release") == 7 && !skipped("release"),
+            loud: tape.below(6, "loud") == 5 && !skipped("loud-flag"),
+            short: tape.below(8, "short") == 7 && !skipped("short"),
         },
     };
     Turn { request, edits, save, event, event_last, width }
 }
 
-/// A sequence of one to `most` turns, drawn.
-pub fn turns(draw: &mut dyn Draw, parts: Parts, library_only: bool, most: u64) -> Vec<Turn> {
-    let count = 1 + draw.below(most);
-    (0..count).map(|_| turn(draw, parts, library_only)).collect()
+/// A sequence of one to `most` turns, drawn, each turn's draws one span.
+pub fn turns(tape: &Tape, parts: Parts, library_only: bool, most: u64) -> Vec<Turn> {
+    let count = 1 + tape.below(most, "turns");
+    (0..count).map(|_| tape.span("turn", |tape| turn(tape, parts, library_only))).collect()
 }
 
 /// What a turn from `before` to `after` may make again: `None` where the model has no bound.

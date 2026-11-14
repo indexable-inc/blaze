@@ -8,9 +8,9 @@
 use std::time::Duration;
 
 use blaze_core::{FileName, sim::Faults};
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, write_synced};
+use super::{check, control, path, root, write_synced};
 use crate::{
     Cx, Plant, Stopped,
     clock::{Clock, SleepError},
@@ -37,17 +37,17 @@ struct Plan {
     calls: Vec<(Call, u64)>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 100, 5_000]);
-    let calls = (0..d.int(1, 12))
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 100, 5_000], "latency us");
+    let calls = (0..tape.int_in(1..=12u64, "calls"))
         .map(|_| {
-            let call = match d.int(0, 2) {
-                0 => Call::Sleep { ms: d.int(0, 200) },
+            let call = match tape.int_in(0..=2u64, "call") {
+                0 => Call::Sleep { ms: tape.int_in(0..=200u64, "sleep ms") },
                 1 => Call::SlowWrite,
                 _ => Call::HeldSync,
             };
-            (call, d.int(0, 200))
+            (call, tape.int_in(0..=200u64, "deadline ms"))
         })
         .collect();
     Plan { seed, latency_us, calls }
@@ -125,12 +125,12 @@ fn calls(plan: &Plan, cx: &Cx, clock: &Clock, slow: &Dir<ReadWrite>, file: &File
 /// driver's clock past `d` (unless it was past already), a call that stopped with
 /// `Stopped::Deadline` did so once `d` had passed, and a call that cannot finish ends with
 /// `Stopped::Deadline`, not later and not otherwise.
-#[hegel::test(test_cases = 150)]
-fn a_deadline_always_ends_a_wait(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_deadline_always_ends_a_wait() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_wait_that_ignores_its_deadline() {
-    control(Plant::WaitIgnoresDeadline, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::WaitIgnoresDeadline, plan, run);
 }

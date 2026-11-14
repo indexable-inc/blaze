@@ -124,8 +124,7 @@ impl SplitMix64 {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
@@ -222,52 +221,56 @@ mod tests {
         });
     }
 
-    #[hegel::test]
-    fn matches_the_reference(tc: TestCase) {
-        let seed: u64 = tc.draw(gs::integers());
-        let n: u64 = tc.draw(gs::integers().min_value(1).max_value(u64::MAX - 1));
-        let len: usize = tc.draw(gs::integers().max_value(39));
-        let mut state = seed;
-        let mut rng = SplitMix64::new(seed);
-        for _ in 0..16 {
-            assert_eq!(rng.next_u64(), reference(&mut state));
-        }
-        assert_eq!(rng.below(n), reference(&mut state) % n);
-        assert_eq!(rng.next_u32(), (reference(&mut state) >> 32) as u32);
-        assert_eq!(rng.state(), state);
-        assert_eq!(mix(seed), reference(&mut seed.wrapping_sub(GAMMA)));
+    #[test]
+    fn matches_the_reference() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let seed: u64 = tape.int("seed");
+            let n: u64 = tape.int_in(1..=u64::MAX - 1, "n");
+            let len: usize = tape.int_in(0..=39, "len");
+            let mut state = seed;
+            let mut rng = SplitMix64::new(seed);
+            for _ in 0..16 {
+                assert_eq!(rng.next_u64(), reference(&mut state));
+            }
+            assert_eq!(rng.below(n), reference(&mut state) % n);
+            assert_eq!(rng.next_u32(), (reference(&mut state) >> 32) as u32);
+            assert_eq!(rng.state(), state);
+            assert_eq!(mix(seed), reference(&mut seed.wrapping_sub(GAMMA)));
 
-        let mut bytes = vec![0u8; len];
-        rng.fill(&mut bytes);
-        let mut expected = Vec::new();
-        while expected.len() < len {
-            expected.extend_from_slice(&reference(&mut state).to_le_bytes());
-        }
-        expected.truncate(len);
-        assert_eq!(bytes, expected);
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes);
+            let mut expected = Vec::new();
+            while expected.len() < len {
+                expected.extend_from_slice(&reference(&mut state).to_le_bytes());
+            }
+            expected.truncate(len);
+            assert_eq!(bytes, expected);
+        });
     }
 
     /// The simulator's and the model checker's draws, as they call them (`below` of a
     /// nonzero bound, `one_in` of a `u32`, `shuffle`), are the old copy's.
-    #[hegel::test]
-    fn matches_the_kept_copy(tc: TestCase) {
-        let seed: u64 = tc.draw(gs::integers());
-        let bounds: Vec<u64> =
-            tc.draw(gs::vecs(gs::integers().min_value(1).max_value((1 << 40) - 1)).max_size(31));
-        let ones: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(7)).max_size(31));
-        let len: usize = tc.draw(gs::integers().max_value(63));
-        let (mut new, mut old) = (SplitMix64::new(seed), Kept(seed));
-        for n in bounds {
-            assert_eq!(new.below(n), old.below(n));
-        }
-        for n in ones {
-            assert_eq!(new.one_in(u64::from(n)), old.one_in(n));
-        }
-        let mut a: Vec<usize> = (0..len).collect();
-        let mut b = a.clone();
-        new.shuffle(&mut a);
-        old.shuffle(&mut b);
-        assert_eq!(a, b);
-        assert_eq!(new.next_u64(), old.next_u64());
+    #[test]
+    fn matches_the_kept_copy() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let seed: u64 = tape.int("seed");
+            let bounds: Vec<u64> =
+                tape.vec(0..=31, "bounds", |tape| tape.int_in(1..=(1 << 40) - 1, "bound"));
+            let ones: Vec<u32> = tape.vec(0..=31, "ones", |tape| tape.int_in(0..=7, "one in"));
+            let len: usize = tape.int_in(0..=63, "len");
+            let (mut new, mut old) = (SplitMix64::new(seed), Kept(seed));
+            for n in bounds {
+                assert_eq!(new.below(n), old.below(n));
+            }
+            for n in ones {
+                assert_eq!(new.one_in(u64::from(n)), old.one_in(n));
+            }
+            let mut a: Vec<usize> = (0..len).collect();
+            let mut b = a.clone();
+            new.shuffle(&mut a);
+            old.shuffle(&mut b);
+            assert_eq!(a, b);
+            assert_eq!(new.next_u64(), old.next_u64());
+        });
     }
 }

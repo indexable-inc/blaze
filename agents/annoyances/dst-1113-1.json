@@ -1,0 +1,13 @@
+{
+ "id": "dst-1113-1",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "scripts/src/bin/ledger.rs and scripts/src/bin/invariants.rs on main at e6635c9ba7",
+ "what": "Two generators refuse on main, so a change that adds a ledger row or an invariant cannot regenerate their tables: `ledger write` exits 1 (rows T10, R2, R4, R9 and G5 name paths that no longer exist: crates/blaze-premap, crates/blaze-cargo/src/serve/unit/release.rs, crates/blaze-query/src/image.rs) and `invariants write` exits 1 (crates/blaze-item-hash/src/tests/classify.rs:1936: the level `keys-cover-every-input` is none of tested, simulated, model-checked, proved).",
+ "cost": "docs/v2/plan/objectives.md and invariants.md left stale for row V12 and blaze-sim`s 13 invariants",
+ "cause": "files were deleted or moved, and a statement was written with a rule name as its level, without the checks being run; I did not find a gate job that runs them",
+ "class": "a generated table whose generator is not in the merge gate goes unwritable without anyone seeing",
+ "prevention": "run `ledger check` and `invariants check` in the merge gate; not built",
+ "workaround": "edited objectives.json only and said so in the commit",
+ "state": "open"
+}

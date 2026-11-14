@@ -370,23 +370,44 @@ pub(crate) fn lower_impl(
     let mut expr_collector =
         ExprCollector::with_maps(db, module, impl_syntax.file_id, LoweringMode::Analysis, maps);
     expr_collector.set_lowering(lowering);
-    expr_collector.impl_header_lifetimes = Some(0);
-    let self_ty =
-        expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
-    let trait_ = impl_syntax.value.trait_().and_then(|it| match it {
-        ast::Type::PathType(path_type) => {
-            let path = expr_collector.lower_path_type(path_type, &mut ImplTraitLowering::Opaque)?;
-            Some(TraitRef { path: expr_collector.alloc_path(path, TypePtr::of(it)) })
-        }
-        _ => None,
-    });
-    let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
     let mut collector = generics::GenericParamsCollector::new(impl_id.into());
-    collector.lower(
-        &mut expr_collector,
-        impl_syntax.value.generic_param_list(),
-        impl_syntax.value.where_clause(),
-    );
+    let lower_trait = |ec: &mut ExprCollector<'_>, lowering: &mut ImplTraitLowering<'_>| {
+        impl_syntax.value.trait_().and_then(|it| match it {
+            ast::Type::PathType(path_type) => {
+                let path = ec.lower_path_type(path_type, lowering)?;
+                Some(TraitRef { path: ec.alloc_path(path, TypePtr::of(it)) })
+            }
+            _ => None,
+        })
+    };
+    let (self_ty, trait_, fresh) = if expr_collector.features().blaze_anon_params {
+        // A `_` of the header is a parameter of the impl after those its list names, so the
+        // list is lowered first, before the header's fresh lifetimes are counted.
+        collector.lower(
+            &mut expr_collector,
+            impl_syntax.value.generic_param_list(),
+            impl_syntax.value.where_clause(),
+        );
+        expr_collector.impl_header_lifetimes = Some(0);
+        let self_ty = collector.collect_impl_header(&mut expr_collector, false, |ec, lowering| {
+            ec.lower_type_ref_opt(impl_syntax.value.self_ty(), lowering)
+        });
+        let trait_ = collector.collect_impl_header(&mut expr_collector, true, lower_trait);
+        let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
+        (self_ty, trait_, fresh)
+    } else {
+        expr_collector.impl_header_lifetimes = Some(0);
+        let self_ty =
+            expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
+        let trait_ = lower_trait(&mut expr_collector, &mut ImplTraitLowering::Opaque);
+        let fresh = expr_collector.impl_header_lifetimes.take().unwrap_or(0);
+        collector.lower(
+            &mut expr_collector,
+            impl_syntax.value.generic_param_list(),
+            impl_syntax.value.where_clause(),
+        );
+        (self_ty, trait_, fresh)
+    };
     collector.push_fresh_lifetimes(fresh);
     let params = collector.finish();
     let (store, source_map) = expr_collector.finish_store();
@@ -1169,7 +1190,12 @@ impl<'db> ExprCollector<'db> {
                     ptr,
                 )
             }
-            ast::Type::InferType(_inner) => self.alloc_type_ref(TypeRef::Placeholder, ptr),
+            // A parameter of the item where `_` is one (`#![feature(blaze_anon_params)]`),
+            // else the placeholder.
+            ast::Type::InferType(_inner) => match impl_trait_lower_fn.anonymous(self, ptr) {
+                Some(param) => param,
+                None => self.alloc_type_ref(TypeRef::Placeholder, ptr),
+            },
             ast::Type::FnPtrType(inner) => {
                 // Taken before the parameters are lowered: a function pointer among them
                 // is not what the `for` is written on.
@@ -1944,7 +1970,14 @@ impl<'db> ExprCollector<'db> {
                     (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
                 });
                 let body = self.collect_labelled_block_opt(label, e.loop_body());
-                self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr);
+                // `#[loop_match]` changes how MIR lowers the loop's `#[const_continue]` breaks;
+                // the attribute stays off `Expr::Loop`, in the store's marked column.
+                let loop_match = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "loop_match");
+                if ast::HasAttrs::attrs(&e).any(loop_match) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::WhileExpr(e) => self.collect_while_loop(syntax_ptr, e),
             ast::Expr::ForExpr(e) if e.const_token().is_some() => {
@@ -2036,7 +2069,14 @@ impl<'db> ExprCollector<'db> {
                     None
                 });
                 let expr = e.expr().map(|e| self.collect_expr(e));
-                self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Break { expr, label }, syntax_ptr);
+                // `#[const_continue]` makes the break a jump into the `#[loop_match]` arm its
+                // value selects; kept off `Expr::Break`, in the store's marked column.
+                let const_continue = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "const_continue");
+                if ast::HasAttrs::attrs(&e).any(const_continue) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::ParenExpr(e) => {
                 // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
@@ -2302,7 +2342,7 @@ impl<'db> ExprCollector<'db> {
                         attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
                     };
                     if ast::HasAttrs::attrs(&e).any(inherits) {
-                        this.store.overflow_inheriting.insert(closure);
+                        this.store.marked_exprs.insert(closure);
                     }
 
                     (if is_coroutine_closure { body } else { closure }, closure)

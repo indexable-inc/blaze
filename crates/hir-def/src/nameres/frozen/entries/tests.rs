@@ -57,16 +57,20 @@ fn macro_ids(db: &Db) -> Vec<u32> {
         .collect()
 }
 
-/// The expander of each macro of `ids`, as its `Debug` text: equal for equal expanders of two
-/// databases of the same text.
+/// The expander of each macro of `ids`, as the `Debug` text of its rules and transparency:
+/// equal for equal expanders of two databases of the same text. Not the whole expander's: it
+/// names the arena its tokens' contexts are of (`table`), whose generation is the database's
+/// own (a database given a store by [`set`] committed an edit of the session, so each of its
+/// arenas is in its second generation, and one of the same text that was not is in its first).
 fn expanders(db: &Db, ids: &[u32]) -> Vec<String> {
     let (lib, file) = lib_file(db);
     ids.iter()
         .map(|&raw| {
             let id = FileAstId::<ast::Macro>::from_erased_unchecked(ErasedFileAstId::from_raw(raw));
             let id = InFile::new(HirFileId::FileId(file), id);
+            let expander = id.decl_macro_expander(db, lib);
             // alloc: a test's text
-            format!("{:?}", id.decl_macro_expander(db, lib))
+            format!("{:?} {:?}", expander.mac, expander.transparency)
         })
         // alloc: a test's list
         .collect()

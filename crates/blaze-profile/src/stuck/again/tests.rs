@@ -1,7 +1,7 @@
 //! The same-work-again verdict under simulation: a driver whose tasks restart and end in an
-//! order Hegel draws, against a reference model of the rule kept beside the core.
+//! order the tape draws, against a reference model of the rule kept beside the core.
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -62,18 +62,18 @@ struct Model {
 
 const NODES: usize = 4;
 
-/// One run Hegel draws: tasks of the driver end, nodes end and nodes start again; each start's
+/// One run the tape draws: tasks of the driver end, nodes end and nodes start again; each start's
 /// verdict held to the model. How many verdicts it saw, or the first disagreement.
-fn simulate(tc: &TestCase, flaw: Flaw) -> Result<u32, String> {
+fn simulate(tape: &Tape, flaw: Flaw) -> Result<u32, String> {
     let mut again = Again::new();
     again.flaw = flaw;
     let mut model: [Option<Model>; NODES] = [None; NODES];
     let mut ended = 0u64;
     let mut said = 0;
-    let steps = tc.draw(gs::integers::<u32>().min_value(1).max_value(200));
+    let steps = tape.int_in(1..=200u32, "steps");
     for _ in 0..steps {
-        let node = tc.draw(gs::integers::<usize>().max_value(NODES - 1));
-        match tc.draw(gs::integers::<u8>().max_value(9)) {
+        let node = tape.index(NODES, "node");
+        match tape.int_in(0..=9u8, "event") {
             0 => ended += 1,
             1 => {
                 again.forget(node as u64);
@@ -105,9 +105,7 @@ fn simulate(tc: &TestCase, flaw: Flaw) -> Result<u32, String> {
 /// The invariant: under any order of restarts and ends, the core says a task exactly when it
 /// has started more than [`AGAIN_BOUND`] times in a row with nothing changed, once, and never
 /// otherwise.
-#[hegel::test(test_cases = 300)]
-fn the_core_says_exactly_the_tasks_started_again_unchanged(tc: TestCase) {
-    if let Err(why) = simulate(&tc, Flaw::None) {
-        panic!("{why}");
-    }
+#[test]
+fn the_core_says_exactly_the_tasks_started_again_unchanged() {
+    blaze_sim::check(Config::cases(300), |tape| simulate(tape, Flaw::None).map(|_| ()));
 }

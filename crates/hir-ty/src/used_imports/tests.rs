@@ -116,6 +116,7 @@ const FOLDS: [&str; 2] = ["crate_uses", "used_imports_with_traits"];
 /// within its crate is the item store's and the kernel's to keep small, not the memo's. Left
 /// failing until it is restated over the body entries.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_with_equal_uses_reruns_no_fold() {
     let equal = executed_after(&with_by_method("1u8.method();"));
     assert!(equal.iter().any(|it| it == "body_uses"), "the body's record ran again: {equal:?}");
@@ -241,6 +242,99 @@ fn macro_path_uses(source: &str) -> (Vec<String>, usize) {
     (texts, no_rule)
 }
 
+/// What decides why an associated item's attribute path records no use, each step of
+/// hir-def's `Walk::attr_call` (nameres/uses.rs) redone over `source`'s impls: the impl's
+/// macro calls (none: the impl's collection kept no attribute call), each call's kind, the
+/// meta `find_attr_range_view` picks and the path made of it, what `resolve_path_as_macro`
+/// finds and whether its definition is the call's (`attr_call` returns before recording
+/// when not), and the uses `record_macro_path_uses` gives (none with the two equal: the
+/// lookup of the path's segments misses the import).
+fn assoc_attr_evidence(source: &str) -> String {
+    use hir_def::{nameres::MacroSubNs, resolver::HasResolver as _};
+    use hir_expand::{MacroCallKind, mod_path::ModPath};
+    use syntax::view;
+
+    let db = fixture::db(source).into_db();
+    let db = &db;
+    let krate = main_crate(db);
+    let mut out = String::from("evidence:\n");
+    for (_, module) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
+        for imp in module.scope(db).impls() {
+            let items = imp.impl_items(db);
+            out.push_str(&format!(
+                "  impl {imp:?}: {} items, macro calls {:?}\n",
+                items.items.len(),
+                items.macro_calls,
+            ));
+            let resolver = imp.resolver(db);
+            // The impl's own diagnostics (an unresolved attribute macro is one), and what the
+            // attribute's name resolves to here: `resolve_attr_macro` (attr_resolution.rs)
+            // keeps a call only where `MacroId::is_attribute` holds, the module collector
+            // (facts/macros.rs) where `MacroDefId::is_attribute` does.
+            out.push_str(&format!(
+                "  impl {imp:?} diagnostics: {:?}\n",
+                imp.impl_items_with_diagnostics(db).1,
+            ));
+            let name = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("ga_assoc"));
+            let by_name = ModPath::from_segments(hir_expand::mod_path::PathKind::Plain, [name]);
+            let found = resolver.resolve_path_as_macro(db, &by_name, Some(MacroSubNs::Attr));
+            out.push_str(&format!(
+                "  `ga_assoc` here: {:?}, kind {:?}, MacroId::is_attribute {:?}, \
+                 MacroDefId::is_attribute {:?}\n",
+                found.map(|it| it.def),
+                found.map(|it| it.def.definition(db).kind),
+                found.map(|it| it.def.is_attribute(db)),
+                found.map(|it| it.def.definition(db).is_attribute()),
+            ));
+            for &(item, call) in items.macro_calls.iter() {
+                let loc = call.loc(db);
+                let MacroCallKind::Attr { censored_attr_ids, .. } = &loc.kind else {
+                    out.push_str(&format!("  call {call:?}: not an attribute call\n"));
+                    continue;
+                };
+                let (_, meta) =
+                    censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, item);
+                let ast_path = match meta {
+                    view::Meta::PathMeta(it) => it.path(),
+                    view::Meta::TokenTreeMeta(it) => it.path(),
+                    _ => None,
+                };
+                let meta_text = view::AstNode::syntax(&meta).text().to_string();
+                let Some(ast_path) = ast_path else {
+                    out.push_str(&format!("  call {call:?}: meta `{meta_text}` has no path\n"));
+                    continue;
+                };
+                let span_map = item.file_id.span_map(db);
+                let table = item.file_id.context_arena();
+                let path = ModPath::from_src_view(db, table, ast_path, &mut |range| {
+                    span_map.span_for_range(range).ctx
+                });
+                let Some(path) = path else {
+                    out.push_str(&format!("  call {call:?}: meta `{meta_text}`, no ModPath\n"));
+                    continue;
+                };
+                let subns = Some(MacroSubNs::Attr);
+                let found = resolver.resolve_path_as_macro(db, &path, subns);
+                let found_def = found.map(|it| it.def.definition(db));
+                let mut uses = Vec::new_in(std::alloc::Global);
+                resolver.record_macro_path_uses(db, &path, subns, &mut uses);
+                out.push_str(&format!(
+                    "  call {call:?}: meta `{meta_text}`, path {:?} {:?}, table {table:?}, \
+                     resolver table {:?}\n    found {:?}, its definition is the call's: {}\n    \
+                     found def {found_def:?}\n    call def {:?}\n    uses {uses:?}\n",
+                    path.kind,
+                    path.segments(),
+                    resolver.ctx_table(),
+                    found.map(|it| it.def),
+                    found_def == Some(loc.def),
+                    loc.def,
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The invariant: the path of each derive and attribute macro is resolved again as a use, so an
 /// import only `#[derive(Dup)]`, a module item's `#[ga]` or an associated item's `#[ga_assoc]`
 /// reads is used by a path, and each such call is recorded invoked with no rule. Control: with
@@ -250,13 +344,16 @@ fn macro_path_uses(source: &str) -> (Vec<String>, usize) {
 #[test]
 fn derive_and_attribute_macro_paths_are_uses() {
     let (texts, no_rule) = macro_path_uses(MACRO_PATHS);
+    // The evidence is made only on a failure (an `assert_eq!`'s message is).
     assert_eq!(
         texts,
         [
             "core::clone::Clone as Dup",
             "core::prelude::v1::global_allocator as ga",
             "core::prelude::v1::global_allocator as ga_assoc",
-        ]
+        ],
+        "{}",
+        assoc_attr_evidence(MACRO_PATHS),
     );
     // `Dup`'s derive and `global_allocator` (both attributes name it, one record) at least.
     assert!(no_rule >= 2, "the derive and the attribute are invoked with no rule: {no_rule}");

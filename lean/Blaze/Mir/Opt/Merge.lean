@@ -39,16 +39,16 @@ theorem withTopBlock_memMap (c : BlockId) : MemMap (withTopBlock c) where
       by_cases h : fr.id = id
       · have h' : (fr.withBlock c).id = id := h
         have left : findFrame (withTopBlock c (fr :: rest)) id = some (fr.withBlock c) :=
-          (findFrame_cons (fr.withBlock c) rest id).trans (if_pos h')
+          (findFrame_cons (fr.withBlock c) rest id).trans (ite_eq_left h')
         have right : findFrame (fr :: rest) id = some fr :=
-          (findFrame_cons fr rest id).trans (if_pos h)
+          (findFrame_cons fr rest id).trans (ite_eq_left h)
         rw [left, right]
         try rfl
       · have h' : ¬ (fr.withBlock c).id = id := h
         have left : findFrame (withTopBlock c (fr :: rest)) id = findFrame rest id :=
-          (findFrame_cons (fr.withBlock c) rest id).trans (if_neg h')
+          (findFrame_cons (fr.withBlock c) rest id).trans (ite_eq_right h')
         have right : findFrame (fr :: rest) id = findFrame rest id :=
-          (findFrame_cons fr rest id).trans (if_neg h)
+          (findFrame_cons fr rest id).trans (ite_eq_right h)
         rw [left, right]
   set := by
     intro l id slots
@@ -59,16 +59,16 @@ theorem withTopBlock_memMap (c : BlockId) : MemMap (withTopBlock c) where
       · have h' : (fr.withBlock c).id = id := h
         have left : setFrame (withTopBlock c (fr :: rest)) id slots =
             (fr.withBlock c).withLocals slots :: rest :=
-          (setFrame_cons (fr.withBlock c) rest id slots).trans (if_pos h')
+          (setFrame_cons (fr.withBlock c) rest id slots).trans (ite_eq_left h')
         have right : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
-          (setFrame_cons fr rest id slots).trans (if_pos h)
+          (setFrame_cons fr rest id slots).trans (ite_eq_left h)
         exact left.trans (congrTo (withTopBlock c) right).symm
       · have h' : ¬ (fr.withBlock c).id = id := h
         have left : setFrame (withTopBlock c (fr :: rest)) id slots =
             fr.withBlock c :: setFrame rest id slots :=
-          (setFrame_cons (fr.withBlock c) rest id slots).trans (if_neg h')
+          (setFrame_cons (fr.withBlock c) rest id slots).trans (ite_eq_right h')
         have right : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
-          (setFrame_cons fr rest id slots).trans (if_neg h)
+          (setFrame_cons fr rest id slots).trans (ite_eq_right h)
         exact left.trans (congrTo (withTopBlock c) right).symm
   top := by
     intro l
@@ -111,15 +111,15 @@ theorem assertOn_top (c : BlockId) (st : State) (expected : Bool) (kind : Error)
     by_cases h : b = expected
     · have left : assertOn (st.mapStack (withTopBlock c)) expected kind target (Value.bool b) =
           (st.mapStack (withTopBlock c)).jump target :=
-        (assertOn_bool (st.mapStack (withTopBlock c)) expected kind target b).trans (if_pos h)
+        (assertOn_bool (st.mapStack (withTopBlock c)) expected kind target b).trans (ite_eq_left h)
       have right : assertOn st expected kind target (Value.bool b) = st.jump target :=
-        (assertOn_bool st expected kind target b).trans (if_pos h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_left h)
       exact left.trans ((State.jump_top c st target).trans right.symm)
     · have left : assertOn (st.mapStack (withTopBlock c)) expected kind target (Value.bool b) =
           Outcome.panic kind :=
-        (assertOn_bool (st.mapStack (withTopBlock c)) expected kind target b).trans (if_neg h)
+        (assertOn_bool (st.mapStack (withTopBlock c)) expected kind target b).trans (ite_eq_right h)
       have right : assertOn st expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool st expected kind target b).trans (if_neg h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_right h)
       exact left.trans right.symm
   | Value.unit => rfl
   | Value.int _ _ => rfl
@@ -331,9 +331,9 @@ theorem merged_ite (prog : Program) (st : State) (blk : BasicBlock) (c : Prop) [
     (a b : BasicBlock) (ha : c → Merged prog st blk a) (hb : Merged prog st blk b) :
     Merged prog st blk (if c then a else b) := by
   by_cases h : c
-  · rw [if_pos h]
+  · rw [ite_eq_left h]
     exact ha h
-  · rw [if_neg h]
+  · rw [ite_eq_right h]
     exact hb
 
 theorem inlineOpt_merged (prog : Program) (st : State) (blk : BasicBlock) :

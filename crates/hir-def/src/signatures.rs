@@ -2587,11 +2587,40 @@ impl EnumVariants {
         self.variants.get(name).map(|&(id, _)| id)
     }
 
+    /// The variant of the enum `e` (whose variants these are) bound under `name`, a name keyed
+    /// in `table`'s contexts: the reading crate's table, which has the enum's crate in its
+    /// closure. A variant's own key is of the table of its enum's file
+    /// ([`def_site::variant_name`]), so the two keys are compared in `table`, the variant's
+    /// carried there ([`span::SyntaxContext::translate`]): context ids are per table, and the
+    /// same chain of marks is another id in another crate's table. A name with no key is
+    /// looked up as it is.
+    pub fn variant_keyed(
+        &self,
+        db: &Db,
+        e: EnumId,
+        table: blaze_memo::ArenaId,
+        name: Name,
+    ) -> Option<(EnumVariantId, FieldsShape)> {
+        let Some(key) = name.key() else { return self.variants.get(&name).copied() };
+        let names = e.lookup(db).id.file_id.context_arena();
+        if names == table {
+            return self.variants.get(&name).copied();
+        }
+        let text = name.unkeyed();
+        self.variants.iter().find_map(|(bound, &found)| {
+            let carried = bound.key().map(|it| it.translate(db, names, table));
+            (bound.unkeyed() == text && carried == Some(key)).then_some(found)
+        })
+    }
+
     /// The variant of `e` that a path segment `name`, written with `ctxt`, names (`E::V`,
     /// `<E>::V`, `Self::V`, `use E::V`): `name` looked up by [`def_site::name_in`] the scope the
     /// enum's expansion made, as rustc's `resolve_ident_in_module` of the enum's module and
     /// `hygienic_eq` of `lower_type_relative_path` and `resolve_fully_qualified_call` do. A
-    /// name with no macros 2.0 mark is looked up as written. `ctxt` is of `table`.
+    /// name with no macros 2.0 mark is looked up as written. `ctxt` is of `table`, the reading
+    /// crate's, and so is the key `name_in` gives; the variants' keys are of the table of the
+    /// enum's file, so the two are compared in `table` ([`EnumVariants::variant_keyed`]), the
+    /// one table both have a context in when the enum is a dependency's.
     pub fn variant_written(
         db: &Db,
         table: blaze_memo::ArenaId,
@@ -2600,7 +2629,7 @@ impl EnumVariants {
         ctxt: span::SyntaxContext,
     ) -> Option<EnumVariantId> {
         let name = def_site::name_in(db, table, *name, ctxt, def_site::enum_expansion(db, e));
-        e.enum_variants(db).variant(&name)
+        e.enum_variants(db).variant_keyed(db, e, table, name).map(|(id, _)| id)
     }
 
     /// The name `variant_id` is written with, its key dropped: what a message or a printed
@@ -3167,6 +3196,7 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
     // signature of another item of the same crate; on the port the edit makes the crate's arena
     // again, so every signature of it is lowered again. The signatures are still equal.
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_body_edit_lowers_no_signature() {
         let (log, before, after) = lowered_by(&BODY_EDITS);
         assert_eq!(lowerings(&log), Vec::<&str>::new(), "{log:#?}");
@@ -3174,6 +3204,7 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
     }
 
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn an_edit_of_another_item_lowers_none_of_this_one() {
         // `S` gets a field: its signature and fields are lowered again, and every item after
         // it moves, but none of them is lowered again.
@@ -3185,7 +3216,13 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         assert!(lowerings[1].contains("VariantFields::lowered"), "{lowerings:?}");
     }
 
+    // PORT (round 22): false by design on blaze-memo, as the two above. It claimed an edit of
+    // a discriminant lowers the enum's variants again and not its signature. True now: the
+    // edit makes the crate's arena again, so the enum's signature is lowered again too (the
+    // signature lowered is equal); that only the variants move is the host's claim, on
+    // records.
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_discriminant_edit_lowers_the_variants_not_the_enum() {
         let (log, ..) = lowered_by(&[("A = 1", "A = 1 + 1")]);
         let lowerings = lowerings(&log);
@@ -3327,6 +3364,7 @@ pub const K: u8 = ;
     }
 
     #[test]
+    #[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
     fn a_body_edit_runs_no_signature_syntax() {
         let fx = fixture::db(CODE);
         let file = fx.only_file();

@@ -72,16 +72,19 @@ mod tests {
         assert_eq!(list(Vec::<&str>::new(), Join::Or, true), "");
     }
 
-    #[hegel::test]
-    fn list_is_the_slice_matchs(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let items: Vec<String> =
-            tc.draw(gs::vecs(gs::text().alphabet("ab ,").max_size(3)).max_size(5));
-        let quote: bool = tc.draw(gs::booleans());
-        for join in [Join::And, Join::Or, Join::AndNoSerialComma] {
-            let quoted: Vec<String> =
-                items.iter().map(|it| if quote { format!("`{it}`") } else { it.clone() }).collect();
-            assert_eq!(list(&items, join, quote), reference(&quoted, join));
-        }
+    #[test]
+    fn list_is_the_slice_matchs() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let items: Vec<String> =
+                tape.vec(0..=5, "items", |tape| tape.text_from("ab ,", 0..=3, "item"));
+            let quote: bool = tape.bool("quote");
+            for join in [Join::And, Join::Or, Join::AndNoSerialComma] {
+                let quoted: Vec<String> = items
+                    .iter()
+                    .map(|it| if quote { format!("`{it}`") } else { it.clone() })
+                    .collect();
+                assert_eq!(list(&items, join, quote), reference(&quoted, join));
+            }
+        });
     }
 }

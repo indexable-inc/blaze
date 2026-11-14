@@ -12,36 +12,41 @@
 //! #[::core::prelude::v1::test]
 //! fn f_contract() {
 //!     // per argument: traits whose `on_unimplemented` names the argument, the function and
-//!     // what is missing (a Hegel default generator, `Debug`, `Clone`, `ToOwned`)
-//!     ::hegel::Hegel::new(|__blaze_tc: ::hegel::TestCase| {
-//!         let __blaze_arg0: u32 = <u32 as __BlazeDraw0>::__blaze_draw(&__blaze_tc);
-//!         let __blaze_arg1: String = /* a `<str as ToOwned>::Owned` drawn */;
-//!         let __blaze_case: String = /* the case as a plain `#[test]`, the values printed */;
-//!         { let x: u32 = clone of arg0; let s: &str = borrow of arg1; __blaze_tc.assume(x < 10); }
+//!     // what is missing (`blaze_sim::Any`, `Debug`, `Clone`, `ToOwned`)
+//!     ::blaze_sim::check(::blaze_sim::Config::DEFAULT, |__blaze_tape: &::blaze_sim::Tape| {
+//!         let __blaze_arg0: u32 = <u32 as __BlazeDraw0>::__blaze_draw(__blaze_tape); // `tape.any("x")`
+//!         let __blaze_arg1: String = /* a `<str as ToOwned>::Owned` drawn as `"s"` */;
+//!         let __blaze_fail = |what: &str| -> ! { /* note the case as a plain `#[test]`, the values
+//!                                                 printed; panic with `what` */ };
+//!         { let x: u32 = clone of arg0; let s: &str = borrow of arg1; __blaze_tape.assume(x < 10); }
 //!         let __blaze_ret = catch_unwind(|| f(clone of arg0, borrow of arg1)); // a panic fails the case
 //!         { let x: u32 = ..; let s: &str = ..; let r = __blaze_ret; if !(r > x) { fail } }
-//!     }).__database_key(..).run();
+//!     });
 //! }
 //! ```
 //!
-//! Each argument is drawn with Hegel's default generator for its type; an argument `&T` is lent
-//! from a drawn `<T as ToOwned>::Owned` (`&str` from a `String`, `&[T]` from a `Vec<T>`). An
-//! owned argument is passed as a clone, so the drawn value is still there for the clauses and
-//! the report: it must be `Clone`, and every argument `Debug`, each a compile error naming the
-//! argument when it is not. The `requires` are assumed (a case where one is false is rejected,
-//! not failed), each `ensures` is checked after the call with the named return bound to the
-//! result. `recommends` and `decreases` are not checked: a `recommends` does not restrict the
-//! callers of a function that runs, and termination is not a property one call can fail.
+//! Each argument is drawn from blaze-sim's tape by its type's own rule (`blaze_sim::Any`,
+//! labelled with the argument's name, calm at the type's simplest value); an argument `&T` is
+//! lent from a drawn `<T as ToOwned>::Owned` (`&str` from a `String`, `&[T]` from a `Vec<T>`).
+//! An owned argument is passed as a clone, so the drawn value is still there for the clauses
+//! and the report: it must be `Clone`, and every argument `Debug`, each a compile error naming
+//! the argument when it is not. The `requires` are assumed (`tape.assume`: a case where one is
+//! false is discarded, not failed), each `ensures` is checked after the call with the named
+//! return bound to the result. `recommends` and `decreases` are not checked: a `recommends` does
+//! not restrict the callers of a function that runs, and termination is not a property one call
+//! can fail.
 //!
-//! A failure, on Hegel's last replay of the shrunk case, panics with a message naming the
-//! function and the clause (or the function's own panic) and the case as a plain `#[test]` with
-//! the arguments as literals, to paste next to the function and keep. A value whose `Debug` is
-//! not its own Rust expression (a NaN, a map, a `Vec<String>`'s elements) prints as its `Debug`.
+//! A failing case notes itself as a plain `#[test]` with the arguments as literals, to paste
+//! next to the function and keep, and panics with a message naming the function and the clause
+//! (or the function's own panic). blaze-sim shrinks the failure to its least tape and its report
+//! prints the notes of that case only, after the failure's text. A value whose `Debug` is not
+//! its own Rust expression (a NaN, a map, a `Vec<String>`'s elements) prints as its `Debug`.
 //!
 //! What the test can't do is refused with an error naming the function and what it is: a
 //! generic function, a method or associated function, one inside a block, an `async` or
-//! `unsafe` one, an argument that is `&mut`, `impl Trait` or a pattern, and a crate built with
-//! `cfg(test)` that has no `hegel` dependency. On a refusal the function is kept as written.
+//! `unsafe` one, one without arguments (every case would be the same call), an argument that is
+//! `&mut`, `impl Trait` or a pattern, and a crate built with `cfg(test)` that has no `blaze_sim`
+//! dependency. On a refusal the function is kept as written.
 //!
 //! `#[blaze::contract_test(skip)]` keeps the function and adds nothing.
 
@@ -95,16 +100,17 @@ pub(super) fn contract_test_expand<'f>(
     }
     let item = loc.to_node_item_view(db).value;
     let parent = item.syntax().parent().map(|it| it.kind());
-    let has_hegel =
-        || loc.krate.data(db).dependencies.iter().any(|dep| dep.name.symbol().as_str() == "hegel");
+    let has_engine = || {
+        loc.krate.data(db).dependencies.iter().any(|dep| dep.name.symbol().as_str() == "blaze_sim")
+    };
     let test_cfg = loc.krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(sym::test));
     let generated = generate(db, id, tt, span, parent).and_then(|generated| {
         // Without `cfg(test)` the test is configured out and names nothing.
-        match test_cfg && !has_hegel() {
+        match test_cfg && !has_engine() {
             true => Err(format!(
-                "`#[blaze::contract_test]` on `{}`: the generated test calls the `hegel` crate, and \
-                 this crate, built with `cfg(test)`, has no dependency named `hegel`; add \
-                 `hegeltest` as a dev-dependency",
+                "`#[blaze::contract_test]` on `{}`: the generated test calls blaze's test engine, \
+                 the `blaze_sim` crate, and this crate, built with `cfg(test)`, has no dependency \
+                 named `blaze_sim`; add `blaze-sim` as a dev-dependency",
                 generated.function
             )),
             false => Ok(generated),
@@ -371,6 +377,13 @@ fn generate(
         };
         args.push(Arg { binding, shown, ty: ty_ph, ty_text, lent, prefix, suffix });
     }
+    if args.is_empty() {
+        return refuse(
+            "a function without arguments is not supported: the test draws the arguments, and \
+             with none every case is the same call, which blaze-sim refuses as no property test; \
+             call it in a plain `#[test]`",
+        );
+    }
 
     let template = write_template(&fn_ph, &fn_text, &args, &requires, &ensures, ret.as_ref());
     let template = syntax_bridge::parse_to_token_tree_static_span(edition, span, &template)
@@ -429,19 +442,22 @@ fn write_template(
             }
             None => a.ty.clone(), // clone: a placeholder's name, once per argument
         };
+        // A trait of its own, not a bare `tape.any::<T>(..)`: its `on_unimplemented` names the
+        // argument and the function where `T: blaze_sim::Any` does not hold.
         w(format_args!(
             "#[diagnostic::on_unimplemented(message = {}, note = {})]\n\
-             trait __BlazeDraw{i}: ::core::marker::Sized {{ fn __blaze_draw(__blaze_tc: &::hegel::TestCase) -> Self; }}\n\
-             impl<__BlazeX: ::hegel::generators::DefaultGenerator> __BlazeDraw{i} for __BlazeX {{\n\
-             fn __blaze_draw(__blaze_tc: &::hegel::TestCase) -> Self {{ __blaze_tc.draw_silent(::hegel::generators::default::<__BlazeX>()) }}\n\
+             trait __BlazeDraw{i}: ::core::marker::Sized {{ fn __blaze_draw(__blaze_tape: &::blaze_sim::Tape) -> Self; }}\n\
+             impl<__BlazeX: ::blaze_sim::Any> __BlazeDraw{i} for __BlazeX {{\n\
+             fn __blaze_draw(__blaze_tape: &::blaze_sim::Tape) -> Self {{ __blaze_tape.any::<__BlazeX>({}) }}\n\
              }}\n",
             message(&format!(
-                "argument `{n}` can't be drawn: `{{Self}}` has no Hegel default generator"
+                "argument `{n}` can't be drawn: `{{Self}}` has no draw of its own (`blaze_sim::Any`)"
             )),
             lit(&format!(
-                "derive or implement `hegel::DefaultGenerator` for `{{Self}}`, or leave `{fn_text}` out \
-                 with `#[blaze::contract_test(skip)]`"
+                "implement `blaze_sim::Any` for `{{Self}}`, or leave `{fn_text}` out with \
+                 `#[blaze::contract_test(skip)]`"
             )),
+            lit(n),
         ));
         w(format_args!(
             "#[diagnostic::on_unimplemented(message = {})]\n\
@@ -470,14 +486,21 @@ fn write_template(
     }
 
     // The case.
-    w(format_args!("::hegel::Hegel::new(|__blaze_tc: ::hegel::TestCase| {{\n"));
+    w(format_args!(
+        "::blaze_sim::check(::blaze_sim::Config::DEFAULT, |__blaze_tape: &::blaze_sim::Tape| {{\n"
+    ));
     for i in 0..args.len() {
         w(format_args!(
-            "let __blaze_arg{i}: __BlazeDrawn{i} = <__BlazeDrawn{i} as __BlazeDraw{i}>::__blaze_draw(&__blaze_tc);\n"
+            "let __blaze_arg{i}: __BlazeDrawn{i} = <__BlazeDrawn{i} as __BlazeDraw{i}>::__blaze_draw(__blaze_tape);\n"
         ));
     }
-    // The case as a plain test, to paste next to the function.
-    w(format_args!("let mut __blaze_case = ::std::string::String::new();\n"));
+    // A failure notes the case as a plain test, to paste next to the function, and panics with
+    // what failed. The case is written only when one fails; blaze-sim's report prints the notes
+    // of the least failing case, after the failure's text.
+    w(format_args!(
+        "let __blaze_fail = |__blaze_what: &str| -> ! {{\n\
+         let mut __blaze_case = ::std::string::String::new();\n"
+    ));
     let push = |w: &mut dyn FnMut(std::fmt::Arguments<'_>), text: &str| {
         w(format_args!("__blaze_case.push_str({});\n", lit(text)))
     };
@@ -505,10 +528,13 @@ fn write_template(
     for (_, text) in ensures {
         push(&mut w, &format!("    assert!({text});\n"));
     }
-    push(&mut w, "}\n");
+    // No newline after the last `}`: the note is the report's last lines before its replay line.
+    push(&mut w, "}");
     w(format_args!(
-        "let __blaze_fail = |__blaze_what: &str| -> ! {{ ::core::panic!(\"{{}}{{}}{{}}\", __blaze_what, {}, __blaze_case) }};\n",
-        lit(&format!("\n\nthe shrunk case, as a test to paste next to `{fn_text}`:\n\n")),
+        "__blaze_tape.note(::core::format_args!(\"{{}}{{}}\", {}, __blaze_case));\n\
+         ::core::panic!(\"{{}}\", __blaze_what)\n\
+         }};\n",
+        lit(&format!("the least case, as a test to paste next to `{fn_text}`:\n")),
     ));
     let views = |w: &mut dyn FnMut(std::fmt::Arguments<'_>)| {
         for (i, a) in args.iter().enumerate() {
@@ -522,7 +548,7 @@ fn write_template(
         w(format_args!("{{\n"));
         views(&mut w);
         for (ph, _) in requires {
-            w(format_args!("__blaze_tc.assume({ph});\n"));
+            w(format_args!("__blaze_tape.assume({ph});\n"));
         }
         w(format_args!("}}\n"));
     }
@@ -557,10 +583,7 @@ fn write_template(
     }
     w(format_args!("}}\n"));
 
-    w(format_args!(
-        "}})\n.__database_key(::std::format!(\"{{}}::{{}}\", ::core::module_path!(), {}))\n.run();\n}}\n",
-        lit(&test),
-    ));
+    w(format_args!("}});\n}}\n"));
     t
 }
 

@@ -185,13 +185,12 @@ fn g() { fn inner() {} }
     assert!(now.changed_since(now).is_empty());
 }
 
-// The port onto blaze-memo made the last assertion false by design, left failing for a
-// decision: an edit of a file drops its crate's arena at the commit, so
-// `crate_items_by_key` runs again whatever the edit; reuse across an edit comes from the
-// records, not the memo. What this claimed: a body edit reruns `crate_hashes` and not
-// `crate_items_by_key`.
+// Restated for blaze-memo (port decision 9). It also claimed the edit reruns `crate_hashes`
+// and not `crate_items_by_key`: false by design, since an edit of a file drops its crate's
+// arena at the commit and every query of the crate runs again; reuse across an edit is the
+// host's, on records (docs/v2/plan/design/host.md), and that claim is owed there.
 #[test]
-fn a_body_edit_rebuilds_the_columns_without_their_key_order() {
+fn a_body_edit_changes_the_hash_of_its_item_alone() {
     let (mut db, file) = single(
         r#"
 pub struct S { x: u32 }
@@ -218,5 +217,4 @@ fn g() { fn inner() {} }
         assert_eq!(now.changed_since(&before), [item_key(&db, super::item(&db, "f"))]);
     });
     assert!(ran(&executed, crate::table::crate_hashes::KIND_NAME), "{executed:#?}");
-    assert!(!ran(&executed, crate::table::crate_items_by_key::KIND_NAME), "{executed:#?}");
 }

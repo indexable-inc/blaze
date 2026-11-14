@@ -2166,6 +2166,13 @@ impl Files {
         list
     }
 
+    /// How many rows the log holds: one per call site whose latest expansion read something,
+    /// and one per value served by its reads, each by its crate. What bounds the log's memory:
+    /// it grows with the sites ever expanded, not with the edits ([`ReadBy::Call`]).
+    pub fn expansion_rows(&self) -> usize {
+        self.expansions_read.read().len()
+    }
+
     /// What `by` in `krate` read, as [`Files::expansions_are_read`] last noted it: a crate's
     /// image filed by its reads keeps what its dependencies' were served by
     /// (`hir_def::deps::reads`).
@@ -2324,8 +2331,14 @@ fn keep_aliases(writer: &Writer, root: &mut Arc<SourceRoot>) {
 /// Where reads in [`Files::expansions_read`] come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadBy {
-    /// The latest expansion of a proc-macro call.
-    Call(span::MacroCallId),
+    /// The latest expansion of a proc-macro call, by the call's key by its site
+    /// (`hir_expand::MacroCallId::site_key`): the log outlives the snapshots, and a call's id
+    /// is of one (an edit of its crate makes its arena again, and the call takes another id),
+    /// so an id here would leave each expansion's reads under an id no later expansion has,
+    /// never replaced. Keyed by its site, the log holds one row per call site its crate ever
+    /// expanded: an edit that keeps a call where it is (its item's kind, name and index)
+    /// replaces its row, and only a call that moved or went adds or keeps one.
+    Call(ContentId),
     /// A value served by its reads in place of resolving its crate, by the key it is filed
     /// under: a crate's image, or a check of its bodies.
     Served(ContentId),

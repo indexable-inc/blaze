@@ -131,7 +131,12 @@ fn checked_after_an_edit(functions: usize, kept: bool) -> usize {
 /// bodies that read what changed of it (none here: its signature is the same), never every
 /// body, nor every body of the edited file, which the edit moves.
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_checks_a_number_of_bodies_that_does_not_grow_with_the_crate() {
+    // Claimed: one edited body among 20 or 200 checks one or two bodies again. True on
+    // blaze-memo: the edit makes the crate's arena again, the memos of `body_check_clean` the
+    // kept check stands for go with it, and every body of the crate is checked again (21 of
+    // 20). The floor (the bodies whose reads moved) is the host's Body records'.
     let small = checked_after_an_edit(20, true);
     let large = checked_after_an_edit(200, true);
     assert!(small >= 1, "the edited body is checked again");
@@ -539,7 +544,13 @@ fn both(db: &Db) -> Both {
 /// visits what it changed): while an edit drops its crate's whole arena (front-end-on-memo.md,
 /// decision 4) they do not hold, and the oracle above them does.
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn a_plan_from_the_kept_check_gives_what_a_whole_plan_gives() {
+    // Claimed: after each edit of the one crate the plan is from the kept check. True on
+    // blaze-memo: every edit makes the crate's arena again, so every plan after one is whole
+    // (`Whole::Dropped`, the kept check found by the crate's key). The oracle (from the kept
+    // check equals whole) still holds on every state; its controls run on a snapshot that
+    // carried the arena (`the_oracle_catches_*`).
     let fixture = fixture::db(EDITED);
     let [main, a, b] = ["/main.rs", "/a.rs", "/b.rs"].map(|it| fixture.file_at(it).file_id(fixture.db()));
     let mut db = fixture.into_db();
@@ -648,7 +659,12 @@ fn work_after_an_edit(functions: usize) -> Work {
 /// edited body and at most its module, whatever the crate's size; every other body and
 /// module is held with its kept answer and no task.
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_posts_a_number_of_tasks_that_does_not_grow_with_the_crate() {
+    // Claimed: the plan after one body's edit is from the kept check and posts one body's
+    // task. True on blaze-memo: the edit makes the crate's arena again, the kept "clean"
+    // answers stood for memos in it, so the plan is whole (`Whole::Dropped`) and posts every
+    // body's task.
     let small = work_after_an_edit(20);
     let large = work_after_an_edit(200);
     for work in [small, large] {
@@ -772,7 +788,12 @@ const EDITS_OF_WHAT_IS_READ: [(&str, &str, &str, &str, &str); 4] = [
 /// was checked again; and a body beside it that reads none of it was not (its memo hit, its
 /// crate's arena dropped or not).
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_what_a_body_reads_reaches_that_body_and_no_other() {
+    // Claimed: the reader is checked again and `apart`, beside it, is not. The first half and
+    // the kept-against-scratch oracle hold; the second is not true on blaze-memo: an edit of
+    // `base` makes `base`'s arena again and `top`'s with it (it borrows `base`), so every body
+    // of `top`, `apart` among them, is checked again.
     let mut files = consumed();
     let fixture = fixture::db(&render(&files));
     let ids: Vec<base_db::FileId> = EDITS_OF_WHAT_IS_READ
@@ -813,6 +834,10 @@ fn an_edit_of_what_a_body_reads_reaches_that_body_and_no_other() {
 /// kept check taken though the edit dropped an arena of its memos ([`Plant::CarriesDropped`]),
 /// the body that reads a changed signature keeps its kept answer, clean, and the build from
 /// scratch reports the mismatch it lost.
+///
+/// Its premise: the kept check is found after the edit, by its crates' keys, though the edit
+/// made `top`'s arena and `Crate` id again (a kept check found by the id was never found after
+/// such an edit, so the plant changed nothing and the oracle told nothing apart).
 #[test]
 fn the_oracle_catches_a_kept_check_over_a_dropped_arena() {
     let mut files = consumed();
@@ -937,7 +962,11 @@ fn cost_of_a_body_edit(functions: usize) -> EditCost {
 /// state the floor: while an edit drops its crate's whole arena and the crates borrowing from
 /// it (front-end-on-memo.md, decision 4) the plans are whole and they do not hold.
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_touches_only_what_reads_the_body() {
+    // Claimed: every count of the edit is the same among 200 functions and 2,000. True on
+    // blaze-memo: the edit of `base` makes the arenas of `base`, `mid` and `top` again, the
+    // three plans are whole and every body is checked again (203 and 2,003).
     let small = cost_of_a_body_edit(200);
     let large = cost_of_a_body_edit(2_000);
     assert_eq!(small, large, "every count of a body edit is the same among 200 functions and 2,000");
@@ -1018,7 +1047,12 @@ fn checks_of_a_body_edit_over(libraries: usize) -> usize {
 /// dependencies. Over 5 library crates and over 50 the edit runs the same checks: a library's
 /// arena borrows from no workspace crate's, so the edit drops none of them.
 #[test]
+#[ignore = "blaze-memo: the kept check holds its crate's arena; reuse across edits is the host's, on body records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_costs_the_same_over_five_libraries_and_fifty() {
+    // Claimed: the same checks over 5 libraries and 50, and one or two of them. The first
+    // holds (63 and 63: no library is checked again); the second is not true on blaze-memo:
+    // the edit makes the three workspace crates' arenas again and every body of them is
+    // checked again.
     let (few, many) = (checks_of_a_body_edit_over(5), checks_of_a_body_edit_over(50));
     assert_eq!(few, many, "the checks run over 5 libraries and over 50");
     assert!((1..=2).contains(&few), "the edited body's check ran, at most one more: {few}");
@@ -1038,6 +1072,13 @@ fn over_a_library() -> Files {
 /// library's rows are durable and are not looked at after a write of a workspace file: a
 /// write of a library file is a write of its own kind. The diagnostics after it are a
 /// database's made from scratch.
+///
+/// The fixture's library is sealed, so its edit starts a new session (base-db's
+/// `Fresh::SealedMarked`): every arena is made again from the same world in the same order.
+/// The new session goes on in the database's id space, so `top`'s arena and `Crate` id differ
+/// from the ones the kept check names, and the kept check is refused as dropped (until
+/// 2026-11-14 a new session restarted every generation at 0, the ids came out equal, and the
+/// kept check served its stale clean answer).
 #[test]
 fn an_edit_of_a_librarys_file_reaches_the_workspace_body_that_reads_it() {
     let mut files = over_a_library();
@@ -1057,9 +1098,10 @@ fn an_edit_of_a_librarys_file_reaches_the_workspace_body_that_reads_it() {
 }
 
 /// The control of [`an_edit_of_a_librarys_file_reaches_the_workspace_body_that_reads_it`]:
-/// with the workspace crate's kept check taken though the library's edit dropped its arena by
-/// borrow ([`Plant::CarriesDropped`]), the body that reads the library keeps its kept answer,
-/// and the build from scratch reports the mismatch it lost.
+/// with the workspace crate's kept check taken though the library's edit made every arena
+/// again in a new session ([`Plant::CarriesDropped`]: the kept arenas not compared), the
+/// body that reads the library keeps its kept answer, and the build from scratch reports the
+/// mismatch it lost.
 #[test]
 fn the_oracle_catches_a_library_edit_that_reaches_no_reader() {
     let mut files = over_a_library();

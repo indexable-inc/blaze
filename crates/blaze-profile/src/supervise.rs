@@ -229,25 +229,26 @@ mod tests {
     /// alone is in exactly one batch, in order, no batch holds more than fits, and each row
     /// that does not fit alone is counted dropped: rows written plus rows dropped is the rows
     /// given.
-    #[hegel::test(test_cases = 300)]
-    fn an_oversized_batch_is_split_and_every_row_that_fits_is_written_once(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let sizes: Vec<usize> = tc.draw(gs::vecs(gs::integers::<usize>().max_value(100)).max_size(60));
-        let most_rows = 1 + tc.draw(gs::integers::<usize>().max_value(40));
-        let most_bytes = tc.draw(gs::integers::<usize>().max_value(400));
-        // The planted panics print as they are caught: the test's own noise.
-        let made = split(&sizes, most_rows, make(most_bytes)).unwrap();
-        let fit: Vec<usize> = sizes.iter().copied().filter(|it| *it <= most_bytes).collect();
-        let written: Vec<usize> = made.batches.iter().flatten().copied().collect();
-        // With no bound on halvings reached (60 rows are far under it), exactly the rows that
-        // fit alone are written.
-        assert!(made.splits < MOST_SPLITS);
-        assert_eq!(written, fit);
-        assert_eq!(written.len() + made.dropped, sizes.len());
-        for batch in &made.batches {
-            assert!(batch.len() <= most_rows && batch.iter().sum::<usize>() <= most_bytes);
-        }
-        assert_eq!(made.why.is_some(), made.splits > 0 || made.dropped > 0);
+    #[test]
+    fn an_oversized_batch_is_split_and_every_row_that_fits_is_written_once() {
+        blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+            let sizes: Vec<usize> = tape.vec(0..=60, "sizes", |tape| tape.int_in(0..=100usize, "size"));
+            let most_rows = 1 + tape.int_in(0..=40usize, "most rows");
+            let most_bytes = tape.int_in(0..=400usize, "most bytes");
+            // The planted panics print as they are caught: the test's own noise.
+            let made = split(&sizes, most_rows, make(most_bytes)).unwrap();
+            let fit: Vec<usize> = sizes.iter().copied().filter(|it| *it <= most_bytes).collect();
+            let written: Vec<usize> = made.batches.iter().flatten().copied().collect();
+            // With no bound on halvings reached (60 rows are far under it), exactly the rows that
+            // fit alone are written.
+            assert!(made.splits < MOST_SPLITS);
+            assert_eq!(written, fit);
+            assert_eq!(written.len() + made.dropped, sizes.len());
+            for batch in &made.batches {
+                assert!(batch.len() <= most_rows && batch.iter().sum::<usize>() <= most_bytes);
+            }
+            assert_eq!(made.why.is_some(), made.splits > 0 || made.dropped > 0);
+        });
     }
 
     /// The control: without the halving (one batch of all the rows, as a flush made until

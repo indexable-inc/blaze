@@ -12,11 +12,11 @@ theorem State.setSlots_next (st : State) (f : Nat) (slots : List Slot) :
     (st.setSlots f slots).next = st.next := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     exact congrTo State.next e
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     exact congrTo State.next e
 
 theorem State.setSlotIn_next (st : State) (p : Pointer) (slot : Slot) :
@@ -108,7 +108,7 @@ theorem evalRvalue_next (adts : List AdtDecl) (st : State) :
 /-- A statement leaves the next frame id as it was. -/
 theorem execStmt_next (adts : List AdtDecl) (st : State) :
     ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.next = st.next) (execStmt adts st s)
-  | Statement.assign p rv =>
+  | Statement.assign _ rv =>
     Outcome.all_bind (evalRvalue_next adts st rv) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         Outcome.All.imp (State.write_next r.2 ptr r.1) (fun _ h => Eq.trans h hr)))

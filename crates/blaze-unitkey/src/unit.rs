@@ -1,4 +1,4 @@
-//! A unit's keys from its file images (D38, docs/v2/plan/design/read-addressed.md): [`asks`] for
+//! A unit's keys from its file images (D39, docs/v2/plan/design/read-addressed.md): [`asks`] for
 //! the late reads to answer, [`key`] for every key.
 //!
 //! A key says what a record is and reads nothing of any other unit:

@@ -1778,16 +1778,26 @@ fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
 fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
     let level = mir_opt_level_of(db, krate)?;
+    let lang = krate.data(db).origin.is_lang();
+    // The library's bodies as shipped (rustc's pipeline, no pass on facts); another crate's
+    // optimizing where its level is 2, else tier 0. v1 keeps the library inlined at every
+    // level, as it was; v2's `Build::options` decides per unit.
+    let tier = match (level, lang) {
+        (_, true) => hir_ty::facts::Tier::Shipped,
+        (MirOptLevel::Release, false) => hir_ty::facts::Tier::Optimizing,
+        (_, false) => hir_ty::facts::Tier::Zero,
+    };
     Ok(MirOptions {
         level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
-        inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
+        inline: rustc_inlines(level, lang, backend::optimizing()),
         // v1 knows nothing of the program its crates are linked into, so not what allocator
         // it has: no allocation moves to the stack.
         heap_to_stack: false,
         // Nor what trait objects it makes.
         world: None,
+        tier,
     })
 }
 
@@ -3946,6 +3956,23 @@ pub(crate) mod plant {
     /// before it kept the release it was filled under.
     pub(crate) static KEEPS_ERASED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    /// Under [`KEEPS_ERASED`], how many reads of [`super::erase_regions`]' map found a key it
+    /// held at the release (a row the release freed, read as a number again), and how many of
+    /// those answered other than a fresh erase of the arguments now: what the control's child
+    /// prints, so a run tells a stale map never read from one read and right by coincidence
+    /// (the rows renumbered in step) and from one read and wrong.
+    pub(crate) static STALE_READS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub(crate) static STALE_WRONG: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    thread_local! {
+        /// The keys the planted map held when it was kept across a release.
+        pub(crate) static STALE_KEYS: std::cell::RefCell<
+            blaze_hash::HashSet<hir_ty::next_solver::StoredGenericArgs, std::alloc::Global>,
+        > = std::cell::RefCell::new(blaze_hash::HashSet::new_in(std::alloc::Global));
+    }
 }
 
 /// `args` with every lifetime but a bound one erased: lifetimes change nothing about the
@@ -3982,6 +4009,10 @@ pub(crate) fn erase_regions<'db>(
     let known = ERASED.with_borrow_mut(|(under, map)| {
         #[cfg(test)]
         if plant::KEEPS_ERASED.load(std::sync::atomic::Ordering::Relaxed) {
+            if *under != released {
+                // clone: the planted map's keys, a test's few, noted to count their reads
+                plant::STALE_KEYS.with_borrow_mut(|it| it.extend(map.keys().cloned()));
+            }
             *under = released;
         }
         if *under != released {
@@ -3990,6 +4021,16 @@ pub(crate) fn erase_regions<'db>(
         }
         map.get(&key).map(|it| it.as_ref())
     });
+    #[cfg(test)]
+    if let Some(known) = known
+        && plant::STALE_KEYS.with_borrow(|it| it.contains(&key))
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        plant::STALE_READS.fetch_add(1, Relaxed);
+        if known != hir_ty_identity::instance::erased(interner, args) {
+            plant::STALE_WRONG.fetch_add(1, Relaxed);
+        }
+    }
     if let Some(known) = known {
         return known;
     }

@@ -156,43 +156,47 @@ pub fn share_of(word: u64, dur: u64) -> Share {
 
 #[cfg(test)]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
-    #[hegel::test(test_cases = 300)]
-    fn a_share_reads_back_within_a_part_of_its_spans_duration(tc: TestCase) {
-        let dur = tc.draw(gs::integers::<u64>().min_value(1).max_value(1 << 50));
-        let pending = tc.draw(gs::integers::<u64>().max_value(dur));
-        let word = share_word(pending, dur);
-        assert!(
-            word != 0 && word < 1 << SHARE_BITS,
-            "{word} is a counted share of {SHARE_BITS} bits"
-        );
-        let Share::Counted { pending: read } = share_of(word, dur) else {
-            panic!("{word} reads as counted")
-        };
-        assert!(
-            read.abs_diff(pending) <= dur / SHARE_ONE + 1,
-            "{pending} of {dur} read back as {read}"
-        );
+    #[test]
+    fn a_share_reads_back_within_a_part_of_its_spans_duration() {
+        blaze_sim::check(Config::cases(300), |tape| {
+            let dur = tape.int_in(1..=1u64 << 50, "dur");
+            let pending = tape.int_in(0..=dur, "pending");
+            let word = share_word(pending, dur);
+            assert!(
+                word != 0 && word < 1 << SHARE_BITS,
+                "{word} is a counted share of {SHARE_BITS} bits"
+            );
+            let Share::Counted { pending: read } = share_of(word, dur) else {
+                panic!("{word} reads as counted")
+            };
+            assert!(
+                read.abs_diff(pending) <= dur / SHARE_ONE + 1,
+                "{pending} of {dur} read back as {read}"
+            );
+        });
     }
 
-    #[hegel::test(test_cases = 300)]
-    fn a_stretchs_rate_gives_its_whole_cpu_to_its_whole_wall(tc: TestCase) {
-        let from = Reading {
-            ticks: tc.draw(gs::integers::<u64>().max_value(1 << 60)),
-            cpu_ns: tc.draw(gs::integers::<u64>().max_value(1 << 60)),
-        };
-        let wall = tc.draw(gs::integers::<u64>().min_value(1).max_value(1 << 40));
-        let cpu = tc.draw(gs::integers::<u64>().max_value(1 << 40));
-        let rate =
-            Rate::between(from, Reading { ticks: from.ticks + wall, cpu_ns: from.cpu_ns + cpu })
-                .expect("a stretch");
-        assert_eq!(rate.cpu_of(wall), cpu);
-        let part = tc.draw(gs::integers::<u64>().max_value(wall));
-        assert!(rate.cpu_of(part) <= cpu, "a part of the stretch has at most its CPU");
-        assert_eq!(Rate::between(from, from), None, "a stretch of no ticks has no rate");
+    #[test]
+    fn a_stretchs_rate_gives_its_whole_cpu_to_its_whole_wall() {
+        blaze_sim::check(Config::cases(300), |tape| {
+            let from = Reading {
+                ticks: tape.int_in(0..=1u64 << 60, "ticks"),
+                cpu_ns: tape.int_in(0..=1u64 << 60, "cpu ns"),
+            };
+            let wall = tape.int_in(1..=1u64 << 40, "wall");
+            let cpu = tape.int_in(0..=1u64 << 40, "cpu");
+            let rate =
+                Rate::between(from, Reading { ticks: from.ticks + wall, cpu_ns: from.cpu_ns + cpu })
+                    .expect("a stretch");
+            assert_eq!(rate.cpu_of(wall), cpu);
+            let part = tape.int_in(0..=wall, "part");
+            assert!(rate.cpu_of(part) <= cpu, "a part of the stretch has at most its CPU");
+            assert_eq!(Rate::between(from, from), None, "a stretch of no ticks has no rate");
+        });
     }
 
     /// A thread's synthetic timeline, in units of [`UNIT`] ticks (a tick a nanosecond): the CPU
@@ -207,13 +211,13 @@ mod tests {
 
     const UNIT: u64 = 1_000;
 
-    fn timeline(tc: &TestCase, on_cpu: bool) -> Timeline {
-        let units = tc.draw(gs::integers::<usize>().min_value(1).max_value(160));
+    fn timeline(tape: &Tape, on_cpu: bool) -> Timeline {
+        let units = tape.int_in(1..=160usize, "units");
         let mut it = Timeline { cpu: Vec::new(), step: Vec::new(), boundary: Vec::new() };
         for _ in 0..units {
-            it.cpu.push(if on_cpu { UNIT } else { tc.draw(gs::integers::<u64>().max_value(UNIT)) });
-            it.step.push(tc.draw(gs::integers::<u8>().max_value(2)));
-            it.boundary.push(tc.draw(gs::integers::<u8>().max_value(5)) == 0);
+            it.cpu.push(if on_cpu { UNIT } else { tape.int_in(0..=UNIT, "cpu") });
+            it.step.push(tape.int_in(0..=2u8, "step"));
+            it.boundary.push(tape.int_in(0..=5u8, "boundary") == 0);
         }
         it
     }
@@ -330,14 +334,14 @@ mod tests {
     /// What the stretches give each span is what reading the clock at its every enter and exit
     /// gave it, to within its stretches' off-CPU time (min of its ticks and theirs) and the
     /// roundings, however the boundaries fall.
-    #[hegel::test(test_cases = 300)]
-    fn self_cpu_from_stretches_is_the_per_span_reads_within_the_bound(tc: TestCase) {
-        check(&timeline(&tc, false));
+    #[test]
+    fn self_cpu_from_stretches_is_the_per_span_reads_within_the_bound() {
+        blaze_sim::check(Config::cases(300), |tape| check(&timeline(tape, false)));
     }
 
     /// On a thread that never leaves the CPU the bound is the roundings alone.
-    #[hegel::test(test_cases = 200)]
-    fn a_thread_always_on_cpu_gets_each_spans_cpu_to_the_roundings(tc: TestCase) {
-        check(&timeline(&tc, true));
+    #[test]
+    fn a_thread_always_on_cpu_gets_each_spans_cpu_to_the_roundings() {
+        blaze_sim::check(Config::cases(200), |tape| check(&timeline(tape, true)));
     }
 }

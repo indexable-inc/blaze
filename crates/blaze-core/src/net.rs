@@ -554,5 +554,7 @@ pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) mod udp;
+
 #[cfg(test)]
 mod tests;

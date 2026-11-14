@@ -168,6 +168,58 @@ fn key_outside_closure_panics_naming_it() {
     assert_eq!(refused(Plant::MarkOutsideClosure), Ok(7), "the plant must let the key through");
 }
 
+/// Arena 1 and arena 2 with a leaf each, neither declaring a borrow of the other, `open_1` and
+/// `open_2` opening each (`Inputs::open`).
+fn opened(open_1: bool, open_2: bool) -> (TestDb, Leaf, Leaf) {
+    let mut builder = Memo::builder(config(Plant::None));
+    builder.arena(0, Tag::Query);
+    let first = builder.arena(1, Tag::Query);
+    if open_1 {
+        first.open();
+    }
+    let a = Leaf::new(&first, leaf_fact(1, 0, 3), 3);
+    let second = builder.arena(2, Tag::Query);
+    if open_2 {
+        second.open();
+    }
+    let b = Leaf::new(&second, leaf_fact(2, 0, 4), 4);
+    (db(builder.build()), a, b)
+}
+
+/// The invariant: a key homed at an arena may name an open arena outside its declared closure
+/// (a source root's files, which a crate reaches through a `#[path]` module only once it
+/// runs), and its entry borrows the open arena: a change of the open arena drops the home.
+///
+/// The control: the same key with arena 1 not open is refused
+/// ([`key_outside_closure_panics_naming_it`]), as it is here.
+#[test]
+fn a_key_may_name_an_open_arena_and_its_home_drops_with_it() {
+    let (db, a, b) = opened(true, false);
+    assert_eq!(pair(&db, a, b), 7, "a key naming the open arena 1 from arena 2 is accepted");
+    let next = db.memo.next(&[a.gid().arena()]).expect("a next snapshot");
+    assert!(next.dropped().contains(&2), "the open arena changed, and its namer was carried: {:?}", next.dropped());
+
+    let (db, a, b) = opened(false, false);
+    let why = catch_unwind(AssertUnwindSafe(|| pair(&db, a, b))).map_err(panic_text);
+    assert!(why.is_err_and(|why| why.contains("outside its home's declared")), "the control: refused");
+}
+
+/// The invariant: an entry homed at an open arena (its key names only inputs no crate owns)
+/// that reads an arena neither open nor in its declared closure panics, naming the open arena:
+/// its key is missing the crate.
+///
+/// The control: the same read of an open arena is accepted.
+#[test]
+fn an_open_arenas_entry_that_reads_a_crates_arena_panics() {
+    // `pair(a, b)` is homed at arena 2, the greatest it names, and reads arena 1.
+    let (db, a, b) = opened(false, true);
+    let why = catch_unwind(AssertUnwindSafe(|| pair(&db, a, b))).map_err(panic_text);
+    assert!(why.as_ref().is_err_and(|why| why.contains("open arena")), "{why:?}");
+
+    let (db, a, b) = opened(true, true);
+    assert_eq!(pair(&db, a, b), 7, "the control: an open arena reads another open one");
+}
+
 /// The invariant: a declared borrow's index is below its dependent's (index = 1 + topological
 /// position); one above panics.
 #[test]
@@ -273,28 +325,12 @@ fn image_serves_only_what_still_holds() {
 // (e) Sealed arenas.
 
 /// The invariant: `changed` is false exactly for sealed arenas; a sealed arena with an
-/// unsealed dependency, or a sealed arena named changed, is refused (the controls: the same
-/// with the seal removed is accepted).
+/// unsealed dependency is refused (the control: the same with the seal removed is accepted);
+/// and a sealed arena named changed is dropped with every arena that borrows it, and nothing
+/// else (2026-11-14: it was refused, and base-db started a new session instead).
 #[test]
 fn sealed_is_not_changed() {
-    let made = |seal_one: bool, seal_two: bool| {
-        catch_unwind(AssertUnwindSafe(|| {
-            let mut builder = Memo::builder(config(Plant::None));
-            builder.arena(0, Tag::Query);
-            let one = builder.arena(1, Tag::Query);
-            let one_id = one.id();
-            if seal_one {
-                one.seal();
-            }
-            let two = builder.arena(2, Tag::Query);
-            two.borrows(one_id);
-            if seal_two {
-                two.seal();
-            }
-            builder.build()
-        }))
-        .map_err(panic_text)
-    };
+    let made = |seal_one: bool, seal_two: bool| made_under(Plant::None, seal_one, seal_two);
     let memo = made(true, false).expect("a sealed dependency of an unsealed crate");
     let ids: Vec<_> = memo.arenas().collect();
     let one = ids.iter().copied().find(|it| it.index() == 1).expect("arena 1");
@@ -304,10 +340,61 @@ fn sealed_is_not_changed() {
         panic!("a sealed crate with an unsealed dependency was built");
     };
     assert!(why.contains("sealed"), "{why}");
-    let refused = catch_unwind(AssertUnwindSafe(|| drop(memo.next(&[one])))).map_err(panic_text);
-    assert!(refused.is_err(), "a sealed arena was accepted in a changed set");
     let control = made(true, false).expect("as above");
     assert!(catch_unwind(AssertUnwindSafe(|| drop(control.next(&[two])))).is_ok(), "the control");
+}
+
+/// Arenas 0 (the session), 1 and 2, 2 declaring a borrow of 1, each sealed as asked, built
+/// under `plant`; a refusal's text.
+fn made_under(plant: Plant, seal_one: bool, seal_two: bool) -> Result<Memo, String> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let mut builder = Memo::builder(config(plant));
+        builder.arena(0, Tag::Query);
+        let one = builder.arena(1, Tag::Query);
+        let one_id = one.id();
+        if seal_one {
+            one.seal();
+        }
+        let two = builder.arena(2, Tag::Query);
+        two.borrows(one_id);
+        if seal_two {
+            two.seal();
+        }
+        builder.build()
+    }))
+    .map_err(panic_text)
+}
+
+/// The indices `memo.next` drops when the arena at `index` is named changed.
+fn dropped_naming(memo: &Memo, index: u32) -> Vec<u32> {
+    let named: Vec<_> = memo.arenas().filter(|it| it.index() == index).collect();
+    let next = memo.next(&named).unwrap_or_else(|refused| panic!("{refused}"));
+    next.dropped().to_vec()
+}
+
+/// The invariant (2026-11-14): a sealed arena named changed is dropped, and so is every arena
+/// that borrows it (declared or read: a sealed arena's borrows are tracked as any other's),
+/// and nothing else: the session and an arena that borrows nothing of it are carried. So a
+/// driver drops a sealed crate's closure for a write to it, never the whole session. The
+/// planted bug: [`Plant::IgnoreBorrows`] carries the sealed arena's borrower, and the oracle
+/// names it.
+#[test]
+fn a_sealed_arena_named_changed_drops_its_borrowers_alone() {
+    let check = |plant: Plant| -> Result<(), String> {
+        // Both sealed: a sealed crate over a sealed dependency, as std over core.
+        let memo = made_under(plant, true, true)?;
+        let dropped = dropped_naming(&memo, 1);
+        match dropped.as_slice() {
+            [1, 2] => Ok(()),
+            other => Err(format!("naming the sealed arena 1 dropped {other:?}, not [1, 2]")),
+        }
+    };
+    check(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = check(Plant::IgnoreBorrows).expect_err("a carried borrower of a dropped sealed arena went unnoticed");
+    assert!(planted.contains("dropped [1]"), "{planted}");
+    // The control: the borrower alone named drops it alone, sealed or not.
+    let memo = made_under(Plant::None, true, true).expect("both sealed");
+    assert_eq!(dropped_naming(&memo, 2), vec![2]);
 }
 
 // (f) The snapshot epoch.
@@ -947,7 +1034,7 @@ fn each_run_is_completed_and_told() {
     assert_eq!(HOOKED.with(Cell::get), told, "a hit was told as a run");
 }
 
-/// The invariant: an arena index is made at most `MAX_GENERATION + 1` times in a session;
+/// The invariant: an arena index is made at most `MAX_GENERATION + 1` times in an id space;
 /// a drop that would make it once more is refused by `Memo::next`, naming the arena, never a
 /// wrapped generation (the control: every remake up to the last generation succeeds).
 #[test]
@@ -973,6 +1060,117 @@ fn a_spent_generation_is_refused_naming_the_arena() {
     assert_eq!(refused, NextRefused::GenerationsSpent { arena: last });
     let why = refused.to_string();
     assert!(why.contains(&format!("{last:?}")), "the refusal names the arena: {why}");
+}
+
+// One id space per database: a new session never hands out an earlier id (2026-11-14).
+
+/// Arenas `0..=CRATES` of a session's first snapshot, index 1 sealed (a crate not being built),
+/// each id it took noted in `seen`.
+fn whole_session(mut builder: blaze_memo::Builder, seen: &mut Seen) -> Result<Memo, String> {
+    for index in 0..=CRATES {
+        let inputs = builder.arena(index, Tag::Query);
+        if index == 1 {
+            inputs.seal();
+        }
+        seen.note(inputs.id())?;
+    }
+    Ok(builder.build())
+}
+
+/// Every arena id handed out so far, and the oracle: an id handed out twice.
+#[derive(Default)]
+struct Seen(std::collections::HashSet<blaze_memo::ArenaId>);
+
+impl Seen {
+    fn note(&mut self, id: blaze_memo::ArenaId) -> Result<(), String> {
+        // An id equal to an earlier making's: its first `Gid` equals that making's first too.
+        match self.0.insert(id) {
+            true => Ok(()),
+            false => Err(format!("{id:?} was handed out twice (local 0 of each: {:?})", Gid::in_arena(id, 0))),
+        }
+    }
+}
+
+/// The driver's life in miniature: three sessions after the first, each started as base-db
+/// starts one when it cannot carry (`Memo::next_session`: a failed commit, the arenas
+/// outgrown), and between them
+/// commits that each drop an unsealed crate's arena, and every fifth the session arena. How
+/// many ids were handed out, or the first handed out twice.
+fn ids_across_sessions(plant: Plant) -> Result<usize, String> {
+    let mut seen = Seen::default();
+    let mut memo = whole_session(Memo::builder(config(Plant::None)), &mut seen)?;
+    for session in 0..4 {
+        for commit in 0..24_u32 {
+            let index = match commit % 5 {
+                4 => blaze_memo::ArenaId::SESSION_INDEX,
+                n => 2 + n % (CRATES - 1),
+            };
+            let changed = memo.arenas().find(|it| it.index() == index).expect("every index is held");
+            let next = memo.next(&[changed]).map_err(|why| why.to_string())?;
+            assert_eq!(next.dropped(), &[index], "no borrows: only the named arena is dropped");
+            let mut builder = next.builder;
+            seen.note(builder.arena(index, Tag::Query).id())?;
+            memo = builder.build();
+        }
+        if session < 3 {
+            let builder = memo.next_session(config(plant)).map_err(|why| why.to_string())?;
+            memo = whole_session(builder, &mut seen)?;
+        }
+    }
+    Ok(seen.0.len())
+}
+
+/// The invariant: within one database's id space an `ArenaId` handed out names one making for
+/// ever: over 96 commits and three new sessions (each what base-db starts when it cannot carry), no
+/// arena, carried, remade by a commit or made by a new session, takes an id an earlier arena
+/// had, so no `Gid` of a later making equals one of an earlier making, and a cache outside the
+/// memo keyed by them is never answered by another arena's memory. The control (the cause put
+/// back): with `Plant::SessionRestartsIds` the first new session makes the session arena at
+/// generation 0 again, and the oracle names the id handed out twice.
+#[test]
+fn a_new_session_after_a_sealed_arenas_write_never_hands_out_an_earlier_id() {
+    let handed = ids_across_sessions(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    // Five arenas in each of four sessions, and one remade per commit.
+    assert_eq!(handed, 4 * (CRATES as usize + 1) + 4 * 24);
+    let planted = ids_across_sessions(Plant::SessionRestartsIds).expect_err("a restarted id space was not caught");
+    assert!(planted.contains("arena 0.0 was handed out twice"), "{planted}");
+}
+
+/// The invariant: an index's last generation in an id space is its last in every session of
+/// the database: once an arena is made at `MAX_GENERATION`, a new session of the database
+/// (`Memo::next_session`) is refused naming that making, as `Memo::next` refuses its drop,
+/// and never makes the index again at generation 0 in the same space; only a new id space
+/// (`Memo::builder`) makes it again. The control: one generation before the last, the new
+/// session is made and its arena takes the last generation.
+#[test]
+fn a_new_session_of_a_spent_index_is_refused_naming_its_last_making() {
+    let mut builder = Memo::builder(config(Plant::None));
+    builder.arena(0, Tag::Query);
+    builder.arena(1, Tag::Query);
+    let mut memo = builder.build();
+    let one = |memo: &Memo| memo.arenas().find(|it| it.index() == 1).expect("arena 1");
+    while one(&memo).generation() < MAX_GENERATION - 1 {
+        let next = memo.next(&[one(&memo)]).unwrap_or_else(|why| panic!("{why}"));
+        let mut builder = next.builder;
+        builder.arena(1, Tag::Query);
+        memo = builder.build();
+    }
+    // The control: the index has one generation left, which the new session takes.
+    let mut builder = memo.next_session(config(Plant::None)).unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(builder.arena(0, Tag::Query).id().generation(), 1, "the session index goes on");
+    let last = builder.arena(1, Tag::Query).id();
+    assert_eq!(last.generation(), MAX_GENERATION, "a new session goes on from the last making");
+    let memo = builder.build();
+
+    let refused = memo.next_session(config(Plant::None)).map(drop).expect_err("a new session restarted a spent index");
+    assert_eq!(refused, NextRefused::GenerationsSpent { arena: last });
+    let why = refused.to_string();
+    assert!(why.contains(&format!("{last:?}")) && why.contains("id space"), "the refusal names the arena: {why}");
+    let dropped = memo.next(&[last]).map(drop).expect_err("a drop of the spent index was accepted");
+    assert_eq!(dropped, NextRefused::GenerationsSpent { arena: last });
+    // Only a new id space makes the index again from generation 0.
+    let mut fresh = Memo::builder(config(Plant::None));
+    assert_eq!(fresh.arena(1, Tag::Query).id().generation(), 0);
 }
 
 // `try_from_gid`: an id from outside checked, not trusted (2026-11-14).
@@ -1075,11 +1273,12 @@ fn full_print<'db>(db: &'db TestDb, node: Node<'db>) -> String {
 }
 
 /// The invariant: an interned id's `Debug` names its kind and id and prints its fields one
-/// level deep (an id inside a field, through any container, as its kind and id alone), and
-/// an input's prints each field cut at `FIELD_CAP` bytes: so a key 12 levels deep with
-/// fan-out 4 (a full print of 4^12 leaves) and an input with a megabyte of text each print in
-/// a few hundred bytes. The control: the recursive print, the old `Debug`, grows by the
-/// fan-out each level, so at depth 12 it would be millions of bytes.
+/// level deep (an id inside a field, through any container, as its kind and id alone), each
+/// field cut at `FIELD_CAP` bytes, and an input's `Debug` names its kind and id and none of its
+/// fields (they are its value, not what it is): so a key 12 levels deep with fan-out 4 (a full
+/// print of 4^12 leaves) prints in a few hundred bytes and an input with a megabyte of text in
+/// a few tens. The control: the recursive print, the old `Debug`, grows by the fan-out each
+/// level, so at depth 12 it would be millions of bytes.
 #[test]
 fn a_print_of_an_id_is_bounded() {
     let mut world = World::new(values());
@@ -1118,9 +1317,9 @@ fn a_print_of_an_id_is_bounded() {
     let doc = Doc::new(&inputs, fact, "a".repeat(1 << 20));
     let docs = TestDb { memo: builder.build(), runs: new_runs() };
     let printed = attach(&docs, || format!("{doc:?}"));
-    assert!(printed.len() < 400, "a megabyte of text printed {} bytes", printed.len());
+    assert!(printed.len() < 100, "a megabyte of text printed {} bytes", printed.len());
     assert!(printed.starts_with("Doc {") && printed.contains(&format!("{:?}", doc.gid())), "{printed}");
-    assert!(printed.contains(&format!("cut at {} bytes", blaze_memo::FIELD_CAP)), "{printed}");
+    assert!(!printed.contains("aaaa"), "an input's print holds none of its value: {printed}");
 }
 
 // The session arena named by no constant (2026-11-14).

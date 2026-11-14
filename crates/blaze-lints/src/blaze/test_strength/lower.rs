@@ -47,8 +47,10 @@ pub(crate) const CLOSURES: usize = 64;
 /// How many references a type is peeled of to see what it is.
 const REFS: usize = 4;
 
-/// The crates whose calls make a test a property test.
-const PROPERTY_CRATES: &[&str] = &["hegel", "hegeltest", "proptest", "quickcheck"];
+/// The crates whose calls make a test a property test: blaze's own engine (a plain `#[test]`
+/// whose body calls `blaze_sim::check`, `check_given`, `search` or `control`), and the property
+/// crates other people's projects use.
+const PROPERTY_CRATES: &[&str] = &["blaze_sim", "hegel", "hegeltest", "proptest", "quickcheck"];
 
 /// What a body is lowered as.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -489,9 +491,10 @@ impl<'db> Lower<'db> {
     ) -> (Effect, Option<Subject>) {
         let db = self.db;
         let krate = hir::Function::from(g).module(db).krate(db);
-        // Before the locality test: a property crate may be a workspace member (blaze vendors
-        // Hegel as `vendor/hegeltest`, and a fixture's crates are all local). Its functions are
-        // the runner, not code under test: they observe what they are handed.
+        // Before the locality test: a property crate may be a workspace member (`blaze-sim` is
+        // one of blaze's, and a fixture's crates are all local). Its functions are the runner,
+        // not code under test: they observe what they are handed. A test is a property test by
+        // this call alone, never by its attribute.
         if PROPERTY_CRATES.iter().any(|it| facts::crate_is(db, krate, it)) {
             self.property = true;
             return (Effect::Opaque { observes: true, writes: self.mut_args(mir, args) }, None);

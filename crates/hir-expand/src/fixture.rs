@@ -134,11 +134,21 @@ pub fn db_with_proc_macros(
 /// [`db`] in a build's database ([`Db::logged`]: single flight across tasks,
 /// `blaze_memo::Scheduled`, and batches on the pool), with a run log and no read lists: for a
 /// test whose queries are asked from several threads at once (a store's own threads,
-/// `hir_def::deps::ImageStore::for_each`). A test database's single flight is one thread's
-/// (`blaze_memo::Alone`): a key another thread runs reads to it as a cycle of its own.
+/// `hir_def::deps::ImageStore::for_each`). A test database's single flight is one task's
+/// (`blaze_memo::Alone`): it refuses, by name, an ask of a key another task runs.
 #[track_caller]
 pub fn db_on_threads(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
     build(fixture, Vec::new(), || Db::logged(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] that several tasks drive at once while its batches stay on the calling thread in
+/// this thread's order ([`Db::for_tests_driven`]: single flight across tasks,
+/// `blaze_memo::Scheduled`): for a test that runs a build driver or a simulation's tasks over
+/// the fixture and needs the same order every run. It goes when a test database's own flight
+/// can wait off a fiber (`blaze_graph::pool`'s off-fiber waits are not deadline waits yet).
+#[track_caller]
+pub fn db_driven(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || Db::for_tests_driven(|_| {}, blaze_memo::Reads::Off))
 }
 
 /// [`db`] whose queries keep read lists ([`Db::for_tests_with_reads`]), so
@@ -252,40 +262,75 @@ pub fn test_crate(db: &Db) -> Crate {
         .expect("the fixture has a crate that is neither a language crate nor a dependency")
 }
 
-/// `out` with each raw interned id renumbered, per id type, in the order `out` first names it:
-/// `Crate(Id(10240))` is `Crate(Id(#0))`, `FunctionId(8c03)` is `FunctionId(#0)`. A raw id is
-/// its place in interning order (its ingredient's page, made when the ingredient first
-/// interns), which anything interned first moves; which lines name the same id is what an
-/// expectation holds. For every test whose expectation prints ids.
+/// `out` with each raw id renumbered, per id type, in the order `out` first names it:
+/// `StructId(1.0:25)` is `StructId(#0)`, and the id an interned struct's print begins with,
+/// `ModuleIdLt { [id]: 1.0:7, .. }`, is `ModuleIdLt { [id]: #0, .. }`. A raw id is its arena,
+/// the arena's generation and its place in that arena's interning order (`arena.generation:place`),
+/// which anything interned first moves; which lines name the same id is what an expectation
+/// holds. For every test whose expectation prints ids.
 pub fn stable_ids(out: &str) -> String {
     use std::fmt::Write as _;
+    /// What an interned struct's print names its own id by, before the id.
+    const FIELD: &str = "[id]: ";
     let mut labels = blaze_hash::HashMap::<(&str, &str), usize, Global>::default();
     let mut counts = blaze_hash::HashMap::<&str, usize, Global>::default();
     // alloc: a test's expectation text, once
     let mut result = String::with_capacity(out.len());
     let (mut at, mut copied) = (0, 0);
-    while let Some(found) = out[at..].find("Id(") {
-        let open = at + found + 2;
-        let name_start = out[..open]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .map_or(0, |it| it + 1);
-        let name = &out[name_start..open];
-        let end = out[open + 1..].find(|c: char| !c.is_ascii_hexdigit()).map(|it| open + 1 + it);
-        match end {
-            Some(end) if end > open + 1 && out[end..].starts_with(')') => {
-                let raw = &out[open + 1..end];
-                let label = *labels.entry((name, raw)).or_insert_with(|| {
-                    let count = counts.entry(name).or_default();
-                    *count += 1;
-                    *count - 1
-                });
-                result.push_str(&out[copied..=open]);
-                write!(result, "#{label}").unwrap();
-                copied = end;
-                at = end;
+    let ident_start = |end: usize| {
+        out[..end].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |it| it + 1)
+    };
+    /// Whether `raw` is `arena.generation:place`, each a decimal number.
+    fn memo_id(raw: &str) -> bool {
+        let number = |it: &str| !it.is_empty() && it.bytes().all(|c| c.is_ascii_digit());
+        raw.split_once('.').is_some_and(|(arena, rest)| {
+            number(arena)
+                && rest.split_once(':').is_some_and(|(generation, place)| number(generation) && number(place))
+        })
+    }
+    loop {
+        // The next place a raw id can begin: after a `(` or after `[id]: `.
+        let bare = out[at..].find('(').map(|it| at + it + 1);
+        let field = out[at..].find(FIELD).map(|it| at + it + FIELD.len());
+        let (start, is_field) = match (bare, field) {
+            (Some(bare), Some(field)) if field < bare => (field, true),
+            (Some(bare), _) => (bare, false),
+            (None, Some(field)) => (field, true),
+            (None, None) => break,
+        };
+        // The id's type: the name before `(`, or the struct's name before ` { [id]: `.
+        let name = if is_field {
+            let before = start - FIELD.len();
+            match out[..before].strip_suffix(" { ") {
+                Some(head) => &out[ident_start(head.len())..head.len()],
+                None => FIELD,
             }
-            _ => at = open + 1,
+        } else {
+            &out[ident_start(start - 1)..start - 1]
+        };
+        // An id is `arena.generation:place`, or, in a type named `..Id`, hex digits alone.
+        let end = out[start..]
+            .find(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':'))
+            .map_or(out.len(), |it| start + it);
+        let raw = &out[start..end];
+        let hex = !raw.is_empty() && raw.bytes().all(|c| c.is_ascii_hexdigit());
+        let is_id = match is_field {
+            true => (memo_id(raw) || hex) && out[end..].starts_with([',', ' ', '}']),
+            false => (memo_id(raw) || (hex && name.ends_with("Id"))) && out[end..].starts_with(')'),
+        };
+        if !is_id {
+            at = start;
+            continue;
         }
+        let label = *labels.entry((name, raw)).or_insert_with(|| {
+            let count = counts.entry(name).or_default();
+            *count += 1;
+            *count - 1
+        });
+        result.push_str(&out[copied..start]);
+        write!(result, "#{label}").unwrap();
+        copied = end;
+        at = end;
     }
     result.push_str(&out[copied..]);
     result

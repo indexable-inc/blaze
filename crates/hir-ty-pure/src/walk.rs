@@ -15,6 +15,25 @@
 //! foreign functions, inline assembly, intrinsics not known to be pure, state that changes
 //! (`static mut`, thread-locals, foreign statics, statics with interior mutability), bodies
 //! that do not lower, code pointers made of bytes, and instances past [`LONGEST`].
+//!
+//! Proofs are an input of a summary ([`Proofs`], in its key: [`summary_in`]'s, and every
+//! callee is asked with its caller's, [`Cx::summary`]). Under [`Proofs::None`] no site is
+//! discharged by the reachability prover and the prover never runs; under [`Proofs::Spent`]
+//! it does ([`proof_of`]). Who asks for which is decided once, `hir_ty::facts::proofs_at` of
+//! the asking body's tier: a tier 0 body and the library's as shipped ask for no summary at
+//! all (`SpendFacts` is not in their pass list, `hir_ty_mir::mir::passes_at`); the optimizing
+//! tier and the checks (`nopanic`, `pure`, `noalloc`, `nonblocking`, the role lints,
+//! `unreachable`, `proved_unreachable`) ask `Spent`.
+//!
+//! The floor (rule 67). A summary of an instance is one pass over its body's sites and calls,
+//! plus a read of each callee's summary: an oracle redoing only what an edit changed walks
+//! exactly the edited bodies and re-reads their callers' rows, so the walk is at the floor
+//! per body (one scan, no fixpoint outside a call cycle). Under `None` that is all of it: at
+//! tier 0 the floor of a fact is zero prover work, and the walk spends zero. Under `Spent` the
+//! prover's own floor is one proof per body as written, which [`proof_of`] reaches for a
+//! function with no `for const` loop (one `reach::of_body` row per definition, shared by
+//! every instance); a closure, a coroutine and a `for const` body are proved once per
+//! instance, which is above the floor by the number of instances of each. Not measured.
 
 use std::{cmp::Ordering, sync::Arc};
 
@@ -42,6 +61,7 @@ use hir_ty::{
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     display::{DisplayTarget, HirDisplay as _},
     drop::is_freeze,
+    facts::Proofs,
     intrinsic::{Intrinsic, SimdOp},
     next_solver::{
         AllocationData, ConstKind, DbInterner, GenericArg, GenericArgs, ParamEnv,
@@ -285,7 +305,8 @@ pub fn script_purity(db: &Db, main: FunctionId) -> &Purity {
 #[blaze_memo::tracked(returns(ref), owns)]
 pub fn script_proof(db: &Db, main: FunctionId) -> ScriptProof {
     let stored = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) }.store();
-    let cx = Cx::new(db, stored);
+    // A build script's purity is a check: it spends proofs.
+    let cx = Cx::new(db, stored, Proofs::Spent);
     let mut roots: SmallVec<[(Instance, String); 2]> = SmallVec::new();
     let empty = GenericArgs::new_from_slice(&[]).store();
     roots.push((Instance { def: Def::Body(Body::Fn(main)), args: empty }, "`main`".to_owned())); // alloc: once per script
@@ -563,31 +584,60 @@ pub(crate) fn step_key(body: Body, args: &StoredGenericArgs) -> u128 {
 /// build script that reaches it shares one summary. A body instance is a step of the walk's
 /// bound, if one is set ([`crate::with_steps`]), however often it is asked for, whether its
 /// summary runs or is found in the memo.
+///
+/// This is the checks' summary: proofs spent ([`Proofs::Spent`]), as every effect and role
+/// lint asks, on demand. What a tier asks for code is [`summary_at`].
 pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
+    summary_at(db, Proofs::Spent, env, instance)
+}
+
+/// [`summary`] made with `proofs`: [`Proofs::None`] for the facts a tier 0 body spends. A
+/// summary asks its callees with its own `proofs`, so one made without proofs never reads one
+/// made with them.
+pub(crate) fn summary_at(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> Arc<Summary> {
     if let Def::Body(body) = instance.def {
         crate::steps::step(|| step_key(body, &instance.args), || name_of(db, &instance));
     }
-    summary_in(db, home_env(db, &env, &instance), instance)
+    summary_in(db, home_env(db, &env, &instance), proofs, instance)
 }
 
-/// What the instance does, in `env`, its home. Keyed by the instance and the home, so it is
-/// homed by the greatest arena they name (spec rule 2): a crate's arena drops with what it
-/// read. A cycle of instances starts from the summary of a recursion (`Summary::recursive`)
-/// and iterates to its fixpoint: each local's value only rises, in a lattice three high, and
-/// the recursion's witness keeps one depth.
-#[blaze_memo::tracked(returns(clone), owns, cycle_initial = |_, _, _| Arc::new(Summary::recursive()))]
+/// What the instance does, in `env`, its home, made with `proofs`: a summary of one mode is a
+/// row of its own and never read for the other's. Keyed by the instance, the home and the
+/// mode, so it is homed by the greatest arena they name (spec rule 2): a crate's arena drops
+/// with what it read. A cycle of instances starts from the summary of a recursion
+/// (`Summary::recursive`) and iterates to its fixpoint: each local's value only rises, in a
+/// lattice three high, and the recursion's witness keeps one depth.
+#[blaze_memo::tracked(returns(clone), owns, cycle_initial = |_, _, _, _| Arc::new(Summary::recursive()))]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
-pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
-    summarized(db, env, &instance)
+pub(crate) fn summary_in(
+    db: &Db,
+    env: StoredParamEnvAndCrate,
+    proofs: Proofs,
+    instance: Instance,
+) -> Arc<Summary> {
+    summarized(db, proofs, env, &instance)
 }
 
-/// What the instance does, in `env`: the body of [`summary_in`].
-pub(crate) fn summarized(db: &Db, env: StoredParamEnvAndCrate, instance: &Instance) -> Arc<Summary> {
+/// What the instance does, in `env`: the body of [`summary_in`]. Made with `proofs`, which its
+/// callees are asked with too.
+pub(crate) fn summarized(
+    db: &Db,
+    proofs: Proofs,
+    env: StoredParamEnvAndCrate,
+    instance: &Instance,
+) -> Arc<Summary> {
     let Def::Body(of) = instance.def else { return Arc::new(Summary::default()) }; // alloc: a leaf's summary, empty
-    let cx = Cx::new(db, env);
+    #[cfg(test)]
+    plant::count_summary();
+    let cx = Cx::new(db, env, proofs);
     // The body is read here once and only the summary is kept: made for this run and dropped
     // with it ([`dispatch::body_once`]), never the memo `dispatch::body_of` reads, which would keep one
     // monomorphized body an instance the walk reaches until the build lets every MIR go.
@@ -620,10 +670,36 @@ pub(crate) mod plant {
 
     thread_local! {
         static KEEPS_BODIES: Cell<bool> = const { Cell::new(false) };
+        /// How many proofs summaries on this thread asked for ([`super::proof_of`]).
+        static PROOFS_ASKED: Cell<u64> = const { Cell::new(0) };
+        /// How many summaries were made on this thread ([`super::summarized`]).
+        static SUMMARIES_MADE: Cell<u64> = const { Cell::new(0) };
     }
 
     pub(super) fn keeps_bodies() -> bool {
         KEEPS_BODIES.with(Cell::get)
+    }
+
+    pub(super) fn count_proof() {
+        PROOFS_ASKED.with(|it| it.set(it.get() + 1));
+    }
+
+    pub(super) fn count_summary() {
+        SUMMARIES_MADE.with(|it| it.set(it.get() + 1));
+    }
+
+    /// What `work` gives, and how many summaries it made on this thread.
+    pub(crate) fn counting_summaries<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = SUMMARIES_MADE.with(Cell::get);
+        let made = work();
+        (made, SUMMARIES_MADE.with(Cell::get) - before)
+    }
+
+    /// What `work` gives, and how many proofs the summaries it made on this thread asked for.
+    pub(crate) fn counting_proofs<R>(work: impl FnOnce() -> R) -> (R, u64) {
+        let before = PROOFS_ASKED.with(Cell::get);
+        let made = work();
+        (made, PROOFS_ASKED.with(Cell::get) - before)
     }
 
     /// `work` with every summary made on this thread reading its body from the memo that
@@ -765,19 +841,23 @@ pub(crate) struct Cx<'db> {
     pub(crate) env: ParamEnvAndCrate<'db>,
     pub(crate) stored: StoredParamEnvAndCrate,
     lang: &'db LangItems,
+    /// Whether the summaries made and asked from here spend proofs: part of every summary's
+    /// key ([`summary_in`]), so a callee is asked with the caller's.
+    pub(crate) proofs: Proofs,
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate) -> Cx<'db> {
+    /// The context of a summary or check asked in `stored`, made with `proofs`.
+    pub(crate) fn new(db: &'db Db, stored: StoredParamEnvAndCrate, proofs: Proofs) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate) }
+        Cx { db, interner, infcx, env, stored, lang: lang_items(db, env.krate), proofs }
     }
 
-    /// The summary of `instance` asked from this environment.
+    /// The summary of `instance` asked from this environment, with this context's proofs.
     pub(crate) fn summary(&self, instance: Instance) -> Arc<Summary> {
-        summary(self.db, self.stored, instance)
+        summary_at(self.db, self.proofs, self.stored, instance)
     }
 
     pub(crate) fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
@@ -918,10 +998,9 @@ pub(crate) fn own_part<'db>(cx: &Cx<'db>, body: &MirBody<'db>, def: Def) -> OwnP
     let db = cx.db;
     let mut walk = Walk::new(cx, Some(body));
     // What is proved dead or unable to fail is not a panic of this body
-    // (docs/v2/plan/design/proved-unreachable.md): asked only of a body with a branch or a check.
-    let reach = crate::reach::worth(body)
-        .then(|| crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[]));
-    let reach = reach.as_ref();
+    // (docs/v2/plan/design/proved-unreachable.md): asked only where proofs are spent.
+    let proof = proof_of(cx, body, def);
+    let reach = proof.as_deref();
     walk.gather(body, reach);
     // A closure's or `async` block's `unsafe` is its function's: one scan of the function's
     // source, which holds them.
@@ -1078,6 +1157,53 @@ pub(crate) fn fold<'db>(cx: &Cx<'db>, body: &MirBody<'db>, own: OwnPart) -> Summ
         trusted_calls: trusted_calls.into_iter().collect(), // alloc: once per instance, mostly empty
         ..out.finish(ret, callees.into_boxed_slice())
     }
+}
+
+/// The proof the walk reads of `body`, `def`'s instance, under `cx.proofs`.
+///
+/// - Under [`Proofs::None`] there is none: tier 0 runs no prover, by construction, and every
+///   site counts as reached.
+/// - Under [`Proofs::Spent`], for a function whose generic body has no `for const` loop, the
+///   definition's proof ([`crate::reach::of_body`], one row per definition): monomorphization
+///   folds types into a clone of the generic body (`monomorphization::monomorphized`), so its
+///   blocks keep their ids and the definition's verdict per block is the instance's. A
+///   `for const` loop is expanded per instance (`comptime::expand` adds blocks), and closures
+///   and coroutines are not definitions `of_body` takes: those are proved per instance.
+///
+/// What the definition's proof loses against an instance's: a discharge that needs a value
+/// only the instance has (a const generic `N`, `size_of::<T>()`, an associated const, the
+/// concrete integer type behind a normalized alias); the prover takes those as unknown.
+fn proof_of<'db>(
+    cx: &Cx<'db>,
+    body: &MirBody<'db>,
+    def: Def,
+) -> Option<std::borrow::Cow<'db, crate::reach::Reach>> {
+    if cx.proofs == Proofs::None || !crate::reach::worth(body) {
+        return None;
+    }
+    #[cfg(test)]
+    plant::count_proof();
+    let db = cx.db;
+    if let Def::Body(Body::Fn(func)) = def
+        && let Ok(generic) =
+            db.runtime_mir_body(InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)))
+        && !generic.has_comptime_loop()
+    {
+        // The invariant the definition's proof rests on: the instance is the generic body
+        // with types folded in, block for block. A body that breaks it is refused loudly,
+        // never read against another body's block ids.
+        assert_eq!(
+            generic.basic_blocks.len(),
+            body.basic_blocks.len(),
+            "the instance of {func:?} does not keep its definition's blocks, so the \
+             definition's proof (reach::of_body) cannot be read for it",
+        );
+        return Some(std::borrow::Cow::Borrowed(crate::reach::of_body(
+            db,
+            DefWithBodyId::FunctionId(func),
+        )));
+    }
+    Some(std::borrow::Cow::Owned(crate::reach::prove(db, &cx.infcx, cx.env.param_env, body, &[])))
 }
 
 /// The effects of a body as its sites are taken in: per effect, each kind once with its

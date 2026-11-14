@@ -45,6 +45,7 @@ mod intent;
 mod layout;
 mod memo;
 mod perf;
+mod prove;
 // Lane packs-1112: `Places` is also the export's guard against a record that holds a
 // directory of this machine (`serve::packs::home_places`).
 pub(crate) mod portable;
@@ -209,6 +210,11 @@ impl Steps for Real {
     type KeptFront = KeptLowered;
     type Linked = codegen::Linked;
     type Runs = UnitRuns;
+    type Proving = prove::Proving;
+
+    fn check_proofs(proving: prove::Proving, lean: Option<&str>, tags: u64) -> UnitRuns {
+        UnitRuns::Proofs(prove::Checking::new(proving, lean, tags))
+    }
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = self.fetcher.fetch(fetch)?;
@@ -580,29 +586,41 @@ impl Steps for Real {
                 // it has first (restore.md, "Restart reads records (d)", C): what its image is
                 // filed under, and its own surface, which `give_surfaces` then takes in place
                 // of parsing the crate's files. A kept front end found them when it was made.
-                if session.is_none() {
+                //
+                // A database made freshly is first given its session: the goal store and the
+                // item store installed, then every maker of its session arena in one commit
+                // ([`deps::makers`]: which front end computes a body's identity, where its
+                // per-item entries are kept, its constants' store), before any query runs and
+                // before the surfaces are given, so no commit of a session maker drops an arena
+                // that holds anything (round 27: three commits, each dropping all 32 arenas,
+                // after the surfaces' commit). Until 2026-11-10 nothing told it the front end,
+                // so every identity was `Err("no front-end build is set")` behind an untracked
+                // read of the singleton's absence. A database lowered into again was told when
+                // it was made. (blaze-item-hash's fact boundaries were marked when the database
+                // was made: `lower_anew`.)
+                let fresh = session.is_none();
+                let made = match fresh {
+                    true => {
+                        let mut made = deps::session(
+                            &lowered,
+                            &input.store,
+                            &input.reads,
+                            &input.macros,
+                            &input.config.invocation.env,
+                        )?;
+                        deps::makers(&mut lowered, &mut made, &input.config.invocation.env)?;
+                        Some(made)
+                    }
+                    false => None,
+                };
+                if fresh {
                     deps::find(&mut lowered, &input.store)?;
                 }
                 lowered.give_surfaces();
-                                // Before any key is resolved: two crates of one key would take each other's items.
+                // Before any key is resolved: two crates of one key would take each other's items.
                 blaze_items::key::check_crate_keys(lowered.db()).map_err(|clash| {
                     Failed::Error(ApiError::new(format!("blaze-items: {clash}"), None))
                 })?; // alloc: an error, once
-                let fresh = session.is_none();
-                if fresh {
-                    // Which front end computes a body's identity, told before any is asked:
-                    // the one the goal store and the item store are given below. Until
-                    // 2026-11-10 nothing told it, so every identity was `Err("no front-end
-                    // build is set")` behind an untracked read of the singleton's absence:
-                    // the item store refused every body (`Refusal::NoIdentity`), and
-                    // `identity_of` ran again for every body it was asked of in every
-                    // revision (about 10,000 runs a build, all `ran_untracked`). A database
-                    // lowered into again was told when it was made. (blaze-item-hash's fact
-                    // boundaries were marked when the database was made: `lower_anew`.)
-                    let mut edit = lowered.served_db().edit();
-                    blaze_item_hash::identity::give_build(&mut edit, deps::front_end()?);
-                    _ = edit.commit();
-                }
                 // The guard: a build whose database was not told stops here, naming it, where
                 // it used to go on with no identity and an untracked read a body.
                 if blaze_item_hash::identity::FrontEnd::try_get(lowered.db()).is_none() {
@@ -612,21 +630,10 @@ impl Steps for Real {
                         None,
                     )));
                 }
-                let mut session = match session {
-                    Some(session) => session,
-                    None => deps::session(
-                        &lowered,
-                        &input.store,
-                        &input.reads,
-                        &input.macros,
-                        &input.config.invocation.env,
-                    )?,
+                let mut session = match (session, made) {
+                    (Some(session), _) | (None, Some(session)) => session,
+                    (None, None) => unreachable!("a database made freshly is given its session above"),
                 };
-                if fresh {
-                    // Where the database keeps its per-item entries, told before the first
-                    // serve below reads a crate from them.
-                    deps::entries(&mut lowered, &session);
-                }
                 let mut job =
                     Job::new(input.clone(), lowered.crates().clone(), self.shared.clone(), held)?;
                 job._seeded = seeded;
@@ -1446,16 +1453,43 @@ impl Writer<Real> for UnitWriter {
                         Err(it) => broke.push(it),
                     }
                 }
+                // Every run's writes in one commit (`Lowered::apply_runs`), so the arenas they
+                // share are dropped once, not once a run: each run checked and read first, its
+                // refusal or its panic its own unit's; then the runs that passed written
+                // together, each refused alone where its write is; a unit made ready only by
+                // a run whose write held.
+                let mut prepared = Vec::with_capacity_in(runs.len(), std::alloc::Global);
+                // Each run that passed its checks, in the runs' order, and whether it writes
+                // (a run of a class another run is applied for is taken, writing nothing).
+                let mut passed: Vec<(usize, bool), std::alloc::Global> =
+                    Vec::with_capacity_in(runs.len(), std::alloc::Global);
                 for (run, ran) in runs.drain(..) {
-                    let from = ready.len();
-                    let applied = applying_fallible(run, "a build script's run", || {
-                        lowered.ran(run, &ran).map_err(lower_error)?;
-                        waits.applied(run as u32, ready);
-                        Ok(())
-                    });
-                    if let Err(it) = applied {
-                        ready.truncate(from);
-                        broke.push(it);
+                    match applying(run, "a build script's run", || lowered.prepare_run(run, &ran)) {
+                        Ok(Ok(Some(it))) => {
+                            prepared.push(it);
+                            passed.push((run, true));
+                        }
+                        Ok(Ok(None)) => passed.push((run, false)),
+                        Ok(Err(error)) => broke.push(Broke::failed(run, "a build script's run", lower_error(error))),
+                        Err(it) => broke.push(it),
+                    }
+                }
+                // In `prepared`'s order, which is `passed`'s writing runs' order.
+                let mut outcomes = lowered.apply_runs(prepared).into_iter();
+                for (run, writes) in passed {
+                    let outcome = match writes {
+                        false => Ok(()),
+                        true => match outcomes.next() {
+                            Some((of, outcome)) if of == run => outcome,
+                            other => unreachable!(
+                                "`Lowered::apply_runs` gives one outcome a prepared run, in order: run {run} got {:?}",
+                                other.map(|it| it.0)
+                            ),
+                        },
+                    };
+                    match outcome {
+                        Ok(()) => waits.applied(run as u32, ready),
+                        Err(error) => broke.push(Broke::failed(run, "a build script's run", lower_error(error))),
                     }
                 }
                 // A device unit's MSL is, to its dependents, what a run is: what their crates
@@ -2650,6 +2684,13 @@ impl Front<Real> for JobFront {
         cancellable(|| intent::ahead(&self.0, &reader, filter))?
     }
 
+    fn prove(&self, reader: UnitReader, emit: bool, subset: bool) -> Result<prove::Proving, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| prove::prove(&self.0, reader.db(), emit, subset))?
+    }
+
     fn codegen_inputs(&self, reader: UnitReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         // Read from the units' records in the store: the front end is not asked.
         drop(reader);
@@ -2707,12 +2748,13 @@ impl Kept for codegen::Linked {
     }
 }
 
-/// User code of a job, run on the loop: a build script's run, the build's tests, or its
-/// program.
+/// User code of a job, run on the loop: a build script's run, the build's tests, its
+/// program, or Lean over its proofs.
 pub enum UnitRuns {
     Script(script::ScriptRun),
     Tests(test::TestRun),
     Program(run::Program),
+    Proofs(prove::Checking),
 }
 
 impl Runs<Real> for UnitRuns {
@@ -2727,6 +2769,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.start(store, writer, effects, out),
             UnitRuns::Tests(it) => it.start(store, writer, effects, out),
             UnitRuns::Program(it) => it.start(store, writer, effects, out),
+            UnitRuns::Proofs(it) => it.start(store, writer, effects, out),
         }
     }
 
@@ -2735,6 +2778,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.owns(tag),
             UnitRuns::Tests(it) => it.owns(tag),
             UnitRuns::Program(it) => it.owns(tag),
+            UnitRuns::Proofs(it) => it.owns(tag),
         }
     }
 
@@ -2750,6 +2794,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Tests(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Program(it) => it.complete(completion, store, writer, effects, out),
+            UnitRuns::Proofs(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -2758,6 +2803,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.cancel(effects),
             UnitRuns::Tests(it) => it.cancel(effects),
             UnitRuns::Program(it) => it.cancel(effects),
+            UnitRuns::Proofs(it) => it.cancel(effects),
         }
     }
 
@@ -2766,6 +2812,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.take_puts(),
             UnitRuns::Tests(it) => it.take_puts(),
             UnitRuns::Program(it) => it.take_puts(),
+            UnitRuns::Proofs(it) => it.take_puts(),
         }
     }
 }

@@ -52,9 +52,9 @@ theorem permuteChecked_preserves (orders : List (List BlockId)) :
       renumber (fun fn => ordersOr (nth? orders fn)) prog
     else prog).call n id base args = r
   by_cases hc : checkPermutation (fun fn => ordersOr (nth? orders fn)) prog = true
-  · rw [if_pos hc]
+  · rw [ite_eq_left hc]
     exact (permuteBlocks_call (fun fn => ordersOr (nth? orders fn)) prog hc n id base args).trans h
-  · rw [if_neg hc]
+  · rw [ite_eq_right hc]
     exact h
 
 theorem mapBlocks_preserves (f : BasicBlock → BasicBlock) (hf : BlockPreserving f) :
@@ -95,7 +95,7 @@ theorem removeOverwrittenChecked_preserves : PreservesWhen FrameZero removeOverw
   show (if checkBorrows refsOf prog = true then removeOverwritten refsOf prog
     else prog).call n id base args = r
   by_cases hc : checkBorrows refsOf prog = true
-  · rw [if_pos hc]
+  · rw [ite_eq_left hc]
     have zero : ∀ (q : Pointer), ZeroPtr q → PtrOk (BorrowedIn refsOf prog) [] q :=
       fun _ hq => Or.inl hq
     have hbase : SlotsOk (PtrOk (BorrowedIn refsOf prog) []) base :=
@@ -111,7 +111,7 @@ theorem removeOverwrittenChecked_preserves : PreservesWhen FrameZero removeOverw
       have ⟨why, e⟩ := undef
       exact absurd (h.symm.trans e) (hu why)
     | inr same => exact same.trans h
-  · rw [if_neg hc]
+  · rw [ite_eq_right hc]
     exact h
 
 /-- `removeDead` with the certificate given and the references the body takes as its borrowed
@@ -129,7 +129,7 @@ theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local))
       removeDead cert refsOf prog
     else prog).call n id base args = r
   by_cases hc : (checkBorrows refsOf prog && checkLiveness prog cert) = true
-  · rw [if_pos hc]
+  · rw [ite_eq_left hc]
     have zero : ∀ (q : Pointer), ZeroPtr q → PtrOk (BorrowedIn refsOf prog) [] q :=
       fun _ hq => Or.inl hq
     have hbase : SlotsOk (PtrOk (BorrowedIn refsOf prog) []) base :=
@@ -145,7 +145,7 @@ theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local))
       have ⟨why, e⟩ := undef
       exact absurd (h.symm.trans e) (hu why)
     | inr same => exact same.trans h
-  · rw [if_neg hc]
+  · rw [ite_eq_right hc]
     exact h
 
 /-- One proved rewrite, with what it takes. -/

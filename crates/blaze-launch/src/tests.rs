@@ -1,6 +1,6 @@
-//! The tests: the core under every schedule Hegel draws, with its planted bugs ([`sim`]); the
-//! wire's bytes against blaze-protocol's check of the deterministic encoding ([`wire`]); and
-//! here, what one call of the core refuses and what the area gives back.
+//! The tests: the core under every schedule a case's tape draws, with its planted bugs
+//! ([`sim`]); the wire's bytes against blaze-protocol's check of the deterministic encoding
+//! ([`wire`]); and here, what one call of the core refuses and what the area gives back.
 
 mod image;
 mod record;

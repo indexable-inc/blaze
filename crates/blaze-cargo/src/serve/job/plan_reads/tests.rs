@@ -5,8 +5,8 @@
 
 use blaze_core::FileName;
 use blaze_ids::ContentId;
+use blaze_sim::{Config, Tape};
 use blaze_vfs::{Mode, Op, Vfs};
-use hegel::generators as gs;
 
 use super::{Plant, PlanReads, holds, PLANT};
 
@@ -110,16 +110,20 @@ fn source_only(kind: u8) -> bool {
 /// two views (its files and its relisted directories) equals a fresh plan of the edited one (it is
 /// never kept wrongly), and edits of sources alone always keep it (a body edit plans nothing).
 /// The control is [`the_oracle_catches_a_hold_blind_to_listings`].
-#[hegel::test]
-fn a_source_edit_keeps_the_plan_and_its_units(tc: hegel::TestCase) {
+#[test]
+fn a_source_edit_keeps_the_plan_and_its_units() {
+    blaze_sim::check(Config::DEFAULT, a_source_edit_keeps_the_plan);
+}
+
+fn a_source_edit_keeps_the_plan(tape: &Tape) {
     let mut vfs = vfs();
     let before = base(&mut vfs);
     let (kept, reads) = plan(&vfs, before);
-    let count = 1 + usize::from(tc.draw(gs::integers::<u8>())) % 4;
+    let count = 1 + usize::from(tape.int::<u8>("count")) % 4;
     let mut ops = Vec::new();
     let mut sources = true;
     for _ in 0..count {
-        let (kind, n) = (tc.draw(gs::integers::<u8>()), tc.draw(gs::integers::<u8>()));
+        let (kind, n) = (tape.int::<u8>("kind"), tape.int::<u8>("n"));
         sources &= source_only(kind);
         // A removal of what an earlier edit of the run removed is no edit.
         if kind % KINDS == 4 && ops.iter().any(|it| matches!(it, Op::Delete { .. })) {

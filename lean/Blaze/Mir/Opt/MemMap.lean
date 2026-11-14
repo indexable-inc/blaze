@@ -64,17 +64,17 @@ theorem State.setSlots_mapStack {M : List Frame → List Frame} (hM : MemMap M) 
   by_cases hf : f = 0
   · have left : (st.mapStack M).setSlots f slots =
         { base := slots, stack := M st.stack, next := st.next } :=
-      (State.setSlots_def (st.mapStack M) f slots).trans (if_pos hf)
+      (State.setSlots_def (st.mapStack M) f slots).trans (ite_eq_left hf)
     have right : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     exact left.trans (congrTo (State.mapStack M) right).symm
   · have left : (st.mapStack M).setSlots f slots =
         { base := st.base, stack := setFrame (M st.stack) f slots,
           next := st.next } :=
-      (State.setSlots_def (st.mapStack M) f slots).trans (if_neg hf)
+      (State.setSlots_def (st.mapStack M) f slots).trans (ite_eq_right hf)
     have right : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     have mid : State.mk st.base (setFrame (M st.stack) f slots) st.next =
         State.mapStack M (State.mk st.base (setFrame st.stack f slots) st.next) :=
       congrTo (fun s => State.mk st.base s st.next) (hM.set st.stack f slots)
@@ -98,7 +98,7 @@ theorem State.write_mapStack {M : List Frame → List Frame} (hM : MemMap M) (st
     Outcome.bind_commutes rfl (fun slot' _ =>
       congrTo Outcome.ok (State.setSlot_mapStack hM st p slot')))
 
-theorem stateOr_mapStack {M : List Frame → List Frame} (hM : MemMap M) (st : State) :
+theorem stateOr_mapStack {M : List Frame → List Frame} (_hM : MemMap M) (st : State) :
     ∀ (x : Outcome State),
       stateOr (st.mapStack M) (Outcome.map (State.mapStack M) x) = (stateOr st x).mapStack M
   | Outcome.ok _ => rfl

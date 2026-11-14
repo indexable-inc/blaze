@@ -21,7 +21,7 @@ use std::{
 
 use blaze_mem::ArenaLocal;
 
-use crate::{Kind, Read};
+use crate::{Kind, Read, record::Lists};
 
 const FANOUT: usize = 16;
 const BITS: u32 = 4;
@@ -35,33 +35,62 @@ pub(crate) struct Head {
     pub(crate) kind: &'static Kind,
     /// The next entry of the same full hash.
     chain: AtomicPtr<Head>,
-    /// The entry's read list ([`crate::Reads::Kept`]), in the same arena; empty otherwise.
-    reads: *const Read,
-    reads_len: u32,
+    /// What the entry read ([`crate::Reads::Kept`]): its direct rows, the entries it asked and
+    /// its flat list once made ([`Lists`]), in its arena, or a fixpoint member's: its head's.
+    /// Null when nothing was read or lists are off: one word per entry, the recorder's whole
+    /// cost to an entry when off.
+    lists: *const Lists,
     /// An interned value's or input's index in its arena's column; 0 for a query's entry.
     pub(crate) local: u32,
 }
 
 impl Head {
-    pub(crate) fn new(hash: u64, kind: &'static Kind, reads: &[Read], local: u32) -> Head {
-        Head {
-            hash,
-            kind,
-            chain: AtomicPtr::new(ptr::null_mut()),
-            reads: reads.as_ptr(),
-            reads_len: u32::try_from(reads.len()).expect("a read list of under 2^32 facts"),
-            local,
-        }
+    /// A head with no read lists: an input's, an interned value's, a store record's, or an
+    /// entry whose run read nothing (or ran with lists off).
+    pub(crate) fn new(hash: u64, kind: &'static Kind, local: u32) -> Head {
+        Head::listed(hash, kind, ptr::null(), local)
     }
 
-    /// The entry's read list.
-    pub(crate) fn reads(&self) -> &[Read] {
-        if self.reads_len == 0 {
-            return &[];
-        }
-        // SAFETY: `reads` was a slice of `reads_len` facts in the entry's own arena, which
-        // lives as long as the entry.
-        unsafe { std::slice::from_raw_parts(self.reads, self.reads_len as usize) }
+    /// A head whose entry read what `lists` holds (null for nothing): in the entry's arena, or
+    /// one that outlives it ([`Lists`] says which).
+    pub(crate) fn listed(hash: u64, kind: &'static Kind, lists: *const Lists, local: u32) -> Head {
+        Head { hash, kind, chain: AtomicPtr::new(ptr::null_mut()), lists, local }
+    }
+
+    /// Sets the lists of a head no reader has yet: a fixpoint member's entry made in place in
+    /// its round and given its cycle's lists when its head settles.
+    ///
+    /// # Safety
+    ///
+    /// `head` points at an unpublished head nothing else refers to, with write permission;
+    /// `lists` is null or as for [`Head::listed`].
+    pub(crate) unsafe fn set_lists(head: *mut Head, lists: *const Lists) {
+        // SAFETY: the caller's.
+        unsafe { (&raw mut (*head).lists).write(lists) };
+    }
+
+    /// The entry's lists, `None` when it read nothing (or lists are off).
+    pub(crate) fn lists(&self) -> Option<&Lists> {
+        // SAFETY: `lists` is null or points at lists in an arena that outlives the entry
+        // ([`Lists`]), never written after the head is published.
+        unsafe { self.lists.as_ref() }
+    }
+
+    /// The raw lists pointer, to share with a fixpoint member ([`Head::set_lists`]).
+    pub(crate) fn lists_ptr(&self) -> *const Lists {
+        self.lists
+    }
+
+    /// The rows the entry's run read itself, sorted and deduplicated: input rows and one
+    /// [`Read::Query`] per boundary asked. Not what the value depends on: that is the flat
+    /// list ([`crate::record::flat_of`]), these plus everything [`Head::callees`] read.
+    pub(crate) fn direct_reads(&self) -> &[Read] {
+        self.lists().map_or(&[], Lists::direct)
+    }
+
+    /// The entries (not boundaries) the entry's run asked, each once.
+    pub(crate) fn callees(&self) -> &[*const Head] {
+        self.lists().map_or(&[], Lists::callees)
     }
 }
 

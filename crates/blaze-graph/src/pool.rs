@@ -5254,7 +5254,7 @@ mod broken {
 mod victims {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::{Pool, Stealing, Victims, pick_two, worker_seed, xorshift};
     use crate::topology::{Cpu, Topology};
@@ -5266,15 +5266,16 @@ mod victims {
     /// Over generated groups, deque lengths and seeds: each pick draws two workers other than
     /// `me`, is the one of the longer deque (the first on a tie), is none only when both are
     /// empty, and the same seed draws the same picks again.
-    #[hegel::test(test_cases = 200)]
-    fn a_two_choices_pick_is_the_longer_of_two_others_and_replays_for_a_seed(tc: TestCase) {
-        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
-        let me =
-            tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<usize>().max_value(count - 1)));
-        let lens: Vec<usize> =
-            (0..count).map(|_| tc.draw(gs::integers::<usize>().max_value(4))).collect();
-        let (seed, index) =
-            (tc.draw(gs::integers::<u64>()), tc.draw(gs::integers::<usize>().max_value(255)));
+    #[test]
+    fn a_two_choices_pick_is_the_longer_of_two_others_and_replays_for_a_seed() {
+        blaze_sim::check(Config::cases(200), |tape| two_choices(tape))
+    }
+
+    fn two_choices(tape: &Tape) {
+        let count = tape.int_in(1..=8usize, "workers");
+        let me = tape.bool("me in the group").then(|| tape.index(count, "me"));
+        let lens: Vec<usize> = (0..count).map(|_| tape.int_in(0..=4usize, "deque len")).collect();
+        let (seed, index) = (tape.int::<u64>("pool seed"), tape.int_in(0..=255usize, "worker index"));
         let workers: Vec<u32> = (0..count).map(|it| (BASE + it) as u32).collect();
         let len = |worker: usize| lens[worker - BASE];
         let run = || {
@@ -5341,8 +5342,12 @@ mod victims {
     /// A worker per generated topology's CPU, one job per node of a generated tree, each
     /// node's job a scope of its children's (so jobs pile up in deques and are stolen), under
     /// either [`Victims`]: every job runs exactly once and the scope at the root ends.
-    #[hegel::test(test_cases = 32)]
-    fn every_job_of_a_tree_runs_once_under_either_victims(tc: TestCase) {
+    #[test]
+    fn every_job_of_a_tree_runs_once_under_either_victims() {
+        blaze_sim::check(Config::cases(32), |tape| every_job_runs_once(tape))
+    }
+
+    fn every_job_runs_once(tape: &Tape) {
         fn run(pool: &Pool, children: &[Vec<usize>], ran: &[AtomicU32], at: usize) {
             ran[at].fetch_add(1, Ordering::Relaxed);
             let mut spin = 0u64;
@@ -5355,14 +5360,14 @@ mod victims {
                 }
             });
         }
-        let groups = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-        let each = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
-        let victims = if tc.draw(gs::booleans()) { Victims::TwoChoices } else { Victims::Walk };
-        let seed = tc.draw(gs::integers::<u64>());
-        let nodes = tc.draw(gs::integers::<usize>().min_value(1).max_value(40));
+        let groups = tape.int_in(1..=2u32, "groups");
+        let each = tape.int_in(1..=3u32, "cpus a group");
+        let victims = if tape.bool("two choices") { Victims::TwoChoices } else { Victims::Walk };
+        let seed = tape.int::<u64>("pool seed");
+        let nodes = tape.int_in(1..=40usize, "nodes");
         let mut children: Vec<Vec<usize>> = vec![Vec::new(); nodes];
         for node in 1..nodes {
-            let parent = tc.draw(gs::integers::<usize>().max_value(node - 1));
+            let parent = tape.index(node, "parent");
             children[parent].push(node);
         }
         let topology = Topology {

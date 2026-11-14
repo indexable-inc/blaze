@@ -955,6 +955,7 @@ impl Iocp {
             | Effect::SendTo { .. }
             | Effect::RecvFrom { .. }
             | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }) => {
                 let tag = effect.tag();

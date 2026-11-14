@@ -3,8 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -47,33 +46,33 @@ struct Case {
     seed: u64,
 }
 
-fn behaviour(tc: &TestCase) -> Behaviour {
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
+fn behaviour(tape: &Tape) -> Behaviour {
+    match tape.int_in(0u8..=7, "behaviour") {
         0 | 1 => Behaviour::Honest,
         2 => Behaviour::Silent,
         3 => Behaviour::Short,
         4 => Behaviour::Liar,
-        5 => Behaviour::LiesEvery(tc.draw(gs::integers().min_value(2).max_value(5))),
-        6 => Behaviour::FailsEvery(tc.draw(gs::integers().min_value(2).max_value(5))),
+        5 => Behaviour::LiesEvery(tape.int_in(2u8..=5, "lies every")),
+        6 => Behaviour::FailsEvery(tape.int_in(2u8..=5, "fails every")),
         _ => Behaviour::HasHalf,
     }
 }
 
-fn event(tc: &TestCase) -> Event {
-    match tc.draw(gs::integers::<u8>().max_value(19)) {
-        0..14 => Event::Answer(tc.draw(gs::integers())),
-        14..17 => Event::Tick(tc.draw(gs::integers().max_value(25))),
+fn event(tape: &Tape) -> Event {
+    match tape.int_in(0u8..=19, "event") {
+        0..14 => Event::Answer(tape.int::<u8>("answer")),
+        14..17 => Event::Tick(tape.int_in(0u8..=25, "tick seconds")),
         17 => Event::Appears,
-        _ => Event::Disappears(tc.draw(gs::integers())),
+        _ => Event::Disappears(tape.int::<u8>("disappears")),
     }
 }
 
-fn case(tc: &TestCase) -> Case {
+fn case(tape: &Tape) -> Case {
     Case {
-        sizes: tc.draw(gs::vecs(gs::integers::<u32>().max_value(5 * CHUNK as u32)).min_size(1).max_size(3)),
-        sources: (0..tc.draw(gs::integers::<usize>().max_value(4))).map(|_| behaviour(tc)).collect(),
-        events: (0..tc.draw(gs::integers::<usize>().max_value(120))).map(|_| event(tc)).collect(),
-        seed: tc.draw(gs::integers()),
+        sizes: tape.vec(1..=3, "sizes", |tape| tape.int_in(0u32..=5 * CHUNK as u32, "size")),
+        sources: tape.vec(0..=4, "sources", behaviour),
+        events: tape.vec(0..=120, "events", event),
+        seed: tape.int::<u64>("object bytes seed"),
     }
 }
 
@@ -295,21 +294,15 @@ fn runs(case: &Case, plant: bool) -> Result<(), String> {
     }
 }
 
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: whatever the sources do (answer slowly or never, short, with wrong bytes,
 /// with failures, lacking objects, appearing and going away) and in whatever order their
 /// answers arrive, no byte is kept that is not the object's, an object called whole is whole,
 /// the fetch ends (done, or failed naming an object), and it ends done whenever one honest
-/// source had every object throughout. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// source had every object throughout. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn no_unverified_byte_is_kept_and_an_honest_source_is_enough() {
-    run_cases(300, |tc| {
-        let case = case(&tc);
+    blaze_sim::check(Config::cases(300), |tape| {
+        let case = case(tape);
         if let Err(why) = runs(&case, false) {
             panic!("{case:?}: {why}");
         }

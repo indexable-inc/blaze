@@ -37,12 +37,15 @@ use blaze_item_hash::identity::early_identity;
 use blaze_items::{ItemId, ItemKey, key};
 use blaze_memo::Id as _;
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
-use hir_ty::db::{InternedClosureId, InternedCoroutineId};
+use hir_ty::{
+    db::{InternedClosureId, InternedCoroutineId},
+    facts::Proofs,
+};
 use hir_ty_mir::mir::dispatch::{self, Body};
 use hir_ty_share::identity as share;
 
 use crate::{
-    effects::EffectSet,
+    effects::{self, EffectSet, Rule},
     models::tag,
     walk::{Cx, Def, How, OwnPart, Witness, own_part},
 };
@@ -113,7 +116,8 @@ pub struct OwnEffects {
     /// The body's key made from its own text (`early_identity`): what covers the passes the
     /// fold runs over the body again.
     code: ContentId,
-    /// Every kind the body has itself, no trust applied.
+    /// Every kind the body has itself, no trust applied: what its walk observes and what its
+    /// calls of the models' leaves do (a leaf's body is not walked).
     kinds: EffectSet,
     /// Per effect of `EFFECTS`, the kinds it refuses that the body has itself.
     sets: Box<[EffectSet]>,
@@ -235,6 +239,9 @@ impl OwnEffects {
             shape.update(&[u8::from(it)]);
         }
         let mut own_sites = Vec::with_capacity_in(sites.len(), Global);
+        // A leaf of the models is not walked: its kinds are the body's own, as the fold counts
+        // them (`walk::fold`'s row for a leaf), its panic dropped where its call is discharged.
+        let mut leaf_kinds = EffectSet::EMPTY;
         for (site, &discharged) in sites.iter().zip(&discharged) {
             let (instance, spread) = site.reached.instance();
             feed(&mut shape, &(spread, site.call, site.origin, site.span));
@@ -245,6 +252,11 @@ impl OwnEffects {
                     Callee::Body { kind, item, args }
                 }
                 Def::Leaf(func, leaf) => {
+                    let (kinds, _) = effects::leaf_kinds(leaf);
+                    leaf_kinds = leaf_kinds.union(match discharged {
+                        true => kinds.without(EffectSet::one(Rule::Panic)),
+                        false => kinds,
+                    });
                     Callee::Leaf { func: key::item_key(db, ItemId::Function(func)), leaf: tag(leaf) }
                 }
             };
@@ -260,7 +272,7 @@ impl OwnEffects {
         trusted.dedup();
         let mut links = Vec::with_capacity_in(foreign.len(), Global);
         links.extend(foreign.into_iter().map(|it| it.link));
-        let own_kinds = kinds.kinds;
+        let own_kinds = kinds.kinds.union(leaf_kinds);
         let (sets, witnesses) = kinds.into_sets();
         let mut set_list = Vec::with_capacity_in(sets.len(), Global);
         set_list.extend(sets.iter().copied());
@@ -290,7 +302,8 @@ pub fn own_effects(db: &Db, func: FunctionId) -> Result<OwnEffects, &'static str
     }
     let code = early_identity(db, DefWithBodyId::FunctionId(func)).map_err(|_| NO_KEY)?;
     let (env, args) = crate::function::generic(db, func);
-    let cx = Cx::new(db, env);
+    // The checks' part: proofs spent, as every effect and role lint asks (`walk::summary`).
+    let cx = Cx::new(db, env, Proofs::Spent);
     let body = dispatch::body_once(db, &cx.stored, Body::Fn(func), &args).map_err(|_| UNLOWERED)?;
     let part = own_part(&cx, &body, Def::Body(Body::Fn(func)));
     OwnEffects::of(db, code, part)

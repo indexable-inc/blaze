@@ -43,6 +43,7 @@ pub mod reach;
 pub mod refined;
 pub mod roles;
 pub mod steps;
+pub mod trust;
 mod values;
 mod walk;
 

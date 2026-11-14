@@ -2,7 +2,7 @@
 //! rewrite holds on its own, and the e-graph is closed under congruence and finds a term no
 //! dearer than naive rewriting does.
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::{float_term, pick};
 use crate::{
@@ -34,11 +34,11 @@ const SPECIAL: &[f64] = &[
 ];
 
 /// A drawn input: one of [`SPECIAL`], or any bits at all.
-fn input(tc: &hegel::TestCase) -> f64 {
-    if pick(tc, 3) == 0 {
-        f64::from_bits(tc.draw(gs::integers::<u64>()))
+fn input(tape: &Tape) -> f64 {
+    if pick(tape, 3, "input kind") == 0 {
+        f64::from_bits(tape.int::<u64>("input bits"))
     } else {
-        SPECIAL[pick(tc, SPECIAL.len() as u32 - 1) as usize]
+        SPECIAL[tape.index(SPECIAL.len(), "special input")]
     }
 }
 
@@ -68,22 +68,25 @@ fn refines(before: (&Graph, &[Id]), after: (&Graph, &[Id]), point: &[f64]) -> Re
 /// over every operation and drawn inputs, signed zeros, infinities, NaN and subnormals
 /// included, the simplified term evaluates to the same bits as the term (any NaN is any NaN),
 /// whether or not the fuel stopped the run.
-#[hegel::test]
-fn exact_simplification_preserves_every_value(tc: hegel::TestCase) {
-    let mut graph = Graph::new(Width::F64);
-    let roots =
-        [float_term(&tc, &mut graph, 3, 3, false), float_term(&tc, &mut graph, 3, 2, false)];
-    // Sometimes too little fuel to finish: what is found so far is still the same value.
-    let fuel = if pick(&tc, 3) == 0 { Fuel { nodes: 40, iterations: 2 } } else { Fuel::default() };
-    let simplified = simplify(&graph, &roots, &Options { fuel, ..Options::default() });
-    for _ in 0..8 {
-        let point = [input(&tc), input(&tc), input(&tc)];
-        if let Err(message) =
-            refines((&graph, &roots), (&simplified.graph, &simplified.roots), &point)
-        {
-            panic!("{message}");
+#[test]
+fn exact_simplification_preserves_every_value() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut graph = Graph::new(Width::F64);
+        let roots =
+            [float_term(tape, &mut graph, 3, 3, false), float_term(tape, &mut graph, 3, 2, false)];
+        // Sometimes too little fuel to finish: what is found so far is still the same value.
+        let fuel =
+            if pick(tape, 3, "fuel") == 0 { Fuel { nodes: 40, iterations: 2 } } else { Fuel::default() };
+        let simplified = simplify(&graph, &roots, &Options { fuel, ..Options::default() });
+        for _ in 0..8 {
+            let point = [input(tape), input(tape), input(tape)];
+            if let Err(message) =
+                refines((&graph, &roots), (&simplified.graph, &simplified.roots), &point)
+            {
+                panic!("{message}");
+            }
         }
-    }
+    });
 }
 
 #[test]
@@ -190,18 +193,20 @@ fn each_exact_rewrite_holds_bit_for_bit_on_every_special_value() {
     }
 }
 
-#[hegel::test]
-fn each_exact_rewrite_holds_bit_for_bit_on_any_bits(tc: hegel::TestCase) {
-    let exact = rewrites(false);
-    let rule = &exact[pick(&tc, exact.len() as u32 - 1) as usize];
-    let (graph, [lhs, rhs], _) = sides(rule);
-    let mut point = [0.0; 2 * MAX_VARS];
-    for coordinate in &mut point {
-        *coordinate = input(&tc);
-    }
-    if let Err(message) = refines((&graph, &[lhs]), (&graph, &[rhs]), &point) {
-        panic!("`{}` is not exact: {message}", rule.name);
-    }
+#[test]
+fn each_exact_rewrite_holds_bit_for_bit_on_any_bits() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let exact = rewrites(false);
+        let rule = &exact[tape.index(exact.len(), "rule")];
+        let (graph, [lhs, rhs], _) = sides(rule);
+        let mut point = [0.0; 2 * MAX_VARS];
+        for coordinate in &mut point {
+            *coordinate = input(tape);
+        }
+        if let Err(message) = refines((&graph, &[lhs]), (&graph, &[rhs]), &point) {
+            panic!("`{}` is not exact: {message}", rule.name);
+        }
+    });
 }
 
 /// A rewrite's two sides over `f32`, evaluated without allocating: what an exhaustive run
@@ -318,20 +323,22 @@ fn each_exact_rewrite_keeps_every_bit_f32_exhaustive() {
 }
 
 /// The exact rewrites of several variables, and of conditions, on any `f32` bits.
-#[hegel::test]
-fn each_exact_rewrite_holds_bit_for_bit_on_any_f32_bits(tc: hegel::TestCase) {
-    let exact = rewrites(false);
-    let rule = &exact[pick(&tc, exact.len() as u32 - 1) as usize];
-    let mut sides = InF32::new(rule);
-    let mut point = [0.0f32; 2 * MAX_VARS];
-    for coordinate in &mut point {
-        *coordinate = if pick(&tc, 3) == 0 {
-            f32::from_bits(tc.draw(gs::integers::<u32>()))
-        } else {
-            SPECIAL[pick(&tc, SPECIAL.len() as u32 - 1) as usize] as f32
-        };
-    }
-    assert!(sides.holds_at(&point), "`{}` is not exact in f32 at {point:?}", rule.name);
+#[test]
+fn each_exact_rewrite_holds_bit_for_bit_on_any_f32_bits() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let exact = rewrites(false);
+        let rule = &exact[tape.index(exact.len(), "rule")];
+        let mut sides = InF32::new(rule);
+        let mut point = [0.0f32; 2 * MAX_VARS];
+        for coordinate in &mut point {
+            *coordinate = if pick(tape, 3, "input kind") == 0 {
+                f32::from_bits(tape.int::<u32>("input bits"))
+            } else {
+                SPECIAL[tape.index(SPECIAL.len(), "special input")] as f32
+            };
+        }
+        assert!(sides.holds_at(&point), "`{}` is not exact in f32 at {point:?}", rule.name);
+    });
 }
 
 #[test]
@@ -489,31 +496,33 @@ fn congruent_terms_are_one_class_after_a_rebuild() {
 /// The invariant: after a rebuild the e-graph is closed under congruence: every e-node's
 /// arguments are class roots, and two e-nodes of the same operation, payload and argument
 /// classes are in one class, whatever unions came before.
-#[hegel::test]
-fn a_rebuilt_egraph_is_closed_under_congruence(tc: hegel::TestCase) {
-    let mut egraph = EGraph::new(Width::F64);
-    let mut classes: Vec<u32> = (0..4)
-        .map(|index| egraph.add(Node { op: Op::Var, args: [Id::NONE; 3], payload: index }))
-        .collect();
-    for _ in 0..pick(&tc, 12) {
-        let class = |tc: &hegel::TestCase| Id(classes[pick(tc, classes.len() as u32 - 1) as usize]);
-        let node = match pick(&tc, 3) {
-            0 => Node { op: Op::Sin, args: [class(&tc), Id::NONE, Id::NONE], payload: 0 },
-            1 => Node { op: Op::Neg, args: [class(&tc), Id::NONE, Id::NONE], payload: 0 },
-            2 => Node { op: Op::Add, args: [class(&tc), class(&tc), Id::NONE], payload: 0 },
-            _ => Node { op: Op::Mul, args: [class(&tc), class(&tc), Id::NONE], payload: 0 },
-        };
-        let added = egraph.add(node);
-        classes.push(added);
-    }
-    for _ in 0..pick(&tc, 6) {
-        let a = classes[pick(&tc, classes.len() as u32 - 1) as usize];
-        let b = classes[pick(&tc, classes.len() as u32 - 1) as usize];
-        egraph.union(a, b);
-    }
-    if let Err(message) = closed(&mut egraph, false) {
-        panic!("{message}");
-    }
+#[test]
+fn a_rebuilt_egraph_is_closed_under_congruence() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut egraph = EGraph::new(Width::F64);
+        let mut classes: Vec<u32> = (0..4)
+            .map(|index| egraph.add(Node { op: Op::Var, args: [Id::NONE; 3], payload: index }))
+            .collect();
+        for _ in 0..pick(tape, 12, "nodes") {
+            let class = |tape: &Tape| Id(classes[tape.index(classes.len(), "argument class")]);
+            let node = match pick(tape, 3, "node op") {
+                0 => Node { op: Op::Sin, args: [class(tape), Id::NONE, Id::NONE], payload: 0 },
+                1 => Node { op: Op::Neg, args: [class(tape), Id::NONE, Id::NONE], payload: 0 },
+                2 => Node { op: Op::Add, args: [class(tape), class(tape), Id::NONE], payload: 0 },
+                _ => Node { op: Op::Mul, args: [class(tape), class(tape), Id::NONE], payload: 0 },
+            };
+            let added = egraph.add(node);
+            classes.push(added);
+        }
+        for _ in 0..pick(tape, 6, "unions") {
+            let a = classes[tape.index(classes.len(), "union a")];
+            let b = classes[tape.index(classes.len(), "union b")];
+            egraph.union(a, b);
+        }
+        if let Err(message) = closed(&mut egraph, false) {
+            panic!("{message}");
+        }
+    });
 }
 
 /// The oracle of [`a_rebuilt_egraph_is_closed_under_congruence`]: rebuilds (unless `skip`, the
@@ -629,22 +638,24 @@ fn naive(graph: &mut Graph, id: Id, rules: &[Rewrite], cost: CostModel) -> Id {
 /// The reference model: equality saturation that ran to the end finds a term at most as dear
 /// as naive rewriting to a fixpoint does, since every term naive rewriting reaches is in the
 /// root's class, and extraction takes the cheapest of the class.
-#[hegel::test]
-fn saturation_is_no_dearer_than_naive_rewriting(tc: hegel::TestCase) {
-    let mut graph = Graph::new(Width::F64);
-    let root = float_term(&tc, &mut graph, 2, 3, false);
-    let rules = rewrites(false);
-    let cost = CostModel::default();
-    let out = simplify_with(&graph, &[root], &rules, Fuel { nodes: 20_000, iterations: 40 }, cost);
-    if out.stop != Stop::Saturated {
-        return;
-    }
-    let rewritten = naive(&mut graph, root, &rules, cost);
-    let (saturated, naive) =
-        (tree_cost(&out.graph, out.roots[0], cost), tree_cost(&graph, rewritten, cost));
-    assert!(
-        saturated <= naive,
-        "saturation found cost {saturated}, naive rewriting {naive}\n{graph:?}"
-    );
-    assert!(naive <= tree_cost(&graph, root, cost));
+#[test]
+fn saturation_is_no_dearer_than_naive_rewriting() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let mut graph = Graph::new(Width::F64);
+        let root = float_term(tape, &mut graph, 2, 3, false);
+        let rules = rewrites(false);
+        let cost = CostModel::default();
+        let out = simplify_with(&graph, &[root], &rules, Fuel { nodes: 20_000, iterations: 40 }, cost);
+        if out.stop != Stop::Saturated {
+            return;
+        }
+        let rewritten = naive(&mut graph, root, &rules, cost);
+        let (saturated, naive) =
+            (tree_cost(&out.graph, out.roots[0], cost), tree_cost(&graph, rewritten, cost));
+        assert!(
+            saturated <= naive,
+            "saturation found cost {saturated}, naive rewriting {naive}\n{graph:?}"
+        );
+        assert!(naive <= tree_cost(&graph, root, cost));
+    });
 }

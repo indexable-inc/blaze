@@ -26,19 +26,17 @@ blaze-ids.workspace = true
 blaze-format.workspace = true
 # Ed25519 (statements, roots, key lists), SHA-256 and HMAC (SigV4).
 ring.workspace = true
-# The HTTP driver: blaze-http's sans-IO client on its tokio driver.
-blaze-http = { workspace = true, features = ["tokio"] }
+# The HTTP driver: blaze-http's sans-IO client on its driver on blaze-core's effects.
+blaze-http.workspace = true
 http.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 # Settings and the commands' typed input.
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 [dev-dependencies]
-blaze-rng.workspace = true
 # An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).
 blaze-sha256.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

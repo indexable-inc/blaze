@@ -113,25 +113,27 @@ pub(super) fn agrees(
 /// expression over every operation and a drawn point inside each operation's domain and away
 /// from its kinks, the value of `d(e)/dx` agrees with the central finite difference of `e`,
 /// within a tolerance relative to the derivative's size; and so does its exact simplification.
-#[hegel::test]
-fn the_symbolic_derivative_agrees_with_finite_differences(tc: hegel::TestCase) {
-    let mut graph = Graph::new(Width::F64);
-    let f = float_term(&tc, &mut graph, 2, 3, true);
-    // Coordinates in [0.3, 1.7], in steps of 1/1000.
-    let coordinate = |tc: &hegel::TestCase| 0.3 + f64::from(pick(tc, 1400)) / 1000.0;
-    let point = [coordinate(&tc), coordinate(&tc)];
-    let var = pick(&tc, 1);
-    let policy = Policy { kinks: Choice::Subgradient(0.5) };
-    let df = diff::derivative(&mut graph, f, var, policy).expect("a subgradient is chosen");
-    if let Err(message) = agrees(&graph, f, df, var as usize, &point) {
-        panic!("{message}");
-    }
-    // The same derivative after the exact rewrites, in one graph with the function.
-    let simplified = simplify(&graph, &[f, df], &Options::default());
-    let [f, df] = simplified.roots[..] else { panic!("two roots in, two out") };
-    if let Err(message) = agrees(&simplified.graph, f, df, var as usize, &point) {
-        panic!("after simplification: {message}");
-    }
+#[test]
+fn the_symbolic_derivative_agrees_with_finite_differences() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut graph = Graph::new(Width::F64);
+        let f = float_term(tape, &mut graph, 2, 3, true);
+        // Coordinates in [0.3, 1.7], in steps of 1/1000.
+        let coordinate = |tape: &blaze_sim::Tape| 0.3 + f64::from(pick(tape, 1400, "coordinate")) / 1000.0;
+        let point = [coordinate(tape), coordinate(tape)];
+        let var = pick(tape, 1, "by var");
+        let policy = Policy { kinks: Choice::Subgradient(0.5) };
+        let df = diff::derivative(&mut graph, f, var, policy).expect("a subgradient is chosen");
+        if let Err(message) = agrees(&graph, f, df, var as usize, &point) {
+            panic!("{message}");
+        }
+        // The same derivative after the exact rewrites, in one graph with the function.
+        let simplified = simplify(&graph, &[f, df], &Options::default());
+        let [f, df] = simplified.roots[..] else { panic!("two roots in, two out") };
+        if let Err(message) = agrees(&simplified.graph, f, df, var as usize, &point) {
+            panic!("after simplification: {message}");
+        }
+    });
 }
 
 /// `term`'s derivative by `x` at `point` as `differentiator` takes it, judged by the oracle.
@@ -402,18 +404,20 @@ fn a_shared_node_is_differentiated_once() {
     assert!(graph.len() <= before * 6, "{} nodes became {}", before, graph.len());
 }
 
-#[hegel::test]
-fn a_gradient_is_the_derivative_by_each_variable(tc: hegel::TestCase) {
-    let mut graph = Graph::new(Width::F64);
-    let f = float_term(&tc, &mut graph, 3, 2, true);
-    let policy = Policy { kinks: Choice::Subgradient(0.0) };
-    let gradient = diff::gradient(&mut graph, f, &[0, 1, 2], policy).unwrap();
-    let jacobian = diff::jacobian(&mut graph, &[f, f], &[0, 1, 2], policy).unwrap();
-    for (var, &entry) in gradient.iter().enumerate() {
-        let alone = diff::derivative(&mut graph, f, var as u32, policy).unwrap();
-        // Hash-consing: the same derivative is the same node.
-        assert_eq!(entry, alone);
-        assert_eq!(jacobian[0][var], alone);
-        assert_eq!(jacobian[1][var], alone);
-    }
+#[test]
+fn a_gradient_is_the_derivative_by_each_variable() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut graph = Graph::new(Width::F64);
+        let f = float_term(tape, &mut graph, 3, 2, true);
+        let policy = Policy { kinks: Choice::Subgradient(0.0) };
+        let gradient = diff::gradient(&mut graph, f, &[0, 1, 2], policy).unwrap();
+        let jacobian = diff::jacobian(&mut graph, &[f, f], &[0, 1, 2], policy).unwrap();
+        for (var, &entry) in gradient.iter().enumerate() {
+            let alone = diff::derivative(&mut graph, f, var as u32, policy).unwrap();
+            // Hash-consing: the same derivative is the same node.
+            assert_eq!(entry, alone);
+            assert_eq!(jacobian[0][var], alone);
+            assert_eq!(jacobian[1][var], alone);
+        }
+    });
 }

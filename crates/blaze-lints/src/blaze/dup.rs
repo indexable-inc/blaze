@@ -351,7 +351,7 @@ fn report<'t>(cx: &mut Cx<'_, 't>, found: &index::Found, types: &[String]) {
         }
         index::Note::Table { .. } => {
             diagnostic.help(
-                "write one test over the table (`for (input, want) in [..] { .. }`), or a Hegel property where the expected value can be computed from the input",
+                "write one test over the table (`for (input, want) in [..] { .. }`), or a property test over generated inputs where the expected value can be computed from the input (blaze's own form: `blaze_sim::check(Config::cases(200), |tape| ..)`)",
             );
         }
         index::Note::ByType { .. } => {

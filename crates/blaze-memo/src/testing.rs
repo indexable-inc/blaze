@@ -159,3 +159,19 @@ impl RunLog {
         self.runs.lock().iter().filter(|it| it.query == query).count()
     }
 }
+
+/// The flat read list of the boundary entry a [`crate::Read::Query`] row names (`row` from a
+/// [`crate::record`] in `memo`): what a test compares a boundary's own reads against, which
+/// its askers' lists keep behind the row. `None` for an input row, or a row naming no entry
+/// of its kind in `memo`. Makes and keeps the entry's flat list, as any ask of it does.
+pub fn flat_reads_behind(memo: &crate::Memo, row: crate::Read) -> Option<Vec<crate::Read, Global>> {
+    let crate::Read::Query { kind, key } = row else { return None };
+    let slot = if key.is_spill() { Some(memo.spill()) } else { memo.try_slot(key.arena()) }?;
+    let head = slot.local(key.local())?;
+    if !ptr::eq(head.kind, kind.kind()) {
+        return None;
+    }
+    let mut out = Vec::new_in(Global);
+    out.extend_from_slice(crate::record::flat_of(memo, head));
+    Some(out)
+}

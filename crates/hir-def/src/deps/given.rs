@@ -41,6 +41,25 @@ pub fn give<K: 'static, T: std::any::Any + Send + Sync + PartialEq>(
     true
 }
 
+/// [`give`] for a located kind ([`base_db::Located`]: a gift that says where a value can be
+/// read, which every reader computes alike without it): kept in the snapshot's table, read by
+/// [`Crate::located`], its first gift to a crate marking no arena. A value equal to the one
+/// held gives nothing; whether it was given.
+pub fn give_located<K: base_db::Located, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    krate: Crate,
+    fact: Fact,
+    value: T,
+) -> bool {
+    let db = edit.db();
+    if krate.located::<K, T>(db) == Some(&value) {
+        return false;
+    }
+    let key = krate.key(db);
+    edit.give_located::<K>(key, fact, Given::new(value));
+    true
+}
+
 /// [`give`] of each crate of `entries` in `edit`: how many crates were given. For a driver
 /// that gives one kind to many crates at once (`nameres::frozen`'s, hir-ty's impl tables).
 pub fn give_each<K: 'static, T: std::any::Any + Send + Sync + PartialEq>(
@@ -50,6 +69,18 @@ pub fn give_each<K: 'static, T: std::any::Any + Send + Sync + PartialEq>(
     let mut given = 0;
     for (krate, fact, value) in entries {
         given += usize::from(give::<K, T>(edit, krate, fact, value));
+    }
+    given
+}
+
+/// [`give_located`] of each crate of `entries` in `edit`: how many crates were given.
+pub fn give_each_located<K: base_db::Located, T: std::any::Any + Send + Sync + PartialEq>(
+    edit: &mut Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, Fact, T)>,
+) -> usize {
+    let mut given = 0;
+    for (krate, fact, value) in entries {
+        given += usize::from(give_located::<K, T>(edit, krate, fact, value));
     }
     given
 }

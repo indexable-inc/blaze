@@ -6,9 +6,9 @@
 //! `../x` lands in `jail`.
 
 use blaze_core::{Done, Effect};
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world, write_synced};
+use super::{check, control, path, root, world, write_synced};
 use crate::{Plant, path::Path};
 
 const PARTS: [&str; 7] = ["a", "b", "..", ".", "", "c.d", "..."];
@@ -19,12 +19,12 @@ struct Plan {
     raws: Vec<String>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let raws = (0..d.int(1, 16))
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let raws = (0..tape.int_in(1..=16u64, "paths"))
         .map(|_| {
-            let rooted = d.one_in(6);
-            let parts: Vec<&str> = (0..d.int(1, 5)).map(|_| d.pick(&PARTS)).collect();
+            let rooted = tape.one_in(6, "rooted");
+            let parts: Vec<&str> = (0..tape.int_in(1..=5u64, "parts")).map(|_| *tape.one_of(&PARTS, "part")).collect();
             let joined = parts.join("/");
             if rooted { format!("/{joined}") } else { joined }
         })
@@ -77,12 +77,12 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The invariant: a `Path` never escapes its `Dir`. Whatever text a path is made of, what
 /// `Path::new` takes is plain and relative, and a write through `jail/in` of it names a file
 /// beneath `jail/in`.
-#[hegel::test(test_cases = 200)]
-fn a_path_never_escapes_its_directory(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_path_never_escapes_its_directory() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_parent_resolved_by_text() {
-    control(Plant::LexicalParent, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::LexicalParent, plan, run);
 }

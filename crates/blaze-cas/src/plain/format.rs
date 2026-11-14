@@ -20,12 +20,19 @@ use blaze_keyed::{
     store::{ALIGN, ENTRY, FOOTER, HEADER, SEGMENT_MOST, SegmentId, StoreError},
 };
 
-/// The format of everything in a plain store's directory: head slots, manifests and segments.
-/// Format 1 put a kind's byte in an entry's place (bits 56..64); format 2 puts blaze-keyed's
-/// [`Tag`] there (bits 40..56, the u16 little-endian at bytes 37..39 of the entry). A file of
-/// another format is refused naming both; there is no migration: the store is rebuilt from what
-/// made it.
-pub const FORMAT: u32 = 2;
+/// The format of a plain store's own files: its head slots and its manifests. Formats 1 and 2
+/// shared their number with the segments'; format 3 gives each retired row a mark, "lost, not
+/// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero. A head or a manifest of
+/// another format is refused naming both; there is no migration: the store is rebuilt from
+/// what made it.
+pub const FORMAT: u32 = 3;
+
+/// The format of a plain segment, which outlives any one store (a published segment is shared
+/// through a bucket): its own number, so a change to the store's own files never changes a
+/// segment's bytes or digest. Format 1 put a kind's byte in an entry's place (bits 56..64);
+/// format 2 puts blaze-keyed's [`Tag`] there (bits 40..56, the u16 little-endian at bytes
+/// 37..39 of the entry). A segment of another format is refused naming both.
+pub const SEGMENT_FORMAT: u32 = 2;
 
 /// What a head slot starts with.
 pub(crate) const HEAD_MAGIC: [u8; 4] = *b"BLPH";
@@ -106,7 +113,7 @@ pub(crate) enum SlotRead {
     /// Of this layout, its checksum failing: a flip the power cut short.
     Torn,
     /// Not this layout's: another store's file.
-    Foreign { magic: [u8; 4] },
+    Foreign,
     /// This layout's, whole, of another format.
     Format { found: u32 },
     Slot(Slot),
@@ -149,7 +156,7 @@ impl Slot {
             return SlotRead::Torn;
         }
         if magic != HEAD_MAGIC {
-            return SlotRead::Foreign { magic };
+            return SlotRead::Foreign;
         }
         if crc32c::crc32c(&bytes[..60]) != u32_at(bytes, 60) {
             return SlotRead::Torn;
@@ -190,9 +197,23 @@ pub(crate) enum HeadRead {
     /// A whole slot of another format: a store of the previous layout (rule 26), refused by
     /// the format it is and the one this blaze reads, never read as empty.
     Version { slot: usize, found: u32 },
-    /// Not a head this blaze reads; why, without the file's name (the caller adds it).
-    Refused(String),
+    /// Not a head this blaze reads: [`StoreError::Head`], what is wrong and at which byte.
+    Refused(StoreError),
 }
+
+/// A head longer than any plain head ([`HEAD_LEN`]): another store's file (the
+/// content-addressed store keeps a `head` of its own); the plain store needs a directory of its
+/// own. `at` is the file's length.
+pub(crate) const HEAD_TOO_LONG: &str = "longer than any plain store's head: another store's file; give the plain store a directory of its own";
+/// Where a slot begins, another magic than a plain slot's: another store's file. `at` is the
+/// slot's offset.
+pub(crate) const HEAD_FOREIGN: &str = "another magic than a plain slot's where a slot begins: another store's file; give the plain store a directory of its own";
+/// A whole slot holding a generation of the other slot's parity. `at` is the slot's offset.
+pub(crate) const HEAD_PARITY: &str = "a slot holding a generation that belongs in the other slot";
+/// Shorter than this process made it and synced it: cut outside blaze. `at` is its length.
+pub(crate) const HEAD_CUT: &str = "shorter than this process made it and synced it: cut outside blaze";
+/// What [`StoreError::Format`] says of a head slot of another format.
+pub(crate) const HEAD_SLOT: &str = "a plain store's head slot";
 
 /// What `bytes[at..at + SLOT]` holds when the head is `bytes`, which may end before it: a slot
 /// only partly there is torn, unless what is there cannot begin a plain slot.
@@ -209,9 +230,7 @@ fn slot_in(bytes: &[u8], at: usize) -> SlotRead {
     let present = &bytes[at.min(bytes.len())..];
     let n = present.len().min(4);
     if present[..n] != HEAD_MAGIC[..n] && present[..n].iter().any(|it| *it != 0) {
-        let mut magic = [0u8; 4];
-        magic[..n].copy_from_slice(&present[..n]);
-        return SlotRead::Foreign { magic };
+        return SlotRead::Foreign;
     }
     SlotRead::Torn
 }
@@ -222,10 +241,7 @@ fn slot_in(bytes: &[u8], at: usize) -> SlotRead {
 /// for its length alone, except a file longer than any plain head.
 pub(crate) fn read_head(bytes: &[u8]) -> HeadRead {
     if bytes.len() > HEAD_LEN {
-        return HeadRead::Refused(format!(
-            "it is {} bytes, and a plain store's head of format {FORMAT} is never longer than {HEAD_LEN}: it is another store's file (the content-addressed store `blaze_cas::Store` keeps a `head` of its own); give the plain store a directory of its own",
-            bytes.len()
-        ));
+        return HeadRead::Refused(StoreError::Head { what: HEAD_TOO_LONG, at: bytes.len() as u64 });
     }
     let slots = [slot_in(bytes, SLOT_AT[0] as usize), slot_in(bytes, SLOT_AT[1] as usize)];
     let mut whole: [Option<Slot>; 2] = [None, None];
@@ -234,19 +250,13 @@ pub(crate) fn read_head(bytes: &[u8]) -> HeadRead {
         match *read {
             SlotRead::Blank => {}
             SlotRead::Torn => torn = Some(at),
-            SlotRead::Foreign { magic } => {
-                return HeadRead::Refused(format!(
-                    "its slot {at} starts with {magic:02x?}, not a plain store's {HEAD_MAGIC:02x?}: it is another store's file (the content-addressed store `blaze_cas::Store` keeps a `head` of its own); give the plain store a directory of its own"
-                ));
+            SlotRead::Foreign => {
+                return HeadRead::Refused(StoreError::Head { what: HEAD_FOREIGN, at: SLOT_AT[at] });
             }
             SlotRead::Format { found } => return HeadRead::Version { slot: at, found },
             SlotRead::Slot(slot) => {
                 if slot.generation % 2 != at as u64 {
-                    return HeadRead::Refused(format!(
-                        "its slot {at} holds generation {}, which belongs in slot {}",
-                        slot.generation,
-                        slot.generation % 2
-                    ));
+                    return HeadRead::Refused(StoreError::Head { what: HEAD_PARITY, at: SLOT_AT[at] });
                 }
                 whole[at] = Some(slot);
             }
@@ -300,7 +310,7 @@ pub(crate) fn header(namespace: Namespace, run: &[u8], index_at: u64) -> [u8; HE
     let count = run.len() / ENTRY;
     let mut out = [0u8; HEADER];
     out[0..4].copy_from_slice(&SEGMENT_MAGIC);
-    out[4..8].copy_from_slice(&FORMAT.to_le_bytes());
+    out[4..8].copy_from_slice(&SEGMENT_FORMAT.to_le_bytes());
     out[8..16].copy_from_slice(&namespace.0.to_le_bytes());
     out[16..20].copy_from_slice(&(count as u32).to_le_bytes());
     out[24..32].copy_from_slice(&index_at.to_le_bytes());
@@ -469,8 +479,8 @@ pub fn check_segment(bytes: &[u8]) -> Result<Described, StoreError> {
     if bytes[0..4] != SEGMENT_MAGIC {
         return Err(layout("its header does not start with `BLPS`: not a plain segment", 0));
     }
-    if u32_at(bytes, 4) != FORMAT {
-        return Err(StoreError::Format { what: "a plain store's segment", found: u32_at(bytes, 4), wanted: FORMAT });
+    if u32_at(bytes, 4) != SEGMENT_FORMAT {
+        return Err(StoreError::Format { what: "a plain store's segment", found: u32_at(bytes, 4), wanted: SEGMENT_FORMAT });
     }
     let foot = &bytes[len - FOOTER..];
     let (count, index_at) = (u32_at(bytes, 16), u64_at(bytes, 24));
@@ -506,7 +516,7 @@ pub fn check_segment(bytes: &[u8]) -> Result<Described, StoreError> {
 /// plain segment's of this format or disagree. Untrusted until [`check_segment`] passes on the
 /// whole.
 pub fn describe(head: &[u8], foot: &[u8], len: u64) -> Option<Described> {
-    if head.len() != HEADER || foot.len() != FOOTER || head[0..4] != SEGMENT_MAGIC || u32_at(head, 4) != FORMAT || foot[0..4] != FOOTER_MAGIC {
+    if head.len() != HEADER || foot.len() != FOOTER || head[0..4] != SEGMENT_MAGIC || u32_at(head, 4) != SEGMENT_FORMAT || foot[0..4] != FOOTER_MAGIC {
         return None;
     }
     let (count, index_at) = (u32_at(head, 16), u64_at(head, 24));
@@ -636,8 +646,71 @@ pub(crate) struct Retired {
     pub id: u64,
     /// A manifest log, else a segment.
     pub log: bool,
-    /// The wall clock when it was retired; it is unlinked a grace period later.
+    /// The wall clock when it was retired; it is unlinked a grace period later, and never while
+    /// it is marked lost.
     pub since_ns: u64,
+    /// A segment retired because an open found it lost, its loss not yet reported: set in the
+    /// manifest that retires it, so the retirement and the report are one durable fact; every
+    /// open that reads it reports it, whoever wrote it, and only a flip made after a report of
+    /// it was handed to its caller clears it ([`super::core::Plain::handed`]).
+    pub lost: Option<LostMark>,
+}
+
+/// Why an open found a segment lost, as a retired row keeps it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LostKind {
+    /// Named by no whole generation: the one that did was lost in a power cut.
+    Orphan = 1,
+    /// Named by a generation of an earlier boot and not whole at its end: a power cut before
+    /// the kernel wrote it back.
+    NotWhole = 2,
+    /// Named by a generation of an earlier boot and gone: its directory entry was not written
+    /// back before a power cut.
+    Gone = 3,
+}
+
+/// "Lost, not yet reported": why, and how many records it held when that could be read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct LostMark {
+    pub kind: LostKind,
+    pub records: Option<u32>,
+}
+
+impl LostMark {
+    /// The most records a mark can name; a segment holds fewer (4 GiB over [`ENTRY`] bytes).
+    const RECORDS_MOST: u32 = (1 << 30) - 2;
+
+    /// Bits 0..2 the kind (0: no mark), bits 2..32 the records plus one (0: not known).
+    pub(crate) fn encode(mark: Option<LostMark>) -> u32 {
+        match mark {
+            None => 0,
+            Some(mark) => {
+                let records = mark.records.filter(|it| *it <= LostMark::RECORDS_MOST).map_or(0, |it| it + 1);
+                mark.kind as u32 | records << 2
+            }
+        }
+    }
+
+    pub(crate) fn decode(word: u32) -> Result<Option<LostMark>, &'static str> {
+        let kind = match word & 3 {
+            0 if word == 0 => return Ok(None),
+            0 => return Err("a retired row's mark names records and no kind"),
+            1 => LostKind::Orphan,
+            2 => LostKind::NotWhole,
+            _ => LostKind::Gone,
+        };
+        let records = (word >> 2).checked_sub(1);
+        Ok(Some(LostMark { kind, records }))
+    }
+
+    /// What a report of it says, as the open that found it said it.
+    pub(crate) fn why(&self) -> String {
+        match self.kind {
+            LostKind::Orphan => "no whole generation names it: the generation that did was lost in a power cut, and its records with it".to_owned(),
+            LostKind::NotWhole => "it was written in an earlier boot and did not survive its end whole: a power cut before the kernel wrote it back; its records are dropped".to_owned(),
+            LostKind::Gone => "a generation named it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped".to_owned(),
+        }
+    }
 }
 
 /// A named root: the store's own record (tag [`super::ROOT_TAG`]) listing the keys compaction
@@ -662,9 +735,9 @@ impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
     /// retired `r`, 24..28 roots `t`, 28..32 zero; then `s` x 80 (digest 32, length u64, index
     /// offset u64, entries u32, flags u32 (1 here, 2 published), namespace u64, generation
-    /// u64, boot u64), `r` x 24 (id u64, 1 for a log u32, zero u32,
-    /// since ns u64), and `t` roots, each 32 key, 8 generation, 2 name length, the name's
-    /// UTF-8, zeros to a multiple of 8. Little-endian.
+    /// u64, boot u64), `r` x 24 (id u64, 1 for a log u32, the mark u32 ([`LostMark::encode`]:
+    /// zero for none, never set on a log), since ns u64), and `t` roots, each 32 key, 8
+    /// generation, 2 name length, the name's UTF-8, zeros to a multiple of 8. Little-endian.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity_in(MANIFEST_HEADER + SEGMENT_ROW * self.segments.len() + 24 * self.retired.len(), Global);
         out.extend_from_slice(&MANIFEST_MAGIC);
@@ -687,7 +760,7 @@ impl Manifest {
         for it in &self.retired {
             out.extend_from_slice(&it.id.to_le_bytes());
             out.extend_from_slice(&u32::from(it.log).to_le_bytes());
-            out.extend_from_slice(&[0u8; 4]);
+            out.extend_from_slice(&LostMark::encode(it.lost).to_le_bytes());
             out.extend_from_slice(&it.since_ns.to_le_bytes());
         }
         for root in &self.roots {
@@ -702,18 +775,22 @@ impl Manifest {
         out
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Manifest, String> {
-        let short = || format!("it is cut short at {} bytes", bytes.len());
+    /// The manifest `bytes` hold, or why not: [`StoreError::Format`] for one of another format
+    /// (format 2's, before retired rows were marked, is refused so, rule 26), else
+    /// [`StoreError::Manifest`] naming what is wrong and the byte it is at.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Manifest, StoreError> {
+        let generation = if bytes.len() >= 16 { u64_at(bytes, 8) } else { 0 };
+        let bad = |what: &'static str, at: usize| StoreError::Manifest { generation, what, at: at as u64 };
+        let short = || bad("it is cut short", bytes.len());
         if bytes.len() < MANIFEST_HEADER {
             return Err(short());
         }
         if bytes[0..4] != MANIFEST_MAGIC {
-            return Err(format!("it starts with {:02x?}, not {MANIFEST_MAGIC:02x?}", &bytes[0..4]));
+            return Err(bad("it does not start with `BLPM`: not a plain manifest", 0));
         }
         if u32_at(bytes, 4) != FORMAT {
-            return Err(format!("it is of format {}, and this blaze reads format {FORMAT}", u32_at(bytes, 4)));
+            return Err(StoreError::Format { what: "a plain store's manifest", found: u32_at(bytes, 4), wanted: FORMAT });
         }
-        let generation = u64_at(bytes, 8);
         let (s, r, t) = (u32_at(bytes, 16) as usize, u32_at(bytes, 20) as usize, u32_at(bytes, 24) as usize);
         let fixed = MANIFEST_HEADER.saturating_add(SEGMENT_ROW.saturating_mul(s)).saturating_add(24usize.saturating_mul(r));
         if bytes.len() < fixed {
@@ -738,14 +815,23 @@ impl Manifest {
             };
             let end = it.index_at.checked_add(u64::from(it.count) * ENTRY as u64 + FOOTER as u64);
             if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || flags > 3 {
-                return Err(format!("its segment {:016x} of {} bytes, index at {}, generation {}, flags {flags}, is not one a commit writes", it.id, it.len, it.index_at, it.generation));
+                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation newer than the manifest's, or flags past 3)", at));
             }
             segments.push(it);
         }
         let mut retired = Vec::with_capacity_in(r, Global);
         for i in 0..r {
             let at = MANIFEST_HEADER + SEGMENT_ROW * s + 24 * i;
-            retired.push(Retired { id: u64_at(bytes, at), log: u32_at(bytes, at + 8) == 1, since_ns: u64_at(bytes, at + 16) });
+            let log = match u32_at(bytes, at + 8) {
+                0 => false,
+                1 => true,
+                _ => return Err(bad("a retired row is neither a segment (0) nor a log (1)", at + 8)),
+            };
+            let lost = LostMark::decode(u32_at(bytes, at + 12)).map_err(|what| bad(what, at + 12))?;
+            if log && lost.is_some() {
+                return Err(bad("a retired log is marked lost: only a segment is", at + 12));
+            }
+            retired.push(Retired { id: u64_at(bytes, at), log, since_ns: u64_at(bytes, at + 16), lost });
         }
         let mut roots = Vec::with_capacity_in(t, Global);
         let mut at = fixed;
@@ -757,12 +843,12 @@ impl Manifest {
             let generation = u64_at(bytes, at + 32);
             let len = u16::from_le_bytes([bytes[at + 40], bytes[at + 41]]) as usize;
             let Some(name) = bytes.get(at + 42..at + 42 + len) else { return Err(short()) };
-            let name = std::str::from_utf8(name).map_err(|_| "a root's name is not UTF-8".to_owned())?.to_owned();
+            let name = std::str::from_utf8(name).map_err(|_| bad("a root's name is not UTF-8", at + 42))?.to_owned();
             roots.push(Root { name, key, generation });
             at = (at + 42 + len).div_ceil(8) * 8;
         }
         if at != bytes.len() {
-            return Err(format!("it is {} bytes and its fields end at {at}", bytes.len()));
+            return Err(bad("its fields end before its last byte", at));
         }
         Ok(Manifest { generation, segments, roots, retired })
     }
@@ -866,8 +952,9 @@ pub(crate) fn find(run: &[u8], key: &ContentId) -> Option<usize> {
 }
 
 /// `entries` as one sorted run, each key once. Two entries of one key that are not one record
-/// (two values under one key, rule 21) stop it with an error naming the key.
-pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, String> {
+/// (two values under one key, rule 21) stop it with [`StoreError::TwoValues`], naming the key
+/// and the later record's tag.
+pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, StoreError> {
     entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
     let mut out = Vec::with_capacity_in(entries.len() * ENTRY, Global);
     let mut last: Option<Entry> = None;
@@ -875,10 +962,7 @@ pub(crate) fn sorted_run(mut entries: Vec<Entry>) -> Result<Vec<u8>, String> {
         match last {
             Some(kept) if kept.key == entry.key => {
                 if !kept.same_record(&entry) {
-                    return Err(format!(
-                        "two values under one key {:x}: of tag {} and {} bytes (CRC {:08x}), and of tag {} and {} bytes (CRC {:08x}); a key covers every input its value depends on",
-                        entry.key, kept.tag.0, kept.len, kept.crc, entry.tag.0, entry.len, entry.crc
-                    ));
+                    return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
                 }
             }
             _ => {

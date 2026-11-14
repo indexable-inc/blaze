@@ -471,10 +471,14 @@ pub enum Asked {
     Why(Vec<OsString>),
     /// `blaze reach [ROOT]`, with the words after it ([`super::reach::main`]).
     Reach(Vec<OsString>),
+    /// `blaze prove`, with the words after it ([`super::prove::main`]).
+    Prove(Vec<OsString>),
     /// `blaze slow`, with the words after it ([`super::observe::slow`]).
     Slow(Vec<OsString>),
     /// `blaze doctor`, with the words after it ([`super::doctor::main`]).
     Doctor(Vec<OsString>),
+    /// `blaze audit [pin|fetch]`, with the words after it ([`super::audit::main`]).
+    Audit(Vec<OsString>),
     /// `blaze diagnostics`, with the words after it ([`super::diagnostics::main`]).
     Diagnostics(Vec<OsString>),
     /// `blaze agents install|hook|status|remove`, with the words after `agents`
@@ -852,8 +856,10 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("explain") => return Ok(Asked::Explain(words.collect())),
             Some("why") => return Ok(Asked::Why(words.collect())),
             Some("reach") => return Ok(Asked::Reach(words.collect())),
+            Some("prove") => return Ok(Asked::Prove(words.collect())),
             Some("slow") => return Ok(Asked::Slow(words.collect())),
             Some("doctor") => return Ok(Asked::Doctor(words.collect())),
+            Some("audit") => return Ok(Asked::Audit(words.collect())),
             Some("diagnostics") => return Ok(Asked::Diagnostics(words.collect())),
             Some("agents") => return Ok(Asked::Agents(words.collect())),
             Some("pprof") => return Ok(Asked::Pprof(words.collect())),

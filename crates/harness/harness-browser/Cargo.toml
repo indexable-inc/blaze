@@ -25,8 +25,8 @@ serde_json = "1"
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
-# Property tests and the DSTs (slots.rs, cdp_ids.rs): Hegel, imported as `hegel` (blaze's vendor/hegeltest).
-hegeltest = { path = "../../../vendor/hegeltest", default-features = false, features = ["static-engine"] }
+# Property tests and the DSTs (slots.rs, cdp_ids.rs): blaze's own test engine (crates/blaze-sim).
+blaze-sim = { path = "../../blaze-sim" }
 
 [lints.rust]
 unsafe_code = "allow"

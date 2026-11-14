@@ -120,7 +120,9 @@ use serde::{Deserialize, Serialize};
 /// 56: [`Request::Diagnostics`] and [`Response::Diagnostics`] ([`Seen`]): a check's errors and
 /// warnings against what the client was last told, as new, fixed and unchanged, by stable id
 /// (`blaze diagnostics --since`, `blaze agents hook`).
-pub const SCHEMA: u32 = 56;
+/// 57: [`Request::Prove`] and [`Response::Proven`] ([`Proven`], [`ProofRecord`], [`Subset`]):
+/// `blaze prove`, the theorem functions of the crates selected translated to Lean and checked.
+pub const SCHEMA: u32 = 57;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -557,6 +559,21 @@ pub enum Request {
         folded: Vec<u8>,
         ended_ns: i64,
         started_ns: i64,
+    },
+    /// `blaze prove`: every function marked `#[blaze::theorem]` in the library crates `targets`
+    /// selects (as [`Request::Check`] selects them), translated to Lean from the view's front
+    /// end (`hir_ty_lean::emit`), and unless `emit`, its proof checked by the Lean at `lean`
+    /// (an absolute path; the client reads it from `BLAZE_LEAN_PROVER`) against the crate's
+    /// proof file under `lean/` beside its `src/`. Nothing is compiled: the view's proc macros
+    /// and build scripts' runs, which its front end applies before it is read, are built
+    /// first. With `subset`, also the count of what the translator takes over every function
+    /// in a `#![blaze::sans_io]` module of those crates. Answered with [`Response::Proven`].
+    Prove {
+        emit: bool,
+        lean: Option<String>,
+        view: ViewRef,
+        subset: bool,
+        targets: Targets,
     },
 }
 
@@ -1031,6 +1048,8 @@ pub enum Response {
     Doing(Doing),
     /// [`Request::Diagnostics`]'s one answer.
     Diagnostics(Seen),
+    /// [`Request::Prove`]'s one answer.
+    Proven(Proven),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -2039,6 +2058,63 @@ pub struct ReachedItem {
     /// The item's path, as rustc prints it.
     pub path: String,
     pub facts: Vec<FactRead>,
+}
+
+/// What `blaze prove` found ([`Request::Prove`]): one record per theorem function, sorted
+/// (by function, then the whole record), so the same tree answers the same bytes.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Proven {
+    /// Why no proof was checked, where none could be: no Lean was named, the one named is not
+    /// the pinned release, a file could not be written, or Lean refused blaze's own library.
+    /// The records are then the refusals alone, and the command fails with this.
+    pub failed: Option<String>,
+    /// With [`Request::Prove`]'s `subset`: what the translator takes of the sans-IO cores.
+    pub subset: Option<Subset>,
+    pub records: Vec<ProofRecord>,
+}
+
+/// One theorem function's outcome. `function` is the translator's path of it
+/// (`krate::module::name`); a refusal in a function it calls names that function.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum ProofRecord {
+    /// Not proved: no proof file at `proof_file`, or Lean refused it (or the model, or the
+    /// check that it proves `statement`); `why` is that, with Lean's whole output, whose
+    /// remaining goals are what the proof's writer reads.
+    Open { why: String, function: String, statement: String, proof_file: String },
+    /// The pinned Lean's kernel accepted the proof of `theorem`, resting only on `axioms`
+    /// (among Lean's three). `key` is the proof's identity (`hir_ty_lean::proof_key`): every
+    /// input the verdict depends on. `model` is the generated model's file.
+    Proved {
+        key: ContentId,
+        model: String,
+        axioms: Vec<String>,
+        theorem: String,
+        function: String,
+    },
+    /// `--emit`: the model and statement written, nothing checked. `path` is the model's file,
+    /// `module` its Lean module.
+    Emitted { path: String, module: String, function: String, statement: String },
+    /// The translator refused it: what construct, and where (`hir_ty_lean::NotTranslated`).
+    Refused { at: String, what: String, function: String },
+}
+
+/// What the translator takes of every function in a `#![blaze::sans_io]` module of the crates
+/// proved, theorem or not: what decides the subset's next step
+/// (docs/v2/plan/design/proofs-for-sans-io.md, section 3).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Subset {
+    /// Each refusal's `what` with the number of functions refused for it, most first (then by
+    /// `what`). A function is counted under the first refusal the translator meets; how many
+    /// it would meet past that one is not known.
+    pub refused: Vec<SubsetRefusal>,
+    pub functions: u32,
+    pub translated: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SubsetRefusal {
+    pub what: String,
+    pub count: u32,
 }
 
 /// One candidate of a best-of-N, as it was ranked: fewest errors, then fewest failed tests,

@@ -676,40 +676,41 @@ struct Program {
     steps: Vec<Step>,
 }
 
-fn program(tc: &TestCase) -> Program {
-    let int = |low: usize, high: usize| tc.draw(gs::integers::<usize>().min_value(low).max_value(high));
-    let groups: Vec<Vec<usize>> = (0..int(1, 4))
-        .map(|at| (0..at).filter(|_| tc.draw(gs::booleans())).collect())
+fn program(tape: &Tape) -> Program {
+    let int = |low: usize, high: usize, label: &'static str| tape.int_in(low..=high, label);
+    let groups: Vec<Vec<usize>> = (0..int(1, 4, "groups"))
+        .map(|at| (0..at).filter(|_| tape.bool("group dependency")).collect())
         .collect();
-    let libraries: Vec<bool> = groups.iter().map(|_| tc.draw(gs::booleans())).collect();
+    let libraries: Vec<bool> = groups.iter().map(|_| tape.bool("a library")).collect();
     // One input in five is of no group.
-    let inputs: Vec<Option<usize>> =
-        (0..int(1, 6)).map(|_| (int(0, 4) != 0).then(|| int(0, groups.len() - 1))).collect();
-    let nodes = int(1, 12);
+    let inputs: Vec<Option<usize>> = (0..int(1, 6, "inputs"))
+        .map(|_| (int(0, 4, "input in a group") != 0).then(|| int(0, groups.len() - 1, "input's group")))
+        .collect();
+    let nodes = int(1, 12, "nodes");
     let mut flow = Vec::with_capacity(nodes);
     for at in 0..nodes {
         let op = [FlowOp::Sum, FlowOp::Sum, FlowOp::Mod3, FlowOp::Max, FlowOp::Pick, FlowOp::World]
-            [int(0, 5)];
-        let deps = (0..int(1, 4))
+            [int(0, 5, "op")];
+        let deps = (0..int(1, 4, "reads"))
             .map(|_| {
-                if at > 0 && tc.draw(gs::booleans()) {
-                    Dep::Query(int(0, at - 1))
+                if at > 0 && tape.bool("reads a node") {
+                    Dep::Query(int(0, at - 1, "node read"))
                 } else {
-                    Dep::Input(int(0, inputs.len() - 1))
+                    Dep::Input(int(0, inputs.len() - 1, "input read"))
                 }
             })
             .collect();
         flow.push(FlowNode { op, deps });
     }
     let mut steps = Vec::new();
-    for _ in 0..int(1, 20) {
-        steps.push(match int(0, 13) {
-            0..=3 => Step::Write(int(0, inputs.len() - 1), tc.draw(gs::integers::<u64>().max_value(6))),
-            4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
+    for _ in 0..int(1, 20, "steps") {
+        steps.push(match int(0, 13, "step") {
+            0..=3 => Step::Write(int(0, inputs.len() - 1, "input written"), tape.int_in(0..=6u64, "value written")),
+            4 => Step::World(tape.int_in(0..=3u64, "world")),
             5 => Step::Evict,
-            6 | 7 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
+            6 | 7 => Step::Pull((0..int(1, 3, "pulls")).map(|_| int(0, nodes - 1, "node pulled")).collect()),
             8 | 9 => Step::Seal,
-            10 => Step::Unwind(int(1, 3) as u32),
+            10 => Step::Unwind(int(1, 3, "claims before the unwind") as u32),
             11 => Step::Shed,
             _ => Step::Ask,
         });
@@ -837,14 +838,16 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
 /// of their edges behind the seal) or not, drawn, and the reverse index is made again without
 /// the readers behind seals among the steps.
 ///
-/// 10,000 cases, a hundred times Hegel's default: at 100 the three stale answers this test
-/// found took several runs each to meet.
-#[hegel::test(test_cases = 10000)]
-fn a_sealed_database_answers_as_an_unsealed_one_under_random_writes(tc: TestCase) {
-    let program = program(&tc);
-    if let Err(why) = simulate(&program, Plant::None) {
-        panic!("{why}\n{program:#?}");
-    }
+/// 10,000 cases, a hundred times the old engine's default: at 100 the three stale answers this
+/// test found took several runs each to meet.
+#[test]
+fn a_sealed_database_answers_as_an_unsealed_one_under_random_writes() {
+    blaze_sim::check(blaze_sim::Config::cases(10000), |tape| {
+        let program = program(tape);
+        if let Err(why) = simulate(&program, Plant::None) {
+            panic!("{why}\n{program:#?}");
+        }
+    })
 }
 
 /// A directed program for the simulation's controls: a library and a crate over it, both
@@ -1021,7 +1024,7 @@ fn the_oracle_catches_a_result_stored_over_a_seal_the_walk_broke() {
     }
 }
 
-/// The program Hegel shrank the refinement's first failure to (2026-11-12): one group; rows 0
+/// The program the refinement's first failure shrank to (2026-11-12): one group; rows 0
 /// and 1 read its input and inputs of no group, row 2 reads both rows. All sealed; an input
 /// of no group that row 1 reads is written; row 1 is pulled (the pull's check breaks the seal
 /// and runs row 1 again); then the walk.
@@ -1062,7 +1065,7 @@ fn the_oracle_catches_a_walk_that_misses_what_changed_before_it_entered_the_grou
     assert!(why.contains("from scratch") || why.contains("does not name it"), "{why}");
 }
 
-/// The program Hegel shrank the refinement's second failure to (2026-11-12), less the rows
+/// The program the refinement's second failure shrank to (2026-11-12), less the rows
 /// that take no part: no input is of a group, so no row is and no seal is involved. Row 0
 /// reads the world, which the engine cannot see; row 1 reads row 0. Both are pulled; the
 /// world changes (a view opens with nothing written); the host settles at its build's end;

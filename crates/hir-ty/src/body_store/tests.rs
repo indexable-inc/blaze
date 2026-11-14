@@ -29,7 +29,7 @@ use blaze_record::{AnswerKey, Digest};
 use std::alloc::Global;
 
 use super::{
-    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, Traced, Untraced, capture,
+    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, Traced, capture,
     entries, infer, install, install_trace, lookup_inference, lookup_passed, offer_passed,
     offer_verdict,
     record::{self, ShapeRef},
@@ -201,7 +201,8 @@ fn served_by_the_kernel(s: &Session, memory: &Memory) {
             facts: kept.facts.clone(),
             answer: kept.answer.clone(),
         };
-        super::with_store(db, |store| store.served.lock().post(def, kept.step, kept.schema, served))
+        let name = super::entries::BodyName::of(db, def).expect("a body of `main` outside a block has a name");
+        super::with_store(db, |store| store.served.lock().post(name, def, kept.step, kept.schema, served))
             .expect("the database's item store");
     }
 }
@@ -1238,52 +1239,8 @@ fn trace_session(db: Db) -> Session {
     Session { installed, facts, db }
 }
 
-/// What a body task takes of `name`'s inference and the built MIR of each of its owners in
-/// `s`, through the entry points it calls: each step with its schema and its trace.
-fn body_task(s: &Session, name: &str) -> Vec<(Step, blaze_format::SchemaHash, Arc<Traced>)> {
-    let db = &s.db;
-    let def = function(db, name);
-    let mut out = Vec::new();
-    let schema = entries::run_infer(db, def);
-    out.push((Step::Infer, schema, s.installed.trace(def, Step::Infer, schema).expect("the inference is traced")));
-    for place in entries::places(db, def) {
-        let schema = entries::run_mir(db, def, place).unwrap();
-        out.push((Step::Mir, schema, s.installed.trace(def, Step::Mir, schema).expect("the MIR is traced")));
-    }
-    out
-}
-
-/// In `Mode::Trace` two runs of the same body in two fresh databases, whose ids differ
-/// ([`second`]), give byte-equal traces: the same facts and the same answers, every step kept.
-/// And a trace store files nothing: its flush is an error, and a store not in `Mode::Trace`
-/// gives no trace.
-///
-/// To move: it asks built MIR ([`entries::run_mir`] → `providers::mir_at(.., Built)`), which
-/// this crate's test binary cannot build (it registers only the coroutine-witness `Mir`
-/// table, whose `no_build` is `unreachable!`). It belongs with hir-ty-mir's tests, which link
-/// the MIR builder, with [`TestFacts`], [`trace_session`], [`second`] and [`FIXTURE`] made
-/// reachable there. Fails here until it is moved; what it claims is still true.
-#[test]
-fn a_trace_is_the_same_in_two_fresh_databases() {
-    let first = trace_session(db_of(FIXTURE));
-    let other = trace_session(second(FIXTURE));
-    for name in BODIES {
-        let (a, b) = (body_task(&first, name), body_task(&other, name));
-        assert_eq!(a.len(), b.len(), "`{name}`'s owners");
-        for ((step, schema, one), (_, other_schema, two)) in a.iter().zip(&b) {
-            assert_eq!(schema, other_schema, "`{name}`'s {step:?} schema");
-            assert!(matches!(&**one, Traced::Kept { .. }), "`{name}`'s {step:?} is kept: {one:?}");
-            assert_eq!(**one, **two, "`{name}`'s {step:?} traces, facts and answers");
-        }
-    }
-    assert!(first.installed.flush().is_err(), "a trace store files nothing");
-    drop((first, other));
-
-    let serve = session(db_of(FIXTURE), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
-    let seven = function(&serve.db, "seven");
-    let schema = entries::run_infer(&serve.db, seven);
-    assert_eq!(serve.installed.trace(seven, Step::Infer, schema), Err(Untraced::NotTracing));
-}
+// `a_trace_is_the_same_in_two_fresh_databases` asks built MIR, which this test binary cannot
+// build: it is hir-ty-mir's (`tests::mir::body_store`), with its own facts.
 
 /// What `hir_ty_borrowck::borrowck` does with the store, for [`Verdict`]'s stand-in: a stored
 /// pass answers; else the check runs, captured, and its verdict is offered (traced whatever it
@@ -1317,7 +1274,8 @@ fn plant_a_pass(s: &Session) -> blaze_format::SchemaHash {
     let schema = entries::borrowck_schema(db, def, CHECKER);
     let identity = s.facts.identity(db, def).expect("the checked body has an identity");
     let planted = super::entries::Served { identity, facts: Box::new([]), answer: Arc::from(&[][..]) };
-    super::with_store(db, |store| store.served.lock().post(def, Step::Borrowck, schema, planted))
+    let name = super::entries::BodyName::of(db, def).expect("the checked body has a name");
+    super::with_store(db, |store| store.served.lock().post(name, def, Step::Borrowck, schema, planted))
         .expect("the database's item store");
     schema
 }

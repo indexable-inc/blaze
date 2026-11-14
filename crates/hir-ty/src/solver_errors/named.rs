@@ -3,7 +3,7 @@
 
 use hir_def::{
     GenericParamId,
-    hir::generics::{GenericParams, TypeParamProvenance},
+    hir::generics::GenericParams,
 };
 use rustc_type_ir::{
     InferConst, InferTy, TypeFlags, TypeFoldable as _, TypeFolder, TypeSuperFoldable,
@@ -91,7 +91,7 @@ impl Namer<'_, '_> {
         if let GenericParamId::TypeParamId(it) = param
             && GenericParams::of(self.infcx.interner.db, it.parent())[it.local_id()]
                 .type_param()
-                .is_some_and(|it| it.provenance == TypeParamProvenance::ArgumentImplTrait)
+                .is_some_and(|it| it.provenance.is_synthetic())
         {
             return None;
         }

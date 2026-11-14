@@ -322,8 +322,7 @@ fn take<'b>(
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -335,19 +334,19 @@ mod tests {
 
     /// A manifest by draws: up to 40 files of up to four components, no file under another
     /// file's path, each path once.
-    fn drawn(tc: &TestCase) -> Vec<(String, ContentId)> {
-        let count: usize = tc.draw(gs::integers().max_value(40));
+    fn drawn(tape: &Tape) -> Vec<(String, ContentId)> {
+        let count: usize = tape.int_in(0..=40, "files");
         let mut files: Vec<(String, ContentId)> = Vec::new();
         for _ in 0..count {
-            let depth: usize = tc.draw(gs::integers().max_value(3));
+            let depth: usize = tape.int_in(0..=3, "depth");
             let mut parts: Vec<&str> = Vec::new();
             for _ in 0..=depth {
-                let part: usize = tc.draw(gs::integers().max_value(PARTS.len() - 1));
+                let part: usize = tape.index(PARTS.len(), "part");
                 parts.push(PARTS[part]);
             }
             let path = parts.join("/");
             if !files.iter().any(|(it, _)| *it == path) {
-                let content: u64 = tc.draw(gs::integers().max_value(5));
+                let content: u64 = tape.int_in(0..=5, "content");
                 files.push((path, id(content)));
             }
         }
@@ -358,13 +357,17 @@ mod tests {
     /// bytes are a function of the filed key and the set of files alone: the same files
     /// given in another order encode to the same bytes (what two databases of the same
     /// sources write).
-    #[hegel::test]
-    fn a_record_reads_back_as_written_and_its_bytes_are_of_its_files_alone(tc: TestCase) {
-        let files = drawn(&tc);
-        let filed: u64 = tc.draw(gs::integers().max_value(3));
+    #[test]
+    fn a_record_reads_back_as_written_and_its_bytes_are_of_its_files_alone() {
+        blaze_sim::check(Config::DEFAULT, |tape| reads_back_as_written(tape))
+    }
+
+    fn reads_back_as_written(tape: &Tape) {
+        let files = drawn(tape);
+        let filed: u64 = tape.int_in(0..=3, "filed");
         let filed = id(filed);
-        let kept: usize = tc.draw(gs::integers().max_value(32));
-        let surface = tc.draw(gs::booleans()).then(|| id(50).0[..kept].to_vec());
+        let kept: usize = tape.int_in(0..=32, "kept");
+        let surface = tape.bool("surface").then(|| id(50).0[..kept].to_vec());
         let found =
             Found::new(filed, family::ALL, surface.clone(), files.clone()).expect("generated paths are under the package");
         let bytes = found.encode().unwrap();
@@ -380,7 +383,7 @@ mod tests {
         // Another order, as another database's file IDs would list them.
         let mut other = files;
         other.reverse();
-        let turn: usize = tc.draw(gs::integers().max_value(7));
+        let turn: usize = tape.int_in(0..=7, "turn");
         if !other.is_empty() {
             let by = turn % other.len();
             other.rotate_left(by);
@@ -398,21 +401,23 @@ mod tests {
 
     /// Bytes that are a record cut short, or with a byte more, are refused naming the part:
     /// never read as a record of fewer files.
-    #[hegel::test]
-    fn a_record_cut_anywhere_is_refused(tc: TestCase) {
-        let surface = tc.draw(gs::booleans()).then(|| id(50).0.to_vec());
-        let found = Found::new(id(1), family::ALL, surface, drawn(&tc)).unwrap();
-        let bytes = found.encode().unwrap();
-        let cut: usize = tc.draw(gs::integers().max_value(bytes.len() - 1));
-        assert!(
-            matches!(Found::decode(&bytes[..cut]), Err(FoundError::Truncated { .. })),
-            "cut at {cut} of {}: {:?}",
-            bytes.len(),
-            Found::decode(&bytes[..cut])
-        );
-        let mut more = bytes.clone();
-        more.push(0);
-        assert_eq!(Found::decode(&more), Err(FoundError::Trailing { at: bytes.len() }));
+    #[test]
+    fn a_record_cut_anywhere_is_refused() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let surface = tape.bool("surface").then(|| id(50).0.to_vec());
+            let found = Found::new(id(1), family::ALL, surface, drawn(tape)).unwrap();
+            let bytes = found.encode().unwrap();
+            let cut: usize = tape.index(bytes.len(), "cut");
+            assert!(
+                matches!(Found::decode(&bytes[..cut]), Err(FoundError::Truncated { .. })),
+                "cut at {cut} of {}: {:?}",
+                bytes.len(),
+                Found::decode(&bytes[..cut])
+            );
+            let mut more = bytes.clone();
+            more.push(0);
+            assert_eq!(Found::decode(&more), Err(FoundError::Trailing { at: bytes.len() }));
+        })
     }
 
     #[test]

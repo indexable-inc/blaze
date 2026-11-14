@@ -221,11 +221,15 @@ fn moved(a: &BTreeMap<ContentId, ContentId>, b: &BTreeMap<ContentId, ContentId>)
     out
 }
 
+/// `A` and `B` differ in shape, not only in name: an item's hashes are anonymous (Unison-style,
+/// docs/v2/plan/design/item-hash.md section 1), so a reference to a type is its signature hash,
+/// and two unit structs of different names are one signature; `f(_x: A)` to `f(_x: B)` moves
+/// `f`'s signature only when `B` is another shape than `A`.
 const BEFORE: &str = r#"
 //- /lib.rs crate:lib
 #![no_core]
 pub struct A;
-pub struct B;
+pub struct B(pub u32);
 pub fn f(_x: A) {}
 pub fn g() {}
 "#;
@@ -242,6 +246,36 @@ fn a_signature_edit_moves_one_digest() {
     let mut want = Vec::new_in(Global);
     want.push(signature);
     assert_eq!(moved(&before, &edited), want);
+}
+
+/// [`BEFORE`] as it was written until 2026-11-14: `A` and `B` two unit structs, one shape.
+const ONE_SHAPE: &str = r#"
+//- /lib.rs crate:lib
+#![no_core]
+pub struct A;
+pub struct B;
+pub fn f(_x: A) {}
+pub fn g() {}
+"#;
+
+/// What is observed today: `f(_x: A)` to `f(_x: B)`, where `A` and `B` are two unit structs of
+/// one shape, moves no `Signature` row of `f`, since a reference to a type is filled by the
+/// type's signature hash and an ADT's form holds no name (docs/v2/plan/design/item-hash.md).
+///
+/// Under review as a possible stale-reuse hole: two nominal types of one shape give `f` one
+/// signature, so a reader of `f`'s signature keyed by it would not run again for the edit.
+/// Another lane is deciding it on main. The assertion flips (to the `Signature` row of `f`
+/// moving) if the signature form comes to name a nominal type by its key.
+#[test]
+fn a_parameter_moved_between_two_nominal_types_of_one_shape_moves_no_signature_today() {
+    let after = ONE_SHAPE.replace("pub fn f(_x: A)", "pub fn f(_x: B)");
+    let (before, edited) = (digests(ONE_SHAPE), digests(&after));
+    let db = db_of(ONE_SHAPE);
+    let lib = crate_named(&db, "lib");
+    let f = key::item_key(&db, function_named(&db, lib, "f")).0;
+    let signature = facts::id_of(&FactRef { kind: items::SIGNATURE, subject: f, object: FactObject::None }).expect("a signature's id");
+    let moved = moved(&before, &edited);
+    assert!(!moved.contains(&signature), "`f`'s signature moved: {moved:?}");
 }
 
 /// The control of the two edit tests: the same text moves nothing, so what moves above is

@@ -45,6 +45,12 @@ pub struct Conf {
     /// over its bound is a finding then, which is what a bless runs under.
     #[serde(skip)]
     pub items: Option<crate::baseline::items::Loaded>,
+    /// What the workspace's root manifest grants its dependencies
+    /// (`[workspace.metadata.blaze.trust]`, [`crate::trust::grants::Grants::of_metadata`]), as
+    /// the driver read it: the trust lints run only when it is given, as the profile lints
+    /// only with a profile. Hashed by what it says.
+    #[serde(skip)]
+    pub trust: Option<crate::trust::grants::Grants>,
 }
 
 /// A `clippy.toml` holds no NaN that two equal configurations could differ by in practice; a
@@ -58,6 +64,7 @@ impl std::hash::Hash for Conf {
         state.write_u64(table_hash(&self.table));
         self.profile.hash(state);
         self.items.hash(state);
+        self.trust.hash(state);
     }
 }
 
@@ -406,7 +413,7 @@ impl Conf {
             }
             None => rust_version.and_then(Version::parse),
         };
-        Ok(Conf { path, table, msrv, profile: None, items: None })
+        Ok(Conf { path, table, msrv, profile: None, items: None, trust: None })
     }
 
     /// The profile the lints are to read: `profile` and its percents from this file, each key

@@ -452,4 +452,12 @@ fn stable_ids_renumber_by_first_use() {
         ),
         "Crate(Id(#0)) FileId(EditionedFileId(Id(#1))) Crate(Id(#0)) FunctionId(#0) Idx::<FieldData>(0) FunctionId(\"f\")",
     );
+    // An id as blaze-memo prints it (arena.generation:place), under any type's name and as the
+    // first field of an interned struct's print; numbered per type, a struct's by its name.
+    assert_eq!(
+        stable_ids(
+            "StructId(1.0:25) StructId(1.0:9) StructId(1.0:25) ModuleIdLt { [id]: 1.0:7, krate: Crate(1.0:2) } VfsText { [id]: 1.0:7 } ModuleIdLt { [id]: 1.0:7 } EditionedFileId(0, Edition2024) [id]: x"
+        ),
+        "StructId(#0) StructId(#1) StructId(#0) ModuleIdLt { [id]: #0, krate: Crate(#0) } VfsText { [id]: #0 } ModuleIdLt { [id]: #0 } EditionedFileId(0, Edition2024) [id]: x",
+    );
 }

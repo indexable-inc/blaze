@@ -66,7 +66,7 @@ theorem loop_eq (bytes : Slice U8) :
     rw [blaze_graph.ledger.fnv1a_from.loop_0]
     by_cases hlt : Scalar.lt i (Slice.len bytes) = true
     · have ⟨hidx, hadd, hnext⟩ := in_bounds bytes i hlt
-      rw [if_pos hlt]
+      rw [ite_eq_left hlt]
       simp only [Slice.index_ok bytes i hidx, Scalar.add_ok i (1 : Usize) hadd, Result.bind_ok]
       have hstep := ih (step hash (bytes.val.get ⟨i.val.toNat, hidx⟩))
         ⟨i.val + (1 : Usize).val, hadd.1, hadd.2⟩ (by
@@ -74,7 +74,7 @@ theorem loop_eq (bytes : Slice U8) :
           omega)
       rw [Blaze.List.drop_eq_get_cons bytes.val i.val.toNat hidx, fold_cons, ← hnext]
       exact hstep
-    · rw [if_neg hlt]
+    · rw [ite_eq_right hlt]
       have hge : ¬ i.val < (Slice.len bytes).val := fun h => hlt ((Scalar.lt_iff _ _).mpr h)
       have hlen : (Slice.len bytes).val = (bytes.val.length : Int) := Slice.len_val bytes
       have h0 : (0 : Int) ≤ i.val := i.hmin
@@ -98,7 +98,7 @@ theorem loop_returns (bytes : Slice U8) :
     rw [blaze_graph.ledger.fnv1a_from.loop_0]
     by_cases hlt : Scalar.lt i (Slice.len bytes) = true
     · have ⟨hidx, hadd, hnext⟩ := in_bounds bytes i hlt
-      rw [if_pos hlt]
+      rw [ite_eq_left hlt]
       simp only [Slice.index_ok bytes i hidx, Scalar.add_ok i (1 : Usize) hadd, Result.bind_ok]
       exact ih (step hash (bytes.val.get ⟨i.val.toNat, hidx⟩))
         ⟨i.val + (1 : Usize).val, hadd.1, hadd.2⟩
@@ -108,7 +108,7 @@ theorem loop_returns (bytes : Slice U8) :
         (by
           show bytes.val.length - (i.val + (1 : Usize).val).toNat < n
           omega)
-    · rw [if_neg hlt]
+    · rw [ite_eq_right hlt]
       intro h
       cases h
 

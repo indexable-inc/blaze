@@ -9,9 +9,9 @@
 
 use std::net::SocketAddr;
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root, world};
+use super::{check, control, path, root, world};
 use crate::{
     Cx, Plant,
     fs::{Content, Dir, FsKind, ReadWrite, Unsynced},
@@ -36,14 +36,14 @@ struct NetPlan {
     flows: Vec<Flow>,
 }
 
-fn net_plan(d: &mut impl Draw) -> NetPlan {
-    let seed = d.int(0, u64::MAX);
-    let limit = d.int(0, 200);
-    let inner = d.coin().then(|| d.int(0, 300));
-    let flows = (0..d.int(1, 24))
-        .map(|_| match d.coin() {
-            true => Flow::Send(d.int(0, 48) as usize),
-            false => Flow::Recv(d.int(1, 48) as usize, d.int(1, 48) as usize),
+fn net_plan(tape: &Tape) -> NetPlan {
+    let seed = tape.next_u64("sim seed");
+    let limit = tape.int_in(0..=200u64, "limit");
+    let inner = tape.coin("inner limit").then(|| tape.int_in(0..=300u64, "inner"));
+    let flows = (0..tape.int_in(1..=24u64, "flows"))
+        .map(|_| match tape.coin("send") {
+            true => Flow::Send(tape.int_in(0..=48u64, "send len") as usize),
+            false => Flow::Recv(tape.int_in(1..=48u64, "peer sends") as usize, tape.int_in(1..=48u64, "recv most") as usize),
         })
         .collect();
     NetPlan { seed, limit, inner, flows }
@@ -164,14 +164,14 @@ fn net_run(plan: &NetPlan, plant: Plant) -> Result<(), String> {
 /// The invariant: a `Net` with a byte limit never passes it and spends it exactly. What the
 /// peer was sent and what was received from it, counted outside bstd, fit the limit; a send
 /// that does not fit is a typed `Over` and moves nothing.
-#[hegel::test(test_cases = 150)]
-fn a_net_never_passes_its_byte_limit(tc: TestCase) {
-    check(net_plan(&mut Drawn(&tc)), net_run);
+#[test]
+fn a_net_never_passes_its_byte_limit() {
+    blaze_sim::check(Config::cases(150), |tape| check(net_plan(tape), net_run));
 }
 
 #[test]
 fn the_oracle_catches_a_limit_checked_after_the_send() {
-    control(Plant::BudgetCheckedAfter, |seeds: &mut Seeds| net_plan(seeds), net_run);
+    control(Plant::BudgetCheckedAfter, net_plan, net_run);
 }
 
 const FILES: [&str; 3] = ["a", "b", "sub/c"];
@@ -191,13 +191,13 @@ struct QuotaPlan {
     changes: Vec<Change>,
 }
 
-fn quota_plan(d: &mut impl Draw) -> QuotaPlan {
-    let seed = d.int(0, u64::MAX);
-    let quota = d.int(0, 200);
-    let changes = (0..d.int(1, 24))
-        .map(|_| match d.coin() {
-            true => Change::Write(d.int(0, 2) as usize, d.int(0, 48) as usize),
-            false => Change::Append(d.int(0, 2) as usize, d.int(0, 48) as usize),
+fn quota_plan(tape: &Tape) -> QuotaPlan {
+    let seed = tape.next_u64("sim seed");
+    let quota = tape.int_in(0..=200u64, "quota");
+    let changes = (0..tape.int_in(1..=24u64, "changes"))
+        .map(|_| match tape.coin("write") {
+            true => Change::Write(tape.int_in(0..=2u64, "file") as usize, tape.int_in(0..=48u64, "len") as usize),
+            false => Change::Append(tape.int_in(0..=2u64, "file") as usize, tape.int_in(0..=48u64, "len") as usize),
         })
         .collect();
     QuotaPlan { seed, quota, changes }
@@ -271,12 +271,12 @@ fn quota_run(plan: &QuotaPlan, plant: Plant) -> Result<(), String> {
 /// The invariant: a `Dir` with a quota never passes it and spends it exactly. The lengths of
 /// the files on the simulated disk fit the quota; a write that does not fit is a typed `Over`
 /// and writes nothing.
-#[hegel::test(test_cases = 150)]
-fn a_directory_never_passes_its_quota(tc: TestCase) {
-    check(quota_plan(&mut Drawn(&tc)), quota_run);
+#[test]
+fn a_directory_never_passes_its_quota() {
+    blaze_sim::check(Config::cases(150), |tape| check(quota_plan(tape), quota_run));
 }
 
 #[test]
 fn the_oracle_catches_a_quota_checked_after_the_write() {
-    control(Plant::BudgetCheckedAfter, |seeds: &mut Seeds| quota_plan(seeds), quota_run);
+    control(Plant::BudgetCheckedAfter, quota_plan, quota_run);
 }

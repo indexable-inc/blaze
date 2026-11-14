@@ -2,8 +2,7 @@
 //! any `//` or `/* */` comments, any order of the items around it and any edit of their
 //! literals, and changes when any literal of its own does.
 
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::{differ, same, with_dep};
 
@@ -18,27 +17,27 @@ fn word(text: impl Into<String>) -> Tok {
 }
 
 /// One operand: a literal, an earlier local, a helper's result or the dependency's `g`.
-fn operand(tc: &TestCase, locals: usize, helpers: usize, out: &mut Vec<Tok>) {
-    match tc.draw(gs::integers::<u8>().max_value(3)) {
+fn operand(tape: &Tape, locals: usize, helpers: usize, out: &mut Vec<Tok>) {
+    match tape.int_in(0u8..=3, "operand") {
         1 if locals > 0 => {
-            let at: usize = tc.draw(gs::integers().max_value(locals - 1));
+            let at = tape.index(locals, "local");
             out.push(word(format!("x{at}")));
         }
         2 if helpers > 0 => {
-            let at: usize = tc.draw(gs::integers().max_value(helpers - 1));
+            let at = tape.index(helpers, "helper");
             out.extend([word(format!("h{at}")), word("("), word(")")]);
         }
         3 => out.extend(["(", "dep", "::", "g", "(", ")", "as", "u64", ")"].map(word)),
-        _ => out.push(Tok::Lit(tc.draw(gs::integers().max_value(99)))),
+        _ => out.push(Tok::Lit(tape.int_in(0u64..=99, "literal"))),
     }
 }
 
 /// Operands joined by operators that cannot overflow on these sizes.
-fn expr(tc: &TestCase, locals: usize, helpers: usize, out: &mut Vec<Tok>) {
-    operand(tc, locals, helpers, out);
-    for _ in 0..tc.draw(gs::integers::<u8>().max_value(2)) {
-        out.push(tc.draw(gs::sampled_from(vec!["+", "^", "|", "&"])).into());
-        operand(tc, locals, helpers, out);
+fn expr(tape: &Tape, locals: usize, helpers: usize, out: &mut Vec<Tok>) {
+    operand(tape, locals, helpers, out);
+    for _ in 0..tape.int_in(0u8..=2, "operators") {
+        out.push((*tape.one_of(&["+", "^", "|", "&"], "operator")).into());
+        operand(tape, locals, helpers, out);
     }
 }
 
@@ -49,29 +48,29 @@ impl From<&str> for Tok {
 }
 
 /// The items of `main`, each as its tokens: `f` first, then helpers, structs and constants.
-fn program(tc: &TestCase) -> Vec<Vec<Tok>> {
-    let helpers: usize = tc.draw(gs::integers().max_value(3));
+fn program(tape: &Tape) -> Vec<Vec<Tok>> {
+    let helpers = tape.int_in(0usize..=3, "helpers");
     let mut f: Vec<Tok> = ["pub", "fn", "f", "(", ")", "->", "u64", "{"].map(word).to_vec();
-    let locals: usize = tc.draw(gs::integers().max_value(5));
+    let locals = tape.int_in(0usize..=5, "locals");
     for at in 0..locals {
         f.extend([word("let"), word(format!("x{at}")), word("=")]);
-        expr(tc, at, helpers, &mut f);
+        expr(tape, at, helpers, &mut f);
         f.push(word(";"));
     }
-    expr(tc, locals, helpers, &mut f);
+    expr(tape, locals, helpers, &mut f);
     f.push(word("}"));
     let mut items = vec![f];
     for at in 0..helpers {
-        let lit = Tok::Lit(tc.draw(gs::integers().max_value(99)));
+        let lit = Tok::Lit(tape.int_in(0u64..=99, "helper literal"));
         let mut h = vec![word("pub"), word("fn"), word(format!("h{at}"))];
         h.extend([word("("), word(")"), word("->"), word("u64"), word("{"), lit, word("}")]);
         items.push(h);
     }
-    for at in 0..tc.draw(gs::integers::<usize>().max_value(2)) {
+    for at in 0..tape.int_in(0usize..=2, "structs") {
         items.push(vec![word("pub"), word("struct"), word(format!("S{at}")), word(";")]);
     }
-    for at in 0..tc.draw(gs::integers::<usize>().max_value(2)) {
-        let lit = Tok::Lit(tc.draw(gs::integers().max_value(99)));
+    for at in 0..tape.int_in(0usize..=2, "consts") {
+        let lit = Tok::Lit(tape.int_in(0u64..=99, "const literal"));
         let mut c = vec![word("pub"), word("const"), word(format!("C{at}"))];
         c.extend([word(":"), word("u64"), word("="), lit, word(";")]);
         items.push(c);
@@ -94,13 +93,13 @@ fn plain(items: &[Vec<Tok>], order: &[usize]) -> String {
 }
 
 /// `items` in `order`, each gap between tokens and items drawn: spaces, line breaks, comments.
-fn laid_out(tc: &TestCase, items: &[Vec<Tok>], order: &[usize]) -> String {
-    let gaps = vec![" ", "  ", "\n", "\n    ", "\t", " /* c */ ", "/**/", " // c\n", "\n// c\n"];
+fn laid_out(tape: &Tape, items: &[Vec<Tok>], order: &[usize]) -> String {
+    const GAPS: [&str; 9] = [" ", "  ", "\n", "\n    ", "\t", " /* c */ ", "/**/", " // c\n", "\n// c\n"];
     let mut out = String::new();
     for &at in order {
         for tok in &items[at] {
             out.push_str(&text(tok));
-            out.push_str(tc.draw(gs::sampled_from(gaps.clone())));
+            out.push_str(tape.one_of(&GAPS, "gap"));
         }
         out.push('\n');
     }
@@ -113,50 +112,39 @@ fn literals(item: &[Tok]) -> Vec<usize> {
 }
 
 /// Another literal in place of the one at a drawn place of `item`; false if it has none.
-fn edit_a_literal(tc: &TestCase, item: &mut [Tok]) -> bool {
+fn edit_a_literal(tape: &Tape, item: &mut [Tok]) -> bool {
     let places = literals(item);
     if places.is_empty() {
         return false;
     }
-    let at = places[tc.draw(gs::integers::<usize>().max_value(places.len() - 1))];
+    let at = places[tape.index(places.len(), "literal edited")];
     if let Tok::Lit(n) = &mut item[at] {
-        *n = (*n + 1 + tc.draw(gs::integers::<u64>().max_value(97))) % 100;
+        *n = (*n + 1 + tape.int_in(0u64..=97, "literal step")) % 100;
     }
     true
 }
 
 /// Each case builds four databases.
-fn keeps_and_loses_its_identity(tc: &TestCase) {
-    let mut items = program(tc);
+fn keeps_and_loses_its_identity(tape: &Tape) {
+    let mut items = program(tape);
     let mut order: Vec<usize> = (0..items.len()).collect();
     let base = plain(&items, &order);
-    for at in (1..order.len()).rev() {
-        order.swap(at, tc.draw(gs::integers().max_value(at)));
-    }
-    same(&base, &laid_out(tc, &items, &order));
+    tape.shuffle(&mut order, "item order");
+    same(&base, &laid_out(tape, &items, &order));
     if items.len() > 1 {
-        let other: usize = tc.draw(gs::integers().min_value(1).max_value(items.len() - 1));
+        let other = tape.int_in(1usize..=items.len() - 1, "other item");
         let mut edited = items.clone();
-        if edit_a_literal(tc, &mut edited[other]) {
+        if edit_a_literal(tape, &mut edited[other]) {
             same(&base, &plain(&edited, &order));
         }
     }
-    if edit_a_literal(tc, &mut items[0]) {
+    if edit_a_literal(tape, &mut items[0]) {
         differ(&base, &plain(&items, &order));
     }
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, mut property: impl FnMut(&TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(move |tc: TestCase| property(&tc))
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
-}
-
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn layout_comments_order_and_other_items_keep_a_body_and_its_own_literals_do_not() {
-    run_cases(24, keeps_and_loses_its_identity);
+    blaze_sim::check(Config::cases(24), keeps_and_loses_its_identity);
 }

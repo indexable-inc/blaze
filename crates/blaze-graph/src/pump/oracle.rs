@@ -10,7 +10,7 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use super::{Flights, NotHeld, sharded::Sharded};
 use crate::{Cancelled, Key, sched::JobId};
@@ -23,10 +23,6 @@ fn key(n: usize) -> Key {
     let mut key = [0x5a; 32];
     key[0] = n as u8;
     Key(key)
-}
-
-fn below(tc: &TestCase, n: usize) -> usize {
-    tc.draw(gs::integers::<u32>().max_value(n as u32 - 1)) as usize
 }
 
 // dyn: a hold of either design, let go once by the actor that holds it
@@ -391,8 +387,12 @@ impl Expect {
 /// Random steps by three tasks over three keys (asks, runs if idle, holds and their ends or
 /// cancels), each given to both designs: every answer, every woken ask's and every count of
 /// runs under way is the same.
-#[hegel::test(test_cases = 64)]
-fn the_table_answers_as_the_sharded_design_did(tc: TestCase) {
+#[test]
+fn the_table_answers_as_the_sharded_design_did() {
+    blaze_sim::check(Config::cases(64), |tape| the_table_answers(tape))
+}
+
+fn the_table_answers(tape: &Tape) {
     let table = Flights::<u32>::new();
     let sharded = Sharded::<u32>::new();
     let (left, gone) = unbounded();
@@ -402,7 +402,7 @@ fn the_table_answers_as_the_sharded_design_did(tc: TestCase) {
             World::new(scope, "table", &table, &left),
             World::new(scope, "sharded", &sharded, &left),
         ];
-        let checked = std::panic::catch_unwind(AssertUnwindSafe(|| check(&tc, &worlds, &watch)));
+        let checked = std::panic::catch_unwind(AssertUnwindSafe(|| check(tape, &worlds, &watch)));
         watch.at(format_args!(
             "joining the actors after the case ({})",
             if checked.is_ok() { "passed" } else { "failed" }
@@ -512,9 +512,8 @@ fn a_retry_after_giving_way_waits_for_that_run_unless_the_wait_closes_a_cycle() 
 /// before it aborts): a case still running past it is blocked where no bound reaches.
 const CASE: Duration = Duration::from_secs(90);
 
-/// The whole run's bound once a case hung: hegel replays a hung case while it shrinks, each
-/// replay a [`LONG`] of its own, so no one case passes [`CASE`]. Under hegel's own 300 s shrink
-/// budget, and far over a passing run's second.
+/// The whole run's bound once a case hung: the shrinker reruns a hung case, each rerun a
+/// [`LONG`] of its own, so no one case passes [`CASE`]. Far over a passing run's second.
 const RUN: Duration = Duration::from_secs(200);
 
 /// Where the running case is, as [`Watch::at`] last named it.
@@ -525,8 +524,8 @@ static PLACE: blaze_core::lock::Lock<String> =
 static HUNG: blaze_core::lock::Lock<Option<String>> =
     blaze_core::lock::Lock::new("graph.test.oracle.hung", None);
 
-/// A bounded wait of the case timed out: said on stderr at once (hegel keeps a case's panic
-/// until it ends shrinking) and kept as the run's first hang, then the case fails with it.
+/// A bounded wait of the case timed out: said on stderr at once (the check reports a case's
+/// panic only once it ends shrinking) and kept as the run's first hang, then the case fails with it.
 fn hung(why: &str) -> ! {
     let mut first = HUNG.lock();
     if first.is_none() {
@@ -577,7 +576,7 @@ impl Watch {
                 let Some(first) = HUNG.lock().clone() else { return };
                 let at = PLACE.lock().clone();
                 sample_and_abort(&format!(
-                    "the oracle ran past {RUN:?} while hegel replayed a hung case: first {first}; now at {at}"
+                    "the oracle ran past {RUN:?} while the shrinker reran a hung case: first {first}; now at {at}"
                 ));
             });
         });
@@ -607,20 +606,20 @@ impl Watch {
     }
 }
 
-fn check(tc: &TestCase, worlds: &[World<'_>; 2], watch: &Watch) {
+fn check(tape: &Tape, worlds: &[World<'_>; 2], watch: &Watch) {
     let mut expect = Expect::default();
-    let steps = 1 + below(tc, 40);
+    let steps = 1 + tape.index(40, "steps");
     for step in 0..steps {
         let idle: Vec<usize> = (0..ACTORS).filter(|it| expect.idle(*it)).collect();
-        let actor = idle[below(tc, idle.len())];
-        let at = below(tc, KEYS);
+        let actor = idle[tape.index(idle.len(), "actor")];
+        let at = tape.index(KEYS, "key");
         let value = 1 + step as u32;
         // Two retries waiting for one run would race for their asks as it ends: one at a time.
         let racing = expect.retry_waits_for(actor).is_some_and(|it| {
             expect.retry.iter().any(|retry| retry.is_some_and(|(at, _)| at == it))
         });
-        let todo = match (below(tc, 4), expect.holder[at] == Some(actor)) {
-            (_, true) => Do::Release(at, tc.draw(gs::booleans()).then_some(value)),
+        let todo = match (tape.index(4, "what the actor does"), expect.holder[at] == Some(actor)) {
+            (_, true) => Do::Release(at, tape.bool("the run ends with a value").then_some(value)),
             (0, false) if !racing => Do::Ask(at, value),
             (1, false) => Do::IfIdle(at, value),
             _ => Do::Hold(at),

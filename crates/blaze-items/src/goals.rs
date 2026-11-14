@@ -77,8 +77,12 @@ impl GoalFacts for Goals {
 ///   loads, all in its arena's closure;
 /// - for every other fact, whose value is one for every asker, the crate the fact's subject is
 ///   of (an item key's crate prefix, or a crate key: `key::crate_of_key`), so one memo serves
-///   every asker; `None` when no crate of this snapshot has that prefix, where the value is
-///   "absent", read from the session's crate list alone.
+///   every asker; where no crate of this snapshot has that prefix, the asking crate: the value
+///   is "absent", read from the crate list (`base_db::listed_by_prefix`'s miss, the list's own
+///   arena, which a crate's arena may read and a session-homed run may not), so a crate that
+///   takes the prefix drops it with the list.
+///
+/// `None` only in a key made by hand, which [`fact_value`] answers as no fact.
 #[blaze_memo::interned(debug)]
 pub struct FactRefKey<'db> {
     #[returns(copy)]
@@ -100,7 +104,8 @@ fn fact_home(db: &Db, krate: Crate, fact: FactRef) -> Option<Crate> {
     if facts::asked_by_crate(fact.kind) {
         Some(krate)
     } else {
-        key::crate_of_key(db, &fact.subject)
+        // A miss is homed at the asker: never the session, which may not read the list's arena.
+        key::crate_of_key(db, &fact.subject).or(Some(krate))
     }
 }
 
@@ -120,12 +125,15 @@ pub fn fact_ref_key(db: &Db, krate: Crate, fact: FactRef) -> FactRefKey<'_> {
 pub fn fact_value<'db>(db: &'db Db, key: FactRefKey<'db>) -> Option<ContentId> {
     let parts = key.fact(db);
     let fact = table::fact_of_ref(parts)?;
-    // A key made other than by `fact_ref_key` (a fact asked by a crate with none, or a fact
-    // homed at a crate its subject is not of) is no fact.
-    let made = if facts::asked_by_crate(fact.kind()) {
-        key.krate(db).is_some()
-    } else {
-        key.krate(db) == key::crate_of_key(db, &parts.subject)
+    // A key made other than by `fact_ref_key` (a fact asked by a crate with none, a fact homed
+    // at a crate its subject is not of, or one of a subject no crate has homed at none) is no
+    // fact.
+    // A key of no crate is homed at the session, which reads no crate and not the list: it is
+    // answered before the lookup.
+    let made = match key.krate(db) {
+        None => false,
+        Some(_) if facts::asked_by_crate(fact.kind()) => true,
+        Some(krate) => key::crate_of_key(db, &parts.subject).is_none_or(|home| home == krate),
     };
     if !made {
         return None;

@@ -3,7 +3,7 @@
 //! no fix stay found and say why. Then `truncating_cast` over the fixed text: it lists the
 //! wrapping operations the fix wrote, and nothing else.
 //!
-//! That each operation the fix writes has the value of the `as` it replaces, on Hegel's draws
+//! That each operation the fix writes has the value of the `as` it replaces, on generated values
 //! and on every boundary value, is blaze-cast's own tests (crates/blaze-cast/src/tests.rs): one
 //! per function and one per composition written here.
 

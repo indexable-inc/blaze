@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use blaze_core::lock::Lock;
 use blaze_mem::Tag;
 
 use crate::{
@@ -18,12 +19,15 @@ use crate::{
     trie::Head,
 };
 
-/// Why [`Memo::next`] made no next snapshot.
+/// Why [`Memo::next`] made no next snapshot, or [`Memo::next_session`] no new session.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NextRefused {
-    /// The arena would be dropped, but it is at [`MAX_GENERATION`]: its next making would wrap
-    /// its generation to 0, and an id or a cache keyed by (arena, generation) of an earlier
-    /// making would name the new one. The session has spent this index.
+    /// The arena would be made again, but it is its index's last making in its id space
+    /// (generation [`MAX_GENERATION`]): another making would have to take a generation an
+    /// earlier making had, and an id, or a cache outside the memo keyed by (arena,
+    /// generation), of that earlier making would name the new one. The id space has spent
+    /// this index: only a new id space ([`Memo::builder`]) makes it again, and a holder of ids
+    /// must tell that space from this one (base-db gives the database another nonce).
     GenerationsSpent { arena: ArenaId },
 }
 
@@ -32,10 +36,11 @@ impl std::fmt::Display for NextRefused {
         match self {
             NextRefused::GenerationsSpent { arena } => write!(
                 f,
-                "{arena:?} would be dropped and made again, but its index has had all \
-                 {} generations of this session: a wrapped generation would let an id or a cache \
-                 keyed by (arena, generation) of an earlier making answer for the new one; \
-                 start a new session (`Memo::builder`)",
+                "{arena:?} would be made again, but its index has had all {} generations of its \
+                 id space (every session of the database shares one): another making would \
+                 take an id an earlier making had, and an id or a cache keyed by (arena, \
+                 generation) of that making would answer for the new one; start a new id space \
+                 (`Memo::builder`) under another database identity",
                 MAX_GENERATION + 1
             ),
         }
@@ -43,6 +48,51 @@ impl std::fmt::Display for NextRefused {
 }
 
 impl std::error::Error for NextRefused {}
+
+/// The ids a database hands out over its life: each arena index's next generation, one table
+/// shared by every snapshot and builder of every session of the database (a new session takes
+/// it over, [`Memo::next_session`]).
+///
+/// The invariant: within one id space an [`ArenaId`] is taken once, so once it was handed out
+/// it names that one making for ever; no later making, in this session or a later one, has
+/// it, and so no [`Gid`] of a later making equals one of an earlier making. A builder that
+/// never builds (a maker that panicked) has taken its ids too, and they are never taken again.
+///
+/// Locked once per arena made and once per [`Memo::next`] or [`Memo::next_session`]: never on
+/// a fetch.
+#[derive(Clone)]
+struct Ids(Arc<Lock<Vec<u32, Global>>, Global>);
+
+impl Ids {
+    /// A new id space: no index made yet.
+    fn new() -> Ids {
+        Ids(Arc::new_in(Lock::new("memo.ids", Vec::new_in(Global)), Global))
+    }
+
+    /// The id of `index`'s next making, taken; `None` where the index has made its last
+    /// generation ([`MAX_GENERATION`]) in this space.
+    fn take(&self, index: u32) -> Option<ArenaId> {
+        let mut next = self.0.lock();
+        let at = index as usize;
+        if next.len() <= at {
+            next.resize(at + 1, 0);
+        }
+        let generation = next[at];
+        if generation > MAX_GENERATION {
+            return None;
+        }
+        next[at] = generation + 1;
+        Some(ArenaId::new(index, generation))
+    }
+
+    /// The lowest of `indices` (ascending) that has made its last generation in this space.
+    fn first_spent(&self, indices: impl IntoIterator<Item = u32>) -> Option<u32> {
+        let next = self.0.lock();
+        indices
+            .into_iter()
+            .find(|index| next.get(*index as usize).is_some_and(|it| *it > MAX_GENERATION))
+    }
+}
 
 /// Each snapshot's epoch: which snapshot may write to a shared arena.
 static EPOCHS: AtomicU64 = AtomicU64::new(1);
@@ -52,7 +102,12 @@ static EPOCHS: AtomicU64 = AtomicU64::new(1);
 /// check cache) of one snapshot from another's: it replaces blaze-query's
 /// `nonce_and_revision`. An answer that depends only on one arena's entries keys on that
 /// arena's [`crate::ArenaId`] instead (index and generation), which outlives the snapshot
-/// while the arena is carried.
+/// while the arena is carried, together with which id space the id is of (base-db: the
+/// database's nonce): within one id space an `ArenaId` names one making of an arena for ever,
+/// across every commit and every new session of the database ([`Memo::next_session`]), so a
+/// live arena with the id the answer holds is the arena it was computed in. Another id space
+/// (another database, or one made again once an index spent its generations) hands out the
+/// same ids again.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Epoch(u64);
 
@@ -66,10 +121,13 @@ impl Epoch {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Reads {
     /// No read lists: [`crate::record`] is refused, a hit replays nothing, and an entry's list
-    /// is empty. The cost of the recorder when off: one branch per fetch and 16 bytes per entry.
+    /// is empty. The cost of the recorder when off: one branch per fetch and a null word per
+    /// entry.
     #[default]
     Off,
-    /// Every entry keeps the facts its run read, and a hit replays them into the asker.
+    /// Every entry keeps what its run read directly (input and boundary rows, and the entries
+    /// it asked), and an ask, hit or run, adds one row naming the entry to the asker; an
+    /// entry's flat list is made when asked for (`record::Lists`).
     Kept,
 }
 
@@ -106,6 +164,25 @@ pub enum Plant {
     /// The run log writes a run's key as text when the run starts, with no database attached
     /// (`RunLog::push`): a key whose `Debug` needs one panics there.
     LogFormatsEagerly,
+    /// [`Memo::next_session`] gives its session a new id space, as `Memo::builder` does: every
+    /// index starts again at generation 0, and the new session's arenas take the ids of the
+    /// old one's (the bug base-db's fresh session met, when a sealed crate's write started one).
+    SessionRestartsIds,
+    /// A flat list's walk stops at the first entry it reaches a second time (`break` for
+    /// `continue`): every entry still to visit is skipped (`record::flatten_in`).
+    FlattenStopsAtRevisit,
+    /// An ask copies the asked entry's whole flat list into its asker (the eager lists the
+    /// lazy ones replaced): right lists, at N×M rows for N asks of M-row lists.
+    AskCopiesFlatList,
+    /// A settled cycle's members are published with no lists, not their head's: a member's
+    /// flat list misses what its value depends on through the head.
+    MemberListsNothing,
+    /// A borrow of a sealed arena is never noted: the shortcut "a sealed arena never goes
+    /// away", which nothing may take since [`Memo::next`] drops a sealed arena as any other.
+    /// Planted where [`Memo::next`] reads the borrows (a bit naming a sealed arena reads as
+    /// unset), not in `Slot::borrow`: that is given the borrowed arena's id alone, neither its
+    /// seal nor the session's plant.
+    SealedSkipsBorrow,
 }
 
 /// What every snapshot of a session shares.
@@ -116,7 +193,7 @@ pub struct Config {
     pub arenas: u32,
     pub reads: Reads,
     /// How a second asker of a running key waits: [`crate::Scheduled`] on the pool,
-    /// [`crate::Alone`] on one thread.
+    /// [`crate::Alone`] for one task, which refuses another task's ask of a key it holds.
     pub flight: Arc<dyn Flight>,
     /// The most bytes the arenas carried into a next snapshot may hold: past it,
     /// [`Memo::next`] drops every arena (they refill lazily from inputs and records). What a
@@ -190,9 +267,10 @@ pub struct Memo {
     log: Option<Arc<crate::testing::RunLog, Global>>,
     /// The fact boundaries ([`Builder::mark_boundary`]), sorted.
     boundaries: Boundaries,
-    /// Arena index to the generation its next making gets: one past the last making of the
-    /// session, held or not (an index dropped and not made again keeps its count).
-    generations: Box<[u32], Global>,
+    /// The database's id space ([`Ids`]): each index's next generation, shared with every
+    /// snapshot and session of the database, held or not (an index dropped and not made again
+    /// keeps its count).
+    ids: Ids,
 }
 
 /// The query kinds marked fact boundaries: (name hash, name), sorted, shared by every snapshot
@@ -218,8 +296,43 @@ impl Memo {
         std::ptr::eq(head.kind, kind).then(|| &unsafe { crate::trie::Entry::<K, ()>::of(head) }.key)
     }
 
-    /// A builder of a session's first snapshot.
+    /// A builder of the first snapshot of a new database: the first session of a new id space
+    /// ([`crate::ArenaId`]'s invariant). Its arenas' ids may equal those of any other id space (another database's,
+    /// or this database's before an index spent its generations), so a holder of ids outside
+    /// the memo keys by which space they are of (base-db: the database's nonce). A new session
+    /// of the same database is [`Memo::next_session`], never this.
     pub fn builder(config: Config) -> Builder {
+        Memo::session_in(config, Ids::new())
+    }
+
+    /// A builder of a new session of this snapshot's database: no arena carried (the driver
+    /// adds every one again, with its inputs, and marks the boundaries again), each made at its
+    /// index's next generation in this snapshot's id space, so no arena it makes takes an id
+    /// any arena of this session or an earlier one of the database had. What a driver starts
+    /// when it cannot carry (the arena capacity outgrown, a failed commit); allowed whether or
+    /// not this snapshot has a successor.
+    ///
+    /// # Errors
+    ///
+    /// [`NextRefused::GenerationsSpent`] naming the last making of the lowest index below
+    /// `config.arenas` that has made its last generation in the id space: the session would
+    /// make it again. The driver starts a new id space ([`Memo::builder`]) under another
+    /// database identity.
+    pub fn next_session(&self, config: Config) -> Result<Builder, NextRefused> {
+        if config.plant == Plant::SessionRestartsIds {
+            return Ok(Memo::session_in(config, Ids::new()));
+        }
+        match self.ids.first_spent(0..config.arenas) {
+            Some(index) => {
+                Err(NextRefused::GenerationsSpent { arena: ArenaId::new(index, MAX_GENERATION) })
+            }
+            // clone: a reference count of the database's one id space
+            None => Ok(Memo::session_in(config, self.ids.clone())),
+        }
+    }
+
+    /// A builder of a session's first snapshot, its arenas' ids taken from `ids`.
+    fn session_in(config: Config, ids: Ids) -> Builder {
         assert!(
             config.arenas >= 1 && config.arenas <= MAX_ARENAS,
             "a session has 1 to {MAX_ARENAS} arena indices, not {}",
@@ -227,13 +340,11 @@ impl Memo {
         );
         let epoch = EPOCHS.fetch_add(1, Ordering::Relaxed);
         let slots = Slots::new(config.arenas);
-        let mut generations = Vec::new_in(Global);
-        generations.resize(config.arenas as usize, 0_u32);
         Builder {
             epoch,
             slots,
             first: true,
-            generations,
+            ids,
             config,
             log: None,
             boundaries: Arc::new_in(Vec::new_in(Global), Global),
@@ -254,12 +365,21 @@ impl Memo {
         Epoch(self.epoch)
     }
 
-    /// Whether `arena` may be named changed in this session: `false` for an arena the driver
-    /// sealed ([`Inputs::seal`]: a crate not being built, whose inputs never change while the
-    /// session lives; the session arena when the driver sealed it). What replaces
-    /// `deps::key::sealed(db, krate)`: `!memo.changed(arena)`. Nothing witnesses it: a sealed
-    /// arena is refused in [`Memo::next`]'s changed set, and is dropped only by a borrow (its
-    /// dependency's or the session's drop).
+    /// Whether `arena` is not sealed in this snapshot: `false` for an arena the driver sealed
+    /// ([`Inputs::seal`]: a crate not being built, whose sources are pinned). What replaces
+    /// `deps::key::sealed(db, krate)`: `!memo.changed(arena)`, an answer of this snapshot.
+    ///
+    /// Sealed arenas. Sealing changes nothing of how an arena is read or carried: every read
+    /// of another arena sets a borrow bit, a sealed arena's as any other's, and every declared
+    /// borrow ([`Inputs::borrows`]) is one from the start. So [`Memo::next`] takes a sealed
+    /// arena in its changed set like any other (2026-11-14; it refused one before, and the
+    /// driver started a whole new session instead): the set it drops is closed under
+    /// borrowers, so every arena that declared or read the sealed one goes with it, and an
+    /// arena it carries read nothing that changed. What is sound to carry is decided by the
+    /// borrows alone; what a seal says is where the crate's records are kept
+    /// (`deps::key::sealed`), and an arena made again is sealed again by its maker, with a new
+    /// id. The one thing a seal still checks is at [`Builder::build`]: a sealed arena's
+    /// declared dependencies are sealed.
     ///
     /// # Panics
     ///
@@ -416,9 +536,10 @@ impl Memo {
     ///
     /// # Errors
     ///
-    /// [`NextRefused::GenerationsSpent`] naming the lowest arena to drop that is at
-    /// [`MAX_GENERATION`]. The refusal is final for this snapshot (it has a successor no
-    /// longer, and never will; it keeps answering): the driver starts a new session.
+    /// [`NextRefused::GenerationsSpent`] naming the lowest arena to drop whose index has made
+    /// its last generation in the id space. The refusal is final for this snapshot (it has a
+    /// successor no longer, and never will; it keeps answering), and a new session of the
+    /// database would be refused too ([`Memo::next_session`]): the driver starts a new id space.
     ///
     /// # Panics
     ///
@@ -438,14 +559,11 @@ impl Memo {
         fn is(dropped: &[u64], index: u32) -> bool {
             dropped[index as usize / 64] & (1 << (index % 64)) != 0
         }
+        // A sealed arena may be named: it goes with every arena that borrows it, as any arena
+        // does (see "Sealed arenas" on `Memo::changed`).
         if self.config.plant != Plant::CarryChanged {
             for id in changed {
                 let slot = self.slot(*id);
-                assert!(
-                    !slot.is_sealed(),
-                    "{id:?} is named changed but the driver sealed it (`Inputs::seal`): a sealed \
-                     arena's inputs never change in its session"
-                );
                 mark(&mut dropped, slot.id.index());
             }
         }
@@ -459,12 +577,26 @@ impl Memo {
                 slot.freeze(epoch);
             }
         }
+        // Whether `slot` borrowed an arena in `dropped`; under the planted `SealedSkipsBorrow`,
+        // as though no borrow of a sealed arena had been noted.
+        let borrowed = |slot: &Slot, dropped: &[u64]| {
+            if self.config.plant != Plant::SealedSkipsBorrow {
+                return slot.borrowed_any(dropped);
+            }
+            let mut unsealed = Vec::new_in(Global);
+            unsealed.extend_from_slice(dropped);
+            for sealed in self.slots.iter().flatten().filter(|it| it.is_sealed()) {
+                let index = sealed.id.index();
+                unsealed[index as usize / 64] &= !(1_u64 << (index % 64));
+            }
+            slot.borrowed_any(&unsealed)
+        };
         if self.config.plant != Plant::IgnoreBorrows {
             loop {
                 let mut grew = false;
                 for slot in self.slots.iter().flatten() {
                     let index = slot.id.index();
-                    if !is(&dropped, index) && slot.borrowed_any(&dropped) {
+                    if !is(&dropped, index) && borrowed(&**slot, &dropped[..]) {
                         mark(&mut dropped, index);
                         grew = true;
                     }
@@ -486,16 +618,16 @@ impl Memo {
                 mark(&mut dropped, slot.id.index());
             }
         }
-        // A dropped arena is made again at its index's next generation: none left, and the
-        // making would wrap and reuse generation 0. Ascending, so the lowest is named.
-        if let Some(spent) = self.slots.iter().flatten().find(|slot| {
-            is(&dropped, slot.id.index()) && self.generations[slot.id.index() as usize] > MAX_GENERATION
-        }) {
+        // A dropped arena is made again at its index's next generation in the id space: none
+        // left, and the making would take a generation an earlier making had. Ascending, so the
+        // lowest is named.
+        let dropped_indices =
+            self.slots.iter().flatten().map(|slot| slot.id.index()).filter(|index| is(&dropped, *index));
+        if let Some(index) = self.ids.first_spent(dropped_indices) {
+            let spent = self.slots[index as usize].as_deref().expect("a held arena's index");
             return Err(NextRefused::GenerationsSpent { arena: spent.id });
         }
         let mut slots = Slots::new(self.config.arenas);
-        let mut generations = Vec::new_in(Global);
-        generations.extend_from_slice(&self.generations);
         let mut gone = Vec::new_in(Global);
         for slot in self.slots.iter().flatten() {
             let index = slot.id.index();
@@ -510,7 +642,8 @@ impl Memo {
                 epoch,
                 slots,
                 first: false,
-                generations,
+                // clone: a reference count of the database's one id space
+                ids: self.ids.clone(),
                 config: self.config.clone(),
                 log: self.log.clone(),
                 boundaries: Arc::clone(&self.boundaries),
@@ -532,9 +665,9 @@ pub struct Builder {
     slots: Slots,
     /// Whether this builds the session's first snapshot (fact boundaries are marked only here).
     first: bool,
-    /// The generation each index's next making gets ([`Memo`]'s, carried), so a remade
-    /// arena's ids differ from every earlier making's.
-    generations: Vec<u32, Global>,
+    /// The database's id space ([`Ids`], [`Memo`]'s, shared): each index's next generation, so
+    /// a remade arena's ids differ from every earlier making's, in any session of the database.
+    ids: Ids,
     config: Config,
     log: Option<Arc<crate::testing::RunLog, Global>>,
     boundaries: Boundaries,
@@ -573,9 +706,9 @@ impl Builder {
     /// Adds an empty arena at `index`, its memory counted to `tag`, and gives the handle its
     /// inputs are made through.
     ///
-    /// The contract on `index` (the driver's, blaze-cargo's): a crate's arena index is
-    /// `1 + its position in a topological order of the crate graph` (dependencies first), and
-    /// 0 is the session arena. A key's home is the greatest index it names, so that order makes
+    /// The contract on `index` (the driver's, base-db's): 0 is the session arena, the open
+    /// arenas ([`Inputs::open`], the source roots' files) come next, and then each crate's in a
+    /// topological order of the crate graph (dependencies first). A key's home is the greatest index it names, so that order makes
     /// it the most downstream crate the key names; [`Inputs::borrows`] checks each declared
     /// dependency's index is below its dependent's, and a key naming an arena outside its
     /// home's declared closure panics naming the key.
@@ -595,15 +728,15 @@ impl Builder {
             self.slots[at].is_none(),
             "arena index {index} is in this snapshot already: a carried arena keeps its inputs"
         );
-        let generation = self.generations[at];
-        // Never wraps: an index at its last generation is held (made) until `Memo::next`
-        // would drop it, and `next` refuses that drop (`NextRefused::GenerationsSpent`).
-        assert!(
-            generation <= MAX_GENERATION,
-            "arena index {index} has no generation left: `Memo::next` refuses its drop"
-        );
-        self.generations[at] = generation + 1;
-        let id = ArenaId::new(index, generation);
+        // Never wraps: an index at its last generation in the id space is held (made) until
+        // `Memo::next` would drop it, and `next` refuses that drop, as `Memo::next_session`
+        // refuses a session that would make it (`NextRefused::GenerationsSpent`).
+        let id = self.ids.take(index).unwrap_or_else(|| {
+            panic!(
+                "arena index {index} has no generation left in its id space: `Memo::next` \
+                 refuses its drop and `Memo::next_session` a session that makes it again"
+            )
+        });
         let slot = Arc::new_in(Slot::new(id, tag, self.epoch, self.config.arenas), Global);
         self.slots[at] = Some(slot);
         let slot = self.slots[at].as_deref().expect("just added");
@@ -671,6 +804,17 @@ impl Builder {
                     slot.id
                 ),
             });
+            // An open arena is any arena's to name: what it declared would be in the closure of
+            // none of them, so a carried namer could hold its dependency's dead ids.
+            if slot.is_open()
+                && let Some(index) = slot.declared().find(|index| *index != ArenaId::SESSION_INDEX)
+            {
+                panic!(
+                    "{:?} is open (`Inputs::open`) but declared a borrow of arena index {index}: an \
+                     open arena borrows only the session",
+                    slot.id
+                );
+            }
             // A sealed crate's dependencies are sealed (what `deps::key::sealed` checked per
             // ask, once here): else its arena drops when theirs change, and `changed` lies.
             if slot.is_sealed() {
@@ -701,7 +845,7 @@ impl Builder {
             filed: crate::image::Outbox::new(),
             log: self.log,
             boundaries: self.boundaries,
-            generations: self.generations.into_boxed_slice(),
+            ids: self.ids,
         }
     }
 }
@@ -747,10 +891,31 @@ impl Inputs<'_> {
         self.slot.declare(from, self.epoch);
     }
 
-    /// Seals this arena: its inputs never change while the session lives (a crate that is
-    /// not being built). [`Memo::changed`] is `false` for it from now on, carried or not, and
-    /// [`Memo::next`] refuses it in a changed set.
+    /// Seals this arena: a crate that is not being built, whose sources are pinned.
+    /// [`Memo::changed`] is `false` for it while it lives, carried or not. [`Memo::next`] takes
+    /// it in a changed set like any arena, and drops it with every arena that borrows it.
     pub fn seal(&self) {
         self.slot.seal();
+    }
+
+    /// Opens this arena: a key homed in any arena of the snapshot may name its ids, though
+    /// no arena declared a borrow of it, and the entry it keys borrows it when written
+    /// ([`crate::home::mark_borrows`], at a run's end and at an image record's serving alike),
+    /// as a read of it does. For inputs that no crate owns and that a crate is found to read
+    /// only once it runs: a source root's files, which a `#[path]` module reaches from another
+    /// package. So an edit of them drops the arenas that named or read them, and their
+    /// readers, and no arena that only might have.
+    ///
+    /// The contract: an open arena declares no borrow but the session's, and its index is
+    /// below every arena whose keys name it (a key's home is the greatest index it names, so
+    /// a key naming an open arena and a crate is homed at the crate). Its own entries are
+    /// keyed by its ids alone and read no arena of a crate ([`crate::task`]'s read check).
+    ///
+    /// # Panics
+    ///
+    /// Where the snapshot is built already; at [`Builder::build`], where it declared a borrow
+    /// of an arena other than the session.
+    pub fn open(&self) {
+        self.slot.open();
     }
 }

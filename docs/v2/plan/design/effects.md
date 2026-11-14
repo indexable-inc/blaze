@@ -381,7 +381,7 @@ and respelled, the rewrite of the old spellings, and a crate that declares nothi
 function's signature and flags other than the effect bits are the same with the attributes
 and without, so an unmarked crate builds byte for byte the same.
 
-Two invariants are stated and tested with Hegel, each with planted-bug controls:
+Two invariants are stated and tested with blaze-sim, each with planted-bug controls:
 
 - `loops.rs`: a control flow graph the analysis accepts has no infinite path. Random small
   graphs with random bounding facts, model-checked by brute force. Controls: a self-loop not

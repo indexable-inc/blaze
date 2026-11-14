@@ -608,6 +608,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             is_member,
             default_run: None,
             checksum: None,
+            tree: None,
             tests: TestSandbox::default(),
             const_macros: None,
         };
@@ -661,6 +662,12 @@ impl Steps for Fake {
     type KeptFront = FakeInputs;
     type Linked = FakeImage;
     type Runs = FakeRuns;
+    /// The simulated front end has no Lean: what its worker found is its answer.
+    type Proving = blaze_api::Proven;
+
+    fn check_proofs(proving: blaze_api::Proven, _: Option<&str>, _: u64) -> FakeRuns {
+        FakeRuns::Over(Over(vec![Response::Proven(proving)]))
+    }
 
     fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64) {
         self.times.lock().execd(pid, build, exec_ns);
@@ -1603,6 +1610,13 @@ impl Front<Fake> for FakeFront {
     fn ahead(&self, FakeReader(read): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
         AHEAD_READ.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(if filter.iter().all(|it| "a::adds".contains(&**it)) { vec![0] } else { Vec::new() })
+    }
+
+    /// The simulated front end has no Lean: its answer is empty, which tests the job's path
+    /// (the units it applies built first, the worker's answer, then the run that answers),
+    /// never a proof.
+    fn prove(&self, _: FakeReader, _: bool, _: bool) -> Result<blaze_api::Proven, Failed> {
+        Ok(blaze_api::Proven { failed: None, subset: None, records: Vec::new() })
     }
 
     fn codegen_inputs(&self, _: FakeReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
@@ -4275,16 +4289,7 @@ fn direct_reads_after_a_restart(seed: u64) -> (blaze_cas::direct::Counts, bool) 
         client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
     let after = crate::serve::direct::thread_counts();
-    let moved = blaze_cas::direct::Counts {
-        records: after.records - before.records,
-        bytes: after.bytes - before.bytes,
-        reads: after.reads - before.reads,
-        runs: after.runs - before.runs,
-        files_opened: after.files_opened - before.files_opened,
-        maps: after.maps - before.maps,
-        mapped_bytes: after.mapped_bytes - before.mapped_bytes,
-        leaked_bytes: after.leaked_bytes - before.leaked_bytes,
-    };
+    let moved = after.since(&before);
     (moved, KEPT_READS.get() == reads + 1)
 }
 

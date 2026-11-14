@@ -23,14 +23,24 @@ hir-expand	9
 # a `Box<str>` and a `Box<[u32]>`: the one to make kept), lower.rs, lower/batch.rs, infer.rs,
 # opaques.rs, consteval.rs, providers.rs, layout.rs, layout/bits.rs, representability.rs,
 # body_store/mir/tests.rs.
-hir-ty	69
+# Raised 69 -> 70, port round 27 (lane T): main's merge brought lower.rs
+# `declared_trait_predicates_of` (implied bounds), a `TyLoweringResult<GenericPredicates>` as
+# its siblings `generic_predicates*` and `explicit_*_clauses` are, all `owns`: the predicates
+# and their diagnostics are a real tree until `GenericPredicates` is a flat record.
+hir-ty	70
 hir-ty-borrowck	2
 # First counted 2026-11-14: its library is at the crate's top (`[lib] path = "mod.rs"`), which
 # the count of `src/` alone never saw.
 hir-ty-codegen	17
 hir-ty-identity	4
 hir-ty-matchck	1
-hir-ty-mir	12
-hir-ty-pure	12
+# Raised 12 -> 13, port round 27 (lane T): main's merge brought mir/loop_match.rs
+# `loop_match_check`, whose refusals hold a `StoredTy` (a reference count) and whose loops a
+# `Box<[u32]>`: owned until the refusal names its type by an arena id.
+hir-ty-mir	13
+# Raised 12 -> 14, port round 27 (lane T): main's merge brought trust.rs `edge` and
+# `toolchain_call`, each holding `Instance`s (their `StoredGenericArgs` are reference counts)
+# and `Done`'s `Box<str>` text: owned until an instance is an interned id of the arena.
+hir-ty-pure	14
 hir-ty-share	6
 hir-ty-wfcheck	1

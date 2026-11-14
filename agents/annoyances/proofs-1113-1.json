@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-1",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "scripts/src/bin/ledger.rs write; docs/v2/plan/objectives.json",
+ "what": "`cargo run -p scripts --bin ledger -- {\"command\": \"write\"}` exits 1 on main at e6635c9ba7 before any change of mine: rows T10, R2, R4, R9 and G5 name paths that no longer exist (crates/blaze-premap, crates/blaze-cargo/src/serve/unit/release.rs, crates/blaze-query/src/image.rs), so objectives.md cannot be regenerated after adding a row.",
+ "cost": "ten minutes; objectives.md left stale for this lane's five rows (V13 to V17 since the merge of main)",
+ "cause": "a file was deleted or moved without the ledger row that names it; nothing in the gate runs the ledger check on the commit that deletes the path (not verified which job should)",
+ "whys": "a row names a path as text; deleting the path does not touch the row; the check that would say so is not run where the deletion lands",
+ "class": "a generated or checked document that no gate holds to the tree goes stale silently (the same class as invariants.md and hir-ty-lean`s golden files on 2026-11-13)",
+ "prevention": "the gate runs every generator in check mode on every pull request, so a stale generated file fails the change that made it stale; not built",
+ "workaround": "none taken; my rows name only existing paths",
+ "state": "open"
+}

@@ -959,7 +959,7 @@ fn a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first() {
         let solver = ["one", "two", "three"][order[0]];
         let (_, trace) = traces.iter().find(|(own, _)| *own == solver).expect("each body's trace");
         assert!(
-            trace.iter().any(|it| it.starts_with("facts.")),
+            trace.iter().any(|it| it == "facts"),
             "{order:?}: the planted bug unseen: {trace:?}"
         );
     }

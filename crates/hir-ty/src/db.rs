@@ -1463,6 +1463,8 @@ pub mod kinds {
         IMPL_DIRECTORY = 0x2520, "impl_directory";
         CANDIDATES = 0x2521, "candidates";
         TRAIT_IMPLS_IN_CRATE_FOR_SELF_TY = 0x2522, "TraitImpls::in_crate_for_self_ty";
+        TRAIT_IMPLS_IN_CRATE_AND_DEPS_FOR_SELF_TY = 0x2523,
+            "TraitImpls::in_crate_and_deps_for_self_ty";
 
         // Impl tables read from pages (`method_resolution/frozen/pages`).
         IMPL_PAGES_HEAD = 0x24e1, "impl_pages_head";

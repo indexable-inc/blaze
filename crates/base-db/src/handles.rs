@@ -30,7 +30,7 @@ use crate::{
     reparse::Reparse,
 };
 
-/// A file of the VFS with text: made by the world in the arena of its source root's owner.
+/// A file of the VFS with text: made by the world in its source root's arena.
 #[blaze_memo::input(debug)]
 pub struct VfsText {
     /// The text, which the file's parse tree shares: the VFS's bytes as they are.

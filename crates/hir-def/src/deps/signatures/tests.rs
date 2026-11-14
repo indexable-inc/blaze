@@ -640,7 +640,9 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     let image = ImageRef::open(&image, key).unwrap();
     // A test's part, made by hand: bytes the image takes as they are.
     let lang = Portable::written(image.part(Part::LangItems).to_vec_in(Global));
-    let bytes = write_image(key, [&lang, &Portable::written(part.to_vec_in(Global))]);
+    let diagnostic = Portable::written(image.part(Part::DiagnosticItems).to_vec_in(Global));
+    let bytes =
+        write_image(key, [&lang, &Portable::written(part.to_vec_in(Global)), &diagnostic]);
     memory.images.lock().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 

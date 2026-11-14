@@ -9,7 +9,7 @@ use std::{
     ptr::NonNull,
 };
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
 use crate::{
     BuildKeyHasher, ByHash, FixedState, HashMap, IndexMap, IndexSet, KeyedMap, KeyedSet, OrderMap,
@@ -34,20 +34,16 @@ unsafe impl Allocator for Counted<'_> {
     }
 }
 
-fn below(tc: &TestCase, n: u64) -> u64 {
-    tc.draw(gs::integers::<u64>().min_value(0).max_value(n - 1))
-}
-
 /// One run of random operations on a map and on the model, compared after each.
-fn agrees(tc: &TestCase) -> Result<(), String> {
+fn agrees(tape: &Tape) -> Result<(), String> {
     let mut map: IndexMap<u8, u32, Global> = IndexMap::new_in(Global); // alloc: a test's map
     let mut model: Vec<(u8, u32)> = Vec::new(); // alloc: a test's model
     let place = |model: &Vec<(u8, u32)>, key: u8| model.iter().position(|it| it.0 == key);
-    for step in 0..below(tc, 200) {
+    for step in 0..tape.below(200, "steps") {
         // Few keys, so that most operations meet a key that is there.
-        let key = below(tc, 24) as u8;
+        let key = tape.below(24, "key") as u8;
         let value = step as u32;
-        match below(tc, 9) {
+        match tape.below(9, "op") {
             0..=2 => {
                 let old = map.insert(key, value);
                 match place(&model, key) {
@@ -91,7 +87,7 @@ fn agrees(tc: &TestCase) -> Result<(), String> {
                 }
             }
             6 => {
-                let at = below(tc, 26) as usize;
+                let at = tape.below(26, "at") as usize;
                 let removed = map.shift_remove_index(at);
                 let expected = (at < model.len()).then(|| model.remove(at));
                 if removed != expected {
@@ -99,7 +95,7 @@ fn agrees(tc: &TestCase) -> Result<(), String> {
                 }
             }
             7 => {
-                let at = below(tc, 26) as usize;
+                let at = tape.below(26, "at") as usize;
                 let removed = map.swap_remove_index(at);
                 let expected = (at < model.len()).then(|| model.swap_remove(at));
                 if removed != expected {
@@ -107,7 +103,7 @@ fn agrees(tc: &TestCase) -> Result<(), String> {
                 }
             }
             _ => {
-                let cut = below(tc, 4) as u8;
+                let cut = tape.below(4, "cut") as u8;
                 map.retain(|key, _| key % 4 != cut);
                 model.retain(|it| it.0 % 4 != cut);
             }
@@ -131,11 +127,9 @@ fn agrees(tc: &TestCase) -> Result<(), String> {
 
 /// The invariant: after any operations an insertion-ordered map iterates the pairs a `Vec`
 /// under the same operations holds, in its order, and finds each key at its index.
-#[hegel::test(test_cases = 300)]
-fn an_ordered_map_is_a_vec_of_pairs_under_any_operations(tc: TestCase) {
-    if let Err(why) = agrees(&tc) {
-        panic!("{why}");
-    }
+#[test]
+fn an_ordered_map_is_a_vec_of_pairs_under_any_operations() {
+    blaze_sim::check(Config::cases(300), agrees);
 }
 
 /// The two removals are two orders, so the model above tells them apart: `swap_remove` moves

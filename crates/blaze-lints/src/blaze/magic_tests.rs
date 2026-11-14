@@ -557,14 +557,15 @@ fn near_misses_are_one_spelling_twice_and_nothing_wider() {
 
 /// The invariant: a number other than the identities passed as an argument is always a
 /// finding, and the same number as a `const`'s initializer never is.
-#[hegel::test(test_cases = 16)]
-fn magic_number_fires_on_a_bare_argument_and_never_on_a_const(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let value: u64 = tc.draw(gs::integers().min_value(2).max_value(1 << 40));
-    let other: u64 = tc.draw(gs::integers().min_value(2).max_value(1 << 40));
-    let out = numbers(&format!(
-        "pub const C: u64 = {value} * {other} + {value};\npub fn take(n: u64) {{}}\npub fn f() {{ take({value}); }}\n"
-    ));
-    assert_eq!(out.matches("magic_number").count(), 1, "{out}");
-    assert!(out.contains(&format!("`{value}` is a magic number")), "{out}");
+#[test]
+fn magic_number_fires_on_a_bare_argument_and_never_on_a_const() {
+    blaze_sim::check(blaze_sim::Config::cases(16), |tape| {
+        let value: u64 = tape.int_in(2..=1 << 40, "value");
+        let other: u64 = tape.int_in(2..=1 << 40, "other");
+        let out = numbers(&format!(
+            "pub const C: u64 = {value} * {other} + {value};\npub fn take(n: u64) {{}}\npub fn f() {{ take({value}); }}\n"
+        ));
+        assert_eq!(out.matches("magic_number").count(), 1, "{out}");
+        assert!(out.contains(&format!("`{value}` is a magic number")), "{out}");
+    });
 }

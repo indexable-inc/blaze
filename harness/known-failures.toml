@@ -152,7 +152,7 @@
 "hir_def::macro_expansion_tests::mbe::test_match_group_pattern_with_multiple_defs" = { cause = "expect-test snapshot moved (ids/ranges)" }
 "hir_def::macro_expansion_tests::mbe::token_mapping_across_files" = { cause = "expect-test snapshot moved (ids/ranges)" }
 "hir_def::macro_expansion_tests::mbe::token_mapping_smoke_test" = { cause = "expect-test snapshot moved (ids/ranges)" }
-"hir_def::nameres::delta::tests::random::edit_scripts_over_generated_crates" = { cause = "hegel random nameres delta test fails (random.rs:719); reproduce_failure seed in the log" }
+"hir_def::nameres::delta::tests::random::edit_scripts_over_generated_crates" = { cause = "the random nameres delta test fails on some cases (random.rs); the failure prints the tape that replays it" }
 "hir_def::nameres::tests::views::a_modules_source_views" = { cause = "expect-test snapshot moved (ids/ranges)" }
 "hir_def::src::tests::child_source_view" = { cause = "expect-test snapshot moved (ids/ranges)" }
 "hir_def::src::tests::use_tree_views" = { cause = "expect-test snapshot moved (ids/ranges)" }

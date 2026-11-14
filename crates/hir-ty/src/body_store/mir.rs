@@ -406,7 +406,12 @@ pub(super) fn owners<'db>(db: &'db Db, def: DefWithBodyId) -> Vec<(Place, MirOwn
     // alloc: the body's owners, a handful
     let mut out = Vec::new();
     let mut push = |owner: MirOwner<'db>| {
-        if let Some((_, place)) = place(db, owner) {
+        // A closure inside one of the body's anonymous constants (an array length) is in the
+        // body's inference, which the constants' are merged into, and is no owner of the
+        // body's own lowering: the constant's body lowers it.
+        if let Some((_, place)) = place(db, owner)
+            && place.anon == NONE
+        {
             out.push((place, owner));
         }
     };

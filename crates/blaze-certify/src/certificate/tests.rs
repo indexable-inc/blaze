@@ -1,6 +1,8 @@
 //! The certificate's record: its parts' bytes, its keys and the local evidence beside it.
 //! The check and the write are tested against a model in `request/tests.rs`.
 
+use blaze_sim::{Config, Tape};
+
 use super::*;
 
 fn id(n: u8) -> ContentId {
@@ -249,17 +251,16 @@ enum Op {
     Crash(u8),
 }
 
-fn draw_op(tc: &hegel::TestCase) -> Op {
-    use hegel::generators as gs;
-    let at = tc.draw(gs::integers::<u8>().max_value(2));
-    match tc.draw(gs::integers::<u8>().max_value(6)) {
-        0 => Op::Tick(tc.draw(gs::integers::<u16>().max_value(3_000))),
-        1 => Op::Write(at, tc.draw(gs::integers::<u8>().max_value(3))),
+fn draw_op(tape: &Tape) -> Op {
+    let at = tape.int_in(0..=2u8, "file");
+    match tape.int_in(0..=6u8, "op") {
+        0 => Op::Tick(tape.int_in(0..=3_000u16, "tick ms")),
+        1 => Op::Write(at, tape.int_in(0..=3u8, "content")),
         2 => Op::Look(at),
         3 => Op::Forget(at),
         4 => Op::Drain,
         5 => Op::Sync,
-        _ => Op::Crash(tc.draw(gs::integers::<u8>().max_value(8))),
+        _ => Op::Crash(tape.int_in(0..=8u8, "marks that stay")),
     }
 }
 
@@ -350,23 +351,24 @@ fn simulate(ops: &[Op], plant: bool) -> Result<(), String> {
 /// never a content the file does not hold. Control: the planted bug of keeping racy looks
 /// (`Evidence::keep_racy`) vouches for a file's old content after a second write in the same
 /// second, and across a crash and start, and the oracle catches both.
-#[hegel::test]
-fn marks_through_crashes_vouch_only_for_what_the_files_hold(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let count = tc.draw(gs::integers::<usize>().max_value(40));
-    let ops: Vec<Op> = (0..count).map(|_| draw_op(&tc)).collect();
-    if let Err(why) = simulate(&ops, false) {
-        panic!("{why}\n{ops:?}");
-    }
-    let rewritten = [Op::Write(0, 1), Op::Tick(100), Op::Look(0), Op::Tick(100), Op::Write(0, 2)];
-    assert!(simulate(&rewritten, true).is_err(), "the control");
-    assert!(simulate(&rewritten, false).is_ok());
-    // The racy mark synced, the machine stopped and started, the file written again in the
-    // second it was first written: the seeded evidence of the plant vouches for the old.
-    let restarted =
-        [Op::Write(0, 1), Op::Tick(100), Op::Look(0), Op::Drain, Op::Sync, Op::Crash(0), Op::Write(0, 2)];
-    assert!(simulate(&restarted, true).is_err(), "the control, across a start");
-    assert!(simulate(&restarted, false).is_ok());
+#[test]
+fn marks_through_crashes_vouch_only_for_what_the_files_hold() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let count = tape.int_in(0..=40usize, "ops");
+        let ops: Vec<Op> = (0..count).map(|_| draw_op(tape)).collect();
+        if let Err(why) = simulate(&ops, false) {
+            panic!("{why}\n{ops:?}");
+        }
+        let rewritten = [Op::Write(0, 1), Op::Tick(100), Op::Look(0), Op::Tick(100), Op::Write(0, 2)];
+        assert!(simulate(&rewritten, true).is_err(), "the control");
+        assert!(simulate(&rewritten, false).is_ok());
+        // The racy mark synced, the machine stopped and started, the file written again in the
+        // second it was first written: the seeded evidence of the plant vouches for the old.
+        let restarted =
+            [Op::Write(0, 1), Op::Tick(100), Op::Look(0), Op::Drain, Op::Sync, Op::Crash(0), Op::Write(0, 2)];
+        assert!(simulate(&restarted, true).is_err(), "the control, across a start");
+        assert!(simulate(&restarted, false).is_ok());
+    });
 }
 
 /// The invariant (rule 26): evidence seeded from the marks an evidence's changes were
@@ -376,19 +378,21 @@ fn marks_through_crashes_vouch_only_for_what_the_files_hold(tc: hegel::TestCase)
 /// with the planted `Evidence::keep_racy` is seeded as steady, but the real keep writes no
 /// such mark. (A mark of another layout is the driver's to refuse by name before seeding:
 /// blaze-cargo's `serve::local::Placed::decode`.)
-#[hegel::test]
-fn evidence_seeded_from_marks_vouches_as_the_evidence_that_wrote_them(tc: hegel::TestCase) {
-    use std::collections::BTreeMap;
+#[test]
+fn evidence_seeded_from_marks_vouches_as_the_evidence_that_wrote_them() {
+    blaze_sim::check(Config::DEFAULT, evidence_seeded_from_marks_vouches_as_the_evidence_that_wrote_them_case);
+}
 
-    use hegel::generators as gs;
+fn evidence_seeded_from_marks_vouches_as_the_evidence_that_wrote_them_case(tape: &Tape) {
+    use std::collections::BTreeMap;
 
     let mut evidence = Evidence::default();
     let mut stamps: Vec<(String, Stamp)> = Vec::new();
-    for at in 0..tc.draw(gs::integers::<u8>().max_value(6)) {
+    for at in 0..tape.int_in(0..=6u8, "outputs") {
         let path = path_of(at);
-        let changed_ns = tc.draw(gs::integers::<u64>().max_value(1 << 40));
-        let stamp = file(tc.draw(gs::integers::<u64>()), changed_ns);
-        let looked_ns = changed_ns + tc.draw(gs::integers::<u64>().max_value(3 * SECOND));
+        let changed_ns = tape.int_in(0..=1u64 << 40, "changed ns");
+        let stamp = file(tape.int::<u64>("size"), changed_ns);
+        let looked_ns = changed_ns + tape.int_in(0..=3 * SECOND, "looked after ns");
         evidence.keep(0, &path, stamp, id(at), looked_ns);
         stamps.push((path, stamp));
     }

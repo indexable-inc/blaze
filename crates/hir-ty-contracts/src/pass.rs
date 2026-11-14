@@ -35,8 +35,8 @@ const MAX_STEPS: u32 = 8;
 /// not proved, not of the one form read, or not shown to be about the very value the check
 /// tests; keeping a check is always correct.
 ///
-/// `prove` answers whether a callee's `ensures` is proved: [`hir_ty_lean::proved`] with the
-/// place of the callee's crate's proofs. An `ensures` it does not prove is reported by name,
+/// `prove` answers whether a callee's `ensures` is proved: by the verdicts of the proof
+/// check (`hir_ty_lean::plan`, which `blaze prove` drives). An `ensures` it does not prove is reported by name,
 /// with why (the event `contracts.not_proved`), and its check stays.
 pub fn use_proved_contracts<'db>(
     db: &'db Db,

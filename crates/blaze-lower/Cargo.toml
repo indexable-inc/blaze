@@ -39,7 +39,7 @@ blaze-core.workspace = true
 # The fact boundaries a build's database is made with (`reads::mark_boundaries`).
 blaze-item-hash.workspace = true
 blaze-items.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

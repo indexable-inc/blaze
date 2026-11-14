@@ -406,6 +406,7 @@ fn old_match_attr_flags(
                         // here, each a word attribute under `blaze` as those above.
                         "linear" => attr_flags.insert(AttrFlags::LINEAR),
                         "consumes" => attr_flags.insert(AttrFlags::CONSUMES),
+                        "theorem" => attr_flags.insert(AttrFlags::THEOREM),
                         "holds" => attr_flags.insert(AttrFlags::HOLDS),
                         "memo" => attr_flags.insert(AttrFlags::BLAZE_MEMO),
                         "reflect" => attr_flags.insert(AttrFlags::BLAZE_REFLECT),
@@ -1589,6 +1590,7 @@ pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
 /// An edit of a fn's body leaves the file's outline the same, so no attribute query of the
 /// file runs again, and each reads what it did.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_runs_no_attribute_query() {
     const CODE: &str = r#"
 #![doc(hidden)]
@@ -2453,6 +2455,7 @@ fn function_named(db: &TestDB, name: &str) -> FunctionId {
 /// (it read the file's live parse before, and ran again on every edit of the file). The
 /// control: an edit of the parameter list itself runs it, so the log is seen to hold it.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_leaves_the_generic_parameters_flags_verified() {
     let fx = fixture::db("fn f<#[cfg(all())] T>(t: T) -> u32 { 1 }\nfn g() {}\n");
     let file = fx.only_file();

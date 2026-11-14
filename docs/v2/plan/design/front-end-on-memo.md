@@ -107,8 +107,9 @@ about 10.3k lines. The tracked macros in blaze-query-macros go. A `.clippy.toml`
 
 ## B. Hard cases
 
-**Sealed summaries.** A dependency's summary is its image, read in place. Its arena is never in the
-changed set, so there is nothing to witness. `deps::key::sealed(db, krate)` (37 calls) becomes
+**Sealed summaries.** A dependency's summary is its image, read in place. Its arena is in the
+changed set only when the driver writes the crate (a build script's env, a gift), and then it is
+dropped with its dependents like any arena, so there is nothing to witness. `deps::key::sealed(db, krate)` (37 calls) becomes
 `!memo.changed(arena)`, the same for the session. Who is sealed is the driver's decision: a crate is
 sealed if it is not being built. The cold hang in `task_scope`/`settled = publish`
 (sealed.rs:510-534) has no successor.
@@ -472,7 +473,9 @@ impl Memo { pub fn changed(&self, arena: ArenaId) -> bool; }   // !sealed
 `changed` is `false` exactly for an arena the driver sealed (`Inputs::seal`: a crate not being
 built). `build()` panics where a sealed arena declared an unsealed dependency (other than the
 session), so `!changed` means what `deps::key::sealed` meant: the crate and all its dependencies
-are sealed. `next()` panics where a sealed arena is in the changed set. This is not "made anew
+are sealed. `next()` takes a sealed arena in the changed set like any other (2026-11-14): every
+read and declared borrow sets a borrow bit, so the dropped set is closed under its borrowers,
+and the remade arena is sealed again. This is not "made anew
 in this snapshot": L3 assumed that wording, but `sealed` is `!changed` and a crate being built
 whose arena was carried is still not sealed.
 
@@ -659,15 +662,42 @@ pub type CratesIdMap = HashMap<CrateBuilderId, CrateKey, Global>;    // was `-> 
 ```
 
 Arenas: index 0 is the session arena (settings, process env, library and local roots, named
-paths, the crate list); a crate's index is `1 + its topological position`. A source root's
-files live in the arena of the lowest-index crate whose root file is in that source root (its
-owner); every other crate rooted there declares a borrow of the owner; files of a source root no
-crate is rooted in live in the session arena. Each crate arena `borrows` each dependency and the
-session; `seal` for a crate not being built (all its dependencies are). `commit` compares each
+paths); index 1 is the crate list's (`LIST_ARENA`: the `AllCrates` singleton, open, borrowing
+the session); each source root has an arena of its own at indices `2..2 + roots`, below every
+crate's; a crate's index is `2 + roots + its topological position`. A source root's files
+live in the root's arena, which is open (`Inputs::open`): any arena's key may name it, and an
+entry that does borrows it when written, so a crate that reads a file of another root (a
+`#[path]` module, an include) is homed at the crate and dropped with that root's arena, and no
+arena that only might have read it is. A crate declares the arena of its own root. Each crate
+arena `borrows` each dependency and the session; `seal` for a crate not being built (all its
+dependencies are). Within one database an arena's id is never handed out twice: generations
+carry on across sessions, and at the generation limit the database takes a new id space under
+a new nonce. `commit` compares each
 written entry's content digest with the world's: an equal digest marks nothing (writing the same
-text twice drops nothing), a file marks its owner's arena, a crate's data or gift that crate's,
+text twice drops nothing), a file marks its source root's arena, a crate's data or gift that crate's,
 a change of the graph's shape (indices move) every crate arena whose index or dependencies
-changed, settings and env and roots the session arena. It then calls `Memo::next(&changed)`,
+changed, settings and env and roots the session arena. A sealed crate's write (a build script's
+env, a gift, a maker) marks that crate like any other: `next` drops it and its borrowers, never
+the session. The crate list (its digest of each listed crate's item key and root path, so it
+moves for a crate added, taken out, moved or given another cfg) marks its own arena, never the
+session's: only runs that read the list borrow it. A crate key is found by its prefix in an index
+the commit builds into the table (`listed_by_prefix`): a hit reads the found crate's own input
+(the asker borrows that crate), a miss reads the list; a clash of two prefixes stops the build
+before any key is resolved (`listed_clash`). A crate's other `OUT_DIR`s are a field of its own
+input, made at commit (`world::out_dirs_of`), marked only when they move. A gift that says where
+a value can be read, never what it is (`base_db::Located`: the image's lang items, the key a
+crate's constants are kept under), lives in the table, not a slot: its first gift marks nothing
+(the kind's promise: every reader computes the same value with it as without it), a replacement
+under another fact or a withdrawal marks the crate. A surface stays a value gift: a dependent's
+image key reads it, so it marks. Floors, by write: a file, its root's arena and its readers and
+their dependents; a crate's env, value gift or maker, its arena and its dependents'; its cfg, its
+arena, its dependents', the list's arena and its readers; a crate added, the list's arena, its
+readers and the crates of its root whose `OUT_DIR`s moved; a located gift, nothing. The driver's
+writes known before any query runs (the session makers: the build target, the entries holder,
+the constants' store) go in one commit (`serve::unit::deps::makers`). A new session only for a first commit, an
+outgrown arena capacity, spent generations or after a failed commit. The `db commit` span says
+why: `marked`, `causes` (each marked arena, sealed or not, and why, the first 8 then a count) and
+`fresh`. It then calls `Memo::next(&changed)`,
 remakes each dropped arena's inputs from the world (`Builder::arena`, `borrows`, `seal`), builds
 the snapshot and rebuilds the table rows of the remade arenas. An input id held from before is
 valid while its arena is carried; one of a dropped arena panics on use (the generation compare):
@@ -701,5 +731,18 @@ Global>)`. Gone: `Crate::create*`, every `Crate::set_*`/`seal_*`/`give`, the fre
 stays (a gift is world data, so it survives a remake). `Shared`/`Reader`: a reader holds its
 snapshot; a commit never waits for it. Changed returns: `process_env_reads -> Vec<(CrateKey,
 String)>`, `other_out_dirs -> &'db [&'db str]`, `Crate::transitive_rev_deps -> Vec<Crate,
-Global>`, `SaidBlazeEdition<'t>`. Known heavy drops (every arena): a change of the crate list's
-shape, a new named path, a change of an included source, an edit of a file in no crate's root.
+Global>`, `SaidBlazeEdition<'t>`. `Edit::give_located::<K>(CrateKey, Fact, Given)`,
+`Edit::take_located::<K>(CrateKey) -> bool` and `Crate::located::<K, T>(self, &Db)` for a
+`K: Located`; a kind is given one way (a slot gift of a located kind, or the reverse, stops).
+Known heavy drops (every arena): a new named path, a change of an included source, an edit of a
+file in no crate's root. The build scripts' runs of one write pass (a restart's, found in
+records, among them) are one commit (`blaze_lower::Lowered::prepare_run` checks each before
+any edit, `apply_runs` writes them all, each refused alone). Located: the lang items and the
+diagnostic items; slots, since what is read with them is not what is computed without: the
+image and the def map pages (a served value has the image's block scopes, a paged def map
+`ScopeSlot::Paged`), the def map whole (its readers are comparisons that compare only when the
+def map runs) and the surface (a dependent's image key takes it in place of the key). A surface
+is worked out by queries over the snapshot the write commits, so it is given in the commit
+after it, dropping the written crate and its dependents a second time; the end state is the
+surface as a query of the crate's own arena, read by the image key with the memo's cutoff, its
+driver-held inputs (spellings, const macros, carried records) made inputs of the database.

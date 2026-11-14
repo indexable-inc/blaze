@@ -151,6 +151,18 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     plot_named("direct maps", direct.maps);
     plot_named("direct mapped bytes", direct.mapped_bytes);
     plot_named("direct leaked bytes", direct.leaked_bytes);
+    // What the front end asked of packs one record at a time, and how much of it waited: a
+    // build's numbers are its last sample's less its first's. `direct records read` less
+    // `direct hits` is the records that waited on a read; `direct waits` the waits themselves
+    // (each a span `store direct reads`). The two maxima are each sample's interval's
+    // (`take_longest`): a build's is the largest of its samples'.
+    plot_named("direct records asked", direct.asked);
+    plot_named("direct hits", direct.hits);
+    plot_named("direct hit bytes", direct.hit_bytes);
+    plot_named("direct waits", direct.waits);
+    let (longest_wait_ns, longest_run) = blaze_cas::direct::take_longest();
+    plot_named("direct longest wait ns", longest_wait_ns);
+    plot_named("direct longest run bytes", longest_run);
     // The part of the footprint past the heaps that is not an allocator's: the fibers' stacks,
     // and the threads that each hold a stack and heaps of their own.
     blaze_profile::plot(Plot::StackBytes, blaze_graph::sched::stack::resident());

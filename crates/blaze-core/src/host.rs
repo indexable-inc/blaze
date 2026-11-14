@@ -1,19 +1,29 @@
 //! The host's own effects, the same on every native driver: UDP sockets ([`Effect::Bind`],
-//! [`Effect::SendTo`], [`Effect::RecvFrom`], [`Effect::Unbind`]), the standard streams
-//! ([`Effect::ReadStdin`], [`Effect::WriteOut`]), the wall clock ([`Effect::Now`]) and the
-//! system's random bytes ([`Effect::Random`]). Making and removing an empty directory are file
-//! effects, in `threads::run` with the rest.
+//! [`Effect::SendTo`], [`Effect::RecvFrom`], [`Effect::Unbind`]), names resolved
+//! ([`Effect::Resolve`]), the standard streams ([`Effect::ReadStdin`], [`Effect::WriteOut`]),
+//! the wall clock ([`Effect::Now`]) and the system's random bytes ([`Effect::Random`]). Making
+//! and removing an empty directory are file effects, in `threads::run` with the rest.
 //!
 //! On Unix a [`Host`] runs them for the threads, kqueue and io_uring drivers. What waits on a
 //! peer (a receive, a read of the input, a write the output's reader is slow to take) waits on
 //! a thread of the host's through [`crate::wait::readable`], with no deadline (it waits as long
 //! as nothing comes) and with the host's stop and, for a socket, the socket's own among its
-//! descriptors, so an unbind or the driver's end wakes it. A send the system takes at once is
-//! answered on the driver's thread; one it cannot take yet waits on a thread for room. Every
-//! answer goes through the driver's [`Sink`], which wakes the driver's wait.
+//! descriptors, so an unbind or the driver's end wakes it. Every answer goes through the
+//! driver's [`Sink`], which wakes the driver's wait.
+//!
+//! A batch of datagrams moves in one system call per [`crate::dgram::BATCH_MOST`] messages
+//! (`net::udp`: `sendmmsg` and `recvmmsg` on Linux, `sendmsg_x` and `recvmsg_x` on macOS). A
+//! send is tried at once on the driver's thread, where nearly every one ends; one the socket
+//! has no room for waits on a thread for room. Each socket has one receiving thread, started
+//! with its first receive, which answers its receives in the order asked and parks on the
+//! socket's [`crate::wait::Parker`] while none is queued: a receive costs no thread's start.
+//! A resolve is `getaddrinfo` on a thread of its own, waited for until
+//! [`crate::dgram::RESOLVE_WAIT`].
 //!
 //! The datagram drivers do not yet put a socket on their own kernel queue (io_uring's
-//! `IORING_OP_RECVMSG`, kqueue's `EVFILT_READ`): a receive in flight is a thread of its own.
+//! `IORING_OP_RECVMSG` multishot with provided buffers, kqueue's `EVFILT_READ`): a socket's
+//! receives wait on a thread of its own, and a datagram's arrival costs that thread's wake and
+//! a wake of the driver.
 //!
 //! Windows' (the IOCP driver's) and WASI's are [`wall`] and [`random`] alone: their drivers
 //! refuse the sockets and the streams, naming why.
@@ -73,15 +83,32 @@ pub(crate) fn refused(effect: crate::Effect) -> Done {
     let why = "on WASI (the wasm32-wasip1 seed): it has no sockets, and a read of its input \
                or a write of its output would block with no deadline wait to put it behind";
     match effect {
-        Effect::SendTo { bytes, .. } => {
-            Done::unsent(bytes, format_args!("Effect::SendTo is refused {why}"))
-        }
+        Effect::SendTo { sock, batch, .. } => Done::dgram_failed(
+            batch,
+            false,
+            sock,
+            None,
+            None,
+            None,
+            format_args!("Effect::SendTo is refused {why}"),
+        ),
         Effect::WriteOut { bytes, .. } => {
             Done::unsent(bytes, format_args!("Effect::WriteOut is refused {why}"))
         }
-        Effect::RecvFrom { into, .. } => {
-            Done::unread(into, format_args!("Effect::RecvFrom is refused {why}"))
-        }
+        Effect::RecvFrom { sock, into, .. } => Done::dgram_failed(
+            into,
+            true,
+            sock,
+            None,
+            None,
+            None,
+            format_args!("Effect::RecvFrom is refused {why}"),
+        ),
+        Effect::Resolve { name, port, .. } => Done::Unresolved(crate::dgram::Unresolved {
+            name,
+            port,
+            why: format!("Effect::Resolve is refused {why}"),
+        }),
         Effect::ReadStdin { into, .. } => {
             Done::unread(into, format_args!("Effect::ReadStdin is refused {why}"))
         }
@@ -98,17 +125,24 @@ mod unix {
     use std::{
         alloc::Global,
         io,
-        net::{SocketAddr, UdpSocket},
+        net::{SocketAddr, ToSocketAddrs as _, UdpSocket},
         os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
 
     use blaze_hash::HashMap;
     use crossbeam_channel::{Receiver, Sender};
+    use crossbeam_queue::SegQueue;
 
     use crate::{
-        Completion, DATAGRAM_MOST, Dgram, Done, Effect, IoError, RECV_MOST, Stream, Tag,
-        wait::{self, Monotonic, Waited},
+        Completion, Dgram, Done, Effect, IoError, RECV_MOST, Stream, Tag,
+        dgram::{self, Batch, Ecn, Options, Slots},
+        lock::Lock,
+        net::udp::{self, At},
+        wait::{self, Deadline, Monotonic, Parker, Waited},
     };
 
     /// Where the host tells a completion: the driver's mailbox, waking its wait. Called from
@@ -143,10 +177,41 @@ mod unix {
 
     /// A socket bound, shared by the host's table and the threads that wait on it.
     struct Bound {
+        sock: Dgram,
         socket: UdpSocket,
         local: SocketAddr,
+        options: Options,
         /// Fired as it is unbound.
         stop: Stop,
+        /// The receives asked of it, in order, for its one receiving thread.
+        receives: SegQueue<Receive>,
+        /// What its receiving thread parks on while `receives` is empty.
+        parker: Parker,
+        /// Whether its receiving thread was started.
+        receiving: AtomicBool,
+        /// Set as it is unbound: its receiving thread ends once `receives` is drained.
+        unbound: AtomicBool,
+    }
+
+    /// A receive of a socket, for its receiving thread.
+    struct Receive {
+        tag: Tag,
+        into: Batch,
+        slots: Slots,
+    }
+
+    impl Bound {
+        fn failed(
+            &self,
+            batch: Batch,
+            clear: bool,
+            peer: Option<SocketAddr>,
+            error: Option<&io::Error>,
+            why: impl std::fmt::Display,
+        ) -> Done {
+            let errno = error.and_then(io::Error::raw_os_error);
+            Done::dgram_failed(batch, clear, self.sock, Some(self.local), peer, errno, why)
+        }
     }
 
     /// What the host's threads share with it.
@@ -210,6 +275,7 @@ mod unix {
                     | Effect::SendTo { .. }
                     | Effect::RecvFrom { .. }
                     | Effect::Unbind { .. }
+                    | Effect::Resolve { .. }
                     | Effect::ReadStdin { .. }
                     | Effect::WriteOut { .. }
                     | Effect::Now { .. }
@@ -240,20 +306,19 @@ mod unix {
             match effect {
                 Effect::Now { tag } => self.tell(tag, super::wall()),
                 Effect::Random { len, tag } => self.tell(tag, super::random(len)),
-                Effect::Bind { at, tag } => {
-                    let done = match bind(at) {
+                Effect::Bind { at, options, tag } => {
+                    let sock = Dgram(self.next);
+                    let done = match bind(sock, at, options) {
                         Ok(bound) => {
-                            let sock = Dgram(self.next);
                             self.next += 1;
                             let local = bound.local;
-                            // alloc: once per socket bound, shared with its receives.
-                            self.socks.insert(sock.0, Arc::new(bound));
+                            // Once per socket bound, shared with its receiving thread.
+                            self.socks.insert(sock.0, Arc::new_in(bound, Global));
                             Done::Bound { sock, local }
                         }
-                        // alloc: an error path.
-                        Err(error) => {
-                            Done::Failed(IoError(format!("binding a UDP socket at {at}: {error}")))
-                        }
+                        Err((what, error)) => Done::Failed(IoError(format!(
+                            "binding a UDP socket at {at} ({options:?}): {what}: {error}"
+                        ))),
                     };
                     self.tell(tag, done);
                 }
@@ -262,7 +327,9 @@ mod unix {
                         Some(bound) => {
                             // The receives in flight wake and end; the socket closes with the
                             // last of them.
+                            bound.unbound.store(true, Ordering::Release);
                             bound.stop.fire();
+                            bound.parker.unpark();
                             Done::Unbound
                         }
                         // alloc: an error path.
@@ -272,82 +339,144 @@ mod unix {
                     };
                     self.tell(tag, done);
                 }
-                Effect::SendTo { sock, to, bytes, tag } => self.send_to(sock, to, bytes, tag),
-                Effect::RecvFrom { sock, into, tag } => self.recv_from(sock, into, tag),
+                Effect::SendTo { sock, batch, tag } => self.send_to(sock, batch, tag),
+                Effect::RecvFrom { sock, into, slots, tag } => {
+                    self.recv_from(sock, into, slots, tag);
+                }
+                Effect::Resolve { name, port, tag } => self.resolve(name, port, tag),
                 Effect::WriteOut { stream, bytes, tag } => self.write_out(stream, bytes, tag),
                 Effect::ReadStdin { most, into, tag } => self.read_stdin(most, into, tag),
                 effect => unreachable!("{:?} is no effect of the host's", effect.tag()),
             }
         }
 
-        fn send_to(&mut self, sock: Dgram, to: SocketAddr, bytes: Vec<u8>, tag: Tag) {
+        /// A batch's send: tried at once on the driver's thread, which is where nearly every
+        /// send ends (one `sendmmsg` or `sendmsg_x` per [`dgram::BATCH_MOST`] runs); one the
+        /// socket has no room for yet waits for room on a thread of its own.
+        fn send_to(&mut self, sock: Dgram, batch: Batch, tag: Tag) {
             let Some(bound) = self.socks.get(&sock.0) else {
-                let done = Done::unsent(
-                    bytes,
-                    format_args!("sending to {to} from {sock:?}: no such socket is bound"),
+                let done = Done::dgram_failed(
+                    batch,
+                    false,
+                    sock,
+                    None,
+                    None,
+                    None,
+                    "sending: no such socket is bound",
                 );
                 return self.tell(tag, done);
             };
-            if bytes.len() > DATAGRAM_MOST {
-                let (len, local) = (bytes.len(), bound.local);
-                let done = Done::unsent(
-                    bytes,
+            if let Some(refused) = batch.refused() {
+                let peer = batch.heads.first().map(|it| it.peer);
+                let done = bound.failed(batch, false, peer, None, format_args!("sending {refused}"));
+                return self.tell(tag, done);
+            }
+            if !bound.options.ecn
+                && let Some(head) = batch.heads.iter().find(|it| it.ecn != Ecn::NotEct)
+            {
+                let (peer, ecn) = (head.peer, head.ecn);
+                let done = bound.failed(
+                    batch,
+                    false,
+                    Some(peer),
+                    None,
                     format_args!(
-                        "sending {len} bytes from {local} to {to}: a datagram is at most \
-                         DATAGRAM_MOST, {DATAGRAM_MOST}"
+                        "sending a datagram marked {ecn:?} on a socket bound without \
+                         Options::ecn: its codepoint would not be sent"
                     ),
                 );
                 return self.tell(tag, done);
             }
-            match send_now(bound, to, bytes) {
+            match send_now(bound, batch, At::default()) {
                 Ok(done) => self.tell(tag, done),
                 // No room in the socket's buffer yet: a thread waits for it.
-                Err(bytes) => {
+                Err((batch, at)) => {
                     // clone: a count of the socket, for the thread that waits on it.
                     let bound = Arc::clone(bound);
                     let started = self.shared().and_then(|shared| {
                         // clone: a count, for the thread.
                         let thread = Arc::clone(&shared);
                         spawn("blaze-host-send", move || {
-                            let done = send_when_room(&thread, &bound, to, bytes);
+                            let done = send_when_room(&thread, &bound, batch, at);
                             thread.sink.tell(Completion { tag, done });
                         })
                     });
                     if let Err(error) = started {
-                        // alloc: an error path; the bytes went with the thread not started.
-                        let why = format!("sending to {to}: starting its wait: {error}");
-                        self.tell(tag, Done::unsent(Vec::new(), why));
+                        // The batch went with the thread not started.
+                        let why = format!("sending: starting its wait for room: {error}");
+                        let done =
+                            Done::dgram_failed(Batch::new(), false, sock, None, None, None, why);
+                        self.tell(tag, done);
                     }
                 }
             }
         }
 
-        fn recv_from(&mut self, sock: Dgram, into: Vec<u8>, tag: Tag) {
+        /// A batch's receive, queued for the socket's one receiving thread (started with its
+        /// first receive), which answers them in the order asked.
+        fn recv_from(&mut self, sock: Dgram, into: Batch, slots: Slots, tag: Tag) {
             let Some(bound) = self.socks.get(&sock.0) else {
-                let done = Done::unread(
+                let done = Done::dgram_failed(
                     into,
-                    format_args!("receiving on {sock:?}: no such socket is bound"),
+                    true,
+                    sock,
+                    None,
+                    None,
+                    None,
+                    "receiving: no such socket is bound",
                 );
                 return self.tell(tag, done);
             };
-            // clone: a count of the socket, for the thread that waits on it.
+            if let Some(why) = slots.refused(bound.options.coalesce) {
+                let done = bound.failed(into, true, None, None, why);
+                return self.tell(tag, done);
+            }
+            bound.receives.push(Receive { tag, into, slots });
+            if bound.receiving.swap(true, Ordering::AcqRel) {
+                bound.parker.unpark();
+                return;
+            }
+            // clone: a count of the socket, for its receiving thread.
             let bound = Arc::clone(bound);
-            let shared = match self.shared() {
-                Ok(shared) => shared,
-                Err(error) => {
-                    let local = bound.local;
-                    let done = Done::unread(into, format_args!("receiving on {local}: {error}"));
-                    return self.tell(tag, done);
-                }
-            };
-            let started = spawn("blaze-host-recv", move || {
-                let done = receive(&shared, &bound, into);
-                shared.sink.tell(Completion { tag, done });
+            let started = self.shared().and_then(|shared| {
+                // clone: a count of the socket, for the thread.
+                let thread = Arc::clone(&bound);
+                spawn("blaze-host-recv", move || serve_receives(&shared, &thread))
             });
             if let Err(error) = started {
-                // alloc: an error path; the buffer went with the thread not started.
-                let why = format!("receiving on {sock:?}: starting its wait: {error}");
-                self.tell(tag, Done::unread(Vec::new(), why));
+                bound.receiving.store(false, Ordering::Release);
+                while let Some(Receive { tag, into, .. }) = bound.receives.pop() {
+                    let why = format!("receiving: starting its thread: {error}");
+                    self.tell(tag, bound.failed(into, true, None, None, why));
+                }
+            }
+        }
+
+        /// A name resolved by `getaddrinfo` on a thread of its own, which the thread that
+        /// waits for it gives [`dgram::RESOLVE_WAIT`]: `getaddrinfo` cannot be cancelled, so
+        /// one past its wait fails the resolve, naming the name, and its answer, when it
+        /// comes, has no one to go to.
+        fn resolve(&mut self, name: String, port: u16, tag: Tag) {
+            if name.len() > dgram::NAME_MOST || name.contains('\0') || name.is_empty() {
+                let why = format!(
+                    "a name of {} bytes: one is 1 to NAME_MOST ({}) bytes with no NUL",
+                    name.len(),
+                    dgram::NAME_MOST
+                );
+                return self.tell(tag, Done::Unresolved(dgram::Unresolved { name, port, why }));
+            }
+            // clone: the name, for the error of a thread not started, which takes the other.
+            let named = name.clone();
+            let started = self.shared().and_then(|shared| {
+                spawn("blaze-host-resolve", move || {
+                    let done = resolve_by(name, port);
+                    shared.sink.tell(Completion { tag, done });
+                })
+            });
+            if let Err(error) = started {
+                let why = format!("starting its thread: {error}");
+                let unresolved = dgram::Unresolved { name: named, port, why };
+                self.tell(tag, Done::Unresolved(unresolved));
             }
         }
 
@@ -440,7 +569,9 @@ mod unix {
                 shared.stop.fire();
             }
             for bound in self.socks.values() {
+                bound.unbound.store(true, Ordering::Release);
                 bound.stop.fire();
+                bound.parker.unpark();
             }
         }
     }
@@ -450,33 +581,47 @@ mod unix {
         std::thread::Builder::new().name(name.to_owned()).spawn(f).map(drop)
     }
 
-    fn bind(at: SocketAddr) -> io::Result<Bound> {
-        // std's sockets are made close-on-exec.
-        let socket = UdpSocket::bind(at)?;
-        socket.set_nonblocking(true)?;
-        let local = socket.local_addr()?;
-        Ok(Bound { socket, local, stop: Stop::new()? })
+    fn bind(
+        sock: Dgram,
+        at: SocketAddr,
+        options: Options,
+    ) -> Result<Bound, (&'static str, io::Error)> {
+        let socket: UdpSocket = udp::bind(at, options)?;
+        let local = socket.local_addr().map_err(|error| ("its address", error))?;
+        let stop = Stop::new().map_err(|error| ("its stop", error))?;
+        Ok(Bound {
+            sock,
+            socket,
+            local,
+            options,
+            stop,
+            receives: SegQueue::new(),
+            parker: Parker::new(),
+            receiving: AtomicBool::new(false),
+            unbound: AtomicBool::new(false),
+        })
     }
 
-    /// One try of the send: done, or the bytes back where the socket has no room yet.
-    fn send_now(bound: &Bound, to: SocketAddr, mut bytes: Vec<u8>) -> Result<Done, Vec<u8>> {
-        loop {
-            match bound.socket.send_to(&bytes, to) {
-                Ok(_) => {
-                    bytes.clear();
-                    return Ok(Done::Sent(bytes));
+    /// Sends of the batch from `at`, one system call each, until all of it is sent: done, or
+    /// the batch back and how far it got where the socket has no room yet. Each call moves
+    /// at least one message, so this ends in at most as many calls as the batch has
+    /// datagrams.
+    fn send_now(bound: &Bound, mut batch: Batch, mut at: At) -> Result<Done, (Batch, At)> {
+        let v6 = bound.local.is_ipv6();
+        while !at.done(&batch) {
+            match udp::send(&bound.socket, v6, &batch, at) {
+                Ok(next) => at = next,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Err((batch, at));
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Err(bytes),
                 Err(error) => {
-                    let local = bound.local;
-                    return Ok(Done::unsent(
-                        bytes,
-                        format_args!("sending from {local} to {to}: {error}"),
-                    ));
+                    let peer = batch.heads.get(at.run).map(|it| it.peer);
+                    return Ok(bound.failed(batch, false, peer, Some(&error), error.to_string()));
                 }
             }
         }
+        batch.clear();
+        Ok(Done::SentDatagrams(batch))
     }
 
     /// What woke a wait of the host's: its descriptor, or a stop.
@@ -513,70 +658,151 @@ mod unix {
         }
     }
 
-    fn send_when_room(shared: &Shared, bound: &Bound, to: SocketAddr, bytes: Vec<u8>) -> Done {
-        let mut bytes = bytes;
+    /// The rest of a batch's send after a wait for room. Each wait ends with room, the
+    /// socket's unbind or the host's end; each send after it moves at least a message, so the
+    /// loop ends in at most as many turns as the batch has datagrams.
+    fn send_when_room(shared: &Shared, bound: &Bound, batch: Batch, at: At) -> Done {
+        let (mut batch, mut at) = (batch, at);
         loop {
             let what = "room in a UDP socket's buffer for an Effect::SendTo";
-            let local = bound.local;
+            let peer = batch.heads.get(at.run).map(|it| it.peer);
             match wait_for(what, bound.socket.as_fd(), libc::POLLOUT, Some(&bound.stop), shared) {
                 Woke::Ready => {}
                 Woke::Stopped => {
-                    return Done::unsent(
-                        bytes,
-                        format_args!(
-                            "sending from {local} to {to}: unbound with the send in flight"
-                        ),
-                    );
+                    return bound.failed(batch, false, peer, None, "unbound with the send in flight");
                 }
                 Woke::Failed(error) => {
-                    return Done::unsent(
-                        bytes,
-                        format_args!("sending from {local} to {to}: {error}"),
-                    );
+                    return bound.failed(batch, false, peer, Some(&error), error.to_string());
                 }
             }
-            match send_now(bound, to, bytes) {
+            match send_now(bound, batch, at) {
                 Ok(done) => return done,
-                Err(back) => bytes = back,
+                Err((back, next)) => (batch, at) = (back, next),
             }
         }
     }
 
-    fn receive(shared: &Shared, bound: &Bound, mut into: Vec<u8>) -> Done {
+    /// A socket's receiving thread: each receive queued, in order, until the socket is
+    /// unbound or the host ends, when each left ends failed. It parks while none is queued.
+    fn serve_receives(shared: &Shared, bound: &Bound) {
+        let clock = Monotonic::new();
         loop {
-            let what = "a datagram for an Effect::RecvFrom";
-            let local = bound.local;
-            match wait_for(what, bound.socket.as_fd(), libc::POLLIN, Some(&bound.stop), shared) {
-                Woke::Ready => {}
-                Woke::Stopped => {
-                    return Done::unread(
-                        into,
-                        format_args!("receiving on {local}: unbound with the receive in flight"),
-                    );
-                }
-                Woke::Failed(error) => {
-                    return Done::unread(into, format_args!("receiving on {local}: {error}"));
-                }
+            while let Some(Receive { tag, into, slots }) = bound.receives.pop() {
+                let done = match bound.unbound.load(Ordering::Acquire) {
+                    true => bound.failed(into, true, None, None, "unbound with the receive in flight"),
+                    false => receive(shared, bound, into, slots),
+                };
+                shared.sink.tell(Completion { tag, done });
             }
-            into.clear();
-            // alloc: none once the asker's buffer has grown to a datagram's most.
-            into.resize(DATAGRAM_MOST, 0);
-            match bound.socket.recv_from(&mut into) {
-                Ok((n, from)) => {
-                    into.truncate(n);
-                    return Done::Datagram { from, bytes: into };
+            if bound.unbound.load(Ordering::Acquire) {
+                // A receive pushed between the pop above and the flag is answered, not lost.
+                if bound.receives.is_empty() {
+                    return;
                 }
+                continue;
+            }
+            let what = "the next Effect::RecvFrom of a UDP socket";
+            if let Err(error) = bound.parker.park(what, None, &clock) {
+                while let Some(Receive { tag, into, .. }) = bound.receives.pop() {
+                    let done = bound.failed(into, true, None, None, format_args!("{error}"));
+                    shared.sink.tell(Completion { tag, done });
+                }
+                return;
+            }
+        }
+    }
+
+    /// One receive: a wait until the socket is readable (or unbound, or the host ends), then
+    /// one call that takes what is there. A wake with nothing there (another reader of the
+    /// socket's, or a spurious one) waits again; each wait is unbounded in time, as the
+    /// effect waits as long as nothing comes, and ends with the socket's unbind.
+    fn receive(shared: &Shared, bound: &Bound, mut into: Batch, slots: Slots) -> Done {
+        loop {
+            match udp::recv(&bound.socket, &mut into, slots) {
+                Ok(_) => return Done::Datagrams(into),
                 Err(error)
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    into.clear();
+                    ) => {}
+                Err(error) => {
+                    return bound.failed(into, true, None, Some(&error), error.to_string());
+                }
+            }
+            let what = "a datagram for an Effect::RecvFrom";
+            match wait_for(what, bound.socket.as_fd(), libc::POLLIN, Some(&bound.stop), shared) {
+                Woke::Ready => {}
+                Woke::Stopped => {
+                    return bound.failed(into, true, None, None, "unbound with the receive in flight");
+                }
+                Woke::Failed(error) => {
+                    return bound.failed(into, true, None, Some(&error), error.to_string());
+                }
+            }
+        }
+    }
+
+    /// `name`'s addresses by `getaddrinfo`, on a thread of their own, waited for until
+    /// [`dgram::RESOLVE_WAIT`].
+    fn resolve_by(name: String, port: u16) -> Done {
+        struct Answer {
+            got: Lock<Option<io::Result<Vec<SocketAddr>>>>,
+            parker: Parker,
+        }
+        let answer = Arc::new_in(
+            Answer { got: Lock::new("core.host.resolve_answer", None), parker: Parker::new() },
+            Global,
+        );
+        // clone: a count, for the thread that calls getaddrinfo.
+        let theirs = Arc::clone(&answer);
+        // clone: the name, for that thread; this one names it in the answer.
+        let asked = name.clone();
+        let started = spawn("blaze-host-getaddrinfo", move || {
+            let got = (asked.as_str(), port).to_socket_addrs().map(|found| {
+                let mut addresses = Vec::new_in(Global);
+                addresses.extend(found);
+                addresses
+            });
+            *theirs.got.lock() = Some(got);
+            theirs.parker.unpark();
+        });
+        if let Err(error) = started {
+            let why = format!("starting its thread: {error}");
+            return Done::Unresolved(dgram::Unresolved { name, port, why });
+        }
+        let clock = Monotonic::new();
+        let deadline = Deadline::after(wait::Clock::now(&clock), dgram::RESOLVE_WAIT);
+        // Each park ends with the answer, a spurious wake (parked again) or the deadline, so
+        // this ends by the deadline.
+        loop {
+            if let Some(got) = answer.got.lock().take() {
+                return match got {
+                    Ok(addresses) if addresses.is_empty() => Done::Unresolved(dgram::Unresolved {
+                        name,
+                        port,
+                        why: "the system resolver gave no address".to_owned(),
+                    }),
+                    Ok(addresses) => Done::Resolved(addresses),
+                    Err(error) => Done::Unresolved(dgram::Unresolved {
+                        name,
+                        port,
+                        why: error.to_string(),
+                    }),
+                };
+            }
+            let what = "getaddrinfo's answer for an Effect::Resolve";
+            match answer.parker.park(what, Some(deadline), &clock) {
+                Ok(Waited::Ready(())) => {}
+                Ok(Waited::Deadline) => {
+                    let why = format!(
+                        "the system resolver gave no answer in RESOLVE_WAIT, {:?}",
+                        dgram::RESOLVE_WAIT
+                    );
+                    return Done::Unresolved(dgram::Unresolved { name, port, why });
                 }
                 Err(error) => {
-                    into.clear();
-                    return Done::unread(into, format_args!("receiving on {local}: {error}"));
+                    let why = error.to_string();
+                    return Done::Unresolved(dgram::Unresolved { name, port, why });
                 }
             }
         }

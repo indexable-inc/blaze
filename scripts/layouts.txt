@@ -208,7 +208,7 @@ crates/hir-ty-codegen/v2/report.rs	VERSION	none
 crates/hir-ty-codegen/v2/roots/kept/frozen.rs	MAGIC	none
 crates/hir-ty-codegen/v2/shape.rs	VERSION	none
 crates/hir-ty-codegen/v2/side.rs	VERSION	none
-crates/hir-ty-lean/src/driver.rs	LEAN_VERSION	not persisted: the Lean release pinned
+crates/hir-ty-lean/src/plan.rs	LEAN_VERSION	not persisted: the Lean release pinned
 crates/hir-ty-mir/src/mir/eval/shim/thread.rs	ATTR_MAGIC	not persisted: a word in an interpreted program's memory
 crates/hir-ty-mir/src/mir/eval/shim/thread.rs	SEMAPHORE_MAGIC	not persisted: a word in an interpreted program's memory
 crates/hir-ty-ub/src/borrows/diagnostics.rs	DEFAULT_FORMATTER	not persisted: a display setting

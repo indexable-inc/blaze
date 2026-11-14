@@ -444,7 +444,8 @@ fn alt_versions(registry: &impl Registry, dep: &Dependency) -> Option<CargoResul
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
-    let candidates = match crate::poll::block_on(registry.query_vec(&wild_dep, QueryKind::Exact)) {
+    let what = "the registry's every version of a dependency, for an error's hint (bounded by the HTTP client's timeouts)";
+    let candidates = match crate::poll::answer(what, registry.query_vec(&wild_dep, QueryKind::Exact)) {
         Ok(candidates) => candidates,
         Err(e) => return Some(Err(e)),
     };
@@ -464,8 +465,9 @@ fn rejected_versions(
     registry: &impl Registry,
     dep: &Dependency,
 ) -> Option<CargoResult<Vec<IndexSummary>>> {
+    let what = "the registry's rejected versions of a dependency, for an error's hint (bounded by the HTTP client's timeouts)";
     let mut version_candidates =
-        match crate::poll::block_on(registry.query_vec(dep, QueryKind::RejectedVersions)) {
+        match crate::poll::answer(what, registry.query_vec(dep, QueryKind::RejectedVersions)) {
             Ok(candidates) => candidates,
             Err(e) => return Some(Err(e)),
         };
@@ -483,8 +485,9 @@ fn alt_names(
     let mut wild_dep = dep.clone();
     wild_dep.set_version_req(OptVersionReq::Any);
 
+    let what = "the registry's names near a dependency's, for an error's hint (bounded by the HTTP client's timeouts)";
     let name_candidates =
-        match crate::poll::block_on(registry.query_vec(&wild_dep, QueryKind::AlternativeNames)) {
+        match crate::poll::answer(what, registry.query_vec(&wild_dep, QueryKind::AlternativeNames)) {
             Ok(candidates) => candidates,
             Err(e) => return Some(Err(e)),
         };

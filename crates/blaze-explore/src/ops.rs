@@ -1,7 +1,7 @@
 //! The answer to each op of the `blaze` layer (`hello` is the session's,
 //! `ix_prof::explore::session`), with no transport in it: a header and at most one table.
 //! Everything here may wait (DuckDB runs as a process), so the
-//! server calls it on tokio's blocking pool.
+//! server calls it as a job on a thread of its own, off its loop (`ix_prof::explore::serving`).
 
 use std::{fmt, path::PathBuf, sync::Arc, time::Instant};
 

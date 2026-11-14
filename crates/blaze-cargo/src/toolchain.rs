@@ -161,42 +161,45 @@ pub fn sysroot() -> Option<&'static Path> {
     FOUND.get().map(PathBuf::as_path)
 }
 
-/// `file` under `base` (an address ending in `/`) from byte `offset` on, through blaze-registry's
-/// HTTP client; `None` when the server has no such file. A server that ignores the range sends
-/// the whole file, of which what is had is left out.
-async fn read_from(
-    http: &HyperHttp,
-    base: &url::Url,
-    file: &str,
-    offset: u64,
-) -> anyhow::Result<Option<Vec<u8>>> {
+/// `file` under `base` (an address ending in `/`), whole, through blaze-registry's HTTP client:
+/// asked once (rule no-fallback: no retry), in parallel ranges said in blaze-fetch's downloads
+/// (the status line, `blaze status`, the build's stall bound) and stopped after its stall bound
+/// without a byte. Any failure, a server with no such file among them, is the error, its
+/// context the file and its address ([`DownloadFailed`]).
+fn download_whole(http: &HyperHttp, base: &url::Url, file: &str) -> anyhow::Result<Vec<u8>> {
     let url = base.join(file)?;
-    // In parallel ranges, said in blaze-fetch's downloads (the status line, `blaze status`, the
-    // build's stall bound) and stopped after its stall bound without a byte.
-    let response = http.get_from_async(url.as_str(), &[], offset, file).await?;
-    match response.status {
-        404 | 410 => Ok(None),
-        200 | 206 => Ok(Some(response.body)),
-        _ => Err(HttpNotSuccessful::new(url.as_str(), &response).into()),
+    let got = (|| -> anyhow::Result<Vec<u8>> {
+        // No bound of its own: every wait of the request is bounded by the client's deadlines
+        // (its timeout and the stall bound), as the wait's name says.
+        let what = "a download of blaze's files (bounded by the HTTP client's timeout and stall bound)";
+        let response = blaze_core::wait::block_on(what, None, http.get_from_async(url.as_str(), &[], 0, file))??;
+        match response.status {
+            200 | 206 => Ok(response.body),
+            404 | 410 => anyhow::bail!("{url} answered {}: the server has no such file", response.status),
+            _ => Err(HttpNotSuccessful::new(url.as_str(), &response).into()),
+        }
+    })();
+    got.map_err(|e| e.context(DownloadFailed::of(file, url.to_string())))
+}
+
+/// A download of one of blaze's files that failed. It was asked for once (rule no-fallback:
+/// blaze tries nothing again); the error it is the context of is what failed.
+#[derive(Debug)]
+struct DownloadFailed {
+    file: String,
+    /// Its address, or its path in a directory that has the files.
+    from: String,
+}
+
+impl DownloadFailed {
+    fn of(file: &str, from: String) -> DownloadFailed {
+        DownloadFailed { file: file.to_owned(), from }
     }
 }
 
-/// A runtime for a download's own waits, on this thread: the requests run on the HTTP client's.
-fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
-    Ok(tokio::runtime::Builder::new_current_thread().enable_all().build()?)
-}
-
-/// A download that failed every time it was tried; the error it is the context of is the last
-/// failure.
-#[derive(Debug)]
-struct GaveUp {
-    file: String,
-    tries: u32,
-}
-
-impl std::fmt::Display for GaveUp {
+impl std::fmt::Display for DownloadFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: the download gave up after {} tries", self.file, self.tries)
+        write!(f, "downloading {} from {}", self.file, self.from)
     }
 }
 
@@ -225,7 +228,7 @@ fn given_var(name: &'static str) -> Result<Option<String>, NotUtf8Var> {
     }
 }
 
-/// `address` as the base [`read_from`] joins file names to.
+/// `address` as the base a download joins file names to ([`download_whole`]).
 fn base(address: &str) -> anyhow::Result<url::Url> {
     Ok(url::Url::parse(&format!("{}/", address.trim_end_matches('/')))?)
 }
@@ -282,15 +285,76 @@ mod tests {
         semver::Version::parse(ours_release()).expect("a release is a version");
     }
 
+    /// A server on a local port that answers every request with a 500 and closes the
+    /// connection: its address (ending in `/`) and the path of each request it was asked, in
+    /// the order it was asked. It takes at most `most` connections, each on a thread of its own.
+    pub(super) fn failing_server(
+        most: usize,
+    ) -> (String, std::sync::Arc<blaze_core::lock::Lock<Vec<String>>, std::alloc::Global>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new_in(
+            blaze_core::lock::Lock::new("test.toolchain.asked", Vec::new()),
+            std::alloc::Global,
+        );
+        let told = std::sync::Arc::clone(&asked);
+        std::thread::Builder::new()
+            .name("test: a server that answers 500".to_owned())
+            .spawn(move || {
+                for _ in 0..most {
+                    let Ok((mut stream, _)) = listener.accept() else { return };
+                    let told = std::sync::Arc::clone(&told);
+                    std::thread::Builder::new()
+                        .name("test: one connection of a server that answers 500".to_owned())
+                        .spawn(move || {
+                            // The request's head, at most 64 KiB of it.
+                            let (mut head, mut piece) = (Vec::new(), [0u8; 4096]);
+                            while !head.windows(4).any(|it| it == b"\r\n\r\n") && head.len() < 64 << 10 {
+                                match stream.read(&mut piece) {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => head.extend_from_slice(&piece[..n]),
+                                }
+                            }
+                            let line = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_owned();
+                            told.lock().push(line.split(' ').nth(1).unwrap_or("").to_owned());
+                            _ = stream.write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
+                            );
+                        })
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        (address, asked)
+    }
+
+    /// The invariant (rule no-fallback): a download that fails is asked once, and its error
+    /// names the file and its address. The control: the server saw that one request.
     #[test]
-    fn a_download_that_gave_up_says_how_often_it_tried_and_why() {
-        let error = anyhow::anyhow!("connection reset")
-            .context(GaveUp { file: "library-ab.tar.xz".to_owned(), tries: 4 });
+    fn a_failed_download_is_asked_once_and_names_its_address() {
+        let (address, asked) = failing_server(8);
+        let http = HyperHttp::new(std::time::Duration::from_secs(10)).unwrap();
+        let said = download_whole(&http, &base(&address).unwrap(), "library-ab.tar.xz").unwrap_err();
+        let said = format!("{said:#}");
+        let url = format!("{address}library-ab.tar.xz");
+        assert!(said.starts_with(&format!("downloading library-ab.tar.xz from {url}: ")), "{said}");
+        assert!(said.contains("got 500"), "{said}");
+        assert_eq!(*asked.lock(), ["/library-ab.tar.xz"], "one request, and no other");
+    }
+
+    #[test]
+    fn a_download_that_failed_names_its_file_and_address_and_a_variable_its_name() {
+        let error = anyhow::anyhow!("connection reset").context(DownloadFailed::of(
+            "library-ab.tar.xz",
+            "https://example.com/library-ab.tar.xz".to_owned(),
+        ));
         assert_eq!(
             format!("{error:#}"),
-            "library-ab.tar.xz: the download gave up after 4 tries: connection reset"
+            "downloading library-ab.tar.xz from https://example.com/library-ab.tar.xz: connection reset"
         );
-        assert!(error.downcast_ref::<GaveUp>().is_some_and(|it| it.tries == 4));
+        assert!(error.downcast_ref::<DownloadFailed>().is_some_and(|it| it.file == "library-ab.tar.xz"));
         assert_eq!(
             NotUtf8Var("BLAZE_RUST_DIST").to_string(),
             "`BLAZE_RUST_DIST` is not UTF-8, and blaze reads the address or directory it names as text"

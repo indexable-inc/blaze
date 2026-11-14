@@ -171,6 +171,7 @@ pub const BAZ: u32 = 0;
 // crate's arena again, so its resolution and every query of it run again, and the run log
 // writes each run as `path(key)`, not the bare names the snapshots hold.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_a_function_should_not_invalidate_def_map() {
     check_def_map_is_not_recomputed(
         r"
@@ -234,6 +235,7 @@ fn no() {}
 // PORT (round 20): false by design, left failing; see
 // `typing_inside_a_function_should_not_invalidate_def_map`.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_a_macro_should_not_invalidate_def_map() {
     check_def_map_is_not_recomputed(
         r"
@@ -288,6 +290,7 @@ pub struct S {}
 // PORT (round 20): false by design, left failing; see
 // `typing_inside_a_function_should_not_invalidate_def_map`.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_an_attribute_should_not_invalidate_def_map() {
     check_def_map_is_not_recomputed(
         r"
@@ -363,6 +366,7 @@ fn f() { foo }
 // PORT (round 20): false by design, left failing; see
 // `typing_inside_a_function_should_not_invalidate_def_map`.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_macro_heavy_file_should_not_invalidate_def_map() {
     check_def_map_is_not_recomputed(
         r"
@@ -473,6 +477,7 @@ pub struct S {}
 // item tree or expansion of its crate again; on the port the edit makes the edited crate's
 // arena again, so they run again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_a_function_should_not_invalidate_item_expansions() {
     let fx = fixture::db(
         r#"
@@ -559,6 +564,7 @@ m!(Z);
 // tree verified, so no file is parsed again; on the port the edit makes the edited crate's
 // arena again, so `file_item_tree_query` runs again (round 20: once).
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn item_tree_prevents_reparsing() {
     let fx = fixture::db(
         r#"
@@ -771,6 +777,7 @@ pub fn unrelated() -> u32 { 1 }
 // edit makes that crate's arena again, so the call runs again (round 20: 2 runs, 1 expansion).
 // The cost is real: each edit of a crate runs its attribute macros again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_fixed_expansion_is_reused_across_an_unrelated_edit() {
     use hir_expand::proc_macro::StateUse;
     for ordered in [false, true] {

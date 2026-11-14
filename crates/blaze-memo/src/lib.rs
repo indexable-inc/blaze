@@ -11,15 +11,18 @@
 //! - **Arenas.** One per crate, at index `1 +` its topological position (dependencies first),
 //!   and the session's (index [`ArenaId::SESSION_INDEX`], 0) for what names no crate: a
 //!   snapshot's own is [`Memo::session`], at the generation that snapshot holds, and no
-//!   constant names one (a commit that drops the session makes it again at the next
-//!   generation, so a constant would name a dead arena from then on). Every entry,
+//!   constant names one (a commit that drops the session, or a new session, makes it again
+//!   at the next generation, so a constant would name a dead arena from then on). Every entry,
 //!   trie node, read list and interned value of an arena is bump-allocated in its
 //!   [`blaze_mem::Arena`] and freed with it.
 //! - **Ids** are process-local `(arena, local)` pairs ([`Gid`]): the arena's index and the
 //!   generation of its making, and an index into its column. Never persisted (a persisted
-//!   word holds a stable id); an id of a dropped arena is dead and refused by name. Each index
-//!   has [`MAX_GENERATION`]` + 1` makings in a session; a drop past the last is a typed
-//!   refusal ([`NextRefused::GenerationsSpent`]), never a reused generation.
+//!   word holds a stable id); an id of a dropped arena is dead and refused by name. A
+//!   database's sessions share one id space ([`Memo::next_session`]), in which an id is handed
+//!   out once: it names one making for ever, so a cache outside the memo keyed by (id space,
+//!   id) is never answered by another making's memory. Each index has [`MAX_GENERATION`]` + 1`
+//!   makings in an id space; one past the last is a typed refusal
+//!   ([`NextRefused::GenerationsSpent`]), never a reused generation.
 //! - **A key's home** ([`Home`]) is the greatest arena among the ids it holds, the session's
 //!   when it holds none: one key has one entry in a snapshot.
 //! - **Borrows are declared.** The driver names what each arena may read
@@ -60,10 +63,11 @@
 //!   head to a fixpoint (`MAX_ROUNDS`, then a panic naming it); a query with neither panics
 //!   naming the cycle's path.
 //! - **The read recorder** ([`record`]) is off unless the snapshot was made with
-//!   [`Reads::Kept`]: then each entry keeps the sorted, deduplicated list of [`Read`] rows its
-//!   run read, directly or through anything it called, and a hit replays the entry's list into
-//!   the asker, so a list is exactly what the result depends on whether it was computed or
-//!   found. A fact boundary ([`Builder::mark_boundary`]) is listed in its asker as one
+//!   [`Reads::Kept`]: then each entry keeps what its run read directly (its input rows and
+//!   the entries it asked), and an ask, hit or run, adds one row naming the entry to its
+//!   asker; the flat list of [`Read`] rows a result depends on, through everything it called,
+//!   is made when asked for ([`record`], an image record), once per entry, so it is the same
+//!   whether the result was computed or found. A fact boundary ([`Builder::mark_boundary`]) is listed in its asker as one
 //!   [`Read::Query`] row, its own list kept behind (the firewall). [`unrecorded`] runs
 //!   bookkeeping whose reads are no part of the running query's value.
 //!
@@ -128,10 +132,11 @@ pub trait Database: Send + Sync {
 const GENERATION_BITS: u32 = 12;
 const GENERATION_MASK: u32 = (1 << GENERATION_BITS) - 1;
 
-/// The last generation an arena index has in a session: its making after this one would take
-/// a generation the bits cannot hold, so [`Memo::next`] refuses to drop an arena at it
-/// ([`NextRefused::GenerationsSpent`]). One below the mask: no arena's bits are all ones, which
-/// is [`ArenaId`]'s niche.
+/// The last generation an arena index has in an id space (every session of one database): its
+/// making after this one would take a generation the bits cannot hold, so [`Memo::next`]
+/// refuses to drop an arena at it and [`Memo::next_session`] a session that would make it
+/// again ([`NextRefused::GenerationsSpent`]). One below the mask: no arena's bits are all
+/// ones, which is [`ArenaId`]'s niche.
 pub const MAX_GENERATION: u32 = GENERATION_MASK - 1;
 
 /// The most arena indices a session has: the index's bits.
@@ -139,6 +144,14 @@ pub const MAX_ARENAS: u32 = 1 << (32 - GENERATION_BITS);
 
 /// An arena of a session: its index (the driver's, a crate's surface or bodies, ordered so a
 /// crate comes after its dependencies) and the generation of its making.
+///
+/// The invariant: within one id space (every snapshot of every session of one database:
+/// [`Memo::next`] carries it, [`Memo::next_session`] takes it over; only [`Memo::builder`]
+/// makes a new one) an `ArenaId` is handed out once, so it names one making of an arena for
+/// ever: once that arena is dropped no later arena has its id, and an id equal to a live
+/// arena's is that arena. A cache outside the memo may key by it (with the id space's
+/// identity, base-db's database nonce) and judge an entry live by the id alone. Another id
+/// space hands out the same ids again.
 ///
 /// Ordered by index first, so the [`Home`] of a key is the most downstream arena it names.
 ///
@@ -304,14 +317,14 @@ impl Gid {
     }
 
     /// This id's bits, for an in-process table keyed by ids (a hash, a dense map of one
-    /// session). Not a persisted id: the bits name an arena generation of this session and
-    /// mean nothing in another process or after the arena is remade. The store never files
-    /// them; persist stable ids (fact ids) instead.
+    /// database). Not a persisted id: the bits name an arena generation of this id space
+    /// ([`ArenaId`]'s invariant) and mean nothing in another process or another id space. The
+    /// store never files them; persist stable ids (fact ids) instead.
     pub const fn session_bits(self) -> u64 {
         ((self.arena.bits() as u64) << 32) | self.local.get() as u64
     }
 
-    /// The id whose [`Gid::session_bits`] are `bits`, in this session; `None` for bits no id
+    /// The id whose [`Gid::session_bits`] are `bits`, in this id space; `None` for bits no id
     /// has (a zero local, or an all-ones arena half).
     pub const fn from_session_bits(bits: u64) -> Option<Gid> {
         match NonZeroU32::new(bits as u32) {
@@ -458,7 +471,7 @@ impl fmt::Display for Cancelled {
 /// What generated code reaches the memo by; not for hand-written code.
 #[doc(hidden)]
 pub mod plumbing {
-    pub use crate::attach::{Bounded, attached_input, attached_interned};
+    pub use crate::attach::{Bounded, attached_interned};
     pub use crate::fetch::{Query, Recovery, fetch};
     pub use crate::home::{Home, Homes};
     pub use crate::image::{Imaged, Stable, StableKey};

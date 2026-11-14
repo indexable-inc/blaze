@@ -4,8 +4,7 @@
 //! The planted bug (`Store::plant_clear_then_clone`) restores the old order (remove `to`, then
 //! clone onto it), which loses to the other place's clone landing in between (`File exists`).
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config as SimConfig, Tape};
 
 use super::*;
 
@@ -130,28 +129,25 @@ fn race(case: Race, plant: bool) -> Result<(), String> {
     }
 }
 
-#[hegel::composite]
-fn race_draw(tc: &TestCase) -> Race {
-    let shape = [Shape::Output, Shape::External, Shape::Written]
-        [usize::from(tc.draw(gs::integers::<u8>().max_value(2)))];
-    let before = [Before::Nothing, Before::Other, Before::Same]
-        [usize::from(tc.draw(gs::integers::<u8>().max_value(2)))];
+fn race_draw(tape: &Tape) -> Race {
+    let shape = [Shape::Output, Shape::External, Shape::Written][usize::from(tape.int_in(0..=2u8, "shape"))];
+    let before = [Before::Nothing, Before::Other, Before::Same][usize::from(tape.int_in(0..=2u8, "before"))];
     Race {
-        seed: tc.draw(gs::integers()),
-        latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
+        seed: tape.next_u64("sim seed"),
+        latency_us: tape.int_in(1..=2000u64, "latency us"),
         shape,
         before,
-        first: usize::from(tc.draw(gs::integers::<u8>().max_value(1))),
-        lead: tc.draw(gs::integers().max_value(12)),
+        first: usize::from(tape.int_in(0..=1u8, "first")),
+        lead: tape.int_in(0..=12u32, "lead"),
     }
 }
 
 /// The invariant: any schedule of two stores placing the same value at one shared path ends with
-/// both Ok and the path holding the value. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// both Ok and the path holding the value. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
-    super::model_check::run_cases(64, |tc| {
-        let case = tc.draw(race_draw());
+    blaze_sim::check(SimConfig::cases(64), |tape| {
+        let case = race_draw(tape);
         if let Err(why) = race(case, false) {
             panic!("{case:?}: {why}");
         }
@@ -159,29 +155,20 @@ fn two_stores_placing_one_value_at_one_path_both_succeed_in_any_order() {
 }
 
 /// The planted-bug control: with the old remove-then-clone-onto-`to` order switched back on,
-/// the same oracle fails under some schedule of the same draws, with the error seen live.
+/// the same oracle fails under some schedule of the same draws, with the error seen live. Its
+/// cases are the 512 races it searched by hand before (64 seeds, two shapes, four leads).
 #[test]
 fn the_oracle_catches_a_remove_then_clone_onto_the_path() {
-    let mut caught = None;
-    'search: for seed in 0..64 {
-        for shape in [Shape::Output, Shape::External] {
-            for lead in [0, 1, 2, 4] {
-                let it = Race {
-                    seed,
-                    latency_us: 200,
-                    shape,
-                    before: Before::Nothing,
-                    first: (seed % 2) as usize,
-                    lead,
-                };
-                assert_eq!(race(it, false), Ok(()), "{it:?}: the fixed store must pass");
-                if let Err(why) = race(it, true) {
-                    caught = Some((it, why));
-                    break 'search;
-                }
-            }
-        }
-    }
-    let (it, why) = caught.expect("the oracle missed the planted remove-then-clone race");
-    assert!(why.contains("already there"), "{it:?}: caught, but not as the race: {why}");
+    blaze_sim::control(SimConfig::cases(512), false, true, "already there", |tape, plant| {
+        let seed = tape.next_u64("sim seed");
+        let it = Race {
+            seed,
+            latency_us: 200,
+            shape: *tape.one_of(&[Shape::Output, Shape::External], "shape"),
+            before: Before::Nothing,
+            first: (seed % 2) as usize,
+            lead: *tape.one_of(&[0, 1, 2, 4], "lead"),
+        };
+        race(it, plant).map_err(|why| Broke::Oracle(format!("{it:?}: {why}")))
+    });
 }

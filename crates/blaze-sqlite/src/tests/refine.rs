@@ -14,15 +14,14 @@
 //! minus an infinity into a null, which no description of the subset can say.
 
 use std::alloc::Global;
-use std::cell::Cell;
 use std::fmt::{self, Write as _};
+use std::ops::RangeInclusive;
 
 use blaze_sql::Checked;
 use blaze_sql::desc::{ResultCol, Returns, Slot, Storage, Ty, ValueRef};
 use blaze_sql::infer::Plant;
 use blaze_sql::schema::{Column, Schema, Table};
-use hegel::generators as gs;
-use hegel::{HealthCheck, Hegel, Settings, TestCase};
+use blaze_sim::{Broke, Config, Tape};
 
 use crate::{Connection, Statement, Step};
 
@@ -58,7 +57,7 @@ const MAX_STEPS: u32 = 4096;
 /// How deep a result or filter expression nests.
 const MAX_DEPTH: u32 = 2;
 
-const CONTROL_CASES: u64 = 40;
+const CONTROL_CASES: u32 = 40;
 
 /// What a run generates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +119,7 @@ struct ColRef {
 /// The statement generator: one test case's choices, and counters for the parameters and
 /// aliases of the statement being written.
 struct Gen<'t> {
-    tc: &'t TestCase,
+    tape: &'t Tape,
     params: u32,
     aliases: u32,
 }
@@ -129,11 +128,11 @@ impl Gen<'_> {
     /// A number in `0..n`; `n` is at least 1.
     fn below(&self, n: usize) -> usize {
         assert!(n > 0, "a choice among no options");
-        self.tc.draw_silent(gs::integers::<usize>().max_value(n - 1))
+        self.tape.index(n, "below")
     }
 
     fn chance(&self, p: f64) -> bool {
-        self.tc.draw_silent(gs::weighted_booleans(p))
+        self.tape.chance(p, "chance")
     }
 
     fn storage(&self) -> Storage {
@@ -210,20 +209,20 @@ impl Gen<'_> {
         match storage {
             Storage::Boolean => (if self.chance(0.5) { "true" } else { "false" }).to_owned(),
             Storage::Integer => {
-                let value = self.tc.draw_silent(gs::integers::<u32>().max_value(1000));
+                let value = self.tape.int_in(0..=1000u32, "integer literal");
                 if self.chance(0.2) { format!("(-{value})") } else { format!("{value}") }
             }
             Storage::Real => {
-                let eighths = self.tc.draw_silent(gs::integers::<u32>().max_value(8000));
+                let eighths = self.tape.int_in(0..=8000u32, "real literal");
                 let value = f64::from(eighths) / 8.0;
                 if self.chance(0.2) { format!("(-{value:?})") } else { format!("{value:?}") }
             }
             Storage::Text => {
-                let text = self.tc.draw_silent(gs::text().max_size(4).exclude_characters("\0"));
+                let text = text_without_nul(self.tape, 0..=4, "text literal");
                 format!("'{}'", text.replace('\'', "''"))
             }
             Storage::Blob => {
-                let bytes = self.tc.draw_silent(gs::binary().max_size(4));
+                let bytes = self.tape.bytes(0..=4, "blob literal");
                 let mut out = String::from("x'");
                 for byte in bytes {
                     let _ = write!(out, "{byte:02x}");
@@ -775,8 +774,23 @@ fn sql_type(storage: Storage) -> &'static str {
     }
 }
 
-fn draw_case(tc: &TestCase, shape: Shape) -> Case {
-    let mut g = Gen { tc, params: 0, aliases: 0 };
+/// `sizes` characters of `Tape::char`, none of them NUL: a NUL drawn is redrawn, in its own
+/// span, at most eight times before the case is discarded.
+fn text_without_nul(tape: &Tape, sizes: RangeInclusive<usize>, label: &'static str) -> String {
+    let characters = tape.vec(sizes, label, |tape| {
+        for _ in 0..8 {
+            match tape.char(label) {
+                '\0' => {}
+                character => return character,
+            }
+        }
+        tape.discard()
+    });
+    characters.into_iter().collect()
+}
+
+fn draw_case(tape: &Tape, shape: Shape) -> Case {
+    let mut g = Gen { tape, params: 0, aliases: 0 };
     let table_count = match shape {
         Shape::Any => 1 + g.below(3),
         Shape::LeftJoinUnmatched => 2 + g.below(2),
@@ -894,23 +908,23 @@ enum Want {
 /// The values a run binds: drawn from the test case and logged, or replayed from a log, so a
 /// second run of one case (the control's planted one) binds what the first bound.
 struct Values<'t> {
-    tc: Option<&'t TestCase>,
+    tape: Option<&'t Tape>,
     log: Vec<(Want, Owned)>,
     at: usize,
 }
 
 impl<'t> Values<'t> {
-    fn drawing(tc: &'t TestCase) -> Values<'t> {
-        Values { tc: Some(tc), log: Vec::new(), at: 0 }
+    fn drawing(tape: &'t Tape) -> Values<'t> {
+        Values { tape: Some(tape), log: Vec::new(), at: 0 }
     }
 
     fn replaying(self) -> Values<'static> {
-        Values { tc: None, log: self.log, at: 0 }
+        Values { tape: None, log: self.log, at: 0 }
     }
 
     fn next(&mut self, want: Want) -> Owned {
-        if let Some(tc) = self.tc {
-            let value = draw_wanted(tc, want);
+        if let Some(tape) = self.tape {
+            let value = draw_wanted(tape, want);
             self.log.push((want, value.clone()));
             return value;
         }
@@ -939,42 +953,35 @@ impl<'t> Values<'t> {
     }
 }
 
-fn draw_wanted(tc: &TestCase, want: Want) -> Owned {
+fn draw_wanted(tape: &Tape, want: Want) -> Owned {
     match want {
-        Want::ListLen => {
-            Owned::Integer(tc.draw_silent(gs::integers::<i64>().max_value(3).min_value(0)))
-        }
+        Want::ListLen => Owned::Integer(tape.int_in(0..=3i64, "list length")),
         Want::Value { storage, nullable } => {
-            if nullable && tc.draw_silent(gs::weighted_booleans(0.25)) {
+            if nullable && tape.chance(0.25, "null") {
                 return Owned::Null;
             }
             match storage {
-                Storage::Boolean => Owned::Boolean(tc.draw_silent(gs::booleans())),
+                Storage::Boolean => Owned::Boolean(tape.bool("boolean")),
                 Storage::Integer => {
                     // Mostly near the keys, so joins and equalities meet.
-                    if tc.draw_silent(gs::weighted_booleans(0.6)) {
-                        Owned::Integer(
-                            tc.draw_silent(gs::integers::<i64>().min_value(0).max_value(9)),
-                        )
+                    if tape.chance(0.6, "near a key") {
+                        Owned::Integer(tape.int_in(0..=9i64, "integer"))
                     } else {
-                        Owned::Integer(
-                            tc.draw_silent(gs::integers::<i64>().min_value(-1000).max_value(1000)),
-                        )
+                        Owned::Integer(tape.int_in(-1000..=1000i64, "integer"))
                     }
                 }
                 Storage::Real => {
-                    let eighths =
-                        tc.draw_silent(gs::integers::<i32>().min_value(-8000).max_value(8000));
+                    let eighths = tape.int_in(-8000..=8000i32, "real");
                     Owned::Real(f64::from(eighths) / 8.0)
                 }
                 Storage::Text => {
-                    if tc.draw_silent(gs::weighted_booleans(0.3)) {
-                        Owned::Text(tc.draw_silent(gs::sampled_from(&SHORT_TEXTS[..])).to_owned())
+                    if tape.chance(0.3, "short text") {
+                        Owned::Text((*tape.one_of(&SHORT_TEXTS, "short text")).to_owned())
                     } else {
-                        Owned::Text(tc.draw_silent(gs::text().max_size(4)))
+                        Owned::Text(tape.text(0..=4, "text"))
                     }
                 }
-                Storage::Blob => Owned::Blob(tc.draw_silent(gs::binary().max_size(4))),
+                Storage::Blob => Owned::Blob(tape.bytes(0..=4, "blob")),
             }
         }
     }
@@ -1261,49 +1268,47 @@ fn run_case(case: &Case, values: &mut Values<'_>, plant: Option<Plant>) -> Resul
 /// subset that the checker accepts, real SQLite prepares each statement as its description
 /// says (placeholders, result width and names), and every value of every row it returns is
 /// admitted by the description: null only where nullable, otherwise of the described storage.
-#[hegel::test(test_cases = 300, suppress_health_check = [HealthCheck::TooSlow])]
-fn every_row_sqlite_returns_is_admitted_by_the_description(tc: TestCase) {
-    let case = draw_case(&tc, Shape::Any);
-    let mut values = Values::drawing(&tc);
-    if let Err(failure) = run_case(&case, &mut values, None) {
-        panic!("{failure}\n  schema:{}", case.schema_text());
-    }
+#[test]
+fn every_row_sqlite_returns_is_admitted_by_the_description() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let case = draw_case(tape, Shape::Any);
+        let mut values = Values::drawing(tape);
+        run_case(&case, &mut values, None)
+            .map_err(|failure| format!("{failure}\n  schema:{}", case.schema_text()))
+    });
 }
 
 /// A checker that keeps a left join's right side non-null describes columns SQLite fills
 /// with null when the right side has no matching row; the oracle must see that within the
 /// case count. Each case runs honestly first (which must pass) and then planted, binding the
-/// same values.
+/// same values; a planted run refused by `column` or by this file's admission check is the
+/// catch, and one refused at any other stage is the harness's fault.
 #[test]
 fn the_oracle_catches_a_left_join_kept_non_null() {
-    let caught = Cell::new(0u64);
-    Hegel::new(|tc: TestCase| {
-        let case = draw_case(&tc, Shape::LeftJoinUnmatched);
-        let mut values = Values::drawing(&tc);
-        if let Err(failure) = run_case(&case, &mut values, None) {
-            panic!(
-                "the honest checker failed the control's case: {failure}\n  schema:{}",
-                case.schema_text()
-            );
-        }
-        let mut replay = values.replaying();
-        match run_case(&case, &mut replay, Some(Plant::LeftJoinKeepsNonNull)) {
-            Ok(()) => {}
-            Err(failure) if matches!(failure.stage, Stage::Column | Stage::Admit) => {
-                caught.set(caught.get() + 1);
+    blaze_sim::control(
+        Config::cases(CONTROL_CASES),
+        None,
+        Some(Plant::LeftJoinKeepsNonNull),
+        "",
+        |tape, plant| {
+            let case = draw_case(tape, Shape::LeftJoinUnmatched);
+            let mut values = Values::drawing(tape);
+            run_case(&case, &mut values, None).map_err(|failure| {
+                Broke::Harness(format!(
+                    "the honest checker failed the control's case: {failure}\n  schema:{}",
+                    case.schema_text()
+                ))
+            })?;
+            let mut replay = values.replaying();
+            match run_case(&case, &mut replay, plant) {
+                Ok(()) => Ok(()),
+                Err(failure) if matches!(failure.stage, Stage::Column | Stage::Admit) => {
+                    Err(Broke::Oracle(format!("{failure}\n  schema:{}", case.schema_text())))
+                }
+                Err(failure) => Err(Broke::Harness(format!(
+                    "the planted run failed for another reason: {failure}"
+                ))),
             }
-            Err(failure) => panic!("the planted run failed for another reason: {failure}"),
-        }
-    })
-    .settings(
-        Settings::new()
-            .test_cases(CONTROL_CASES)
-            .database(None)
-            .suppress_health_check([HealthCheck::TooSlow]),
-    )
-    .run();
-    assert!(
-        caught.get() > 0,
-        "the oracle let a left join's right side through as non-null in {CONTROL_CASES} cases"
+        },
     );
 }

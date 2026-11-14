@@ -83,7 +83,7 @@ const LEDGER: &str = "docs/v2/plan/objectives.json";
 const MANIFEST: &str = "lean/analysis/lake-manifest.json";
 /// A package's name, its directory, and the directories its modules are found under, in order.
 const PACKAGES: [(&str, &str, &[&str]); 2] =
-    [("core", "lean", &["lean", "crates/blaze-graph/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
+    [("core", "lean", &["lean", "crates/blaze-graph/lean", "crates/blaze-core/lean"]), ("analysis", "lean/analysis", &["lean/analysis"])];
 const SORRY: &str = "declaration uses 'sorry'";
 
 fn package_dir(package: &str) -> &'static str {

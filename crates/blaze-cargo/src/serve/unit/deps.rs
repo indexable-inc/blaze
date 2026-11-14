@@ -144,37 +144,37 @@ pub(crate) fn serve(
     session.lookups.checks.add(std::mem::take(&mut checks.lookups));
     served.map_err(|why| ApiError::new(why, None))?;
     let db = lowered.db();
-    let kept: Vec<Crate> = (0..job.graph.len())
-        .filter_map(|unit| job.crates.krate(db, unit))
-        .filter(|&krate| cache::image_key(db, krate).is_some())
-        .collect(); // alloc: once per serve, one entry per crate read from an image
-    // Each with its stable id and filed key.
-    let mut ided: Vec<(CrateKey, ContentId, Option<ContentId>), Global> =
-        Vec::with_capacity_in(kept.len(), Global);
-    ided.extend(kept.into_iter().map(|krate| {
-        let key = krate.key(lowered.db());
-        (key, lowered.stable_id(krate), checks.keys.get(&key).copied())
+    // Each crate of the job by key, with whether it is read from an image and the key its check
+    // results are filed under.
+    let mut keyed: Vec<(CrateKey, bool, Option<ContentId>), Global> = Vec::new_in(Global);
+    keyed.extend((0..job.graph.len()).filter_map(|unit| job.crates.krate(db, unit)).map(|krate| {
+        let key = krate.key(db);
+        (key, cache::image_key(db, krate).is_some(), checks.keys.get(&key).copied())
     }));
-    let fact = hir_ty::consteval::deps::kept_fact(mode, ided.iter().map(|&(_, id, key)| (id, key)));
-    let consts: HashMap<CrateKey, Option<ContentId>, Global> =
-        HashMap::from_iter_in(ided.into_iter().map(|(krate, _, key)| (krate, key)), Global);
-    // dyn: the constants' store keeps it for the database's life: the same `Arc` each build
-    let adapter: Arc<dyn ImageStore + Send + Sync> = session.images.clone(); // clone: an `Arc`, once per serve
-    // An input of the session arena, given each time base-db makes it; the same fact (mode,
-    // crates, keys) names it unchanged, and every constant's record reads as before. Its own
-    // commit, which moves nothing (and makes no snapshot) when that fact is given already.
+    use hir_ty::consteval::deps as consts;
+    // The store and the mode are the session's, given once with the database's other session
+    // makers before any query ran ([`makers`]), under a fact of the mode alone. Which crates are
+    // kept and under which key is each crate's own located gift (`consts::give_base`): its
+    // first gift marks no arena, and a key that moves for one crate drops that crate and its
+    // dependents, never the session (the measured drop of every arena when the cold build
+    // stored std's keys). Its own commit, which moves nothing (and makes no snapshot) when
+    // nothing moved.
     let mut edit = lowered.served_db().edit();
-    edit.set_given(
-        None,
-        fact,
-        Box::new_in(
-            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
-                // clone: an `Arc` and the crates' map, once per making of the session arena
-                hir_ty::consteval::deps::set(builder, fact, Arc::clone(&adapter), consts.clone(), mode);
-            },
-            Global,
-        ),
-    );
+    for (key, imaged, base) in keyed {
+        if !imaged {
+            // Not read from an image: its constants are not kept.
+            _ = consts::take_base(&mut edit, key);
+            continue;
+        }
+        match (consts::given_base(&edit, key), base) {
+            // Checked in this session (`None`), now filed under a key: its values are the ones
+            // it evaluated in memory, which it keeps, so its arena and its dependents' are
+            // kept rather than dropped for a key that serves the same values.
+            (Some(None), Some(_)) => {}
+            // Else the key as filed now; one equal to the held one marks nothing (its fact).
+            _ => consts::give_base(&mut edit, key, base),
+        }
+    }
     _ = edit.commit();
     stamp(lowered, build, session);
     Ok(())
@@ -1557,27 +1557,51 @@ struct Images {
 /// held every other asker. Here an ask is one lookup and, for a new key, one insert of bytes
 /// copied before it: no ask holds anything another waits for.
 ///
-/// A take lists the keys, removes each, and hands back the bytes sorted by key, so what the
+/// A take lists the keys, removes each, and hands back the bytes sorted by set and key, so what the
 /// store is given does not depend on which thread asked first (deterministic-output), where
 /// the list was in the order of the asks. An ask that races a take is in this take or the
 /// next; one made after its key was removed asks it into the next take again, with the same
 /// bytes, as a value asked for again before the store holds it always was ([`Images::ask`]).
 /// Taking moves no value out of the table (papaya lends its values): each is copied out once,
 /// by the take, outside any lock.
+///
+/// Each value is asked in a set (an entry's file set, `entries::Entries::put`; [`NO_SET`] for
+/// the rest), and a take sorts by set, then key: one file's entries lie side by side in the
+/// pack the store writes them to, so the front end's reads of them one by one, a build later,
+/// are one read of the bytes around the first (`blaze_cas::direct`'s docs, "Records beside each
+/// other") and the rest are taken from memory. The set orders and keys nothing: an entry is
+/// found by its key alone.
 #[derive(Default)]
 struct Asked {
-    by_key: SharedByHash<ContentId, Box<[u8]>>,
+    by_key: SharedByHash<ContentId, (ContentId, Box<[u8]>)>,
 }
 
+/// The set of a value asked in none ([`Asked::ask`]): the puts', ordered by key alone.
+const NO_SET: ContentId = ContentId([0; 32]);
+
 impl Asked {
-    /// Asks the next take for `value` under `key`: nothing when an ask since the last take
-    /// holds these bytes under it, an error naming the key and how the two differ when it
-    /// holds others (two values under one key: the key misses an input). A borrowed value's
-    /// bytes are copied only when the key is new.
+    /// [`Asked::ask_in`] in no set: the tests' ask of a value of no file.
+    #[cfg(test)]
     fn ask(&self, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+        self.ask_in(NO_SET, key, value)
+    }
+
+    /// Asks the next take for `value` under `key`, in `set`: nothing when an ask since the last
+    /// take holds these bytes under it, an error naming the key and how the two differ when it
+    /// holds others (two values under one key: the key misses an input). A borrowed value's
+    /// bytes are copied only when the key is new. One value asked in two sets is kept in the
+    /// lesser, so a take's order does not depend on which ask came first.
+    fn ask_in(&self, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
         let asked = self.by_key.pin();
-        if let Some(held) = asked.get(&key) {
-            return same(key, held, &value);
+        if let Some((held_set, held)) = asked.get(&key) {
+            same(key, held, &value)?;
+            if set < *held_set {
+                // Rare (one entry's bytes made under two files' sets): its bytes copied once
+                // more, as papaya replaces a value whole; `min` again inside, as another ask
+                // may lower it between the look and the update.
+                asked.update(key, |(was, bytes)| ((*was).min(set), Box::<[u8], Global>::clone(bytes)));
+            }
+            return Ok(());
         }
         let owned: Box<[u8]> = match value {
             // alloc: none, or a shrink of the value's own spare capacity
@@ -1586,27 +1610,37 @@ impl Asked {
             // which takes no lock
             std::borrow::Cow::Borrowed(it) => Box::from(it),
         };
-        match asked.try_insert(key, owned) {
+        match asked.try_insert(key, (set, owned)) {
             Ok(_) => Ok(()),
             // Another task asked it between the look and the insert.
-            Err(occupied) => same(key, occupied.current, &occupied.not_inserted),
+            Err(occupied) => {
+                same(key, &occupied.current.1, &occupied.not_inserted.1)?;
+                if set < occupied.current.0 {
+                    // As above: the set lowered, the bytes copied once more.
+                    asked.update(key, |(was, bytes)| ((*was).min(set), Box::<[u8], Global>::clone(bytes)));
+                }
+                Ok(())
+            }
         }
     }
 
-    /// What was asked since the last take, each key once, sorted by key.
+    /// What was asked since the last take, each key once, sorted by set, then key.
     fn take(&self) -> Vec<Put> {
         let asked = self.by_key.pin();
         // alloc: once a take, one key per value asked since the last
         let mut keys: Vec<ContentId> = asked.keys().copied().collect();
         keys.sort_unstable();
         keys.dedup();
-        keys.into_iter()
+        let mut taken: Vec<(ContentId, Put), Global> = keys
+            .into_iter()
             .filter_map(|key| {
-                let bytes = asked.remove(&key)?;
+                let (set, bytes) = asked.remove(&key)?;
                 // alloc: the value's bytes, until the loop writes them
-                Some(Put { key: Key(key), kind: Kind::Query, bytes: bytes.to_vec() })
+                Some((*set, Put { key: Key(key), kind: Kind::Query, bytes: bytes.to_vec() }))
             })
-            .collect() // alloc: as `keys`
+            .collect();
+        taken.sort_unstable_by_key(|(set, put)| (*set, put.key.0));
+        taken.into_iter().map(|(_, put)| put).collect() // alloc: as `keys`
     }
 }
 
@@ -1635,8 +1669,8 @@ impl Images {
         self.puts.take()
     }
 
-    /// The per-item entries it was asked to keep since the last take, sorted by key
-    /// ([`Asked::take`]).
+    /// The per-item entries it was asked to keep since the last take, sorted by set and key
+    /// ([`Asked::take`]): a file's together.
     fn take_entries(&self) -> Vec<Put> {
         self.entries.take()
     }
@@ -1649,11 +1683,11 @@ impl Images {
     /// A get does not read what was asked: a value is in the store once the loop put it, after
     /// the flush that asked. A flush that writes two values of one family of keys in turn (two
     /// shapes of one base key) keeps what it placed itself (`goal_store::slots`).
-    fn ask(&self, into: &Asked, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
+    fn ask(&self, into: &Asked, set: ContentId, key: ContentId, value: std::borrow::Cow<'_, [u8]>) -> Result<(), String> {
         if self.held(key, &value)? {
             return Ok(());
         }
-        into.ask(key, value)
+        into.ask_in(set, key, value)
     }
 
     /// Whether the store holds `value` under `key`: read into the task's frame (or mapped) and
@@ -1677,8 +1711,8 @@ impl Images {
 
 /// Per-item entries (`hir_def::nameres::frozen::entries`: a file's entry set, a macro
 /// definition's source and tokens) as plain values of the store, each under its own key as a
-/// query's record. `set` is not used: an entry is found by its key alone, so one whose set
-/// moved is found as before.
+/// query's record. An entry is found by its key alone, so one whose set moved is found as
+/// before; a put's `set` only orders the take, so a file's entries lie together on disk.
 ///
 /// As a get of an image, a get does not read the puts asked and not yet written: an entry
 /// asked twice before the store that writes it is made twice, to the same bytes
@@ -1704,35 +1738,67 @@ impl hir_def::nameres::frozen::entries::Entries for Images {
         })
     }
 
-    fn put(&self, _set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
-        self.ask(&self.entries, key, std::borrow::Cow::Borrowed(bytes))
+    fn put(&self, set: &ContentId, key: ContentId, bytes: &[u8]) -> Result<(), String> {
+        // In its set, so a file's entries lie together on disk ([`Asked`]).
+        self.ask(&self.entries, *set, key, std::borrow::Cow::Borrowed(bytes))
     }
 }
 
-/// Has `lowered`'s database keep and find its per-item entries in `session`'s store
-/// (`hir_def::nameres::frozen::entries::set`): once, for a database made freshly, before any
-/// crate of it is served. A write, as [`Lowered::ran`] is.
-pub(crate) fn entries(lowered: &mut Lowered, session: &Session) {
+/// Gives `lowered`'s database, made freshly, every maker of its session arena, in one edit and
+/// one commit, before any query of it runs: which front end computes its bodies' identities
+/// (`blaze_item_hash::identity::give_build`), where it keeps and finds its per-item entries
+/// (`hir_def::nameres::frozen::entries::set`) and its dependencies' constants' store and mode
+/// (`hir_ty::consteval::deps::set`), all of `session`, the mode read from the job's `env`.
+///
+/// Why one commit, first. A session maker marks the session arena, which every arena borrows,
+/// so each commit of one drops every arena made: round 27's cold build gave the three in three
+/// commits (after the first surfaces were given and queries had run), each dropping all 32.
+/// Known before any query runs, they are written before any: the one commit drops arenas that
+/// hold nothing. Each is a fact of the build or the mode alone, so a later serve that gave one
+/// again would move nothing; none does.
+pub(crate) fn makers(
+    lowered: &mut Lowered,
+    session: &mut Session,
+    env: &[(String, String)],
+) -> Result<(), ApiError> {
     use hir_def::nameres::frozen::entries;
+    use hir_ty::consteval::deps as consts;
+    let _span = tracing::info_span!(target: "blaze", "session makers given").entered();
+    let mode = mode_in(&mut session.env, env)?;
+    let build = front_end()?;
     // clone: an `Arc`, once per database; dyn: the database's one holder of entries
     let held: Arc<dyn entries::Entries> = session.images.clone();
+    // dyn: the constants' store keeps it for the database's life
+    let adapter: Arc<dyn ImageStore + Send + Sync> = session.images.clone(); // clone: an `Arc`, once per database
     // One holder a database, so one name for it: the session arena is made again with the
     // same fact, and nothing evaluated is dropped for it.
-    let fact = entries::store_fact(ContentId::of("blaze-cargo entry holder", b"session images"));
-    // An input of the session arena, given each time base-db makes that arena; one edit and
-    // its commit.
+    let held_fact = entries::store_fact(ContentId::of("blaze-cargo entry holder", b"session images"));
+    let consts_fact = consts::session_fact(mode);
     let mut edit = lowered.served_db().edit();
+    blaze_item_hash::identity::give_build(&mut edit, build);
     edit.set_given(
         None,
-        fact,
+        held_fact,
         Box::new_in(
             move |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
-                entries::set(inputs, fact, Arc::clone(&held));
+                entries::set(inputs, held_fact, Arc::clone(&held));
+            },
+            Global,
+        ),
+    );
+    edit.set_given(
+        None,
+        consts_fact,
+        Box::new_in(
+            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
+                // clone: an `Arc`, once per making of the session arena
+                consts::set(builder, consts_fact, Arc::clone(&adapter), mode);
             },
             Global,
         ),
     );
     _ = edit.commit();
+    Ok(())
 }
 
 /// An image of the store held past the read, with no page pool (`blaze_cas::direct`):
@@ -1889,7 +1955,7 @@ impl ImageStore for Images {
     }
 
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
-        self.ask(&self.puts, key, std::borrow::Cow::Owned(value))
+        self.ask(&self.puts, NO_SET, key, std::borrow::Cow::Owned(value))
     }
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {

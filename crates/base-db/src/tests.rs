@@ -24,9 +24,10 @@ use crate::{
     },
     target::{Arch, TargetData},
     db::{Committed, Edit},
-    world::CrateKey,
+    world::{CrateKey, Plant},
 };
 
+mod id_space;
 mod memo_properties;
 mod world_model;
 
@@ -269,9 +270,22 @@ fn a_dependencys_change_changes_its_dependents_ids() {
     assert_ne!(after.1, before.1);
     assert_ne!(after.0, before.0);
     assert_eq!(after.2, before.2);
-    assert_ne!(after.3, before.3);
+    // The list is of each crate's item key, which a crate's variables are not in: the session
+    // arena, which every arena borrows, stays (`world::List`).
+    assert_eq!(after.3, before.3, "a crate's variables moved the crate list");
 
     db.commit_with(|edit| { edit.set_crate_env(b, Env::default()); });
+    assert_eq!(ids(&db), before);
+
+    // A crate's cfg is in its item key and its dependents', so in the list.
+    db.commit_with(|edit| { edit.set_crate_cfg_options(b, cfg(&[flag("moved")])); });
+    let after = ids(&db);
+    assert_ne!(after.1, before.1);
+    assert_ne!(after.0, before.0);
+    assert_eq!(after.2, before.2);
+    assert_ne!(after.3, before.3, "a crate's cfg left the crate list as it was");
+
+    db.commit_with(|edit| { edit.set_crate_cfg_options(b, CfgOptions::default()); });
     assert_eq!(ids(&db), before);
 }
 
@@ -2313,8 +2327,8 @@ fn a_crate_graph_set_keeps_every_content_id_a_fresh_database_gives() {
 
 
 /// An equal graph set again drops nothing; a changed dependency drops its own arena and its
-/// dependent's (and, as a listed crate's content moved, the session's, which the crate list
-/// is part of).
+/// dependent's. A change of its variables leaves its item key, so the crate list
+/// (`world::List`) and the session arena, as they were.
 #[test]
 fn an_equal_crate_graph_drops_nothing() {
     let mut db = test_db();
@@ -2341,6 +2355,7 @@ fn an_equal_crate_graph_drops_nothing() {
         let index = arena_of(&db, key);
         assert!(committed.dropped.contains(&index), "arena {index} of {key:?} kept: {:?}", committed.dropped);
     }
+    assert!(!committed.dropped.contains(&0), "a crate's variables dropped the session: {:?}", committed.dropped);
 }
 
 /// A crate left out of the graph while its dependency changed comes back with the content ID
@@ -2697,6 +2712,158 @@ fn a_crate_maker_runs_in_its_crates_arena_each_time_it_is_made() {
     assert_eq!(other.load(Ordering::Relaxed), 0);
 }
 
+/// A sealed library crate `lib` (source root 1), a workspace crate `top` over it (root 0) and
+/// a workspace crate `other` beside them (root 2), committed: `[lib, top, other]`.
+fn beside_a_sealed_library(db: &mut Db) -> [CrateKey; 3] {
+    let (lib_file, top_file, other_file) = (FileId::from_raw(0), FileId::from_raw(1), FileId::from_raw(2));
+    put_root(db, 0, &[(top_file, "/top/lib.rs", "pub fn caller() {}")]);
+    put_root(db, 1, &[(lib_file, "/lib/lib.rs", "pub fn callee() {}")]);
+    put_root(db, 2, &[(other_file, "/other/lib.rs", "pub fn other() {}")]);
+    let mut graph = CrateGraphBuilder::default();
+    let lib = add(&mut graph, lib_file, CfgOptions::default(), Env::default());
+    graph.seal(lib, ContentId::of("base-db sealed write test pin", b"lib"));
+    let top = add(&mut graph, top_file, CfgOptions::default(), Env::default());
+    depend(&mut graph, top, lib, "lib");
+    let other = add(&mut graph, other_file, CfgOptions::default(), Env::default());
+    let crates = set_graph(db, graph);
+    [crates[&lib], crates[&top], crates[&other]]
+}
+
+/// The oracle of a commit that wrote `lib` alone ([`beside_a_sealed_library`]): it dropped
+/// exactly `lib`'s arena and its dependent `top`'s, never the session's, the roots' or
+/// `other`'s (so it started no new session).
+fn dropped_lib_and_top(before: &[u32; 3], committed: &Committed) -> Result<(), String> {
+    let mut want = Vec::new_in(Global);
+    want.extend_from_slice(&before[..2]);
+    want.sort_unstable();
+    match committed.dropped[..] == want[..] {
+        true => Ok(()),
+        false => Err(format!(
+            "a write for the sealed crate dropped arenas {:?}, not {want:?} (its own and its dependent's; `other` was at {})",
+            committed.dropped, before[2]
+        )),
+    }
+}
+
+/// The arenas of `keys` in `db`'s snapshot.
+fn arenas_of(db: &Db, keys: [CrateKey; 3]) -> [u32; 3] {
+    keys.map(|key| arena_of(db, key))
+}
+
+/// Each write of a sealed crate the driver makes after the crate was first made: a build
+/// script's variables, a gift (a surface, an image, a key of its check results) and a maker
+/// of its arena.
+fn sealed_writes() -> [(&'static str, fn(&mut Edit<'_>, CrateKey)); 3] {
+    fn env(edit: &mut Edit<'_>, lib: CrateKey) {
+        edit.set_crate_env(lib, some_env());
+    }
+    fn gift(edit: &mut Edit<'_>, lib: CrateKey) {
+        edit.give_by::<ByFact>(lib, test_fact("sealed gift"), crate::Given::new(5_u32));
+    }
+    fn maker(edit: &mut Edit<'_>, lib: CrateKey) {
+        let (runs, arena) = counters();
+        edit.set_given(Some(lib), test_fact("sealed maker"), held_maker(&runs, &arena, test_fact("sealed maker"), None));
+    }
+    [("its variables", env), ("a gift", gift), ("a maker", maker)]
+}
+
+/// One sealed write `write` under `plant`, through the oracle [`dropped_lib_and_top`], and
+/// the write read back.
+fn a_sealed_write(plant: Plant, what: &str, write: fn(&mut Edit<'_>, CrateKey)) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| write(edit, lib));
+    dropped_lib_and_top(&before, &committed).map_err(|why| format!("{what}: {why}"))?;
+    let after = arenas_of(&db, keys);
+    if after[2] != before[2] {
+        return Err(format!("{what}: `other` moved from arena {} to {}", before[2], after[2]));
+    }
+    Ok(())
+}
+
+/// The invariant: a write to a sealed crate (its variables, a gift, a maker: what a build
+/// script's run, a served surface or image and a key of its check results write after the
+/// crate was made) drops that crate's arena and its dependents' (each borrowed it), and
+/// nothing else: not the session, not a source root, not a crate beside it; no new session.
+/// The control: with `Plant::SealedRestartsSession` (a sealed arena marked starts a new
+/// session, as a commit did while `Memo::next` refused one) the oracle names the session.
+#[test]
+fn a_write_to_a_sealed_crate_drops_it_and_its_dependents_alone() {
+    for (what, write) in sealed_writes() {
+        a_sealed_write(Plant::None, what, write).unwrap_or_else(|why| panic!("{why}"));
+        let planted = a_sealed_write(Plant::SealedRestartsSession, what, write)
+            .expect_err("a sealed write that started a new session was not caught");
+        assert!(planted.contains("dropped arenas"), "{planted}");
+    }
+    // Read back: the variables written are the arena's made again.
+    let mut db = test_db();
+    let [lib, top, _] = beside_a_sealed_library(&mut db);
+    let before = db.krate(top).content(&db);
+    db.commit_with(|edit| { edit.set_crate_env(lib, some_env()); });
+    assert_eq!(db.krate(lib).env(&db), &some_env());
+    assert_ne!(db.krate(top).content(&db), before, "the dependent's content follows its dependency");
+}
+
+/// A driver's giver of one value per crate (the key a crate's constants are kept under,
+/// `hir_ty::consteval::deps`), with a session input beside it (the store): given `value` for
+/// `lib`. `in_session`: the value is in the session maker's fact (one session input for
+/// every crate's value, as the constants' were given), not a gift of `lib`'s own.
+fn give_for_lib(edit: &mut Edit<'_>, lib: CrateKey, value: u32, in_session: bool) {
+    let (runs, arena) = counters();
+    match in_session {
+        true => {
+            let fact = test_fact(&format!("store, lib {value}"));
+            edit.set_given(None, fact, held_maker(&runs, &arena, fact, Some(value)));
+        }
+        false => {
+            let fact = test_fact("store");
+            edit.set_given(None, fact, held_maker(&runs, &arena, fact, Some(0)));
+            edit.give_by::<ByFact>(lib, test_fact(&format!("lib {value}")), crate::Given::new(value));
+        }
+    }
+}
+
+/// A value for `lib` given, then another (a crate checked, then its key stored), through the
+/// oracle [`dropped_lib_and_top`], and the value read back.
+fn a_given_for_one_crate(plant: Plant, in_session: bool) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    db.commit_with(|edit| give_for_lib(edit, lib, 1, in_session));
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| give_for_lib(edit, lib, 2, in_session));
+    dropped_lib_and_top(&before, &committed)?;
+    let read = match in_session {
+        true => Held::try_get(&db).map(|it| it.value(&db)),
+        false => db.krate(lib).given::<ByFact, u32>(&db).copied(),
+    };
+    match read {
+        Some(2) => Ok(()),
+        other => Err(format!("the value read back is {other:?}, not 2")),
+    }
+}
+
+/// The invariant: a value a driver gives for one crate, given as that crate's own gift beside
+/// a session input whose fact does not move, keeps every other arena (the session's, the
+/// roots', a crate beside it) when it moves, and starts no new session, though the crate is
+/// sealed: it drops that crate and its dependents alone. The controls: given in the session
+/// maker's fact (what the constants' kept fact was), the oracle names the session; and with
+/// `Plant::SealedRestartsSession` it names it too.
+#[test]
+fn a_given_for_one_crate_keeps_every_other_crates_arena() {
+    a_given_for_one_crate(Plant::None, false).unwrap_or_else(|why| panic!("{why}"));
+    let in_session = a_given_for_one_crate(Plant::None, true)
+        .expect_err("a value for one crate in the session's fact was not caught");
+    assert!(in_session.contains("dropped arenas"), "{in_session}");
+    let planted = a_given_for_one_crate(Plant::SealedRestartsSession, false)
+        .expect_err("a sealed write that started a new session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
 /// The kind of [`a_crate_added_and_given_in_one_edit_is_one_commit`]'s gift, as a driver's
 /// proc macros are given.
 struct ProcMacrosGift;
@@ -2759,4 +2926,257 @@ fn a_crates_keyed_data_round_trips_through_the_world() {
     });
     assert_dropped_nothing(&committed, "a crate's own data given back");
     assert_eq!(db.krate(a).content(&db), content);
+}
+
+/// How [`len_while_another_asks`]'s run and its second asker meet.
+struct Meeting {
+    /// The runs of the query begun.
+    runs: u32,
+    /// The second asker has its answer.
+    answered: bool,
+}
+
+static MEETING: blaze_core::lock::Lock<Meeting> =
+    blaze_core::lock::Lock::new("base-db.tests.meeting", Meeting { runs: 0, answered: false });
+static MET: blaze_core::lock::Signal = blaze_core::lock::Signal::new("base-db.tests.met");
+
+/// The length of `file`'s text. Its run lets the second asker go, then gives it a bounded
+/// while to ask: on the scheduler's flight that asker waits for this run, so it has no answer
+/// before the run ends and the while runs out; on a flight that refused it, it ends at once.
+#[blaze_memo::tracked(returns(copy))]
+fn len_while_another_asks(db: &Db, file: EditionedFileId) -> u32 {
+    let (file, _) = file.unpack(db);
+    let len = db.file_text(file).text(db).len() as u32;
+    let mut meeting = MEETING.lock();
+    meeting.runs += 1;
+    MET.notify_all();
+    _ = MET.wait_while_for(&mut meeting, |it| !it.answered, std::time::Duration::from_millis(200));
+    len
+}
+
+/// The invariant: a test database that several threads drive ([`Db::for_tests_driven`]) asked
+/// for one query from two threads at once runs it once, and both get its value: the second
+/// asker waits for the first one's run, never told it is in a cycle with a run on another
+/// thread's stack. The interleavings are proven in blaze-memo's simulation
+/// (`two_tasks_ask_one_key`); this is the database's flight as tests take it.
+#[test]
+fn a_driven_test_database_asked_one_query_from_two_threads_runs_it_once() {
+    let mut db = Db::for_tests_driven(no_boundaries, blaze_memo::Reads::Off);
+    let file = load(&mut db, 0, &[("/lib.rs", "fn f() {}")])[0];
+    let file = EditionedFileId::new(&db, file, Edition::Edition2021);
+    ran(&db, "len_while_another_asks");
+    let (first, second) = std::thread::scope(|scope| {
+        let db = &db;
+        let second = scope.spawn(move || {
+            {
+                let mut meeting = MEETING.lock();
+                let timed_out = MET.wait_while_for(
+                    &mut meeting,
+                    |it| it.runs == 0,
+                    std::time::Duration::from_secs(60),
+                );
+                assert!(!timed_out, "the first asker's run did not begin in 60 s");
+            }
+            let got = len_while_another_asks(db, file);
+            MEETING.lock().answered = true;
+            MET.notify_all();
+            got
+        });
+        let first = len_while_another_asks(db, file);
+        let second = second.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        (first, second)
+    });
+    assert_eq!(first, 9, "the text's length");
+    assert_eq!(second, first, "both askers get the one run's value");
+    assert_eq!(ran(&db, "len_while_another_asks"), 1, "the query ran once");
+    assert_eq!(MEETING.lock().runs, 1, "one run of the query began");
+}
+
+/// Has every crate of `keys` evaluate a query in its own arena ([`crate::crate_root_content`]:
+/// its root's files, its other `OUT_DIR`s), so each arena holds something a drop would lose.
+fn evaluate_in(db: &Db, keys: &[CrateKey]) {
+    for &key in keys {
+        _ = crate::crate_root_content(db, db.krate(key));
+    }
+}
+
+/// [`beside_a_sealed_library`] with each crate's arena holding a query's value, then a located
+/// gift to the sealed `lib` (the image's lang items, a crate's constants' key), under `plant`:
+/// the commit must drop nothing and the gift read back; given again under the fact held, it
+/// moves nothing; withdrawn, it drops `lib` and `top` alone ([`dropped_lib_and_top`]).
+fn a_located_gift(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, _, _] = keys;
+    evaluate_in(&db, &keys);
+    db.plant(plant);
+    let give = |edit: &mut Edit<'_>, value: u32| {
+        edit.give_located::<crate::LocatedForTests>(lib, test_fact("located"), crate::Given::new(value));
+    };
+    let committed = db.commit_with(|edit| give(edit, 5));
+    if !committed.dropped.is_empty() {
+        return Err(format!("a located gift's first gift dropped arenas {:?}", committed.dropped));
+    }
+    match db.krate(lib).located::<crate::LocatedForTests, u32>(&db) {
+        Some(5) => {}
+        other => return Err(format!("the located gift read back is {other:?}, not 5")),
+    }
+    // A slot of the crate's arena it is not: `given` of the kind finds none.
+    assert_eq!(db.krate(lib).given::<crate::LocatedForTests, u32>(&db), None, "no slot");
+    let committed = db.commit_with(|edit| give(edit, 6));
+    assert_dropped_nothing(&committed, "a located gift under the fact held");
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| {
+        edit.take_located::<crate::LocatedForTests>(lib);
+    });
+    dropped_lib_and_top(&before, &committed).map_err(|why| format!("withdrawn: {why}"))?;
+    assert_eq!(db.krate(lib).located::<crate::LocatedForTests, u32>(&db), None, "withdrawn");
+    Ok(())
+}
+
+/// The invariant: a gift that says where a value can be read ([`crate::Located`]) is no input
+/// of any arena, so its first gift to a sealed crate whose arena holds evaluated queries
+/// drops nothing, and it is read back off the table; a withdrawal drops the crate and its
+/// dependents alone. The control: with `Plant::LocatedMarks` (the first gift marks its crate,
+/// as the lang items' and the constants' key's slots did, 28 and 24 arenas in round 27's
+/// first body edit) the oracle names the drop.
+#[test]
+fn a_located_gift_to_a_sealed_crate_drops_nothing() {
+    a_located_gift(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_located_gift(Plant::LocatedMarks).expect_err("a located gift that marked its crate was not caught");
+    assert!(planted.contains("first gift dropped arenas"), "{planted}");
+}
+
+/// The invariant's control of [`a_located_gift_to_a_sealed_crate_drops_nothing`]'s rule that a
+/// kind is given one way: a slot gift of a kind held located stops, naming the kind.
+#[test]
+#[should_panic(expected = "which holds a gift of that kind given as located")]
+fn a_slot_gift_of_a_located_kind_stops() {
+    let mut db = test_db();
+    let [lib, _, _] = beside_a_sealed_library(&mut db);
+    db.commit_with(|edit| {
+        edit.give_located::<crate::LocatedForTests>(lib, test_fact("located"), crate::Given::new(1_u32));
+    });
+    let mut edit = db.edit();
+    edit.give_by::<crate::LocatedForTests>(lib, test_fact("slot"), crate::Given::new(2_u32));
+}
+
+/// [`beside_a_sealed_library`] with each crate's arena holding a query's value, then `lib`'s
+/// cfg written under `plant` (a build script's `cargo:rustc-cfg`, which moves its item key and
+/// so the crate list): the commit must drop `lib` and its dependent `top`, and nothing of the
+/// session's, the roots' or `other`'s (the crate list's own arena may go: nothing here read
+/// it); the cfg read back.
+fn a_cfg_write(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let keys = beside_a_sealed_library(&mut db);
+    let [lib, top, other] = keys;
+    evaluate_in(&db, &keys);
+    db.plant(plant);
+    let before = arenas_of(&db, keys);
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_cfg_options(lib, cfg(&[flag("from_build_script")]));
+    });
+    let list = crate::world::LIST_ARENA;
+    let stray: Vec<u32, Global> = {
+        let mut stray = Vec::new_in(Global);
+        stray.extend(committed.dropped.iter().copied().filter(|&it| it != list && it != before[0] && it != before[1]));
+        stray
+    };
+    if !stray.is_empty() || !committed.dropped.contains(&before[0]) || !committed.dropped.contains(&before[1]) {
+        return Err(format!(
+            "a cfg write to `lib` dropped arenas {:?}: not `lib` ({}) and `top` ({}) alone, and `other` was at {}",
+            committed.dropped, before[0], before[1], before[2]
+        ));
+    }
+    assert_eq!(db.krate(lib).cfg_options(&db), &cfg(&[flag("from_build_script")]));
+    assert_eq!(arena_of(&db, other), before[2], "`other` kept its arena");
+    assert_ne!(arena_of(&db, top), before[1], "`top`, its dependent, made again");
+    Ok(())
+}
+
+/// The invariant: a cfg written for one crate (each of a cold build's build scripts' runs)
+/// drops that crate's arena and its dependents' and keeps every other crate's arena, the
+/// session's and the roots': the crate list it moves has an arena of its own, which only the
+/// runs that read the list borrow. The control: with `Plant::ListMarksSession` (the list a
+/// singleton of the session's, as it was until round 28: four cfg writes, 32 arenas dropped
+/// each) the oracle names the session.
+#[test]
+fn a_cfg_write_drops_its_crate_and_dependents_alone() {
+    a_cfg_write(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_cfg_write(Plant::ListMarksSession).expect_err("a cfg write that dropped the session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// [`two_roots`] with `a`'s and `c`'s arenas holding a query's value, then a crate `d` added
+/// to the list under `plant`, on `c`'s root file with another cfg (a second crate of one
+/// package: `check` after `run` adds the test crate beside the binary): the commit must keep
+/// the session's arena, the roots', `a`'s and `c`'s (neither depends on `d`).
+fn a_crate_added(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let (a, c, _) = two_roots(&mut db);
+    evaluate_in(&db, &[a, c]);
+    db.plant(plant);
+    let before = [arena_of(&db, a), arena_of(&db, c)];
+    let (fa, fc) = (FileId::from_raw(0), FileId::from_raw(1));
+    let mut graph = CrateGraphBuilder::default();
+    add(&mut graph, fa, CfgOptions::default(), Env::default());
+    add(&mut graph, fc, CfgOptions::default(), Env::default());
+    let d = add(&mut graph, fc, cfg(&[flag("test")]), Env::default());
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_graph(graph);
+    });
+    let d = committed.crates[&d];
+    let kept = |index: u32| !committed.dropped.contains(&index);
+    if !(kept(0) && kept(before[0]) && kept(before[1])) {
+        return Err(format!(
+            "adding `d` dropped arenas {:?}: the session's (0), `a`'s ({}) or `c`'s ({})",
+            committed.dropped, before[0], before[1]
+        ));
+    }
+    assert_eq!([arena_of(&db, a), arena_of(&db, c)], before, "`a` and `c` kept their arenas");
+    assert!(crate::all_crates(&db).contains(&db.krate(d)), "`d` is listed");
+    Ok(())
+}
+
+/// The invariant: a crate added to the list keeps every arena that does not depend on it (the
+/// session's, the roots', every other crate's); what moves is the list's own arena, and a
+/// crate whose root's other `OUT_DIR`s moved. The control: with `Plant::ListMarksSession` (the
+/// list a singleton of the session's, round 27's `check` after `run`: the second `hi` crate
+/// added at index 32 dropped all 32 arenas) the oracle names the drop.
+#[test]
+fn a_crate_added_to_the_list_keeps_every_arena_not_depending_on_it() {
+    a_crate_added(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_crate_added(Plant::ListMarksSession).expect_err("a crate added that dropped the session was not caught");
+    assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// The invariant: a crate's other `OUT_DIR`s are those of the listed crates of its root, its
+/// own left out, sorted, each once, as the query read them off the list; a crate of its root
+/// given an `OUT_DIR` marks its arena (its field moved) and not the arena of a crate on
+/// another root. The control is the same write read back on `a`, whose root holds no other
+/// crate: its dirs stay empty and its arena is kept.
+#[test]
+fn a_crates_other_out_dirs_are_its_roots_others_and_move_its_arena_alone() {
+    let mut db = test_db();
+    let (a, c, _) = two_roots(&mut db);
+    let fc = FileId::from_raw(1);
+    let out = |dir: &str| -> Env { [("OUT_DIR".to_owned(), dir.to_owned())].into_iter().collect() };
+    let mut graph = CrateGraphBuilder::default();
+    add(&mut graph, FileId::from_raw(0), CfgOptions::default(), Env::default());
+    add(&mut graph, fc, CfgOptions::default(), Env::default());
+    let d = add(&mut graph, fc, cfg(&[flag("test")]), out("/target/out/d/"));
+    let d = set_graph(&mut db, graph)[&d];
+    fn dirs(db: &Db, key: CrateKey) -> &[&str] {
+        crate::other_out_dirs(db, db.krate(key))
+    }
+    assert_eq!(dirs(&db, c), ["/target/out/d"], "`d`'s, its trailing separator gone");
+    assert!(dirs(&db, d).is_empty(), "its own left out");
+    assert!(dirs(&db, a).is_empty(), "another root's");
+    let before = [arena_of(&db, a), arena_of(&db, c)];
+    let committed = db.commit_with(|edit| {
+        edit.set_crate_env(d, out("/target/out/d2"));
+    });
+    assert!(committed.dropped.contains(&before[1]), "`c`'s dirs moved: {committed:?}");
+    assert!(!committed.dropped.contains(&before[0]), "`a` is on another root: {committed:?}");
+    assert_eq!(dirs(&db, c), ["/target/out/d2"]);
 }

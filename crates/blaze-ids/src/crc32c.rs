@@ -255,8 +255,7 @@ mod arm {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
     use crate::rng::SplitMix64;
@@ -438,16 +437,18 @@ mod tests {
         assert_eq!(crc, extend_portable(0, &bytes));
     }
 
-    #[hegel::test]
-    fn matches_the_bitwise_definition(tc: TestCase) {
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(39_999));
-        let at: usize = tc.draw(gs::integers().max_value(bytes.len()));
-        let want = bitwise(&bytes);
-        assert_eq!(crc32c(&bytes), want);
-        let (a, b) = bytes.split_at(at);
-        assert_eq!(extend(crc32c(a), b), want);
-        for (name, path) in paths() {
-            assert_eq!(path(0, &bytes), want, "{}", name);
-        }
+    #[test]
+    fn matches_the_bitwise_definition() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let bytes: Vec<u8> = tape.bytes(0..=39_999, "bytes");
+            let at: usize = tape.int_in(0..=bytes.len(), "at");
+            let want = bitwise(&bytes);
+            assert_eq!(crc32c(&bytes), want);
+            let (a, b) = bytes.split_at(at);
+            assert_eq!(extend(crc32c(a), b), want);
+            for (name, path) in paths() {
+                assert_eq!(path(0, &bytes), want, "{}", name);
+            }
+        });
     }
 }

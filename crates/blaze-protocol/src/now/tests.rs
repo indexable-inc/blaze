@@ -456,22 +456,26 @@ fn a_now_is_written_in_its_keys_order_and_round_trips() {
 /// settled), said in one batch: under the cap, the blockers are the frontier, ranked, each
 /// holding exactly the unfinished tasks off the frontier that wait on it with the longest
 /// chain behind it, and every such task is held by one.
-#[hegel::test]
-fn every_task_off_the_frontier_is_held_by_a_blocker(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let len: usize = tc.draw(gs::integers::<usize>().max_value(24));
+#[test]
+fn every_task_off_the_frontier_is_held_by_a_blocker() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, frontier_case);
+}
+
+/// One case of [`every_task_off_the_frontier_is_held_by_a_blocker`].
+fn frontier_case(tape: &blaze_sim::Tape) {
+    let len = tape.int_in(0usize..=24, "tasks");
     let (mut deps, mut states): (Vec<Vec<u32>>, Vec<NodeState>) = (vec![], vec![]);
     for id in 0..len {
         let mut mine = vec![];
         if id > 0 {
-            for _ in 0..tc.draw(gs::integers::<usize>().max_value(3)) {
-                mine.push(tc.draw(gs::integers::<u32>().max_value(id as u32 - 1)));
+            for _ in 0..tape.int_in(0usize..=3, "deps") {
+                mine.push(tape.int_in(0u32..=id as u32 - 1, "dep"));
             }
         }
         let state = if mine.iter().any(|&dep| !states[dep as usize].settled()) {
             NodeState::Waiting
         } else {
-            match tc.draw(gs::integers::<u8>().max_value(6)) {
+            match tape.int_in(0u8..=6, "state") {
                 0 => NodeState::Waiting,
                 1 => NodeState::Ready,
                 2 => NodeState::Running,

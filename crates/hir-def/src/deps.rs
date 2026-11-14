@@ -79,6 +79,9 @@ pub struct Image {
     mode: Mode,
     /// The image's lang items part, as name resolution reads it ([`crate::nameres::frozen`]).
     lang_items: crate::nameres::frozen::Frozen,
+    /// The image's diagnostic items part ([`Part::DiagnosticItems`]), as
+    /// `diagnostic_item::crate_diagnostic_items` reads it.
+    diagnostic_items: crate::nameres::frozen::Frozen,
     /// Under `Mode::Check` and `Mode::Verify` the crate's def map record whole, which what is
     /// resolved or read is compared with; never when serving.
     def_map: Option<crate::nameres::frozen::Frozen>,
@@ -105,7 +108,7 @@ impl Image {
     /// exactly that. The check reads the image's head (its root, 40 bytes, and a 12-byte
     /// record a part) and nothing of a part's bytes or of the pages; the holder and the pages'
     /// source are counted, not copied. Giving it ([`give_image`]) then hashes the lang items
-    /// part once for the fact its slot is read by.
+    /// and diagnostic items parts once each for the facts their slots are read by.
     ///
     /// Errors, each naming what: `range` outside the record ([`ImageError::OutOfRecord`]) or
     /// not aligned ([`ImageError::Unaligned`]); bytes written under another key
@@ -153,7 +156,21 @@ impl Image {
             bytes: PartBytes::of(&bytes, &parts, Part::LangItems),
             mode,
         };
-        Ok(Image { base, key, bytes, parts, mode, lang_items, def_map: None, pages: Some(pages) })
+        let diagnostic_items = crate::nameres::frozen::Frozen {
+            bytes: PartBytes::of(&bytes, &parts, Part::DiagnosticItems),
+            mode,
+        };
+        Ok(Image {
+            base,
+            key,
+            bytes,
+            parts,
+            mode,
+            lang_items,
+            diagnostic_items,
+            def_map: None,
+            pages: Some(pages),
+        })
     }
 
     /// The image, read in place: a slice of the buffer [`serve`] or [`Image::in_place`]
@@ -230,11 +247,20 @@ pub fn image_slot_fact(krate_id: base_db::ContentId, mode: Mode) -> blaze_memo::
 
 /// Gives `krate`, whose stable id is `krate_id`, what it is read from, in `edit`: `image`, as
 /// [`serve`] found it, in the crate's slot [`ImageSlot`] (read by [`image_slot_fact`]); its
-/// lang items, its def map pages (`Mode::Serve`, `Mode::Verify`) and its def map whole
-/// (`Mode::Check`, `Mode::Verify`) go in name resolution's slots of the crate
-/// (`nameres::frozen`'s `LangItemsSlot`, `PagesSlot`, `DefMapSlot`), each read by its own
+/// lang items and its diagnostic items as located gifts (`nameres::frozen`'s `LangItemsSlot`,
+/// `DiagnosticItemsSlot`: `base_db::Located`, their first gift marking nothing), its def map
+/// pages (`Mode::Serve`, `Mode::Verify`) and its def map whole (`Mode::Check`, `Mode::Verify`)
+/// in name resolution's slots of the crate (`PagesSlot`, `DefMapSlot`), each read by its own
 /// fact. Called by the driver in the edit that commits the snapshot it serves the crate in,
 /// never during a build.
+///
+/// The image and the pages stay slots, which mark the crate: what is read with them is not
+/// what is computed without them. A served signature carries the image's block scopes, not a
+/// lowering's (`signatures::Serve::lowering`), and `is_served` itself is read as a value (the
+/// served-else-lowered predicate); a paged crate's def map holds `ScopeSlot::Paged` scopes read
+/// a name at a time, not the resolved ones. So a crate whose arena holds lowered values and is
+/// then given its image is made again: the floor of serving a crate already lowered, which
+/// only not serving it (keeping it lowered while its arena lives) would avoid.
 ///
 /// A gift lasts until it is replaced or taken (`base_db::Edit::take_given`), so a slot this
 /// image has no part for (a def map whole under `Mode::Serve`) is taken: none is left from an
@@ -245,12 +271,20 @@ pub fn give_image(
     krate_id: base_db::ContentId,
     image: Image,
 ) {
-    use crate::nameres::frozen::{self, DefMapSlot, Frozen, LangItemsSlot, pages};
+    use crate::nameres::frozen::{
+        self, DefMapSlot, DiagnosticItemsSlot, Frozen, LangItemsSlot, pages,
+    };
     let key = krate.key(edit.db());
     let lang_items = &image.lang_items;
     let fact = frozen::frozen_fact(krate_id, "lang items", lang_items);
+    // Located: its first gift marks no arena (`LangItemsSlot`'s promise).
     // clone: a `PartBytes` handle on the image's buffer, once per crate given an image
-    given::give::<LangItemsSlot, Frozen>(edit, krate, fact, lang_items.clone());
+    given::give_located::<LangItemsSlot, Frozen>(edit, krate, fact, lang_items.clone());
+    let diagnostic_items = &image.diagnostic_items;
+    let fact = frozen::frozen_fact(krate_id, "diagnostic items", diagnostic_items);
+    // Located, as the lang items are (`DiagnosticItemsSlot`'s promise).
+    // clone: as above
+    given::give_located::<DiagnosticItemsSlot, Frozen>(edit, krate, fact, diagnostic_items.clone());
     if let Some(def_map) = &image.def_map {
         let fact = frozen::frozen_fact(krate_id, "def map", def_map);
         // clone: as above
@@ -270,7 +304,8 @@ pub fn give_image(
 }
 
 /// Takes from the crate of `key`, in `edit`, everything [`give_image`] gives it: the image, its
-/// lang items, its def map pages and its def map whole. What the driver does for each crate of
+/// lang items, its diagnostic items, its def map pages and its def map whole. What the driver
+/// does for each crate of
 /// [`Served::withdrawn`] (keys, as a gift is taken by key): from the commit the crate is
 /// resolved from its files. Whether it held any.
 ///
@@ -278,11 +313,12 @@ pub fn give_image(
 ///
 /// Where the world has no crate `key` (`base_db::Edit::take_given`).
 pub fn withdraw_image(edit: &mut base_db::Edit<'_>, key: base_db::CrateKey) -> bool {
-    use crate::nameres::frozen::{DefMapSlot, LangItemsSlot, pages};
+    use crate::nameres::frozen::{DefMapSlot, DiagnosticItemsSlot, LangItemsSlot, pages};
     // Each taken, none skipped by a short circuit.
     let taken = [
         edit.take_given::<ImageSlot>(key),
-        edit.take_given::<LangItemsSlot>(key),
+        edit.take_located::<LangItemsSlot>(key),
+        edit.take_located::<DiagnosticItemsSlot>(key),
         edit.take_given::<DefMapSlot>(key),
         edit.take_given::<pages::PagesSlot>(key),
     ];

@@ -2266,17 +2266,67 @@ impl Lowered {
     /// A write: `&mut self` means no task holds a reference to read through, so nothing is
     /// cancelled or waited for here; tasks that read after it read the run applied. One change:
     /// its files, cfgs and envs are one batch, and inside [`Lowered::batch`] part of that one.
+    ///
+    /// One run: [`Lowered::prepare_run`] then [`Lowered::apply_runs`] of it alone. A driver
+    /// with several runs to apply at once (the runs a restart finds in records, a write pass's
+    /// runs) prepares each and applies them all in one commit.
     pub fn ran(&mut self, run: usize, ran: &Ran) -> Result<(), LowerError> {
-        let crates = self.crates.clone();
+        let Some(prepared) = self.prepare_run(run, ran)? else { return Ok(()) };
+        let crates = std::sync::Arc::clone(&self.crates);
+        let trigger = Trigger::of("a build script's run applied", &crates.units[run].what);
+        let mut one = Vec::with_capacity_in(1, Global);
+        one.push(prepared);
+        let mut outcomes = self.batch(trigger, |this| this.apply_runs(one));
+        match outcomes.pop() {
+            Some((_, outcome)) => outcome,
+            None => unreachable!("`Lowered::apply_runs` gives one outcome a run, and was given one"),
+        }
+    }
+
+    /// The run `ran` of build script unit `run` checked and read before any edit: every check
+    /// that can refuse it ([`checked`], its cfgs, its `OUT_DIR` and each file's path under it)
+    /// made here, and the files it left made the front end's files, so that its writes
+    /// ([`Lowered::apply_runs`]) refuse nothing these checks find and a refusal of one run
+    /// never ends an edit that holds another's writes. `None` for a run whose class another
+    /// run of this job is applied for ([`Lowered::applies_for_class`]): taken, changing nothing
+    /// the front end reads. Writes nothing to the database.
+    pub fn prepare_run(&mut self, run: usize, ran: &Ran) -> Result<Option<PreparedRun>, LowerError> {
+        let crates = std::sync::Arc::clone(&self.crates);
         let (lowering, _) = checked(&crates, run, ran)?;
         if !self.applies_for_class(&crates, run) {
-            return Ok(());
+            return Ok(None);
         }
         let ran = canonical_run(&crates, run, ran);
         // alloc: once per apply, the run's cfgs parsed, shared by every crate it applies to
         let cfgs: std::sync::Arc<[CfgAtom]> = cfg_atoms(&ran, &lowering.what)?.into();
-        let trigger = Trigger::of("a build script's run applied", &lowering.what);
-        self.batch(trigger, |this| this.apply_run(&ran, &crates, lowering, &cfgs))
+        let out_dir = &ran.out_dir;
+        // `set_files`' base, checked here as it checks it.
+        _ = abs(out_dir)?;
+        let mut loaded = Vec::with_capacity_in(ran.files.len(), Global);
+        // Each file with the bytes the run left, for the reads of it made before the run: its
+        // path checked here, before any edit.
+        let mut left: Vec<(AbsPathBuf, std::sync::Arc<[u8]>), Global> = Vec::with_capacity_in(ran.files.len(), Global);
+        for (path, bytes) in &ran.files {
+            let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
+            // The run's own bytes, shared: the text is the allocation the run's result holds.
+            let shared = std::sync::Arc::clone(bytes); // clone: a count
+            let at = format!("{out_dir}/{path}"); // alloc: a file's path, once per file a run
+            // `set_files`' check of each file, made here: a path that is not a file under the
+            // `OUT_DIR` refuses the run before its edit.
+            if files::rest(&at, out_dir).is_none_or(str::is_empty) {
+                return Err(LowerError::at(format!("`{at}` is not under `{out_dir}`"), at));
+            }
+            left.push((abs(&at)?, std::sync::Arc::clone(&shared))); // clone: a count
+            loaded.push(files::Loaded { path: at, id, bytes: blaze_vfs::Bytes::from(shared) });
+        }
+        Ok(Some(PreparedRun {
+            run,
+            out_dir: out_dir.clone(), // clone: the `OUT_DIR`, once per run
+            env: std::sync::Arc::clone(&ran.env), // clone: a count
+            cfgs,
+            loaded,
+            left,
+        }))
     }
 
     /// Whether run `run` is the one applied for its run class in this job: the first of the
@@ -2288,35 +2338,88 @@ impl Lowered {
         !shared || *self.class_runs.entry(class).or_insert(run) == run
     }
 
-    /// [`Lowered::ran`]'s writes, in its batch: `ran`, a run checked against `crates` and made
-    /// its class's ([`canonical_run`]), of unit `lowering`, its cfgs `cfgs`.
-    fn apply_run(
+    /// The writes of `prepared` ([`Lowered::prepare_run`]), every run's in one edit and one
+    /// commit, in its caller's batch: one snapshot, and so one set of arenas dropped, for all
+    /// of them, where a commit a run dropped the arenas the runs share once a run (a restart's
+    /// runs found in records, each its own commit until round 28). The outcome of each run, by
+    /// its unit, in `prepared`'s order.
+    ///
+    /// A run is refused alone and leaves nothing in the edit: everything a check can refuse
+    /// was refused by `prepare_run`; what remains is the view's write of its files, which plans
+    /// the whole view before it writes any of it (`base_db::Edit::set_view_root_from_tree`
+    /// refuses a view whole), and the run's source root, checked before that write. Each other
+    /// run is written and committed. A panic in a run's writes unwinds out of this with the
+    /// edit uncommitted, so no run of `prepared` is in the world, and the caller's catch fails
+    /// each of them, naming the panic: never a commit of the runs before it, which a later
+    /// commit would be needed to finish.
+    pub fn apply_runs(
         &mut self,
-        ran: &Ran,
-        crates: &Crates,
-        lowering: &Lowering,
-        cfgs: &std::sync::Arc<[CfgAtom]>,
-    ) -> Result<(), LowerError> {
-        let out_dir = &ran.out_dir;
-        let mut loaded = Vec::with_capacity(ran.files.len());
-        // Each file with the bytes the run left, for the reads of it made before the run: its
-        // path checked here, before the edit, so no error ends the edit after `self.paths`
-        // took the run's files.
-        let mut left: Vec<(AbsPathBuf, std::sync::Arc<[u8]>), Global> = Vec::with_capacity_in(ran.files.len(), Global);
-        for (path, bytes) in &ran.files {
-            let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-            // The run's own bytes, shared: the text is the allocation the run's result holds.
-            let shared = std::sync::Arc::clone(bytes); // clone: a count
-            let at = format!("{out_dir}/{path}");
-            left.push((abs(&at)?, std::sync::Arc::clone(&shared))); // clone: a count
-            loaded.push(files::Loaded { path: at, id, bytes: blaze_vfs::Bytes::from(shared) });
+        prepared: Vec<PreparedRun, Global>,
+    ) -> Vec<(usize, Result<(), LowerError>), Global> {
+        let crates = std::sync::Arc::clone(&self.crates);
+        let Lowered { db, paths, applied, identities, narrowed, carried, found, surfaces_due, .. } = self;
+        let mut beside = Beside { paths, applied, identities, narrowed, carried, found, surfaces_due };
+        let mut outcomes = Vec::with_capacity_in(prepared.len(), Global);
+        // The change's one edit: dropped, with every write in it, at a panic below.
+        let mut edit = db.edit();
+        for prepared in prepared {
+            let run = prepared.run;
+            let outcome = write_run(&mut edit, &crates, &mut beside, prepared);
+            outcomes.push((run, outcome));
         }
+        _ = edit.commit();
+        outcomes
+    }
+}
 
-        // The change's one edit: dropped, with every write in it, at an error below.
-        let mut edit = self.db.edit();
+/// What a run's writes write beside the database ([`Lowered::apply_runs`]): the fields of a
+/// [`Lowered`] other than its database, which the run's edit holds.
+struct Beside<'a> {
+    paths: &'a mut std::sync::Arc<HashMap<FileId, String>>,
+    applied: &'a mut blaze_hash::HashMap<CrateKey, Vec<Applied>, Global>,
+    identities: &'a mut blaze_hash::HashMap<CrateKey, ContentId, Global>,
+    narrowed: &'a mut blaze_hash::HashMap<CrateKey, Narrow, Global>,
+    carried: &'a mut blaze_hash::HashMap<CrateKey, code::OwnNarrow, Global>,
+    found: &'a mut blaze_hash::HashMap<CrateKey, ContentId, Global>,
+    surfaces_due: &'a mut bool,
+}
+
+/// A build script's run checked and read, ready to be written ([`Lowered::prepare_run`],
+/// [`Lowered::apply_runs`]): what its writes need, nothing of which can refuse it.
+pub struct PreparedRun {
+    /// Its unit.
+    run: usize,
+    /// Its class's `OUT_DIR` ([`canonical_run`]).
+    out_dir: String,
+    env: std::sync::Arc<[(String, String)]>,
+    cfgs: std::sync::Arc<[CfgAtom]>,
+    /// The files it left, as the front end's files.
+    loaded: Vec<files::Loaded, Global>,
+    /// Each file it left by its absolute path, with its bytes.
+    left: Vec<(AbsPathBuf, std::sync::Arc<[u8]>), Global>,
+}
+
+/// One prepared run's writes in `edit`, in its batch's one edit ([`Lowered::apply_runs`]): an
+/// error only where none of them was made.
+fn write_run(
+    edit: &mut Edit<'_>,
+    crates: &Crates,
+    beside: &mut Beside<'_>,
+    prepared: PreparedRun,
+) -> Result<(), LowerError> {
+        let PreparedRun { run, out_dir, env: run_env, cfgs, loaded, left } = prepared;
+        let lowering = &crates.units[run];
+        let out_dir = &out_dir;
+        // The run's source root, which `note` reads once its files are written: checked
+        // before any write, so `note` cannot refuse after `set_files` wrote.
+        written_root(edit, SourceRootId(lowering.set as u32))?;
+        // Writes the view whole or refuses it whole.
         let change =
-            set_files(&mut edit, out_dir, &[], lowering.set, crates.sets, crates.other, &loaded)?;
-        note(&mut self.paths, &edit, lowering.set, &change)?;
+            set_files(edit, out_dir, &[], lowering.set, crates.sets, crates.other, &loaded)?;
+        if let Err(error) = note(beside.paths, edit, lowering.set, &change) {
+            // The root was there before the write, and a view's write takes out no root.
+            panic!("blaze-lower: run {run}'s files were written and their source root is gone: {error}");
+        }
         // A crate given this `OUT_DIR` by the plan is resolved before the run is applied (the
         // name resolution maintainer ends every write), and its `include!` of a file the run
         // had not left yet read the disk and kept "no such file" as an input
@@ -2351,12 +2454,12 @@ impl Lowered {
             written.push(krate);
             // By the class's `OUT_DIR` (`ran` is its class's, `canonical_run`): the one name
             // of a run class that every plan naming this crate has for it.
-            let runs = self.applied.entry(krate).or_default();
+            let runs = beside.applied.entry(krate).or_default();
             runs.retain(|it| it.out_dir != *out_dir);
             // clone: two counts and the `OUT_DIR`, once per dependent crate
             let applying = Applied {
-                cfgs: std::sync::Arc::clone(cfgs),
-                env: std::sync::Arc::clone(&ran.env),
+                cfgs: std::sync::Arc::clone(&cfgs),
+                env: std::sync::Arc::clone(&run_env),
                 out_dir: out_dir.clone(),
             };
             runs.push(applying);
@@ -2381,22 +2484,23 @@ impl Lowered {
             changed |= cfg_moved || env_moved;
         }
         if changed {
-            self.identities.clear();
-            self.narrowed.clear();
+            beside.identities.clear();
+            beside.narrowed.clear();
             // A run's cfgs, env and files are in the settings and files of the crates it
             // applies to, and their settings in those of every crate above them: what a
             // record carried of any of those is let go.
-            self.carried.retain(|krate, _| !reaches(&edit, *krate, &written));
+            let edit = &*edit;
+            beside.carried.retain(|krate, _| !reaches(edit, *krate, &written));
             // And what a found record said its image is filed under: of the crate before.
-            self.found.retain(|krate, _| !reaches(&edit, *krate, &written));
+            beside.found.retain(|krate, _| !reaches(edit, *krate, &written));
             // Given once this run's batch commits: the crates given the run have other
             // settings or files.
-            self.surfaces_due = true;
+            *beside.surfaces_due = true;
         }
-        _ = edit.commit();
         Ok(())
-    }
+}
 
+impl Lowered {
     /// The front end moved to the view `lower` names, `lower`'s units and config being the
     /// ones it was lowered from (the caller compares them): each directory whose files were
     /// read from the view read again and applied as the change it is (O(its files), the

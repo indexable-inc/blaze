@@ -6060,17 +6060,16 @@ mod tests {
         spin_us: Vec<u64>,
     }
 
-    fn tree(tc: &hegel::TestCase) -> Tree {
-        use hegel::generators as gs;
-        let jobs = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    fn tree(tape: &blaze_sim::Tape) -> Tree {
+        let jobs = tape.int_in(1..=6usize, "jobs");
         let mut it = Tree { parent: vec![0], key: Vec::new(), spin_us: Vec::new() };
         for i in 1..jobs {
-            it.parent.push(tc.draw(gs::integers::<usize>().max_value(i - 1)));
+            it.parent.push(tape.index(i, "parent"));
         }
         for _ in 0..jobs {
-            let key = tc.draw(gs::integers::<u8>().max_value(2));
+            let key = tape.int_in(0..=2u8, "key");
             it.key.push((key < 2).then_some(key));
-            it.spin_us.push(tc.draw(gs::integers::<u64>().max_value(300)));
+            it.spin_us.push(tape.int_in(0..=300u64, "spin us"));
         }
         it
     }
@@ -6177,10 +6176,12 @@ mod tests {
     /// row with no unrecorded time, and the critical path crosses from each job's start to its
     /// spawner and from each wait to its waker without a gap, from the build's first row to its
     /// last.
-    #[hegel::test(test_cases = 40)]
-    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build(
-        tc: hegel::TestCase,
-    ) {
+    #[test]
+    fn a_recorded_pool_run_accounts_for_every_jobs_wall_time_and_its_critical_path_spans_the_build() {
+        blaze_sim::check(blaze_sim::Config::cases(40), recorded_pool_run);
+    }
+
+    fn recorded_pool_run(tape: &blaze_sim::Tape) {
         use blaze_graph::{pool::Pool, pump::Flights, topology::Topology};
 
         use crate::time::{Begin, End, Input, Model, path};
@@ -6189,7 +6190,7 @@ mod tests {
         crate::install();
         let pool =
             std::sync::Arc::new(Pool::new(&Topology::flat(2), false).expect("the pool starts"));
-        let tree = tree(&tc);
+        let tree = tree(tape);
         let jobs = tree.parent.len();
         let build = BUILDS.fetch_add(1, Ordering::Relaxed);
         let (done, finished) = crossbeam_channel::unbounded();

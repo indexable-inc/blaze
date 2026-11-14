@@ -117,6 +117,7 @@ fn a_warm_check_of_every_body_allocates_nothing() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_reinfers_only_that_body() {
     let (infer, borrowck, executed) = rerun_after("let x = 2;", "let x = 25;");
     assert_eq!(infer, 1, "only `edited`: {executed:#?}");
@@ -124,6 +125,7 @@ fn a_body_edit_reinfers_only_that_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_that_types_the_same_reinfers_only_that_body() {
     let (infer, _, executed) =
         rerun_after("let y = 3;\n    y", "let y = 3;\n    let z = y;\n    z");
@@ -131,6 +133,7 @@ fn a_body_edit_that_types_the_same_reinfers_only_that_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_unrelated_impl_reinfers_no_body() {
     let (infer, borrowck, executed) = rerun_after(
         "pub struct Other;",
@@ -141,6 +144,7 @@ fn an_unrelated_impl_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_new_item_reinfers_no_body() {
     let (infer, borrowck, executed) = rerun_after(
         "pub fn sibling()",
@@ -151,6 +155,7 @@ fn a_new_item_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_derived_item_reinfers_no_body() {
     let (infer, borrowck, executed) = rerun_after(
         "pub fn sibling()",
@@ -161,6 +166,7 @@ fn a_derived_item_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_use_reinfers_no_body() {
     let (infer, borrowck, executed) =
         rerun_after("pub fn edited()", "use crate::Other;\npub fn edited()");
@@ -169,6 +175,7 @@ fn a_use_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_use_in_another_module_reinfers_no_body() {
     let (infer, _, executed) =
         rerun_after("use crate::Shared;", "use crate::Shared;\nuse crate::b::sibling;");
@@ -176,6 +183,7 @@ fn a_use_in_another_module_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_unresolved_use_reinfers_no_body() {
     let (infer, _, executed) =
         rerun_after("pub fn edited()", "use crate::Missing;\npub fn edited()");
@@ -183,6 +191,7 @@ fn an_unresolved_use_reinfers_no_body() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_trait_use_reinfers_no_body_of_another_module() {
     let (mut db, files) = fixture();
     edit(
@@ -204,6 +213,7 @@ fn a_trait_use_reinfers_no_body_of_another_module() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_changed_signature_reinfers_its_callers() {
     let (mut db, files) = fixture();
     edit(
@@ -226,6 +236,7 @@ fn a_changed_signature_reinfers_its_callers() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_removed_impl_reinfers_its_reader() {
     let (infer, _, executed) =
         rerun_after("impl Shared {\n    pub fn get(&self) -> u32 {\n        self.0\n    }\n}", "");
@@ -233,6 +244,7 @@ fn a_removed_impl_reinfers_its_reader() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_another_crate_reinfers_no_body() {
     let fx = fixture::db(
         r#"

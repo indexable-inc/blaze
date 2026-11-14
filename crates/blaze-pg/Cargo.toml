@@ -19,7 +19,7 @@ blaze-sha256.workspace = true
 blaze-sql.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

@@ -10,6 +10,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_sim::Tape;
+
 use crate::inline::{InlineAttr, InlineEdge, OwnFacts, SizeClass};
 use crate::key::{ArgsKey, BodyKey, ItemId, Settings, Symbol, Tier, TypeKey, plan_key};
 use crate::program::Arch;
@@ -27,29 +29,9 @@ pub(super) const ARM64_BL: u32 = 0x9400_0000;
 pub(super) const PANIC_EXTERN: &[u8] = b"blaze_panic";
 pub(super) const TYPES: u8 = 3;
 
-/// SplitMix64: a seeded generator, so every run replays from its seed.
-pub(super) struct Rng(u64);
-
-impl Rng {
-    pub(super) fn new(seed: u64) -> Rng {
-        Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-
-    pub(super) fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    pub(super) fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
-
-    pub(super) fn chance(&mut self, num: u64, den: u64) -> bool {
-        self.below(den) < num
-    }
+/// True `num` times in `den`, drawn from the tape; calm (a draw of 0) is false.
+pub(super) fn chance(tape: &Tape, num: u64, den: u64, label: &'static str) -> bool {
+    tape.below(den, label) >= den.saturating_sub(num)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -100,8 +82,8 @@ pub(super) struct Model {
 
 const COSTS: [u32; 4] = [10, 40, 80, 200];
 
-fn attr_of(rng: &mut Rng) -> InlineAttr {
-    match rng.below(10) {
+fn attr_of(tape: &Tape) -> InlineAttr {
+    match tape.below(10, "attr") {
         0..=4 => InlineAttr::None,
         5 | 6 => InlineAttr::Hint,
         7 | 8 => InlineAttr::Always,
@@ -110,24 +92,24 @@ fn attr_of(rng: &mut Rng) -> InlineAttr {
 }
 
 impl Model {
-    pub(super) fn generate(rng: &mut Rng) -> Model {
-        let count = 6 + rng.below(8) as usize;
+    pub(super) fn generate(tape: &Tape) -> Model {
+        let count = 6 + tape.below(8, "functions") as usize;
         let tests = vec![1, 2];
         let mut fns = Vec::new();
         for index in 0..count {
-            let generics = if index == 0 || tests.contains(&index) { 0 } else { rng.below(3) as u8 };
+            let generics = if index == 0 || tests.contains(&index) { 0 } else { tape.below(3, "generics") as u8 };
             fns.push(ModelFn {
                 generics,
                 text: 0,
                 sig: 0,
-                attr: attr_of(rng),
-                cost: COSTS[rng.below(4) as usize],
-                cold: rng.chance(1, 8),
+                attr: attr_of(tape),
+                cost: COSTS[tape.below(4, "cost") as usize],
+                cold: chance(tape, 1, 8, "cold"),
                 calls: Vec::new(),
                 statics: Vec::new(),
-                panics: rng.below(3) as u8,
+                panics: tape.below(3, "panics") as u8,
                 alive: true,
-                file: rng.below(2) as u8,
+                file: tape.below(2, "file") as u8,
                 line: 10 * index as u32 + 1,
             });
         }
@@ -139,21 +121,21 @@ impl Model {
             refused: None,
         };
         for caller in 0..count {
-            let calls = if caller == 0 { 2 + rng.below(2) } else { rng.below(4) };
+            let calls = if caller == 0 { 2 + tape.below(2, "calls") } else { tape.below(4, "calls") };
             for _ in 0..calls {
-                let call = model.random_call(rng, caller);
+                let call = model.random_call(tape, caller);
                 model.fns[caller].calls.push(call);
             }
-            if rng.chance(1, 3) {
-                let target = rng.below(3) as usize;
+            if chance(tape, 1, 3, "reads a static") {
+                let target = tape.below(3, "static read") as usize;
                 model.fns[caller].statics.push(target);
             }
         }
         for _ in 0..3 {
             let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&rng.next().to_le_bytes());
-            let fn_ref = match rng.chance(1, 2) {
-                true => model.random_plain(rng),
+            bytes.copy_from_slice(&tape.next_u64("static bytes").to_le_bytes());
+            let fn_ref = match chance(tape, 1, 2, "static points at a function") {
+                true => model.random_plain(tape),
                 false => None,
             };
             model.statics.push(ModelStatic { bytes, fn_ref });
@@ -162,30 +144,30 @@ impl Model {
     }
 
     /// A call from `caller` to a live function, its type arguments drawn.
-    pub(super) fn random_call(&self, rng: &mut Rng, caller: usize) -> Call {
+    pub(super) fn random_call(&self, tape: &Tape, caller: usize) -> Call {
         let live: Vec<usize> = (0..self.fns.len()).filter(|index| self.fns[*index].alive).collect();
-        let callee = live[rng.below(live.len() as u64) as usize];
+        let callee = live[tape.index(live.len(), "callee")];
         let mut args = Vec::new();
         for _ in 0..self.fns[callee].generics {
             let generics = self.fns[caller].generics;
-            if generics > 0 && rng.chance(1, 2) {
-                args.push(Arg::Param(rng.below(u64::from(generics)) as u8));
+            if generics > 0 && chance(tape, 1, 2, "passes a parameter") {
+                args.push(Arg::Param(tape.below(u64::from(generics), "parameter") as u8));
             } else {
-                args.push(Arg::Concrete(rng.below(u64::from(TYPES)) as u8));
+                args.push(Arg::Concrete(tape.below(u64::from(TYPES), "type argument") as u8));
             }
         }
         Call { callee, args }
     }
 
     /// A live non-generic function, not `main`.
-    pub(super) fn random_plain(&self, rng: &mut Rng) -> Option<usize> {
+    pub(super) fn random_plain(&self, tape: &Tape) -> Option<usize> {
         let plain: Vec<usize> = (1..self.fns.len())
             .filter(|index| self.fns[*index].alive && self.fns[*index].generics == 0)
             .collect();
         if plain.is_empty() {
             return None;
         }
-        Some(plain[rng.below(plain.len() as u64) as usize])
+        Some(plain[tape.index(plain.len(), "plain function")])
     }
 
     pub(super) fn roots(&self) -> Vec<usize> {

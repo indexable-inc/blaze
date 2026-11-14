@@ -48,7 +48,7 @@ objc2-core-video.workspace = true
 objc2-video-toolbox.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

@@ -32,7 +32,6 @@ explore = [
   "dep:blaze-sha256",
   "dep:crossbeam-channel",
   "dep:rcgen",
-  "dep:tokio",
 ]
 
 [dependencies]
@@ -61,19 +60,20 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 # The explorer (feature `explore`): the certificate's hash in the link (base64url, SHA-256), the
 # certificate (rcgen), the request's stop (crossbeam-channel), and the WebTransport server:
-# blaze-http's sans-IO HTTP/3 core under its tokio driver (and the tests' client).
+# blaze-http's sans-IO HTTP/3 core and its driver loop, run with the explorer's own sans-IO
+# machine (`explore::serving`) on one blaze-core driver; the jobs' results come back on a
+# crossbeam-queue. No async runtime.
 base64 = { workspace = true, optional = true }
-blaze-http = { workspace = true, optional = true, features = ["tokio"] }
+blaze-http = { workspace = true, optional = true }
 blaze-sha256 = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

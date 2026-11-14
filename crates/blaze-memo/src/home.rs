@@ -14,8 +14,9 @@ pub trait Home {
 pub struct Homes<'a> {
     /// The greatest arena named; `None` while none is.
     max: Option<ArenaId>,
-    marking: Option<(&'a Slot, u64)>,
-    /// The first arena named outside the marking home's declared closure.
+    marking: Option<(&'a Memo, &'a Slot)>,
+    /// The first arena named outside the marking home's declared closure that is not open
+    /// ([`crate::Inputs::open`]).
     outside: Option<ArenaId>,
 }
 
@@ -24,11 +25,15 @@ impl Homes<'_> {
         if self.max.is_none_or(|max| arena > max) {
             self.max = Some(arena);
         }
-        if let Some((slot, epoch)) = self.marking {
-            if self.outside.is_none() && !slot.reaches(arena) {
+        if let Some((memo, slot)) = self.marking {
+            // An open arena is any home's to name: the borrow below is what keeps it sound.
+            if self.outside.is_none()
+                && !slot.reaches(arena)
+                && !memo.try_slot(arena).is_some_and(Slot::is_open)
+            {
                 self.outside = Some(arena);
             }
-            slot.borrow(arena, epoch);
+            slot.borrow(arena, memo.epoch());
         }
     }
 }
@@ -58,7 +63,8 @@ pub(crate) fn home_of<K: Home + ?Sized>(memo: &Memo, key: &K) -> ArenaId {
 /// # Panics
 ///
 /// Where `key` names an arena outside its home's declared closure ([`crate::Inputs::borrows`],
-/// closed over the dependencies' own): a key naming two unrelated crates is a key missing its
+/// closed over the dependencies' own) that is not open ([`crate::Inputs::open`], a source
+/// root's files: any key may name those): a key naming two unrelated crates is a key missing its
 /// asking crate, and would drop its whole arena on an edit of the other. The message names the
 /// key (`name` writes it) and both arenas; the fix is the asking `Crate` in the key.
 pub(crate) fn mark_borrows<K: Home + ?Sized>(
@@ -67,8 +73,7 @@ pub(crate) fn mark_borrows<K: Home + ?Sized>(
     key: &K,
     name: &dyn Fn(&mut String),
 ) {
-    let mut homes =
-        Homes { max: None, marking: Some((slot, memo.epoch())), outside: None };
+    let mut homes = Homes { max: None, marking: Some((memo, slot)), outside: None };
     key.home(&mut homes);
     if let Some(outside) = homes.outside
         && memo.plant() != crate::Plant::MarkOutsideClosure

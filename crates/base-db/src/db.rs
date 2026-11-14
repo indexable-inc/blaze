@@ -121,6 +121,16 @@ mod tests;
 
 pub use shared::{Reader, Shared};
 
+/// The scheduler's single flight: a database that several tasks drive.
+fn scheduled() -> std::sync::Arc<dyn blaze_memo::Flight, Global> {
+    std::sync::Arc::new_in(blaze_memo::Scheduled::new(), Global)
+}
+
+/// One task's single flight: a test's database, which one task drives.
+fn alone() -> std::sync::Arc<dyn blaze_memo::Flight, Global> {
+    std::sync::Arc::new_in(blaze_memo::Alone::new(), Global)
+}
+
 /// Whether `payload` is a task's give-way ([`blaze_memo::Cancelled::GaveWay`]).
 fn gave_way(payload: &(dyn std::any::Any + Send)) -> bool {
     matches!(payload.downcast_ref::<blaze_memo::Cancelled>(), Some(blaze_memo::Cancelled::GaveWay))
@@ -204,7 +214,7 @@ impl Db {
     /// ([`blaze_memo::record`] answers only under [`blaze_memo::Reads::Kept`]): a build that
     /// files body records keeps them, every other build passes [`blaze_memo::Reads::Off`].
     pub fn new(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
-        Db::with(Run::Pool, None, boundaries, reads)
+        Db::with(Run::Pool, scheduled(), None, boundaries, reads)
     }
 
     /// A build's database ([`Db::new`]) that keeps a [`blaze_memo::testing::RunLog`] of the
@@ -212,7 +222,7 @@ impl Db {
     /// runs (`crates/hir-firewall`). `reads` as for [`Db::new`].
     pub fn logged(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Pool, Some(log), boundaries, reads)
+        Db::with(Run::Pool, scheduled(), Some(log), boundaries, reads)
     }
 
     /// A database for tests: its batches run on the calling thread in this thread's
@@ -220,9 +230,14 @@ impl Db {
     /// roots and an empty crate graph, committed, as a fixture expects to find them. It keeps
     /// no read lists ([`blaze_memo::Reads::Off`]); a test that checks them takes
     /// [`Db::for_tests_with_reads`].
+    ///
+    /// One task drives it: its single flight is one task's ([`blaze_memo::Alone`]), which
+    /// refuses, naming the key, an ask by a second task of a key the first one runs. A test that
+    /// several tasks or threads drive (a build driver on a pool, a simulation's tasks) takes
+    /// [`Db::for_tests_driven`].
     pub fn for_tests(boundaries: fn(&mut blaze_memo::Builder)) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Here, Some(log), boundaries, blaze_memo::Reads::Off)
+        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Off)
     }
 
     /// A database for tests ([`Db::for_tests`]) whose queries keep read lists
@@ -230,19 +245,29 @@ impl Db {
     /// checks what a query read.
     pub fn for_tests_with_reads(boundaries: fn(&mut blaze_memo::Builder)) -> Db {
         let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
-        Db::with(Run::Here, Some(log), boundaries, blaze_memo::Reads::Kept)
+        Db::with(Run::Here, alone(), Some(log), boundaries, blaze_memo::Reads::Kept)
+    }
+
+    /// A database for tests ([`Db::for_tests`]: its batches in this thread's [`RunOrder`], a
+    /// run log, `reads` as for [`Db::new`]) that several tasks or threads drive at once: a
+    /// build driver on a pool, a simulation's tasks. Its single flight is the scheduler's
+    /// ([`blaze_memo::Scheduled`]), as a build's database's is: an asker of a key another task
+    /// runs waits for that run and gets its value.
+    pub fn for_tests_driven(
+        boundaries: fn(&mut blaze_memo::Builder),
+        reads: blaze_memo::Reads,
+    ) -> Db {
+        let log = std::sync::Arc::new_in(blaze_memo::testing::RunLog::new(), Global);
+        Db::with(Run::Here, scheduled(), Some(log), boundaries, reads)
     }
 
     fn with(
         run: Run,
+        flight: std::sync::Arc<dyn blaze_memo::Flight, Global>,
         log: Option<std::sync::Arc<blaze_memo::testing::RunLog, Global>>,
         boundaries: fn(&mut blaze_memo::Builder),
         reads: blaze_memo::Reads,
     ) -> Db {
-        let flight: std::sync::Arc<dyn blaze_memo::Flight> = match run {
-            Run::Pool => std::sync::Arc::new_in(blaze_memo::Scheduled::new(), Global),
-            Run::Here => std::sync::Arc::new_in(blaze_memo::Alone::default(), Global),
-        };
         let mut world = World::new(boundaries, log, flight, reads);
         let files: Arc<Files> = Arc::default();
         // Empty roots and an empty graph: what a fixture expects to find, and a build's first
@@ -321,8 +346,15 @@ impl Db {
         self.snap.memo.snapshot_epoch()
     }
 
-    /// This database's nonce: the same for one `Db` across every commit, another for every
-    /// other `Db` of the process. What tells two databases apart.
+    /// This database's nonce: another for every other `Db` of the process, and the same for
+    /// one `Db` across every commit while its id space lasts. What tells two databases apart,
+    /// and what a holder of ids outside the memo keys by: within one nonce an
+    /// [`blaze_memo::ArenaId`] (and so a [`blaze_memo::Gid`]) names one making of an arena
+    /// for ever, across every commit and every new session (blaze-memo's id space, which a
+    /// new session goes on in). The one commit that starts a new id space, once an arena
+    /// index has made its last generation in the old one ([`blaze_memo::MAX_GENERATION`]` + 1`
+    /// makings of one index in the database's life), gives the database another nonce, and
+    /// so a reader's copy made after it has the new one with the new snapshot.
     #[inline]
     pub fn nonce(&self) -> Nonce {
         self.nonce
@@ -687,6 +719,8 @@ impl Db {
             moved = tracing::field::Empty,
             dropped = tracing::field::Empty,
             fresh = tracing::field::Empty,
+            marked = tracing::field::Empty,
+            causes = tracing::field::Empty,
         )
         .entered();
         let crates = crates.unwrap_or_else(|| CratesIdMap::new_in(Global));
@@ -705,14 +739,28 @@ impl Db {
         // The old snapshot's table is taken over in place when no reader holds it.
         let made = world::commit(world, &self.files, Some(&mut self.snap));
         span.record("dropped", made.dropped.len() as u64);
-        // Why every arena was made again, when the commit carried none (`world::Fresh`).
-        if let Some(fresh) = made.fresh {
-            span.record("fresh", fresh.name());
+        // Why every arena was made again, when the commit carried none (`world::Fresh`), and
+        // each arena marked with why: the first `world::MARKS_NAMED`, then a count. Written
+        // only when the span is recorded.
+        span.record("marked", made.marked.len() as u64);
+        if !span.is_disabled() {
+            if let Some(fresh) = made.fresh {
+                span.record("fresh", tracing::field::display(fresh));
+            }
+            let mut causes: Vec<u8, Global> = Vec::new_in(Global);
+            world::describe(world, &made.marked, made.fresh, &mut causes)
+                .expect("writing to a Vec does not fail");
+            span.record("causes", &*String::from_utf8_lossy(&causes));
         }
         if let Some(arenas) = made.arenas {
             world.arenas = arenas;
         }
         let seq = made.snap.seq;
+        // A new id space: its ids may be ones an earlier snapshot of this database handed out,
+        // so the database is another to every holder of ids, which keys by its nonce.
+        if made.renewed {
+            self.nonce = Nonce::new();
+        }
         // The old snapshot released here (unless a reader holds it), so the file sets the edit
         // changed where they are are written in place in the new one's inputs, before any
         // query runs on it: nothing after this point can fail, so a commit that panicked
@@ -1061,6 +1109,29 @@ impl Edit<'_> {
         self.world().crates.take_gift(krate, std::any::TypeId::of::<K>())
     }
 
+    /// Gives `krate` `value` as the located kind `K` under the giver's `fact`
+    /// ([`crate::Located`]): read by [`crate::Crate::located`] off the next snapshot's table,
+    /// no slot of any arena. The first gift of the kind to the crate marks no arena, however
+    /// much its arena holds; one under the fact held moves nothing; one under another fact
+    /// replaces it and marks the crate, as [`Edit::take_located`] does.
+    ///
+    /// # Panics
+    ///
+    /// Where the world has no crate `krate`, or it holds a gift of kind `K` given as a slot
+    /// ([`Edit::give`], [`Edit::give_by`]).
+    pub fn give_located<K: crate::Located>(&mut self, krate: CrateKey, fact: Fact, value: Given) -> &mut Self {
+        let kind = std::any::TypeId::of::<K>();
+        self.world().crates.give_located(krate, kind, std::any::type_name::<K>(), fact, value);
+        self
+    }
+
+    /// Takes `krate`'s located gift of kind `K` away ([`Edit::give_located`]): from this
+    /// commit [`crate::Crate::located`] answers `None`, and the crate's arena is marked, so every
+    /// run that read the value goes. Whether anything moved: a crate holding none moves nothing.
+    pub fn take_located<K: crate::Located>(&mut self, krate: CrateKey) -> bool {
+        self.world().crates.take_gift(krate, std::any::TypeId::of::<K>())
+    }
+
     /// Has the arena of `krate` (the session arena for `None`) run `make` each time it is made,
     /// from the next commit on, after the world's own inputs there: how a crate above base-db
     /// sets inputs of its own types (a singleton, the driver's holder of something) in an
@@ -1071,8 +1142,10 @@ impl Edit<'_> {
     /// # Panics
     ///
     /// Where the world has no crate `krate`.
+    #[track_caller]
     pub fn set_given(&mut self, krate: Option<CrateKey>, fact: Fact, make: MakeGiven) -> &mut Self {
-        let maker = world::Maker { fact, make };
+        // Where it is given: what a commit's span names when this maker marks its arena.
+        let maker = world::Maker { fact, make, at: std::panic::Location::caller() };
         let id = maker.fact.id;
         let world = self.world();
         match krate {

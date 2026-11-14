@@ -1,6 +1,6 @@
 [package]
 name = "blaze-unitkey"
-description = "Task::Key of the keyed driver (D38, docs/v2/plan/design/read-addressed.md): a file's FileImage record from its bytes, and every key of a unit (manifest, surface, each body) from its own text alone, reading nothing of any other unit; sans-IO, reads no file"
+description = "Task::Key of the keyed driver (D39, docs/v2/plan/design/read-addressed.md): a file's FileImage record from its bytes, and every key of a unit (manifest, surface, each body) from its own text alone, reading nothing of any other unit; sans-IO, reads no file"
 publish = false
 
 version.workspace = true
@@ -29,7 +29,7 @@ cfg.workspace = true
 intern.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

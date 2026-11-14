@@ -1,22 +1,37 @@
-//! What an [`Endpoint`](super::Endpoint) is made with: the certificate it serves, the hashes
-//! it pins as a client, and the transport's limits; and their rustls and quinn-proto configs.
+//! What an [`Endpoint`](super::Endpoint) is made with: the certificate it serves, how it trusts
+//! a server as a client, and the transport's limits; and their rustls and quinn-proto configs.
 //!
-//! A client here checks a server's certificate as a browser's `serverCertificateHashes` does
-//! (the WebTransport API, 7.2): the SHA-256 of the end-entity certificate's DER is one of the
-//! pinned hashes, its key is ECDSA P-256, its validity is at most 14 days, and now is inside
-//! it. No name and no chain are checked; the hash is the trust.
+//! A client trusts a server one of two ways ([`Trust`]). Pinned, it checks a server's
+//! certificate as a browser's `serverCertificateHashes` does (the WebTransport API, 7.2): the
+//! SHA-256 of the end-entity certificate's DER is one of the pinned hashes, its key is ECDSA
+//! P-256, its validity is at most 14 days, and now is inside it; no name and no chain are
+//! checked, the hash is the trust. With roots, it checks the chain and the name against them, as
+//! any HTTPS client does (a public origin's, the remote cache's).
+//!
+//! Every client resumes: its TLS session tickets are kept in [`Tickets`], in memory, and given
+//! out as [`Ticket`]s for the driver to keep across processes; with one, a connection's first
+//! requests go as 0-RTT early data (the [`super::request`] module says which may).
 
 #![blaze::sans_io]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    alloc::Global,
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
+use blaze_core::lock::Lock;
 use quinn_proto::{
     IdleTimeout, TransportConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::{
-    DigitallySignedStruct, SignatureScheme,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    DigitallySignedStruct, NamedGroup, RootCertStore, SignatureScheme,
+    client::{
+        ClientSessionStore, Resumption, Tls12ClientSessionValue, Tls13ClientSessionValue,
+        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    },
     crypto::{CryptoProvider, WebPkiSupportedAlgorithms},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
 };
@@ -27,6 +42,15 @@ use super::{Error, Step};
 pub const ALPN: &[u8] = b"h3";
 /// The longest validity `serverCertificateHashes` takes.
 pub const MOST_VALID: Duration = Duration::from_secs(14 * 86_400);
+/// The most tickets kept for one server. rustls servers send two after each handshake, and one
+/// is spent by each connection that resumes: four covers two connections opened at once with
+/// one to spare, and the server sets how many it sends, so the store bounds it (rustls's
+/// `ClientSessionStore` asks for a bound).
+pub const MOST_TICKETS_PER_SERVER: usize = 4;
+/// The most servers tickets are kept for. A process of blaze talks to one cache origin, and a
+/// test to a few; past this, the server first in name order loses its tickets, so the store
+/// stays bounded whatever the asker connects to.
+pub const MOST_TICKET_SERVERS: usize = 8;
 
 /// A certificate and its PKCS #8 private key, both DER.
 #[derive(Clone)]
@@ -63,14 +87,172 @@ impl Default for Transport {
 pub struct ServerConfig {
     pub identity: Identity,
     pub transport: Transport,
+    /// Whether requests that are not a WebTransport CONNECT are the asker's
+    /// ([`super::Event::Request`], answered with [`super::Endpoint::respond`]); without it they
+    /// are answered 400 or 501 by the core, as a WebTransport-only server does.
+    pub requests: bool,
+}
+
+/// How a client trusts the servers it connects to.
+#[derive(Clone, Debug)]
+pub enum Trust {
+    /// `serverCertificateHashes`: the SHA-256s of the server certificates it takes.
+    Pinned(Vec<[u8; 32]>),
+    /// Web PKI: the chain and the name, checked against these roots.
+    Roots(Arc<RootCertStore>),
 }
 
 /// How an endpoint connects.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    /// The SHA-256s of the server certificates it takes.
-    pub pins: Vec<[u8; 32]>,
+    pub trust: Trust,
     pub transport: Transport,
+}
+
+/// A TLS 1.3 session ticket, as bytes a driver keeps between processes: given out as
+/// [`super::Event::Ticket`] when a server sends one, and taken back by
+/// [`super::Endpoint::add_ticket`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    /// The server name it resumes with (the name the connection was made to).
+    pub server_name: String,
+    /// When the server issued it, in Unix seconds (rustls's clock).
+    pub issued_unix_s: u64,
+    /// How long after `issued_unix_s` the server takes it.
+    pub lifetime_s: u32,
+    /// The ticket, its secret and the server's transport parameters, in the vendored rustls's
+    /// layout (vendor/rustls/SOURCE.md). Secret: whoever has them can resume as this client.
+    pub bytes: Vec<u8>,
+}
+
+/// The client's TLS 1.3 tickets, by server name: rustls's resumption store, and what the
+/// endpoint drains to the driver.
+pub(crate) struct Tickets {
+    held: Lock<Held>,
+}
+
+struct Held {
+    by_server: BTreeMap<String, VecDeque<Tls13ClientSessionValue>>,
+    kx: BTreeMap<String, NamedGroup>,
+    /// Tickets the servers sent since the endpoint last drained them.
+    fresh: VecDeque<Ticket>,
+}
+
+impl std::fmt::Debug for Tickets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self.held.lock();
+        f.debug_struct("Tickets").field("servers", &held.by_server.len()).finish_non_exhaustive()
+    }
+}
+
+impl Tickets {
+    fn new() -> Tickets {
+        Tickets {
+            held: Lock::new(
+                "h3.tickets",
+                Held {
+                    by_server: BTreeMap::new(),
+                    kx: BTreeMap::new(),
+                    fresh: VecDeque::new_in(Global),
+                },
+            ),
+        }
+    }
+
+    /// Keeps `value` for `server`, in the bounds.
+    fn keep(held: &mut Held, server: String, value: Tls13ClientSessionValue) {
+        if !held.by_server.contains_key(&server) && held.by_server.len() >= MOST_TICKET_SERVERS {
+            held.by_server.pop_first();
+        }
+        let kept = held.by_server.entry(server).or_insert_with(|| VecDeque::new_in(Global));
+        if kept.len() >= MOST_TICKETS_PER_SERVER {
+            kept.pop_front();
+        }
+        kept.push_back(value);
+    }
+
+    /// A ticket a driver kept, decoded under `tls` (the config every connection of this
+    /// endpoint is made with, so rustls resumes with it).
+    pub(crate) fn add(&self, tls: &rustls::ClientConfig, ticket: &Ticket) -> Result<(), Error> {
+        let value = tls.tls13_ticket_from_bytes(&ticket.bytes).map_err(|why| {
+            config_error(format!(
+                "the ticket kept for {} (issued at {} s) is not one this rustls reads: {why:?}",
+                ticket.server_name, ticket.issued_unix_s
+            ))
+        })?;
+        let mut held = self.held.lock();
+        Tickets::keep(&mut held, ticket.server_name.clone(), value);
+        Ok(())
+    }
+
+    /// The tickets servers sent since the last call, oldest first.
+    pub(crate) fn take_fresh(&self) -> Option<Ticket> {
+        self.held.lock().fresh.pop_front()
+    }
+}
+
+impl ClientSessionStore for Tickets {
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+        let mut held = self.held.lock();
+        let name = server_name.to_str().into_owned();
+        if !held.kx.contains_key(&name) && held.kx.len() >= MOST_TICKET_SERVERS {
+            held.kx.pop_first();
+        }
+        held.kx.insert(name, group);
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
+        self.held.lock().kx.get(server_name.to_str().as_ref()).copied()
+    }
+
+    // TLS 1.2 is never offered (every config here is TLS 1.3 only), so there is no TLS 1.2
+    // session to keep, give or forget.
+    fn set_tls12_session(&self, _: ServerName<'static>, _: Tls12ClientSessionValue) {}
+
+    fn tls12_session(&self, _: &ServerName<'_>) -> Option<Tls12ClientSessionValue> {
+        None
+    }
+
+    fn remove_tls12_session(&self, _: &ServerName<'static>) {}
+
+    fn insert_tls13_ticket(&self, server_name: ServerName<'static>, value: Tls13ClientSessionValue) {
+        let name = server_name.to_str().into_owned();
+        let ticket = Ticket {
+            server_name: name.clone(),
+            issued_unix_s: value.issued().as_secs(),
+            lifetime_s: value.lifetime_secs(),
+            bytes: value.to_bytes(),
+        };
+        let mut held = self.held.lock();
+        // The driver drains these after every call; a server that sends more between two calls
+        // than the store keeps for it loses its oldest, as the store would.
+        if held.fresh.len() >= MOST_TICKETS_PER_SERVER * MOST_TICKET_SERVERS {
+            held.fresh.pop_front();
+        }
+        held.fresh.push_back(ticket);
+        Tickets::keep(&mut held, name, value);
+    }
+
+    fn take_tls13_ticket(&self, server_name: &ServerName<'static>) -> Option<Tls13ClientSessionValue> {
+        let mut held = self.held.lock();
+        let name = server_name.to_str();
+        // The newest: it has the most of its lifetime left. Each is given at most once, as
+        // rustls's contract asks (a ticket used twice is a replay the server may refuse).
+        let kept = held.by_server.get_mut(name.as_ref())?;
+        let value = kept.pop_back();
+        if kept.is_empty() {
+            held.by_server.remove(name.as_ref());
+        }
+        value
+    }
+}
+
+/// A client's configs: quinn-proto's, the rustls one inside it (tickets decode under it), and
+/// its ticket store.
+pub(crate) struct Client {
+    pub(crate) quic: quinn_proto::ClientConfig,
+    pub(crate) tls: Arc<rustls::ClientConfig>,
+    pub(crate) tickets: Arc<Tickets>,
 }
 
 fn config_error(why: String) -> Error {
@@ -118,7 +300,12 @@ pub fn server_tls(identity: &Identity) -> Result<rustls::ServerConfig, Error> {
 
 /// quinn-proto's server config of `config`.
 pub(crate) fn server(config: &ServerConfig) -> Result<Arc<quinn_proto::ServerConfig>, Error> {
-    let tls = server_tls(&config.identity)?;
+    let mut tls = server_tls(&config.identity)?;
+    // Early data is taken: QUIC allows only 0 or u32::MAX here (RFC 9001, 4.6.1), and
+    // quinn-proto's conversion leaves it as given. rustls takes it only with its default,
+    // stateful resumption (a ticket is a key into this config's session cache, so each is
+    // taken once and a replayed first flight is refused by rustls).
+    tls.max_early_data_size = u32::MAX;
     let quic = QuicServerConfig::try_from(tls)
         // alloc: an error's message, made only when it fails.
         .map_err(|why| config_error(format!("quinn-proto did not take the TLS config: {why}")))?;
@@ -129,30 +316,38 @@ pub(crate) fn server(config: &ServerConfig) -> Result<Arc<quinn_proto::ServerCon
     Ok(Arc::new(server))
 }
 
-/// quinn-proto's client config of `config`.
-pub(crate) fn client(config: &ClientConfig) -> Result<quinn_proto::ClientConfig, Error> {
+/// quinn-proto's client config of `config`, with the rustls config inside it and its ticket
+/// store: every connection made with it resumes from the store and offers early data.
+pub(crate) fn client(config: &ClientConfig) -> Result<Client, Error> {
     let provider = provider();
-    // alloc: one verifier per config.
-    let verifier = Arc::new(Pinned {
-        pins: config.pins.clone(),
-        algorithms: provider.signature_verification_algorithms,
-    });
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+    let algorithms = provider.signature_verification_algorithms;
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        // alloc: an error's message, made only when it fails.
-        .map_err(|why| config_error(format!("rustls refused TLS 1.3 with ring: {why}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    // alloc: one ALPN list per config.
-    tls.alpn_protocols = vec![ALPN.to_vec()];
-    let quic = QuicClientConfig::try_from(tls)
-        // alloc: an error's message, made only when it fails.
+        .map_err(|why| config_error(format!("rustls refused TLS 1.3 with ring: {why}")))?;
+    let mut tls = match &config.trust {
+        Trust::Pinned(pins) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new_in(
+                Pinned { pins: pins.clone(), algorithms },
+                Global,
+            ))
+            .with_no_client_auth(),
+        Trust::Roots(roots) => builder.with_root_certificates(Arc::clone(roots)).with_no_client_auth(),
+    };
+    let mut alpn = Vec::new_in(Global);
+    alpn.push(ALPN.to_vec());
+    tls.alpn_protocols = alpn;
+    let tickets = Arc::new_in(Tickets::new(), Global);
+    tls.resumption = Resumption::store(Arc::clone(&tickets) as Arc<dyn ClientSessionStore>);
+    tls.enable_early_data = true;
+    let tls = Arc::new_in(tls, Global);
+    // From the Arc, so the config inside quinn-proto is this very one: a ticket decoded under
+    // `tls` is `compatible_config` with the connections quinn-proto makes.
+    let quic = QuicClientConfig::try_from(Arc::clone(&tls))
         .map_err(|why| config_error(format!("quinn-proto did not take the TLS config: {why}")))?;
-    // alloc: one per config.
-    let mut client = quinn_proto::ClientConfig::new(Arc::new(quic));
+    let mut client = quinn_proto::ClientConfig::new(Arc::new_in(quic, Global));
     client.transport_config(transport(&config.transport)?);
-    Ok(client)
+    Ok(Client { quic: client, tls, tickets })
 }
 
 /// `serverCertificateHashes`' check, as rustls's verifier.

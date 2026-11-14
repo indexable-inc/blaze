@@ -159,7 +159,7 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
             store_settings.reads().into_iter().map(space_said).collect::<Vec<_>>().join(", ")
         ));
     }
-    let mut driven = Driven::open(root, &store_settings)?;
+    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
     let mut bucket = connect(&settings).map_err(|it| it.to_string())?;
     let mut remote = Remote::new(&mut *bucket, &settings.root, trusted);
     let (bundle, segments) = remote.bundle_ahead(ns, &id).map_err(|it| it.to_string())?;
@@ -238,7 +238,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let ns = name::namespace_named(&input.namespace).map_err(|it| it.to_string())?;
     let store_settings = StoreSettings::read(root)?;
     let store_file = root.join(blaze_cas::plain::settings::FILE);
-    let mut driven = Driven::open(root, &store_settings)?;
+    let mut driven = Driven::open(root, &store_settings).map_err(|it| it.to_string())?;
     if !store_settings.trusted_writer {
         // By construction: a machine that is not a trusted writer files everything in
         // namespace local, so its store holds nothing of a namespace that can be pushed.
@@ -304,7 +304,7 @@ fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>)
     let report = drive(&mut machine, &mut *bucket, &mut |()| Ok(())).map_err(|it| it.to_string())?;
     let counts = bucket.counts();
     drop(machine);
-    driven.publish(ids)?;
+    driven.publish(ids).map_err(|it| it.to_string())?;
     Ok(format!(
         "pushed {} records in {} segment(s) to {} ({} put, {} already there, {} bytes); {} shard(s), {} merge(s), root generation {} after {} attempt(s), {} key(s) sampled against the bucket; {} requests, {} bytes sent; {other} segment(s) of other namespaces stay here\n",
         report.records,

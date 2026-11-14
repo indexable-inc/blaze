@@ -6,9 +6,9 @@ date: 2026-11-13
 # The host: one command drives the keyed driver on real code
 
 Owner: the main agent. Part of `target.md` (its Order, step 2). Records are read-addressed
-(decision D38, `read-addressed.md`). Every number is an **estimate**; nothing here is measured.
+(decision D39, `read-addressed.md`). Every number is an **estimate**; nothing here is measured.
 
-## What exists (read in the tree, 2026-11-13, branch port-memo-1113)
+## What exists (read in the tree, 2026-11-14)
 
 - `crates/blaze-keyed`: the driver of one request (`driver.rs`), the kinds and their keys
   (`kind.rs`), records, fact ids and their routing (`record.rs`), the `Front` seam and the one
@@ -18,8 +18,9 @@ Owner: the main agent. Part of `target.md` (its Order, step 2). Records are read
 - `crates/blaze-host`: performs every effect on `blaze_keyed::store::Store` (blaze-cas's plain
   store in its tests) and blaze-graph's pool, with a scripted `Front` in its tests.
 - `crates/blaze-cas/src/plain`: the store. `crates/blaze-unitkey`: `unit::key`, a unit's keys
-  from text. `crates/blaze-front`: the surface and body tasks over the ported front end (being
-  moved onto this seam: its `now` and reuse paths go).
+  from text.
+- `crates/blaze-front`: the surface and body tasks over the ported front end (blaze-memo), on
+  this seam.
 
 ## The rule everything below follows
 

@@ -150,7 +150,7 @@ simulator's prediction for 256 and 512 from the same transcript.
 | time from `run` to a program's first instruction, `edit` goal | not measured | the cost of the code it executes first, not of what it can reach |
 | time a band 0 node waits behind lower bands | not measured | p99 under 1 ms |
 
-Proof is by simulation, not review (`dst-not-review`): Hegel properties over random graphs with
+Proof is by simulation, not review (`dst-not-review`): blaze-sim properties over random graphs with
 bands, cycles and cancellations (no lost wakeup, no starvation within the aging bound, a
 component run by exactly one task, every true cycle refused and nothing else, the same records
 under every schedule), and the transcript simulator replaying a real profile under each step's

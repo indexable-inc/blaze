@@ -35,7 +35,7 @@ tracing.workspace = true
 # The real store the end-to-end tests run on.
 blaze-cas.workspace = true
 # The property test: any edit sequence files what a fresh build files.
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

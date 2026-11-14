@@ -3816,7 +3816,9 @@ impl TypeParam {
         let data = &params[self.id.local_id()];
         match data.type_param().unwrap().provenance {
             TypeParamProvenance::TypeParamList => false,
-            TypeParamProvenance::TraitSelf | TypeParamProvenance::ArgumentImplTrait => true,
+            TypeParamProvenance::TraitSelf
+            | TypeParamProvenance::ArgumentImplTrait
+            | TypeParamProvenance::Anonymous => true,
         }
     }
 
@@ -4078,11 +4080,11 @@ impl Impl {
         }
         // Each crate's trait impls for the type alone: of a crate read from impl table pages,
         // the type's entry and its rows, not the crate's whole table.
+        // Asked once, keyed by `krate`: a query keyed by one loaded crate and the type's (two
+        // unrelated crates) is refused by homing.
         let key = method_resolution::SelfTyKey(simplified_ty);
-        for &seen in method_resolution::loaded_crates(db, krate.id) {
-            let impls = TraitImpls::in_crate_for_self_ty(db, seen, key);
-            result.extend(impls.iter().copied().map(|id| Impl { id }));
-        }
+        let impls = TraitImpls::in_crate_and_deps_for_self_ty(db, krate.id, key);
+        result.extend(impls.iter().copied().map(|id| Impl { id }));
         // An impl in a block is one of its crate as well as of the block.
         let mut seen = HashSet::new_in(Global); // alloc: editor edge, sized by the impls found
         result.retain(|it| seen.insert(*it));

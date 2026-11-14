@@ -368,6 +368,10 @@ pub enum Refused {
     Length { found: SegmentLen, wanted: SegmentLen },
     /// The fetched bytes' digest is not the segment's id: the store's one check of them.
     Digest { found: ContentId, wanted: SegmentId },
+    /// The signer's key was revoked by its namespace's key list.
+    Revoked { signer: [u8; 32] },
+    /// The signer is known to the namespace, but not in the role that may sign this.
+    Role { signer: [u8; 32] },
 }
 
 impl fmt::Display for Refused {
@@ -393,6 +397,32 @@ impl fmt::Display for Refused {
             Refused::Digest { found, wanted } => {
                 write!(f, "the fetched bytes digest to {found:?}, not the segment's id {:?}", wanted.0)
             }
+            Refused::Revoked { signer } => write!(f, "its signer {} was revoked by its namespace's key list", Hex(signer)),
+            Refused::Role { signer } => write!(f, "its signer {} is not in the role that may sign it", Hex(signer)),
+        }
+    }
+}
+
+/// A file of the store, as an error names it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreFile {
+    Head,
+    FlipLock,
+    CacheTag,
+    Directory,
+    Log { id: u64 },
+    Segment { id: u64 },
+}
+
+impl fmt::Display for StoreFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreFile::Head => f.write_str("the head"),
+            StoreFile::FlipLock => f.write_str("the flip lock"),
+            StoreFile::CacheTag => f.write_str("the cache tag file"),
+            StoreFile::Directory => f.write_str("the store's directory"),
+            StoreFile::Log { id } => write!(f, "log {id}"),
+            StoreFile::Segment { id } => write!(f, "segment {id}"),
         }
     }
 }
@@ -443,9 +473,27 @@ pub enum StoreError {
     /// The record of `tag`, `key` was put by this process and is not committed yet: it has no
     /// mapped place, so it is said, never answered as absent.
     Uncommitted { tag: Tag, key: ContentId },
-    /// The store's core stopped: `why`, as the core said it. The one variant that still carries
-    /// text; its reasons become variants as the core's stop reasons are typed.
-    Broken { why: String },
+    /// An IO effect of the store failed: `doing` what, on which `file`, and the driver's own
+    /// text of the error (blaze-core's IO error carries no number yet; it becomes one when it
+    /// does).
+    Io { doing: &'static str, file: StoreFile, error: String },
+    /// The driver completed effect `op`, index `index`, that the core did not ask for in
+    /// `phase`: a driver's bug, said rather than absorbed.
+    Unasked { op: u8, index: u32, phase: &'static str },
+    /// The head is not a head this blaze made: `what` is wrong at byte `at`.
+    Head { what: &'static str, at: u64 },
+    /// A segment of this boot is `len` bytes where its row in generation `generation` names
+    /// `named`: changed outside blaze.
+    Changed { segment: u64, generation: u64, len: u64, named: u64 },
+    /// A commit took `took_s` seconds, past the grace of `grace_s` that keeps its files.
+    CommitTooSlow { took_s: u64, grace_s: u64 },
+    /// The store was asked for something while in `phase`, which takes no such ask.
+    Busy { phase: &'static str },
+    /// The root `key` of generation `generation` names a record no segment holds.
+    RootGone { generation: u64, key: ContentId },
+    /// A bucket object (`object`: its name in the bucket) was refused or failed: `what`, with
+    /// the bucket's status (0 when it gave none).
+    RemoteObject { what: &'static str, object: String, status: u32 },
     /// A failure only printed, never matched on.
     Other { what: &'static str },
 }
@@ -497,7 +545,25 @@ impl fmt::Display for StoreError {
             StoreError::Uncommitted { tag, key } => {
                 write!(f, "the record of kind {} key {key:?} is put but not committed: it has no mapped place yet", tag.0)
             }
-            StoreError::Broken { why } => write!(f, "the store stopped: {why}"),
+            StoreError::Io { doing, file, error } => write!(f, "{doing} {file} failed: {error}"),
+            StoreError::Unasked { op, index, phase } => {
+                write!(f, "the driver completed effect {op} (index {index}) that the store did not ask for while {phase}")
+            }
+            StoreError::Head { what, at } => write!(f, "the store's head is not one this blaze made: {what} at byte {at}"),
+            StoreError::Changed { segment, generation, len, named } => write!(
+                f,
+                "segment {segment} is {len} bytes, and generation {generation} names {named}: changed outside blaze"
+            ),
+            StoreError::CommitTooSlow { took_s, grace_s } => {
+                write!(f, "a commit took {took_s} s, past the {grace_s} s that keep its files")
+            }
+            StoreError::Busy { phase } => write!(f, "the store is {phase}, and takes no such ask then"),
+            StoreError::RootGone { generation, key } => {
+                write!(f, "the root {key:?} of generation {generation} names a record no segment holds")
+            }
+            StoreError::RemoteObject { what, object, status } => {
+                write!(f, "the remote cache: {what} for `{object}` ({status})")
+            }
             StoreError::Other { what } => f.write_str(what),
         }
     }

@@ -51,7 +51,7 @@ pub fn intern<T: Interned>(memo: &Memo, fields: T::Fields) -> Gid {
     let column = if spill { memo.spill() } else { slot };
     let local = column.reserve_local(spill);
     let entry = with_local(slot, |at| -> *const Entry<T::Fields, ()> {
-        at.alloc(Entry { head: Head::new(hash, T::KIND, &[], local), key: fields, value: () })
+        at.alloc(Entry { head: Head::new(hash, T::KIND, local), key: fields, value: () })
     });
     // SAFETY: just made in `slot`'s arena, which `memo` holds; an `owns` entry's fields are
     // dropped with the arena, once, whether or not this one wins the race below (a loser is

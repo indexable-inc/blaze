@@ -619,18 +619,48 @@ pub struct Served {
     pub(super) answer: Arc<[u8]>,
 }
 
+/// A body as its posted rows are found ([`Posted`]): its crate's key and its item's key
+/// (`hir_def::deps::body_key`), each the same in every snapshot of the session. Never the
+/// body's `DefWithBodyId`: an edit rebuilds its crate's arena and the arenas of the crates
+/// above it, and every id of a rebuilt arena is another id after the commit, so a row filed
+/// under an id is never found again once its crate or a dependency is edited (rules 21, 65:
+/// a key holds nothing that moves without the value). Whether a row found by its name still
+/// answers is its read list's question (`super::Store::served_answer`), never the name's.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) struct BodyName {
+    krate: base_db::CrateKey,
+    item: ContentId,
+}
+
+impl BodyName {
+    /// `def`'s name now; none for a body in a block, which has no item key (no row of it is
+    /// posted: [`serve`] refuses it by name).
+    pub(super) fn of(db: &Db, def: DefWithBodyId) -> Option<BodyName> {
+        use hir_def::HasModule as _;
+        let item = hir_def::deps::body_key(db, def)?;
+        Some(BodyName { krate: def.krate(db).key(db), item })
+    }
+}
+
 /// The served answers of one database (`super::Store::served`), by body: each answers while
-/// the identity and every fact it read hash as they did (`super::Store::served_answer`). A
-/// body's rows go when the driver unposts it ([`unpost`]).
+/// the identity and every fact it read hash as they did (`super::Store::served_answer`), in
+/// any snapshot (a row is filed under the body's [`BodyName`], not its id). A body's rows go
+/// when the driver unposts it ([`unpost`]).
 ///
 /// With them, what the driver claimed of the database (`claim_serve`, `claim_keeps`), so a
 /// body is served once a snapshot and kept once a run, however many units reach it.
 #[derive(Default)]
 pub(super) struct Posted {
     /// Each body's rows, one a step and schema.
-    rows: blaze_hash::HashMap<DefWithBodyId, Vec<(Step, SchemaHash, Arc<Served>)>, Global>,
-    /// The snapshot (`blaze_memo::Epoch`) each crate's serve was last claimed in.
-    claimed: blaze_hash::HashMap<base_db::Crate, blaze_memo::Epoch, Global>,
+    rows: blaze_hash::HashMap<BodyName, Vec<(Step, SchemaHash, Arc<Served>)>, Global>,
+    /// The name each id a row was posted for names, so [`unpost`] finds the rows of an id it
+    /// is given without reading it: the driver unposts the id it served, which an edit since
+    /// may have left in a dropped arena (an id of one is never looked up). An entry goes with
+    /// its id's unpost; one per body a serve since its last unpost.
+    names: blaze_hash::HashMap<DefWithBodyId, BodyName, Global>,
+    /// The snapshot (`blaze_memo::Epoch`) each crate's serve was last claimed in, by the
+    /// crate's key (its id is another after a commit that rebuilt its arena).
+    claimed: blaze_hash::HashMap<base_db::CrateKey, blaze_memo::Epoch, Global>,
     /// Each trace a keep claimed, by its body, step and schema: the trace itself (a counted
     /// reference), so a run that replaced it is claimed again and nothing else is. Not cleared
     /// at a snapshot: a trace is the run's, whatever snapshot it is read in.
@@ -712,18 +742,21 @@ pub(super) fn unchecked() -> bool {
 }
 
 impl Posted {
-    /// The posted answer of `step` of `def` under `schema`, if any: whether it holds now is
-    /// the asker's check of what it read (`super::Store::served_answer`).
-    pub(super) fn get(&self, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<Arc<Served>> {
-        let rows = self.rows.get(&def)?;
+    /// The posted answer of `step` of the body `name` under `schema`, if any: whether it holds
+    /// now is the asker's check of what it read (`super::Store::served_answer`).
+    pub(super) fn get(&self, name: BodyName, step: Step, schema: SchemaHash) -> Option<Arc<Served>> {
+        let rows = self.rows.get(&name)?;
         let (_, _, served) = rows.iter().find(|(at, of, _)| (*at, *of) == (step, schema))?;
         // clone: a counted reference
         Some(served.clone())
     }
 
-    pub(super) fn post(&mut self, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
+    /// Posts `served` as the row of `step` under `schema` of the body `name`, served for its
+    /// id `def` in this snapshot.
+    pub(super) fn post(&mut self, name: BodyName, def: DefWithBodyId, step: Step, schema: SchemaHash, served: Served) {
+        self.names.insert(def, name);
         // alloc: a body's rows, a handful, kept until the driver unposts the body
-        let rows = self.rows.entry(def).or_insert_with(Vec::new);
+        let rows = self.rows.entry(name).or_insert_with(Vec::new);
         // alloc: one answer a served step of a body, kept until its body is unposted
         let served = Arc::new(served);
         match rows.iter_mut().find(|(at, of, _)| (*at, *of) == (step, schema)) {
@@ -747,12 +780,19 @@ pub(super) fn answering(db: &Db, def: DefWithBodyId, step: Step, schema: SchemaH
     .flatten()
 }
 
-/// Drops every row of `def` in `db`'s item store: the driver's word that the entries they
-/// were posted from may not hold now. Nothing where `db` has no item store (none was posted).
+/// Drops every row posted for `def` in `db`'s item store (by the name it was posted under,
+/// [`BodyName`]): the driver's word that the entries they were posted from may not hold now.
+/// `def` is not read, so it may be an id of an earlier snapshot, the one the driver served.
+/// The rows of its name go whichever id posted them last: at worst a hit lost, never a stale
+/// answer, as a row answers only while what it read holds (`super::Store::served_answer`).
+/// Nothing where `db` has no item store (none was posted) or `def` was never posted.
 pub fn unpost(db: &Db, def: DefWithBodyId) {
     with_store(db, |store| {
         if !keep_all() {
-            store.served.lock().rows.remove(&def);
+            let mut posted = store.served.lock();
+            if let Some(name) = posted.names.remove(&def) {
+                posted.rows.remove(&name);
+            }
         }
     });
 }
@@ -787,6 +827,12 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
     let def = world.body(key)?;
     let schema = world.schema(def, of)?;
     let db = world.db();
+    let Some(name) = BodyName::of(db, def) else {
+        return Err(format!(
+            "{key:?}: its {} has no item key (a body in a block), so no row of it is found again after a commit",
+            super::what(step)
+        ));
+    };
     let mut identity = None;
     // alloc: the entry's facts and its earlier steps', kept with its answer
     let mut facts = Vec::new();
@@ -818,7 +864,7 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
                 return Ok(());
             }
             let earlier_schema = world.schema(def, earlier)?;
-            let posted = with_store(db, |store| store.served.lock().get(def, earlier.step(), earlier_schema));
+            let posted = with_store(db, |store| store.served.lock().get(name, earlier.step(), earlier_schema));
             match posted {
                 Some(Some(row)) => facts.extend_from_slice(&row.facts),
                 Some(None) => {
@@ -846,7 +892,7 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
     facts.sort_unstable();
     facts.dedup();
     let served = Served { identity, facts: facts.into(), answer: got.value().into() };
-    match with_store(db, |store| store.served.lock().post(def, step, schema, served)) {
+    match with_store(db, |store| store.served.lock().post(name, def, step, schema, served)) {
         Some(()) => Ok(()),
         // alloc: error path
         None => Err(format!("{key:?}: the database has no item store installed")),
@@ -860,6 +906,7 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
 /// has no item store installed (`BLAZE_ITEM_STORE=off`): nothing is served or kept there.
 pub fn claim_serve(db: &Db, krate: base_db::Crate) -> Option<bool> {
     let now = db.snapshot_epoch();
+    let krate = krate.key(db);
     with_store(db, |store| store.served.lock().claimed.insert(krate, now) != Some(now))
 }
 

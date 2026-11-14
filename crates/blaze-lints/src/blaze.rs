@@ -83,6 +83,9 @@ mod hash_twice;
 mod hashmap;
 mod held_across_wait;
 mod implicit_allocator;
+mod implied_bound_written;
+#[cfg(test)]
+mod implied_bound_written_tests;
 mod intern_candidate;
 mod jagged_vec;
 mod key_ignores_field;
@@ -95,6 +98,9 @@ mod lock_held_across_slow;
 mod lock_order;
 #[cfg(test)]
 mod lock_order_tests;
+mod loop_match_candidate;
+#[cfg(test)]
+mod loop_match_candidate_tests;
 mod loops;
 mod implicit_overflow;
 #[cfg(test)]
@@ -171,6 +177,7 @@ mod todo;
 mod thread_local_tests;
 mod tmp_path;
 mod truncating_cast;
+pub mod trust;
 mod unbounded_from_input;
 mod unbounded_test_wait;
 mod unbounded_wait;
@@ -304,6 +311,7 @@ pub enum Lint {
     BorrowWorkaround,
     NllWorkaround,
     NativeContracts,
+    ImpliedBoundWritten,
     ThreadLocalInWaitingFn,
     LenientDeserialize,
     LockHeldAcrossSlow,
@@ -491,6 +499,14 @@ pub enum Lint {
     RegistrySpread,
     // Duplicated behaviour (`dup::semantic`): two functions whose canonical runtime MIR is one.
     SameBehaviour,
+    // Trust (`trust`): what a dependency may do only when the workspace grants it.
+    DependencyCapability,
+    DependencyUnsafe,
+    TrustGrantUnused,
+    DependencyCapabilityUnreached,
+    WorkspaceUnsafe,
+    // A hand-written state machine nightly's `#[loop_match]` could turn into direct jumps.
+    LoopMatchCandidate,
 }
 
 /// Which workspaces a lint is for.
@@ -548,7 +564,15 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     // Fire only on a function marked with its role (docs/v2/plan/design/effect-summary.md).
     Lint::LoopTurnEffects,
     Lint::SyncOnAnswerPath,
+    // A dependency doing what the workspace did not grant it: a compromised version stops the
+    // build that pulls it in. Fires only where the driver gave the grants (`Conf::trust`).
+    Lint::DependencyCapability,
+    Lint::DependencyUnsafe,
 ];
+
+/// The group `blaze::trust`: what a dependency may do only when the workspace grants it, and
+/// a workspace crate's own `unsafe` ([`trust`]).
+pub(crate) const TRUST: &[Lint] = &trust::LINTS;
 
 /// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
 /// attribute, a flag, a manifest table or `--cap-lints` says ([`crate::level::Levels::of`]).
@@ -741,6 +765,7 @@ impl Lint {
         Lint::BorrowWorkaround,
         Lint::NllWorkaround,
         Lint::NativeContracts,
+        Lint::ImpliedBoundWritten,
         Lint::ThreadLocalInWaitingFn,
         Lint::LenientDeserialize,
         Lint::LockHeldAcrossSlow,
@@ -899,6 +924,12 @@ impl Lint {
         Lint::RepeatedFieldList,
         Lint::RegistrySpread,
         Lint::SameBehaviour,
+        Lint::DependencyCapability,
+        Lint::DependencyUnsafe,
+        Lint::TrustGrantUnused,
+        Lint::DependencyCapabilityUnreached,
+        Lint::WorkspaceUnsafe,
+        Lint::LoopMatchCandidate,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -964,6 +995,8 @@ impl Lint {
             | Lint::BorrowWorkaround
             // Fires only in a crate with `#![feature(blaze_verify)]`.
             | Lint::NativeContracts
+            // Fires only in a crate with `#![feature(blaze_implied_bounds)]`.
+            | Lint::ImpliedBoundWritten
             // Fire only where the code declares what a function is expected to do
             // (`#[blaze::expect(..)]`, a module's default, `#![blaze::effects]`):
             // `undeclared_effect` and `unfulfilled_effect` are `deny` there.
@@ -972,9 +1005,11 @@ impl Lint {
             | Lint::NegativeEffect => Kind::General,
             // `packable`'s fix is a field with no address and a shift and mask per access,
             // and its `#[blaze::bits]` is an opt-in extension.
-            Lint::DeepDropAtExit | Lint::PodSerializedByField | Lint::Packable | Lint::SoaCandidate => {
-                Kind::PedanticPerf
-            }
+            Lint::DeepDropAtExit
+            | Lint::PodSerializedByField
+            | Lint::Packable
+            | Lint::SoaCandidate
+            | Lint::LoopMatchCandidate => Kind::PedanticPerf,
             // What the blaze edition removes or respells; right for any crate getting ready
             // for it.
             Lint::AsCast | Lint::GlobalState | Lint::AsyncFn | Lint::MutRef => Kind::Edition,
@@ -1206,6 +1241,14 @@ impl Lint {
             | Lint::CouldHaveInvariant => Kind::Suggest,
             // Allowed elsewhere, as the other duplicate lints: held by the ratchet baselines.
             Lint::SameBehaviour => Kind::Internal,
+            // A dependency's capabilities are every workspace's concern: the two denials are
+            // `deny` ([`DENY_BY_DEFAULT`], which wins over this), the other two warn. A
+            // workspace crate's own `unsafe` is a policy blaze holds itself to by its ratchet.
+            Lint::DependencyCapability
+            | Lint::DependencyUnsafe
+            | Lint::TrustGrantUnused
+            | Lint::DependencyCapabilityUnreached => Kind::General,
+            Lint::WorkspaceUnsafe => Kind::Internal,
         }
     }
 
@@ -1317,6 +1360,7 @@ impl Lint {
             Lint::BorrowWorkaround => "borrow_workaround",
             Lint::NllWorkaround => "nll_workaround",
             Lint::NativeContracts => "native_contracts",
+            Lint::ImpliedBoundWritten => "implied_bound_written",
             Lint::ThreadLocalInWaitingFn => "thread_local_in_waiting_fn",
             Lint::LenientDeserialize => "lenient_deserialize",
             Lint::LockHeldAcrossSlow => "lock_held_across_slow",
@@ -1472,6 +1516,12 @@ impl Lint {
             Lint::RepeatedFieldList => "repeated_field_list",
             Lint::RegistrySpread => "registry_spread",
             Lint::SameBehaviour => "same_behaviour",
+            Lint::DependencyCapability => "dependency_capability",
+            Lint::DependencyUnsafe => "dependency_unsafe",
+            Lint::TrustGrantUnused => "trust_grant_unused",
+            Lint::DependencyCapabilityUnreached => "dependency_capability_unreached",
+            Lint::WorkspaceUnsafe => "workspace_unsafe",
+            Lint::LoopMatchCandidate => "loop_match_candidate",
         }
     }
 
@@ -1567,6 +1617,7 @@ impl Lint {
             Lint::BorrowWorkaround => concat!(general_docs!(), "#borrow_workaround"),
             Lint::NllWorkaround => concat!(general_docs!(), "#nll_workaround"),
             Lint::NativeContracts => concat!(general_docs!(), "#native_contracts"),
+            Lint::ImpliedBoundWritten => concat!(general_docs!(), "#implied_bound_written"),
             Lint::ThreadLocalInWaitingFn => concat!(docs!(), "#thread_local_in_waiting_fn"),
             Lint::LenientDeserialize => concat!(docs!(), "#lenient_deserialize"),
             Lint::LockHeldAcrossSlow => concat!(docs!(), "#lock_held_across_slow"),
@@ -1708,6 +1759,7 @@ impl Lint {
             Lint::CouldBeLinear => concat!(docs!(), "#could_be_linear"),
             Lint::CouldHaveInvariant => concat!(docs!(), "#could_have_invariant"),
             Lint::SameBehaviour => concat!(docs!(), "#same_behaviour"),
+            Lint::LoopMatchCandidate => concat!(general_docs!(), "#loop_match_candidate"),
             Lint::HandWrittenDerivable => concat!(docs!(), "#hand_written_derivable"),
             Lint::ImplMissesField => concat!(docs!(), "#impl_misses_field"),
             Lint::HandKeptVariantList | Lint::VariantListDrift => {
@@ -1729,6 +1781,13 @@ impl Lint {
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
+            Lint::DependencyCapability => concat!(general_docs!(), "#dependency_capability"),
+            Lint::DependencyUnsafe => concat!(general_docs!(), "#dependency_unsafe"),
+            Lint::TrustGrantUnused => concat!(general_docs!(), "#trust_grant_unused"),
+            Lint::DependencyCapabilityUnreached => {
+                concat!(general_docs!(), "#dependency_capability_unreached")
+            }
+            Lint::WorkspaceUnsafe => concat!(docs!(), "#workspace_unsafe"),
         }
     }
 
@@ -2125,7 +2184,7 @@ impl Lint {
                 "add a test that hands it a bad input and asserts which error comes back (`assert_eq!(f(bad), Err(..))`)"
             }
             Lint::PropertyOverExamples => {
-                "add a property test (Hegel) that draws a value and asserts the inverse gives it back"
+                "add a property test over generated inputs that draws a value and asserts the inverse gives it back (blaze's own form: `blaze_sim::check(Config::cases(200), |tape| ..)`)"
             }
             Lint::CouldBeNarrower => {
                 "return the narrower type (callers widen with `.into()` where they need to); or say why with `#[expect(blaze::could_be_narrower, reason = \"..\")]`"
@@ -2328,6 +2387,9 @@ impl Lint {
             Lint::DeepDropAtExit => {
                 "`std::mem::forget` it at the end of `main`, or flush and `std::process::exit(0)`; the operating system frees it at once"
             }
+            Lint::LoopMatchCandidate => {
+                "on nightly, `#[loop_match]` on the loop and `#[const_continue]` on each constant transition; or say why with `#[expect(blaze::loop_match_candidate, reason = \"..\")]`"
+            }
             Lint::DynFnParam => {
                 "take the closure as `impl Fn(..)` (a type parameter), so the call is direct and inlinable"
             }
@@ -2378,6 +2440,9 @@ impl Lint {
             }
             Lint::LenientDeserialize => {
                 "add `#[serde(deny_unknown_fields)]` under the derive (`blaze check --fix` does), so an unknown field is an error naming it; or say why the format must accept fields it doesn't know with `#[expect(blaze::lenient_deserialize, reason = \"..\")]`"
+            }
+            Lint::ImpliedBoundWritten => {
+                "remove the bound: the type or trait the header names declares it once, for every item that names it; or say why it is written again with `#[expect(blaze::implied_bound_written, reason = \"..\")]`"
             }
             Lint::NativeContracts => {
                 "write the contract as `requires`/`ensures` clauses between the signature and the body (`blaze check --fix` does), naming the return `-> (r: T)` for the `ensures`"
@@ -2465,6 +2530,21 @@ impl Lint {
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
+            Lint::DependencyCapability => {
+                "read what the dependency does there; if it is trusted with it, add the capability to its entry under `[workspace.metadata.blaze.trust]` in the root Cargo.toml with a `reason` (`blaze audit grants` prints the table the workspace needs today); if not, pin or drop the dependency"
+            }
+            Lint::DependencyUnsafe => {
+                "read the dependency's `unsafe` code; if it is trusted with it, add `\"unsafe\"` to its `allow` under `[workspace.metadata.blaze.trust]` in the root Cargo.toml with a `reason`; if not, pin or drop the dependency"
+            }
+            Lint::TrustGrantUnused => {
+                "remove what the grant no longer needs from `[workspace.metadata.blaze.trust]`, so a version that starts to use it again is told"
+            }
+            Lint::DependencyCapabilityUnreached => {
+                "no build reaches it yet; grant it under `[workspace.metadata.blaze.trust]` before a call does, or keep the workspace from calling it"
+            }
+            Lint::WorkspaceUnsafe => {
+                "say why the crate runs `unsafe` code at its root: `#![blaze::trust(unsafe, reason = \"..\")]`, or make the code safe"
+            }
         }
     }
 }
@@ -2539,6 +2619,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         cold_error::check_fn(cx, f);
         profiled::check_fn(cx, f);
         native_contracts::check(cx, f);
+        implied_bound_written::check_fn(cx, f);
         proc_macro::check(cx, f);
         async_fn::check_fn(cx, f);
     }
@@ -2585,6 +2666,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if let Some(item) = ast::Impl::cast(node) {
         missing_size_hint::check(cx, item);
         default_policy::check_impl(cx, item);
+        implied_bound_written::check_impl(cx, item);
     }
     if let Some(record) = ast::RecordExpr::cast(node) {
         struct_update::check(cx, record);
@@ -2666,6 +2748,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         push_without_reserve::check(cx);
         scratch_in_loop::check(cx);
         deep_drop_at_exit::check(cx);
+        loop_match_candidate::check(cx);
         dyn_fn_param::check(cx);
         box_large_new::check(cx);
         checkfree::check(cx);
@@ -2685,6 +2768,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         truncating_cast::check(cx);
         build_script_ambient::check(cx);
         not_latest_edition::check(cx);
+        trust::check(cx);
         std_use::check(cx);
         env_read::check(cx);
         untied_child::check(cx);

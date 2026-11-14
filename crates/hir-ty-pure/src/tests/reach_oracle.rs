@@ -3,7 +3,7 @@
 //!
 //! The invariant: a site `reach` discharges is not reached, or its condition holds, in every
 //! run of the body's MIR. Held here as: a body all of whose panic sites are discharged does
-//! not panic when the evaluator runs it. Hegel draws the body (guards over variants, bounds,
+//! not panic when the evaluator runs it. The tape draws the body (guards over variants, bounds,
 //! lengths and linear arithmetic around one site), the arguments (the ends of `usize` among
 //! them) and whether the crate keeps overflow checks; the control plants an unsound model
 //! entry, which the oracle catches.
@@ -15,7 +15,7 @@
 //! control plants a `+` always taken to fit, which the oracle catches.
 
 use base_db::Db;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_expand::fixture;
 use hir_ty::{InferBodyId, ParamEnvAndCrate, db::HirDatabase as _, next_solver::GenericArgs};
@@ -130,72 +130,75 @@ fn check(program: &Program) -> Result<Verdict, String> {
     })
 }
 
-fn below(tc: &TestCase, n: u32) -> u32 {
-    tc.draw(gs::integers::<u32>().max_value(n - 1))
+/// Below `n`, at least 1.
+fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+    tape.int_in(0..=n - 1, label)
 }
 
-fn pick<'a>(tc: &TestCase, of: &[&'a str]) -> &'a str {
-    of[below(tc, of.len() as u32) as usize]
+fn pick<'a>(tape: &Tape, of: &[&'a str], label: &'static str) -> &'a str {
+    *tape.one_of(of, label)
 }
 
 /// A linear expression over `a`, `b` and the length.
-fn linear(tc: &TestCase) -> String {
-    let base = pick(tc, &["a", "b", "v.len()", "0", "1", "2"]);
-    match below(tc, 6) {
-        0 => format!("{base} + {}", pick(tc, &["1", "2", "b"])), // alloc: a test's text
-        1 => format!("{base} - {}", pick(tc, &["1", "2", "a"])), // alloc: a test's text
+fn linear(tape: &Tape) -> String {
+    let base = pick(tape, &["a", "b", "v.len()", "0", "1", "2"], "base");
+    match below(tape, 6, "linear") {
+        0 => format!("{base} + {}", pick(tape, &["1", "2", "b"], "added")), // alloc: a test's text
+        1 => format!("{base} - {}", pick(tape, &["1", "2", "a"], "taken")), // alloc: a test's text
         2 => format!("{base} / 2"),                             // alloc: a test's text
         3 => format!("a + (b - a) / 2"),                        // alloc: a test's text
         _ => base.to_owned(),                                   // alloc: a test's text
     }
 }
 
-fn guard(tc: &TestCase) -> String {
-    match below(tc, 8) {
+fn guard(tape: &Tape) -> String {
+    match below(tape, 8, "guard") {
         0 => "!v.is_empty()".to_owned(), // alloc: a test's text
         1 => "o.is_some()".to_owned(),   // alloc: a test's text
         2 => "d != 0".to_owned(),        // alloc: a test's text
         3 => "a < b && b <= v.len()".to_owned(), // alloc: a test's text
         _ => {
-            let relation = pick(tc, &["<", "<=", ">", ">=", "!=", "=="]);
-            format!("{} {relation} {}", linear(tc), linear(tc)) // alloc: a test's text
+            let relation = pick(tape, &["<", "<=", ">", ">=", "!=", "=="], "relation");
+            format!("{} {relation} {}", linear(tape), linear(tape)) // alloc: a test's text
         }
     }
 }
 
-fn site(tc: &TestCase) -> String {
-    match below(tc, 7) {
+fn site(tape: &Tape) -> String {
+    match below(tape, 7, "site") {
         0 => "o.unwrap()".to_owned(),         // alloc: a test's text
         1 => "100 / d".to_owned(),            // alloc: a test's text
         2 => "*v.first().unwrap()".to_owned(), // alloc: a test's text
-        3 => format!("v[{}] ^ v[{}]", linear(tc), linear(tc)), // alloc: a test's text
-        _ => format!("v[{}]", linear(tc)),    // alloc: a test's text
+        3 => format!("v[{}] ^ v[{}]", linear(tape), linear(tape)), // alloc: a test's text
+        _ => format!("v[{}]", linear(tape)),  // alloc: a test's text
     }
 }
 
-fn drawn(tc: &TestCase) -> Program {
+fn drawn(tape: &Tape) -> Program {
     let ends = [0, 1, 2, 3, 4, 5, usize::MAX - 1, usize::MAX];
     Program {
-        guards: (0..below(tc, 4)).map(|_| guard(tc)).collect(),
-        site: site(tc),
-        slice: (0..below(tc, 5)).collect(),
-        a: ends[below(tc, ends.len() as u32) as usize],
-        b: ends[below(tc, ends.len() as u32) as usize],
-        option: (below(tc, 2) == 0).then_some(7),
-        divisor: below(tc, 3),
-        overflow_checks: below(tc, 2) == 0,
+        guards: (0..below(tape, 4, "guards")).map(|_| guard(tape)).collect(),
+        site: site(tape),
+        slice: (0..below(tape, 5, "slice length")).collect(),
+        a: ends[below(tape, ends.len() as u32, "a") as usize],
+        b: ends[below(tape, ends.len() as u32, "b") as usize],
+        option: (below(tape, 2, "option") == 0).then_some(7),
+        divisor: below(tape, 3, "divisor"),
+        overflow_checks: below(tape, 2, "overflow checks") == 0,
     }
 }
 
 /// The invariant: a body all of whose panic sites `reach` discharges does not panic when the
 /// evaluator runs it. Random guards (variants, bounds, lengths, linear arithmetic, `&&`)
 /// around a random site, random arguments, both overflow profiles.
-#[hegel::test(test_cases = 150)]
-fn a_body_whose_sites_are_discharged_does_not_panic(tc: TestCase) {
-    let program = drawn(&tc);
-    if let Err(what) = check(&program) {
-        panic!("{what}");
-    }
+#[test]
+fn a_body_whose_sites_are_discharged_does_not_panic() {
+    blaze_sim::check(Config::cases(150), |tape| {
+        let program = drawn(tape);
+        if let Err(what) = check(&program) {
+            panic!("{what}");
+        }
+    })
 }
 
 fn program(guards: &[&str], site: &str, slice: &[u32], a: usize, b: usize) -> Program {
@@ -343,41 +346,41 @@ fn check_overflow(program: &Arith) -> Result<bool, String> {
     })
 }
 
-fn operand(tc: &TestCase) -> &'static str {
-    pick(tc, &["a", "b", "v.len()", "1", "2", "63", "64", "1000"])
+fn operand(tape: &Tape) -> &'static str {
+    pick(tape, &["a", "b", "v.len()", "1", "2", "63", "64", "1000"], "operand")
 }
 
-fn arith_guard(tc: &TestCase) -> String {
-    match below(tc, 6) {
-        0 => format!("{} < {}", operand(tc), operand(tc)), // alloc: a test's text
-        1 => format!("{} <= {}", operand(tc), operand(tc)), // alloc: a test's text
-        2 => "a < 1000 && b < 1000".to_owned(),            // alloc: a test's text
-        3 => "b < 64".to_owned(),                          // alloc: a test's text
+fn arith_guard(tape: &Tape) -> String {
+    match below(tape, 6, "guard") {
+        0 => format!("{} < {}", operand(tape), operand(tape)), // alloc: a test's text
+        1 => format!("{} <= {}", operand(tape), operand(tape)), // alloc: a test's text
+        2 => "a < 1000 && b < 1000".to_owned(),                // alloc: a test's text
+        3 => "b < 64".to_owned(),                              // alloc: a test's text
         _ => {
-            let relation = pick(tc, &["<", "<=", ">", ">=", "!=", "=="]);
-            format!("{} {relation} {}", linear(tc), linear(tc)) // alloc: a test's text
+            let relation = pick(tape, &["<", "<=", ">", ">=", "!=", "=="], "relation");
+            format!("{} {relation} {}", linear(tape), linear(tape)) // alloc: a test's text
         }
     }
 }
 
-fn arith_site(tc: &TestCase) -> String {
-    let op = pick(tc, &["+", "-", "*", "<<", ">>"]);
+fn arith_site(tape: &Tape) -> String {
+    let op = pick(tape, &["+", "-", "*", "<<", ">>"], "op");
     // alloc: a test's text
-    match below(tc, 4) {
-        0 => format!("{} {op} {} {} {}", operand(tc), operand(tc), pick(tc, &["+", "-"]), operand(tc)),
-        1 => format!("{{ let mut x = {}; x {op}= {}; x }}", operand(tc), operand(tc)),
-        _ => format!("{} {op} {}", operand(tc), operand(tc)),
+    match below(tape, 4, "site") {
+        0 => format!("{} {op} {} {} {}", operand(tape), operand(tape), pick(tape, &["+", "-"], "second op"), operand(tape)),
+        1 => format!("{{ let mut x = {}; x {op}= {}; x }}", operand(tape), operand(tape)),
+        _ => format!("{} {op} {}", operand(tape), operand(tape)),
     }
 }
 
-fn drawn_arith(tc: &TestCase) -> Arith {
+fn drawn_arith(tape: &Tape) -> Arith {
     let ends = [0, 1, 2, 3, 63, 64, 999, usize::MAX / 2, usize::MAX - 1, usize::MAX];
     Arith {
-        guards: (0..below(tc, 4)).map(|_| arith_guard(tc)).collect(),
-        site: arith_site(tc),
-        len: below(tc, 5),
-        a: ends[below(tc, ends.len() as u32) as usize],
-        b: ends[below(tc, ends.len() as u32) as usize],
+        guards: (0..below(tape, 4, "guards")).map(|_| arith_guard(tape)).collect(),
+        site: arith_site(tape),
+        len: below(tape, 5, "len"),
+        a: ends[below(tape, ends.len() as u32, "a") as usize],
+        b: ends[below(tape, ends.len() as u32, "b") as usize],
     }
 }
 
@@ -385,12 +388,14 @@ fn drawn_arith(tc: &TestCase) -> Arith {
 /// evaluator runs it with overflow checks, and the proof is the same in both profiles.
 /// Random guards over `a`, `b` and the length around a random `+ - * << >>`, plain or
 /// compound, random arguments at the ends of `usize`.
-#[hegel::test(test_cases = 150)]
-fn an_operation_shown_to_fit_does_not_overflow(tc: TestCase) {
-    let program = drawn_arith(&tc);
-    if let Err(what) = check_overflow(&program) {
-        panic!("{what}");
-    }
+#[test]
+fn an_operation_shown_to_fit_does_not_overflow() {
+    blaze_sim::check(Config::cases(150), |tape| {
+        let program = drawn_arith(tape);
+        if let Err(what) = check_overflow(&program) {
+            panic!("{what}");
+        }
+    })
 }
 
 fn arith(guards: &[&str], site: &str, a: usize, b: usize) -> Arith {

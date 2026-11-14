@@ -17,7 +17,7 @@
 //! (the driver, search, verified ranges of large files, sync by root between machines, the
 //! router) is hub.md's later steps.
 
-// Tests are built on `std` (the harness, Hegel).
+// Tests are built on `std` (the harness, blaze-sim).
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 // `#![blaze::sans_io]` marks each core for `blaze::sans_io_core`.

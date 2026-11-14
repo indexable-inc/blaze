@@ -789,6 +789,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlF
                 (Some(Word::blaze), Some(Word::effects)) => AttrFlags::BLAZE_EFFECTS,
                 (Some(Word::blaze), Some(Word::linear)) => AttrFlags::LINEAR,
                 (Some(Word::blaze), Some(Word::consumes)) => AttrFlags::CONSUMES,
+                (Some(Word::blaze), Some(Word::theorem)) => AttrFlags::THEOREM,
                 (Some(Word::blaze), Some(Word::holds)) => AttrFlags::HOLDS,
                 (Some(Word::blaze), Some(Word::memo)) => AttrFlags::BLAZE_MEMO,
                 (Some(Word::blaze), Some(Word::reflect)) => AttrFlags::BLAZE_REFLECT,
@@ -1073,6 +1074,7 @@ name_set! {
     specialization_trait,
     stable,
     target_feature,
+    theorem,
     thread_local,
     track_caller,
     unstable,
@@ -1364,6 +1366,12 @@ bitflags::bitflags! {
         /// linear types its by-value parameters have end, so in its body those types are not
         /// linear (`hir-ty-linear`). It changes diagnostics, never code.
         const CONSUMES = 1 << 111;
+        /// `#[blaze::theorem]`, a word, on a function that returns `bool`: a blaze extension
+        /// (inert under rustc with `#![register_tool(blaze)]`). The function is a statement:
+        /// for every argument it returns `true`. `hir-ty-lean` states that of its model in
+        /// Lean, where a proof is checked (docs/v2/plan/design/proofs-for-sans-io.md). It
+        /// changes no code: the function is compiled as written.
+        const THEOREM = 1 << 118;
         /// `#[blaze::holds]`, a word, on a struct or enum: a value of it holds a value of each
         /// of its type arguments although no field does (behind a raw or counted pointer), so
         /// it holds a linear value when an argument does, and the bodies of its own crate's

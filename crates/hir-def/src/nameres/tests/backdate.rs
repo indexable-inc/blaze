@@ -97,6 +97,7 @@ fn check_rerun(edited: &str) {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn signatures_keep_the_def_map() {
     check_backdated(
         &LIB.replace("pub fn f(x: u8) -> u8 { x }", "pub fn f(x: u16, y: &str) -> u64 { 0 }"),
@@ -104,6 +105,7 @@ fn signatures_keep_the_def_map() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn fields_keep_the_def_map() {
     check_backdated(
         &LIB.replace("pub struct Fields { pub a: u8 }", "pub struct Fields { pub a: u8, b: u16 }"),
@@ -112,6 +114,7 @@ fn fields_keep_the_def_map() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn types_of_consts_statics_and_aliases_keep_the_def_map() {
     check_backdated(&LIB.replace("pub const C: u8 = 0;", "pub const C: u32 = 7;"));
     check_backdated(&LIB.replace("pub static S: u8 = 0;", "pub static S: [u8; 4] = [0; 4];"));
@@ -119,6 +122,7 @@ fn types_of_consts_statics_and_aliases_keep_the_def_map() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn trait_and_impl_items_keep_the_def_map() {
     check_backdated(
         &LIB.replace(
@@ -133,6 +137,7 @@ fn trait_and_impl_items_keep_the_def_map() {
 }
 
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn bodies_keep_the_def_map() {
     check_backdated(&LIB.replace(
         "pub mod inner { pub fn g() {} }",

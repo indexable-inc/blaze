@@ -268,32 +268,28 @@ fn const_named(db: &Db, krate: Crate, name: &str) -> ConstId {
 fn kept(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (Db, Crate, ConstId) {
     let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib").key(&db);
-    let crates = HashMap::from_iter_in([(lib, base)], Global);
-    let fact = kept_fact(mode, [(lib_id(), base)]);
+    let fact = session_fact(mode);
     // dyn: the driver's store, as `set` takes it
     let store: Arc<dyn ImageStore + Send + Sync> = Arc::clone(store) as _;
-    // Given as a driver gives it: a maker of the session arena, which the commit makes again,
-    // so every crate's id is taken after it.
+    // Given as the driver gives it (blaze-cargo's `serve::unit::deps::serve`): a maker of the
+    // session arena under the mode's fact, which the commit makes again, so every crate's id is
+    // taken after it; and `lib`'s key, its own located gift, in the same edit.
     let mut edit = db.edit();
     edit.set_given(
         None,
         fact,
         Box::new_in(
             move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
-                set(builder, fact, Arc::clone(&store), crates.clone(), mode);
+                set(builder, fact, Arc::clone(&store), mode);
             },
             Global,
         ),
     );
+    give_base(&mut edit, lib, base);
     _ = edit.commit();
     let lib = db.krate(lib);
     let seven = const_named(&db, lib, "SEVEN");
     (db, lib, seven)
-}
-
-/// The stable id the tests give `lib`.
-fn lib_id() -> ContentId {
-    ContentId::of("blaze test crate", b"lib")
 }
 
 fn u32_value(n: u32) -> Allocation<'static> {
@@ -403,15 +399,17 @@ fn check_mode_records_a_difference_and_verify_serves() {
     });
 }
 
-/// The fact names what decides the values served, and only that: the same mode and crates give
-/// the same fact, so a constant's record read under one is read again under the next; another
-/// base, another mode or another crate gives another.
+/// The facts name what decides the values served, and only that, each in its one home: the
+/// session's ([`session_fact`]) the mode alone, so a constant's record read under one is read
+/// again under the next and no crate kept or stored moves a session input; each crate's
+/// ([`base_fact`]) the key it is kept under, one slot a crate, so another key is another fact
+/// of that slot.
 #[test]
-fn the_kept_fact_is_what_decides_the_values() {
-    let other = ContentId::of("blaze test crate", b"other");
-    let fact = kept_fact(Mode::Serve, [(lib_id(), Some(BASE)), (other, None)]);
-    assert_eq!(kept_fact(Mode::Serve, [(other, None), (lib_id(), Some(BASE))]), fact, "order");
-    assert_ne!(kept_fact(Mode::Serve, [(lib_id(), Some(KEY)), (other, None)]), fact, "base");
-    assert_ne!(kept_fact(Mode::Check, [(lib_id(), Some(BASE)), (other, None)]), fact, "mode");
-    assert_ne!(kept_fact(Mode::Serve, [(lib_id(), Some(BASE))]), fact, "crates");
+fn the_kept_facts_are_what_decides_the_values() {
+    assert_eq!(session_fact(Mode::Serve), session_fact(Mode::Serve), "the same mode");
+    assert_ne!(session_fact(Mode::Check), session_fact(Mode::Serve), "mode");
+    assert_eq!(base_fact(Some(BASE)), base_fact(Some(BASE)), "the same key");
+    assert_ne!(base_fact(Some(KEY)), base_fact(Some(BASE)), "base");
+    assert_ne!(base_fact(None), base_fact(Some(BASE)), "checked in this session");
+    assert_eq!(base_fact(Some(KEY)).id, base_fact(Some(BASE)).id, "one slot a crate");
 }

@@ -1,6 +1,6 @@
 //! The deterministic simulation of the module seam: tasks of the front end, some of whose
 //! steps expand a call of a proc-macro crate whose module does not exist yet, run interleaved
-//! by a seed; a task that misses a module compiles it (the key's one compiler) or parks on it.
+//! by the tape; a task that misses a module compiles it (the key's one compiler) or parks on it.
 //!
 //! The oracle: a task waits only at a step that uses a module, and only on that module; every
 //! module is compiled once; every task finishes. The plant models today's load, a write into
@@ -13,10 +13,9 @@ use blaze_keyed::{
     kind::{CodeKey, ExpanderModule, Key, ProcKind, UnitManifest},
     proof::{self, Snapshot},
 };
-use blaze_rng::SplitMix64;
-use hegel::TestCase;
+use blaze_sim::{Broke, Config, Tape};
 
-use super::support::{Broke, Draw, Drawn, MemStore, NAMESPACE, control, filing, tool};
+use super::support::{CONTROL, MemStore, NAMESPACE, filing, tool};
 use crate::{
     Digest, Subject, What,
     machine::Ticket,
@@ -42,23 +41,23 @@ struct Plan {
     tasks: Vec<Vec<Step>>,
     /// How many of its own steps a compile takes.
     compile_steps: Vec<u64>,
-    seed: u64,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let modules = d.int(1, 3) as usize;
-    let tasks = (0..d.int(2, 8))
+fn plan(tape: &Tape) -> Plan {
+    let modules = tape.int_in(1..=3usize, "modules");
+    let tasks = (0..tape.int_in(2..=8u64, "tasks"))
         .map(|_| {
-            (0..d.int(1, 6))
-                .map(|_| match d.int(0, 2) {
-                    0 => Step::Use(d.under(modules)),
+            (0..tape.int_in(1..=6u64, "steps"))
+                // A use one time in three, as before; plain work, the quiet step, is at 0.
+                .map(|_| match tape.int_in(0..=2u8, "step") {
+                    2 => Step::Use(tape.index(modules, "module used")),
                     _ => Step::Work,
                 })
                 .collect()
         })
         .collect();
-    let compile_steps = (0..modules).map(|_| d.int(1, 4)).collect();
-    Plan { modules, tasks, compile_steps, seed: d.int(0, u64::MAX) }
+    let compile_steps = (0..modules).map(|_| tape.int_in(1..=4u64, "compile steps")).collect();
+    Plan { modules, tasks, compile_steps }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,13 +75,12 @@ fn key(module: usize) -> Key<ExpanderModule> {
     module_key(tool(), CodeKey::of(&tool(), unit, &[]))
 }
 
-/// One request: every task to its end.
-fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
-    proof::scope(|snap| run_in(snap, plan, plant))
+/// One request: every task to its end, the next task to step chosen by `tape`.
+fn run(plan: &Plan, tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    proof::scope(|snap| run_in(snap, plan, tape, plant))
 }
 
-fn run_in(snap: Snapshot<'_>, plan: &Plan, plant: Plant) -> Result<(), Broke> {
-    let mut rng = SplitMix64::new(plan.seed);
+fn run_in(snap: Snapshot<'_>, plan: &Plan, tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let store = MemStore::new();
     let mut seam = Modules::<usize>::default();
     let mut tickets: Vec<Option<Ticket<ExpanderModule>>> = (0..plan.modules).map(|_| None).collect();
@@ -99,7 +97,7 @@ fn run_in(snap: Snapshot<'_>, plan: &Plan, plant: Plant) -> Result<(), Broke> {
         if runnable.is_empty() {
             break;
         }
-        let t = runnable[Draw::under(&mut rng, runnable.len())];
+        let t = runnable[tape.index(runnable.len(), "which task steps")];
         match state[t] {
             State::Compiling { module, left } if left > 1 => state[t] = State::Compiling { module, left: left - 1 },
             State::Compiling { module, .. } => {
@@ -177,19 +175,18 @@ fn run_in(snap: Snapshot<'_>, plan: &Plan, plant: Plant) -> Result<(), Broke> {
 
 /// The invariant: no task that does not use an appearing module waits on it; each module is
 /// compiled once; every task finishes.
-#[hegel::test(test_cases = 300)]
-fn a_module_appearing_stops_only_its_users(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
-}
-
-fn seeded(rng: &mut SplitMix64, plant: Plant) -> Result<(), Broke> {
-    run(&plan(rng), plant)
+#[test]
+fn a_module_appearing_stops_only_its_users() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(&plan, tape, Plant::None)
+    });
 }
 
 #[test]
 fn the_oracle_catches_a_module_load_that_writes_the_front_end() {
-    control(Plant::GlobalWrite, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::GlobalWrite, "none of its steps uses", |tape, plant| {
+        run(&plan(tape), tape, plant)
+    });
 }

@@ -126,7 +126,7 @@ results by test are another record, lane test-results; not this one.)
 ## Tests and controls
 
 `request/tests.rs`: a model world (files in two package directories and at the root, three
-variables, two outside files, one output; a write-once store) and a Hegel property over edits,
+variables, two outside files, one output; a write-once store) and a blaze-sim property over edits,
 variables, probes, outputs changed by hand, waits, restarts and saves under a build, in a seeded
 order of the driver's answers: every hit equals a fresh build, and nothing read changed since a
 recorded build ⇒ hit. Planted bugs the oracle catches: a variable left out, a negative probe

@@ -51,7 +51,9 @@ pub fn on_each_run(hook: fn()) -> Result<(), fn()> {
     ON_RUN.set(hook)
 }
 
-/// One more of [`completed`]'s count, on this thread's stripe.
+/// One more of [`completed`]'s count, on this thread's stripe. Never inlined, as every read of
+/// a thread-local in this crate is (`task::innermost_ptr` says why).
+#[inline(never)]
 pub(crate) fn completed_one() {
     let at = STRIPE.with(|it| {
         if it.get() == usize::MAX {
@@ -100,6 +102,10 @@ pub struct Counts {
     /// value, each head round's value and each member round's entry, each placed once in its
     /// arena and dropped once with it. At most `MAX_ROUNDS` per head and member of a cycle.
     pub owned_rounds: u64,
+    /// Rows an ask appended to its asker's read list ([`crate::Reads::Kept`]): one per entry
+    /// asked, hit or run, whatever that entry read; a recorder's or a fixpoint member's round's
+    /// own direct rows passed to its outer run. Never a callee's whole flat list.
+    pub rows_replayed: u64,
 }
 
 impl Counts {
@@ -118,6 +124,7 @@ impl Counts {
         self.image_filed += other.image_filed;
         self.image_untracked += other.image_untracked;
         self.owned_rounds += other.owned_rounds;
+        self.rows_replayed += other.rows_replayed;
     }
 }
 
@@ -138,15 +145,20 @@ thread_local! {
             image_filed: 0,
             image_untracked: 0,
             owned_rounds: 0,
+            rows_replayed: 0,
         })
     };
 }
 
-/// This thread's counts, reset.
+/// This thread's counts, reset. Never inlined ([`completed_one`]).
+#[inline(never)]
 pub fn take_counts() -> Counts {
     COUNTS.with(|it| it.replace(Counts::default()))
 }
 
+/// Never inlined ([`completed_one`]): a count before a run's function and one after it must
+/// each reach the worker they run on.
+#[inline(never)]
 fn bump(field: impl FnOnce(&mut Counts)) {
     COUNTS.with(|it| {
         let mut counts = it.get();
@@ -209,4 +221,9 @@ pub(crate) fn image_untracked() {
 
 pub(crate) fn owned_round() {
     bump(|it| it.owned_rounds += 1);
+}
+
+pub(crate) fn rows_replayed(rows: usize) {
+    let rows = u64::try_from(rows).expect("a count of rows fits in 64 bits");
+    bump(|it| it.rows_replayed += rows);
 }

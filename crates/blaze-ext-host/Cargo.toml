@@ -40,7 +40,7 @@ toml.workspace = true
 [dev-dependencies]
 # The in-tree `panic_in_drop`, which the worked example is held to.
 blaze-lints.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 # The worked example, compiled into the tests as a user's extension is into the daemon.
 panic-in-drop = { path = "../../extensions/panic-in-drop" }

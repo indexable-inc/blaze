@@ -11,23 +11,30 @@
 //! and rebuilds those arenas' table rows.
 //!
 //! Arenas: index 0 is the session arena (settings, process environment, library and local
-//! roots, named paths, the crate list's shape, and the files of a source root no crate is
-//! rooted in); a crate's index is `1 +` its place in [`Crates::order`], every crate after the
-//! crates it depends on. A source root's files live in the arena of the lowest-index crate
-//! rooted in it (its owner); every other crate rooted there borrows the owner. A crate's
-//! attribute files live in its own arena. Each crate arena borrows its dependencies and the
-//! session; a crate whose sources are pinned ([`crate::CrateData::sealed`]) and whose
-//! dependencies are all sealed is sealed.
+//! roots, named paths, the crate list's digest ([`List`]: of each listed crate's item key and
+//! root path, not of its content ID), and the files of no source root); indices
+//! `1..=roots` are the source roots' (each root's files in an open arena of its own, by root
+//! id, [`Layout`]); then a crate's index is `roots + 1 +` its place in [`Crates::order`], every
+//! crate after the crates it depends on. Each crate arena borrows its dependencies, the
+//! session and its root file's root; a root another crate reaches (a `#[path]` module across
+//! packages) is borrowed by the entries that name or read it. A crate's attribute files live
+//! in its own arena. A crate whose sources are pinned ([`crate::CrateData::sealed`]) and whose
+//! dependencies are all sealed is sealed, and so is the root it is rooted in. Sealing changes
+//! what a commit drops not at all: a write to a sealed crate (a build script's env, a gift,
+//! a maker) drops that crate's arena and every arena that borrowed from it, its dependents,
+//! never the session's; only what the session arena holds moving drops it (a crate's cfg,
+//! which is in its item key, so in the list), and with it every arena. A commit's span names
+//! each arena it marked and why ([`describe`]).
 //!
 //! Cost (rule 67). A commit is O(entries written) to mark, O(crates + roots) to lay the arenas
-//! out again (the order, each root's owner: a vector walk, within the `Memo::next` floor of
+//! out again (the order, each root's arena: a vector walk, within the `Memo::next` floor of
 //! O(arenas)), and O(inputs of the dropped arenas) to make them again: the floor is the
 //! dropped arenas' inputs, as nothing carried is touched. A lookup is one index of a vector.
 //! When no reader holds the old snapshot its table is taken over in place; while one does,
 //! the table is copied (O(files + crates), a vector copy), which a resident helper pays only
 //! when a reader outlives a commit.
 
-use std::{alloc::Global, any::TypeId, collections::BTreeSet};
+use std::{alloc::Global, any::TypeId, io::Write as _};
 
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
@@ -163,6 +170,10 @@ pub(crate) struct Gift {
     pub(crate) name: &'static str,
     pub(crate) value: Given,
     pub(crate) fact: GiftFact,
+    /// A gift of a [`crate::Located`] kind ([`crate::Edit::give_located`]): kept in the
+    /// snapshot's table ([`Table::located`]), never a slot of the crate's arena, so its first
+    /// gift marks no arena.
+    pub(crate) located: bool,
 }
 
 /// What a gift's slot is read by.
@@ -193,6 +204,9 @@ impl Gift {
 pub(crate) struct Maker {
     pub(crate) fact: Fact,
     pub(crate) make: crate::db::MakeGiven,
+    /// Where it was given (the caller of `Edit::set_given`): what a commit's span names as the
+    /// cause when this maker marks its arena.
+    pub(crate) at: &'static std::panic::Location<'static>,
 }
 
 /// Puts `maker` in `makers` (sorted by fact id), in place of one of the same fact id: whether
@@ -320,6 +334,10 @@ pub(crate) struct Crates {
     pub(crate) attr_of: HashMap<FileId, CrateKey, Global>,
     /// Crates whose entry moved since the last commit.
     pub(crate) dirty: Vec<CrateKey, Global>,
+    /// Crates given a located gift of a kind they held none of since the last commit
+    /// ([`Crates::give_located`]): a write of the next snapshot's table alone, which marks no
+    /// arena (under [`Plant::LocatedMarks`], each of their arenas).
+    pub(crate) located: Vec<CrateKey, Global>,
     /// Whether the order or the list moved since the last commit.
     pub(crate) shape_moved: bool,
     /// The builder ids of the last graph set, for [`crate::Committed::crates`].
@@ -661,12 +679,64 @@ impl Crates {
     /// Gives `key` `value` as kind `K`, its slot read by a fact drawn for it: whether anything
     /// moved. Two [`Given`] are equal only when they are one value.
     pub(crate) fn give(&mut self, key: CrateKey, kind: TypeId, name: &'static str, value: Given) -> bool {
+        self.refuse_located(key, kind, name, "Edit::give");
         if self.get(key).gifts.iter().any(|it| it.kind == kind && it.value == value) {
             return false;
         }
         self.gifts_drawn += 1;
         let digest = ContentId::of(facts::GIFT, &self.gifts_drawn.to_le_bytes());
-        self.put_gift(key, Gift { kind, name, value, fact: GiftFact::Drawn(digest) })
+        self.put_gift(key, Gift { kind, name, value, fact: GiftFact::Drawn(digest), located: false })
+    }
+
+    /// Stops where `key` holds a gift of `kind` given as [`crate::Located`]: one kind is given
+    /// one way, so a slot write and a table write never stand for one gift.
+    fn refuse_located(&self, key: CrateKey, kind: TypeId, name: &'static str, by: &str) {
+        if self.get(key).gifts.iter().any(|it| it.kind == kind && it.located) {
+            panic!(
+                "`{by}` of the kind `{name}` to the crate {key:?}, which holds a gift of that kind given \
+                 as located (`Edit::give_located`): a kind is given one way"
+            );
+        }
+    }
+
+    /// Gives `key` `value` as the located kind `kind` ([`crate::Located`]) under the giver's
+    /// `fact`: whether anything moved. The first gift of the kind marks no arena: it goes in
+    /// the next snapshot's table ([`Table::located`]), and the kind's promise is that every
+    /// reader computes the same value with it as without it. A gift under the fact held moves
+    /// nothing. One under another fact replaces it and marks the crate, as [`Crates::take_gift`]
+    /// does: a value replaced or withdrawn is one a reader may have read and that the inputs
+    /// no longer give (a dependency's image whose crate moved), so whatever read it goes.
+    pub(crate) fn give_located(
+        &mut self,
+        key: CrateKey,
+        kind: TypeId,
+        name: &'static str,
+        fact: Fact,
+        value: Given,
+    ) -> bool {
+        let held = self.get(key).gifts.iter().find(|it| it.kind == kind);
+        match held {
+            Some(held) if !held.located => panic!(
+                "`Edit::give_located` of the kind `{name}` to the crate {key:?}, which holds a gift of \
+                 that kind given as a slot (`Edit::give`, `Edit::give_by`): a kind is given one way"
+            ),
+            Some(held) if held.fact == GiftFact::Given(fact) => false,
+            Some(_) => {
+                self.put_gift(key, Gift { kind, name, value, fact: GiftFact::Given(fact), located: true })
+            }
+            None => {
+                self.get_mut(key).gifts.push(Gift {
+                    kind,
+                    name,
+                    value,
+                    fact: GiftFact::Given(fact),
+                    located: true,
+                });
+                self.undo.push(Undo::Gift(key, kind, None));
+                self.located.push(key);
+                true
+            }
+        }
     }
 
     /// Gives `key` `value` as kind `K`, its slot read by the giver's `fact`: whether anything
@@ -681,10 +751,11 @@ impl Crates {
         fact: Fact,
         value: Given,
     ) -> bool {
+        self.refuse_located(key, kind, name, "Edit::give_by");
         if self.get(key).gifts.iter().any(|it| it.kind == kind && it.fact == GiftFact::Given(fact)) {
             return false;
         }
-        self.put_gift(key, Gift { kind, name, value, fact: GiftFact::Given(fact) })
+        self.put_gift(key, Gift { kind, name, value, fact: GiftFact::Given(fact), located: false })
     }
 
     /// Puts `gift` in `key`'s slot of its kind and marks the crate: a slot that held a gift
@@ -796,20 +867,114 @@ impl Crates {
         map
     }
 
-    /// Each crate's content ID, in order, of the listed: what the crate list's shape digest is.
-    pub(crate) fn list_content(&self) -> ContentId {
+    /// The crate list as the session arena holds it ([`List`]). O(listed crates) hashes, made
+    /// when the shape moved or the session arena is made.
+    ///
+    /// # Panics
+    ///
+    /// Where a listed crate depends on a crate not listed before it (the order keeps every
+    /// crate after its dependencies, and a graph lists what its crates depend on), or a listed
+    /// crate's root file is in no source root.
+    pub(crate) fn list(&self, files: &Files) -> List {
+        let mut by_key: HashMap<CrateKey, ContentId, Global> = HashMap::new_in(Global);
+        let mut keys: Vec<(CrateKey, ContentId), Global> = Vec::new_in(Global);
         let mut hasher = Hasher::new(crate::CRATE_GRAPH_DOMAIN);
-        let listed: Vec<ContentId, Global> = {
-            let mut listed = Vec::new_in(Global);
-            listed.extend(self.order.iter().map(|&key| self.get(key)).filter(|it| it.listed).map(|it| it.content));
-            listed
-        };
-        crate::content::len(&mut hasher, listed.len());
-        for content in &listed {
-            hasher.id(content);
+        let listed = self.order.iter().filter(|&&key| self.get(key).listed).count();
+        crate::content::len(&mut hasher, listed);
+        for &key in &self.order {
+            let entry = self.get(key);
+            if !entry.listed {
+                continue;
+            }
+            let item_key = crate::crate_item_key(&entry.data, &entry.extra, &entry.cfg, &|dep: CrateKey| {
+                *by_key.get(&dep).unwrap_or_else(|| {
+                    panic!("the listed crate {key:?} depends on {dep:?}, which is not listed before it")
+                })
+            });
+            by_key.insert(key, item_key);
+            keys.push((key, item_key));
+            let root = files.path_of(entry.data.root_file_id).unwrap_or_else(|| {
+                panic!("the root file {:?} of the listed crate {key:?} is in no source root", entry.data.root_file_id)
+            });
+            hasher.id(&item_key);
+            blaze_mem::scratch::with_bytes(|bytes| {
+                crate::content::path_key_into(&root, bytes);
+                hasher.part(&bytes[..]);
+            });
         }
-        hasher.finish()
+        List { digest: hasher.finish(), item_keys: std::sync::Arc::from(&keys[..]) }
     }
+}
+
+/// The crate list as the list's arena holds it ([`LIST_ARENA`]): the digest of [`AllCrates`],
+/// of what a reader of the list can tell apart, and each listed crate's item key in order
+/// (indexed by prefix for [`crate::listed_by_prefix`]).
+///
+/// The digest is content, the same in every database of the same crates: of each listed
+/// crate, in order, its item key ([`crate::crate_item_key`]: its name, origin, what it is
+/// built for, its build script runs, target, edition, crate attributes, cfg and each
+/// dependency's name, flags and item key) and its root file's path (what
+/// [`crate::source_root_crates`] groups it by, with the root's own content). The keys are of
+/// the database: a commit marks the list's arena where the digest or the keys moved
+/// ([`commit`]), which drops the runs that read the list and their borrowers alone. It is not
+/// of the crate's content ID: a write of a crate's env, workspace data or lints, or a gift,
+/// moves that crate's arena and its dependents' (each borrows it), not the list. A [`Crate`]
+/// of the list is read from the table, made each commit, never from the arena.
+#[derive(Clone)] // clone: the table's, an `Arc` and a digest
+pub(crate) struct List {
+    pub(crate) digest: ContentId,
+    pub(crate) item_keys: std::sync::Arc<[(CrateKey, ContentId)]>,
+}
+
+/// One crate's other `OUT_DIR`s ([`crate::other_out_dirs`]): the field its [`Crate`] input is
+/// made with.
+pub(crate) type Dirs = Box<[Box<str>]>;
+
+/// Each crate's [`Dirs`], by key: what a commit compares with the old table's
+/// ([`Table::out_dirs`]) to mark the crates whose dirs moved, and makes their arenas with.
+pub(crate) type OutDirs = HashMap<CrateKey, Dirs, Global>;
+
+/// `env`'s `OUT_DIR` without a trailing separator; `None` for none or an empty one.
+fn out_dir(env: &Env) -> Option<Box<str>> {
+    let dir = env.get("OUT_DIR")?;
+    let trimmed = dir.trim_end_matches(['/', '\\']);
+    (!trimmed.is_empty()).then(|| Box::from(trimmed))
+}
+
+/// Every crate's other `OUT_DIR`s: for each crate of the order, the `OUT_DIR`s of the listed
+/// crates whose root file is in its root file's source root, its own left out, sorted, each
+/// once (what [`crate::other_out_dirs`] read off the list and each crate's variables while it
+/// was a query: a reader of every crate of its root and of the list, which every arena read).
+/// O(crates), once a commit.
+pub(crate) fn out_dirs_of(world: &World, files: &Files) -> OutDirs {
+    let crates = &world.crates;
+    let mut by_root: HashMap<SourceRootId, Vec<Box<str>, Global>, Global> = HashMap::new_in(Global);
+    for &key in &crates.order {
+        let entry = crates.get(key);
+        if !entry.listed {
+            continue;
+        }
+        let (Some(root), Some(dir)) = (files.root_of(entry.data.root_file_id), out_dir(&entry.env)) else {
+            continue;
+        };
+        by_root.entry(root).or_insert_with(|| Vec::new_in(Global)).push(dir);
+    }
+    for dirs in by_root.values_mut() {
+        dirs.sort_unstable();
+        dirs.dedup();
+    }
+    let mut out = HashMap::with_capacity_in(crates.order.len(), Global);
+    for &key in &crates.order {
+        let entry = crates.get(key);
+        let own = out_dir(&entry.env);
+        let mut dirs: Vec<Box<str>, Global> = Vec::new_in(Global);
+        if let Some(of_root) = files.root_of(entry.data.root_file_id).and_then(|root| by_root.get(&root)) {
+            // clone: a directory's name, once per crate of its root a commit
+            dirs.extend(of_root.iter().filter(|dir| Some(*dir) != own.as_ref()).cloned());
+        }
+        out.insert(key, dirs.into_boxed_slice());
+    }
+    out
 }
 
 /// [`Crates::set_graph`]'s walk, each crate after its dependencies.
@@ -1058,6 +1223,19 @@ pub enum Plant {
     /// A crate arena made again takes the crate's variables as they were when it was first
     /// made, not as the world holds them now.
     RemakeReusesStale,
+    /// A commit that starts a new session gives it a new id space and keeps the database's
+    /// nonce (`Memo::builder` in place of `Memo::next_session`): every arena starts again at
+    /// generation 0 and takes the ids the old session's arenas had, under the same nonce.
+    FreshRestartsIds,
+    /// A commit that marks a sealed arena starts a new session, every arena made again: what a
+    /// commit did while `Memo::next` refused to drop a sealed arena.
+    SealedRestartsSession,
+    /// A located gift's first gift marks its crate's arena, as a slot's gift does: what the
+    /// image's lang items and a crate's constants' key did before they were located.
+    LocatedMarks,
+    /// A moved crate list marks the session arena, not the list's own ([`LIST_ARENA`]): what
+    /// a commit did while the list was a singleton of the session, which every arena borrows.
+    ListMarksSession,
 }
 
 /// The world: everything but the files ([`Files`], shared with the snapshot's readers).
@@ -1113,7 +1291,10 @@ impl World {
     /// Whether the world has a write no commit took: a crate, the graph's shape or the
     /// session moved. The files' are [`Files::has_marks`].
     pub(crate) fn moved(&self) -> bool {
-        !self.crates.dirty.is_empty() || self.crates.shape_moved || self.session.moved
+        !self.crates.dirty.is_empty()
+            || !self.crates.located.is_empty()
+            || self.crates.shape_moved
+            || self.session.moved
     }
 
     /// Ends the open edit, its writes kept: once a commit has made its snapshot, which holds
@@ -1121,6 +1302,7 @@ impl World {
     pub(crate) fn forget(&mut self) {
         self.crates.undo.clear();
         self.crates.dirty.clear();
+        self.crates.located.clear();
         self.crates.shape_moved = false;
         self.session.moved = false;
     }
@@ -1178,6 +1360,7 @@ impl World {
             }
         }
         crates.dirty.clear();
+        crates.located.clear();
         crates.shape_moved = false;
         self.session.moved = false;
     }
@@ -1213,10 +1396,33 @@ pub(crate) struct Table {
     pub(crate) root_crates: HashMap<SourceRootId, std::sync::Arc<[Crate]>, Global>,
     /// The primary crates, sorted.
     pub(crate) primary: std::sync::Arc<[Crate]>,
-    /// Each listed crate's item key ([`crate::crate_item_key`]), in order
-    /// ([`crate::crate_item_keys`]): session-level, made from the world when the session arena
-    /// is (a listed crate written, added or taken out), carried with the table otherwise.
+    /// Each listed crate's item key ([`crate::crate_item_key`]), in order: of the [`List`] the
+    /// list's arena ([`LIST_ARENA`]) was made with, carried with the table while that arena is.
     pub(crate) item_keys: std::sync::Arc<[(CrateKey, ContentId)]>,
+    /// The same crates by the first 8 bytes of their item key read little-endian
+    /// ([`crate::listed_by_prefix`]), sorted by it; made with `item_keys`.
+    pub(crate) by_prefix: std::sync::Arc<[(u64, CrateKey)]>,
+    /// The first two listed crates found with one prefix, by key: a build with two stops
+    /// ([`crate::listed_clash`]).
+    pub(crate) clash: Option<[CrateKey; 2]>,
+    /// The digest of that [`List`] ([`AllCrates`]); `None` before the first session.
+    pub(crate) list: Option<ContentId>,
+    /// Each crate's other `OUT_DIR`s, as its arena was made with them ([`out_dirs_of`]).
+    pub(crate) out_dirs: OutDirs,
+    /// Each crate's located gifts ([`crate::Edit::give_located`]), by key index: its kind, the
+    /// giver's fact and the value. Made whole each commit from the world, a few `Arc`s a crate.
+    pub(crate) located: Vec<Vec<(TypeId, Fact, Given), Global>, Global>,
+}
+
+/// `item_keys` by prefix, sorted, and the first two crates of one prefix
+/// ([`Table::by_prefix`], [`Table::clash`]). O(n log n) in the listed crates, made when the
+/// list is.
+fn by_prefix(item_keys: &[(CrateKey, ContentId)]) -> (std::sync::Arc<[(u64, CrateKey)]>, Option<[CrateKey; 2]>) {
+    let mut sorted: Vec<(u64, CrateKey), Global> = Vec::with_capacity_in(item_keys.len(), Global);
+    sorted.extend(item_keys.iter().map(|&(key, item_key)| (crate::key_prefix(&item_key), key)));
+    sorted.sort_unstable();
+    let clash = sorted.windows(2).find(|pair| pair[0].0 == pair[1].0).map(|pair| [pair[0].1, pair[1].1]);
+    (std::sync::Arc::from(&sorted[..]), clash)
 }
 
 fn put<T>(rows: &mut Vec<Option<T>, Global>, at: usize, value: Option<T>) {
@@ -1349,14 +1555,42 @@ impl Placed<'_> {
     }
 }
 
-/// Where everything goes in a snapshot: each crate's index, each root's owner.
+/// Where everything goes in a snapshot: the session at index 0, the crate list at
+/// [`LIST_ARENA`], then each source root's files in an open arena of their own (indices
+/// `FIRST_ROOT..FIRST_ROOT + roots`, by root id), then each crate's arena in the graph's order.
+///
+/// Why the list has an open arena of its own: what moves it (a crate added, taken out or
+/// moved, or a listed crate's item key, which its cfg is in) is read by few: an enumeration of
+/// every crate ([`crate::all_crates`]) and a crate-key lookup that found none
+/// ([`crate::listed_by_prefix`]). Each run that reads it borrows it, as a root's readers do,
+/// so a moved list drops those readers and their borrowers, where it dropped every arena
+/// while it was a singleton of the session's (round 27: each build script's cfg written,
+/// and the second `hi` crate added, dropped all 32 arenas). No crate declares it: a crate's
+/// own lookups that find their crate read that crate ([`crate::listed_by_prefix`]), and its
+/// root's other `OUT_DIR`s are a field of its own ([`crate::other_out_dirs`]).
+///
+/// Why a root's files have an arena of their own, below every crate's: a crate reads files of
+/// another source root (a `#[path]` module into another package's directory) that it is found
+/// to read only once its def map is made, so no crate can declare that borrow when the arenas
+/// are made, and a crate cannot borrow a later crate's arena. Each root's arena is open
+/// (`Inputs::open`): any crate's key may name its files, and each entry that does borrows it,
+/// as each run that reads it does. An edit of a file drops its root's arena and so exactly the
+/// crates rooted in that root (each declares it), the crates that read a file of that root
+/// across roots (each borrowed it), and their dependents. Against the floor (the crates whose
+/// def maps reach the edited file, and their dependents) the grain is the root, as a crate's
+/// own files have always been read: the crates rooted beside the file's crate are dropped too.
+/// A root no crate is rooted in has an arena of its own as well, so an edit there drops its
+/// readers, not the session arena, whose drop drops every arena.
 struct Layout {
-    /// Arena index to crate (index 0 is none).
+    /// Arena index to crate (none for the session's, 0, the list's and the roots').
     at: Vec<Option<CrateKey>, Global>,
     index_of: HashMap<CrateKey, u32, Global>,
-    /// Each source root's owner's index (0: the session).
+    /// How many source roots there are: their arenas are at indices
+    /// `FIRST_ROOT..FIRST_ROOT + roots`.
+    roots: u32,
+    /// Each source root's arena's index.
     owner: HashMap<SourceRootId, u32, Global>,
-    /// Each arena's roots, by index.
+    /// Each arena's roots, by index: one for a root's arena, none for any other.
     owned: Vec<Vec<SourceRootId, Global>, Global>,
     sealed: Vec<bool, Global>,
 }
@@ -1364,36 +1598,52 @@ struct Layout {
 impl Layout {
     fn of(world: &World, files: &Files) -> Layout {
         let crates = &world.crates;
-        let n = crates.order.len() + 1;
+        let roots = files.roots();
+        let first_crate = FIRST_ROOT + roots.len() as u32;
+        let n = first_crate as usize + crates.order.len();
         let mut at = Vec::with_capacity_in(n, Global);
-        at.push(None);
+        at.resize(first_crate as usize, None);
         let mut index_of = HashMap::with_capacity_in(n, Global);
-        let mut owner = HashMap::new_in(Global);
+        let mut owner = HashMap::with_capacity_in(roots.len(), Global);
+        let mut owned = Vec::with_capacity_in(n, Global);
+        owned.resize_with(n, || Vec::new_in(Global));
+        for (place, &root) in roots.iter().enumerate() {
+            let index = FIRST_ROOT + place as u32;
+            owner.insert(root, index);
+            owned[index as usize].push(root);
+        }
         let mut sealed = Vec::with_capacity_in(n, Global);
-        sealed.push(false);
+        sealed.resize(first_crate as usize, false);
         for (place, &key) in crates.order.iter().enumerate() {
-            let index = place as u32 + 1;
+            let index = first_crate + place as u32;
             at.push(Some(key));
             index_of.insert(key, index);
             let entry = crates.get(key);
-            if let Some(root) = files.root_of(entry.data.root_file_id) {
-                owner.entry(root).or_insert(index);
-            }
             let deps_sealed =
                 entry.data.dependencies.iter().all(|dep| sealed[index_of[&dep.crate_id] as usize]);
-            sealed.push(entry.data.sealed.is_some() && deps_sealed);
+            let is_sealed = entry.data.sealed.is_some() && deps_sealed;
+            sealed.push(is_sealed);
+            // A root is sealed where a sealed crate is rooted in it: a sealed arena borrows
+            // only sealed ones (`Builder::build` checks it). An edit of a file there (of an
+            // unsealed crate beside it, or the sealed crate's own) drops the root's arena and
+            // its borrowers, as for any root.
+            if is_sealed
+                && let Some(&root_at) = files.root_of(entry.data.root_file_id).and_then(|root| owner.get(&root))
+            {
+                sealed[root_at as usize] = true;
+            }
         }
-        let mut owned = Vec::with_capacity_in(n, Global);
-        owned.resize_with(n, || Vec::new_in(Global));
-        for root in files.roots() {
-            let index = owner.get(&root).copied().unwrap_or(0);
-            owned[index as usize].push(root);
-        }
-        Layout { at, index_of, owner, owned, sealed }
+        Layout { at, index_of, roots: first_crate - FIRST_ROOT, owner, owned, sealed }
     }
 
-    fn owner(&self, root: SourceRootId) -> u32 {
-        self.owner.get(&root).copied().unwrap_or(0)
+    /// The index of `root`'s arena; `None` where the world has no such source root set.
+    fn owner(&self, root: SourceRootId) -> Option<u32> {
+        self.owner.get(&root).copied()
+    }
+
+    /// Whether arena `index` is a source root's.
+    fn is_root(&self, index: u32) -> bool {
+        (FIRST_ROOT..FIRST_ROOT + self.roots).contains(&index)
     }
 
     fn len(&self) -> u32 {
@@ -1401,65 +1651,283 @@ impl Layout {
     }
 }
 
+/// The index of the crate list's open arena ([`Layout`]): [`AllCrates`] alone.
+pub(crate) const LIST_ARENA: u32 = 1;
+
+/// The index of the first source root's arena ([`Layout`]).
+const FIRST_ROOT: u32 = 2;
+
 /// What [`commit`] did.
 pub(crate) struct Made {
     pub(crate) snap: Snap,
     pub(crate) dropped: Box<[u32]>,
+    /// Each arena the commit marked, by index, with why: what its span says ([`describe`]).
+    /// Empty for a first commit, which marks nothing (it makes every arena).
+    pub(crate) marked: Vec<Mark, Global>,
     /// Why the commit started a new session, carrying nothing; `None` when it carried.
     pub(crate) fresh: Option<Fresh>,
     /// The arena capacity of the new session, when it started one ([`World::arenas`]).
     pub(crate) arenas: Option<u32>,
+    /// Whether the new session is of a new id space (`Memo::builder`): an index of the old one
+    /// had made its last generation, so the old space can hand out no id the session needs.
+    /// Every id of the snapshot is then one an earlier snapshot of the database may have had,
+    /// and the caller gives the database another nonce, the identity every holder of ids
+    /// outside the memo keys by ([`crate::Db::nonce`]).
+    pub(crate) renewed: bool,
 }
 
 /// Why a commit started a new session (every arena made again) instead of carrying the old
 /// one's arenas: what the commit's span says, so a profile can tell a rare full remake apart.
+/// A new session goes on in the database's id space (`Memo::next_session`): each arena takes
+/// its index's next generation, so no id of the new session is one an old arena had and a
+/// holder of ids outside the memo sees every old one as dropped.
+///
+/// A write never starts one: a sealed arena is dropped with its borrowers as any arena is
+/// (`Memo::next`, "Sealed arenas" on `Memo::changed`), so a commit of a carried snapshot
+/// starts a new session only when the memo cannot carry it (the cases below but the first).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Fresh {
     /// The database's first commit.
     First,
-    /// The world has more arenas than the session was made with.
-    Outgrown,
-    /// A sealed arena was marked (`Memo::next` refuses to drop one).
-    SealedMarked,
-    /// An arena to drop has spent its generations (`NextRefused::GenerationsSpent`).
-    GenerationsSpent,
+    /// The world has more arenas (`needed`) than the session was made with (`capacity`).
+    Outgrown { needed: u32, capacity: u32 },
+    /// The arena to drop at this id has spent its generations in the database's id space
+    /// (`NextRefused::GenerationsSpent`): the session is of a new id space ([`Made::renewed`]).
+    GenerationsSpent(ArenaId),
     /// The last commit failed after the old snapshot was asked for its next
     /// ([`Memo::has_successor`]): a maker panicked while the next was made, and the edit was
     /// dropped. The old snapshot answers still but makes no other next.
     AfterFailedCommit,
+    /// A test's planted bug ([`Plant::SealedRestartsSession`]): a sealed arena was marked.
+    Planted,
 }
 
-impl Fresh {
-    /// Its name, as the commit's span records it.
-    pub(crate) fn name(self) -> &'static str {
+impl std::fmt::Display for Fresh {
+    /// What the commit's span records as `fresh`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Fresh::First => "first",
-            Fresh::Outgrown => "arenas outgrown",
-            Fresh::SealedMarked => "a sealed arena marked",
-            Fresh::GenerationsSpent => "generations spent",
-            Fresh::AfterFailedCommit => "after a failed commit",
+            Fresh::First => f.write_str("first"),
+            Fresh::Outgrown { needed, capacity } => {
+                write!(f, "arenas outgrown: {needed} needed, the session was made with {capacity}")
+            }
+            Fresh::GenerationsSpent(arena) => write!(f, "generations spent at {arena:?}"),
+            Fresh::AfterFailedCommit => f.write_str("after a failed commit"),
+            Fresh::Planted => f.write_str("a planted bug: a sealed arena marked"),
         }
     }
 }
 
-/// The arenas a commit marks: what moved since `old`, by where it was and where it goes.
-#[allow(clippy::too_many_arguments, reason = "what moved, each kind on its own")]
+/// An arena a commit marked: its index, what it holds, whether the old snapshot had it
+/// sealed, and why it was marked (the first cause found; one arena may have more).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Mark {
+    pub(crate) index: u32,
+    pub(crate) who: Who,
+    pub(crate) sealed: bool,
+    pub(crate) cause: Cause,
+}
+
+/// What a marked arena holds: in the next snapshot's layout, or else the old one's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Who {
+    Session,
+    /// The crate list's arena ([`LIST_ARENA`]).
+    List,
+    Root(SourceRootId),
+    Crate(CrateKey),
+    /// No crate or root is at this index in either snapshot.
+    Empty,
+}
+
+/// Why a commit marked an arena: what the `db commit` span names for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cause {
+    /// A session datum or maker was written (the session arena).
+    Session(SessionWrite),
+    /// The crate list's digest moved ([`List`]): a crate listed, taken out or put in another
+    /// place, or a listed crate's item key or root file's path moved (the session arena).
+    List,
+    /// A file of no source root, or the session's own file data, was written.
+    SessionFiles,
+    /// The crate's own entry was written, or its content ID moved with a dependency's.
+    Crate(CrateKey, CrateWrite),
+    /// Another crate or root (or none) is at this index than the old snapshot had.
+    IndexMoved,
+    /// The source root's file set was written, or a file of it (`Some`).
+    Root(SourceRootId, Option<FileId>),
+    /// A crate's attribute file was written.
+    AttrFile(FileId),
+    /// A file read outside the VFS that the crate read was written.
+    Included,
+}
+
+/// What of the session an edit wrote first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SessionWrite {
+    /// A datum ([`SessionField`]), by name.
+    Field(&'static str),
+    /// A maker, given at this place ([`crate::Edit::set_given`]).
+    Given(&'static std::panic::Location<'static>),
+    /// Moved with no write logged: a new world's session, never made yet.
+    Unlogged,
+}
+
+/// What of a crate an edit wrote first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CrateWrite {
+    Made,
+    /// A field ([`Field`]), by name.
+    Field(&'static str),
+    /// Its content ID alone: a dependency's moved, or its root file's path.
+    Content,
+    AttrFiles,
+    /// A gift of the kind named.
+    Gift(&'static str),
+    /// A maker, given at this place ([`crate::Edit::set_given`]).
+    Given(&'static std::panic::Location<'static>),
+    /// Listed (`true`) or taken out of the list.
+    Listed(bool),
+    /// The other `OUT_DIR`s of its source root moved ([`OutDirs`]): a crate of its root
+    /// added, taken out, or given another `OUT_DIR`.
+    OutDirs,
+    /// Marked with no write logged.
+    Unlogged,
+}
+
+impl Field {
+    fn name(&self) -> &'static str {
+        match self {
+            Field::Data(_) => "data",
+            Field::Extra(_) => "extra",
+            Field::Workspace(_) => "workspace",
+            Field::Cfg(_) => "cfg",
+            Field::Env(_) => "env",
+            Field::Lints(_) => "lints",
+        }
+    }
+}
+
+impl SessionField {
+    fn name(&self) -> &'static str {
+        match self {
+            SessionField::LibraryRoots(_) => "library roots",
+            SessionField::LocalRoots(_) => "local roots",
+            SessionField::ProcessEnv(_) => "process env",
+            SessionField::Settings(_) => "settings",
+            SessionField::Primary(_) => "primary crates",
+        }
+    }
+}
+
+/// The open edit's first write of the session and of each crate, read from the undo log in
+/// the order written: O(the edit's writes), once a commit that carries.
+struct Writes {
+    session: Option<SessionWrite>,
+    crates: HashMap<CrateKey, CrateWrite, Global>,
+}
+
+impl Writes {
+    fn of(world: &World) -> Writes {
+        let crates = &world.crates;
+        let mut writes = Writes { session: None, crates: HashMap::new_in(Global) };
+        let maker_at = |makers: &[Maker], id: ContentId, was: &Option<Maker>| {
+            let now = makers.binary_search_by(|it| it.fact.id.cmp(&id)).ok().map(|at| makers[at].at);
+            now.or_else(|| was.as_ref().map(|it| it.at))
+        };
+        for undo in &crates.undo {
+            let (key, write) = match undo {
+                Undo::Made(key) => (*key, CrateWrite::Made),
+                Undo::Field(key, was) => (*key, CrateWrite::Field(was.name())),
+                Undo::Content(key, _) => (*key, CrateWrite::Content),
+                Undo::AttrFiles(key, _) => (*key, CrateWrite::AttrFiles),
+                Undo::Gift(key, kind, was) => {
+                    let now = crates.get(*key).gifts.iter().find(|it| it.kind == *kind).map(|it| it.name);
+                    let name = now.or_else(|| was.as_ref().map(|it| it.name)).unwrap_or("a gift");
+                    (*key, CrateWrite::Gift(name))
+                }
+                Undo::Maker(Some(key), id, was) => match maker_at(&crates.get(*key).makers, *id, was) {
+                    Some(at) => (*key, CrateWrite::Given(at)),
+                    None => (*key, CrateWrite::Unlogged),
+                },
+                Undo::Listed(key, was) => (*key, CrateWrite::Listed(!*was)),
+                Undo::Maker(None, id, was) => {
+                    let write = maker_at(&world.session.makers, *id, was).map_or(SessionWrite::Unlogged, SessionWrite::Given);
+                    writes.session.get_or_insert(write);
+                    continue;
+                }
+                // Not of the session arena: each crate whose flag moved is given it.
+                Undo::Session(SessionField::Primary(_)) => continue,
+                Undo::Session(field) => {
+                    writes.session.get_or_insert(SessionWrite::Field(field.name()));
+                    continue;
+                }
+                Undo::AttrOf(..)
+                | Undo::OrderPushed
+                | Undo::OrderPopped(_)
+                | Undo::Order(_)
+                | Undo::Unique(_) => continue,
+            };
+            writes.crates.entry(key).or_insert(write);
+        }
+        writes
+    }
+}
+
+/// Arena indices marked, each with the cause found first: sorted by index, one per index, once
+/// [`marked`] returns it.
+type Marked = Vec<(u32, Cause), Global>;
+
+fn mark(marked: &mut Marked, index: Option<u32>, cause: Cause) {
+    if let Some(index) = index {
+        marked.push((index, cause));
+    }
+}
+
+/// The arenas a commit marks, each with why: what moved since `old`, by where it was and
+/// where it goes. `list_moved`: the crate list's digest differs from `old`'s ([`List`]);
+/// `out_dirs_moved`: the crates whose other `OUT_DIR`s differ from `old`'s ([`OutDirs`]).
 fn marked(
     world: &World,
     files: &Files,
     layout: &Layout,
     old: &Table,
     marks: FileMarks,
-    crates_dirty: &[CrateKey],
-    session_moved: bool,
-    shape_moved: bool,
-) -> BTreeSet<u32> {
-    let mut marked: BTreeSet<u32> = BTreeSet::new();
+    list_moved: bool,
+    out_dirs_moved: &[CrateKey],
+) -> Marked {
+    let mut marked: Marked = Vec::new_in(Global);
     if world.plant == Plant::EditMarksNothing {
         return marked;
     }
-    if session_moved || shape_moved || marks.session {
-        marked.insert(0);
+    let writes = Writes::of(world);
+    let old_index =
+        |key: CrateKey| old.at_index.iter().position(|it| *it == Some(key)).map(|it| it as u32);
+    if world.session.moved {
+        mark(&mut marked, Some(0), Cause::Session(writes.session.unwrap_or(SessionWrite::Unlogged)));
+    }
+    if list_moved {
+        let at = if world.plant == Plant::ListMarksSession { 0 } else { LIST_ARENA };
+        mark(&mut marked, Some(at), Cause::List);
+    }
+    // A located gift given for the first time marks nothing ([`Crates::give_located`]).
+    if world.plant == Plant::LocatedMarks {
+        for &key in &world.crates.located {
+            let cause = Cause::Crate(key, writes.crates.get(&key).copied().unwrap_or(CrateWrite::Unlogged));
+            mark(&mut marked, old_index(key), cause);
+        }
+    }
+    // A crate whose root's other `OUT_DIR`s moved ([`crate::other_out_dirs`], a field of its
+    // own): its arena alone, and its borrowers with it.
+    for &key in out_dirs_moved {
+        mark(&mut marked, old_index(key), Cause::Crate(key, CrateWrite::OutDirs));
+    }
+    if marks.session {
+        mark(&mut marked, Some(0), Cause::SessionFiles);
+    }
+    for &key in &world.crates.dirty {
+        let cause = Cause::Crate(key, writes.crates.get(&key).copied().unwrap_or(CrateWrite::Unlogged));
+        mark(&mut marked, old_index(key), cause);
+        mark(&mut marked, layout.index_of.get(&key).copied(), cause);
     }
     // A crate that moved to another index is made again at both.
     let span = old.at_index.len().max(layout.at.len());
@@ -1467,46 +1935,161 @@ fn marked(
         let was = old.at_index.get(index as usize).copied().flatten();
         let now = layout.at.get(index as usize).copied().flatten();
         if was != now {
-            marked.insert(index);
+            mark(&mut marked, Some(index), Cause::IndexMoved);
         }
     }
-    let old_index =
-        |key: CrateKey| old.at_index.iter().position(|it| *it == Some(key)).map(|it| it as u32);
-    for &key in crates_dirty {
-        marked.extend(old_index(key));
-        marked.extend(layout.index_of.get(&key).copied());
-    }
-    let old_owner = |root: SourceRootId| -> u32 {
-        old.arena_roots.iter().position(|roots| roots.contains(&root)).map_or(0, |it| it as u32)
+    // The arena a root was placed in: its own (`Layout`); none for a root the old snapshot did
+    // not have.
+    let old_owner = |root: SourceRootId| -> Option<u32> {
+        old.arena_roots.iter().position(|roots| roots.contains(&root)).map(|it| it as u32)
     };
-    let mut roots: Vec<SourceRootId, Global> = marks.roots;
+    let mut roots: Vec<(SourceRootId, Cause), Global> = Vec::new_in(Global);
+    roots.extend(marks.roots.iter().map(|&root| (root, Cause::Root(root, None))));
     for &file in &marks.files {
         if let Some(&krate) = world.crates.attr_of.get(&file) {
-            marked.extend(layout.index_of.get(&krate).copied());
+            mark(&mut marked, layout.index_of.get(&krate).copied(), Cause::AttrFile(file));
             continue;
         }
         match files.root_of(file) {
-            Some(root) => roots.push(root),
+            Some(root) => roots.push((root, Cause::Root(root, Some(file)))),
             // A file of no root lives in the session arena.
-            None => _ = marked.insert(0),
+            None => mark(&mut marked, Some(0), Cause::SessionFiles),
         }
     }
-    // A root whose owner moved is placed again in both.
+    // A root whose arena moved to another index is placed again at both.
     for root in files.roots() {
         if old_owner(root) != layout.owner(root) {
-            roots.push(root);
+            roots.push((root, Cause::IndexMoved));
         }
     }
-    for root in roots {
-        marked.insert(old_owner(root));
-        marked.insert(layout.owner(root));
+    for (root, cause) in roots {
+        mark(&mut marked, old_owner(root), cause);
+        mark(&mut marked, layout.owner(root), cause);
     }
     for row in marks.included {
         for key in files.included_readers(row) {
-            marked.extend(layout.index_of.get(&key).copied());
+            mark(&mut marked, layout.index_of.get(&key).copied(), Cause::Included);
         }
     }
+    // By index, the cause found first kept (a stable sort).
+    marked.sort_by_key(|it| it.0);
+    marked.dedup_by_key(|it| it.0);
     marked
+}
+
+/// The marks of `marked`, each with what its arena holds and whether `old` had it sealed.
+fn marks_of(marked: &Marked, layout: &Layout, old: &Table) -> Vec<Mark, Global> {
+    let mut marks = Vec::with_capacity_in(marked.len(), Global);
+    for &(index, cause) in marked {
+        let at = index as usize;
+        let who = if index == 0 {
+            Who::Session
+        } else if index == LIST_ARENA {
+            Who::List
+        } else if let Some(Some(key)) = layout.at.get(at) {
+            Who::Crate(*key)
+        } else if let Some(&root) = layout.owned.get(at).and_then(|it| it.first()) {
+            Who::Root(root)
+        } else if let Some(Some(key)) = old.at_index.get(at) {
+            Who::Crate(*key)
+        } else if let Some(&root) = old.arena_roots.get(at).and_then(|it| it.first()) {
+            Who::Root(root)
+        } else {
+            Who::Empty
+        };
+        let sealed = old.sealed.get(at).copied().unwrap_or(false);
+        marks.push(Mark { index, who, sealed, cause });
+    }
+    marks
+}
+
+/// How many marks [`describe`] names; the rest it counts.
+pub(crate) const MARKS_NAMED: usize = 8;
+
+/// What a commit's span records as `causes`: the first [`MARKS_NAMED`] marks, each as
+/// `index who [sealed]: cause`, joined by `; `, then how many more; and when the commit
+/// started a new session, what forced it, with the cause of the arena it names.
+pub(crate) fn describe(
+    world: &World,
+    marks: &[Mark],
+    fresh: Option<Fresh>,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    for (at, it) in marks.iter().take(MARKS_NAMED).enumerate() {
+        if at > 0 {
+            out.write_all(b"; ")?;
+        }
+        write!(out, "{} ", it.index)?;
+        match it.who {
+            Who::Session => out.write_all(b"session")?,
+            Who::List => out.write_all(b"crate list")?,
+            Who::Root(root) => write!(out, "root {}", root.0)?,
+            Who::Crate(key) => write_crate(world, key, out)?,
+            Who::Empty => out.write_all(b"empty")?,
+        }
+        if it.sealed {
+            out.write_all(b" sealed")?;
+        }
+        out.write_all(b": ")?;
+        write_cause(world, it.cause, out)?;
+    }
+    if marks.len() > MARKS_NAMED {
+        write!(out, "; and {} more", marks.len() - MARKS_NAMED)?;
+    }
+    if let Some(fresh) = fresh {
+        if !marks.is_empty() {
+            out.write_all(b"; ")?;
+        }
+        write!(out, "fresh: {fresh}")?;
+        if let Fresh::GenerationsSpent(arena) = fresh
+            && let Some(it) = marks.iter().find(|it| it.index == arena.index())
+        {
+            out.write_all(b", marked for ")?;
+            write_cause(world, it.cause, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// A crate's display name, or its key where it has none or is gone.
+fn write_crate(world: &World, key: CrateKey, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    match world.crates.entries.get(key.0 as usize) {
+        Some(Some(entry)) => match &entry.extra.display_name {
+            Some(name) => out.write_all(name.canonical_name().as_str().as_bytes()),
+            None => write!(out, "crate {}", key.0),
+        },
+        _ => write!(out, "crate {} (gone)", key.0),
+    }
+}
+
+fn write_cause(world: &World, cause: Cause, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    match cause {
+        Cause::Session(SessionWrite::Field(field)) => write!(out, "session {field} written"),
+        Cause::Session(SessionWrite::Given(at)) => write!(out, "session maker given at {at}"),
+        Cause::Session(SessionWrite::Unlogged) => out.write_all(b"session moved"),
+        Cause::List => out.write_all(b"the crate list moved"),
+        Cause::SessionFiles => out.write_all(b"a session file written"),
+        Cause::Crate(key, write) => {
+            write_crate(world, key, out)?;
+            match write {
+                CrateWrite::Made => out.write_all(b" made"),
+                CrateWrite::Field(field) => write!(out, " {field} written"),
+                CrateWrite::Content => out.write_all(b" content moved (a dependency's, or its root path)"),
+                CrateWrite::AttrFiles => out.write_all(b" attribute files set"),
+                CrateWrite::Gift(kind) => write!(out, " given {kind}"),
+                CrateWrite::Given(at) => write!(out, " maker given at {at}"),
+                CrateWrite::Listed(true) => out.write_all(b" listed"),
+                CrateWrite::Listed(false) => out.write_all(b" taken out of the list"),
+                CrateWrite::OutDirs => out.write_all(b" its root's other OUT_DIRs moved"),
+                CrateWrite::Unlogged => out.write_all(b" marked"),
+            }
+        }
+        Cause::IndexMoved => out.write_all(b"index moved"),
+        Cause::Root(root, None) => write!(out, "root {} written", root.0),
+        Cause::Root(root, Some(file)) => write!(out, "file {} of root {} written", file.index(), root.0),
+        Cause::AttrFile(file) => write!(out, "attribute file {} written", file.index()),
+        Cause::Included => out.write_all(b"a file read outside the VFS written"),
+    }
 }
 
 /// A commit's first step, before it asks whether anything moved: makes again the content ID of
@@ -1534,69 +2117,96 @@ pub(crate) fn commit(
     let marks = files.marks();
     let layout = Layout::of(world, files);
     let seq = old.as_ref().map_or(0, |it| it.seq + 1);
+    // The crate list, made again only where the shape moved (a listed crate's content ID, the
+    // list or the order); else the old table's, which the session arena was made with.
+    let list: Option<List> = match (&old, world.crates.shape_moved) {
+        (Some(old), false) => old.table.list.map(|digest| List {
+            digest,
+            item_keys: std::sync::Arc::clone(&old.table.item_keys),
+        }),
+        _ => None,
+    };
+    let list = list.unwrap_or_else(|| world.crates.list(files));
+    // Each crate's other `OUT_DIR`s, and those that moved since the old table's.
+    let out_dirs = out_dirs_of(world, files);
+    let mut out_dirs_moved: Vec<CrateKey, Global> = Vec::new_in(Global);
+    if let Some(old) = old.as_deref() {
+        out_dirs_moved.extend(
+            world.crates.order.iter().copied().filter(|key| old.table.out_dirs.get(key) != out_dirs.get(key)),
+        );
+    }
 
-    // The carried arenas, or none: a first commit, an arena capacity outgrown, a sealed arena
-    // that moved (`Memo::next` refuses to drop one), or an old snapshot a failed commit asked
-    // for its next already, starts a new session.
+    // The carried arenas, or none: a first commit, an arena capacity outgrown, or an old
+    // snapshot a failed commit asked for its next already, starts a new session. A write never
+    // does: a sealed arena marked is dropped with its borrowers, as any arena is.
+    let mut marked_list: Vec<Mark, Global> = Vec::new_in(Global);
     let carried: Result<_, Fresh> = match old.as_deref() {
         None => Err(Fresh::First),
-        Some(_) if layout.len() > world.arenas => Err(Fresh::Outgrown),
+        Some(_) if layout.len() > world.arenas => {
+            Err(Fresh::Outgrown { needed: layout.len(), capacity: world.arenas })
+        }
         Some(old) if old.memo.has_successor() => Err(Fresh::AfterFailedCommit),
         Some(old) => {
-            let marked = marked(
-                world,
-                files,
-                &layout,
-                &old.table,
-                marks,
-                &world.crates.dirty,
-                world.session.moved,
-                world.crates.shape_moved,
-            );
-            let hits_sealed =
-                marked.iter().any(|&index| old.table.sealed.get(index as usize).copied().unwrap_or(false));
-            match hits_sealed {
-                true => Err(Fresh::SealedMarked),
-                false => {
-                    let mut ids: Vec<ArenaId, Global> = Vec::new_in(Global);
-                    ids.extend(old.memo.arenas().filter(|it| marked.contains(&it.index())));
-                    match old.memo.next(&ids) {
-                        // An arena to drop has spent its generations
-                        // (`NextRefused::GenerationsSpent`): the session ends here and a fresh
-                        // one is made below, as when a sealed arena is marked. Nothing of the
-                        // old session is carried, so no id of an earlier making can be read.
-                        // Rare (2^generation bits remakes of one index), so an event names the
-                        // arena, and the commit's span says the session is fresh.
-                        Err(refused @ blaze_memo::NextRefused::GenerationsSpent { .. }) => {
-                            tracing::info!(
-                                target: "blaze",
-                                "a commit starts a new session: {refused}"
-                            );
-                            Err(Fresh::GenerationsSpent)
-                        }
-                        Ok(next) => {
-                            let mut dropped: Vec<u32, Global> = Vec::new_in(Global);
-                            dropped.extend_from_slice(next.dropped());
-                            Ok((next.builder, dropped))
-                        }
+            // The digest is content; the item keys' list also names each crate by its key.
+            let list_moved = old.table.list != Some(list.digest) || old.table.item_keys[..] != list.item_keys[..];
+            let marked = marked(world, files, &layout, &old.table, marks, list_moved, &out_dirs_moved);
+            marked_list = marks_of(&marked, &layout, &old.table);
+            let mut ids: Vec<ArenaId, Global> = Vec::new_in(Global);
+            ids.extend(old.memo.arenas().filter(|it| marked.binary_search_by_key(&it.index(), |m| m.0).is_ok()));
+            let planted = world.plant == Plant::SealedRestartsSession && marked_list.iter().any(|it| it.sealed);
+            if planted {
+                Err(Fresh::Planted)
+            } else {
+                match old.memo.next(&ids) {
+                    // An arena to drop has spent its generations in the database's id space
+                    // (`NextRefused::GenerationsSpent`): the session ends here and one of a
+                    // new id space is made below, under another nonce (`Made::renewed`). Rare
+                    // (2^generation bits makings of one index in the database's life), so the
+                    // session's making says it.
+                    Err(blaze_memo::NextRefused::GenerationsSpent { arena }) => {
+                        Err(Fresh::GenerationsSpent(arena))
+                    }
+                    Ok(next) => {
+                        let mut dropped: Vec<u32, Global> = Vec::new_in(Global);
+                        dropped.extend_from_slice(next.dropped());
+                        Ok((next.builder, dropped))
                     }
                 }
             }
         }
     };
     let fresh = carried.as_ref().err().copied();
+    let mut renewed = false;
     let (mut builder, dropped, arenas) = match carried {
         Ok((builder, dropped)) => (builder, dropped, None),
         Err(_) => {
             let capacity = (2 * layout.len()).clamp(64, blaze_memo::MAX_ARENAS);
-            let config = blaze_memo::Config {
+            let config = || blaze_memo::Config {
                 arenas: capacity,
                 reads: world.reads,
                 flight: std::sync::Arc::clone(&world.flight),
                 cap_bytes: u64::MAX,
                 plant: blaze_memo::Plant::None,
             };
-            let mut builder = Memo::builder(config);
+            // A new session of this database goes on in its id space, so no arena it makes
+            // takes an id an old arena had. Only the first commit, and one after an index spent
+            // its generations in the space, start a new id space (the caller gives the
+            // database another nonce for the second, `Made::renewed`).
+            let mut builder = match old.as_deref() {
+                None => Memo::builder(config()),
+                Some(_) if world.plant == Plant::FreshRestartsIds => Memo::builder(config()),
+                Some(old) => match old.memo.next_session(config()) {
+                    Ok(builder) => builder,
+                    Err(refused @ blaze_memo::NextRefused::GenerationsSpent { .. }) => {
+                        tracing::info!(
+                            target: "blaze",
+                            "a commit starts a new id space, and the database another nonce: {refused}"
+                        );
+                        renewed = true;
+                        Memo::builder(config())
+                    }
+                },
+            };
             (world.boundaries)(&mut builder);
             if let Some(log) = &world.log {
                 builder.log_runs(std::sync::Arc::clone(log));
@@ -1624,7 +2234,7 @@ pub(crate) fn commit(
         if builder.has(index) {
             continue;
         }
-        remake(world, files, &layout, &mut builder, &mut rows, base, index);
+        remake(world, files, &layout, &mut builder, &mut rows, base, index, list.digest, &out_dirs);
     }
     let memo = builder.build();
 
@@ -1686,46 +2296,48 @@ pub(crate) fn commit(
     table.all = all;
     table.root_crates = root_crates;
     table.primary = primary;
-    // The session list of item keys, made again with the session arena: a listed crate
-    // written, added or taken out moves the shape (`Crates::shape_moved`), which makes the
-    // session arena again, so a carried session arena has the carried table's list. Made from
-    // the world as this commit has it, so a rolled-back edit leaves no trace in it.
-    if !carried_at.first().copied().unwrap_or(false) {
-        table.item_keys = item_keys_of(&world.crates);
+    // The list of item keys, its index by prefix and its digest, put with the list's arena
+    // they were made into: a list whose digest or keys moved marks that arena, so a carried
+    // one has the carried table's. Made from the world as this commit has it, so a
+    // rolled-back edit leaves no trace in it.
+    if !carried_at.get(LIST_ARENA as usize).copied().unwrap_or(false) {
+        (table.by_prefix, table.clash) = by_prefix(&list.item_keys);
+        table.item_keys = list.item_keys;
+        table.list = Some(list.digest);
     }
-
-    Made { snap: Snap { memo, table, seq }, dropped: dropped.into_boxed_slice(), fresh, arenas }
-}
-
-/// Each listed crate's item key ([`crate::crate_item_key`]), in the graph's order, each
-/// dependency's read from those before it. O(listed crates) hashes, once per making of the
-/// session arena, which already makes every crate's arena again.
-///
-/// # Panics
-///
-/// Where a listed crate depends on a crate not listed before it: the order keeps every crate
-/// after its dependencies, and a graph lists what its crates depend on.
-fn item_keys_of(crates: &Crates) -> std::sync::Arc<[(CrateKey, ContentId)]> {
-    let mut by_key: HashMap<CrateKey, ContentId, Global> = HashMap::new_in(Global);
-    let mut keys: Vec<(CrateKey, ContentId), Global> = Vec::new_in(Global);
-    for &key in &crates.order {
-        let entry = crates.get(key);
-        if !entry.listed {
-            continue;
+    table.out_dirs = out_dirs;
+    // Every crate's located gifts, made whole: a few `Arc`s a crate.
+    table.located.clear();
+    for &key in &world.crates.order {
+        let at = key.0 as usize;
+        if table.located.len() <= at {
+            table.located.resize_with(at + 1, || Vec::new_in(Global));
         }
-        let item_key = crate::crate_item_key(&entry.data, &entry.extra, &entry.cfg, &|dep: CrateKey| {
-            *by_key.get(&dep).unwrap_or_else(|| {
-                panic!("the listed crate {key:?} depends on {dep:?}, which is not listed before it")
-            })
-        });
-        by_key.insert(key, item_key);
-        keys.push((key, item_key));
+        let row = &mut table.located[at];
+        row.extend(world.crates.get(key).gifts.iter().filter(|it| it.located).map(|it| {
+            let GiftFact::Given(fact) = it.fact else {
+                unreachable!("a located gift is given by its giver's fact (`Crates::give_located`)")
+            };
+            // clone: the gift's `Arc`, once per located gift a commit
+            (it.kind, fact, it.value.clone())
+        }));
     }
-    std::sync::Arc::from(&keys[..])
+
+    Made {
+        snap: Snap { memo, table, seq },
+        dropped: dropped.into_boxed_slice(),
+        marked: marked_list,
+        fresh,
+        arenas,
+        renewed,
+    }
 }
 
 /// Makes arena `index`'s inputs from the world, its rows into `rows`; a dependency carried
-/// from the old session is read from `base`, its table.
+/// from the old session is read from `base`, its table. `list`: the crate list's digest
+/// ([`List`]), what the list arena's [`AllCrates`] holds; `out_dirs`: each crate's other
+/// `OUT_DIR`s.
+#[allow(clippy::too_many_arguments, reason = "what one arena is made from")]
 fn remake(
     world: &mut World,
     files: &Files,
@@ -1734,18 +2346,47 @@ fn remake(
     rows: &mut Rows,
     base: Option<&Table>,
     index: u32,
+    list: ContentId,
+    out_dirs: &OutDirs,
 ) {
+    if index == LIST_ARENA {
+        // The crate list: open to every key, borrowing only the session ([`Layout`]); never
+        // sealed, as a sealed crate's lookup that finds no crate reads it and seals nothing.
+        let session = builder.id(0).expect("the session arena is made first");
+        let inputs = builder.arena(LIST_ARENA, Tag::Query);
+        inputs.borrows(session);
+        inputs.open();
+        const LIST: &str = "blaze v2 crate list 1";
+        let list = InputId(list);
+        AllCrates::set(&inputs, facts::singleton(LIST, list), list);
+        return;
+    }
     if index == 0 {
         let inputs = builder.arena(0, Tag::Query);
         make_session(world, files, &inputs);
+        // Every source root has an arena of its own ([`Layout`]): the session holds the files
+        // of none.
         let mut placed = rows.placed(0);
-        for &root in &layout.owned[0] {
-            files.make_root(&inputs, root, &mut placed);
-        }
         files.make_rootless(&inputs, &|file| world.crates.attr_of.contains_key(&file), &mut placed);
         // `inputs` (a borrow of the builder) ends above: the driver's makers are given the
         // builder and the arena's inputs again ([`Builder::inputs`]).
         make_given(builder, 0, &world.session.makers);
+        return;
+    }
+    if layout.is_root(index) {
+        // A source root's files: open to every crate's keys, borrowing only the session
+        // ([`Layout`]).
+        let session = builder.id(0).expect("the session arena is made first");
+        let inputs = builder.arena(index, Tag::Query);
+        inputs.borrows(session);
+        inputs.open();
+        if layout.sealed[index as usize] {
+            inputs.seal();
+        }
+        let mut placed = rows.placed(index);
+        for &root in &layout.owned[index as usize] {
+            files.make_root(&inputs, root, &mut placed);
+        }
         return;
     }
     let key = layout.at[index as usize].expect("a crate arena");
@@ -1757,11 +2398,10 @@ fn remake(
         let at = layout.index_of[&dep.crate_id];
         borrows.push(builder.id(at).expect("a dependency's arena is made before it"));
     }
-    if let Some(root) = files.root_of(entry.data.root_file_id) {
-        let owner = layout.owner(root);
-        if owner != index && owner != 0 {
-            borrows.push(builder.id(owner).expect("a root's owner is made before the crates rooted there"));
-        }
+    // The arena of its root file's source root, which its def map reads before anything else;
+    // another root's files it reads are borrowed when read ([`Layout`]).
+    if let Some(owner) = files.root_of(entry.data.root_file_id).and_then(|root| layout.owner(root)) {
+        borrows.push(builder.id(owner).expect("a root's arena is made before every crate's"));
     }
     let deps: Vec<Crate, Global> = {
         let mut deps = Vec::new_in(Global);
@@ -1787,12 +2427,10 @@ fn remake(
         inputs.seal();
     }
     let mut placed = rows.placed(index);
-    for &root in &layout.owned[index as usize] {
-        files.make_root(&inputs, root, &mut placed);
-    }
     files.make_files(&inputs, &entry.attr_files, &mut placed);
     let mut slots = Vec::with_capacity_in(entry.gifts.len(), Global);
-    for gift in &entry.gifts {
+    // A located gift is the table's ([`Table::located`]), no slot of the arena.
+    for gift in entry.gifts.iter().filter(|it| !it.located) {
         let fact = gift.slot_fact(entry.content);
         // clone: the gift's `Arc`, once per making of its arena
         slots.push((gift.kind, CrateSlot::new(&inputs, fact, gift.value.clone())));
@@ -1810,6 +2448,8 @@ fn remake(
         entry.attr_files.clone(), // clone: as above
         entry.lints.clone(), // clone: as above
         slots,
+        // clone: its directories' names, once per making of its arena
+        out_dirs.get(&key).cloned().unwrap_or_default(),
     );
     make_given(builder, index, &entry.makers);
     rows.crates.insert(key, (krate, index));
@@ -1824,7 +2464,7 @@ fn make_given(builder: &Builder, index: u32, makers: &[Maker]) {
     run_makers(makers, builder, &builder.inputs(id));
 }
 
-/// The session arena's singletons.
+/// The session arena's singletons. The crate list is the list arena's ([`LIST_ARENA`]).
 fn make_session(world: &World, files: &Files, inputs: &Inputs<'_>) {
     let session = &world.session;
     let roots_content = |domain: &'static str, roots: &blaze_hash::HashSet<SourceRootId, Global>| {
@@ -1841,7 +2481,6 @@ fn make_session(world: &World, files: &Files, inputs: &Inputs<'_>) {
     const LIBRARY: &str = "blaze v2 library roots 1";
     const LOCAL: &str = "blaze v2 local roots 1";
     const ENV: &str = "blaze v2 process env 1";
-    const LIST: &str = "blaze v2 crate list 1";
     let library = roots_content(LIBRARY, &session.library_roots);
     // clone: the root sets, once per making of the session arena
     LibraryRoots::set(inputs, facts::singleton(LIBRARY, library), session.library_roots.clone());
@@ -1852,8 +2491,6 @@ fn make_session(world: &World, files: &Files, inputs: &Inputs<'_>) {
         // clone: the process's variables, once per making of the session arena
         ProcessEnv::set(inputs, facts::singleton(ENV, content), env.clone(), content);
     }
-    let list = InputId(world.crates.list_content());
-    AllCrates::set(inputs, facts::singleton(LIST, list), list);
     session.settings.set_in(inputs);
     files.make_session(inputs);
 }

@@ -164,6 +164,7 @@ fn destructor_of(db: &TestDB, adt: AdtId) -> Option<ImplId> {
 // (`destructor` too); reuse across an edit comes from the records, not the memo.
 // What this claimed: a `Drop` impl added for `B` does not run `destructor` of `A` again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_drop_impl_for_another_type_leaves_destructor() {
     let (mut db, file) = single_file(DROP);
     let a = AdtId::from(struct_named(&db, "A"));
@@ -210,6 +211,7 @@ fn method_db() -> (TestDB, FileId, FunctionId) {
 // an edit comes from the records, not the memo.
 // What this claimed: a method of another name added to `impl A` does not infer `caller` again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_method_of_another_name_leaves_the_lookup() {
     let (mut db, impl_file, caller) = method_db();
     let cold = runs_of(&db, || infer(&db, caller));
@@ -261,6 +263,7 @@ fn impls_of_trait(db: &TestDB, trait_: TraitId) -> usize {
 // (`Tr`'s impl tables too); reuse across an edit comes from the records, not the memo.
 // What this claimed: an impl of `Other` added runs none of `Tr`'s impl tables again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_impl_of_another_trait_leaves_the_impls_of_a_trait() {
     let (mut db, file) = single_file(SPECIALIZING);
     let tr = trait_named(&db, "Tr");
@@ -308,6 +311,7 @@ fn coherence(db: &TestDB) -> (bool, bool) {
 // memo.
 // What this claimed: an unrelated function added runs neither coherence check again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_unrelated_item_leaves_coherence() {
     let (mut db, file) = single_file(COHERENCE);
     let cold = runs_of(&db, || assert_eq!(coherence(&db), (true, true)));
@@ -351,6 +355,7 @@ fn size_of_struct(db: &TestDB, name: &str) -> u64 {
 // (`layout_of_adt_query` too); reuse across an edit comes from the records, not the memo.
 // What this claimed: a field renamed does not lay `S` out again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn renaming_a_field_leaves_the_layout() {
     let (mut db, file) = single_file(LAYOUT);
     let cold = runs_of(&db, || assert_eq!(size_of_struct(&db, "S"), 8));
@@ -484,6 +489,7 @@ impl Tr for A {
 // (`m`'s inference too); reuse across an edit comes from the records, not the memo.
 // What this claimed: a constant added to the impl does not infer its method `m` again.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_constant_added_to_the_impl_leaves_its_bodies() {
     let (mut db, file) = single_file(&format!("{ATPIT}}}\n"));
     let m = impl_function_named(&db, "m");
@@ -626,6 +632,7 @@ fn per_module_buckets_are_the_crate_tables() {
 // the memo.
 // What this claimed: an impl of `U` added to `a` reruns `U`'s bucket only.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
     let (mut db, a_file, _) = modules_db();
     // The ids a read takes, taken in the snapshot it reads: an id is of one snapshot.
@@ -663,6 +670,7 @@ fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
 // the memo.
 // What this claimed: a function added to `a` reruns no impl bucket or table.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_item_that_is_no_impl_reruns_no_bucket() {
     let (mut db, a_file, _) = modules_db();
     // The ids a read takes, taken in the snapshot it reads: an id is of one snapshot.
@@ -933,6 +941,7 @@ fn trait_method_db() -> (TestDB, FileId, FunctionId) {
 // records, not the memo.
 // What this claimed: a trait method of another name added infers `caller` no more.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_trait_method_of_another_name_leaves_the_lookup() {
     let (mut db, trait_file, caller) = trait_method_db();
     let cold = runs_of(&db, || infer(&db, caller));

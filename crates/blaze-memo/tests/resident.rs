@@ -15,7 +15,7 @@ use blaze_keyed::{
     record::{self, Traced},
 };
 use blaze_memo::Resident;
-use hegel::generators as gs;
+use blaze_sim::Tape;
 
 /// Small enough that keeps cross it and drop every arena.
 const CAP: u64 = 512;
@@ -29,18 +29,17 @@ enum Op {
     End,
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let arena = u32::from(tc.draw(gs::integers::<u8>().max_value(ARENAS as u8 - 1)));
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
+fn op(tape: &Tape) -> Op {
+    let arena = u32::from(tape.int_in(0u8..=ARENAS as u8 - 1, "arena"));
+    match tape.int_in(0u8..=7, "op") {
         0 => Op::Drop(arena),
         1 => Op::End,
         _ => Op::Keep {
-            kind: tc.draw(gs::integers::<u8>().max_value(2)),
+            kind: tape.int_in(0u8..=2, "kind"),
             arena,
-            key: tc.draw(gs::integers::<u8>().max_value(KEYS - 1)),
-            len: usize::from(tc.draw(gs::integers::<u8>().max_value(200))),
-            fill: tc.draw(gs::integers::<u8>()),
+            key: tape.int_in(0u8..=KEYS - 1, "key"),
+            len: usize::from(tape.int_in(0u8..=200, "len")),
+            fill: tape.int::<u8>("fill"),
         },
     }
 }
@@ -121,12 +120,12 @@ fn refines<M: Memo>(ops: &[Op], mut mine: M) -> Result<(), String> {
     Ok(())
 }
 
-#[hegel::test(test_cases = 300)]
-fn resident_refines_the_reference(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(60));
-    if let Err(why) = refines(&ops, Resident::new(CAP)) {
-        panic!("{why}");
-    }
+#[test]
+fn resident_refines_the_reference() {
+    blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+        let ops: Vec<Op> = tape.vec(0..=60, "ops", op);
+        refines(&ops, Resident::new(CAP))
+    });
 }
 
 /// A memo that forgets to drop an arena: the planted bug the oracle must refuse.

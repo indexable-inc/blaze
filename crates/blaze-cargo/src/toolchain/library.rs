@@ -25,9 +25,9 @@
 use std::{
     io::Read as _,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
+use anyhow::Context as _;
 use blaze_registry::http::HyperHttp;
 
 #[blaze::sans_io]
@@ -49,9 +49,6 @@ const BUILT_WITH: &str = include_str!("../../../../library/DIGEST");
 
 /// What the library this blaze was built with is a copy of (`library/UPSTREAM`).
 const UPSTREAM: &str = include_str!("../../../../library/UPSTREAM");
-
-/// How many times the archive is asked for before the download gives up.
-const TRIES: u32 = 4;
 
 /// The digest of the library this blaze was built with.
 pub fn digest() -> &'static str {
@@ -505,29 +502,16 @@ fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `file` in `from`, a directory or an address, whole: read, or downloaded once (rule
+/// no-fallback: no retry), its error naming the file and its address.
 fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
     if !from.contains("://") {
-        return Ok(std::fs::read(Path::new(from).join(file))?);
+        let path = Path::new(from).join(file);
+        return std::fs::read(&path).with_context(|| format!("reading {}", path.display()));
     }
     let address = super::base(from)?;
     let http = HyperHttp::shared()?;
-    super::runtime()?.block_on(async {
-        let mut tries = 0;
-        loop {
-            let got = super::read_from(&http, &address, file, 0)
-                .await
-                .and_then(|it| it.ok_or_else(|| anyhow::anyhow!("not there")));
-            match got {
-                Ok(bytes) => return Ok(bytes),
-                // alloc: error path, the last failure.
-                Err(e) if tries + 1 == TRIES => {
-                    return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
-                }
-                Err(_) => tries += 1,
-            }
-            tokio::time::sleep(Duration::from_secs(tries.into())).await;
-        }
-    })
+    super::download_whole(&http, &address, file)
 }
 
 /// The digest of the library at `dir`: the BLAKE3 hash of a line per file and link under it but

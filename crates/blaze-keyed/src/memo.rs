@@ -40,7 +40,7 @@ pub type Arena = u32;
 
 /// A session memo.
 ///
-/// The invariant (refinement): a driver over any `Memo` gives the same answers, runs the same
+/// The invariant, a refinement: a driver over any `Memo` gives the same answers, runs the same
 /// tasks and writes the same records as one over [`RecordsOnly`], for any sequence of requests
 /// and edits (tests.rs, `resident_refines_records_only`).
 pub trait Memo {

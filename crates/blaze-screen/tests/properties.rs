@@ -1,9 +1,9 @@
 //! The screen's properties, on drawn builds: a plan is a terminal's size and a sequence of
 //! steps (the clock moving, the build's model with any number of units under way, lines that
 //! stay, the terminal resized, tests starting and ending, the build's end), run through the
-//! core and its encoder into the reference terminal ([`vt::Vt`]) with no real terminal. Hegel
-//! draws the plan and shrinks a failing one; each control plants one bug in the core
-//! ([`Plant`]) and expects the oracle to catch it at some seed.
+//! core and its encoder into the reference terminal ([`vt::Vt`]) with no real terminal. The
+//! tape draws the plan and shrinks a failing one; each control plants one bug in the core
+//! ([`Plant`]) and expects the oracle to catch it in some case.
 
 mod vt;
 
@@ -13,33 +13,11 @@ use blaze_screen::{
     BinaryEnd, Built, Caps, Command, Event, Frame, Line, Options, Plant, Screen, Test, Verdict, Why,
     encode,
 };
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config, Tape};
 
-/// Where a plan's choices come from: Hegel's draws, or a seed's.
-trait Draws {
-    /// A number below `n`.
-    fn below(&mut self, n: u32) -> u32;
-}
-
-struct Drawn(hegel::TestCase);
-
-impl Draws for Drawn {
-    fn below(&mut self, n: u32) -> u32 {
-        self.0.draw(gs::integers::<u32>().max_value(n.saturating_sub(1)))
-    }
-}
-
-/// SplitMix64: a control's plans, one a seed.
-struct Seeded(u64);
-
-impl Draws for Seeded {
-    fn below(&mut self, n: u32) -> u32 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        ((z ^ (z >> 31)) % u64::from(n.max(1))) as u32
-    }
+/// A number below `n` (0 when `n` is 0), drawn from `tape`.
+fn below(tape: &Tape, n: u32, label: &'static str) -> u32 {
+    u32::try_from(tape.below(u64::from(n), label)).expect("a draw below a u32 fits a u32")
 }
 
 #[derive(Clone, Debug)]
@@ -56,58 +34,58 @@ struct Plan {
     steps: Vec<Step>,
 }
 
-fn name(draws: &mut impl Draws, most: u32) -> String {
-    let len = 1 + draws.below(most);
+fn name(tape: &Tape, most: u32) -> String {
+    let len = 1 + below(tape, most, "name length");
     (0..len).map(|at| (b'a' + ((at * 7 + len) % 26) as u8) as char).collect()
 }
 
-fn model(draws: &mut impl Draws) -> Now {
-    let running = draws.below(40);
-    let total = running + draws.below(400);
+fn model(tape: &Tape) -> Now {
+    let running = below(tape, 40, "running");
+    let total = running + below(tape, 400, "total past running");
     let mut now = Now {
-        phase: [Phase::Starting, Phase::Compiling, Phase::Linking, Phase::Planning][draws.below(4) as usize],
+        phase: [Phase::Starting, Phase::Compiling, Phase::Linking, Phase::Planning][tape.index(4, "phase")],
         workers: 16,
-        tally: Tally { running, total, done: draws.below(total + 1), ..Tally::default() },
-        quiet_ms: u64::from(draws.below(30_000)),
+        tally: Tally { running, total, done: below(tape, total + 1, "done"), ..Tally::default() },
+        quiet_ms: u64::from(below(tape, 30_000, "quiet ms")),
         ..Now::default()
     };
-    if draws.below(4) == 0 {
-        now.stage = name(draws, 120);
+    if below(tape, 4, "stage") == 0 {
+        now.stage = name(tape, 120);
     }
-    if draws.below(6) == 0 {
-        now.memory.held_back = 1 + draws.below(4);
-        now.memory.over = Some(name(draws, 20));
+    if below(tape, 6, "memory over") == 0 {
+        now.memory.held_back = 1 + below(tape, 4, "held back");
+        now.memory.over = Some(name(tape, 20));
     }
     for id in 0..u64::from(running) {
-        let kind = ["names", "bodies", "codegen", "link", "script-run"][draws.below(5) as usize];
+        let kind = ["names", "bodies", "codegen", "link", "script-run"][tape.index(5, "task kind")];
         // Two tasks of one unit now and then: they are one row.
-        let unit = match draws.below(5) {
+        let unit = match below(tape, 5, "unit") {
             0 => format!("p{} 1.0.0 lib (host)", id.saturating_sub(1)),
-            1 => format!("{} 0.1.0 build-script (host)", name(draws, 60)),
-            _ => format!("{} 1.2.3 lib (host)", name(draws, 30)),
+            1 => format!("{} 0.1.0 build-script (host)", name(tape, 60)),
+            _ => format!("{} 1.2.3 lib (host)", name(tape, 30)),
         };
-        let span = (draws.below(2) == 0).then(|| Span {
+        let span = (below(tape, 2, "span") == 0).then(|| Span {
             name: "infer".to_owned(),
-            item: (draws.below(2) == 0).then(|| format!("{}::<impl#0 in macro call 3ca1.0 in macro call 3ca1.0>::{}", name(draws, 80), name(draws, 12))),
+            item: (below(tape, 2, "span item") == 0).then(|| format!("{}::<impl#0 in macro call 3ca1.0 in macro call 3ca1.0>::{}", name(tape, 80), name(tape, 12))),
             krate: None,
-            awaits: (draws.below(4) == 0).then(|| name(draws, 90)),
-            for_ms: u64::from(draws.below(9000)),
+            awaits: (below(tape, 4, "awaits") == 0).then(|| name(tape, 90)),
+            for_ms: u64::from(below(tape, 9000, "span for ms")),
         });
         let task = Task { id, kind: kind.to_owned(), name: unit };
-        if draws.below(2) == 0 {
+        if below(tape, 2, "blocker") == 0 {
             now.blockers.push(Blocker {
                 task: task.clone(),
                 running: true,
                 for_ms: 0,
                 span: None,
-                holds: draws.below(500),
+                holds: below(tape, 500, "holds"),
                 chain: 0,
                 behind: Vec::new(),
             });
         }
         now.running.push(Running {
             task,
-            for_ms: u64::from(draws.below(600_000)),
+            for_ms: u64::from(below(tape, 600_000, "running for ms")),
             thread: None,
             span,
             path: Vec::new(),
@@ -116,69 +94,74 @@ fn model(draws: &mut impl Draws) -> Now {
     now
 }
 
-fn plan(draws: &mut impl Draws) -> Plan {
-    let cols = 4 + draws.below(220) as u16;
-    let rows = 2 + draws.below(70) as u16;
-    let testing = draws.below(3) == 0;
+/// A terminal's width or height: `least` and up to `extra` more.
+fn side(tape: &Tape, least: u16, extra: u32, label: &'static str) -> u16 {
+    least + u16::try_from(below(tape, extra, label)).expect("a side below a u16's range")
+}
+
+fn plan(tape: &Tape) -> Plan {
+    let cols = side(tape, 4, 220, "cols");
+    let rows = side(tape, 2, 70, "rows");
+    let testing = below(tape, 3, "testing") == 0;
     let mut steps = Vec::new();
     let mut binaries = 0;
-    for _ in 0..draws.below(40) {
-        let step = match draws.below(10) {
-            0 | 1 => Step::Tick(u64::from(draws.below(5000))),
-            2..=4 => Step::Event(Event::Now(Box::new(model(draws)))),
+    for _ in 0..below(tape, 40, "steps") {
+        let step = match below(tape, 10, "step") {
+            0 | 1 => Step::Tick(u64::from(below(tape, 5000, "tick ms"))),
+            2..=4 => Step::Event(Event::Now(Box::new(model(tape)))),
             5 => {
                 let lines: Vec<String> =
-                    (0..1 + draws.below(4)).map(|_| name(draws, u32::from(cols) * 2)).collect();
+                    (0..1 + below(tape, 4, "said lines")).map(|_| name(tape, u32::from(cols) * 2)).collect();
                 Step::Event(Event::Said(lines.join("\n") + "\n"))
             }
-            6 if draws.below(3) == 0 => {
-                Step::Event(Event::Waits((draws.below(3) != 0).then(|| name(draws, 300))))
+            6 if below(tape, 3, "waits") == 0 => {
+                Step::Event(Event::Waits((below(tape, 3, "waits on") != 0).then(|| name(tape, 300))))
             }
-            6 => Step::Event(Event::Diagnosed { error: draws.below(2) == 0, unit: Some(name(draws, 20)) }),
+            6 => Step::Event(Event::Diagnosed { error: below(tape, 2, "error") == 0, unit: Some(name(tape, 20)) }),
             7 => Step::Event(Event::Resized {
-                cols: 4 + draws.below(220) as u16,
-                rows: 2 + draws.below(70) as u16,
+                cols: side(tape, 4, 220, "resized cols"),
+                rows: side(tape, 2, 70, "resized rows"),
             }),
             _ if testing => {
                 binaries += 1;
                 let binary = binaries;
                 steps.push(Step::Event(Event::Test(Test::Queued {
                     binary,
-                    label: name(draws, 50),
+                    label: name(tape, 50),
                     rerun: "blaze test".to_owned(),
                 })));
                 steps.push(Step::Event(Event::Test(Test::Started { binary })));
                 steps.push(Step::Event(Event::Test(Test::Total { binary, tests: 3 })));
-                steps.push(Step::Event(Event::Test(Test::TestStarted { binary, name: name(draws, 90) })));
-                steps.push(Step::Tick(u64::from(draws.below(4000))));
-                let verdict = [Verdict::Passed, Verdict::Failed, Verdict::Ignored][draws.below(3) as usize];
+                steps.push(Step::Event(Event::Test(Test::TestStarted { binary, name: name(tape, 90) })));
+                steps.push(Step::Tick(u64::from(below(tape, 4000, "test ms"))));
+                let verdict = [Verdict::Passed, Verdict::Failed, Verdict::Ignored][tape.index(3, "verdict")];
                 Step::Event(Event::Test(Test::TestEnded {
                     binary,
-                    name: name(draws, 90),
+                    name: name(tape, 90),
                     verdict,
                     took_ms: Some(3),
                     output: "left: 1\nright: 2\n".to_owned(),
                 }))
             }
-            _ => Step::Event(Event::Unit { name: name(draws, 30), fresh: draws.below(2) == 0 }),
+            _ => Step::Event(Event::Unit { name: name(tape, 30), fresh: below(tape, 2, "fresh") == 0 }),
         };
         steps.push(step);
     }
     // The end: the build's, then the tests' or the program's.
-    let ok = draws.below(3) != 0;
+    let ok = below(tape, 3, "ok") != 0;
     steps.push(Step::Event(Event::Built(Built {
         ok,
-        compiled: u64::from(draws.below(3)),
+        compiled: u64::from(below(tape, 3, "compiled")),
         cached: 30,
         tier: Some("tier 0".to_owned()),
         why_follows: ok,
         tests_follow: testing,
-        program: Some(format!("/w/target/debug/{}", name(draws, 200))),
+        program: Some(format!("/w/target/debug/{}", name(tape, 200))),
         ..Built::default()
     })));
     if ok {
         steps.push(Step::Event(Event::Why(vec![Why {
-            wasted: draws.below(2) == 0,
+            wasted: below(tape, 2, "wasted") == 0,
             cause: blaze_report::say!(blaze_report::say::At("/w/src/main.rs"), " changed"),
             headline: blaze_report::say!(
                 "recomputed ",
@@ -193,7 +176,7 @@ fn plan(draws: &mut impl Draws) -> Plan {
         }])));
     }
     for binary in 1..=binaries {
-        if draws.below(2) == 0 {
+        if below(tape, 2, "binary failed") == 0 {
             steps.push(Step::Event(Event::Test(Test::Ended {
                 binary,
                 end: BinaryEnd::Failed { status: "exit status: 101".to_owned() },
@@ -207,7 +190,7 @@ fn plan(draws: &mut impl Draws) -> Plan {
     }));
     let command = match testing {
         true => Command::Test,
-        false => [Command::Build, Command::Run, Command::Check][draws.below(3) as usize],
+        false => [Command::Build, Command::Run, Command::Check][tape.index(3, "command")],
     };
     Plan { cols, rows, command, steps }
 }
@@ -355,39 +338,38 @@ fn to_a_pipe(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// lines that stay and the region with no stale row, a resize in the middle included, and the
 /// last frame leaves the lines that stay alone, the cursor shown and the progress report
 /// cleared.
-#[hegel::test(test_cases = 300)]
-fn the_region_fits_and_leaves_nothing_behind(tc: hegel::TestCase) {
-    let plan = plan(&mut Drawn(tc));
-    if let Err(why) = on_a_terminal(&plan, Plant::None) {
-        panic!("{why}\n{plan:#?}");
-    }
+#[test]
+fn the_region_fits_and_leaves_nothing_behind() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let plan = plan(tape);
+        if let Err(why) = on_a_terminal(&plan, Plant::None) {
+            panic!("{why}\n{plan:#?}");
+        }
+    });
 }
 
 /// The invariant: what is written to a pipe holds no escape byte and no carriage return.
-#[hegel::test(test_cases = 300)]
-fn a_pipe_is_written_no_escape(tc: hegel::TestCase) {
-    let plan = plan(&mut Drawn(tc));
-    if let Err(why) = to_a_pipe(&plan, Plant::None) {
-        panic!("{why}\n{plan:#?}");
-    }
+#[test]
+fn a_pipe_is_written_no_escape() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let plan = plan(tape);
+        if let Err(why) = to_a_pipe(&plan, Plant::None) {
+            panic!("{why}\n{plan:#?}");
+        }
+    });
 }
 
-/// The seeds a control tries.
-const CONTROL_SEEDS: u64 = 400;
+/// The cases a control tries.
+const CONTROL_CASES: u32 = 400;
 
-/// `plant` is caught by `oracle` at some seed, with what it said; no plant is caught at any.
+/// No case is caught by `oracle` with no plant, and `plant` is caught in some case, with what
+/// it said.
+#[track_caller]
 fn control(plant: Plant, oracle: fn(&Plan, Plant) -> Result<(), String>, says: &str) {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan(&mut Seeded(seed));
-        if let Err(why) = oracle(&plan, Plant::None) {
-            panic!("seed {seed} fails with no plant: {why}");
-        }
-        if let Err(why) = oracle(&plan, plant) {
-            assert!(why.contains(says), "Plant::{plant:?} was caught at seed {seed}, as something else: {why}");
-            return;
-        }
-    }
-    panic!("the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak");
+    blaze_sim::control(Config::cases(CONTROL_CASES), Plant::None, plant, says, |tape, plant| {
+        let plan = plan(tape);
+        oracle(&plan, plant).map_err(|why| Broke::Oracle(format!("{why}\n{plan:#?}")))
+    });
 }
 
 #[test]
@@ -424,7 +406,7 @@ fn an_interrupt_puts_the_terminal_back() {
     let mut vt = vt::Vt::new(80, 24);
     let terminal = terminal();
     screen.take(Event::Said("warning: unused\n".to_owned()));
-    screen.take(Event::Now(Box::new(model(&mut Seeded(7)))));
+    screen.take(Event::Now(Box::new(model(&Tape::seeded(7)))));
     let frame = screen.frame().expect("a frame is due");
     let rows = frame.region.len() as u16;
     assert!(rows > 0);

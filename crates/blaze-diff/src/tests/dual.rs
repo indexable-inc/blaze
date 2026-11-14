@@ -57,22 +57,24 @@ fn tangent_agrees(graph: &Graph, f: Id, df: Id, var: u32, point: &[f64]) -> Resu
 /// the sum of the tangent's terms (exactly where there are none); and central finite
 /// differences, a third method, do not contradict it. (The rule table itself is proved over
 /// the reals in Lean, `BlazeDiff.diff_correct`.)
-#[hegel::test]
-fn the_symbolic_derivative_is_the_dual_tangent(tc: hegel::TestCase) {
-    let mut graph = Graph::new(Width::F64);
-    let f = float_term(&tc, &mut graph, 2, 3, true);
-    // Coordinates in [0.3, 1.7], in steps of 1/1000.
-    let coordinate = |tc: &hegel::TestCase| 0.3 + f64::from(pick(tc, 1400)) / 1000.0;
-    let point = [coordinate(&tc), coordinate(&tc)];
-    let var = pick(&tc, 1);
-    let policy = Policy { kinks: Choice::Subgradient(0.5) };
-    let df = diff::derivative(&mut graph, f, var, policy).expect("a subgradient is chosen");
-    if let Err(message) = tangent_agrees(&graph, f, df, var, &point) {
-        panic!("{message}");
-    }
-    if let Err(message) = agrees(&graph, f, df, var as usize, &point) {
-        panic!("{message}");
-    }
+#[test]
+fn the_symbolic_derivative_is_the_dual_tangent() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut graph = Graph::new(Width::F64);
+        let f = float_term(tape, &mut graph, 2, 3, true);
+        // Coordinates in [0.3, 1.7], in steps of 1/1000.
+        let coordinate = |tape: &blaze_sim::Tape| 0.3 + f64::from(pick(tape, 1400, "coordinate")) / 1000.0;
+        let point = [coordinate(tape), coordinate(tape)];
+        let var = pick(tape, 1, "by var");
+        let policy = Policy { kinks: Choice::Subgradient(0.5) };
+        let df = diff::derivative(&mut graph, f, var, policy).expect("a subgradient is chosen");
+        if let Err(message) = tangent_agrees(&graph, f, df, var, &point) {
+            panic!("{message}");
+        }
+        if let Err(message) = agrees(&graph, f, df, var as usize, &point) {
+            panic!("{message}");
+        }
+    });
 }
 
 /// `term`'s derivative by `x` at `point` as `differentiator` takes it, judged by the dual

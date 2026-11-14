@@ -7,8 +7,17 @@
 //! A datagram sent is a copy on its way per copy the network makes: lost once in
 //! [`Datagrams::lose_one_in`], doubled once in [`Datagrams::duplicate_one_in`], and each copy
 //! delayed on its own up to [`Datagrams::max_delay`], so two sent one after the other arrive in
-//! either order. One arrives at the socket bound at its address, or at the port on the
-//! unspecified address of its family; one nothing is bound for is gone, as UDP's is. The test
+//! either order. One sent to an address the test cut off ([`Sim::black_hole`]) is lost, every
+//! one, as on a path that drops everything. One arrives at the socket bound at its address, or
+//! at the port on the unspecified address of its family; one nothing is bound for is gone, as
+//! UDP's is. A datagram keeps its ECN codepoint on its way (a receiving socket bound without
+//! [`dgram::Options::ecn`] reads none); one longer than its receive's slot arrives cut short and
+//! said to be; a socket bound to coalesce gets runs of datagrams of one length from one peer as
+//! one run, as Linux's `UDP_GRO` hands them up. A batch sent is its datagrams, each on its own
+//! way.
+//!
+//! A name resolves from the table the test gives ([`Sim::name`]); an address resolves to itself,
+//! and a name not in the table fails, naming it. The test
 //! scripts the standard input ([`Sim::stdin`], [`Sim::stdin_ends`]) and reads what was written
 //! ([`Sim::output`]); the wall clock is the seed's start ([`Sim::wall_start`]) plus the virtual
 //! clock, and random bytes are the seed's numbers.
@@ -26,8 +35,8 @@ use std::{
 
 use super::{Of, Rng, Sim, Told};
 use crate::{
-    Completion, DATAGRAM_MOST, Dgram, Done, Effect, FileName, IoError, RANDOM_MOST, RECV_MOST,
-    Stream, Tag,
+    Completion, Dgram, Done, Effect, FileName, IoError, RANDOM_MOST, RECV_MOST, Stream, Tag,
+    dgram::{self, Batch, Ecn, Head, Options, Slots},
 };
 
 /// The first port a bind of port 0 is given; the next is the one after, wrapping to this.
@@ -67,13 +76,34 @@ pub(super) enum Plant {
     RandomRepeats,
     /// A directory not empty is removed, and what was under it.
     RemovesFull,
+    /// A crash keeps a change made after a barrier completed without keeping what the barrier
+    /// covers.
+    BarriersNotKept,
+    /// A rename that waits for the drive flushes every file but the one it renames.
+    RenameFlushesOthers,
+    /// A file a crash puts back under its name keeps the barriers, and the epochs, of the
+    /// changes it lost.
+    PutBackWithBarriers,
+    /// A sync that completes makes durable one change fewer than it covered, when it covers
+    /// at least one.
+    SyncCoversLess,
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.
 struct Bound {
     id: u64,
     local: SocketAddr,
-    inbox: VecDeque<(SocketAddr, Vec<u8>)>,
+    options: Options,
+    inbox: VecDeque<Landed>,
+}
+
+/// A datagram arrived at a socket: who sent it, the address it was sent to, its codepoint
+/// and its bytes.
+struct Landed {
+    from: SocketAddr,
+    to: SocketAddr,
+    ecn: Ecn,
+    bytes: Vec<u8>,
 }
 
 /// A copy of a datagram on its way, arriving at `at`.
@@ -81,6 +111,7 @@ struct Flying {
     at: Duration,
     from: SocketAddr,
     to: SocketAddr,
+    ecn: Ecn,
     bytes: Vec<u8>,
 }
 
@@ -88,7 +119,8 @@ struct Flying {
 struct Receiving {
     tag: Tag,
     sock: u64,
-    into: Vec<u8>,
+    into: Batch,
+    slots: Slots,
 }
 
 /// A read of the standard input waiting for its bytes or its end.
@@ -106,6 +138,10 @@ pub(super) struct Host {
     next_port: u16,
     flying: Vec<Flying>,
     receiving: Vec<Receiving>,
+    /// Addresses every datagram to is lost ([`Sim::black_hole`]).
+    holes: Vec<SocketAddr>,
+    /// The names a resolve answers from ([`Sim::name`]).
+    names: Vec<(String, Vec<IpAddr>)>,
     input: Vec<u8>,
     /// How much of `input` reads took.
     input_at: usize,
@@ -136,6 +172,8 @@ impl Host {
             flying: Vec::new(),
             // alloc: none until a datagram is received.
             receiving: Vec::new(),
+            holes: Vec::new_in(std::alloc::Global),
+            names: Vec::new_in(std::alloc::Global),
             // alloc: none until the test scripts the input.
             input: Vec::new(),
             input_at: 0,
@@ -190,6 +228,27 @@ impl Sim {
         self.host.net = net;
     }
 
+    /// From now on every datagram sent to `to` is lost: a path that drops everything.
+    pub fn black_hole(&mut self, to: SocketAddr) {
+        if !self.host.holes.contains(&to) {
+            self.host.holes.push(to);
+        }
+    }
+
+    /// From now on datagrams to `to` cross the network again.
+    pub fn clear_black_hole(&mut self, to: SocketAddr) {
+        self.host.holes.retain(|it| *it != to);
+    }
+
+    /// From now on [`Effect::Resolve`] of `name` answers `addresses`, in their order; none
+    /// makes it a name that has no address.
+    pub fn name(&mut self, name: &str, addresses: &[IpAddr]) {
+        self.host.names.retain(|(it, _)| it != name);
+        let mut kept = Vec::with_capacity_in(addresses.len(), std::alloc::Global);
+        kept.extend_from_slice(addresses);
+        self.host.names.push((name.to_owned(), kept));
+    }
+
     /// `bytes` come next on the standard input, after what the test gave before.
     pub fn stdin(&mut self, bytes: &[u8]) {
         self.host.input.extend_from_slice(bytes);
@@ -231,35 +290,49 @@ impl Sim {
         self.host.plant = Some(plant);
     }
 
-    fn planted(&self, plant: Plant) -> bool {
+    pub(super) fn planted(&self, plant: Plant) -> bool {
         self.host.plant == Some(plant)
     }
 
     /// One of the host's effects, other than a directory's, which is pended as a file's is.
     pub(super) fn hosted(&mut self, effect: Effect) {
         match effect {
-            Effect::Bind { at, tag } => {
-                let done = self.bind(tag, at);
+            Effect::Bind { at, options, tag } => {
+                let done = self.bind(tag, at, options);
                 self.tell(tag, done, Of::Op);
             }
-            Effect::SendTo { sock, to, bytes, tag } => {
-                let done = self.send_to(sock, to, bytes);
+            Effect::SendTo { sock, batch, tag } => {
+                let done = self.send_to(sock, batch);
                 self.tell(tag, done, Of::Op);
             }
-            Effect::RecvFrom { sock, into, tag } => {
-                match self.host.socks.iter().any(|it| it.id == sock.0) {
-                    true => {
-                        self.host.receiving.push(Receiving { tag, sock: sock.0, into });
+            Effect::RecvFrom { sock, into, slots, tag } => {
+                let found = self.host.socks.iter().find(|it| it.id == sock.0);
+                match found.map(|it| (it.local, slots.refused(it.options.coalesce))) {
+                    Some((_, None)) => {
+                        self.host.receiving.push(Receiving { tag, sock: sock.0, into, slots });
                         self.serve_datagrams();
                     }
-                    false => {
-                        let done = Done::unread(
+                    Some((local, Some(why))) => {
+                        let done = Done::dgram_failed(into, true, sock, Some(local), None, None, why);
+                        self.tell(tag, done, Of::Op);
+                    }
+                    None => {
+                        let done = Done::dgram_failed(
                             into,
-                            format_args!("{sock:?}: no such socket: it is not bound"),
+                            true,
+                            sock,
+                            None,
+                            None,
+                            None,
+                            "no such socket: it is not bound",
                         );
                         self.tell(tag, done, Of::Op);
                     }
                 }
+            }
+            Effect::Resolve { name, port, tag } => {
+                let done = self.resolve_name(name, port);
+                self.tell(tag, done, Of::Op);
             }
             Effect::Unbind { sock, tag } => {
                 let done = self.unbind(sock);
@@ -285,7 +358,36 @@ impl Sim {
         }
     }
 
-    fn bind(&mut self, tag: Tag, at: SocketAddr) -> Done {
+    /// A name from the test's table ([`Sim::name`]), or an address as itself.
+    fn resolve_name(&mut self, name: String, port: u16) -> Done {
+        if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
+            let why = "the resolver failed: injected by the simulation".to_owned();
+            return Done::Unresolved(dgram::Unresolved { name, port, why });
+        }
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            let mut one = Vec::with_capacity_in(1, std::alloc::Global);
+            one.push(SocketAddr::new(ip, port));
+            return Done::Resolved(one);
+        }
+        let found = self.host.names.iter().find(|(it, _)| *it == name).map(|(_, ips)| ips);
+        match found {
+            Some(ips) if !ips.is_empty() => {
+                let mut addresses = Vec::with_capacity_in(ips.len(), std::alloc::Global);
+                addresses.extend(ips.iter().map(|&ip| SocketAddr::new(ip, port)));
+                Done::Resolved(addresses)
+            }
+            Some(_) => {
+                let why = "the name has no address".to_owned();
+                Done::Unresolved(dgram::Unresolved { name, port, why })
+            }
+            None => {
+                let why = "no such name in the simulation's table (Sim::name)".to_owned();
+                Done::Unresolved(dgram::Unresolved { name, port, why })
+            }
+        }
+    }
+
+    fn bind(&mut self, tag: Tag, at: SocketAddr, options: Options) -> Done {
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
             return self.fail(tag).done;
         }
@@ -309,7 +411,7 @@ impl Sim {
         let id = self.host.next_sock;
         self.host.next_sock += 1;
         // alloc: none until a datagram lands.
-        self.host.socks.push(Bound { id, local, inbox: VecDeque::new() });
+        self.host.socks.push(Bound { id, local, options, inbox: VecDeque::new() });
         Done::Bound { sock: Dgram(id), local }
     }
 
@@ -327,48 +429,70 @@ impl Sim {
         None
     }
 
-    fn send_to(&mut self, sock: Dgram, to: SocketAddr, mut bytes: Vec<u8>) -> Done {
-        let Some(local) = self.host.socks.iter().find(|it| it.id == sock.0).map(|it| it.local)
+    fn send_to(&mut self, sock: Dgram, mut batch: Batch) -> Done {
+        let peer = batch.heads.first().map(|it| it.peer);
+        let Some((local, options)) =
+            self.host.socks.iter().find(|it| it.id == sock.0).map(|it| (it.local, it.options))
         else {
-            return Done::unsent(
-                bytes,
-                format_args!("{sock:?}: no such socket: it is not bound (sending to {to})"),
+            return Done::dgram_failed(
+                batch,
+                false,
+                sock,
+                None,
+                peer,
+                None,
+                "no such socket: it is not bound",
             );
         };
-        let len = bytes.len();
-        if len > DATAGRAM_MOST {
-            return Done::unsent(
-                bytes,
-                format_args!(
-                    "{local} to {to}: {len} bytes is more than one datagram carries \
-                     ({DATAGRAM_MOST})"
-                ),
-            );
+        if let Some(refused) = batch.refused() {
+            let why = format!("sending {refused}");
+            return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
+        }
+        if !options.ecn && batch.heads.iter().any(|it| it.ecn != Ecn::NotEct) {
+            let why = "sending a datagram marked with ECN on a socket bound without Options::ecn";
+            return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
         }
         if self.rng.one_in(u64::from(self.faults.fail_one_in)) {
-            return Done::unsent(bytes, format_args!("{local} to {to}: injected by the simulation"));
+            // A failure part way: the datagrams before a drawn one were sent, as a system call
+            // that took some of a batch and refused the rest.
+            let taken = self.rng.below(batch.datagrams() as u64) as usize;
+            self.fly(local, &batch, taken);
+            let why = "injected by the simulation";
+            return Done::dgram_failed(batch, false, sock, Some(local), peer, None, why);
         }
+        self.fly(local, &batch, usize::MAX);
+        batch.clear();
+        Done::SentDatagrams(batch)
+    }
+
+    /// The first `most` datagrams of `batch` from the socket at `local` put on their way, each
+    /// lost, doubled and delayed on its own.
+    fn fly(&mut self, local: SocketAddr, batch: &Batch, most: usize) {
         let net = self.host.net;
-        let mut copies = match self.rng.one_in(u64::from(net.lose_one_in)) {
-            true => 0,
-            false => 1 + u32::from(self.rng.one_in(u64::from(net.duplicate_one_in))),
-        };
-        if copies > 0 && self.planted(Plant::ExtraCopies) {
-            copies += 1;
-        }
         let from = seen_from(local);
         let from = match self.planted(Plant::SenderLies) {
             true => SocketAddr::new(from.ip(), from.port().wrapping_add(1)),
             false => from,
         };
-        for _ in 0..copies {
-            let delay = Duration::from_nanos(self.rng.below(net.max_delay.as_nanos() as u64 + 1));
-            let at = self.now + delay;
-            // clone: a copy of the datagram on its way, lost, delayed or doubled on its own.
-            self.host.flying.push(Flying { at, from, to, bytes: bytes.clone() });
+        for (head, bytes) in batch.each().take(most) {
+            let to = head.peer;
+            let holed = self.host.holes.contains(&to);
+            let mut copies = match holed || self.rng.one_in(u64::from(net.lose_one_in)) {
+                true => 0,
+                false => 1 + u32::from(self.rng.one_in(u64::from(net.duplicate_one_in))),
+            };
+            if copies > 0 && self.planted(Plant::ExtraCopies) {
+                copies += 1;
+            }
+            for _ in 0..copies {
+                let delay =
+                    Duration::from_nanos(self.rng.below(net.max_delay.as_nanos() as u64 + 1));
+                let at = self.now + delay;
+                let mut copy = Vec::with_capacity_in(bytes.len(), std::alloc::Global);
+                copy.extend_from_slice(bytes);
+                self.host.flying.push(Flying { at, from, to, ecn: head.ecn, bytes: copy });
+            }
         }
-        bytes.clear();
-        Done::Sent(bytes)
     }
 
     fn unbind(&mut self, sock: Dgram) -> Done {
@@ -384,33 +508,72 @@ impl Sim {
                 continue;
             }
             let Receiving { tag, into, .. } = self.host.receiving.remove(at);
-            let done =
-                Done::unread(into, format_args!("{local}: unbound with the receive in flight"));
+            let why = "unbound with the receive in flight";
+            let done = Done::dgram_failed(into, true, sock, Some(local), None, None, why);
             self.tell(tag, done, Of::Op);
         }
         Done::Unbound
     }
 
-    /// Each waiting receive whose socket has a datagram is told it, in the order asked.
+    /// Each waiting receive whose socket has a datagram is told what it holds, up to the
+    /// receive's slots, in the order asked: a drawn number of them, at least one, as a system
+    /// call takes what has arrived by then.
     fn serve_datagrams(&mut self) {
         let mut at = 0;
         while at < self.host.receiving.len() {
             let sock = self.host.receiving[at].sock;
-            let got = self
-                .host
-                .socks
-                .iter_mut()
-                .find(|it| it.id == sock)
-                .and_then(|it| it.inbox.pop_front());
-            let Some((from, bytes)) = got else {
+            let Some(index) = self.host.socks.iter().position(|it| it.id == sock) else {
                 at += 1;
                 continue;
             };
-            let Receiving { tag, mut into, .. } = self.host.receiving.remove(at);
+            if self.host.socks[index].inbox.is_empty() {
+                at += 1;
+                continue;
+            }
+            let Receiving { tag, mut into, slots, .. } = self.host.receiving.remove(at);
+            let waiting = self.host.socks[index].inbox.len();
+            let most = (slots.most as usize).min(waiting);
+            let runs = 1 + self.rng.below(most as u64) as usize;
             into.clear();
-            // alloc: none once the asker's buffer has held a datagram this long.
-            into.extend_from_slice(&bytes);
-            self.tell(tag, Done::Datagram { from, bytes: into }, Of::Op);
+            let bound = &mut self.host.socks[index];
+            let options = bound.options;
+            for _ in 0..runs {
+                let Some(first) = bound.inbox.pop_front() else { break };
+                let size = slots.size as usize;
+                let mut run = Head {
+                    peer: first.from,
+                    local: options.local_address.then_some(first.to.ip()),
+                    ecn: if options.ecn { first.ecn } else { Ecn::NotEct },
+                    len: 0,
+                    segment: 0,
+                    truncated: first.bytes.len() > size,
+                };
+                let kept = first.bytes.len().min(size);
+                into.bytes.extend_from_slice(&first.bytes[..kept]);
+                run.len = kept as u32;
+                run.segment = kept as u32;
+                // A coalescing socket takes the datagrams after it of the same length, from
+                // the same peer with the same codepoint, into the run, as UDP_GRO does; the
+                // last may be shorter, and ends it.
+                while options.coalesce
+                    && !run.truncated
+                    && run.segment > 0
+                    && run.len % run.segment == 0
+                    && run.datagrams() < dgram::SEGMENTS_MOST
+                    && let Some(next) = bound.inbox.front()
+                    && next.from == first.from
+                    && next.ecn == first.ecn
+                    && next.bytes.len() <= kept
+                    && !next.bytes.is_empty()
+                    && run.len as usize + next.bytes.len() <= size
+                {
+                    let next = bound.inbox.pop_front().expect("looked at above");
+                    into.bytes.extend_from_slice(&next.bytes);
+                    run.len += next.bytes.len() as u32;
+                }
+                into.heads.push(run);
+            }
+            self.tell(tag, Done::Datagrams(into), Of::Op);
         }
     }
 
@@ -433,9 +596,9 @@ impl Sim {
         self.host.flying = left;
         // Stable: two due at once arrive in the order sent.
         landed.sort_by_key(|it| it.at);
-        for Flying { from, to, bytes, .. } in landed {
+        for Flying { from, to, ecn, bytes, .. } in landed {
             if let Some(sock) = self.host.socks.iter_mut().find(|it| reaches(it.local, to)) {
-                sock.inbox.push_back((from, bytes));
+                sock.inbox.push_back(Landed { from, to, ecn, bytes });
             }
         }
         self.serve_datagrams();

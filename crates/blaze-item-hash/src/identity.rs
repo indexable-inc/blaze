@@ -49,8 +49,9 @@ fn module_chain(db: &Db, def: DefWithBodyId, mut h: Hasher) -> ContentId {
     h.update(&depth.to_le_bytes()).finish()
 }
 
-/// 1: the first form.
-pub const EARLY_DOMAIN: &str = "blaze v2 item early identity 1";
+/// 1: the first form. 2: the item's source by its tokens (file index layout 4), and the item a
+/// derive or an attribute macro is on by all of its tokens ([`index::whole`]).
+pub const EARLY_DOMAIN: &str = "blaze v2 item early identity 2";
 
 /// The identity of `def`'s body made before the body is lowered
 /// (docs/v2/plan/design/restore.md, "The entry's key, made before lowering"): what
@@ -82,10 +83,16 @@ pub const EARLY_PARTS: usize = 4;
 ///   or trait that item is in. No signature: two bodies of one text in two impls differ by
 ///   this part, and what a step reads of either item is a fact;
 /// - "module chain": the modules it is in, by key;
-/// - "source": for a body written in a file, the position-free hash of the item's own node
-///   ([`item_source`]: the whole item, since lowering reads its parameters and attributes
-///   with its block); for one a macro writes, the outermost call's node and each
-///   macro of the chain of calls that wrote it ([`macro_chain`]).
+/// - "source": for a body written in a file, the hash of the item's own tokens, with no
+///   position, whitespace or plain comment in it ([`item_source`]: the whole item, since
+///   lowering reads its parameters and attributes with its block); for one a macro writes,
+///   the outermost call's node and each macro of the chain of calls that wrote it
+///   ([`macro_chain`]). What it leaves out no step's answer holds: a position is read only
+///   off the file's text (`line!`'s and `column!`'s value, a caller's `Location`, a proc
+///   macro's `Span::line`, `stringify!`'s spacing), a read `reads::classify` refuses, and MIR
+///   keeps a slot for each location literal, never its value
+///   (`hir_ty::body_store::mir::location_literals`); codegen keys what shows a place by the
+///   body's presentation (`crate::presentation`).
 ///
 /// `Err` for a body with no key of its own: an item of a block (it is keyed with the body it
 /// is in), or one whose chain of calls holds a macro this cannot hash.
@@ -146,8 +153,9 @@ pub fn early_parts(
 
 /// The source hashes of the item `ast` of the file `file`, onto `h`: its
 /// [`ItemSource`](index::ItemSource) `header` (the item with every body cut, its attributes
-/// with it) and `body`, the whole item between them, hashed from its text and so the same for
-/// an outline and a full parse of its file. `None` when the file's index has no row for it.
+/// with it) and `body`, the whole item between them, hashed from its tokens and so the same for
+/// an outline and a full parse of its file, wherever it is and however it is spaced. `None`
+/// when the file's index has no row for it.
 fn item_source(
     db: &Db,
     file: HirFileId,
@@ -201,7 +209,7 @@ const MACRO_CHAIN_BOUND: u32 = 256;
 /// in a file, by which macro it is (its crate's key, its kind, its edition) and the hash of
 /// its definition (`hir_expand::declarative::stored::def_hash`), then that outermost
 /// call as it is written in its file (a call's path and tokens by its node's hash; the item a
-/// derive or an attribute is on by its `ItemSource`). The calls between are tokens the outer expansion wrote, a function of these. Every
+/// derive or an attribute is on by all of its tokens, `index::whole`). The calls between are tokens the outer expansion wrote, a function of these. Every
 /// macro is named, not only hashed: two definitions of equal tokens in two crates resolve
 /// their own names (`$crate`) in different scopes.
 ///
@@ -260,9 +268,13 @@ fn macro_chain(
                 if kind == 0 {
                     h.update(&[0xff]).update(&ast_node_hash(db, at).to_le_bytes());
                 } else {
-                    h.update(&[0xfe]);
-                    item_source(db, at.file_id, at.value, home, h)
+                    // The macro is given the whole item: every token of it, not its row's
+                    // `header` and `body`, which leave out an enum's discriminants and an
+                    // `impl`'s methods that a derive or an attribute macro reads.
+                    let file = at.file_id.file_id().ok_or("its outermost call is in no file")?;
+                    let whole = index::whole(db, file, at.value, home)
                         .ok_or("the item its macro is on has no row in its file's index")?;
+                    h.update(&[0xfe]).update(&whole.to_le_bytes());
                 }
                 return Ok(());
             }

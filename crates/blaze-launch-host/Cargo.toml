@@ -30,7 +30,7 @@ blaze-report.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

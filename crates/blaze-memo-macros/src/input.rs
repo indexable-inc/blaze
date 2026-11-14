@@ -116,25 +116,16 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
     };
 
     let debug = options.debug.as_ref().map(|_| {
-        // alloc: expansion time, once per annotated item; no query runs this
-        let names = fields.iter().map(|it| it.ident.to_string());
-        let indices = (0..fields.len()).map(syn::Index::from);
         quote! {
+            // An input's print is its kind and id, attached or not. Its fields are its value
+            // (a crate's data, a file's text), which the host sets and changes, not what it
+            // is: an interned struct's fields are its identity and are printed (one level,
+            // bounded); an input's are not, so a key that names a crate costs a message a few
+            // bytes and never a kilobyte of the crate's data. A message that wants the
+            // crate's name or the file's path prints that.
             impl ::core::fmt::Debug for #ident {
                 fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                    let this = *self;
-                    #plumbing::attached_input::<#config, _>(this.0, |fields| match fields {
-                        ::core::option::Option::Some(fields) => f
-                            .debug_struct(::core::stringify!(#ident))
-                            .field("[id]", &this.0)
-                            // One level, each field cut at `FIELD_CAP` (see interned's).
-                            #(.field(#names, &#plumbing::Bounded::field(&fields.#indices)))*
-                            .finish(),
-                        ::core::option::Option::None => f
-                            .debug_struct(::core::stringify!(#ident))
-                            .field("[id]", &this.0)
-                            .finish(),
-                    })
+                    f.debug_struct(::core::stringify!(#ident)).field("[id]", &self.0).finish()
                 }
             }
         }

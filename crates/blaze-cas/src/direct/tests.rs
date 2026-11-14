@@ -3,8 +3,9 @@
 //! and every answer [`Direct`] gives is checked against what was put.
 //!
 //! The planted bugs ([`Plant`]) are the oracle's controls: a batch's values placed back in disk
-//! order, a record taken with no check, and a run read one byte short. Each has a directed plan
-//! the oracle must refuse.
+//! order, a record taken with no check, a run read one byte short, a chunked value's chunks put
+//! together out of order, and a file of its own put over its neighbour's place. Each has a
+//! directed plan the oracle must refuse.
 
 use std::collections::BTreeMap;
 
@@ -12,8 +13,7 @@ use blaze_core::{
     Effect, FileName, run_until_idle,
     sim::{Faults, Rng, Sim},
 };
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 use crate::{Config, Kind, Store};
@@ -202,7 +202,7 @@ fn run(seed: u64, ops: &[Op], plant: Plant) -> Result<(), String> {
     let mut sim = Sim::new(seed, Faults::default());
     let mut store = open(&mut sim);
     let fresh = |store: &Store| {
-        let mut direct = Direct::new(store.reader(), DIRECT_TAGS);
+        let mut direct = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
         direct.plant(plant);
         direct
     };
@@ -367,14 +367,63 @@ fn map_one(sim: &mut Sim, direct: &mut Direct, model: &BTreeMap<u64, State>, n: 
     }
 }
 
-#[hegel::test(test_cases = 200)]
-fn the_direct_reader_answers_what_was_put(tc: TestCase) {
-    let seed: u64 = tc.draw(gs::integers());
-    let ops: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(80));
+/// The property's body: a drawn seed and plan, run with no bug planted.
+fn answers_what_was_put(tape: &Tape) {
+    let seed: u64 = tape.next_u64("sim seed");
+    let ops: Vec<u16> = tape.vec(0..=80, "ops", |tape| tape.int::<u16>("op"));
     let ops: Vec<Op> = ops.into_iter().map(Op::decode).collect();
     if let Err(why) = run(seed, &ops, Plant::None) {
         panic!("seed {seed}: {why}\nops: {ops:?}");
     }
+}
+
+#[test]
+fn the_direct_reader_answers_what_was_put() {
+    blaze_sim::check(SimConfig::cases(200), answers_what_was_put);
+}
+
+/// The case the search found: keys 15 and 23, each a file of its own once flushed, read in one
+/// batch, where the first's place came to cover the second's bytes.
+#[test]
+fn the_direct_reader_answers_what_was_put_in_the_found_case() {
+    answers_what_was_put(&Tape::replay(&[
+        1, 1, 6, 12, 1, 5, 0, 0, 1, 6, 7405, 1, 6, 12, 1, 6, 44, 1, 6, 38256, 1, 6, 22640, 1, 6, 405, 1, 0, 4,
+        12,
+    ]));
+}
+
+/// Plans whose one batch holds a value kept as a file of its own (keys 7, 15 and 23) beside a
+/// neighbour: another such file, or a value of another form (key 14 short noise kept raw, key 3
+/// an output kept in chunks). A file of its own stands in the first round as a place of no
+/// bytes, at the same position as the answer after it.
+fn neighbours_of_files() -> [Vec<Op>; 6] {
+    let batch = |keys: &[u64]| {
+        let mut ops: Vec<Op> = keys.iter().map(|n| Op::Put(*n)).collect();
+        ops.push(Op::Flush);
+        ops.push(Op::ReadMany(keys.to_vec()));
+        ops
+    };
+    [batch(&[7, 15]), batch(&[7, 15, 23]), batch(&[7, 14]), batch(&[14, 7]), batch(&[7, 3]), batch(&[3, 7])]
+}
+
+/// The invariant: a batch that holds neighbouring values kept as files of their own, or such a
+/// file beside a value of another form, hands each key its own bytes, under every seed.
+#[test]
+fn a_batch_hands_each_file_of_its_own_its_own_bytes() {
+    for ops in neighbours_of_files() {
+        for seed in 0..16 {
+            if let Err(why) = run(seed, &ops, Plant::None) {
+                panic!("seed {seed}: {why}\nops: {ops:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_oracle_catches_a_file_put_over_its_neighbour() {
+    let [files, _, file_then_raw, ..] = neighbours_of_files();
+    control(&files, Plant::StrictlyAfter);
+    control(&file_then_raw, Plant::StrictlyAfter);
 }
 
 /// Each control's plan passes with no bug planted and is refused with it, under every seed.
@@ -426,7 +475,7 @@ fn the_direct_reader_reads_format_8_records() {
         store.put(key(n), kind, &bytes).unwrap();
     }
     flush(&mut sim, &mut store);
-    let mut direct = Direct::new(store.reader(), DIRECT_TAGS);
+    let mut direct = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
     let model: BTreeMap<u64, State> = [2, 3, 6, 10, 11].into_iter().map(|n| (n, State::Durable)).collect();
     let keys: Vec<u64> = model.keys().copied().collect();
     read_batch(&mut sim, &mut direct, &model, &keys, b"before", false).unwrap();
@@ -434,8 +483,13 @@ fn the_direct_reader_reads_format_8_records() {
         let (file, payload, _) = direct.where_of(&key(n)).unwrap();
         let byte = sim.contents(&file)[payload as usize];
         sim.rot(&file, payload, &[!byte]);
+        // A reader of its own, holding no page: `direct` read the record's block above, so it
+        // takes the record from its pack's mapping, which in the simulation is a copy made
+        // before the rot (a page cache holding the bytes as they were written). The rot is on
+        // the disk, so it is a read that must see it.
+        let mut cold = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
         let mut into = Vec::new();
-        let read = direct.read(&mut sim, &key(n), &mut into);
+        let read = cold.read(&mut sim, &key(n), &mut into);
         sim.rot(&file, payload, &[byte]);
         assert!(matches!(read, Read::Failed(Failed::Corrupt { .. })), "key {n}'s rotted byte: {read:?}");
     }
@@ -444,6 +498,215 @@ fn the_direct_reader_reads_format_8_records() {
 #[test]
 fn the_oracle_catches_a_run_read_one_byte_short() {
     control(&[Op::Put(2), Op::Flush, Op::Read(2)], Plant::RunEnd);
+}
+
+/// The key of the `n`th record one build puts in the one-by-one tests: clear of [`key`]'s.
+fn beside_key(n: u64) -> Key {
+    Key(ContentId::of("blaze v2 store direct test record beside", &n.to_le_bytes()))
+}
+
+/// The value of the `n`th record one build puts: short noise, as a file's per-item entries
+/// are (tens to hundreds of bytes), kept raw in a pack.
+fn beside_value(n: u64) -> Vec<u8> {
+    let mut rng = Rng::new(n ^ 0xb10c_5eed);
+    let len = 1 + rng.below(1500);
+    (0..len).map(|_| rng.next_u64() as u8).collect()
+}
+
+/// What one reader's asks of a build's records cost, against what they had to.
+struct Cost {
+    /// The reader's counts over the asks.
+    counts: Counts,
+    /// The blocks of [`AROUND`] bytes the records lie in, each `(file, block start)`.
+    blocks: u64,
+    /// The packs the records lie in.
+    files: u64,
+    /// The bytes of those blocks, each clipped to what its pack commits.
+    block_bytes: u64,
+}
+
+/// `count` records put by one build (one flush), then asked one by one, in `order` (indices
+/// into them), each by a call of its own of one fresh reader with `plant` planted: why a value
+/// read is not the one put, if one is not, and what the asks cost.
+fn asked_one_by_one(seed: u64, count: u64, order: &[u64], plant: Plant) -> Result<Cost, String> {
+    let mut sim = Sim::new(seed, Faults::default());
+    let mut store = open(&mut sim);
+    for n in 0..count {
+        store.put(beside_key(n), Kind::Query, &beside_value(n)).map_err(|why| format!("the put of {n}: {why:?}"))?;
+    }
+    flush(&mut sim, &mut store);
+    let mut direct = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
+    direct.plant(plant);
+    let mut blocks = std::collections::BTreeSet::new();
+    let mut files = std::collections::BTreeSet::new();
+    let mut usable_of = BTreeMap::new();
+    for n in 0..count {
+        let (file, at, len, usable) =
+            direct.record_of(&beside_key(n)).ok_or_else(|| format!("record {n} is in no pack after the flush"))?;
+        // Bounded: a record of at most 1,500 bytes and its header lie in one or two blocks.
+        let mut block = at - at % AROUND;
+        while block < at + len {
+            blocks.insert((file.clone(), block));
+            block += AROUND;
+        }
+        usable_of.insert(file.clone(), usable);
+        files.insert(file);
+    }
+    let block_bytes = blocks.iter().map(|(file, block)| (block + AROUND).min(usable_of[file]) - block).sum();
+    for &n in order {
+        let mut into = Vec::new();
+        match direct.read(&mut sim, &beside_key(n), &mut into) {
+            Read::Found { len } if into == beside_value(n) && len == into.len() => {}
+            other => return Err(format!("record {n} read as {other:?}, {} bytes, not the value put", into.len())),
+        }
+        if !direct.others().is_empty() {
+            return Err("the reader was handed completions of effects not its own".into());
+        }
+    }
+    Ok(Cost { counts: direct.own_counts(), blocks: blocks.len() as u64, files: files.len() as u64, block_bytes })
+}
+
+/// The oracle over one run's cost: the bound on device reads (the simulation's `ReadInto`s,
+/// `Counts::reads`) and waits, and the bytes read.
+fn costs_at_most_a_read_a_block(cost: &Cost, asked: u64) -> Result<(), String> {
+    let Cost { counts, blocks, files, block_bytes } = cost;
+    if counts.reads > *blocks {
+        return Err(format!("{asked} records in {blocks} blocks cost {} reads: {counts:?}", counts.reads));
+    }
+    // A wait a read, and one a pack for its mapping (the pack does not grow after the build).
+    if counts.waits > blocks + files {
+        return Err(format!("{asked} records in {blocks} blocks of {files} packs cost {} waits: {counts:?}", counts.waits));
+    }
+    if counts.bytes != *block_bytes {
+        return Err(format!(
+            "{asked} records read {} bytes, not the {block_bytes} of the blocks they lie in, each once: {counts:?}",
+            counts.bytes
+        ));
+    }
+    if counts.records != asked || counts.asked != asked {
+        return Err(format!("{asked} records asked, and the reader counts otherwise: {counts:?}"));
+    }
+    Ok(())
+}
+
+/// The property's body: a drawn count of records, all put by one build, asked one by one in a
+/// drawn order (each once), with `plant` planted: why the oracle refused it, if it did.
+fn one_by_one_body(tape: &Tape, plant: Plant) -> Result<(), String> {
+    let seed = tape.next_u64("sim seed");
+    let count = 1 + tape.below(160, "records");
+    let mut order: Vec<u64> = (0..count).collect();
+    // Fisher-Yates, each swap drawn: every order can be drawn.
+    for at in (1..order.len()).rev() {
+        let with = tape.index(at + 1, "swap");
+        order.swap(at, with);
+    }
+    let cost = asked_one_by_one(seed, count, &order, plant)?;
+    costs_at_most_a_read_a_block(&cost, count)
+}
+
+/// The invariant: `n` records one build put, asked one by one by a reader in any order, are
+/// each the value put, and cost at most one device read (and one wait) per block of [`AROUND`]
+/// bytes they lie in, plus one wait a pack for its mapping; the bytes read are exactly those
+/// blocks', each once, whatever the order of the asks (the floor: each byte the records lie in
+/// read once, and not one ask that finds its record in memory waits). With 160 records of at
+/// most 1.5 KB the bound is a few reads where one read an ask is up to 160.
+///
+/// The control is the planted bug `Plant::OneByOne`, each ask its own read with nothing taken
+/// from memory: the oracle refuses it ([`the_oracle_catches_each_ask_its_own_read`]).
+#[test]
+fn records_put_together_and_asked_one_by_one_cost_a_read_a_block() {
+    blaze_sim::check(SimConfig::cases(200), |tape: &Tape| {
+        if let Err(why) = one_by_one_body(tape, Plant::None) {
+            panic!("{why}");
+        }
+    });
+}
+
+/// The invariant: the bytes read for records one build put equal the bytes of the blocks they
+/// lie in, each once, for every order of asks: here every order of six records spread over
+/// more than one block (every 60th of 360 put, some 300 KB of pack; asserted), all 720 of
+/// them.
+#[test]
+fn the_bytes_read_are_the_blocks_once_for_every_order_of_asks() {
+    const COUNT: u64 = 6;
+    // The asked records are every `STRIDE`th of the build's puts, so they lie in several
+    // blocks.
+    const STRIDE: u64 = 60;
+    let all = COUNT * STRIDE;
+    let asked: Vec<u64> = (0..COUNT).map(|it| it * STRIDE).collect();
+    // One build's puts; each order is asked by a fresh reader, holding no page, of the same
+    // store (a read changes nothing a later reader sees).
+    let mut sim = Sim::new(7, Faults::default());
+    let mut store = open(&mut sim);
+    for n in 0..all {
+        store.put(beside_key(n), Kind::Query, &beside_value(n)).unwrap();
+    }
+    flush(&mut sim, &mut store);
+    let probe = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
+    let mut blocks = std::collections::BTreeSet::new();
+    for &n in &asked {
+        let (file, at, len, usable) = probe.record_of(&beside_key(n)).expect("in a pack after the flush");
+        // Bounded: a record of at most 1,500 bytes and its header lie in one or two blocks.
+        let mut block = at - at % AROUND;
+        while block < at + len {
+            blocks.insert((file.clone(), block, (block + AROUND).min(usable) - block));
+            block += AROUND;
+        }
+    }
+    let block_bytes: u64 = blocks.iter().map(|it| it.2).sum();
+    assert!(blocks.len() > 1, "the asked records lie in {} block: the test needs more", blocks.len());
+    let mut try_order = |order: &[u64]| {
+        let mut direct = Direct::new(store.reader(), DIRECT_TAGS, Residency::model());
+        for &n in order {
+            let mut into = Vec::new();
+            let read = direct.read(&mut sim, &beside_key(n), &mut into);
+            assert!(matches!(read, Read::Found { .. }) && into == beside_value(n), "record {n} in order {order:?}: {read:?}");
+        }
+        let read = direct.own_counts().bytes;
+        assert_eq!(read, block_bytes, "order {order:?}: the bytes read are the asked records' blocks', each once");
+    };
+    // Heap's algorithm over the six asked records: every order once.
+    let mut order = asked.clone();
+    let mut runs = 1;
+    try_order(&order);
+    let mut c = [0usize; COUNT as usize];
+    let mut at = 1;
+    // Bounded: Heap's algorithm makes `COUNT!` orders, each turn one swap or one step of `at`.
+    while at < COUNT as usize {
+        if c[at] < at {
+            match at % 2 {
+                0 => order.swap(0, at),
+                _ => order.swap(c[at], at),
+            }
+            try_order(&order);
+            runs += 1;
+            c[at] += 1;
+            at = 1;
+        } else {
+            c[at] = 0;
+            at += 1;
+        }
+    }
+    assert_eq!(runs, 720, "every order of six");
+}
+
+/// The control: each ask its own read, nothing taken from memory (`Plant::OneByOne`), is
+/// refused by the oracle, under every seed: 64 records cost 64 reads where their blocks are a
+/// few, and the bytes read are the records' alone, not their blocks'.
+#[test]
+fn the_oracle_catches_each_ask_its_own_read() {
+    for seed in 0..16 {
+        let order: Vec<u64> = (0..64).rev().collect();
+        let honest = asked_one_by_one(seed, 64, &order, Plant::None).unwrap();
+        costs_at_most_a_read_a_block(&honest, 64).unwrap_or_else(|why| panic!("seed {seed}, no bug planted: {why}"));
+        let planted = asked_one_by_one(seed, 64, &order, Plant::OneByOne).unwrap();
+        assert_eq!(planted.counts.reads, 64, "seed {seed}: the planted bug reads once an ask");
+        assert!(
+            costs_at_most_a_read_a_block(&planted, 64).is_err(),
+            "seed {seed}: the oracle missed each ask its own read: {:?}",
+            planted.counts
+        );
+    }
 }
 
 /// The core alone: neighbours join, a far record starts a run, and every record's bytes are

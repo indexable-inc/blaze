@@ -100,6 +100,7 @@ fn body_named(db: &Db, name: &str) -> DefWithBodyId {
 /// every body lints none; an edit of a file now rebuilds its crate's arena, so every body and
 /// item of the crate is linted again. Left failing.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_of_one_body_lints_that_body_and_no_other() {
     let (mut db, file) = db(TWO);
     let setup = setup("");

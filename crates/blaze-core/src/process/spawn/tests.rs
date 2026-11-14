@@ -1,5 +1,4 @@
 use crate::busy;
-use crate::sim::Rng;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod path {
@@ -102,18 +101,6 @@ mod path {
     }
 }
 
-/// [`busy::next`] as a loop: the wait doubled once per try, held at the cap, cut at the bound.
-fn reference(tried: u32, waited: u64) -> Option<u64> {
-    if waited >= busy::MOST_NS {
-        return None;
-    }
-    let mut wait = busy::FIRST_NS;
-    for _ in 0..tried {
-        wait = (wait * 2).min(busy::CAP_NS);
-    }
-    Some(wait.min(busy::MOST_NS - waited))
-}
-
 /// Followed from the first try, the waits start at the first, never pass the cap, never get
 /// shorter but for the last, and add up to the bound exactly in a few dozen tries.
 #[test]
@@ -137,27 +124,10 @@ fn busy_waits_add_up_to_the_bound() {
     assert!(tried >= 20, "{tried} tries: the cap keeps the tries close together");
 }
 
-/// The schedule against its loop, from any point: random tries (past the shift's limit too)
-/// and time waited (past the bound too).
-#[test]
-fn busy_waits_are_the_reference_schedule() {
-    for seed in 0..64 {
-        let mut rng = Rng::new(seed);
-        for _ in 0..1000 {
-            let tried = rng.below(80) as u32;
-            let waited = match rng.below(4) {
-                0 => busy::MOST_NS + rng.below(busy::MOST_NS),
-                1 => busy::MOST_NS - rng.below(busy::CAP_NS * 2).min(busy::MOST_NS),
-                _ => rng.below(busy::MOST_NS),
-            };
-            assert_eq!(
-                busy::next(tried, waited),
-                reference(tried, waited),
-                "seed {seed}: {tried} tries, {waited} ns"
-            );
-        }
-    }
-}
+// That the schedule is its loop, from any point (any number of tries, any time waited), is
+// proved, not sampled: `busy::next_is_the_doubling_schedule` (crates/blaze-core/src/busy.rs),
+// by crates/blaze-core/lean/BlazeCore/Busy.lean. The test that sampled 64,000 points of it
+// stood here until 2026-11-13.
 
 mod held {
     use std::{

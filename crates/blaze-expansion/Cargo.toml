@@ -26,8 +26,7 @@ blaze-keyed.workspace = true
 [dev-dependencies]
 # `Aligned`: the test store holds records 16-aligned, as `blaze_keyed::record::open` reads them.
 blaze-format.workspace = true
-blaze-rng.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

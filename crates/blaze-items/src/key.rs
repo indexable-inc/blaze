@@ -36,7 +36,7 @@ use std::{alloc::Global, fmt, mem};
 
 use base_db::{Crate, CrateKey, Db};
 use blaze_format::cursor::Put;
-use blaze_ids::{ContentId, Hasher, radix};
+use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId,
@@ -101,8 +101,8 @@ pub enum Resolved {
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
-/// Its hash is base-db's [`base_db::crate_item_key`], the one home of it, which the session
-/// list of every crate's key ([`base_db::crate_item_keys`]) is made with too.
+/// Its hash is base-db's [`base_db::crate_item_key`], the one home of it, which the commit's
+/// prefix index of the listed crates ([`base_db::listed_by_prefix`]) is made with too.
 #[blaze_memo::tracked(returns(copy))]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     base_db::crate_item_key(krate.data(db), krate.extra_data(db), krate.cfg_options(db), &|dep: Crate| {
@@ -929,21 +929,18 @@ pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
 
 /// The crate of the current database an item key or a crate key is of: the one whose
 /// [`crate_key`] begins with the key's first 8 bytes (an [`ItemKey`]'s crate prefix), if one
-/// does. Reads the session's crate list only, never a crate's arena: what a query that must
-/// name the crate it reads ([`crate::goals::FactRefKey`]) is keyed by.
+/// does: base-db's index of the list ([`base_db::listed_by_prefix`]), whose reads are its
+/// answer's inputs alone. A crate found is read in its own arena, so the asker borrows that
+/// crate and nothing else of the list; none found reads the list's arena, which a crate that
+/// takes the prefix moves. What a query that must name the crate it reads
+/// ([`crate::goals::FactRefKey`]) is keyed by.
 pub fn crate_of_key(db: &Db, key: &ContentId) -> Option<Crate> {
-    let krates = checked_crates(db);
-    let prefix = u64::from_le_bytes(crate_prefix(key));
-    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
-    Some(listed_crate(db, krates[at].1))
+    base_db::listed_by_prefix(db, u64::from_le_bytes(crate_prefix(key)))
 }
 
 /// The crate of the current database whose [`crate_key`] is `key`, if one has it.
 pub fn resolve_crate(db: &Db, key: &ContentId) -> Option<Crate> {
-    let krates = checked_crates(db);
-    let prefix = u64::from_le_bytes(crate_prefix(key));
-    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
-    let krate = listed_crate(db, krates[at].1);
+    let krate = crate_of_key(db, key)?;
     (crate_key(db, krate) == *key).then_some(krate)
 }
 
@@ -1192,14 +1189,15 @@ impl std::error::Error for CrateKeyClash {}
 /// once its crate graph is set and before any key is resolved: [`resolve`] and
 /// [`resolve_crate`] hold it.
 pub fn check_crate_keys(db: &Db) -> Result<(), CrateKeyClash> {
-    match crates_by_prefix(db) {
-        Ok(_) => Ok(()),
-        Err(pair) => Err(CrateKeyClash::of(db, pair)),
+    match base_db::listed_clash(db) {
+        None => Ok(()),
+        Some(pair) => Err(CrateKeyClash::of(db, pair)),
     }
 }
 
 impl CrateKeyClash {
-    /// The clash of `pair`, two crates [`crates_by_prefix`] found with one key prefix, named.
+    /// The clash of `pair`, two crates [`base_db::listed_clash`] found with one key prefix,
+    /// named.
     fn of(db: &Db, pair: [CrateKey; 2]) -> CrateKeyClash {
         let [krate, other] = pair.map(|key| listed_crate(db, key));
         CrateKeyClash {
@@ -1209,52 +1207,14 @@ impl CrateKeyClash {
     }
 }
 
-/// Every crate of the build by the first 8 bytes of its key, sorted, kept in the arena; the
-/// first two crates found with one prefix as an error, by id ([`CrateKeyClash::of`] names
-/// them outside the query, so its value owns nothing).
-///
-/// Homed at the session arena (its key names no crate), so it reads only session-level data:
-/// base-db's list of each listed crate's key ([`base_db::crate_item_keys`]), never a crate's
-/// arena. Its scratch is the run's frame (a run is a `frame::task` of its query's tag). It
-/// holds each crate by its world key, never its `Crate` id: the session arena outlives a crate
-/// arena a file edit makes again, so an id kept here would be dead ([`listed_crate`] reads the
-/// id of this snapshot at each use).
-#[blaze_memo::tracked(returns(copy))]
-fn crates_by_prefix<'db>(db: &'db Db) -> Result<&'db [(u64, CrateKey)], [CrateKey; 2]> {
-    let keys = base_db::crate_item_keys(db);
-    frame::current(|frame| {
-        let mut krates: Vec<(u64, CrateKey), &Frame> = Vec::with_capacity_in(keys.len(), frame);
-        krates.extend(keys.iter().map(|&(key, item_key)| (u64::from_le_bytes(crate_prefix(&item_key)), key)));
-        radix::sort_copy_by_key(&mut krates, |&(prefix, _)| prefix);
-        for pair in krates.windows(2) {
-            let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
-            if prefix == other_prefix {
-                return Err([krate, other]);
-            }
-        }
-        Ok(blaze_memo::keep_slice(blaze_memo::Database::memo(db), &krates))
-    })
-}
-
-/// [`crates_by_prefix`] of a build [`check_crate_keys`] let through.
-fn checked_crates(db: &Db) -> &[(u64, CrateKey)] {
-    match crates_by_prefix(db) {
-        Ok(it) => it,
-        Err(pair) => {
-            let clash = CrateKeyClash::of(db, pair);
-            panic!("blaze-items: a key resolved in a build check_crate_keys stops: {clash}")
-        }
-    }
-}
-
-/// The crate of this snapshot listed under `key`. [`crates_by_prefix`] lists only the keys of
-/// this snapshot's listed crates ([`base_db::crate_item_keys`] is written with the table in the
-/// same commit), so a key with no crate is a broken base-db table, and it stops naming the key.
+/// The crate of this snapshot listed under `key`, named by base-db's clash
+/// ([`base_db::listed_clash`]), which lists only this snapshot's listed crates: a key with no
+/// crate is a broken base-db table, and it stops naming the key.
 fn listed_crate(db: &Db, key: CrateKey) -> Crate {
     db.crate_at(key).unwrap_or_else(|| {
         panic!(
-            "blaze-items: crates_by_prefix lists the crate {key:?}, which this snapshot's table \
-             has no crate for (base-db's crate_item_keys and its table disagree)"
+            "blaze-items: base-db's clash names the crate {key:?}, which this snapshot's table has no \
+             crate for (base-db's prefix index and its table disagree)"
         )
     })
 }

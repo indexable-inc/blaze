@@ -517,6 +517,8 @@ pub fn serve(
             }
         };
         let lang_items = Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode };
+        let diagnostic_items =
+            Frozen { bytes: PartBytes::of(&bytes, &parts, Part::DiagnosticItems), mode };
         // Under `Mode::Check` and `Mode::Verify` the def map's record whole, which what the
         // crate resolves to (`Check`) or what was read of its pages (`Verify`) is compared
         // with; never when serving, which holds no byte of it past a read.
@@ -527,7 +529,17 @@ pub fn serve(
         // Read from pages in `Mode::Serve` and `Mode::Verify`; `Mode::Check` resolves the
         // crate and compares what it resolves to with its pages.
         let pages = (mode != Mode::Check).then_some(def_pages);
-        let image = Image { base, key: filed, bytes, parts, mode, lang_items, def_map, pages };
+        let image = Image {
+            base,
+            key: filed,
+            bytes,
+            parts,
+            mode,
+            lang_items,
+            diagnostic_items,
+            def_map,
+            pages,
+        };
         given.push((krate, image));
         hits.push(krate);
     }
@@ -909,7 +921,8 @@ fn make(
         Ok(paged) => paged,
         Err(why) => return Ok(Err(Refused::Encode { part: Part::DefMap, why })),
     };
-    // Every part of the image, then the pages beside it.
+    // Every part of the image (lang items, signatures, diagnostic items: [`Part::ALL`]), then
+    // the pages beside it.
     let held: [(Part, &[u8]); Part::ALL.len() + 1] = std::array::from_fn(|at| match Part::ALL.get(at) {
         Some(&part) => (part, parts[at].as_bytes()),
         None => (Part::DefMap, paged.as_slice()),
@@ -1033,6 +1046,9 @@ fn encode(
             frozen::encode_lang_items(db, krate).map_err(refused(Part::LangItems))?,
         ),
         signatures::encode(db, krate, calls).map_err(refused(Part::Signatures))?,
+        Portable::written(
+            frozen::encode_diagnostic_items(db, krate).map_err(refused(Part::DiagnosticItems))?,
+        ),
     ])
 }
 

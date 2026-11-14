@@ -15,7 +15,7 @@ use std::{
     sync::Once,
 };
 
-use crate::{Gid, Kind, KindId, Memo, Plant, Read, Reads, arena::Slot, trie::Head};
+use crate::{Gid, Kind, KindId, Memo, Plant, Read, Reads, arena::Slot, record::Lists, trie::Head};
 
 thread_local! {
     static INNERMOST: Cell<*const Run> = const { Cell::new(ptr::null()) };
@@ -55,16 +55,16 @@ struct Prov {
     settle: Settle,
 }
 
-/// What publishes a member's `Entry<K, V>` of (key, value) in its slot, the reads its list:
-/// one made from the value (`fetch::publish_member`), or, for an `owns` query, the entry the
-/// value was placed in (`fetch::publish_member_placed`).
-pub(crate) type Publish = unsafe fn(&Memo, &Slot, &'static Kind, u64, *const (), *const (), &[Read]);
+/// What publishes a member's `Entry<K, V>` of (key, value) in its slot, with its cycle's lists
+/// (the head's entry's, or null): one made from the value (`fetch::publish_member`), or, for an
+/// `owns` query, the entry the value was placed in (`fetch::publish_member_placed`).
+pub(crate) type Publish = unsafe fn(&Memo, &Slot, &'static Kind, u64, *const (), *const (), *const Lists);
 
-/// A member's entry, made final when its head settles.
+/// A member's entry, made final when its head settles. Its reads are not kept here: a member's
+/// rows of each round reached its asker (and so its head) when the round's run returned, and
+/// its entry shares its head's lists ([`Run::settle_members`]).
 pub(crate) struct Settle {
     pub(crate) slot: *const Slot,
-    /// The member's reads in its round, in its arena.
-    pub(crate) reads: *const [Read],
     pub(crate) publish: Publish,
 }
 
@@ -202,9 +202,31 @@ pub(crate) struct Run {
     provisional: Cell<*const ()>,
     book: RefCell<Option<Book>>,
     keeping: bool,
+    /// The input and boundary rows this run read itself ([`note_fact`], [`pass_on`]).
     reads: RefCell<Vec<Read, Global>>,
+    /// The entries (not boundaries) this run asked, hit or run: one row each ([`pass_on`]);
+    /// their own reads stay with them until a flat list is asked ([`crate::record`]).
+    callees: RefCell<Vec<*const Head, Global>>,
     /// A run of an imaged query: it reads only its home and its home's declared closure.
     imaged: bool,
+}
+
+/// What a run read directly ([`Run::take_reads`]): its rows and the entries it asked, each
+/// sorted and deduplicated, on the global heap until its entry keeps them in its arena
+/// ([`Lists::in_arena`]) or its asker takes them ([`replay_taken`]).
+pub(crate) struct Taken {
+    pub(crate) reads: Vec<Read, Global>,
+    pub(crate) callees: Vec<*const Head, Global>,
+}
+
+impl Taken {
+    fn len(&self) -> usize {
+        self.reads.len() + self.callees.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// # Safety
@@ -247,7 +269,7 @@ impl Run {
         key: &K,
         imaged: bool,
     ) -> Run {
-        let outer = INNERMOST.with(Cell::get);
+        let outer = innermost_ptr();
         // SAFETY: the innermost run is on this task's stack below us.
         let outer_ref = unsafe { outer.as_ref() };
         Run {
@@ -267,6 +289,7 @@ impl Run {
             book: RefCell::new(None),
             keeping: memo.reads() == Reads::Kept,
             reads: RefCell::new(Vec::new_in(Global)),
+            callees: RefCell::new(Vec::new_in(Global)),
             imaged,
         }
     }
@@ -283,7 +306,7 @@ impl Run {
     }
 
     fn frame(memo: &Memo, keeping: bool) -> Run {
-        let outer = INNERMOST.with(Cell::get);
+        let outer = innermost_ptr();
         // SAFETY: as in `new`.
         let outer_ref = unsafe { outer.as_ref() };
         Run {
@@ -303,6 +326,7 @@ impl Run {
             book: RefCell::new(None),
             keeping,
             reads: RefCell::new(Vec::new_in(Global)),
+            callees: RefCell::new(Vec::new_in(Global)),
             // A recorder inside an imaged run reads for that run.
             imaged: outer_ref.is_some_and(|it| it.imaged),
         }
@@ -347,30 +371,27 @@ impl Run {
         self.provisional.set(value);
     }
 
-    /// The facts this run read, sorted and deduplicated.
+    /// What this run read directly, each list sorted and deduplicated: the run's own cost for
+    /// its list, O(r log r) in the r rows it appended (one per input read and per query asked),
+    /// whatever its callees read.
     ///
     /// # Panics
     ///
-    /// Where one fact was read with two digests: inputs are fixed for a snapshot, so that is
-    /// two snapshots' reads mixed.
-    pub(crate) fn take_reads(&self) -> Vec<Read, Global> {
+    /// Where one fact was read with two digests directly: inputs are fixed for a snapshot, so
+    /// that is two snapshots' reads mixed. (Through callees, the flat list's making refuses
+    /// the same: `record::flatten_in`.)
+    pub(crate) fn take_reads(&self) -> Taken {
         let mut reads = std::mem::replace(&mut *self.reads.borrow_mut(), Vec::new_in(Global));
         reads.sort_unstable();
         reads.dedup();
-        for pair in reads.windows(2) {
-            if let (Read::Input { kind: a, fact: x }, Read::Input { kind: b, fact: y }) = (pair[0], pair[1])
-            {
-                assert!(
-                    a != b || x.id != y.id || a.name() == crate::record::UNTRACKED.name(),
-                    "{} read fact {:?} with two digests ({:?} and {:?}) in one snapshot",
-                    self.name(),
-                    x.id,
-                    x.digest,
-                    y.digest
-                );
-            }
-        }
-        reads
+        crate::record::one_digest_each(&reads, &|out: &mut String| {
+            // SAFETY: `key` points at the key `describe` was made for, on this task's stack.
+            unsafe { (self.describe)(self.kind, self.key, out) };
+        });
+        let mut callees = std::mem::replace(&mut *self.callees.borrow_mut(), Vec::new_in(Global));
+        callees.sort_unstable();
+        callees.dedup();
+        Taken { reads, callees }
     }
 
     /// Whether the head's members moved this round, and starts the next.
@@ -406,22 +427,38 @@ pub(crate) struct Pushed<'a> {
 
 impl Drop for Pushed<'_> {
     fn drop(&mut self) {
-        INNERMOST.with(|cell| cell.set(self.run.outer));
+        set_innermost(self.run.outer);
     }
 }
 
 pub(crate) fn push(run: &Run) -> Pushed<'_> {
     register();
-    INNERMOST.with(|cell| {
-        debug_assert!(ptr::eq(cell.get(), run.outer), "a run pushed onto another task's stack");
-        cell.set(run);
-    });
+    debug_assert!(ptr::eq(innermost_ptr(), run.outer), "a run pushed onto another task's stack");
+    set_innermost(run);
     Pushed { run }
+}
+
+/// This thread's innermost run. Never inlined, as every read of a thread-local in this crate
+/// is (`blaze_graph::sched::fiber`'s rule, AGENTS.md rule 27): a run's function may park its
+/// fiber and resume on another worker, and a reader inlined into a function that spans that
+/// wait (a fetch pushes its run, runs the function and pops it) may keep the thread-local's
+/// address from before the wait, so the run would be popped off the worker it left and looked
+/// up there. The value, not the address, is what this returns: a function returning the
+/// address reads no memory, so two calls of it may be merged across the wait all the same.
+#[inline(never)]
+fn innermost_ptr() -> *const Run {
+    INNERMOST.with(Cell::get)
+}
+
+/// Sets this thread's innermost run. Never inlined ([`innermost_ptr`]).
+#[inline(never)]
+fn set_innermost(run: *const Run) {
+    INNERMOST.with(|cell| cell.set(run));
 }
 
 fn innermost<'a>() -> Option<&'a Run> {
     // SAFETY: the innermost run is on this task's stack and outlives this call's use.
-    unsafe { INNERMOST.with(Cell::get).as_ref() }
+    unsafe { innermost_ptr().as_ref() }
 }
 
 /// Notes that the innermost run reads arena `slot`: a borrow of it by the run's home.
@@ -444,6 +481,18 @@ pub(crate) fn note_read_of(memo: &Memo, slot: &Slot) {
             "{} is homed at the session arena (its key names no arena) but reads {:?}: give it \
              a key that names the crate",
             run.name(),
+            slot.id
+        );
+    }
+    // The same mistake one level down: an open arena's entries are keyed by inputs no crate
+    // owns (a source root's files), so one that reads a crate's arena is missing the crate in
+    // its key, and would drop every arena that named the open one with that crate's edits.
+    if home.is_open() && !home.reaches(slot.id) && !slot.is_open() {
+        panic!(
+            "{} is homed at the open arena {:?} (its key names only inputs no crate owns) but \
+             reads {:?}: give it a key that names the crate",
+            run.name(),
+            home.id,
             slot.id
         );
     }
@@ -473,8 +522,10 @@ pub(crate) fn note_fact(memo: &Memo, fact: Read) {
 }
 
 /// What an ask of the entry `head` (homed at `arena`) adds to the innermost run's list, hit or
-/// run alike: for a boundary kind one [`Read::Query`] row naming the entry (the firewall: its
-/// own list stays behind), for any other its list.
+/// run alike: ONE row. For a boundary kind a [`Read::Query`] naming the entry (the firewall:
+/// its own list stays behind); for any other a callee row naming the entry, whose reads its
+/// asker's flat list reaches through it when one is asked ([`crate::record`]); nothing for an
+/// entry that read nothing. O(1) whatever the entry read.
 /// This is a hit's; [`pass_on`] is a run's own end.
 #[inline]
 pub(crate) fn replay(memo: &Memo, arena: crate::ArenaId, head: &Head) {
@@ -490,23 +541,40 @@ pub(crate) fn pass_on(memo: &Memo, arena: crate::ArenaId, head: &Head) {
     if memo.reads() != Reads::Kept {
         return;
     }
+    let Some(run) = innermost() else { return };
+    if !run.keeping {
+        return;
+    }
     if memo.is_boundary(head.kind) && memo.plant() != Plant::BoundaryLeaks {
         let row = Read::Query { kind: KindId::of(head.kind), key: Gid::new(arena, head.local) };
-        replay_list(std::slice::from_ref(&row));
+        run.reads.borrow_mut().push(row);
+    } else if head.lists().is_none() {
+        return;
+    } else if memo.plant() == Plant::AskCopiesFlatList {
+        // The eager lists this replaced: the callee's whole flat list copied into the asker.
+        let flat = crate::record::flat_of(memo, head);
+        run.reads.borrow_mut().extend_from_slice(flat);
+        crate::counts::rows_replayed(flat.len());
+        return;
     } else {
-        replay_list(head.reads());
+        run.callees.borrow_mut().push(ptr::from_ref(head));
     }
+    crate::counts::rows_replayed(1);
 }
 
-/// Appends `reads` to the innermost run's list.
-pub(crate) fn replay_list(reads: &[Read]) {
-    if reads.is_empty() {
+/// Appends what a run (a recorder's frame, or a fixpoint member's round, which has no entry
+/// to name yet) read directly to the innermost run's lists: its asker read it too. O(its
+/// direct rows), never its callees' reads.
+pub(crate) fn replay_taken(taken: &Taken) {
+    if taken.is_empty() {
         return;
     }
     if let Some(run) = innermost()
         && run.keeping
     {
-        run.reads.borrow_mut().extend_from_slice(reads);
+        run.reads.borrow_mut().extend_from_slice(&taken.reads);
+        run.callees.borrow_mut().extend_from_slice(&taken.callees);
+        crate::counts::rows_replayed(taken.len());
     }
 }
 
@@ -686,14 +754,22 @@ pub(crate) fn member_done(
 
 impl Run {
     /// Publishes, as final, the value each member of this head's cycle had in the round that
-    /// just settled (`round`, before [`Run::next_round`] moved past it). Members of earlier
-    /// rounds that the last round did not reach are not published: nothing asked them.
-    pub(crate) fn settle_members(&self, memo: &Memo, round: u32) {
+    /// just settled (`round`, before [`Run::next_round`] moved past it), each with `lists`: the
+    /// head's entry's, published just before. Members of earlier rounds that the last round
+    /// did not reach are not published: nothing asked them.
+    ///
+    /// One list for the component: a member's value is a function of its head's provisional
+    /// value, so it depends on everything any member read in any round; and every member's
+    /// rows of every round reached the head's list (a member's round passes its direct rows to
+    /// its asker, `replay_taken`, down the cycle's path to the head). So the head's lists are
+    /// each member's, and the component's flat list is made once, for whichever is asked first.
+    pub(crate) fn settle_members(&self, memo: &Memo, round: u32, lists: *const Lists) {
         let book = self.book.borrow();
         let Some(book) = book.as_ref() else { return };
         for prov in book.provs.iter().filter(|it| it.round == round) {
-            // SAFETY: the member's slot is held by `memo`; its reads, key and value were made
-            // in that slot's arena for this `publish`'s types.
+            // SAFETY: the member's slot is held by `memo`; its key and value were made in that
+            // slot's arena for this `publish`'s types; `lists` is the head's entry's, in an
+            // arena that outlives the member's (`record::Lists`).
             unsafe {
                 (prov.settle.publish)(
                     memo,
@@ -702,7 +778,7 @@ impl Run {
                     prov.hash,
                     prov.key,
                     prov.value,
-                    &*prov.settle.reads,
+                    lists,
                 );
             }
         }

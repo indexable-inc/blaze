@@ -98,8 +98,9 @@ impl Walking {
     /// [`Build::WALK`], and where a unit of the instance MIR-inlines, each of
     /// [`Build::WALKS_INLINED`] against the program's world. It is the same list for every kind
     /// of instance and every crate: a unit builds each under its own settings, and even where
-    /// the instance's own MIR is the same under all of them (a body of the library's, inlined
-    /// in every unit; a shim, which has none) the `#[inline(always)]` callees of other crates
+    /// the instance's own MIR is the same under all of them (a shim, which has none; a body
+    /// of the library's is MIR-inlined only where the unit inlines, `Build::options`) the
+    /// `#[inline(always)]` callees of other crates
     /// it builds in are built under them (`always_inlinable_callee`), their bodies MIR-inlined
     /// where the unit inlines: core's `<&A as PartialEq<&B>>::eq` builds in smol_str's
     /// `<SmolStr as PartialEq<str>>::eq`, whose code inlined asks for `Repr::as_str` and
@@ -313,8 +314,8 @@ fn code_refs(
     }
     // The body each pass walks, as a unit under its settings reads it: under `WALK` first, so
     // the list starts with what a unit that inlines nothing asks for. A body of the library's
-    // or a coroutine is the same MIR under each (the library's is inlined in every unit, a
-    // coroutine has nothing inlined into it), and is walked under each all the same: the
+    // is inlined only under the passes that inline (`Build::options`), and a coroutine has
+    // nothing inlined into it under any; each is walked under every pass all the same: the
     // callees it builds in are built under the pass's settings ([`Walking::builds`]).
     // alloc: inline, one body a pass
     let mut bodies: SmallVec<[(Build, _); 3]> = SmallVec::new();

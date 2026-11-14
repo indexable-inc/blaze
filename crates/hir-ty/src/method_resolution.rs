@@ -1197,9 +1197,22 @@ impl<'db> CratesThatName<'db> {
         Some(&self.rows[r * words..(r + 1) * words])
     }
 
+    /// The places in [`loaded_crates`], ascending, of the crates that can name `krate`: none
+    /// where `krate` is neither a loaded crate nor what one depends on.
+    pub fn namers(&self, krate: Crate) -> Ones<'db> {
+        let rows: &'db [u64] = self.rows;
+        match self.crates.binary_search(&krate) {
+            Ok(r) => {
+                let words = self.row_words as usize;
+                Ones::new(&rows[r * words..(r + 1) * words])
+            }
+            Err(_) => Ones::new(&[]),
+        }
+    }
+
     /// The places in [`loaded_crates`], ascending, of the crates that can name both
     /// `trait_crate` and, given, `self_crate`.
-    fn holders<'f>(
+    pub fn holders<'f>(
         &self,
         frame: &'f Frame,
         trait_crate: Crate,
@@ -2714,6 +2727,39 @@ impl<'db> TraitImpls<'db> {
                         found.extend(derives.iter().map(|&it| AnyImplId::from(it)))
                     }
                 });
+            }
+            blaze_memo::keep_slice(db.memo(), &found)
+        })
+    }
+
+    /// Every trait impl for one type that `krate` sees, built-in derives among them:
+    /// [`Self::in_crate_for_self_ty`] of each of its [`loaded_crates`], in their order, that can
+    /// name the type's crate ([`CratesThatName::namers`]). A loaded crate that cannot name the
+    /// type holds no impl for it and is never asked: its key would name two unrelated crates,
+    /// homed at the type's and naming one that crate does not borrow (a homing refusal), which
+    /// is what asking every loaded crate did (blaze-lints' `wall_clock` test: `hir_ty`'s table
+    /// asked for `std::time::Instant`). Keyed by the asking crate, which borrows both.
+    #[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+    pub fn in_crate_and_deps_for_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> &'db [AnyImplId] {
+        blaze_mem::frame::current(|frame| {
+            let mut found: Vec<AnyImplId, &Frame> = Vec::new_in(frame);
+            let loaded = loaded_crates(db, krate);
+            let mut ask = |seen: Crate| {
+                found.extend_from_slice(Self::in_crate_for_self_ty(db, seen, self_ty))
+            };
+            match simplified_type_module(db, &self_ty.0) {
+                Some(module) => {
+                    for at in crates_that_name(db, krate).namers(module.krate(db)) {
+                        ask(loaded[at]);
+                    }
+                }
+                // A type that names no definition (a primitive, a reference, ...): any crate
+                // can name it.
+                None => loaded.iter().for_each(|&seen| ask(seen)),
             }
             blaze_memo::keep_slice(db.memo(), &found)
         })

@@ -209,11 +209,13 @@ impl Sink<'_> {
         }
     }
 
+    /// A variant's attributes and fields. A variant is no item (blaze-items' `Resolved::Variant`):
+    /// it has no `Signature` or `Name` fact of its own; what a body reads of its shape is its
+    /// enum's `Signature` and `Fields` (blaze-item-hash `reads`, lane items' `fact_of_read`),
+    /// written by [`Self::adt`], and its discriminant is a `ConstValue` a body makes.
     fn variant(&mut self, variant: EnumVariantId) -> Result<(), TaskFailed> {
         let subject = key::variant_key(self.db, variant).0;
         self.attrs(AttrDefId::EnumVariantId(variant))?;
-        self.fact(plain(items::SIGNATURE, subject))?;
-        self.fact(plain(items::NAME, subject))?;
         self.fields(variant.into(), subject)
     }
 

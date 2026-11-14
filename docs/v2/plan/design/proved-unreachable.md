@@ -233,7 +233,7 @@ reported: `v[len - 1]` unguarded (the wrap, with overflow checks off), `v[i + 2]
 started one past the length is reported.
 
 The invariant: *a site the prover discharges is not reached, or its condition holds, in every
-run of the MIR*. It is held by a Hegel test against the MIR evaluator
+run of the MIR*. It is held by a blaze-sim test against the MIR evaluator
 (`crates/hir-ty-pure/src/tests/reach_oracle.rs`): random guards (variants, bounds, lengths,
 linear expressions with `+`, `-`, `/ 2`, `&&`) around a random site, random arguments with
 the ends of `usize` among them, both overflow profiles; a body all of whose panic sites are

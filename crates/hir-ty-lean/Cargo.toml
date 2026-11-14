@@ -29,8 +29,8 @@ syntax.workspace = true
 
 [dev-dependencies]
 blaze-core.workspace = true
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 hir-ty-mir.workspace = true
 

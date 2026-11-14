@@ -341,7 +341,7 @@ pub fn gated(db: &Db, krate: base_db::Crate) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -448,35 +448,31 @@ mod tests {
         })
     }
 
-    fn below(tc: &TestCase, n: usize) -> usize {
-        tc.draw(gs::integers::<u32>().max_value(n as u32 - 1)) as usize
+    fn words(tape: &Tape, label: &'static str) -> Words {
+        Words(tape.int_in(0..=Words::ALL.0, label))
     }
 
-    fn words(tc: &TestCase) -> Words {
-        Words(tc.draw(gs::integers::<u8>().max_value(Words::ALL.0)))
+    fn maybe_words(tape: &Tape, label: &'static str) -> Option<Words> {
+        tape.bool(label).then(|| words(tape, label))
     }
 
-    fn maybe_words(tc: &TestCase) -> Option<Words> {
-        tc.draw(gs::booleans()).then(|| words(tc))
-    }
-
-    fn drawn(tc: &TestCase) -> Model {
-        let modules: Vec<(Option<usize>, Option<Words>)> = (0..1 + below(tc, 3))
-            .map(|at| ((at > 0).then(|| below(tc, at)), maybe_words(tc)))
+    fn drawn(tape: &Tape) -> Model {
+        let modules: Vec<(Option<usize>, Option<Words>)> = (0..1 + tape.index(3, "modules"))
+            .map(|at| ((at > 0).then(|| tape.index(at, "parent")), maybe_words(tape, "module default")))
             .collect();
-        let count = 1 + below(tc, 5);
+        let count = 1 + tape.index(5, "functions");
         let functions = (0..count)
             .map(|_| Function {
                 // Few effects, so that some crates are accepted.
-                own_effects: if below(tc, 3) == 0 { words(tc) } else { Words::NONE },
-                calls: (0..below(tc, 3)).map(|_| below(tc, count)).collect(),
-                own: maybe_words(tc),
-                bound: if below(tc, 3) == 0 { Some(words(tc)) } else { None },
-                exact: tc.draw(gs::booleans()),
-                module: below(tc, modules.len()),
+                own_effects: if tape.index(3, "has effects") == 0 { words(tape, "own effects") } else { Words::NONE },
+                calls: (0..tape.index(3, "calls")).map(|_| tape.index(count, "callee")).collect(),
+                own: maybe_words(tape, "own mark"),
+                bound: if tape.index(3, "has bound") == 0 { Some(words(tape, "bound")) } else { None },
+                exact: tape.bool("exact"),
+                module: tape.index(modules.len(), "module"),
             })
             .collect();
-        Model { functions, modules, gated: tc.draw(gs::booleans()) }
+        Model { functions, modules, gated: tape.bool("gated") }
     }
 
     /// The invariant: the checker accepts a crate exactly when every function's inferred
@@ -485,10 +481,12 @@ mod tests {
     /// and anything outside it; an impl's own mark is within its trait method's; and every word
     /// of an own list held exact is an effect the function has. For random small call graphs
     /// with random effect sources and random declarations.
-    #[hegel::test]
-    fn the_checker_accepts_exactly_what_is_within_its_allowance(tc: TestCase) {
-        let model = drawn(&tc);
-        assert_eq!(checker_accepts(&model, Plant::Off), spec_accepts(&model), "{model:?}");
+    #[test]
+    fn the_checker_accepts_exactly_what_is_within_its_allowance() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let model = drawn(tape);
+            assert_eq!(checker_accepts(&model, Plant::Off), spec_accepts(&model), "{model:?}");
+        })
     }
 
     fn function(own_effects: Words, own: Option<Words>, bound: Option<Words>) -> Function {

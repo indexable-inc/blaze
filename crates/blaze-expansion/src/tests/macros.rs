@@ -14,10 +14,9 @@ use blaze_keyed::{
     kind::{Expander, Expansion, ExpansionInputs, Kind, ProcKind, StartState},
     proof::{self, Checks, Snapshot},
 };
-use blaze_rng::SplitMix64;
-use hegel::TestCase;
+use blaze_sim::{Broke, Config, Tape};
 
-use super::support::{Broke, Draw, Drawn, MemStore, NAMESPACE, control, filing, tool};
+use super::support::{CONTROL, MemStore, NAMESPACE, filing, tool};
 use crate::{
     Digest, NOTHING, Subject, What,
     machine::{Found, file, lookup, payload, settle},
@@ -71,25 +70,26 @@ struct Plan {
     edits: Vec<Edit>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let modules: Vec<Module> =
-        (0..d.int(1, 3)).map(|_| Module { reads_env: d.coin(), asks_line: d.coin() }).collect();
-    let calls = (0..d.int(2, 6))
+fn plan(tape: &Tape) -> Plan {
+    let modules: Vec<Module> = (0..tape.int_in(1..=3u64, "modules"))
+        .map(|_| Module { reads_env: tape.coin("reads env"), asks_line: tape.coin("asks line") })
+        .collect();
+    let calls = (0..tape.int_in(2..=6u64, "calls"))
         .map(|i| Call {
-            module: d.under(modules.len()),
-            words: (0..d.int(1, 5)).map(|_| d.int(0, 3)).collect(),
+            module: tape.index(modules.len(), "module"),
+            words: (0..tape.int_in(1..=5u64, "words")).map(|_| tape.int_in(0..=3u64, "word")).collect(),
             offset: 100 * i as u32,
         })
         .collect::<Vec<_>>();
-    let edits = (0..d.int(1, 12))
-        .map(|_| match d.int(0, 3) {
+    let edits = (0..tape.int_in(1..=12u64, "edits"))
+        .map(|_| match tape.int_in(0..=3u8, "edit") {
             0 => {
-                let call = d.under(calls.len());
-                Edit::Token { call, at: d.under(calls[call].words.len()), to: d.int(0, 3) }
+                let call = tape.index(calls.len(), "call");
+                Edit::Token { call, at: tape.index(calls[call].words.len(), "at"), to: tape.int_in(0..=3u64, "to") }
             }
-            1 => Edit::Rebuild { module: d.under(modules.len()) },
-            2 => Edit::Shift { call: d.under(calls.len()), lines: d.int(1, 3) as u32 },
-            _ => Edit::Env { to: d.int(0, 2) },
+            1 => Edit::Rebuild { module: tape.index(modules.len(), "module") },
+            2 => Edit::Shift { call: tape.index(calls.len(), "call"), lines: tape.int_in(1..=3u32, "lines") },
+            _ => Edit::Env { to: tape.int_in(0..=2u64, "to") },
         })
         .collect();
     Plan { modules, calls, edits }
@@ -292,34 +292,42 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 
 /// The invariant: a call is redone exactly when its key or a listed answer changed, and what
 /// a record gives is what a run gives.
-#[hegel::test(test_cases = 200)]
-fn a_call_is_redone_exactly_when_its_key_or_a_listed_answer_changed(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn a_call_is_redone_exactly_when_its_key_or_a_listed_answer_changed() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(&plan, Plant::None)
+    });
 }
 
-fn seeded(rng: &mut SplitMix64, plant: Plant) -> Result<(), Broke> {
-    run(&plan(rng), plant)
+/// A drawn plan under `plant`: what each control runs.
+fn planned(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(&plan(tape), plant)
 }
 
+/// A rebuilt expander keeps its key, so the old record answers and its output is not a fresh
+/// run's; or two modules' calls of the same words share one key, and the second is answered from
+/// a record though never run. Which the oracle sees first depends on the plan, so any finding.
 #[test]
 fn the_oracle_catches_the_module_left_out_of_the_key() {
-    control(Plant::ModuleOutOfKey, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::ModuleOutOfKey, "", planned);
 }
 
+/// A changed variable the record does not list still hits: its output is not a fresh run's.
 #[test]
 fn the_oracle_catches_a_host_answer_not_recorded() {
-    control(Plant::AnswerNotRecorded, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::AnswerNotRecorded, "a fresh run gives", planned);
 }
 
+/// The second call a build runs counts one: its output is not a fresh run's.
 #[test]
 fn the_oracle_catches_expander_state_carried_across_calls() {
-    control(Plant::StateCarried, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::StateCarried, "a fresh run gives", planned);
 }
 
+/// Lines added above a call move its key: it runs again with inputs it ran with before.
 #[test]
 fn the_oracle_catches_spans_hashed_by_absolute_position() {
-    control(Plant::AbsolutePositions, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::AbsolutePositions, "ran with these inputs before", planned);
 }

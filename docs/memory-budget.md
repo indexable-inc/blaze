@@ -318,7 +318,7 @@ daemon holds moves by more than a 64th of the budget or the tasks it waits on ch
 /Users/a/.blaze), waiting on 3 tasks: codegen of hir-ty, ...`. It names what waits, on what,
 and who holds the rest.
 
-**Proof.** A Hegel DST of the ledger core and the plane's admission against it
+**Proof.** A blaze-sim DST of the ledger core and the plane's admission against it
 (`crates/blaze-graph/src/ledger/tests.rs`).
 - The simulation runs several daemons, each with tasks whose grants and real use are drawn.
   Their steps interleave with crashes (a daemon gone without leaving), pid reuse and restarts.

@@ -280,6 +280,9 @@ pub(crate) enum IdRefused {
     PastTable { index: u64, len: u64 },
     /// In a scope, an entry of another kind than the reader's, or one not made yet.
     OtherKind,
+    /// Outside a scope, bits no id of this session has ([`id_at`]: a zero local or an
+    /// all-ones arena half).
+    NoId { bits: u64 },
 }
 
 impl IdRefused {
@@ -297,13 +300,18 @@ impl IdRefused {
                 at,
                 what: "an id whose entry in the record's table is of another kind or not made",
             },
+            IdRefused::NoId { .. } => FormatError::Invalid {
+                at,
+                what: "an id's bits that name no id of this session (a zero local or an all-ones arena)",
+            },
         }
     }
 }
 
 /// The id `bits` name, as [`id_bits`] wrote them, or why they name none: 0, and in a scope an
-/// index the table has no id of `T`'s kind at. Outside a scope every other word is some id's
-/// bits ([`gid_bits`]); the id is checked where its fields are read, once
+/// index the table has no id of `T`'s kind at. Outside a scope a word is refused when no id
+/// has its bits ([`id_at`]: a damaged word can name none, so this is an error, never a
+/// panic); an id it does name is checked where its fields are read, once
 /// (`blaze_memo::Id::from_gid`).
 #[inline(never)]
 pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
@@ -311,7 +319,7 @@ pub(crate) fn id_of<T: Relocate>(bits: u64) -> Result<T, IdRefused> {
         return Err(IdRefused::Zero);
     }
     TABLE.with(|slot| match slot.borrow().as_ref() {
-        None => Ok(T::from_gid(entry_id(bits))),
+        None => id_at(bits).map(T::from_gid).ok_or(IdRefused::NoId { bits }),
         Some(table) => {
             let index = bits - 1;
             let len = table.len() as u64;

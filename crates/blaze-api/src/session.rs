@@ -695,6 +695,9 @@ impl Session {
             }
             Request::Trace { view, targets } => self.build(cx, req, &view, Work::Trace(targets))?,
             Request::Lock { view, targets } => self.build(cx, req, &view, Work::Lock(targets))?,
+            Request::Prove { emit, lean, view, subset, targets } => {
+                self.build(cx, req, &view, Work::Prove { targets, emit, subset, lean })?
+            }
             Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
             Request::Doc { view, targets, no_deps, private } => {
                 self.build(cx, req, &view, Work::Doc { targets, no_deps, private })?
@@ -1258,6 +1261,7 @@ fn incremental(work: &Work) -> bool {
         | Work::Tables
         | Work::Edit(_)
         | Work::Ahead { .. }
+        | Work::Prove { .. }
         | Work::Lock(_) => false,
     }
 }

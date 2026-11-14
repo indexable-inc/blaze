@@ -9,7 +9,7 @@ use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Relocs, Static, T
 use blaze_core::{Completion, Effect};
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
 use super::{
@@ -421,21 +421,17 @@ enum Op {
     Value(u8, u8),
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let n = tc.draw(gs::integers::<u8>().max_value(NAMES - 1));
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
-        0 => Op::Edit(n, tc.draw(gs::integers::<u8>().max_value(3))),
-        1 => Op::Size(n, tc.draw(gs::integers::<u8>().max_value(200))),
+fn op(tape: &Tape) -> Op {
+    let n = tape.int_in(0..=NAMES - 1, "function");
+    match tape.int_in(0..=7u8, "op") {
+        0 => Op::Edit(n, tape.int_in(0..=3u8, "version")),
+        1 => Op::Size(n, tape.int_in(0..=200u8, "pad")),
         2 => Op::Add(n),
         3 => Op::Remove(n),
-        4 => Op::Calls(n, tc.draw(gs::integers::<u8>().max_value((1 << NAMES) - 1))),
+        4 => Op::Calls(n, tape.int_in(0..=(1u8 << NAMES) - 1, "callee mask")),
         5 => Op::Frame(n),
-        6 => Op::Reads(n, tc.draw(gs::integers::<u8>().max_value(STATICS)).checked_sub(1)),
-        _ => Op::Value(
-            tc.draw(gs::integers::<u8>().max_value(STATICS - 1)),
-            tc.draw(gs::integers::<u8>()),
-        ),
+        6 => Op::Reads(n, tape.int_in(0..=STATICS, "static read").checked_sub(1)),
+        _ => Op::Value(tape.int_in(0..=STATICS - 1, "static"), tape.int::<u8>("value")),
     }
 }
 
@@ -528,12 +524,14 @@ fn patched_is_fresh(ops: &[Op], plant: Plant) -> Result<(), String> {
 /// covers it, and the same function names in the symbol table. Each patch is of the file
 /// the last one left, never lays the image out whole, and the digest it gives is the
 /// patched file's hashed whole.
-#[hegel::test(test_cases = 64)]
-fn a_patched_file_behaves_as_a_fresh_link(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(8));
-    if let Err(why) = patched_is_fresh(&ops, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_patched_file_behaves_as_a_fresh_link() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let ops: Vec<Op> = tape.vec(0..=8, "ops", op);
+        if let Err(why) = patched_is_fresh(&ops, Plant::None) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// One of each kind of edit, in an order that makes each do something: the directed case
@@ -771,13 +769,15 @@ fn torn_is_refused(landed: u64, cut: usize, check: Check) -> Result<(), String> 
 /// Whatever part of a patch's writes a crash kept, [`Image::verify`] refuses the file unless
 /// it is byte for byte the link's, naming it torn, and the link from scratch that follows
 /// writes the whole file, which verifies and behaves as the program.
-#[hegel::test(test_cases = 64)]
-fn a_torn_patch_is_never_taken_for_the_links_file(tc: hegel::TestCase) {
-    let landed = tc.draw(gs::integers::<u64>());
-    let cut = tc.draw(gs::integers::<usize>().max_value(2 * BLOCK));
-    if let Err(why) = torn_is_refused(landed, cut, Check::Digest) {
-        panic!("{why}");
-    }
+#[test]
+fn a_torn_patch_is_never_taken_for_the_links_file() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let landed = tape.int::<u64>("writes landed");
+        let cut = tape.int_in(0..=2 * BLOCK, "cut");
+        if let Err(why) = torn_is_refused(landed, cut, Check::Digest) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A control of [`a_torn_patch_is_never_taken_for_the_links_file`]: every write lost, the

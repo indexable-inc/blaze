@@ -12,6 +12,7 @@ use crate::msgs::codec::{Codec, Reader};
 #[cfg(feature = "tls12")]
 use crate::msgs::handshake::SessionId;
 use crate::msgs::handshake::{CertificateChain, ProtocolName};
+use crate::suites::SupportedCipherSuite;
 use crate::sync::{Arc, Weak};
 #[cfg(feature = "tls12")]
 use crate::tls12::Tls12CipherSuite;
@@ -137,7 +138,90 @@ impl Tls13ClientSessionValue {
     pub fn quic_params(&self) -> Vec<u8> {
         self.quic_params.0.clone()
     }
+
+    /// blaze: when the ticket was issued, as this client's clock read it then (its age and
+    /// expiry count from here).
+    pub fn issued(&self) -> UnixTime {
+        UnixTime::since_unix_epoch(core::time::Duration::from_secs(self.common.epoch))
+    }
+
+    /// blaze: how many seconds after [`Self::issued`] the server allows the ticket's use (at
+    /// most seven days, TLS 1.3's bound).
+    pub fn lifetime_secs(&self) -> u32 {
+        self.common.lifetime_secs
+    }
+
+    /// blaze: the ticket as bytes, for a client that resumes in another process. They hold
+    /// the resumption secret: whoever reads them can resume as this client, so they are kept
+    /// where only this client's owner can read them. Read back with
+    /// [`crate::ClientConfig::tls13_ticket_from_bytes`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        TICKET_BYTES_LAYOUT.encode(&mut out);
+        self.suite.common.suite.encode(&mut out);
+        self.age_add.encode(&mut out);
+        self.max_early_data_size.encode(&mut out);
+        self.common.ticket.encode(&mut out);
+        self.common.secret.encode(&mut out);
+        self.common.epoch.encode(&mut out);
+        self.common.lifetime_secs.encode(&mut out);
+        self.common.server_cert_chain.encode(&mut out);
+        self.quic_params.encode(&mut out);
+        out
+    }
+
+    /// blaze: the ticket [`Self::to_bytes`] wrote, bound to `verifier` and `client_creds` (the
+    /// config's, so `compatible_config` takes it) and to the suite of `suites` it names. Bytes
+    /// of another layout, or naming a suite not in `suites`, are refused.
+    pub(crate) fn from_bytes(
+        bytes: &[u8],
+        suites: &[SupportedCipherSuite],
+        verifier: &Arc<dyn ServerCertVerifier>,
+        client_creds: &Arc<dyn ResolvesClientCert>,
+    ) -> Result<Self, InvalidMessage> {
+        let r = &mut Reader::init(bytes);
+        if u8::read(r)? != TICKET_BYTES_LAYOUT {
+            return Err(InvalidMessage::UnexpectedMessage(
+                "a TLS 1.3 ticket of a layout this rustls does not write",
+            ));
+        }
+        let id = CipherSuite::read(r)?;
+        let suite = suites
+            .iter()
+            .find_map(|it| it.tls13().filter(|suite| suite.common.suite == id))
+            .ok_or(InvalidMessage::UnexpectedMessage(
+                "a TLS 1.3 ticket of a cipher suite the config does not have",
+            ))?;
+        let age_add = u32::read(r)?;
+        let max_early_data_size = u32::read(r)?;
+        let ticket: PayloadU16 = PayloadU16::read(r)?;
+        let secret: PayloadU8 = PayloadU8::read(r)?;
+        let epoch = u64::read(r)?;
+        let lifetime_secs = u32::read(r)?;
+        let server_cert_chain = CertificateChain::read(r)?.into_owned();
+        let quic_params: PayloadU16 = PayloadU16::read(r)?;
+        r.expect_empty("Tls13ClientSessionValue")?;
+        Ok(Self {
+            suite,
+            age_add,
+            max_early_data_size,
+            common: ClientSessionCommon {
+                ticket: Arc::new(ticket),
+                secret: Zeroizing::new(secret),
+                epoch,
+                lifetime_secs: cmp::min(lifetime_secs, MAX_TICKET_LIFETIME),
+                server_cert_chain: Arc::new(server_cert_chain),
+                server_cert_verifier: Arc::downgrade(verifier),
+                client_creds: Arc::downgrade(client_creds),
+            },
+            quic_params,
+        })
+    }
 }
+
+/// blaze: the layout [`Tls13ClientSessionValue::to_bytes`] writes, its first byte; a change
+/// to the layout is a new value, so bytes of an older one are refused, never misread.
+const TICKET_BYTES_LAYOUT: u8 = 1;
 
 impl core::ops::Deref for Tls13ClientSessionValue {
     type Target = ClientSessionCommon;

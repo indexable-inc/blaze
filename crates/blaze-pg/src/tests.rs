@@ -8,8 +8,7 @@ use alloc::alloc::Global;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use blaze_sql::desc::{Storage, ValueRef};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Tape;
 
 use crate::codec::{self, EncodeError, ValueError};
 use crate::proto::{base64_18, put_base64};
@@ -76,23 +75,42 @@ impl Owned {
     }
 }
 
-pub(crate) fn storage(tc: &TestCase) -> Storage {
-    tc.draw(gs::sampled_from(&STORAGES[..]))
+pub(crate) fn storage(tape: &Tape) -> Storage {
+    *tape.one_of(&STORAGES, "storage")
 }
 
 /// A value of `storage`, null sometimes when `nullable`. Text has no NUL, which Postgres text
 /// cannot hold.
-pub(crate) fn value(tc: &TestCase, storage: Storage, nullable: bool) -> Owned {
-    if nullable && tc.draw(gs::integers::<u8>().max_value(4)) == 0 {
+pub(crate) fn value(tape: &Tape, storage: Storage, nullable: bool) -> Owned {
+    if nullable && tape.int_in(0..=4u8, "null") == 0 {
         return Owned::Null;
     }
     match storage {
-        Storage::Boolean => Owned::Boolean(tc.draw(gs::booleans())),
-        Storage::Integer => Owned::Integer(tc.draw(gs::integers::<i64>())),
-        Storage::Real => Owned::Real(tc.draw(gs::floats::<f64>())),
-        Storage::Text => Owned::Text(tc.draw(gs::text().max_size(10).exclude_characters("\0"))),
-        Storage::Blob => Owned::Blob(tc.draw(gs::binary().max_size(10))),
+        Storage::Boolean => Owned::Boolean(tape.bool("boolean")),
+        Storage::Integer => Owned::Integer(tape.int("integer")),
+        Storage::Real => Owned::Real(tape.f64("real")),
+        Storage::Text => Owned::Text(text_without_nul(tape, 0..=10, "text")),
+        Storage::Blob => Owned::Blob(tape.bytes(0..=10, "blob")),
     }
+}
+
+/// `sizes` characters of `Tape::char`, none of them NUL: a NUL drawn is redrawn, in its own
+/// span, at most eight times before the case is discarded.
+fn text_without_nul(
+    tape: &Tape,
+    sizes: core::ops::RangeInclusive<usize>,
+    label: &'static str,
+) -> String {
+    let characters = tape.vec(sizes, label, |tape| {
+        for _ in 0..8 {
+            match tape.char(label) {
+                '\0' => {}
+                character => return character,
+            }
+        }
+        tape.discard()
+    });
+    characters.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -462,48 +480,55 @@ fn scram_refuses_a_server_first_message_by_name() {
     assert_eq!(first(b"r=abcd,s=c2FsdA==,i=1"), Ok(()));
 }
 
-#[hegel::test]
-fn base64_is_the_crate_s(tc: TestCase) {
-    let bytes = tc.draw(gs::binary().max_size(70));
-    let mut ours = Vec::new();
-    put_base64(&mut ours, &bytes);
-    assert_eq!(ours, STANDARD.encode(&bytes).into_bytes());
-    let nonce: [u8; 18] = core::array::from_fn(|at| bytes.get(at).copied().unwrap_or(at as u8));
-    assert_eq!(base64_18(&nonce).to_vec(), STANDARD.encode(nonce).into_bytes());
+#[test]
+fn base64_is_the_crate_s() {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
+        let bytes = tape.bytes(0..=70, "bytes");
+        let mut ours = Vec::new();
+        put_base64(&mut ours, &bytes);
+        assert_eq!(ours, STANDARD.encode(&bytes).into_bytes());
+        let nonce: [u8; 18] =
+            core::array::from_fn(|at| bytes.get(at).copied().unwrap_or(at as u8));
+        assert_eq!(base64_18(&nonce).to_vec(), STANDARD.encode(nonce).into_bytes());
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
 // The codecs.
 
 /// The refinement: decoding what `encode` wrote gives the value back, for every storage.
-#[hegel::test]
-fn a_value_round_trips(tc: TestCase) {
-    let storage = storage(&tc);
-    let value = value(&tc, storage, true);
-    let mut bytes = Vec::new();
-    codec::encode(value.as_ref(), &mut bytes).unwrap();
-    let mut rest = &bytes[..];
-    let body = codec::split_value(&mut rest, "value").unwrap();
-    assert!(rest.is_empty());
-    assert_eq!(Owned::of(codec::decode(storage, body).unwrap()), value);
+#[test]
+fn a_value_round_trips() {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
+        let storage = storage(tape);
+        let value = value(tape, storage, true);
+        let mut bytes = Vec::new();
+        codec::encode(value.as_ref(), &mut bytes).unwrap();
+        let mut rest = &bytes[..];
+        let body = codec::split_value(&mut rest, "value").unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(Owned::of(codec::decode(storage, body).unwrap()), value);
+    });
 }
 
 /// The refinement: decoding what `encode_array` wrote gives the elements back, nulls included.
-#[hegel::test]
-fn an_array_round_trips(tc: TestCase) {
-    let storage = storage(&tc);
-    let count = tc.draw(gs::integers::<usize>().max_value(6));
-    let items: Vec<Owned> = (0..count).map(|_| value(&tc, storage, true)).collect();
-    let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
-    let mut bytes = Vec::new();
-    codec::encode_array(storage, &refs, &mut bytes).unwrap();
-    let mut rest = &bytes[..];
-    let body = codec::split_value(&mut rest, "array").unwrap().expect("an array is not null");
-    assert!(rest.is_empty());
-    let mut elements = codec::decode_array(storage, body).unwrap();
-    let got: Vec<Owned> = elements.by_ref().map(|it| Owned::of(it.unwrap())).collect();
-    elements.finish().unwrap();
-    assert_eq!(got, items);
+#[test]
+fn an_array_round_trips() {
+    blaze_sim::check(blaze_sim::Config::cases(100), |tape| {
+        let storage = storage(tape);
+        let items: Vec<Owned> = tape.vec(0..=6, "items", |tape| value(tape, storage, true));
+        let refs: Vec<ValueRef<'_>> = items.iter().map(Owned::as_ref).collect();
+        let mut bytes = Vec::new();
+        codec::encode_array(storage, &refs, &mut bytes).unwrap();
+        let mut rest = &bytes[..];
+        let body =
+            codec::split_value(&mut rest, "array").unwrap().expect("an array is not null");
+        assert!(rest.is_empty());
+        let mut elements = codec::decode_array(storage, body).unwrap();
+        let got: Vec<Owned> = elements.by_ref().map(|it| Owned::of(it.unwrap())).collect();
+        elements.finish().unwrap();
+        assert_eq!(got, items);
+    });
 }
 
 #[test]

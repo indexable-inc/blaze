@@ -12,19 +12,23 @@
 //! - a test's key moved exactly when something it reaches changed;
 //! - every page hash of the file is current, and the manifest round-trips (whole and chunked).
 //!
-//! Every planted bug is caught by some seed ([`super::controls`]).
+//! Every choice (the model, the edits, the order of completions) is drawn from one tape, so a
+//! failure shrinks to its plan and its schedule together. Every planted bug is caught by some
+//! case ([`super::controls`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_sim::{Config, Flight, Nanos, Tape};
+
 use super::model::{
-    ARM64_BL, Model, ModelFront, OP_CALL, OP_HEAD, OP_PANIC, OP_RET, OP_STATIC, Rng, TYPES, fn_symbol, item, static_symbol,
+    ARM64_BL, Model, ModelFront, OP_CALL, OP_HEAD, OP_PANIC, OP_RET, OP_STATIC, TYPES, chance, fn_symbol, item, static_symbol,
 };
 use crate::Plant;
 use crate::change::{PlacementChange, Section, Sink, apply};
 use crate::key::{DebugInfo, InstanceKey, ItemId, Node, Panic, PlanKey, Settings, Symbol, Tier};
 use crate::program::{Arch, Delta, Machine, Program, ProgramError, Records};
-use crate::reach::{reach, test_key};
-use crate::record::{CodeHead, InstanceCode, Plan, RelocKind, TestKey};
+use crate::reach::{reach, reach_digest};
+use crate::record::{CodeHead, InstanceCode, Plan, RelocKind};
 use crate::codec::{Digest, Hasher, Payload};
 use crate::walk::{Answer, Ask, Fresh, Front, Prior, Seed, Walk, WalkConfig, Walked, shard_of};
 
@@ -135,7 +139,7 @@ pub(super) fn settings() -> Settings {
 }
 
 /// One walk, driven to its end over `shards` shards with completions in an order drawn from
-/// `rng`, making nodes new to the program at `new_at`. Gives what was walked, the stale nodes
+/// `tape`, making nodes new to the program at `new_at`. Gives what was walked, the stale nodes
 /// never reached, and the code records made, in order.
 pub(super) fn walk(
     front: &ModelFront,
@@ -145,7 +149,7 @@ pub(super) fn walk(
     shards: u32,
     plant: Plant,
     new_at: Tier,
-    rng: &mut Rng,
+    tape: &Tape,
 ) -> Result<(Vec<Walked>, Vec<Node>, Vec<InstanceKey>), String> {
     let mut walks = Vec::new();
     for shard in 0..shards {
@@ -154,7 +158,8 @@ pub(super) fn walk(
     for (node, seed) in seeds {
         walks[shard_of(&node.symbol(), shards) as usize].reach(*node, *seed, prior);
     }
-    let mut pending: Vec<(usize, Answer)> = Vec::new();
+    // Every answer is due at once: which comes next is the tape's choice.
+    let mut pending: Flight<(usize, Answer)> = Flight::new();
     let mut makes = Vec::new();
     for _ in 0..1_000_000 {
         let mut asked = false;
@@ -170,7 +175,7 @@ pub(super) fn walk(
                             Some(bytes) => Some(Plan::decode(bytes).map_err(|error| error.to_string())?),
                             None => None,
                         };
-                        pending.push((shard, Answer::Plan { symbol, key, plan }));
+                        pending.ask((shard, Answer::Plan { symbol, key, plan }));
                     }
                     Ask::MakePlan { symbol, key } => {
                         let plan = front.plan(&symbol);
@@ -181,14 +186,14 @@ pub(super) fn walk(
                             }
                         }
                         store.plans.insert(key, bytes);
-                        pending.push((shard, Answer::Plan { symbol, key, plan: Some(plan) }));
+                        pending.ask((shard, Answer::Plan { symbol, key, plan: Some(plan) }));
                     }
                     Ask::LookupCode { symbol, key } => {
                         let head = match store.code.get(&key) {
                             Some(bytes) => Some(CodeHead::decode_prefix(bytes).map_err(|error| error.to_string())?),
                             None => None,
                         };
-                        pending.push((shard, Answer::Code { symbol, key, head }));
+                        pending.ask((shard, Answer::Code { symbol, key, head }));
                     }
                     Ask::MakeCode { symbol, key, tier, inline, .. } => {
                         if store.code.contains_key(&key) {
@@ -198,7 +203,7 @@ pub(super) fn walk(
                         let head = code.head();
                         store.code.insert(key, code.encode());
                         makes.push(key);
-                        pending.push((shard, Answer::Code { symbol, key, head: Some(head) }));
+                        pending.ask((shard, Answer::Code { symbol, key, head: Some(head) }));
                     }
                 }
             }
@@ -220,8 +225,9 @@ pub(super) fn walk(
             }
             continue;
         }
-        let at = rng.below(pending.len() as u64) as usize;
-        let (shard, answer) = pending.swap_remove(at);
+        let Some((shard, answer)) = pending.deliver(tape, Nanos(0)) else {
+            return Err("answers are in flight, yet none is due".to_string());
+        };
         walks[shard].answer(answer, front, prior).map_err(|error| error.to_string())?;
     }
     Err("the walk's driver ran out of steps".to_string())
@@ -240,7 +246,7 @@ pub(super) fn fresh(
     shards: u32,
     plant: Plant,
     top: &[Symbol],
-    rng: &mut Rng,
+    tape: &Tape,
 ) -> Result<(Program, FileImage, Store), String> {
     let mut store = Store::default();
     let mut machine = machine;
@@ -249,7 +255,7 @@ pub(super) fn fresh(
         let mut program = Program::new(machine, front.settings, &roots(&front.model), plant);
         let seeds = program.seeds(&delta);
         // A whole build: every node is new, and only `top` is made at the top tier.
-        let (walked, unreached, _) = walk(front, &mut store, &seeds, &Fresh, shards, plant, Tier::Edit, rng)?;
+        let (walked, unreached, _) = walk(front, &mut store, &seeds, &Fresh, shards, plant, Tier::Edit, tape)?;
         match program.place(&walked, &unreached, &[], front, &store) {
             Ok(change) => {
                 let mut image = FileImage::new(machine.page);
@@ -536,11 +542,11 @@ pub(super) fn trace(program: &Program, image: &FileImage, front: &ModelFront, ar
     let Some(address) = program.address_of(&Node::Function(*entry)) else {
         return vec![Event::Bad(format!("{entry} is not placed"))];
     };
-    run(program, image, front, arch, address, budget, &mut out);
+    execute(program, image, front, arch, address, budget, &mut out);
     out
 }
 
-fn run(program: &Program, image: &FileImage, front: &ModelFront, arch: Arch, address: u64, budget: usize, out: &mut Vec<Event>) {
+fn execute(program: &Program, image: &FileImage, front: &ModelFront, arch: Arch, address: u64, budget: usize, out: &mut Vec<Event>) {
     let machine = *program.machine();
     let text = &image.sections[Section::Text.index()];
     let Some((Section::Text, mut at)) = section_of(&machine, address) else {
@@ -574,7 +580,7 @@ fn run(program: &Program, image: &FileImage, front: &ModelFront, arch: Arch, add
                 match target.map(|target| identify(program, image, target)) {
                     Some(Id::Function(_)) => {
                         if let Some(target) = target {
-                            run(program, image, front, arch, target, budget, out);
+                            execute(program, image, front, arch, target, budget, out);
                         }
                     }
                     other => out.push(Event::Bad(format!("a call to {other:?}"))),
@@ -669,7 +675,8 @@ fn model_reach(front: &ModelFront, entry: usize) -> Digest {
 
 /// A program under edit, with everything the oracles compare it to.
 pub(super) struct World {
-    pub(super) rng: Rng,
+    /// Where every choice of the world comes from.
+    pub(super) tape: Tape,
     pub(super) model: Model,
     pub(super) front: ModelFront,
     pub(super) store: Store,
@@ -710,22 +717,21 @@ pub(super) enum Edit {
 }
 
 impl World {
-    pub(super) fn new(seed: u64, plant: Plant) -> Result<World, String> {
-        let mut rng = Rng::new(seed);
-        let model = Model::generate(&mut rng);
-        let arch = if rng.chance(1, 2) { Arch::Arm64 } else { Arch::X86_64 };
-        let shards = 1 + rng.below(3) as u32;
-        let reserve = if rng.chance(1, 3) { 1 << 12 } else { 1 << 16 };
-        World::of(model, rng, arch, shards, reserve, plant)
+    pub(super) fn new(tape: &Tape, plant: Plant) -> Result<World, String> {
+        let model = Model::generate(tape);
+        let arch = if chance(tape, 1, 2, "arm64") { Arch::Arm64 } else { Arch::X86_64 };
+        let shards = 1 + tape.below(3, "more shards") as u32;
+        let reserve = if chance(tape, 1, 3, "small reserve") { 1 << 12 } else { 1 << 16 };
+        World::of(model, tape.clone(), arch, shards, reserve, plant)
     }
 
     /// A world over a model a test wrote.
-    pub(super) fn of(model: Model, mut rng: Rng, arch: Arch, shards: u32, reserve: u64, plant: Plant) -> Result<World, String> {
+    pub(super) fn of(model: Model, tape: Tape, arch: Arch, shards: u32, reserve: u64, plant: Plant) -> Result<World, String> {
         let machine = Machine { arch, page: 256, reserve };
         let front = ModelFront::new(&model, settings(), arch);
-        let (program, image, store) = fresh(&front, machine, shards, plant, &[], &mut rng)?;
+        let (program, image, store) = fresh(&front, machine, shards, plant, &[], &tape)?;
         Ok(World {
-            rng,
+            tape,
             model,
             front,
             store,
@@ -744,10 +750,11 @@ impl World {
 
     /// Applies a drawn edit to the model, giving the delta a front end would give.
     fn edit(&mut self, edit: Edit) -> Delta {
-        let rng = &mut self.rng;
+        let tape = self.tape.clone();
+        let tape = &tape;
         let mut model = self.model.clone();
         let live: Vec<usize> = (0..model.fns.len()).filter(|index| model.fns[*index].alive).collect();
-        let drawn = live[rng.below(live.len() as u64) as usize];
+        let drawn = live[tape.index(live.len(), "edited function")];
         let pick = self.pick.take().unwrap_or(drawn);
         match edit {
             Edit::Text => model.fns[pick].text += 1,
@@ -763,25 +770,25 @@ impl World {
             Edit::Body => {
                 let function = &mut model.fns[pick];
                 function.text += 1;
-                if rng.chance(1, 2) {
-                    function.cost = [10, 40, 80, 200][rng.below(4) as usize];
+                if chance(tape, 1, 2, "new cost") {
+                    function.cost = [10, 40, 80, 200][tape.below(4, "cost") as usize];
                 }
-                if rng.chance(1, 2) {
+                if chance(tape, 1, 2, "panics change") {
                     function.panics = (function.panics + 1) % 4;
                 }
-                if rng.chance(1, 3) {
-                    function.attr = [crate::inline::InlineAttr::None, crate::inline::InlineAttr::Always][rng.below(2) as usize];
+                if chance(tape, 1, 3, "attr changes") {
+                    function.attr = [crate::inline::InlineAttr::None, crate::inline::InlineAttr::Always][tape.below(2, "attr") as usize];
                 }
             }
             Edit::Signature => model.fns[pick].sig += 1,
             Edit::AddCall => {
-                let call = model.random_call(rng, pick);
+                let call = model.random_call(tape, pick);
                 model.fns[pick].calls.push(call);
                 model.fns[pick].text += 1;
             }
             Edit::RemoveFunction => {
                 let roots = model.roots();
-                if let Some(gone) = live.iter().copied().find(|index| !roots.contains(index) && rng.chance(1, 2)) {
+                if let Some(gone) = live.iter().copied().find(|index| !roots.contains(index) && chance(tape, 1, 2, "removed")) {
                     model.fns[gone].alive = false;
                     for function in &mut model.fns {
                         let before = function.calls.len();
@@ -798,14 +805,14 @@ impl World {
                 }
             }
             Edit::ChangeType => {
-                let ty = rng.below(u64::from(TYPES)) as usize;
+                let ty = tape.below(u64::from(TYPES), "retyped") as usize;
                 model.types[ty] += 1;
             }
             Edit::StaticValue => {
-                let target = rng.below(model.statics.len() as u64) as usize;
+                let target = tape.index(model.statics.len(), "static edited");
                 model.statics[target].bytes[0] = model.statics[target].bytes[0].wrapping_add(1);
-                if rng.chance(1, 3) {
-                    model.statics[target].fn_ref = model.random_plain(rng);
+                if chance(tape, 1, 3, "static repointed") {
+                    model.statics[target].fn_ref = model.random_plain(tape);
                 }
             }
             Edit::MoveSpan => model.fns[pick].line += 3,
@@ -838,12 +845,13 @@ impl World {
         delta
     }
 
-    fn test_keys(&self) -> Vec<TestKey> {
+    /// Each test's reach digest: what a reached-basis result and a mutant verdict are kept under.
+    fn test_reaches(&self) -> Vec<Digest> {
         let mut out = Vec::new();
         for test in &self.model.tests {
             let entry = fn_symbol(&self.model, *test, &[]);
             let reached = reach(&self.program, &entry, self.plant);
-            out.push(test_key(&entry, &reached, b""));
+            out.push(reach_digest(&reached));
         }
         out
     }
@@ -861,7 +869,7 @@ impl World {
                 let mut program = Program::new(machine, self.front.settings, &roots(&self.model), self.plant);
                 let seeds = program.seeds(&Delta::default());
                 let (walked, unreached, more) =
-                    walk(&self.front, &mut self.store, &seeds, &Fresh, self.shards, self.plant, Tier::Edit, &mut self.rng)?;
+                    walk(&self.front, &mut self.store, &seeds, &Fresh, self.shards, self.plant, Tier::Edit, &self.tape)?;
                 makes.extend(more);
                 let change = program.place(&walked, &unreached, &[], &self.front, &self.store).map_err(|error| error.to_string())?;
                 self.program = program;
@@ -892,7 +900,7 @@ impl World {
 
     /// One edit, walked, placed and checked by every oracle.
     pub(super) fn step(&mut self, edit: Edit) -> Result<(), String> {
-        let tests_before = self.test_keys();
+        let tests_before = self.test_reaches();
         let reaches_before = self.model_reaches();
         let delta = self.edit(edit);
         let store_before: BTreeSet<InstanceKey> = self.store.code.keys().copied().collect();
@@ -901,7 +909,7 @@ impl World {
         self.rebuilt = false;
         self.written = 0;
         let (walked, unreached, mut makes) =
-            walk(&self.front, &mut self.store, &seeds, &program, self.shards, self.plant, delta.new_at(), &mut self.rng)?;
+            walk(&self.front, &mut self.store, &seeds, &program, self.shards, self.plant, delta.new_at(), &self.tape)?;
         let first_walk: BTreeSet<InstanceKey> = makes.iter().copied().collect();
         self.place(&walked, &unreached, &delta.moved, &mut makes)?;
 
@@ -943,16 +951,16 @@ impl World {
         self.last_delta = delta;
         self.last_makes = makes;
 
-        // A test's key moved exactly when what it reaches changed; a tier-up changes nothing a
-        // test observes, so it moves no key.
-        let tests_after = self.test_keys();
+        // A test's reach digest moved exactly when what it reaches changed; a tier-up changes
+        // nothing a test observes, so it moves no digest.
+        let tests_after = self.test_reaches();
         let reaches_after = self.model_reaches();
         for index in 0..tests_after.len() {
             let moved = tests_before[index] != tests_after[index];
             let changed = reaches_before[index] != reaches_after[index];
             if moved != changed {
                 return Err(format!(
-                    "test {index}: its key {} but what it reaches {}",
+                    "test {index}: its reach digest {} but what it reaches {}",
                     if moved { "moved" } else { "stayed" },
                     if changed { "changed" } else { "did not" }
                 ));
@@ -967,7 +975,7 @@ impl World {
         // The same revision built whole, holding the same functions at the top tier: every
         // node, its key and its content must be the same.
         let top = self.program.top_tier();
-        let (program, image, store) = fresh(&self.front, *self.program.machine(), self.shards, self.plant, &top, &mut self.rng)?;
+        let (program, image, store) = fresh(&self.front, *self.program.machine(), self.shards, self.plant, &top, &self.tape)?;
         if let Some(why) = first_difference((&self.program, &self.image, &self.store), (&program, &image, &store), &self.front)? {
             return Err(why);
         }
@@ -1019,13 +1027,14 @@ pub(super) const EDITS: [Edit; 8] = [
     Edit::TierUp,
 ];
 
-/// Runs `steps` drawn edits from `seed`; the first violation, named with its seed and step.
-pub(super) fn run_seed(seed: u64, steps: usize, plant: Plant) -> Result<(), String> {
-    let mut world = World::new(seed, plant).map_err(|why| format!("seed {seed}, first build: {why}"))?;
-    world.check().map_err(|why| format!("seed {seed}, first build: {why}"))?;
+/// Runs `steps` edits drawn from `tape`; the first violation, named with its step (the failure
+/// report gives the tape that replays it).
+pub(super) fn run(tape: &Tape, steps: usize, plant: Plant) -> Result<(), String> {
+    let mut world = World::new(tape, plant).map_err(|why| format!("first build: {why}"))?;
+    world.check().map_err(|why| format!("first build: {why}"))?;
     for step in 0..steps {
-        let edit = EDITS[world.rng.below(EDITS.len() as u64) as usize];
-        world.step(edit).map_err(|why| format!("seed {seed}, step {step} ({edit:?}): {why}"))?;
+        let edit = *tape.one_of(&EDITS, "edit");
+        world.step(edit).map_err(|why| format!("step {step} ({edit:?}): {why}"))?;
     }
     Ok(())
 }
@@ -1040,27 +1049,19 @@ pub(super) fn run_seed(seed: u64, steps: usize, plant: Plant) -> Result<(), Stri
 /// test runs placed or taken in, never moves a test's key, so it never runs a test again.
 #[test]
 fn patched_programs_equal_fresh_builds() {
-    for seed in 0..64 {
-        if let Err(why) = run_seed(seed, 12, Plant::None) {
-            panic!("{why}");
-        }
-    }
+    blaze_sim::check(Config::cases(64), |tape| run(tape, 12, Plant::None));
 }
 
-/// Every edit kind, on every seed, at least once.
+/// Every edit kind, on every case, at least once.
 #[test]
 fn every_edit_kind_holds() {
-    for seed in 100..116 {
-        let mut world = match World::new(seed, Plant::None) {
-            Ok(world) => world,
-            Err(why) => panic!("seed {seed}: {why}"),
-        };
+    blaze_sim::check(Config::cases(16).first(100), |tape| -> Result<(), String> {
+        let mut world = World::new(tape, Plant::None)?;
         for edit in EDITS {
-            if let Err(why) = world.step(edit) {
-                panic!("seed {seed}, {edit:?}: {why}");
-            }
+            world.step(edit).map_err(|why| format!("{edit:?}: {why}"))?;
         }
-    }
+        Ok(())
+    });
 }
 
 /// The floor of each edit. A text-only edit of a function remakes exactly its instances and
@@ -1069,17 +1070,20 @@ fn every_edit_kind_holds() {
 /// moved item.
 #[test]
 fn edits_cost_their_floor() {
-    let mut tried = 0;
-    for seed in 200..264 {
-        let mut world = match World::new(seed, Plant::None) {
+    // Cases run, and those of them that kept their reserve: more than half must have.
+    let mut ran = 0u32;
+    let mut tried = 0u32;
+    blaze_sim::check(Config::cases(64).first(200), |tape| {
+        ran += 1;
+        let mut world = match World::new(tape, Plant::None) {
             Ok(world) => world,
-            Err(why) => panic!("seed {seed}: {why}"),
+            Err(why) => panic!("first build: {why}"),
         };
-        // Some seeds tier everything up first, so the inliners are the top tier's.
+        // Some cases tier everything up first, so the inliners are the top tier's.
         // (A row tiers up once it has been unchanged for one build, so a build passes first.)
-        if seed % 2 == 0 {
-            world.step(Edit::MoveSpan).unwrap_or_else(|why| panic!("seed {seed}, span move: {why}"));
-            world.step(Edit::TierUp).unwrap_or_else(|why| panic!("seed {seed}, tier-up: {why}"));
+        if tape.coin("tier up first") {
+            world.step(Edit::MoveSpan).unwrap_or_else(|why| panic!("span move: {why}"));
+            world.step(Edit::TierUp).unwrap_or_else(|why| panic!("tier-up: {why}"));
             if !world.rebuilt {
                 let fast: Vec<String> = world
                     .program
@@ -1098,11 +1102,11 @@ fn edits_cost_their_floor() {
                         )
                     })
                     .collect();
-                assert!(fast.is_empty(), "seed {seed}: a tier-up left rows at the fast tier: {}", fast.join("; "));
+                assert!(fast.is_empty(), "a tier-up left rows at the fast tier: {}", fast.join("; "));
             }
         }
         let live: Vec<usize> = (0..world.model.fns.len()).filter(|index| world.model.fns[*index].alive).collect();
-        let target = live[(seed as usize) % live.len()];
+        let target = live[tape.index(live.len(), "target")];
         let target_item = item(target);
         let mut expected = BTreeSet::new();
         for (symbol, row) in world.program.functions() {
@@ -1112,9 +1116,9 @@ fn edits_cost_their_floor() {
             }
         }
         world.pick = Some(target);
-        world.step(Edit::Text).unwrap_or_else(|why| panic!("seed {seed}, text edit: {why}"));
+        world.step(Edit::Text).unwrap_or_else(|why| panic!("text edit: {why}"));
         if world.rebuilt {
-            continue;
+            return;
         }
         let mut remade = BTreeSet::new();
         for (symbol, row) in world.program.functions() {
@@ -1122,36 +1126,37 @@ fn edits_cost_their_floor() {
                 remade.insert(*symbol);
             }
         }
-        assert_eq!(world.last_makes.len(), remade.len(), "seed {seed}: a make the program does not hold");
-        assert_eq!(remade, expected, "seed {seed}: a text edit of function {target} remade other than it and its inliners");
+        assert_eq!(world.last_makes.len(), remade.len(), "a make the program does not hold");
+        assert_eq!(remade, expected, "a text edit of function {target} remade other than it and its inliners");
 
         // A span move of the same function.
         world.pick = Some(target);
-        world.step(Edit::MoveSpan).unwrap_or_else(|why| panic!("seed {seed}, span move: {why}"));
-        assert!(world.last_makes.is_empty(), "seed {seed}: a span move made a code record");
+        world.step(Edit::MoveSpan).unwrap_or_else(|why| panic!("span move: {why}"));
+        assert!(world.last_makes.is_empty(), "a span move made a code record");
         let mut records = 0u64;
         for row in world.program.functions().values() {
             records += row.loc_items.iter().filter(|located| **located == target_item).count() as u64;
         }
         if !world.rebuilt {
-            assert_eq!(world.written, 4 * records, "seed {seed}: a span move wrote other than 4 bytes per location");
+            assert_eq!(world.written, 4 * records, "a span move wrote other than 4 bytes per location");
         }
         tried += 1;
-    }
-    assert!(tried > 32, "only {tried} seeds kept their reserve");
+    });
+    // Of 64 cases, more than 32: more than half.
+    assert!(2 * tried > ran, "only {tried} of {ran} cases kept their reserve");
 }
 
 /// A reached body that fails its check stops the build with an error naming the body and the
 /// check; a body nothing reaches is never checked.
 #[test]
 fn a_reached_refused_body_stops_the_walk() {
-    let mut rng = Rng::new(7);
-    let mut model = Model::generate(&mut rng);
+    let tape = Tape::seeded(7);
+    let mut model = Model::generate(&tape);
     let machine = Machine { arch: Arch::Arm64, page: 256, reserve: 1 << 16 };
     let reached = model.fns[0].calls[0].callee;
     model.refused = Some(reached);
     let refusing = ModelFront::new(&model, settings(), Arch::Arm64);
-    let error = match fresh(&refusing, machine, 1, Plant::None, &[], &mut rng) {
+    let error = match fresh(&refusing, machine, 1, Plant::None, &[], &tape) {
         Ok(_) => panic!("a build reaching a refused body succeeded"),
         Err(error) => error,
     };
@@ -1161,7 +1166,7 @@ fn a_reached_refused_body_stops_the_walk() {
     model.fns.push(model.fns[1].clone());
     model.refused = Some(unreached);
     let unreferenced = ModelFront::new(&model, settings(), Arch::Arm64);
-    if let Err(why) = fresh(&unreferenced, machine, 1, Plant::None, &[], &mut rng) {
+    if let Err(why) = fresh(&unreferenced, machine, 1, Plant::None, &[], &tape) {
         panic!("a build failed on a body it does not reach: {why}");
     }
 }
@@ -1214,7 +1219,7 @@ fn main_calls_three(attr: crate::inline::InlineAttr, cost: u32) -> Model {
 fn an_edit_of_an_instance_only_inlined_remakes_its_inliners() {
     for arch in [Arch::Arm64, Arch::X86_64] {
         let model = main_calls_three(crate::inline::InlineAttr::Always, 10);
-        let mut world = World::of(model, Rng::new(1), arch, 1, 1 << 16, Plant::None)
+        let mut world = World::of(model, Tape::seeded(1), arch, 1, 1 << 16, Plant::None)
             .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
         assert!(
             !world.program.functions().keys().any(|symbol| symbol.item == item(3)),
@@ -1237,7 +1242,7 @@ fn an_edit_of_an_instance_only_inlined_remakes_its_inliners() {
 fn a_tier_up_makes_only_what_the_program_holds() {
     for arch in [Arch::Arm64, Arch::X86_64] {
         let model = main_calls_three(crate::inline::InlineAttr::Hint, 40);
-        let mut world = World::of(model, Rng::new(2), arch, 1, 1 << 16, Plant::None)
+        let mut world = World::of(model, Tape::seeded(2), arch, 1, 1 << 16, Plant::None)
             .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
         assert!(
             world.program.functions().keys().any(|symbol| symbol.item == item(3)),
@@ -1270,7 +1275,7 @@ fn a_static_pointing_at_a_moved_function_reads_the_same() {
         let mut model = main_calls_three(crate::inline::InlineAttr::None, 40);
         model.fns[0].statics = vec![0];
         model.statics = vec![super::model::ModelStatic { bytes: [7; 8], fn_ref: Some(1) }];
-        let mut world = World::of(model, Rng::new(3), arch, 1, 1 << 16, Plant::None)
+        let mut world = World::of(model, Tape::seeded(3), arch, 1, 1 << 16, Plant::None)
             .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
         let one = Node::Function(fn_symbol(&world.model, 1, &[]));
         let before = world.program.address_of(&one);
@@ -1290,7 +1295,7 @@ fn a_static_pointing_at_a_moved_function_reads_the_same() {
 fn an_instance_its_callers_now_take_in_is_not_made() {
     for arch in [Arch::Arm64, Arch::X86_64] {
         let model = main_calls_three(crate::inline::InlineAttr::None, 40);
-        let mut world = World::of(model, Rng::new(4), arch, 1, 1 << 16, Plant::None)
+        let mut world = World::of(model, Tape::seeded(4), arch, 1, 1 << 16, Plant::None)
             .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
         world.pick = Some(3);
         world.step(Edit::Always).unwrap_or_else(|why| panic!("{arch:?}, function 3 made inline(always): {why}"));
@@ -1324,7 +1329,7 @@ fn an_edited_instance_at_a_retyped_argument_is_not_walked() {
         four.calls.push(Call { callee: 3, args: vec![Arg::Concrete(0)] });
         model.fns.push(four);
         model.fns.push(written(5, none, 40, &[]));
-        let mut world = World::of(model, Rng::new(5), arch, 1, 1 << 16, Plant::None)
+        let mut world = World::of(model, Tape::seeded(5), arch, 1, 1 << 16, Plant::None)
             .unwrap_or_else(|why| panic!("{arch:?}, first build: {why}"));
         let old_four = fn_symbol(&world.model, 4, &[0]);
         assert!(world.program.functions().contains_key(&old_four), "{arch:?}: 4<0> is not placed, so the case is not tested");
@@ -1345,9 +1350,8 @@ fn records_round_trip_through_the_core_framing() {
     use blaze_keyed::proof;
 
     use crate::keyed;
-    use crate::record::{OutsideRead, TestRecord};
 
-    let world = World::new(3, Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let world = World::new(&Tape::seeded(3), Plant::None).unwrap_or_else(|why| panic!("{why}"));
     proof::scope(|snap| {
         for (symbol, row) in world.program.functions() {
             let Some(code) = world.store.code(&row.key) else { panic!("no record of {symbol}") };
@@ -1377,19 +1381,5 @@ fn records_round_trip_through_the_core_framing() {
             Some((chunk, &bytes[..]))
         });
         assert_eq!(read, Ok(world.program.clone()));
-    });
-    let result = TestRecord {
-        key: TestKey(Digest::of("blaze program test result key 1", b"t")),
-        passed: true,
-        output: b"ok".to_vec(),
-        reads: vec![
-            OutsideRead { what: b"env:HOME".to_vec(), digest: None },
-            OutsideRead { what: b"file:data.txt".to_vec(), digest: Some(Digest::of("blaze program test file 1", b"x")) },
-        ],
-    };
-    let filed = Aligned::copy_from(&keyed::write_test(&result));
-    proof::scope(|snap| {
-        let holds = proof::hit(snap, keyed::test_key(&result.key), &filed).unwrap_or_else(|error| panic!("{error}")).holds();
-        assert_eq!(keyed::read_test(&holds, &filed), Ok(result));
     });
 }

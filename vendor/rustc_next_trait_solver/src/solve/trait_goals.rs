@@ -991,6 +991,21 @@ where
         if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
+        // `Described<'a, D, Args>: TypeOf` holds when `D` describes a type.
+        if item == SolverTraitLangItem::ReflectTypeOf {
+            use rustc_type_ir::reflect::TypeOfAnswer;
+            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                match ecx.type_of_answer(goal.param_env, goal.predicate.self_ty())? {
+                    TypeOfAnswer::Type(_) => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    }
+                    TypeOfAnswer::Unknown => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                    }
+                    TypeOfAnswer::Refused => Err(NoSolution.into()),
+                }
+            });
+        }
         let answer = reflect_trait_holds(ecx.cx(), item, goal.predicate.self_ty());
         let base = domain_of(item).map(|_| goal.predicate.trait_ref.args.type_at(1));
         ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc)

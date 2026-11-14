@@ -68,7 +68,7 @@ theorem fnOfIds_key :
     by_cases hc : e.1 = id
     · exact ⟨e, List.mem_cons.mpr (Or.inl rfl), hc⟩
     · have h' : fnOfIds rest id = some fn :=
-        ((fnOfIds_cons e rest id).trans (if_neg hc)).symm.trans h
+        ((fnOfIds_cons e rest id).trans (ite_eq_right hc)).symm.trans h
       have ⟨x, hx, hk⟩ := fnOfIds_key rest id fn h'
       exact ⟨x, List.mem_cons.mpr (Or.inr hx), hk⟩
 
@@ -86,7 +86,7 @@ theorem fnOfIds_grow (g : List (Nat × FnId)) (n : Nat) (hk : KeysBelow g n) (fn
   have ⟨e, he, hkey⟩ := fnOfIds_key g id f h
   have lt : e.1 < n := And.right (And.right hk e he)
   have ne : ¬ n = id := by omega
-  exact ((fnOfIds_cons (n, fn) g id).trans (if_neg ne)).trans h
+  exact ((fnOfIds_cons (n, fn) g id).trans (ite_eq_right ne)).trans h
 
 theorem ptrOk_grow (B : FnId → Local → Prop) (g : List (Nat × FnId)) (n : Nat)
     (hk : KeysBelow g n) (fn : FnId) (p : Pointer) (h : PtrOk B g p) :
@@ -155,9 +155,9 @@ theorem assertOn_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId)} 
     ∀ (v : Value), Outcome.All (NextBorrows B) (assertOn st expected kind target v)
   | Value.bool b => by
     by_cases hb : b = expected
-    · rw [assertOn_bool, if_pos hb]
+    · rw [assertOn_bool, ite_eq_left hb]
       exact State.jump_borrows target st h
-    · rw [assertOn_bool, if_neg hb]
+    · rw [assertOn_bool, ite_eq_right hb]
       exact Outcome.all_panic _ _
   | Value.unit => Outcome.all_undefined _ _
   | Value.int _ _ => Outcome.all_undefined _ _
@@ -192,7 +192,7 @@ theorem enterState_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId)
     cases List.mem_cons.mp he' with
     | inl here =>
       rw [here]
-      exact (fnOfIds_cons (st.next, id) g st.next).trans (if_pos rfl)
+      exact (fnOfIds_cons (st.next, id) g st.next).trans (ite_eq_left rfl)
     | inr there => exact fnOfIds_grow g st.next hk id e.1 e.2 (hcov e there)
   have locals : SlotsOk (PtrOk B ((st.next, id) :: g))
       (Slot.uninit ::
@@ -235,10 +235,10 @@ theorem State.enter_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId
     (target : Option BlockId) (hargs : ∀ (v : Value), v ∈ args → Value.Ok (PtrOk B g) v) :
     Outcome.All (NextBorrows B) (st.enter id sig args dest target) := by
   by_cases hl : args.length = sig.args
-  · rw [State.enter_eq, if_pos hl]
+  · rw [State.enter_eq, ite_eq_left hl]
     exact Outcome.all_ok
       (Exists.intro ((st.next, id) :: g) (enterState_borrows h id sig args dest target hargs))
-  · rw [State.enter_eq, if_neg hl]
+  · rw [State.enter_eq, ite_eq_right hl]
     exact Outcome.all_undefined _ _
 
 /-- A return: the frame goes, the list stays, and what is returned is a value the invariant
@@ -337,7 +337,7 @@ theorem execTerm_borrows {B : FnId → Local → Prop} {g : List (Nat × FnId)}
         switchOn_borrows r.2
           (And.intro (And.right (And.left hr)) (KeysBelow.of_next (And.right hr) (And.right h)))
           arms otherwise (switchKey r.1))
-  | Terminator.call callee args dest target =>
+  | Terminator.call callee args _ target =>
     Outcome.all_bind
       (Outcome.All.and (evalOperands_okAt args st (And.left h)) (evalOperands_next args st))
       (fun r hr =>

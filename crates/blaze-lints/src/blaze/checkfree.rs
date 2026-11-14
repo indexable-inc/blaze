@@ -45,7 +45,7 @@ const LINT: Lint = Lint::Checkfree;
 const BODIES: usize = 64;
 
 /// The options the release build's MIR is optimized with: what a checkfree function is held
-/// to.
+/// to. A release unit is an optimizing tier, which spends proofs on the program's bodies.
 pub(crate) const RELEASE: MirOptions = MirOptions {
     level: MirOptLevel::Release,
     ub_checks: false,
@@ -53,6 +53,7 @@ pub(crate) const RELEASE: MirOptions = MirOptions {
     inline: true,
     heap_to_stack: false,
     world: None,
+    tier: hir_ty::facts::Tier::Optimizing,
 };
 
 /// Whether `def` is a function marked `#[blaze::checkfree]`.

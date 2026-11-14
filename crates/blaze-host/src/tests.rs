@@ -39,7 +39,7 @@ use blaze_keyed::{
     record::{self, Fact, FactKind, Owner, StableId},
     store::{Compacted, Generation, Put, Read, RootRef, Store, StoreError},
 };
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::{
     HostError, Request,
@@ -207,8 +207,8 @@ struct Scripted {
     world: World,
     /// A body task that panics: (unit, item).
     panics: Option<(u32, &'static str)>,
-    /// The bodies write how many tasks ran before them into their payload: other bytes at one
-    /// address, which only an audit sees.
+    /// The bodies write how many tasks this front ran before them, over every request it
+    /// answered, into their payload: other bytes at one address, which only an audit sees.
     counts: bool,
     log: Lock<Vec<String>>,
 }
@@ -669,21 +669,24 @@ fn an_audit_redoes_every_hit_and_finds_no_difference() {
 
     let bench = Bench::new("blaze-host-audit-control");
     let store = bench.store();
+    // One counting front for every request: its count goes on from one request to the next, so
+    // each body it makes again holds other bytes than the record found, whatever order the pool
+    // runs the tasks in. A fresh front per request restarted the count, and the difference then
+    // hung on the pool running the bodies in another order than the cold request did: a run
+    // that kept the order was not caught (round 26).
     let mut counting = Scripted::new(world());
     counting.counts = true;
     let cold = ask(&bench.src(), &store, &counting, 5, &[]).expect("the counting cold request runs");
     cold.built();
-    let mut counting = Scripted::new(world());
-    counting.counts = true;
     let asked = ask_with(&bench.src(), &store, &counting, &mut Audit, 5, &cold.manifests).expect("the audited request runs");
     assert!(
         matches!(asked.outcome, Outcome::Failed { why: Failure::Audit { .. }, .. }),
         "a front end that is not deterministic is caught by the audit: {:?}",
         asked.outcome
     );
-    let mut counting = Scripted::new(world());
-    counting.counts = true;
+    let before = counting.calls();
     let trusted = ask(&bench.src(), &store, &counting, 5, &cold.manifests).expect("the unaudited request runs");
+    assert_eq!(counting.calls(), before, "records only asks nothing of the front end");
     assert!(matches!(trusted.outcome, Outcome::Certified { .. }), "records only trusts the hit: {:?}", trusted.outcome);
 }
 
@@ -744,11 +747,10 @@ enum Edit {
     None,
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let unit = u32::from(tc.draw(gs::integers::<u8>().max_value(1)));
-    let at = usize::from(tc.draw(gs::integers::<u8>().max_value(2)));
-    match tc.draw(gs::integers::<u8>().max_value(2)) {
+fn edit(tape: &Tape) -> Edit {
+    let unit = u32::from(tape.int_in(0..=1u8, "unit"));
+    let at = usize::from(tape.int_in(0..=2u8, "at"));
+    match tape.int_in(0..=2u8, "edit") {
         0 => Edit::Sig(unit, at),
         1 => Edit::Body(unit, at),
         _ => Edit::None,
@@ -761,9 +763,14 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// and byte for byte, the record a fresh build proves for its item (a record found by address
 /// is only what redoing it makes). Its planted-bug controls are the scenario tests' (each
 /// removes the cause and watches the effect go) and the audit's.
-#[hegel::test(test_cases = 40)]
-fn any_edits_file_what_a_fresh_build_files(tc: hegel::TestCase) {
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(6));
+#[test]
+fn any_edits_file_what_a_fresh_build_files() {
+    blaze_sim::check(Config::cases(40), any_edits);
+}
+
+/// One case of `any_edits_file_what_a_fresh_build_files`.
+fn any_edits(tape: &Tape) {
+    let edits: Vec<Edit> = tape.vec(0..=6, "edits", edit);
     let bench = Bench::new("blaze-host-edits");
     let store = bench.store();
     let mut state = world();

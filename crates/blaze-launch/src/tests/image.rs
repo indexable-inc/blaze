@@ -2,8 +2,7 @@
 //! there gives, byte for byte; its bytes read back as it was; and what is no image, or one of
 //! another layout, is refused by name.
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::image::{Base, Bases, Image, Input, LONGEST, StaticAt, VERSION, Why, lay};
 use crate::record::{Datum, Fixup, Kind, Place, Record, To, Unwind, What};
@@ -153,9 +152,10 @@ impl Program {
 }
 
 /// Where a drawn process has its mappings and its one outside symbol.
-fn drawn(tc: &TestCase) -> (u64, u64, u64) {
-    let page = |tc: &TestCase| tc.draw(gs::integers::<u64>().min_value(1).max_value(1 << 30)) * 4096;
-    (page(tc), page(tc), tc.draw(gs::integers::<u64>().max_value(1 << 46)))
+fn drawn(tape: &Tape) -> (u64, u64, u64) {
+    let code = tape.int_in(1..=1u64 << 30, "code page") * 4096;
+    let data = tape.int_in(1..=1u64 << 30, "data page") * 4096;
+    (code, data, tape.int_in(0..=1u64 << 46, "write at"))
 }
 
 /// The image kept (laid against no process, written and read back), rebased to `bases`,
@@ -177,17 +177,19 @@ fn kept(program: &Program, bases: &Bases<'_>, plant: bool) -> (Vec<u8>, Vec<u8>)
 /// against the addresses of no process, written, read back and rebased to a process's
 /// mappings and symbols, holds in its code and its data exactly the bytes that placing the
 /// same records at those addresses gives.
-#[hegel::test]
-fn an_image_rebased_is_the_placement(tc: TestCase) {
-    let (code, data, write) = drawn(&tc);
-    let addend = tc.draw(gs::integers::<i64>().min_value(-64).max_value(64));
-    let program = program(addend);
-    let outside = [write];
-    let bases = Bases { code, data, outside: &outside, tls_thunk: 0, tls: &[] };
-    let placed = program.lay(&bases);
-    let (area, bytes) = kept(&program, &bases, false);
-    assert_eq!(area, placed.area, "the code, with its mappings at {code:#x} and {data:#x}");
-    assert_eq!(bytes, placed.data, "the data, with its mappings at {code:#x} and {data:#x}");
+#[test]
+fn an_image_rebased_is_the_placement() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (code, data, write) = drawn(tape);
+        let addend = tape.int_in(-64..=64i64, "addend");
+        let program = program(addend);
+        let outside = [write];
+        let bases = Bases { code, data, outside: &outside, tls_thunk: 0, tls: &[] };
+        let placed = program.lay(&bases);
+        let (area, bytes) = kept(&program, &bases, false);
+        assert_eq!(area, placed.area, "the code, with its mappings at {code:#x} and {data:#x}");
+        assert_eq!(bytes, placed.data, "the data, with its mappings at {code:#x} and {data:#x}");
+    });
 }
 
 /// A control of [`an_image_rebased_is_the_placement`]: an image whose fixes against outside

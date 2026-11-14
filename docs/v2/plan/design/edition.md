@@ -59,6 +59,8 @@ features some of them are written with):
 | `#![feature(blaze_comptime)]`: `where const { COND }` | a where predicate that is a `bool` constant over the generic parameters; a blanket impl gated on it derives a trait from a type's shape | [ownership](ownership.md) |
 | `#![feature(blaze_const_exprs)]` | const generic arguments and array lengths that are expressions over generic parameters, unified by value or by a normal form (ledger E16) | [ownership](ownership.md) |
 | `#[blaze::holds]` | a type that holds its type arguments where no field shows it, so a handle over a linear value is linear (part of change 7) | [linear](linear.md), rule 7 |
+| `#![feature(blaze_implied_bounds)]` | the bounds a struct, enum, union or trait declares hold in every function, impl and trait whose header names it, unwritten | [implied bounds](implied-bounds.md) |
+| `#![feature(blaze_anon_params)]` | a `_` type argument in a function's parameter types or an impl's header is a parameter of its own, bounded by its position (`fn len<T>(v: &Vec<T, _>)`); turns on implied bounds | [implied bounds](implied-bounds.md) |
 
 ### Rules for the four that have no spec yet
 

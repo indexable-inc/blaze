@@ -1592,7 +1592,9 @@ fn f(x: u32) -> Option<u32> {{
 
 /// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): the path resolves to
 /// `core::blaze::contract_test` without a `blaze` crate, and the function is kept beside a test
-/// `f_contract` that assumes the `requires`, calls `f` and checks the `ensures`. `main` has
+/// `f_contract` that runs under `blaze_sim::check` (a stub crate here, with the items the
+/// expansion names), assumes the `requires`, calls `f`, checks the `ensures` and, on a failure,
+/// notes the case to paste. `main` has
 /// `core` and no `std`, so the fixture makes it `no_std` and it imports
 /// `core::prelude::rust_2024`, which the fixture's `core` has, as the real one does.
 #[test]
@@ -1613,8 +1615,21 @@ pub mod prelude {
         pub use super::v1::*;
     }
 }
-//- /hegel.rs crate:hegel
-//- /main.rs crate:main deps:core,hegel cfg:test
+//- /blaze_sim.rs crate:blaze_sim
+pub struct Tape;
+impl Tape {
+    pub fn any<T: Any>(&self, label: &'static str) -> T { T::any(self, label) }
+    pub fn assume(&self, holds: bool) {}
+}
+pub struct Config;
+impl Config {
+    pub const DEFAULT: Config = Config;
+}
+pub trait Any {
+    fn any(tape: &Tape, label: &'static str) -> Self;
+}
+pub fn check<F>(config: Config, body: F) {}
+//- /main.rs crate:main deps:core,blaze_sim cfg:test
 #![feature(blaze_verify)]
 #[blaze::contract_test]
 fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
@@ -1649,6 +1664,8 @@ fn f(x: u32) -> (r: u32) requires x < 10 ensures r > x { x + 1 }
     );
     assert!(printed.contains("r > x"), "the ensures is checked: {printed}");
     assert!(printed.contains("f("), "`f` is called: {printed}");
+    assert!(printed.contains("check("), "the case runs under `blaze_sim::check`: {printed}");
+    assert!(printed.contains(".note("), "a failure notes the case to paste: {printed}");
 }
 
 /// rustc's `lower_maybe_coroutine_body` wraps only a body that is written: a required `async fn`

@@ -1201,11 +1201,14 @@ mod tests {
 
     /// A target is what its triple says whichever targets the process named before: its word,
     /// its pointer type and its ISA are its own, and naming it again gives the same one.
-    #[hegel::test]
-    fn a_target_is_its_triple_whatever_was_named_before(tc: hegel::TestCase) {
-        use hegel::generators as gs;
+    #[test]
+    fn a_target_is_its_triple_whatever_was_named_before() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| a_target_is_its_triple(tape))
+    }
+
+    fn a_target_is_its_triple(tape: &blaze_sim::Tape) {
         let triples = vec![Target::host(), "wasm32-wasip1", "wasm64-blaze-wasip1"];
-        let order: Vec<&str> = tc.draw(gs::vecs(gs::sampled_from(triples)).min_size(1).max_size(8));
+        let order: Vec<&str> = tape.vec(1..=8, "order", |tape| *tape.one_of(&triples, "triple"));
         for triple in order {
             let target = Target::of(triple).expect("a target");
             assert_eq!(target.triple(), triple);

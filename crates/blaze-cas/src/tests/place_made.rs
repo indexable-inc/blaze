@@ -1,7 +1,7 @@
 //! An output placed from its maker's bytes ([`Store::place_made`]): the edit path's place, on
 //! the simulation ([`Sim`]), with the store's own whole files in every state beside it (a cold
 //! place writes one, seals it and begins its write-back), write-backs that never complete
-//! ([`Sim::hold_syncs`]), clean reopens and crashes at any completion. Hegel draws the run.
+//! ([`Sim::hold_syncs`]), clean reopens and crashes at any completion. The case's tape draws the run.
 //!
 //! What the simulation shows of a clone of a file with data not written back: the bytes the
 //! clone forces out of its source ([`Sim::bytes_forced`]), which on a real disk the clone
@@ -19,10 +19,8 @@
 //! once the write-back each place asks for as it ends has completed
 //! ([`PlacePlant::MadeNoWriteBack`] takes it out).
 
-use hegel::TestCase;
-use hegel::generators as gs;
-
 use blaze_core::sim::SECTOR;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -503,41 +501,36 @@ fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     Ok(world.sim.bytes_forced().saturating_sub(world.allowed))
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let byte = |tc: &TestCase| tc.draw(gs::integers::<u8>());
-    let steps = |tc: &TestCase| match tc.draw(gs::booleans()) {
-        true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
-        false => None,
-    };
-    match tc.draw(gs::integers::<u8>().max_value(21)) {
+fn op(tape: &Tape) -> Op {
+    let byte = |tape: &Tape, label: &'static str| tape.int::<u8>(label);
+    let steps = |tape: &Tape| tape.option("steps", |tape| tape.int_in(0..=12u8, "steps"));
+    match tape.int_in(0..=21u8, "op") {
         16.. => Op::Patch {
-            seed: tc.draw(gs::integers()),
-            path: byte(tc),
-            grow: byte(tc),
-            steps: steps(tc),
+            seed: tape.int::<u64>("patch seed"),
+            path: byte(tape, "path"),
+            grow: byte(tape, "grow"),
+            steps: steps(tape),
         },
         0..3 => Op::Make {
-            seed: tc.draw(gs::integers()),
-            sectors: tc.draw(gs::integers::<u8>().max_value(60)),
-            tail: byte(tc),
-            runs: byte(tc),
+            seed: tape.int::<u64>("make seed"),
+            sectors: tape.int_in(0..=60u8, "sectors"),
+            tail: byte(tape, "tail"),
+            runs: byte(tape, "runs"),
         },
-        3 | 4 => Op::Cold { seed: tc.draw(gs::integers()), path: byte(tc), steps: steps(tc) },
-        5..12 => Op::Place { image: byte(tc), path: byte(tc), steps: steps(tc) },
+        3 | 4 => Op::Cold { seed: tape.int::<u64>("cold seed"), path: byte(tape, "path"), steps: steps(tape) },
+        5..12 => Op::Place { image: byte(tape, "image"), path: byte(tape, "path"), steps: steps(tape) },
         12 => Op::Settle,
         13 | 14 => Op::Crash,
         _ => Op::Reopen,
     }
 }
 
-#[hegel::composite]
-fn case(tc: &TestCase) -> Case {
+fn case(tape: &Tape) -> Case {
     Case {
-        seed: tc.draw(gs::integers()),
-        latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
-        held: tc.draw(gs::booleans()),
-        ops: tc.draw(gs::vecs(op()).min_size(1).max_size(24)),
+        seed: tape.next_u64("sim seed"),
+        latency_us: tape.int_in(1..=2000u64, "latency us"),
+        held: tape.bool("held"),
+        ops: tape.vec(1..=24, "ops", op),
     }
 }
 
@@ -555,11 +548,11 @@ fn case(tc: &TestCase) -> Case {
 /// path holds nothing, a value once placed there whole, or what the power left of one (each
 /// byte the value's, a zero or, for a patch, its base's), never bytes of anything else; and
 /// the store opens.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_made_output_is_placed_with_no_clone_and_no_wait_for_a_write_back() {
-    super::model_check::run_cases(96, |tc| {
-        let case = tc.draw(case());
+    blaze_sim::check(SimConfig::cases(96), |tape| {
+        let case = case(tape);
         match forced(&case, PlacePlant::None) {
             Err(why) => panic!("{case:?}: {why}"),
             Ok(0) => {}

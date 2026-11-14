@@ -40,7 +40,6 @@ one level down:
     fuzz/                     the fuzz targets and their corpora (docs/fuzzing.md)
     site/                     the website, and install.sh, the installer `curl | sh` and CI run
     licenses/                 NOTICE and the license texts of code blaze includes
-    hegel.toml                Hegel's settings for the property tests (read from the root)
     Cargo.toml, pyproject.toml, flake.nix
                               the Rust, Python (uv) and Nix workspaces, each with its lock
 
@@ -231,8 +230,8 @@ files are, what they hold, the DuckDB queries that answer each question and the 
 - A test that fails before and passes after: the real crate's own tests for a bug found in
   it, a unit test beside the code for one small enough to state, a step in the relevant edit
   harness for a daemon bug ([harness.md](harness.md#adding-a-test)).
-- For concurrent, durable, crash-recovering, billing or data-deleting code: a Hegel
-  deterministic simulation test whose oracle checks the invariant, with a planted bug it
+- For concurrent, durable, crash-recovering, billing or data-deleting code: a deterministic
+  simulation test (`blaze_sim::check`) whose oracle checks the invariant, with a planted bug it
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, under Cranelift and under LLVM, on the platform you have. Say which platforms
   you did not run. CI's merge gate is the build and the unit tests on Linux AArch64 (on ix runners), and
@@ -301,9 +300,9 @@ mean `blaze stop`), which helps a person; a script is helped only by stopping.
 
 How blaze tests its own code is the `testing` skill
 ([.agents/skills/testing/SKILL.md](../.agents/skills/testing/SKILL.md)), the one home for it:
-which tests to write and how few, property tests with Hegel (vendor/hegeltest, imported as
-`hegel`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation tests on
-`blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
+which tests to write and how few, property tests and simulations on blaze's own engine
+(`crates/blaze-sim`; never proptest, quickcheck, arbitrary or bolero), deterministic simulation
+tests on `blaze_core::sim::Sim` and their oracles, and testing a causal claim. Concurrent, durable,
 crash-recovering, billing and data-deleting code is proven by a deterministic simulation test,
 not by a code review (rule `dst-not-review`).
 

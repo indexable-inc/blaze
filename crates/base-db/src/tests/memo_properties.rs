@@ -4,7 +4,7 @@
 
 use std::alloc::Global;
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::{EditDb, load, ran, test_db};
 use crate::{Db, FileId, FileText};
@@ -31,25 +31,21 @@ enum Op {
     Commit,
 }
 
-fn text(tc: &hegel::TestCase) -> String {
-    tc.draw(gs::text().alphabet("ab\n").max_size(40))
+fn text(tape: &Tape) -> String {
+    tape.text_from("ab\n", 0..=40, "text")
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=7u8, "op") {
         0 | 1 => {
-            let count = tc.draw(gs::integers::<u8>().min_value(1).max_value(3));
+            let count = tape.int_in(1..=3u8, "texts");
             let mut texts = Vec::new_in(Global);
             for _ in 0..count {
-                texts.push((tc.draw(gs::integers().max_value(FILES - 1)), text(tc)));
+                texts.push((tape.int_in(0..=FILES - 1, "file"), text(tape)));
             }
             Op::Set(texts)
         }
-        2..7 => Op::Read {
-            file: tc.draw(gs::integers().max_value(FILES - 1)),
-            through: tc.draw(gs::booleans()),
-        },
+        2..7 => Op::Read { file: tape.int_in(0..=FILES - 1, "file"), through: tape.bool("through") },
         _ => Op::Commit,
     }
 }
@@ -57,18 +53,18 @@ fn op(tc: &hegel::TestCase) -> Op {
 /// The invariant: every answer of [`text_len`] and [`len_read_through`] is the length the
 /// model's text gives, after any edits and commits; and an ask twice in one snapshot runs
 /// nothing the second time.
-fn gives_what_recomputing_gives(tc: &hegel::TestCase) {
+fn gives_what_recomputing_gives(tape: &Tape) {
     let mut db = test_db();
     let mut model = Vec::new_in(Global);
     let mut paths = Vec::new_in(Global);
     for file in 0..FILES {
-        model.push(text(tc));
+        model.push(text(tape));
         paths.push(format!("/f{file}.rs"));
     }
     let mut files = Vec::new_in(Global);
     files.extend(paths.iter().zip(&model).map(|(path, text)| (path.as_str(), text.as_str())));
     load(&mut db, 0, &files);
-    for op in tc.draw(gs::vecs(op()).max_size(60)) {
+    for op in tape.vec(0..=60, "ops", op) {
         match op {
             Op::Set(texts) => {
                 db.commit_with(|edit| {
@@ -101,7 +97,8 @@ fn gives_what_recomputing_gives(tc: &hegel::TestCase) {
     }
 }
 
-#[hegel::test(test_cases = 64)]
-fn memos_give_what_recomputing_gives(tc: hegel::TestCase) {
-    gives_what_recomputing_gives(&tc);
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
+#[test]
+fn memos_give_what_recomputing_gives() {
+    blaze_sim::check(Config::cases(64), gives_what_recomputing_gives);
 }

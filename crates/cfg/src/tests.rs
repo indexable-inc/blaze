@@ -1,6 +1,5 @@
+use blaze_sim::{Config, Tape};
 use expect_test::{Expect, expect};
-use hegel::TestCase;
-use hegel::generators as gs;
 use intern::Symbol;
 use syntax::{Edition, SourceFile, view, view::AstNode as _};
 use syntax_bridge::{
@@ -248,27 +247,30 @@ fn fold_answers_every_variant() {
 }
 
 /// A name from few letters, so atoms repeat across an expression.
-fn name(tc: &TestCase) -> Symbol {
-    Symbol::intern(&tc.draw(gs::text().alphabet("abc").max_size(3)))
+fn name(tape: &Tape) -> Symbol {
+    Symbol::intern(&tape.text_from("abc", 0..=3, "name"))
 }
 
-fn cfg_expr(tc: &TestCase, depth: u32) -> CfgExpr {
-    let pick: u8 = tc.draw(gs::integers().max_value(if depth == 0 { 1 } else { 4 }));
+fn cfg_expr(tape: &Tape, depth: u32) -> CfgExpr {
+    let most: u8 = if depth == 0 { 1 } else { 4 };
+    let pick: u8 = tape.int_in(0..=most, "pick");
     let exprs = || -> Box<[CfgExpr]> {
-        let len: usize = tc.draw(gs::integers().max_value(4));
-        (0..len).map(|_| cfg_expr(tc, depth - 1)).collect()
+        let len: usize = tape.int_in(0..=4, "len");
+        (0..len).map(|_| cfg_expr(tape, depth - 1)).collect()
     };
     match pick {
         0 => CfgExpr::Invalid,
-        1 if tc.draw(gs::booleans()) => CfgAtom::Flag(name(tc)).into(),
-        1 => CfgAtom::KeyValue { key: name(tc), value: name(tc) }.into(),
+        1 if tape.bool("a flag") => CfgAtom::Flag(name(tape)).into(),
+        1 => CfgAtom::KeyValue { key: name(tape), value: name(tape) }.into(),
         2 => CfgExpr::All(exprs()),
         3 => CfgExpr::Any(exprs()),
-        _ => CfgExpr::Not(Box::new(cfg_expr(tc, depth - 1))),
+        _ => CfgExpr::Not(Box::new(cfg_expr(tape, depth - 1))),
     }
 }
 
-#[hegel::test(test_cases = 512)]
-fn any_expr_has_a_dnf(tc: TestCase) {
-    DnfExpr::new(&cfg_expr(&tc, 5));
+#[test]
+fn any_expr_has_a_dnf() {
+    blaze_sim::check(Config::cases(512), |tape| {
+        DnfExpr::new(&cfg_expr(tape, 5));
+    });
 }

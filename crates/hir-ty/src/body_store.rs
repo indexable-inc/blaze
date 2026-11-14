@@ -403,7 +403,8 @@ impl Store {
     }
 
     /// The kernel's verified answer of `step` of `def` under `schema` for this database, if
-    /// one was posted ([`entries::serve`]) and it still holds: the body's `identity` (read by
+    /// one was posted for its body ([`entries::serve`], by [`entries::BodyName`], in any
+    /// snapshot) and it still holds: the body's `identity` (read by
     /// the caller) and each fact it and every earlier step it read saw (the row holds them
     /// all, `entries::serve`) are read again here, in the running query, so its read list
     /// holds what the answer depends on, with nothing run. A kept answer's validity is its
@@ -417,7 +418,10 @@ impl Store {
         schema: SchemaHash,
         identity: ContentId,
     ) -> Option<Arc<entries::Served>> {
-        let served = self.served.lock().get(def, step, schema)?;
+        // By the body's name, never its id: a row posted in an earlier snapshot answers in
+        // this one while what it read holds, and the id it was posted for may be dead.
+        let name = entries::BodyName::of(db, def)?;
+        let served = self.served.lock().get(name, step, schema)?;
         if entries::unchecked() {
             return Some(served);
         }

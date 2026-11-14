@@ -31,7 +31,7 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

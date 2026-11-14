@@ -34,8 +34,8 @@ half-ported tree blocks every lane's run.
 Build only what you are proud of, on the first iteration too: the first version of a design is
 already the one you would defend, never a placeholder to improve later; then iterate. Pick the best
 long-term design, not the least work: own the layer or port rustc's rule properly, and spend the
-effort on proving it right: real crates' own test suites passing under blaze, Hegel property tests
-and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
+effort on proving it right: real crates' own test suites passing under blaze, property tests and
+deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
 hostile bytes.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).

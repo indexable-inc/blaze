@@ -213,7 +213,7 @@ Steps, each its own PR:
 
 ## How it is proven
 
-A DST (`dst-not-review`), `crates/blaze-core/src/wait/tests.rs`: Hegel draws a sequence of
+A DST (`dst-not-review`), `crates/blaze-core/src/wait/tests.rs`: the tape draws a sequence of
 waits (a deadline, or none), when the awaited event arrives (before, at or after the deadline,
 or never), and a swarm of kernel faults on a simulated kernel with a virtual clock: spurious
 EINTR at any blocking call (and a drawn train of them at a fixed period, the sampler's shape),

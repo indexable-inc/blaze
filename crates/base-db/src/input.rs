@@ -828,6 +828,13 @@ pub struct Crate {
     /// ([`crate::Edit::give`]). Not in its content ID.
     #[get(slots_field)]
     slots: Vec<(std::any::TypeId, CrateSlot)>,
+    /// The `OUT_DIR`s of the other listed crates of its root file's source root, each without
+    /// a trailing separator, its own left out, sorted, each once ([`crate::other_out_dirs`]).
+    /// Made by the world each commit from every crate's variables (`world::out_dirs_of`); a
+    /// commit where they moved marks this crate's arena alone. Not in its content ID: what it
+    /// selects is in [`crate::crate_root_content`].
+    #[get(out_dirs_field)]
+    out_dirs: crate::world::Dirs,
 }
 
 /// One thing given to one crate ([`crate::Edit::give`]): an input of its own, in the crate's
@@ -838,6 +845,12 @@ pub struct CrateSlot {
 }
 
 impl Crate {
+    /// The crate's other `OUT_DIR`s as the world made them at the last commit (the field's
+    /// getter is this module's own): what [`crate::other_out_dirs`] keeps for its callers.
+    pub(crate) fn out_dirs(self, db: &Db) -> &crate::world::Dirs {
+        self.out_dirs_field(db)
+    }
+
     /// What was given to this crate as kind `K` ([`crate::Edit::give`]), if it is a `T`;
     /// `None` when nothing was. Reads the crate's list of slots and the one slot, both facts of
     /// the crate's own arena: a gift to another crate or of another kind is not read.
@@ -851,6 +864,19 @@ impl Crate {
         let kind = std::any::TypeId::of::<K>();
         let slot = self.slots_field(db).iter().find(|it| it.0 == kind)?.1;
         slot.value(db).get::<T>()
+    }
+
+    /// What was given to this crate as the located kind `K` ([`crate::Edit::give_located`]), if
+    /// it is a `T`; `None` when nothing was. Read off the snapshot's table, no input of any
+    /// arena: no reader depends on it, which the kind's promise makes sound ([`crate::Located`]:
+    /// a reader computes the same value with the gift as without it). The giver's fact is
+    /// listed as read (`blaze_memo::read`), so a read list kept for a store names it.
+    pub fn located<K: crate::Located, T: std::any::Any>(self, db: &Db) -> Option<&T> {
+        let kind = std::any::TypeId::of::<K>();
+        let row = db.snap().table.located.get(self.key(db).0 as usize)?;
+        let (_, fact, value) = row.iter().find(|it| it.0 == kind)?;
+        blaze_memo::read(blaze_memo::Database::memo(db), *fact);
+        value.get::<T>()
     }
 
     /// The world's key of this crate: what an edit names it by, the same in every snapshot.

@@ -82,12 +82,26 @@ impl<H: Http + 'static> Fetcher<H> {
             .with_policy(blaze_registry::pinned::policy(&self.retry))
     }
 
+    /// The BLAKE3 tree digest of the git repository `url` at `commit`, fetched fresh into
+    /// the fetcher's scratch and pinned by nothing: what `blaze audit pin` records on trust
+    /// at first use. `at` is the checkout's place as the load names it
+    /// (`<sources>/git/checkouts/<ident>/<commit>`); nothing is written there.
+    pub fn unpinned_git_digest(&self, url: &str, commit: &str, at: &str) -> anyhow::Result<blaze_fetch::Digest> {
+        let fetch = Fetch {
+            what: format!("git repository `{url}`"),
+            url: url.to_owned(),
+            kind: FetchKind::Git { commit: commit.to_owned(), tree: String::new() },
+            at: at.to_owned(),
+        };
+        git::unpinned_digest(self, &fetch, commit)
+    }
+
     /// `fetch`, fetched and checked, as the daemon puts it into the VFS.
     pub fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = match &fetch.kind {
             FetchKind::Crate { sha256 } => self.package(fetch, sha256)?,
             FetchKind::IndexFile => self.index_file(fetch)?,
-            FetchKind::Git { commit } => git::tree(self, fetch, commit)?,
+            FetchKind::Git { commit, tree } => git::tree(self, fetch, commit, tree)?,
             // Read where it is, never fetched: the job reads it through `Steps::local`.
             FetchKind::Local { .. } => {
                 return Err(failed(fetch, &[format!("`{}` is a path on the disk, which is read where it is, not fetched", fetch.at)], None));

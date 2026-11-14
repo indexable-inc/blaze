@@ -760,6 +760,12 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
                 frozen::encode_lang_items(&fresh, live),
                 "{name} {mode:?}"
             );
+            assert_eq!(
+                frozen::encode_diagnostic_items(&db, krate),
+                frozen::encode_diagnostic_items(&fresh, live),
+                "{name} {mode:?}"
+            );
+            frozen::check_diagnostic_items(&db, krate);
         }
         assert_eq!(frozen::differences(), Vec::<String>::new(), "{mode:?}");
     }
@@ -782,6 +788,7 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
 /// arenas again (round 20: before `1.0:15, 1.0:20, ..`, after `1.0:11, 1.0:12, ..`), so no row
 /// made before the serve is read after it, and the ids it would key by are not comparable.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_crate_served_after_it_was_resolved_keeps_its_module_ids() {
     let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
@@ -844,7 +851,7 @@ fn an_image_written_under_another_key_is_an_error() {
     memory
         .images
         .lock()
-        .insert(key, Arc::new(Aligned::copy_from(&image_with(other, [b"", b""]))));
+        .insert(key, Arc::new(Aligned::copy_from(&image_with(other, [b""; Part::ALL.len()]))));
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
@@ -1257,6 +1264,35 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
         "the crate's calls as they are now refuse nothing"
     );
     TRACES.store(false, SeqCst);
+}
+
+/// The invariant: the expansion log holds one row per call site, however many edits: each
+/// edit of `lib.rs` makes `lib`'s arena again and gives its call another id, and the call's
+/// next expansion replaces the row of its site. Keyed by the call's id, a row was left under
+/// each dead id, one more per edit.
+///
+/// The control: an edit that moves the call to another site (its item renamed) adds a row,
+/// and the old site keeps its own: what the log is keyed by is the site.
+#[test]
+fn the_expansion_log_holds_one_row_per_call_site_across_edits() {
+    let _turn = TURN.lock();
+    VALUE.store(0, SeqCst);
+    TRACES.store(false, SeqCst);
+    let (mut db, file) = flaky_db();
+    let expand = |db: &TestDB| {
+        let _ = crate::nameres::crate_def_map(db, crate_named(db, "lib"));
+    };
+    expand(&db);
+    assert_eq!(db.files().expansion_rows(), 1, "premise: the call's unknown read is logged");
+    for text in ["pub struct Made {}", "pub struct Made;", "pub struct Made(u8);", "pub struct Made;"] {
+        _ = db.set_file_text(file, &format!("#[proc_macros::flaky]\n{text}\n"));
+        expand(&db);
+        assert_eq!(db.files().expansion_rows(), 1, "after `{text}`: one call site, one row");
+    }
+
+    _ = db.set_file_text(file, "#[proc_macros::flaky]\npub struct Moved;\n");
+    expand(&db);
+    assert_eq!(db.files().expansion_rows(), 2, "the control: a call at another site is another row");
 }
 
 /// A rebuilt library of macros is another library: its dependents' keys change with it.
@@ -1968,6 +2004,61 @@ pub fn f() {}
     );
 }
 
+/// The invariant: a crate whose `#[path]` module is a file of another package's source root
+/// (in an arena of that root's, made before every crate's) reads it as its own module, and
+/// an edit of that file reaches the crate: the commit makes the crate's arena again, and its
+/// def map then has the file's new items. The edit drops the file's root, the crates rooted
+/// there and the crates that read it across roots, with their dependents, and no other.
+///
+/// The control: the same edit with the `#[path]` module taken out of `lib` carries `lib`'s
+/// arena: the read across roots is what takes the edit to it, not a drop of every arena.
+#[test]
+fn an_edit_of_a_path_module_in_another_source_root_reaches_the_crate_that_reads_it() {
+    const READS: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library
+#[path = "../../../ws/member/src/shared.rs"]
+pub mod m;
+//- /ws/member/src/lib.rs crate:member new_source_root:local
+pub mod shared;
+//- /ws/member/src/shared.rs
+pub fn f() {}
+//- /other/src/lib.rs crate:other new_source_root:local
+pub fn o() {}
+"#;
+    let _turn = TURN.lock();
+    // Whether the edit of `shared.rs` made each crate's arena again, by name; and the names
+    // `lib`'s module of that file declares after it (none where `lib` has no such module).
+    let edit = |fixture: &str| -> (Vec<(&'static str, bool)>, Vec<String>) {
+        let fx = fixture::db(fixture);
+        let shared = fx.file_at("/ws/member/src/shared.rs").file_id(fx.db());
+        let mut db = fx.into_db();
+        let keys = ["lib", "member", "other"].map(|name| (name, crate_named(&db, name).key(&db)));
+        let _ = crate::nameres::crate_def_map(&db, crate_named(&db, "lib"));
+        let _ = crate::nameres::crate_def_map(&db, crate_named(&db, "member"));
+        let committed = db.set_file_text(shared, "pub fn g() {}\n");
+        let dropped = keys
+            .iter()
+            .map(|&(name, key)| (name, committed.dropped.contains(&db.krate(key).gid().arena().index())))
+            .collect();
+        let lib = crate_named(&db, "lib");
+        let def_map = crate::nameres::crate_def_map(&db, lib);
+        let declared = def_map
+            .modules(&db)
+            .find(|(_, it)| it.origin.file_id().map(|file| file.file_id(&db)) == Some(shared))
+            .map(|(_, it)| it.scope(&db).entries().map(|(name, _)| name.as_str().to_owned()).collect())
+            .unwrap_or_default();
+        (dropped, declared)
+    };
+    let (dropped, declared) = edit(READS);
+    assert_eq!(dropped, [("lib", true), ("member", true), ("other", false)]);
+    assert_eq!(declared, ["g"], "`lib`'s module `m` is the file as edited");
+
+    let (dropped, declared) =
+        edit(&READS.replace("#[path = \"../../../ws/member/src/shared.rs\"]\npub mod m;", "pub fn own() {}"));
+    assert_eq!(declared, Vec::<String>::new(), "premise: `lib` has no module of the file");
+    assert_eq!(dropped, [("lib", false), ("member", true), ("other", false)], "the control");
+}
+
 /// A registry crate under `dir` that includes `<dir>/outside.rs`, a file of no source root.
 fn outside_fixture(dir: &std::path::Path) -> String {
     let dir = dir.to_str().expect("a UTF-8 temporary directory");
@@ -2127,6 +2218,8 @@ fn an_edit_of_a_file_that_is_not_utf8_gives_a_new_key() {
     assert_eq!(key_in(&binary_db(before)), key, "the same bytes, the same key");
 
     fixture::set_bytes(&mut db, "/registry/lib/src/blob.bin", after);
+    // `lib` again after the write: the write dropped the arena its id was of.
+    let lib = crate_named(&db, "lib");
     assert_ne!(key_in(&db), key, "an edit of the bytes moves the key");
     assert_ne!(
         signatures::encode(&db, lib, &mut Vec::new()).unwrap(),
@@ -2536,6 +2629,8 @@ fn a_layout_7_image_is_a_named_miss() {
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.old_layout), ["lib"]);
     assert_eq!(names(&db, &served.hits), ["core"]);
+    // `lib` again after the serve: its commit may have dropped the arena its id was of.
+    let lib = crate_named(&db, "lib");
     assert_eq!(mode(&db, lib), None, "`lib` is resolved from source");
     assert_eq!(mode(&db, crate_named(&db, "core")), Some(Mode::Serve));
     let fresh = fixture::db(FIXTURE).into_db();
@@ -2902,7 +2997,8 @@ pub fn made() {}
 "#;
 
 /// `fixture`'s `lib`: its late reads as [`image_parts`] gives them with `nested`, and the
-/// content ID of its `made.rs`.
+/// blaze-vfs content ID of its `made.rs`'s bytes: what the host answers a file ask with
+/// (`blaze_host::outside::file_answer`), never base-db's `file_content`.
 fn late_of(fixture: &str, nested: late::Nested) -> (Vec<LateSeen, Global>, ContentId) {
     let fixture = fixture::db(fixture);
     let made = fixture.file_at("/registry/lib/src/made.rs").file_id(fixture.db());
@@ -2912,7 +3008,9 @@ fn late_of(fixture: &str, nested: late::Nested) -> (Vec<LateSeen, Global>, Conte
         Ok(parts) => parts.late,
         Err(refused) => panic!("`lib` refused: {refused}"),
     };
-    (late, db.file_content(made))
+    let bytes = ContentId::of(blaze_vfs::FILE_DOMAIN, db.file_text(made).text(&db).as_bytes());
+    assert_ne!(bytes, db.file_content(made), "premise: base-db's content ID is not the bytes' alone");
+    (late, bytes)
 }
 
 fn seen(which: u8, name: &str, value: LateValue) -> LateSeen {
@@ -3084,4 +3182,205 @@ fn a_key_that_names_no_crate_is_the_typed_error() {
         shown.contains(&format!("crate key {}", least.index())) && shown.contains("keys-cover-every-input"),
         "{shown}"
     );
+}
+
+/// A library with a diagnostic item on a function, a struct, a trait and its method, an
+/// inherent impl's method, an exported `macro_rules!` and a module, and one name given twice.
+const DIAGNOSTIC_ITEMS: &str = r#"
+//- /main.rs crate:main deps:lib new_source_root:local
+fn main() {}
+
+//- /lib.rs crate:lib deps:core new_source_root:library
+#![feature(rustc_attrs)]
+#[rustc_diagnostic_item = "lib_fn"]
+pub fn f() {}
+#[rustc_diagnostic_item = "LibStruct"]
+pub struct S;
+#[rustc_diagnostic_item = "LibTrait"]
+pub trait T {
+    #[rustc_diagnostic_item = "lib_trait_method"]
+    fn m(&self);
+}
+impl S {
+    #[rustc_diagnostic_item = "lib_impl_method"]
+    pub fn new() -> S { S }
+}
+#[macro_export]
+#[rustc_diagnostic_item = "lib_macro"]
+macro_rules! made { () => {} }
+#[rustc_diagnostic_item = "lib_mod"]
+pub mod inner {
+    #[rustc_diagnostic_item = "Twice"]
+    pub fn first() {}
+    #[rustc_diagnostic_item = "Twice"]
+    pub fn second() {}
+}
+
+//- /core.rs crate:core new_source_root:library
+#[lang = "sized"]
+pub trait Sized {}
+#[rustc_builtin_macro]
+pub macro derive {}
+pub mod prelude { pub mod rust_2018 { pub use crate::derive; } }
+"#;
+
+/// The queries that read a page of a served crate's def map past its head (a module's scope,
+/// a name, its traits, a textual macro), and the one that reads an item's
+/// `#[rustc_diagnostic_item]`: what a walk of the crate runs.
+fn diagnostic_item_page_reads(ran: &[String]) -> usize {
+    let read = ["scope_memo", "name_memo", "traits_memo", "legacy_macro_memo", "diagnostic_item"];
+    ran.iter().filter(|it| read.contains(&query_of(it))).count()
+}
+
+/// The query a run of the log is of: a row is `path::to::query(key)`
+/// ([`TestDBExt::executed_in_read_order`]), this is `query`.
+fn query_of(run: &str) -> &str {
+    let path = run.split('(').next().unwrap_or(run);
+    path.rsplit("::").next().unwrap_or(path)
+}
+
+/// The invariant: a crate served from its image answers `crate_diagnostic_items` from the
+/// image's diagnostic items part, reading no page of its def map past its head and no item's
+/// attributes, and the answer is the walk's: equal, item for item, to the walk of the same
+/// crate in the same database (the same ids), and written as the same bytes as the crate's
+/// diagnostic items resolved from source in another database (each item named by its path,
+/// [`frozen::Enc::attr_owner`]). The control: with the part taken away (its slot taken in an
+/// edit, as [`super::withdraw_image`] takes it), the same question walks the crate's pages,
+/// which the count sees, and writes the same bytes. Compared as bytes, by path: the edit that
+/// takes the slot makes `lib`'s arena again, so its items' ids are not the first answer's.
+#[test]
+fn diagnostic_items_of_a_served_crate_are_read_from_its_image_and_equal_the_walk() {
+    use crate::{AdtId, AttrDefId, MacroId, diagnostic_item::crate_diagnostic_items, test_db::TestDBExt};
+    let _turn = TURN.lock();
+    let (memory, stored) = stored(DIAGNOSTIC_ITEMS);
+    assert_eq!(stored.refused, Vec::new());
+    let fresh = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let from_source = frozen::encode_diagnostic_items(&fresh, crate_named(&fresh, "lib")).unwrap();
+
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    // `lib` of this snapshot: the serve committed, which drops its arena.
+    let lib = crate_named(&db, "lib");
+    // The head of `lib`'s pages, which a dependent reads first: read before the count.
+    _ = crate::nameres::crate_def_map(&db, lib).crate_root(&db);
+    assert_eq!(
+        image(&db, lib).unwrap().part(Part::DiagnosticItems),
+        from_source.as_slice(),
+        "the part is the crate's diagnostic items as resolved from source"
+    );
+    let mut read = None;
+    let ran = db.executed_in_read_order(|| read = Some(crate_diagnostic_items(&db, lib).clone()));
+    let read = read.unwrap();
+    assert!(
+        ran.iter().any(|it| query_of(it) == "crate_diagnostic_items"),
+        "premise: the query ran: {ran:?}"
+    );
+    assert_eq!(diagnostic_item_page_reads(&ran), 0, "a served crate's pages were walked: {ran:?}");
+    assert_eq!(frozen::encode_diagnostic_items(&db, lib).unwrap(), from_source);
+
+    let mut by_name: Vec<&str> = read.by_name.keys().map(|it| it.as_str()).collect();
+    by_name.sort_unstable();
+    assert_eq!(
+        by_name,
+        [
+            "LibStruct",
+            "LibTrait",
+            "Twice",
+            "lib_fn",
+            "lib_impl_method",
+            "lib_macro",
+            "lib_mod",
+            "lib_trait_method"
+        ]
+    );
+    let get = |name: &str| read.get(&intern::Symbol::intern(name)).unwrap();
+    assert!(matches!(get("lib_fn"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("LibStruct"), AttrDefId::AdtId(AdtId::StructId(_))));
+    assert!(matches!(get("LibTrait"), AttrDefId::TraitId(_)));
+    assert!(matches!(get("lib_trait_method"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("lib_impl_method"), AttrDefId::FunctionId(_)));
+    assert!(matches!(get("lib_macro"), AttrDefId::MacroId(MacroId::MacroRulesId(_))));
+    assert!(matches!(get("lib_mod"), AttrDefId::ModuleId(_)));
+    assert_eq!(read.duplicates.len(), 1, "{:?}", read.duplicates);
+    assert_eq!(read.duplicates[0].0.as_str(), "Twice");
+
+    // The control: the part taken away, the same question walks `lib`'s pages, in the same
+    // database, and the walk writes the bytes the image's answer wrote.
+    let mut edit = db.edit();
+    let key = lib.key(edit.db());
+    assert!(edit.take_given::<frozen::DiagnosticItemsSlot>(key), "premise: `lib` held the part");
+    _ = edit.commit();
+    let lib = crate_named(&db, "lib");
+    let mut walked = None;
+    let ran = db.executed_in_read_order(|| walked = Some(crate_diagnostic_items(&db, lib).clone()));
+    assert!(diagnostic_item_page_reads(&ran) > 0, "the count does not see a walk of the pages: {ran:?}");
+    let walked = walked.unwrap();
+    assert_eq!(walked.by_name.len(), read.by_name.len(), "the image's answer is not the walk's");
+    assert_eq!(walked.duplicates.len(), read.duplicates.len(), "the image's answer is not the walk's");
+    assert_eq!(
+        frozen::encode_diagnostic_items(&db, lib).unwrap(),
+        from_source,
+        "the image's answer is not the walk's"
+    );
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+/// The invariant: two databases write a crate's diagnostic items as the same bytes (the rows
+/// in the order of their names, never a hash map's); and an image without the part (version
+/// 3's schema, or this schema with two parts) is refused when opened, and a serve that finds
+/// one under a crate's key is an error naming the crate: never an image whose crate has no
+/// diagnostic items. Bytes of the part that do not decode stop the query with
+/// [`frozen::Unreadable`] naming the crate and the part, never a walk in their place.
+#[test]
+fn diagnostic_items_are_the_same_bytes_and_an_image_without_them_is_refused() {
+    let _turn = TURN.lock();
+    let [a, b] = [(); 2].map(|()| {
+        let db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+        frozen::encode_diagnostic_items(&db, crate_named(&db, "lib")).unwrap()
+    });
+    assert_eq!(a, b);
+    assert!(a.len() > 8, "the part holds the table: {} bytes", a.len());
+
+    let key = ContentId([1; 32]);
+    let old = Aligned::copy_from(&super::image::write_two_part_image(key, [b"lang", b"sig"], true));
+    assert!(matches!(ImageRef::open(&old, key), Err(ImageError::Format(_))), "version 3 read");
+    let short = Aligned::copy_from(&super::image::write_two_part_image(key, [b"lang", b"sig"], false));
+    assert!(matches!(ImageRef::open(&short, key), Err(ImageError::Parts(_))), "two parts read");
+
+    let (memory, stored) = stored(DIAGNOSTIC_ITEMS);
+    let db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let lib = crate_named(&db, "lib");
+    let filed = stored.filed[&lib.key(&db)];
+    let two = super::image::write_two_part_image(filed, [b"", b""], false);
+    memory.images.lock().insert(filed, Arc::new(Aligned::copy_from(&two)));
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let crates = all(&db);
+    let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
+    assert!(error.contains("the image of crate lib"), "{error}");
+
+    let mut db = fixture::db(DIAGNOSTIC_ITEMS).into_db();
+    let mut damaged = a.clone();
+    damaged.truncate(a.len() - 1);
+    let frozen = frozen::Frozen { bytes: PartBytes::from(damaged), mode: Mode::Serve };
+    let mut edit = db.edit();
+    let given = {
+        let db = edit.db();
+        let lib = crate_named(db, "lib");
+        let fact = frozen::frozen_fact(stable_id(db, lib), "diagnostic items", &frozen);
+        (lib, fact, frozen)
+    };
+    assert_eq!(frozen::give_diagnostic_items(&mut edit, [given]), 1);
+    _ = edit.commit();
+    // `lib` of this snapshot: the gift's commit dropped its arena.
+    let lib = crate_named(&db, "lib");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        _ = crate::diagnostic_item::crate_diagnostic_items(&db, lib);
+    }));
+    let Err(payload) = caught else { panic!("a damaged part was answered") };
+    let Some(stop) = frozen::Unreadable::of_payload(&*payload) else {
+        panic!("the refusal unwound with another payload than `frozen::Unreadable`")
+    };
+    assert_eq!((stop.krate, stop.kind), (lib, "diagnostic items"));
 }

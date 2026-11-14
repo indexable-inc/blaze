@@ -8,7 +8,7 @@ use blaze_report::{
     say,
     say::{Code, Words},
 };
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use hir_expand::declarative::stored::index;
 use span::AstIdMap;
 use syntax::{Edition, Extensions, SourceFile, SyntaxKind};
@@ -157,13 +157,18 @@ fn items_agree_with_the_old_front_end_on_real_files() {
 /// as comment, body, header, insert or remove, the entries whose bytes changed are exactly
 /// what the classification says: none; that item; that item; the file and the new item; the
 /// file and the removed item.
-#[hegel::test(test_cases = 200)]
-fn an_edit_changes_exactly_the_entries_its_class_says(tc: TestCase) {
-    let count = 1 + tc.draw(gs::integers::<usize>().max_value(11));
+#[test]
+fn an_edit_changes_exactly_the_entries_its_class_says() {
+    blaze_sim::check(Config::cases(200), edit_case);
+}
+
+/// One case of [`an_edit_changes_exactly_the_entries_its_class_says`].
+fn edit_case(tape: &Tape) {
+    let count = 1 + tape.int_in(0usize..=11, "items past the first");
     let mut pieces: Vec<String> = Vec::new();
     for n in 0..count {
-        let value = tc.draw(gs::integers::<u32>().max_value(9));
-        pieces.push(match tc.draw(gs::integers::<u8>().max_value(3)) {
+        let value = tape.int_in(0u32..=9, "value");
+        pieces.push(match tape.int_in(0u8..=3, "piece") {
             0 => format!("pub fn item{n}(x: u32) -> u32 {{\n    x + {value} + 7777\n}}\n"),
             1 => format!("struct Item{n} {{ a: u32 }}\nimpl Item{n} {{\n    fn item{n}(&self) -> u32 {{ self.a + {value} + 7777 }}\n}}\n"),
             2 => format!("const ITEM{n}: u32 = {value};\nfn item{n}() -> u32 {{ fn inner() -> u32 {{ {value} }} inner() + 7777 }}\n"),
@@ -171,11 +176,11 @@ fn an_edit_changes_exactly_the_entries_its_class_says(tc: TestCase) {
         });
     }
     let before = items_of(&pieces.concat());
-    let target = tc.draw(gs::integers::<usize>().max_value(count - 1));
+    let target = tape.index(count, "target");
     let name = format!("item{target}");
     let id = id_of(&before, Kind::Fn, &name);
     let mut edited = pieces.clone();
-    let mut expected: Vec<Key> = match tc.draw(gs::integers::<u8>().max_value(4)) {
+    let mut expected: Vec<Key> = match tape.int_in(0u8..=4, "edit class") {
         0 => {
             edited[target] = format!("// a comment\n{}\n\n", edited[target].replace(" + ", "  /* c */ +  "));
             Vec::new()
@@ -190,7 +195,7 @@ fn an_edit_changes_exactly_the_entries_its_class_says(tc: TestCase) {
             vec![id.0]
         }
         3 => {
-            let at = tc.draw(gs::integers::<usize>().max_value(count));
+            let at = tape.int_in(0usize..=count, "insert at");
             edited.insert(at, String::from("fn fresh(y: u8) -> u8 { y }\n"));
             Vec::new()
         }

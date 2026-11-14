@@ -1,10 +1,9 @@
-//! The token hash's properties (Hegel): a stream hashes the same wherever it sits and however
-//! the caller numbers its anchors and contexts, and any change to a token changes the hash.
+//! The token hash's properties: a stream hashes the same wherever it sits and however the caller
+//! numbers its anchors and contexts, and any change to a token changes the hash.
 
-use blaze_rng::SplitMix64;
-use hegel::TestCase;
+use blaze_sim::{Broke, Config, Tape};
 
-use super::support::{CONTROL_SEEDS, Draw, Drawn};
+use super::support::CONTROL;
 use crate::{
     Digest,
     tokens::{
@@ -33,15 +32,15 @@ struct Spec {
     ctx: u32,
 }
 
-fn stream(d: &mut impl Draw) -> Vec<Spec> {
-    (0..d.int(1, 12))
+fn stream(tape: &Tape) -> Vec<Spec> {
+    (0..tape.int_in(1..=12u64, "tokens"))
         .map(|_| Spec {
-            kind: d.under(KINDS.len()),
-            text: format!("t{}", d.int(0, 5)),
-            start: d.int(0, 200) as u32,
-            len: d.int(0, 8) as u32,
-            anchor: d.int(0, 2),
-            ctx: d.int(0, 2) as u32,
+            kind: tape.index(KINDS.len(), "kind"),
+            text: format!("t{}", tape.int_in(0..=5u64, "text")),
+            start: tape.int_in(0..=200u32, "start"),
+            len: tape.int_in(0..=8u32, "len"),
+            anchor: tape.int_in(0..=2u64, "anchor"),
+            ctx: tape.int_in(0..=2u32, "ctx"),
         })
         .collect()
 }
@@ -76,48 +75,58 @@ fn hash(specs: &[Spec], placing: Placing, plant: TokenPlant) -> Digest {
     hasher.finish().0
 }
 
-fn other_placing(d: &mut impl Draw) -> Placing {
-    Placing { shift: d.int(1, 50_000) as u32, anchor_base: d.int(1, 1 << 40), ctx_base: d.int(1, 1 << 20) as u32 }
+fn other_placing(tape: &Tape) -> Placing {
+    Placing {
+        shift: tape.int_in(1..=50_000u32, "shift"),
+        anchor_base: tape.int_in(1..=1u64 << 40, "anchor base"),
+        ctx_base: tape.int_in(1..=1u32 << 20, "ctx base"),
+    }
 }
 
 const HERE: Placing = Placing { shift: 0, anchor_base: 0, ctx_base: 0 };
 
+/// A stream, placed here and elsewhere: the first property's oracle, under `plant`.
+fn placed(tape: &Tape, plant: TokenPlant) -> Result<(), Broke> {
+    let specs = stream(tape);
+    let there = other_placing(tape);
+    if hash(&specs, HERE, plant) != hash(&specs, there, plant) {
+        return Err(Broke::Oracle(format!("a stream moved and renumbered hashes otherwise: {specs:?}")));
+    }
+    Ok(())
+}
+
 /// The invariant: a stream moved in its file (an edit above the call) and numbered with
 /// other ids (another database, another revision) hashes as it did.
-#[hegel::test(test_cases = 300)]
-fn equal_streams_hash_equal_wherever_they_sit(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let specs = stream(&mut d);
-    let there = other_placing(&mut d);
-    assert_eq!(hash(&specs, HERE, TokenPlant::None), hash(&specs, there, TokenPlant::None), "{specs:?}");
+#[test]
+fn equal_streams_hash_equal_wherever_they_sit() {
+    blaze_sim::check(Config::cases(300), |tape| placed(tape, TokenPlant::None));
 }
 
 /// The invariant: any change to one token (its kind, text, start or length) changes the hash.
-#[hegel::test(test_cases = 300)]
-fn any_token_change_changes_the_hash(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let specs = stream(&mut d);
-    let mut changed = specs.clone();
-    let at = d.under(changed.len());
-    match d.int(0, 3) {
-        0 => changed[at].kind = (changed[at].kind + 1 + d.under(KINDS.len() - 1)) % KINDS.len(),
-        1 => changed[at].text.push('x'),
-        2 => changed[at].start += 1,
-        _ => changed[at].len += 1,
-    }
-    assert_ne!(hash(&specs, HERE, TokenPlant::None), hash(&changed, HERE, TokenPlant::None), "{specs:?} -> {changed:?}");
+#[test]
+fn any_token_change_changes_the_hash() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let specs = stream(tape);
+        let mut changed = specs.clone();
+        let at = tape.index(changed.len(), "changed token");
+        match tape.int_in(0..=3u8, "change") {
+            0 => {
+                changed[at].kind = (changed[at].kind + 1 + tape.index(KINDS.len() - 1, "other kind")) % KINDS.len()
+            }
+            1 => changed[at].text.push('x'),
+            2 => changed[at].start += 1,
+            _ => changed[at].len += 1,
+        }
+        assert_ne!(
+            hash(&specs, HERE, TokenPlant::None),
+            hash(&changed, HERE, TokenPlant::None),
+            "{specs:?} -> {changed:?}"
+        );
+    });
 }
 
 /// The control: a hash of the caller's anchor ids is caught by the first property.
 #[test]
 fn the_property_catches_anchor_ids_hashed() {
-    for seed in 0..CONTROL_SEEDS {
-        let mut d = SplitMix64::new(seed);
-        let specs = stream(&mut d);
-        let there = other_placing(&mut d);
-        if hash(&specs, HERE, TokenPlant::HashAnchorIds) != hash(&specs, there, TokenPlant::HashAnchorIds) {
-            return;
-        }
-    }
-    panic!("hashing the caller's anchor ids went unseen at seeds 0..{CONTROL_SEEDS}");
+    blaze_sim::control(CONTROL, TokenPlant::None, TokenPlant::HashAnchorIds, "hashes otherwise", placed);
 }

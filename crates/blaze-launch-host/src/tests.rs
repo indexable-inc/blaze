@@ -1,4 +1,4 @@
-//! The daemon's side under every schedule Hegel draws: builds landing while launchers'
+//! The daemon's side under every schedule a case's tape draws: builds landing while launchers'
 //! messages, the daemon's frames and the answers to first calls are in flight, launchers
 //! connecting between them, and stubs firing against whatever build is newest when their
 //! need arrives.
@@ -29,16 +29,15 @@ use blaze_items::{CodeHash, ItemKey};
 use blaze_launch::wire::{self, Ask, ProgramId, RecordId, Tell};
 use blaze_launch::{Slot, Thread};
 use blaze_link::Position;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::bind::{self, Bound, Names, Under};
 use crate::program::{Conn, Piece, Plant, Program, Said, Told};
 use crate::record::{self, Defines, Positions};
 use crate::start::{self, Of};
 
-fn pick(tc: &TestCase, max: usize) -> usize {
-    tc.draw(gs::integers::<usize>().max_value(max))
+fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
+    tape.int_in(0..=max, label)
 }
 
 fn id(domain: u8, a: u64, b: u64) -> ContentId {
@@ -851,18 +850,23 @@ enum Op {
     Answer(usize),
 }
 
-fn op(tc: &TestCase) -> Op {
-    match pick(tc, 15) {
-        0 | 1 => Op::OneBody(pick(tc, 7)),
-        2 => Op::TwoBodies(pick(tc, 7)),
+fn op(tape: &Tape) -> Op {
+    match pick(tape, 15, "op") {
+        0 | 1 => Op::OneBody(pick(tape, 7, "function")),
+        2 => Op::TwoBodies(pick(tape, 7, "function")),
         3 => Op::Static,
         4 => Op::Added,
         5 => Op::Connect,
-        6..=8 => Op::Read(pick(tc, 3)),
-        9 | 10 => Op::Heard(pick(tc, 3)),
-        11 | 12 => Op::Need(pick(tc, 3), pick(tc, 9)),
-        _ => Op::Answer(pick(tc, 7)),
+        6..=8 => Op::Read(pick(tape, 3, "launcher")),
+        9 | 10 => Op::Heard(pick(tape, 3, "launcher")),
+        11 | 12 => Op::Need(pick(tape, 3, "launcher"), pick(tape, 9, "slot")),
+        _ => Op::Answer(pick(tape, 7, "want")),
     }
+}
+
+/// A schedule of up to 60 ops.
+fn ops(tape: &Tape) -> Vec<Op> {
+    tape.vec(0..=60, "ops", op)
 }
 
 /// Runs `ops` against a program with `plant`, then lets everything in flight arrive, and
@@ -955,12 +959,14 @@ fn step(sim: &mut Sim, op: Op, version: &mut u64) -> Result<(), String> {
 /// static it defined changed) was told to start again. So an edit that lands while another
 /// is in flight, or while a stub's need or the driver's answer to it is, never leaves code of
 /// an old input bound.
-#[hegel::test(test_cases = 300)]
-fn no_schedule_leaves_a_launcher_on_code_of_an_old_build(tc: TestCase) {
-    let ops: Vec<Op> = (0..pick(&tc, 60)).map(|_| op(&tc)).collect();
-    if let Err(why) = run(&ops, Plant::None) {
-        panic!("{why}\nops: {ops:?}");
-    }
+#[test]
+fn no_schedule_leaves_a_launcher_on_code_of_an_old_build() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let ops = ops(tape);
+        if let Err(why) = run(&ops, Plant::None) {
+            panic!("{why}\nops: {ops:?}");
+        }
+    });
 }
 
 /// The refinement: for any program, call order and interleaving of builds, each slot a
@@ -968,10 +974,14 @@ fn no_schedule_leaves_a_launcher_on_code_of_an_old_build(tc: TestCase) {
 /// the build given at its start) holds for it: a program given only its start, and each
 /// first call's piece when it is asked for (by bind key from the store, or made by the newest
 /// build), binds what one given everything binds.
-#[hegel::test(test_cases = 200)]
-fn a_lazy_program_binds_what_the_whole_build_binds(tc: TestCase) {
-    let functions = 2 + pick(&tc, 3);
-    let ops: Vec<Op> = (0..pick(&tc, 60)).map(|_| op(&tc)).collect();
+#[test]
+fn a_lazy_program_binds_what_the_whole_build_binds() {
+    blaze_sim::check(Config::cases(200), lazy_binds_as_whole);
+}
+
+fn lazy_binds_as_whole(tape: &Tape) {
+    let functions = 2 + pick(tape, 3, "functions");
+    let ops = ops(tape);
     let checked = (|| {
         let mut sim = Sim::new(Source::new(functions), Plant::None)?;
         let mut version = 1;
@@ -1020,12 +1030,14 @@ fn a_lazy_program_binds_what_the_whole_build_binds(tc: TestCase) {
 /// by an edit that binds it or by a refusal of it, whether the program held its record, the
 /// driver read it from the store or the newest build made it, and however the answers
 /// interleave with builds and other launchers' calls.
-#[hegel::test(test_cases = 200)]
-fn every_need_is_answered_once(tc: TestCase) {
-    let ops: Vec<Op> = (0..pick(&tc, 60)).map(|_| op(&tc)).collect();
-    if let Err(why) = run(&ops, Plant::None) {
-        panic!("{why}\nops: {ops:?}");
-    }
+#[test]
+fn every_need_is_answered_once() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        if let Err(why) = run(&ops, Plant::None) {
+            panic!("{why}\nops: {ops:?}");
+        }
+    });
 }
 
 /// The schedules that show each planted bug: a launcher whose entry is bound by its start,
@@ -1464,14 +1476,18 @@ fn bound_by(bound: Bound) -> (Result<(), String>, Vec<u8>, Option<RecordId>) {
 /// The invariant: `decode(encode(b)) == b` for any bound record (byte for byte: its encoding
 /// again is the same bytes), and `took` of the decoded record leaves the launcher as `took` of
 /// `b`: the same frames, and its slot bound to `b`'s record.
-#[hegel::test(test_cases = 200)]
-fn a_bind_record_reads_back_and_binds_as_its_piece(tc: TestCase) {
-    let callees = pick(&tc, 3);
-    let statics = pick(&tc, 2);
-    let symbols = (tc.draw(gs::booleans()), tc.draw(gs::booleans()));
-    let outside = tc.draw(gs::booleans());
-    let binds: Vec<bool> = (0..callees + statics).map(|_| tc.draw(gs::booleans())).collect();
-    let anchors: Vec<u8> = (0..pick(&tc, 3)).map(|_| tc.draw(gs::integers::<u8>())).collect();
+#[test]
+fn a_bind_record_reads_back_and_binds_as_its_piece() {
+    blaze_sim::check(Config::cases(200), bind_record_reads_back);
+}
+
+fn bind_record_reads_back(tape: &Tape) {
+    let callees = pick(tape, 3, "callees");
+    let statics = pick(tape, 2, "statics");
+    let symbols = (tape.bool("callee symbol"), tape.bool("static symbol"));
+    let outside = tape.bool("outside");
+    let binds: Vec<bool> = (0..callees + statics).map(|_| tape.bool("bind")).collect();
+    let anchors: Vec<u8> = tape.vec(0..=3, "anchors", |tape| tape.int::<u8>("anchor"));
     let bound = drawn(callees, statics, symbols, outside, &binds, &anchors);
     let bytes = bind::encode(&bound);
     let read = bind::decode(&bytes).expect("a bind record reads back");
@@ -1540,12 +1556,15 @@ fn restarted(ops: &[(bool, Op)], plant: Plant) -> Result<(), String> {
 /// `awaited()` and `ask_of`; and each image it keeps is byte for byte the one the never
 /// restored one keeps at the same point. The controls are
 /// [`the_oracle_catches_a_restore_that_drops_needed_forgets_asks_or_keys_by_identity_alone`].
-#[hegel::test(test_cases = 200)]
-fn a_restored_program_tells_what_the_kept_one_tells(tc: TestCase) {
-    let ops: Vec<(bool, Op)> = (0..pick(&tc, 60)).map(|_| (pick(&tc, 7) == 0, op(&tc))).collect();
-    if let Err(why) = restarted(&ops, Plant::None) {
-        panic!("{why}\nops: {ops:?}");
-    }
+#[test]
+fn a_restored_program_tells_what_the_kept_one_tells() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        // A restart before one op in eight, as before; calm is none.
+        let ops: Vec<(bool, Op)> = tape.vec(0..=60, "ops", |tape| (tape.one_in(8, "restart first"), op(tape)));
+        if let Err(why) = restarted(&ops, Plant::None) {
+            panic!("{why}\nops: {ops:?}");
+        }
+    });
 }
 
 /// A launcher that started and called `f1`.

@@ -28,7 +28,9 @@
 //! read the environment and files; `ExpansionReads` is the deps image's, not this key's), an
 //! eager call (`include!`, `env!`, `concat!`: its input is an expansion and a file or the
 //! environment), an attribute macro (which attributes before it are active is a resolution),
-//! a builtin that reads a position, a path or a module (`line!`, `file!`, `module_path!`), a
+//! a builtin that reads a position, a path or a module (`line!`, `file!`, `module_path!`) or
+//! the spacing of its tokens as the file has it (`stringify!`, `assert!`: a row is of tokens,
+//! `index::tokens`, and holds only the spacing the parser and a token tree see), a
 //! call in a body (no row: lane records-bodies) and a call in an expansion whose key is
 //! `None`. Such an expansion's items are made from it, as before.
 //!
@@ -50,8 +52,9 @@ use crate::{
 };
 
 /// The layout of the key: a change of what a key hashes changes it, so a kept entry under a
-/// key of another layout is a miss.
-pub const LAYOUT: u32 = 1;
+/// key of another layout is a miss. 2: a call and a definition by their rows' hashes of tokens
+/// (index layout 4), and no key for `stringify!` and `assert!`.
+pub const LAYOUT: u32 = 2;
 
 const DOMAIN: &str = "blaze v2 expansion key";
 
@@ -169,9 +172,7 @@ fn site(db: &Db, file: HirFileId, ast: ErasedFileAstId, krate: Crate, hasher: &m
 fn pure_fn_like(expander: BuiltinFnLikeExpander) -> Option<()> {
     use BuiltinFnLikeExpander as E;
     match expander {
-        E::Assert
-        | E::Stringify
-        | E::Asm
+        E::Asm
         | E::GlobalAsm
         | E::NakedAsm
         | E::CfgSelect
@@ -189,6 +190,10 @@ fn pure_fn_like(expander: BuiltinFnLikeExpander) -> Option<()> {
         | E::PatternType => Some(()),
         // A position, a path or a module of the call, which no part of the key names.
         E::Column | E::File | E::Line | E::ModulePath => None,
+        // The spacing of the call's tokens as the file has it (`source_joined` reads the
+        // file's text: `stringify!(f( x ))` is `"f( x )"`, an assertion's message likewise),
+        // which the call's row, of tokens and not of text, does not hold.
+        E::Stringify | E::Assert => None,
         // Not read for what it reads.
         E::Gca => None,
     }

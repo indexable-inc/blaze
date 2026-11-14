@@ -1024,7 +1024,7 @@ impl MacroCallId {
             let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
             db.files().expansions_are_read(
                 loc.krate.key(db),
-                base_db::ReadBy::Call(self.into()),
+                base_db::ReadBy::Call(self.site_key(db)),
                 Vec::new(),
             );
             return (
@@ -1082,7 +1082,7 @@ impl MacroCallId {
             // alloc: one entry, once per expansion of unknown reads
             &proc_macro::ExpansionReads::Unknown(why) => vec![base_db::ExpansionRead::Unknown(why)],
         };
-        db.files().expansions_are_read(loc.krate.key(db), base_db::ReadBy::Call(self.into()), logged);
+        db.files().expansions_are_read(loc.krate.key(db), base_db::ReadBy::Call(self.site_key(db)), logged);
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
@@ -1090,7 +1090,68 @@ impl MacroCallId {
     }
 }
 
+/// The most calls [`MacroCallId::site_key`] walks from a call to the real file its chain is
+/// written in: past any recursion limit a crate can set (rustc's default is 128, and a call
+/// nested in expansions is one step per level).
+pub const SITE_CHAIN_BOUND: u32 = 1 << 16;
+
 impl MacroCallId {
+    /// The call's key by its site, which outlives the snapshot its id is of: its kind, the ast
+    /// id of the node it is written on (`span::ast_id`: an item's kind, name and index among
+    /// its namesakes, not its place in the file, so an edit elsewhere keeps it), which
+    /// attribute or derive of that node it is, and the file it is written in: a real file by
+    /// its [`span::FileId`], an expansion by its own call's key, so a call nested in expansions is
+    /// named by its chain down to a real file. Not the macro its path resolves to (a call that
+    /// resolves elsewhere after an edit is the same call, expanded again), and not its crate,
+    /// which whoever keys by this keys by beside it ([`base_db::ReadBy::Call`]). Two calls of
+    /// one crate share it only where one file is two modules of the crate (two `#[path]`
+    /// declarations of it): the same tokens under the same macro.
+    ///
+    /// Cost: one hash of a few words per call in the chain, once per expansion of a proc
+    /// macro, whose run is the expander's.
+    ///
+    /// # Panics
+    ///
+    /// Where the chain is longer than [`SITE_CHAIN_BOUND`] calls: each call's file is an
+    /// expansion of a call made before it, so the chain ends at a real file well within it.
+    pub fn site_key(self, db: &Db) -> blaze_ids::ContentId {
+        let mut hasher = blaze_ids::Hasher::new("blaze hir-expand macro call site");
+        let mut call = self;
+        for _ in 0..SITE_CHAIN_BOUND {
+            let loc = call.loc(db);
+            hasher.update(&loc.kind.erased_ast_id().into_raw().to_le_bytes());
+            match &loc.kind {
+                MacroCallKind::FnLike { eager, .. } => {
+                    hasher.update(&[0, u8::from(eager.is_some())]);
+                }
+                MacroCallKind::Derive { derive_attr_index, derive_index, .. } => {
+                    hasher.update(&[1]);
+                    hasher.update(&derive_attr_index.item_tree_index().to_le_bytes());
+                    hasher.update(&derive_index.to_le_bytes());
+                }
+                MacroCallKind::Attr { censored_attr_ids, .. } => {
+                    hasher.update(&[2]);
+                    hasher.update(&censored_attr_ids.invoc_attr().item_tree_index().to_le_bytes());
+                }
+            }
+            match loc.kind.file_id() {
+                HirFileId::FileId(file) => {
+                    hasher.update(&[0]).update(&file.file_id(db).index().to_le_bytes());
+                    return hasher.finish();
+                }
+                HirFileId::MacroFile(parent) => {
+                    hasher.update(&[1]);
+                    call = parent;
+                }
+            }
+        }
+        panic!(
+            "the macro call {self:?} is written in an expansion more than {SITE_CHAIN_BOUND} \
+             calls deep, past `SITE_CHAIN_BOUND`: a call's file is an expansion of an earlier \
+             call, so its chain ends at a real file"
+        );
+    }
+
     /// Special case of [`Self::macro_expand`] for procedural macros.
     fn expand_proc_macro(self, db: &Db) -> &ExpandResult<tt::TopSubtree> {
         &self.proc_macro_expansion(db).0

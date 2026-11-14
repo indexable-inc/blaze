@@ -1080,8 +1080,23 @@ mod tests {
     /// rounds`, making tokio-macros): a new revision retires every crate's shared cache, and
     /// the replace that found them past their grace dropped them all under the table's spin
     /// lock, while every other thread's first use of a scope spun on it.
+    ///
+    /// Run in a process of its own: a grace is process-wide (`blaze_reclaim`'s one epoch), so
+    /// in the shared test binary any other test's task, a parked fiber's slot or a long query on
+    /// another thread, pins it, and whether the armed value passed its grace within the loop
+    /// below then hung on how other tests were scheduled (round 26: "the armed value was never
+    /// dropped"). Alone, the only tasks are this test's own, each ended before the next state,
+    /// so the armed generation, retired at state 1, passes its grace at state 2, every run.
     #[test]
     fn a_retired_generation_is_dropped_outside_the_tables_lock() {
+        if std::env::var_os(CHILD).is_none() {
+            in_own_process("a_retired_generation_is_dropped_outside_the_tables_lock");
+            return;
+        }
+        a_retired_generation_is_dropped_outside_the_tables_lock_here();
+    }
+
+    fn a_retired_generation_is_dropped_outside_the_tables_lock_here() {
         let table = table::<SlowDrop>(4);
         let (dropped, other) = (key(), key());
         {

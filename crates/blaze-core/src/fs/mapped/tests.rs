@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use blaze_ids::rng::SplitMix64;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config;
 
 use super::{Advice, MapOptions, Mapped};
 
@@ -165,21 +164,23 @@ fn a_mapping_is_shared_across_threads() {
 }
 
 /// The mapping against the safe reference, for any bytes and any options.
-#[hegel::test(test_cases = 64)]
-fn a_mapping_is_the_file_read(tc: TestCase) {
-    let bytes: Vec<u8> = tc.draw(gs::binary().max_size(39_999));
-    let populate = tc.draw(gs::booleans());
-    let huge = tc.draw(gs::booleans());
-    let advice: usize = tc.draw(gs::integers().max_value(3));
-    let dir = dir("prop");
-    let path = dir.join(format!("{:016x}", name_of(&bytes)));
-    std::fs::write(&path, &bytes).unwrap();
-    let options = MapOptions::new().populate(populate).huge_pages(huge).advise(ADVICE[advice]);
-    // SAFETY: the case's own file; cases run one at a time, and each drops its mapping
-    // before the next writes a file.
-    let mapped = unsafe { options.open(&path) }.unwrap();
-    assert_eq!(mapped.bytes(), &reference(&path)[..]);
-    assert_eq!(mapped.bytes(), &bytes[..]);
+#[test]
+fn a_mapping_is_the_file_read() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=39_999, "bytes");
+        let populate = tape.bool("populate");
+        let huge = tape.bool("huge");
+        let advice: usize = tape.int_in(0..=3, "advice");
+        let dir = dir("prop");
+        let path = dir.join(format!("{:016x}", name_of(&bytes)));
+        std::fs::write(&path, &bytes).unwrap();
+        let options = MapOptions::new().populate(populate).huge_pages(huge).advise(ADVICE[advice]);
+        // SAFETY: the case's own file; cases run one at a time, and each drops its mapping
+        // before the next writes a file.
+        let mapped = unsafe { options.open(&path) }.unwrap();
+        assert_eq!(mapped.bytes(), &reference(&path)[..]);
+        assert_eq!(mapped.bytes(), &bytes[..]);
+    })
 }
 
 /// FNV-1a: a name for a case's file.

@@ -13,7 +13,7 @@ use blaze_ids::ContentId;
 pub const NONE: u32 = u32::MAX;
 
 /// The layout of a file image's tables, [`ImageTables::layout`]. 2: the read-addressed image
-/// (D38): no name pool, a row's header and own-text digests and its escapes; 1 was the
+/// (D39): no name pool, a row's header and own-text digests and its escapes; 1 was the
 /// text-closure image, whose rows a reader of this layout refuses by name.
 pub const LAYOUT: u32 = 2;
 

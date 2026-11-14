@@ -157,7 +157,7 @@ mod writer {
     use blaze_core::Stamp;
     use blaze_ids::{ContentId, Hasher};
     use blaze_record::Digest;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::super::{Of, PLANT, Plant, Saved, Seen, Step, Writing};
 
@@ -519,11 +519,10 @@ mod writer {
         Err("the writer did not end in 64 steps".to_owned())
     }
 
-    #[hegel::composite]
-    fn op(tc: &hegel::TestCase) -> Op {
-        let file = FILES[tc.draw(gs::integers::<u8>().max_value(2)) as usize];
-        let byte = tc.draw(gs::integers::<u8>().min_value(1).max_value(3));
-        match tc.draw(gs::integers::<u8>().max_value(7)) {
+    fn op(tape: &Tape) -> Op {
+        let file = FILES[tape.int_in(0..=2u8, "file") as usize];
+        let byte = tape.int_in(1..=3u8, "byte");
+        match tape.int_in(0..=7u8, "op") {
             0 | 1 => Op::Edit(file, byte),
             2 => Op::Header(byte),
             3 => Op::Wait(GRANULE_NS / 3),
@@ -533,9 +532,8 @@ mod writer {
         }
     }
 
-    #[hegel::composite]
-    fn timed(tc: &hegel::TestCase) -> (u8, Op) {
-        (tc.draw(gs::integers::<u8>().max_value(6)), tc.draw(op()))
+    fn timed(tape: &Tape) -> (u8, Op) {
+        (tape.int_in(0..=6u8, "at step"), op(tape))
     }
 
     /// With `plant`, the oracle says `says` of `before` and `during`; unplanted, they pass.
@@ -568,13 +566,13 @@ mod writer {
     /// nothing moved hits on it. Controls: `Plant::SlotBeforeLook` (the stamps taken once,
     /// after the reads), `Plant::ColumnOfAnotherRoot` (the certificate's root taken whatever
     /// root the column's stamps vouch for).
-    #[hegel::test]
-    fn a_slot_is_written_only_where_a_client_would_hit_on_it(tc: hegel::TestCase) {
+    #[test]
+    fn a_slot_is_written_only_where_a_client_would_hit_on_it() {
         CONTROLS.call_once(controls);
-        let before: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
-        let during: Vec<(u8, Op)> = tc.draw(gs::vecs(timed()).max_size(6));
-        if let Err(why) = run(&before, &during, Plant::None) {
-            panic!("{why}");
-        }
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let before: Vec<Op> = tape.vec(0..=12, "before", op);
+            let during: Vec<(u8, Op)> = tape.vec(0..=6, "during", timed);
+            run(&before, &during, Plant::None).map(|_| ())
+        });
     }
 }

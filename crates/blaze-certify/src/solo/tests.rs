@@ -14,7 +14,7 @@ use std::{collections::BTreeMap, sync::Once};
 
 use blaze_api::{Cargo, Targets};
 use blaze_ids::Hasher;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 use crate::certificate::{LAUNCHER, Output, Shape};
@@ -513,12 +513,11 @@ fn run_planted(ops: &[Op], writer: Writer, oracle: Oracle) -> Result<usize, Stri
     Ok(alone)
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let which = tc.draw(gs::integers::<u8>().max_value(4)) as usize;
-    let byte = tc.draw(gs::integers::<u8>().max_value(2));
+fn op(tape: &Tape) -> Op {
+    let which = tape.int_in(0..=4u8, "which") as usize;
+    let byte = tape.int_in(0..=2u8, "value");
     let value = (byte > 0).then_some(byte);
-    match tc.draw(gs::integers::<u8>().max_value(13)) {
+    match tape.int_in(0..=13u8, "op") {
         0 | 1 => Op::File(FILES[which], value),
         2 => Op::Rename(FILES[which], FILES[(which + 1) % FILES.len()]),
         3 => Op::Env(VARS[which % VARS.len()], value),
@@ -581,13 +580,15 @@ fn fresh_controls() {
 /// says `a` and leaves its outputs. Controls: `Plant::TrustsRacy`, `Plant::SkipsNames`,
 /// `Plant::SkipsPremises`, `Plant::SkipsDirectories` (a file added is missed), and a read left
 /// out of the slot (`Writer::LeavesANameOut`).
-#[hegel::test]
-fn a_solo_hit_is_what_a_fresh_build_says(tc: hegel::TestCase) {
+#[test]
+fn a_solo_hit_is_what_a_fresh_build_says() {
     FRESH_CONTROLS.call_once(fresh_controls);
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(40));
-    if let Err(why) = run(&ops, Plant::None, Writer::Faithful, Oracle::Fresh) {
-        panic!("{why}");
-    }
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ops: Vec<Op> = tape.vec(0..=40, "ops", op);
+        if let Err(why) = run(&ops, Plant::None, Writer::Faithful, Oracle::Fresh) {
+            panic!("{why}");
+        }
+    });
 }
 
 static DAEMON_CONTROLS: Once = Once::new();
@@ -609,13 +610,15 @@ fn daemon_controls() {
 /// The refinement: for any state, where `Solo` answers `Hit(a)` the machine driven with the
 /// world's own digests answers `Hit(a)`; and after `rehearse` gave `Ok`, with nothing moved,
 /// `Solo` hits. Control: one record's bytes swapped for another answer's.
-#[hegel::test]
-fn the_client_and_the_daemon_decide_the_same(tc: hegel::TestCase) {
+#[test]
+fn the_client_and_the_daemon_decide_the_same() {
     DAEMON_CONTROLS.call_once(daemon_controls);
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(40));
-    if let Err(why) = run(&ops, Plant::None, Writer::Faithful, Oracle::Daemon) {
-        panic!("{why}");
-    }
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ops: Vec<Op> = tape.vec(0..=40, "ops", op);
+        if let Err(why) = run(&ops, Plant::None, Writer::Faithful, Oracle::Daemon) {
+            panic!("{why}");
+        }
+    });
 }
 
 /// A slot with something in every list.

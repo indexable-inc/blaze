@@ -899,10 +899,10 @@ fn a_no_std_proc_macro_expands() {
 }
 
 /// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
-/// `ensures` is wrong for one input gets a generated Hegel test that fails, naming the function
-/// and the clause, with the shrunk case as a test to paste; a contract that holds passes, and
-/// `skip` generates nothing. The crate's manifest names `vendor/hegeltest` by its absolute path,
-/// and blaze's own lock pins hegeltest's registry dependencies to the versions blaze builds.
+/// `ensures` is wrong for one input gets a generated blaze-sim test that fails, naming the
+/// function and the clause, with the least case as a test to paste; a contract that holds
+/// passes, and `skip` generates nothing. The crate's manifest names `crates/blaze-sim` by its
+/// absolute path, and blaze's own lock pins blaze-sim's dependencies to the versions blaze builds.
 #[test]
 fn generated_test_finds_planted_bug() {
     let case = Case::new("generated_test_finds_planted_bug");
@@ -911,9 +911,9 @@ fn generated_test_finds_planted_bug() {
         "Cargo.toml",
         &format!(
             "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dev-dependencies]\n\
-             hegeltest = {{ path = {:?}, default-features = false, features = [\"static-engine\"] }}\n\n\
+             blaze-sim = {{ path = {:?} }}\n\n\
              [profile.test]\ncontract-checks = false\n\n[workspace]\n",
-            root.join("vendor/hegeltest").display().to_string()
+            root.join("crates/blaze-sim").display().to_string()
         ),
     );
     case.write("Cargo.lock", &fs::read_to_string(root.join("Cargo.lock")).unwrap());
@@ -1201,4 +1201,34 @@ fn a_package_not_on_the_latest_blaze_edition_is_told_once() {
     case.write("src/main.rs", "fn main(cx: &Cx, io: Io) -> Result<(), Error> {\n    io.need_out()?.line(cx, \"x\")?;\n    Ok(())\n}\n");
     let out = case.ok_in("", &["check"]);
     assert_eq!(out.stderr.matches(TOLD).count(), 0, "{}", out.stderr);
+}
+
+/// `blaze prove --emit` translates each `#[blaze::theorem]` of the crate and checks nothing, so
+/// needs no Lean: a theorem returning `bool` is emitted with its statement, one returning `u32`
+/// is refused naming its return type, the command exits 1 (not every theorem was emitted), and
+/// a second run prints the same bytes.
+#[test]
+fn a_theorem_function_is_emitted_and_one_not_returning_bool_refused() {
+    let case = Case::new("a_theorem_function_is_emitted_and_one_not_returning_bool_refused");
+    let first = case.blaze_in("", &["prove", "--emit", "--json"]);
+    assert!(!first.ok, "a refused theorem exits 1:\n{}\n{}", first.stdout, first.stderr);
+    let answer: serde_json::Value = serde_json::from_str(first.stdout.trim())
+        .unwrap_or_else(|error| panic!("no JSON answer ({error}):\n{}\n{}", first.stdout, first.stderr));
+    let records = answer["records"].as_array().unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(records.len(), 2, "{answer}");
+    let emitted: Vec<_> = records.iter().filter(|it| it["outcome"] == "Emitted").collect();
+    assert_eq!(emitted.len(), 1, "{answer}");
+    assert_eq!(emitted[0]["function"], "theorems::add_commutes", "{answer}");
+    assert_eq!(emitted[0]["statement"], "theorems.add_commutes.spec.statement", "{answer}");
+    let model = emitted[0]["path"].as_str().unwrap();
+    assert!(Path::new(model).is_file(), "the model {model} was not written");
+    assert!(!model.starts_with(case.dir.to_str().unwrap()), "the model {model} is in the checkout");
+    let refused: Vec<_> = records.iter().filter(|it| it["outcome"] == "Refused").collect();
+    assert_eq!(refused.len(), 1, "{answer}");
+    assert_eq!(refused[0]["function"], "theorems::not_bool", "{answer}");
+    let said = format!("{} {}", refused[0]["what"], refused[0]["at"]);
+    assert!(said.contains("u32"), "the refusal does not name the return type: {said}");
+    let second = case.blaze_in("", &["prove", "--emit", "--json"]);
+    assert_eq!(second.stdout, first.stdout, "a second run printed other bytes");
+    assert!(!second.ok);
 }

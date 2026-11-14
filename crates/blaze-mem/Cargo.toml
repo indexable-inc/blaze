@@ -30,7 +30,7 @@ blaze-check.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-rng.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 # Random reads over 1 GiB on base, transparent and reserved huge pages, in page walks per read
 # against the bound; prints a verdict.

@@ -1,17 +1,25 @@
 //! The read recorder: what a piece of work read, at item grain, for its read list.
 //!
 //! Off unless the snapshot was made with [`Reads::Kept`]. On, each run gathers in its own
-//! frame the rows it read: [`Read::Input`] for an input getter (and [`read`]), and for each
-//! tracked query it asked, hit or run, either one [`Read::Query`] row (the query's kind is a
-//! fact boundary, [`crate::Builder::mark_boundary`]: its own list stays behind, the firewall)
-//! or that query's own list appended (every other kind is flattened into its asker). At the
-//! run's end the list is sorted and deduplicated and kept in the entry, in the arena; it
-//! depends on the entry alone, never on who asked first. Port decision 2 (2026-11-13).
+//! frame what it read DIRECTLY: [`Read::Input`] for an input getter (and [`read`]), and for
+//! each tracked query it asked, hit or run, one row: a [`Read::Query`] when the query's kind
+//! is a fact boundary ([`crate::Builder::mark_boundary`]: its own list stays behind, the
+//! firewall), else a reference to the asked entry (its callee list). At the run's end both
+//! are sorted and deduplicated and kept with the entry, in its arena ([`Lists`]).
 //!
-//! Cost (rule 67): one row per boundary call and per input read in the list of each entry
-//! that reads it (inputs flattened through non-boundary queries are copied into each asker:
-//! up to 88 bytes a row), an append per hit, a sort per run. No per-entry edge list beyond
-//! that, and no walk afterwards. Off: one branch per fetch and an empty slice per entry.
+//! The FLAT list (every input and boundary row the value depends on, through every callee
+//! down to the boundaries: what [`record`] gives and an image record files) is made on demand,
+//! once per entry that something asks it of ([`flat_of`]), by a walk of the callee graph that
+//! visits each entry once and stops at an entry whose flat list is made, and kept with the
+//! entry. It depends on the entry alone, never on who asked first. Port decision 2
+//! (2026-11-13); lists made lazy 2026-11-14 (the eager form appended each callee's whole flat
+//! list at every ask, and sorted it at every run's end: name resolution of `core` spent most
+//! of its 80 s there).
+//!
+//! Cost (rule 67): an ask, hit or run, appends one row to its asker's list (the floor: the
+//! asker must name what it asked); a run sorts only its own direct rows; a flat list costs a
+//! walk of its entry's closure (each entry once) and a sort, at most once per entry asked for
+//! one, and its rows in the entry's arena. Off: one branch per fetch and a null word per entry.
 
 use std::{
     alloc::{Allocator, Global},
@@ -19,11 +27,17 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     ptr,
+    sync::atomic::{AtomicPtr, Ordering as Atomic},
 };
 
 use blaze_ids::ContentId;
 
-use crate::{CycleKind, Fact, Gid, Kind, Memo, Reads, task};
+use crate::{
+    CycleKind, Fact, Gid, Kind, Memo, Plant, Reads,
+    arena::{Slot, with_local},
+    task,
+    trie::Head,
+};
 
 /// A query's or an input's kind, as a list row names it: copied, compared and ordered by the
 /// kind's name hash then its name, so a sorted list is in the same order in every process.
@@ -164,7 +178,9 @@ pub fn unrecorded<T>(memo: &Memo, work: impl FnOnce() -> T) -> T {
     work()
 }
 
-/// Runs `work` and gives the rows it read, sorted and deduplicated, in the global heap.
+/// Runs `work` and gives the rows it read, sorted and deduplicated, in the global heap: its
+/// flat list (every input and boundary row it depends on, directly or through any query it
+/// asked, hit or run, down to the boundaries).
 ///
 /// # Errors
 ///
@@ -178,6 +194,11 @@ pub fn record<T>(memo: &Memo, work: impl FnOnce() -> T) -> Result<(T, Vec<Read, 
 /// # Errors
 ///
 /// As [`record`].
+///
+/// # Panics
+///
+/// Where `work` read one fact with two digests, directly or through what it asked: two
+/// snapshots' reads mixed.
 pub fn record_in<T, A: Allocator>(
     memo: &Memo,
     alloc: A,
@@ -189,11 +210,191 @@ pub fn record_in<T, A: Allocator>(
     let frame = task::Run::recorder(memo);
     let pushed = task::push(&frame);
     let value = work();
-    let reads = frame.take_reads();
+    let taken = frame.take_reads();
     drop(pushed);
-    // An outer run read what this work read.
-    task::replay_list(&reads);
-    let mut out = Vec::with_capacity_in(reads.len(), alloc);
-    out.extend_from_slice(&reads);
-    Ok((value, out))
+    // An outer run read what this work read: its direct rows and the entries it asked, as
+    // though asked there (the outer run's own flat list reaches the rest through them).
+    task::replay_taken(&taken);
+    let rows = flatten_in(memo, &taken.reads, &taken.callees, alloc, &|out: &mut String| {
+        out.push_str("a piece of work recorded by `blaze_memo::record`");
+    });
+    Ok((value, rows))
+}
+
+/// What one entry read, under [`Reads::Kept`]: its direct rows and the entries it asked, made
+/// once with the entry in its arena (`slot`), and its flat list, made at most once, on demand
+/// ([`Lists::flat`]). Never written after it is made but for `flat`, set once.
+///
+/// Why a callee outlives every entry naming it: a callee is an entry its asker's run looked up
+/// through a fetch, which noted a borrow of the callee's arena by the run's home
+/// (`task::note_read_of`; the homing check there refuses a session-homed run that reads a
+/// crate's arena), or it is in the same arena. [`crate::Memo::next`] drops a changed arena and,
+/// to a fixpoint, every arena that borrowed from a dropped one, so an arena that holds an entry
+/// holds the arenas of everything its entries name, carried or not. An entry a predecessor
+/// snapshot made in a carried arena goes to that snapshot's spill table (its borrow is not
+/// noted, `Slot::borrow`) and is reachable only while that snapshot, which holds every arena
+/// it names, lives. A fixpoint member shares its head's lists (its head is published first,
+/// `fetch::execute`): the member read its head through the cycle's path of asks, each a noted
+/// borrow, so the head's arena outlives it the same way. Nothing here has a destructor: an
+/// arena's drop frees its lists and flat lists with its memory, in whatever order arenas drop.
+pub(crate) struct Lists {
+    /// The arena these lists are in: where the flat list is kept when made.
+    slot: *const Slot,
+    /// Input rows and boundary rows, sorted, deduplicated, each fact with one digest.
+    direct: *const [Read],
+    /// Each entry asked that is not a boundary, once, ordered by address (only to merge
+    /// duplicates: nothing is output in this order).
+    callees: *const [*const Head],
+    /// The flat list ([`Flat`]), null until made.
+    flat: AtomicPtr<Flat>,
+}
+
+/// A made flat list, in its lists' arena.
+struct Flat {
+    rows: *const [Read],
+}
+
+impl Lists {
+    /// Lists of `reads` and `callees` in `slot`'s arena (`local` its allocator), or null when
+    /// both are empty.
+    pub(crate) fn in_arena(
+        slot: &Slot,
+        local: &blaze_mem::ArenaLocal<'_>,
+        reads: &[Read],
+        callees: &[*const Head],
+    ) -> *const Lists {
+        if reads.is_empty() && callees.is_empty() {
+            return ptr::null();
+        }
+        let direct: *const [Read] = local.alloc_slice_copy(reads);
+        let callees: *const [*const Head] = local.alloc_slice_copy(callees);
+        local.alloc(Lists { slot: ptr::from_ref(slot), direct, callees, flat: AtomicPtr::new(ptr::null_mut()) })
+    }
+
+    pub(crate) fn direct(&self) -> &[Read] {
+        // SAFETY: made in `slot`'s arena with these lists, which live as long as it.
+        unsafe { &*self.direct }
+    }
+
+    pub(crate) fn callees(&self) -> &[*const Head] {
+        // SAFETY: as for `direct`.
+        unsafe { &*self.callees }
+    }
+
+    /// The flat list if made.
+    fn made(&self) -> Option<&[Read]> {
+        let flat = self.flat.load(Atomic::Acquire);
+        // SAFETY: a published `Flat` and its rows are in the lists' arena, never written again.
+        (!flat.is_null()).then(|| unsafe { &*(*flat).rows })
+    }
+
+    /// The flat list: every input and boundary row of these lists and of every callee's,
+    /// transitively, sorted and deduplicated; `named` names the entry for a refusal. Made at
+    /// the first ask and kept in the lists' arena; with no callees it is the direct list.
+    /// Two tasks asking at once may both make it, and the first published is kept (the same
+    /// rows: the list is a function of the entry; the other copy is unreachable arena bytes,
+    /// as a lost trie race's node is).
+    ///
+    /// # Panics
+    ///
+    /// Where the rows hold one fact with two digests: two snapshots' reads mixed.
+    pub(crate) fn flat(&self, memo: &Memo, named: &dyn Fn(&mut String)) -> &[Read] {
+        if let Some(made) = self.made() {
+            return made;
+        }
+        if self.callees().is_empty() {
+            return self.direct();
+        }
+        let rows = flatten_in(memo, self.direct(), self.callees(), Global, named);
+        // SAFETY: the lists' own arena, alive while the lists are.
+        let slot = unsafe { &*self.slot };
+        let made = with_local(slot, |local| -> *mut Flat {
+            let kept: *const [Read] = local.alloc_slice_copy(&rows);
+            local.alloc(Flat { rows: kept })
+        });
+        match self.flat.compare_exchange(ptr::null_mut(), made, Atomic::AcqRel, Atomic::Acquire) {
+            // SAFETY: just made in the arena, published by release.
+            Ok(_) => unsafe { &*(*made).rows },
+            // SAFETY: the winner's, published by release.
+            Err(theirs) => unsafe { &*(*theirs).rows },
+        }
+    }
+}
+
+/// The flat list of the entry `head` starts ([`Lists::flat`]); empty when it read nothing.
+pub(crate) fn flat_of<'a>(memo: &Memo, head: &'a Head) -> &'a [Read] {
+    let Some(lists) = head.lists() else { return &[] };
+    lists.flat(memo, &|out: &mut String| name_entry(head, out))
+}
+
+/// An entry as a refusal names it when its key's type is not known here: its kind and its
+/// key's hash.
+fn name_entry(head: &Head, out: &mut String) {
+    use fmt::Write as _;
+    let _ = write!(out, "an entry of {} (key hash {:#018x})", head.kind.name(), head.hash);
+}
+
+/// `direct` and the direct rows of every entry reachable through `callees`, each entry visited
+/// once (and none below an entry whose flat list is made: that list is taken whole), sorted and
+/// deduplicated, in `alloc`. The walk's own scratch (the visited set and the stack) is on the
+/// global heap and freed at its end. Bounded: each entry is pushed once per row naming it and
+/// expanded once.
+///
+/// # Panics
+///
+/// As [`Lists::flat`]; `named` names whose rows they are.
+fn flatten_in<A: Allocator>(
+    memo: &Memo,
+    direct: &[Read],
+    callees: &[*const Head],
+    alloc: A,
+    named: &dyn Fn(&mut String),
+) -> Vec<Read, A> {
+    let mut rows = Vec::new_in(alloc);
+    rows.extend_from_slice(direct);
+    if !callees.is_empty() {
+        let mut seen: blaze_hash::HashSet<*const Head, Global> = blaze_hash::HashSet::new_in(Global);
+        let mut todo: Vec<*const Head, Global> = Vec::new_in(Global);
+        todo.extend_from_slice(callees);
+        while let Some(at) = todo.pop() {
+            if !seen.insert(at) {
+                if memo.plant() == Plant::FlattenStopsAtRevisit {
+                    break;
+                }
+                continue;
+            }
+            // SAFETY: a callee outlives every entry and run that names it ([`Lists`]).
+            let Some(lists) = (unsafe { &*at }).lists() else { continue };
+            if let Some(made) = lists.made() {
+                rows.extend_from_slice(made);
+                continue;
+            }
+            rows.extend_from_slice(lists.direct());
+            todo.extend_from_slice(lists.callees());
+        }
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    one_digest_each(&rows, named);
+    rows
+}
+
+/// Refuses sorted, deduplicated `rows` that hold one fact (of one input kind) with two digests,
+/// `named` naming whose they are: inputs are fixed for a snapshot, so that is two snapshots'
+/// reads mixed. Untracked reads are exempt (each is its snapshot's own).
+pub(crate) fn one_digest_each(rows: &[Read], named: &dyn Fn(&mut String)) {
+    for pair in rows.windows(2) {
+        if let (Read::Input { kind: a, fact: x }, Read::Input { kind: b, fact: y }) = (pair[0], pair[1])
+            && a == b
+            && x.id == y.id
+            && a.name() != UNTRACKED.name()
+        {
+            let mut name = String::new();
+            named(&mut name);
+            panic!(
+                "{name} read fact {:?} with two digests ({:?} and {:?}) in one snapshot",
+                x.id, x.digest, y.digest
+            );
+        }
+    }
 }

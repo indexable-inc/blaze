@@ -18,8 +18,8 @@ blaze-sql.workspace = true
 libsqlite3-sys.workspace = true
 
 [dev-dependencies]
+blaze-sim.workspace = true
 blaze-sql = { workspace = true, features = ["plant"] }
-hegeltest.workspace = true
 
 [lints]
 workspace = true

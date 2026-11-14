@@ -8,8 +8,7 @@ use std::collections::BTreeMap;
 
 use blaze_api::{Diagnostic, Level};
 use blaze_units::query::{Command, Invocation, Mount, Origin};
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use super::*;
 use blaze_vfs::outside::{Look, LookKind};
@@ -798,9 +797,8 @@ fn counts(mut world: World, ops: &[Op], bug: Option<Bug>) -> Result<(u32, u32), 
     ran.map(|()| (daemon.answered, daemon.planned))
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(31)) {
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=31u8, "op") {
         0 => Op::Edit(Input::Source),
         1 => Op::Edit(Input::Lock),
         2 => Op::Edit(Input::Header),
@@ -827,13 +825,6 @@ fn op(tc: &TestCase) -> Op {
     }
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: the lane says a kept answer again only when a walk of every unit would say
 /// the same of the state the request is asked in, with every output in place and no other
 /// job under way: no input a build reads changed since the answer was kept, whatever requests
@@ -848,20 +839,16 @@ fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
 /// the watches confirmed in time or late; and of a `//` comment at a line's end, in the
 /// source (its unit keyed by code text or, a lint reading comments, by bytes; its build
 /// warning of the commented line or not) and in a file the build script reads by its bytes.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_kept_answer_is_said_again_only_while_a_walk_would_say_the_same() {
-    run_cases(256, |tc| {
-        let mut world = World::new(
-            tc.draw(gs::booleans()),
-            tc.draw(gs::booleans()),
-            tc.draw(gs::booleans()),
-        );
-        world.narrow = tc.draw(gs::booleans());
-        world.warns = tc.draw(gs::booleans());
-        world.names = tc.draw(gs::booleans());
-        world.lock_there = tc.draw(gs::booleans());
-        let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(40));
+    blaze_sim::check(Config::cases(256), |tape| {
+        let mut world = World::new(tape.bool("lists"), tape.bool("dep watched"), tape.bool("lag"));
+        world.narrow = tape.bool("narrow");
+        world.warns = tape.bool("warns");
+        world.names = tape.bool("names");
+        world.lock_there = tape.bool("lock there");
+        let ops = tape.vec(1..=40, "ops", op);
         if let Err(why) = runs(world.clone(), &ops, None) {
             panic!("{world:?}, {ops:?}: {why}");
         }

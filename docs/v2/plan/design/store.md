@@ -573,13 +573,13 @@ has no surface. Optimized libraries. The walk stopping at the crate boundary (a 
 misses still walks into its dependencies).
 
 **Checks.** `blaze-lower`, `code::tests`: `the_surface_text_moves_exactly_with_what_a_front_end_observes`
-(Hegel) with controls `the_oracle_catches_a_surface_that_holds_a_bodys_lines` and
+(blaze-sim) with controls `the_oracle_catches_a_surface_that_holds_a_bodys_lines` and
 `a_position_a_constant_holds_is_in_the_surface` (`Plant::Unstamped`); `tests`:
 `a_dependents_key_moves_only_with_what_it_observes_of_a_dependency`,
 `a_library_built_over_a_crate_is_keyed_by_what_it_compiles_of_it`, controls
 `the_oracle_catches_a_library_built_under_its_dependencies_code` and
 `the_oracle_catches_a_dependents_key_that_holds_a_bodys_lines`. `blaze-cargo`,
-`compile::parts::tests`: a model crate, units and edits under Hegel
+`compile::parts::tests`: a model crate, units and edits under blaze-sim
 (`no_unit_is_found_stale_after_any_edit_of_the_crate_below`), the directed cases (a line or a
 body below, a signature one unit reads, an item that shadows, an impl that changes
 selection), controls `the_oracle_catches_a_trace_without_its_negative_reads` and

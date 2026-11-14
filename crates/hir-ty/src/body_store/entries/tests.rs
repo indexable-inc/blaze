@@ -22,7 +22,7 @@
 
 use std::{cell::Cell, collections::BTreeMap, sync::Arc};
 
-use base_db::{Crate, Db, all_crates};
+use base_db::{Crate, CrateKey, Db, all_crates};
 use blaze_cas::{Key as StoreKey, Kind as StoreKind, Mismatch, content_of};
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_front_items::{
@@ -39,14 +39,16 @@ use blaze_core::lock::Lock;
 use blaze_query::QueryKind;
 use blaze_store_check::Setting;
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, ModuleDefId, StaticId,
-    StructId, TraitId, TypeAliasId, UnionId, VariantId,
-    deps::{PortableIds, body_key as hir_body_key},
+    AdtId, AssocItemId, DefWithBodyId, HasModule as _, Lookup as _, ModuleDefId, StructId, VariantId,
+    deps::body_key as hir_body_key,
     expr_store::Body,
     nameres::{crate_def_map, demand::crate_body_owners},
     signatures::{ConstSignature, FunctionSignature},
 };
-use hir_expand::fixture::{self, Fixture};
+use hir_expand::{
+    HirFileId, MacroCallKind,
+    fixture::{self, Fixture},
+};
 use std::alloc::Global;
 use syntax::{Edition, Extensions};
 
@@ -61,7 +63,7 @@ use crate::{
     body_store::{
         BodyFacts, Classified, Installed, Mode, Step, StepCounts, capture, infer, install,
         lookup_passed, offer, offer_passed,
-        tests::{BUILD, Memory as Images, OWN, is_impl_table, own, portable},
+        tests::{BUILD, Memory as Images, OWN, is_impl_table, own},
     },
     db::HirDatabase,
     next_solver::{
@@ -188,36 +190,113 @@ fn impls(db: &Db) -> ContentId {
 /// fixture (a stand-in for item-hash's "entries" part: what each id the body names is), so a
 /// signature edit reaches every body's identity and a body edit only its own.
 ///
-/// An item an answer names is keyed by its kind and its id in this one database ([`def_key`]):
-/// the same in every revision of it, so an answer's bytes are a function of what the entry
-/// read. (The item store's [`TestFacts`](super::super::tests::TestFacts) keys an item by its
-/// portable form, whose header holds the text of the item's file: any edit of `leaf.rs`, a
-/// comment's too, gave every caller's answer other bytes than the entry had read, with no read
-/// of that file in its trace.)
-/// What [`EntryFacts::def_key`] gave each id it named, by its key: shared by two trees, so a
-/// second database decodes what the first encoded (the keys are a tag and the interned id's
-/// bits, equal in two fixture databases built alike).
-type Defs = Arc<Lock<HashMap<ContentId, (u8, PortableIds), Global>>>;
+/// An item an answer names is keyed by what names it in every snapshot of the session
+/// ([`item_name`]: its kind, its crate's key and where it is written), never by its id: an
+/// edit rebuilds the arenas of the edited crate and of the crates above it, and every id of a
+/// rebuilt arena is another one after the commit. Keyed by its id (as it was), a caller's
+/// answer kept across an edit of `leaf.rs` named the leaf by an id a fresh run does not have
+/// (other bytes than the oracle's), and read back after the edit gave an id of a dropped
+/// arena. So an answer's bytes are a function of what the entry read. (The item store's
+/// [`TestFacts`](super::super::tests::TestFacts) keys an item by its portable form, whose
+/// header holds the text of the item's file: any edit of `leaf.rs`, a comment's too, gave
+/// every caller's answer other bytes than the entry had read, with no read of that file in
+/// its trace.)
+/// What [`EntryFacts::def_key`] gave each item it named, by its key: its tag, its crate's key
+/// and its name ([`item_name`]); shared by two trees, so a second database decodes what the
+/// first encoded (a name is the same in two fixture databases built alike).
+type Defs = Arc<Lock<HashMap<ContentId, (u8, CrateKey, Vec<u8>), Global>>>;
 
 struct EntryFacts {
     defs: Defs,
 }
 
-/// `def`'s id in its database, as its interned id's bits.
-fn raw(def: SolverDefId<'_>) -> u64 {
-    match def {
-        SolverDefId::FunctionId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::AdtId(AdtId::StructId(it)) => crate::check_cache::ids::word_of(it),
-        SolverDefId::AdtId(AdtId::UnionId(it)) => crate::check_cache::ids::word_of(it),
-        SolverDefId::AdtId(AdtId::EnumId(it)) => crate::check_cache::ids::word_of(it),
-        SolverDefId::ConstId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::StaticId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::TraitId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::TypeAliasId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::ImplId(it) => crate::check_cache::ids::word_of(it),
-        SolverDefId::EnumVariantId(it) => crate::check_cache::ids::word_of(it),
+/// What names `def` in every snapshot of a session and in two databases built alike: its tag
+/// (as [`EntryFacts::def_of`] reads it), its crate's key, and where it is written: its ast id
+/// (a hash of what its node is keyed by and an ordinal among those of one hash, never a
+/// position: `span::ast_id`), then for an item a macro wrote each call it is expanded from,
+/// innermost first (the call's kind, a derive's attribute and place, the call's ast id), then
+/// the real file's id.
+fn item_name(db: &Db, def: SolverDefId<'_>) -> (u8, CrateKey, Vec<u8>) {
+    let (tag, krate, at) = match def {
+        SolverDefId::FunctionId(it) => (0, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::StructId(it)) => (1, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::UnionId(it)) => (2, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::AdtId(AdtId::EnumId(it)) => (3, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::ConstId(it) => (4, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::StaticId(it) => (5, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::TraitId(it) => (6, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::TypeAliasId(it) => (7, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::ImplId(it) => (8, it.krate(db), it.lookup(db).id.erase()),
+        SolverDefId::EnumVariantId(it) => (9, it.krate(db), it.lookup(db).id.erase()),
         _ => panic!("a key asked of a definition that is no item"),
+    };
+    let mut name = Vec::new_in(Global);
+    name.extend_from_slice(&at.value.into_raw().to_le_bytes());
+    let mut file = at.file_id;
+    let file = loop {
+        match file {
+            HirFileId::FileId(it) => break it.file_id(db),
+            HirFileId::MacroFile(call) => {
+                let kind = &call.loc(db).kind;
+                match kind {
+                    MacroCallKind::FnLike { .. } => name.push(0),
+                    MacroCallKind::Derive { derive_attr_index, derive_index, .. } => {
+                        name.push(1);
+                        name.extend_from_slice(&derive_attr_index.item_tree_index().to_le_bytes());
+                        name.extend_from_slice(&derive_index.to_le_bytes());
+                    }
+                    MacroCallKind::Attr { .. } => name.push(2),
+                }
+                name.extend_from_slice(&kind.erased_ast_id().into_raw().to_le_bytes());
+                file = kind.file_id();
+            }
+        }
+    };
+    name.extend_from_slice(&file.index().to_le_bytes());
+    (tag, krate.key(db), name)
+}
+
+/// Every item of `krate` an answer may name ([`item_name`]'s kinds): each declaration and impl
+/// of each module of its def map, each item of each trait and impl, each variant of each enum.
+fn items_of<'db>(db: &'db Db, krate: Crate) -> Vec<SolverDefId<'db>> {
+    fn assoc<'db>(out: &mut Vec<SolverDefId<'db>>, items: &[(hir_expand::name::Name, AssocItemId)]) {
+        for (_, item) in items {
+            out.push(match *item {
+                AssocItemId::FunctionId(it) => SolverDefId::FunctionId(it),
+                AssocItemId::ConstId(it) => SolverDefId::ConstId(it),
+                AssocItemId::TypeAliasId(it) => SolverDefId::TypeAliasId(it),
+            });
+        }
     }
+    let mut out = Vec::new_in(Global);
+    let def_map = crate_def_map(db, krate);
+    for (_, module) in def_map.modules(db) {
+        let scope = module.scope(db);
+        for it in scope.declarations() {
+            match it {
+                ModuleDefId::FunctionId(it) => out.push(SolverDefId::FunctionId(it)),
+                ModuleDefId::AdtId(it) => {
+                    out.push(SolverDefId::AdtId(it));
+                    if let AdtId::EnumId(it) = it {
+                        out.extend(it.enum_variants(db).variants.values().map(|&(variant, _)| SolverDefId::EnumVariantId(variant)));
+                    }
+                }
+                ModuleDefId::ConstId(it) => out.push(SolverDefId::ConstId(it)),
+                ModuleDefId::StaticId(it) => out.push(SolverDefId::StaticId(it)),
+                ModuleDefId::TraitId(it) => {
+                    out.push(SolverDefId::TraitId(it));
+                    assoc(&mut out, &it.trait_items(db).items);
+                }
+                ModuleDefId::TypeAliasId(it) => out.push(SolverDefId::TypeAliasId(it)),
+                _ => {}
+            }
+        }
+        for it in scope.impls() {
+            out.push(SolverDefId::ImplId(it));
+            assoc(&mut out, &it.impl_items(db).items);
+        }
+    }
+    out
 }
 
 fn signatures(db: &Db) -> ContentId {
@@ -226,8 +305,10 @@ fn signatures(db: &Db) -> ContentId {
         for def in crate_body_owners(db, crate_named(db, krate)) {
             let DefWithBodyId::FunctionId(it) = def else { continue };
             // The signature as it is written: its name, its types' store (no positions; the
-            // source map is not in it), its flags.
-            h.part(format!("{:?}", FunctionSignature::of(db, it)).as_bytes());
+            // source map is not in it), its flags. Any id its print names renumbered by first
+            // use ([`fixture::stable_ids`]): an id's bits are another after a commit that
+            // rebuilt its arena, and the identity is of what is written.
+            h.part(fixture::stable_ids(&format!("{:?}", FunctionSignature::of(db, it))).as_bytes());
         }
     }
     h.finish()
@@ -317,38 +398,33 @@ impl BodyFacts for EntryFacts {
         }
     }
 
-    fn def_key<'db>(&self, _: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
         if def == own(body) {
             return OWN;
         }
-        let (tag, ids) = portable(def);
-        let key = Hasher::new("blaze v2 body entries test def")
+        let (tag, krate, name) = item_name(db, def);
+        let key = Hasher::new("blaze v2 body entries test def 2")
             .update(&[tag])
-            .update(&raw(def).to_le_bytes())
+            .update(&krate.index().to_le_bytes())
+            .part(&name)
             .finish();
-        self.defs.lock().insert(key, (tag, ids));
+        self.defs.lock().insert(key, (tag, krate, name));
         key
     }
 
-    fn def_of<'db>(&self, _: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    /// The item of this database named as [`EntryFacts::def_key`] named it, found by walking
+    /// its crate's items ([`items_of`]): no id is kept, as none outlives its arena.
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
         if key == OWN {
             return Some(own(body));
         }
-        let defs = self.defs.lock();
-        let (tag, ids) = defs.get(&key)?;
-        match tag {
-            0 => ids.get::<FunctionId>(0).map(SolverDefId::FunctionId),
-            1 => ids.get::<StructId>(0).map(|it| SolverDefId::AdtId(AdtId::StructId(it))),
-            2 => ids.get::<UnionId>(0).map(|it| SolverDefId::AdtId(AdtId::UnionId(it))),
-            3 => ids.get::<EnumId>(0).map(|it| SolverDefId::AdtId(AdtId::EnumId(it))),
-            4 => ids.get::<ConstId>(0).map(SolverDefId::ConstId),
-            5 => ids.get::<StaticId>(0).map(SolverDefId::StaticId),
-            6 => ids.get::<TraitId>(0).map(SolverDefId::TraitId),
-            7 => ids.get::<TypeAliasId>(0).map(SolverDefId::TypeAliasId),
-            8 => ids.get::<ImplId>(0).map(SolverDefId::ImplId),
-            9 => ids.get::<EnumVariantId>(0).map(SolverDefId::EnumVariantId),
-            _ => None,
-        }
+        // clone: a test item's name, so no lock is held across the walk's queries
+        let (tag, krate, name) = self.defs.lock().get(&key)?.clone();
+        let krate = *all_crates(db).iter().find(|it| it.key(db) == krate)?;
+        items_of(db, krate).into_iter().find(|&def| {
+            let (at, _, named) = item_name(db, def);
+            at == tag && named == name
+        })
     }
 }
 
@@ -451,18 +527,29 @@ impl Tree {
         self.map();
     }
 
-    /// Whether the last edit wrote the impl tables (port decision 1: what the deleted impls
-    /// maintainer's last write said, restated on the run log): after it, the impl-table
-    /// queries of the edited crate ran, and those of no crate it cannot reach (the crates it
-    /// depends on: `core`, and the files before it in [`FILES`]) did.
-    fn impls_written(&mut self) -> bool {
+    /// Asks every crate's impl tables in the snapshot now: what [`Tree::impls_written`] asks
+    /// after an edit, asked before it, so a run it sees after is a run again and never a first
+    /// one. (Without it, an impl table no body's inference had asked, `core`'s inherent impls
+    /// among them, ran first after the edit, homed in `core`'s arena, which the edit did not
+    /// rebuild, and was taken for a table the edit reached.)
+    fn ask_impl_tables(&self) {
         use crate::method_resolution::{InherentImpls, TraitImpls};
-        let Some(edited) = self.edited else { return false };
         let db = self.fixture.db();
         for &krate in all_crates(db).iter() {
             TraitImpls::for_crate(db, krate);
             InherentImpls::for_crate(db, krate);
         }
+    }
+
+    /// Whether the last edit wrote the impl tables (port decision 1: what the deleted impls
+    /// maintainer's last write said, restated on the run log): after it, the impl-table
+    /// queries of the edited crate ran, and those of no crate it cannot reach (the crates it
+    /// depends on: `core`, and the files before it in [`FILES`]) ran again. Asks them all
+    /// ([`Tree::ask_impl_tables`]), which the caller did before the edit too.
+    fn impls_written(&mut self) -> bool {
+        let Some(edited) = self.edited else { return false };
+        self.ask_impl_tables();
+        let db = self.fixture.db();
         let ran = db.runs().expect("a fixture's database logs its runs").take();
         // By the arena a run is homed in, the crate's own (its key's greatest id is the
         // crate's or an item of it): no key is printed to compare.
@@ -818,6 +905,8 @@ fn carried_from(first: Option<&str>, then: &str, dropped: Option<ReadKind>, says
     assert_eq!(before.len(), BODIES, "every body of the fixture");
     let layout = session.names_of(&store, ReadKind(LAYOUT.kind.0)).unwrap();
     let from = tree.pin();
+    // At the first pin, so a run of an impl table after the edit is one the edit reached.
+    tree.ask_impl_tables();
     tree.edit("leaf.rs", then);
     let delta = delta(&mut tree, &before_ids, says);
     let mut changed = Changed::between(from, tree.pin());

@@ -8,8 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -31,16 +30,16 @@ struct Case {
     rounds: Vec<Round>,
 }
 
-fn draw_case(tc: &TestCase) -> Case {
-    let rounds = tc.draw(gs::integers::<u8>().min_value(1).max_value(4));
+fn draw_case(tape: &Tape) -> Case {
+    let rounds = tape.int_in(1..=4u8, "rounds");
     Case {
-        seed: tc.draw(gs::integers()),
-        fail_one_in: [0, 9, 4][usize::from(tc.draw(gs::integers::<u8>().max_value(2)))],
+        seed: tape.next_u64("sim seed"),
+        fail_one_in: [0, 9, 4][usize::from(tape.int_in(0..=2u8, "fail one in"))],
         rounds: (0..rounds)
             .map(|_| Round {
-                puts: tc.draw(gs::integers::<u64>().min_value(1).max_value(24)),
-                polls: tc.draw(gs::integers::<u64>().max_value(40)),
-                settles: tc.draw(gs::integers::<u8>().max_value(3)) == 0,
+                puts: tape.int_in(1..=24u64, "puts"),
+                polls: tape.int_in(0..=40u64, "polls before the crash"),
+                settles: tape.int_in(0..=3u8, "settles") == 0,
             })
             .collect(),
     }
@@ -189,12 +188,12 @@ fn crashes(case: &Case, plant: bool) -> Result<(), String> {
 /// The invariant: after a crash at any point of any number of commits, under injected IO
 /// failures, the store opens; each pack's checks file holds the checks of the blocks its head
 /// names, and the store holds the same; every put reported durable reads back the bytes it was
-/// given; and no value reads back other bytes than were put. `HEGEL_TEST_CASES=<n>` runs it
+/// given; and no value reads back other bytes than were put. `BLAZE_SIM_SEEDS=<n>` runs it
 /// longer.
 #[test]
 fn a_crash_leaves_every_pack_and_its_checks_as_the_head_names_them() {
-    super::model_check::run_cases(48, |tc| {
-        let case = draw_case(&tc);
+    blaze_sim::check(SimConfig::cases(48), |tape| {
+        let case = draw_case(tape);
         if let Err(why) = crashes(&case, false) {
             panic!("{case:?}: {why}");
         }

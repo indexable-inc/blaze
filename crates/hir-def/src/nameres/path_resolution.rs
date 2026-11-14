@@ -814,14 +814,20 @@ impl DefMap {
                     // expansion (rustc's `resolve_ident_in_module` of the enum's module).
                     let segment =
                         segments.keyed_for(db, || super::def_site::enum_expansion(db, e), i);
-                    let res =
-                        e.enum_variants(db).variants.get(&segment).map(|&(variant, shape)| {
-                            if shape.has_value_ns_ctor() {
-                                PerNs::both(variant.into(), variant.into(), vis, None)
-                            } else {
-                                PerNs::types(variant.into(), vis, None)
-                            }
-                        });
+                    // A keyed segment is of the path's table, the variants' keys of the enum
+                    // file's: compared in the path's (`EnumVariants::variant_keyed`).
+                    let variants = e.enum_variants(db);
+                    let found = match segments.contexts {
+                        Some((_, table)) => variants.variant_keyed(db, e, table, segment),
+                        None => variants.variants.get(&segment).copied(),
+                    };
+                    let res = found.map(|(variant, shape)| {
+                        if shape.has_value_ns_ctor() {
+                            PerNs::both(variant.into(), variant.into(), vis, None)
+                        } else {
+                            PerNs::types(variant.into(), vis, None)
+                        }
+                    });
                     // FIXME: Need to filter visibility here and below? Not sure.
                     return match res {
                         // Enum variants are in value namespace, segments left => no resolution.

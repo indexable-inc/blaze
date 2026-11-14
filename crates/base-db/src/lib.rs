@@ -250,7 +250,8 @@ fn primary_macro_env(db: &Db, krate: Crate) -> Env {
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
 
-/// What tells two databases of one process apart ([`Db::nonce`]).
+/// What tells two databases of one process apart ([`Db::nonce`]), and two id spaces of one
+/// database: what a holder of ids outside the memo keys by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Nonce(usize);
 
@@ -384,19 +385,25 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-/// The crate graph's list: the session arena's singleton of its content ID, which every
-/// reader of the list reads, beside the list itself in the snapshot's table
-/// ([`all_crates`], [`source_root_crates`]). The list's content is of each listed crate's
-/// content ID in order ([`CRATE_GRAPH_DOMAIN`]), so a crate added, taken out or changed is a
-/// new session arena: every arena borrows it.
+/// The crate graph's list: the singleton of its content ID in the list's own open arena
+/// (`world::LIST_ARENA`), which every reader of the list reads, beside the list itself in the
+/// snapshot's table ([`all_crates`], [`source_root_crates`], a [`listed_by_prefix`] that
+/// found none). The list's content is of each listed crate's item key and root file's path in
+/// order (`world::List`, [`CRATE_GRAPH_DOMAIN`]), so a crate added, taken out, put elsewhere
+/// or written where its item key moves ([`crate_item_key`]: its cfg, edition, dependencies,
+/// ...) makes that arena again, which drops the runs that read it and their borrowers: no
+/// crate declares it, and the session does not hold it. A write of a crate's env, workspace
+/// data or lints, or of what of its data and extra data the item key leaves out, moves its
+/// content ID, not the list: it drops that crate's arena and its dependents' alone.
 #[blaze_memo::input(singleton, debug)]
 pub(crate) struct AllCrates {
     #[returns(copy)]
     content: InputId,
 }
 
-/// The crate graph's content ID is of its crates' content IDs, in topological order.
-pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 1";
+/// The domain of the crate list's digest (`world::List`): each listed crate's item key and
+/// root file's path, in topological order.
+pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 2";
 
 /// The content ID of [`all_crates`].
 pub fn all_crates_content(db: &Db) -> ContentId {
@@ -416,7 +423,7 @@ pub fn all_crates_content(db: &Db) -> ContentId {
 pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
     match AllCrates::try_get(db) {
         Some(all) => {
-            // The read: the list's content, of the session arena.
+            // The read: the list's content, of the list's own arena (`world::LIST_ARENA`).
             _ = all.content(db);
             std::sync::Arc::clone(&db.snap().table.all)
         }
@@ -424,19 +431,92 @@ pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
     }
 }
 
-/// Each listed crate with its item key ([`crate_item_key`]), in the crate graph's order: the
-/// session-level list a query homed at the session arena reads in place of each crate's arena
-/// (blaze-items' `crates_by_prefix`). The read is the list's content, of the session arena, as
-/// for [`all_crates`]: a listed crate written, added or taken out moves it.
-pub fn crate_item_keys(db: &Db) -> std::sync::Arc<[(CrateKey, ContentId)]> {
-    match AllCrates::try_get(db) {
-        Some(all) => {
-            _ = all.content(db);
-            std::sync::Arc::clone(&db.snap().table.item_keys)
+/// The prefix a crate's item key is found by ([`listed_by_prefix`]): its first 8 bytes read
+/// little-endian, the crate prefix every item key of the crate begins with (blaze-items'
+/// `crate_prefix`).
+pub fn key_prefix(item_key: &ContentId) -> u64 {
+    u64::from_le_bytes(*item_key.0.first_chunk().expect("a content ID is 32 bytes"))
+}
+
+/// The listed crate whose item key ([`crate_item_key`]) begins with `prefix`
+/// ([`key_prefix`]), if one does: one binary search of the snapshot's table, made each commit
+/// the list moved.
+///
+/// What it reads is what its answer depends on, and no more:
+/// - a crate found is read through its own [`Crate`] input (its data, an input of its own
+///   arena): the asker borrows that crate, whose arena a write that moves its item key off
+///   `prefix` (its cfg, its dependencies) or takes it out of the list marks. A second crate
+///   that took the prefix is a clash, which stops the build ([`listed_clash`]);
+/// - none found reads the list ([`AllCrates`], its own open arena): a crate that takes the
+///   prefix moves the list, so the runs that found none are dropped with it.
+///
+/// So a build script's cfg written drops that crate, its dependents and the runs that found
+/// no crate; never a crate that found another crate's key. Until round 28 every lookup read a
+/// session query of every crate's key (`crates_by_prefix`), so each cfg written, and each
+/// crate added, dropped every arena.
+///
+/// # Panics
+///
+/// Where the list has a clash ([`listed_clash`]): a key resolved in a build that check stops.
+pub fn listed_by_prefix(db: &Db, prefix: u64) -> Option<Crate> {
+    let table = &db.snap().table;
+    if let Some([krate, other]) = table.clash {
+        panic!(
+            "base-db: a crate key looked up in a crate list where the crates {krate:?} and {other:?} share \
+             the prefix of their item keys (`listed_clash`, which a build checks before any key is resolved)"
+        );
+    }
+    match table.by_prefix.binary_search_by_key(&prefix, |&(it, _)| it) {
+        Ok(at) => {
+            let key = table.by_prefix[at].1;
+            let krate = db.crate_at(key).unwrap_or_else(|| {
+                panic!(
+                    "base-db: the crate list's prefix index names the crate {key:?}, which this snapshot's \
+                     table has no crate for (the index and the table are made in one commit)"
+                )
+            });
+            // The read: the found crate's own input, so the asker borrows its arena.
+            _ = krate.data(db);
+            Some(krate)
         }
-        None => std::sync::Arc::default(),
+        Err(_) => {
+            if let Some(all) = AllCrates::try_get(db) {
+                _ = all.content(db);
+            }
+            None
+        }
     }
 }
+
+/// The first two listed crates whose item keys share a prefix ([`key_prefix`]), by key; none
+/// where every prefix is one crate's. Read off the snapshot's table, outside any run: what a
+/// build checks once its crate graph is set, before any key is resolved.
+pub fn listed_clash(db: &Db) -> Option<[CrateKey; 2]> {
+    db.snap().table.clash
+}
+
+/// A kind of gift that says where a value can be read, never what it is: the kind's promise,
+/// stated once here, is that every reader of the gift computes the same value with it as
+/// without it (an image's lang items are the ones the crate's def map collects; a crate's
+/// constants filed under a key are the ones its evaluation gives). So a gift of the kind is
+/// no input of any arena: it lives in the snapshot's table ([`Crate::located`]), and its first
+/// gift to a crate marks no arena, however much the crate's arena holds
+/// ([`Edit::give_located`]). A gift that replaces one under another fact, or a withdrawal
+/// ([`Edit::take_located`]), marks the crate: the value held may be one the inputs no longer
+/// give, and whatever read it goes with the crate's arena (each reader of a crate's gift
+/// reads it in that crate's arena or in a dependent's, each of which borrows it).
+///
+/// A kind given located is given and read that way only: [`Edit::give`] or [`Edit::give_by`]
+/// of a kind a crate holds located stops, as does [`Edit::give_located`] of one it holds as a
+/// slot.
+pub trait Located: 'static {}
+
+/// The kind of the planted-bug control of the located-gift tests.
+#[cfg(test)]
+pub(crate) struct LocatedForTests;
+
+#[cfg(test)]
+impl Located for LocatedForTests {}
 
 /// Crates whose root file is in `id`, in the crate graph's order.
 ///
@@ -454,16 +534,16 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
 /// `OUT_DIR`.
 pub const OWN_ROOT_DOMAIN: &str = "blaze v2 source root content without other crates' OUT_DIRs 1";
 
-/// `krate`'s `OUT_DIR`, without a trailing separator; `None` for none or an empty one.
-fn out_dir(db: &Db, krate: Crate) -> Option<String> {
-    let dir = krate.env(db).get("OUT_DIR")?;
-    let trimmed = dir.trim_end_matches(['/', '\\']);
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
 /// The `OUT_DIR`s of the other crates of `krate`'s source root, sorted, each without a
 /// trailing separator: the directories of that root whose files `krate` is not made from.
 /// Kept in the crate's arena.
+///
+/// A field of the crate's own input, made by the world each commit (`world::out_dirs_of`):
+/// until round 28 this query read the list of its root's crates and each one's variables,
+/// so every crate's arena read the crate list, and a crate added anywhere (the second `hi`
+/// crate of `check` after `run`) dropped every arena. Now a commit marks a crate's arena when
+/// its own dirs move (a crate of its root added, taken out or given another `OUT_DIR`), and
+/// nothing else of the list reaches it.
 ///
 /// A build script's run is applied by putting the files it left in `OUT_DIR` into its
 /// package's source root (`blaze_lower::Lowered::ran`), where the crates given that `OUT_DIR`
@@ -473,19 +553,8 @@ fn out_dir(db: &Db, krate: Crate) -> Option<String> {
 /// sets before any run, so it is the same before a run is applied and after.
 #[blaze_memo::tracked(returns(copy))]
 pub fn other_out_dirs<'db>(db: &'db Db, krate: Crate) -> &'db [&'db str] {
-    let own = out_dir(db, krate);
-    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
-    let mut dirs: Vec<String, Global> = Vec::new_in(Global);
-    dirs.extend(
-        source_root_crates(db, root)
-            .iter()
-            .filter_map(|&other| out_dir(db, other))
-            .filter(|dir| Some(dir) != own.as_ref()),
-    );
-    dirs.sort_unstable();
-    dirs.dedup();
     let memo = db.memo();
-    blaze_memo::keep_iter(memo, dirs.iter().map(|dir| blaze_memo::keep_str(memo, dir)))
+    blaze_memo::keep_iter(memo, krate.out_dirs(db).iter().map(|dir| blaze_memo::keep_str(memo, dir)))
 }
 
 /// Whether `path` is a file below one of `dirs` ([`other_out_dirs`]).

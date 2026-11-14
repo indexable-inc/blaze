@@ -149,8 +149,7 @@ mod tests {
         query::{Command, Invocation, Mount, Origin},
         schema::{Mode, UnitGraph},
     };
-    use hegel::generators as gs;
-    use hegel::{Hegel, Settings, TestCase};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
     use crate::serve::tests::{of_graph, unit};
@@ -231,44 +230,33 @@ mod tests {
         }
     }
 
-    #[hegel::composite]
-    fn case(tc: &TestCase) -> Case {
-        let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(9));
+    fn case(tape: &Tape) -> Case {
+        let count = tape.int_in(1..=9usize, "count");
         let mut deps = Vec::new();
         for at in 0..count {
             let mut of = Vec::new();
             for below in 0..at {
-                if tc.draw(gs::booleans()) {
+                if tape.bool("depends") {
                     of.push(below);
                 }
             }
             deps.push(of);
         }
-        let flags = || gs::vecs(gs::booleans()).min_size(count).max_size(count);
         Case {
             deps,
-            kept: tc.draw(flags()),
-            sealed: tc.draw(flags()),
-            same_plan: tc.draw(gs::booleans()),
-            same_config: tc.draw(gs::booleans()),
+            kept: tape.vec(count..=count, "kept", |tape| tape.bool("kept")),
+            sealed: tape.vec(count..=count, "sealed", |tape| tape.bool("sealed")),
+            same_plan: tape.bool("same plan"),
+            same_config: tape.bool("same config"),
         }
     }
 
     /// The invariant: a unit stands only when the last build was of this very plan and an
     /// equal config, kept the unit, the unit is sealed and every unit below it stands; any
-    /// other plan or config stands nothing. `HEGEL_TEST_CASES=<n>` runs it longer.
+    /// other plan or config stands nothing. `BLAZE_SIM_SEEDS=<n>` runs it longer.
     #[test]
     fn a_unit_stands_only_under_the_plan_and_config_that_kept_it_over_units_that_stand() {
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(256);
-        Hegel::new(|tc: TestCase| {
-            let case = tc.draw(case());
-            if let Err(why) = check(&case) {
-                panic!("{why}");
-            }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        blaze_sim::check(Config::cases(256), |tape| check(&case(tape)));
     }
 
     /// The controls: each planted bug stands a unit the model posts, on a case that shows it.

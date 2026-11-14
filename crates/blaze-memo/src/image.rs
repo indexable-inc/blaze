@@ -476,13 +476,14 @@ pub(crate) fn probe<'db, K: Copy + Eq + Debug + crate::Home + 'static, V: 'stati
         // The record's facts, as this entry's rows: what a reader of it now depends on (the
         // same facts the check above compared).
         let boundary = boundary_local(memo, slot, kind);
+        // The record's facts are its whole flat list (sorted and merged when filed): direct
+        // rows with no callees. Scratch on the global heap, copied once into the arena.
+        let mut rows = Vec::with_capacity_in(reads.len(), Global);
+        rows.extend(reads.iter().map(|fact| Read::Input { kind: KindId::of(&crate::IMAGE_FACT), fact: *fact }));
         let entry = with_local(slot, |local| -> *const Entry<K, V> {
-            let reads = local.alloc_slice_fill_with(reads.len(), |at| Read::Input {
-                kind: KindId::of(&crate::IMAGE_FACT),
-                fact: reads[at],
-            });
+            let lists = crate::record::Lists::in_arena(slot, local, &rows, &[]);
             let at = boundary.map_or(0, |(_, at)| at);
-            local.alloc(Entry { head: Head::new(hash, kind, reads, at), key: *key, value })
+            local.alloc(Entry { head: Head::listed(hash, kind, lists, at), key: *key, value })
         });
         // SAFETY: just made in `slot`'s arena, which `memo` holds.
         let entry: &Entry<K, V> = unsafe { &*entry };
@@ -504,12 +505,14 @@ pub(crate) fn probe<'db, K: Copy + Eq + Debug + crate::Home + 'static, V: 'stati
     Some(&entry.value)
 }
 
-/// After a run of an imaged query computed `value` as itself (no cycle) with `reads`: its
-/// record, queued for [`Memo::file_records`]. Nothing is filed outside a [`Memo::serve`], and
-/// nothing for a list holding an untracked read ([`crate::read_untracked`]: valid in this
-/// snapshot only, so the entry is recomputed in each; counted, `image_untracked`).
+/// After a run of an imaged query computed `value` as itself (no cycle), its entry `head`
+/// published: its record, queued for [`Memo::file_records`]. Nothing is filed outside a
+/// [`Memo::serve`] (and no flat list made for it there), and nothing for a list holding an
+/// untracked read ([`crate::read_untracked`]: valid in this snapshot only, so the entry is
+/// recomputed in each; counted, `image_untracked`, inside a serve).
 ///
-/// The filed list is stable facts: an input row's fact as it is, a boundary row
+/// The filed list is the entry's flat list ([`crate::record::flat_of`], made here and kept
+/// with the entry) as stable facts: an input row's fact as it is, a boundary row
 /// ([`Read::Query`]) as the image translates it ([`Image::query_fact`]); duplicates merged.
 ///
 /// # Panics
@@ -522,14 +525,16 @@ pub(crate) fn file<K, V>(
     kind: &'static Kind,
     key: &K,
     value: &V,
-    reads: &[Read],
+    head: &Head,
     imaged: &Imaged<K, V>,
 ) {
-    if reads.iter().any(|read| read.is_untracked()) {
-        counts::image_untracked();
-        return;
-    }
+    let mut untracked = false;
     let made = memo.image.with(|image| {
+        let reads = crate::record::flat_of(memo, head);
+        if reads.iter().any(|read| read.is_untracked()) {
+            untracked = true;
+            return None;
+        }
         let record_key = entry_key(memo, image.tool(), kind, key, imaged);
         let mut facts = Vec::with_capacity_in(reads.len(), Global);
         for read in reads {
@@ -549,6 +554,9 @@ pub(crate) fn file<K, V>(
         let bytes = record::write_traced(&record_key, &facts, &[], (imaged.encode)(value));
         Some(Filed { arena: slot.id.index(), key: record_key, bytes })
     });
+    if untracked {
+        counts::image_untracked();
+    }
     if let Some(filed) = made {
         counts::image_filed();
         memo.filed.0.push(filed);

@@ -10,8 +10,7 @@ use std::string::String;
 use std::vec;
 use std::vec::Vec;
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::desc::{Backend, Description, Param, ResultCol, Returns, RustTy, Slot, Storage, Ty};
 use crate::infer::{Expected, Place, TypeError, TypeErrorKind, What, infer};
@@ -826,21 +825,22 @@ fn compared_param_holds(column: &Column<'static>, is: bool, params: &[Param<'sta
 
 /// The invariant: a parameter compared with a column takes the column's storage and Rust type
 /// (its newtype, not the plain type), non-null for `=` and nullable for `is`.
-#[hegel::test]
-fn a_compared_parameter_takes_its_columns_type(tc: TestCase) {
-    let table = tc.draw(gs::sampled_from(TABLES.to_vec()));
-    let index: usize = tc.draw(gs::integers().max_value(table.columns.len() - 1));
-    let column = &table.columns[index];
-    let is = tc.draw(gs::booleans());
-    let text: &'static str = format!(
-        "select 1 as one from {} where {} {} $p",
-        table.name,
-        column.name,
-        if is { "is" } else { "=" }
-    )
-    .leak();
-    let d = describe(text);
-    assert!(compared_param_holds(column, is, &d.params), "{text}: {:?}", d.params);
+#[test]
+fn a_compared_parameter_takes_its_columns_type() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let table = *tape.one_of(&TABLES, "table");
+        let column = &table.columns[tape.index(table.columns.len(), "column")];
+        let is = tape.bool("is");
+        let text: &'static str = format!(
+            "select 1 as one from {} where {} {} $p",
+            table.name,
+            column.name,
+            if is { "is" } else { "=" }
+        )
+        .leak();
+        let d = describe(text);
+        assert!(compared_param_holds(column, is, &d.params), "{text}: {:?}", d.params);
+    });
 }
 
 #[test]
@@ -869,12 +869,13 @@ fn left_join_text(column: &Column<'static>) -> &'static str {
 
 /// The invariant: every column of a `left join`'s right side is nullable, and the left side's
 /// columns keep their own nullability.
-#[hegel::test]
-fn a_left_joins_right_columns_are_nullable(tc: TestCase) {
-    let index: usize = tc.draw(gs::integers().max_value(ORDERS_COLUMNS.len() - 1));
-    let column = &ORDERS_COLUMNS[index];
-    let d = describe(left_join_text(column));
-    assert!(left_join_holds(rows(&d), column), "{:?}", rows(&d));
+#[test]
+fn a_left_joins_right_columns_are_nullable() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let column = &ORDERS_COLUMNS[tape.index(ORDERS_COLUMNS.len(), "column")];
+        let d = describe(left_join_text(column));
+        assert!(left_join_holds(rows(&d), column), "{:?}", rows(&d));
+    });
 }
 
 #[cfg(feature = "plant")]
@@ -1143,11 +1144,15 @@ const PLACEHOLDERS: &str =
 
 /// The invariant: placeholders are numbered from 1 in the order they first appear, each with
 /// one slot; a SQLite list of length n is n `ListItem` slots, a Postgres list one `Array`.
-#[hegel::test]
-fn placeholders_are_numbered_in_order(tc: TestCase) {
-    let a: u32 = tc.draw(gs::integers().max_value(5));
-    let b: u32 = tc.draw(gs::integers().max_value(5));
-    let backend = tc.draw(gs::sampled_from(vec![Backend::Sqlite, Backend::Postgres]));
+#[test]
+fn placeholders_are_numbered_in_order() {
+    blaze_sim::check(Config::DEFAULT, numbered_in_order_for_any_lists);
+}
+
+fn numbered_in_order_for_any_lists(tape: &Tape) {
+    let a = tape.int_in(0..=5u32, "a");
+    let b = tape.int_in(0..=5u32, "b");
+    let backend = *tape.one_of(&[Backend::Sqlite, Backend::Postgres], "backend");
     let checked = crate::check(&SCHEMA, PLACEHOLDERS, Global).unwrap();
     let out = render(&checked, backend, &[a, b], Global).unwrap();
     assert!(

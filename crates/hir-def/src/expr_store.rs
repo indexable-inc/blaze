@@ -171,8 +171,10 @@ struct ExpressionOnlyStore {
     /// macro's, not the one of the crate that uses the macro.
     block_editions: Col<(ExprId, Edition)>,
 
-    /// The closures written with `#[rustc_inherit_overflow_checks]`, in increasing order.
-    overflow_inheriting: Col<ExprId>,
+    /// The expressions an attribute changes the lowering of, in increasing order: closures
+    /// written with `#[rustc_inherit_overflow_checks]`, `loop`s with `#[loop_match]`, `break`s
+    /// with `#[const_continue]`. One column, since the expression's kind says which attribute.
+    marked_exprs: Col<ExprId>,
 
     /// The expressions lowering made with no syntax of their own, in increasing order: the
     /// parts of a desugaring (`for`, `?`, `.await`, `format_args!`, an `async fn`'s parameter
@@ -265,8 +267,8 @@ pub struct ExpressionStoreBuilder {
     pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: HashMap<ExprId, Edition, Global>,
 
-    /// The closures written with `#[rustc_inherit_overflow_checks]`.
-    overflow_inheriting: HashSet<ExprId, Global>,
+    /// The expressions an attribute changes the lowering of, as the store's `marked_exprs`.
+    marked_exprs: HashSet<ExprId, Global>,
     /// A bit per expression, by id, set when lowering gives it syntax of its own
     /// ([`Self::map_expr_back`]), recorded with or without the source map: `finish` makes the
     /// store's `synthesized` of the expressions whose bit is clear.
@@ -726,7 +728,7 @@ struct Scratch {
     field_hygiene: HashMap<ExprOrPatIdPacked, HygieneId, Global>,
     type_hygiene: Vec<(TypeRefId, HygieneId)>,
     block_editions: HashMap<ExprId, Edition, Global>,
-    overflow_inheriting: HashSet<ExprId, Global>,
+    marked_exprs: HashSet<ExprId, Global>,
     with_syntax: Vec<u64>,
     spec_clauses: Vec<(ExprId, SpecClauseKind)>,
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
@@ -758,12 +760,12 @@ struct Packing {
     hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
     field_hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
     editions: Vec<(ExprId, Edition)>,
-    inheriting: Vec<ExprId>,
+    marked: Vec<ExprId>,
     /// The synthesized expressions, gathered in increasing order.
     synthesized: Vec<ExprId>,
     /// The radix sorts' buffers.
     editions_sort: Vec<(ExprId, Edition)>,
-    inheriting_sort: Vec<ExprId>,
+    marked_sort: Vec<ExprId>,
 }
 
 impl Packing {
@@ -773,19 +775,19 @@ impl Packing {
             hygiene,
             field_hygiene,
             editions,
-            inheriting,
+            marked,
             synthesized,
             editions_sort,
-            inheriting_sort,
+            marked_sort,
         } = self;
         owners.clear();
         hygiene.clear();
         field_hygiene.clear();
         editions.clear();
-        inheriting.clear();
+        marked.clear();
         synthesized.clear();
         editions_sort.clear();
-        inheriting_sort.clear();
+        marked_sort.clear();
     }
 
     fn capacity(&self) -> usize {
@@ -793,10 +795,10 @@ impl Packing {
             + self.hygiene.capacity()
             + self.field_hygiene.capacity()
             + self.editions.capacity()
-            + self.inheriting.capacity()
+            + self.marked.capacity()
             + self.synthesized.capacity()
             + self.editions_sort.capacity()
-            + self.inheriting_sort.capacity()
+            + self.marked_sort.capacity()
     }
 }
 
@@ -860,7 +862,7 @@ impl Scratch {
             field_hygiene,
             type_hygiene,
             block_editions,
-            overflow_inheriting,
+            marked_exprs,
             with_syntax,
             spec_clauses,
             expr_map,
@@ -893,7 +895,7 @@ impl Scratch {
         field_hygiene.clear();
         type_hygiene.clear();
         block_editions.clear();
-        overflow_inheriting.clear();
+        marked_exprs.clear();
         with_syntax.clear();
         spec_clauses.clear();
         expr_map.clear();
@@ -928,7 +930,7 @@ impl Scratch {
             + self.field_hygiene.capacity()
             + self.type_hygiene.capacity()
             + self.block_editions.capacity()
-            + self.overflow_inheriting.capacity()
+            + self.marked_exprs.capacity()
             + self.with_syntax.capacity()
             + self.spec_clauses.capacity()
             + self.expr_map.capacity()
@@ -967,7 +969,7 @@ impl ExpressionStoreBuilder {
             field_hygiene,
             type_hygiene,
             block_editions,
-            overflow_inheriting,
+            marked_exprs,
             with_syntax,
             spec_clauses,
             expr_map,
@@ -1001,7 +1003,7 @@ impl ExpressionStoreBuilder {
             field_hygiene,
             type_hygiene,
             block_editions,
-            overflow_inheriting,
+            marked_exprs,
             with_syntax,
             spec_clauses,
             inference_roots: None,
@@ -1045,7 +1047,7 @@ impl ExpressionStoreBuilder {
             field_hygiene: mem::take(&mut self.field_hygiene),
             type_hygiene: mem::take(&mut self.type_hygiene),
             block_editions: mem::take(&mut self.block_editions),
-            overflow_inheriting: mem::take(&mut self.overflow_inheriting),
+            marked_exprs: mem::take(&mut self.marked_exprs),
             with_syntax: mem::take(&mut self.with_syntax),
             spec_clauses: mem::take(&mut self.spec_clauses),
             expr_map: mem::take(&mut self.expr_map),
@@ -1445,7 +1447,7 @@ impl ExpressionStoreBuilder {
                     ident_hygiene,
                     field_hygiene,
                     block_editions,
-                    overflow_inheriting,
+                    marked_exprs,
                     with_syntax,
                     spec_clauses,
                     packing,
@@ -1470,11 +1472,11 @@ impl ExpressionStoreBuilder {
                     |&(id, _)| id.into_raw().into_u32(),
                     &mut packing.editions_sort,
                 );
-                packing.inheriting.extend(overflow_inheriting.iter().copied());
+                packing.marked.extend(marked_exprs.iter().copied());
                 radix::sort_copy_by_key_in(
-                    &mut packing.inheriting,
+                    &mut packing.marked,
                     |it| it.into_raw().into_u32(),
-                    &mut packing.inheriting_sort,
+                    &mut packing.marked_sort,
                 );
                 synthesized_of(with_syntax, columns.expr_count(), &mut packing.synthesized);
                 // Every element type here is 4-byte aligned, so no padding between columns.
@@ -1484,7 +1486,7 @@ impl ExpressionStoreBuilder {
                 layout.add::<(ExprOrPatIdPacked, HygieneId)>(packing.field_hygiene.len());
                 layout.add::<(ExprId, Edition)>(packing.editions.len());
                 layout.add::<u32>(packing.owners.len());
-                layout.add::<ExprId>(packing.inheriting.len());
+                layout.add::<ExprId>(packing.marked.len());
                 layout.add::<ExprId>(packing.synthesized.len());
                 // Lowered in order, so already sorted but for a group lowered inside another's.
                 spec_clauses.sort_unstable_by_key(|&(group, _)| group.into_raw().into_u32());
@@ -1495,7 +1497,7 @@ impl ExpressionStoreBuilder {
                 let field_hygiene = slab.copy(&packing.field_hygiene[..]);
                 let block_editions = slab.copy(&packing.editions[..]);
                 let binding_owners = slab.copy(&packing.owners[..]);
-                let overflow_inheriting = slab.copy(&packing.inheriting[..]);
+                let marked_exprs = slab.copy(&packing.marked[..]);
                 let synthesized = slab.copy(&packing.synthesized[..]);
                 let spec_clauses = slab.copy(&spec_clauses[..]);
                 // Once per store, boxed to keep signature-only stores small.
@@ -1509,7 +1511,7 @@ impl ExpressionStoreBuilder {
                     ident_hygiene,
                     field_hygiene,
                     block_editions,
-                    overflow_inheriting,
+                    marked_exprs,
                     synthesized,
                     spec_clauses,
                     expr_roots: expr_roots
@@ -1571,7 +1573,7 @@ impl ExpressionOnlyStore {
             ident_hygiene,
             field_hygiene,
             block_editions,
-            overflow_inheriting,
+            marked_exprs,
             synthesized,
             spec_clauses,
             expr_roots,
@@ -1588,7 +1590,7 @@ impl ExpressionOnlyStore {
             + ident_hygiene.heap_bytes()
             + field_hygiene.heap_bytes()
             + block_editions.heap_bytes()
-            + overflow_inheriting.heap_bytes()
+            + marked_exprs.heap_bytes()
             + synthesized.heap_bytes()
             + spec_clauses.heap_bytes()
             + roots
@@ -2096,7 +2098,37 @@ impl ExpressionStore {
     /// Whether a closure takes the overflow checks of the crate that compiles it, as a function
     /// with `#[rustc_inherit_overflow_checks]` does.
     pub fn inherits_overflow_checks(&self, closure: ExprId) -> bool {
-        self.assert_expr_only().overflow_inheriting.binary_search(&closure).is_ok()
+        self.is_marked(closure) && self.expr_kind(closure) == columns::ExprKind::Closure
+    }
+
+    /// Whether `expr` is a `loop` written with `#[loop_match]`: its body is a state machine
+    /// whose `#[const_continue]` breaks MIR lowering turns into jumps (`loop_match_check`).
+    pub fn is_loop_match(&self, expr: ExprId) -> bool {
+        self.is_marked(expr) && self.expr_kind(expr) == columns::ExprKind::Loop
+    }
+
+    /// Whether `expr` is a `break` written with `#[const_continue]`.
+    pub fn is_const_continue(&self, expr: ExprId) -> bool {
+        self.is_marked(expr) && self.expr_kind(expr) == columns::ExprKind::Break
+    }
+
+    /// Whether some `loop` or `break` of the store has one of the two attributes: the check's
+    /// gate, so a body with neither never walks its expressions. A `#[const_continue]` outside
+    /// any `#[loop_match]` is refused, so the breaks count too.
+    pub fn has_loop_match(&self) -> bool {
+        self.expr_only.as_ref().is_some_and(|only| {
+            only.marked_exprs.iter().any(|&expr| {
+                matches!(
+                    self.expr_kind(expr),
+                    columns::ExprKind::Loop | columns::ExprKind::Break
+                )
+            })
+        })
+    }
+
+    /// The column holds closures, loops and breaks together; the caller checks the kind.
+    fn is_marked(&self, expr: ExprId) -> bool {
+        self.assert_expr_only().marked_exprs.binary_search(&expr).is_ok()
     }
 
     /// Whether lowering made `expr` with no syntax of its own: a part of a desugaring (rustc's
@@ -2550,7 +2582,7 @@ mod scratch_tests {
         builder.ident_hygiene.insert(missing.into(), HygieneId::ROOT);
         builder.field_hygiene.insert(missing.into(), HygieneId::ROOT);
         builder.block_editions.insert(matched, Edition::Edition2021);
-        builder.overflow_inheriting.insert(matched);
+        builder.marked_exprs.insert(matched);
         let unit = builder.alloc_type_ref(TypeRef::UNIT);
         builder.type_hygiene.push((unit, HygieneId::ROOT));
         for at in 0..n {
@@ -2610,7 +2642,7 @@ mod scratch_tests {
         let only = store.expr_only.as_deref().expect("a store with expressions");
         assert!(only.columns.arms.in_slab(), "match arms are in the column slab");
         assert!(only.block_editions.in_slab() && only.binding_owners.in_slab());
-        assert_eq!(&*only.overflow_inheriting, &[only.block_editions[0].0]);
+        assert_eq!(&*only.marked_exprs, &[only.block_editions[0].0]);
     }
 
     /// A store's kinds are a bit for each variant some expression of it has, and no other.

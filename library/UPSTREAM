@@ -49,7 +49,9 @@ rust-src https://static.rust-lang.org/dist/2026-10-27/rust-src-nightly.tar.xz a9
 #   under `blaze_verify` and `blaze_unreachable`; nothing else in library/ refers to it
 #   (docs/v2/plan/design/contracts.md, part 2). It also holds `ConstExprs`, unstable under
 #   `blaze_const_exprs`, which only puts that language feature's name in the library's table of
-#   features (docs/v2/plan/design/ownership.md).
+#   features (docs/v2/plan/design/ownership.md), and `ImpliedBounds` and `AnonParams`, unstable
+#   under `blaze_implied_bounds` and `blaze_anon_params`, the same for those two
+#   (docs/v2/plan/design/implied-bounds.md).
 # - core/src/blaze_simd.rs (new) with its `mod blaze_simd;` and the re-export
 #   `pub use crate::blaze_simd::native_lanes;` in `pub mod simd` of core/src/lib.rs:
 #   `core::simd::native_lanes!(T)`, the lanes of the widest vector the calling crate is compiled

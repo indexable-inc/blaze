@@ -5,7 +5,8 @@
 //! laid out at 16 bytes, padded to a block, each file written whole and durable, with its
 //! blocks' checks.
 //!
-//! What it draws, as one plan (Hegel's, shrunk; or a seed's, for the controls and replay):
+//! What it draws from the case's tape, as one plan (shrunk on a failure; a seed's for the
+//! controls and replay):
 //!
 //! - files and their records (16 bytes to several pages, a file longer than a window taking a
 //!   run of them; one in four an index file, which the sweep weighs four times);
@@ -15,7 +16,9 @@
 //!   batch given back as its own step; the loader's completions, delayed and shuffled. Which
 //!   takes its next step is drawn, at the granularity of word operations (`Sim` is one thread,
 //!   so the test steps each machine itself; two threads' atomics interleaving at every operation
-//!   waits for `hegel::sim`'s scheduled atomics);
+//!   are `blaze-check`'s (docs/v2/plan/design/model-checker.md), and one case that interleaves
+//!   threads and crashes a disk waits for the tape to drive both (docs/v2/plan/design/sim.md,
+//!   "Order"));
 //! - faults, as a swarm: failed reads, short reads, held reads, any effect failed once in a
 //!   while, and a block of a file changed on disk (rot);
 //! - the commit: an append to a file, as the store's commit makes one. It pins the file's last
@@ -54,7 +57,8 @@
 //! Planted bugs 1 to 6, 8, 9 and 10 ([`Plant`]), each a safeguard of the pool's removed, must each be caught on
 //! the plan built to expose it ([`directed`]), which passes with nothing planted; the
 //! [`CONTROL_SEEDS`] seeded plans are searched too, and whether one catches it is reported. Replay: a failure names its plan and the simulator's
-//! seed in it; a control names a seed of [`plan_of`] for [`REPLAY`].
+//! seed in it, and `blaze_sim` prints the case's seed and tape (`BLAZE_SIM_SEED`, `BLAZE_SIM_TAPE`);
+//! a control names a case's seed for [`REPLAY`].
 
 use std::{
     cell::RefCell,
@@ -66,11 +70,11 @@ use std::{
 
 use blaze_core::{
     Cache, Completion, Done, Driver, Effect, FileName, Priority, Tag,
-    sim::{Faults, Rng, SCRIBBLE, Sim},
+    sim::{Faults, SCRIBBLE, Sim},
     wait::Deadline,
 };
 use blaze_mem::MemError;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::{
     Append, BLOCK, Ended, FileId, Give, Kernel, LoadFailure, Loads, Opened, Optimistic, PAGE, PinSet, Pins,
@@ -112,7 +116,7 @@ const TRIES: u32 = 64;
 /// The most an optimistic read copies: the store's are 16 to 96 bytes.
 const OPTIMISTIC_MOST: u64 = 256;
 /// Seeded plans a control searches, after its built plan, for one its plant breaks.
-const CONTROL_SEEDS: u64 = 1024;
+const CONTROL_SEEDS: u32 = 1024;
 /// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
 const REPLAY: (u64, Plant) = (0, Plant::None);
 
@@ -236,66 +240,40 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn spec(d: &mut impl Draw) -> Spec {
-    let records = d.int(1, 3);
+fn spec(tape: &Tape) -> Spec {
+    let records = tape.int_in(1..=3u64, "records");
     let sizes = (0..records)
-        .map(|_| match d.int(0, 5) {
-            0..=2 => d.int(16, 512),
-            3 | 4 => d.int(4 << 10, 40 << 10),
-            _ => d.int(60 << 10, 200 << 10),
+        .map(|_| match tape.int_in(0..=5u64, "record size kind") {
+            0..=2 => tape.int_in(16..=512u64, "record size"),
+            3 | 4 => tape.int_in((4u64 << 10)..=(40 << 10), "record size"),
+            _ => tape.int_in((60u64 << 10)..=(200 << 10), "record size"),
         })
         .collect();
-    let rank = match d.int(0, 3) {
+    let rank = match tape.int_in(0..=3u64, "rank") {
         0 => Rank::Index,
         _ => Rank::Plain,
     };
-    Spec { sizes, fill: d.int(0, u64::from(CONTENT) - 2) as u8, rank }
+    Spec { sizes, fill: tape.int_in(0..=u64::from(CONTENT) - 2, "fill") as u8, rank }
 }
 
 /// A plan: the simulator's seed, the fault classes it turns on (a swarm, so a rare class is not
 /// drowned by a common one), its files, and its acts.
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let fail_one_in = match d.coin() {
-        true => d.int(4, 40) as u32,
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let fail_one_in = match tape.coin("effects fail") {
+        true => tape.int_in(4..=40u64, "fail one in") as u32,
         false => 0,
     };
-    let (fail_reads, short_reads, hold_reads, rot) = (d.coin(), d.coin(), d.coin(), d.coin());
-    let files = (0..d.int(1, 3)).map(|_| spec(d)).collect();
-    let spares = (0..2).map(|_| spec(d)).collect();
-    let n = d.int(1, MOST_ACTS);
+    let (fail_reads, short_reads, hold_reads, rot) =
+        (tape.coin("fail reads"), tape.coin("short reads"), tape.coin("hold reads"), tape.coin("rot"));
+    let files = (0..tape.int_in(1..=3u64, "files")).map(|_| spec(tape)).collect();
+    let spares = (0..2).map(|_| spec(tape)).collect();
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     let mut acts = Vec::new();
     for _ in 0..n {
-        let reader = d.int(0, READERS as u64 - 1) as u8;
-        let (file, rec) = (d.int(0, 2) as u8, d.int(0, 2) as u8);
-        acts.push(match d.int(0, 29) {
+        let reader = tape.int_in(0..=READERS as u64 - 1, "reader") as u8;
+        let (file, rec) = (tape.int_in(0..=2u64, "file") as u8, tape.int_in(0..=2u64, "record") as u8);
+        acts.push(match tape.int_in(0..=29u64, "act") {
             0..=3 => Act::Read { reader, file, rec, set: false },
             4 | 5 => Act::Read { reader, file, rec, set: true },
             6 | 7 => Act::Optimistic { reader, file, rec },
@@ -306,8 +284,8 @@ fn plan(d: &mut impl Draw) -> Plan {
             15 | 16 => Act::Evict,
             17 => Act::Visit,
             18 => Act::Give,
-            19 | 20 => Act::Step { us: d.int(0, 400) as u16 },
-            21 if rot => Act::Rot { file, block: d.int(0, 255) as u8 },
+            19 | 20 => Act::Step { us: tape.int_in(0..=400u64, "step us") as u16 },
+            21 if rot => Act::Rot { file, block: tape.int_in(0..=255u64, "rotted block") as u8 },
             21 if hold_reads => Act::ReleaseReads,
             21 => Act::Step { us: 0 },
             22 => Act::Retire { file },
@@ -315,15 +293,11 @@ fn plan(d: &mut impl Draw) -> Plan {
             25 => Act::Prefetch { file },
             26 => Act::BuildEnd,
             27 => Act::BuildStart,
-            28 => Act::Budget { pages: d.int(0, 12) as u8 },
+            28 => Act::Budget { pages: tape.int_in(0..=12u64, "budget pages") as u8 },
             _ => Act::Crash,
         });
     }
     Plan { seed, fail_one_in, fail_reads, short_reads, hold_reads, rot, files, spares, acts }
-}
-
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 /// The bytes of a file of `spec`'s records, padded to a block, and each record's place.
@@ -1235,11 +1209,27 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 /// The invariant: whatever the faults, the schedule, the evictions and the crashes, a read hands
 /// back the bytes its file holds or a refusal its faults explain, nothing pinned or loading is
 /// given back, the process holds exactly the pages in use, and every load ends.
-#[hegel::test(test_cases = 200)]
-fn the_pool_reads_back_what_its_files_hold(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
+#[test]
+fn the_pool_reads_back_what_its_files_hold() {
+    blaze_sim::check(SimConfig::cases(200), |tape| {
+        let plan = plan(tape);
+        if let Err(broke) = run(&plan, Plant::None) {
+            panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
+        }
+    });
+}
+
+/// The words a finding of `rule` says as a `blaze_sim` finding: `[<rule>]` first, so a search
+/// tells one rule's findings from another's.
+fn said_by(rule: Rule) -> String {
+    format!("[{rule:?}]")
+}
+
+/// `broke` as `blaze_sim` takes it: an oracle's finding headed by the words of its rule.
+fn sim_broke(broke: Broke) -> blaze_sim::Broke {
+    match broke {
+        Broke::Oracle(rule, why) => blaze_sim::Broke::Oracle(format!("{} {why}", said_by(rule))),
+        Broke::Harness(why) => blaze_sim::Broke::Harness(why),
     }
 }
 
@@ -1368,23 +1358,40 @@ fn control(plant: Plant) {
         Err(broke) => panic!("the plan built for Plant::{plant:?} must end in the oracle's {rule:?}, and ended in {broke}\nplan {plan:?}"),
         Ok(()) => panic!("the oracle did not catch Plant::{plant:?} on the plan built to expose it: {plan:?}"),
     }
-    let mut other = None;
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(found, why)) if found == rule => {
-                eprintln!("{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})) by {rule:?}: {why}");
-                return;
+    // The drawn plans, searched unshrunk (`blaze_sim::control`'s planted half, but reported, not
+    // required: see above). Another rule's finding under the plant is kept, not counted as the
+    // catch, and the search goes on.
+    let says = said_by(rule);
+    let other: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+    let verdict = blaze_sim::search(SimConfig::cases(CONTROL_SEEDS).shrink_runs(0), |tape| {
+        // `self::`: the built plan above is named `plan` too.
+        match run(&self::plan(tape), plant).map_err(sim_broke) {
+            Err(blaze_sim::Broke::Oracle(why)) if !why.contains(&says) => {
+                let first = other.take();
+                other.set(Some(first.unwrap_or(why)));
+                Ok(())
             }
-            // Another rule's finding under the plant: reported, not counted as its catch.
-            Err(Broke::Oracle(found, why)) => _ = other.get_or_insert((seed, found, why)),
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
+            ran => ran,
         }
+    });
+    match verdict {
+        blaze_sim::Verdict::Failed(failed) if failed.failure.origin == blaze_sim::Origin::Oracle => {
+            let seed = failed.seed.expect("a generated case has a seed");
+            eprintln!(
+                "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})) by {rule:?}: {}",
+                failed.failure.text
+            );
+        }
+        blaze_sim::Verdict::Failed(failed) => {
+            panic!("seed {:?}, {plant:?}: {:?}: {}", failed.seed, failed.failure.origin, failed.failure.text)
+        }
+        blaze_sim::Verdict::Passed(_) => eprintln!(
+            "{plant:?} caught on its built plan and by {rule:?} in none of {CONTROL_SEEDS} drawn plans: drawn plans \
+             rarely make its shape (the first finding of another rule: {:?})",
+            other.take()
+        ),
+        verdict => panic!("the drawn plans of {plant:?}'s control did not run: {verdict:?}"),
     }
-    eprintln!(
-        "{plant:?} caught on its built plan and by {rule:?} at none of seeds 0..{CONTROL_SEEDS}: drawn plans rarely \
-         make its shape (the first finding of another rule: {other:?})"
-    );
 }
 
 #[test]
@@ -1565,9 +1572,7 @@ fn an_append_is_the_file_s_once_its_sync_completes_and_reads_back() {
 #[test]
 fn replay_one_seed() {
     let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
-    }
+    blaze_sim::check(SimConfig::cases(1).first(seed), |tape| run(&plan(tape), plant).map_err(sim_broke));
 }
 
 /// A plan of one file of one short record, with no acts and no faults: for the tests that step a
@@ -1874,22 +1879,22 @@ fn two_readers_of_one_page_are_served_by_one_load() {
 /// Readers pinning records of one file and letting them go, under a budget of `ROOM` resident
 /// pages, each read making room first ([`Sweep::make_room`]) when `room` says so: `Err` at the
 /// first read after which the pool holds more than the budget and more than what is pinned.
-fn reads_under_a_budget(seed: u64, room: bool) -> Result<(), String> {
+fn reads_under_a_budget(tape: &Tape, room: bool) -> Result<(), String> {
     const ROOM: u64 = 3;
     const RECORDS: u64 = 12;
     let spec = Spec { sizes: vec![40_000; RECORDS as usize], fill: 5, rank: Rank::Plain };
+    let seed = tape.next_u64("sim seed");
     let plan = Plan { seed, files: vec![spec], ..quiet_plan() };
     let said = |broke: Broke| broke.to_string();
     let mut world = World::new(&plan, Plant::None).map_err(said)?;
-    let mut rng = Rng::new(seed);
     let resident = |world: &World| world.pool.give().held.borrow().len() as u64 * PAGE;
     for n in 0..200 {
-        let reader = rng.below(READERS as u64) as usize;
+        let reader = tape.below(READERS as u64, "reader") as usize;
         // The reader's last read is let go as its next begins.
         if matches!(world.actors[reader], Actor::Holding { .. }) {
             world.actors[reader] = Actor::Idle;
         }
-        let rec = rng.below(RECORDS) as usize;
+        let rec = tape.below(RECORDS, "record") as usize;
         let (at, len) = world.place(0, rec);
         let load = u64::from(Run::of(at, len).pages) * PAGE;
         if room {
@@ -1930,19 +1935,15 @@ fn reads_under_a_budget(seed: u64, room: bool) -> Result<(), String> {
 /// where readers pin more than that, at most what they pin.
 #[test]
 fn a_load_that_makes_room_first_keeps_the_pool_within_its_budget_and_what_is_pinned() {
-    for seed in 0..64 {
-        if let Err(why) = reads_under_a_budget(seed, true) {
-            panic!("seed {seed}: {why}");
-        }
-    }
+    blaze_sim::check(SimConfig::cases(64), |tape| reads_under_a_budget(tape, true));
 }
 
 /// The cause removed: with no room made before a load, nothing gives a page back, and the pool
-/// passes its budget and what is pinned on every seed.
+/// passes its budget and what is pinned on every case (the 64 seeds it looped by hand before).
 #[test]
 fn the_oracle_catches_a_load_that_makes_no_room() {
-    for seed in 0..64 {
-        let why = reads_under_a_budget(seed, false).expect_err("a pool that gives nothing back stays within no budget");
-        assert!(why.contains("more than its budget"), "seed {seed}: {why}");
-    }
+    blaze_sim::check(SimConfig::cases(64), |tape| {
+        let why = reads_under_a_budget(tape, false).expect_err("a pool that gives nothing back stays within no budget");
+        assert!(why.contains("more than its budget"), "{why}");
+    });
 }

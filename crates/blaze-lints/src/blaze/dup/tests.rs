@@ -3,7 +3,7 @@
 //! of shapes over generated names and literals, and each lint over a crate: where it fires,
 //! where it does not, the fixes made and linted again clean.
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use span::Edition;
 use syntax::{SourceFile, SyntaxKind, TextRange, view as ast};
 
@@ -69,27 +69,29 @@ fn d(values: &[u32], cap: u32) -> u32 { let mut sum = 0; for value in values { i
 
 /// The invariant: renaming the locals of a function never changes its shape, and changing
 /// one literal always does.
-#[hegel::test(test_cases = 64)]
-fn a_shape_is_the_code_up_to_its_locals_names(tc: hegel::TestCase) {
-    let names = ["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta"].map(String::from);
-    let pick = |tc: &hegel::TestCase| -> String { tc.draw(gs::sampled_from(names.to_vec())) };
-    let (x, y, z) = (pick(&tc), pick(&tc), pick(&tc));
-    if x == y || y == z || x == z {
-        return;
-    }
-    let value: u64 = tc.draw(gs::integers().max_value(1 << 40));
-    let other: u64 = tc.draw(gs::integers().max_value(1 << 40));
-    let write = |x: &str, y: &str, z: &str, value: u64| {
-        format!("fn f({x}: u64, {y}: u64) -> u64 {{ let {z} = {x} + {value}; if {z} > {y} {{ {z} * {y} }} else {{ {x} }} }}\n")
-    };
-    let shapes = alphas(&format!(
-        "{}{}{}",
-        write("a", "b", "c", value),
-        write(&x, &y, &z, value),
-        write(&x, &y, &z, other)
-    ));
-    assert_eq!(shapes[0], shapes[1], "renamed to {x}, {y}, {z}");
-    assert_eq!(shapes[1] == shapes[2], value == other, "{value} and {other}");
+#[test]
+fn a_shape_is_the_code_up_to_its_locals_names() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let names = ["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta"].map(String::from);
+        let pick = |tape: &Tape| -> String { tape.one_of(&names, "name").clone() };
+        let (x, y, z) = (pick(tape), pick(tape), pick(tape));
+        if x == y || y == z || x == z {
+            return;
+        }
+        let value: u64 = tape.int_in(0..=1 << 40, "value");
+        let other: u64 = tape.int_in(0..=1 << 40, "other");
+        let write = |x: &str, y: &str, z: &str, value: u64| {
+            format!("fn f({x}: u64, {y}: u64) -> u64 {{ let {z} = {x} + {value}; if {z} > {y} {{ {z} * {y} }} else {{ {x} }} }}\n")
+        };
+        let shapes = alphas(&format!(
+            "{}{}{}",
+            write("a", "b", "c", value),
+            write(&x, &y, &z, value),
+            write(&x, &y, &z, other)
+        ));
+        assert_eq!(shapes[0], shapes[1], "renamed to {x}, {y}, {z}");
+        assert_eq!(shapes[1] == shapes[2], value == other, "{value} and {other}");
+    });
 }
 
 /// The tokens of each top block (`{ .. }` statement of the body) of the first function.

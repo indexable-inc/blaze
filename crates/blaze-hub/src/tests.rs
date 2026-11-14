@@ -1,14 +1,14 @@
 //! The hub's core held to a model (rules dst-not-review, invariants-are-stated): agents'
-//! requests drawn by Hegel and run against the real [`Hub`] over a store in memory, with a
-//! flat map of paths beside it; after every step each lane's root must be the root of the
-//! model's files built from nothing. The planted bugs are in the cores (`crate::Plant`).
+//! requests drawn from a `blaze_sim` tape and run against the real [`Hub`] over a store in
+//! memory, with a flat map of paths beside it; after every step each lane's root must be the
+//! root of the model's files built from nothing. The planted bugs are in the cores
+//! (`crate::Plant`).
 
 use std::collections::BTreeMap;
 
+use blaze_sim::{Config as SimConfig, Tape};
 use blaze_vfs::{Mode, Op};
 use bstd::id::ContentId;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
 
 use crate::{
     Config, Hub, Memory, Plant,
@@ -170,35 +170,39 @@ enum Step {
     Tick { ms: u64 },
 }
 
-fn below(tc: &TestCase, most: u8) -> usize {
-    tc.draw(gs::integers::<u8>().max_value(most)) as usize
+fn below(tape: &Tape, most: u8, label: &'static str) -> usize {
+    tape.int_in(0..=most, label) as usize
 }
 
-fn op(tc: &TestCase) -> Op {
-    let path = PATHS[below(tc, 6)].to_string();
-    let bytes = BYTES[below(tc, 3)].to_vec();
-    match below(tc, 5) {
+fn op(tape: &Tape) -> Op {
+    let path = PATHS[below(tape, 6, "path")].to_string();
+    let bytes = BYTES[below(tape, 3, "bytes")].to_vec();
+    match below(tape, 5, "op") {
         0..=2 => Op::Write { mode: Mode::Regular, path, bytes },
-        3 => Op::Edit { at: below(tc, 8) as u64, len: below(tc, 8) as u64, path, bytes },
+        3 => Op::Edit {
+            at: below(tape, 8, "edit at") as u64,
+            len: below(tape, 8, "edit len") as u64,
+            path,
+            bytes,
+        },
         4 => Op::Delete { path },
-        _ => Op::Rename { to: PATHS[below(tc, 6)].to_string(), from: path },
+        _ => Op::Rename { to: PATHS[below(tape, 6, "rename to")].to_string(), from: path },
     }
 }
 
-#[hegel::composite]
-fn step(tc: &TestCase) -> Step {
-    let (who, lane) = (below(tc, 1), below(tc, 2));
-    match below(tc, 11) {
+fn step(tape: &Tape) -> Step {
+    let (who, lane) = (below(tape, 1, "who"), below(tape, 2, "lane"));
+    match below(tape, 11, "step") {
         0 | 1 => Step::Open { who, lane },
-        2 => Step::Fork { who, from: below(tc, 2), lane },
+        2 => Step::Fork { who, from: below(tape, 2, "fork from"), lane },
         3..=7 => {
-            let on = [On::Any, On::Any, On::Here, On::Elsewhere][below(tc, 3)];
-            let ops = (0..=below(tc, 3)).map(|_| op(tc)).collect();
+            let on = [On::Any, On::Any, On::Here, On::Elsewhere][below(tape, 3, "on")];
+            let ops = (0..=below(tape, 3, "ops")).map(|_| op(tape)).collect();
             Step::Change { who, lane, on, ops }
         }
-        8 | 9 => Step::Read { who, lane, path: below(tc, 6) },
+        8 | 9 => Step::Read { who, lane, path: below(tape, 6, "read path") },
         10 => Step::Close { who, lane },
-        _ => Step::Tick { ms: below(tc, 200) as u64 },
+        _ => Step::Tick { ms: below(tape, 200, "tick ms") as u64 },
     }
 }
 
@@ -342,22 +346,15 @@ fn run(steps: &[Step], plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: whatever two agents ask in whatever order (opens, forks, changes written
 /// against the lane's root, a stale one or none, reads, closes), a lane's root is the root
 /// of its files built from nothing: it does not depend on how the lane got there; a change
 /// applies whole or not at all; only a lane's owner reads or moves it; and a read answers
-/// the model's bytes. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// the model's bytes. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_lanes_root_is_the_root_of_its_files_whatever_was_asked() {
-    run_cases(300, |tc| {
-        let steps = tc.draw(gs::vecs(step()).min_size(1).max_size(24));
+    blaze_sim::check(SimConfig::cases(300), |tape| {
+        let steps = tape.vec(1..=24, "steps", step);
         if let Err(why) = run(&steps, Plant::None) {
             panic!("{why}");
         }

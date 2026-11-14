@@ -33,6 +33,14 @@ namespace Slice
 
 variable {α : Type}
 
+/-- Two slices are equal when their elements are. -/
+theorem ext : ∀ {a b : Slice α}, a.val = b.val → a = b
+  | ⟨_, _⟩, ⟨_, _⟩, rfl => rfl
+
+/-- `==` of slices, `Vec`s and what holds them: element by element. -/
+instance [DecidableEq α] : DecidableEq (Slice α) := fun a b =>
+  if h : a.val = b.val then isTrue (ext h) else isFalse (fun e => h (congrArg Slice.val e))
+
 /-- A list short enough to be a slice. -/
 def ofList? (l : _root_.List α) : Option (Slice α) :=
   if h : l.length ≤ 18446744073709551615 then some ⟨l, h⟩ else none
@@ -52,7 +60,7 @@ def index (s : Slice α) (i : Usize) : Result α :=
 theorem index_ok (s : Slice α) (i : Usize) (h : i.val.toNat < s.val.length) :
     index s i = Result.ok (s.val.get ⟨i.val.toNat, h⟩) := by
   unfold index
-  rw [dif_pos h]
+  rw [dite_eq_left h]
 
 /-- `s[i] = v`. -/
 def update (s : Slice α) (i : Usize) (v : α) : Result (Slice α) :=
@@ -70,6 +78,14 @@ structure Arr (α : Type) (n : Nat) where
 namespace Arr
 
 variable {α : Type} {n : Nat}
+
+/-- Two arrays are equal when their elements are. -/
+theorem ext : ∀ {a b : Arr α n}, a.val = b.val → a = b
+  | ⟨_, _⟩, ⟨_, _⟩, rfl => rfl
+
+/-- `==` of arrays: element by element. -/
+instance [DecidableEq α] : DecidableEq (Arr α n) := fun a b =>
+  if h : a.val = b.val then isTrue (ext h) else isFalse (fun e => h (congrArg Arr.val e))
 
 def ofList (l : _root_.List α) : Arr α l.length := ⟨l, rfl⟩
 

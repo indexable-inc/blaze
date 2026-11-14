@@ -829,19 +829,21 @@ impl Net for Cutting {
 /// every answer keeps to its range and none lies no byte is sent twice: each try resumes where
 /// the last stopped, even across `get`s (as across attempts of a build). With resume taken out
 /// (a try from nothing) that last check fails on the first cut.
-#[hegel::test]
-fn a_cut_download_resumes_and_keeps_only_the_pinned_bytes(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let len: usize = tc.draw(gs::integers().min_value(1).max_value(200));
+#[test]
+fn a_cut_download_resumes_and_keeps_only_the_pinned_bytes() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, cut_download_case);
+}
+
+/// One case of [`a_cut_download_resumes_and_keeps_only_the_pinned_bytes`]. Calm is an answer
+/// that keeps to its range and does not lie (a lie is one in ten, as before).
+fn cut_download_case(tape: &blaze_sim::Tape) {
+    let len = tape.int_in(1usize..=200, "len");
     let body: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
-    let script: Vec<Answer> = tc
-        .draw(
-            gs::vecs(gs::tuples!(gs::booleans(), gs::integers().max_value(len + 10), gs::integers().max_value(9)))
-                .max_size(12),
-        )
-        .into_iter()
-        .map(|(ranged, cut, lie): (bool, usize, u8)| Answer { ranged, cut, lies: lie == 0 })
-        .collect();
+    let script: Vec<Answer> = tape.vec(0..=12, "script", |tape| Answer {
+        ranged: !tape.bool("ignores the range"),
+        cut: tape.int_in(0usize..=len + 10, "cut"),
+        lies: tape.int_in(0u8..=9, "lie") == 9,
+    });
     let honest = script.iter().all(|it| it.ranged && !it.lies);
     let dir = tempfile::tempdir().unwrap();
     let (_driven, store) = store(dir.path());

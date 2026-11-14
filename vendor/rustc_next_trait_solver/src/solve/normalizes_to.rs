@@ -1118,6 +1118,27 @@ where
         item: SolverTraitLangItem,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         let cx = ecx.cx();
+        // `<Described<'a, D, Args> as TypeOf>::Type` is the type `D` describes; while `D` is
+        // not known, ambiguous, so a generic `type_of!` stays an alias.
+        if item == SolverTraitLangItem::ReflectTypeOf {
+            use rustc_type_ir::reflect::TypeOfAnswer;
+            let def_id = goal.predicate.alias.expect_projection_ty_def_id();
+            if !cx.is_projection_lang_item(def_id, SolverProjectionLangItem::ReflectTypeOfType) {
+                return Err(NoSolution.into());
+            }
+            return ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
+                match ecx.type_of_answer(goal.param_env, goal.predicate.self_ty())? {
+                    TypeOfAnswer::Type(ty) => {
+                        ecx.instantiate_normalizes_to_term(goal, ty.into())?;
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                    }
+                    TypeOfAnswer::Unknown => {
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
+                    }
+                    TypeOfAnswer::Refused => Err(NoSolution.into()),
+                }
+            });
+        }
         if item != SolverTraitLangItem::ReflectVariant {
             return Err(NoSolution.into());
         }

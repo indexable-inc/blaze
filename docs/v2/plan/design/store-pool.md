@@ -834,7 +834,7 @@ after (rule `slow-is-p0-traced`).
 
 ### The DST
 
-`crates/blaze-cas/src/pool/tests.rs` is one Hegel test (the `testing` skill) of the real pool, loads
+`crates/blaze-cas/src/pool/tests.rs` is one `blaze_sim::check` (the `testing` skill) of the real pool, loads
 core, sweep and store, driven by `blaze_core::sim::Sim`. `Sim` gains `ReadInto` and `WriteFrom`
 against the registered region. The test's `os::evict` poisons the bytes it gives back with
 `0xDB`, standing in for Linux's zeros and macOS's anything.
@@ -848,8 +848,9 @@ What it draws:
 - **Actors and schedule:** several readers, the commit, the sweep and the loader's completions.
   Which one takes its next step is drawn, at the granularity of state-word operations.
   `Sim` is one thread, so the test steps each actor's state machine one CAS at a time. Two
-  threads' atomics interleaving at every operation waits for `hegel::sim`'s scheduled atomics,
-  and the test moves there once they are on the fork's main.
+  threads' atomics interleaving at every operation are `blaze-check`'s; one case that
+  interleaves threads and crashes a disk waits for the tape to drive both ([sim.md](sim.md),
+  "Order"), and the test moves there once it does.
 - **Faults, as a swarm:** failed reads, short reads, torn writes, failed and held syncs, ENOSPC
   (`fill`), a block of a pack changed on disk (rot), and completions delayed and shuffled.
 - **Crash points:** after any completion count. The reopen runs the open's recovery scan.
@@ -961,7 +962,7 @@ kept as a record yet.
      read's span as it is submitted, takes a write's bytes as it completes, lands any of a failed
      or in-flight write's 512-byte sectors, tears unsynced writes from memory by sector at a
      crash, and has `hold_reads`, `fail_reads`, `short_reads` and `rot`. `Memory` is a
-     registered buffer for tests. `crates/blaze-core/src/sim/pages.rs` is a Hegel DST of a
+     registered buffer for tests. `crates/blaze-core/src/sim/pages.rs` is a blaze-sim DST of a
      pool-shaped page store on them, with planted bugs 4 to 8 of section 7 in miniature: the
      scaffolding lane 3's DST grows from.
 3. **blaze-cas: the pool core and its DST.**

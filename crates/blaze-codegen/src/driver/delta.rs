@@ -523,7 +523,7 @@ fn id_from(
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -533,13 +533,12 @@ mod tests {
     }
 
     /// A list of entries sorted by key, each key once.
-    #[hegel::composite]
-    fn entries(tc: &hegel::TestCase) -> Vec<(u8, ContentId)> {
-        let keys: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().max_value(15)).max_size(16));
+    fn entries(tape: &Tape) -> Vec<(u8, ContentId)> {
+        let keys: Vec<u8> = tape.vec(0..=16, "keys", |tape| tape.int_in(0..=15u8, "key"));
         let mut made: Vec<(u8, ContentId)> = Vec::new();
         for at in keys {
             if made.iter().all(|it| it.0 != at) {
-                let value = tc.draw(gs::integers::<u8>().max_value(3));
+                let value = tape.int_in(0..=3u8, "value");
                 made.push((at, ContentId::of("built id test entry", &[value])));
             }
         }
@@ -562,14 +561,17 @@ mod tests {
     /// The invariant: the ID maintained incrementally equals a fresh build's. The set of one
     /// build's entries moved to the next build's has the root of the next build's entries made
     /// whole, whatever was added, changed and removed between them.
-    #[hegel::test]
-    fn an_id_kept_through_edits_is_a_fresh_builds(tc: hegel::TestCase) {
-        let (before, now) = (tc.draw(entries()), tc.draw(entries()));
-        assert_eq!(
-            moved_root(&before, &now, false),
-            whole(&now, key).root(),
-            "moved from {before:?} to {now:?}"
-        );
+    #[test]
+    fn an_id_kept_through_edits_is_a_fresh_builds() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let before = tape.span("before", entries);
+            let now = tape.span("now", entries);
+            assert_eq!(
+                moved_root(&before, &now, false),
+                whole(&now, key).root(),
+                "moved from {before:?} to {now:?}"
+            );
+        })
     }
 
     /// A control of [`an_id_kept_through_edits_is_a_fresh_builds`]: a move that removes

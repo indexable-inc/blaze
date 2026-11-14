@@ -4,7 +4,7 @@
 
 use std::alloc::Global;
 
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use span::TextSize;
 use triomphe::Arc;
 
@@ -134,39 +134,37 @@ enum Op {
     Commit,
 }
 
-fn draw_text(tc: &hegel::TestCase) -> String {
-    tc.draw(gs::text().alphabet("ab\n").max_size(20))
+fn draw_text(tape: &Tape) -> String {
+    tape.text_from("ab\n", 0..=20, "text")
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
-        0..=2 => Op::Text { file: tc.draw(gs::integers()), text: draw_text(tc) },
-        3 => Op::Env { krate: tc.draw(gs::integers()), env: tc.draw(gs::integers::<u8>().max_value(2)) },
-        4 => Op::Gift { krate: tc.draw(gs::integers()), value: tc.draw(gs::integers::<u32>().max_value(3)) },
-        5 => Op::AddFile { krate: tc.draw(gs::integers()) },
-        6 => Op::Move { file: tc.draw(gs::integers()), to: tc.draw(gs::integers()) },
+fn op(tape: &Tape) -> Op {
+    match tape.int_in(0..=9u8, "op") {
+        0..=2 => Op::Text { file: tape.int::<u8>("file"), text: draw_text(tape) },
+        3 => Op::Env { krate: tape.int::<u8>("krate"), env: tape.int_in(0..=2u8, "env") },
+        4 => Op::Gift { krate: tape.int::<u8>("krate"), value: tape.int_in(0..=3u32, "gift") },
+        5 => Op::AddFile { krate: tape.int::<u8>("krate") },
+        6 => Op::Move { file: tape.int::<u8>("file"), to: tape.int::<u8>("to") },
         _ => Op::Commit,
     }
 }
 
 /// 2-4 crates in a chain or a diamond, each with 1-3 files in its own source root and its own
 /// variables.
-#[hegel::composite]
-fn world(tc: &hegel::TestCase) -> WorldModel {
-    let diamond = tc.draw(gs::booleans());
-    let count = tc.draw(gs::integers::<u32>().min_value(2).max_value(4));
+fn world(tape: &Tape) -> WorldModel {
+    let diamond = tape.bool("diamond");
+    let count = tape.int_in(2..=4u32, "crates");
     let mut crates = Vec::new_in(Global);
     let mut files = Vec::new_in(Global);
     for root in 0..count {
         let root_file = files.len() as u32;
-        files.push(FileModel { root, path: format!("/c{root}/lib.rs"), text: draw_text(tc) });
-        for _ in 1..tc.draw(gs::integers::<u32>().min_value(1).max_value(3)) {
+        files.push(FileModel { root, path: format!("/c{root}/lib.rs"), text: draw_text(tape) });
+        for _ in 1..tape.int_in(1..=3u32, "files") {
             let at = files.len();
-            files.push(FileModel { root, path: format!("/c{root}/f{at}.rs"), text: draw_text(tc) });
+            files.push(FileModel { root, path: format!("/c{root}/f{at}.rs"), text: draw_text(tape) });
         }
-        let gift = tc.draw(gs::booleans()).then(|| tc.draw(gs::integers::<u32>().max_value(3)));
-        crates.push(CrateModel { root_file, env: tc.draw(gs::integers::<u8>().max_value(2)), gift });
+        let gift = tape.bool("given").then(|| tape.int_in(0..=3u32, "gift"));
+        crates.push(CrateModel { root_file, env: tape.int_in(0..=2u8, "env"), gift });
     }
     WorldModel { diamond, crates, files }
 }
@@ -335,13 +333,14 @@ fn check(start: &WorldModel, ops: &[Op], plant: Plant) -> Result<(), String> {
 }
 
 /// The invariant: after any edits and commits, every sampled query answer equals that of a fresh Db built from the same world.
-#[hegel::test(test_cases = 64)]
-fn the_database_answers_what_a_fresh_one_does(tc: hegel::TestCase) {
-    let start = tc.draw(world());
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    if let Err(why) = check(&start, &ops, Plant::None) {
-        panic!("{why}");
-    }
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
+#[test]
+fn the_database_answers_what_a_fresh_one_does() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let start = world(tape);
+        let ops = tape.vec(0..=30, "ops", op);
+        check(&start, &ops, Plant::None)
+    });
 }
 
 /// A chain of two crates, a file each.

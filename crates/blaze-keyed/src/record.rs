@@ -278,8 +278,7 @@ pub enum FactKind {
     Escaped = 11,
     /// A body's own effect and purity summary, its callees by item: made by the body.
     Effects = 12,
-    /// The kinds blaze-front reads (moved here from its `facts::Proposed`, each at the byte it
-    /// proposed).
+    /// The kinds a front end's tasks read (blaze-front, not built on main yet).
     Attrs = 13,
     CrateRoot = 14,
     TraitsInScope = 15,

@@ -570,12 +570,36 @@ served! {
     served_variant_fields(VariantId) -> VariantFields as Fields;
 }
 
-/// [`EnumVariants::of`] from the image of its crate, if it has one.
+/// [`EnumVariants::of`] from the image of its crate, if it has one and its crate's def map is
+/// read from the image's pages too.
+///
+/// A crate whose def map is resolved here ([`Mode::Check`], or an image without pages) reads
+/// its enums' variants from syntax: name resolution asks them while the def map is being made
+/// (`use E::*`, a path through a variant), and a record is found by its item's [`key`] and
+/// decoded by the positions of modules in that same def map, so serving them would make the
+/// crate's resolution ask for itself (`crate_resolution -> scc_state -> EnumVariants::of ->
+/// key::module_indexes -> crate_resolution`). The cost: [`Mode::Check`] compares no variants
+/// record, and says so by name ([`frozen::uncompared`]), never as an agreement; the variants'
+/// ids are the same either way (interned by their syntax).
 pub(crate) fn served_enum_variants(
     db: &Db,
     id: EnumId,
 ) -> Option<(EnumVariants, ThinVec<InactiveEnumVariantCode>)> {
     let item = Item::Variants(id);
+    let krate = item.module(db).krate(db);
+    if !crate::nameres::frozen::pages::is_paged(db, krate) {
+        if super::mode(db, krate) == Some(Mode::Check) {
+            frozen::record_uncompared(
+                db,
+                krate,
+                "enum variants",
+                "the crate is resolved from source in Check mode, and a variants record is \
+                 found by module positions in that same def map, so comparing it while \
+                 resolving would make the resolution ask for itself",
+            );
+        }
+        return None;
+    }
     served::<codes::Variants>(db, item, |krate| {
         record::<codes::Variants>(db, krate, item.what(), &EnumVariants::lower(db, id))
     })

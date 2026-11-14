@@ -16,8 +16,8 @@ use std::{
 };
 
 use blaze_format::FormatError;
-use hegel::{TestCase, generators as gs};
 use blaze_core::lock::Lock;
+use blaze_sim::Tape;
 
 use super::{
     AsId, Cancelled, Cause, Counts, Cycle, Database, DatabaseKeyIndex, Durability, Event, FromIdIn,
@@ -1499,21 +1499,23 @@ fn a_word_that_is_no_id_is_refused_by_the_checked_constructors_naming_it() {
 /// given, and a word it refuses is 0 or past `Id::MAX_U32`, so no word decodes to another ID
 /// and none to an ID no storage could give. Words are drawn around the bounds as well as
 /// anywhere in 64 bits.
-#[hegel::test]
-fn a_decoded_id_is_its_word_and_a_refused_word_is_no_id(tc: TestCase) {
-    let max = u64::from(Id::MAX_U32);
-    let near: u64 = tc.draw(gs::integers::<u64>().max_value(8));
-    let word = match tc.draw(gs::integers::<u8>().max_value(4)) {
-        0 => near,
-        1 => max - near,
-        2 => max + near,
-        3 => u64::from(u32::MAX) - 4 + near,
-        _ => tc.draw(gs::integers::<u64>()),
-    };
-    match Id::decode(word, 40, "a test's id") {
-        Ok(id) => assert_eq!(u64::from(id.as_u32()), word),
-        Err(_) => assert!(word == 0 || word > max, "{word} is an ID and was refused"),
-    }
+#[test]
+fn a_decoded_id_is_its_word_and_a_refused_word_is_no_id() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let max = u64::from(Id::MAX_U32);
+        let near: u64 = tape.int_in(0..=8u64, "near");
+        let word = match tape.int_in(0..=4u8, "where the word is") {
+            0 => near,
+            1 => max - near,
+            2 => max + near,
+            3 => u64::from(u32::MAX) - 4 + near,
+            _ => tape.int::<u64>("word"),
+        };
+        match Id::decode(word, 40, "a test's id") {
+            Ok(id) => assert_eq!(u64::from(id.as_u32()), word),
+            Err(_) => assert!(word == 0 || word > max, "{word} is an ID and was refused"),
+        }
+    })
 }
 
 #[test]
@@ -3269,19 +3271,19 @@ fn evaluate(graph: &[GNode], inputs: &[u64]) -> Vec<u64> {
 
 /// A random acyclic graph: how many inputs it reads, and its nodes, each reading inputs and
 /// nodes before it.
-fn random_graph(tc: &TestCase) -> (usize, Vec<GNode>) {
-    let inputs: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
-    let queries: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+fn random_graph(tape: &Tape) -> (usize, Vec<GNode>) {
+    let inputs: usize = tape.int_in(1..=6usize, "inputs");
+    let queries: usize = tape.int_in(1..=12usize, "queries");
     let mut graph = Vec::with_capacity(queries);
     for at in 0..queries {
-        let op = [Op::Sum, Op::Mod3, Op::Max][tc.draw(gs::integers::<usize>().max_value(2))];
-        let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+        let op = [Op::Sum, Op::Mod3, Op::Max][tape.index(3, "op")];
+        let count: usize = tape.int_in(1..=4usize, "reads");
         let deps = (0..count)
             .map(|_| {
-                if at > 0 && tc.draw(gs::booleans()) {
-                    Dep::Query(tc.draw(gs::integers::<usize>().max_value(at - 1)))
+                if at > 0 && tape.bool("reads a query") {
+                    Dep::Query(tape.index(at, "query read"))
                 } else {
-                    Dep::Input(tc.draw(gs::integers::<usize>().max_value(inputs - 1)))
+                    Dep::Input(tape.index(inputs, "input read"))
                 }
             })
             .collect();
@@ -3290,23 +3292,27 @@ fn random_graph(tc: &TestCase) -> (usize, Vec<GNode>) {
     (inputs, graph)
 }
 
-#[hegel::test]
-fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
-    let (inputs, graph) = random_graph(&tc);
+#[test]
+fn random_graphs_agree_with_a_run_from_scratch() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| random_graphs_agree(tape))
+}
+
+fn random_graphs_agree(tape: &Tape) {
+    let (inputs, graph) = random_graph(tape);
     let queries = graph.len();
     let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
     let mut db = TestDb::made(None, graph);
     let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
-    let writes: usize = tc.draw(gs::integers::<usize>().max_value(12));
+    let writes: usize = tape.int_in(0..=12usize, "writes");
     for step in 0..=writes {
         if step > 0 {
-            let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
-            values[input] += 1 + tc.draw(gs::integers::<u64>().max_value(3));
+            let input: usize = tape.index(inputs, "input written");
+            values[input] += 1 + tape.int_in(0..=3u64, "raised by");
             cells[input].set_a(&mut db, values[input]);
         }
         let expected = evaluate(&db.graph, &values);
-        let reverse = tc.draw(gs::booleans());
+        let reverse = tape.bool("ask in reverse");
         for at in 0..queries {
             let at = if reverse { queries - 1 - at } else { at };
             assert_eq!(
@@ -3384,19 +3390,23 @@ fn least_fixpoint(graph: &[GNode], inputs: &[u64]) -> Vec<u64> {
 /// Converged cycles verified whole agree with a run from scratch: a random graph of max nodes
 /// whose reads may point anywhere (so cycles, nested and overlapping), its inputs written up
 /// and down at random, every node asked for in a random order after each write.
-#[hegel::test]
-fn random_cyclic_fixpoints_agree_with_a_run_from_scratch(tc: TestCase) {
-    let inputs: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
-    let queries: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+#[test]
+fn random_cyclic_fixpoints_agree_with_a_run_from_scratch() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| random_cyclic_fixpoints_agree(tape))
+}
+
+fn random_cyclic_fixpoints_agree(tape: &Tape) {
+    let inputs: usize = tape.int_in(1..=4usize, "inputs");
+    let queries: usize = tape.int_in(1..=8usize, "queries");
     let graph: Vec<GNode> = (0..queries)
         .map(|_| {
-            let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+            let count: usize = tape.int_in(1..=3usize, "reads");
             let deps = (0..count)
                 .map(|_| {
-                    if tc.draw(gs::booleans()) {
-                        Dep::Query(tc.draw(gs::integers::<usize>().max_value(queries - 1)))
+                    if tape.bool("reads a query") {
+                        Dep::Query(tape.index(queries, "query read"))
                     } else {
-                        Dep::Input(tc.draw(gs::integers::<usize>().max_value(inputs - 1)))
+                        Dep::Input(tape.index(inputs, "input read"))
                     }
                 })
                 .collect();
@@ -3407,15 +3417,15 @@ fn random_cyclic_fixpoints_agree_with_a_run_from_scratch(tc: TestCase) {
     let mut db = TestDb::made(None, graph);
     let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
     db.cells.lock().extend(cells.iter().map(|it| it.0));
-    let writes: usize = tc.draw(gs::integers::<usize>().max_value(10));
+    let writes: usize = tape.int_in(0..=10usize, "writes");
     for step in 0..=writes {
         if step > 0 {
-            let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
-            values[input] = tc.draw(gs::integers::<u64>().max_value(9));
+            let input: usize = tape.index(inputs, "input written");
+            values[input] = tape.int_in(0..=9u64, "value written");
             cells[input].set_a(&mut db, values[input]);
         }
         let expected = least_fixpoint(&db.graph, &values);
-        let first: usize = tc.draw(gs::integers::<usize>().max_value(queries - 1));
+        let first: usize = tape.index(queries, "first asked");
         for at in (0..queries).map(|at| (at + first) % queries) {
             assert_eq!(
                 *fetch::<CycGraph>(&db, node(&db, at)),
@@ -3431,9 +3441,13 @@ fn random_cyclic_fixpoints_agree_with_a_run_from_scratch(tc: TestCase) {
 /// After one input is edited and every node is asked for again, every memo that ran did so
 /// because of a changed read, and following each cause (a memo that changed in this view, by
 /// its own cause) reaches the edited field.
-#[hegel::test]
-fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: TestCase) {
-    let (inputs, graph) = random_graph(&tc);
+#[test]
+fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| every_rerun_memos_cause_chain_leads_back(tape))
+}
+
+fn every_rerun_memos_cause_chain_leads_back(tape: &Tape) {
+    let (inputs, graph) = random_graph(tape);
     let queries = graph.len();
     let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
     let mut db = TestDb::made(None, graph);
@@ -3448,10 +3462,10 @@ fn after_editing_one_input_every_rerun_memos_cause_chain_leads_back_to_it(tc: Te
     let first = table(&db);
     assert_eq!(first.len(), queries);
     assert!(first.iter().all(|it| (it.outcome, it.cause) == (Outcome::Reran, Some(Cause::New))));
-    let writes: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(8));
+    let writes: usize = tape.int_in(1..=8usize, "writes");
     for step in 0..writes {
-        let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
-        values[input] += 1 + tc.draw(gs::integers::<u64>().max_value(3));
+        let input: usize = tape.index(inputs, "input written");
+        values[input] += 1 + tape.int_in(0..=3u64, "raised by");
         cells[input].set_a(&mut db, values[input]);
         ask(&db);
         let edited = field_node::<Cells>(db.storage(), cells[input].0, 0);
@@ -3597,19 +3611,21 @@ fn requests_cost_what_they_change(
 }
 
 /// The invariant of [`requests_cost_what_they_change`], over random graphs and requests.
-#[hegel::test]
-fn a_request_that_changes_nothing_writes_no_input_and_an_edit_runs_what_reads_it(tc: TestCase) {
-    let (inputs, graph) = random_graph(&tc);
-    let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
-    let requests: Vec<Request> = (0..count)
-        .map(|_| match tc.draw(gs::booleans()) {
-            true => Request::Unchanged,
-            false => Request::Edit(tc.draw(gs::integers::<usize>().max_value(inputs - 1))),
-        })
-        .collect();
-    if let Err(why) = requests_cost_what_they_change(inputs, graph, &requests, super::frontier::Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_request_that_changes_nothing_writes_no_input_and_an_edit_runs_what_reads_it() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let (inputs, graph) = random_graph(tape);
+        let count: usize = tape.int_in(1..=12usize, "requests");
+        let requests: Vec<Request> = (0..count)
+            .map(|_| match tape.bool("unchanged") {
+                true => Request::Unchanged,
+                false => Request::Edit(tape.index(inputs, "input edited")),
+            })
+            .collect();
+        if let Err(why) = requests_cost_what_they_change(inputs, graph, &requests, super::frontier::Plant::None) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A graph and requests the invariant holds over, for the control below.

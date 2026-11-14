@@ -1,0 +1,14 @@
+{
+ "id": "image-part-array-positional-callers",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane diagnostic-items-image-part, blaze-merge-1113",
+ "where": "crates/hir-def/src/deps/image.rs write_image, Part::ALL; crates/hir-def/src/deps/signatures/tests.rs with_signatures; crates/hir-def/src/deps/tests.rs",
+ "what": "Adding a part to a dependency image changes `write_image`'s argument from `[&[u8]; 2]` to `[&[u8]; 3]`, so every caller (serve.rs, deps/tests.rs, deps/signatures/tests.rs) must change in the same batch; one of them is a file outside the lane's list, so the lane cannot leave a compiling test tree alone. `Part::DefMap` also held tag 2, the next free part tag, and parts are indexed by `part as usize`, so a part numbered after it would have indexed past the array.",
+ "cost": "a hand-off to the main agent for a one-line edit, and a read of every `Part` use to find the tag/index coupling",
+ "cause": "an image's parts are a positional array whose length is the number of kinds, and a non-part (`DefMap`, a refusal's name) shares the tag space",
+ "class": "a persisted container whose shape is spelled at each writer by position",
+ "prevention": "write an image from a value with one named field a part (or a builder keyed by `Part`), and take `DefMap` out of `Part` into the refusal's own type",
+ "workaround": "renumbered DefMap to 3 with a const assertion that each part's tag is its place in Part::ALL; listed signatures/tests.rs:603 for the main agent",
+ "fix": "not yet",
+ "state": "open"
+}

@@ -2068,6 +2068,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverProjectionLangItem::FieldBase => lang_items.FieldBase,
             SolverProjectionLangItem::FieldType => lang_items.FieldType,
             SolverProjectionLangItem::ReflectVariantView => lang_items.ReflectVariantView,
+            SolverProjectionLangItem::ReflectTypeOfType => lang_items.ReflectTypeOfType,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -2117,6 +2118,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverTraitLangItem::ReflectMemoPoint => lang_items.ReflectMemoPoint,
             SolverTraitLangItem::ReflectStruct => lang_items.ReflectStruct,
             SolverTraitLangItem::ReflectVariant => lang_items.ReflectVariant,
+            SolverTraitLangItem::ReflectTypeOf => lang_items.ReflectTypeOf,
         };
         lang_item.expect("Lang item required but not found.").into()
     }
@@ -2188,6 +2190,7 @@ impl<'db> Interner for DbInterner<'db> {
             ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
+            ReflectTypeOf,
         )
     }
 
@@ -2209,6 +2212,7 @@ impl<'db> Interner for DbInterner<'db> {
             FieldBase,
             FieldType,
             ReflectVariantView,
+            ReflectTypeOfType,
         )
     }
 
@@ -2258,6 +2262,7 @@ impl<'db> Interner for DbInterner<'db> {
             ReflectMemoPoint,
             ReflectStruct,
             ReflectVariant,
+            ReflectTypeOf,
         )
     }
 
@@ -2283,6 +2288,18 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn reflect_variant_view(self, member: Ty<'db>) -> Option<Ty<'db>> {
         crate::comptime::reflect_variant_view(self, member)
+    }
+
+    fn reflect_described_desc(self, ty: Ty<'db>) -> Option<Const<'db>> {
+        crate::type_of::described_desc(self, ty)
+    }
+
+    fn reflect_type_of(
+        self,
+        ty: Ty<'db>,
+        desc: Const<'db>,
+    ) -> rustc_type_ir::reflect::TypeOfAnswer<Self> {
+        crate::type_of::type_of(self, ty, desc)
     }
 
     fn reflect_is_enum(self, ty: Ty<'db>) -> bool {

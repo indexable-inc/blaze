@@ -10,7 +10,7 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
 use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
@@ -430,10 +430,22 @@ fn a_body_reading_its_line_keeps_its_hir_and_key_below_an_inserted_line() {
         let shifted =
             LINE_SHIFTED.replacen("pub fn above", &format!("{}pub fn above", "\n".repeat(n)), 1);
         write_file(&mut db, file, &shifted);
-        let (body2, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
+        let (_, key2, places2, literal2, placed2, row2, linked2) = seen(&db);
         let now = line_of_call(&shifted);
         assert_eq!(now, written + n as u32, "the control: the call moved {n} lines");
-        assert_eq!(body2, body, "the HIR body after {n} lines");
+        // The body is compared with the body of a fresh database of the shifted text, not with
+        // the edited database's: since the front end is on blaze-memo an edit remakes its
+        // crate's arena at the next generation, and a body holds the ids of its blocks (the
+        // `Block` row of `HirColumns::extra` is the id's two words, `BlockId(1.0:27)` is
+        // `[28, 4096]` and `BlockId(1.1:27)` `[28, 4097]`), so the edited body prints the next
+        // generation where the fresh one prints the first. Nothing of the body is a position:
+        // two fresh databases of the two texts give the same ids, and the body is equal.
+        let fresh = {
+            let fx = fixture::db(&shifted);
+            let db = fx.into_db();
+            seen(&db).0
+        };
+        assert_eq!(fresh, body, "the HIR body after {n} lines");
         assert_eq!(key2, key, "the item key after {n} lines");
         assert_eq!(places2, places, "the places after {n} lines");
         assert_eq!(literal2, literal, "the placeholder after {n} lines");
@@ -709,10 +721,9 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
     Ok(work)
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let at = tc.draw(gs::integers::<usize>().max_value(3));
-    match tc.draw(gs::integers::<u8>().max_value(5)) {
+fn edit(tape: &Tape) -> Edit {
+    let at = tape.int_in(0..=3usize, "at");
+    match tape.int_in(0..=5u8, "edit") {
         0 => Edit::Reformat,
         1 => Edit::Body(at),
         2 => Edit::Drop(at),
@@ -726,12 +737,14 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// function gone or back, a function that names another table), the span tables a link holds
 /// by applying each build's link inputs to those of the link before are the tables made
 /// whole from the build, with nothing kept.
-#[hegel::test]
-fn the_link_inputs_kept_are_the_tables_made_whole(tc: hegel::TestCase) {
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn the_link_inputs_kept_are_the_tables_made_whole() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let edits: Vec<Edit> = tape.vec(0..=8, "edits", edit);
+        if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that keeps
@@ -783,7 +796,19 @@ fn body_edit_cost(count: usize, plant: Plant) -> (usize, usize, usize, usize) {
 /// none is asked of the database for being watched, and none of another file than the
 /// edit's is looked at.
 #[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_among_many_makes_its_own_tables() {
+    // What it claimed: after one body edit among N functions the link keeps the tables before
+    // and encodes the edited function's alone, the same work among 100 as among 2,000. What is
+    // true now: `Kept` (linked.rs) holds its owners by id (`sources`: anchor to `Source`, a
+    // `DefWithBodyId` or `FunctionId`; `watched`: `Owner` ids), and which kept owners an edit
+    // moved was the old engine's changed set, which blaze-memo has none of; an edit remakes the
+    // crate's arena, so `Kept::advance` refuses with `ARENA_DROPPED` and every table is made.
+    // The record form: the program's link record holds, by anchor, its table's id and its owner
+    // by stable name (`ItemKey`, table index), and per owner its `Bases` and file; the host,
+    // which knows the files an edit changed, names them, and the link reads the bases of the
+    // owners of those files alone and encodes the tables of those whose bases moved and of the
+    // new keys' anchors: one edited function among N makes its own tables.
     let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::None));
     let (made, bytes, _, verified) = costs[0];
     assert!(made <= 4 && bytes <= 2048 && verified <= 2, "100 functions: {:?}", costs[0]);
@@ -794,7 +819,11 @@ fn a_body_edit_among_many_makes_its_own_tables() {
 /// watched owner as moved (what it did while it asked a stamp of each) gives the right
 /// tables, and the counter says its work follows the program.
 #[test]
+#[ignore = "blaze-memo: the kept link tables hold their crate's arena; reuse across edits is the host's, on records (docs/v2/plan/design/host.md)"]
 fn the_oracle_catches_a_link_that_asks_of_every_body() {
+    // The control of the test above, ignored with it: its premise (`body_edit_cost`'s "the link
+    // before was kept") fails before the planted sweep is counted, for the same reason: an edit
+    // remakes the crate's arena and the kept tables hold its ids (`ARENA_DROPPED`).
     let costs = [100, 2_000].map(|count| body_edit_cost(count, Plant::Sweeps));
     assert_ne!(costs[0], costs[1], "a sweep of every watched owner was counted as the edit's");
     assert!(costs[1].3 >= 2_000, "2,000 functions: {:?}", costs[1]);

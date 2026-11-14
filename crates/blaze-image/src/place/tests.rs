@@ -10,8 +10,7 @@ use blaze_core::{
 };
 use blaze_format::{SchemaHash, schema};
 use blaze_ids::rng::SplitMix64 as Rng;
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Broke, Config, Tape};
 
 use super::*;
 use crate::{Builder, Image, SectionId, serial};
@@ -66,19 +65,16 @@ struct Step {
     maps: bool,
 }
 
-#[hegel::composite]
-fn step(tc: &TestCase) -> Step {
-    let part = |tc: &TestCase| {
-        (tc.draw(gs::integers::<u8>().max_value(4)), tc.draw(gs::integers::<u8>().max_value(2)))
-    };
-    let shape = [part(tc), part(tc), part(tc)];
-    let stop = match tc.draw(gs::integers::<u8>().max_value(9)) {
+fn step(tape: &Tape) -> Step {
+    let part = |tape: &Tape| (tape.int_in(0..=4u8, "section len"), tape.int_in(0..=2u8, "section noise"));
+    let shape = [part(tape), part(tape), part(tape)];
+    let stop = match tape.int_in(0..=9u8, "stop") {
         0..5 => Stop::Nothing,
-        5 | 6 => Stop::LetGo(tc.draw(gs::integers::<u8>().max_value(8))),
-        7 | 8 => Stop::Crash(tc.draw(gs::integers::<u8>().max_value(8))),
+        5 | 6 => Stop::LetGo(tape.int_in(0..=8u8, "let go after")),
+        7 | 8 => Stop::Crash(tape.int_in(0..=8u8, "crash after")),
         _ => Stop::CrashAfter,
     };
-    Step { shape, stop, maps: tc.draw(gs::integers::<u8>().max_value(3)) != 0 }
+    Step { shape, stop, maps: tape.int_in(0..=3u8, "maps") != 0 }
 }
 
 /// The fault classes of a run, drawn as a swarm.
@@ -220,29 +216,22 @@ fn places_as_the_model_says(
     Ok(())
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
 /// The invariant: after any run of images placed, let go, failed and cut by a crash, the
 /// image's file holds one image whole, byte for byte what a fresh build wrote: the one placed
 /// once the placing said so (and after a crash then), the one before it when the placing was
 /// let go, and one of the two when it failed or the power went; and it opens and verifies.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn the_images_file_is_always_one_image_whole() {
-    run_cases(96, |tc| {
-        let steps = tc.draw(gs::vecs(step()).min_size(1).max_size(8));
+    blaze_sim::check(Config::cases(96), |tape| {
+        let steps = tape.vec(1..=8, "steps", step);
         let swarm = Swarm {
-            fail_one_in: [0, 0, 3, 9][tc.draw(gs::integers::<u8>().max_value(3)) as usize],
-            no_clone: tc.draw(gs::integers::<u8>().max_value(3)) == 0,
-            room: (tc.draw(gs::integers::<u8>().max_value(3)) == 0)
-                .then(|| tc.draw(gs::integers::<u64>().max_value(12 * UNIT as u64))),
+            fail_one_in: [0, 0, 3, 9][tape.int_in(0..=3u8, "fail one in") as usize],
+            no_clone: tape.int_in(0..=3u8, "no clone") == 0,
+            room: (tape.int_in(0..=3u8, "disk fills") == 0)
+                .then(|| tape.int_in(0..=12 * UNIT as u64, "room")),
         };
-        let seed = tc.draw(gs::integers());
+        let seed = tape.next_u64("sim seed");
         if let Err(why) = places_as_the_model_says(&steps, seed, swarm, Plant::None) {
             panic!("seed {seed}, {swarm:?}, {steps:?}: {why}");
         }
@@ -253,9 +242,9 @@ fn plain(shape: Shape, stop: Stop, maps: bool) -> Step {
     Step { shape, stop, maps }
 }
 
-/// The seeds a directed control is run over: a crash keeps a drawn prefix of what was not
-/// synced, so one seed may keep all of it.
-const SEEDS: u64 = 32;
+/// The cases a directed control is run over (the 32 seeds it looped by hand before): a crash
+/// keeps a drawn prefix of what was not synced, so one seed may keep all of it.
+const CONTROL: Config = Config::cases(32);
 
 /// The planted-bug control: a clone renamed over the image without its sync is the new image
 /// in name only. The directed case (an image placed and mapped, a second placed over it, the
@@ -267,15 +256,16 @@ fn the_oracle_catches_a_rename_without_its_sync() {
         plain([(4, 0), (3, 0), (2, 0)], Stop::Nothing, true),
         plain([(4, 0), (3, 1), (4, 2)], Stop::CrashAfter, true),
     ];
-    for seed in 0..SEEDS {
-        let ran = places_as_the_model_says(&directed, seed, Swarm::default(), Plant::None);
-        assert_eq!(ran, Ok(()), "seed {seed}: the placer as it is must pass");
-    }
-    let caught = (0..SEEDS).find_map(|seed| {
-        places_as_the_model_says(&directed, seed, Swarm::default(), Plant::NoSync).err()
-    });
-    let why = caught.expect("the oracle missed the planted rename without its sync");
-    assert!(why.contains("the placing said the image is placed"), "{why}");
+    blaze_sim::control(
+        CONTROL,
+        Plant::None,
+        Plant::NoSync,
+        "the placing said the image is placed",
+        |tape, plant| {
+            let seed = tape.next_u64("sim seed");
+            places_as_the_model_says(&directed, seed, Swarm::default(), plant).map_err(Broke::Oracle)
+        },
+    );
 }
 
 /// The planted-bug control: the file's bytes kept as known across a rename no map followed

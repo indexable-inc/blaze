@@ -1,4 +1,4 @@
-//! `Task::Key` of the keyed driver (docs/v2/plan/design/host.md, "blaze-unitkey"; D38,
+//! `Task::Key` of the keyed driver (docs/v2/plan/design/host.md, "blaze-unitkey"; D39,
 //! docs/v2/plan/design/read-addressed.md): every key of a unit (its manifest's, its surface's,
 //! each body's) from its own text alone, before any work. Reads no file, no store, no clock and
 //! nothing of any other unit: the caller hands in bytes and images and files what comes back.

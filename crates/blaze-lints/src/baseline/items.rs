@@ -523,28 +523,31 @@ mod tests {
         assert_eq!(Items::default().blessed(&now), now, "the first bless takes the run");
     }
 
-    #[hegel::test]
-    fn no_bless_raises_a_value(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let draw = |tc: &hegel::TestCase| {
-            let rows: Vec<(u64, u64, u64)> = tc.draw(gs::vecs(gs::tuples3(
-                gs::integers::<u64>().max_value(5),
-                gs::integers::<u64>().max_value(5),
-                gs::integers::<u64>().max_value(99),
-            )).max_size(12));
-            Items::of(rows.into_iter().map(|(path, print, value)| entry("w", &format!("p{path}"), print, value)))
-        };
-        let old = draw(&tc);
-        let now = draw(&tc);
-        let blessed = old.blessed(&now);
-        if old.is_empty() {
-            return;
-        }
-        for line in blessed.entries() {
-            let was = old.held(&line.key.measure, &line.key.path, line.key.fingerprint);
-            assert!(was.is_some_and(|was| line.value <= was), "{line:?} over the old file's");
-        }
-        assert!(blessed.off(&blessed).is_empty(), "a blessed file is not off itself");
+    #[test]
+    fn no_bless_raises_a_value() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let draw = |tape: &blaze_sim::Tape| {
+                let rows: Vec<(u64, u64, u64)> = tape.vec(0..=12, "rows", |tape| {
+                    (
+                        tape.int_in(0..=5u64, "path"),
+                        tape.int_in(0..=5u64, "print"),
+                        tape.int_in(0..=99u64, "value"),
+                    )
+                });
+                Items::of(rows.into_iter().map(|(path, print, value)| entry("w", &format!("p{path}"), print, value)))
+            };
+            let old = draw(tape);
+            let now = draw(tape);
+            let blessed = old.blessed(&now);
+            if old.is_empty() {
+                return;
+            }
+            for line in blessed.entries() {
+                let was = old.held(&line.key.measure, &line.key.path, line.key.fingerprint);
+                assert!(was.is_some_and(|was| line.value <= was), "{line:?} over the old file's");
+            }
+            assert!(blessed.off(&blessed).is_empty(), "a blessed file is not off itself");
+        });
     }
 
     #[test]

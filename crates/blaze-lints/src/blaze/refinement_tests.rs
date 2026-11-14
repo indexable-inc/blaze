@@ -59,9 +59,8 @@ fn linted(main: &str, flags: &str) -> String {
     lint(&fixture, flags)
 }
 
-/// The findings of `blaze::refinement` alone.
-/// `blaze::unreachable` is left at its level, deny: it can't be waived (a flag below deny
-/// refuses the check), and these fixtures write no `blaze::unreachable!()` for it to find.
+/// The crate's findings with clippy's off; the tests count `blaze::refinement`'s alone.
+/// `blaze::unreachable` stays at its level: no flag may lower it (the check refuses the crate).
 fn refinement(main: &str) -> String {
     linted(main, "-A clippy::all")
 }

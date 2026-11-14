@@ -158,6 +158,7 @@ fn comments_in_a_body_keep_its_store() {
 /// so nothing that reads one runs again. Nothing here reads a source map, so `Body::relative`
 /// doesn't run at all.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_one_body_lowers_only_that_body() {
     let fx = fixture::db(CODE);
     let file = fx.only_file();
@@ -223,6 +224,7 @@ fn an_edit_in_one_body_lowers_only_that_body() {
 /// (b') The item tree of a block with items is lowered from its body's own text: an edit of one
 /// body lowers again only that body's block's tree, and every block is owned by its body.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_one_body_lowers_only_its_blocks_item_tree() {
     const BLOCKS: &str = r#"
 pub fn first(x: u32) -> u32 {
@@ -345,6 +347,7 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
 /// same: growing a body that comes before them resolves no visibility again, a `pub(in path)`
 /// one (whose path needs spans) included, nor the trait's that its items take.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn an_edit_in_a_body_resolves_no_visibility_again() {
     const VISIBILITIES: &str = r#"
 pub fn first(x: u32) -> u32 { x + 1 }

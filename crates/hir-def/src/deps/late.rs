@@ -81,8 +81,11 @@ pub enum LateValue {
     /// What `base_db::env_var` gave the expansion (the crate's own variable,
     /// `CARGO_PRIMARY_PACKAGE`, else the process's); `None` when unset.
     Var(Option<Box<str>>),
-    /// The included file's content ID (`base_db::Db::file_content`: its `FileText`'s content
-    /// ID; for a file that is not UTF-8, that of the bytes `include_bytes!` reads).
+    /// The blaze-vfs content ID of the included file's bytes (`blaze_vfs::FILE_DOMAIN`: its
+    /// text's, or for a file that is not UTF-8 the bytes `include_bytes!` reads): what the host
+    /// answers a file ask with (`blaze_host::outside::file_answer`). Never
+    /// `base_db::Db::file_content`, which is of the text and its appended root module in
+    /// base-db's own domain (`FileText::DOMAIN`), or of the bytes in `IncludedFile::DOMAIN`.
     File(ContentId),
 }
 
@@ -226,11 +229,35 @@ pub(super) fn walk(
             );
             Refused::OutsideSourceRoot { what }
         })?;
-        late.push(LateSeen { which, name, value: LateValue::File(db.file_content(file)) });
+        let Some(content) = vfs_content(db, file) else {
+            // alloc: as above
+            let what = format!(
+                "`{macro_name}` of crate {} at {} reads {}, a file of its source root with neither text nor bytes",
+                krate.named(db),
+                call_site(db, loc),
+                shown_path(db, file)
+            );
+            return Err(Refused::OutsideSourceRoot { what });
+        };
+        late.push(LateSeen { which, name, value: LateValue::File(content) });
         Ok(())
     })?;
     settle(&mut late, db, krate)?;
     Ok(Walked { late, unasked })
+}
+
+/// The blaze-vfs content ID of `file`'s bytes ([`LateValue::File`]): of its text, else of the
+/// bytes of a file that is not UTF-8; `None` for a file with neither (an alias of a file
+/// without text).
+///
+/// Floor: base-db holds this ID already (each text's `Reparse` slot keeps it); with no public
+/// reader of it the bytes are hashed again here, once per included file per walk.
+fn vfs_content(db: &Db, file: base_db::FileId) -> Option<ContentId> {
+    if db.has_file_text(file) {
+        return Some(ContentId::of(blaze_vfs::FILE_DOMAIN, db.file_text(file).text(db).as_bytes()));
+    }
+    let bytes = db.raw_file(file)?.bytes(db)?;
+    Some(ContentId::of(blaze_vfs::FILE_DOMAIN, bytes))
 }
 
 /// `late` sorted by `(which, name)` with each read once: the same read twice is one, and one

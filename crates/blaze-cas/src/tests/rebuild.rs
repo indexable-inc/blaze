@@ -5,10 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
-use super::model_check::run_cases;
 use super::*;
 use crate::rebuild::IndexBuild;
 
@@ -40,18 +38,17 @@ enum Op {
     Reopen,
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let key = || tc.draw(gs::integers::<u64>().max_value(KEYS - 1));
-    match tc.draw(gs::integers::<u8>().max_value(19)) {
-        0..6 => Op::Put(key(), tc.draw(gs::integers::<u8>().min_value(1).max_value(70))),
+fn op(tape: &Tape) -> Op {
+    let key = || tape.int_in(0..=KEYS - 1, "from key");
+    match tape.int_in(0..=19u8, "op") {
+        0..6 => Op::Put(key(), tape.int_in(1..=70u8, "count")),
         6..9 => Op::Flush,
         9..12 => Op::Take,
         12 | 13 => Op::Run,
         14 | 15 => Op::Back,
         16 => Op::Lose,
-        17 => Op::Moves(tc.draw(gs::integers::<u8>().min_value(1).max_value(6))),
-        18 => match tc.draw(gs::integers::<u8>().max_value(2)) {
+        17 => Op::Moves(tape.int_in(1..=6u8, "move steps")),
+        18 => match tape.int_in(0..=2u8, "crash kind") {
             0 => Op::Crash,
             1 => Op::Reopen,
             _ => Op::CrashInCommit,
@@ -246,15 +243,15 @@ fn quiet() -> Faults {
 /// The invariant: with its index tables built off its thread, the store reads every record
 /// it was given, and after any crash every record that was durable, whatever was put, moved
 /// or committed while a build was out, whenever the build came back or was lost, and wherever
-/// in the commit that writes the table the power went. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// in the commit that writes the table the power went. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn an_index_built_off_the_thread_loses_no_record() {
-    run_cases(96, |tc| {
-        let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(50));
-        let seed = tc.draw(gs::integers());
+    blaze_sim::check(SimConfig::cases(96), |tape| {
+        let ops = tape.vec(1..=50, "ops", op);
+        let seed = tape.next_u64("sim seed");
         let faults = Faults {
-            fail_one_in: [0, 0, 0, 23][tc.draw(gs::integers::<usize>().max_value(3))],
-            max_latency: Duration::from_micros(tc.draw(gs::integers::<u64>().max_value(5000))),
+            fail_one_in: [0, 0, 0, 23][tape.index(4, "fail one in")],
+            max_latency: Duration::from_micros(tape.int_in(0..=5000u64, "max latency us")),
             ..Faults::default()
         };
         if let Err(why) = runs(&ops, seed, faults.clone(), false, true)

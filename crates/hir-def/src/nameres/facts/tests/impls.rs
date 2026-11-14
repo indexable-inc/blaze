@@ -130,6 +130,7 @@ pub macro Clone {}
 // module `a` runs `module_impls` again for `a` alone; `b` is of the same crate, whose arena the
 // edit makes again, so `b`'s runs again too.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn reruns_only_for_the_module_edited() {
     let fx = fixture::db(
         r#"

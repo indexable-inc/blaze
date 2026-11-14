@@ -551,13 +551,34 @@ fn a_git_tree_is_its_commit_with_modes() {
         .unwrap();
     let home = dir.path().join("home");
     let at = home.join("git/checkouts").join(id.git_ident()).join(&commit[..7]);
+    // The commit's files, by `blaze tree 2`'s listing: what `blaze.lock` pins the tree by.
+    use blaze_audit::tree::{Kind, TreeFile, digest};
+    let pinned = digest(
+        &[
+            TreeFile { path: "Cargo.toml", kind: Kind::File, bytes: b"[package]\nname = \"g\"\n" },
+            TreeFile { path: "lib", kind: Kind::Link, bytes: b"src/lib.rs" },
+            TreeFile { path: "run.sh", kind: Kind::Exec, bytes: b"#!/bin/sh\n" },
+            TreeFile { path: "src/lib.rs", kind: Kind::File, bytes: b"" },
+        ],
+        blaze_fetch::Algo::Blake3,
+    )
+    .unwrap();
     let fetch = Fetch {
         what: "g v0.0.0".to_owned(),
         url: url.to_string(),
-        kind: FetchKind::Git { commit: commit.clone() },
+        kind: FetchKind::Git { commit: commit.clone(), tree: pinned.to_string() },
         at: at.to_str().unwrap().to_owned(),
     };
     let fake = Fake::new(Vec::new());
+    // Pinned by another tree's digest, the fetch is refused naming both.
+    let other = blaze_fetch::Digest::of(blaze_fetch::Algo::Blake3, b"another tree");
+    let mut wrong = fetch.clone();
+    wrong.kind = FetchKind::Git { commit: commit.clone(), tree: other.to_string() };
+    let refused = format!("{:?}", fetcher(&fake).fetch(&wrong).unwrap_err());
+    assert!(
+        refused.contains("weak_source_pin") && refused.contains(&pinned.to_string()) && refused.contains(&other.to_string()),
+        "{refused}"
+    );
     let source = fetcher(&fake).fetch(&fetch).unwrap();
     assert_eq!(source.under, "");
     // The tree comes with the repository blaze-registry keeps of a checkout (`.git/...`, its
@@ -579,6 +600,6 @@ fn a_git_tree_is_its_commit_with_modes() {
     );
 
     let mut short = fetch.clone();
-    short.kind = FetchKind::Git { commit: commit[..12].to_owned() };
+    short.kind = FetchKind::Git { commit: commit[..12].to_owned(), tree: pinned.to_string() };
     assert!(fetcher(&fake).fetch(&short).is_err());
 }

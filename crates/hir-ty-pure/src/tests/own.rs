@@ -5,7 +5,7 @@
 
 use base_db::Db;
 use blaze_ids::ContentId;
-use hir_ty::next_solver::GenericArgs;
+use hir_ty::{facts::Proofs, next_solver::GenericArgs};
 use hir_ty_mir::mir::dispatch::{self, Body};
 
 use super::{
@@ -113,8 +113,8 @@ pub fn pong(n: u32) {
             let func = fn_named(&db, krate, name);
             let (env, args) = crate::function::generic(&db, func);
             let instance = Instance { def: Def::Body(Body::Fn(func)), args: args.clone() }; // clone: reference counts
-            let walked = summary_in(&db, env.clone(), instance); // clone: reference counts
-            let cx = Cx::new(&db, env);
+            let walked = summary_in(&db, env.clone(), Proofs::Spent, instance); // clone: reference counts
+            let cx = Cx::new(&db, env, Proofs::Spent);
             let body = dispatch::body_once(&db, &cx.stored, Body::Fn(func), &args)
                 .unwrap_or_else(|it| panic!("`{name}` lowers: {it:?}"));
             let folded = fold(&cx, &body, own_part(&cx, &body, Def::Body(Body::Fn(func))));

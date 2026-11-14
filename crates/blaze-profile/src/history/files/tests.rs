@@ -1,5 +1,5 @@
 //! The history's files core under blaze-core's simulator (`testing` skill, dst-not-review): one
-//! Hegel test draws flushes, build ends, crashes at any completion, crashes during the reopen,
+//! property test draws flushes, build ends, crashes at any completion, crashes during the reopen,
 //! crash records, and a swarm of fault classes (failed effects, a full disk, failing syncs,
 //! another writer holding the manifest's lock), runs the real core against [`Sim`], and after
 //! every crash and reopen checks one invariant: every row ever handed to the history is, exactly
@@ -19,18 +19,18 @@
 //! - A table's file that fails to place keeps its rows for the next flush, re-marked in the
 //!   recorder as that flush's, as the daemon does (history.rs keeps a failed table's rows).
 //!
-//! Replay: a control or [`replay_one_seed`] names a seed of [`plan_of`]; the Hegel test prints
-//! its whole plan, the simulator's seed in it.
+//! Replay: a failure prints its least tape and the line that replays it; the plan, the
+//! simulator's seed in it, is a note of the report.
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, cast::AsArray, types::Int64Type};
 use arrow_schema::{DataType, Field, Schema};
 use blaze_core::{
     Driver,
-    sim::{Faults, Rng, Sim},
+    sim::{Faults, Sim},
 };
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 
 use super::*;
@@ -53,11 +53,8 @@ const STEP_CAP: u32 = 10_000;
 /// Opens in a row that may fail with an injected error before the history is said not to open.
 const OPEN_TRIES: u32 = 200;
 
-/// Seeds of [`plan_of`] a control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 128;
-
-/// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
-const REPLAY: (u64, Plant) = (0, Plant::None);
+/// The cases a control searches for a plan its plant breaks.
+const CONTROL: Config = Config::cases(128);
 
 // --- The plan ------------------------------------------------------------------------------
 
@@ -117,91 +114,58 @@ struct Swarm {
     records: bool,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        self.int(0, n - 1) == 0
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
     let swarm = Swarm {
-        fail: d.coin(),
-        fill: d.coin(),
-        fail_syncs: d.one_in(4),
-        contend: d.coin(),
-        records: d.coin(),
+        fail: tape.coin("failed effects"),
+        fill: tape.coin("full disks"),
+        fail_syncs: tape.one_in(4, "failing syncs"),
+        contend: tape.coin("contended locks"),
+        records: tape.coin("crash records"),
     };
     let fail_one_in = match swarm.fail {
-        true => d.int(20, 200) as u32,
+        true => tape.int_in(20..=200u32, "fail one in"),
         false => 0,
     };
-    let latency_us = d.int(0, 500);
-    let n = d.int(1, MOST_ACTS);
+    let latency_us = tape.int_in(0..=500u64, "latency us");
+    let n = tape.int_in(1..=MOST_ACTS, "acts");
     // alloc: a plan, once a case
-    let acts = (0..n).map(|_| act(d, &swarm)).collect();
+    let acts = (0..n).map(|_| tape.span("act", |tape| act(tape, &swarm))).collect();
     Plan { seed, fail_one_in, latency_us, acts }
 }
 
-fn act(d: &mut impl Draw, swarm: &Swarm) -> Act {
-    match d.int(0, 9) {
-        0 => Act::Crash(crash_point(d, swarm)),
+fn act(tape: &Tape, swarm: &Swarm) -> Act {
+    // Calm is a flush: a crash with nothing in flight is the act that is not quiet.
+    match tape.int_in(0..=9u8, "act") {
+        9 => Act::Crash(crash_point(tape, swarm)),
         _ => Act::Flush {
-            rows: d.int(0, 5) as u8,
-            end: d.one_in(4),
-            fault: fault(d, swarm),
-            crash: d.one_in(4).then(|| crash_point(d, swarm)),
+            rows: tape.int_in(0..=5u8, "rows"),
+            end: tape.one_in(4, "the build ends"),
+            fault: fault(tape, swarm),
+            crash: tape.one_in(4, "the flush crashes").then(|| crash_point(tape, swarm)),
         },
     }
 }
 
-fn crash_point(d: &mut impl Draw, swarm: &Swarm) -> Crash {
+fn crash_point(tape: &Tape, swarm: &Swarm) -> Crash {
     Crash {
-        at: d.int(0, 63) as u32,
-        record: swarm.records && d.coin(),
-        reopen_at: d.one_in(4).then(|| d.int(0, 63) as u32),
+        at: tape.int_in(0..=63u32, "crash at"),
+        record: swarm.records && tape.coin("leaves a crash record"),
+        reopen_at: tape.one_in(4, "the reopen crashes").then(|| tape.int_in(0..=63u32, "reopen crash at")),
     }
 }
 
-fn fault(d: &mut impl Draw, swarm: &Swarm) -> Fault {
-    match d.int(0, 5) {
-        0 if swarm.fill => Fault::Fill { room: d.int(0, 4096) },
-        1 if swarm.fail_syncs => Fault::FailSyncs,
-        2 if swarm.contend => {
-            Fault::Contend { release_at: d.int(0, 40) as u32, timeout: d.one_in(3) }
-        }
+fn fault(tape: &Tape, swarm: &Swarm) -> Fault {
+    // Calm is no fault: the classes are 1..=3.
+    match tape.int_in(0..=5u8, "fault") {
+        1 if swarm.fill => Fault::Fill { room: tape.int_in(0..=4096u64, "room") },
+        2 if swarm.fail_syncs => Fault::FailSyncs,
+        3 if swarm.contend => Fault::Contend {
+            release_at: tape.int_in(0..=40u32, "release at"),
+            timeout: tape.one_in(3, "the lock wait times out"),
+        },
         _ => Fault::None,
     }
-}
-
-/// The plan seed `seed` makes: what the controls search and [`REPLAY`] replays.
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 // --- Rows as Parquet ------------------------------------------------------------------------
@@ -417,21 +381,6 @@ impl Host for TestHost {
 enum Driven {
     Done(Outcome),
     Crashed,
-}
-
-/// What broke a run: the oracle (a bug of the core, or a plant), or the test itself.
-enum Broke {
-    Oracle(String),
-    Harness(String),
-}
-
-impl fmt::Display for Broke {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Broke::Oracle(why) => write!(f, "the oracle failed: {why}"),
-            Broke::Harness(why) => write!(f, "the test broke: {why}"),
-        }
-    }
 }
 
 /// Another process holding the manifest's lock while a job runs ([`Fault::Contend`]).
@@ -992,32 +941,20 @@ impl World {
 
 /// The invariant: whatever the faults, wherever the power goes out, every row handed to the
 /// history is listed, handed back or left to read, exactly once, and the history opens.
-#[hegel::test(test_cases = 200)]
-fn every_row_is_in_the_history_once_after_any_crash(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nreplay: simulator seed {}, plan {plan:?}", plan.seed);
-    }
+#[test]
+fn every_row_is_in_the_history_once_after_any_crash() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(&plan, Plant::None)
+    });
 }
 
-/// A plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a green DST with a blind oracle proves nothing.
+/// A plant the oracle must catch in one of [`CONTROL`]'s plans (test-the-cause on the test
+/// itself): a green DST with a blind oracle proves nothing. Any of the oracle's findings is the
+/// catch, as before; the test's own trouble fails the control.
 fn control(plant: Plant) {
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant) {
-            Err(Broke::Oracle(why)) => {
-                eprintln!(
-                    "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}"
-                );
-                return;
-            }
-            Err(broke @ Broke::Harness(_)) => panic!("seed {seed}, {plant:?}: {broke}"),
-            Ok(()) => {}
-        }
-    }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+    blaze_sim::control(CONTROL, Plant::None, plant, "", |tape, plant| run(&plan(tape), plant));
 }
 
 #[test]
@@ -1030,7 +967,7 @@ fn the_oracle_catches_what_a_flush_consumed_marked_after_its_commit() {
     control(Plant::MarkAfterCommit);
 }
 
-/// The plan Hegel shrank on 2026-11-04, written out: pid 106's flush of row 5 fails to place
+/// The plan the property test shrank to on 2026-11-04, written out: pid 106's flush of row 5 fails to place
 /// its file (an injected failure), so the row is kept for the next flush; that flush's file
 /// fails to place too, its commit is done, and the power goes out on the next completion,
 /// before the test can re-mark the row as the next flush's. The core used to commit a flush
@@ -1061,15 +998,6 @@ fn a_row_whose_file_was_not_placed_survives_a_crash_after_that_flush() {
     };
     if let Err(broke) = run(&plan, Plant::None) {
         panic!("{broke}\nplan {plan:?}");
-    }
-}
-
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant) {
-        panic!("seed {seed}, Plant::{plant:?}: {broke}");
     }
 }
 
@@ -1150,26 +1078,30 @@ fn past_cap_by_name_alone(kept: &[Kept], total: u64, cap: u64) -> BTreeSet<usize
 /// The invariant: past the cap no build loses a part of its rows, a running build loses none,
 /// and the newest flush's file stays, whichever builds ran at once and whatever each flush
 /// was named for.
-#[hegel::test(test_cases = 300)]
-fn the_cap_retires_whole_builds_and_none_that_runs(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let files = d.int(1, 24);
+#[test]
+fn the_cap_retires_whole_builds_and_none_that_runs() {
+    blaze_sim::check(Config::cases(300), cap_retires_whole_builds);
+}
+
+fn cap_retires_whole_builds(tape: &Tape) {
+    let files = tape.int_in(1..=24u64, "files");
     let mut kept = Vec::new();
     for seq in 1..=files {
         // A flush holds rows of builds `lo..=hi` and is named for the highest, or holds none.
-        let builds = match d.one_in(6) {
+        let builds = match tape.one_in(6, "of no build") {
             true => None,
             false => {
-                let lo = d.int(1, 12);
-                Some([lo, lo + d.int(0, 3)])
+                let lo = tape.int_in(1..=12u64, "first build");
+                Some([lo, lo + tape.int_in(0..=3u64, "more builds")])
             }
         };
         let named = builds.map_or(0, |[_, hi]| hi);
-        kept.push(capped_file(named, seq, builds, d.int(1, 100)));
+        kept.push(capped_file(named, seq, builds, tape.int_in(1..=100u64, "bytes")));
     }
-    let running: BTreeSet<u64> = (0..d.int(0, 3)).map(|_| d.int(1, 15)).collect();
+    let running: BTreeSet<u64> =
+        (0..tape.int_in(0..=3u64, "running builds")).map(|_| tape.int_in(1..=15u64, "running")).collect();
     let total: u64 = kept.iter().map(|it| it.bytes).sum();
-    let cap = d.int(0, total);
+    let cap = tape.int_in(0..=total, "cap");
     let gone = past_cap(kept.iter(), total, cap, &running);
     if let Err(broke) = cap_oracle(&kept, &gone, &running) {
         panic!("{broke}\ncap {cap} of {total}, running {running:?}");
@@ -1226,29 +1158,31 @@ fn no_build_first_oracle(kept: &[Kept], gone: &BTreeSet<usize>) -> Result<(), St
 
 /// The invariant: past the cap, rows of no build (a daemon's own between builds) go before
 /// any build's rows do, whatever their ages.
-#[hegel::test(test_cases = 300)]
-fn the_cap_retires_rows_of_no_build_before_any_build_s(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let files = d.int(1, 24);
-    let mut kept = Vec::new();
-    for seq in 1..=files {
-        let builds = match d.one_in(2) {
-            true => None,
-            false => {
-                let lo = d.int(1, 12);
-                Some([lo, lo + d.int(0, 3)])
-            }
-        };
-        kept.push(capped_file(builds.map_or(0, |[_, hi]| hi), seq, builds, d.int(1, 100)));
-    }
-    let running: BTreeSet<u64> = (0..d.int(0, 3)).map(|_| d.int(1, 15)).collect();
-    let total: u64 = kept.iter().map(|it| it.bytes).sum();
-    let cap = d.int(0, total);
-    let gone = past_cap(kept.iter(), total, cap, &running);
-    if let Err(broke) = no_build_first_oracle(&kept, &gone) {
-        panic!("{broke}\ncap {cap} of {total}, running {running:?}");
-    }
-    cap_oracle(&kept, &gone, &running).unwrap();
+#[test]
+fn the_cap_retires_rows_of_no_build_before_any_build_s() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let files = tape.int_in(1..=24u64, "files");
+        let mut kept = Vec::new();
+        for seq in 1..=files {
+            let builds = match tape.coin("of no build") {
+                true => None,
+                false => {
+                    let lo = tape.int_in(1..=12u64, "first build");
+                    Some([lo, lo + tape.int_in(0..=3u64, "more builds")])
+                }
+            };
+            kept.push(capped_file(builds.map_or(0, |[_, hi]| hi), seq, builds, tape.int_in(1..=100u64, "bytes")));
+        }
+        let running: BTreeSet<u64> =
+            (0..tape.int_in(0..=3u64, "running builds")).map(|_| tape.int_in(1..=15u64, "running")).collect();
+        let total: u64 = kept.iter().map(|it| it.bytes).sum();
+        let cap = tape.int_in(0..=total, "cap");
+        let gone = past_cap(kept.iter(), total, cap, &running);
+        if let Err(broke) = no_build_first_oracle(&kept, &gone) {
+            panic!("{broke}\ncap {cap} of {total}, running {running:?}");
+        }
+        cap_oracle(&kept, &gone, &running).unwrap();
+    });
 }
 
 /// A day of builds, then a daemon left idle: builds 1 and 2, then four flushes of no build.

@@ -91,6 +91,11 @@ pub enum Work {
     /// [`crate::Request::Lock`]: the view's plan made, which writes its lock files, and the job
     /// over; nothing lowered, checked or built.
     Lock(Targets),
+    /// [`crate::Request::Prove`]: each theorem function of the library crates `targets`
+    /// selects translated to Lean and, unless `emit`, its proof checked by the Lean at `lean`,
+    /// answered with [`crate::Response::Proven`]. Builds only the view's proc macros and build
+    /// scripts' runs, applied before its front end is read.
+    Prove { targets: Targets, emit: bool, subset: bool, lean: Option<String> },
 }
 
 /// The daemon's build, as the session drives it.

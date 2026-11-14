@@ -1,7 +1,8 @@
-//! A database attached to the task, for `Debug` of interned and input ids (which hold no
-//! database): `attach(db, || format!("{id:?}"))` prints its fields one level deep, each cut at
-//! [`FIELD_CAP`] bytes ([`Bounded`]), unattached the id; and for
-//! code that formats against the front end's own database type ([`with_attached_db`]).
+//! A database attached to the task, for `Debug` of interned ids (which hold no database):
+//! `attach(db, || format!("{id:?}"))` prints an interned id's fields one level deep, each cut
+//! at [`FIELD_CAP`] bytes ([`Bounded`]), unattached the id (an input's print is its kind and
+//! id either way: its fields are its value, not what it is); and for code that formats
+//! against the front end's own database type ([`with_attached_db`]).
 //!
 //! What is attached lives on the stack of the [`attach`] call; the task-local is a pointer to
 //! it, carried with the task across fiber waits (`blaze_graph::sched::carry`) as the stack of
@@ -11,7 +12,7 @@
 use std::{any::TypeId, cell::Cell, num::NonZeroUsize, ptr, sync::Once};
 
 use crate::{
-    Database, Fact, Gid, Input, Interned, Kind, Memo,
+    Database, Gid, Interned, Kind, Memo,
     trie::{Entry, Head},
 };
 
@@ -49,7 +50,7 @@ pub fn attach<D: Database + 'static, R>(db: &D, f: impl FnOnce() -> R) -> R {
     struct Restore(*const Attached);
     impl Drop for Restore {
         fn drop(&mut self) {
-            ATTACHED.with(|it| it.set(self.0));
+            replace_attached(self.0);
         }
     }
     let attached = Attached {
@@ -57,14 +58,29 @@ pub fn attach<D: Database + 'static, R>(db: &D, f: impl FnOnce() -> R) -> R {
         db: ptr::from_ref(db).cast::<()>(),
         ty: TypeId::of::<D>(),
     };
-    let _restore = Restore(ATTACHED.with(|it| it.replace(&raw const attached)));
+    let _restore = Restore(replace_attached(&raw const attached));
     f()
+}
+
+/// Attaches `it` to this thread and gives what was attached. Never inlined, as every read of a
+/// thread-local in this crate is (`task::innermost_ptr` says why): `f` in [`attach`] may park
+/// its fiber and resume on another worker, and the restore after it must reach that worker's
+/// slot, not the address taken before the wait.
+#[inline(never)]
+fn replace_attached(it: *const Attached) -> *const Attached {
+    ATTACHED.with(|cell| cell.replace(it))
+}
+
+/// What is attached to this thread. Never inlined ([`replace_attached`]).
+#[inline(never)]
+fn attached_ptr() -> *const Attached {
+    ATTACHED.with(Cell::get)
 }
 
 fn attached<'a>() -> Option<&'a Attached> {
     // SAFETY: an attached record lives on the stack of the `attach` call that attached it,
     // below this one on the task's stack, and is detached before that call returns.
-    unsafe { ATTACHED.with(Cell::get).as_ref() }
+    unsafe { attached_ptr().as_ref() }
 }
 
 /// Runs `f` with the attached snapshot, if any.
@@ -93,6 +109,14 @@ thread_local! {
     static PRINTING_FIELDS: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Says whether this thread is printing an id's fields `now`, and gives what it said before.
+/// Never inlined ([`replace_attached`]): a print parks nowhere, but the function it is inlined
+/// into may.
+#[inline(never)]
+fn printing_fields(now: bool) -> bool {
+    PRINTING_FIELDS.with(|it| it.replace(now))
+}
+
 /// Hands `f` the fields `found` gives, unless this thread is printing an id's fields already:
 /// then `None`, so the id prints as its kind and id alone. So a print of an id is one level
 /// deep whatever its fields hold, through any container (a `Box<[Id]>`, an `Option`, a
@@ -103,11 +127,11 @@ fn shallow<F: ?Sized, R>(found: Option<&F>, f: impl FnOnce(Option<&F>) -> R) -> 
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            PRINTING_FIELDS.with(|it| it.set(false));
+            printing_fields(false);
         }
     }
     match found {
-        Some(fields) if !PRINTING_FIELDS.with(|it| it.replace(true)) => {
+        Some(fields) if !printing_fields(true) => {
             let _restore = Restore;
             f(Some(fields))
         }
@@ -123,15 +147,6 @@ pub fn attached_interned<T: Interned, R>(id: Gid, f: impl FnOnce(Option<&T::Fiel
         let head = memo.and_then(|memo| memo.try_head(id, T::KIND));
         // SAFETY: an entry of `T::KIND` is an `Entry<T::Fields, ()>`.
         shallow(head.map(|head| &unsafe { Entry::<T::Fields, ()>::of(head) }.key), f)
-    })
-}
-
-/// The fields of input `id` in the attached snapshot, as [`attached_interned`].
-pub fn attached_input<T: Input, R>(id: Gid, f: impl FnOnce(Option<&T::Fields>) -> R) -> R {
-    with_attached(|memo| {
-        let head = memo.and_then(|memo| memo.try_head(id, T::KIND));
-        // SAFETY: an input of `T::KIND` is an `Entry<(), (Fact, T::Fields)>`.
-        shallow(head.map(|head| &unsafe { Entry::<(), (Fact, T::Fields)>::of(head) }.value.1), f)
     })
 }
 

@@ -34,6 +34,25 @@
 //! Where nothing is kept (the first check of its key) or an arena of a crate's check was
 //! dropped (its kept IDs are dead), the plan is whole and says why ([`Whole`]).
 //!
+//! A kept check is found by stable names (the database's nonce and each crate's
+//! [`CrateKey`]), never by an id: an edit of a crate makes its arena again and its `Crate` id
+//! with it, and a check found by that id would never be found after the one edit whose kept
+//! answers must be refused for it. The ids it holds are touched only once every arena it names
+//! is known carried. An [`ArenaId`] (index and generation) names one making of an arena for
+//! ever within one database nonce (blaze-memo's id space: an arena a commit drops, a sealed
+//! crate's as any other's together with every arena that declared or read it, and every arena
+//! of a new session, base-db's `Fresh`, is made again at its index's next generation), so an
+//! arena the snapshot holds with the kept id is the one the memos were made in.
+//!
+//! What this keeps across an edit on blaze-memo (decision 4: an edit makes its crate's arena
+//! again, and every crate's that borrows it): nothing of the edited crate nor of its
+//! dependents; their plans are whole ([`Whole::Dropped`]). Its answers stand for the crates the
+//! edit did not reach. The floor of an edit of one body among N is a check of the bodies whose
+//! reads moved (the edited one); this reaches N for the edited crate and every crate on it.
+//! Reuse across an edit of a crate is the host's, on body records
+//! (docs/v2/plan/design/host.md): a kept "clean" is valid here only as long as the memo it
+//! stands for is carried, and that memo is arena memory.
+//!
 //! [`Memo::next`]: blaze_memo::Memo::next
 
 use std::{
@@ -41,7 +60,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use base_db::{Db, Nonce};
+use base_db::{CrateKey, Db, Nonce};
 use blaze_core::lock::Lock;
 use blaze_hash::{HashMap, HashSet};
 use blaze_memo::{ArenaId, Database as _, Id as _};
@@ -126,7 +145,8 @@ pub enum Whole {
     /// of them in this process, or another plan of them has not run yet.
     NothingKept,
     /// An arena the kept check of this crate lives in (its crate's, a module's, a body's) was
-    /// dropped since: its memos are gone and the IDs it holds are dead.
+    /// dropped since (by a commit, or a new session that made every arena again): its memos
+    /// are gone and the IDs it holds are dead.
     Dropped(Crate),
 }
 
@@ -184,13 +204,15 @@ pub(crate) enum Plant {
     CarriesDropped,
 }
 
-/// What a kept check is of: its key. The database (its nonce: the IDs below are that
-/// database's, and a view is one of its storage's), the crates in the plan's order, and the
-/// style lints the checks ran with.
+/// What a kept check is of: its key, by stable names only. The database (its nonce: the IDs
+/// the kept check holds are that database's, and a view is one of its storage's), the crates
+/// in the plan's order by their world keys (a `Crate` id is made again with its arena, so a
+/// key of ids would lose the kept check at the edit that must refuse it), and the style lints
+/// the checks ran with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Of {
     database: Nonce,
-    crates: Vec<Crate>,
+    crates: Vec<CrateKey, Global>,
     style_lints: bool,
 }
 
@@ -210,6 +232,11 @@ struct Of {
 /// not clean is visited every time, since its diagnostics are not kept. Where one of them was
 /// dropped the plan is whole ([`Whole::Dropped`]), and no ID held here is touched. A database
 /// made again has another nonce, so no kept check.
+///
+/// An `ArenaId` names one making of an arena for ever within the database's nonce (blaze-memo:
+/// a database's sessions share one id space; base-db gives the database another nonce when it
+/// starts a new one), so an equal `ArenaId` in a later snapshot of the same nonce says carried,
+/// across commits and new sessions alike.
 ///
 /// Memory only: it names the database's IDs, and a restart begins with none (the first plan is
 /// whole and says so, [`Whole::NothingKept`]).
@@ -277,6 +304,9 @@ fn put_kept(of: Of, kept: Kept) {
 /// dropped before it ran puts the kept check back as it was, which its arenas still describe.
 struct Carry {
     of: Of,
+    /// The plan's crates in this snapshot, in `of`'s order: what the arenas of a whole plan's
+    /// kept check are read from.
+    crates: Vec<Crate, Global>,
     /// `None` for a whole plan: the next kept check is made from the plan's own tables.
     last: Option<Last>,
 }
@@ -337,19 +367,25 @@ fn arenas_of(krate: Crate, modules: &[Module], lists: &[&[Planned]]) -> Vec<Aren
 
 /// What a plan from `kept` visits: the modules and bodies that were not clean, every other
 /// answer being the kept one. `Err` where an arena of a crate's kept check is not in `db`'s
-/// snapshot as it was (dropped, and maybe made again): a whole plan.
-fn changes(db: &Db, of: &Of, kept: &Kept) -> Result<Patch, Whole> {
+/// snapshot as it was (dropped, and maybe made again at another generation, in this session or
+/// a new one: within the database's nonce no making takes an earlier one's `ArenaId`): a
+/// whole plan. `crates` are the plan's, of this snapshot, in the kept check's order. No id the
+/// kept check holds is touched before every arena it names is known carried.
+fn changes(db: &Db, of: &Of, crates: &[Crate], kept: &Kept) -> Result<Patch, Whole> {
+    #[cfg(test)]
+    let carries_dropped = tests::planted(of.database) == Some(Plant::CarriesDropped);
+    #[cfg(not(test))]
+    let carries_dropped = {
+        _ = of;
+        false
+    };
     // Ascending ([`blaze_memo::Memo::arenas`]), so each kept arena is one binary search.
     let live: Vec<ArenaId> = {
         let mut live = Vec::new_in(Global);
         live.extend(db.memo().arenas());
         live
     };
-    #[cfg(test)]
-    let carries_dropped = tests::planted(of.database) == Some(Plant::CarriesDropped);
-    #[cfg(not(test))]
-    let carries_dropped = false;
-    for (&krate, arenas) in of.crates.iter().zip(&kept.arenas) {
+    for (&krate, arenas) in crates.iter().zip(&kept.arenas) {
         if !carries_dropped && arenas.iter().any(|it| live.binary_search(it).is_err()) {
             return Err(Whole::Dropped(krate));
         }
@@ -499,7 +535,7 @@ impl<F: Fn(DefWithBody) -> bool + Sync + ?Sized> Drop for Plan<'_, F> {
     fn drop(&mut self) {
         // A plan that never ran, or whose run unwound: the kept check it took is as it was.
         let carry = self.carry.lock().take();
-        if let Some(Carry { of, last: Some(last) }) = carry {
+        if let Some(Carry { of, last: Some(last), .. }) = carry {
             put_kept(of, last.kept);
         }
     }
@@ -536,19 +572,19 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             database: at.0,
             crates: {
                 let mut key = Vec::with_capacity_in(crates.len(), Global);
-                key.extend_from_slice(crates);
+                key.extend(crates.iter().map(|it| it.id.key(db)));
                 key
             },
             style_lints,
         });
         let from_kept = match &of {
-            None => Err(Whole::KeepsNothing),
             Some(of) => match take_kept(of) {
                 None => Err(Whole::NothingKept),
                 // A kept check one of whose arenas was dropped is dropped here, its IDs
                 // untouched: the whole plan's run keeps the next.
-                Some(kept) => changes(db, of, &kept).map(|patch| (kept, patch)),
+                Some(kept) => changes(db, of, crates, &kept).map(|patch| (kept, patch)),
             },
+            None => Err(Whole::KeepsNothing),
         };
         let (tables, work, last) = match from_kept {
             Ok((kept, patch)) => {
@@ -637,7 +673,18 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
             started: AtomicBool::new(false),
             keep,
             at,
-            carry: Lock::new("hir.check.carry", of.map(|of| Carry { of, last })),
+            carry: Lock::new(
+                "hir.check.carry",
+                of.map(|of| Carry {
+                    of,
+                    crates: {
+                        let mut own = Vec::with_capacity_in(crates.len(), Global);
+                        own.extend_from_slice(crates);
+                        own
+                    },
+                    last,
+                }),
+            ),
             work,
             #[cfg(test)]
             ran: Lock::new("test.hir.check.ran", Vec::new()),
@@ -851,7 +898,7 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
     fn keep_check(&self, slots: Slots<'_, '_>) {
         const RAN: &str = "`run_all` returned before a task of the check ran";
         let carry = self.carry.lock().take();
-        let Some(Carry { of, last }) = carry else { return };
+        let Some(Carry { of, crates, last }) = carry else { return };
         let (mut kept, places) = match last {
             // Every arena it names was carried into this snapshot: they are still its arenas.
             Some(Last { kept, places }) => (kept, Some(places)),
@@ -866,9 +913,9 @@ impl<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized> Plan<'f, F> {
                     kept_list.extend_from_slice(list);
                     lists.push(kept_list);
                 }
-                let mut arenas = Vec::with_capacity_in(of.crates.len(), Global);
+                let mut arenas = Vec::with_capacity_in(crates.len(), Global);
                 let mut from = 0;
-                for (&krate, &end) in of.crates.iter().zip(&self.crate_ends) {
+                for (&krate, &end) in crates.iter().zip(&self.crate_ends) {
                     let (from_at, end_at) = (from as usize, end as usize);
                     let mut crate_lists = Vec::with_capacity_in(end_at - from_at, Global);
                     crate_lists.extend(lists[from_at..end_at].iter().map(|it| &it[..]));

@@ -21,8 +21,7 @@ blaze-ids.workspace = true
 blaze-keyed.workspace = true
 
 [dev-dependencies]
-blaze-rng.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

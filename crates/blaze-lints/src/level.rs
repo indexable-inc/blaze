@@ -98,6 +98,17 @@ const BLAZE_PROC_MACRO: On = {
     }
     bits
 };
+/// The group `blaze::trust` ([`blaze::TRUST`]): what a dependency may do only when the
+/// workspace grants it, and a workspace crate's own `unsafe`.
+const BLAZE_TRUST: On = {
+    let mut bits = On::EMPTY;
+    let mut at = 0;
+    while at < blaze::TRUST.len() {
+        bits = bits.or(blaze::TRUST[at].bit());
+        at += 1;
+    }
+    bits
+};
 /// The group `blaze::suggest`, the adoption ladder's second step: where a plain Rust project
 /// gains from a blaze feature or a tighter type, every lint of [`blaze::Kind::Suggest`].
 pub(crate) const BLAZE_SUGGEST: On = blaze_kind(blaze::Kind::Suggest);
@@ -167,6 +178,7 @@ impl Target {
             "edition" => return Some(BLAZE_EDITION),
             "proc_macro" => return Some(BLAZE_PROC_MACRO),
             "suggest" => return Some(BLAZE_SUGGEST),
+            "trust" => return Some(BLAZE_TRUST),
             _ => {}
         }
         blaze::Lint::named(name).map(blaze::Lint::bit)
@@ -665,17 +677,18 @@ mod tests {
         })
     }
 
-    #[hegel::test]
-    fn levels_are_named_as_the_reference_named_them(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
-        let name: String = tc.draw(hegel::one_of!(
-            gs::sampled_from(names.to_vec()),
-            gs::text().alphabet("abcdefghijklmnopqrstuvwxyz-").max_size(12),
-        ));
-        assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
-        let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
-        assert_eq!(Level::of_cap(&name), cap);
+    #[test]
+    fn levels_are_named_as_the_reference_named_them() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let names = ["allow", "expect", "warn", "force-warn", "deny", "forbid"].map(String::from);
+            let name: String = match tape.below(2, "a level's name or any word") {
+                0 => tape.one_of(&names, "name").clone(),
+                _ => tape.text_from("abcdefghijklmnopqrstuvwxyz-", 0..=12, "name"),
+            };
+            assert_eq!(Level::of_attr(&name), reference_of_attr(&name));
+            let cap = reference_of_attr(&name).filter(|it| *it != Level::Expect);
+            assert_eq!(Level::of_cap(&name), cap);
+        });
     }
 
     #[test]

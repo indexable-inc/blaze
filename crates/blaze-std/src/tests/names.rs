@@ -6,9 +6,8 @@
 //! - [`HostPort::parse`] of `host:port` is [`HostPort::new`] of the host and the port: the
 //!   same name, or the same refusal; and a name prints as what parses back to it.
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn};
 use crate::{
     env::{VarName, VarNameWhy},
     net::{HostPort, HostPortWhy},
@@ -16,8 +15,8 @@ use crate::{
 };
 
 /// A string of at most `most` bytes, each one of `alphabet`.
-fn word(d: &mut impl Draw, alphabet: &[u8], most: u64) -> String {
-    let bytes: Vec<u8> = (0..d.int(0, most)).map(|_| d.pick(alphabet)).collect();
+fn word(tape: &Tape, alphabet: &[u8], most: u64) -> String {
+    let bytes: Vec<u8> = (0..tape.int_in(0..=most, "word len")).map(|_| *tape.one_of(alphabet, "byte")).collect();
     String::from_utf8(bytes).expect("the alphabets are ASCII")
 }
 
@@ -42,25 +41,28 @@ fn path_by_text(raw: &str) -> Option<PathWhy> {
     None
 }
 
-#[hegel::test(test_cases = 500)]
-fn a_path_is_refused_as_the_rule_by_text_refuses_it(tc: TestCase) {
-    let raw = word(&mut Drawn(&tc), b"a./\\:\0", 8);
-    let got = Path::new(&raw).err().map(|error| error.why);
-    assert_eq!(got, path_by_text(&raw), "Path::new({raw:?})");
+#[test]
+fn a_path_is_refused_as_the_rule_by_text_refuses_it() {
+    blaze_sim::check(Config::cases(500), |tape| {
+        let raw = word(tape, b"a./\\:\0", 8);
+        let got = Path::new(&raw).err().map(|error| error.why);
+        assert_eq!(got, path_by_text(&raw), "Path::new({raw:?})");
+    });
 }
 
-#[hegel::test(test_cases = 500)]
-fn parse_of_host_and_port_is_new_of_them(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let host = word(&mut d, b"a0-.:", 10);
-    let port = d.int(0, u64::from(u16::MAX)) as u16;
-    let joined = format!("{host}:{port}");
-    let new = HostPort::new(&host, port).map_err(|error| error.why);
-    let parsed = HostPort::parse(&joined).map_err(|error| error.why);
-    assert_eq!(new, parsed, "HostPort::new({host:?}, {port}) and HostPort::parse({joined:?})");
-    if let Ok(name) = new {
-        assert_eq!(HostPort::parse(&name.to_string()).as_ref(), Ok(&name), "{name} prints as it parses");
-    }
+#[test]
+fn parse_of_host_and_port_is_new_of_them() {
+    blaze_sim::check(Config::cases(500), |tape| {
+        let host = word(tape, b"a0-.:", 10);
+        let port = tape.int_in(0..=u64::from(u16::MAX), "port") as u16;
+        let joined = format!("{host}:{port}");
+        let new = HostPort::new(&host, port).map_err(|error| error.why);
+        let parsed = HostPort::parse(&joined).map_err(|error| error.why);
+        assert_eq!(new, parsed, "HostPort::new({host:?}, {port}) and HostPort::parse({joined:?})");
+        if let Ok(name) = new {
+            assert_eq!(HostPort::parse(&name.to_string()).as_ref(), Ok(&name), "{name} prints as it parses");
+        }
+    });
 }
 
 #[test]

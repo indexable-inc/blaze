@@ -358,7 +358,15 @@ fn trait_holders<'db>(db: &'db Db, krate: Crate, trait_: TraitId) -> &'db [Crate
     let _p = tracing::info_span!(target: "blaze", "trait_holders", ?krate, ?trait_).entered();
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<Crate, &Frame> = Vec::new_in(frame);
-        for &seen in loaded_crates(db, krate) {
+        let loaded = loaded_crates(db, krate);
+        // Only the crates that can name the trait's crate are asked: one that cannot holds no
+        // impl of it, and a key pairing it with the trait names two arenas neither of which
+        // borrows the other, which the memo refuses (the panic that stopped a build at
+        // `codegen describe`). hir-ty's own walks ask the same crates
+        // (`TraitImpls::blanket_in_crate_and_deps`).
+        let names = method_resolution::crates_that_name(db, krate);
+        for at in names.holders(frame, trait_.krate(db), None) {
+            let seen = loaded[at];
             if trait_impls_in(db, seen, trait_).all().iter().len() != 0 {
                 found.push(seen);
             }

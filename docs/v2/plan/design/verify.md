@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How blaze checks its own store and incremental builds: BLAZE_VERIFY_STORE recomputes a sampled fraction of store hits and compares bytes, and a Hegel edit fuzzer holds every incremental build to a clean one through the invalidation oracle (blaze-v2-proof).
+summary: How blaze checks its own store and incremental builds: BLAZE_VERIFY_STORE recomputes a sampled fraction of store hits and compares bytes, and a property-test edit fuzzer holds every incremental build to a clean one through the invalidation oracle (blaze-v2-proof).
 date: 2026-11-02
 ---
 # Verifying the store and incremental builds
@@ -76,7 +76,7 @@ and did not, which is the missing input a key must cover (rule 18).
 
 ## The edit fuzzer: incremental equals clean
 
-`crates/hir-ty-codegen/v2/edits.rs` is a Hegel property test. It renders a small real crate
+`crates/hir-ty-codegen/v2/edits.rs` is a property test (`blaze_sim::check`). It renders a small real crate
 on minicore from a model. The crate has:
 
 - a struct whose fields are built and read,
@@ -87,8 +87,8 @@ on minicore from a model. The crate has:
 - a static,
 - a struct boxed by a small `alloc` of the fixture's, whose `impl Drop` comes and goes.
 
-Each run builds with `heap_to_stack` (`hir-ty-mir`'s `HeapToStack`) on or off, which Hegel
-draws; the smoke run does both. Hegel draws one to four edits:
+Each run builds with `heap_to_stack` (`hir-ty-mir`'s `HeapToStack`) on or off, which the tape
+draws; the smoke run does both. The tape draws one to four edits:
 
 - add a struct field,
 - change a const,
@@ -133,16 +133,16 @@ is the hash it saw. What the kernel exposes for that is `Entry::reads()` on a hi
 templates are keyed by the driver itself under `whole::key`, so the driver records them in
 `Built::kernel`; a lazy build (`Build::run_later`) records none yet.
 
-Hegel shrinks a failure to the shortest edit sequence that still breaks the property. That
+blaze-sim shrinks a failure to the shortest edit sequence that still breaks the property. That
 sequence is saved as a `#[test]` calling `replay(&[..])`, named for the property it breaks.
 The default is 12 cases of up to four edits on a seven-item crate, to stay inside the one-to-two
-minute loop. `HEGEL_TEST_CASES=<n>` runs longer. `each_edit_kind_builds_incrementally_as_clean`
+minute loop. `BLAZE_SIM_SEEDS=<n>` runs longer. `each_edit_kind_builds_incrementally_as_clean`
 replays one edit of each kind as a smoke run.
 
 ## The identity property
 
 The same model checks code identity (lane identity, `hir-ty-identity`), in
-`crates/hir-ty-codegen/v2/edits/identity.rs`: a smoke run of each edit kind and a Hegel run.
+`crates/hir-ty-codegen/v2/edits/identity.rs`: a smoke run of each edit kind and a blaze-sim run.
 After each edit, in a database of its own as another process would build it:
 
 1. an edit of comments, formatting or item order keeps every root's compile identity

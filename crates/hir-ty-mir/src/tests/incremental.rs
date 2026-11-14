@@ -23,6 +23,7 @@ const TRAIT_IMPLS_FOR_CRATE: &str = crate::kinds::TraitImpls_for_crate::KIND_NAM
 // across edits comes from records (the body store), not from the memo. The first snapshot (the
 // cold run's list) is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_whitespace_inside_a_function_should_not_invalidate_types() {
     let fx = fixture::db(
         "
@@ -111,6 +112,7 @@ fn foo() -> i32 {
 // its crate's arena, so every body of the crate is inferred again; reuse across edits comes from
 // records (the body store), not from the memo. The first snapshot is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn typing_inside_a_function_should_not_invalidate_types_in_another() {
     let fx = fixture::db(
         "
@@ -239,6 +241,7 @@ fn baz() -> i32 {
 // rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
 // from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_struct_invalidates_infer() {
     let fx = fixture::db(
         "
@@ -307,6 +310,7 @@ pub struct NewStruct {
 // rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
 // from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_enum_query_log() {
     let fx = fixture::db(
         "
@@ -376,6 +380,7 @@ pub enum SomeEnum {
 // rebuilds its crate's arena, so every query of that crate runs again; reuse across edits comes
 // from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_use_query_log() {
     let fx = fixture::db(
         "
@@ -442,6 +447,7 @@ fn bar() -> f32 {
 // file now rebuilds its crate's arena, so every query of that crate runs again; reuse across
 // edits comes from records, not from the memo. The first snapshot is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn adding_impl_query_log() {
     let fx = fixture::db(
         "
@@ -522,6 +528,7 @@ impl SomeStruct {
 // query of that crate runs again; reuse across edits comes from records, not from the memo. The
 // first snapshot (the cold run's list) is only to re-bless.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn add_struct_invalidates_trait_solve() {
     let fx = fixture::db(
         "

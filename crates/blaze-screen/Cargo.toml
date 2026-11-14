@@ -22,8 +22,8 @@ serde = { workspace = true, features = ["derive"] }
 unicode-width.workspace = true
 
 [dev-dependencies]
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -6,8 +6,6 @@ __pycache__/
 # Cloudflare Workers (site/, tools/remote-cache/) when run from the root.
 /.venv/
 .wrangler/
-# Hegel's failing-example database, where a run finds no hegel.toml (it turns it off).
-.hegel/
 # The standard library is upstream's file for file (harness/library.py import), `target/` source
 # directories included.
 !/library/**

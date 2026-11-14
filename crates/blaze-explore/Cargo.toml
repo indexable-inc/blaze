@@ -35,12 +35,18 @@ ix-prof = { workspace = true, features = ["explore"] }
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
-# The probe's echo server: blaze-http's sans-IO HTTP/3 core and its tokio driver.
-tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
-blaze-http = { workspace = true, features = ["tokio"] }
+# The probe's echo server: blaze-http's sans-IO HTTP/3 core (`probe::Echo` steps it) and its
+# driver loop on blaze-core's effects, run by the probe's one native driver. No async runtime.
+blaze-http.workspace = true
+# The probe's waits, each in a span naming what it waits for.
+tracing.workspace = true
 
 [dev-dependencies]
 blaze-rng.workspace = true
+# The probe's simulation pins its certificate by its hash.
+blaze-sha256.workspace = true
+# The probe's simulation test.
+blaze-sim.workspace = true
 # A stop that never comes, for the ops' tests.
 crossbeam-channel.workspace = true
 

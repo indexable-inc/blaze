@@ -11,9 +11,7 @@
 //! blaze reads as a carried value though any order gives the same; and a write of `out`
 //! another write overwrites, whose read is dead. Both are misses the notes name.
 
-use blaze_ids::rng::SplitMix64;
-use hegel::TestCase;
-use hegel::generators::{self as gs, Generator as _};
+use blaze_sim::{Config, Tape};
 
 use super::tests::{FLAGS, MAIN, MINICORE, STD, conf, found};
 use crate::tests::lint_with;
@@ -157,18 +155,17 @@ impl Body {
         state
     }
 
-    /// Whether every order sampled gives what the order written gives, over inputs sampled
-    /// from `seed`, which Hegel shrinks.
-    fn order_free(&self, seed: u64) -> bool {
-        let mut rng = SplitMix64::new(seed);
+    /// Whether every order sampled gives what the order written gives, over inputs and orders
+    /// drawn from `tape`, so they shrink with the loop.
+    fn order_free(&self, tape: &Tape) -> bool {
         let written: Vec<usize> = (0..N).collect();
         for _ in 0..16 {
-            let xs: [u64; N] = std::array::from_fn(|_| rng.below(16));
-            let out: [u64; N] = std::array::from_fn(|_| 100 + rng.below(16));
+            let xs: [u64; N] = std::array::from_fn(|_| tape.below(16, "x"));
+            let out: [u64; N] = std::array::from_fn(|_| 100 + tape.below(16, "out"));
             let expected = self.run(&xs, out, &written);
             for _ in 0..16 {
                 let mut order = written.clone();
-                rng.shuffle(&mut order);
+                tape.shuffle(&mut order, "order");
                 if self.run(&xs, out, &order) != expected {
                     return false;
                 }
@@ -186,23 +183,24 @@ impl Body {
     }
 }
 
-fn draw_body(tc: &TestCase) -> Body {
+fn draw_body(tape: &Tape) -> Body {
     let reduces =
         [Reduce::Add, Reduce::Mul, Reduce::Or, Reduce::And, Reduce::Xor, Reduce::Min, Reduce::Max];
-    let reduce = tc.draw(gs::vecs(gs::sampled_from(reduces.to_vec())).max_size(3));
-    let write = tc.draw(gs::optional(hegel::one_of!(
-        gs::integers::<u64>().min_value(1).max_value(15).map(Write::Own),
-        gs::just(Write::Next),
-    )));
-    let carry = tc.draw(gs::booleans());
-    let push = tc.draw(gs::booleans());
+    let reduce = tape.vec(0..=3, "reductions", |tape| *tape.one_of(&reduces, "reduction"));
+    let write = tape.option("write", |tape| match tape.below(2, "own or next") {
+        0 => Write::Own(tape.int_in(1..=15u64, "factor")),
+        _ => Write::Next,
+    });
+    let carry = tape.bool("carry");
+    let push = tape.bool("push");
     Body { reduce, write, carry, push }
 }
 
-#[hegel::test(test_cases = 64)]
+#[test]
 #[ignore = "a front end per case: run once compiling is allowed (lane lints-parallel)"]
-fn any_order_gives_the_same_iff_the_loop_is_found(tc: TestCase) {
-    let body = draw_body(&tc);
-    let seed: u64 = tc.draw(gs::integers());
-    assert_eq!(body.found(), body.order_free(seed), "{}", body.rendered().0);
+fn any_order_gives_the_same_iff_the_loop_is_found() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let body = draw_body(tape);
+        assert_eq!(body.found(), body.order_free(tape), "{}", body.rendered().0);
+    });
 }

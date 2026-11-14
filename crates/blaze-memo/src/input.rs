@@ -41,7 +41,7 @@ fn make<'b, T: Input>(
     let local = slot.reserve_local(false);
     let entry = with_local(slot, |at| -> *mut Entry<(), (Fact, T::Fields)> {
         at.alloc(Entry {
-            head: Head::new(hash, T::KIND, &[], local),
+            head: Head::new(hash, T::KIND, local),
             key: (),
             value: (fact, fields),
         })

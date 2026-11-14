@@ -8,7 +8,7 @@ date: 2026-11-13
 Owner: the main agent, on the owner's instruction. Built from the outside audit
 (`/Volumes/Projects/blaze-int-1112-notes/audit-1113.md`) and `target-decisions-1113.md` beside it
 (which holds where they differ), and Relax (MIT; its text-closure key rules were copied with
-credit into blaze-keyed's `text.rs`, deleted under decision D38: a derived record is found by
+credit into blaze-keyed's `text.rs`, deleted under decision D39: a derived record is found by
 what it read, read-addressed.md). Supersedes `end-state.md` and `end-state/`. Every number is an
 **estimate**. The owner: "dont measure just build": nothing waits for a measurement.
 
@@ -85,7 +85,7 @@ cores, 16-64 GB). One code path sized by a machine descriptor (`blaze_keyed::mac
 | ScriptRun, TestRun | script program / reached instances, package, declared env, settings | outside form | outputs; traced outside reads |
 | ProgramManifest | link settings, instance keys | the key | the instances; image digest |
 
-Validity is two traces, both built from the start (decision D38, read-addressed.md):
+Validity is two traces, both built from the start (decision D39, read-addressed.md):
 
 - **The key** (trace a), computed from text before the work: what the record is (its own text and
   settings), never what it reads. An equal key with equal answers is the same address.
@@ -269,7 +269,7 @@ A lint finding is a record keyed like the check it comes from, never a side effe
 - An instance (and its plan) is keyed by its body's *result* digest, so a body found at a new
   address with the same result keeps its code.
 - At the certificate's 64 shapes the request ends `Built { filed: Full }`: it costs the next
-  request a mark lookup per unit, not a failed build (before D38 the cap failed the request).
+  request a mark lookup per unit, not a failed build (before D39 the cap failed the request).
 - Commands run `RecordsOnly`; a build's helper `Resident`. The crate is `blaze-keyed`:
   `blaze-record` (the read-list form it replaces) has the name.
 

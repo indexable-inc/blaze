@@ -155,14 +155,14 @@ theorem assertOn_thread (τ : BlockId → BlockId) (s : State) (expected : Bool)
   | Value.bool b => by
     by_cases h : b = expected
     · have left : assertOn s expected kind target (Value.bool b) = s.jump target :=
-        (assertOn_bool s expected kind target b).trans (if_pos h)
+        (assertOn_bool s expected kind target b).trans (ite_eq_left h)
       have right : assertOn s expected kind (τ target) (Value.bool b) = s.jump (τ target) :=
-        (assertOn_bool s expected kind (τ target) b).trans (if_pos h)
+        (assertOn_bool s expected kind (τ target) b).trans (ite_eq_left h)
       exact Or.inr ⟨s, target, rfl, left, right⟩
     · have left : assertOn s expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool s expected kind target b).trans (if_neg h)
+        (assertOn_bool s expected kind target b).trans (ite_eq_right h)
       have right : assertOn s expected kind (τ target) (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool s expected kind (τ target) b).trans (if_neg h)
+        (assertOn_bool s expected kind (τ target) b).trans (ite_eq_right h)
       exact Or.inl (right.trans left.symm)
   | Value.unit => Or.inl rfl
   | Value.int _ _ => Or.inl rfl

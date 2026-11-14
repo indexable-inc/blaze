@@ -310,7 +310,7 @@ impl Digest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     /// One step of a file's life: bytes written at an offset, or a new length.
     #[derive(Clone, Debug)]
@@ -319,15 +319,14 @@ mod tests {
         Resize(u32),
     }
 
-    #[hegel::composite]
-    fn op(tc: &hegel::TestCase) -> Op {
+    fn op(tape: &Tape) -> Op {
         // Offsets up to 40 blocks, so trees of several levels and files that cross a power of
         // two both ways.
-        match tc.draw(gs::integers::<u8>().max_value(3)) {
-            0 => Op::Resize(tc.draw(gs::integers::<u32>().max_value(40 * BLOCK as u32))),
+        match tape.int_in(0..=3u8, "op") {
+            0 => Op::Resize(tape.int_in(0..=40 * BLOCK as u32, "length")),
             _ => Op::Write {
-                at: tc.draw(gs::integers::<u32>().max_value(40 * BLOCK as u32)),
-                bytes: tc.draw(gs::binary().max_size(3 * BLOCK)),
+                at: tape.int_in(0..=40 * BLOCK as u32, "at"),
+                bytes: tape.bytes(0..=3 * BLOCK, "bytes"),
             },
         }
     }
@@ -384,12 +383,14 @@ mod tests {
     /// The refinement: after any sequence of writes and changes of length, the digest kept by
     /// updating only the blocks written is the digest of the file hashed whole, root and
     /// nodes.
-    #[hegel::test]
-    fn a_digest_kept_by_updates_is_the_files(tc: hegel::TestCase) {
-        let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(12));
-        if let Err(why) = kept_is_whole(&ops, false) {
-            panic!("{why}");
-        }
+    #[test]
+    fn a_digest_kept_by_updates_is_the_files() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let ops: Vec<Op> = tape.vec(0..=12, "ops", op);
+            if let Err(why) = kept_is_whole(&ops, false) {
+                panic!("{why}");
+            }
+        })
     }
 
     /// A control of [`a_digest_kept_by_updates_is_the_files`]: with an update that skips a

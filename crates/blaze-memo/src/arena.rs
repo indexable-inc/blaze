@@ -60,9 +60,13 @@ pub(crate) struct Slot {
     borrow_words: usize,
     /// Whether `reach` is made: set once, by the build of the snapshot that added the arena.
     closed: AtomicBool,
-    /// The driver sealed this arena ([`crate::Inputs::seal`]): its inputs never change in the
-    /// session, so it is never named changed ([`crate::Memo::changed`]).
+    /// The driver sealed this arena ([`crate::Inputs::seal`]): its sources are pinned. A write
+    /// of its inputs names it changed like any arena, and [`crate::Memo::next`] drops it with
+    /// its borrowers ([`crate::Memo::changed`]).
     sealed: AtomicBool,
+    /// The driver opened this arena ([`crate::Inputs::open`]): a key homed in any arena may
+    /// name its ids, each such entry borrowing it when written ([`crate::home::mark_borrows`]).
+    open: AtomicBool,
     /// The inputs' destructors, filled while the snapshot is built.
     drops: Lock<Vec<InputDrop, Global>>,
     /// Declared last: dropped after every field that points into it.
@@ -101,6 +105,7 @@ impl Slot {
             borrow_words,
             closed: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
+            open: AtomicBool::new(false),
             drops: Lock::new("memo.arena.drops", Vec::new_in(Global)),
             arena,
         }
@@ -198,6 +203,20 @@ impl Slot {
 
     pub(crate) fn is_sealed(&self) -> bool {
         self.sealed.load(Ordering::Acquire)
+    }
+
+    /// Opens this arena to every arena's keys ([`crate::Inputs::open`]).
+    ///
+    /// # Panics
+    ///
+    /// Where the snapshot that added it is built already.
+    pub(crate) fn open(&self) {
+        assert!(!self.closed.load(Ordering::Acquire), "{:?} opened after its snapshot was built", self.id);
+        self.open.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
     }
 
     /// Notes that an entry of this arena read from arena `from`, for the snapshot of `epoch`.
@@ -409,6 +428,12 @@ thread_local! {
 
 /// Runs `f` with this thread's bump allocator into `slot`'s arena. `f` runs no user code (an
 /// allocation, a table insert); a nested call panics.
+///
+/// Never inlined, as every read of a thread-local in this crate is (`task::innermost_ptr` says
+/// why): a fetch allocates before its run's function and after it, the function may park the
+/// fiber and resume on another worker, and an inlined copy may keep the first worker's
+/// `LOCALS` address for the second allocation: two threads in one bump allocator.
+#[inline(never)]
 pub(crate) fn with_local<R>(slot: &Slot, f: impl FnOnce(&ArenaLocal<'_>) -> R) -> R {
     LOCALS.with(|cell| {
         // SAFETY: the thread's own, and `busy` refuses a second borrow below.

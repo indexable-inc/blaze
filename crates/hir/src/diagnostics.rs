@@ -277,6 +277,7 @@ diagnostics![AnyDiagnostic<'db> ->
     ReturnOutsideFunction,
     TailCallRefused,
     TailCallTrackCaller,
+    LoopMatchRefused,
     UnsafeBinderCastOfNonBinder<'db>,
     InvalidConstArg,
     NotAStructPath<'db>,
@@ -893,6 +894,8 @@ pub enum Unplaced {
     ConstCheck { code: &'static str, message: String },
     /// `check_tail_calls`'s, its message.
     TailCall(&'static str),
+    /// The `#[loop_match]` checks', its message.
+    LoopMatch(&'static str),
     /// Type lowering's (a signature's, a field's, a type alias's), which its node in the store's
     /// source map could not place: the lowering diagnostic as hir-ty has it.
     Lowering(String),
@@ -1846,6 +1849,26 @@ impl GenericDef {
     pub fn bound_source(self, db: &Db, bound_index: u32) -> Option<BoundSource> {
         bound_source(db, GenericDefId::try_from(self).ok()?, bound_index)
     }
+
+    /// The bounds written on the item that its header already implies
+    /// (`#![feature(blaze_implied_bounds)]`): `T: X` on `impl<T: X> C<T>` where `struct C<A:
+    /// X>`. Empty without the feature.
+    pub fn written_implied_bounds(self, db: &Db) -> Vec<InFile<AstPtr<ast::TypeBound>>> {
+        let Ok(def) = GenericDefId::try_from(self) else {
+            // alloc: empty, allocates nothing
+            return Vec::new();
+        };
+        let found = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+            hir_ty::written_implied_predicates(db, def)
+        });
+        found
+            .into_iter()
+            .filter_map(|index| match bound_source(db, def, index)? {
+                BoundSource::Written(ptr) => Some(ptr),
+                _ => None,
+            })
+            .collect() // alloc: a lint's findings, one per bound said twice
+    }
 }
 
 pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Option<BoundSource> {
@@ -1864,6 +1887,25 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         }
         // A `where const { .. }` condition is no bound on a type: nothing points at it yet.
         PredicateSource::WhereConst { .. } => return None,
+        // `#![feature(blaze_implied_bounds)]`: the bound where the type or trait the header
+        // names declares it, the `index`th of its sources but its implied ones.
+        PredicateSource::Implied { from, index } => {
+            let declared = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+                hir_ty::predicate_sources(db, from)
+            });
+            let position = declared
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| {
+                    !matches!(
+                        it,
+                        PredicateSource::ImpliedTrait(_) | PredicateSource::Implied { .. }
+                    )
+                })
+                .nth(index as usize)?
+                .0;
+            return bound_source(db, from, position as u32);
+        }
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {
@@ -2123,6 +2165,15 @@ pub struct TailCallRefused {
     /// The `become` expression.
     pub become_expr: InFile<ExprOrPatPtr>,
     pub kind: TailCallErrorKind<InFile<ExprOrPatPtr>>,
+}
+
+pub use hir_ty_mir::mir::loop_match::{LoopMatchErrorKind, NotEarlyWhy as LoopMatchNotEarly};
+
+/// A `#[loop_match]` loop or `#[const_continue]` break rustc refuses:
+/// `hir_ty_mir::mir::loop_match::LoopMatchError` at its syntax.
+#[derive(Debug)]
+pub struct LoopMatchRefused {
+    pub kind: LoopMatchErrorKind<InFile<ExprOrPatPtr>>,
 }
 
 /// A tail call of a `#[track_caller]` function: the lint `tail_call_track_caller`.
@@ -3552,6 +3603,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         if hir_ty_tailck::has_become(body) {
             self.collect_tail_calls(def, placing.get());
         }
+        if body.has_loop_match() {
+            self.collect_loop_match(def, placing.get());
+        }
 
         for diagnostic in BodyValidationDiagnostic::collect(self.db, def, self.style_lints) {
             self.acc.extend(AnyDiagnostic::body_validation_diagnostic(
@@ -3613,6 +3667,25 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             // A lint at code with no syntax is not given: rustc's is at the call it writes.
             if let Ok(it) = placed {
                 self.acc.push(it.into());
+            }
+        }
+    }
+
+    /// What rustc refuses of the body's `#[loop_match]` loops and `#[const_continue]` breaks.
+    fn collect_loop_match(&mut self, def: DefWithBodyId, source_map: &ExpressionStoreSourceMap) {
+        let check = hir_ty_mir::mir::loop_match::loop_match_check(self.db, def);
+        for error in check.errors() {
+            // clone: the refusal's type, once per refusal
+            let placed = (error.kind.clone()).try_map(|expr| source_map.expr_syntax(expr));
+            match placed {
+                Ok(kind) => self.acc.push(LoopMatchRefused { kind }.into()),
+                Err(SyntheticSyntax) => self.acc.push(
+                    UnplacedDiagnostic {
+                        owner: unplaced_owner(self.db, def.into(), source_map),
+                        what: Unplaced::LoopMatch(error.kind.message()),
+                    }
+                    .into(),
+                ),
             }
         }
     }

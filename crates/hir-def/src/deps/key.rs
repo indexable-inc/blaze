@@ -110,15 +110,19 @@ pub fn eligible(db: &Db, krate: Crate) -> bool {
     of(db, krate, &mut HashMap::new_in(Global))
 }
 
-/// Whether `krate` is sealed: its arena is not in this snapshot's changed set
-/// (docs/v2/plan/design/front-end-on-memo.md, B "Sealed summaries"). Who is sealed is the
-/// driver's decision: a crate is sealed when it is not being built, and the arenas of the crates
-/// being built (and, through their borrows, of every crate above them) are the ones the driver
-/// made anew in this snapshot. A dependency's summary is its image, read in place: nothing has
+/// Whether `krate` is sealed: the driver sealed its arena (`blaze_memo::Inputs::seal`, so
+/// `Memo::changed` is `false` for it; docs/v2/plan/design/front-end-on-memo.md, B "Sealed
+/// summaries"). Who is sealed is the driver's decision: a crate that is not being built, whose
+/// sources are pinned, with all its dependencies sealed too (`Builder::build` checks). A seal
+/// says where the crate's records are kept, not that its arena lives for the session: a write
+/// to a sealed crate's own inputs drops its arena and every arena that declared or read it, as
+/// for any crate (2026-11-14; before, it started a new session), and the arena made again is
+/// sealed again by its maker. A dependency's summary is its image, read in place: nothing has
 /// to witness that it did not change. What a build's end stores (`super::store` with
-/// [`super::Which::Sealed`]): a sealed crate's resolution does not change with an edit of the
-/// workspace, so its pages are written once; a member's are written when its front end is let
-/// go, or at a stop.
+/// [`super::Which::Sealed`]): an edit of the workspace never reaches a sealed crate, so its
+/// resolution moves only when its own pinned inputs are written, which moves its key; its
+/// pages are written once per key (a store whose served key moved refuses the crate,
+/// `Refused::KeyMoved`). A member's are written when its front end is let go, or at a stop.
 #[inline]
 pub fn sealed(db: &Db, krate: Crate) -> bool {
     use blaze_memo::Id as _;

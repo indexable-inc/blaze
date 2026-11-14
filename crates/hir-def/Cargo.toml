@@ -52,6 +52,9 @@ blaze-format.workspace = true
 blaze-dbsp.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
+# `blaze_vfs::FILE_DOMAIN` alone: the id a late read of an included file is asked by
+# (`deps::late`), the host's answer to a file ask.
+blaze-vfs.workspace = true
 inventory.workspace = true
 blaze-phf.workspace = true
 blaze-memo.workspace = true
@@ -66,10 +69,10 @@ unicode-ident.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
 expect-test.workspace = true
 fst.workspace = true
-hegeltest.workspace = true
 
 # local deps
 test-utils.workspace = true

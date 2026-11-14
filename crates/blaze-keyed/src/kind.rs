@@ -759,27 +759,78 @@ impl ScriptInputs<'_> {
 }
 
 kind! {
-    /// One test's result, with the outside reads it made.
+    /// One test's result: an outside kind ([`crate::outside`]) whose asks are the functions the
+    /// test executed and the outside reads it made (blaze-testsel's `ask`), so an edit misses
+    /// only the tests that executed what it changed, and an undone edit finds its old result
+    /// (docs/v2/plan/design/test-selection.md).
     TestRun {
-        tag: 8, version: 1, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
+        tag: 8, version: 2, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
         inputs: TestInputs,
     }
 }
 
-/// A test's key: its entry's symbol (item and type arguments), the digest of what its program
-/// reaches from the entry (every reachable function's and static's symbol and instance key, and
-/// the spans a panic message can name: blaze-program's `reach_digest`), and the arguments it is
-/// run with. The instance keys carry the toolchain, target and settings.
+/// A test's base key: its identity, nothing its code is. The toolchain, the unit's settings, the
+/// environment blaze declares to tests, its entry's symbol (item and type arguments), its
+/// libtest attributes (name, ignore, should_panic) and its arguments. What it executes and reads
+/// is in its asks, never here: a reach in the key made every reachable edit a miss.
 pub struct TestInputs<'a> {
+    pub tool: ToolId,
+    pub settings: Settings,
+    /// The variables blaze gives the test, sorted by name, each once (declared, not traced).
+    pub env: ContentId,
     pub item: ContentId,
     pub entry_args: ContentId,
-    pub reach: ContentId,
+    /// The test's libtest name, `#[ignore]` and `#[should_panic]` (and its expected message).
+    pub attrs: ContentId,
     pub args: &'a [u8],
 }
 
 impl TestInputs<'_> {
     fn key(&self) -> Key<TestRun> {
-        KeyHasher::of::<TestRun>().id(&self.item).id(&self.entry_args).id(&self.reach).bytes(self.args).finish()
+        KeyHasher::of::<TestRun>()
+            .toolchain(&self.tool)
+            .id(&self.settings.0)
+            .id(&self.env)
+            .id(&self.item)
+            .id(&self.entry_args)
+            .id(&self.attrs)
+            .bytes(self.args)
+            .finish()
+    }
+}
+
+kind! {
+    /// A test suite's index head (blaze-testsel's `index`): one row per kept test, the read
+    /// table and the program state the rows hold at. It changes with every edit, so it is filed
+    /// by content; which head is a suite's current one is a root the host keeps.
+    TestIndex {
+        tag: 20, version: 1, layout: Flat, grain: Unit, trace: Key, keep: Disk, root: Opaque,
+        inputs: IndexInputs,
+    }
+}
+
+kind! {
+    /// A test suite's postings: from each ask to the tests that asked it. Rewritten only when a
+    /// head's inline asks pass half of it, so filed by content like the head.
+    TestPostings {
+        tag: 21, version: 1, layout: Flat, grain: Unit, trace: Key, keep: Disk, root: Opaque,
+        inputs: IndexInputs,
+    }
+}
+
+/// An index record's key, by its content: the toolchain, what suite it is of, and the digest of
+/// its payload, so its bytes are one value under one key.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexInputs<'a> {
+    pub tool: ToolId,
+    pub suite: ContentId,
+    pub content: ContentId,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl IndexInputs<'_> {
+    fn key<K: Kind>(&self) -> Key<K> {
+        KeyHasher::of::<K>().toolchain(&self.tool).id(&self.suite).id(&self.content).finish()
     }
 }
 
@@ -824,7 +875,7 @@ kind! {
     /// read it. Filed by content; it holds no digest, so it moves only when one of its items'
     /// key, address or shape does, and an unchanged file's chunk is named again by address.
     UnitChunk {
-        tag: 23, version: 1, layout: Flat, grain: File, trace: Content, keep: DiskAndResident,
+        tag: 24, version: 1, layout: Flat, grain: File, trace: Content, keep: DiskAndResident,
         root: ChunkRoot, inputs: ContentInputs,
     }
 }
@@ -850,7 +901,7 @@ kind! {
     /// address names the answers it was made with), so a node another run filed first is
     /// counted ([`crate::proof::Checks::shape_races`]), never a failure.
     Shape {
-        tag: 21, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
+        tag: 22, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
         root: ShapeRoot, inputs: ContentInputs,
     }
 }
@@ -860,7 +911,7 @@ kind! {
     /// digests), the manifest that stands, its surface's address and the unit's own universe
     /// digest. One lookup settles a unit: a hit reads no manifest, no chunk and no record.
     Mark {
-        tag: 22, version: 1, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
+        tag: 23, version: 1, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
         root: MarkRoot, inputs: MarkInputs,
     }
 }
@@ -1109,7 +1160,7 @@ kind! {
     /// query runs again): the read list is blaze-memo's, not the driver's. The value is a plain
     /// record (`blaze_format::Record::PLAIN`), so the bytes are the value.
     MemoEntry {
-        tag: 20, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
+        tag: 25, version: 1, layout: Flat, grain: Item, trace: Key, keep: DiskAndResident,
         root: Traced, inputs: MemoEntryInputs,
     }
 }
@@ -1161,10 +1212,12 @@ tags![
     ItemRows,
     FoldFindings,
     DeferredFindings,
-    MemoEntry,
+    TestIndex,
+    TestPostings,
     Shape,
     Mark,
     UnitChunk,
+    MemoEntry,
 ];
 
 const fn same_name(a: &str, b: &str) -> bool {

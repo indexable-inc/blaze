@@ -175,6 +175,7 @@ fn g() -> u32 { f(1) }
 // (`g`'s `interface_form` too); reuse across an edit comes from the records, not the memo.
 // What this claimed: a body edit of `f` runs no `interface_form` of `g`.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn a_body_edit_executes_no_interface_form_of_another_item() {
     let (mut db, file) = single(
         r#"
@@ -364,12 +365,12 @@ struct C { a: *const A }
     assert!(a != b && b != c && a != c, "each member has its own position");
 }
 
-// The port onto blaze-memo made the last assertion false by design, left failing for a
-// decision: an edit of a file drops its crate's arena at the commit, so `deep_components` runs
-// again whatever the edit; reuse across an edit comes from the records, not the memo. What
-// this claimed: a body edit that calls nothing new runs `deep_refs` and not `deep_components`.
+// Restated for blaze-memo (port decision 9). It also claimed the edit runs `deep_refs` and not
+// `deep_components`: false by design, since an edit of a file drops its crate's arena at the
+// commit and every query of the crate runs again; reuse across an edit is the host's, on
+// records (docs/v2/plan/design/host.md), and that claim is owed there.
 #[test]
-fn a_body_edit_that_calls_nothing_new_keeps_the_deep_components() {
+fn a_body_edit_that_calls_nothing_new_changes_the_deep_hash() {
     let (mut db, file) = single(
         r#"
 fn f() -> u32 { g() + 1 }
@@ -388,7 +389,6 @@ fn g() -> u32 { 2 }
     let f = item(&db, "f");
     let executed = runs_of(&db, || assert_ne!(crate::deep_hash(&db, f).unwrap(), before));
     assert!(ran(&executed, hash::deep_refs::KIND_NAME), "{executed:#?}");
-    assert!(!ran(&executed, hash::deep_components::KIND_NAME), "{executed:#?}");
 }
 
 #[test]

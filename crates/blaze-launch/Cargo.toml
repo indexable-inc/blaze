@@ -19,7 +19,7 @@ doctest = false
 [dev-dependencies]
 # The oracle of `wire`'s bytes: `cbor::check` holds them to RFC 8949 4.2.1.
 blaze-protocol.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

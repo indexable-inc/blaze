@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use blaze_core::sim::{Faults, Sim};
 use blaze_ids::Hasher;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 use crate::testing::{GRANULE_NS, Shelf, stamp_at, the_base};
@@ -337,12 +337,11 @@ fn run_planted(ops: &[Op], seed: u64) -> Result<Vec<Seen>, String> {
     Ok(seen)
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let which = tc.draw(gs::integers::<u8>().max_value(5)) as usize;
-    let byte = tc.draw(gs::integers::<u8>().max_value(2));
+fn op(tape: &Tape) -> Op {
+    let which = tape.int_in(0..=5u8, "which") as usize;
+    let byte = tape.int_in(0..=2u8, "value");
     let value = (byte > 0).then_some(byte);
-    match tc.draw(gs::integers::<u8>().max_value(11)) {
+    match tape.int_in(0..=11u8, "op") {
         0 | 1 => Op::File(FILES[which], value),
         2 => Op::Env(VARS[which % 3], value),
         3 => Op::Outside(OUTSIDE[which % 2], value),
@@ -359,24 +358,29 @@ fn op(tc: &hegel::TestCase) -> Op {
 /// hits; for any sequence of edits, variable changes, outside files appearing and going,
 /// outputs changed by hand, waits, restarts and saves under a build, in any order of the
 /// driver's answers.
-#[hegel::test]
-fn a_hit_is_given_only_when_a_fresh_build_would_say_the_same(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(40));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn a_hit_is_given_only_when_a_fresh_build_would_say_the_same() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let ops: Vec<Op> = tape.vec(0..=40, "ops", op);
+        let seed = tape.next_u64("sim seed");
+        if let Err(why) = run(&ops, seed, Plant::None) {
+            panic!("{why}");
+        }
+    });
 }
 
 const REQUEST: Op = Op::Request { mid: None };
 
-/// `ops` pass as the machine is, and with `plant` the oracle says `says`.
+/// `ops` pass as the machine is, and with `plant` the oracle says `says`, on every one of 8
+/// cases (the 8 seeds this looped by hand before), each case's simulation seed drawn from
+/// its tape.
 fn caught(ops: &[Op], plant: Plant, says: &str) {
-    for seed in 0..8 {
+    blaze_sim::check(Config::cases(8), |tape| {
+        let seed = tape.next_u64("sim seed");
         run(ops, seed, Plant::None).unwrap();
         let why = run(ops, seed, plant).expect_err("the oracle missed the planted bug");
         assert!(why.contains(says), "{why}");
-    }
+    });
 }
 
 /// A control: a variable a step read is left out of the record, then changes.

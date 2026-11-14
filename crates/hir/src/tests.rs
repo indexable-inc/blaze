@@ -598,6 +598,7 @@ fn checking_the_same_edits_twice_retains_nothing_more() {
 /// the edit is of `main`'s own file, so the commit drops `main`'s arena and every body of it is
 /// checked and its MIR made again. Left failing until the per-item records serve it.
 #[test]
+#[ignore = "blaze-memo: an edit rebuilds its crate's arena; the claim is the host's, on records (docs/v2/plan/design/host.md)"]
 fn the_check_after_a_release_makes_only_the_edited_bodys_mir() {
     const A: &str = "fn edited() -> u32 {\n    let x = 1;\n    x + 1\n}\nfn kept() -> u32 {\n    let y = 2;\n    y\n}\nfn also_kept(z: u32) -> u32 {\n    z\n}\n";
     let fx = fixture::db(&format!("//- minicore: sized, copy\n//- /main.rs crate:main\n{A}"));
@@ -868,11 +869,12 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
     });
 }
 
-/// False by design since the port to blaze-memo, in its first claim only (port decision 3: the
-/// memo is not the incremental mechanism): it claimed `unrelated`, of the edited crate, is
-/// not inferred again. The edit is of a file of `main`, so the commit drops `main`'s arena and
-/// every body of it is inferred again; that `second` reruns as `first` does still holds.
-/// Left failing until restated over the body entries.
+/// Restated for blaze-memo (port decision 9). It also claimed `unrelated`, of the edited
+/// crate, is not inferred again: false by design (port decision 3: the memo is not the
+/// incremental mechanism), since the edit is of a file of `main`, so the commit drops `main`'s
+/// arena and every body of it is inferred again. That claim is the host's, on the body entries
+/// (docs/v2/plan/design/host.md), and is owed there. What holds here: `second`, answered from
+/// the goal `first` solved, reruns as `first` does when what the goal read changes.
 #[test]
 fn a_goal_reused_from_another_query_reruns_it_when_what_the_goal_read_changes() {
     let fx = fixture::db(
@@ -920,11 +922,7 @@ impl<T> Tr for B<T> where T: Tr {}
 
     blaze_memo::attach(&db, || {
         // The bodies' ids are of the snapshot they were taken in: taken again after the commit.
-        let [first, second, unrelated] = ["first", "second", "unrelated"].map(|it| function(&db, it));
-        let executed = runs_of(&db, || {
-            InferenceResult::of(&db, InferBodyId::DefWithBodyId(unrelated));
-        });
-        assert_eq!(count(&executed, INFER), 0, "{executed:#?}");
+        let [first, second] = ["first", "second"].map(|it| function(&db, it));
         // `second` took the goal's reads with its answer, so it reruns as `first` does.
         for body in [second, first] {
             let executed = runs_of(&db, || {

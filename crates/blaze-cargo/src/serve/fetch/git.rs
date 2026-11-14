@@ -32,23 +32,57 @@ use super::{Fetcher, failed};
 use crate::serve::work::{Source, SourceFile};
 use blaze_vfs::Bytes;
 
+/// The tree of `fetch` at `commit`, refused unless it is `pinned`, the digest `blaze.lock`
+/// pins it by (rule `weak_source_pin`, [`blaze_audit::source::verify_git`]): checked over the
+/// commit's files before the repository blaze keeps with them is added and before anything
+/// is mounted or written to disk.
 pub(super) fn tree<H: Http + 'static>(
     fetcher: &Fetcher<H>,
     fetch: &Fetch,
     commit: &str,
+    pinned: &str,
 ) -> Result<Source, ApiError> {
     let commit = commit.to_ascii_lowercase();
     let short = commit.get(..8).unwrap_or(&commit);
     let top = format!("Unable to update {}#{short}", fetch.url);
-    let files = checkout(fetcher, fetch, &commit).map_err(|e| failed(fetch, &[top], Some(&e)))?;
+    let files = checkout(fetcher, fetch, &commit, Some(pinned))
+        .map(|(files, _)| files)
+        .map_err(|e| failed(fetch, &[top], Some(&e)))?;
     Ok(Source { files, under: String::new() })
+}
+
+/// The digest in BLAKE3 of `fetch`'s tree at `commit`, fetched fresh and pinned by nothing:
+/// what `blaze audit pin` records, on trust at first use, for a person to review.
+pub(super) fn unpinned_digest<H: Http + 'static>(
+    fetcher: &Fetcher<H>,
+    fetch: &Fetch,
+    commit: &str,
+) -> anyhow::Result<blaze_fetch::Digest> {
+    checkout(fetcher, fetch, &commit.to_ascii_lowercase(), None).map(|(_, digest)| digest)
+}
+
+/// The digest in `algo` of a checkout's files as [`read_tree`] read them, by
+/// [`blaze_audit::tree`]'s one rule: a symlink out of the tree is refused.
+fn digest_of(files: &[SourceFile], algo: blaze_fetch::Algo) -> anyhow::Result<blaze_fetch::Digest> {
+    let mut tree: Vec<blaze_audit::tree::TreeFile<'_>, std::alloc::Global> =
+        Vec::with_capacity_in(files.len(), std::alloc::Global);
+    for file in files {
+        let kind = match file.mode {
+            Mode::Regular => blaze_audit::tree::Kind::File,
+            Mode::Executable => blaze_audit::tree::Kind::Exec,
+            Mode::Symlink => blaze_audit::tree::Kind::Link,
+        };
+        tree.push(blaze_audit::tree::TreeFile { path: &file.path, kind, bytes: &file.bytes });
+    }
+    blaze_audit::tree::digest(&tree, algo).map_err(|why| anyhow::anyhow!("{why}"))
 }
 
 fn checkout<H: Http + 'static>(
     fetcher: &Fetcher<H>,
     fetch: &Fetch,
     commit: &str,
-) -> anyhow::Result<Vec<SourceFile>> {
+    pinned: Option<&str>,
+) -> anyhow::Result<(Vec<SourceFile>, blaze_fetch::Digest)> {
     if !(matches!(commit.len(), 40 | 64) && commit.bytes().all(|it| it.is_ascii_hexdigit())) {
         bail!("the locked revision `{commit}` is not a full commit id");
     }
@@ -76,13 +110,26 @@ fn checkout<H: Http + 'static>(
         );
     }
     let mut files = read_tree(&checkout.root, |_| false)?;
+    // The commit's own files, checked against their pin before anything of them is used.
+    let digest = match pinned {
+        None => digest_of(&files, blaze_fetch::Algo::Blake3)?,
+        Some(pinned) => {
+            let recorded = blaze_fetch::Digest::parse(pinned).map_err(|why| {
+                anyhow::anyhow!("the load pins `{}` at {commit} by `{pinned}`, which is no strong digest: {why}", fetch.url)
+            })?;
+            let found = digest_of(&files, recorded.algo())?;
+            blaze_audit::source::verify_git(&recorded, &found, &fetch.what, &fetch.url, commit)
+                .map_err(|refused| anyhow::anyhow!("{refused}"))?;
+            found
+        }
+    };
     // The repository kept with the tree, read from the clone before it goes.
     for (path, bytes) in checkout.repository()? {
         let bytes = Bytes::copy_kept(blaze_mem::Tag::Vfs, &bytes);
         files.push(SourceFile::of(path, bytes, Mode::Regular));
     }
     blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
-    Ok(files)
+    Ok((files, digest))
 }
 
 /// One fetch's own `$CARGO_HOME`, removed when the fetch is over.
