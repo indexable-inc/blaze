@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-100 theorems: 87 in `lean`, 13 in `lean/analysis`.
+103 theorems: 90 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -957,6 +957,35 @@ theorem allows_orders (fuel : Nat) (d : Disk) (cut : Slice Kept)
 theorem allows_total (fuel : Nat) (d : Disk) (cut : Slice Kept)
     (h : 73786976294838206464 ≤ fuel) :
     ∃ b, Disk.allows fuel d cut = Result.ok b
+```
+
+**`BlazeCore.World.DiskBytes.cut_appended`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a crash cuts a file within the bounds whose changes not synced are all appends, by any share that fits it, to a prefix of what it read as that begins with all its durable bytes; the file keeps its name and has no change and nothing to undo left.
+
+```lean
+theorem cut_appended (fuel : Nat) (f : File) (k : Kept) (hs : Small f) (ha : AllAppend f)
+    (hfits : File.fits f k = Result.ok true) (hfuel : 73786976294838206464 ≤ fuel) :
+    ∃ f', File.cut fuel f k = Result.ok f' ∧ f'.name = f.name ∧ f'.changes.val = [] ∧
+      f'.undo = none ∧ f.durable.val <+: f'.durable.val ∧
+      f'.durable.val <+: f.durable.val ++ appended f
+```
+
+**`BlazeCore.World.DiskBytes.cut_synced`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a share that fits a file with no change not synced keeps nothing and tears nothing, and the crash leaves the file's durable bytes and name as they were.
+
+```lean
+theorem cut_synced (fuel : Nat) (f : File) (k : Kept) (hs : Small f) (hc : f.changes.val = [])
+    (hfits : File.fits f k = Result.ok true) (hfuel : 73786976294838206464 ≤ fuel) :
+    k.whole.val = 0 ∧ k.torn = Torn.Nothing ∧
+      ∃ f', File.cut fuel f k = Result.ok f' ∧ f'.durable.val = f.durable.val ∧
+        f'.name = f.name ∧ f'.changes.val = [] ∧ f'.undo = none
+```
+
+**`BlazeCore.World.DiskBytes.sync_all`** (`BlazeCore.World.DiskBytes`, `lean`): Of the disk world's model: a sync that covers every change of a file within the bounds, whatever kinds they are, leaves no change and nothing to undo, and its durable bytes are what the file read as.
+
+```lean
+theorem sync_all (fuel : Nat) (f : File) (covers : Usize) (hs : Small f)
+    (hall : (f.changes.val.length : Int) ≤ covers.val) (hfuel : 73786976294838206464 ≤ fuel) :
+    ∃ r v, File.sync fuel f covers = Result.ok r ∧ File.contents fuel f = Result.ok v ∧
+      r.changes.val = [] ∧ r.undo = none ∧ r.name = f.name ∧ r.durable.val = v.val
 ```
 
 ## V15
