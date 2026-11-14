@@ -131,6 +131,8 @@ pub enum ResponseRef<'a> {
     Doing(Doing),
     /// Once a request: read owned.
     Diagnostics(Seen),
+    /// Once a request: read owned.
+    Rows(crate::query::Rows),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -380,6 +382,7 @@ impl ResponseRef<'_> {
             }
             ResponseRef::Doing(it) => Response::Doing(it),
             ResponseRef::Diagnostics(it) => Response::Diagnostics(it),
+            ResponseRef::Rows(it) => Response::Rows(it),
         }
     }
 }
