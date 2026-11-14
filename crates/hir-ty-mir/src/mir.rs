@@ -27,6 +27,7 @@ mod framed;
 pub mod handles;
 pub mod home;
 pub mod location;
+pub mod loop_match;
 mod lower;
 mod monomorphization;
 mod optimize;

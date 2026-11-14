@@ -353,6 +353,8 @@ struct MirLowerCtx<'a, 'f, 'db> {
     early_drops: &'a [EarlyDrop],
     /// How many of `early_drops` were lowered.
     early_drops_placed: usize,
+    /// The `#[loop_match]` loops being lowered, innermost last ([`loop_match`]).
+    loop_matches: Vec<loop_match::LoopMatchFrame<'f>, &'f Frame>,
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
@@ -415,9 +417,10 @@ macro_rules! implementation_error {
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
-// After `not_supported!` and `implementation_error!`, which it uses.
+// After `not_supported!` and `implementation_error!`, which these use.
 mod comptime;
 mod contract;
+mod loop_match;
 
 impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
     fn new(
@@ -534,6 +537,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             probe: None,
             early_drops: &[],
             early_drops_placed: 0,
+            loop_matches: Vec::new_in(frame),
         }
     }
 
@@ -1407,7 +1411,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 }
             }
             Expr::Loop { body, label, source: _ } => {
-                self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                self.enter_loop_match(expr_id)?;
+                let lowered = self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
+                    this.loop_match_begins(expr_id);
                     let scope = this.push_drop_scope();
                     if let Some((_, mut current)) = this.lower_expr_as_place(begin, body, true)? {
                         current = scope.pop_and_drop(this, current, body.into());
@@ -1416,7 +1422,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         scope.pop_assume_dropped(this);
                     }
                     Ok(())
-                })
+                })?;
+                self.leave_loop_match(expr_id)?;
+                Ok(lowered)
             }
             Expr::Call { callee, args, .. } => {
                 if let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id) {
@@ -1527,6 +1535,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     return Ok(None);
                 };
                 self.push_fake_read(current, cond_place, expr_id.into());
+                self.loop_match_dispatch(expr_id, cond_place);
                 let mut end = None;
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
@@ -1616,7 +1625,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                         }
                         next
                     } else {
-                        then
+                        self.loop_match_arm_entry(expr_id, index, *pat, then)?
                     };
                     if let Some(block) = self.lower_expr_to_place(*expr, place, then)? {
                         let block = arm.pop_and_drop(self, block, expr_id.into());
@@ -1669,6 +1678,9 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                 Ok(None)
             }
             Expr::Break { expr, label } => {
+                if self.store.is_const_continue(expr_id) {
+                    return self.lower_const_continue(expr_id, expr, label, current);
+                }
                 let loop_data = match label {
                     Some(l) => {
                         self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
@@ -5395,6 +5407,13 @@ fn lower_closure_body_in<'db>(
     {
         return Err(MirLowerError::HasErrors);
     }
+    // rustc builds no MIR for a closure whose `#[loop_match]` it refused.
+    if let InferBodyId::DefWithBodyId(def) = body_owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(Some(expr))
+    {
+        return Err(MirLowerError::HasErrors);
+    }
     let Expr::Closure { args, body: root, closure_kind, .. } = store.expr(expr) else {
         implementation_error!("closure expression is not closure");
     };
@@ -5874,6 +5893,13 @@ fn lower_body_dropping<'db>(
     if let InferBodyId::DefWithBodyId(def) = owner
         && hir_ty_tailck::has_become(store)
         && hir_ty_tailck::tail_call_check(db, def).fails_body(None)
+    {
+        return Err(MirLowerError::HasErrors);
+    }
+    // rustc refused a `#[loop_match]` or `#[const_continue]` of the body: it builds no MIR.
+    if let InferBodyId::DefWithBodyId(def) = owner
+        && store.has_loop_match()
+        && super::loop_match::loop_match_check(db, def).fails_body(None)
     {
         return Err(MirLowerError::HasErrors);
     }

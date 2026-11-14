@@ -1970,7 +1970,14 @@ impl<'db> ExprCollector<'db> {
                     (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
                 });
                 let body = self.collect_labelled_block_opt(label, e.loop_body());
-                self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Loop { body, label: label.map(|it| it.1), source: LoopSource::Loop }, syntax_ptr);
+                // `#[loop_match]` changes how MIR lowers the loop's `#[const_continue]` breaks;
+                // the attribute stays off `Expr::Loop`, in the store's marked column.
+                let loop_match = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "loop_match");
+                if ast::HasAttrs::attrs(&e).any(loop_match) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::WhileExpr(e) => self.collect_while_loop(syntax_ptr, e),
             ast::Expr::ForExpr(e) if e.const_token().is_some() => {
@@ -2062,7 +2069,14 @@ impl<'db> ExprCollector<'db> {
                     None
                 });
                 let expr = e.expr().map(|e| self.collect_expr(e));
-                self.alloc_expr(Expr::Break { expr, label }, syntax_ptr)
+                let lowered = self.alloc_expr(Expr::Break { expr, label }, syntax_ptr);
+                // `#[const_continue]` makes the break a jump into the `#[loop_match]` arm its
+                // value selects; kept off `Expr::Break`, in the store's marked column.
+                let const_continue = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "const_continue");
+                if ast::HasAttrs::attrs(&e).any(const_continue) {
+                    self.store.marked_exprs.insert(lowered);
+                }
+                lowered
             }
             ast::Expr::ParenExpr(e) => {
                 // A macro puts its `$x:expr` in parentheses: with `#[cfg]` on what was handed in,
@@ -2328,7 +2342,7 @@ impl<'db> ExprCollector<'db> {
                         attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
                     };
                     if ast::HasAttrs::attrs(&e).any(inherits) {
-                        this.store.overflow_inheriting.insert(closure);
+                        this.store.marked_exprs.insert(closure);
                     }
 
                     (if is_coroutine_closure { body } else { closure }, closure)
