@@ -1023,6 +1023,26 @@ impl Writer<Fake> for FakeWriter {
         None // the fakes offer no goal
     }
 
+    // What the fakes' steps read, said: each list is known and empty, so a fake build's
+    // request certificate is written, of its view and its outputs alone. Left to the trait's
+    // defaults ("its front end does not say ..."), no build of the simulation left a
+    // certificate, and every test whose premise is a certificate's answer failed at it.
+
+    /// The fakes' steps ask for no variable by name.
+    fn env_named(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// The fakes' steps read no path under the build's outputs beside their own units'.
+    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
+        Ok((Vec::new(), Vec::new()))
+    }
+
+    /// The fakes run no traced step.
+    fn read_seen(&self) -> Result<Vec<crate::serve::work::Seen>, String> {
+        Ok(Vec::new())
+    }
+
     fn apply(&mut self) -> Result<bool, ApiError> {
         if self.asked.is_empty() {
             return Ok(true);
