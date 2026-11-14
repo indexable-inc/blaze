@@ -16,6 +16,14 @@
 //! crates/blaze-lints/baselines/alloc-sites.txt only shrinks, except `global` while any
 //! `// alloc:` line is left: converting those to `Global` raises it. It runs with no
 //! compiler: a gate step of the `scripts` job (.github/workflows/blaze.yaml), beside `domains`.
+//!
+//! The `signatures` column (2026-11-14) counts the function signatures that fix a caller's
+//! allocator: a std collection or box with its allocator left to the default or given as
+//! `Global`, or `String`. The rule it holds is `blaze::unwritten_allocator`'s: a function is
+//! generic over `A: Allocator + Clone` and takes `alloc: A`, and the caller names `Global`. It is
+//! the count the gate can hold before blaze checks blaze's own crates.
+
+#![feature(allocator_api)]
 
 /// What the usage error prints.
 const DOC: &str = r#"allocs: what is left of the global heap in each crate only goes down (AGENTS.md bump-allocate).
@@ -24,21 +32,22 @@ const DOC: &str = r#"allocs: what is left of the global heap in each crate only 
     blaze run -q -p scripts --bin allocs -- '{"command": "write"}'
     blaze run -q -p scripts --bin allocs -- selftest
 
-    command   check   each count of every crate equals its row's in the list (a `comments` or
-                      `expects` count over its row is refused, with its new sites named given
-                      `base`; one under it must be lowered; a `global` count off its row is
-                      written with `write`); a crate with no row is held to 0; with `base`, no
-                      `comments` or `expects` of a row is above the base's, and no `global`
-                      either once the base has no `// alloc:` line left in any crate (while
-                      some are, converting them to `Global` raises it) (CI)
+    command   check   each count of every crate equals its row's in the list (a `comments`,
+                      `expects` or `signatures` count over its row is refused, with its new
+                      sites named given `base`; one under it must be lowered; a `global` count
+                      off its row is written with `write`); a crate with no row is held to 0;
+                      with `base`, no `comments`, `expects` or `signatures` of a row is above
+                      the base's, and no `global` either once the base has no `// alloc:` line
+                      left in any crate (while some are, converting them to `Global` raises it)
+                      (CI)
               write   write the list from the tree as it is
     root      the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row down, and the lines added since it (`git diff --unified=0`) name a crate's
               new sites
 
-The list's row is `<crate><TAB><comments><TAB><expects><TAB><global>`, of lines of `.rs` files
-under crates/ (a directory named `target` is not read):
+The list's row is `<crate><TAB><comments><TAB><expects><TAB><global><TAB><signatures>`, of lines
+of `.rs` files under crates/ (a directory named `target` is not read):
   comments  a line with `// alloc: <why>` (`//`, then `alloc:` and a reason that is not
             empty): the comment that once kept an allocator lint's finding and now keeps
             nothing; each is a site to convert, and the count goes to 0
@@ -47,8 +56,29 @@ under crates/ (a directory named `target` is not read):
   global    a line whose code (not a comment, a string or a character, and not a `use` item)
             has the word `Global`: the global heap named where it is used, which moving to
             frames brings down
-A line can count in more than one column. The previous layout, `<crate><TAB><count>`, is
-refused with a message to run `write`.
+  signatures
+            a function signature, from the word `fn` and its name to the `{` or `;` that ends
+            it, over as many lines as it spans (comments, strings and characters skipped),
+            that names `Vec`, `VecDeque`, `Box`, `Rc`, `Arc`, `BTreeSet`, `BinaryHeap` or
+            `LinkedList` with one type argument (`BTreeMap` with two), that is, with its
+            allocator left to its default, or with the allocator given as `Global` (`Vec<T,
+            Global>`, `Vec<T, std::alloc::Global>`), or `String` with no `<..>` after it; once
+            a signature however many such types it names, at the line of its `fn`. Not
+            counted: a method of an `impl <Trait> for <Type>` block (its signature is the
+            trait's, found at the trait's declaration, which counts), a function pointer type
+            (`fn(u8)`, no name) and `fn main`. The form to write instead: the function generic
+            over `A: Allocator + Clone`, taking `alloc: A`, `Vec<T, A>` in its signature, and
+            the caller naming `Global`
+A line can count in more than one column. The previous layouts, `<crate><TAB><count>` and
+`<crate><TAB><comments><TAB><expects><TAB><global>`, are refused with a message to run `write`;
+a base whose list has one of them holds no row (the columns begin with the change).
+
+`signatures` is read from the text, so it differs from the lint at the edges: a crate's own type
+named `Vec`, a type alias of a std collection, a function a macro makes, a `fn` in a
+`macro_rules!` body, and whose trait an impl implements (no impl's method counts, its trait in
+the crate or not). The lint `blaze::unwritten_allocator` is the definition; this column is the
+count the gate can hold before blaze checks blaze's own crates, and it goes when that lint's
+baseline joins the gate.
 
 A site in test code is not counted. Test code is, and nothing else is:
   - a file under a directory named `tests` or `benches`, or named `tests.rs` or `test.rs`;
@@ -68,6 +98,7 @@ by its path under crates/ (`blaze-cargo`, `harness/harness-native`).
 "#;
 
 use std::{
+    alloc::{Allocator, Global},
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
@@ -98,10 +129,27 @@ const RULE: &str = "AGENTS.md bump-allocate: don't allocate where a borrow, a fi
 /// The list's first lines.
 const HEADER: &str = "# What is left of the global heap outside test code, by crate (its directory under crates/):\n\
                       # `// alloc: <why>` lines, which keep nothing now and go to 0; `allow`/`expect`s of\n\
-                      # `blaze::implicit_allocator`; lines whose code names `Global`. Only shrinks (`global` may rise\n\
-                      # while any `// alloc:` line is left); a crate with no row is held to 0 (AGENTS.md bump-allocate).\n\
-                      # Written by scripts/src/bin/allocs.rs (`{\"command\": \"write\"}`), checked in CI.\n\
-                      # crate\tcomments\texpects\tglobal\n";
+                      # `blaze::implicit_allocator`; lines whose code names `Global`; function signatures that fix\n\
+                      # the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text). Only shrinks\n\
+                      # (`global` may rise while any `// alloc:` line is left); a crate with no row is held to 0\n\
+                      # (AGENTS.md bump-allocate). Written by scripts/src/bin/allocs.rs (`{\"command\": \"write\"}`),\n\
+                      # checked in CI.\n\
+                      # crate\tcomments\texpects\tglobal\tsignatures\n";
+/// The std types that take an allocator, each with the number of type arguments of its form
+/// with one: a signature that writes one fewer leaves the allocator to its default.
+const ALLOCATING: [(&str, usize); 9] = [
+    ("Vec", 2),
+    ("VecDeque", 2),
+    ("Box", 2),
+    ("Rc", 2),
+    ("Arc", 2),
+    ("BTreeMap", 3),
+    ("BTreeSet", 2),
+    ("BinaryHeap", 2),
+    ("LinkedList", 2),
+];
+/// std's text type, which takes no allocator; `blaze_mem::String<A>` (written with `<..>`) does.
+const TEXT: &str = "String";
 
 struct Args {
     command: String,
@@ -130,9 +178,11 @@ enum Kind {
     Expect,
     /// Code that names `Global`.
     Global,
+    /// A function signature that fixes its caller's allocator.
+    Signature,
 }
 
-const KINDS: [Kind; 3] = [Kind::Comment, Kind::Expect, Kind::Global];
+const KINDS: [Kind; 4] = [Kind::Comment, Kind::Expect, Kind::Global, Kind::Signature];
 
 impl Kind {
     /// Its column in a row, from 0.
@@ -141,6 +191,7 @@ impl Kind {
             Kind::Comment => 0,
             Kind::Expect => 1,
             Kind::Global => 2,
+            Kind::Signature => 3,
         }
     }
 
@@ -150,6 +201,7 @@ impl Kind {
             Kind::Comment => "comments",
             Kind::Expect => "expects",
             Kind::Global => "global",
+            Kind::Signature => "signatures",
         }
     }
 
@@ -159,12 +211,13 @@ impl Kind {
             Kind::Comment => "`// alloc:` lines, which keep nothing now",
             Kind::Expect => "`allow`/`expect`s of `blaze::implicit_allocator`",
             Kind::Global => "lines that name `Global`",
+            Kind::Signature => "function signatures that fix the caller's allocator (`blaze::unwritten_allocator`)",
         }
     }
 }
 
 /// A crate's counts, by [`Kind::column`].
-type Row = [usize; 3];
+type Row = [usize; 4];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Site {
@@ -176,7 +229,7 @@ struct Site {
 
 /// The counts of `sites`, by kind.
 fn tally(sites: &[Site]) -> Row {
-    let mut row = [0; 3];
+    let mut row = [0; 4];
     for it in sites {
         row[it.kind.column()] += 1;
     }
@@ -236,6 +289,9 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
     let mut out = Scanned::default();
     let global = global_lines(text);
     let mut global = global.iter().peekable();
+    let mut signatures = Vec::new_in(Global);
+    signature_lines(text, &mut signatures);
+    let mut signatures = signatures.iter().peekable();
     // The byte where line `at` starts.
     let mut start = 0;
     for (at, line) in lines.iter().enumerate() {
@@ -257,9 +313,16 @@ fn scan_file(p: &Patterns, text: &str) -> Scanned {
         }
         // `global` is in line order: take this line's entry, if it has one, test code or not.
         let names_global = global.next_if(|it| **it == at + 1).is_some();
+        // `signatures` likewise, each signature whose `fn` is on this line (two can share one).
+        let mut signed: usize = 0;
+        // Bounded: each turn takes one entry of the list.
+        while signatures.next_if(|it| **it == at + 1).is_some() {
+            signed += 1;
+        }
         if !test[at] {
             let kinds = [(keeps(line), Kind::Comment), (p.allowed.is_match(line), Kind::Expect), (names_global, Kind::Global)];
             out.sites.extend(kinds.iter().filter(|(is, _)| *is).map(|(_, kind)| (at + 1, *kind)));
+            out.sites.extend(std::iter::repeat_n((at + 1, Kind::Signature), signed));
         }
         start += line.len() + 1;
     }
@@ -354,6 +417,176 @@ fn global_lines(text: &str) -> Vec<usize> {
         };
     }
     out
+}
+
+/// Pushes onto `out` the line (from 1, ascending) of the `fn` of each function signature in
+/// `text` that fixes its caller's allocator ([`fixes_allocator`]): comments, strings and
+/// characters skipped as [`item_end`] skips them. Not a method directly in an `impl <Trait> for
+/// <Type>` block (its signature is the trait's), not a function pointer type (`fn` with no name
+/// after it), not `fn main`.
+fn signature_lines<A: Allocator>(text: &str, out: &mut Vec<usize, A>) {
+    let bytes = text.as_bytes();
+    // For each `{` open, outermost first: whether it opens an `impl <Trait> for <Type>` block.
+    let mut blocks = Vec::new_in(Global);
+    // From the word `impl` to the `{` or `;` after it: whether a `for` is in it (not `for<..>`,
+    // a bound's).
+    let mut header: Option<bool> = None;
+    // The line of byte `counted`, kept up to date as `at` moves on.
+    let mut line = 1;
+    let mut counted = 0;
+    let mut at = 0;
+    // Bounded: every turn moves `at` forward, to the end of the text at most.
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let next = bytes.get(at + 1).copied();
+        at = match byte {
+            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
+            b'/' if next == Some(b'*') => comment_end(bytes, at),
+            b'"' => string_end(bytes, at + 1),
+            b'\'' => quote_end(text, at),
+            b'{' => {
+                blocks.push(header.take().unwrap_or(false));
+                at + 1
+            }
+            b'}' => {
+                blocks.pop();
+                at + 1
+            }
+            b';' => {
+                header = None;
+                at + 1
+            }
+            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                let end = word_end(text, at);
+                match &text[at..end] {
+                    "impl" => header = Some(false),
+                    "for" if header.is_some() && !text[end..].trim_start().starts_with('<') => header = Some(true),
+                    "fn" if blocks.last() != Some(&true) => {
+                        let rest = text[end..].trim_start();
+                        let rest = rest.strip_prefix("r#").unwrap_or(rest);
+                        let len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || *b == b'_').count();
+                        let name = &rest[..len];
+                        let named = name.bytes().next().is_some_and(|b| !b.is_ascii_digit());
+                        if named
+                            && name != "main"
+                            && let Some(close) = signature_end(text, end)
+                            && fixes_allocator(&text[end..close])
+                        {
+                            line += text[counted..at].matches('\n').count();
+                            counted = at;
+                            out.push(line);
+                        }
+                    }
+                    _ => {}
+                }
+                end
+            }
+            // A number's digits and suffix (`1u8`, `0x1F`): never the start of a word.
+            b'0'..=b'9' => at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count(),
+            _ => at + 1,
+        };
+    }
+}
+
+/// The byte of the `{` or `;` that ends the signature whose text (after the word `fn`) starts
+/// at byte `from` of `text`: the first outside brackets (`(`, `[`, `<`, and `{` of a const
+/// argument; the `>` of `->` closes none); `None` when a bracket closes that it did not open, or
+/// the text ends.
+fn signature_end(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth: usize = 0;
+    let mut at = from;
+    // Bounded: every turn moves `at` forward, to the end of the text at most.
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let next = bytes.get(at + 1).copied();
+        at = match byte {
+            b'/' if next == Some(b'/') => text[at..].find('\n').map_or(bytes.len(), |n| at + n),
+            b'/' if next == Some(b'*') => comment_end(bytes, at),
+            b'"' => string_end(bytes, at + 1),
+            b'\'' => quote_end(text, at),
+            b'{' | b';' if depth == 0 => return Some(at),
+            b'(' | b'[' | b'<' | b'{' => {
+                depth += 1;
+                at + 1
+            }
+            b'>' if at > 0 && bytes[at - 1] == b'-' => at + 1,
+            b')' | b']' | b'>' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                at + 1
+            }
+            b'_' | b'a'..=b'z' | b'A'..=b'Z' => word_end(text, at),
+            _ => at + 1,
+        };
+    }
+    None
+}
+
+/// Whether the signature text `signature` names a type of [`ALLOCATING`] with one type argument
+/// fewer than its form with an allocator, or with `Global` as its last argument, or [`TEXT`]
+/// with no `<..>` after it. Comments, strings and characters are skipped.
+fn fixes_allocator(signature: &str) -> bool {
+    let bytes = signature.as_bytes();
+    let mut at = 0;
+    // Bounded: every turn moves `at` forward, to the end of the text at most.
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let next = bytes.get(at + 1).copied();
+        at = match byte {
+            b'/' if next == Some(b'/') => signature[at..].find('\n').map_or(bytes.len(), |n| at + n),
+            b'/' if next == Some(b'*') => comment_end(bytes, at),
+            b'"' => string_end(bytes, at + 1),
+            b'\'' => quote_end(signature, at),
+            b'_' | b'a'..=b'z' | b'A'..=b'Z' => {
+                let end = word_end(signature, at);
+                let word = &signature[at..end];
+                let after = signature[end..].trim_start();
+                if word == TEXT && !after.starts_with('<') {
+                    return true;
+                }
+                if let Some(&(_, arity)) = ALLOCATING.iter().find(|(name, _)| *name == word)
+                    && after.starts_with('<')
+                    && let Some((count, last)) = type_args(after)
+                    && (count + 1 == arity || (count == arity && (last == GLOBAL || last.ends_with("::Global"))))
+                {
+                    return true;
+                }
+                end
+            }
+            b'0'..=b'9' => at + bytes[at..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count(),
+            _ => at + 1,
+        };
+    }
+    false
+}
+
+/// The number of arguments of the `<..>` that `text` starts with, and its last argument's text,
+/// trimmed: commas count only at its own level (`(`, `[` and `<` nest; the `>` of `->` closes
+/// none), and a trailing comma adds none. `None` when it does not close.
+fn type_args(text: &str) -> Option<(usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut depth: usize = 0;
+    let mut count = 1;
+    let mut last = 1;
+    for (at, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' if at > 0 && bytes[at - 1] == b'-' => {}
+            b'>' | b')' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let tail = text[last..at].trim();
+                    return Some(if tail.is_empty() { (count - 1, text[..last - 1].rsplit(',').next()?.trim()) } else { (count, tail) });
+                }
+            }
+            b',' if depth == 1 => {
+                count += 1;
+                last = at + 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The byte after the block comment that opens at `from`, comments nested in it included.
@@ -553,18 +786,19 @@ fn count(p: &Patterns, root: &Path) -> BTreeMap<String, Vec<Site>> {
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><comments><TAB><expects><TAB>
-/// <global>` for each crate with a site, sorted.
+/// <global><TAB><signatures>` for each crate with a site, sorted.
 fn render(counts: &BTreeMap<String, Vec<Site>>) -> String {
     let mut out = HEADER.to_owned();
     for (krate, sites) in counts.iter().filter(|(_, sites)| !sites.is_empty()) {
-        let [comments, expects, global] = tally(sites);
-        out.push_str(&format!("{krate}\t{comments}\t{expects}\t{global}\n"));
+        let [comments, expects, global, signatures] = tally(sites);
+        out.push_str(&format!("{krate}\t{comments}\t{expects}\t{global}\t{signatures}\n"));
     }
     out
 }
 
 /// The list's rows; `Err` names the line that is not a row, a comment or blank, and says to run
-/// `write` for a row of the previous layout, `<crate><TAB><count>`.
+/// `write` for a row of a previous layout, `<crate><TAB><count>` or `<crate><TAB><comments>
+/// <TAB><expects><TAB><global>`.
 fn parse_rows(text: &str) -> Result<BTreeMap<String, Row>, String> {
     let mut rows = BTreeMap::new();
     for (at, line) in text.split('\n').enumerate() {
@@ -576,18 +810,32 @@ fn parse_rows(text: &str) -> Result<BTreeMap<String, Row>, String> {
         let row = match fields.as_slice() {
             [krate, n] if !krate.is_empty() && number(*n).is_some() => {
                 return Err(format!(
-                    "{LIST}:{}: {line:?} is a row of the previous layout, `<crate><TAB><count>`: run command `write`",
+                    "{LIST}:{}: {line:?} is a row of a previous layout, `<crate><TAB><count>`: run command `write`",
                     at + 1
                 ));
             }
-            [krate, comments, expects, global] if !krate.is_empty() => match (number(*comments), number(*expects), number(*global)) {
-                (Some(comments), Some(expects), Some(global)) => Some((*krate, [comments, expects, global])),
-                _ => None,
-            },
+            [krate, rest @ ..] if !krate.is_empty() && rest.len() == 3 && rest.iter().all(|it| number(*it).is_some()) => {
+                return Err(format!(
+                    "{LIST}:{}: {line:?} is a row of a previous layout, `<crate><TAB><comments><TAB><expects><TAB><global>`, \
+                     with no `signatures`: run command `write`",
+                    at + 1
+                ));
+            }
+            [krate, comments, expects, global, signatures] if !krate.is_empty() => {
+                match (number(*comments), number(*expects), number(*global), number(*signatures)) {
+                    (Some(comments), Some(expects), Some(global), Some(signatures)) => {
+                        Some((*krate, [comments, expects, global, signatures]))
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         };
         let Some((krate, n)) = row else {
-            return Err(format!("{LIST}:{}: {line:?} is not `<crate><TAB><comments><TAB><expects><TAB><global>`", at + 1));
+            return Err(format!(
+                "{LIST}:{}: {line:?} is not `<crate><TAB><comments><TAB><expects><TAB><global><TAB><signatures>`",
+                at + 1
+            ));
         };
         if rows.insert(krate.to_owned(), n).is_some() {
             return Err(format!("{LIST}:{}: `{krate}` has two rows", at + 1));
@@ -596,10 +844,11 @@ fn parse_rows(text: &str) -> Result<BTreeMap<String, Row>, String> {
     Ok(rows)
 }
 
-/// Whether `text` is a list of the previous layout: its first row is `<crate><TAB><count>`.
+/// Whether `text` is a list of a previous layout: its first row is `<crate><TAB><count>` or
+/// `<crate><TAB><comments><TAB><expects><TAB><global>`.
 fn previous_layout(text: &str) -> bool {
     let first = text.split('\n').find(|line| !line.is_empty() && !line.starts_with('#'));
-    first.is_some_and(|line| line.split('\t').count() == 2)
+    first.is_some_and(|line| matches!(line.split('\t').count(), 2 | 4))
 }
 
 /// The lines each file has that `base` did not, from `git diff --unified=0`'s hunks: by path
@@ -652,8 +901,8 @@ fn at_base(root: &Path, base: &str) -> Result<(Option<BTreeMap<String, Row>>, BT
     } else {
         let spec = format!("{base}:{LIST}");
         let text = git(root, &["-C", dir, "show", spec.as_str()])?;
-        // A list of the previous layout counted one number the columns split: nothing to hold
-        // a column to, as before the ratchet began.
+        // A list of a previous layout has a column fewer, or one number the columns split:
+        // nothing to hold the columns to, as before the ratchet began.
         if previous_layout(&text) { None } else { Some(parse_rows(&text).map_err(|e| format!("at {base}: {e}"))?) }
     };
     let diff = git(root, &["-C", dir, "diff", "--no-color", "--no-ext-diff", "--no-renames", "--unified=0", base, "--", "crates"])?;
@@ -706,12 +955,17 @@ fn problems(
                 };
                 let instead = match kind {
                     Kind::Comment => "no comment keeps an allocation: borrow or write into a buffer, or name the allocator where it is used",
+                    Kind::Signature => {
+                        "make the function generic over `A: Allocator + Clone`, take `alloc: A` from its caller and write `A` \
+                         in the type (`Vec<T, A>`; `blaze_mem::String<A>` or a typed error for `String`); the caller names \
+                         `Global` where the lifetime is decided"
+                    }
                     _ => "borrow or write into a buffer, or give each value its allocator, from a parameter or the task's frame",
                 };
                 out.push(format!("`{krate}` has {now} {what} outside tests, over {shown} in {LIST} ({new}): {instead} ({RULE})"));
             } else if now < held {
                 let lower = match now_row {
-                    [0, 0, 0] => "remove the row".to_owned(),
+                    [0, 0, 0, 0] => "remove the row".to_owned(),
                     _ => format!("lower its `{column}` to {now}"),
                 };
                 out.push(format!(
@@ -725,7 +979,7 @@ fn problems(
         // base has none left.
         let converting = base.values().any(|it| it[Kind::Comment.column()] > 0);
         for (krate, n) in rows {
-            let was = base.get(krate).copied().unwrap_or([0; 3]);
+            let was = base.get(krate).copied().unwrap_or([0; 4]);
             for kind in KINDS {
                 let (now, then) = (n[kind.column()], was[kind.column()]);
                 if now > then && !(kind == Kind::Global && converting) {
@@ -742,7 +996,7 @@ fn problems(
 
 /// The tree's counts, by kind.
 fn total(counts: &BTreeMap<String, Vec<Site>>) -> Row {
-    let mut row = [0; 3];
+    let mut row = [0; 4];
     for sites in counts.values() {
         for (sum, n) in row.iter_mut().zip(tally(sites)) {
             *sum += n;
@@ -753,9 +1007,10 @@ fn total(counts: &BTreeMap<String, Vec<Site>>) -> Row {
 
 /// `counts`' totals, for a line of output.
 fn summary(counts: &BTreeMap<String, Vec<Site>>) -> String {
-    let [comments, expects, global] = total(counts);
+    let [comments, expects, global, signatures] = total(counts);
     format!(
-        "{comments} `// alloc:` lines left to convert, {expects} `allow`/`expect`s of the lint and {global} lines naming `Global`, outside tests, in {} crates",
+        "{comments} `// alloc:` lines left to convert, {expects} `allow`/`expect`s of the lint, {global} lines naming `Global` \
+         and {signatures} signatures fixing the caller's allocator, outside tests, in {} crates",
         counts.len()
     )
 }
@@ -795,7 +1050,7 @@ fn main_with(p: &Patterns, it: &Args) {
     let mut wrong = problems(&counts, &rows, base_rows.as_ref(), added.as_ref());
     if wrong.is_empty() && listed != text {
         wrong.push(format!(
-            "{LIST} is not as command `write` writes it (its header, then a sorted `<crate><TAB><comments><TAB><expects><TAB><global>` row per crate with a site): run it"
+            "{LIST} is not as command `write` writes it (its header, then a sorted `<crate><TAB><comments><TAB><expects><TAB><global><TAB><signatures>` row per crate with a site): run it"
         ));
     }
     if !wrong.is_empty() {
@@ -950,12 +1205,12 @@ fn selftest(p: &Patterns) {
         ("b/c".to_owned(), sites_of(&[("crates/b/c/src/lib.rs", 1, Kind::Comment)])),
     ]);
     expect(counts == want, &format!("the tree's sites: {}", shown(&counts)));
-    expect(total(&counts) == [5, 1, 3], &format!("the totals: {:?}", total(&counts)));
+    expect(total(&counts) == [5, 1, 3, 0],&format!("the totals: {:?}", total(&counts)));
 
     // The ratchet. As recorded, nothing is wrong, and the list reads back as it was written.
     let rows = parse_rows(&render(&counts)).unwrap_or_else(|e| fail(&format!("{SCRIPT} selftest"), &e));
     expect(
-        rows == BTreeMap::from([("a".to_owned(), [4, 1, 3]), ("b/c".to_owned(), [1, 0, 0])]),
+        rows == BTreeMap::from([("a".to_owned(), [4, 1, 3, 0]), ("b/c".to_owned(), [1, 0, 0, 0])]),
         &format!("the rows read back: {rows:?}"),
     );
     expect(problems(&counts, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
@@ -963,7 +1218,7 @@ fn selftest(p: &Patterns) {
     // base's diff, which also added the `Global` on that line: not named, it is another column)
     // and the rule.
     let mut fewer = rows.clone();
-    fewer.insert("a".to_owned(), [3, 1, 3]);
+    fewer.insert("a".to_owned(), [3, 1, 3, 0]);
     let added = BTreeMap::from([(lib.to_owned(), BTreeSet::from([24]))]);
     let said = problems(&counts, &fewer, None, Some(&added));
     expect(
@@ -976,12 +1231,12 @@ fn selftest(p: &Patterns) {
     );
     // Planted: one `expect` added; the column is named.
     let mut fewer_expects = rows.clone();
-    fewer_expects.insert("a".to_owned(), [4, 0, 3]);
+    fewer_expects.insert("a".to_owned(), [4, 0, 3, 0]);
     let said = problems(&counts, &fewer_expects, None, None);
     expect(said.len() == 1 && said[0].contains("`a` has 1 `allow`/`expect`s"), &format!("one expect added is caught: {said:?}"));
     // Planted: one site removed. Its column must come down.
     let mut more = rows.clone();
-    more.insert("b/c".to_owned(), [2, 0, 0]);
+    more.insert("b/c".to_owned(), [2, 0, 0, 0]);
     let said = problems(&counts, &more, None, None);
     expect(
         said.len() == 1 && said[0].contains("`b/c`") && said[0].contains("lower its `comments` to 1"),
@@ -990,7 +1245,7 @@ fn selftest(p: &Patterns) {
     // Planted: `global` off its row, either way: the list is written again.
     for off in [2, 4] {
         let mut stale = rows.clone();
-        stale.insert("a".to_owned(), [4, 1, off]);
+        stale.insert("a".to_owned(), [4, 1, off, 0]);
         let said = problems(&counts, &stale, None, None);
         expect(
             said.len() == 1 && said[0].contains("`a` has 3 lines that name `Global`") && said[0].contains("run command `write`"),
@@ -999,10 +1254,10 @@ fn selftest(p: &Patterns) {
     }
     // Planted: a crate with no row is held to 0; a row with no site goes; a row raised above
     // the base's is caught even where the tree matches it.
-    let said = problems(&counts, &BTreeMap::from([("a".to_owned(), [4, 1, 3])]), None, None);
+    let said = problems(&counts, &BTreeMap::from([("a".to_owned(), [4, 1, 3, 0])]), None, None);
     expect(said.len() == 1 && said[0].contains("`b/c` has 1") && said[0].contains("held"), &format!("a new crate starts at 0: {said:?}"));
     let mut gone = rows.clone();
-    gone.insert("old".to_owned(), [5, 0, 2]);
+    gone.insert("old".to_owned(), [5, 0, 2, 0]);
     let said = problems(&counts, &gone, None, None);
     expect(
         !said.is_empty() && said.iter().all(|it| it.contains("`old`")) && said.iter().any(|it| it.contains("remove the row")),
@@ -1012,9 +1267,9 @@ fn selftest(p: &Patterns) {
     expect(said.len() == 1 && said[0].contains("the row `a`'s `comments` is 4 and was 3 at the base"), &format!("a row raised: {said:?}"));
     // `global` rises while the base has `// alloc:` lines left to convert, and not after.
     let mut converting = rows.clone();
-    converting.insert("a".to_owned(), [5, 1, 2]);
+    converting.insert("a".to_owned(), [5, 1, 2, 0]);
     expect(problems(&counts, &rows, Some(&converting), None).is_empty(), "`global` rises while converting");
-    let converted = BTreeMap::from([("a".to_owned(), [0, 1, 2])]);
+    let converted = BTreeMap::from([("a".to_owned(), [0, 1, 2, 0])]);
     let said = problems(&counts, &rows, Some(&converted), None);
     expect(
         said.iter().any(|it| it.contains("the row `a`'s `global` is 3 and was 2 at the base")),
@@ -1032,10 +1287,11 @@ fn selftest(p: &Patterns) {
         &format!("the lines added: {lines:?}"),
     );
     expect(
-        parse_rows("a\t1\t0\t0\nb 2\n").is_err()
-            && parse_rows("a\t1\t0\t0\na\t2\t0\t0\n").is_err()
+        parse_rows("a\t1\t0\t0\t0\nb 2\n").is_err()
+            && parse_rows("a\t1\t0\t0\t0\na\t2\t0\t0\t0\n").is_err()
             && parse_rows("a\t1\t0\n").is_err()
-            && parse_rows("\t1\t0\t0\n").is_err(),
+            && parse_rows("a\t1\t0\t0\tx\n").is_err()
+            && parse_rows("\t1\t0\t0\t0\n").is_err(),
         "a bad row is refused",
     );
     let old = parse_rows("# header\na\t1\n");
@@ -1043,8 +1299,141 @@ fn selftest(p: &Patterns) {
         old.as_ref().is_err_and(|e| e.contains("previous layout") && e.contains("`write`")),
         &format!("a row of the previous layout says to write the list: {old:?}"),
     );
-    expect(previous_layout("# h\n\na\t3\n") && !previous_layout("# h\na\t3\t0\t1\n") && !previous_layout("# h\n"), "the previous layout");
+    // The layout before `signatures`, four fields: refused with the same message.
+    let four = parse_rows("# header\na\t1\t0\t2\n");
+    expect(
+        four.as_ref().is_err_and(|e| e.contains("previous layout") && e.contains("no `signatures`") && e.contains("`write`")),
+        &format!("a row of the four-field layout says to write the list: {four:?}"),
+    );
+    expect(
+        previous_layout("# h\n\na\t3\n")
+            && previous_layout("# h\na\t3\t0\t1\n")
+            && !previous_layout("# h\na\t3\t0\t1\t2\n")
+            && !previous_layout("# h\n"),
+        "the previous layouts",
+    );
+    signatures_selftest(p);
     println!("{SCRIPT} selftest: ok");
+}
+
+/// The `signatures` fixture, a file of crate `s`. Line by line, what each signature is:
+/// - 2-4, `spans`: a signature over three lines whose `Vec<u8>` leaves its allocator to the
+///   default: counted, at line 2, its `fn`;
+/// - 7, `handed`: `Vec<u8, A>`, generic and handed its allocator: not counted;
+/// - 8, `named`: `Vec<u8, std::alloc::Global>`, `Global` written into a signature: counted;
+/// - 9, `pages`, the owner's signature, `Arc<dyn PageSource>` two levels down and `String`:
+///   counted once;
+/// - 11, the same signature in `impl ImageStore for Store`, a trait impl's method: not counted;
+/// - 14, `made`, a declaration in `pub trait Local`: counted;
+/// - 17, `inherent`, `BTreeMap<u8, u8>` in an inherent impl: counted;
+/// - 18, `mapped`, `BTreeMap<u8, u8, A>`: not counted;
+/// - 20, `fn main`: not counted;
+/// - 21, `text`: `blaze_mem::String<A>` takes its allocator; the `String` and `Vec` after it
+///   are a string's and a comment's: not counted;
+/// - 22, `pointer`: `fn(u8) -> u8` is a pointer type, no signature, and `pointer`'s own has no
+///   such type: not counted;
+/// - 24, `from` in `impl<T> From<T> for Kept where T: for<'a> Fn(..)`, a trait impl's method
+///   (the bound's `for<'a>` is no impl's `for`): not counted;
+/// - 28, `helper`, in `#[cfg(test)] mod tests`: a signature, but test code, so not a site.
+const SIGNATURES: &str = "use std::alloc::Global;
+pub fn spans(
+    a: u8,
+) -> Vec<u8> {
+    Vec::new()
+}
+pub fn handed<A: Allocator>(v: Vec<u8, A>) -> Vec<u8, A> { v }
+pub fn named(v: Vec<u8, std::alloc::Global>) {}
+fn pages(&self) -> Result<Option<std::sync::Arc<dyn PageSource>>, String> { loop {} }
+impl ImageStore for Store {
+    fn pages(&self) -> Result<Option<std::sync::Arc<dyn PageSource>>, String> { loop {} }
+}
+pub trait Local {
+    fn made(&self) -> Box<u8>;
+}
+impl Store {
+    fn inherent(&self) -> BTreeMap<u8, u8> { loop {} }
+    fn mapped<A: Allocator + Clone>(&self, alloc: A) -> BTreeMap<u8, u8, A> { loop {} }
+}
+fn main() -> Vec<u8> { Vec::new() }
+fn text(s: blaze_mem::String<A>) -> &str { \"fn x() -> String {\" } // fn y() -> Vec<u8> {}
+fn pointer(f: fn(u8) -> u8) {}
+impl<T> From<T> for Kept where T: for<'a> Fn(&'a u8) {
+    fn from(t: T) -> Vec<u8> { loop {} }
+}
+#[cfg(test)]
+mod tests {
+    fn helper() -> Vec<u8> { Vec::new() }
+}
+";
+
+/// The lines [`signature_lines`] gives for `text`, in `alloc`.
+fn signatures_of<A: Allocator>(text: &str, alloc: A) -> Vec<usize, A> {
+    let mut out = Vec::new_in(alloc);
+    signature_lines(text, &mut out);
+    out
+}
+
+/// The `signatures` column: what a signature is, what counts, its planted controls, and the
+/// ratchet's refusal of a rise naming the site.
+fn signatures_selftest(p: &Patterns) {
+    let lines = signatures_of(SIGNATURES, Global);
+    expect(lines == [2, 8, 9, 14, 17, 28], &format!("the signatures that fix the allocator: {lines:?}"));
+    let found = scan_file(p, SIGNATURES);
+    let sites: Vec<usize> = found.sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
+    expect(sites == [2, 8, 9, 14, 17], &format!("the sites outside test code (28 is a test's): {sites:?}"));
+
+    // Planted: `Global` where `handed` takes `A` is counted, at line 7.
+    let planted = SIGNATURES.replace("Vec<u8, A>", "Vec<u8, Global>");
+    let lines = signatures_of(&planted, Global);
+    expect(lines == [2, 7, 8, 9, 14, 17, 28], &format!("`Global` in `handed` is counted: {lines:?}"));
+    // Planted: the trait impl made inherent, its `pages` is counted, at line 11.
+    let planted = SIGNATURES.replace("impl ImageStore for Store {", "impl Store {");
+    let lines = signatures_of(&planted, Global);
+    expect(lines == [2, 8, 9, 11, 14, 17, 28], &format!("an inherent impl's method is counted: {lines:?}"));
+    // Planted: `From`'s impl made inherent, its `from` is counted, at line 24.
+    let planted = SIGNATURES.replace("impl<T> From<T> for Kept where T: for<'a> Fn(&'a u8) {", "impl<T> Kept<T> {");
+    let lines = signatures_of(&planted, Global);
+    expect(lines == [2, 8, 9, 14, 17, 24, 28], &format!("an inherent impl's `from` is counted: {lines:?}"));
+    // Planted: the test module's attribute removed, `helper` is a site.
+    let planted = SIGNATURES.replace("#[cfg(test)]\n", "\n");
+    let found = scan_file(p, &planted);
+    let sites: Vec<usize> = found.sites.iter().filter(|(_, kind)| *kind == Kind::Signature).map(|(line, _)| *line).collect();
+    expect(sites == [2, 8, 9, 14, 17, 28], &format!("`helper` outside test code is a site: {sites:?}"));
+    // `String` with no `<..>`, and one fewer argument than the allocator's form, at any depth.
+    expect(fixes_allocator("f(x: &[Rc<u8>])") && fixes_allocator("f() -> Option<(u8, Box<dyn Fn(u8) -> u8>)>"), "at depth");
+    expect(fixes_allocator("f(s: String)") && !fixes_allocator("f(s: blaze_mem::String<A>)"), "`String`");
+    expect(!fixes_allocator("f(v: Vec<u8, A,>)") && fixes_allocator("f(v: Vec<u8,>)"), "a trailing comma adds no argument");
+    expect(!fixes_allocator("f(v: MyVec<u8>, s: OsStrings)"), "a longer word is not the type");
+
+    // The ratchet: a rise over the row is refused, with the new site named from the base's diff.
+    let path = "crates/s/src/lib.rs";
+    let found = scan_file(p, SIGNATURES);
+    let sites: Vec<Site> =
+        found.sites.iter().map(|(line, kind)| Site { path: path.to_owned(), line: *line, kind: *kind }).collect();
+    let counts = BTreeMap::from([("s".to_owned(), sites)]);
+    let row = tally(&counts["s"]);
+    expect(row == [0, 0, 1, 5], &format!("crate `s`'s row: {row:?}"));
+    let rows = BTreeMap::from([("s".to_owned(), row)]);
+    expect(problems(&counts, &rows, Some(&rows), None).is_empty(), "the tree as recorded is right");
+    let fewer = BTreeMap::from([("s".to_owned(), [0, 0, 1, 4])]);
+    let added = BTreeMap::from([(path.to_owned(), BTreeSet::from([9]))]);
+    let said = problems(&counts, &fewer, None, Some(&added));
+    expect(
+        said.len() == 1
+            && said[0].contains("`s` has 5 function signatures that fix the caller's allocator")
+            && said[0].contains("over its row's `signatures` 4")
+            && said[0].contains("new: crates/s/src/lib.rs:9)")
+            && said[0].contains("generic over `A: Allocator + Clone`"),
+        &format!("one signature added is caught and named: {said:?}"),
+    );
+    // A crate with no row is held to 0; a row above the base's is refused.
+    let said = problems(&counts, &BTreeMap::new(), None, None);
+    expect(said.iter().any(|it| it.contains("`s` has 5 function signatures") && it.contains("held")), &format!("no row: {said:?}"));
+    let said = problems(&counts, &rows, Some(&fewer), None);
+    expect(
+        said.len() == 1 && said[0].contains("the row `s`'s `signatures` is 5 and was 4 at the base"),
+        &format!("a row raised over the base's: {said:?}"),
+    );
 }
 
 fn main() {
@@ -1069,5 +1458,60 @@ mod tests {
     #[test]
     fn the_patterns_compile() {
         let _ = Patterns::new();
+    }
+
+    /// The script's own cases run under `blaze test` and `cargo test` too: one that fails ends
+    /// the test process with status 1, which fails the run.
+    #[test]
+    fn the_selftest_holds() {
+        selftest(&Patterns::new());
+    }
+
+    /// The `signatures` column's cases, each with its control: a multi-line signature, the
+    /// generic form, the owner's signature once, a trait impl's method, a trait's declaration
+    /// and test code (the fixture [`SIGNATURES`] says what each line is).
+    #[test]
+    fn signatures_fixing_the_allocator_are_counted() {
+        assert_eq!(signatures_of(SIGNATURES, Global), [2, 8, 9, 14, 17, 28]);
+        // Multi-line: the site is the `fn`'s line, 1, not the `{`'s, 3.
+        assert_eq!(signatures_of("pub fn spans(\n    a: u8,\n) -> Vec<u8> {\n}\n", Global), [1]);
+        assert!(signatures_of("pub fn spans(\n    a: u8,\n) -> Vec<u8, A> {\n}\n", Global).is_empty());
+        // `Vec<T, A>` is not counted; `Global` given is.
+        assert!(signatures_of("fn f<A: Allocator>(v: Vec<u8, A>) {}\n", Global).is_empty());
+        assert_eq!(signatures_of("fn f(v: Vec<u8, Global>) {}\n", Global), [1]);
+        // The owner's signature: two such types, counted once.
+        let owner = "fn pages(&self) -> Result<Option<std::sync::Arc<dyn PageSource>>, String> {}\n";
+        assert_eq!(signatures_of(owner, Global), [1]);
+        // A trait impl's method is not counted; the same method in an inherent impl is.
+        assert!(signatures_of(&format!("impl ImageStore for Store {{\n    {owner}}}\n"), Global).is_empty());
+        assert_eq!(signatures_of(&format!("impl Store {{\n    {owner}}}\n"), Global), [2]);
+        // A declaration in a trait block is counted.
+        assert_eq!(signatures_of("pub trait Local {\n    fn made(&self) -> Box<u8>;\n}\n", Global), [2]);
+        // Test code is not a site; the same file without its attribute is.
+        let p = Patterns::new();
+        let in_test = "#[cfg(test)]\nmod tests {\n    fn helper() -> Vec<u8> { loop {} }\n}\n";
+        let signed = |text: &str| -> usize { scan_file(&p, text).sites.iter().filter(|(_, kind)| *kind == Kind::Signature).count() };
+        assert_eq!(signed(in_test), 0);
+        assert_eq!(signed(&in_test.replace("#[cfg(test)]\n", "\n")), 1);
+    }
+
+    /// A rise in `signatures` over the crate's row is refused, naming the site the base's diff
+    /// added; the tree at its row is not.
+    #[test]
+    fn a_rise_in_signatures_is_refused_with_its_site() {
+        let sites = [
+            Site { path: "crates/s/src/lib.rs".to_owned(), line: 3, kind: Kind::Signature },
+            Site { path: "crates/s/src/lib.rs".to_owned(), line: 9, kind: Kind::Signature },
+        ];
+        let counts = BTreeMap::from([("s".to_owned(), sites.to_vec())]);
+        let at_row = BTreeMap::from([("s".to_owned(), [0, 0, 0, 2])]);
+        assert!(problems(&counts, &at_row, Some(&at_row), None).is_empty());
+        let under = BTreeMap::from([("s".to_owned(), [0, 0, 0, 1])]);
+        let added = BTreeMap::from([("crates/s/src/lib.rs".to_owned(), BTreeSet::from([9]))]);
+        let said = problems(&counts, &under, None, Some(&added));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("over its row's `signatures` 1") && said[0].contains("new: crates/s/src/lib.rs:9)"), "{said:?}");
+        // The layout before this column is refused, saying to write the list.
+        assert!(parse_rows("s\t0\t0\t0\n").is_err_and(|e| e.contains("previous layout") && e.contains("`write`")));
     }
 }

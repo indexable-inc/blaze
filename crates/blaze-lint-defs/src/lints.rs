@@ -549,6 +549,13 @@ pub(super) const BLAZE: &[Lint] = &[
     // Nightly-only speed advice, after the rest so the order stays `Lint::ALL`'s.
     l("blaze::loop_match_candidate", Allow, "detects a `loop` over a local state that sets the next state from a `match` on it, with transitions to constant states that nightly's `#[loop_match]` would make direct jumps")
         .externally_loaded(),
+    // Faults seen in the tree (2026-11-14), after the rest so the order stays `Lint::ALL`'s.
+    l("blaze::default_refuses", Allow, "detects a trait method whose default body answers nothing (`Err(..)`, `None`, an empty value, `Default::default()`, or `Ok` of one), which every implementor that forgot the method inherits without a word; a doc line `/// The default:` says why every implementor may")
+        .externally_loaded(),
+    l("blaze::one_at_a_time", Allow, "detects a call of a function `.clippy.toml`'s `one-at-a-time` names, once per item of a `for` loop or of a closure given to an iterator adaptor, where the configuration names the batched form that reads them in one call")
+        .externally_loaded(),
+    l("blaze::unwritten_allocator", Allow, "detects a type with an allocator parameter (`Vec`, `Box`, `Arc`, `BTreeMap`, ..) written without it in a function's parameter or return type, a field, a type alias or an associated type, so its allocator is the `Global` default nobody chose, and `Global` written as the allocator in a function's signature; a function is generic over `A: Allocator + Clone` and takes `alloc: A` from its caller")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

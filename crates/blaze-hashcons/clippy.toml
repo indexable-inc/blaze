@@ -1,6 +1,11 @@
 # A hot crate's lints (docs/v2/plan/design/concurrency.md): the root `.clippy.toml`, which clippy
 # does not read for a crate that has its own, plus no lock. Keep the first part equal to the root's,
 # less `std::sync::{Mutex, RwLock}`, which the second bans with no replacement.
+# The single-record reads with a batched form (`blaze::one_at_a_time`), as the root's.
+one-at-a-time = [
+    { path = "blaze_cas::direct::Direct::read", batched = "read_many" },
+    { path = "blaze_cargo::serve::direct::read", batched = "read_many" },
+]
 disallowed-types = [
     # The memory control stack, removed 2026-11-13 (audit-1113 verdicts (c), (e); AGENTS.md rule end-state-not-hill-climb).
     { path = "blaze_mem::gate::Gate", reason = "the memory control stack is gone (2026-11-13, agents/annoyances/control-stack-gone.json): the system's malloc behind a counting wrapper, frames by lifetime, a task starts when a worker is free, and the kernel's limit is the ceiling; shrink what holds memory instead of gating it", allow-invalid = true },
