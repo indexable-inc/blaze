@@ -32,7 +32,7 @@ use crate::{
         crate_def_map,
         diagnostics::DefDiagnosticKind,
         frozen::{
-            self, Frozen, FrozenDefMaps, FrozenLangItems, Mode,
+            self, Frozen, FrozenDefMaps, FrozenDiagnosticItems, FrozenLangItems, Mode,
             pages::{self, PageSource, Paged},
         },
     },
@@ -441,6 +441,8 @@ pub fn serve(
     let mut served = (*before).clone();
     let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
+    let mut diagnostic_items =
+        copied(FrozenDiagnosticItems::try_get(&*db).map(|it| it.maps(&*db)));
     // The crates read from pages: every crate found in `Mode::Serve` and `Mode::Verify`;
     // `Mode::Check` resolves each and compares what it resolves to with its pages.
     let mut paged = pages::all(&*db);
@@ -456,6 +458,7 @@ pub fn serve(
         changed |= served.remove(krate).is_some();
         changed |= maps.remove(krate).is_some();
         changed |= lang_items.remove(krate).is_some();
+        changed |= diagnostic_items.remove(krate).is_some();
         changed |= paged.remove(krate).is_some();
     }
     for (&(krate, base), found) in order.iter().zip(found) {
@@ -465,6 +468,7 @@ pub fn serve(
         changed |= served.remove(&krate).is_some();
         changed |= maps.remove(&krate).is_some();
         changed |= lang_items.remove(&krate).is_some();
+        changed |= diagnostic_items.remove(&krate).is_some();
         changed |= paged.remove(&krate).is_some();
         let Hit { bytes, parts, filed, pages: def_pages, whole } = match found? {
             Found::Hit(hit) => hit,
@@ -479,6 +483,10 @@ pub fn serve(
             }
         };
         lang_items.insert(krate, Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode });
+        diagnostic_items.insert(
+            krate,
+            Frozen { bytes: PartBytes::of(&bytes, &parts, Part::DiagnosticItems), mode },
+        );
         // Under `Mode::Check` and `Mode::Verify` the def map's record whole, which what the
         // crate resolves to (`Check`) or what was read of its pages (`Verify`) is compared
         // with; never when serving, which holds no byte of it past a read.
@@ -529,6 +537,7 @@ pub fn serve(
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
+    frozen::set_diagnostic_items(db, diagnostic_items);
     if !paged.is_empty() || !pages::all(&*db).is_empty() {
         pages::set(db, paged);
     }
@@ -726,7 +735,8 @@ fn moved_served(db: &Db, written: &base_db::Written<'_>) -> Vec<Crate> {
     served.into_iter().filter(|&krate| reaches_moved(db, krate, &moved, &mut reaches)).collect()
 }
 
-/// Every crate given an image, a frozen def map or frozen lang items, sorted.
+/// Every crate given an image, a frozen def map, frozen lang items or frozen diagnostic
+/// items, sorted.
 fn served_crates(db: &Db) -> Vec<Crate> {
     // alloc: once per write that moved a file while any crate is served
     let mut crates = Vec::new();
@@ -737,6 +747,9 @@ fn served_crates(db: &Db) -> Vec<Crate> {
         crates.extend(it.maps(db).keys().copied());
     }
     if let Some(it) = FrozenLangItems::try_get(db) {
+        crates.extend(it.maps(db).keys().copied());
+    }
+    if let Some(it) = FrozenDiagnosticItems::try_get(db) {
         crates.extend(it.maps(db).keys().copied());
     }
     crates.extend(pages::all(db).keys().copied());
@@ -779,24 +792,29 @@ fn reaches_moved(
     it
 }
 
-/// Takes the image, frozen def map and frozen lang items of each of `gone` away, and has the
-/// maintainers go over the crate graph again: from here on each resolves as a fresh crate.
+/// Takes the image, frozen def map, frozen lang items and frozen diagnostic items of each of
+/// `gone` away, and has the maintainers go over the crate graph again: from here on each
+/// resolves as a fresh crate.
 fn withdraw(db: &mut Db, gone: &[Crate]) {
     // clone: what was served, once per write that withdraws an image
     let mut images =
         DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
     let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
     let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
+    let mut diagnostic_items =
+        copied(FrozenDiagnosticItems::try_get(&*db).map(|it| it.maps(&*db)));
     let mut paged = pages::all(&*db);
     let mut paged_gone = false;
     for krate in gone {
         images.remove(krate);
         maps.remove(krate);
         lang_items.remove(krate);
+        diagnostic_items.remove(krate);
         paged_gone |= paged.remove(krate).is_some();
     }
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
+    frozen::set_diagnostic_items(db, diagnostic_items);
     if paged_gone {
         pages::set(db, paged);
     }
@@ -933,6 +951,7 @@ fn make(
     let held = [
         (Part::LangItems, parts[0].as_slice()),
         (Part::Signatures, parts[1].as_slice()),
+        (Part::DiagnosticItems, parts[2].as_slice()),
         (Part::DefMap, paged.as_slice()),
     ];
     if let Some(why) = Base::of(db, krate).held_by(&held) {
@@ -946,7 +965,7 @@ fn make(
         Ok(filed) => filed,
         Err(why) => return Ok(Err(why)),
     };
-    let image = write_image(filed, [&parts[0], &parts[1]]);
+    let image = write_image(filed, [&parts[0], &parts[1], &parts[2]]);
     drop(parts);
     images.put(filed, image).map_err(|why| {
         // alloc: error text
@@ -977,6 +996,7 @@ fn encode(
     Ok([
         frozen::encode_lang_items(db, krate).map_err(refused(Part::LangItems))?,
         signatures::encode(db, krate, calls).map_err(refused(Part::Signatures))?,
+        frozen::encode_diagnostic_items(db, krate).map_err(refused(Part::DiagnosticItems))?,
     ])
 }
 
