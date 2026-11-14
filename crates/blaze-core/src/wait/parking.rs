@@ -329,7 +329,8 @@ fn keeps<K: Futex + Sync>(kernel: &K, schedule: &[Step], readings: &[Duration], 
 /// Whether a park of a word (holding a token where `token`) and an unpark, run by `schedule`
 /// and then left to the park alone for [`ALONE`] steps with the kernel quiet (pick 0: no
 /// return for nothing, no timeout it is not owed), end with the park returned or asleep:
-/// never still running.
+/// never still running. A schedule with no room for those steps (a `Vec` holds `usize::MAX`
+/// at most) says nothing.
 fn settles<K: Futex + Sync>(
     kernel: &K,
     schedule: Vec<Step>,
@@ -337,6 +338,9 @@ fn settles<K: Futex + Sync>(
     deadline: Option<Deadline>,
     token: bool,
 ) -> bool {
+    if schedule.len() > usize::MAX - ALONE {
+        return true;
+    }
     let mut steps = schedule;
     let mut alone = 0;
     while alone < ALONE {
