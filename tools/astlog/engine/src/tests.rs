@@ -417,6 +417,48 @@ fn dollar_templates_splice_and_escape()-> Result<(), Error<GraphError>> {
 }
 
 #[test]
+fn a_regex_that_does_not_compile_or_is_past_the_size_cap_is_refused_at_load() {
+    let unclosed = Program::<Graph>::parse(
+        "(rule (r a) (edge a b))\n(rule (m a) (edge a b) (text-match a \"(unclosed\"))",
+    )
+    .expect_err("an unclosed group is refused when the file is read, before any fact");
+    assert!(
+        matches!(unclosed, Error::Regex { line: 2, ref name, .. } if name == "text-match"),
+        "{unclosed}"
+    );
+    // The `regex` crate's own default takes this pattern; the cap is what refuses it.
+    let big = r"(?:\w{100}){2}";
+    assert!(regex::Regex::new(big).is_ok(), "within the crate's default limit");
+    let rules = format!("(rule (m a) (edge a b) (text-match a \"{}\"))", big.replace('\\', "\\\\"));
+    let past = Program::<Graph>::parse(&rules).expect_err("past MAX_REGEX_BYTES");
+    assert!(matches!(past, Error::Regex { line: 1, .. }), "{past}");
+}
+
+#[test]
+fn text_capture_binds_each_group_and_holds_only_on_a_match() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (digit a d) (edge a b) (text-capture a \"^1(\\\\d)?$\" d))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (12, 3), (5, 6), (123, 7)]))?;
+    // `1` matches with the group unused (empty text); `12` binds `2`; `5` and `123` do not match.
+    assert_eq!(rows(&sets, "digit"), [["1", ""], ["12", "2"]]);
+    Ok(())
+}
+
+#[test]
+fn text_capture_with_a_variable_count_other_than_its_groups_is_refused_at_load() {
+    let error = Program::<Graph>::parse(
+        "(rule (r a) (edge a b))\n(rule (two a x y) (edge a b) (text-capture a \"(\\\\d)\" x y))",
+    )
+    .expect_err("one group, two variables");
+    let message = error.to_string();
+    assert!(
+        message.starts_with("rules:2: ") && message.contains("1 capture groups, but 2 variables"),
+        "{message}"
+    );
+}
+
+#[test]
 fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(
         "(rule (path a b) (edge a b))

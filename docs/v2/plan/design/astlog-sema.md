@@ -143,6 +143,15 @@ bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals a
 `(not (atom ...))` negates a source atom as well as a relation: every variable bound to its left,
 it needs no stratum, and it is how a rule excludes macro-made matches.
 
+Text builtins take a node or text first and need it bound. A regex is a string literal,
+compiled when the file is read; one that does not compile, or whose compiled program is past
+1 MiB (`MAX_REGEX_BYTES`), is a load error naming the line and the pattern.
+
+| Builtin | Needs | Gives |
+|---|---|---|
+| `(text-match x "re")` | `x` | holds when the regex matches somewhere in `x`'s text |
+| `(text-capture x "re" g1 g2 ...)` | `x` | holds when the regex matches; binds each capture group of the first match, in order, as text (a group that took no part binds empty text). The variables must be one per group, checked at load |
+
 ## Type patterns
 
 A `type-matches` pattern is `_` (any type), `$name` (any type, bound; one name used twice binds

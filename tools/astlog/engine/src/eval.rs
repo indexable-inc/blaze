@@ -20,11 +20,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
-use snafu::ResultExt as _;
 
 use crate::error::{
-    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, RegexSnafu,
-    TooManyBindingsSnafu, TooManyRowsSnafu, TooManySourceRowsSnafu,
+    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, TooManyBindingsSnafu,
+    TooManyRowsSnafu, TooManySourceRowsSnafu,
 };
 use crate::program::{AppAtom, BodyAtom, Language, Program, Term};
 
@@ -195,6 +194,7 @@ enum Builtin {
     SameFile,
     FilePath,
     TextMatch,
+    TextCapture,
     MisgroupedDigits,
     Lt,
     Le,
@@ -212,6 +212,7 @@ impl Builtin {
             "same-file" => Self::SameFile,
             "file-path" => Self::FilePath,
             "text-match" => Self::TextMatch,
+            "text-capture" => Self::TextCapture,
             "misgrouped-digits" => Self::MisgroupedDigits,
             "lt" => Self::Lt,
             "le" => Self::Le,
@@ -224,7 +225,7 @@ enum Step<'p, A, N> {
     Scan { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, recursive: bool },
     Not { relation: usize, args: Vec<Arg<N>>, index: Option<usize> },
     Count { relation: usize, args: Vec<Arg<N>>, index: Option<usize>, result: Arg<N> },
-    Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>>, regex: Option<regex::Regex> },
+    Builtin { builtin: Builtin, app: &'p AppAtom, args: Vec<Arg<N>> },
     /// `occurrence` keys the atom's answers in [`Evaluator::asked`]: one per atom in the program
     /// text, so two occurrences never share answers they might not agree on.
     Source { atom: &'p A, line: usize, args: Vec<Arg<N>>, occurrence: usize },
@@ -302,7 +303,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
     ///
     /// # Errors
     ///
-    /// An invalid `text-match` regex.
+    /// [`Error::Internal`] for a program [`Program::parse`] did not check.
     pub fn new(
         program: &'p Program<F::Lang>,
         facts: &'p F,
@@ -372,21 +373,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 },
                 BodyAtom::App(app) => match Builtin::of(&app.name) {
                     Some(builtin) => {
-                        let regex = match (builtin, app.args.get(1)) {
-                            (Builtin::TextMatch, Some(Term::Text(pattern))) => {
-                                Some(regex::Regex::new(pattern).context(RegexSnafu {
-                                    line: app.line,
-                                    pattern: pattern.clone(),
-                                })?)
-                            }
-                            _ => None,
-                        };
-                        Step::Builtin {
-                            builtin,
-                            app,
-                            args: args(&mut names, &app.args, true),
-                            regex,
-                        }
+                        Step::Builtin { builtin, app, args: args(&mut names, &app.args, true) }
                     }
                     None => {
                         let relation = self.relation(&app.name)?;
@@ -628,8 +615,8 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     self.solve(body, at + 1, windows, env, emit)?;
                 }
             }
-            Step::Builtin { builtin, app, args, regex } => {
-                for row in self.builtin(*builtin, app, args, regex.as_ref(), env)? {
+            Step::Builtin { builtin, app, args } => {
+                for row in self.builtin(*builtin, app, args, env)? {
                     if let Some(set) = unify(args, &row, env) {
                         self.solve(body, at + 1, windows, env, emit)?;
                         clear(env, &set);
@@ -646,10 +633,15 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         builtin: Builtin,
         app: &AppAtom,
         args: &[Arg<F::Node>],
-        regex: Option<&regex::Regex>,
         env: &Env<F::Node>,
     ) -> Result<Vec<Row<F::Node>>, FError<F>> {
         let facts = self.facts;
+        let regex = || {
+            app.regex.as_ref().ok_or_else(|| {
+                InternalSnafu { what: format!("{} at rules:{} has no regex", app.name, app.line) }
+                    .build()
+            })
+        };
         let value = |at: usize| {
             input(&args[at], env).ok_or_else(|| {
                 InternalSnafu {
@@ -748,13 +740,26 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 vec![vec![value(0)?, Value::Text(Arc::from(facts.path(file).as_ref()))]]
             }
             Builtin::TextMatch => {
-                let regex = regex.ok_or_else(|| {
-                    InternalSnafu { what: format!("text-match at rules:{} has no regex", app.line) }
-                        .build()
-                })?;
                 let subject = value(0)?;
-                let matched = regex.is_match(&facts.value_text(&subject));
+                let matched = regex()?.is_match(&facts.value_text(&subject));
                 holds(matched, vec![subject, value(1)?])
+            }
+            Builtin::TextCapture => {
+                let subject = value(0)?;
+                let pattern = value(1)?;
+                let text = facts.value_text(&subject);
+                // The first match; a group that took no part in it binds empty text, as `$n`
+                // of a replacement writes it.
+                let row = regex()?.captures(&text).map(|groups| {
+                    let mut row = Vec::with_capacity(groups.len() + 1);
+                    row.push(subject.clone());
+                    row.push(pattern.clone());
+                    row.extend(groups.iter().skip(1).map(|group| {
+                        Value::Text(Arc::from(group.map_or("", |it| it.as_str())))
+                    }));
+                    row
+                });
+                row.into_iter().collect()
             }
             Builtin::MisgroupedDigits => {
                 let subject = value(0)?;

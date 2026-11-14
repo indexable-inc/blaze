@@ -19,10 +19,12 @@ use std::fmt;
 
 use blaze_hash::{HashMap, HashSet};
 
+use snafu::ResultExt as _;
+
 use crate::error::{
     ArityMismatchSnafu, BuiltinAritySnafu, DslSnafu, Error, LintSeveritySnafu, LintVarSnafu,
-    TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu, UnboundSourceArgSnafu,
-    UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
+    RegexSnafu, TemplateVarSnafu, UnboundBuiltinArgSnafu, UnboundHeadVarSnafu,
+    UnboundSourceArgSnafu, UnknownRelationSnafu, UnsafeNegationSnafu, UnstratifiableProgramSnafu,
 };
 use crate::sexpr::{self, Sexpr};
 
@@ -104,6 +106,8 @@ pub(crate) const BUILTINS: &[(&str, usize, &[usize])] = &[
     ("same-file", 2, &[0, 1]),
     ("file-path", 2, &[0]),
     ("text-match", 2, &[0, 1]),
+    // Two or more: the text, the pattern, then one variable per capture group.
+    ("text-capture", 2, &[0, 1]),
     ("misgrouped-digits", 2, &[0]),
     ("lt", 2, &[0, 1]),
     ("le", 2, &[0, 1]),
@@ -127,6 +131,36 @@ pub struct AppAtom {
     pub name: String,
     pub args: Vec<Term>,
     pub line: usize,
+    /// The compiled pattern of a builtin in [`REGEX_BUILTINS`], compiled once at load.
+    pub regex: Option<regex::Regex>,
+}
+
+/// The builtins whose second argument is a regex, which must be a string literal.
+pub(crate) const REGEX_BUILTINS: &[&str] = &["text-match", "text-capture"];
+
+/// The builtins whose arity is a least: `text-capture` binds one variable per capture group.
+const VARIADIC: &[&str] = &["text-capture"];
+
+/// The most bytes one compiled regex may take, its lazy DFA's cache included. The `regex` crate
+/// matches in time linear in the text; this bounds the memory a rules file's pattern takes.
+pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
+
+/// `pattern` compiled within [`MAX_REGEX_BYTES`].
+///
+/// # Errors
+///
+/// [`Error::Regex`] naming the line and the builtin, for a pattern that does not compile or is
+/// past the size limit.
+fn compile_regex<S: std::error::Error + 'static>(
+    name: &str,
+    pattern: &str,
+    line: usize,
+) -> Result<regex::Regex, Error<S>> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(MAX_REGEX_BYTES)
+        .dfa_size_limit(MAX_REGEX_BYTES)
+        .build()
+        .context(RegexSnafu { line, name: name.to_owned(), pattern: pattern.to_owned() })
 }
 
 #[derive(Debug)]
@@ -498,17 +532,7 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => continue,
             BodyAtom::App(app) => {
                 if let Some((arity, _)) = builtin(&app.name) {
-                    check_arity(app, arity, true)?;
-                    // The pattern is compiled once at evaluator setup, which requires it to be a
-                    // literal; a variable pattern would also make match results depend on corpus
-                    // text, which no rule legitimately needs.
-                    if app.name == "text-match" && !matches!(app.args.get(1), Some(Term::Text(_))) {
-                        return DslSnafu {
-                            line: app.line,
-                            message: "text-match pattern must be a string literal".to_owned(),
-                        }
-                        .fail();
-                    }
+                    check_builtin(app, arity)?;
                     continue;
                 }
                 let expected = *arities.get(app.name.as_str()).ok_or_else(|| {
@@ -531,6 +555,40 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
         })?;
         check_arity(relation, expected, false)?;
+    }
+    Ok(())
+}
+
+/// A builtin's arity, and its literal arguments: a regex builtin's pattern is a string literal,
+/// compiled at load (a variable pattern would make what matches depend on corpus text, which no
+/// rule needs), and `text-capture` binds exactly one variable per capture group.
+fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) -> Result<(), Error<S>> {
+    let dsl = |message: String| DslSnafu { line: app.line, message }.fail();
+    if VARIADIC.contains(&app.name.as_str()) {
+        if app.args.len() < arity {
+            return dsl(format!(
+                "{} takes the text, a pattern and one variable per capture group",
+                app.name
+            ));
+        }
+    } else {
+        check_arity(app, arity, true)?;
+    }
+    if !REGEX_BUILTINS.contains(&app.name.as_str()) {
+        return Ok(());
+    }
+    let (Some(regex), Some(Term::Text(pattern))) = (&app.regex, app.args.get(1)) else {
+        return dsl(format!("{} pattern must be a string literal", app.name));
+    };
+    if app.name == "text-capture" {
+        let groups = regex.captures_len() - 1;
+        let vars = app.args.len() - 2;
+        if groups != vars {
+            return dsl(format!(
+                "text-capture pattern `{pattern}` has {groups} capture groups, but {vars} \
+                 variables follow it: one per group"
+            ));
+        }
     }
     Ok(())
 }
@@ -916,7 +974,14 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
             line: form.line(),
         }));
     }
-    Ok(BodyAtom::App(AppAtom { name: name.to_owned(), args: terms(args)?, line: form.line() }))
+    let args = terms(args)?;
+    let regex = match args.get(1) {
+        Some(Term::Text(pattern)) if REGEX_BUILTINS.contains(&name) => {
+            Some(compile_regex(name, pattern, form.line())?)
+        }
+        _ => None,
+    };
+    Ok(BodyAtom::App(AppAtom { name: name.to_owned(), args, line: form.line(), regex }))
 }
 
 /// Atom arguments as terms: a bare number is an integer, any other bare atom a variable, a

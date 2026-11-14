@@ -59,7 +59,8 @@ Builtins:
 - `ancestor`, `parent`. The lower argument must be bound by an atom to its left, and the error says so when it is not.
 - `text`, `kind`, `same-text`, `same-file`, and `lt`, `le` over integers.
 - `(file-path <node> <path>)` binds the path the file was loaded under, to scope a rule to `tests/`.
-- `(text-match <node-or-text> "<regex>")`. The pattern must be a string literal.
+- `(text-match <node-or-text> "<regex>")`. The pattern must be a string literal. It is compiled when the file is read, so a pattern that does not compile, or whose compiled program is past 1 MiB, is a load error naming the line.
+- `(text-capture <node-or-text> "<regex>" g1 g2 ...)` holds when the regex matches and binds each capture group of the first match as text, one variable per group (checked at load). A group that took no part binds empty text.
 - `(misgrouped-digits <node-or-text> <fixed>)` holds when a numeric literal's underscore grouping is not canonical threes, and binds the regrouped text, for a digit-grouping lint and its fix.
 - `(no-descendant <node> "<kind>" "<text>")` holds when no strict descendant has that kind and exact text, and `(attached-sibling <node> "<kind>" "<text>")` when an attribute-like sibling directly above the node has such a descendant. Both are tree-sitter atoms, not engine builtins.
 

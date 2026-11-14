@@ -18,8 +18,8 @@ pub enum Error<S: std::error::Error + 'static> {
     ))]
     TooDeep { line: usize, max: usize },
 
-    #[snafu(display("rules:{line}: invalid regex `{pattern}` in text-match"))]
-    Regex { line: usize, pattern: String, source: regex::Error },
+    #[snafu(display("rules:{line}: invalid regex `{pattern}` in {name}"))]
+    Regex { line: usize, name: String, pattern: String, source: regex::Error },
 
     #[snafu(display("rules:{line}: head variable `{var}` is not bound by the body"))]
     UnboundHeadVar { line: usize, var: String },
