@@ -25,39 +25,47 @@ pub(super) struct Common {
     held: Option<Lines>,
     /// `held`'s shared lines assembled; a result's own spliced in while it is lent.
     traced: Traced,
+    /// Whether something `traced`'s shared part names moved after the run began, asked once
+    /// as it is assembled.
+    moved: bool,
     splice: Splice,
 }
 
 impl Common {
     /// `with` called with what `trace` read, hashed as `inputs` has it now, or `None` when not
-    /// known: the same [`Traced`] as [`Trace::traced`].
+    /// known: the same [`Traced`] as [`Trace::traced`]; and whether `moved` says something it
+    /// names changed after the run began, so a hash need not be what the run read. `moved` is
+    /// asked once of the shared part per buffer and once of each result's own part.
     pub(super) fn traced<I: Inputs, R>(
         &mut self,
         trace: Trace,
         inputs: &mut I,
-        with: impl FnOnce(Option<&Traced>) -> R,
+        moved: impl Fn(&Traced) -> bool,
+        with: impl FnOnce(Option<&Traced>, bool) -> R,
     ) -> Result<R, I::Error> {
         let lines = match trace {
             Trace::Lines(lines) => lines,
-            Trace::Whole(traced) => return Ok(with(Some(&traced))),
-            Trace::Unknown(_) => return Ok(with(None)),
+            Trace::Whole(traced) => return Ok(with(Some(&traced), moved(&traced))),
+            Trace::Unknown(_) => return Ok(with(None, false)),
         };
         let shared = lines.common();
         let kept = self.held.as_ref().is_some_and(|it| it.common_is(&lines));
         if !kept {
             self.held = None;
             self.traced = trace::assemble_seen(lines.iter().take(shared), inputs)?;
+            self.moved = moved(&self.traced);
         }
         let own = trace::assemble_seen(lines.iter().skip(shared), inputs)?;
         if !kept {
             self.held = Some(lines);
         }
-        Ok(self.lend(own, with))
+        let own_moved = !self.moved && moved(&own);
+        Ok(self.lend(own, self.moved || own_moved, with))
     }
 
-    fn lend<R>(&mut self, own: Traced, with: impl FnOnce(Option<&Traced>) -> R) -> R {
+    fn lend<R>(&mut self, own: Traced, moved: bool, with: impl FnOnce(Option<&Traced>, bool) -> R) -> R {
         self.splice.put(&mut self.traced, own);
-        let out = with(Some(&self.traced));
+        let out = with(Some(&self.traced), moved);
         self.splice.undo(&mut self.traced);
         out
     }

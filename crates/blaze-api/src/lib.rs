@@ -55,8 +55,8 @@ pub use blaze_protocol::events::NodeKind;
 pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
 pub use blaze_vfs::{Mode, Op};
 pub use borrowed::{
-    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
-    SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
+    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, RanWhyRef,
+    ResponseRef, SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
 pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
@@ -125,7 +125,13 @@ use serde::{Deserialize, Serialize};
 /// 58: [`Subset::outcomes`] ([`SubsetFunction`], [`SubsetOutcome`]), each function of the
 /// sans-IO cores with its outcome by path, and [`Subset::generic`], the generic functions
 /// counted apart from the refused.
-pub const SCHEMA: u32 = 58;
+/// 59: [`TestResult::not_kept`] ([`NotKept`]), and `TestOutcome::Unreached` is gone: a cached
+/// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0; and
+/// [`Response::TestsOf`] ([`TestsOf`], [`Near`]): each test executable's count of tests, how
+/// many the filter left out, and the nearest names to a filter that matched none.
+/// 60: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
+/// name, and for a changed ask which one with its answers then and now.
+pub const SCHEMA: u32 = 60;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1053,6 +1059,9 @@ pub enum Response {
     Diagnostics(Seen),
     /// [`Request::Prove`]'s one answer.
     Proven(Proven),
+    /// What a test run asked of one test executable, said once per executable: what a client
+    /// refusing a run of none names.
+    TestsOf(TestsOf),
 }
 
 /// [`Response::Doing`]. Its fields are declared in the order CBOR writes a map's keys.
@@ -1758,13 +1767,17 @@ impl ArtifactKind {
     }
 }
 
+/// One test's result. Its fields are declared in the order CBOR writes a map's keys.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct TestResult {
+    /// It ran although selection was asked: why no kept pass of it held. `None` for a cached
+    /// result, an ignored test and a run selection did not judge.
+    pub ran: Option<RanWhy>,
     pub name: String,
     /// The test executable, as cargo's `Running` line names it.
     pub binary: String,
-    /// Not run: the result that stands, and what it was kept by. A cached result is
-    /// `Unreached` with `millis` 0.
+    /// Not run: the pass that stands, and what it was kept by. A cached result is
+    /// [`TestOutcome::Passed`] with `millis` 0; only a pass is ever kept.
     pub cached: Option<Cached>,
     pub millis: u64,
     #[serde(with = "blaze_protocol::bytes")]
@@ -1773,9 +1786,65 @@ pub struct TestResult {
     /// It ran outside the sandbox (docs/cargo.md), so the command's summary names it. False for
     /// a cached result, whose run is not this one.
     pub outside: bool,
+    /// A pass that ran and was not kept, so the test runs again next time: why. `None` for a
+    /// failure (never kept), a cached result and a pass that was kept.
+    pub not_kept: Option<NotKept>,
     /// The daemon's index of `binary` among the request's test executables: dense from 0, the
     /// same for every result of one executable, so a client groups results by it.
     pub executable: u32,
+}
+
+/// What a test run asked of one test executable ([`Response::TestsOf`]), one per executable
+/// of the request whose tests were selected: how many tests it has, how many the name
+/// filter left out, and, when the filter left out every one, its tests nearest the filter. A
+/// client that refuses a run of none says the counts and the nearest names from these. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct TestsOf {
+    /// Its tests, ignored ones included.
+    pub tests: u32,
+    /// The test executable, as [`TestResult::binary`] names it.
+    pub binary: String,
+    /// When the filter left out every one of its tests: those nearest it, nearest first, at
+    /// most three. Empty otherwise.
+    pub nearest: Vec<Near>,
+    /// As [`TestResult::executable`].
+    pub executable: u32,
+    /// Those the name filter left out.
+    pub filtered_out: u32,
+}
+
+/// A test's name near a filter that matched none ([`TestsOf::nearest`]): `distance` is the
+/// edit distance (rustc's, with substrings) between a filter and its whole path or its last
+/// segment, so a client ranks the nearest of every executable together.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Near {
+    pub name: String,
+    pub distance: u32,
+}
+
+/// Why a test ran rather than being reported cached (blaze-testsel's `machine::Missed`):
+/// `why` is the stable word a tool matches on (`run-all`, `no-head`, `unknown-state`,
+/// `no-row`, `function-changed`, `read-changed`) and `said` the sentence a person reads. For a
+/// changed ask, `ask` names it (`fn` and its id, or `file`, `dir` or `env` and its name) and
+/// `before` and `now` are its answers at the kept pass and now, as short ids (`absent` for
+/// nothing there, `gone` for a function no longer in the binary); `None` where not known. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RanWhy {
+    pub ask: Option<String>,
+    pub now: Option<String>,
+    pub why: String,
+    pub said: String,
+    pub before: Option<String>,
+}
+
+/// Why a pass was not kept (blaze-testsel's `machine::NotKept`): `no` is the stable word a
+/// tool matches on (`clock`, `unsandboxed`, `doctest`, ...), `why` the sentence a person reads.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct NotKept {
+    pub no: String,
+    pub why: String,
 }
 
 /// The run that stands for a test not run.
@@ -1801,8 +1870,6 @@ pub enum TestOutcome {
     Passed,
     Failed,
     Ignored,
-    /// Not run: the edit reached none of its code; its last result stands.
-    Unreached,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -2358,9 +2425,11 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), ran);
 
         let result = TestResult {
+            ran: None,
             name: "t".to_owned(),
             binary: "b".to_owned(),
             cached: None,
+            not_kept: None,
             millis: 1,
             output: vec![9; 30],
             outcome: TestOutcome::Passed,

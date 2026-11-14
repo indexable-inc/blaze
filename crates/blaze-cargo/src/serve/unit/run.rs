@@ -322,7 +322,7 @@ pub(crate) fn start(
 impl Runs<Real> for Program {
     fn start(
         &mut self,
-        _store: &Store,
+        _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         _out: &mut Vec<Response>,

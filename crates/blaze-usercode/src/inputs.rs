@@ -126,6 +126,68 @@ fn wall_ns() -> i128 {
         .map_or(i128::MIN, |it| i128::try_from(it.as_nanos()).unwrap_or(i128::MAX))
 }
 
+/// When a run began, for asking whether what it read can have moved since ([`Began::moved`]).
+/// A run's reads are hashed when its trace is assembled, after it ends: a file written between
+/// the run's read and that hash would be kept under bytes the run never saw, and a pass kept
+/// under them reported cached for an input that can fail it. What changed after the assembly
+/// is the next check's to find; what changed before it is this one's.
+#[derive(Clone, Copy, Debug)]
+pub struct Began {
+    /// The watches' generation ([`Dirs::generation`]) before the run.
+    generation: u64,
+    /// The wall clock ([`wall_ns`]) before the run, as a kernel stamps a write.
+    wall_ns: i128,
+}
+
+impl Began {
+    /// Now, read before a run starts.
+    pub fn now() -> Began {
+        Began { generation: blaze_vfs::outside::generation(), wall_ns: wall_ns() }
+    }
+
+    /// Whether anything `traced` read can have changed since the run began, so the hashes it
+    /// was assembled with need not be what the run read. Each path is asked of by every name
+    /// its answer rests on ([`names`]): a watch that heard nothing of the name since vouches
+    /// for it with no syscall; else the name and every directory above it are `stat`ed, and
+    /// one whose last change can share a tick with the run's start or come after it
+    /// ([`Stamp::racy`]) has moved. A path whose names can't be told has moved: it is never
+    /// taken as still. Conservative: a change beside the name in its directory, or the run's
+    /// own write of what it read, counts as a move, and the pass is not kept, never a stale
+    /// one kept.
+    pub fn moved(&self, traced: &blaze_core::Traced) -> bool {
+        // A `stat` of each name the watches can't vouch for, and of every directory above it:
+        // a row naming how many paths were asked, so its time is never unnamed.
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "ask whether what a run read changed since it began",
+            files = traced.files.len() as u64,
+            dirs = traced.dirs.len() as u64,
+        )
+        .entered();
+        let files = traced.files.iter().map(|(path, answer)| (path, *answer));
+        let dirs = traced.dirs.iter().map(|(path, _)| (path, Some(DIRECTORY)));
+        files.chain(dirs).any(|(path, answer)| self.path_moved(path, answer))
+    }
+
+    fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>) -> bool {
+        let Some(names) = names(path, answer) else { return true };
+        let dirs = blaze_vfs::outside::dirs();
+        names.iter().any(|name| {
+            !dirs.name_unchanged_since(name, self.generation) && stamped_since(name, self.wall_ns)
+        })
+    }
+}
+
+/// Whether `name` (with no link in it, as [`names`] gives it) or a directory above it last
+/// changed within [`RACY_NS`] of `since_ns` or after it. A name that is not there is a name
+/// whose removal its directory's stamp says; one that can't be `stat`ed has moved.
+fn stamped_since(name: &Path, since_ns: i128) -> bool {
+    name.ancestors().any(|at| match std::fs::symlink_metadata(at) {
+        Ok(meta) => Stamp::of(&meta).racy(since_ns),
+        Err(error) => !missing(&error),
+    })
+}
+
 /// The hashes of the machine's files, each under its path and what `stat` said of it when it
 /// was hashed. Append-only: a lookup takes no lock and writes nothing shared, a file is hashed
 /// outside any lock, and an edit adds an entry under its new stamp rather than changing one.
@@ -257,7 +319,8 @@ pub(crate) const MOST_LINKS: usize = 40;
 /// one in its own: with a watch over each, nothing the answer depends on moves unheard. A
 /// missing path's name is the first part of it that is not there: the name that would be made.
 /// `None` for a path that is not absolute, has `..` in it, has more than [`MOST_LINKS`]
-/// links, or of which a part before the last is unreadable. Cold: on a miss only.
+/// links, or of which a part before the last is unreadable. Cold: on a miss only, and once
+/// per path a kept test pass read ([`Began::moved`]).
 fn names(path: &Path, answer: Option<[u8; 32]>) -> Option<Vec<PathBuf>> {
     use std::path::Component;
     let mut parts = path.components();
@@ -1021,6 +1084,42 @@ mod tests {
         drop(dir);
         assert!(first.is_some() && second.is_some());
         assert_ne!(first, second, "the second write's bytes are what is hashed");
+    }
+
+    /// The invariant: a run's reads, hashed after it ends, are taken for what it read only when
+    /// nothing they name changed since it began: a file written, one made and one removed
+    /// after the run began have moved, and a listed directory a name was made in has. The
+    /// control is the same files asked of by a run that began after they last changed (its
+    /// clock past the racy window), which nothing moved for: the cause removed, the effect
+    /// goes.
+    #[test]
+    fn a_read_changed_after_its_run_began_has_moved() {
+        let dir = TempDir::for_test("blaze-usercode-moved-");
+        let (written, made, removed) = (dir.join("written"), dir.join("made"), dir.join("removed"));
+        std::fs::write(&written, b"before").unwrap();
+        std::fs::write(&removed, b"there").unwrap();
+        let began = Began::now();
+        std::fs::write(&written, b"after").unwrap();
+        std::fs::write(&made, b"new").unwrap();
+        std::fs::remove_file(&removed).unwrap();
+        let read = |path: &Path, answer: Option<[u8; 32]>| blaze_core::Traced {
+            files: vec![(path.to_path_buf(), answer)],
+            ..blaze_core::Traced::default()
+        };
+        let listed = blaze_core::Traced { dirs: vec![(dir.path().to_path_buf(), [1; 32])], ..Default::default() };
+        let asked = [
+            read(&written, Some([1; 32])),
+            read(&made, Some([2; 32])),
+            read(&made, None),
+            read(&removed, None),
+            listed,
+        ];
+        let later = Began { generation: 0, wall_ns: wall_ns() + 3 * RACY_NS };
+        for traced in &asked {
+            assert!(began.moved(traced), "changed after the run began: {traced:?}");
+            assert!(!later.moved(traced), "the control: nothing changed after it began: {traced:?}");
+        }
+        drop(dir);
     }
 
     #[test]

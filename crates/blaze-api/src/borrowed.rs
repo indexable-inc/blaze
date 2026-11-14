@@ -17,8 +17,9 @@ use serde::Deserialize;
 
 use crate::{
     ApiError, Applicability, Artifact, Basis, BuildScriptRan, Cached, CrateType, Diagnostic,
-    Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, Proven,
-    Ranked, Reach, Rebuilt, Report, Response, Seen, Span, Status, Table, TargetKind, TestOutcome, TestResult,
+    Doing, Documented, Edited, FactRead, FetchVerb, Hot, Level, LiveFrame, Memory, Mismatch, NotKept,
+    Proven, RanWhy, Ranked, Reach, Rebuilt, Report, Response, Seen, Span, Status, Table, TargetKind, TestOutcome,
+    TestResult, TestsOf,
     Traced, Unchecked, UnitOf, UnitStarted, UnitTarget, Verb, Worked,
 };
 
@@ -133,6 +134,8 @@ pub enum ResponseRef<'a> {
     Diagnostics(Seen),
     /// Once a request: read owned.
     Proven(Proven),
+    /// Once a test executable a test run: read owned.
+    TestsOf(TestsOf),
 }
 
 /// [`LiveFrame`], read where it lies: a frame every 250 ms decodes with no copy of its tables.
@@ -273,6 +276,8 @@ pub struct BuildScriptRanRef<'a> {
 /// [`TestResult`], read where it lies.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TestResultRef<'a> {
+    #[serde(borrow)]
+    pub ran: Option<RanWhyRef<'a>>,
     pub name: &'a str,
     pub binary: &'a str,
     #[serde(borrow)]
@@ -282,7 +287,29 @@ pub struct TestResultRef<'a> {
     pub output: &'a [u8],
     pub outcome: TestOutcome,
     pub outside: bool,
+    #[serde(borrow)]
+    pub not_kept: Option<NotKeptRef<'a>>,
     pub executable: u32,
+}
+
+/// [`RanWhy`], read where it lies.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RanWhyRef<'a> {
+    #[serde(borrow)]
+    pub ask: Option<&'a str>,
+    #[serde(borrow)]
+    pub now: Option<&'a str>,
+    pub why: &'a str,
+    pub said: &'a str,
+    #[serde(borrow)]
+    pub before: Option<&'a str>,
+}
+
+/// [`NotKept`], read where it lies.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NotKeptRef<'a> {
+    pub no: &'a str,
+    pub why: &'a str,
 }
 
 /// [`Cached`], read where it lies.
@@ -383,6 +410,7 @@ impl ResponseRef<'_> {
             ResponseRef::Doing(it) => Response::Doing(it),
             ResponseRef::Diagnostics(it) => Response::Diagnostics(it),
             ResponseRef::Proven(it) => Response::Proven(it),
+            ResponseRef::TestsOf(it) => Response::TestsOf(it),
         }
     }
 }
@@ -485,6 +513,13 @@ impl BuildScriptRanRef<'_> {
 impl TestResultRef<'_> {
     pub fn into_owned(self) -> TestResult {
         TestResult {
+            ran: self.ran.map(|it| RanWhy {
+                ask: it.ask.map(owned),
+                now: it.now.map(owned),
+                why: owned(it.why),
+                said: owned(it.said),
+                before: it.before.map(owned),
+            }),
             name: owned(self.name),
             binary: owned(self.binary),
             cached: self.cached.map(CachedRef::into_owned),
@@ -493,6 +528,7 @@ impl TestResultRef<'_> {
             outcome: self.outcome,
             outside: self.outside,
             executable: self.executable,
+            not_kept: self.not_kept.map(|it| NotKept { no: owned(it.no), why: owned(it.why) }),
         }
     }
 }

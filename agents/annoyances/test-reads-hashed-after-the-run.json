@@ -1,0 +1,14 @@
+{
+ "id": "test-reads-hashed-after-the-run",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane test-selection-wiring pass 2, blaze-merge-1113",
+ "where": "crates/blaze-cargo/src/serve/unit/test/traced.rs Common::traced; crates/blaze-usercode/src/trace.rs assemble_seen; crates/blaze-usercode/src/inputs.rs Began",
+ "what": "A test's sandbox trace names what it read, not the bytes; the runner hashes each file when it assembles the trace after the test ends. A file written between the read and that hash was kept under bytes the test never saw, so a later run could report a stale cached pass. Guarded now by Began::moved (stat of every name the read rests on against the run's start, racy window included): such a pass is not kept, NotKept::Moved. The guard is conservative: a test that reads a file it wrote, or one under a directory something else wrote in during the run, is never kept.",
+ "cost": "a known way to report a stale pass until this pass; now a stat per name and per directory above it for each read of a kept pass",
+ "cause": "the sandbox records names only, so the hash is taken by someone else, later",
+ "class": "a fact recorded by name and valued later: the value can be of another moment than the read (build scripts' traces have the same shape, blaze_core::Traced)",
+ "prevention": "the sandbox records each read's identity as it reads (inode, size and change time, or a hash for small files) so assembly compares instead of re-reading; then Began::moved and its conservatism go",
+ "workaround": "Began::moved marks the pass not kept by name",
+ "fix": "partial: the guard; the sandbox-side record is not built",
+ "state": "open"
+}

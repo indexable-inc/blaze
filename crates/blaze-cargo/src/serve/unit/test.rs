@@ -1,12 +1,17 @@
 //! The tests of a build ([`Front::tests`](crate::serve::work::Front::tests)), as
-//! `blaze_usercode::test` runs them: each test asked for ([`select::asked`]) whose pass the
-//! store does not keep for the functions it executed and what it read (blaze-testsel's
-//! [`Selector::choose`], one selector per suite for the daemon's life, [`image::Selectors`])
-//! runs in a process of its own, forked from its binary's server, on one queue over every
-//! binary: in the sandbox where the workspace opts in, outside it otherwise (docs/cargo.md);
-//! the rest are reported cached, unless every test is asked for. Each result is kept with
-//! what its server says it executed ([`Selector::keep`]; a test run outside never is) and
-//! reported as a [`Response::TestResult`].
+//! `blaze_usercode::test` runs them, selected by blaze-testsel's machine
+//! (docs/v2/plan/design/test-selection.md): per suite, the tests asked for ([`select::asked`])
+//! go to a [`Selecting`] (the machine's selection) from the suite's index head
+//! ([`image::Selectors`]); its effects are
+//! performed on the store ([`image::Filed`]), the binary's image and the files now
+//! ([`blaze_testsel::host::Driver`]), and the tests it runs go to one queue over every binary,
+//! each in a process of its own forked from its binary's server: in the sandbox, but where
+//! `BLAZE_SANDBOX=off` or its package takes it out (docs/cargo.md); one note counts those
+//! outside ([`outside_note`]), and a sandbox that fails stops the run, saying once how to run
+//! outside and why ([`unsandboxable`]). Each test is reported as a
+//! [`Response::TestResult`] by its verdict: a cached pass (with what settled it), a run kept,
+//! or a run not kept with why. `--run-all` runs every test asked and still files what it
+//! learns.
 //!
 //! `blaze test --ub` compiles nothing: [`ub_tests`] lists each test unit's tests as its harness
 //! would, and [`evaluate`] runs one in blaze's MIR evaluator under the checker of undefined
@@ -21,7 +26,9 @@ mod traced;
 mod tests;
 
 use std::{
+    alloc::Global,
     ffi::OsString,
+    fmt::Write as _,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -32,9 +39,19 @@ use blaze_cas::Store;
 use blaze_codegen::ExecTable;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
+use blaze_keyed::{
+    kind::{Namespace, ToolId},
+    pool::Ticket,
+    proof,
+};
 use blaze_lower::Db;
-use blaze_testsel::{Choice, Reached, Selector, Subject};
+use blaze_testsel::{
+    ask::{ABSENT, Basis, ReadKind, UNLOGGED},
+    host::{self, BaseOf, Driver, Drove, Ended, HostError, Out, Program},
+    machine::{Missed, NotKept, SelectError, Selection as Selecting, Start, Test as Asked, Verdict},
+};
 use blaze_units::schema::{Mode, Unit};
+use blaze_usercode::provider::Provider;
 use blaze_usercode::test::{
     self, Attrs, Binary, Config, Filter, Finished, Ignored, Job as TestJob, Mode as TestMode,
     Outcome, Queue, Reported, ShouldPanic, Suite, Wanted, select,
@@ -47,12 +64,18 @@ use super::{
     graph::flag,
     package_of,
 };
-use crate::serve::work::{Asks, Failed, RunPuts, Runs, Selection};
+use crate::serve::local::TestHeadMark;
+use crate::serve::work::{Asks, Failed, HeadFiled, RunPuts, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a test's server is given to end a test it was told to kill.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// The inline asks a suite's index head carries before its postings are rewritten, at the
+/// least (the machine's `Start::compact_at`).
+const COMPACT_AT: u32 = 64;
+/// A test's place among a suite's tests asked: none, for a test not asked.
+const NOT_ASKED: u32 = u32::MAX;
 
 /// The unit an artifact is of: the test of its package's target, by the graph's hash of it.
 pub(crate) fn unit_of_artifact(job: &Job, artifact: &Artifact) -> Option<usize> {
@@ -257,10 +280,12 @@ pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResu
     })?;
     let binary = selected.map_or("", |it| it.binaries[test.binary as usize].as_str());
     let result = |outcome, output: String, millis| TestResult {
+        ran: None,
         name: test.name.clone(),
         binary: binary.to_owned(),
         executable: test.binary,
         cached: None,
+        not_kept: None,
         millis,
         output: output.into_bytes(),
         outcome,
@@ -353,24 +378,253 @@ pub(crate) fn judged(ran: Ran<'_>, expects: &ShouldPanic) -> (TestOutcome, Strin
     }
 }
 
+/// What put a binary's tests outside the sandbox, as the run's note says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OutsideBy {
+    /// `BLAZE_SANDBOX=off` in the command's environment: every test of the run.
+    Command,
+    /// `tests = false` in its package's `[package.metadata.blaze.sandbox]`: every test of it.
+    Package,
+    /// Its package's `unsandboxed-tests` names them: those alone.
+    Named,
+    /// The host sandboxes tests only on an opt-in, and neither its package nor the workspace
+    /// opted in (`TestSandbox::outside_by_host`, decided by blaze-units'
+    /// `load::sandbox::tests_sandboxed_by_default`: macOS today).
+    Host,
+}
+
+/// The run's one note of the tests it runs outside the sandbox, from each binary's package,
+/// what puts its tests outside and how many of them run there: how many in all, that they run
+/// every time, and each setting that put them there with its count, a package's once, in the
+/// order given. `None` when none runs outside. It counts and does not list: each test's own
+/// line says `(not kept: not sandboxed)`.
+pub(crate) fn outside_note<'a>(
+    counts: impl IntoIterator<Item = (&'a str, OutsideBy, usize)>,
+) -> Option<String> {
+    let mut merged: Vec<(&'a str, OutsideBy, usize), Global> = Vec::new_in(Global);
+    for (package, by, runs) in counts {
+        if runs == 0 {
+            continue;
+        }
+        match merged.iter_mut().find(|it| it.0 == package && it.1 == by) {
+            Some(it) => it.2 += runs,
+            None => merged.push((package, by, runs)),
+        }
+    }
+    let total: usize = merged.iter().map(|it| it.2).sum();
+    let (them, run) = match total {
+        0 => return None,
+        1 => ("it runs", "runs"),
+        _ => ("they run", "run"),
+    };
+    let tests = if total == 1 { "test" } else { "tests" };
+    let mut said = String::with_capacity(96 + 96 * merged.len());
+    // Writing to a String cannot fail.
+    _ = write!(
+        said,
+        "{total} {tests} {run} outside the sandbox, so {them} every time: only a sandboxed run, \
+         which records what it reads, is kept as passed"
+    );
+    if merged.iter().any(|it| it.1 == OutsideBy::Command) {
+        said.push_str("; `BLAZE_SANDBOX=off` is set");
+        return Some(said);
+    }
+    for (at, (package, by, runs)) in merged.iter().enumerate() {
+        said.push_str(if at == 0 { ": " } else { "; " });
+        _ = match by {
+            OutsideBy::Package => write!(
+                said,
+                "{runs} of `{package}`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`"
+            ),
+            OutsideBy::Named => {
+                write!(said, "{runs} of `{package}`, named by its `unsandboxed-tests`")
+            }
+            OutsideBy::Host => write!(said, "{runs} of `{package}`, which does not opt in"),
+            OutsideBy::Command => unreachable!("said above"),
+        };
+    }
+    if merged.iter().any(|it| it.1 == OutsideBy::Host) {
+        said.push_str(MACOS_OPT_IN);
+    }
+    Some(said)
+}
+
+/// What the run's note adds where tests are outside for want of an opt-in: the one thing to do
+/// to have passes kept, and the hole a sandboxed test carries there today.
+pub(crate) const MACOS_OPT_IN: &str = ". On macOS tests run outside the sandbox unless their \
+     package opts in: `tests = true` under its `[package.metadata.blaze.sandbox]` runs them \
+     sandboxed and keeps their passes, though a sandboxed test on macOS can still read the \
+     arguments and environment of the user's other processes, another test binary's launch \
+     token among them (docs/cargo.md, \"Sandboxed tests\")";
+
+/// What a run whose sandbox failed says, once ([`Queue::take_unsandboxable`]): first the one
+/// thing to do, for someone who has never heard of the sandbox, then why, `why` the failed
+/// fork server's own words.
+pub(crate) fn unsandboxable(why: &str) -> String {
+    format!(
+        "to run these tests anyway, set `BLAZE_SANDBOX=off` (for one command: \
+         `BLAZE_SANDBOX=off blaze test`). They then run outside blaze's sandbox, as cargo runs them, \
+         and every test runs every time: only a test run in the sandbox, which records what it \
+         reads, is kept as passed. The sandbox failed here, so the run stopped before its other \
+         tests: {why}"
+    )
+}
+
 /// The result of `report`, a test of the run's executable `executable` (its index among the
-/// run's test binaries), run outside the sandbox when `outside`.
-fn result(report: test::Report, executable: u32, outside: bool) -> TestResult {
+/// run's test binaries), run outside the sandbox when `outside`, as its verdict and why it ran
+/// say: `None` for a test the machine did not judge (ignored, or a run whose keeping was
+/// refused).
+fn result(
+    report: test::Report,
+    executable: u32,
+    outside: bool,
+    verdict: Option<(Verdict, Option<blaze_api::RanWhy>)>,
+) -> TestResult {
+    let (verdict, ran) = verdict.map_or((None, None), |(verdict, ran)| (Some(verdict), ran));
     TestResult {
+        ran,
         binary: report.binary,
         executable,
         outside,
         name: report.name,
         cached: None,
+        not_kept: verdict.and_then(not_kept),
         outcome: match report.outcome {
             Reported::Passed => TestOutcome::Passed,
             Reported::Failed => TestOutcome::Failed,
             Reported::Ignored => TestOutcome::Ignored,
-            Reported::Unreached => TestOutcome::Unreached,
         },
         output: report.output,
         millis: report.millis,
     }
+}
+
+/// Why a run that passed is not kept, as a result says it: `None` for a run kept, and for a
+/// failure (a failure runs every time; its outcome says so).
+fn not_kept(verdict: Verdict) -> Option<blaze_api::NotKept> {
+    match verdict {
+        Verdict::NotKept { why: NotKept::Failed, .. } | Verdict::Ran { .. } | Verdict::Cached { .. } => None,
+        Verdict::NotKept { why, .. } => {
+            // alloc: once per test not kept, its two words
+            Some(blaze_api::NotKept { no: why.code().to_owned(), why: why.name().to_owned() })
+        }
+    }
+}
+
+/// Why a test ran although selection was asked, as its result says it: the miss `verdict`
+/// carries ([`Missed`]), named against `selection` (the read that changed, its answers at the
+/// head and now) and `taken` (a function's bound code then and now). `None` for a test not run.
+#[expect(
+    blaze::implicit_allocator,
+    reason = "the result owns its words, once per test run"
+)]
+fn ran_why(verdict: Verdict, selection: &Selecting<'_, Global>, taken: &image::Taken) -> Option<blaze_api::RanWhy> {
+    let missed = match verdict {
+        Verdict::Cached { .. } => return None,
+        Verdict::Ran { missed, .. } | Verdict::NotKept { missed, .. } => missed,
+    };
+    let short = |id: ContentId| if id == ABSENT { "absent".to_owned() } else { id.to_string() };
+    let changed = |why: &str, ask: String, before: Option<String>, now: Option<String>| {
+        let said = format!(
+            "{ask} changed: {} -> {}",
+            before.as_deref().unwrap_or("unknown"),
+            now.as_deref().unwrap_or("unknown")
+        );
+        blaze_api::RanWhy { ask: Some(ask), now, why: why.to_owned(), said, before }
+    };
+    let plain = |why: &str, said: &str| blaze_api::RanWhy {
+        ask: None,
+        now: None,
+        why: why.to_owned(),
+        said: said.to_owned(),
+        before: None,
+    };
+    Some(match missed {
+        Missed::RunAll => plain(missed.code(), "--run-all runs every test asked"),
+        Missed::NoHead if taken.head_dropped() => plain(
+            "unknown-state",
+            "the kept passes are of another binary this daemon has no image of (restored from its journal), \
+             so what changed since can't be told",
+        ),
+        Missed::NoHead => plain(missed.code(), "no pass of this suite was kept yet"),
+        Missed::NoRow => plain(missed.code(), "no pass of it was kept: none ran yet, or its last run was not kept"),
+        Missed::Function(function) => {
+            let unlogged = function == UNLOGGED;
+            let code = |image: &blaze_testsel::Image| match unlogged {
+                true => short(image.unlogged()),
+                false => image.bound_of(&function).map_or_else(|| "gone".to_owned(), |bound| short(bound.0)),
+            };
+            let ask = match unlogged {
+                true => "the code no slot calls".to_owned(),
+                false => format!("fn {}", function.0),
+            };
+            changed(missed.code(), ask, taken.before.as_deref().map(&code), Some(code(&taken.now)))
+        }
+        Missed::Read(place) => {
+            let Some((kind, name, before, now)) = selection.read_missed(place) else {
+                return Some(plain(missed.code(), "a read changed, which the selection no longer names"));
+            };
+            let kind = match kind {
+                ReadKind::File => "file",
+                ReadKind::Dir => "dir",
+                ReadKind::Env => "env",
+            };
+            // The whole environment is asked as one read of a name no variable has.
+            let name = match name == blaze_usercode::trace::ALL_ENV_NAME.as_bytes() {
+                true => std::borrow::Cow::Borrowed("*"),
+                false => String::from_utf8_lossy(name),
+            };
+            changed(missed.code(), format!("{kind} {name}"), Some(short(before)), Some(short(now)))
+        }
+    })
+}
+
+/// What a cached result's basis says when its pass was kept by what its test reaches: the
+/// index keeps the basis, not the run's own words.
+const REACHED_WHY: &str = "its run's execution record was not whole, so it is kept by what it reaches";
+
+/// The result of test `name` of `binary` (the run's executable `executable`), not run as a
+/// kept pass of it holds now (kept by `by`, its last run taking `micros`): passed, in no
+/// time, marked cached.
+fn cached(binary: &str, executable: u32, name: &str, by: Basis, micros: Option<u64>) -> TestResult {
+    TestResult {
+        ran: None,
+        // clone: once per cached test, the strings its result owns
+        name: name.to_owned(),
+        binary: binary.to_owned(),
+        executable,
+        cached: Some(blaze_api::Cached {
+            basis: match by {
+                Basis::Executed => blaze_api::Basis::Executed,
+                // alloc: once per test cached by reach
+                Basis::Reached => blaze_api::Basis::Reached { why: REACHED_WHY.to_owned() },
+            },
+            millis: micros.map_or(0, |it| it / 1000),
+            outcome: TestOutcome::Passed,
+        }),
+        not_kept: None,
+        millis: 0,
+        output: Vec::new(),
+        outcome: TestOutcome::Passed,
+        outside: false,
+    }
+}
+
+/// What the run asked of the test binary `binary`, the run's executable `executable`, whose
+/// tests are `tests`: how many, how many `filter` left out, and when it left out every one,
+/// those nearest its names (`cli::test::nearest`, the one rule for both sides).
+#[expect(
+    blaze::implicit_allocator,
+    reason = "the response owns its binary's name and the nearest names, once a binary a run"
+)]
+fn tests_of(binary: &str, executable: u32, tests: &[TestOf], filtered_out: u32, filter: &Filter) -> blaze_api::TestsOf {
+    let all = u32::try_from(tests.len()).expect("under 2^32 tests");
+    let mut nearest = Vec::new_in(Global);
+    if all > 0 && filtered_out == all && !filter.names.is_empty() {
+        let near = crate::cli::test::nearest(&filter.names, tests.iter().map(|it| it.name.as_str()));
+        nearest.extend(near.into_iter().map(|(distance, name)| blaze_api::Near { name: name.to_owned(), distance }));
+    }
+    blaze_api::TestsOf { tests: all, binary: binary.to_owned(), nearest, executable, filtered_out }
 }
 
 /// One binary's tests as the queue and selection see them. Its tests are its unit's
@@ -379,31 +633,50 @@ struct Suited {
     name: String,
     /// Its unit, whose `Made` lists its tests and holds its execution table.
     unit: usize,
-    /// Its binary's content: what its selector's image is of.
+    /// Its binary's content: what its image is of.
     content: ContentId,
+    /// The suite's settings ([`Suite::given`]): what its head is held by, and in each test's
+    /// base key.
+    given: ContentId,
+    /// [`Suite::given_outside`]: in the base key of each of its tests not `inside`, so a pass
+    /// kept of a sandboxed run never stands for a run outside, and none is kept of it.
+    given_outside: ContentId,
+    /// Its record makers and target: in every key of its selection.
+    tool: ToolId,
     /// By test: what of its attributes selection reads.
     attrs: Vec<Attrs>,
     /// The tests by name, sorted: a finished test is found in `O(log n)` with nothing allocated.
     by_name: Vec<u32>,
-    /// Taken from the daemon's for the run, and given back when it ends having kept every
-    /// result; dropped otherwise.
-    selector: Option<Selector>,
-    /// Every result of the run was kept through `selector`.
-    kept_all: bool,
+    /// The binary's image now, the one its head was filed at and its head, taken from the
+    /// daemon's for the run ([`image::Selectors::take`]); given back as the new head when its
+    /// selection ends, and as it was taken when it does not.
+    taken: Option<image::Taken>,
+    /// Its tests' selection, from the first drive (which reads its head) until it ends.
+    selection: Option<Selecting<'static, Global>>,
+    driver: Driver,
+    /// By test: its place among the tests asked ([`NOT_ASKED`] for one not asked).
+    asked_at: Vec<u32>,
+    /// By place among the tests asked: its test, and the ticket its run is given back with
+    /// once the selection asked for it.
+    asked: Vec<(u32, Option<Ticket>)>,
     /// Handed to the queue when it starts: sandboxed when the package's tests are.
     binary: Option<Binary>,
     /// The run of its `unsandboxed-tests`, outside, after every sandboxed test of the queue;
     /// none when `binary` is outside already.
     outside: Option<Binary>,
     /// By test: whether it runs in `binary` rather than in `outside`.
-    inside: Vec<bool>,
-    /// Why every test of it runs outside the sandbox, when they all do: said under `-v`.
-    outside_why: Option<&'static str>,
-    /// Under `-v`, the tests its package's `unsandboxed-tests` runs outside, by name.
-    unsandboxed: Vec<String>,
+    inside: Vec<bool, Global>,
+    /// What puts those of its tests that are not `inside` outside the sandbox: said, with how
+    /// many ran there, in the run's one note ([`outside_note`]).
+    outside_by: OutsideBy,
+    /// Its package's name, as that note names it.
+    package: String,
     /// The machine's files and the binary's environment, as what a test read is checked
     /// against: made once per binary.
     disk: blaze_usercode::inputs::Disk,
+    /// Read before any of its tests ran: what a test read must not have moved since for its
+    /// hashes, taken once it ends, to stand for what it read ([`NotKept::Moved`]).
+    began: blaze_usercode::inputs::Began,
     /// What the tests of its server all read, hashed once per buffer of it.
     common: traced::Common,
 }
@@ -414,6 +687,242 @@ impl Suited {
         let at =
             self.by_name.binary_search_by(|it| tests[*it as usize].name.as_str().cmp(name)).ok()?;
         Some(self.by_name[at] as usize)
+    }
+
+    /// Its tests `filter` asks for, each ignored one reported to `out` as the run's executable
+    /// `executable`, given to a new selection from its head and driven over `records` until it
+    /// waits for its runs or ends: the runs it asks for into `runs`. `env` is what its binary
+    /// gives each test. `None` when it asks for no test (its head is given back as taken).
+    #[expect(clippy::too_many_arguments, reason = "one call, in `Runs::start`")]
+    fn begin(
+        &mut self,
+        job: &Job,
+        filter: &Filter,
+        run_all: bool,
+        env: &[(OsString, OsString)],
+        records: &mut image::Filed<'_>,
+        runs: &mut Vec<Out, Global>,
+        executable: u32,
+        out: &mut Vec<Response>,
+    ) -> Result<Option<Drove>, String> {
+        let (tests, _) = listing(job, self.unit);
+        let mut asked: Vec<Asked<'_>, Global> = Vec::new_in(Global);
+        self.asked.clear();
+        let mut filtered_out = 0u32;
+        for (n, test) in tests.iter().enumerate() {
+            let attrs = &self.attrs[n];
+            match select::asked(&test.name, attrs, filter) {
+                Wanted::Filtered => {
+                    filtered_out += 1;
+                    continue;
+                }
+                Wanted::Ignored => {
+                    let report = test::report_unrun(&self.name, &test.name, Reported::Ignored, None);
+                    out.push(Response::TestResult(result(report, executable, false, None)));
+                    continue;
+                }
+                Wanted::Yes => {}
+            }
+            self.asked_at[n] = u32::try_from(self.asked.len()).expect("under 2^32 tests");
+            self.asked.push((u32::try_from(n).expect("under 2^32 tests"), None));
+            let base = host::base(&BaseOf {
+                tool: self.tool,
+                settings: if self.inside[n] { self.given } else { self.given_outside },
+                env,
+                name: &test.name,
+                attrs: attrs.id(),
+            });
+            asked.push(Asked { base, name: &test.name });
+        }
+        out.push(Response::TestsOf(tests_of(&self.name, executable, tests, filtered_out, filter)));
+        if asked.is_empty() {
+            self.give_back(&job.shared.selectors);
+            return Ok(None);
+        }
+        let Some(taken) = self.taken.as_ref() else {
+            // alloc: error path
+            return Err(format!("the tests of `{}` were selected twice in one run", self.name));
+        };
+        let program = Program { now: &taken.now, before: taken.before.as_deref() };
+        let (tool, suite, state, head) = (self.tool, self.given, taken.now.state(), taken.head);
+        let workers = u32::try_from(asked.len()).expect("under 2^32 tests");
+        let (driver, disk) = (&mut self.driver, &mut self.disk);
+        // Every test asked can be out at once, so each lookup is answered before the first
+        // wait and the selection is detached from the snapshot it read its head under.
+        let begun = proof::scope(|snap| -> Result<(Selecting<'static, Global>, Drove), HostError> {
+            let start = Start {
+                tool,
+                suite,
+                program: state,
+                head,
+                certified: None,
+                run_all,
+                workers,
+                compact_at: COMPACT_AT,
+            };
+            let mut selection = Selecting::new(snap, start, &asked, Global)?;
+            let drove = driver.drive(&mut selection, records, program, disk, runs)?;
+            Ok((selection.detach()?, drove))
+        });
+        let (selection, drove) = match begun {
+            Ok(begun) => begun,
+            Err(HostError::Select(why)) => return Err(self.refused(&why, records.puts)),
+            // alloc: error path
+            Err(why) => return Err(format!("selecting the tests of `{}` to run: {why}", self.name)),
+        };
+        self.selection = Some(selection);
+        Ok(Some(drove))
+    }
+
+    /// The run of its test `name` given to its selection, which then is driven over `records`
+    /// until it waits or ends: the test's verdict with why it ran ([`ran_why`]), and where the
+    /// drive stopped. `outside`: the trace says it ran outside the sandbox. `None` for the
+    /// verdict once its selection was refused (said once, when it was).
+    #[expect(clippy::too_many_arguments, reason = "one call, a finished test's parts")]
+    fn ran(
+        &mut self,
+        job: &Job,
+        records: &mut image::Filed<'_>,
+        name: &str,
+        passed: bool,
+        took: Duration,
+        executed: test::Executed,
+        trace: test::Trace,
+        outside: bool,
+    ) -> Result<(Option<(Verdict, Option<blaze_api::RanWhy>)>, Option<Drove>), String> {
+        let (tests, table) = listing(job, self.unit);
+        let Some(n) = self.find(tests, name) else {
+            // alloc: error path
+            return Err(format!(
+                "test `{name}` of `{}` ran, and is none of the tests its build listed: how it ran can't be kept",
+                self.name
+            ));
+        };
+        let place = self.asked_at[n];
+        let Some(ticket) = self.asked.get(place as usize).and_then(|it| it.1) else {
+            // alloc: error path
+            return Err(format!(
+                "test `{name}` of `{}` ran, and its selection did not ask for it",
+                self.name
+            ));
+        };
+        let (Some(selection), Some(taken)) = (self.selection.as_mut(), self.taken.as_ref()) else {
+            return Ok((None, None));
+        };
+        let record = image::record(executed);
+        let suite = self.name.as_str();
+        // What the test reaches is walked only when its record is not whole and its pass can
+        // be kept: never at link, as a binary of many tests would walk the program once per
+        // test.
+        let reached = || {
+            let _span = tracing::info_span!(target: "blaze", "test reach", suite = %suite, test = %name).entered();
+            table.reached(n)
+        };
+        let (micros, sandboxed) =
+            (u64::try_from(took.as_micros()).unwrap_or(u64::MAX), self.inside[n] && !outside);
+        let (driver, began) = (&mut self.driver, self.began);
+        let given = self
+            .common
+            .traced(trace, &mut self.disk, |traced| began.moved(traced), |traced, moved| {
+                let ended = Ended {
+                    ticket,
+                    name,
+                    passed,
+                    micros,
+                    record: &record,
+                    reached: &reached,
+                    traced,
+                    sandboxed,
+                    foreign: tests[n].outside,
+                    moved,
+                };
+                driver.ran(&mut *selection, &taken.now, &ended)
+            })
+            // alloc: error path
+            .map_err(|why| format!("what test `{name}` of `{suite}` read can't be told, so how it ran can't be kept: {why}"))?;
+        // alloc: error path
+        given.map_err(|why| format!("keeping how test `{name}` of `{suite}` ran: {why}"))?;
+        let program = Program { now: &taken.now, before: taken.before.as_deref() };
+        let mut runs = Vec::new_in(Global);
+        // The verdict after the drive that settles and files the run: read before it, a pass
+        // not kept for a race its settle found said only `ok` (until 2026-11-14).
+        let settled = self.driver.settled(selection, records, program, &mut self.disk, &mut runs, place);
+        let (verdict, drove) = match settled {
+            Ok(settled) => settled,
+            Err(HostError::Select(why @ SelectError::MissingIndex { .. })) => return Err(self.refused(&why, records.puts)),
+            // alloc: error path
+            Err(why) => return Err(format!("selecting the tests of `{suite}` after `{name}` ran: {why}")),
+        };
+        if let Some(late) = runs.first() {
+            // alloc: error path
+            return Err(format!("the tests of `{suite}`: {}", HostError::LateRun { test: late.test }));
+        }
+        let why = ran_why(verdict, selection, taken);
+        Ok((Some((verdict, why)), Some(drove)))
+    }
+
+    /// Its selection ended: the new head given to `selectors` for its next run, and to `puts`
+    /// to be marked in the journal once what the run put is durable.
+    fn ended(&mut self, selectors: &image::Selectors, puts: &mut RunPuts) -> Result<(), String> {
+        let (head, postings) = match self.selection.as_ref().and_then(|it| it.outcome()) {
+            Some(Ok(report)) => (report.head, report.postings),
+            Some(Err(why)) => {
+                // clone: an error path, the refusal out of the selection it is dropped with
+                let why = why.clone();
+                let what = self.refused(&why, puts);
+                self.give_back(selectors);
+                return Err(what);
+            }
+            None => {
+                self.give_back(selectors);
+                // alloc: error path
+                return Err(format!("the selection of the tests of `{}` ended with no outcome", self.name));
+            }
+        };
+        self.selection = None;
+        if let Some(taken) = self.taken.take() {
+            let state = taken.now.state();
+            let mark = TestHeadMark { given: self.given, head: head.id(), postings, state };
+            puts.heads.push(HeadFiled { given: self.given, mark: Some(mark) });
+            let held =
+                image::Held { binary: Some(self.content), state, image: Some(taken.now), head: Some(head), postings };
+            selectors.give(self.given, held);
+        }
+        Ok(())
+    }
+
+    /// What its selection's refusal `why` says, naming the suite. A head (or its postings)
+    /// the store does not hold is said once, naming the suite and the head's key: its suite
+    /// starts its next run with no head (each test looked up by its answers), as the head is
+    /// not given back and its journal mark is let go (`puts`). Never selected against
+    /// (rule no-fallback), and never failing every later run.
+    fn refused(&mut self, why: &SelectError, puts: &mut RunPuts) -> String {
+        let head = self.taken.as_ref().and_then(|it| it.head);
+        if let (SelectError::MissingIndex { key }, Some(taken)) = (why, self.taken.as_mut()) {
+            taken.head = None;
+            taken.held = None;
+            puts.heads.push(HeadFiled { given: self.given, mark: None });
+            // alloc: error path
+            return format!(
+                "the tests of `{}`: the store does not hold {key:?} of their index head {:?}, so nothing is \
+                 selected against it (rule no-fallback); the head is let go, and the next run of these tests \
+                 starts with no head, each test looked up by its answers",
+                self.name,
+                head.map(|it| it.id()),
+            );
+        }
+        // alloc: error path
+        format!("selecting the tests of `{}`: {why}", self.name)
+    }
+
+    /// Its selection dropped, and what it was taken from given back to `selectors` as it was:
+    /// the head stands, as nothing replaced it. A head [`Suited::refused`] found missing is
+    /// not given back.
+    fn give_back(&mut self, selectors: &image::Selectors) {
+        self.selection = None;
+        if let Some(held) = self.taken.take().and_then(|it| it.held) {
+            selectors.give(self.given, held);
+        }
     }
 }
 
@@ -529,32 +1038,20 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     };
     let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
     let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
-    let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
-    let outside_why = if job.sandbox_off() {
-        Some("`BLAZE_SANDBOX=off` is set")
-    } else if package.tests.all {
-        Some("its package sets `tests = false` in `[package.metadata.blaze.sandbox]`")
-    } else if !sandboxed {
-        Some(
-            "its package does not opt in (`tests = true` in `[package.metadata.blaze.sandbox]`, or the \
-             workspace's `sandboxed-tests` experiment)",
-        )
-    } else {
-        None
+    // A test the daemon runs is sandboxed by the host's default as its plan holds it
+    // (docs/cargo.md, "Sandboxed tests"), but those the command or its package takes out.
+    let sandboxed = !job.sandbox_off() && package.tests_sandboxed();
+    let outside_by = match (job.sandbox_off(), sandboxed) {
+        (true, _) => OutsideBy::Command,
+        (false, false) if package.tests.outside_by_host => OutsideBy::Host,
+        (false, false) => OutsideBy::Package,
+        (false, true) => OutsideBy::Named,
     };
-    let unsandboxed = match sandboxed && job.input.verbose > 0 {
-        // alloc: under `-v`, once per binary
-        true => made
-            .tests
-            .iter()
-            .filter(|it| package.tests.outside(&it.name))
-            .map(|it| it.name.clone())
-            .collect(),
-        false => Vec::new(),
+    let inside: Vec<bool, Global> = {
+        let mut inside = Vec::with_capacity_in(made.tests.len(), Global);
+        inside.extend(made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)));
+        inside
     };
-    // alloc: one flag per test, once per binary
-    let inside: Vec<bool> =
-        made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
     let Some(table) = &made.table else {
         return Err(ApiError::new(
             // alloc: error path
@@ -619,8 +1116,10 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         jobs: Vec::new(),
         loaded: loaded.clone(),
         sandboxed,
+        // Given below, once its suite's key is known: to the sandboxed binary alone.
+        provider: None,
     };
-    let binary = make(sandboxed);
+    let mut binary = make(sandboxed);
     let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
     let tests = &made.tests;
     // alloc: once per binary, a place per test
@@ -630,26 +1129,46 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     // clone: once per binary, the environment its tests' reads are checked in; each look at
     // the disk a check makes is the build's own ([`crate::serve::work::JobInput::looks`])
     let disk = blaze_usercode::inputs::Disk::new(binary.env.clone(), &job.input.looks);
-    let selector = job
+    let tool = ToolId {
+        tool: crate::serve::record_makers().map_err(|what| ApiError::new(what, None))?.id(),
+        target: context,
+        namespace: Namespace::LOCAL,
+    };
+    let given = suite.given();
+    // The sandboxed binary's provider, made of what every test's base key has (`host::suite`
+    // over the tool, `given` and the environment `begin` keys each test by), so it adds no
+    // input to any key; each test is answered from its own name's stream of it.
+    if binary.sandboxed {
+        binary.provider = Some(Provider::of_suite(&host::suite(&tool, given, &binary.env)));
+    }
+    let taken = job
         .shared
         .selectors
-        .take(suite.given(), artifact.content, || image::image(program, table))
+        .take(given, artifact.content, || image::image(program, table))
         .map_err(|what| ApiError::new(what, None))?;
     Ok(Some(Suited {
         name: program.clone(),
         unit: at,
         content: artifact.content,
+        given,
+        given_outside: suite.given_outside(),
+        tool,
         // alloc: once per binary, a test's attributes each
         attrs: tests.iter().map(attrs).collect(),
         by_name,
-        selector: Some(selector),
-        kept_all: true,
+        taken: Some(taken),
+        selection: None,
+        driver: Driver::default(),
+        // alloc: once per binary, a place per test
+        asked_at: vec![NOT_ASKED; tests.len()],
+        asked: Vec::new(),
         binary: Some(binary),
         outside,
         inside,
-        outside_why,
-        unsandboxed,
+        outside_by,
+        package: package.name.clone(), // clone: once per binary, the name its note says
         disk,
+        began: blaze_usercode::inputs::Began::now(),
         common: traced::Common::default(),
     }))
 }
@@ -720,89 +1239,54 @@ impl TestRun {
             if let Some(row) = test_run_row(&job, suite, &done) {
                 self.puts.test_runs.push(row);
             }
-            if let Some(report) = test::report(&suite.name, &done) {
-                let outside =
-                    matches!(&done.trace, test::Trace::Unknown(why) if why == test::OUTSIDE);
-                out.push(Response::TestResult(result(report, executable, outside)));
-            }
+            let outside = matches!(&done.trace, test::Trace::Unknown(why) if why == test::OUTSIDE);
             let passed = match done.outcome {
                 Outcome::Passed => true,
                 Outcome::Failed(_) => false,
+                // Not run (the run was cancelled), which the API does not report: its selection
+                // never ends, and its head is given back as it was taken ([`TestRun::end`]).
                 Outcome::NotRun => continue,
             };
-            let Some(name) = &done.test else { continue };
-            let (tests, table) = listing(&job, suite.unit);
-            let Some(n) = suite.find(tests, name) else {
+            let Some(report) = test::report(&suite.name, &done) else { continue };
+            let Some(name) = done.test.as_deref() else {
                 self.ok = false;
-                suite.kept_all = false;
-                out.push(refused(format!(
-                    "test `{name}` of `{}` ran, and is none of the tests its build listed: how it ran can't be kept",
-                    suite.name
-                )));
-                continue;
-            };
-            let Some(selector) = suite.selector.as_mut() else {
-                self.ok = false;
+                out.push(Response::TestResult(result(report, executable, outside, None)));
                 // alloc: error path
                 out.push(refused(format!(
-                    "test `{name}` of `{}` ran after its run gave its selector back",
+                    "the test binary `{}` was run whole, and blaze selects and keeps its tests one by one",
                     suite.name
                 )));
+                suite.give_back(&job.shared.selectors);
                 continue;
             };
-            // What the test reaches is walked only when its record is not whole, which is the
-            // only run kept under it: never at link, as a binary of many tests would walk the
-            // program once per test.
-            let walk = || {
-                let _span = tracing::info_span!(target: "blaze", "test reach", suite = %suite.name, test = %name).entered();
-                table.reached(n)
-            };
-            let subject = Subject {
-                name,
-                attrs: &suite.attrs[n],
-                outside: tests[n].outside || !suite.inside[n],
-                reached: Reached::Lazy(&walk),
-            };
-            let record = image::record(done.executed);
-            let took = done.took;
-            let kept = suite.common.traced(done.trace, &mut suite.disk, |traced| {
-                selector.keep(
-                    store,
-                    &subject,
-                    &blaze_testsel::Ran { passed, took, traced, record: &record },
-                )
-            });
-            let kept = match kept {
-                Ok(it) => it,
-                Err(error) => {
-                    self.ok = false;
-                    suite.kept_all = false;
-                    out.push(refused(format!("what test `{name}` read can't be told, so how it ran can't be kept: {error}")));
-                    continue;
+            let mut records = image::Filed { store: &mut *store, puts: &mut self.puts };
+            let ran = suite.ran(&job, &mut records, name, passed, done.took, done.executed, done.trace, outside);
+            match ran {
+                Ok((verdict, drove)) => {
+                    out.push(Response::TestResult(result(report, executable, outside, verdict)));
+                    if drove == Some(Drove::Ended)
+                        && let Err(why) = suite.ended(&job.shared.selectors, &mut self.puts)
+                    {
+                        self.ok = false;
+                        out.push(refused(why));
+                    }
                 }
-            };
-            match kept {
-                Ok(kept) => self.puts.kept(kept.tickets),
-                Err(error) => {
+                Err(why) => {
                     self.ok = false;
-                    suite.kept_all = false;
-                    // alloc: error path
-                    out.push(refused(format!(
-                        "keeping how test `{name}` of the test binary `{}` ran: {error}",
-                        suite.name
-                    )));
+                    out.push(Response::TestResult(result(report, executable, outside, None)));
+                    out.push(refused(why));
+                    suite.give_back(&job.shared.selectors);
                 }
             }
         }
     }
 
-    /// The run's verdict, each suite's selector given back to the daemon's when every result
-    /// of it was kept, and dropped otherwise, to be made again from the store.
+    /// The run's verdict, each suite whose selection did not end given back what it took, so
+    /// its head stands for the next run.
     fn end(&mut self) -> Option<bool> {
         for suite in &mut self.suites {
-            let Some(selector) = suite.selector.take() else { continue };
-            if suite.kept_all {
-                self.job.shared.selectors.give(suite.content, selector);
+            if suite.selection.is_some() || suite.taken.is_some() {
+                suite.give_back(&self.job.shared.selectors);
             }
         }
         Some(self.ok)
@@ -812,7 +1296,7 @@ impl TestRun {
 impl Runs<Real> for TestRun {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
@@ -827,93 +1311,85 @@ impl Runs<Real> for TestRun {
             };
             out.push(Response::Diagnostic(super::say::refused(what, None, super::compile::drawing(&self.job).color)));
         }
-        if self.job.input.verbose > 0 {
-            for suite in &self.suites {
-                let said = match (suite.outside_why, suite.unsandboxed.as_slice()) {
-                    (Some(why), _) => {
-                        format!("the tests of `{}` run outside the sandbox: {why}", suite.name)
-                    }
-                    (None, []) => continue,
-                    (None, names) => format!(
-                        "{} of `{}` run outside the sandbox: its package's `unsandboxed-tests` names them",
-                        names.iter().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", "),
-                        suite.name
-                    ),
-                };
-                // alloc: under `-v`, a note per binary with tests outside
-                out.push(Response::Diagnostic(super::say::cargo(
-                    Level::Note,
-                    said,
-                    None,
-                    super::compile::drawing(&self.job).color,
-                )));
-            }
-        }
         // clone: a reference count, once per run
         let job = self.job.clone();
+        let color = super::compile::drawing(&job).color;
+        let mut runs: Vec<Out, Global> = Vec::new_in(Global);
+        // By suite: how many of the tests it runs run outside the sandbox.
+        let mut outside_runs: Vec<usize, Global> = Vec::with_capacity_in(self.suites.len(), Global);
+        outside_runs.resize(self.suites.len(), 0);
         for (at, suite) in self.suites.iter_mut().enumerate() {
+            let counted = at;
             let Some(mut binary) = suite.binary.take() else { continue };
             let at = u32::try_from(at).expect("under 2^32 suites");
             let mut outside = suite.outside.take();
-            let (tests, table) = listing(&job, suite.unit);
-            let Some(selector) = suite.selector.as_mut() else {
-                self.ok = false;
-                let what = UnitError::NoSelector { binary: suite.name.clone() }.to_string();
-                out.push(Response::Diagnostic(super::say::refused(what, None, super::compile::drawing(&job).color)));
-                continue;
-            };
-            for (n, test) in tests.iter().enumerate() {
-                let inside = suite.inside[n];
-                let binary = match (inside, &mut outside) {
-                    (false, Some(outside)) => outside,
-                    _ => &mut binary,
-                };
-                let attrs = &suite.attrs[n];
-                match select::asked(&test.name, attrs, &self.filter) {
-                    Wanted::Filtered => continue,
-                    Wanted::Ignored => {
-                        let report =
-                            test::report_unrun(&suite.name, &test.name, Reported::Ignored, None);
-                        out.push(Response::TestResult(result(report, at, false)));
-                        continue;
-                    }
-                    Wanted::Yes => {}
+            let (tests, _) = listing(&job, suite.unit);
+            runs.clear();
+            let mut records = image::Filed { store: &mut *store, puts: &mut self.puts };
+            let begun = suite.begin(
+                &job,
+                &self.filter,
+                self.all,
+                &binary.env,
+                &mut records,
+                &mut runs,
+                at,
+                out,
+            );
+            match begun {
+                Err(why) => {
+                    // Its tests asked are not run: nothing is run that its selection did not
+                    // ask for, and the run fails, naming the binary.
+                    self.ok = false;
+                    out.push(Response::Diagnostic(super::say::refused(why, None, color)));
+                    suite.give_back(&job.shared.selectors);
                 }
-                // Choosing reads no reach: only keeping a run whose record is not whole does.
-                let walk = || table.reached(n);
-                let subject = Subject {
-                    name: &test.name,
-                    attrs,
-                    outside: test.outside || !inside,
-                    reached: Reached::Lazy(&walk),
-                };
-                match selector.choose(store, &subject, self.all, &mut suite.disk) {
-                    Ok(Choice::Cached(kept)) => {
-                        out.push(Response::TestResult(blaze_testsel::api::result(
-                            &suite.name,
-                            at,
-                            &test.name,
-                            &kept,
-                        )));
+                Ok(None) => {}
+                Ok(Some(drove)) => {
+                    for run in &runs {
+                        let Some((n, ticket)) = suite.asked.get_mut(run.test as usize) else {
+                            self.ok = false;
+                            // alloc: error path
+                            let what = format!(
+                                "the selection of the tests of `{}` asked to run its test {}, which it was not given",
+                                suite.name, run.test
+                            );
+                            out.push(Response::Diagnostic(super::say::refused(what, None, color)));
+                            continue;
+                        };
+                        *ticket = Some(run.ticket);
+                        let n = *n as usize;
+                        // The queue runs the longest first: a test's last kept run's time from
+                        // its head row; one with no row (new, or last failed) has none.
+                        let last = suite.selection.as_ref().and_then(|it| it.last_micros(run.test));
+                        outside_runs[counted] += usize::from(!suite.inside[n]);
+                        let binary = match (suite.inside[n], &mut outside) {
+                            (false, Some(outside)) => outside,
+                            _ => &mut binary,
+                        };
+                        binary.jobs.push(TestJob {
+                            // clone: the queue owns its jobs' names, once per test run
+                            name: tests[n].name.clone(),
+                            ignore: false,
+                            expected: Duration::from_micros(last.unwrap_or(0)),
+                            timeout: TIMEOUT,
+                            retries: 0,
+                        });
                     }
-                    Ok(Choice::Run { expected, .. }) => binary.jobs.push(TestJob {
-                        // clone: the queue owns its jobs' names, once per test run
-                        name: test.name.clone(),
-                        ignore: false,
-                        expected: expected.unwrap_or_default(),
-                        timeout: TIMEOUT,
-                        retries: 0,
-                    }),
-                    Err(error) => {
+                    if let Some(selection) = &suite.selection {
+                        for (place, &(n, _)) in suite.asked.iter().enumerate() {
+                            let place = u32::try_from(place).expect("under 2^32 tests");
+                            if let Some(Verdict::Cached { basis, micros, .. }) = selection.verdict(place) {
+                                let name = &tests[n as usize].name;
+                                out.push(Response::TestResult(cached(&suite.name, at, name, basis, micros)));
+                            }
+                        }
+                    }
+                    if drove == Drove::Ended
+                        && let Err(why) = suite.ended(&job.shared.selectors, &mut self.puts)
+                    {
                         self.ok = false;
-                        out.push(Response::Diagnostic(super::say::refused(
-                            format!(
-                                "whether test `{}` of `{}` runs: {error}",
-                                test.name, suite.name
-                            ),
-                            None,
-                            super::compile::drawing(&job).color,
-                        )));
+                        out.push(Response::Diagnostic(super::say::refused(why, None, color)));
                     }
                 }
             }
@@ -923,6 +1399,16 @@ impl Runs<Real> for TestRun {
                 binaries.push(outside);
                 self.suite_of.push(at);
             }
+        }
+        // One note for every test that runs outside the sandbox: how many, and the setting that
+        // put them there. Each one's own line says `(not kept: not sandboxed)`.
+        let counts = self
+            .suites
+            .iter()
+            .zip(&outside_runs)
+            .map(|(suite, &runs)| (suite.package.as_str(), suite.outside_by, runs));
+        if let Some(said) = outside_note(counts) {
+            out.push(Response::Diagnostic(super::say::cargo(Level::Note, said, None, color)));
         }
         // The run's sockets and records go under the daemon's state. The queue names them to the
         // driver from its root, `/` ([`crate::serve::file_name`]), and gives its processes that
@@ -996,6 +1482,14 @@ impl Runs<Real> for TestRun {
         let mut queue = self.queue.take()?;
         queue.complete(completion, now, effects);
         self.finished(queue.drain(), store, out);
+        if let Some(why) = queue.take_unsandboxable() {
+            self.ok = false;
+            out.push(Response::Diagnostic(super::say::refused(
+                unsandboxable(&why),
+                None,
+                super::compile::drawing(&self.job).color,
+            )));
+        }
         let done = queue.finished();
         self.queue = Some(queue);
         match done {

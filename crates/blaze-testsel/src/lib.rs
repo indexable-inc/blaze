@@ -1,47 +1,36 @@
-//! Exact test selection (docs/v2/plan/design/compile-time.md, idea 3;
-//! docs/v2/plan/design/compile-time.md): a test runs again only when a function it
-//! executed is not as it was, or something it read is not; every other test reports its last
-//! pass, marked cached, with how long that run took and what it was selected by.
+//! Exact test selection (docs/v2/plan/design/test-selection.md): a test runs again only when a
+//! function it executed is not as it was, or something it read is not; every other test reports
+//! its kept pass, marked cached, with how long that run took and what settled it.
 //!
 //! - [`record`]: what a test process says it executed: a byte per jump-table slot in a region
 //!   the fork server maps shared and the runtime writes on each slot's first call.
 //! - [`table`]: a test binary's functions by slot, each by its identity ([`FnId`]) and its
-//!   bound code ([`Bound`]: the code and what each of its refs binds to), and the hash of all
-//!   code not called through a slot.
-//! - [`select`]: [`select::choose`] whether a test runs, [`select::keep`] how it ran. A pass is
-//!   kept under the set of functions it executed, or, when its record is not whole, the set it
-//!   reaches, saying why ([`Basis`]); never under a set that is not one of these.
-//! - [`selector`]: the same choices for a whole suite across edits, each edit costing the
-//!   functions it changed times the sets that hold them ([`Selector`]).
-//! - [`api`]: the cached mark as the agent API carries it.
+//!   bound code ([`Bound`]: the code and what each of its refs binds to), the hash of all code
+//!   not called through a slot, and the binary as one program state with the functions two
+//!   states differ in.
 //! - [`ask`]: what a kept result asks, as a blaze-keyed outside shape, and the value filed at
-//!   its address (docs/v2/plan/design/test-selection.md).
+//!   its address.
 //! - [`index`]: a suite's index head and postings: each kept test's row, and which tests ask
 //!   each function or read, so an edit finds its candidates without reading every record.
 //! - [`machine`]: one request's selection as a sans-IO machine on those records: cached with
-//!   why, ran, or not kept with why, per test. It replaces [`select`] and [`selector`] once the
-//!   runner is wired to it.
-//!
-//! The store, the shapes of what a run read and the traced inputs are `blaze-usercode`'s
-//! ([`blaze_usercode::test::Passes`], [`blaze_usercode::index`], [`blaze_usercode::trace`]) for
-//! [`select`]; [`machine`] files its records through blaze-keyed's.
+//!   why, ran, or not kept with why, per test.
+//! - [`host`]: the runner's side: the machine's effects performed on its records, its binary's
+//!   [`Image`] and the files and environment now, and how a run ended given back.
 
 #![forbid(unsafe_code)]
 #![feature(allocator_api, btreemap_alloc)]
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
-pub mod api;
 pub mod ask;
+pub mod host;
 pub mod index;
 pub mod machine;
 pub mod record;
-pub mod select;
-pub mod selector;
 pub mod table;
 
 /// A bug planted on purpose, so a test shows its oracle catches it (rule 43). `None` in every
-/// real use. Each names the place it is planted in, all in [`machine`].
+/// real use. Each names the place it is planted in, in [`machine`] or [`host`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Plant {
     #[default]
@@ -55,6 +44,9 @@ pub enum Plant {
     /// The program's changed functions are dropped: the changed-set shortcut reports a test
     /// cached that executed one.
     ShortcutSkipsChanged,
+    /// [`host::answer`] answers the whole environment as a variable of its name, which none
+    /// has, as until 2026-11-14: every run that read it races its settle and is not kept.
+    WholeEnvAskedByName,
 }
 
 #[cfg(test)]
@@ -76,14 +68,4 @@ pub fn planted(_plant: Plant) -> bool {
 }
 
 pub use record::Record;
-pub use select::{Basis, Cached, Choice, Ran, Reached, Subject, Why};
-pub use selector::Selector;
 pub use table::{Bound, FnId, Image, Set, Version};
-
-/// Counts allocations so the hot paths' tests hold them to a budget.
-#[cfg(all(test, not(blaze_check)))]
-#[global_allocator]
-static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
-
-#[cfg(test)]
-mod sim_tests;

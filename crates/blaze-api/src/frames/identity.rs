@@ -16,14 +16,14 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
 };
 
 const REQUESTS: usize = 38;
-const RESPONSES: usize = 46;
+const RESPONSES: usize = 47;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -103,11 +103,10 @@ impl Gen {
     }
 
     fn outcome(&mut self) -> TestOutcome {
-        match self.below(4) {
+        match self.below(3) {
             0 => TestOutcome::Passed,
             1 => TestOutcome::Failed,
-            2 => TestOutcome::Ignored,
-            _ => TestOutcome::Unreached,
+            _ => TestOutcome::Ignored,
         }
     }
 
@@ -644,6 +643,13 @@ impl Gen {
                 }),
             }),
             8 => Response::TestResult(TestResult {
+                ran: self.maybe(|g| RanWhy {
+                    ask: g.maybe_text(),
+                    now: g.maybe_text(),
+                    why: g.text(),
+                    said: g.text(),
+                    before: g.maybe_text(),
+                }),
                 name: self.text(),
                 binary: self.text(),
                 cached: self.maybe(|g| Cached {
@@ -659,6 +665,7 @@ impl Gen {
                 outcome: self.outcome(),
                 outside: self.yes(),
                 executable: self.u32(),
+                not_kept: self.maybe(|g| NotKept { no: g.text(), why: g.text() }),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),
@@ -912,6 +919,13 @@ impl Gen {
                     },
                     _ => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
                 }),
+            }),
+            45 => Response::TestsOf(crate::TestsOf {
+                tests: self.u32(),
+                binary: self.text(),
+                nearest: self.many(depth, |g| crate::Near { name: g.text(), distance: g.u32() }),
+                executable: self.u32(),
+                filtered_out: self.u32(),
             }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
@@ -1182,7 +1196,8 @@ fn response_index(response: &Response) -> usize {
         Response::Doing(_) => 42,
         Response::Diagnostics(_) => 43,
         Response::Proven(_) => 44,
-        Response::Of { .. } => 45,
+        Response::TestsOf(_) => 45,
+        Response::Of { .. } => 46,
     }
 }
 

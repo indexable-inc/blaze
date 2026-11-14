@@ -56,6 +56,7 @@ mod say;
 mod script;
 pub(crate) use compile::{Filed, PendingRecord, file_records, span_unit};
 pub(crate) use script::compile_of;
+pub(super) use test::image::pinned as test_heads_pinned;
 mod test;
 
 #[cfg(test)]
@@ -396,6 +397,10 @@ impl Steps for Real {
 
     fn launch_kept(&self) -> Vec<super::work::LaunchKept> {
         self.shared.launches.kept()
+    }
+
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        self.shared.selectors.restore(marked.into_iter());
     }
 
     fn launch_wants(&self) -> Vec<String> {
@@ -867,7 +872,6 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         build_dir,
         finished,
         link_dirs,
-        sandboxed_tests,
         native,
     } = kept;
     if graph != &now.graph {
@@ -890,8 +894,6 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the profile"
     } else if link_dirs != &now.link_dirs {
         "the build-script link directories"
-    } else if sandboxed_tests != &now.sandboxed_tests {
-        "whether tests run sandboxed"
     } else if native != &now.native {
         "the pinned native inputs"
     } else {
@@ -2328,8 +2330,12 @@ impl Job {
     }
 }
 
+/// `BLAZE_SANDBOX` turns sandboxes off in `env` (`off` or `0`), by the one rule
+/// ([`crate::sandbox::on_with`]) the build scripts, proc-macro servers and tests all decide by.
 pub(crate) fn sandbox_off(env: &[(String, String)]) -> bool {
-    env.iter().any(|(name, value)| name == "BLAZE_SANDBOX" && value == "off")
+    !crate::sandbox::on_with(|name| {
+        env.iter().find(|it| it.0 == name).map(|it| it.1.clone()) // clone: one variable's value, once per ask
+    })
 }
 
 pub(crate) fn package_of<'a>(
@@ -2746,7 +2752,7 @@ pub enum UnitRuns {
 impl Runs<Real> for UnitRuns {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,

@@ -3243,13 +3243,22 @@ fn tests_table(
     if !test {
         return Ok(None);
     }
+    let image = &linked.image;
+    // The jump table as the binary's runtime will name it (its descriptor's lineage and
+    // generation, its header's slot count: the capacity), and the slots given out of it.
+    let jump = blaze_codegen::JumpTable {
+        lineage: image.lineage(),
+        generation: image.generation(),
+        capacity: image.capacity(),
+        given: image.slots(),
+    };
     let table = super::test::image::table(
         path,
         generated.built,
         // Every span table, made whole: a test binary's table reads them all.
         generated.spans()?,
-        linked.image.slots(),
-        |key| linked.image.slot(key).map(|it| it.0),
+        jump,
+        |key| image.slot(key).map(|it| it.0),
         ContentId::default(),
         &generated.roots.tests,
     )?;

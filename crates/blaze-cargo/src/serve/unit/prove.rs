@@ -994,7 +994,7 @@ impl Checking {
 impl Runs<Real> for Checking {
     fn start(
         &mut self,
-        _store: &Store,
+        _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,

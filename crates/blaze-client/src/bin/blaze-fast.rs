@@ -327,14 +327,17 @@ impl Printer {
                     TestOutcome::Passed => ("ok", false),
                     TestOutcome::Failed => ("FAILED", true),
                     TestOutcome::Ignored => ("ignored", false),
-                    TestOutcome::Unreached => ("unreached", false),
                 };
                 match result.outcome {
-                    TestOutcome::Passed | TestOutcome::Unreached => self.passed += 1,
+                    TestOutcome::Passed => self.passed += 1,
                     TestOutcome::Failed => self.failed += 1,
                     TestOutcome::Ignored => self.ignored += 1,
                 }
-                let mut line = format!("test {} ... {word}\n", result.name);
+                let mark = match result.cached.is_some() {
+                    true => " (cached)",
+                    false => "",
+                };
+                let mut line = format!("test {} ... {word}{mark}\n", result.name);
                 if shown {
                     line.push_str(&String::from_utf8_lossy(&result.output));
                 }

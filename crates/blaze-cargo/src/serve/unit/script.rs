@@ -2034,7 +2034,7 @@ impl Writing {
 impl Runs<Real> for ScriptRun {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the job's writer, or the loop's record of asks while a task holds it
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
@@ -2239,6 +2239,7 @@ impl ScriptRun {
         let value = match (run, &*how) {
             (Some(run), How::Sandboxed(prepared)) => {
                 let mut checked = None;
+                let began = run.began();
                 let completed = run.complete(
                     completion,
                     store,
@@ -2260,6 +2261,9 @@ impl ScriptRun {
                         }
                         script::keyed(prepared, traced)
                     },
+                    // Its reads are hashed as it ends: one changed since it began is kept
+                    // under no key (`blaze_usercode::run::NotKept::Moved`).
+                    |traced| began.moved(traced),
                 );
                 match completed {
                     Ok(completed) => {
@@ -2270,62 +2274,76 @@ impl ScriptRun {
                         if let Some(miss) = self.missed.take() {
                             self.puts.misses.push(with_reads(miss, &completed.traced));
                         }
-                        // What it read, at the values its result is kept under, for its
-                        // build's request certificate ([`ReadBytes::seen`]). Not of a run
-                        // that is checked: a build runs that one again whatever is kept, so
-                        // no certificate answers for it.
-                        if prepared.spec.mode != blaze_usercode::run::Mode::Verify {
-                            job.script_reads.lock().note_ran(run_unit, &completed.traced);
-                        }
-                        let value = completed.value;
-                        // A pure key's hit verified across checkouts, run again and otherwise:
-                        // retracted before the run is kept under the pure key, which then
-                        // keeps this checkout's own here alone.
-                        let differed = match pure::retract(
-                            &job,
-                            run_unit,
-                            unit,
-                            store,
-                            &prepared.spec.roots,
-                            &value,
-                        ) {
-                            Ok(None) => None,
-                            Ok(Some((what, puts))) => {
-                                self.puts.extend(puts);
-                                Some(what)
-                            }
-                            Err((what, puts)) => {
-                                self.puts.extend(puts);
-                                return self.error(what, out);
-                            }
-                        };
-                        match pure::keep(
-                            &job,
-                            run_unit,
-                            unit,
-                            checked,
-                            store,
-                            prepared.script_env(),
-                            &prepared.spec.roots,
-                            &value,
-                        ) {
-                            Ok(puts) => self.puts.extend(puts),
-                            Err((what, puts)) => {
-                                self.puts.extend(puts);
-                                return self.error(what, out);
-                            }
-                        }
-                        if let Some(what) = differed {
-                            let what = format!(
-                                "the build script of `{}`: run again, it gave other than the result \
-                                 its pure key found, verified across checkouts for the same inputs ({what}): it \
-                                 depends on where its roots are, so it is recorded as doing so and no checkout is \
-                                 given that result again",
-                                unit.package.descr()
+                        // A run whose reads moved after it began is this build's alone: kept
+                        // under no key (its sandboxed one or its pure one), compared with
+                        // nothing kept, and its reads are no certificate's, since they need
+                        // not be what it read. Said by name; the next build runs it again.
+                        if let Some(not_kept) = completed.not_kept {
+                            tracing::info!(
+                                target: "blaze",
+                                package = %unit.package.descr(),
+                                not_kept = not_kept.word(),
+                                "a build script's run kept under no key: {not_kept}"
                             );
-                            return self.error(what, out);
+                            completed.value
+                        } else {
+                            // What it read, at the values its result is kept under, for its
+                            // build's request certificate ([`ReadBytes::seen`]). Not of a run
+                            // that is checked: a build runs that one again whatever is kept,
+                            // so no certificate answers for it.
+                            if prepared.spec.mode != blaze_usercode::run::Mode::Verify {
+                                job.script_reads.lock().note_ran(run_unit, &completed.traced);
+                            }
+                            let value = completed.value;
+                            // A pure key's hit verified across checkouts, run again and
+                            // otherwise: retracted before the run is kept under the pure key,
+                            // which then keeps this checkout's own here alone.
+                            let differed = match pure::retract(
+                                &job,
+                                run_unit,
+                                unit,
+                                store,
+                                &prepared.spec.roots,
+                                &value,
+                            ) {
+                                Ok(None) => None,
+                                Ok(Some((what, puts))) => {
+                                    self.puts.extend(puts);
+                                    Some(what)
+                                }
+                                Err((what, puts)) => {
+                                    self.puts.extend(puts);
+                                    return self.error(what, out);
+                                }
+                            };
+                            match pure::keep(
+                                &job,
+                                run_unit,
+                                unit,
+                                checked,
+                                store,
+                                prepared.script_env(),
+                                &prepared.spec.roots,
+                                &value,
+                            ) {
+                                Ok(puts) => self.puts.extend(puts),
+                                Err((what, puts)) => {
+                                    self.puts.extend(puts);
+                                    return self.error(what, out);
+                                }
+                            }
+                            if let Some(what) = differed {
+                                let what = format!(
+                                    "the build script of `{}`: run again, it gave other than the result \
+                                     its pure key found, verified across checkouts for the same inputs ({what}): it \
+                                     depends on where its roots are, so it is recorded as doing so and no checkout is \
+                                     given that result again",
+                                    unit.package.descr()
+                                );
+                                return self.error(what, out);
+                            }
+                            value
                         }
-                        value
                     }
                     Err(error) => {
                         // alloc: error path
