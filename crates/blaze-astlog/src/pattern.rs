@@ -458,6 +458,19 @@ fn significant(node: ast::Node<'_>) -> Vec<ast::Element<'_>> {
     node.children_with_tokens().filter(|it| !it.kind().is_trivia()).collect() // alloc: one level of a match
 }
 
+fn is_attr(kind: SyntaxKind) -> bool {
+    kind == SyntaxKind::ATTR
+}
+
+/// A doc comment (`///`, `//!`, `/** */`, `/*! */`), which this tree keeps as its own node
+/// and tokens, not as trivia.
+fn is_doc(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT
+    )
+}
+
 struct Cx<'p, 'r, 't> {
     pattern: &'p Pattern,
     resolves: &'r mut dyn FnMut(usize, ast::Node<'t>) -> Result<bool, Error>,
@@ -501,7 +514,14 @@ impl<'t> Cx<'_, '_, 't> {
             return Ok(false);
         }
         let want = significant(pattern);
-        let have = significant(target);
+        let mut have = significant(target);
+        // A pattern that writes no attribute matches with any, and one that writes no doc
+        // comment matches with any; one that writes them matches only those, in order.
+        for decoration in [is_attr, is_doc] {
+            if !want.iter().any(|it| decoration(it.kind())) {
+                have.retain(|it| !decoration(it.kind()));
+            }
+        }
         self.seq(target, &want, &have, bound)
     }
 

@@ -52,7 +52,9 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Code patterns.** `(expr n "...")`, `(type n "...")`, `(pat n "...")`, `(stmt n "...")`,
   `(item n "...")` and `(path n "...")` parse the text as that Rust form with `$name` (one node)
   and `$$$name` (a run of sibling nodes, possibly empty) metavariables, and bind `n` to each node
-  of the target files that matches tree against tree, ignoring whitespace and comments. Each
+  of the target files that matches tree against tree, ignoring whitespace and comments. A
+  pattern that writes no attribute matches a node with any, and one that writes no doc comment
+  matches a node with any; one that writes them matches only nodes with those, in order. Each
   metavariable is a rule variable. One used twice must bind equal code (token-equal). A `match`
   atom in a blaze program is a load error that names the pattern forms. A pattern is parsed as
   edition 2024 reads it; searched over a file of an edition that reads its text as other Rust

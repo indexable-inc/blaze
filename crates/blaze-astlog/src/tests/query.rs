@@ -285,3 +285,35 @@ fn a_pattern_past_the_token_cap_is_refused_naming_its_rule() {
     };
     assert!(error.starts_with("rules:1:") && error.contains("has 2050 tokens"), "{error}");
 }
+
+const DECORATED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub fn plain() {}
+#[inline]
+pub fn tagged() {}
+/// Says hi.
+pub fn documented() {}
+/// Other words.
+#[must_use]
+#[inline]
+pub fn both() {}
+"#;
+
+/// An item pattern that writes no attribute or doc comment matches an item with any; one that
+/// writes them matches only the items that have those, as written.
+#[test]
+fn an_item_pattern_ignores_attributes_and_doc_comments_it_does_not_write() {
+    let (db, files) = view(DECORATED, 0, &["lib.rs"]);
+    let rules = r##"
+        (rule (bare n) (item f "pub fn $n() {}"))
+        (rule (inline n) (item f "#[inline] pub fn $n() {}"))
+        (rule (two n) (item f "#[must_use] #[inline] pub fn $n() {}"))
+        (rule (hi n) (item f "/// Says hi.
+pub fn $n() {}"))
+    "##;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "bare"), [["plain"], ["tagged"], ["documented"], ["both"]]);
+    assert_eq!(texts(&outcome, "inline"), [["tagged"]]);
+    assert_eq!(texts(&outcome, "two"), [["both"]]);
+    assert_eq!(texts(&outcome, "hi"), [["documented"]]);
+}
