@@ -1584,6 +1584,7 @@ impl Front<Fake> for FakeFront {
             _ => (TestOutcome::Passed, Vec::new()),
         };
         Ok(TestResult {
+            ran: None,
             name: test.to_owned(),
             binary: "a".into(),
             executable: 0,

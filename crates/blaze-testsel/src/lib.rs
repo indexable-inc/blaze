@@ -30,7 +30,7 @@ pub mod record;
 pub mod table;
 
 /// A bug planted on purpose, so a test shows its oracle catches it (rule 43). `None` in every
-/// real use. Each names the place it is planted in, all in [`machine`].
+/// real use. Each names the place it is planted in, in [`machine`] or [`host`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Plant {
     #[default]
@@ -44,6 +44,9 @@ pub enum Plant {
     /// The program's changed functions are dropped: the changed-set shortcut reports a test
     /// cached that executed one.
     ShortcutSkipsChanged,
+    /// [`host::answer`] answers the whole environment as a variable of its name, which none
+    /// has, as until 2026-11-14: every run that read it races its settle and is not kept.
+    WholeEnvAskedByName,
 }
 
 #[cfg(test)]

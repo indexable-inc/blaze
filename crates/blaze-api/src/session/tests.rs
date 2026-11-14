@@ -194,6 +194,7 @@ fn diagnostic(level: Level) -> Response {
 
 fn test_result(outcome: TestOutcome) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "tests".to_owned(),
         name: "a_test".to_owned(),
         cached: None,

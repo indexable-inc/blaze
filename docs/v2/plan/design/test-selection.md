@@ -32,6 +32,12 @@ A cached test is a pass, and reads as one everywhere:
 A test that ran and is not kept says why, by name: `test net::fetch ... ok <0.300s> (not kept:
 it read the wall clock)`, and in JSON `"kept": {"no": "clock"}`.
 
+A test that ran although selection was asked says why no kept pass held. The machine carries the
+reason in every run's verdict (`machine::Missed`), and the result carries it as
+`TestResult::ran`. The reasons are `run-all`, `no-head`, `unknown-state`, `no-row`,
+`function-changed` (which function, with its code then and now) and `read-changed` (which read,
+with its digests then and now). JSON always has `"ran"`, and `-v` adds `(ran: ...)` to the line.
+
 ## 2. Soundness: what a kept result covers
 
 The invariant: a test is reported cached only if rerunning it now would give the same result.

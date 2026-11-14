@@ -133,6 +133,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
 #[test]
 fn ub_results_print_as_libtest_prints_them() {
     let failed = TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: "tests::aliasing".to_owned(),
         outcome: TestOutcome::Failed,
@@ -167,6 +168,7 @@ fn ub_results_print_as_libtest_prints_them() {
 #[test]
 fn the_client_names_no_test_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: name.to_owned(),
         outcome: TestOutcome::Passed,
@@ -371,6 +373,7 @@ fn driven(api: &mut FakeApi, words: &[&str], programs: &mut Fake) -> (Then, Stri
 /// A test the daemon ran, of the lib's test executable, which passed or failed.
 fn daemon_result(name: &str, passed: bool) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "/w/target/debug/deps/foo-0123abcd".to_owned(),
         name: name.to_owned(),
         outcome: if passed { TestOutcome::Passed } else { TestOutcome::Failed },

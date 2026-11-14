@@ -46,9 +46,9 @@ use blaze_keyed::{
 };
 use blaze_lower::Db;
 use blaze_testsel::{
-    ask::Basis,
+    ask::{ABSENT, Basis, ReadKind, UNLOGGED},
     host::{self, BaseOf, Driver, Drove, Ended, HostError, Out, Program},
-    machine::{NotKept, SelectError, Selection as Selecting, Start, Test as Asked, Verdict},
+    machine::{Missed, NotKept, SelectError, Selection as Selecting, Start, Test as Asked, Verdict},
 };
 use blaze_units::schema::{Mode, Unit};
 use blaze_usercode::provider::Provider;
@@ -280,6 +280,7 @@ pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResu
     })?;
     let binary = selected.map_or("", |it| it.binaries[test.binary as usize].as_str());
     let result = |outcome, output: String, millis| TestResult {
+        ran: None,
         name: test.name.clone(),
         binary: binary.to_owned(),
         executable: test.binary,
@@ -470,10 +471,18 @@ pub(crate) fn unsandboxable(why: &str) -> String {
 }
 
 /// The result of `report`, a test of the run's executable `executable` (its index among the
-/// run's test binaries), run outside the sandbox when `outside`, as its verdict says: `None`
-/// for a test the machine did not judge (ignored, or a run whose keeping was refused).
-fn result(report: test::Report, executable: u32, outside: bool, verdict: Option<Verdict>) -> TestResult {
+/// run's test binaries), run outside the sandbox when `outside`, as its verdict and why it ran
+/// say: `None` for a test the machine did not judge (ignored, or a run whose keeping was
+/// refused).
+fn result(
+    report: test::Report,
+    executable: u32,
+    outside: bool,
+    verdict: Option<(Verdict, Option<blaze_api::RanWhy>)>,
+) -> TestResult {
+    let (verdict, ran) = verdict.map_or((None, None), |(verdict, ran)| (Some(verdict), ran));
     TestResult {
+        ran,
         binary: report.binary,
         executable,
         outside,
@@ -502,6 +511,74 @@ fn not_kept(verdict: Verdict) -> Option<blaze_api::NotKept> {
     }
 }
 
+/// Why a test ran although selection was asked, as its result says it: the miss `verdict`
+/// carries ([`Missed`]), named against `selection` (the read that changed, its answers at the
+/// head and now) and `taken` (a function's bound code then and now). `None` for a test not run.
+#[expect(
+    blaze::implicit_allocator,
+    reason = "the result owns its words, once per test run"
+)]
+fn ran_why(verdict: Verdict, selection: &Selecting<'_, Global>, taken: &image::Taken) -> Option<blaze_api::RanWhy> {
+    let missed = match verdict {
+        Verdict::Cached { .. } => return None,
+        Verdict::Ran { missed, .. } | Verdict::NotKept { missed, .. } => missed,
+    };
+    let short = |id: ContentId| if id == ABSENT { "absent".to_owned() } else { id.to_string() };
+    let changed = |why: &str, ask: String, before: Option<String>, now: Option<String>| {
+        let said = format!(
+            "{ask} changed: {} -> {}",
+            before.as_deref().unwrap_or("unknown"),
+            now.as_deref().unwrap_or("unknown")
+        );
+        blaze_api::RanWhy { ask: Some(ask), now, why: why.to_owned(), said, before }
+    };
+    let plain = |why: &str, said: &str| blaze_api::RanWhy {
+        ask: None,
+        now: None,
+        why: why.to_owned(),
+        said: said.to_owned(),
+        before: None,
+    };
+    Some(match missed {
+        Missed::RunAll => plain(missed.code(), "--run-all runs every test asked"),
+        Missed::NoHead if taken.head_dropped() => plain(
+            "unknown-state",
+            "the kept passes are of another binary this daemon has no image of (restored from its journal), \
+             so what changed since can't be told",
+        ),
+        Missed::NoHead => plain(missed.code(), "no pass of this suite was kept yet"),
+        Missed::NoRow => plain(missed.code(), "no pass of it was kept: none ran yet, or its last run was not kept"),
+        Missed::Function(function) => {
+            let unlogged = function == UNLOGGED;
+            let code = |image: &blaze_testsel::Image| match unlogged {
+                true => short(image.unlogged()),
+                false => image.bound_of(&function).map_or_else(|| "gone".to_owned(), |bound| short(bound.0)),
+            };
+            let ask = match unlogged {
+                true => "the code no slot calls".to_owned(),
+                false => format!("fn {}", function.0),
+            };
+            changed(missed.code(), ask, taken.before.as_deref().map(&code), Some(code(&taken.now)))
+        }
+        Missed::Read(place) => {
+            let Some((kind, name, before, now)) = selection.read_missed(place) else {
+                return Some(plain(missed.code(), "a read changed, which the selection no longer names"));
+            };
+            let kind = match kind {
+                ReadKind::File => "file",
+                ReadKind::Dir => "dir",
+                ReadKind::Env => "env",
+            };
+            // The whole environment is asked as one read of a name no variable has.
+            let name = match name == blaze_usercode::trace::ALL_ENV_NAME.as_bytes() {
+                true => std::borrow::Cow::Borrowed("*"),
+                false => String::from_utf8_lossy(name),
+            };
+            changed(missed.code(), format!("{kind} {name}"), Some(short(before)), Some(short(now)))
+        }
+    })
+}
+
 /// What a cached result's basis says when its pass was kept by what its test reaches: the
 /// index keeps the basis, not the run's own words.
 const REACHED_WHY: &str = "its run's execution record was not whole, so it is kept by what it reaches";
@@ -511,6 +588,7 @@ const REACHED_WHY: &str = "its run's execution record was not whole, so it is ke
 /// time, marked cached.
 fn cached(binary: &str, executable: u32, name: &str, by: Basis, micros: Option<u64>) -> TestResult {
     TestResult {
+        ran: None,
         // clone: once per cached test, the strings its result owns
         name: name.to_owned(),
         binary: binary.to_owned(),
@@ -697,9 +775,9 @@ impl Suited {
     }
 
     /// The run of its test `name` given to its selection, which then is driven over `records`
-    /// until it waits or ends: the test's verdict, and where the drive stopped. `outside`: the
-    /// trace says it ran outside the sandbox. `None` for the verdict once its selection was
-    /// refused (said once, when it was).
+    /// until it waits or ends: the test's verdict with why it ran ([`ran_why`]), and where the
+    /// drive stopped. `outside`: the trace says it ran outside the sandbox. `None` for the
+    /// verdict once its selection was refused (said once, when it was).
     #[expect(clippy::too_many_arguments, reason = "one call, a finished test's parts")]
     fn ran(
         &mut self,
@@ -711,7 +789,7 @@ impl Suited {
         executed: test::Executed,
         trace: test::Trace,
         outside: bool,
-    ) -> Result<(Option<Verdict>, Option<Drove>), String> {
+    ) -> Result<(Option<(Verdict, Option<blaze_api::RanWhy>)>, Option<Drove>), String> {
         let (tests, table) = listing(job, self.unit);
         let Some(n) = self.find(tests, name) else {
             // alloc: error path
@@ -764,11 +842,13 @@ impl Suited {
             .map_err(|why| format!("what test `{name}` of `{suite}` read can't be told, so how it ran can't be kept: {why}"))?;
         // alloc: error path
         given.map_err(|why| format!("keeping how test `{name}` of `{suite}` ran: {why}"))?;
-        let verdict = selection.verdict(place);
         let program = Program { now: &taken.now, before: taken.before.as_deref() };
         let mut runs = Vec::new_in(Global);
-        let drove = match self.driver.drive(selection, records, program, &mut self.disk, &mut runs) {
-            Ok(drove) => drove,
+        // The verdict after the drive that settles and files the run: read before it, a pass
+        // not kept for a race its settle found said only `ok` (until 2026-11-14).
+        let settled = self.driver.settled(selection, records, program, &mut self.disk, &mut runs, place);
+        let (verdict, drove) = match settled {
+            Ok(settled) => settled,
             Err(HostError::Select(why @ SelectError::MissingIndex { .. })) => return Err(self.refused(&why, records.puts)),
             // alloc: error path
             Err(why) => return Err(format!("selecting the tests of `{suite}` after `{name}` ran: {why}")),
@@ -777,7 +857,8 @@ impl Suited {
             // alloc: error path
             return Err(format!("the tests of `{suite}`: {}", HostError::LateRun { test: late.test }));
         }
-        Ok((verdict, Some(drove)))
+        let why = ran_why(verdict, selection, taken);
+        Ok((Some((verdict, why)), Some(drove)))
     }
 
     /// Its selection ended: the new head given to `selectors` for its next run, and to `puts`

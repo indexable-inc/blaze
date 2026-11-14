@@ -172,6 +172,15 @@ export interface Unchecked {
 }
 
 export interface TestResult {
+  /** It ran although selection was asked: why (`no-head`, `no-row`, `unknown-state`,
+   * `function-changed`, `read-changed`, `run-all`), the ask that changed and its answers. */
+  ran: {
+    ask: string | null;
+    now: string | null;
+    why: string;
+    said: string;
+    before: string | null;
+  } | null;
   name: string;
   binary: string;
   cached: {

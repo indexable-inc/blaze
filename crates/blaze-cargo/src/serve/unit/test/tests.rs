@@ -12,7 +12,7 @@ use blaze_keyed::kind::{Key, TestIndex};
 use blaze_testsel::{
     Bound, FnId, Record,
     ask::Basis,
-    machine::{By, NotKept, Verdict},
+    machine::{By, Missed, NotKept, Verdict},
 };
 use blaze_usercode::{
     test::{Executed, Lines, Trace, wire::Table},
@@ -200,12 +200,13 @@ fn a_cached_test_is_a_pass_and_a_run_not_kept_says_why() {
     assert_eq!(cached.millis, 0);
     assert!(matches!(cached.basis, blaze_api::Basis::Reached { .. }), "{cached:?}");
 
-    let clock = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraceable(Untraceable::Clock) };
+    let missed = Missed::NoRow;
+    let clock = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraceable(Untraceable::Clock), missed };
     let said = super::not_kept(clock).expect("a pass not kept says why");
     assert_eq!((said.no.as_str(), said.why.as_str()), ("clock", "it read the wall clock"));
-    let failed = Verdict::NotKept { passed: false, micros: 5, why: NotKept::Failed };
+    let failed = Verdict::NotKept { passed: false, micros: 5, why: NotKept::Failed, missed };
     assert_eq!(super::not_kept(failed), None);
-    assert_eq!(super::not_kept(Verdict::Ran { micros: 5, basis: Basis::Executed }), None);
+    assert_eq!(super::not_kept(Verdict::Ran { micros: 5, basis: Basis::Executed, missed }), None);
     let unchanged = Verdict::Cached { by: By::Unchanged, basis: Basis::Executed, micros: None };
     assert_eq!(super::not_kept(unchanged), None);
 }

@@ -433,6 +433,7 @@ fn result(binary: &str, name: &str, outcome: TestOutcome, output: &str) -> TestR
     let millis = if outcome == TestOutcome::Ignored { 0 } else { 5 };
     let executable = if binary.ends_with("x-4567") { 1 } else { 3 };
     TestResult {
+        ran: None,
         binary: binary.to_owned(),
         name: name.to_owned(),
         outcome,
@@ -522,9 +523,46 @@ fn the_daemons_results_as_json() {
         "{text}"
     );
     assert!(!text.contains(r#""kept""#), "{text}");
+    assert!(text.contains(r#","ran":null,"#), "{text}");
     text.clear();
     super::super::json::test_result(&mut text, &not_kept("/w/foo", "t", "clock", "it read the wall clock"));
     assert!(text.contains(r#""kept":{"no":"clock"}"#), "{text}");
+    text.clear();
+    super::super::json::test_result(&mut text, &ran("/w/foo", "t"));
+    assert!(
+        text.contains(r#","ran":{"why":"read-changed","ask":"env HOME","before":"a1","now":"b2"},"#),
+        "{text}"
+    );
+}
+
+/// `-v` says why a test ran although selection was asked; without it the line is libtest's.
+#[test]
+fn a_test_that_ran_says_why_with_v() {
+    let results = [ran("/w/foo", "t")];
+    let verbose = Speaking { verbose: 1, ..speaking() };
+    for (speaking, line) in [
+        (speaking(), "test t ... ok\n"),
+        (verbose, "test t ... ok (ran: env HOME changed: a1 -> b2)\n"),
+    ] {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert!(from_daemon(&results, speaking, &mut out, &mut err).unwrap());
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains(line), "{out}");
+    }
+}
+
+/// A pass of `binary`'s test `name` that ran because the environment variable `HOME` changed.
+fn ran(binary: &str, name: &str) -> TestResult {
+    TestResult {
+        ran: Some(blaze_api::RanWhy {
+            ask: Some("env HOME".to_owned()),
+            now: Some("b2".to_owned()),
+            why: "read-changed".to_owned(),
+            said: "env HOME changed: a1 -> b2".to_owned(),
+            before: Some("a1".to_owned()),
+        }),
+        ..result(binary, name, TestOutcome::Passed, "")
+    }
 }
 
 #[test]

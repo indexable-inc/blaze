@@ -14,7 +14,7 @@ use blaze_keyed::{
     store::Put,
 };
 
-use super::{Effect, Executed, Input, NotKept, Ran, SelectError, Selection, Start, Step, Test, Verdict};
+use super::{Effect, Executed, Input, Missed, NotKept, Ran, SelectError, Selection, Start, Step, Test, Verdict};
 use crate::{
     ask::{ABSENT, Ask, UNLOGGED},
     table::{Bound, FnId},
@@ -146,11 +146,13 @@ fn one(marks: Marks) -> Verdict {
 fn a_detached_selection_keeps_a_traced_pass_and_names_what_it_does_not_keep() {
     assert!(matches!(one(PLAIN), Verdict::Ran { .. }), "{:?}", one(PLAIN));
     let foreign = Marks { foreign: true, ..PLAIN };
-    assert_eq!(one(foreign), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Foreign });
+    // Each request runs its test whatever its head holds: `--run-all` is why it ran.
+    let missed = Missed::RunAll;
+    assert_eq!(one(foreign), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Foreign, missed });
     let untraced = Marks { traced: false, ..PLAIN };
-    assert_eq!(one(untraced), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraced });
+    assert_eq!(one(untraced), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraced, missed });
     let moved = Marks { moved: true, ..PLAIN };
-    assert_eq!(one(moved), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Moved });
+    assert_eq!(one(moved), Verdict::NotKept { passed: true, micros: 5, why: NotKept::Moved, missed });
     assert_eq!(NotKept::Foreign.code(), "foreign");
     assert_eq!(NotKept::Untraced.code(), "untraced");
     assert_eq!(NotKept::Moved.code(), "moved");

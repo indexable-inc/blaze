@@ -1093,6 +1093,21 @@ are `name`, `binary`, `executable`, `outcome`, `millis`, `outside` and `output`,
 - `kept`: only for a pass that is not kept, as `{"no": "clock"}`. Its word is one of
   `unsandboxed`, `untraced`, `foreign`, `clock`, `random`, `network`, `descriptor`, `raced`,
   `moved` or `too-many-shapes`.
+- `ran`: always present. It is null for a test that did not run (cached, ignored) or that
+  selection did not judge. For a test that ran it is `{"why", "ask", "before", "now"}`, why no
+  kept pass held:
+  - `run-all`: `--run-all` was given.
+  - `no-head`: no pass of the suite was kept yet.
+  - `unknown-state`: the head was restored from the journal for another binary, and this daemon
+    has no image of it.
+  - `no-row`: no pass of this test was kept.
+  - `function-changed`: `ask` is `fn ID` (or `the code no slot calls`), and `before` and `now`
+    are its bound code, or `gone`.
+  - `read-changed`: `ask` is `file PATH`, `dir PATH`, `env NAME` or `env *` (the whole
+    environment), and `before` and `now` are its digests, or `absent`.
+
+  With `-v`, the libtest line ends with the same reason as a sentence:
+  `test tests::muls ... ok (ran: fn 3f2a91c04b1e changed: 81aa02c3d4e5 -> 0c9d17e2b3f4)`.
 
 `--ub` runs the tests picked (every one) in blaze's MIR evaluator under the checker of
 undefined behavior (`crates/hir-ty-ub`), compiling nothing. `--ub-seed N` and

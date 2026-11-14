@@ -55,8 +55,8 @@ pub use blaze_protocol::events::NodeKind;
 pub use blaze_report::{Blocks, Fact, Fix, Report, Severity, Span as ReportSpan, Text};
 pub use blaze_vfs::{Mode, Op};
 pub use borrowed::{
-    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, ResponseRef,
-    SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
+    BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, LiveFrameRef, RanWhyRef,
+    ResponseRef, SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
 };
 pub use diagnostics::{Base, Found, Seen};
 pub use goal::{Goal, Tiers};
@@ -126,7 +126,9 @@ use serde::{Deserialize, Serialize};
 /// test is [`TestOutcome::Passed`] with [`TestResult::cached`] and `millis` 0; and
 /// [`Response::TestsOf`] ([`TestsOf`], [`Near`]): each test executable's count of tests, how
 /// many the filter left out, and the nearest names to a filter that matched none.
-pub const SCHEMA: u32 = 58;
+/// 59: [`TestResult::ran`] ([`RanWhy`]): why a test that ran was not reported cached, by
+/// name, and for a changed ask which one with its answers then and now.
+pub const SCHEMA: u32 = 59;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -1762,8 +1764,12 @@ impl ArtifactKind {
     }
 }
 
+/// One test's result. Its fields are declared in the order CBOR writes a map's keys.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct TestResult {
+    /// It ran although selection was asked: why no kept pass of it held. `None` for a cached
+    /// result, an ignored test and a run selection did not judge.
+    pub ran: Option<RanWhy>,
     pub name: String,
     /// The test executable, as cargo's `Running` line names it.
     pub binary: String,
@@ -1812,6 +1818,22 @@ pub struct TestsOf {
 pub struct Near {
     pub name: String,
     pub distance: u32,
+}
+
+/// Why a test ran rather than being reported cached (blaze-testsel's `machine::Missed`):
+/// `why` is the stable word a tool matches on (`run-all`, `no-head`, `unknown-state`,
+/// `no-row`, `function-changed`, `read-changed`) and `said` the sentence a person reads. For a
+/// changed ask, `ask` names it (`fn` and its id, or `file`, `dir` or `env` and its name) and
+/// `before` and `now` are its answers at the kept pass and now, as short ids (`absent` for
+/// nothing there, `gone` for a function no longer in the binary); `None` where not known. Its
+/// fields are declared in the order CBOR writes a map's keys.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct RanWhy {
+    pub ask: Option<String>,
+    pub now: Option<String>,
+    pub why: String,
+    pub said: String,
+    pub before: Option<String>,
 }
 
 /// Why a pass was not kept (blaze-testsel's `machine::NotKept`): `no` is the stable word a
@@ -2375,6 +2397,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), ran);
 
         let result = TestResult {
+            ran: None,
             name: "t".to_owned(),
             binary: "b".to_owned(),
             cached: None,

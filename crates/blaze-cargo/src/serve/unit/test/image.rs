@@ -93,6 +93,14 @@ pub(crate) struct Taken {
     pub(crate) held: Option<Held>,
 }
 
+impl Taken {
+    /// A head was held and is not used: one restored from its journal mark, of another binary
+    /// than this one, whose changes since can't be told with no image of its state.
+    pub(crate) fn head_dropped(&self) -> bool {
+        self.head.is_none() && self.held.as_ref().is_some_and(|held| held.head.is_some())
+    }
+}
+
 /// The daemon's suites' heads, one per suite (its given): each test run takes its suite's
 /// ([`Selectors::take`]) and gives the new head back when its selection ends
 /// ([`Selectors::give`]); one that does not gives back what it took. The lock is taken twice

@@ -122,6 +122,7 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
             linked_paths: Vec::new(),
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::parses".to_owned(),
             binary: "/t/debug/deps/app-1234".to_owned(),
             cached: Some(Cached {
@@ -137,6 +138,13 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
             not_kept: None,
         }),
         Response::TestResult(TestResult {
+            ran: Some(RanWhy {
+                ask: Some("env HOME".to_owned()),
+                now: Some("b2".to_owned()),
+                why: "read-changed".to_owned(),
+                said: "env HOME changed: a1 -> b2".to_owned(),
+                before: Some("a1".to_owned()),
+            }),
             name: "tests::clock".to_owned(),
             binary: "/t/debug/deps/app-1234".to_owned(),
             cached: None,

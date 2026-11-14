@@ -422,6 +422,7 @@ fn seeds() -> Vec<Vec<u8>> {
             }),
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::a".to_owned(),
             binary: "a".to_owned(),
             cached: None,
@@ -436,6 +437,7 @@ fn seeds() -> Vec<Vec<u8>> {
             executable: 0,
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::b".to_owned(),
             binary: "a".to_owned(),
             cached: Some(Cached {
@@ -451,6 +453,7 @@ fn seeds() -> Vec<Vec<u8>> {
             executable: 0,
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::c".to_owned(),
             binary: "b".to_owned(),
             cached: Some(Cached {

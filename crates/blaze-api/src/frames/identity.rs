@@ -16,7 +16,7 @@ use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, Behind, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Documented, DocumentedCrate, Edit, Edited, EditedItem, Envelope,
     FactRead, FetchVerb, Goal, How, Level, LinkHow, LinkKind, Linked, LiveFrame, Memory, Mismatch,
-    NodeKind, NotKept, OpenFailure, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
+    NodeKind, NotKept, OpenFailure, RanWhy, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, ServedCrate,
     ServedPart, Span, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Tiers, Traced, Ub, Unbuilt, Unchecked, UnitOf, UnitProfile, UnitStarted,
     UnitTarget, Verb, ViewRef, Worked,
@@ -643,6 +643,13 @@ impl Gen {
                 }),
             }),
             8 => Response::TestResult(TestResult {
+                ran: self.maybe(|g| RanWhy {
+                    ask: g.maybe_text(),
+                    now: g.maybe_text(),
+                    why: g.text(),
+                    said: g.text(),
+                    before: g.maybe_text(),
+                }),
                 name: self.text(),
                 binary: self.text(),
                 cached: self.maybe(|g| Cached {

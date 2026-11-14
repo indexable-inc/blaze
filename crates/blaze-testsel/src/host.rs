@@ -33,11 +33,11 @@ use blaze_keyed::{
     pool::Ticket,
     store::Put,
 };
-use blaze_usercode::trace::Inputs;
+use blaze_usercode::trace::{self, Inputs};
 
 use crate::{
     ask::{self, ABSENT, Ask, ReadKind, Shape, UNLOGGED},
-    machine::{Effect, Executed, Input, NotWhole, Ran, Read, SelectError, Selection, Step},
+    machine::{Effect, Executed, Input, NotWhole, Ran, Read, SelectError, Selection, Step, Verdict},
     record::Record,
     table::{Bound, FnId, Image, TableError},
 };
@@ -101,6 +101,8 @@ pub enum HostError {
     Unbounded { steps: u64 },
     /// The machine asked to run a test after its runs were all out.
     LateRun { test: u32 },
+    /// A run given back had no verdict once the selection was driven after it: a bug in it.
+    Unsettled { test: u32 },
 }
 
 impl fmt::Display for HostError {
@@ -134,6 +136,11 @@ impl fmt::Display for HostError {
             HostError::LateRun { test } => {
                 write!(f, "the test selection asked to run test {test} after its runs were out")
             }
+            HostError::Unsettled { test } => write!(
+                f,
+                "test {test} of the selection has no verdict once it was driven after its run (rule \
+                 errors-name-the-thing: a run is never reported without one)"
+            ),
         }
     }
 }
@@ -254,6 +261,31 @@ impl Driver {
         Err(HostError::Unbounded { steps })
     }
 
+    /// `selection` driven after a run was given to it ([`Driver::ran`]), as [`Driver::drive`]
+    /// drives it, and that run's verdict (`at`: its test's place among those asked), with where
+    /// the drive stopped. A pass that can be kept is settled and filed only in this drive, and
+    /// a race its settle finds is said only then: its verdict is none before it, so a runner
+    /// says a run's line from what this returns, never from [`Selection::verdict`] read
+    /// between the two (which hid every settle-time `not kept` until 2026-11-14).
+    pub fn settled<A: AllocatorClone, R: Records, I: Inputs>(
+        &mut self,
+        selection: &mut Selection<'_, A>,
+        records: &mut R,
+        program: Program<'_>,
+        inputs: &mut I,
+        runs: &mut Vec<Out, Global>,
+        at: u32,
+    ) -> Result<(Verdict, Drove), HostError>
+    where
+        I::Error: fmt::Display,
+    {
+        let drove = self.drive(selection, records, program, inputs, runs)?;
+        match selection.verdict(at) {
+            Some(verdict) => Ok((verdict, drove)),
+            None => Err(HostError::Unsettled { test: at }),
+        }
+    }
+
     /// Gives `selection` how a run ended, against `image`, the binary it ran.
     pub fn ran<A: AllocatorClone>(
         &mut self,
@@ -372,6 +404,16 @@ where
             .dir(Path::new(OsStr::from_bytes(name)))
             .map_err(|why| unreadable(ReadKind::Dir, name, why))?
             .map_or(ABSENT, ContentId),
+        // The whole environment: a run that walked it (and every sandboxed test reads it whole
+        // from the start, as its spec names no given variables) has it in its trace as the hash
+        // of the names a walk sees ([`trace::ALL_ENV_NAME`], [`trace::names_hash`]), so its
+        // answer now is that hash of what a walk sees now. No variable has that name: asked by
+        // name it is never there, and every such run would race its own settle.
+        Ask::Read(ReadKind::Env, name)
+            if name == trace::ALL_ENV_NAME.as_bytes() && !crate::planted(crate::Plant::WholeEnvAskedByName) =>
+        {
+            ask::env_digest(trace::names_hash(inputs.env_all()).as_bytes())
+        }
         Ask::Read(ReadKind::Env, name) => {
             inputs.env(OsStr::from_bytes(name)).map_or(ABSENT, |value| ask::env_digest(value.as_bytes()))
         }

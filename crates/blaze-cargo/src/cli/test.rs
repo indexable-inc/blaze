@@ -1089,6 +1089,7 @@ pub fn from_daemon(
             &mut text,
             &grouped[starts[b] as usize..starts[b + 1] as usize],
             speaking.color,
+            speaking.verbose > 0,
         );
         out.write_all(text.as_bytes())?;
     }
@@ -1098,9 +1099,10 @@ pub fn from_daemon(
 
 /// One executable's results as libtest's `PrettyFormatter` writes them, into `text`; whether
 /// none failed. A cached test's line is `test NAME ... ok <0.012s> (cached)`, with the time its
-/// kept run took; a pass not kept ends `(not kept: WHY)`; the summary counts the cached among
-/// the passed: `41 passed (38 cached)`.
-pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool {
+/// kept run took; a pass not kept ends `(not kept: WHY)`; with `verbose` (`-v`), a test that ran
+/// although selection was asked ends `(ran: WHY)`, what changed since its kept pass; the summary
+/// counts the cached among the passed: `41 passed (38 cached)`.
+pub fn libtest(text: &mut String, results: &[&TestResult], color: bool, verbose: bool) -> bool {
     let paint = |text: &mut String, style: &str, said: &str| {
         if color {
             text.push_str(style);
@@ -1143,6 +1145,11 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
         if let Some(not) = &result.not_kept {
             text.push_str(" (not kept: ");
             text.push_str(&not.why);
+            text.push(')');
+        }
+        if let Some(ran) = result.ran.as_ref().filter(|_| verbose) {
+            text.push_str(" (ran: ");
+            text.push_str(&ran.said);
             text.push(')');
         }
         text.push('\n');

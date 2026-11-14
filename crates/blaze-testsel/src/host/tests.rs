@@ -1,15 +1,23 @@
 //! The runner's host, simulated as `blaze test` drives it: per request, the selection driven
 //! in one snapshot until its runs are out, detached, its runs finished by a scripted queue in an
-//! order the tape picks, each given back and the selection driven again, to its end. The store
-//! is a map that never overwrites; the program is a model binary of a few functions whose tests
-//! each execute some of them and read one file.
+//! order the tape picks, each given back and the selection driven again ([`Driver::settled`]),
+//! its line said from the verdict that returns, to its end. The store is a map that never
+//! overwrites; the program is a model binary of a few functions whose tests each execute some
+//! of them and read one file. Each run's reads are assembled from the lines the sandbox writes
+//! for a test (`trace::assemble_seen`), as the runner assembles them: a test server's spec
+//! names no given variables, so every test reads the whole environment from the start
+//! (`E\t\t*`), beside its file. Until 2026-11-14 the script handed the machine a hand-made
+//! read of one file and read verdicts only from the report: the runner's whole-environment
+//! read, which the host answered as a variable no one has, and its line read before the drive
+//! that settles it, were both outside it, and every real run went unkept unseen.
 //!
 //! The invariant: across a sequence of requests (the first, a no-op, an edit of one function,
 //! its undo, an edit of one file, a run of every test, a no-op), a test is reported cached only
 //! when it passes now and everything it executed and read is as it was at a kept pass; and it
 //! runs exactly when that is not so (or every test is asked, or it failed last time): the
 //! no-op runs only the failing tests, the edit runs exactly the tests that executed the
-//! function, the undo runs only the failing tests, `--run-all` runs every test.
+//! function, the undo runs only the failing tests, `--run-all` runs every test. Each run's line
+//! says the verdict the request ends with, and why it ran ([`Missed`]).
 
 use std::alloc::Global;
 use std::collections::BTreeMap;
@@ -24,12 +32,12 @@ use blaze_keyed::{
     store::Put,
 };
 use blaze_sim::{Broke, Config, Tape};
-use blaze_usercode::trace::{Entry, Inputs, Names};
+use blaze_usercode::trace::{self, Entry, Inputs, Names, Seen};
 
 use super::{BaseOf, Driver, Drove, Ended, HostError, Out, Program, Records, base};
 use crate::{
     PLANT, Plant,
-    machine::{NotKept, Selection, Start, Test, Verdict},
+    machine::{Missed, NotKept, Selection, Start, Test, Verdict},
     record::{Record, Table},
     table::{Bound, FnId, Image, Version},
 };
@@ -84,9 +92,15 @@ impl Records for Mem {
     }
 }
 
-/// The files now.
+/// The environment blaze gives each test: in its base key, and what a walk of it sees.
+fn env() -> Vec<(OsString, OsString)> {
+    vec![("HOME".into(), "/h".into()), ("PATH".into(), "/bin".into())]
+}
+
+/// The files now, and the environment blaze gives the tests (sorted by name).
 struct Disk {
     files: [u8; FILES],
+    env: Vec<(OsString, OsString)>,
 }
 
 impl Inputs for Disk {
@@ -100,12 +114,13 @@ impl Inputs for Disk {
         Ok(None)
     }
 
-    fn env(&mut self, _: &OsStr) -> Option<&OsStr> {
-        None
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        let at = self.env.binary_search_by(|it| it.0.as_os_str().cmp(name)).ok()?;
+        Some(&self.env[at].1)
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
-        &[]
+        &self.env
     }
 
     fn names(&mut self, _: &Path, _: &mut Names<'_>) -> Result<bool, String> {
@@ -184,14 +199,17 @@ fn harness(why: HostError) -> Broke {
 fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Result<Vec<Verdict>, Broke> {
     let image = model.image()?;
     let names: Vec<String> = (0..TESTS).map(name).collect();
+    let given = env();
     let tests: Vec<Test<'_>> = names
         .iter()
         .map(|name| {
-            let base = base(&BaseOf { tool: tool(), settings: ContentId::of("host sim suite", &[]), env: &[], name, attrs: ContentId::default() });
+            let base = base(&BaseOf { tool: tool(), settings: ContentId::of("host sim suite", &[]), env: &given, name, attrs: ContentId::default() });
             Test { base, name }
         })
         .collect();
-    let mut disk = Disk { files: model.files };
+    let mut disk = Disk { files: model.files, env: given.clone() };
+    // By test: the verdict its line said, from the drive after its run.
+    let mut said: Vec<Option<Verdict>> = vec![None; TESTS];
     let mut driver = Driver::default();
     let mut runs = Vec::new_in(Global);
     let program = Program { now: &image, before: runner.before.as_ref() };
@@ -220,13 +238,12 @@ fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Re
         let passed = !model.fails[test];
         let hits: Vec<u32> = model.executes[test].iter().map(|at| *at as u32).collect();
         let record = Record::Complete { table: TABLE, hits };
-        let read = file(model.reads[test]);
-        let traced = Traced {
-            files: vec![(read, Some(content(model.files[model.reads[test]])))],
-            dirs: Vec::new(),
-            env: Vec::new(),
-            untraceable: Vec::new(),
-        };
+        // What the sandbox writes for the test: the whole environment from the start (its spec
+        // names no given variables), then its file; assembled against the disk now, as the
+        // runner assembles a test's lines once it ends.
+        let read = file(model.reads[test]).to_string_lossy().into_owned();
+        let lines = [(Seen::Env, trace::ALL_ENV), (Seen::Read, read.as_str())];
+        let traced: Traced = trace::assemble_seen(lines, &mut disk).map_err(Broke::Harness)?;
         let reached = || Vec::new_in(Global);
         let ended = Ended {
             ticket,
@@ -241,7 +258,10 @@ fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Re
             moved: false,
         };
         driver.ran(&mut selection, &image, &ended).map_err(harness)?;
-        drove = driver.drive(&mut selection, &mut runner.store, program, &mut disk, &mut runs).map_err(harness)?;
+        let (verdict, now) =
+            driver.settled(&mut selection, &mut runner.store, program, &mut disk, &mut runs, test as u32).map_err(harness)?;
+        drove = now;
+        said[test] = Some(verdict);
         if !runs.is_empty() {
             return Err(Broke::Harness("the selection asked for a run after its runs were out".into()));
         }
@@ -256,6 +276,26 @@ fn request(runner: &mut Runner, model: &Model, run_all: bool, tape: &Tape) -> Re
     };
     runner.head = Some(report.head);
     let verdicts = report.verdicts.to_vec();
+    // Each run's line is the verdict its request ends with, and says why it ran: none of the
+    // first request's tests had a head to be found in, every `--run-all` test ran for it.
+    for (test, line) in said.iter().enumerate() {
+        let Some(line) = line else { continue };
+        if *line != verdicts[test] {
+            return Err(Broke::Oracle(format!("test {test}'s line said {line:?}, and its request ended with {:?}", verdicts[test])));
+        }
+        let missed = match line {
+            Verdict::Ran { missed, .. } | Verdict::NotKept { missed, .. } => *missed,
+            Verdict::Cached { .. } => return Err(Broke::Oracle(format!("test {test} ran and its line says cached"))),
+        };
+        let expected = match (run_all, head) {
+            (true, _) => Some(Missed::RunAll),
+            (false, None) => Some(Missed::NoHead),
+            (false, Some(_)) => None,
+        };
+        if expected.is_some_and(|expected| expected != missed) {
+            return Err(Broke::Oracle(format!("test {test} ran, and says {missed:?} for why")));
+        }
+    }
     runner.before = Some(image);
     for (test, verdict) in verdicts.iter().enumerate() {
         if matches!(verdict, Verdict::Ran { .. }) {
@@ -354,4 +394,12 @@ fn the_runner_reruns_exactly_what_can_have_changed() {
 #[test]
 fn the_runner_oracle_catches_a_shortcut_that_skips_the_changes() {
     blaze_sim::control(Config::cases(64), Plant::None, Plant::ShortcutSkipsChanged, "reported cached with no kept pass", sequence);
+}
+
+/// The control: with the whole environment answered as a variable of its name (as until
+/// 2026-11-14), every run that read it races its settle and is not kept, so a no-op runs every
+/// test again, and the oracle says so.
+#[test]
+fn the_runner_oracle_catches_the_whole_environment_answered_by_name() {
+    blaze_sim::control(Config::cases(32), Plant::None, Plant::WholeEnvAskedByName, "can have changed", sequence);
 }

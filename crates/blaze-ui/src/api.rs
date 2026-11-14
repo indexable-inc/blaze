@@ -1088,6 +1088,7 @@ mod tests {
     #[test]
     fn a_failed_test_shows_its_output_and_a_passed_one_does_not() {
         let mut result = TestResult {
+            ran: None,
             binary: "t".to_owned(),
             name: "parses".to_owned(),
             cached: None,

@@ -1,0 +1,14 @@
+{
+ "id": "test-selection-ran-every-time-unexplained",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), test selection lane, fix-hello-1113",
+ "where": "crates/blaze-testsel/src/host.rs answer (the env arm); crates/blaze-cargo/src/serve/unit/test.rs Suited::ran; crates/blaze-testsel/src/host/tests.rs",
+ "what": "On a real crate every test ran on every request (ran=3, cached=0) and no line said why. The sandboxed test server gives no variables, so every trace reads the whole environment as one read named `\\0*`; host::answer looked that name up as a variable, answered absent, every settle raced and nothing was kept. The runner read each verdict before the drive that settles it, so the `not kept: raced` was printed as a plain `ok`.",
+ "cost": "a scenario pass that showed only counts, then a pass reading the path by hand to find the cause",
+ "cause": "a run's verdict had no reason for running, and the runner could read a verdict at a moment it was not yet final; the host test scripted traces with no whole-environment read and checked verdicts only in the final report",
+ "class": "a decision whose outcome is reported without its reason, and an outcome read before the step that settles it",
+ "prevention": "every run's verdict carries why it ran (machine::Missed), on the wire as TestResult::ran and on the line with -v; host::Driver::settled is the one way a runner gets a run's verdict; the host simulation scripts real traces (whole environment included) and checks each settled verdict against the report, with a planted control (Plant::WholeEnvAskedByName)",
+ "workaround": "none needed after the fix",
+ "fix": "written in the working tree of fix-hello-1113, not yet compiled or run",
+ "state": "open"
+}

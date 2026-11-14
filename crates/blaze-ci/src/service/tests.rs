@@ -164,6 +164,7 @@ fn error(message: &str, file: &str) -> Response {
 
 fn test_result(name: &str, outcome: TestOutcome, output: &str) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "blaze_ci".to_owned(),
         name: name.to_owned(),
         cached: None,
@@ -179,6 +180,7 @@ fn test_result(name: &str, outcome: TestOutcome, output: &str) -> Response {
 /// A test not run whose kept pass stands.
 fn cached_result(name: &str) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "blaze_ci".to_owned(),
         name: name.to_owned(),
         cached: Some(Cached { basis: Basis::Executed, millis: 12, outcome: TestOutcome::Passed }),
@@ -1095,6 +1097,7 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                     });
                     let output = outputs[rng.index(outputs.len())].repeat(1 + rng.index(40));
                     Response::TestResult(TestResult {
+                        ran: None,
                         binary: "blaze_ci".to_owned(),
                         name: format!("t{at}"),
                         cached,
