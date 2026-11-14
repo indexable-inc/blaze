@@ -35,13 +35,17 @@
 //! encoded in memory here and handed to the core, which writes it to a hidden name, syncs it to
 //! stable storage, then renames it, so DuckDB never reads half a file and a power loss never
 //! leaves the manifest listing bytes the disk lost (every file and the manifest, with the
-//! directory synced around the manifest's rename). Past the cap the history is opened with
-//! ([`cap_for`] of the home's store, or [`CAP_VAR`]), the oldest builds are retired first, each whole: every table and flush of a
-//! build at once, with every file that holds a row of it and so every build those files hold
-//! rows of too, so a reader of a build reads all of it or none; never a build still running
-//! ([`History::build_started`] to [`History::build_ended`]) nor the newest flush's. What goes is
-//! said as a WARN event ([`said_capped`]), as are rows the rings wrote over before a flush
-//! read them: the history never loses rows with nothing said.
+//! directory synced around the manifest's rename). The last [`KEEP_BUILDS`] finished builds
+//! and every build still running ([`History::build_started`] to [`History::build_ended`]) are
+//! kept whole whatever the cap and whatever flushes come after them. Past the cap the history
+//! is opened with ([`cap_for`] of the home's store, or [`CAP_VAR`]), the other builds are
+//! retired oldest first, each whole: every table and flush of a build at once, with every file
+//! that holds a row of it and so every build those files hold rows of too, so a reader of a
+//! build reads all of it or none. Only the Parquet files count against the cap. What goes is
+//! said as a WARN event ([`said_capped`]), and the manifest keeps the highest build the cap
+//! retired ([`manifest::CappedBuilds`]), so a reader that finds no build says why; rows the
+//! rings wrote over before a flush read them are said too: the history never loses rows with
+//! nothing said.
 //!
 //! A flush every [`EVERY`] would leave thousands of files a long build (a 52-minute self-build
 //! left 3,250), and every reader reads each one's footer. So after each flush the
@@ -159,10 +163,28 @@ pub use retire::PINS;
 /// The most the history keeps by default, whatever the store holds: 256 MiB, about 25
 /// million rows at the ~10 bytes a row takes compressed. Measured 2026-11-11: hello-world's
 /// cold build (std's front end and code, 400,000 spans) is 18 MiB and each edit after it
-/// 0.3 MiB; a day's work under the 4 GiB cap of before left 1.3 GiB. The newest flush's
-/// builds and every build still running are never retired ([`files`]), so the build being
-/// asked about is whole whatever the cap. What goes is said each time ([`said_capped`]).
+/// 0.3 MiB; a day's work under the 4 GiB cap of before left 1.3 GiB. The last
+/// [`KEEP_BUILDS`] finished builds and every build still running are never retired
+/// ([`files`]), so the build being asked about is whole whatever the cap. What goes is said
+/// each time ([`said_capped`]).
 pub const CAP_MOST: u64 = 256 << 20;
+
+/// How many finished builds the history keeps whole whatever its cap: the highest-numbered
+/// builds any listed file holds rows of that are not running, beside every running build.
+///
+/// Why a count and not only bytes: until 2026-11-14 the cap kept only the newest flush's
+/// builds, and every reader asks for a flush before it reads, so a flush of rows of no build
+/// (the daemon's own heartbeat) became the newest and the cap retired the build just asked
+/// about; a hello-world home lost every build by its third query (`blaze debug sql` answered
+/// "0 rows" from then on). A count says what a reader may rely on in builds, the unit it asks
+/// about, and no flush can move it.
+///
+/// Why 8: `blaze explain` compares a build with the one before it, and an edit loop asks about
+/// the last few; 8 covers that with room. Its floor is those builds' own bytes: 8 edits of
+/// hello-world are about 2.4 MiB (0.3 MiB each, measured 2026-11-11, see [`CAP_MOST`]), under
+/// [`CAP_LEAST`]; a cold build of a large project can alone be past the cap, and stays, said
+/// once ([`files::Capped::over`]).
+pub const KEEP_BUILDS: usize = 8;
 
 /// The least the history keeps by default: 8 MiB, a few dozen edits' rows, so a new home's
 /// profile is not a tenth of the home (2026-11-12: a hello-world home held 92 MB of profile
@@ -449,7 +471,28 @@ const RECENT_BUILDS: usize = 64;
 /// Says what the cap retired, as one WARN event with the counts as its fields, so `blaze
 /// explain problems` names it and the builds whose rows are gone. Until 2026-11-11 the cap
 /// said nothing: a long build's history held its last five minutes and no row said why.
-fn said_capped(capped: &files::Capped) {
+///
+/// And says once, as the kept builds first hold more than the cap, that they do: the cap keeps
+/// the last [`KEEP_BUILDS`] finished builds and every running one whole, so a cold build of a
+/// large project can alone be past it; that is the promise kept, not a fault, so it is said
+/// once each time the history goes past the cap (`said_over`, cleared as it fits again), not
+/// at every flush.
+fn said_capped(capped: &files::Capped, said_over: &mut bool) {
+    match (capped.over, *said_over) {
+        (0, _) => *said_over = false,
+        (over, false) => {
+            *said_over = true;
+            tracing::warn!(
+                target: "blaze",
+                over,
+                keep = KEEP_BUILDS,
+                "the profile history's kept builds (every running build and the last {KEEP_BUILDS} \
+                 finished) hold {over} bytes more than its cap: they stay whole, and the cap \
+                 retires the other builds as they come"
+            );
+        }
+        (_, true) => {}
+    }
     if capped.files == 0 {
         return;
     }
@@ -997,6 +1040,9 @@ pub struct History {
     /// and the last flush wrote: a history that drops so deletes the mapping.
     persisted: bool,
     clean: bool,
+    /// Whether the history said its kept builds are past the cap since it last fit
+    /// ([`said_capped`]).
+    said_over: bool,
 }
 
 impl History {
@@ -1035,7 +1081,8 @@ impl History {
         for refused in &opened.crashes.refused {
             tracing::warn!(target: "blaze", "{refused}");
         }
-        said_capped(&opened.capped);
+        let mut said_over = false;
+        said_capped(&opened.capped, &mut said_over);
         let blaze = identity::binary().map_err(|error| HistoryError::Identity {
             what: "hashing blaze's own executable",
             path: std::env::current_exe().unwrap_or_default(),
@@ -1129,6 +1176,7 @@ impl History {
             postmortem: opened.postmortem,
             persisted: false,
             clean: false,
+            said_over,
         };
         Ok(history)
     }
@@ -1159,12 +1207,23 @@ impl History {
         flight::persist(self.core.dir(), &self.blaze, self.process.name)
             .map_err(HistoryError::Postmortem)?;
         self.persisted = true;
-        // The cap counts the mapping from now on, as long as it is at this count (a ring made
-        // later grows it by 2 MiB, counted at the next recount), and the crash record armed
-        // beside it.
-        match self.core.job(files::Files::recount)? {
-            files::Outcome::Recounted(retired) => retired.map(|capped| said_capped(&capped)),
-            other => Err(mismatch(self.core.dir(), "counting the files beside", &other)),
+        // The mapping does not count against the cap: until 2026-11-14 it did, and on a new
+        // home (an 8 MiB cap) a mapping of 3 rings or more left the Parquet files no room at
+        // all. It is a fixed reservation the process makes whatever the history holds, so the
+        // cap, a budget for rows, is the wrong place to account it.
+        Ok(())
+    }
+
+    /// Holds the history to `cap` bytes from now on, retiring what is past it at once (the
+    /// last [`KEEP_BUILDS`] finished builds and every running one stay whole). For a daemon
+    /// whose store grew: the cap it opened with is [`cap_for`] of the store as it started.
+    pub fn set_cap(&mut self, cap: u64) -> Result<(), HistoryError> {
+        let said_over = &mut self.said_over;
+        match self.core.job(|it| it.set_cap(cap))? {
+            files::Outcome::Recounted(retired) => {
+                retired.map(|capped| said_capped(&capped, said_over))
+            }
+            other => Err(mismatch(self.core.dir(), "setting the cap of", &other)),
         }
     }
 
@@ -2027,7 +2086,7 @@ impl History {
         flushed.deleted = capped.files;
         flushed.deleted_rows = capped.rows;
         flushed.deleted_bytes = capped.bytes;
-        said_capped(&capped);
+        said_capped(&capped, &mut self.said_over);
         // Committed: what fails from here on is said apart, and the flush's number stands.
         self.deferred.extend(failed);
         self.deferred.extend(deferred);
@@ -2322,25 +2381,6 @@ mod tests {
             .map_err(|it| format!("{} of input {:?}: {}", it.doing, it.input, it.error))?;
         fs::write(output, &merged).unwrap();
         Ok(merged.len() as u64)
-    }
-
-    /// `history` held to `cap` bytes from now on: its core opened again with that cap (the core
-    /// takes its cap at its open), which retires past it at once.
-    fn recap(history: &mut History, cap: u64) {
-        let dir = history.dir().to_owned();
-        let writer = Writer::new();
-        let schemas: Vec<(String, Vec<u8>)> = schema::TABLES
-            .iter()
-            .map(|table| {
-                let file = schema_file(table);
-                let bytes = writer.encode(&dir.join(&file), table, &[]).unwrap();
-                (file, bytes)
-            })
-            .collect();
-        match history.core.job(|it| it.open(cap, schemas)).unwrap() {
-            files::Outcome::Opened(opened) => history.seq = history.seq.max(opened.unwrap().seq),
-            other => panic!("{}", mismatch(&dir, "opening again", &other)),
-        }
     }
 
     /// A fresh directory for `name`: the guard, which removes it with all it holds when it
@@ -3215,30 +3255,12 @@ mod tests {
         cap_follows(cap_for, 0, u64::MAX).unwrap();
     }
 
-    #[test]
-    fn past_the_cap_the_oldest_files_go_first() {
-        let (_tmp, dir) = scratch("cap");
-        let mut history = History::open(&dir, 1, sampler::unsampled()).unwrap();
-        let mut flushes = Vec::new();
-        for build in 1..=3 {
-            history.build_ended(row(build, Outcome::Ok));
-            flushes.push(history.flush(Some(build)).unwrap());
-        }
-        let name = |it: &Flushed| dir.join(format!("{}-{:08}.builds.parquet", it.build, it.seq));
-        assert!(
-            !name(&flushes[0]).exists() && !name(&flushes[1]).exists(),
-            "the older builds' files are deleted"
-        );
-        assert!(
-            name(&flushes[2]).exists(),
-            "the newest flush's files stay, though they are past the cap alone"
-        );
-        assert!(dir.join("schema.spans.parquet").exists(), "the schema files are not the cap's");
-        assert!(
-            history.core.files().kept().all(|it| it.name.last == flushes[2].seq),
-            "only the newest flush is kept"
-        );
-    }
+    // What the cap retires, and when a pinned file goes, is tested on the core under the
+    // simulation (files/tests.rs: `the_last_builds_stay_whole_through_any_flushes_pins_and_restarts`).
+    // Three tests here did it through a `History` until 2026-11-14 and failed one run in a few:
+    // the flight recorder's rings are the process's, so every history of the test process
+    // drains every other test's rows, and their build ids named this test's flushes and tied
+    // its files into units with foreign builds. A core test is handed exactly its rows.
 
     /// The listable files in `dir`, by name: what is on disk beside the manifest.
     fn on_disk(dir: &Path) -> BTreeSet<String> {
@@ -3354,41 +3376,6 @@ mod tests {
         assert_eq!(listed_rows(&dir, &schema::BUILDS), 2);
     }
 
-    /// A reader's pin keeps the files the manifest it read lists on disk while the cap (or a
-    /// merge) retires them; they go at the first flush after the pin drops.
-    #[test]
-    fn a_pinned_reader_keeps_retired_files_until_it_lets_go() {
-        let (_tmp, dir) = scratch("pinned-merge");
-        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
-        history.flush(None).unwrap();
-        history.build_ended(row(5, Outcome::Running));
-        history.flush(None).unwrap();
-        let pin = Pin::take(&dir).unwrap();
-        let read: Vec<String> =
-            pin.manifest().files(schema::BUILDS.name).map(str::to_owned).collect();
-        assert!(!read.is_empty());
-        let next = u64::from(history.next_build());
-        history.build_ended(row(next, Outcome::Ok));
-        // Past the cap, the older builds' files the pin read are retired, not deleted.
-        recap(&mut history, 1);
-        history.flush(Some(next)).unwrap();
-        let now = read_manifest(&dir).unwrap();
-        assert!(
-            read.iter().any(|it| now.retired().holds(it)),
-            "the cap retired a file the pin read"
-        );
-        for name in &read {
-            assert!(dir.join(name).exists(), "{name} was deleted under a pinned reader");
-        }
-        drop(pin);
-        history.flush(None).unwrap();
-        let after = read_manifest(&dir).unwrap();
-        for (name, _) in &now.retired().files {
-            assert!(!dir.join(name).exists(), "{name} stayed after the last pin let go");
-        }
-        assert!(after.retired().files.is_empty());
-    }
-
     /// A history from before manifests gets one made of its files, written once by its next
     /// writer, listing the same files with entries read from their footers.
     #[test]
@@ -3432,37 +3419,6 @@ mod tests {
             "{error}"
         );
         assert!(dir.join("notes.parquet").exists(), "left where it was");
-    }
-
-    /// The cap deletes a build whole: every table of it, every flush of it, at once.
-    #[test]
-    fn past_the_cap_a_build_goes_whole() {
-        let (_tmp, dir) = scratch("cap-whole");
-        let mut history = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
-        // The first flush takes what the rings hold, other tests' builds' rows among them.
-        history.flush(None).unwrap();
-        history.build_ended(row(1, Outcome::Ok));
-        let one = history.flush(None).unwrap();
-        history.build_ended(row(1, Outcome::Failed));
-        history.flush(None).unwrap();
-        let old = one.build;
-        assert!(
-            history.core.files().kept().filter(|it| it.name.build == old).count() >= 2,
-            "two flushes of build {old}"
-        );
-        recap(&mut history, 1);
-        let next = u64::from(history.next_build());
-        history.build_ended(row(next, Outcome::Ok));
-        history.flush(Some(next)).unwrap();
-        assert!(
-            history.core.files().kept().all(|it| it.name.build != old),
-            "every file of build {old} is gone"
-        );
-        let manifest = read_manifest(&dir).unwrap();
-        assert!(
-            manifest.all().all(|it| Name::parse(it).is_none_or(|it| it.build != old)),
-            "and unlisted"
-        );
     }
 
     /// The flush's cost a span, in release: what docs/v2/plan/design/profile-history.md bounds.
