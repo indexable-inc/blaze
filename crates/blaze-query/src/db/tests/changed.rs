@@ -1,7 +1,7 @@
 //! The changed set's deterministic simulation: random programs of queries (sums, cutoffs,
 //! reads chosen by a value so a row's edges change, reads the engine cannot see), run through
 //! random sequences of writes, pulls, evictions, epochs and asks, on one thread, every choice
-//! drawn by Hegel. The engine code that runs is the real one: the feeds in `function`, the
+//! drawn from the tape. The engine code that runs is the real one: the feeds in `function`, the
 //! fold, the reverse index and the walk.
 //!
 //! The oracle is a from-scratch evaluation of the program after every step. The controls plant
@@ -203,35 +203,35 @@ struct Program {
     steps: Vec<Step>,
 }
 
-fn program(tc: &TestCase) -> Program {
-    let int = |low: usize, high: usize| tc.draw(gs::integers::<usize>().min_value(low).max_value(high));
-    let inputs = int(1, 5);
-    let nodes = int(1, 10);
+fn program(tape: &Tape) -> Program {
+    let int = |low: usize, high: usize, label: &'static str| tape.int_in(low..=high, label);
+    let inputs = int(1, 5, "inputs");
+    let nodes = int(1, 10, "nodes");
     let mut flow = Vec::with_capacity(nodes);
     for at in 0..nodes {
         let op = [FlowOp::Sum, FlowOp::Mod3, FlowOp::Max, FlowOp::Pick, FlowOp::Pick, FlowOp::World]
-            [int(0, 5)];
-        let deps = (0..int(1, 4))
+            [int(0, 5, "op")];
+        let deps = (0..int(1, 4, "reads"))
             .map(|_| {
-                if at > 0 && tc.draw(gs::booleans()) {
-                    Dep::Query(int(0, at - 1))
+                if at > 0 && tape.bool("reads a node") {
+                    Dep::Query(int(0, at - 1, "node read"))
                 } else {
-                    Dep::Input(int(0, inputs - 1))
+                    Dep::Input(int(0, inputs - 1, "input read"))
                 }
             })
             .collect();
         flow.push(FlowNode { op, deps });
     }
     let mut steps = Vec::new();
-    for _ in 0..int(1, 16) {
-        steps.push(match int(0, 10) {
-            0..=3 => Step::Write(int(0, inputs - 1), tc.draw(gs::integers::<u64>().max_value(6))),
-            4 => Step::World(tc.draw(gs::integers::<u64>().max_value(3))),
+    for _ in 0..int(1, 16, "steps") {
+        steps.push(match int(0, 10, "step") {
+            0..=3 => Step::Write(int(0, inputs - 1, "input written"), tape.int_in(0..=6u64, "value written")),
+            4 => Step::World(tape.int_in(0..=3u64, "world")),
             5 => Step::Evict,
             6 => Step::Epoch,
-            7 | 8 => Step::Pull((0..int(1, 3)).map(|_| int(0, nodes - 1)).collect()),
+            7 | 8 => Step::Pull((0..int(1, 3, "pulls")).map(|_| int(0, nodes - 1, "node pulled")).collect()),
             9 => Step::Pack,
-            _ => Step::Ask(int(0, 3)),
+            _ => Step::Ask(int(0, 3, "ask")),
         });
     }
     steps.push(Step::Ask(0));
@@ -358,12 +358,14 @@ fn simulate(program: &Program, plant: Plant) -> Result<(), String> {
 /// (a change and a change back); with no untracked read, no eviction and one walk a view it
 /// equals the set. Checked against a from-scratch evaluation after every step of a random
 /// program and edit sequence.
-#[hegel::test]
-fn the_changed_set_names_every_row_whose_value_differs_from_a_run_from_scratch(tc: TestCase) {
-    let program = program(&tc);
-    if let Err(why) = simulate(&program, Plant::None) {
-        panic!("{why}\n{program:#?}");
-    }
+#[test]
+fn the_changed_set_names_every_row_whose_value_differs_from_a_run_from_scratch() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let program = program(tape);
+        if let Err(why) = simulate(&program, Plant::None) {
+            panic!("{why}\n{program:#?}");
+        }
+    })
 }
 
 pub(super) fn sum(deps: &[Dep]) -> FlowNode {

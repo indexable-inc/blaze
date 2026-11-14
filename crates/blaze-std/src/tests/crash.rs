@@ -9,9 +9,9 @@
 use std::time::Duration;
 
 use blaze_core::sim::Faults;
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{check, control, path, root};
 use crate::{
     Cx, Plant,
     fs::{Content, Dir, File, FsKind, ReadWrite, Unsynced},
@@ -36,15 +36,15 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 50, 2_000]);
-    let fail_syncs = d.one_in(4);
-    let acts = (0..d.int(1, 32))
-        .map(|_| match d.int(0, 9) {
-            0..=3 => Act::Append(d.int(0, 64) as usize),
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 50, 2_000], "latency us");
+    let fail_syncs = tape.one_in(4, "fail syncs");
+    let acts = (0..tape.int_in(1..=32u64, "acts"))
+        .map(|_| match tape.int_in(0..=9u64, "act") {
+            0..=3 => Act::Append(tape.int_in(0..=64u64, "append len") as usize),
             4 | 5 => Act::Sync,
-            6 => Act::Replace(d.int(0, 64) as usize),
+            6 => Act::Replace(tape.int_in(0..=64u64, "replace len") as usize),
             7 => Act::Read,
             _ => Act::Crash,
         })
@@ -172,12 +172,12 @@ fn acts(plan: &Plan, io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, file: &File<ReadWri
 /// The invariant: write then read round-trips through crashes. Before a crash a read is
 /// everything written; after one it is everything a returned flush or synced publish made
 /// durable, followed by a prefix of what came after it, never less and never anything else.
-#[hegel::test(test_cases = 150)]
-fn write_then_read_round_trips_through_crashes(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn write_then_read_round_trips_through_crashes() {
+    blaze_sim::check(Config::cases(150), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_sync_that_skips_the_disk() {
-    control(Plant::SyncSkipped, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::SyncSkipped, plan, run);
 }

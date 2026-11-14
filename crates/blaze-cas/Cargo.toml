@@ -41,8 +41,8 @@ test-hooks = []
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
-hegeltest.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

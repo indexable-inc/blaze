@@ -196,7 +196,7 @@ class is known only when read, so each value read costs one compare.
 
 ## How it is proven
 
-- **Parser**: a Hegel round trip, `parse(print(s)) == s`, and a fuzz target (hostile bytes).
+- **Parser**: a blaze-sim round trip, `parse(print(s)) == s`, and a fuzz target (hostile bytes).
 - **Inference** (the one that matters). The refinement: on generated schemas, rows and statements
   of the subset, every row real SQLite returns is admitted by the inferred description (column
   count, names, storage class, null only where nullable), and a statement the checker accepts is

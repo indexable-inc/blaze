@@ -232,7 +232,7 @@ which is not code identity; `content::code_id` is renamed so the name means one 
 
 ## Property for the edit fuzzer
 
-The verify lane's Hegel edit fuzzer
+The verify lane's edit fuzzer
 (`crates/hir-ty-codegen/v2/edits/identity.rs`, `docs/v2/plan/design/verify.md`) holds:
 
 - An edit to comments, whitespace, formatting or item order keeps every instance's compile

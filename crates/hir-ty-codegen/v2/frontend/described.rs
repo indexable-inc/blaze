@@ -966,7 +966,7 @@ mod tests {
     };
     use blaze_ids::ContentId;
     use blaze_items::ItemKey;
-    use hegel::{Hegel, Settings, TestCase, generators as gs};
+    use blaze_sim::Config;
     use hir_expand::fixture;
     use hir_ty::{
         check_cache::port,
@@ -1108,17 +1108,14 @@ pub fn x() {}
         let mut files: Vec<FileId> = all.iter().map(|it| it.data(db).root_file_id).collect();
         files.push(inner);
         let real = |names: &Names| naming(db, closure, names);
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(200);
-        Hegel::new(|tc: TestCase| {
-            let words = vec!["src/lib.rs", "src/main.rs", "lib.rs", "/r/a-1.0/src/lib.rs", ""];
+        blaze_sim::check(Config::cases(200), |tape| {
+            let words = ["src/lib.rs", "src/main.rs", "lib.rs", "/r/a-1.0/src/lib.rs", ""];
             let before: Names = files
                 .iter()
-                // clone: the few words each draw samples from
-                .map(|&file| (file, tc.draw(gs::sampled_from(words.clone())).to_owned()))
+                .map(|&file| (file, (*tape.one_of(&words, "name")).to_owned()))
                 .collect();
-            let at = tc.draw(gs::integers::<u64>().max_value(all.len() as u64 - 1)) as usize;
-            let change = match tc.draw(gs::integers::<u8>().max_value(2)) {
+            let at = tape.index(all.len(), "at");
+            let change = match tape.int_in(0..=2u8, "change") {
                 0 => Change::Rename(at),
                 1 => Change::Unnamed(at),
                 _ => Change::Inner,
@@ -1126,9 +1123,7 @@ pub fn x() {}
             if let Err(why) = held(db, &all, closure, inner, &before, change, &real) {
                 panic!("{why}");
             }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        });
 
         // The control: the home alone. Renaming `a`'s root does not move it, which the
         // oracle names.
@@ -1342,14 +1337,12 @@ pub fn roots() {
     /// written with the instance's arguments as none, caught by a generic callee.
     #[test]
     fn an_ask_reads_back_as_the_instance_it_was_written_of() {
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(40);
-        Hegel::new(|tc: TestCase| {
-            let count: usize = tc.draw(gs::integers().min_value(1).max_value(5));
+        blaze_sim::check(Config::cases(40), |tape| {
+            let count: usize = tape.int_in(1..=5, "calls");
             let calls: Vec<(usize, usize)> = (0..count)
                 .map(|_| {
-                    let call = tc.draw(gs::integers::<usize>().max_value(CALLS.len() - 1));
-                    (call, tc.draw(gs::integers::<usize>().max_value(TYPES.len() - 1)))
+                    let call = tape.index(CALLS.len(), "call");
+                    (call, tape.index(TYPES.len(), "type"))
                 })
                 .collect();
             let text = program(&calls);
@@ -1359,14 +1352,12 @@ pub fn roots() {
             let root = first.root(hir_def::test_items::function(one.db(), main, "roots"));
             let write = |asked: &(HirInstance, Origin)| first.ask_bytes(asked);
             for instance in reached(&first, root) {
-                let origin = origins()[tc.draw(gs::integers::<usize>().max_value(3))];
+                let origin = origins()[tape.int_in(0..=3usize, "origin")];
                 if let Err(why) = held_ask(&first, one.db(), &second, &(instance, origin), &write) {
                     panic!("{why}\n{text}");
                 }
             }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        });
 
         let text = program(&[(0, 1), (5, 6)]);
         let (one, two) = (fixture::db(&text), fixture::db(&text));
@@ -1458,25 +1449,21 @@ pub fn roots() {
     /// two images, which would serve one version's static to the other.
     #[test]
     fn a_static_key_moves_with_its_crates_image_and_with_nothing_else() {
-        let cases =
-            std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(300);
-        Hegel::new(|tc: TestCase| {
+        blaze_sim::check(Config::cases(300), |tape| {
             // A few values a byte, so inputs often equal each other: each is told apart by
             // its place.
             let mut inputs = [[0u8; 32]; 5];
             for input in &mut inputs {
-                *input = [tc.draw(gs::integers::<u8>().max_value(2)); 32];
+                *input = [tape.int_in(0..=2u8, "input byte"); 32];
             }
-            let change = match tc.draw(gs::integers::<usize>().max_value(STATIC_INPUTS.len())) {
+            let change = match tape.int_in(0..=STATIC_INPUTS.len(), "changed input") {
                 input if input == STATIC_INPUTS.len() => None,
-                input => Some((input, tc.draw(gs::integers::<usize>().max_value(31)))),
+                input => Some((input, tape.int_in(0..=31usize, "changed byte"))),
             };
             if let Err(why) = held_static(&inputs, change, &static_key_of) {
                 panic!("{why}");
             }
-        })
-        .settings(Settings::new().test_cases(cases).database(None))
-        .run();
+        });
 
         let fixture = fixture::db(&program(&[(3, 0)]));
         let db = fixture.db();

@@ -135,7 +135,7 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
 | `gpu` | the device behind the `Gpu` capability: buffers, launches, render targets | new, with [gpu](../../../future/gpu/plan.md) |
 | `video`, `image` | codecs as sans-IO cores; image decode and encode as functions | `harness-video`'s encoder, moved; `png` |
-| `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, hegel, `blaze-check`, `blaze-alloc-count` |
+| `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, `blaze-sim`, `blaze-check`, `blaze-alloc-count` |
 | `io`, `fs`, `net`, ... | the capabilities of the sections below | new, on `blaze-core` |
 
 `stdx` (leftover helpers) is dissolved into the modules above or deleted. Each merge follows rule
@@ -1056,7 +1056,7 @@ Decided, with the reason for each:
 
 Proven by (`crates/blaze-hash/src/order_tests.rs`, `crates/blaze-hashcons/src/content_map.rs`):
 an ordered map equals a `Vec` of pairs under random inserts, both removals by key and by index,
-`pop` and `retain` (Hegel, 300 cases); its order is the same under the fixed seed, under random
+`pop` and `retain` (blaze-sim, 300 cases); its order is the same under the fixed seed, under random
 keys, at three capacities and in two other processes, with the control that a hash map's order
 under two keys differs; a table with room allocates when made (hash map 1, ordered map 2, content
 map 1) and never within the room; a content map equals the distinct values by id under random

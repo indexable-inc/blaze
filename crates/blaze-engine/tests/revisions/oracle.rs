@@ -1,4 +1,4 @@
-//! The oracle under the real driver (docs/harness.md, "The oracle"): Hegel draws a workspace
+//! The oracle under the real driver (docs/harness.md, "The oracle"): the tape draws a workspace
 //! and a sequence of turns ([`generate`]), a real daemon builds each on the state the turns
 //! before left, and after every build the program prints what the model says, the outcome,
 //! the output and the diagnostics are a clean build's of the same sources in a fresh home,
@@ -6,12 +6,12 @@
 //! contained no unwind and recomputed nothing it has no reason for.
 //!
 //! A failure is written as a case under `BLAZE_ORACLE_OUT` (the system's temporary directory
-//! otherwise) and Hegel shrinks the sequence; the smallest is the last case written, and its
+//! otherwise) and blaze-sim shrinks the sequence; the smallest is the last case written, and its
 //! directory is checked in as it is (`cases/<name>/`, listed in `real!`).
 //!
 //! Not in the gate: a case is minutes of real builds. `BLAZE_ORACLE_CASES` is how many
-//! sequences (20), `BLAZE_ORACLE_TURNS` the most turns of one (5), `BLAZE_ORACLE_SEED` the
-//! seed, `BLAZE_ORACLE_SKIP` the edit kinds, events and parts not drawn, and
+//! sequences (20), `BLAZE_ORACLE_TURNS` the most turns of one (5), `BLAZE_ORACLE_SEED` a seed
+//! to run alone (one case), `BLAZE_ORACLE_SKIP` the edit kinds, events and parts not drawn, and
 //! `BLAZE_ORACLE_CLEAN=when-wrong` builds a revision from nothing only when its incremental
 //! build failed a check (the model's `prints` still catches a stale program).
 
@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
 };
 
-use hegel::{Hegel, Settings, generators as gs};
+use blaze_sim::Config;
 
 use super::{
     check,
@@ -85,28 +85,24 @@ fn case(parts: Parts, turns: &[Turn]) {
 #[ignore = "minutes of real builds a case: docs/harness.md, \"The oracle\""]
 fn any_turn_sequence_builds_as_clean() {
     let most = number("BLAZE_ORACLE_TURNS", 5);
-    let mut settings = Settings::new()
-        .test_cases(number("BLAZE_ORACLE_CASES", 20))
-        .database(None)
-        .suppress_health_check([hegel::HealthCheck::TooSlow]);
-    if std::env::var_os("BLAZE_ORACLE_SEED").is_some() {
-        settings = settings.seed(Some(number("BLAZE_ORACLE_SEED", 0)));
-    }
+    let cases = u32::try_from(number("BLAZE_ORACLE_CASES", 20)).expect("BLAZE_ORACLE_CASES fits a u32");
+    // A given seed is that one case alone.
+    let config = match std::env::var_os("BLAZE_ORACLE_SEED") {
+        Some(_) => Config::cases(1).first(number("BLAZE_ORACLE_SEED", 0)),
+        None => Config::cases(cases),
+    };
     // `BLAZE_ORACLE_MINUTES=<n>` with a large `BLAZE_ORACLE_CASES`: a run of that long; the
     // sequences after it are not run.
     let minutes = std::env::var_os("BLAZE_ORACLE_MINUTES").map(|_| number("BLAZE_ORACLE_MINUTES", 0));
     let began = std::time::Instant::now();
-    Hegel::new(move |tc: hegel::TestCase| {
+    blaze_sim::check(config, |tape| {
         if minutes.is_some_and(|it| began.elapsed().as_secs() >= it * 60) {
             return;
         }
-        let mut draw = |n: u64| tc.draw(gs::integers::<u64>().max_value(n - 1));
-        let parts = generate::parts(&mut draw);
-        let turns = generate::turns(&mut draw, parts, false, most);
+        let parts = generate::parts(tape);
+        let turns = generate::turns(tape, parts, false, most);
         case(parts, &turns);
-    })
-    .settings(settings)
-    .run();
+    });
 }
 
 /// One of each: every part, every edit kind, every save and every event once, in a fixed

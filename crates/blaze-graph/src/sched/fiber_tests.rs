@@ -7,9 +7,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hegel::TestCase;
-use hegel::generators as gs;
 use blaze_core::lock::Lock;
+use blaze_sim::Tape;
 
 use super::fiber::{Config, Cx, Driver, Handle, NoWait, Work};
 use super::*;
@@ -292,20 +291,25 @@ impl Work for &'static Graph {
 /// No lost wakeup and no deadlock on the real driver: with waits forming a DAG, including
 /// parallel maps inside jobs whose items wait for other jobs (the rayon case), every job runs
 /// once and the driver ends, on 1 to 4 cores.
-#[hegel::test]
-fn every_job_of_a_dag_of_waits_runs_once_on_fibers(tc: TestCase) {
-    let cores = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
-    let nodes = tc.draw(gs::integers::<u32>().min_value(1).max_value(40));
+#[test]
+fn every_job_of_a_dag_of_waits_runs_once_on_fibers() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| every_job_of_a_dag_runs_once(tape))
+}
+
+fn every_job_of_a_dag_runs_once(tape: &Tape) {
+    let cores = tape.int_in(1..=4usize, "cores");
+    let nodes = tape.int_in(1..=40u32, "nodes");
     let mut deps = Vec::new();
     let mut maps = Vec::new();
     for node in 0..nodes {
         let mut on = Vec::new();
         let mut map = Vec::new();
         for earlier in 0..node {
-            if tc.draw(gs::integers::<u32>().max_value(3)) == 0 {
+            // Once in 4 and once in 6, as before; calm is no edge.
+            if tape.one_in(4, "waits on an earlier node") {
                 on.push(earlier);
             }
-            if tc.draw(gs::integers::<u32>().max_value(5)) == 0 {
+            if tape.one_in(6, "maps an earlier node") {
                 map.push(earlier);
             }
         }

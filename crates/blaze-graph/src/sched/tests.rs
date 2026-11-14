@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 
 use blaze_hash::{HashMap, HashSet};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use std::alloc::Global;
 
 use super::*;
@@ -13,21 +12,16 @@ fn key(n: u32) -> Key {
     Key(bytes)
 }
 
-fn below(tc: &TestCase, n: usize) -> usize {
-    debug_assert!(n > 0);
-    tc.draw(gs::integers::<u32>().max_value(n as u32 - 1)) as usize
-}
-
 /// Sockets of nodes of L3 groups of physical cores of SMT threads, each count drawn from 1,
 /// at least `min_nodes` nodes; each physical core fast (1024) or slow (512); distances 10 to a
 /// node itself, 11 to 20 within a socket and 20 to 40 across, symmetric, as kernels report.
-fn shape(tc: &TestCase, min_nodes: u32) -> (Vec<CoreInfo>, Distances) {
-    let sockets = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-    let per = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
+fn shape(tape: &Tape, min_nodes: u32) -> (Vec<CoreInfo>, Distances) {
+    let sockets = tape.int_in(1..=2u32, "sockets");
+    let per = tape.int_in(1..=2u32, "nodes a socket");
     let (sockets, per) = if sockets * per < min_nodes { (min_nodes, 1) } else { (sockets, per) };
-    let l3s = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-    let phys = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
-    let smt = tc.draw(gs::integers::<u32>().min_value(1).max_value(2));
+    let l3s = tape.int_in(1..=2u32, "l3s a node");
+    let phys = tape.int_in(1..=2u32, "cores an l3");
+    let smt = tape.int_in(1..=2u32, "threads a core");
     let mut info = Vec::new();
     for socket in 0..sockets {
         for p in 0..per {
@@ -35,7 +29,7 @@ fn shape(tc: &TestCase, min_nodes: u32) -> (Vec<CoreInfo>, Distances) {
             for l in 0..l3s {
                 let l3 = node * l3s + l;
                 for ph in 0..phys {
-                    let capacity = if tc.draw(gs::booleans()) { 1024 } else { 512 };
+                    let capacity = if tape.bool("fast core") { 1024 } else { 512 };
                     for _ in 0..smt {
                         info.push(CoreInfo { smt: l3 * phys + ph, l3, node, socket, capacity });
                     }
@@ -48,9 +42,9 @@ fn shape(tc: &TestCase, min_nodes: u32) -> (Vec<CoreInfo>, Distances) {
     for a in 0..nodes {
         for b in a + 1..nodes {
             let distance = if a / per == b / per {
-                11 + tc.draw(gs::integers::<u32>().max_value(9))
+                11 + tape.int_in(0..=9u32, "distance within a socket")
             } else {
-                20 + tc.draw(gs::integers::<u32>().max_value(20))
+                20 + tape.int_in(0..=20u32, "distance across sockets")
             };
             table[(a * nodes + b) as usize] = distance;
             table[(b * nodes + a) as usize] = distance;
@@ -195,11 +189,11 @@ impl Sim {
         }
     }
 
-    fn hint(&self, tc: &TestCase) -> Affinity {
-        let info = self.sched.cores().info(below(tc, self.cores() as usize) as u32);
-        match below(tc, 5) {
+    fn hint(&self, tape: &Tape) -> Affinity {
+        let info = self.sched.cores().info(tape.index(self.cores() as usize, "hint's core") as u32);
+        match tape.index(5, "hint") {
             0 => Affinity::Spawner,
-            1 => Affinity::Core(CoreId(below(tc, self.cores() as usize) as u32)),
+            1 => Affinity::Core(CoreId(tape.index(self.cores() as usize, "hinted core") as u32)),
             2 => Affinity::L3(info.l3),
             3 => Affinity::Node(info.node),
             _ => Affinity::Any,
@@ -380,10 +374,10 @@ impl Sim {
     }
 
     /// A wait target for `job`: in a DAG, only on jobs and flights of higher rank.
-    fn target(&self, tc: &TestCase, job: u32) -> Option<ModelWait> {
-        match below(tc, 3) {
+    fn target(&self, tape: &Tape, job: u32) -> Option<ModelWait> {
+        match tape.index(3, "wait kind") {
             0 => {
-                let other = below(tc, self.jobs as usize) as u32;
+                let other = tape.index(self.jobs as usize, "waited job") as u32;
                 (self.mode == Mode::Any || self.rank[other as usize] > self.rank[job as usize])
                     .then_some(ModelWait::Job(other))
             }
@@ -393,7 +387,7 @@ impl Sim {
                 if flights.is_empty() {
                     return None;
                 }
-                let (k, by) = flights[below(tc, flights.len())];
+                let (k, by) = flights[tape.index(flights.len(), "waited flight")];
                 let ok = match by {
                     None => true,
                     Some(by) => {
@@ -402,42 +396,38 @@ impl Sim {
                 };
                 ok.then_some(ModelWait::Key(k))
             }
-            _ => Some(ModelWait::Until(self.sched.now() + below(tc, 200) as u64)),
+            _ => Some(ModelWait::Until(self.sched.now() + tape.below(200, "wait for"))),
         }
     }
 
-    fn step(&mut self, tc: &TestCase) {
+    fn step(&mut self, tape: &Tape) {
         let running = self.running();
-        match below(tc, 14) {
+        match tape.index(14, "actor") {
             0 if self.jobs < MAX_SIM_JOBS => {
-                let how = Spawn::root().hint(self.hint(tc)).critical(tc.draw(gs::booleans()));
-                let rank = tc.draw(gs::integers::<u64>().max_value(1 << 40));
+                let how = Spawn::root().hint(self.hint(tape)).critical(tape.bool("critical"));
+                let rank = tape.int_in(0..=1u64 << 40, "rank");
                 self.spawn(how, rank);
             }
             1 if !running.is_empty() && self.jobs < MAX_SIM_JOBS => {
-                let parent = running[below(tc, running.len())];
-                let how = Spawn::child(JobId(parent))
-                    .hint(self.hint(tc))
-                    .critical(tc.draw(gs::booleans()));
-                let rank = self.rank[parent as usize]
-                    + 1
-                    + tc.draw(gs::integers::<u64>().max_value(1 << 20));
+                let parent = running[tape.index(running.len(), "parent")];
+                let how =
+                    Spawn::child(JobId(parent)).hint(self.hint(tape)).critical(tape.bool("critical"));
+                let rank = self.rank[parent as usize] + 1 + tape.int_in(0..=1u64 << 20, "rank past the parent");
                 self.spawn(how, rank);
             }
             // A parallel map: the job spawns its items on one counter and waits on it once;
             // each item may wait for other jobs when it runs.
             2 if !running.is_empty() && self.jobs + 8 < MAX_SIM_JOBS => {
-                let parent = running[below(tc, running.len())];
+                let parent = running[tape.index(running.len(), "parent")];
                 if self.maps.contains_key(&parent) {
                     return;
                 }
                 let counter = self.sched.counter();
-                let count = 1 + below(tc, 6);
+                let count = 1 + tape.index(6, "items");
                 for _ in 0..count {
-                    let rank = self.rank[parent as usize]
-                        + 1
-                        + tc.draw(gs::integers::<u64>().max_value(1 << 20));
-                    let critical = tc.draw(gs::booleans());
+                    let rank =
+                        self.rank[parent as usize] + 1 + tape.int_in(0..=1u64 << 20, "rank past the parent");
+                    let critical = tape.bool("critical");
                     self.spawn(
                         Spawn::child(JobId(parent)).critical(critical).counted(counter),
                         rank,
@@ -447,21 +437,21 @@ impl Sim {
                 self.join(parent);
             }
             3 | 4 if !running.is_empty() => {
-                let job = running[below(tc, running.len())];
+                let job = running[tape.index(running.len(), "waiting job")];
                 if !self.join(job) {
-                    if let Some(wait) = self.target(tc, job) {
+                    if let Some(wait) = self.target(tape, job) {
                         self.wait(job, wait);
                     }
                 }
             }
             5 | 6 if !running.is_empty() => {
-                let job = running[below(tc, running.len())];
+                let job = running[tape.index(running.len(), "ending job")];
                 if !self.join(job) {
                     self.done(job);
                 }
             }
             7 if !running.is_empty() => {
-                let job = running[below(tc, running.len())];
+                let job = running[tape.index(running.len(), "claiming job")];
                 self.claim(Some(job));
             }
             8 => {
@@ -474,33 +464,33 @@ impl Sim {
                 if mine.is_empty() {
                     self.claim(None);
                 } else {
-                    let k = mine[below(tc, mine.len())];
+                    let k = mine[tape.index(mine.len(), "flight that ends")];
                     self.key_done(k);
                 }
             }
             9 | 10 if !self.woken.is_empty() => {
-                let core = self.woken.swap_remove(below(tc, self.woken.len()));
+                let core = self.woken.swap_remove(tape.index(self.woken.len(), "woken core"));
                 self.sched.core_idle(CoreId(core));
                 self.settle();
             }
             11 => {
-                let core = below(tc, self.cores() as usize) as u32;
+                let core = tape.index(self.cores() as usize, "idle core") as u32;
                 if self.sched.core_state(CoreId(core)) == CoreState::Parked {
                     self.sched.core_idle(CoreId(core));
                     self.settle();
                 } else {
-                    let to = self.sched.now() + below(tc, 300) as u64;
+                    let to = self.sched.now() + tape.below(300, "time passes");
                     self.advance(to);
                 }
             }
             12 if !running.is_empty() => {
-                let job = running[below(tc, running.len())];
+                let job = running[tape.index(running.len(), "missing job")];
                 self.miss(job);
             }
             13 if self.jobs > 0 => {
-                let job = below(tc, self.jobs as usize) as u32;
+                let job = tape.index(self.jobs as usize, "job made critical") as u32;
                 if self.sched.job_state(JobId(job)) != JobState::Done {
-                    self.sched.set_critical(JobId(job), tc.draw(gs::booleans()));
+                    self.sched.set_critical(JobId(job), tape.bool("critical"));
                     self.settle();
                 }
             }
@@ -557,79 +547,83 @@ impl Sim {
     }
 }
 
-fn run_sim(tc: &TestCase, mode: Mode, min_nodes: u32, steps: usize) {
-    let (info, distances) = shape(tc, min_nodes);
+fn run_sim(tape: &Tape, mode: Mode, min_nodes: u32, steps: usize) {
+    let (info, distances) = shape(tape, min_nodes);
     let mut sim = Sim::new(info, &distances, mode);
-    let steps = 1 + below(tc, steps);
+    let steps = 1 + tape.index(steps, "steps");
     for _ in 0..steps {
-        sim.step(tc);
+        sim.step(tape);
     }
     sim.drain();
 }
 
 /// Every job that becomes runnable runs, whatever the order of spawns, waits, ends, moves and
 /// idle reports: once nothing new arrives, every job ends and every core parks.
-#[hegel::test]
-fn every_runnable_job_runs(tc: TestCase) {
-    run_sim(&tc, Mode::Dag, 1, 300);
+#[test]
+fn every_runnable_job_runs() {
+    blaze_sim::check(Config::DEFAULT, |tape| run_sim(tape, Mode::Dag, 1, 300))
 }
 
 /// No deadlock when the waits form a DAG, including parallel maps whose items wait for other
 /// jobs (the case that hung two pools waiting on each other): no thread is held by a wait, so
 /// the jobs end on as few as one core.
-#[hegel::test]
-fn no_deadlock_when_waits_form_a_dag(tc: TestCase) {
-    let cores = 1 + below(&tc, 3);
-    let mut sim = Sim::new(
-        (0..cores as u32)
-            .map(|core| CoreInfo { smt: core, l3: 0, node: 0, socket: 0, capacity: 1024 })
-            .collect(),
-        &Distances::one_node(),
-        Mode::Dag,
-    );
-    let roots = 1 + below(&tc, 4);
-    for _ in 0..roots {
-        let rank = tc.draw(gs::integers::<u64>().max_value(1 << 40));
-        sim.spawn(Spawn::root(), rank);
-    }
-    let steps = 1 + below(&tc, 400);
-    for _ in 0..steps {
-        sim.step(&tc);
-    }
-    sim.drain();
+#[test]
+fn no_deadlock_when_waits_form_a_dag() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let cores = 1 + tape.index(3, "cores");
+        let mut sim = Sim::new(
+            (0..cores as u32)
+                .map(|core| CoreInfo { smt: core, l3: 0, node: 0, socket: 0, capacity: 1024 })
+                .collect(),
+            &Distances::one_node(),
+            Mode::Dag,
+        );
+        let roots = 1 + tape.index(4, "roots");
+        for _ in 0..roots {
+            let rank = tape.int_in(0..=1u64 << 40, "rank");
+            sim.spawn(Spawn::root(), rank);
+        }
+        let steps = 1 + tape.index(400, "steps");
+        for _ in 0..steps {
+            sim.step(tape);
+        }
+        sim.drain();
+    })
 }
 
 /// A wait that closes a cycle (through jobs, key flights and counters) is refused with a
 /// cycle of real waits starting at the asker, and one that closes none is never refused.
-#[hegel::test]
-fn a_cycle_of_waits_is_reported_naming_its_jobs(tc: TestCase) {
-    run_sim(&tc, Mode::Any, 1, 300);
+#[test]
+fn a_cycle_of_waits_is_reported_naming_its_jobs() {
+    blaze_sim::check(Config::DEFAULT, |tape| run_sim(tape, Mode::Any, 1, 300))
 }
 
 /// On a machine of several nodes, a steal or handoff crosses a node only when the thief's own
 /// node has no runnable job.
-#[hegel::test]
-fn a_steal_never_crosses_a_node_while_its_own_has_work(tc: TestCase) {
-    run_sim(&tc, Mode::Dag, 2, 300);
+#[test]
+fn a_steal_never_crosses_a_node_while_its_own_has_work() {
+    blaze_sim::check(Config::DEFAULT, |tape| run_sim(tape, Mode::Dag, 2, 300))
 }
 
 /// On machines of fast and slow cores, a fast core never sits idle while a slow core runs a
 /// critical job without being asked to move it, and a moved job lands on a fast core. Checked
 /// after every input by `Sim::settle` and `Sim::miss`; this test leans on critical jobs.
-#[hegel::test]
-fn a_critical_job_is_never_left_on_a_slow_core_while_a_fast_one_idles(tc: TestCase) {
-    let fast = 1 + below(&tc, 2);
-    let slow = 1 + below(&tc, 3);
-    let cores = Cores::classes(&[(1024, fast), (512, slow)]).unwrap();
-    let mut sim = Sim {
-        sched: Sched::new(cores, 16),
-        ..Sim::new(vec![flat_core(0)], &Distances::one_node(), Mode::Dag)
-    };
-    let steps = 1 + below(&tc, 300);
-    for _ in 0..steps {
-        sim.step(&tc);
-    }
-    sim.drain();
+#[test]
+fn a_critical_job_is_never_left_on_a_slow_core_while_a_fast_one_idles() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let fast = 1 + tape.index(2, "fast cores");
+        let slow = 1 + tape.index(3, "slow cores");
+        let cores = Cores::classes(&[(1024, fast), (512, slow)]).unwrap();
+        let mut sim = Sim {
+            sched: Sched::new(cores, 16),
+            ..Sim::new(vec![flat_core(0)], &Distances::one_node(), Mode::Dag)
+        };
+        let steps = 1 + tape.index(300, "steps");
+        for _ in 0..steps {
+            sim.step(tape);
+        }
+        sim.drain();
+    })
 }
 
 fn flat_core(core: u32) -> CoreInfo {

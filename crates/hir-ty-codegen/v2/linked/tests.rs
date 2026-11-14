@@ -10,7 +10,7 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
 use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 use hir_expand::fixture;
 use hir_ty_mir::mir::MirSpan;
 
@@ -700,10 +700,9 @@ fn kept_is_whole_of(mut program: Program, edits: &[Edit], plant: Plant) -> Resul
     Ok(work)
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let at = tc.draw(gs::integers::<usize>().max_value(3));
-    match tc.draw(gs::integers::<u8>().max_value(5)) {
+fn edit(tape: &Tape) -> Edit {
+    let at = tape.int_in(0..=3usize, "at");
+    match tape.int_in(0..=5u8, "edit") {
         0 => Edit::Reformat,
         1 => Edit::Body(at),
         2 => Edit::Drop(at),
@@ -717,12 +716,14 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// function gone or back, a function that names another table), the span tables a link holds
 /// by applying each build's link inputs to those of the link before are the tables made
 /// whole from the build, with nothing kept.
-#[hegel::test]
-fn the_link_inputs_kept_are_the_tables_made_whole(tc: hegel::TestCase) {
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(8));
-    if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn the_link_inputs_kept_are_the_tables_made_whole() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let edits: Vec<Edit> = tape.vec(0..=8, "edits", edit);
+        if let Err(why) = kept_is_whole(4, &edits, Plant::None) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A control of [`the_link_inputs_kept_are_the_tables_made_whole`]: with a link that does

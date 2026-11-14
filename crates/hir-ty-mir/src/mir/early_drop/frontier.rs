@@ -280,7 +280,7 @@ mod tests {
     //! run on a path with the placed drops in them.
 
     use blaze_mem::{Tag, frame};
-    use hegel::{TestCase, generators as gs};
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -697,17 +697,17 @@ mod tests {
 
     /// Up to `len` nodes, each valid on every path given `state`, which it updates. In a loop's
     /// body (`reads_only`) only reads: the body is valid however often it runs.
-    fn nodes(tc: &TestCase, state: &mut State, depth: u8, reads_only: bool) -> Vec<Node> {
-        let len = tc.draw(gs::integers::<u8>().max_value(6));
+    fn nodes(tape: &Tape, state: &mut State, depth: u8, reads_only: bool) -> Vec<Node> {
+        let len = tape.int_in(0..=6u8, "nodes");
         let owners = state.holds.len() as u32;
         let refs = state.points_to.len() as u32;
         let mut out = Vec::new();
         for _ in 0..len {
-            let owner = tc.draw(gs::integers::<u32>().max_value(owners - 1));
-            let r = tc.draw(gs::integers::<u32>().max_value(refs - 1));
-            let other = tc.draw(gs::integers::<u32>().max_value(refs - 1));
+            let owner = tape.int_in(0..=owners - 1, "owner");
+            let r = tape.int_in(0..=refs - 1, "reference");
+            let other = tape.int_in(0..=refs - 1, "other reference");
             let there = state.holds[owner as usize];
-            match tc.draw(gs::integers::<u8>().max_value(7)) {
+            match tape.int_in(0..=7u8, "node") {
                 0 if !reads_only && there == Known::No => {
                     state.holds[owner as usize] = Known::Yes;
                     out.push(Node::Op(Op::Init(owner)));
@@ -734,23 +734,23 @@ mod tests {
                 }
                 6 if !reads_only && depth > 0 => {
                     let mut other_arm = state.clone(); // clone: a test's state per arm
-                    let then = nodes(tc, state, depth - 1, false);
-                    let otherwise = nodes(tc, &mut other_arm, depth - 1, false);
+                    let then = nodes(tape, state, depth - 1, false);
+                    let otherwise = nodes(tape, &mut other_arm, depth - 1, false);
                     state.join(&other_arm);
                     out.push(Node::If(then, otherwise));
                 }
-                7 if depth > 0 => out.push(Node::Loop(nodes(tc, state, depth - 1, true))),
+                7 if depth > 0 => out.push(Node::Loop(nodes(tape, state, depth - 1, true))),
                 _ => {}
             }
         }
         out
     }
 
-    fn program(tc: &TestCase) -> Program {
-        let early: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(1).max_size(4));
-        let refs = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    fn program(tape: &Tape) -> Program {
+        let early: Vec<bool> = tape.vec(1..=4, "owners", |tape| tape.bool("early"));
+        let refs = tape.int_in(1..=3usize, "references");
         let mut state = State { holds: vec![Known::No; early.len()], points_to: vec![None; refs] };
-        let nodes = nodes(tc, &mut state, 2, false);
+        let nodes = nodes(tape, &mut state, 2, false);
         Program::new(early, refs, &nodes)
     }
 
@@ -758,20 +758,24 @@ mod tests {
     /// is used after its drop, every initialized local is dropped exactly once on every path,
     /// the locals of one edge drop in scope order, and a scoped local drops where Rust drops
     /// it.
-    #[hegel::test(test_cases = 400)]
-    fn early_drops_keep_every_program_as_rust_runs_it(tc: TestCase) {
-        let program = program(&tc);
-        let turns: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).max_size(12));
-        if let Err(why) = holds(&program, &turns, Plant::None, true) {
-            panic!("{why}\n{program:#?}\nturns {turns:?}");
-        }
+    #[test]
+    fn early_drops_keep_every_program_as_rust_runs_it() {
+        blaze_sim::check(Config::cases(400), |tape| {
+            let program = program(tape);
+            let turns: Vec<bool> = tape.vec(0..=12, "turns", |tape| tape.bool("turn"));
+            if let Err(why) = holds(&program, &turns, Plant::None, true) {
+                panic!("{why}\n{program:#?}\nturns {turns:?}");
+            }
+        })
     }
 
     /// Two runs of one program place the same drops in the same order.
-    #[hegel::test(test_cases = 100)]
-    fn placement_is_the_same_on_every_run(tc: TestCase) {
-        let program = program(&tc);
-        assert_eq!(program.placed(Plant::None), program.placed(Plant::None));
+    #[test]
+    fn placement_is_the_same_on_every_run() {
+        blaze_sim::check(Config::cases(100), |tape| {
+            let program = program(tape);
+            assert_eq!(program.placed(Plant::None), program.placed(Plant::None));
+        })
     }
 
     /// `a` is borrowed into a reference that is read after `a`'s own last use.

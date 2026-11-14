@@ -10,9 +10,9 @@
 //!
 //! Plant: [`Plant::HttpOnlyIgnored`], an `only` that hands back the capability it was given.
 
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, root, world};
+use super::{check, control, root, world};
 use crate::{
     Cx, Plant, Stopped,
     mem::Bytes,
@@ -57,16 +57,16 @@ struct Plan {
     asks: Vec<Ask>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let only = d.coin().then(|| d.int(0, 1) as usize);
-    let asks = (0..d.int(1, 8))
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let only = tape.coin("narrowed").then(|| tape.int_in(0..=1u64, "only origin") as usize);
+    let asks = (0..tape.int_in(1..=8u64, "asks"))
         .map(|_| Ask {
-            origin: d.int(0, 1) as usize,
-            target: d.int(0, 3) as usize,
-            method: d.int(0, 3) as usize,
-            body: d.int(0, 300) as usize,
-            framing: d.pick(&[Framing::Length, Framing::Chunked, Framing::Close]),
+            origin: tape.int_in(0..=1u64, "origin") as usize,
+            target: tape.int_in(0..=3u64, "target") as usize,
+            method: tape.int_in(0..=3u64, "method") as usize,
+            body: tape.int_in(0..=300u64, "body") as usize,
+            framing: *tape.one_of(&[Framing::Length, Framing::Chunked, Framing::Close], "framing"),
         })
         .collect();
     Plan { seed, only, asks }
@@ -272,14 +272,14 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// The refinement: `Http::handler` over a function and `Http::over` a `Net` whose peer runs the
 /// same function behind HTTP/1.1 give the same answer to the same request (status and body),
 /// and narrowed to one origin both refuse a request to the other, the same way.
-#[hegel::test(test_cases = 100)]
-fn a_handler_and_a_net_answer_alike(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn a_handler_and_a_net_answer_alike() {
+    blaze_sim::check(Config::cases(100), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_an_only_that_is_ignored() {
-    control(Plant::HttpOnlyIgnored, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::HttpOnlyIgnored, plan, run);
 }
 
 #[test]

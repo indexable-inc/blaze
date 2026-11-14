@@ -14,16 +14,15 @@ fn launched() -> Policy {
 /// member's or a dependency's (which calls dependencies' alone), a member's naming some
 /// static, and a function building in some of the dependency's functions after it that it
 /// calls.
-pub(super) fn drawn(tc: &hegel::TestCase) -> Program {
-    use hegel::generators as gs;
-    let count: u32 = tc.draw(gs::integers::<u32>().min_value(3).max_value(9));
-    let statics: u32 = tc.draw(gs::integers::<u32>().max_value(2));
+pub(super) fn drawn(tape: &blaze_sim::Tape) -> Program {
+    let count: u32 = tape.int_in(3..=9u32, "functions");
+    let statics: u32 = tape.int_in(0..=2u32, "statics");
     let mut program = Program::default();
     for id in 0..statics {
         program.statics.insert(id, (id as u8, None));
     }
     let dependency: Vec<bool> =
-        (1..=count).map(|id| id != 1 && tc.draw(gs::integers::<u8>().max_value(1)) == 0).collect();
+        (1..=count).map(|id| id != 1 && tape.int_in(0..=1u8, "a member's") == 0).collect();
     for id in 1..=count {
         let mut calls: Vec<u32> = Vec::new();
         for callee in 1..=count {
@@ -31,7 +30,7 @@ pub(super) fn drawn(tc: &hegel::TestCase) -> Program {
             if callee == id || (dependency[(id - 1) as usize] && !dependency[(callee - 1) as usize]) {
                 continue;
             }
-            if callee == id + 1 || tc.draw(gs::integers::<u8>().max_value(3)) == 0 {
+            if callee == id + 1 || tape.int_in(0..=3u8, "skips a call") == 0 {
                 calls.push(callee);
             }
         }
@@ -41,11 +40,11 @@ pub(super) fn drawn(tc: &hegel::TestCase) -> Program {
             .iter()
             .enumerate()
             .filter(|(_, callee)| **callee > id && dependency[(**callee - 1) as usize])
-            .filter(|_| tc.draw(gs::integers::<u8>().max_value(1)) == 0)
+            .filter(|_| tape.int_in(0..=1u8, "not built in") == 0)
             .map(|(place, _)| place as u32)
             .collect();
         let named: Vec<u32> = (0..statics)
-            .filter(|_| !dependency[(id - 1) as usize] && tc.draw(gs::integers::<u8>().max_value(2)) == 0)
+            .filter(|_| !dependency[(id - 1) as usize] && tape.int_in(0..=2u8, "names no static") == 0)
             .collect();
         let function = program.function(id, 0x10 + id as u8, &calls);
         function.built_in = built_in;
@@ -161,13 +160,15 @@ fn differs(program: &mut Program, walked: &Program) -> Option<String> {
 /// whole walk of a launched program reaches, [`Build::near`] gives the same key and unit, the
 /// same thing at each place, the same built-in functions and the same code, and describes
 /// only the function, what it builds in, and what those refer to.
-#[hegel::test]
-fn the_frontier_form_of_a_function_is_the_whole_walks(tc: hegel::TestCase) {
-    let mut program = drawn(&tc);
-    let walked = program.copy();
-    if let Some(why) = differs(&mut program, &walked) {
-        panic!("{why}");
-    }
+#[test]
+fn the_frontier_form_of_a_function_is_the_whole_walks() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut program = drawn(tape);
+        let walked = program.copy();
+        if let Some(why) = differs(&mut program, &walked) {
+            panic!("{why}");
+        }
+    })
 }
 
 /// A control of [`the_frontier_form_of_a_function_is_the_whole_walks`]: a frontier form made

@@ -474,25 +474,28 @@ fn values(main: &str) -> Vec<(String, String, u64)> {
 
 /// The invariant: renaming a function's locals and reordering a file's items changes no
 /// measured value of any item (each measure reads structure, not names or order).
-#[hegel::test(test_cases = 8)]
-fn renaming_locals_and_reordering_items_changes_no_value(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let names = tc.draw(gs::permutations(vec!["x", "y", "z", "w", "v"]));
-    let order = tc.draw(gs::permutations(vec![0usize, 1, 2]));
-    let item = |at: usize, [p, q, r, s, t]: [&str; 5]| match at {
-        0 => format!(
-            "pub fn first(max: u64) -> u64 {{\n    let mut {p} = 0;\n    let mut {q} = 1;\n    while {q} < max {{\n        if {q} % 2 == 0 && {p} < 9 || max == 3 {{ {p} += {q}; }}\n        {q} += 1;\n    }}\n    {p}\n}}\n"
-        ),
-        1 => format!(
-            "fn helper() -> u64 {{ 1 }}\npub fn second({r}: bool, {s}: bool) -> u64 {{\n    let mut {t} = helper();\n    if {r} {{ {t} = 2; }} else if {s} {{ {t} = 3; }}\n    match {t} {{ 1 => helper(), _ => {t} }}\n}}\n"
-        ),
-        _ => "pub struct Third {\n    pub a: u8,\n    pub b: u8,\n}\n".to_owned(),
-    };
-    let plain = ["x", "y", "z", "w", "v"];
-    let renamed = [names[0], names[1], names[2], names[3], names[4]];
-    let base: String = (0..3).map(|at| item(at, plain)).collect();
-    let other: String = order.iter().map(|&at| item(at, renamed)).collect();
-    let before = values(&base);
-    assert!(!before.is_empty(), "the measures find something to compare");
-    assert_eq!(values(&other), before);
+#[test]
+fn renaming_locals_and_reordering_items_changes_no_value() {
+    blaze_sim::check(blaze_sim::Config::cases(8), |tape| {
+        let mut names = vec!["x", "y", "z", "w", "v"];
+        tape.shuffle(&mut names, "names");
+        let mut order = vec![0usize, 1, 2];
+        tape.shuffle(&mut order, "order");
+        let item = |at: usize, [p, q, r, s, t]: [&str; 5]| match at {
+            0 => format!(
+                "pub fn first(max: u64) -> u64 {{\n    let mut {p} = 0;\n    let mut {q} = 1;\n    while {q} < max {{\n        if {q} % 2 == 0 && {p} < 9 || max == 3 {{ {p} += {q}; }}\n        {q} += 1;\n    }}\n    {p}\n}}\n"
+            ),
+            1 => format!(
+                "fn helper() -> u64 {{ 1 }}\npub fn second({r}: bool, {s}: bool) -> u64 {{\n    let mut {t} = helper();\n    if {r} {{ {t} = 2; }} else if {s} {{ {t} = 3; }}\n    match {t} {{ 1 => helper(), _ => {t} }}\n}}\n"
+            ),
+            _ => "pub struct Third {\n    pub a: u8,\n    pub b: u8,\n}\n".to_owned(),
+        };
+        let plain = ["x", "y", "z", "w", "v"];
+        let renamed = [names[0], names[1], names[2], names[3], names[4]];
+        let base: String = (0..3).map(|at| item(at, plain)).collect();
+        let other: String = order.iter().map(|&at| item(at, renamed)).collect();
+        let before = values(&base);
+        assert!(!before.is_empty(), "the measures find something to compare");
+        assert_eq!(values(&other), before);
+    });
 }
