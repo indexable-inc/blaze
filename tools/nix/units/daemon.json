@@ -602,13 +602,13 @@
      "crossbeam-channel",
      "crossbeam-queue",
      "flate2",
-     "futures-util",
      "hir",
      "hir-def",
      "hir-expand",
      "hir-ty",
      "hir-ty-borrowck",
      "hir-ty-codegen",
+     "hir-ty-lean",
      "hir-ty-pure",
      "hir-ty-ub",
      "intern",
@@ -627,7 +627,6 @@
      "tar",
      "tempfile",
      "test-utils",
-     "tokio",
      "toml",
      "tracing",
      "uds_windows",
@@ -990,12 +989,14 @@
      "blaze-protocol",
      "blaze-rng",
      "blaze-serde",
+     "blaze-sha256",
+     "blaze-sim",
      "crossbeam-channel",
      "ix-prof",
      "serde",
      "serde_derive",
      "serde_json",
-     "tokio"
+     "tracing"
     ],
     "name": "blaze-explore",
     "version": "0.0.0"
@@ -1326,7 +1327,6 @@
      "rcgen",
      "rustls",
      "rustls-native-certs",
-     "tokio",
      "url"
     ],
     "name": "blaze-http",
@@ -2043,7 +2043,6 @@
      "serde_json",
      "stdx",
      "tar",
-     "tokio",
      "toml",
      "tracing",
      "url"
@@ -2063,8 +2062,7 @@
      "http",
      "ring",
      "serde",
-     "serde_json",
-     "tokio"
+     "serde_json"
     ],
     "name": "blaze-remote",
     "version": "0.0.0"
@@ -4866,7 +4864,6 @@
      "rustc-demangle",
      "serde",
      "serde_json",
-     "tokio",
      "tracing",
      "tracing-subscriber"
     ],
@@ -5127,17 +5124,6 @@
     "name": "miniz_oxide",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.9.1"
-   },
-   {
-    "checksum": "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda",
-    "dependencies": [
-     "libc",
-     "wasi",
-     "windows-sys 0.61.2"
-    ],
-    "name": "mio",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "1.2.1"
    },
    {
     "checksum": "5e17401f259eba956ca16491461b6e8f72913a0a114e39736ce404410f915a0c",
@@ -6156,7 +6142,6 @@
     "version": "1.1.4"
    },
    {
-    "checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
     "dependencies": [
      "once_cell",
      "ring",
@@ -6166,7 +6151,6 @@
      "zeroize"
     ],
     "name": "rustls",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.23.46"
    },
    {
@@ -6518,16 +6502,6 @@
     "name": "snafu-derive",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "0.8.9"
-   },
-   {
-    "checksum": "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
-    "dependencies": [
-     "libc",
-     "windows-sys 0.61.2"
-    ],
-    "name": "socket2",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "0.6.5"
    },
    {
     "checksum": "d7c350a05f295f922fc153a3af8b443c10db70904a9291a624ddb6058c6110d0",
@@ -6908,32 +6882,6 @@
     "name": "tinyvec",
     "source": "registry+https://github.com/rust-lang/crates.io-index",
     "version": "1.13.3"
-   },
-   {
-    "checksum": "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3",
-    "dependencies": [
-     "bytes",
-     "libc",
-     "mio",
-     "pin-project-lite",
-     "socket2",
-     "tokio-macros",
-     "windows-sys 0.61.2"
-    ],
-    "name": "tokio",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "1.54.1"
-   },
-   {
-    "checksum": "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e",
-    "dependencies": [
-     "proc-macro2",
-     "quote",
-     "syn 3.0.9"
-    ],
-    "name": "tokio-macros",
-    "source": "registry+https://github.com/rust-lang/crates.io-index",
-    "version": "2.7.2"
    },
    {
     "checksum": "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d",
@@ -8127,6 +8075,9 @@
     "rsasm": {
      "path": "vendor/rsasm"
     },
+    "rustls": {
+     "path": "vendor/rustls"
+    },
     "sonic-rs": {
      "path": "vendor/sonic-rs"
     },
@@ -9126,7 +9077,6 @@
     "text-size": "1.1.1",
     "thin-vec": "0.2.21",
     "thiserror": "2.0.18",
-    "tokio": "1.54.1",
     "toml": "1.1.8",
     "toml_edit": {
      "default-features": false,
@@ -9253,7 +9203,8 @@
     "vendor/libzstd-rs-sys",
     "vendor/corosensei",
     "vendor/quinn-proto",
-    "vendor/ra-ap-rustc_pattern_analysis"
+    "vendor/ra-ap-rustc_pattern_analysis",
+    "vendor/rustls"
    ],
    "lints": {
     "cargo": {
@@ -10989,7 +10940,7 @@
   },
   "blaze-http@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze's HTTP: an HTTP/1.1 client and an HTTP/3 WebTransport endpoint, each a sans-IO core (deadlines on an injected clock; TLS through rustls, QUIC through quinn-proto) with a thin tokio driver",
+   "description": "blaze's HTTP: an HTTP/1.1 client and an HTTP/3 WebTransport endpoint, each a sans-IO core (deadlines on an injected clock; TLS through rustls, QUIC through quinn-proto), driven on blaze-core's effects",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",
@@ -16036,23 +15987,6 @@
    },
    "version": "0.9.1"
   },
-  "mio@1.2.1": {
-   "authors": "Carl Lerche <me@carllerche.com>:Thomas de Zeeuw <thomasdezeeuw@gmail.com>:Tokio Contributors <team@tokio.rs>",
-   "description": "Lightweight non-blocking I/O.",
-   "homepage": "https://github.com/tokio-rs/mio",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "mio",
-   "readme": "README.md",
-   "repository": "https://github.com/tokio-rs/mio",
-   "rust_version": "1.71",
-   "source": {
-    "checksum": "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda",
-    "kind": "registry"
-   },
-   "version": "1.2.1"
-  },
   "munge@0.4.7": {
    "authors": "David Koloski <djkoloski@gmail.com>",
    "description": "Macro for custom destructuring",
@@ -17799,8 +17733,8 @@
    "repository": "https://github.com/rustls/rustls",
    "rust_version": "1.71",
    "source": {
-    "checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
-    "kind": "registry"
+    "dir": "vendor/rustls",
+    "kind": "path"
    },
    "version": "0.23.46"
   },
@@ -18381,23 +18315,6 @@
     "kind": "registry"
    },
    "version": "0.8.9"
-  },
-  "socket2@0.6.5": {
-   "authors": "Alex Crichton <alex@alexcrichton.com>:Thomas de Zeeuw <thomasdezeeuw@gmail.com>",
-   "description": "Utilities for handling networking sockets with a maximal amount of configuration\npossible intended.\n",
-   "homepage": "https://github.com/rust-lang/socket2",
-   "license": "MIT OR Apache-2.0",
-   "license_file": "",
-   "links": null,
-   "name": "socket2",
-   "readme": "README.md",
-   "repository": "https://github.com/rust-lang/socket2",
-   "rust_version": "1.70",
-   "source": {
-    "checksum": "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4",
-    "kind": "registry"
-   },
-   "version": "0.6.5"
   },
   "sonic-number@0.1.3": {
    "authors": "Volo Team <volo@cloudwego.io>",
@@ -19010,40 +18927,6 @@
     "kind": "registry"
    },
    "version": "1.13.3"
-  },
-  "tokio-macros@2.7.2": {
-   "authors": "Tokio Contributors <team@tokio.rs>",
-   "description": "Tokio's proc macros.\n",
-   "homepage": "https://tokio.rs",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "tokio-macros",
-   "readme": "README.md",
-   "repository": "https://github.com/tokio-rs/tokio",
-   "rust_version": "1.71",
-   "source": {
-    "checksum": "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e",
-    "kind": "registry"
-   },
-   "version": "2.7.2"
-  },
-  "tokio@1.54.1": {
-   "authors": "Tokio Contributors <team@tokio.rs>",
-   "description": "An event-driven, non-blocking I/O platform for writing asynchronous I/O\nbacked applications.\n",
-   "homepage": "https://tokio.rs",
-   "license": "MIT",
-   "license_file": "",
-   "links": null,
-   "name": "tokio",
-   "readme": "README.md",
-   "repository": "https://github.com/tokio-rs/tokio",
-   "rust_version": "1.85",
-   "source": {
-    "checksum": "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3",
-    "kind": "registry"
-   },
-   "version": "1.54.1"
   },
   "toml@1.1.8+spec-1.1.0": {
    "authors": "",
@@ -22975,10 +22858,6 @@
        "unit": "flate2@1.1.10 lib flate2 build"
       },
       {
-       "name": "futures_util",
-       "unit": "futures-util@0.3.34 lib futures_util build"
-      },
-      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -22989,6 +22868,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
       },
       {
        "name": "hir_ty_pure",
@@ -23061,10 +22944,6 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       },
       {
        "name": "toml",
@@ -24456,8 +24335,8 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -25231,18 +25110,12 @@
        "unit": "rustls@0.23.46 lib rustls build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "url",
        "unit": "url@2.5.8 lib url build"
       }
      ],
      "edition": "2024",
-     "features": [
-      "tokio"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-http@0.0.0",
@@ -27391,10 +27264,6 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -27464,10 +27333,6 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       }
      ],
      "edition": "2024",
@@ -31766,93 +31631,6 @@
      "src": "src/lib.rs",
      "target": "form_urlencoded"
     },
-    "futures-core@0.3.34 lib futures_core build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-core@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_core"
-    },
-    "futures-task@0.3.34 lib futures_task build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-task@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_task"
-    },
-    "futures-util@0.3.34 lib futures_util build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "futures_core",
-       "unit": "futures-core@0.3.34 lib futures_core build"
-      },
-      {
-       "name": "futures_task",
-       "unit": "futures-task@0.3.34 lib futures_task build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "slab",
-       "unit": "slab@0.4.12 lib slab build"
-      }
-     ],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "slab",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-util@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_util"
-    },
     "generic-array@0.14.7 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -33245,6 +33023,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -35672,10 +35511,6 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -36745,35 +36580,6 @@
      },
      "src": "src/lib.rs",
      "target": "miniz_oxide"
-    },
-    "mio@1.2.1 lib mio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "net",
-      "os-ext",
-      "os-poll"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mio@1.2.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mio"
     },
     "naga-types@30.0.1 lib naga_types build": {
      "crate_type": "lib",
@@ -41623,33 +41429,6 @@
      "src": "src/lib.rs",
      "target": "smol_str"
     },
-    "socket2@0.6.5 lib socket2 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "all"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "socket2@0.6.5",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "socket2"
-    },
     "sonic-number@0.1.3 lib sonic_number build": {
      "crate_type": "lib",
      "deps": [
@@ -43024,98 +42803,6 @@
      },
      "src": "src/lib.rs",
      "target": "tinyvec"
-    },
-    "tokio-macros@2.7.2 proc-macro tokio_macros build host": {
-     "crate_type": "proc-macro",
-     "deps": [
-      {
-       "name": "proc_macro2",
-       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
-      },
-      {
-       "name": "quote",
-       "unit": "quote@1.0.47 lib quote build host"
-      },
-      {
-       "name": "syn",
-       "unit": "syn@3.0.9 lib syn build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [],
-     "kind": "proc-macro",
-     "mode": "build",
-     "pkg": "tokio-macros@2.7.2",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio_macros"
-    },
-    "tokio@1.54.1 lib tokio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "bytes",
-       "unit": "bytes@1.11.1 lib bytes build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "mio",
-       "unit": "mio@1.2.1 lib mio build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "socket2",
-       "unit": "socket2@0.6.5 lib socket2 build"
-      },
-      {
-       "name": "tokio_macros",
-       "unit": "tokio-macros@2.7.2 proc-macro tokio_macros build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "bytes",
-      "default",
-      "io-util",
-      "libc",
-      "macros",
-      "mio",
-      "net",
-      "rt",
-      "rt-multi-thread",
-      "socket2",
-      "sync",
-      "time",
-      "tokio-macros"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "tokio@1.54.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio"
     },
     "toml@1.1.8+spec-1.1.0 lib toml build": {
      "crate_type": "lib",
@@ -48156,10 +47843,6 @@
        "unit": "flate2@1.1.10 lib flate2 build"
       },
       {
-       "name": "futures_util",
-       "unit": "futures-util@0.3.34 lib futures_util build"
-      },
-      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -48170,6 +47853,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
       },
       {
        "name": "hir_ty_pure",
@@ -48242,10 +47929,6 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       },
       {
        "name": "toml",
@@ -49641,8 +49324,8 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -50416,18 +50099,12 @@
        "unit": "rustls@0.23.46 lib rustls build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "url",
        "unit": "url@2.5.8 lib url build"
       }
      ],
      "edition": "2024",
-     "features": [
-      "tokio"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-http@0.0.0",
@@ -52576,10 +52253,6 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -52649,10 +52322,6 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       }
      ],
      "edition": "2024",
@@ -56885,93 +56554,6 @@
      "src": "src/lib.rs",
      "target": "form_urlencoded"
     },
-    "futures-core@0.3.34 lib futures_core build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-core@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_core"
-    },
-    "futures-task@0.3.34 lib futures_task build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-task@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_task"
-    },
-    "futures-util@0.3.34 lib futures_util build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "futures_core",
-       "unit": "futures-core@0.3.34 lib futures_core build"
-      },
-      {
-       "name": "futures_task",
-       "unit": "futures-task@0.3.34 lib futures_task build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "slab",
-       "unit": "slab@0.4.12 lib slab build"
-      }
-     ],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "slab",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-util@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_util"
-    },
     "generic-array@0.14.7 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -58364,6 +57946,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -60786,10 +60429,6 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -61863,35 +61502,6 @@
      },
      "src": "src/lib.rs",
      "target": "miniz_oxide"
-    },
-    "mio@1.2.1 lib mio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "net",
-      "os-ext",
-      "os-poll"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mio@1.2.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mio"
     },
     "naga-types@30.0.1 lib naga_types build": {
      "crate_type": "lib",
@@ -66584,33 +66194,6 @@
      "src": "src/lib.rs",
      "target": "smol_str"
     },
-    "socket2@0.6.5 lib socket2 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "all"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "socket2@0.6.5",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "socket2"
-    },
     "sonic-number@0.1.3 lib sonic_number build": {
      "crate_type": "lib",
      "deps": [
@@ -67985,98 +67568,6 @@
      },
      "src": "src/lib.rs",
      "target": "tinyvec"
-    },
-    "tokio-macros@2.7.2 proc-macro tokio_macros build host": {
-     "crate_type": "proc-macro",
-     "deps": [
-      {
-       "name": "proc_macro2",
-       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
-      },
-      {
-       "name": "quote",
-       "unit": "quote@1.0.47 lib quote build host"
-      },
-      {
-       "name": "syn",
-       "unit": "syn@3.0.9 lib syn build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [],
-     "kind": "proc-macro",
-     "mode": "build",
-     "pkg": "tokio-macros@2.7.2",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio_macros"
-    },
-    "tokio@1.54.1 lib tokio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "bytes",
-       "unit": "bytes@1.11.1 lib bytes build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "mio",
-       "unit": "mio@1.2.1 lib mio build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "socket2",
-       "unit": "socket2@0.6.5 lib socket2 build"
-      },
-      {
-       "name": "tokio_macros",
-       "unit": "tokio-macros@2.7.2 proc-macro tokio_macros build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "bytes",
-      "default",
-      "io-util",
-      "libc",
-      "macros",
-      "mio",
-      "net",
-      "rt",
-      "rt-multi-thread",
-      "socket2",
-      "sync",
-      "time",
-      "tokio-macros"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "tokio@1.54.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio"
     },
     "toml@1.1.8+spec-1.1.0 lib toml build": {
      "crate_type": "lib",
@@ -73051,10 +72542,6 @@
        "unit": "flate2@1.1.10 lib flate2 build"
       },
       {
-       "name": "futures_util",
-       "unit": "futures-util@0.3.34 lib futures_util build"
-      },
-      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -73065,6 +72552,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
       },
       {
        "name": "hir_ty_pure",
@@ -73137,10 +72628,6 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       },
       {
        "name": "toml",
@@ -74532,8 +74019,8 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -75307,18 +74794,12 @@
        "unit": "rustls@0.23.46 lib rustls build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "url",
        "unit": "url@2.5.8 lib url build"
       }
      ],
      "edition": "2024",
-     "features": [
-      "tokio"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-http@0.0.0",
@@ -77463,10 +76944,6 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -77536,10 +77013,6 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       }
      ],
      "edition": "2024",
@@ -81828,93 +81301,6 @@
      "src": "src/lib.rs",
      "target": "form_urlencoded"
     },
-    "futures-core@0.3.34 lib futures_core build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-core@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_core"
-    },
-    "futures-task@0.3.34 lib futures_task build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-task@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_task"
-    },
-    "futures-util@0.3.34 lib futures_util build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "futures_core",
-       "unit": "futures-core@0.3.34 lib futures_core build"
-      },
-      {
-       "name": "futures_task",
-       "unit": "futures-task@0.3.34 lib futures_task build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "slab",
-       "unit": "slab@0.4.12 lib slab build"
-      }
-     ],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "slab",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-util@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_util"
-    },
     "generic-array@0.14.7 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -83307,6 +82693,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -85734,10 +85181,6 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -86807,35 +86250,6 @@
      },
      "src": "src/lib.rs",
      "target": "miniz_oxide"
-    },
-    "mio@1.2.1 lib mio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "net",
-      "os-ext",
-      "os-poll"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mio@1.2.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mio"
     },
     "naga-types@30.0.1 lib naga_types build": {
      "crate_type": "lib",
@@ -91681,33 +91095,6 @@
      "src": "src/lib.rs",
      "target": "smol_str"
     },
-    "socket2@0.6.5 lib socket2 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "all"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "socket2@0.6.5",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "socket2"
-    },
     "sonic-number@0.1.3 lib sonic_number build": {
      "crate_type": "lib",
      "deps": [
@@ -93082,98 +92469,6 @@
      },
      "src": "src/lib.rs",
      "target": "tinyvec"
-    },
-    "tokio-macros@2.7.2 proc-macro tokio_macros build host": {
-     "crate_type": "proc-macro",
-     "deps": [
-      {
-       "name": "proc_macro2",
-       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
-      },
-      {
-       "name": "quote",
-       "unit": "quote@1.0.47 lib quote build host"
-      },
-      {
-       "name": "syn",
-       "unit": "syn@3.0.9 lib syn build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [],
-     "kind": "proc-macro",
-     "mode": "build",
-     "pkg": "tokio-macros@2.7.2",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio_macros"
-    },
-    "tokio@1.54.1 lib tokio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "bytes",
-       "unit": "bytes@1.11.1 lib bytes build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "mio",
-       "unit": "mio@1.2.1 lib mio build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "socket2",
-       "unit": "socket2@0.6.5 lib socket2 build"
-      },
-      {
-       "name": "tokio_macros",
-       "unit": "tokio-macros@2.7.2 proc-macro tokio_macros build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "bytes",
-      "default",
-      "io-util",
-      "libc",
-      "macros",
-      "mio",
-      "net",
-      "rt",
-      "rt-multi-thread",
-      "socket2",
-      "sync",
-      "time",
-      "tokio-macros"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "tokio@1.54.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio"
     },
     "toml@1.1.8+spec-1.1.0 lib toml build": {
      "crate_type": "lib",
@@ -98214,10 +97509,6 @@
        "unit": "flate2@1.1.10 lib flate2 build"
       },
       {
-       "name": "futures_util",
-       "unit": "futures-util@0.3.34 lib futures_util build"
-      },
-      {
        "name": "hir_def",
        "unit": "hir-def@0.0.0 lib hir_def build"
       },
@@ -98228,6 +97519,10 @@
       {
        "name": "hir_ty_codegen",
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
+      },
+      {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
       },
       {
        "name": "hir_ty_pure",
@@ -98300,10 +97595,6 @@
       {
        "name": "tar",
        "unit": "tar@0.4.46 lib tar build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       },
       {
        "name": "toml",
@@ -99699,8 +98990,8 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -100474,18 +99765,12 @@
        "unit": "rustls@0.23.46 lib rustls build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "url",
        "unit": "url@2.5.8 lib url build"
       }
      ],
      "edition": "2024",
-     "features": [
-      "tokio"
-     ],
+     "features": [],
      "kind": "lib",
      "mode": "build",
      "pkg": "blaze-http@0.0.0",
@@ -102634,10 +101919,6 @@
        "unit": "tar@0.4.46 lib tar build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "toml",
        "unit": "toml@1.1.8+spec-1.1.0 lib toml build"
       },
@@ -102707,10 +101988,6 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
-      },
-      {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
       }
      ],
      "edition": "2024",
@@ -106937,93 +106214,6 @@
      "src": "src/lib.rs",
      "target": "form_urlencoded"
     },
-    "futures-core@0.3.34 lib futures_core build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-core@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_core"
-    },
-    "futures-task@0.3.34 lib futures_task build": {
-     "crate_type": "lib",
-     "deps": [],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-task@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_task"
-    },
-    "futures-util@0.3.34 lib futures_util build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "futures_core",
-       "unit": "futures-core@0.3.34 lib futures_core build"
-      },
-      {
-       "name": "futures_task",
-       "unit": "futures-task@0.3.34 lib futures_task build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "slab",
-       "unit": "slab@0.4.12 lib slab build"
-      }
-     ],
-     "edition": "2018",
-     "features": [
-      "alloc",
-      "slab",
-      "std"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "futures-util@0.3.34",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "futures_util"
-    },
     "generic-array@0.14.7 custom-build build-script-build build host": {
      "crate_type": "bin",
      "deps": [
@@ -108416,6 +107606,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -110838,10 +110089,6 @@
        "unit": "serde_json@1.0.154 lib serde_json build"
       },
       {
-       "name": "tokio",
-       "unit": "tokio@1.54.1 lib tokio build"
-      },
-      {
        "name": "tracing",
        "unit": "tracing@0.1.44 lib tracing build"
       }
@@ -111915,35 +111162,6 @@
      },
      "src": "src/lib.rs",
      "target": "miniz_oxide"
-    },
-    "mio@1.2.1 lib mio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "net",
-      "os-ext",
-      "os-poll"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "mio@1.2.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "mio"
     },
     "naga-types@30.0.1 lib naga_types build": {
      "crate_type": "lib",
@@ -116632,33 +115850,6 @@
      "src": "src/lib.rs",
      "target": "smol_str"
     },
-    "socket2@0.6.5 lib socket2 build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "all"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "socket2@0.6.5",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "socket2"
-    },
     "sonic-number@0.1.3 lib sonic_number build": {
      "crate_type": "lib",
      "deps": [
@@ -118033,98 +117224,6 @@
      },
      "src": "src/lib.rs",
      "target": "tinyvec"
-    },
-    "tokio-macros@2.7.2 proc-macro tokio_macros build host": {
-     "crate_type": "proc-macro",
-     "deps": [
-      {
-       "name": "proc_macro2",
-       "unit": "proc-macro2@1.0.107 lib proc_macro2 build host"
-      },
-      {
-       "name": "quote",
-       "unit": "quote@1.0.47 lib quote build host"
-      },
-      {
-       "name": "syn",
-       "unit": "syn@3.0.9 lib syn build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [],
-     "kind": "proc-macro",
-     "mode": "build",
-     "pkg": "tokio-macros@2.7.2",
-     "profile": {
-      "codegen_units": 16,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio_macros"
-    },
-    "tokio@1.54.1 lib tokio build": {
-     "crate_type": "lib",
-     "deps": [
-      {
-       "name": "bytes",
-       "unit": "bytes@1.11.1 lib bytes build"
-      },
-      {
-       "name": "libc",
-       "unit": "libc@0.2.191 lib libc build"
-      },
-      {
-       "name": "mio",
-       "unit": "mio@1.2.1 lib mio build"
-      },
-      {
-       "name": "pin_project_lite",
-       "unit": "pin-project-lite@0.2.17 lib pin_project_lite build"
-      },
-      {
-       "name": "socket2",
-       "unit": "socket2@0.6.5 lib socket2 build"
-      },
-      {
-       "name": "tokio_macros",
-       "unit": "tokio-macros@2.7.2 proc-macro tokio_macros build host"
-      }
-     ],
-     "edition": "2021",
-     "features": [
-      "bytes",
-      "default",
-      "io-util",
-      "libc",
-      "macros",
-      "mio",
-      "net",
-      "rt",
-      "rt-multi-thread",
-      "socket2",
-      "sync",
-      "time",
-      "tokio-macros"
-     ],
-     "kind": "lib",
-     "mode": "build",
-     "pkg": "tokio@1.54.1",
-     "profile": {
-      "codegen_units": null,
-      "debug_assertions": false,
-      "debuginfo": 0,
-      "name": "release",
-      "opt_level": "3",
-      "overflow_checks": false,
-      "panic": "unwind"
-     },
-     "src": "src/lib.rs",
-     "target": "tokio"
     },
     "toml@1.1.8+spec-1.1.0 lib toml build": {
      "crate_type": "lib",

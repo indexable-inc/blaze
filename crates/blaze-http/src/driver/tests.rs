@@ -13,10 +13,11 @@ use std::{
 use blaze_core::{
     Address, Completion as Finished, Conn, Done, Driver as _, Effect, Tag,
     sim::{Faults, Sim},
+    wait::Deadline,
 };
 
 use super::{IN_FLIGHT_MOST, Loop, Plant, Told};
-use crate::{Client, Config, Event, Request, RequestId};
+use crate::{Client, Config, Event, Kind, Request, RequestId, Step};
 
 /// Every request's timeout: the client's deadline for an answer that does not come.
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -303,6 +304,73 @@ fn the_oracle_catches_a_dropped_completion() {
 fn the_oracle_catches_a_deadline_never_armed() {
     let caught = (0..SEEDS).filter(|seed| run(*seed, faults(0), Plant::NoDeadline).is_err()).count();
     assert_eq!(caught as u64, SEEDS, "a deadline never armed went unseen");
+}
+
+/// The invariant: a request is timed from the step that starts it, wherever the client's clock
+/// stood when it was asked. Here the driver's clock moves past a whole timeout with no step of
+/// the loop's (as `serve`'s thread waits to a deadline, then reads its inbox), then a request
+/// is asked of a port nothing listens on: it ends at once in the refused connect, naming the
+/// address, the port and the step, and never in a timeout spent before it began.
+///
+/// This is the registry client's test on Linux (`requests_reuse_a_pooled_connection_and_a_
+/// refused_one_says_where`), which failed with "no answer ... in 10s" when the driver's thread
+/// slept to its old deadline: `Loop::ask` started the request on the client's clock as the last
+/// step left it, so it was late by the whole wait. The control is the same run with the start
+/// moved back into `Loop::ask`: the request then ends in `Kind::NoAnswer` at its first step.
+#[test]
+fn a_request_asked_after_a_long_wait_is_timed_from_its_start() {
+    let refused = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+    let url = format!("http://{refused}/a");
+    for seed in 0..SEEDS {
+        let mut sim = Sim::new(seed, faults(0));
+        let mut core = Loop::new(client(), 0, IN_FLIGHT_MOST);
+        let mut effects = Vec::new();
+        core.step(sim.now(), &mut effects);
+        assert!(effects.is_empty(), "seed {seed}: an idle loop asked {effects:?}");
+        // The driver's wait, on a timer of the test's own: past the client's whole timeout.
+        let waited = TIMEOUT + SLACK;
+        let mut waiting = vec![Effect::Timer { after: waited, tag: Tag(SERVER) }];
+        sim.submit(&mut waiting);
+        let mut done = Vec::new();
+        sim.poll(&mut done, Deadline::NEVER);
+        assert!(
+            matches!(&done[..], [Finished { tag: Tag(SERVER), done: Done::Fired }]),
+            "seed {seed}: the wait ended with {done:?}"
+        );
+        done.clear();
+        let asked_at = sim.now();
+        assert!(asked_at >= waited, "seed {seed}: the wait ended at {asked_at:?}");
+        // Asked before the loop's next step, as a driver thread reads its inbox.
+        core.ask(RequestId(0), Request::get(url.clone()), None);
+        let mut told = Vec::new();
+        for _ in 0..TURNS_MOST {
+            core.step(sim.now(), &mut effects);
+            while let Some(it) = core.next_told() {
+                told.push((sim.now(), it));
+            }
+            if core.requests() == 0 {
+                break;
+            }
+            sim.submit(&mut effects);
+            sim.poll(&mut done, core.deadline());
+            for completion in done.drain(..) {
+                assert!(core.owns(completion.tag), "seed {seed}: {completion:?} is no effect of the loop's");
+                core.complete(completion);
+            }
+        }
+        let [(when, Told::Event(Event::Failed { request: RequestId(0), error }))] = &told[..] else {
+            panic!("seed {seed}: the request told {told:?}, not one failure");
+        };
+        assert!(
+            matches!(
+                &error.kind,
+                Kind::Io { step: Step::Connect, host, port: 9, why }
+                    if host == "127.0.0.1" && why.contains("refused") && why.contains(&refused.to_string())
+            ),
+            "seed {seed}: the request failed with {error:?}, not the refused connect"
+        );
+        assert!(*when < asked_at + SLACK, "seed {seed}: the refusal came at {when:?}, asked at {asked_at:?}");
+    }
 }
 
 /// Past `most` requests the rest wait in order, and an asker's deadline ends a request that

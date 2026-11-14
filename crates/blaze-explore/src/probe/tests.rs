@@ -1,6 +1,6 @@
 //! [`Echo`] under blaze-core's deterministic simulation: the probe's endpoint on its HTTP/3
 //! driver loop and a page's client on its own, on one [`Sim`] whose network loses, duplicates
-//! and reorders datagrams by the seed. The page sends bidirectional streams, unidirectional
+//! and reorders datagrams by the sim seed the tape gives. The page sends bidirectional streams, unidirectional
 //! streams and datagrams, reads their echoes, then closes its session.
 
 use std::{
@@ -18,7 +18,7 @@ use blaze_http::h3::{
     Transport, Trust,
     driver::{Loop, TAGS},
 };
-use hegel::{HealthCheck, TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 use ix_prof::explore::cert::{Cert, Validity};
 
 use super::{Echo, Ended, Plant, Tally};
@@ -96,20 +96,22 @@ impl Page {
         Ok(())
     }
 
-    fn events(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), String> {
+    /// What the page saw since the last turn; the probe's misstep is the oracle's finding, the
+    /// client endpoint refusing the page's own call the harness's.
+    fn events(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), Broke> {
         while let Some(event) = endpoint.next_event() {
             match event {
                 Event::SessionOpened { session } if session == self.session => {
                     self.opened = true;
                     for (i, len) in DATAGRAMS.iter().enumerate() {
-                        endpoint.send_datagram(session, &body(*len, 100 + i)).map_err(|it| it.to_string())?;
+                        endpoint.send_datagram(session, &body(*len, 100 + i)).map_err(|it| Broke::Harness(it.to_string()))?;
                     }
-                    self.open(endpoint)?;
+                    self.open(endpoint).map_err(Broke::Harness)?;
                 }
-                Event::StreamsAvailable { session } if session == self.session => self.open(endpoint)?,
+                Event::StreamsAvailable { session } if session == self.session => self.open(endpoint).map_err(Broke::Harness)?,
                 Event::StreamOpened { stream, .. } => {
                     if stream.direction() != Direction::Uni {
-                        return Err(format!("the probe opened {stream:?}, which is not unidirectional"));
+                        return Err(Broke::Oracle(format!("the probe opened {stream:?}, which is not unidirectional")));
                     }
                     self.uni_seen.insert(stream, Seen::default());
                 }
@@ -121,7 +123,7 @@ impl Page {
                     };
                     match seen {
                         Some(seen) if seen.ends == 0 => seen.body.extend_from_slice(&bytes),
-                        _ => return Err(format!("{} bytes came on {stream:?}, which is no open stream", bytes.len())),
+                        _ => return Err(Broke::Oracle(format!("{} bytes came on {stream:?}, which is no open stream", bytes.len()))),
                     }
                 }
                 Event::StreamFinished { stream } | Event::StreamReset { stream, .. } => {
@@ -153,7 +155,7 @@ impl Page {
         }
         if !self.close_asked && self.streams_done_at.is_some_and(|at| now >= at + LINGER) {
             self.close_asked = true;
-            endpoint.close(self.session, 0, "probed").map_err(|it| it.to_string())?;
+            endpoint.close(self.session, 0, "probed").map_err(|it| Broke::Harness(it.to_string()))?;
         }
         Ok(())
     }
@@ -170,23 +172,29 @@ fn whole(lens: &[usize]) -> Tally {
     Tally { echoed: lens.len() as u64, bytes: lens.iter().sum::<usize>() as u64, failed: 0 }
 }
 
-fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
-    let fail = |why: String| format!("seed {seed}, {net:?}, {plant:?}: {why}");
+/// One run of the tape, which gives the network's seed: the page's streams and datagrams, their
+/// echoes and the close, then the oracle. What the page or the probe got wrong is
+/// `Broke::Oracle`, the test's own setup or bookkeeping failing `Broke::Harness`.
+fn run(tape: &Tape, net: Net, plant: Plant) -> Result<(), Broke> {
+    let seed = tape.next_u64("sim seed");
+    let prefix = format!("sim seed {seed}, {net:?}, {plant:?}");
+    let harness = |why: String| Broke::Harness(format!("{prefix}: {why}"));
+    let fail = |why: String| Broke::Oracle(format!("{prefix}: {why}"));
     let mut sim = Sim::new(seed, Faults { max_latency: Duration::from_millis(1), ..Faults::default() });
     sim.datagrams(Datagrams { lose_one_in: net.lose_one_in, duplicate_one_in: net.duplicate_one_in, max_delay: Duration::from_millis(5) });
     let epoch = Instant::now();
     let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let cert = Cert::make(Validity::starting(now_s), crate::NAME).map_err(|it| it.to_string())?;
-    let identity = cert.identity().map_err(|it| it.to_string())?;
+    let cert = Cert::make(Validity::starting(now_s), crate::NAME).map_err(|it| harness(it.to_string()))?;
+    let identity = cert.identity().map_err(|it| harness(it.to_string()))?;
     let server_config = ServerConfig { identity, transport: Transport::default(), requests: false };
-    let server = Endpoint::new(epoch, Some(server_config), None).map_err(|it| it.to_string())?;
+    let server = Endpoint::new(epoch, Some(server_config), None).map_err(|it| harness(it.to_string()))?;
     let client_config = ClientConfig { trust: Trust::Pinned(vec![blaze_sha256::digest(&cert.der)]), transport: Transport::default() };
-    let client = Endpoint::new(epoch, None, Some(client_config)).map_err(|it| it.to_string())?;
+    let client = Endpoint::new(epoch, None, Some(client_config)).map_err(|it| harness(it.to_string()))?;
     let mut server = Loop::new(server, 0, server_at());
     let mut client = Loop::new(client, TAGS, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     let mut echo = Echo::new();
     echo.plant(plant);
-    let session = client.endpoint().connect(server_at(), URL, &[("origin", "https://ix.dev")]).map_err(|it| it.to_string())?;
+    let session = client.endpoint().connect(server_at(), URL, &[("origin", "https://ix.dev")]).map_err(|it| harness(it.to_string()))?;
     let mut to_open: Vec<(Direction, usize)> = (0..BIDI.len()).map(|i| (Direction::Bi, i)).collect();
     to_open.extend((0..UNI.len()).map(|i| (Direction::Uni, i)));
     let mut page = Page {
@@ -212,7 +220,10 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
         echo.step(server.endpoint());
         echo.take_said(&mut said);
         echo.take_ended(&mut ended);
-        page.events(client.endpoint(), now).map_err(fail)?;
+        page.events(client.endpoint(), now).map_err(|broke| match broke {
+            Broke::Oracle(why) => fail(why),
+            Broke::Harness(why) => harness(why),
+        })?;
         server.step(now, &mut effects);
         client.step(now, &mut effects);
         sim.submit(&mut effects);
@@ -226,11 +237,11 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
             } else if client.owns(completion.tag) {
                 client.complete(completion);
             } else {
-                return Err(fail(format!("{:?} is no loop's", completion.tag)));
+                return Err(harness(format!("{:?} is no loop's", completion.tag)));
             }
         }
         if let Some(failed) = server.failed().or(client.failed()) {
-            return Err(fail(format!("a loop's socket failed: {failed}")));
+            return Err(harness(format!("a loop's socket failed: {failed}")));
         }
     }
     for (i, len) in BIDI.iter().enumerate() {
@@ -285,36 +296,40 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
 /// that reaches the probe is echoed, and none comes back that was not sent; and the session's
 /// end hands back one tally a part that counts each echo and no failure: whether the network is
 /// clean or loses, duplicates and reorders datagrams.
-#[hegel::test(test_cases = 16, suppress_health_check = [HealthCheck::TooSlow])]
-fn every_stream_and_datagram_is_echoed_once_and_tallied(tc: TestCase) {
-    let seed = tc.draw(gs::integers::<u64>());
-    let net = if tc.draw(gs::booleans()) {
-        Net { lose_one_in: tc.draw(gs::integers::<u32>().min_value(8).max_value(32)), duplicate_one_in: 8 }
-    } else {
-        Net { lose_one_in: 0, duplicate_one_in: 0 }
-    };
-    if let Err(why) = run(seed, net, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn every_stream_and_datagram_is_echoed_once_and_tallied() {
+    blaze_sim::check(Config::cases(16), |tape| {
+        let net = if tape.bool("lossy") {
+            Net { lose_one_in: tape.int_in(8..=32u32, "lose one in"), duplicate_one_in: 8 }
+        } else {
+            Net { lose_one_in: 0, duplicate_one_in: 0 }
+        };
+        run(tape, net, Plant::None)
+    });
 }
 
 const CONTROL_SEEDS: u64 = 4;
 const CLEAN: Net = Net { lose_one_in: 0, duplicate_one_in: 0 };
 
+/// `plant` caught by the oracle in every one of the tapes of seeds `0..CONTROL_SEEDS` on the
+/// clean network, each tape's clean run passing: one control a seed, each of one case, so
+/// every seed has to catch it, not just some.
+fn caught_on_every_seed(plant: Plant) {
+    for seed in 0..CONTROL_SEEDS {
+        blaze_sim::control(Config::cases(1).first(seed), Plant::None, plant, "", |tape, plant| run(tape, CLEAN, plant));
+    }
+}
+
 /// Control: with no stream's bytes said taken, the stream longer than the window stalls, and
 /// the oracle sees its echo short.
 #[test]
 fn the_oracle_catches_bytes_never_said_taken() {
-    for seed in 0..CONTROL_SEEDS {
-        assert!(run(seed, CLEAN, Plant::NoConsume).is_err(), "seed {seed}: bytes never said taken went unseen");
-    }
+    caught_on_every_seed(Plant::NoConsume);
 }
 
 /// Control: with a bidirectional stream's end not echoed, its echo never finishes, and the
 /// oracle says so.
 #[test]
 fn the_oracle_catches_an_end_not_echoed() {
-    for seed in 0..CONTROL_SEEDS {
-        assert!(run(seed, CLEAN, Plant::DropFin).is_err(), "seed {seed}: an end not echoed went unseen");
-    }
+    caught_on_every_seed(Plant::DropFin);
 }

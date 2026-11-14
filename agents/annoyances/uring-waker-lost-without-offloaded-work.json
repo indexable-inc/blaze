@@ -1,0 +1,14 @@
+{
+ "id": "uring-waker-lost-without-offloaded-work",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane for the registry client's refused-connect flake, land-net-1113",
+ "where": "crates/blaze-core/src/uring.rs Uring::poll, Wake, wake_ring; crates/blaze-core/src/uring/flight.rs Uring::offloaded; crates/blaze-http/src/driver.rs Loop::ask, serve",
+ "what": "A test of a refused connect on Linux failed two runs in three with 'no answer ... in 10s'. It looked like a lost io_uring connect completion; it was a lost Waker wake (the ring read its eventfd only while work off the ring was out, so a wake while parked in io_uring_enter ended nothing and the driver slept to an old 10 s timer) plus a request timed from the client's clock as the last step left it, so it started with its timeout already spent.",
+ "cost": "a lane reading the connect path end to end in blaze-core and the kernel's io_connect before finding the wait's wake",
+ "cause": "the Waker contract (ends the poll under way) was met only on the path that also had offloaded work; nothing tested a wake with none, and the simulation has no waker; separately Loop::ask fed the client before the step that moves its clock",
+ "class": "a wake or an input delivered across a wait that the waiting side does not see as of when it came: a wake with no reader armed, an input timed by a clock last set before the wait",
+ "prevention": "one rule on Driver::waker (crates/blaze-core/src/lib.rs): once a waker is handed out a poll with nothing in flight parks until a wake or its deadline, and a wake at any point ends the poll; the eventfd read is in flight before every kernel wait (Uring::read_wakes); uring and kqueue each have a_wake_ends_a_wait_parked_in_the_kernel; the simulation still has no waker (described, not built); requests start only in Loop::step after the clock moves, and serve advances the clock as each wait ends (as h3's serve already did), tested by a_request_asked_after_a_long_wait_is_timed_from_its_start",
+ "workaround": "none",
+ "fix": "in the working tree of land-net-1113 (blaze-net-1114), not yet compiled",
+ "state": "open"
+}

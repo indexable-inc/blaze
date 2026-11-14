@@ -46,7 +46,7 @@ mod flight;
 mod ops;
 
 use std::{
-    cell::{RefCell, UnsafeCell},
+    cell::{Cell, RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CStr,
     fmt::Write as _,
@@ -1806,6 +1806,10 @@ pub struct Uring {
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     in_flight: usize,
+    /// Whether a [`crate::Waker`] was handed out ([`Driver::waker`]): a poll with nothing in
+    /// flight then waits for its wake, to its deadline, rather than returning at once (which
+    /// turned a caller's loop into a spin).
+    waker_given: Cell<bool>,
 }
 
 /// Where the host's effects are told: the channel of the work off the ring, and its wake.
@@ -1887,6 +1891,7 @@ impl Uring {
             offload,
             locks: crate::locks::Locks::new(),
             in_flight: 0,
+            waker_given: Cell::new(false),
         })
     }
 
@@ -2237,6 +2242,20 @@ impl Uring {
         self.offloaded(tag);
         self.stampers.as_ref().expect("made above").start(job);
         Ok(())
+    }
+
+    /// Puts the read of the wake's eventfd in flight unless it is: asked before every wait in
+    /// the kernel, so a write of [`wake_ring`] (a [`crate::Waker`]'s, or a thread's off the
+    /// ring) completes it and ends the wait. Before, it was asked only while work off the ring
+    /// was out ([`Uring::offloaded`]), and a waker's write with none out ended nothing: the
+    /// thread slept to its next deadline, and the turn it was woken for waited with it. Its
+    /// completion is nobody's ([`Kind::Wake`] ends with no effect's completion); the eventfd's
+    /// count is level, so a write made before the read is asked completes it as it is asked.
+    fn read_wakes(&mut self) {
+        if self.offload.reading.is_none() {
+            let id = self.start(Hot::new(NOBODYS, Kind::Wake, 0), ops::NO_BYTES, Cold::EMPTY);
+            self.offload.reading = Some(id);
+        }
     }
 
     /// The completions the threads off the ring have sent.
@@ -2792,7 +2811,10 @@ impl Driver for Uring {
         self.reap();
         self.fire_timers();
         out.append(&mut self.ready);
-        if out.len() == before && self.in_flight > 0 {
+        // With nothing in flight only a waker can end the wait, so it is waited for once one
+        // has been handed out; with neither, nothing can come and the poll only looks (the
+        // rule on `Driver::waker`).
+        if out.len() == before && (self.in_flight > 0 || self.waker_given.get()) {
             let clock = Monotonic::since(self.start);
             while out.len() == before {
                 // The caller's deadline or the next timer's, whichever is sooner.
@@ -2800,6 +2822,9 @@ impl Driver for Uring {
                     .timers
                     .next_deadline()
                     .map_or(until, |due| until.min(Deadline::at(Duration::from_nanos(due))));
+                // The eventfd's read, in flight before the thread parks: the write of a waker or
+                // of a thread off the ring ends the kernel's wait only by completing it.
+                self.read_wakes();
                 // Parked from here ([`Wake`]): a thread off the ring that sends its completion
                 // after this writes the eventfd; one that sent before it is found by the look
                 // below, and the kernel is not entered to wait.
@@ -2859,6 +2884,7 @@ impl Driver for Uring {
     }
 
     fn waker(&self) -> Option<crate::Waker> {
+        self.waker_given.set(true);
         // clone: a handle to the ring's wake, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.offload.wake) as Arc<dyn crate::Wake>))
     }
@@ -3618,6 +3644,64 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// The invariant: a [`crate::Waker`]'s wake ends the poll under way while the ring's thread
+    /// is parked in the kernel with no work off the ring, first with nothing in flight (a poll
+    /// then waits for the wake, to its deadline, rather than returning at once and spinning its
+    /// caller), then with a timer far past the deadline in flight. Each wake comes once the
+    /// thread has parked and had time to enter the kernel, so it is the eventfd's write, not the
+    /// `asked` look before the enter, that ends the wait.
+    ///
+    /// Its control is the driver before the fix, where the eventfd was read only while work off
+    /// the ring was out (`Uring::offloaded`): the first poll returned at once and never parked
+    /// (the waking thread times out waiting for it), and with that skipped the second slept to
+    /// its deadline. That lost wake is why blaze-http's driver thread on Linux slept to an old
+    /// deadline with a request in its inbox (the registry client's
+    /// `requests_reuse_a_pooled_connection_and_a_refused_one_says_where`, "no answer ... in 10s").
+    #[test]
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        const BOUND: Duration = Duration::from_secs(20);
+        /// How long the waking thread lets the parked thread get into `io_uring_enter`.
+        const SETTLE: Duration = Duration::from_millis(100);
+        let root = dir("uring-wake");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let waker = driver.waker().expect("the ring driver has a waker");
+        for timer_in_flight in [false, true] {
+            if timer_in_flight {
+                let mut effects = vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }];
+                driver.submit(&mut effects);
+            }
+            assert_eq!(driver.in_flight(), usize::from(timer_in_flight));
+            // clone: the wake's count and the waker, for the waking thread.
+            let (parked, waker) = (Arc::clone(&driver.offload.wake), waker.clone());
+            let waking = std::thread::spawn(move || {
+                blaze_spin::SpinWait::within("the ring's thread to park", BOUND, || {
+                    parked.parked.load(Ordering::SeqCst)
+                });
+                let clock = Monotonic::new();
+                wait::sleep_until(
+                    "the parked ring's thread to enter the kernel",
+                    Deadline::after(clock.now(), SETTLE),
+                    &clock,
+                )
+                .unwrap();
+                waker.wake();
+            });
+            let began = Instant::now();
+            let mut out = Vec::new();
+            driver.poll(&mut out, Deadline::after(driver.now(), BOUND));
+            let waited = began.elapsed();
+            waking.join().expect("the waking thread saw the ring's thread park, and woke it");
+            assert!(out.is_empty(), "a wake completes nothing: {out:?}");
+            assert!(
+                waited >= SETTLE && waited < BOUND / 2,
+                "with a timer in flight: {timer_in_flight}, the poll waited {waited:?}: the wake did not end it"
+            );
+        }
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// The invariant: a write at an offset goes through the page cache whatever its size and
     /// alignment, so it completes without waiting for a device. Writes of 8 MiB at multiples
     /// of 8 MiB (a linked image's runs, as an edit's output is placed) and one unaligned: the
@@ -4226,8 +4310,10 @@ mod tests {
     }
 
     /// Each request in flight, by its handle.
+    /// The effects' requests in flight. The read of the wake's eventfd is the driver's own,
+    /// in flight across every wait once a waker is given, and no effect's: it is left out.
     fn requests(driver: &Uring) -> Vec<Id> {
-        driver.ops.iter().map(|(id, _)| id).collect()
+        driver.ops.iter().filter(|(_, hot)| hot.kind != Kind::Wake).map(|(id, _)| id).collect()
     }
 
     /// The invariant: a sync and a barrier of a file sealed read-only succeed through the

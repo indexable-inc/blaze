@@ -565,7 +565,7 @@ blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
 blaze-hash = { path = "crates/blaze-hash" }
-# blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
+# blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
@@ -871,7 +871,6 @@ tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = "1.54.1"
 toml_edit = { version = "=0.25.12", default-features = false }
 uds_windows = "1.2.1"
 unicode-segmentation = "=1.12.0"

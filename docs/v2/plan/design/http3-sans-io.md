@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's QUIC and WebTransport stack becomes sans-IO cores with thin drivers, on rustls. quinn-proto stays as the QUIC core; a new HTTP/3 + WebTransport core in blaze-http (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams) drives it; one tokio driver owns the UDP socket and the timers behind the same driver contract as HTTP/1. quinn, quinn-udp, wtransport and wtransport-proto leave the graph. Covers what blaze uses QUIC for, the contracts, the browser's requirements, the losing designs, migration and tests.
+summary: blaze's QUIC and WebTransport stack becomes sans-IO cores with thin drivers, on rustls. quinn-proto stays as the QUIC core; a new HTTP/3 + WebTransport core in blaze-http (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams) drives it; one driver on blaze-core's effects (io_uring, kqueue or the simulation; no tokio) owns the UDP socket and the timer behind the same driver contract as HTTP/1. quinn, quinn-udp, wtransport and wtransport-proto leave the graph. Covers what blaze uses QUIC for, the contracts, the browser's requirements, the losing designs, migration and tests.
 date: 2026-11-04
 ---
 # HTTP/3 and WebTransport, sans-IO
@@ -118,15 +118,17 @@ Errors (`h3::Error`) name the peer, the step (`Handshake`, `Settings`, `Connect`
 the dynamic table, ..."`. How a session ended is `h3::Closed`: `Refused { status }`,
 `ByPeer { code, reason }`, `Local { code, reason }` or `Failed(Error)`.
 
-### The tokio driver
+### The driver
 
-One task owns the core, the `tokio::net::UdpSocket` and one sleep. It loops: advance the clock,
+It was first a tokio task and is now `blaze_http::h3::driver`, on blaze-core's effects (the
+tokio one was deleted 2026-11-13); the loop is the same. One owner holds the core, the UDP
+socket and one timer. It loops: advance the clock,
 send every transmit, hand every event to its asker, then wait on the socket, the inbox of asks
 and the next deadline, whichever is first. Askers hold handles (`Request`, `Session`,
 `SendStream`, `RecvStream`) that post asks to the inbox and receive their events on channels of
 their own. Dropping a `RecvStream` stops it, dropping a `SendStream` finishes it, and dropping
-a `Request` unanswered refuses it with 500. An io_uring driver implements the same loop against
-the same core with no change to it.
+a `Request` unanswered refuses it with 500. The io_uring, kqueue and simulated hosts run the
+same loop against the same core.
 
 The driver's waits open no span yet: blaze-trace is not in the graph
 (docs/v2/plan/design/no-tracing.md). Each is bounded by a core deadline or by the asker's own

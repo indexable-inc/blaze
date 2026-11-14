@@ -27,7 +27,7 @@ use blaze_http::{
     },
     mailbox,
 };
-use hegel::{HealthCheck, TestCase, generators as gs};
+use blaze_sim::{Broke, Tape};
 use serde_json::Value;
 
 use super::{
@@ -574,8 +574,9 @@ fn dropping_the_explorer_closes_its_sessions() {
 // The server's machine under blaze-core's deterministic simulation: the server's [`Loop`]
 // (tags from 0), its [`Serving`] (from `TAGS`), the page's client [`Loop`] (from `2 x TAGS`)
 // and the jobs (from `3 x TAGS`, each a timer whose firing hands its result back after a
-// drawn delay) on one [`Sim`], whose network loses, duplicates and reorders datagrams by the
-// seed. No socket, thread or real clock: every deadline is reached through an armed timer.
+// delay drawn from the tape) on one [`Sim`], whose network loses, duplicates and reorders
+// datagrams by the sim seed the tape gives. No socket, thread or real clock: every deadline is
+// reached through an armed timer.
 
 const NAME: &str = "test explore";
 const EVERY: Duration = Duration::from_millis(250);
@@ -751,7 +752,9 @@ impl Page {
         Ok(())
     }
 
-    fn events(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), String> {
+    /// What the page saw since the last turn; a server's misstep is the oracle's finding, the
+    /// client endpoint refusing the page's own call the harness's.
+    fn events(&mut self, endpoint: &mut Endpoint, now: Duration) -> Result<(), Broke> {
         while let Some(event) = endpoint.next_event() {
             match event {
                 Event::SessionOpened { session } if session == self.a => {
@@ -759,7 +762,9 @@ impl Page {
                     self.advance();
                 }
                 Event::SessionOpened { session } if session == self.c => self.queued.push_back(7),
-                Event::SessionOpened { session } => return Err(format!("session {session:?}, to be refused, opened")),
+                Event::SessionOpened { session } => {
+                    return Err(Broke::Oracle(format!("session {session:?}, to be refused, opened")));
+                }
                 Event::SessionClosed { session, closed } => {
                     for (i, (which, ..)) in ASKS.iter().enumerate() {
                         if self.session(*which) == session && self.seen[i].ends == 0 && self.seen[i].opened_at.is_some() {
@@ -777,7 +782,7 @@ impl Page {
                 }
                 Event::StreamOpened { session, stream } => {
                     if session != self.a || stream.direction() != Direction::Uni || self.live.is_some() {
-                        return Err(format!("the server opened stream {stream:?} of session {session:?}, which is not A's one live stream"));
+                        return Err(Broke::Oracle(format!("the server opened stream {stream:?} of session {session:?}, which is not A's one live stream")));
                     }
                     self.live = Some(stream);
                 }
@@ -786,7 +791,7 @@ impl Page {
                     if self.live == Some(stream) {
                         self.live_bytes.extend_from_slice(&bytes);
                         let mut got = Vec::new();
-                        frames(&mut self.live_bytes, &mut got).map_err(|why| format!("a live frame: {why}"))?;
+                        frames(&mut self.live_bytes, &mut got).map_err(|why| Broke::Oracle(format!("a live frame: {why}")))?;
                         self.live_frames.extend(got.into_iter().map(|(header, ipc)| (now, header, ipc)));
                     } else if let Some(seen) = self.seen(stream) {
                         seen.body.extend_from_slice(&bytes);
@@ -807,7 +812,7 @@ impl Page {
                 _ => {}
             }
         }
-        self.open(endpoint, now)
+        self.open(endpoint, now).map_err(Broke::Harness)
     }
 
     /// Every request asked and ended.
@@ -901,31 +906,26 @@ struct Net {
     job_most_ms: u64,
 }
 
-/// splitmix64: the jobs' delays, from the seed.
-fn splitmix(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
-/// One run under `seed`: the page's script, then the stop, driven to their ends, then the
-/// oracle.
-fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
-    let fail = |why: String| format!("seed {seed}, {net:?}, {plant:?}: {why}");
+/// One run of the tape: the page's script, then the stop, driven to their ends, then the
+/// oracle. The tape gives the network's seed and each job's delay; what the page or the server
+/// got wrong is `Broke::Oracle`, the test's own setup or bookkeeping failing `Broke::Harness`.
+fn run(tape: &Tape, net: Net, plant: Plant) -> Result<(), Broke> {
+    let seed = tape.next_u64("sim seed");
+    let prefix = format!("sim seed {seed}, {net:?}, {plant:?}");
+    let harness = |why: String| Broke::Harness(format!("{prefix}: {why}"));
+    let oracle = |why: String| Broke::Oracle(format!("{prefix}: {why}"));
     let mut sim = Sim::new(seed, Faults { max_latency: Duration::from_millis(1), ..Faults::default() });
     sim.datagrams(Datagrams { lose_one_in: net.lose_one_in, duplicate_one_in: net.duplicate_one_in, max_delay: Duration::from_millis(5) });
     let epoch = Instant::now();
     let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let rotation = Rotation::new(now_s);
-    let cert = Cert::make(rotation.current(), NAME).map_err(|it| it.to_string())?;
-    let identity = cert.identity().map_err(|it| it.to_string())?;
+    let cert = Cert::make(rotation.current(), NAME).map_err(|it| harness(it.to_string()))?;
+    let identity = cert.identity().map_err(|it| harness(it.to_string()))?;
     let pin = blaze_sha256::digest(&cert.der);
     let server_config = ServerConfig { identity, transport: Transport::default(), requests: false };
-    let server = Endpoint::new(epoch, Some(server_config), None).map_err(|it| it.to_string())?;
+    let server = Endpoint::new(epoch, Some(server_config), None).map_err(|it| harness(it.to_string()))?;
     let client_config = ClientConfig { trust: Trust::Pinned(vec![pin]), transport: Transport::default() };
-    let client = Endpoint::new(epoch, None, Some(client_config)).map_err(|it| it.to_string())?;
+    let client = Endpoint::new(epoch, None, Some(client_config)).map_err(|it| harness(it.to_string()))?;
     let mut server = Loop::new(server, 0, server_at());
     let mut client = Loop::new(client, 2 * h3_driver::TAGS, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     let clock = |now: Duration| Clock { now, now_ns: now.as_nanos() as i64, wall_s: now_s + now.as_secs() };
@@ -940,8 +940,7 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
     };
     let mut serving = Serving::new(setup, serving::TAGS, clock(sim.now()));
     serving.plant(plant);
-    let mut page = Page::new(client.endpoint())?;
-    let mut rng = seed;
+    let mut page = Page::new(client.endpoint()).map_err(harness)?;
     let (mut effects, mut done, mut jobs, mut said) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut waiting: BTreeMap<u64, (JobId, Done)> = BTreeMap::new();
     let mut next_job = 0;
@@ -958,14 +957,17 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
         for job in jobs.drain(..) {
             let now_ns = now.as_nanos() as i64;
             let result = work_on(job.work, &Test, &move || now_ns);
-            let after = Duration::from_millis(splitmix(&mut rng) % (net.job_most_ms + 1));
+            let after = Duration::from_millis(tape.int_in(0..=net.job_most_ms, "job delay ms"));
             let tag = JOB_TAGS + next_job;
             next_job += 1;
             waiting.insert(tag, (job.id, result));
             effects.push(Effect::Timer { after, tag: Tag(tag) });
         }
         serving.take_said(&mut said);
-        page.events(client.endpoint(), now).map_err(fail)?;
+        page.events(client.endpoint(), now).map_err(|broke| match broke {
+            Broke::Oracle(why) => oracle(why),
+            Broke::Harness(why) => harness(why),
+        })?;
         if stop_at.is_none() && page.done() {
             serving.stop(now, format!("{NAME} stopped"));
             stop_at = Some(now);
@@ -990,19 +992,19 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
             } else if let Some((id, result)) = waiting.remove(&completion.tag.0) {
                 serving.done(id, result);
             } else {
-                return Err(fail(format!("{:?} is nobody's", completion.tag)));
+                return Err(harness(format!("{:?} is nobody's", completion.tag)));
             }
         }
         if let Some(failed) = server.failed().or(client.failed()) {
-            return Err(fail(format!("a loop's socket failed: {failed}")));
+            return Err(harness(format!("a loop's socket failed: {failed}")));
         }
     }
     if !said.is_empty() {
-        return Err(fail(format!("the server said {said:?}")));
+        return Err(oracle(format!("the server said {said:?}")));
     }
-    page.check(stop_at).map_err(fail)?;
+    page.check(stop_at).map_err(oracle)?;
     if over.is_none() {
-        return Err(fail("the stopped server was never over".to_owned()));
+        return Err(oracle("the stopped server was never over".to_owned()));
     }
     Ok(())
 }
@@ -1016,28 +1018,36 @@ fn run(seed: u64, net: Net, plant: Plant) -> Result<(), String> {
 /// stream's frames all parse and come at least every other period; and the stop closes every
 /// session with CLOSE_STOPPED and ends the machine: whether the network is clean or loses,
 /// duplicates and reorders datagrams, and whatever each job takes.
-#[hegel::test(test_cases = 16, suppress_health_check = [HealthCheck::TooSlow])]
-fn every_request_is_answered_once_by_its_rule_and_the_live_stream_keeps_its_period(tc: TestCase) {
-    let seed = tc.draw(gs::integers::<u64>());
-    let lossy = tc.draw(gs::booleans());
-    let lose_one_in = if lossy { tc.draw(gs::integers::<u32>().min_value(8).max_value(32)) } else { 0 };
-    let net = Net { lose_one_in, duplicate_one_in: if lossy { 8 } else { 0 }, job_most_ms: tc.draw(gs::integers::<u64>().max_value(100)) };
-    if let Err(why) = run(seed, net, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn every_request_is_answered_once_by_its_rule_and_the_live_stream_keeps_its_period() {
+    blaze_sim::check(blaze_sim::Config::cases(16), |tape| {
+        let lossy = tape.bool("lossy");
+        let lose_one_in = if lossy { tape.int_in(8..=32u32, "lose one in") } else { 0 };
+        let duplicate_one_in = if lossy { 8 } else { 0 };
+        let net = Net { lose_one_in, duplicate_one_in, job_most_ms: tape.int_in(0..=100u64, "job most ms") };
+        run(tape, net, Plant::None)
+    });
 }
 
 const CONTROL_SEEDS: u64 = 4;
 const CLEAN: Net = Net { lose_one_in: 0, duplicate_one_in: 0, job_most_ms: 20 };
 
+/// `plant` caught by the oracle in every one of the tapes of seeds `0..CONTROL_SEEDS` on the
+/// clean network, each tape's clean run passing: one control a seed, each of one case, so
+/// every seed has to catch it, not just some.
+fn caught_on_every_seed(plant: Plant) {
+    for seed in 0..CONTROL_SEEDS {
+        let config = blaze_sim::Config::cases(1).first(seed);
+        blaze_sim::control(config, Plant::None, plant, "", |tape, plant| run(tape, CLEAN, plant));
+    }
+}
+
 /// Control: a job's result dropped (the hello's, a tick's or an answer's, by order of coming
 /// back) leaves its request unanswered or the live stream unfed, and the oracle says so.
 #[test]
 fn the_oracle_catches_a_dropped_job_result() {
-    for seed in 0..CONTROL_SEEDS {
-        for nth in 1..=3 {
-            assert!(run(seed, CLEAN, Plant::DropDone { nth }).is_err(), "seed {seed}: the {nth}th job result dropped went unseen");
-        }
+    for nth in 1..=3 {
+        caught_on_every_seed(Plant::DropDone { nth });
     }
 }
 
@@ -1046,7 +1056,5 @@ fn the_oracle_catches_a_dropped_job_result() {
 /// and the oracle says so.
 #[test]
 fn the_oracle_catches_a_timer_never_armed() {
-    for seed in 0..CONTROL_SEEDS {
-        assert!(run(seed, CLEAN, Plant::NoRearm).is_err(), "seed {seed}: a timer never armed went unseen");
-    }
+    caught_on_every_seed(Plant::NoRearm);
 }
