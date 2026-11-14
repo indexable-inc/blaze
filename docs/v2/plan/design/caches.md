@@ -63,7 +63,7 @@ or overwritten: a changed input makes another key.
 | `layout-profiles` | program | address maps and profile weights by function identity, in `<target-dir>/layout`; PGO and lint profiles by content | by build id | files | †not read | †none found |
 | `fetched` | file | downloaded objects by their BLAKE3, an index from an origin (a pin, a pure step) to its object | by key | yes | store | none found |
 | `ext-facts` | crate | an extension's build and each fact it computes, under the extension's key (blaze's code, its sources, its grants) | by key | yes | store | an extension's whole source in every fact's key ("coarser than one identity per fact function", `blaze-ext-host/src/key.rs`); **unowned**: Unowned 6 |
-| `lean-proofs` | item | †a proof checked, by its clause | †not read | †not read | †not read | †not audited |
+| `lean-proofs` | item | what Lean printed of one module of a proof check (a function's model, a proof file, a theorem's check) that it accepted, beside the module under the build directory's `lean/`, with the compiled module Lean kept (`serve/unit/prove.rs`, `blaze prove`) | by the step's key: the Lean release, the module's text and the keys of the modules it imports (`hir_ty_lean::plan`); a verdict carries a hash of itself and is written only after its compiled module is ordered before it | yes | none: one verdict a module of a build directory, gone with the directory | files in the build directory, not records of the store; a proof file is one module however many theorems it proves, so an edit to one proof runs the file again |
 | `profile-history` | process | the profile's parquet history: a log, not a result | appended | files | `BLAZE_PROFILE_CAP_MB` | none found |
 | `store` | none | the store's own keys, values, chunks, dictionaries, pins (`blaze-cas`, `blaze-format`) | the collector | yes | budget | pins not covering every record family: storegc; seal groups naming every row of a broken group: sealgroups |
 | `remote` | none | transport of records between machines (`blaze-global`, `blaze-pack`, `blaze-hub`) | n/a | n/a | n/a | †not audited |
@@ -87,7 +87,7 @@ or overwritten: a changed input makes another key.
 3. **An `include!` outside the source root refuses the crate's image whole**, where
    `unit-records` files the same read by its value. File it in the image's `reads`.
 4. **`disk-stamps`** is never trimmed, and off unix its stamp can be restored by a writer (no ctime).
-5. **`devirt-world`**, `lean-proofs`, `remote`, `layout-profiles` and the rows marked † were
+5. **`devirt-world`**, `remote`, `layout-profiles` and the rows marked † were
    not read to their producers.
 6. **`ext-facts`**: every fact under its extension's whole source.
 
@@ -195,7 +195,7 @@ with a backtick in it is no domain and is not listed.
 - `layout-profiles`: `args`, `layout image`, `layout key`, `layout weights`, `link heat`, `link layout`, `lint profile`, `perf code`, `perf component`, `perf deep`, `perf image`, `perf merged`, `perf rep`, `perf run`, `pgo name`, `pgo profile`
 - `fetched`: `=blaze pack chunk`, `=blaze pack object`, `fetched package on disk`, `=blaze-fetch`, `=blaze-fetch chunk: a piece of an object by its BLAKE3`, `=blaze-fetch index record: form, BLAKE3, length`, `=blaze-fetch object as an input`, `=blaze-fetch object: bytes, or chunks of 4194304 bytes, by their BLAKE3`, `=blaze-fetch origin`
 - `ext-facts`: `extension body`, `extension build`, `extension fact`, `extension fact last`, `extension fact value`
-- `lean-proofs`: `lean proof`
+- `lean-proofs`: `lean step`, `lean verdict`
 - `store`: `=blaze gc lease nonce`, `buffer`, `hashcons pack`, `schema`, `store chunk`, `store cold unit`, `store dictionary`, `store key`, `store pin`, `store staging`, `store value`, `zstd dictionary`, `store set leaf`, `store set root`
 - `remote`: `=blaze hub tree edge`, `=blaze hub tree node`, `=blaze pack manifest`, `=blaze pack signed message`, `global bundle`, `global manifest`, `global manifest key`, `global piece`, `global record key`
 - `flights`: `serve fetch`, `serve library`, `serve library fingerprint`, `serve native`
