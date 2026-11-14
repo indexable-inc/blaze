@@ -296,7 +296,8 @@ fn ends(mut retry: Retry, now: Duration) -> bool {
     false
 }
 
-/// The invariant: a retry waits what is left. From every state of a wait (any deadline or
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/Retry.lean): a retry waits
+/// what is left. From every state of a wait (any deadline or
 /// none, any last reading, any count below [`FUEL`]) and every reading of the clock after a
 /// call that was not ready: the wait ends exactly when its deadline has passed at that
 /// reading, and where it goes on the next call is given what is left of the deadline at that
@@ -320,7 +321,8 @@ pub(crate) fn a_retry_waits_what_is_left(
     steps(retry, deadline, at, still, now)
 }
 
-/// The invariant: a stopped clock ends the wait (rule bounded-progress). From every state of
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Wait/Retry.lean): a stopped clock
+/// ends the wait (rule bounded-progress). From every state of
 /// a wait, [`FUEL`] calls in a row that return not ready with the clock at or before the
 /// wait's last reading do not all say "again": the deadline passes or the wait fails, naming
 /// the clock ([`ends`]). Its control is `the_oracle_catches_a_wait_that_never_gives_up`.
