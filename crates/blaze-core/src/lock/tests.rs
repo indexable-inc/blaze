@@ -3,8 +3,9 @@
 //!
 //! The convoy DST: workers take a hot lock, run a critical section on the virtual clock that
 //! [`Sim::stall_holders`] stalls once in a while, and let it go; a turn loop must read the
-//! state they keep once a turn. One Hegel test draws the worker count, the turns, the stalls
-//! and the schedule (which of the actors due at one virtual time steps first), and every actor
+//! state they keep once a turn. One test draws, from its case's tape, the worker count, the
+//! turns, the stalls, the schedule (which of the actors due at one virtual time steps first)
+//! and the workload (each section's work, each think and gap), and every actor
 //! is a state machine one OS thread steps in virtual-time order, its guard or its wait
 //! ([`Lock::enqueue`], [`Queued::take`]) kept in its state between steps, so no step ever
 //! blocks. Its oracle:
@@ -18,7 +19,7 @@
 //!
 //! The planted bug ([`Plant::HotLock`]) has the turn loop read through the hot lock, as the
 //! daemon's turn loop read `blaze_profile::flight::intern` on 2026-11-05;
-//! [`the_oracle_catches_a_hot_lock_on_the_turn_loop`] must find a seed it breaks. The fixed
+//! [`the_oracle_catches_a_hot_lock_on_the_turn_loop`] must find a case it breaks. The fixed
 //! design ([`Plant::None`]) publishes the state through an atomic the turn loop loads, never
 //! touching the lock, and must pass every case.
 //!
@@ -36,7 +37,7 @@ use std::{
     time::Duration,
 };
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 use super::{
     Awaits, Lock, LockGuard, LockWait, Mode, Probe, Queued, graph, set_thread_mark,
@@ -44,14 +45,15 @@ use super::{
 };
 use crate::{
     Driver,
-    sim::{Faults, Rng, Sim},
+    sim::{Faults, Sim},
 };
 
-/// Seeds of [`plan_of`] the control searches for one its plant breaks.
-const CONTROL_SEEDS: u64 = 256;
+/// Cases the control searches for one its plant breaks.
+const CONTROL_SEEDS: u32 = 256;
 
-/// The seed [`replay_one_seed`] runs, and its plant: set them to what a failure names.
-const REPLAY: (u64, Plant) = (0, Plant::None);
+/// What the oracle says of a turn that did not end within [`TURN_BOUND`]: what the planted hot
+/// lock does. Any other finding is a wrong read or record, which no design may do.
+const LATE: &str = "past TURN_BOUND";
 
 /// How long a turn of the turn loop may take, from its start to its end, on the virtual clock.
 const TURN_BOUND: Duration = Duration::from_millis(2);
@@ -77,9 +79,6 @@ const GAP_US: u64 = 900;
 
 /// A turn's own work: 20 to 20 plus this many microseconds.
 const TURN_WORK_US: u64 = 80;
-
-/// Mixed into a plan's seed for the workload's numbers, so they are not the `Sim`'s.
-const WORKLOAD: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn us(n: u64) -> Duration {
     Duration::from_micros(n)
@@ -186,8 +185,8 @@ enum Plant {
 
 #[derive(Debug)]
 struct Plan {
-    /// The `Sim`'s seed (which sections stall, for how long) and the workload's (each
-    /// section's work, each think and gap).
+    /// The `Sim`'s seed: which sections stall, for how long. The workload (each section's
+    /// work, each think and gap) is drawn from the tape as the run goes.
     seed: u64,
     workers: u64,
     turns: u64,
@@ -200,50 +199,17 @@ struct Plan {
     schedule: Vec<u64>,
 }
 
-/// A source of draws: Hegel's (shrunk, replayed by Hegel) or a seed's ([`plan_of`]).
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-
-    fn coin(&mut self) -> bool {
-        self.int(0, 1) == 1
-    }
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-impl Draw for Rng {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        match (hi - lo).checked_add(1) {
-            Some(n) => lo + self.below(n),
-            None => self.next_u64(),
-        }
-    }
-}
-
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let workers = d.int(1, MOST_WORKERS);
-    let turns = d.int(1, MOST_TURNS);
-    let stall = match d.coin() {
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let workers = tape.int_in(1..=MOST_WORKERS, "workers");
+    let turns = tape.int_in(1..=MOST_TURNS, "turns");
+    let stall = match tape.coin("holders stall") {
         false => None,
-        true => Some((d.int(1, 4) as u32, us(d.int(1, 20_000)))),
+        true => Some((tape.int_in(1..=4u32, "stall one in"), us(tape.int_in(1..=20_000u64, "most stall us")))),
     };
-    let most_work_us = d.int(1, 200);
-    let n = d.int(0, 64);
-    let schedule = (0..n).map(|_| d.int(0, MOST_WORKERS)).collect(); // alloc: a test's plan
+    let most_work_us = tape.int_in(1..=200u64, "most work us");
+    let schedule = tape.vec(0..=64, "schedule", |tape| tape.int_in(0..=MOST_WORKERS, "first due"));
     Plan { seed, workers, turns, stall, most_work_us, schedule }
-}
-
-/// The plan of `seed`, for the control and replays.
-fn plan_of(seed: u64) -> Plan {
-    plan(&mut Rng::new(seed))
 }
 
 // --- A run and its oracle ------------------------------------------------------------------
@@ -301,26 +267,17 @@ impl Expect {
     }
 }
 
-/// The first broken rule of a run.
-#[derive(Debug)]
-enum Broke {
-    /// A turn did not end within [`TURN_BOUND`]: what the planted hot lock does.
-    Late(String),
-    /// Anything else: a wrong read or record, which no design may do.
-    Wrong(String),
-}
-
-/// A worker's critical section, begun at `now` with `guard`: its work, a stall maybe, and the
-/// virtual time it lets go at.
+/// A worker's critical section, begun at `now` with `guard`: its work, drawn from `tape`, a
+/// stall maybe, and the virtual time it lets go at.
 fn hold<'a>(
     mut guard: LockGuard<'a, u64>,
     sim: &mut Sim,
-    rng: &mut Rng,
+    tape: &Tape,
     most_work_us: u64,
     now: Duration,
 ) -> (Doing<'a>, Duration) {
     *guard += 1;
-    let took = sim.hold_for(us(1 + rng.below(most_work_us)));
+    let took = sim.hold_for(us(1 + tape.below(most_work_us, "work us")));
     (Doing::Holding(guard), now + took)
 }
 
@@ -330,8 +287,9 @@ fn tail(log: &str) -> String {
     lines[lines.len().saturating_sub(40)..].join("\n")
 }
 
-/// `plan` run with `plant` on a lock named `name`: the first broken rule.
-fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
+/// `plan` run with `plant` on a lock named `name`, its workload drawn from `tape`: the first
+/// broken rule. A turn past [`TURN_BOUND`] is the oracle's finding saying [`LATE`].
+fn run(tape: &Tape, plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
     let probe = Probed::leaked();
     let lock = Lock::probed(name, 0u64, probe);
     let published = AtomicU64::new(0);
@@ -339,12 +297,11 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
     if let Some((one_in, most)) = plan.stall {
         sim.stall_holders(one_in, most);
     }
-    let mut rng = Rng::new(plan.seed ^ WORKLOAD);
     // alloc: a test's actors.
     let mut actors: Vec<Actor<'_>> = (1..=plan.workers)
-        .map(|id| Actor { id, ready: Some(us(rng.below(THINK_US))), doing: Doing::Next })
+        .map(|id| Actor { id, ready: Some(us(tape.below(THINK_US, "think us"))), doing: Doing::Next })
         .collect();
-    actors.push(Actor { id: TURN_LOOP, ready: Some(us(rng.below(GAP_US))), doing: Doing::Next });
+    actors.push(Actor { id: TURN_LOOP, ready: Some(us(tape.below(GAP_US, "gap us"))), doing: Doing::Next });
     let mut expected: Vec<Expect> = Vec::new(); // alloc: the oracle's model
     let mut log = String::new(); // alloc: a trace for a failure
     let mut enqueued = 0u64;
@@ -356,7 +313,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
     let ran: Result<(), Broke> = 'run: {
         for _ in 0..MOST_STEPS {
             let Some(at) = actors.iter().filter_map(|it| it.ready).min() else {
-                break 'run Err(Broke::Wrong(format!(
+                break 'run Err(Broke::Harness(format!(
                     "no actor can step at {:?}\n{}",
                     sim.now(),
                     tail(&log)
@@ -364,7 +321,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
             };
             let in_turn = actors.last().is_some_and(|it| !matches!(it.doing, Doing::Next));
             if in_turn && at.saturating_sub(turn_start) > TURN_BOUND {
-                break 'run Err(Broke::Late(format!(
+                break 'run Err(Broke::Oracle(format!(
                     "turn {turns} began at {turn_start:?} and had not ended by {at:?}: past \
                      TURN_BOUND {TURN_BOUND:?}\n{}",
                     tail(&log)
@@ -387,7 +344,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
             match (id == TURN_LOOP, mem::replace(&mut actor.doing, Doing::Next)) {
                 (false, Doing::Next) => match lock.try_lock() {
                     Some(guard) => {
-                        let (doing, until) = hold(guard, &mut sim, &mut rng, plan.most_work_us, now);
+                        let (doing, until) = hold(guard, &mut sim, tape, plan.most_work_us, now);
                         _ = writeln!(log, "{now:?} worker {id} takes it, until {until:?}");
                         (actor.doing, actor.ready) = (doing, Some(until));
                     }
@@ -401,7 +358,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                 (false, Doing::Queued { queued, since }) => match queued.take() {
                     Ok(guard) => {
                         expected.push(Expect::of(id, since, now, last));
-                        let (doing, until) = hold(guard, &mut sim, &mut rng, plan.most_work_us, now);
+                        let (doing, until) = hold(guard, &mut sim, tape, plan.most_work_us, now);
                         _ = writeln!(log, "{now:?} worker {id} takes it after waiting, until {until:?}");
                         (actor.doing, actor.ready) = (doing, Some(until));
                     }
@@ -418,7 +375,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                     drop(guard);
                     _ = writeln!(log, "{now:?} worker {id} lets go");
                     (released, last) = (true, Some(id));
-                    actor.ready = Some(now + us(rng.below(THINK_US)));
+                    actor.ready = Some(now + us(tape.below(THINK_US, "think us")));
                 }
                 (true, Doing::Next) => {
                     turn_start = now;
@@ -443,12 +400,12 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                     };
                     if let Some(seen) = seen {
                         if seen != committed {
-                            break 'run Err(Broke::Wrong(format!(
+                            break 'run Err(Broke::Oracle(format!(
                                 "turn {turns} read {seen}, not the {committed} sections let go"
                             )));
                         }
                         actor.doing = Doing::Reading;
-                        actor.ready = Some(now + us(20 + rng.below(TURN_WORK_US)));
+                        actor.ready = Some(now + us(20 + tape.below(TURN_WORK_US, "turn work us")));
                     }
                 }
                 (true, Doing::Queued { queued, since }) => match queued.take() {
@@ -459,12 +416,12 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                         (released, last) = (true, Some(id));
                         _ = writeln!(log, "{now:?} the turn loop reads after waiting");
                         if seen != committed {
-                            break 'run Err(Broke::Wrong(format!(
+                            break 'run Err(Broke::Oracle(format!(
                                 "turn {turns} read {seen}, not the {committed} sections let go"
                             )));
                         }
                         actor.doing = Doing::Reading;
-                        actor.ready = Some(now + us(20 + rng.below(TURN_WORK_US)));
+                        actor.ready = Some(now + us(20 + tape.below(TURN_WORK_US, "turn work us")));
                     }
                     Err(queued) => {
                         actor.doing = Doing::Queued { queued, since };
@@ -474,7 +431,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                 (true, Doing::Reading) => {
                     let took = now - turn_start;
                     if took > TURN_BOUND {
-                        break 'run Err(Broke::Late(format!(
+                        break 'run Err(Broke::Oracle(format!(
                             "turn {turns} took {took:?} from {turn_start:?}: past TURN_BOUND \
                              {TURN_BOUND:?}\n{}",
                             tail(&log)
@@ -484,10 +441,10 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                     if turns == plan.turns {
                         break 'run Ok(());
                     }
-                    actor.ready = Some(now + us(100 + rng.below(GAP_US)));
+                    actor.ready = Some(now + us(100 + tape.below(GAP_US, "gap us")));
                 }
                 (false, Doing::Reading) | (true, Doing::Holding(_)) => {
-                    break 'run Err(Broke::Wrong(format!("actor {id} in a state not its own")));
+                    break 'run Err(Broke::Harness(format!("actor {id} in a state not its own")));
                 }
             }
             if released {
@@ -498,7 +455,7 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
                 }
             }
         }
-        Err(Broke::Wrong(format!("the run took more than {MOST_STEPS} steps")))
+        Err(Broke::Harness(format!("the run took more than {MOST_STEPS} steps")))
     };
     // Every wait and guard ends before the record is read.
     drop(actors);
@@ -506,20 +463,20 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
     let (began, ended) =
         (probe.began.load(Ordering::Relaxed), probe.ended.load(Ordering::Relaxed));
     if began != enqueued || ended != began {
-        return Err(Broke::Wrong(format!(
+        return Err(Broke::Oracle(format!(
             "{enqueued} waits opened {began} wait spans and closed {ended}"
         )));
     }
     let recorded = probe.recorded();
     if recorded.len() != expected.len() {
-        return Err(Broke::Wrong(format!(
+        return Err(Broke::Oracle(format!(
             "{} waits ended with the lock, {} recorded:\nwanted {expected:?}\ngot {recorded:?}",
             expected.len(),
             recorded.len()
         )));
     }
     for (n, (got, want)) in recorded.iter().zip(&expected).enumerate() {
-        let said = |what: &str| Broke::Wrong(format!("wait {n} {what}: got {got:?}, wanted {want:?}"));
+        let said = |what: &str| Broke::Oracle(format!("wait {n} {what}: got {got:?}, wanted {want:?}"));
         if got.lock != name || got.mode != Mode::Lock || got.value_type != type_name::<u64>() {
             return Err(said("names another lock"));
         }
@@ -538,44 +495,34 @@ fn run(plan: &Plan, plant: Plant, name: &'static str) -> Result<(), Broke> {
 /// The invariant: with the state published through an atomic, a stalled holder never holds up
 /// a turn, every turn reads the latest state, and every wait among the workers is recorded
 /// once, behind the holder it waited for.
-#[hegel::test(test_cases = 300)]
-fn the_turn_loop_never_waits_behind_a_stalled_holder(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None, "dst.turn.state.fixed") {
-        panic!("{broke:?}\nplan {plan:?}");
-    }
+#[test]
+fn the_turn_loop_never_waits_behind_a_stalled_holder() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(tape, &plan, Plant::None, "dst.turn.state.fixed")
+    });
 }
 
-/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] seeded plans (test-the-cause on
-/// the test itself): a turn loop that reads through the hot lock waits behind a stalled
-/// holder past its bound. Any other broken rule on the way is a bug in the locks.
+/// The plant the oracle must catch in one of [`CONTROL_SEEDS`] cases (test-the-cause on the
+/// test itself): a turn loop that reads through the hot lock waits behind a stalled holder past
+/// its bound. Any other broken rule on the way is a bug in the locks, and ends the control.
 #[test]
 fn the_oracle_catches_a_hot_lock_on_the_turn_loop() {
-    let plant = Plant::HotLock;
-    for seed in 0..CONTROL_SEEDS {
-        match run(&plan_of(seed), plant, "dst.turn.state.planted") {
-            Ok(()) => {}
-            Err(Broke::Late(why)) => {
-                eprintln!(
-                    "{plant:?} caught at seed {seed} (REPLAY = ({seed}, Plant::{plant:?})): {why}"
-                );
-                return;
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::HotLock, LATE, |tape, plant| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        let name = match plant {
+            Plant::None => "dst.turn.state.fixed",
+            Plant::HotLock => "dst.turn.state.planted",
+        };
+        match run(tape, &plan, plant, name) {
+            Err(Broke::Oracle(why)) if !why.contains(LATE) => {
+                Err(Broke::Harness(format!("a bug in the locks, not the plant: {why}")))
             }
-            Err(Broke::Wrong(why)) => panic!("seed {seed}, Plant::{plant:?}: {why}"),
+            ran => ran,
         }
-    }
-    panic!(
-        "the oracle caught Plant::{plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
-}
-
-/// One seeded plan, [`REPLAY`]'s: set it to a seed a failure names to run that case alone.
-#[test]
-fn replay_one_seed() {
-    let (seed, plant) = REPLAY;
-    if let Err(broke) = run(&plan_of(seed), plant, "dst.turn.state.replay") {
-        panic!("seed {seed}, Plant::{plant:?}: {broke:?}");
-    }
+    });
 }
 
 // --- The wait-for graph --------------------------------------------------------------------
@@ -596,15 +543,18 @@ const CYCLE_B: &str = "dst.graph.cycle.b";
 /// Two holders each waiting on the other's lock are one deadlock, naming both threads and both
 /// locks, once the threshold passes and not before; bystanders queued behind either holder
 /// join no convoy and no second report.
-#[hegel::test(test_cases = 100)]
-fn a_cycle_of_two_holders_is_one_deadlock(tc: TestCase) {
-    let d = &mut Drawn(&tc);
-    let mut sim = Sim::new(d.int(0, u64::MAX), Faults::default());
-    let threshold_us = d.int(1, 100_000);
+#[test]
+fn a_cycle_of_two_holders_is_one_deadlock() {
+    blaze_sim::check(Config::cases(100), a_cycle_of_two_holders);
+}
+
+fn a_cycle_of_two_holders(tape: &Tape) {
+    let mut sim = Sim::new(tape.next_u64("sim seed"), Faults::default());
+    let threshold_us = tape.int_in(1..=100_000u64, "threshold us");
     let threshold = ns(us(threshold_us));
-    let gap = us(d.int(0, threshold_us - 1));
-    let past = us(d.int(0, 50_000));
-    let one_first = d.coin();
+    let gap = us(tape.int_in(0..=threshold_us - 1, "gap us"));
+    let past = us(tape.int_in(0..=50_000u64, "past us"));
+    let one_first = tape.coin("1 waits first");
     let probe = Probed::leaked();
     let a = Lock::probed(CYCLE_A, 0u64, probe);
     let b = Lock::probed(CYCLE_B, 0u64, probe);
@@ -632,10 +582,10 @@ fn a_cycle_of_two_holders_is_one_deadlock(tc: TestCase) {
             (enqueue(&mut sim, 1), q2)
         }
     };
-    let bystanders: Vec<_> = (0..d.int(0, 4))
+    let bystanders: Vec<_> = (0..tape.int_in(0..=4u64, "bystanders"))
         .map(|n| {
             probe.act(10 + n, sim.now());
-            match d.coin() {
+            match tape.coin("bystander waits on a") {
                 true => a.enqueue(),
                 false => b.enqueue(),
             }
@@ -681,14 +631,17 @@ const HEAD: u64 = 100;
 /// A holder stalled in its critical section with `n` waiters behind it is one convoy headed by
 /// it, counting all `n`, once the threshold passes and not before; handed on, each waiter
 /// records one wait behind the one before it.
-#[hegel::test(test_cases = 100)]
-fn a_stalled_holder_is_one_convoy_of_every_waiter_behind_it(tc: TestCase) {
-    let d = &mut Drawn(&tc);
-    let mut sim = Sim::new(d.int(0, u64::MAX), Faults::default());
-    let n = d.int(1, 8);
-    let threshold_us = d.int(1, 50_000);
+#[test]
+fn a_stalled_holder_is_one_convoy_of_every_waiter_behind_it() {
+    blaze_sim::check(Config::cases(100), a_stalled_holder_with_waiters);
+}
+
+fn a_stalled_holder_with_waiters(tape: &Tape) {
+    let mut sim = Sim::new(tape.next_u64("sim seed"), Faults::default());
+    let n = tape.int_in(1..=8u64, "waiters");
+    let threshold_us = tape.int_in(1..=50_000u64, "threshold us");
     let threshold = ns(us(threshold_us));
-    let most = us(d.int(0, 50_000));
+    let most = us(tape.int_in(0..=50_000u64, "most stall us"));
     // Every waiter is in line before the threshold passes for the first.
     let gap_most = (threshold_us - 1) / n;
     sim.stall_holders(1, most);
@@ -698,7 +651,7 @@ fn a_stalled_holder_is_one_convoy_of_every_waiter_behind_it(tc: TestCase) {
     let held = lock.try_lock().expect("free");
     let mut queued = Vec::new(); // alloc: a test's waits
     for id in 1..=n {
-        sim.advance(us(d.int(0, gap_most)));
+        sim.advance(us(tape.int_in(0..=gap_most, "gap us")));
         probe.act(id, sim.now());
         queued.push((id, lock.enqueue()));
     }
@@ -756,31 +709,34 @@ const HEALTHY: &str = "dst.graph.healthy";
 
 /// A run whose waits are all shorter than the threshold reports nothing, nor does a lock taken
 /// and let go with no one waiting, which leaves no row at all.
-#[hegel::test(test_cases = 100)]
-fn a_healthy_run_reports_no_stall(tc: TestCase) {
-    let d = &mut Drawn(&tc);
-    let mut sim = Sim::new(d.int(0, u64::MAX), Faults::default());
-    let n = d.int(0, 8);
-    let threshold_us = d.int(2, 50_000);
+#[test]
+fn a_healthy_run_reports_no_stall() {
+    blaze_sim::check(Config::cases(100), a_healthy_run);
+}
+
+fn a_healthy_run(tape: &Tape) {
+    let mut sim = Sim::new(tape.next_u64("sim seed"), Faults::default());
+    let n = tape.int_in(0..=8u64, "waiters");
+    let threshold_us = tape.int_in(2..=50_000u64, "threshold us");
     let threshold = ns(us(threshold_us));
     // The waiters' gaps and the holder's work together stay under the threshold.
     let gap_most = (threshold_us / 2) / (n + 1);
-    let work = us(d.int(0, threshold_us / 2 - 1));
+    let work = us(tape.int_in(0..=threshold_us / 2 - 1, "work us"));
     let probe = Probed::leaked();
     let lock = Lock::probed(HEALTHY, 0u64, probe);
     let names = [HEALTHY];
-    for round in 0..d.int(0, 8) {
+    for round in 0..tape.int_in(0..=8u64, "uncontended rounds") {
         probe.act(1 + round % 3, sim.now());
         let guard = lock.try_lock().expect("no one holds it");
         assert!(rows_of(&names).waits.is_empty(), "an uncontended lock left a row");
-        sim.critical_section(us(d.int(0, 100)));
+        sim.critical_section(us(tape.int_in(0..=100u64, "section us")));
         drop(guard);
     }
     probe.act(HEAD, sim.now());
     let held = lock.try_lock().expect("free");
     let mut queued = Vec::new(); // alloc: a test's waits
     for id in 1..=n {
-        sim.advance(us(d.int(0, gap_most)));
+        sim.advance(us(tape.int_in(0..=gap_most, "gap us")));
         probe.act(id, sim.now());
         queued.push((id, lock.enqueue()));
     }
