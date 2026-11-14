@@ -327,9 +327,6 @@ theorem loop0_eq : ∀ (i fuel : Nat) (steps : Vec Step) (alone : Usize), alone.
       exact hv
     · rw [hvv]; simp [List.replicate_succ]
 
-/-- A `Result` lifted into a program is the program that ends with it. -/
-theorem lift_done {α : Type} (x : Result α) : (liftM x : Prog α) = Prog.done x := rfl
-
 theorem new_exec (v : U32) :
     (Atomic.new v).exec World.new = .ok (⟨0⟩, ⟨[v.val], [], [], [], false, 0, []⟩) := rfl
 
@@ -346,7 +343,7 @@ theorem settles_true (d : Option Deadline) (schedule : Vec Step)
   by_cases hL : 18446744073709551615 - 8 < (schedule.val.length : Int)
   · have hgt : Scalar.gt (Slice.len schedule) m = true := by
       simp only [Scalar.gt, Slice.len_val, hm, decide_eq_true_eq]; omega
-    simp only [settles.Timed, lift_done, hsub, Prog.bind_done_ok, hgt, ↓reduceIte]
+    simp only [settles.Timed, Prog.lift_done, hsub, Prog.bind_done_ok, hgt, ↓reduceIte]
     rfl
   · have hgt : Scalar.gt (Slice.len schedule) m = false := by
       simp only [Scalar.gt, Slice.len_val, hm, decide_eq_false_iff_not]; omega
@@ -386,7 +383,7 @@ theorem settles_true (d : Option Deadline) (schedule : Vec Step)
       ⟨_, by cases token <;> simp [u32_0, u32_1], rfl⟩
     obtain ⟨e, w', he, hne⟩ := run d schedule.val _ _ _ (hstart x hx)
     apply Prog.value_of_exec (w := w')
-    simp only [settles.Timed, lift_done, hsub, Prog.bind_done_ok, hgt, Bool.false_eq_true,
+    simp only [settles.Timed, Prog.lift_done, hsub, Prog.bind_done_ok, hgt, Bool.false_eq_true,
       ↓reduceIte, hv]
     have hnew : (Atomic.new (if token then (1 : U32) else 0)).exec World.new =
         .ok (⟨0⟩, ⟨[x], [], [], [], false, 0, []⟩) := by rw [new_exec, hxv]
