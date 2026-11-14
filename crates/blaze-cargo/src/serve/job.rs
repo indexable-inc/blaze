@@ -9690,7 +9690,7 @@ impl<S: Steps> Jobs<S> {
         };
         job.stage = Stage::Runs(run);
         if let Some(it) = self.runs.get_mut(run) {
-            it.runs = Some(Box::new(runs)); // alloc: once per check of a job
+            it.runs = Some(Box::new_in(runs, Global));
             it.held = true;
         }
         self.release_runs(w);
