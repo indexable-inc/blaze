@@ -467,33 +467,6 @@ fn not_kept(binary: &str, name: &str, no: &str, why: &str) -> TestResult {
 }
 
 #[test]
-fn the_tests_that_ran_outside_named_in_one_note_as_cargos_shell_writes_it() {
-    let inside = result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "");
-    let outside =
-        TestResult { name: "tests::writes_home".to_owned(), outside: true, ..inside.clone() };
-    let mut text = String::new();
-    super::outside(&mut text, std::slice::from_ref(&inside), false);
-    assert_eq!(text, "", "nothing when every test ran inside");
-    super::outside(&mut text, &[inside.clone(), outside.clone()], false);
-    assert_eq!(
-        text,
-        "note: 1 test ran outside the sandbox, so it runs every time and its pass is never kept: tests::writes_home\n"
-    );
-    text.clear();
-    let failed = TestResult {
-        name: "tests::dials".to_owned(),
-        outcome: TestOutcome::Failed,
-        ..outside.clone()
-    };
-    super::outside(&mut text, &[outside, inside, failed], true);
-    assert_eq!(
-        text,
-        "\x1b[1m\x1b[92mnote\x1b[0m: 2 tests ran outside the sandbox, so they run every time and their passes are \
-         never kept: tests::writes_home, tests::dials\n"
-    );
-}
-
-#[test]
 fn an_executable_index_past_any_request_is_refused_naming_it() {
     let far = TestResult {
         executable: u32::MAX - 1,

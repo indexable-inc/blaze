@@ -279,14 +279,31 @@ impl Host {
             launch.env.iter().filter(|(name, _)| name != HOST_VAR).cloned().collect();
         env.push((HOST_VAR.into(), var));
         let mut sandbox = launch.sandbox.clone();
-        if let Sandbox::On { read, write, services, .. } = &mut sandbox {
+        if let Sandbox::On { read, services, .. } = &mut sandbox {
             read.push(launch.program.clone());
             services.extend(sys::service());
-            // Connecting to a Unix socket is a write of the socket alone: the program gets
-            // neither the directory nor the other runs' sockets in it. A named pipe is not a
-            // path the sandbox's file rules cover.
+            // The host's socket is a readable entry, never a writable one: the sandbox makes
+            // a readable socket one its process may connect to by that exact path and nothing
+            // more (Linux: bound read-only into its view, and the supervisor lets `connect`
+            // through to exactly that path; macOS: a `(remote unix-socket (path-literal ..))`
+            // rule), as it does the fork server's. It gets neither the directory nor the other
+            // runs' sockets in it, and may not bind, unlink or replace the socket. A writable
+            // entry would have been a writable directory to make (macOS) or a bind the Linux
+            // sandbox refuses for a socket, and either way more than a connect.
+            //
+            // What the run can now do that it could not: connect to this host and, within
+            // [`HANDSHAKE`], send a first frame. The host answers a connection only from a
+            // process of the daemon's user (the kernel's peer credentials), only for a HELLO
+            // naming a token of a launch still waiting, and each token once (the first HELLO
+            // naming it takes it from the table): anything else is dropped with nothing sent.
+            // The run's own token is taken by its start hook before `main`, so the program's
+            // code holds no token it can use. Another launch's token is in that process's
+            // environment alone; a sandbox that keeps a run from reading another process's
+            // environment (Linux: a PID namespace with its own `/proc`, or Landlock's scoping
+            // of `ptrace` access when confined) keeps the host from being reached for anything
+            // but nothing. A named pipe (Windows) is not a path the sandbox's file rules cover.
             if cfg!(unix) {
-                write.push(PathBuf::from(&self.address));
+                read.push(PathBuf::from(&self.address));
             }
         }
         let command = Command {
@@ -881,7 +898,7 @@ fn serve(
     launch: &Waiting,
     seq: &mut u32,
 ) -> Result<(sys::Remote, sys::Bells, u64), Error> {
-    if hello.pid != peer {
+    if !is_peer(peer, hello.pid)? {
         return Err(Error::new(format!(
             "a start hook that says it is process {} on a connection from process {peer}",
             hello.pid
@@ -952,4 +969,31 @@ fn serve(
             }
         }
     }
+}
+
+/// Whether the start hook on a connection from `peer` (a process ID in the daemon's PID
+/// namespace, from the kernel) saying it is `said` (its own `getpid`) speaks of itself. A
+/// sandboxed run on Linux is in a PID namespace of its own, where `getpid` answers its ID
+/// there; the kernel lists its ID in every namespace from the daemon's down in `NSpid` of
+/// `/proc/<peer>/status`, the last its own. What a hook says is not what authenticates it
+/// (the token and the peer's user are): this catches a hook that names another process.
+fn is_peer(peer: u32, said: u32) -> Result<bool, Error> {
+    if said == peer {
+        return Ok(true);
+    }
+    if !cfg!(target_os = "linux") {
+        return Ok(false);
+    }
+    let path = format!("/proc/{peer}/status");
+    let status = std::fs::read_to_string(&path).map_err(|it| {
+        Error::new(format!("reading {path}, the process IDs of process {peer}: {it}"))
+    })?;
+    Ok(innermost(&status) == Some(said))
+}
+
+/// The last ID of the `NSpid` line of a `/proc/<pid>/status`: the process's ID in its own
+/// PID namespace. `None` where there is no such line or it is not IDs.
+pub(crate) fn innermost(status: &str) -> Option<u32> {
+    let line = status.lines().find_map(|it| it.strip_prefix("NSpid:"))?;
+    line.split_whitespace().last()?.parse().ok()
 }

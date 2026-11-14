@@ -165,7 +165,7 @@ fn ub_results_print_as_libtest_prints_them() {
 }
 
 #[test]
-fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
+fn the_client_names_no_test_that_ran_outside_the_sandbox() {
     let result = |name: &str, outside: bool| TestResult {
         binary: "/w/target/debug/deps/foo-1".to_owned(),
         name: name.to_owned(),
@@ -190,13 +190,10 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     );
     assert_eq!(then, Then::Exit(0));
     assert!(out.contains("test tests::writes_home ... ok\n"), "{out}");
-    assert!(
-        err.contains(
-            "note: 2 tests ran outside the sandbox, so they run every time and their passes are never kept: \
-             tests::writes_home, tests::dials\n"
-        ),
-        "{err}"
-    );
+    // How many ran outside, and why, is the daemon's one counted note
+    // (`serve::unit::test::outside_note`), sent as a diagnostic: the client lists no names.
+    assert!(!err.contains("outside the sandbox"), "{err}");
+    assert!(!err.contains("tests::writes_home") && !err.contains("tests::dials"), "{err}");
     // The run's last line: its counts, from the results the daemon sent.
     let last = err.lines().last().unwrap();
     assert!(

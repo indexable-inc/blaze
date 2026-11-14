@@ -64,6 +64,23 @@ impl Suite {
             .part("mode", b"process");
         given.finish()
     }
+
+    /// What each test of the suite run outside the sandbox (`BLAZE_SANDBOX=off`, its package's
+    /// `tests = false` or `unsandboxed-tests`, or on macOS no opt-in) is given: [`Suite::given`] and that it runs
+    /// outside. A pass is kept only of a sandboxed run, so a test outside is in the index under
+    /// a base key of its own, which no kept pass is under: it runs every time, and a pass kept
+    /// of the same test inside never stands for it. Its suite's head is still held by
+    /// [`Suite::given`].
+    pub fn given_outside(&self) -> ContentId {
+        let mut given = Given::new(RunKind::Test);
+        given
+            .part("package", self.package.as_bytes())
+            .part("target", self.target.as_bytes())
+            .id("context", &self.context)
+            .part("mode", b"process")
+            .part("sandbox", b"off");
+        given.finish()
+    }
 }
 
 /// Whether libtest's flags ask for a test.

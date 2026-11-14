@@ -1,5 +1,20 @@
 use super::*;
 
+/// The invariant: a test run outside the sandbox is keyed apart from the same test run inside,
+/// so no pass kept of a sandboxed run is ever read for it; the control is the suite's own
+/// `given`, which is stable.
+#[test]
+fn a_run_outside_the_sandbox_is_keyed_apart_from_one_inside() {
+    let suite = Suite {
+        package: "sel".to_owned(),
+        target: "lib".to_owned(),
+        context: ContentId::of("blaze test select context", b"x86_64-unknown-linux-gnu"),
+    };
+    assert_eq!(suite.given(), suite.given());
+    assert_eq!(suite.given_outside(), suite.given_outside());
+    assert_ne!(suite.given(), suite.given_outside());
+}
+
 fn ignored() -> Attrs {
     Attrs { ignore: true, ..Attrs::default() }
 }

@@ -703,7 +703,7 @@ per head. `ed25519-dalek` does the checks (2.2 in the workspace today).
   the Worker's secrets and deletes them from the repository before any workflow uses the cache.
   The job that signs and uploads is a separate job from the build: it receives the
   build's new blobs and entries as an artifact, so build scripts, proc macros and tests (which run
-  sandboxed in the build job, [cargo.md](cargo.md#sandboxed-tests-an-experiment-opt-in)) never run in a
+  sandboxed in the build job, [cargo.md](cargo.md#sandboxed-tests)) never run in a
   process that can read the key.
 
 ### Rotation and revocation
@@ -1100,7 +1100,7 @@ Drivers, and what each is for:
 - **`Uring`**: the bulk `/get` reads and the pack appends on one ring, behind a measurement in
   slice 8 showing it beats `Threads` on a GitHub runner. The daemon is not inside the test
   sandbox, whose seccomp filter refuses `io_uring_setup`
-  ([cargo.md](cargo.md#sandboxed-tests-an-experiment-opt-in)), so nothing stops it there.
+  ([cargo.md](cargo.md#sandboxed-tests)), so nothing stops it there.
 - **HTTP/3** to the gateway's domain, as `quiche` over `SendTo`/`RecvFrom` on any of the three.
   Real work (connection migration, pacing timers through `Timer`); worth it only if slice 8 shows
   it helps on lossy or long links (users far from a Cloudflare location), since a datacenter

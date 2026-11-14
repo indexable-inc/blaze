@@ -631,6 +631,81 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
     assert!(fake.listens.is_empty());
     assert!(fake.spawns.is_empty(), "nothing is started outside in its place: {:?}", fake.spawns);
     assert!(fake.queue.finished());
+    let said = fake.queue.take_unsandboxable().expect("the run says once why it stopped");
+    assert!(said.contains("could not be started in its sandbox: no user namespaces"), "{said}");
+    assert_eq!(fake.queue.take_unsandboxable(), None, "said once");
+}
+
+/// The invariant: a dev executable's launch adds nothing writable to a test's sandbox, so no
+/// path of the daemon's home is a test's to write; what it adds to read (its program, the
+/// code-memory host's socket, which a readable entry lets it connect to by that path alone) is
+/// allowed. The control is the listing the host once made, its socket under
+/// `BLAZE_HOME/v2/inproc` as writable, which Linux's sandbox refused at spawn: refused here,
+/// before any spawn, naming the socket.
+#[test]
+fn a_launch_adds_nothing_writable_to_a_tests_sandbox() {
+    let planned = [PathBuf::from("/scratch/t")];
+    let socket = PathBuf::from("/home/u/.cache/blaze/v2/inproc/inproc-7.sock");
+    let on = |read: Vec<PathBuf>, write: Vec<PathBuf>| Sandbox::On {
+        read,
+        write,
+        network: false,
+        trace: true,
+        services: vec!["dev.blaze.inproc.7".to_owned()],
+    };
+    let now = on(vec!["/ws".into(), "/bin/lib".into(), socket.clone()], planned.to_vec());
+    assert_eq!(adds_no_write(&planned, &now), Ok(()));
+    let old = on(vec!["/ws".into(), "/bin/lib".into()], vec!["/scratch/t".into(), socket.clone()]);
+    assert_eq!(adds_no_write(&planned, &old), Err(&socket));
+    assert_eq!(adds_no_write(&planned, &Sandbox::Off), Ok(()));
+    assert_eq!(adds_no_write(&[], &on(Vec::new(), Vec::new())), Ok(()));
+}
+
+/// The invariant: a sandboxed fork server whose spawn fails stops the run: no test of any
+/// other binary starts after it, the sandboxed ones nor those outside, and the queue says why
+/// once. The control: a binary outside the sandbox that can't be started stops nothing.
+#[test]
+fn a_sandbox_that_cannot_be_made_stops_the_run() {
+    let mut fake = Fake::new(
+        config(4),
+        vec![
+            binary("lib", vec![job("a", 0)]),
+            binary("other", vec![job("c", 0)]),
+            outside("away", vec![job("d", 0)]),
+        ],
+    );
+    let lib = fake.spawn_of("/bin/lib");
+    let other = fake.spawn_of("/bin/other");
+    fake.spawns.retain(|it| it.0 != lib);
+    fake.complete(lib, Done::Failed(IoError("no user namespaces".into())));
+    assert!(matches!(fake.result("a").outcome, Outcome::Failed(Failure::Lost(_))));
+    for test in ["c", "d"] {
+        assert_eq!(fake.result(test).outcome, Outcome::NotRun, "{test}");
+    }
+    assert!(
+        fake.spawns.iter().all(|it| it.0 == other),
+        "nothing starts after the stop, the binary outside neither: {:?}",
+        fake.spawns
+    );
+    assert!(fake.queue.take_unsandboxable().is_some());
+    // `other` was started before the stop and fails the same way: it is said once.
+    fake.spawns.clear();
+    fake.complete(other, Done::Failed(IoError("no user namespaces".into())));
+    assert_eq!(fake.queue.take_unsandboxable(), None);
+    assert!(fake.queue.finished());
+
+    let mut control = Fake::new(
+        config(4),
+        vec![outside("away", vec![job("d", 0)]), outside("near", vec![job("e", 0)])],
+    );
+    let away = control.spawn_of("/bin/away");
+    control.spawns.retain(|it| it.0 != away);
+    control.complete(away, Done::Failed(IoError("no such file".into())));
+    assert_eq!(control.queue.take_unsandboxable(), None);
+    let near = control.hello(1, &["e"]);
+    let e = control.run(near, 0);
+    control.end(near, e, End::Exited(0), b"");
+    assert_eq!(control.result("e").outcome, Outcome::Passed);
 }
 
 /// Outside the sandbox the server is spawned at once, with no sandbox, no record and no

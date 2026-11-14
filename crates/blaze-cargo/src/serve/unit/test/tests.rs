@@ -422,3 +422,64 @@ fn a_binary_that_cant_run_is_named_and_keeps_no_other_from_running() {
         ]
     );
 }
+
+/// The invariant: the tests a run runs outside the sandbox are said in one note, a count with
+/// the setting that put them there, a package's counts merged across its binaries, never a list
+/// of every name; none outside says nothing.
+#[test]
+fn the_tests_outside_are_counted_in_one_note_with_the_setting_that_put_them_there() {
+    use super::{OutsideBy, outside_note};
+    assert_eq!(outside_note([("sel", OutsideBy::Named, 0), ("b", OutsideBy::Package, 0)]), None);
+    assert_eq!(
+        outside_note([("sel", OutsideBy::Package, 3)]).as_deref(),
+        Some(
+            "3 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed: 3 of `sel`, whose \
+             `[package.metadata.blaze.sandbox]` sets `tests = false`"
+        )
+    );
+    assert_eq!(
+        outside_note([("sel", OutsideBy::Command, 2), ("b", OutsideBy::Command, 1)]).as_deref(),
+        Some(
+            "3 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed; `BLAZE_SANDBOX=off` is set"
+        )
+    );
+    let mixed = outside_note([
+        ("a", OutsideBy::Named, 1),
+        ("b", OutsideBy::Package, 2),
+        ("a", OutsideBy::Named, 0),
+        ("b", OutsideBy::Package, 4),
+    ])
+    .unwrap();
+    assert_eq!(
+        mixed,
+        "7 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+         records what it reads, is kept as passed: 1 of `a`, named by its `unsandboxed-tests`; \
+         6 of `b`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`"
+    );
+    let one = outside_note([("a", OutsideBy::Named, 1)]).unwrap();
+    assert!(one.starts_with("1 test runs outside the sandbox, so it runs every time"), "{one}");
+    // Outside for want of an opt-in (macOS): the one thing to do and its hole, said once.
+    let host = outside_note([("sel", OutsideBy::Host, 3), ("b", OutsideBy::Package, 1)]).unwrap();
+    assert_eq!(
+        host,
+        format!(
+            "4 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed: 3 of `sel`, which does not opt in; 1 of `b`, \
+             whose `[package.metadata.blaze.sandbox]` sets `tests = false`{}",
+            super::MACOS_OPT_IN
+        )
+    );
+    assert!(host.contains("`tests = true` under its `[package.metadata.blaze.sandbox]`"), "{host}");
+    assert!(host.contains("another test binary's launch token"), "{host}");
+    assert!(!one.contains("tests = true"), "said only where tests are outside by the host");
+}
+
+/// What a run whose sandbox failed says begins with the one thing to do, then says why.
+#[test]
+fn a_failed_sandbox_says_first_how_to_run_outside_then_why() {
+    let said = super::unsandboxable("/t/lib could not be started in its sandbox: no user namespaces");
+    assert!(said.starts_with("to run these tests anyway, set `BLAZE_SANDBOX=off`"), "{said}");
+    assert!(said.ends_with("so the run stopped before its other tests: /t/lib could not be started in its sandbox: no user namespaces"), "{said}");
+}

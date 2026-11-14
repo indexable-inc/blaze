@@ -639,7 +639,6 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
         build_dir: format!("{root}/target"),
         finished: FINISHED.into(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }

@@ -47,7 +47,7 @@ be an ask, or the result is not kept. Each case, decided:
 | Child processes | Kept when traced | Their file, directory and environment reads are traced into the test's (Linux: the tracer follows forks). A child the tracer cannot follow (a macOS protected binary) makes the run `descriptor`: not kept. |
 | Writes outside its own temporary directory | Not kept (`wrote outside`) | A write that outlives the test is an effect another test or run can read. Needs a private overlay of the home and the workspace so the sandbox can say "it wrote outside"; missing today. |
 | A file read through a descriptor the sandbox did not see opened | Not kept (`descriptor`) | The trace's incomplete (X) lines. |
-| Not sandboxed at all | Not kept (`unsandboxed`) | Tests always run sandboxed (target.md); a run that was not is never kept. |
+| Not sandboxed at all | Not kept (`unsandboxed`) | On Linux tests run sandboxed by default (target.md); a package takes its tests out with `tests = false` or `unsandboxed-tests`, a command with `BLAZE_SANDBOX=off`. On macOS they run sandboxed only where the package (`tests = true`) or the workspace (`experimental = ["sandboxed-tests"]`) opts in, because a sandboxed test there can read another test binary's launch token (docs/cargo.md, "The daemon's socket, and a known hole on macOS"); one rule decides it (`tests_sandboxed_by_default` in blaze-units' `load/sandbox.rs`). A run outside is never kept, and its base key carries that it ran outside (`Suite::given_outside`), so a pass kept of a sandboxed run never stands for it. Where no sandbox can be made the run stops (exit 101) and says `BLAZE_SANDBOX=off` first. |
 
 A test that cannot be traced is "not kept", by name and reason, every time it runs. It is never
 an error and never silently rerun under another rule.
@@ -140,6 +140,18 @@ codegen marked the test as reaching code the tracer cannot see (`foreign`).
 Not given yet, so a pass is refused or costs more rather than kept wrongly: writes outside the
 sandbox's private overlay (not built, so a test that writes outside is not refused for it);
 a raw syscall or the vDSO as `foreign` (codegen marks only what it sees).
+
+Missing, and above the floor: the base hashes the whole environment the test binary is given
+(`run::process_env` over the client's `invocation.env`), not only what blaze declares as
+section 3 says, so a change to any variable of the shell `blaze test` runs from (`PWD`,
+`TERM_SESSION_ID`, `SSH_AUTH_SOCK`, `BLAZE_SANDBOX`) is a new base for every test of every
+suite, and every test runs again though none read it. The floor: a variable is an ask like a
+file. The base holds what blaze sets (toolchain, settings, entry, attributes, arguments, the
+variables blaze declares to tests, and whether the run was sandboxed, as `given_outside`
+already does), and each variable a test read, which the sandbox already traces as an
+environment read, is an ask answered by its value now. A change to a variable no test read
+then reruns nothing, and one read by k tests reruns those k. Against that, today costs every
+kept test per changed variable, an unbounded ratio. Not built.
 
 The head outlives the daemon. Each head a run files is a journal mark per suite
 (`serve/local.rs` `TestHeadMark`: the suite's settings, the head and postings keys, and the

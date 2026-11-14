@@ -469,27 +469,38 @@ A unit's record key covers all of these: its own rustflags through its plan, the
 rustflags of the crates it links in as a part of their own, and its build scripts' link
 arguments as a part of theirs.
 
-### Sandboxed tests (an experiment, opt-in)
+### Sandboxed tests
 
-Tests run in a sandbox only where the daemon runs them (`blaze test`,
-[below](#which-tests-run)) and the workspace opts in, in its root manifest:
+Whether a test the daemon runs (`blaze test`, [below](#which-tests-run)) is sandboxed by
+default depends on the host, decided in one place (`tests_sandboxed_by_default` in
+`crates/blaze-units/src/load/sandbox.rs`):
 
-```toml
-[workspace.metadata.blaze]
-experimental = ["sandboxed-tests"]
-```
+| host | a test is sandboxed |
+|---|---|
+| Linux | always, with nothing to opt into, unless its package takes it out ([below](#a-package-takes-its-tests-out)) or the command says `BLAZE_SANDBOX=off` |
+| macOS | only where its package opts in (`tests = true` in its `[package.metadata.blaze.sandbox]`) or the workspace does (`experimental = ["sandboxed-tests"]`), and then the same way out applies |
 
-or where a package does, in its own manifest, with `tests = true` under
-`[package.metadata.blaze.sandbox]`. `experimental` lists, by name, the experiments a workspace
-opts into: `sandboxed-tests`, and `const-macros` (proc macros written as functions of a file of
-the package, run by blaze's const evaluator: [future/const-macros.md](future/const-macros.md)).
-Any other name, or a value that is not a list of names, is an error that names the manifest and
-the names known (`crates/blaze-units/src/load/sandbox.rs`). A test that is not sandboxed is
-never kept as passed ([below](#which-tests-run)). Build scripts run in the sandbox
-whatever the workspace says ([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and
-proc macros run in blaze's own process, as WebAssembly modules.
+The two differ because of a known hole on macOS ([below](#the-daemons-socket-and-a-known-hole-on-macos)):
+a sandboxed test there can read another test binary's launch token. The difference goes when
+the channel to the daemon is a descriptor the test inherits, with no token in any environment.
 
-In a workspace that opts in, each test binary the daemon runs starts once in a sandbox of its
+The sandbox is what lets blaze keep a pass and rerun a test only when something it executed or
+read changed: it records what each test reads, and a test outside it can read anything, so
+nothing can say when it must run again. A test that is not sandboxed is never kept as passed.
+Build scripts run in the sandbox on every host
+([below](#build-scripts-and-proc-macros-run-in-a-sandbox)), and proc macros run in blaze's own
+process, as WebAssembly modules.
+
+`experimental` in `[workspace.metadata.blaze]` lists, by name, the experiments a workspace
+opts into: `const-macros` (proc macros written as functions of a file of the package, run by
+blaze's const evaluator: [future/const-macros.md](future/const-macros.md)) and
+`sandboxed-tests` (every member's tests sandboxed, on macOS). Any other name, or a value that is
+not a list of names, is an error that names the manifest and the names known
+(`crates/blaze-units/src/load/sandbox.rs`). On Linux, where tests are sandboxed anyway,
+`sandboxed-tests` does nothing, and every build says so in a note; delete it from the list once
+no macOS machine builds the workspace.
+
+Each test binary the daemon runs starts once in a sandbox of its
 own, tracing what it reads, as a fork server, and each test runs in a child forked from it
 (`crates/blaze-usercode/src/test/queue.rs`). In it the machine's files are read-only; the workspace, the target directory and
 cargo's home (`CARGO_HOME`, `~/.cargo`) are as they are, but what a test writes there is kept
@@ -521,7 +532,9 @@ v1 failed a test the sandbox denied something, whatever it ended with, naming wh
 and the way out; v2 records the refusal (`W` and `N` lines of the record) and the test ends as
 it ends.
 
-A package of a workspace that opts in takes its tests out of the sandbox in its manifest:
+#### A package takes its tests out
+
+A member of the workspace takes its tests out of the sandbox in its own manifest:
 
 ```toml
 [package.metadata.blaze.sandbox]
@@ -529,16 +542,59 @@ tests = false                                 # every test of the package runs o
 unsandboxed-tests = ["tests::writes_home"]    # or these, by libtest's names
 ```
 
-Any other key there is an error. The tests named run from a second server of the binary,
-started outside, after every sandboxed test (`crates/blaze-cargo/src/serve/unit/test.rs`);
-`-v` says which and why. `BLAZE_SANDBOX=off` in the command's environment runs every test and
-build script of the command outside, as cargo does. A test outside the sandbox runs every
-time: what it read is not known, so its pass is never kept.
+On Linux `tests = true` is the default said out loud; on macOS it is the opt-in that sandboxes
+the package's tests (with the hole [below](#the-daemons-socket-and-a-known-hole-on-macos)).
+Any other key there is an error, and a
+dependency's own table is not read. The tests named run from a second server of the binary,
+started outside, after every sandboxed test (`crates/blaze-cargo/src/serve/unit/test.rs`).
+`BLAZE_SANDBOX=off` in the command's environment runs every test and build script of the
+command outside, as cargo does. A test outside the sandbox runs every time: what it read is not
+known, so its pass is never kept. Its line says so (`(not kept: not sandboxed)`), and the run
+says, in one note before its results, how many tests run outside and the setting that put them
+there:
 
-Where no sandbox can be made for a test that is opted in, `blaze test` stops before any test runs, says why and how
-to fix it, and exits 101. It does not go on outside with a warning: a run that did would break,
-unseen, the promise that a test can't change the machine or reach the network, and a warning
-in a long log is not seen. `BLAZE_SANDBOX=off` is the explicit way to run outside.
+```text
+note: 3 tests run outside the sandbox, so they run every time: only a sandboxed run, which records what it reads, is kept as passed: 3 of `sel`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`
+```
+
+On macOS a package that does not opt in has every line `(not kept: not sandboxed)`, every run,
+and the note says the one thing to do and what it carries:
+
+```text
+note: 3 tests run outside the sandbox, so they run every time: only a sandboxed run, which records what it reads, is kept as passed: 3 of `sel`, which does not opt in. On macOS tests run outside the sandbox unless their package opts in: `tests = true` under its `[package.metadata.blaze.sandbox]` runs them sandboxed and keeps their passes, though a sandboxed test on macOS can still read the arguments and environment of the user's other processes, another test binary's launch token among them (docs/cargo.md, "Sandboxed tests")
+```
+
+Where the sandbox can't be made (or fails) for a test binary, its tests fail and `blaze test`
+stops there: no other test starts, it says once, first, how to run the tests anyway
+(`BLAZE_SANDBOX=off`, at the cost that nothing is kept and every test runs every time) and then
+why the sandbox failed, and it exits 101. It does not go on outside with a warning: a run that
+did would break, unseen, the promise that a test can't change the machine or reach the
+network, and a warning in a long log is not seen. `BLAZE_SANDBOX=off` is the explicit way to
+run outside.
+
+#### The daemon's socket, and a known hole on macOS
+
+A test binary blaze runs on its code memory (a dev test binary) connects, as it starts, to the
+daemon's socket under `BLAZE_HOME/v2/inproc`, which hands it its code. That socket, like its
+fork server's own, is given to the sandbox as readable: the test may connect to it by that exact
+path and to nothing else of the daemon's home, which it can't write. What a connection gets
+there: the daemon answers only a process of its own user whose first frame names the one-use
+token of a launch still waiting, within 30 seconds, and drops any other with nothing sent. A
+test's own token is used up by its start hook before `main`; another launch's is only in that
+process's environment, which a Linux sandbox can't read (its own PID namespace and `/proc`, or
+Landlock's scoping when confined).
+
+On macOS it can. A sandboxed test reads the arguments and environment of every other process
+of the same user (`sysctl` `KERN_PROCARGS2`), so a second test binary's launch token is
+readable while that binary waits to redeem it, and a test that wins the race takes the grant
+meant for it: its code memory, written by the daemon for that launch. No Seatbelt rule tried
+closed it: `(deny process-info*)`, `(deny sysctl-read (sysctl-name "kern.procargs2"))` and
+`(deny sysctl*)` all left the read working on macOS 27.0.1 (26A434). This hole is known and not
+closed; it is why macOS sandboxes tests only on an opt-in ([above](#sandboxed-tests)), and
+`sandbox::macos::tests::a_sandboxed_run_reads_another_processs_environment` asserts that it is
+still there. A package or workspace that opts in takes this hole with it. The end state,
+on both hosts, is a socket the test inherits per launch, with no path or token to steal; then
+that test is inverted and macOS sandboxes tests by default as Linux does.
 
 On Linux the sandbox is user, mount, network, IPC and PID namespaces: the machine bound
 read-only, overlays for the workspace and target directory, tmpfs for the empty directories, a
@@ -556,8 +612,9 @@ seccomp never sees an `io_uring` operation, so a ring would read, write and conn
 record and the socket check, and libraries fall back to plain calls); and the calls of another
 architecture's table (32-bit or x32 calls on x86-64, `ENOSYS`), which the filter's numbers
 don't name. It asks the supervisor about each `connect` and each `sendto` with an address: one
-to a Unix socket outside the overlays, the writable directories and the empty ones, with every
-link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
+to a Unix socket outside the overlays, the writable directories and the empty ones, but for a
+socket the readable entries name by its exact path (its fork server's, the daemon's code
+memory's), with every link on its path followed as the program sees them, is refused (`EACCES`) and recorded as an
 `N` line, `unix:` and the path. When the run is recorded it also notifies writes, the network
 and the harness's marks, and reads too when they are recorded (`affected`).
 
@@ -595,7 +652,10 @@ the interposer, so what it reads is not known (the test then runs every time und
 `affected`, and `-v` says so) and its writes to the workspace are refused rather than kept
 private; a test that makes raw system calls, or tampers with the interposer in its own process,
 gets past the recording and the private writes but not Seatbelt's read-only machine or its
-network rule; a sandbox inside the sandbox fails with `EPERM`.
+network rule; a sandbox inside the sandbox fails with `EPERM`; and the profile allows reading
+other processes, so a sandboxed program reads the arguments and environment of every process
+of the same user (`sysctl` `KERN_PROCARGS2`), a second test binary's launch token among them,
+which no Seatbelt rule tried closed ([above](#the-daemons-socket-and-a-known-hole-on-macos)).
 
 What it cost v1, measured with `sandboxbench.py` (since deleted) on 2026-10-26 (one sandbox per
 executable, v1's way, against a sandbox per test). v2's fork server is a third way, one sandbox
@@ -633,7 +693,9 @@ usual daemons out of reach whatever the program names); and a `sendmsg` with an 
 asked about when the run is recorded, so a datagram to a Unix socket outside those directories
 is not refused in a run that records nothing. A test that needs `io_uring`, a 32-bit helper
 program or a terminal of its own (`/dev/tty`, or `/dev/ptmx` on macOS) runs outside
-(`unsandboxed-tests`). On macOS a test that makes raw system calls gets past the interposer's
+(`unsandboxed-tests`). On macOS a sandboxed test reads other processes' arguments and
+environments, another test binary's launch token among them (above), which is why tests are
+sandboxed there only on an opt-in; a test that makes raw system calls gets past the interposer's
 recording (above); Metal's compiler service and the log write outside on the program's behalf
 (the shader cache, the system log), as the allowed services do. The plan is
 [#257](https://github.com/indexable-inc/blaze/issues/257). Build scripts and proc macros run
@@ -753,8 +815,8 @@ supervisor refuses every address a call names that is not a Unix socket of the s
 that is not the sandbox's; the sandbox's first process reaps what the program leaves and kills
 it as the program ends. What namespaces hide and this does not: the machine's `/tmp`, `/run`
 and processes are seen (read-only), and SysV IPC and a file's mode, owner and times are not
-refused. A sandboxed test's overlays need a mount namespace, so a workspace that opted into
-sandboxed tests still needs user namespaces: where they can't be made, its tests fail saying
+refused. A sandboxed test's overlays need a mount namespace, so `blaze test` on Linux,
+where tests are sandboxed by default, still needs user namespaces: where they can't be made, its tests fail saying
 so, with the ways on (`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`, an
 AppArmor profile that allows `userns` for blaze; in a container `--security-opt
 seccomp=unconfined`, or on Kubernetes `securityContext.seccompProfile.type: Unconfined`) or
@@ -994,8 +1056,11 @@ test result: ok. 41 passed (38 cached); 0 failed; 0 ignored; 0 measured; 0 filte
 A pass is kept only when rerunning it now would give the same result, so a test that passed
 and is not kept says why, and runs again next time:
 
-- `(not kept: not sandboxed)`: it ran outside the sandbox. The client also names these last,
-  on stderr.
+- `(not kept: not sandboxed)`: it ran outside the sandbox, which only `BLAZE_SANDBOX=off`,
+  its package's manifest ([above](#a-package-takes-its-tests-out)) or, on macOS, the lack of an
+  opt-in ([above](#sandboxed-tests)) does. The run's one note
+  counts these, with the setting that put them there; it does not list them. A test outside
+  never stands on a pass kept of it inside: it runs every time, whichever setting put it there.
 - `(not kept: the sandbox did not say what it read)`: the trace is missing.
 - `(not kept: it reaches code the tracer cannot see (a process start, the network or assembly))`:
   codegen marks it as reaching such code.

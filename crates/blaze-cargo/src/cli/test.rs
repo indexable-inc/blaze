@@ -1011,8 +1011,8 @@ const UNSEEN: u32 = u32::MAX;
 /// format prints them (with a JSON `--message-format`, a `blaze-test-result` line each);
 /// whether every one that ran passed. A cached test, whose kept pass stands, is marked
 /// `(cached)` with the time its kept run took, and a pass not kept says why (blaze's words, not
-/// libtest's). Last, on stderr, the tests that ran outside the sandbox (docs/cargo.md: their
-/// passes are never kept).
+/// libtest's). How many ran outside the sandbox, and what put them there, is the daemon's one
+/// note of the run (`serve::unit::test::outside_note`), not the client's.
 // dyn: the CLI's output writers, written once per test result printed.
 pub fn from_daemon(
     results: &[TestResult],
@@ -1038,11 +1038,6 @@ pub fn from_daemon(
             out.write_all(text.as_bytes())?;
         }
         out.flush()?;
-        if !speaking.quiet {
-            text.clear();
-            outside(&mut text, results, speaking.color);
-            err.write_all(text.as_bytes())?;
-        }
         return Ok(passed_all);
     }
     // Each executable's place in the order executables first came, found by the daemon's dense
@@ -1098,41 +1093,7 @@ pub fn from_daemon(
         out.write_all(text.as_bytes())?;
     }
     out.flush()?;
-    if !speaking.quiet {
-        text.clear();
-        outside(&mut text, results, speaking.color);
-        err.write_all(text.as_bytes())?;
-    }
     Ok(passed_all)
-}
-
-/// The command's summary of the tests that ran outside the sandbox (`TestResult::outside`), as
-/// cargo's `Shell::note` writes a line, into `text`; nothing when none did. Such a test is not
-/// hermetic: it runs every time and its pass is never kept (docs/cargo.md, "Sandboxed tests").
-pub fn outside(text: &mut String, results: &[TestResult], color: bool) {
-    let count = results.iter().filter(|it| it.outside).count();
-    if count == 0 {
-        return;
-    }
-    say::leveled_with(text, say::GOOD, "note", color, |text| {
-        // Writing to a String cannot fail.
-        let _ = match count {
-            1 => write!(
-                text,
-                "1 test ran outside the sandbox, so it runs every time and its pass is never kept: "
-            ),
-            n => write!(
-                text,
-                "{n} tests ran outside the sandbox, so they run every time and their passes are never kept: "
-            ),
-        };
-        for (at, result) in results.iter().filter(|it| it.outside).enumerate() {
-            if at > 0 {
-                text.push_str(", ");
-            }
-            text.push_str(&result.name);
-        }
-    });
 }
 
 /// One executable's results as libtest's `PrettyFormatter` writes them, into `text`; whether

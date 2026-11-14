@@ -5,8 +5,10 @@
 //! ([`image::Selectors`]); its effects are
 //! performed on the store ([`image::Filed`]), the binary's image and the files now
 //! ([`blaze_testsel::host::Driver`]), and the tests it runs go to one queue over every binary,
-//! each in a process of its own forked from its binary's server: in the sandbox where the
-//! workspace opts in, outside it otherwise (docs/cargo.md). Each test is reported as a
+//! each in a process of its own forked from its binary's server: in the sandbox, but where
+//! `BLAZE_SANDBOX=off` or its package takes it out (docs/cargo.md); one note counts those
+//! outside ([`outside_note`]), and a sandbox that fails stops the run, saying once how to run
+//! outside and why ([`unsandboxable`]). Each test is reported as a
 //! [`Response::TestResult`] by its verdict: a cached pass (with what settled it), a run kept,
 //! or a run not kept with why. `--run-all` runs every test asked and still files what it
 //! learns.
@@ -26,6 +28,7 @@ mod tests;
 use std::{
     alloc::Global,
     ffi::OsString,
+    fmt::Write as _,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -373,6 +376,98 @@ pub(crate) fn judged(ran: Ran<'_>, expects: &ShouldPanic) -> (TestOutcome, Strin
     }
 }
 
+/// What put a binary's tests outside the sandbox, as the run's note says it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum OutsideBy {
+    /// `BLAZE_SANDBOX=off` in the command's environment: every test of the run.
+    Command,
+    /// `tests = false` in its package's `[package.metadata.blaze.sandbox]`: every test of it.
+    Package,
+    /// Its package's `unsandboxed-tests` names them: those alone.
+    Named,
+    /// The host sandboxes tests only on an opt-in, and neither its package nor the workspace
+    /// opted in (`TestSandbox::outside_by_host`, decided by blaze-units'
+    /// `load::sandbox::tests_sandboxed_by_default`: macOS today).
+    Host,
+}
+
+/// The run's one note of the tests it runs outside the sandbox, from each binary's package,
+/// what puts its tests outside and how many of them run there: how many in all, that they run
+/// every time, and each setting that put them there with its count, a package's once, in the
+/// order given. `None` when none runs outside. It counts and does not list: each test's own
+/// line says `(not kept: not sandboxed)`.
+pub(crate) fn outside_note<'a>(
+    counts: impl IntoIterator<Item = (&'a str, OutsideBy, usize)>,
+) -> Option<String> {
+    let mut merged: Vec<(&'a str, OutsideBy, usize), Global> = Vec::new_in(Global);
+    for (package, by, runs) in counts {
+        if runs == 0 {
+            continue;
+        }
+        match merged.iter_mut().find(|it| it.0 == package && it.1 == by) {
+            Some(it) => it.2 += runs,
+            None => merged.push((package, by, runs)),
+        }
+    }
+    let total: usize = merged.iter().map(|it| it.2).sum();
+    let (them, run) = match total {
+        0 => return None,
+        1 => ("it runs", "runs"),
+        _ => ("they run", "run"),
+    };
+    let tests = if total == 1 { "test" } else { "tests" };
+    let mut said = String::with_capacity(96 + 96 * merged.len());
+    // Writing to a String cannot fail.
+    _ = write!(
+        said,
+        "{total} {tests} {run} outside the sandbox, so {them} every time: only a sandboxed run, \
+         which records what it reads, is kept as passed"
+    );
+    if merged.iter().any(|it| it.1 == OutsideBy::Command) {
+        said.push_str("; `BLAZE_SANDBOX=off` is set");
+        return Some(said);
+    }
+    for (at, (package, by, runs)) in merged.iter().enumerate() {
+        said.push_str(if at == 0 { ": " } else { "; " });
+        _ = match by {
+            OutsideBy::Package => write!(
+                said,
+                "{runs} of `{package}`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`"
+            ),
+            OutsideBy::Named => {
+                write!(said, "{runs} of `{package}`, named by its `unsandboxed-tests`")
+            }
+            OutsideBy::Host => write!(said, "{runs} of `{package}`, which does not opt in"),
+            OutsideBy::Command => unreachable!("said above"),
+        };
+    }
+    if merged.iter().any(|it| it.1 == OutsideBy::Host) {
+        said.push_str(MACOS_OPT_IN);
+    }
+    Some(said)
+}
+
+/// What the run's note adds where tests are outside for want of an opt-in: the one thing to do
+/// to have passes kept, and the hole a sandboxed test carries there today.
+pub(crate) const MACOS_OPT_IN: &str = ". On macOS tests run outside the sandbox unless their \
+     package opts in: `tests = true` under its `[package.metadata.blaze.sandbox]` runs them \
+     sandboxed and keeps their passes, though a sandboxed test on macOS can still read the \
+     arguments and environment of the user's other processes, another test binary's launch \
+     token among them (docs/cargo.md, \"Sandboxed tests\")";
+
+/// What a run whose sandbox failed says, once ([`Queue::take_unsandboxable`]): first the one
+/// thing to do, for someone who has never heard of the sandbox, then why, `why` the failed
+/// fork server's own words.
+pub(crate) fn unsandboxable(why: &str) -> String {
+    format!(
+        "to run these tests anyway, set `BLAZE_SANDBOX=off` (for one command: \
+         `BLAZE_SANDBOX=off blaze test`). They then run outside blaze's sandbox, as cargo runs them, \
+         and every test runs every time: only a test run in the sandbox, which records what it \
+         reads, is kept as passed. The sandbox failed here, so the run stopped before its other \
+         tests: {why}"
+    )
+}
+
 /// The result of `report`, a test of the run's executable `executable` (its index among the
 /// run's test binaries), run outside the sandbox when `outside`, as its verdict says: `None`
 /// for a test the machine did not judge (ignored, or a run whose keeping was refused).
@@ -464,6 +559,9 @@ struct Suited {
     /// The suite's settings ([`Suite::given`]): what its head is held by, and in each test's
     /// base key.
     given: ContentId,
+    /// [`Suite::given_outside`]: in the base key of each of its tests not `inside`, so a pass
+    /// kept of a sandboxed run never stands for a run outside, and none is kept of it.
+    given_outside: ContentId,
     /// Its record makers and target: in every key of its selection.
     tool: ToolId,
     /// By test: what of its attributes selection reads.
@@ -488,11 +586,12 @@ struct Suited {
     /// none when `binary` is outside already.
     outside: Option<Binary>,
     /// By test: whether it runs in `binary` rather than in `outside`.
-    inside: Vec<bool>,
-    /// Why every test of it runs outside the sandbox, when they all do: said under `-v`.
-    outside_why: Option<&'static str>,
-    /// Under `-v`, the tests its package's `unsandboxed-tests` runs outside, by name.
-    unsandboxed: Vec<String>,
+    inside: Vec<bool, Global>,
+    /// What puts those of its tests that are not `inside` outside the sandbox: said, with how
+    /// many ran there, in the run's one note ([`outside_note`]).
+    outside_by: OutsideBy,
+    /// Its package's name, as that note names it.
+    package: String,
     /// The machine's files and the binary's environment, as what a test read is checked
     /// against: made once per binary.
     disk: blaze_usercode::inputs::Disk,
@@ -549,7 +648,7 @@ impl Suited {
             self.asked.push((u32::try_from(n).expect("under 2^32 tests"), None));
             let base = host::base(&BaseOf {
                 tool: self.tool,
-                settings: self.given,
+                settings: if self.inside[n] { self.given } else { self.given_outside },
                 env,
                 name: &test.name,
                 attrs: attrs.id(),
@@ -857,32 +956,20 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
     };
     let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
     let manifest_dir = manifest_dir(&package.name, &package.manifest_path)?;
-    let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
-    let outside_why = if job.sandbox_off() {
-        Some("`BLAZE_SANDBOX=off` is set")
-    } else if package.tests.all {
-        Some("its package sets `tests = false` in `[package.metadata.blaze.sandbox]`")
-    } else if !sandboxed {
-        Some(
-            "its package does not opt in (`tests = true` in `[package.metadata.blaze.sandbox]`, or the \
-             workspace's `sandboxed-tests` experiment)",
-        )
-    } else {
-        None
+    // A test the daemon runs is sandboxed by the host's default as its plan holds it
+    // (docs/cargo.md, "Sandboxed tests"), but those the command or its package takes out.
+    let sandboxed = !job.sandbox_off() && package.tests_sandboxed();
+    let outside_by = match (job.sandbox_off(), sandboxed) {
+        (true, _) => OutsideBy::Command,
+        (false, false) if package.tests.outside_by_host => OutsideBy::Host,
+        (false, false) => OutsideBy::Package,
+        (false, true) => OutsideBy::Named,
     };
-    let unsandboxed = match sandboxed && job.input.verbose > 0 {
-        // alloc: under `-v`, once per binary
-        true => made
-            .tests
-            .iter()
-            .filter(|it| package.tests.outside(&it.name))
-            .map(|it| it.name.clone())
-            .collect(),
-        false => Vec::new(),
+    let inside: Vec<bool, Global> = {
+        let mut inside = Vec::with_capacity_in(made.tests.len(), Global);
+        inside.extend(made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)));
+        inside
     };
-    // alloc: one flag per test, once per binary
-    let inside: Vec<bool> =
-        made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
     let Some(table) = &made.table else {
         return Err(ApiError::new(
             // alloc: error path
@@ -974,6 +1061,7 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         unit: at,
         content: artifact.content,
         given,
+        given_outside: suite.given_outside(),
         tool,
         // alloc: once per binary, a test's attributes each
         attrs: tests.iter().map(attrs).collect(),
@@ -987,8 +1075,8 @@ fn suited(job: &Arc<Job>, artifact: &Artifact) -> Result<Option<Suited>, ApiErro
         binary: Some(binary),
         outside,
         inside,
-        outside_why,
-        unsandboxed,
+        outside_by,
+        package: package.name.clone(), // clone: once per binary, the name its note says
         disk,
         began: blaze_usercode::inputs::Began::now(),
         common: traced::Common::default(),
@@ -1133,33 +1221,15 @@ impl Runs<Real> for TestRun {
             };
             out.push(Response::Diagnostic(super::say::refused(what, None, super::compile::drawing(&self.job).color)));
         }
-        if self.job.input.verbose > 0 {
-            for suite in &self.suites {
-                let said = match (suite.outside_why, suite.unsandboxed.as_slice()) {
-                    (Some(why), _) => {
-                        format!("the tests of `{}` run outside the sandbox: {why}", suite.name)
-                    }
-                    (None, []) => continue,
-                    (None, names) => format!(
-                        "{} of `{}` run outside the sandbox: its package's `unsandboxed-tests` names them",
-                        names.iter().map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", "),
-                        suite.name
-                    ),
-                };
-                // alloc: under `-v`, a note per binary with tests outside
-                out.push(Response::Diagnostic(super::say::cargo(
-                    Level::Note,
-                    said,
-                    None,
-                    super::compile::drawing(&self.job).color,
-                )));
-            }
-        }
         // clone: a reference count, once per run
         let job = self.job.clone();
         let color = super::compile::drawing(&job).color;
         let mut runs: Vec<Out, Global> = Vec::new_in(Global);
+        // By suite: how many of the tests it runs run outside the sandbox.
+        let mut outside_runs: Vec<usize, Global> = Vec::with_capacity_in(self.suites.len(), Global);
+        outside_runs.resize(self.suites.len(), 0);
         for (at, suite) in self.suites.iter_mut().enumerate() {
+            let counted = at;
             let Some(mut binary) = suite.binary.take() else { continue };
             let at = u32::try_from(at).expect("under 2^32 suites");
             let mut outside = suite.outside.take();
@@ -1202,6 +1272,7 @@ impl Runs<Real> for TestRun {
                         // The queue runs the longest first: a test's last kept run's time from
                         // its head row; one with no row (new, or last failed) has none.
                         let last = suite.selection.as_ref().and_then(|it| it.last_micros(run.test));
+                        outside_runs[counted] += usize::from(!suite.inside[n]);
                         let binary = match (suite.inside[n], &mut outside) {
                             (false, Some(outside)) => outside,
                             _ => &mut binary,
@@ -1238,6 +1309,16 @@ impl Runs<Real> for TestRun {
                 binaries.push(outside);
                 self.suite_of.push(at);
             }
+        }
+        // One note for every test that runs outside the sandbox: how many, and the setting that
+        // put them there. Each one's own line says `(not kept: not sandboxed)`.
+        let counts = self
+            .suites
+            .iter()
+            .zip(&outside_runs)
+            .map(|(suite, &runs)| (suite.package.as_str(), suite.outside_by, runs));
+        if let Some(said) = outside_note(counts) {
+            out.push(Response::Diagnostic(super::say::cargo(Level::Note, said, None, color)));
         }
         // The run's sockets and records go under the daemon's state. The queue names them to the
         // driver from its root, `/` ([`crate::serve::file_name`]), and gives its processes that
@@ -1311,6 +1392,14 @@ impl Runs<Real> for TestRun {
         let mut queue = self.queue.take()?;
         queue.complete(completion, now, effects);
         self.finished(queue.drain(), store, out);
+        if let Some(why) = queue.take_unsandboxable() {
+            self.ok = false;
+            out.push(Response::Diagnostic(super::say::refused(
+                unsandboxable(&why),
+                None,
+                super::compile::drawing(&self.job).color,
+            )));
+        }
         let done = queue.finished();
         self.queue = Some(queue);
         match done {
