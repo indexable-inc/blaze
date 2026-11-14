@@ -59,14 +59,18 @@ def blaze_core.wait.parking.settles.Timed.at_1 (fuel : Nat) (readings : Slice co
   blaze_core.wait.parking.settles.Timed.at_2 fuel steps word kernel deadline
 
 def blaze_core.wait.parking.settles.Timed (fuel : Nat) (kernel : blaze_core.wait.parking.Timed) (schedule : Vec Threads.Step) (readings : Slice core.time.Duration) (deadline : Option blaze_core.wait.retry.Deadline) (token : Bool) : Threads.Prog Bool := do
-  let steps := schedule
-  let alone := (0 : Usize)
-  let steps ← blaze_core.wait.parking.settles.Timed.loop_0 fuel steps alone
-  let t2 := true == token
-  let t3 ←
-    if t2 then Threads.Prog.done (Result.ok (1 : U32))
-    else
-      if false == token then Threads.Prog.done (Result.ok (0 : U32))
-      else Threads.Prog.done (Result.fail Error.unreachable)
-  let word ← core.sync.atomic.Atomic.new t3
-  blaze_core.wait.parking.settles.Timed.at_1 fuel readings steps kernel deadline word
+  let t2 := Slice.len schedule
+  let t3 ← Scalar.sub (18446744073709551615 : Usize) (8 : Usize)
+  if Scalar.gt t2 t3 then Threads.Prog.done (Result.ok true)
+  else do
+    let steps := schedule
+    let alone := (0 : Usize)
+    let steps ← blaze_core.wait.parking.settles.Timed.loop_0 fuel steps alone
+    let t4 := true == token
+    let t5 ←
+      if t4 then Threads.Prog.done (Result.ok (1 : U32))
+      else
+        if false == token then Threads.Prog.done (Result.ok (0 : U32))
+        else Threads.Prog.done (Result.fail Error.unreachable)
+    let word ← core.sync.atomic.Atomic.new t5
+    blaze_core.wait.parking.settles.Timed.at_1 fuel readings steps kernel deadline word
