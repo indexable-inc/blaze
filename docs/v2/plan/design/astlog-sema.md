@@ -1,5 +1,5 @@
 ---
-status: plan
+status: current
 summary: astlog over blaze's own syntax trees and semantic database: Rust code patterns with `$name` metavariables whose paths match by resolution, demand-driven semantic relations (resolves, type-of, implements, callee, references, enclosing items, in-unsafe, in-test), a semi-naive evaluator shared with the tree-sitter source, and rewrites that go out through blaze-intent. One versioned CBOR request for an edit and one for a read-only query; the CLI is a client of both.
 date: 2026-11-13
 ---
@@ -54,7 +54,17 @@ And one over the type behind any references, by the names the std prelude gives:
   and `$$$name` (a run of sibling nodes, possibly empty) metavariables, and bind `n` to each node
   of the target files that matches tree against tree, ignoring whitespace and comments. Each
   metavariable is a rule variable. One used twice must bind equal code (token-equal). A `match`
-  atom in a blaze program is a load error that names the pattern forms.
+  atom in a blaze program is a load error that names the pattern forms. A pattern is parsed as
+  edition 2024 reads it; searched over a file of an edition that reads its text as other Rust
+  (`async {}` is a struct literal in 2015), it is refused, naming the rules line, both editions
+  and the file. A file without the pattern's literal is still walked for its macro expansions,
+  which another crate's macro can make spell it.
+- **Bounded patterns.** A pattern or a template of more than 2048 non-trivia tokens is refused
+  before it is parsed (a pattern at load, a template when its rule renders), and a pattern
+  whose match would recurse more than 128 levels (one a tree level, one more for each `$$$run`
+  before a node among its siblings) is refused at load. Each names the rules line. Siblings are matched in a loop, so a long argument list costs no stack.
+  On a 2 MiB thread a debug build overflows the matcher at depth 690 to 710 and the parser at
+  about 5700 tokens of nested generic arguments.
 - **Paths match by resolution.** A multi-segment path in a pattern is a def path from a crate
   name (`core::mem::take`, `::std::sync::Mutex`) and matches a path in the code only when that
   path resolves to the same item: through an alias, a glob or a re-export, and never another
@@ -76,13 +86,15 @@ And one over the type behind any references, by the names the std prelude gives:
   refused, naming the rule. An absolute path in a template (`::core::mem::take`) is a
   def path, respelled as the edited node's module names that item (`Module::find_path`:
   `crate::new`, `new`, `std::mem::take`); no `use` is added. A template path that names nothing
-  is an error naming the rule. A rewrite may hold several actions; the same edit from two rules
-  is one edit.
-- **Refusals, each naming what it names.** Two edits that overlap (both rules, their rules lines,
-  the file and line). A match a macro made, whose node maps back to no range of the macro's input
+  is an error naming the rule. A path inside a string, char or byte literal or a comment of the
+  template is text and is left as written. A rewrite may hold several actions; the same edit
+  from two rules is one edit, and so is the rename of one def asked by several rows.
+- **Refusals, each naming what it names.** Two edits that overlap, two insertions at one offset
+  included (both rules, their rules lines, the file and line). A match a macro made, whose node maps back to no range of the macro's input
   (the macro call's `path:line`, the rule), unless the rule excluded it with
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
-  syntax error); the whole request fails, nothing is written.
+  syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
+  error); the whole request fails, nothing is written.
 - **Surfaces.** The API first, schema 62: `Edit::Rules { rules }` rides the existing
   `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
   `blaze_intent::apply` sends them); one per request, after the request's other edits.
@@ -109,20 +121,20 @@ argument.
 | `(expr n "pat")` and the other pattern forms | nothing | every matching node and its metavariables |
 | `(syntax n "KIND")` | nothing | every node of that `SyntaxKind` |
 | `(resolves n d)` | `n` | the def a path, name, method call or field names |
-| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included |
+| `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included. A variant is under its enum (`lib::E::V`), a field under its struct, union or variant (`lib::S::field`, `lib::E::V::inner`, `lib::P::0`). An impl's path ends in `<impl Type>` or `<impl Trait<Args> for Type>`; it names the impl and resolves to nothing, so a `p` naming one is refused |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |
 | `(peel-refs t u)` | `t` | `t` with every leading `&` and `&mut` stripped, or `t` itself |
 | `(implements t "krate::Trait")` | `t` | holds when the type implements the trait |
-| `(callee n d)` | `n` | the fn a call or method call runs, through trait dispatch where the front end knows the impl |
+| `(callee n d)` | `n` | the fn a call or method call runs, through parentheses around the callee and trait dispatch where the front end knows the impl |
 | `(enclosing-fn n d)`, `(enclosing-impl n d)`, `(enclosing-module n d)` | `n` | the innermost such item |
 | `(crate-of n c)` | `n` | the crate's name, as text |
 | `(fn-param d i t)`, `(fn-return d t)` | `d` | a fn's parameter types by index (self is 0 when present), its return type |
 | `(def-kind d k)`, `(visibility d v)` | `d` | `fn`, `struct`, ...; `pub`, `pub(crate)`, `private`, ... |
 | `(attribute d "name")` | `d` | holds when the item carries that attribute |
-| `(defines n d)` | `n` or `d` | the def an item's syntax declares; or that item's syntax |
-| `(references d n)` | `d` | every name, path and method call in the target files that resolves to `d` |
-| `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters: `in-macro-input` holds for a node of an expansion that came from the macro's input, `in-macro-expansion` for one the macro made |
+| `(defines n d)` | `n` or `d` | the def an item's, a variant's, a field's (named or tuple), an impl's or a `macro_rules!`'s syntax declares; or that syntax |
+| `(references d n)` | `d` | every name, path, method call and numbered field access (`p.0`) in the target files that resolves to `d` |
+| `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters: `in-macro-input` holds for a node of an expansion that came from the macro's input, `in-macro-expansion` for one the macro made; `in-test` for one under `#[cfg(test)]` or an attribute whose path ends in `test` (`#[tokio::test(...)]`); `cfg-off` for one under an item, variant or field whose `#[cfg]` removed it, and a `#[cfg]` on anything else in between is refused, naming it |
 
 Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`, `same-text`,
 `same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
@@ -136,7 +148,10 @@ it needs no stratum, and it is how a rule excludes macro-made matches.
 A `type-matches` pattern is `_` (any type), `$name` (any type, bound; one name used twice binds
 equal types), a def path from a crate's name with generic arguments on its last segment
 (`std::vec::Vec<$a>`, `lib::Pair<$a, $a>`), a single name with or without arguments
-(`Vec<$a>`, `u32`, `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, `[T]` or `[T; N]`. Arguments
+(`Vec<$a>`, `u32`, `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, `[T]`, or `[T; 4]` and
+`[T; _]`. An array's length is an integer literal, matched against the length the front end
+evaluates, or `_`, any length; a length it cannot evaluate (`[T; N]` in a generic fn) matches
+only `_`, and a pattern length of any other form (`N`, `$n`) is a load error. Arguments
 match the type's first type arguments, so `Vec<$a>` is `Vec<T, A>` for any allocator; one left
 out matches anything. A single name is resolved first. A builtin type's name (`u32`, `str`)
 is that type. A name the std prelude of a view crate gives (`Vec`, `String`, `Option`,
@@ -153,9 +168,14 @@ Semi-naive per stratum: each round evaluates each recursive rule once per body p
 names a relation of the stratum, that position reading only the facts new in the last round.
 Relation atoms join through hash indexes on the columns bound at that position, built once per
 (relation, bound columns) and kept up to date as rows arrive. Variables are slots, not names.
-Source atoms are memoized per bound-argument tuple. Stratified negation and `count`, every
-variable bound; a program with no stratification is a load error naming the relations on the
-cycle. The old naive evaluator stays as the reference model for a property test only.
+Each source atom in the program answers each bound-argument tuple once a run, recursive rounds
+included. Stratified negation and `count`, every variable bound; a program with no
+stratification is a load error naming the relations on the cycle, and so is a `count` whose
+result variable is one it counts over. A rules file nested past 64 lists is refused, naming the
+line of the list past it. A run holds at most 10,000,000 rows at once (`MAX_ROWS`: derived rows,
+kept source answers and rows a body has made and not stored); past it the run stops, naming the
+relation and its rule, the source atom, or the rewrite. The old naive evaluator stays as the
+reference model for a property test only.
 
 ## Cost against the floor (rule 67)
 
@@ -191,3 +211,17 @@ cycle. The old naive evaluator stays as the reference model for a property test 
   replaces any node that is not an expression or a body's statement.
 - A query's cost report. `Response::Rows` carries no per-relation timing; `blaze trace` does
   not see the rules' evaluation.
+- Patterns per edition. A pattern is parsed once, as edition 2024, and refused on a file of an
+  edition that parses its text otherwise. The end state parses it once for each edition the
+  view's files use.
+- Templates per edition. A template is parsed as edition 2024 for precedence and template
+  paths, whatever the edited file's edition.
+- `cfg-off` under a `#[cfg]` on a statement, an expression or any node that declares no def. The
+  front end keeps no def there to say whether it is on, so the rule is refused, naming the
+  attribute and its place.
+- Text rewrites of a file that already has a syntax error. No count or list of errors maps
+  through edits, so such a file is refused whole. The end state checks that the edits add no
+  error by reparsing only what they touch.
+- Patterns and templates past 2048 tokens, and patterns past 128 levels of matching. They are
+  refused. The end state is a
+  matcher and a parser that keep their own stack, bounded by memory rather than by the thread's.
