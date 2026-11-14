@@ -1869,6 +1869,16 @@ impl Line<'_> {
         verbatim: bool,
         own: &[PathBuf],
     ) -> Result<(), LinkError> {
+        // rustc hands link.exe a `+verbatim` name as it is written, and the standard library
+        // writes the C runtime that way (`#[link(name = "/defaultlib:libcmt", modifiers =
+        // "+verbatim")]`, `msvcrt` when it is dynamic): an argument, a `/DEFAULTLIB`, not a file.
+        if verbatim
+            && self.output.format == Format::Pe
+            && let Some(library) = default_library_argument(name)
+        {
+            let path = self.default_library(&library, own)?;
+            return self.push(path, NativeKind::Archive { whole: false });
+        }
         let (path, kind) = self.find(name, kind, verbatim, own)?;
         self.push(path, kind)
     }
@@ -2051,7 +2061,7 @@ impl Line<'_> {
             self.output.arch,
         )?;
         for (member, library) in asked.iter() {
-            let path = self.default_library(library).map_err(|it| LinkError {
+            let path = self.default_library(library, &[]).map_err(|it| LinkError {
                 // alloc: error path
                 what: format!(
                     "{}({member}) asks for {library} (/DEFAULTLIB), and {}",
@@ -2104,8 +2114,9 @@ impl Line<'_> {
     }
 
     /// The file a `/DEFAULTLIB` names: itself when it is a path, else the first in the line's
-    /// directories with its name, ASCII case ignored as link.exe ignores it.
-    fn default_library(&self, library: &str) -> Result<PathBuf, LinkError> {
+    /// directories (`own`, a crate's own, first) with its name, ASCII case ignored as link.exe
+    /// ignores it.
+    fn default_library(&self, library: &str, own: &[PathBuf]) -> Result<PathBuf, LinkError> {
         let given = Path::new(library);
         if given.is_absolute() {
             return match given.is_file() {
@@ -2114,7 +2125,7 @@ impl Line<'_> {
                 false => Err(fail(format!("{library} is not a file"))),
             };
         }
-        for dir in self.dirs(false, &[]) {
+        for dir in self.dirs(false, own) {
             if !self.may_have(dir, library) {
                 continue;
             }
@@ -2128,7 +2139,7 @@ impl Line<'_> {
         }
         // alloc: error path
         let files = [(library.to_owned(), NativeKind::Archive { whole: false })];
-        Err(not_found(library, &files, self.searched(false, &[]), &self.found.unpassed))
+        Err(not_found(library, &files, self.searched(false, own), &self.found.unpassed))
     }
 
     /// The files the linker script at `at` names, after it on the line: an absolute path as it
@@ -2182,6 +2193,26 @@ impl Line<'_> {
         }
         Ok(())
     }
+}
+
+/// The library a `+verbatim` native library name asks for when the name is link.exe's
+/// `/DEFAULTLIB:NAME` argument (`-` for `/` also, as link.exe takes it), named as link.exe names
+/// a default library: `.lib` added when it has no extension, quotes taken off. `None` for a name
+/// that is a file's.
+fn default_library_argument(name: &str) -> Option<String> {
+    const OPTION: &str = "defaultlib:";
+    let option = name.strip_prefix(['/', '-'])?;
+    let (head, library) = option.split_at_checked(OPTION.len())?;
+    if !head.eq_ignore_ascii_case(OPTION) {
+        return None;
+    }
+    let library = library.trim_matches('"');
+    if library.is_empty() {
+        return None;
+    }
+    let file = library.rsplit(['/', '\\']).next().unwrap_or(library);
+    // alloc: once per library searched, its file name
+    Some(if file.contains('.') { library.to_owned() } else { format!("{library}.lib") })
 }
 
 /// The file names a library may have, in the order the linker tries them in a directory, and
