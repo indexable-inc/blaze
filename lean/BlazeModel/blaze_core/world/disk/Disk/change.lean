@@ -13,10 +13,10 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.change (self : blaze_core.world.disk.Disk) («at» : Usize) (change : blaze_core.world.disk.Change) : Result blaze_core.world.disk.Disk := do
   let epoch := self.epoch
-  let t13 := «at»
-  let t10 := ({ change := change, epoch := epoch } : blaze_core.world.disk.Made)
-  let x0 ← Slice.index self.files t13
-  let x1 ← Vec.push x0.changes t10
-  let x2 ← Slice.index self.files t13
-  let x3 ← Slice.update self.files t13 { x2 with changes := x1 }
+  let t0 := «at»
+  let t1 := ({ change := change, epoch := epoch } : blaze_core.world.disk.Made)
+  let x0 ← Slice.index self.files t0
+  let x1 ← Vec.push x0.changes t1
+  let x2 ← Slice.index self.files t0
+  let x3 ← Slice.update self.files t0 { x2 with changes := x1 }
   Result.ok { self with files := x3 }

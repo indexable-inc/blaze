@@ -6,5 +6,5 @@ import BlazeModel.closures.option_methods.closure5.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.option_methods.closure5.call (t1 : closures.option_methods.closure5) : Option U32 :=
-  (Option.some t1.c0 : Option U32)
+def closures.option_methods.closure5.call (t0 : closures.option_methods.closure5) : Option U32 :=
+  (Option.some t0.c0 : Option U32)

@@ -16,8 +16,8 @@ def blaze_core.world.disk.Disk.find.loop_0 (fuel : Nat) (self : blaze_core.world
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.files) then do
-      let t15 ← Slice.index self.files i
-      if Scalar.eq t15.name name then Result.ok (Option.some i : Option Usize)
+      let t0 ← Slice.index self.files i
+      if Scalar.eq t0.name name then Result.ok (Option.some i : Option Usize)
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.Disk.find.loop_0 fuel self name i

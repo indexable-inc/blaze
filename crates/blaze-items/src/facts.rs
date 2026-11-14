@@ -225,7 +225,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             };
             let adt = variant.adt_id(db);
             let sub = crate::form::Cx::new(db).field(variant, local);
-            h.id(&hash::filled(db, domain, sub.view(), ItemId::Adt(adt))?);
+            h.id(&hash::named_filled(db, domain, sub.view(), ItemId::Adt(adt))?);
             field_offset(db, &mut h, adt, variant, local)?;
         }
         Fact::Method { self_ty, name } => write_method(db, &mut h, seen(), self_ty, name)?,
@@ -281,7 +281,12 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                 }
             };
             let sub = crate::form::Cx::new(db).captures(closure);
-            h.id(&hash::filled(db, domain, sub.view(), infer_owner_item(db, closure.loc(db).owner))?);
+            h.id(&hash::named_filled(
+                db,
+                domain,
+                sub.view(),
+                infer_owner_item(db, closure.loc(db).owner),
+            )?);
         }
         Fact::AutoTraits(subject) => {
             let (owner, index) = match key::resolve(db, subject) {
@@ -986,7 +991,7 @@ fn write_evaluated<'db>(
 
 fn ty_hash<'db>(db: &'db Db, owner: ItemId, ty: Ty<'db>) -> Result<ContentId, Unhashable> {
     let sub = crate::form::Cx::new(db).ty(ty);
-    hash::filled(db, CONST_TYPE, sub, owner)
+    hash::named_filled(db, CONST_TYPE, sub, owner)
 }
 
 fn write_eval_error(db: &Db, h: &mut Hasher, err: &ConstEvalError<'_>) {

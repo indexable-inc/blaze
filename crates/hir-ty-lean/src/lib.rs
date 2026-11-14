@@ -74,11 +74,18 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Duration", include_str!("../../../lean/Blaze/Duration.lean")),
     ("Blaze.Str", include_str!("../../../lean/Blaze/Str.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
+    ("Blaze.Opaque", include_str!("../../../lean/Blaze/Opaque.lean")),
+    // Threads that share atomic words, and `core::sync::atomic` over them.
+    ("Blaze.Threads", include_str!("../../../lean/Blaze/Threads.lean")),
+    ("Blaze.Atomic", include_str!("../../../lean/Blaze/Atomic.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
     // The `@[spec]`s of `Blaze.Vec`'s operations, which `Blaze.Auto` must come before.
     ("Blaze.VecAuto", include_str!("../../../lean/Blaze/VecAuto.lean")),
+    // What a proof about two threads is written with: the induction over a schedule and the
+    // world's step on each operation.
+    ("Blaze.ThreadsAuto", include_str!("../../../lean/Blaze/ThreadsAuto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's
@@ -253,38 +260,46 @@ fn emit_in<'db>(
     let mut imports: Vec<Emitted> = body.adts.iter().map(type_module).collect();
     imports.extend(body.adts.iter().filter(|it| lowered.derives.contains(&it.name)).map(eq_module));
     let mut shapes = BTreeMap::new();
+    // What a callee imports comes first; a module two callees share is listed once.
+    let admit = |imports: &mut Vec<Emitted>, import: &Emitted| -> Result<(), NotTranslated> {
+        match imports.iter().find(|it| it.module == import.module) {
+            None => {
+                // Two modules whose files differ only by letter case are one file where the
+                // file system folds case (macOS's, by default).
+                if let Some(it) =
+                    imports.iter().find(|it| it.module.eq_ignore_ascii_case(&import.module))
+                {
+                    return Err(refuse(format!(
+                        "two modules whose files differ only by letter case, `{}` and `{}`",
+                        it.module, import.module
+                    )));
+                }
+                imports.push(import.clone());
+                Ok(())
+            }
+            // One module, two texts: two items with one Lean name (methods of two traits of one
+            // name from two modules, on one type; two instances whose arguments are written
+            // alike). Neither may stand for the other.
+            Some(it) if it.text != import.text => Err(refuse(format!(
+                "two functions with one Lean name, `{}` (`{}` and `{}`)",
+                import.name, it.function, import.function
+            ))),
+            Some(_) => Ok(()),
+        }
+    };
     for (callee_name, callee) in &lowered.callees {
         let callee = emit_in(db, *callee, stack)?;
         shapes.insert(callee_name.clone(), callee.shape.clone());
-        // What the callee imports comes first; a module two callees share is listed once.
         for import in callee.imports.iter().chain([&callee]) {
-            match imports.iter().find(|it| it.module == import.module) {
-                None => {
-                    // Two modules whose files differ only by letter case are one file where
-                    // the file system folds case (macOS's, by default).
-                    if let Some(it) = imports
-                        .iter()
-                        .find(|it| it.module.eq_ignore_ascii_case(&import.module))
-                    {
-                        return Err(refuse(format!(
-                            "two modules whose files differ only by letter case, `{}` and `{}`",
-                            it.module, import.module
-                        )));
-                    }
-                    imports.push(import.clone())
-                }
-                // One module, two texts: two items with one Lean name (methods of two traits
-                // of one name from two modules, on one type; two instances whose arguments are
-                // written alike). Neither may stand for the other.
-                Some(it) if it.text != import.text => {
-                    return Err(refuse(format!(
-                        "two functions with one Lean name, `{}` (`{}` and `{}`)",
-                        import.name, it.function, import.function
-                    )));
-                }
-                Some(_) => {}
-            }
+            admit(&mut imports, import)?;
         }
+    }
+    // An opaque function's module imports only the library and the modules of the types its
+    // signature names, which are among this body's, so it comes after them.
+    for opaque in &lowered.opaques {
+        let module = opaque_module(opaque);
+        shapes.insert(opaque.lean.clone(), module.shape.clone());
+        admit(&mut imports, &module)?;
     }
     stack.pop();
     let func = instance.func;
@@ -306,6 +321,17 @@ fn emit_in<'db>(
     let theorem = AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM);
     let stated = match (theorem, spec.as_ref()) {
         (false, None) => None,
+        (false, Some(_)) if model.shape.shared => {
+            return Err(NotTranslated {
+                function: body.display.clone(),
+                what: "`requires` or `ensures` clauses on a shared function (its model is a \
+                       `Threads.Prog`, a program of operations on the memory threads share, \
+                       whose result depends on the other threads; state it as a \
+                       `#[blaze::theorem]` over a schedule)"
+                    .to_owned(),
+                at: format!("fn {}", body.display),
+            });
+        }
         (false, Some(spec)) => Some(Stated::Clauses(spec)),
         (true, None) => {
             theorem_shape(body, &model)?;
@@ -383,6 +409,8 @@ pub(crate) fn rust_ty(ty: &body::Ty) -> String {
         Ty::Duration => "core::time::Duration".to_owned(),
         Ty::Ordering => "core::cmp::Ordering".to_owned(),
         Ty::Str => "str".to_owned(),
+        Ty::Opaque(opaque) => opaque.rust().to_owned(),
+        Ty::Shared(shared) => shared.rust(),
     }
 }
 
@@ -397,9 +425,12 @@ fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
     }
     args.extend(model.params.iter().map(|it| name(it.name.clone())));
     let call = app(function, args);
-    let holds = match model.shape.monadic {
-        true => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
-        false => infix(Infix::Eq, call, atom("true")),
+    // A shared function's model is a program of operations on the memory threads share: it is
+    // run alone, from an empty memory (`Threads.Prog.value`), and gives `true`.
+    let holds = match (model.shape.shared, model.shape.monadic) {
+        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), "value".to_owned()), app("Result.ok", vec![atom("true")])),
+        (false, true) => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
+        (false, false) => infix(Infix::Eq, call, atom("true")),
     };
     let holds = match model.shape.fuel {
         true => Term::Exists(
@@ -436,7 +467,7 @@ pub fn type_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -475,7 +506,69 @@ pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
+        imports: Vec::new(),
+    }
+}
+
+/// The module of the opaque function `opaque` ([`body::OPAQUE_FUNCTIONS`]) at its instance,
+/// `BlazeModel.<its Lean name>`: `opaque <name> (a0 : A0) .. : Result R`, a Lean constant with
+/// no definition the kernel unfolds, so a proof about a caller holds whatever the function
+/// does. `R` is what a translated function of that signature gives: its result (unless `()`),
+/// then the value after of each `&mut` parameter; in `Result`, for it may panic or run
+/// forever. Lean's `opaque` needs only that the type is inhabited, which `Blaze.Opaque`'s
+/// `Inhabited (Result α)` (by `Result.div`) gives without an axiom; nothing is assumed of the
+/// function but its type. Being a constant, it gives one result for one set of arguments: why
+/// that is true of the Rust function is said by its entry in the list.
+pub fn opaque_module(opaque: &body::OpaqueFn) -> Emitted {
+    let module = format!("BlazeModel.{}", opaque.lean);
+    let about = vec![
+        format!(
+            "Generated by blaze ({TRANSLATOR}) from `{}`: an opaque function, declared with no \
+             definition.",
+            opaque.display
+        ),
+        "Do not edit: the functions that call it import this module.".to_owned(),
+    ];
+    let mut uses = std::collections::BTreeSet::new();
+    for ty in opaque.params.iter().chain([&opaque.result]) {
+        ty.adts(&mut uses);
+    }
+    let mut imports = vec!["Blaze".to_owned()];
+    imports.extend(uses.iter().map(|it| lean::ident(&type_module_name(it))));
+    let returns_unit = matches!(opaque.result, body::Ty::Unit | body::Ty::Never);
+    let mut gives = Vec::new();
+    if !returns_unit {
+        gives.push(translate::lean_ty(&opaque.result));
+    }
+    let mut mut_params = Vec::new();
+    for (at, ty) in opaque.params.iter().enumerate() {
+        if let body::Ty::RefMut(inner) = ty {
+            mut_params.push(at);
+            gives.push(translate::lean_ty(inner));
+        }
+    }
+    let gives = gives
+        .into_iter()
+        .rev()
+        .reduce(|rest, ty| infix(Infix::Prod, ty, rest))
+        .unwrap_or_else(|| name("Unit"));
+    let params = opaque
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, ty)| Binder { name: format!("a{at}"), ty: translate::lean_ty(ty) })
+        .collect();
+    let decl = Decl::Opaque { name: opaque.lean.clone(), params, ty: app("Result", vec![gives]) };
+    let text = Module { about, imports, decls: vec![decl] }.print();
+    Emitted {
+        function: opaque.display.clone(),
+        name: opaque.lean.clone(),
+        module,
+        text,
+        statement: None,
+        clauses: Vec::new(),
+        shape: Shape { fuel: false, monadic: true, shared: false, mut_params, returns_unit },
         imports: Vec::new(),
     }
 }

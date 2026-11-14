@@ -10,6 +10,6 @@ def blaze_core.world.disk.kept (fuel : Nat) (read : Slice U8) (after : Option (V
   match after with
   | Option.some v0 =>
     let bytes := v0
-    let t5 := Scalar.eq (Slice.len bytes) (Slice.len read)
-    if t5 then blaze_core.world.disk.starts_with fuel bytes read else Result.ok t5
+    let t0 := Scalar.eq (Slice.len bytes) (Slice.len read)
+    if t0 then blaze_core.world.disk.starts_with fuel bytes read else Result.ok t0
   | Option.none => Result.ok false

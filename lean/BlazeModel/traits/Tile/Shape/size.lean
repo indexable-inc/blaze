@@ -12,5 +12,5 @@ def traits.Tile.Shape.size (self : traits.Tile) : Result U64 :=
   | traits.Tile.Rect v0 v1 => do
     let w := v0
     let h := v1
-    let t5 ← Scalar.add w h
-    Scalar.mul t5 (2 : U64)
+    let t0 ← Scalar.add w h
+    Scalar.mul t0 (2 : U64)

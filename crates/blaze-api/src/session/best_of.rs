@@ -94,7 +94,7 @@ impl BestOf {
             Response::TestResult(result) => match result.outcome {
                 TestOutcome::Passed => candidate.passed += 1,
                 TestOutcome::Failed => candidate.failed += 1,
-                TestOutcome::Ignored | TestOutcome::Unreached => {}
+                TestOutcome::Ignored => {}
             },
             Response::Report { report, .. } => match report.severity {
                 crate::Severity::Error => candidate.errors += 1,

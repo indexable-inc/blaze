@@ -6,5 +6,5 @@ import BlazeModel.closures.nothing_captured.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.nothing_captured.closure0.call (t1 : closures.nothing_captured.closure0) (y : U32) : Result U32 :=
+def closures.nothing_captured.closure0.call (t0 : closures.nothing_captured.closure0) (y : U32) : Result U32 :=
   Scalar.div y (2 : U32)

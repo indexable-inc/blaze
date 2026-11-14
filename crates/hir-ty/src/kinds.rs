@@ -23,7 +23,7 @@ pub use crate::{
     layout::{enum_variant_ids, target::target_data_layout_query, variant_field_ids},
     lower::{
         batch::{crate_field_types, crate_impl_predicates, crate_impl_self_tys, crate_impl_traits},
-        const_conditions_query, const_param_types_with_diagnostics, elided_groups,
+        batched_field_types, const_conditions_query, const_param_types_with_diagnostics, elided_groups,
         elided_lifetimes, explicit_implied_clauses_of, explicit_super_clauses_of,
         field_types_of_variant, fn_sig_for_enum_variant_constructor, fn_sig_for_fn,
         fn_sig_for_struct_constructor, generic_defaults_with_diagnostics, generic_predicates_of,

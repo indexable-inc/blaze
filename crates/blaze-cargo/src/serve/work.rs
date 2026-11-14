@@ -891,6 +891,12 @@ pub trait Steps: Sized + Send + Sync + 'static {
     ) {
         let _ = (store, waker, marked);
     }
+    /// On the loop, once, as the daemon starts: each test suite's index head its journal mark
+    /// names (`Jobs::test_heads`), which the suite's next run takes. Steps that run no tests
+    /// keep nothing.
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        let _ = marked;
+    }
     /// On the loop, each turn: the start images to put and, once durable, mark.
     fn launch_kept(&self) -> Vec<LaunchKept> {
         Vec::new() // alloc: none, empty
@@ -1450,11 +1456,20 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
 /// build script's is given what asks its job's [`Writer`] to apply its run ([`Asks`]); tests
 /// and runs, none.
 pub trait Runs<S: Steps>: Send + 'static {
-    /// Asks for what it runs first; it may end at once (a result the store kept).
+    /// Asks for what it runs first; it may end at once (a result the store kept). `store` is
+    /// mutable as `complete`'s: a test run reads kept results through it and puts what it learns.
+    ///
+    /// `placed` reads the job's record of a path its build placed an output at: the content
+    /// key of the output whose file is there as placed, or `None` (`Jobs::placed_key`). Asked
+    /// once its job's placements have all ended. A program started from such a path (a test
+    /// binary, a dev run) is started with that key, and refused where it is not the program's
+    /// own (`blaze_inproc::host::StartError::NotPlaced`): the placement is the path's one
+    /// writer, and nothing that starts a program writes its file.
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: the jobs' record read in place, once a run's start
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;
@@ -1492,6 +1507,20 @@ pub struct RunPuts {
     /// The tests a run finished, for the history's `test_runs` table: handed to its job with
     /// its puts, which gives them its build id as it ends.
     pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// Each test suite's index head a run filed, or let go: marked in the journal once the
+    /// run's puts are durable ([`crate::serve::job::Jobs::test_heads`]).
+    pub heads: Vec<HeadFiled>,
+}
+
+/// A test suite's index head as its run left it ([`RunPuts::heads`]): the suite's settings
+/// (`Suite::given`), and the head's mark, or `None` for a suite whose head the store did not
+/// hold, whose mark is let go so its next run starts with no head.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeadFiled {
+    /// The suite's settings: what its mark is named by.
+    pub given: ContentId,
+    /// The mark to write, or `None` to let the suite's mark go.
+    pub mark: Option<super::local::TestHeadMark>,
 }
 
 impl RunPuts {
@@ -1516,5 +1545,6 @@ impl RunPuts {
         self.retracted |= other.retracted;
         self.misses.extend(other.misses);
         self.test_runs.extend(other.test_runs);
+        self.heads.extend(other.heads);
     }
 }

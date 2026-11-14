@@ -1021,4 +1021,195 @@ mod tests {
         assert!(traced.untraceable.contains(&blaze_core::Untraceable::Clock));
         _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// What the socket test runs in the sandbox: connects to the socket it was given and to the
+    /// one it was not, writing "hi" on each connection made, and says on a line each whether
+    /// it connected. Does nothing unless that test runs it.
+    #[test]
+    fn helper_connects_to_the_sockets_it_is_told_of() {
+        use std::io::Write as _;
+        let Some(out) = std::env::var_os("BLAZE_SANDBOX_TEST_SOCKETS") else { return };
+        let try_one = |var: &str| {
+            let path = std::env::var_os(var).unwrap();
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(mut stream) => {
+                    stream.write_all(b"hi").unwrap();
+                    "connected".to_owned()
+                }
+                Err(error) => format!("refused: {error}"),
+            }
+        };
+        let said = format!(
+            "{}\n{}\n",
+            try_one("BLAZE_SANDBOX_TEST_GIVEN"),
+            try_one("BLAZE_SANDBOX_TEST_OTHER")
+        );
+        std::fs::write(std::path::Path::new(&out).join("seen"), said).unwrap();
+    }
+
+    /// The invariant: a sandboxed run connects to a Unix socket its read set names, by that
+    /// path (the `(remote unix-socket (path-literal (param "SOCKET<n>")))` rule, as the
+    /// daemon's in-process socket and a test's fork server's are given), and to no other
+    /// socket outside its writable directories: the control is a socket beside it, in a
+    /// directory it may read, which it is refused. Skipped where no sandbox can be made,
+    /// unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_sandboxed_run_connects_to_a_socket_given_readable_and_to_no_other() {
+        use std::io::Read as _;
+        if let Err(why) = crate::sandbox::alone::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let made = blaze_core::temp::TempDir::for_test("blaze-macos-sock-");
+        let dir = made.path().to_path_buf();
+        let out = dir.join("out");
+        let sockets = dir.join("s");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&sockets).unwrap();
+        let (given, other) = (sockets.join("g.sock"), sockets.join("o.sock"));
+        let given_at = std::os::unix::net::UnixListener::bind(&given).unwrap();
+        let other_at = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        let spec = blaze_usercode::confine::Spec {
+            program: exe.clone(),
+            args: [
+                "sandbox::macos::tests::helper_connects_to_the_sockets_it_is_told_of",
+                "--exact",
+                "--test-threads=1",
+            ]
+            .map(OsString::from)
+            .to_vec(),
+            env: vec![
+                ("BLAZE_SANDBOX_TEST_SOCKETS".into(), out.clone().into()),
+                ("BLAZE_SANDBOX_TEST_GIVEN".into(), given.clone().into()),
+                ("BLAZE_SANDBOX_TEST_OTHER".into(), other.clone().into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            dir: out.clone(),
+            read: vec![dir.clone(), given.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec![exe],
+            given: None,
+        };
+        assert_eq!(crate::sandbox::alone::launch(&spec), 0);
+        let seen = std::fs::read_to_string(out.join("seen")).unwrap();
+        let mut lines = seen.lines();
+        assert_eq!(lines.next(), Some("connected"), "the socket given readable: {seen}");
+        assert!(
+            lines.next().is_some_and(|it| it.starts_with("refused")),
+            "the socket not given: {seen}"
+        );
+        // The run has ended: its connection waits in the listener's queue, with what it wrote.
+        given_at.set_nonblocking(true).unwrap();
+        let (mut stream, _) = given_at.accept().expect("the sandboxed run's connection");
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        let mut got = Vec::new();
+        stream.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hi");
+        other_at.set_nonblocking(true).unwrap();
+        assert!(other_at.accept().is_err(), "no connection reached the socket not given");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the environment test runs in the sandbox: `sysctl` `KERN_PROCARGS2` of the process
+    /// it is told of (its arguments and environment), into `seen`, or `refused: <why>`. Does
+    /// nothing unless that test runs it. Not `ps -E`: the profile refuses running `/bin/ps`,
+    /// which is not the hole; the system call is.
+    #[test]
+    fn helper_reads_another_processs_environment() {
+        let Some(out) = std::env::var_os("BLAZE_SANDBOX_TEST_PROCARGS") else { return };
+        let pid: libc::pid_t =
+            std::env::var("BLAZE_SANDBOX_TEST_PROCARGS_PID").unwrap().parse().unwrap();
+        // `kern.argmax`: the most a process's arguments and environment take together.
+        let mut buffer: Vec<u8, std::alloc::Global> = Vec::new_in(std::alloc::Global);
+        buffer.resize(1 << 20, 0);
+        let seen = match super::raw::procargs(pid, &mut buffer) {
+            Ok(len) => {
+                buffer.truncate(len);
+                buffer
+            }
+            Err(why) => format!("refused: {why}").into_bytes(),
+        };
+        std::fs::write(std::path::Path::new(&out).join("seen"), seen).unwrap();
+    }
+
+    /// The invariant, as it is today, a known hole (docs/cargo.md, "Sandboxed tests"): a
+    /// sandboxed run on macOS reads the arguments and environment of another process of the
+    /// same user, through `sysctl({CTL_KERN, KERN_PROCARGS2, pid})`, so a second test binary's
+    /// `BLAZE_INPROC` token (crates/blaze-inproc/src/host.rs, `Host::launch`) is readable while
+    /// it waits to be redeemed. No Seatbelt rule tried closed it: `(deny process-info*)`,
+    /// `(deny sysctl-read (sysctl-name "kern.procargs2"))` and `(deny sysctl*)` all left the
+    /// read working on macOS 27.0.1 (26A434). This is why tests are sandboxed on macOS only on
+    /// an opt-in (blaze-units' `load::sandbox::tests_sandboxed_by_default`). When the channel
+    /// is a descriptor the test inherits and no token is in any environment, invert this test:
+    /// the read must then find no secret (or be refused), and the macOS default can become
+    /// Linux's. Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_sandboxed_run_reads_another_processs_environment() {
+        if let Err(why) = crate::sandbox::alone::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let secret = format!("blaze-probe-{}", std::process::id());
+        let other = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .env("BLAZE_PROBE_SECRET", &secret)
+            .spawn()
+            .map(stdx::JodChild)
+            .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let made = blaze_core::temp::TempDir::for_test("blaze-macos-env-");
+        let dir = made.path().to_path_buf();
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let spec = blaze_usercode::confine::Spec {
+            program: exe.clone(),
+            args: [
+                "sandbox::macos::tests::helper_reads_another_processs_environment",
+                "--exact",
+                "--test-threads=1",
+            ]
+            .map(OsString::from)
+            .to_vec(),
+            env: vec![
+                ("BLAZE_SANDBOX_TEST_PROCARGS".into(), out.clone().into()),
+                ("BLAZE_SANDBOX_TEST_PROCARGS_PID".into(), other.id().to_string().into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            services: Vec::new(),
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec![exe],
+            given: None,
+        };
+        assert_eq!(crate::sandbox::alone::launch(&spec), 0);
+        drop(other);
+        let seen = std::fs::read(out.join("seen")).unwrap();
+        let said = String::from_utf8_lossy(&seen);
+        // The control: the read reached the sibling (its own argument is there), so a missing
+        // secret below could only mean the environment was kept from it.
+        assert!(said.contains("/bin/sleep"), "the run read nothing of the other process: {said}");
+        assert!(
+            said.contains(&format!("BLAZE_PROBE_SECRET={secret}")),
+            "the known hole closed: a sandboxed run no longer reads another process's \
+             environment; invert this test and see whether macOS can sandbox tests by default: \
+             {said}"
+        );
+        _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -2252,6 +2252,77 @@ fn extract_cfgs(result: &mut Vec<CfgExpr, &Frame>, attr: ast::Meta<'_>) -> Contr
     ControlFlow::Continue(())
 }
 
+/// The attribute flags of `def`'s generic parameters ([`AttrFlags::query_generic_params`] for a
+/// definition with any), read off the item's outline. A fact boundary
+/// (`crate::kinds::generic_params_attr_flags`): the borrow check reads it for a `Drop` impl's
+/// `#[may_dangle]`, and blaze-item-hash answers a row of it by the item's `Attrs` fact, which
+/// hashes these flags (`values::attrs_of`); the signature form does not.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub fn generic_params_attr_flags(
+    db: &Db,
+    def: GenericDefId,
+) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>) {
+    blaze_mem::frame::current(|frame| {
+        let mut cfg_options = None;
+        let mut cfg_options = || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
+
+        let mut flags_of = |attrs: ast::AstChildren<'_, ast::Attr<'_>>| {
+            let mut attr_flags = AttrFlags::empty();
+            expand_cfg_attr_view(attrs, &mut cfg_options, |attr, _| {
+                match_attr_flags(&mut attr_flags, attr)
+            });
+            attr_flags
+        };
+        // One walk of the written params, each zipped with its id in order, as
+        // `HasChildSourceView` finds one of them. The list is read off the item's outline
+        // ([`Tree::Outline`]), never the file's live parse, so an edit of a body of the file (this
+        // item's or another's) leaves this query's row as it was.
+        let generic_params = GenericParams::of(db, def);
+        let list = match def {
+            GenericDefId::FunctionId(it) => outline_generic_params(db, it),
+            GenericDefId::TypeAliasId(it) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::StructId(it)) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::UnionId(it)) => outline_generic_params(db, it),
+            GenericDefId::AdtId(AdtId::EnumId(it)) => outline_generic_params(db, it),
+            GenericDefId::TraitId(it) => outline_generic_params(db, it),
+            GenericDefId::ImplId(it) => outline_generic_params(db, it),
+            GenericDefId::ConstId(_) | GenericDefId::StaticId(_) => None,
+        };
+
+        let mut lifetimes = Vec::new_in(frame);
+        let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
+        for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
+            let attr_flags = flags_of(lifetime.attrs());
+            if !attr_flags.is_empty() {
+                lifetimes.push((lifetime_id, attr_flags));
+            }
+        }
+
+        let mut type_and_consts = Vec::new_in(frame);
+        let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
+        // For traits the first type index is `Self`, the trait itself.
+        if let GenericDefId::TraitId(id) = def
+            && let Some(self_id) = ids.next()
+        {
+            let loc = id.lookup(db);
+            let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
+            let attr_flags = flags_of(node.attrs());
+            if !attr_flags.is_empty() {
+                type_and_consts.push((self_id, attr_flags));
+            }
+        }
+        let type_or_const_params = list.into_iter().flat_map(|it| it.type_or_const_params());
+        for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
+            let attr_flags = flags_of(type_or_const.attrs());
+            if !attr_flags.is_empty() {
+                type_and_consts.push((type_or_const_id, attr_flags));
+            }
+        }
+
+        (exact_arena_map(&lifetimes), exact_arena_map(&type_and_consts))
+    })
+}
+
 #[blaze_memo::tracked]
 impl AttrFlags {
     #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
@@ -2318,76 +2389,7 @@ impl AttrFlags {
         if params_count_excluding_self == 0 {
             return const { &(ArenaMap::new(), ArenaMap::new()) };
         }
-        return generic_params_attr_flags(db, def);
-
-        #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
-        fn generic_params_attr_flags(
-            db: &Db,
-            def: GenericDefId,
-        ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
-        {
-            blaze_mem::frame::current(|frame| {
-                let mut cfg_options = None;
-                let mut cfg_options =
-                    || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
-
-                let mut flags_of = |attrs: ast::AstChildren<'_, ast::Attr<'_>>| {
-                    let mut attr_flags = AttrFlags::empty();
-                    expand_cfg_attr_view(attrs, &mut cfg_options, |attr, _| {
-                        match_attr_flags(&mut attr_flags, attr)
-                    });
-                    attr_flags
-                };
-                // One walk of the written params, each zipped with its id in order, as
-                // `HasChildSourceView` finds one of them. The list is read off the item's
-                // outline ([`Tree::Outline`]), never the file's live parse, so an edit of a
-                // body of the file (this item's or another's) leaves this query's row as it was.
-                let generic_params = GenericParams::of(db, def);
-                let list = match def {
-                    GenericDefId::FunctionId(it) => outline_generic_params(db, it),
-                    GenericDefId::TypeAliasId(it) => outline_generic_params(db, it),
-                    GenericDefId::AdtId(AdtId::StructId(it)) => outline_generic_params(db, it),
-                    GenericDefId::AdtId(AdtId::UnionId(it)) => outline_generic_params(db, it),
-                    GenericDefId::AdtId(AdtId::EnumId(it)) => outline_generic_params(db, it),
-                    GenericDefId::TraitId(it) => outline_generic_params(db, it),
-                    GenericDefId::ImplId(it) => outline_generic_params(db, it),
-                    GenericDefId::ConstId(_) | GenericDefId::StaticId(_) => None,
-                };
-
-                let mut lifetimes = Vec::new_in(frame);
-                let lifetime_params = list.into_iter().flat_map(|it| it.lifetime_params());
-                for ((lifetime_id, _), lifetime) in generic_params.iter_lt().zip(lifetime_params) {
-                    let attr_flags = flags_of(lifetime.attrs());
-                    if !attr_flags.is_empty() {
-                        lifetimes.push((lifetime_id, attr_flags));
-                    }
-                }
-
-                let mut type_and_consts = Vec::new_in(frame);
-                let mut ids = generic_params.iter_type_or_consts().map(|(id, _)| id);
-                // For traits the first type index is `Self`, the trait itself.
-                if let GenericDefId::TraitId(id) = def
-                    && let Some(self_id) = ids.next()
-                {
-                    let loc = id.lookup(db);
-                    let node = item_node(db, loc.ast_id(), loc.module(db), Tree::Outline);
-                    let attr_flags = flags_of(node.attrs());
-                    if !attr_flags.is_empty() {
-                        type_and_consts.push((self_id, attr_flags));
-                    }
-                }
-                let type_or_const_params =
-                    list.into_iter().flat_map(|it| it.type_or_const_params());
-                for (type_or_const_id, type_or_const) in ids.zip(type_or_const_params) {
-                    let attr_flags = flags_of(type_or_const.attrs());
-                    if !attr_flags.is_empty() {
-                        type_and_consts.push((type_or_const_id, attr_flags));
-                    }
-                }
-
-                (exact_arena_map(&lifetimes), exact_arena_map(&type_and_consts))
-            })
-        }
+        generic_params_attr_flags(db, def)
     }
 
     #[inline]

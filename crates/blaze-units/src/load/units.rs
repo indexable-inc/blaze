@@ -53,8 +53,6 @@ pub(crate) struct Built {
     pub roots: Vec<(String, usize)>,
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand.
     pub link_dirs: Vec<String>,
-    /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
-    pub sandboxed_tests: bool,
     /// The pinned native inputs the graph's build script runs are given ([`crate::query::Units::native`]).
     pub native: Vec<crate::query::NativeInput>,
 }
@@ -181,7 +179,11 @@ pub(crate) fn units(
         // alloc: the spec is how a unit names its package (`Unit::pkg_id`), once per package.
         packages_by_spec.insert(id.to_spec().to_string(), (*id, package));
     }
-    let opt_out = match super::sandbox::workspace(ws.custom_metadata(), ws.root_manifest()) {
+    let opt_out = match super::sandbox::workspace(
+        ws.custom_metadata(),
+        ws.root_manifest(),
+        &host.triple,
+    ) {
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
@@ -202,8 +204,18 @@ pub(crate) fn units(
         if own.build_script_outside || opt_out.unsandboxed(id.name().as_str()) {
             unsandboxed.insert(spec.as_str());
         }
-        if own.tests != TestSandbox::default() {
-            test_sandbox.insert(*id, own.tests);
+        // Whether a member's tests run sandboxed by default is the host's
+        // (`sandbox::tests_sandboxed_by_default`), decided here once, into its plan.
+        let tests = match package.is_member {
+            true => super::sandbox::tests_on(
+                own.tests,
+                own.tests_opted_in || opt_out.sandboxed_tests,
+                &host.triple,
+            ),
+            false => own.tests,
+        };
+        if tests != TestSandbox::default() {
+            test_sandbox.insert(*id, tests);
         }
     }
     let request = Request {
@@ -522,7 +534,7 @@ pub(crate) fn units(
     }
 
     // A foreign load builds another build's dependencies, whose profile is that build's.
-    let notes = match &spec.foreign {
+    let mut notes = match &spec.foreign {
         Some(_) => Vec::new(),
         None => strip_notes(
             &profiles.strips(),
@@ -534,6 +546,11 @@ pub(crate) fn units(
                 .map(|(_, plan)| plan.rustflags.as_slice()),
         ),
     };
+    // A retired experiment the root manifest still lists: said by the build of this
+    // workspace, not by a foreign load of another's dependencies.
+    if spec.foreign.is_none() {
+        notes.extend(opt_out.notes);
+    }
 
     let checksums = resolved.resolve.checksums();
     let const_macros_on = super::sandbox::const_macros_on(ws.custom_metadata());
@@ -614,7 +631,6 @@ pub(crate) fn units(
         finished: planned.finished,
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
-        sandboxed_tests: opt_out.sandboxed_tests,
         native,
     }))
 }

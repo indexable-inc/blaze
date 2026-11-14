@@ -489,14 +489,32 @@ pub fn records(mode: Mode) -> bool {
     matches!(mode, Mode::Live | Mode::Tiered)
 }
 
+/// The jump table a test binary's slots are of, as its link made it: the image's lineage and
+/// generation (blaze-link's `Image::lineage` and `Image::generation`, which together name one
+/// commit of one image and so one assignment of functions to slots), the table's slot count,
+/// its capacity (`Image::capacity`: the linker's header count and the live descriptor's, what
+/// the binary's runtime arms a byte for each of), and how many of them the link gave out
+/// (`Image::slots`). The first three are what the runtime names the table by
+/// (`blaze_usercode::test::wire::Table`), which selection reads a record only against.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct JumpTable {
+    pub lineage: [u8; 16],
+    pub generation: u64,
+    pub capacity: u32,
+    pub given: u32,
+}
+
 /// A test binary's table.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct ExecTable {
+    /// The jump table its slots are of.
+    pub jump: JumpTable,
     /// Every function of the binary, those dedupe merged away included, as `(FnId, Bound)`
     /// in `FnId` order: the order `blaze_testsel::Image::new` keys by, which a table already
     /// in checks with a compare per function (fastcompile-sol-select 2).
     pub fns: Vec<(ContentId, ContentId)>,
-    /// Slot `n`'s function, an index into `fns`: one per slot of the binary's jump table.
+    /// Slot `n`'s function, an index into `fns`: one per slot the link gave out
+    /// ([`JumpTable::given`]); a slot past them, up to the table's capacity, names none.
     /// [`ExecTable::EMPTY`] for a slot an incremental link emptied, which no code names.
     pub slot_fn: Vec<u32>,
     /// The content ID of the code the binary runs that is in no table: the premapped
@@ -596,8 +614,10 @@ pub enum ExecError {
     Unbound { function: InstanceKey, why: String },
     /// Two functions of the binary are one function across versions.
     Twice { function: InstanceKey, other: InstanceKey },
-    /// The link put a function in a slot past its jump table's.
+    /// The link put a function in a slot past those it gave out.
     PastTable { function: InstanceKey, slot: u32, slots: u32 },
+    /// The link says it gave out more slots than its jump table has.
+    PastCapacity { given: u32, capacity: u32 },
     /// The link named one slot for two functions.
     TwoInSlot { slot: u32, function: InstanceKey, other: InstanceKey },
     /// A test whose root is not one of the build's.
@@ -649,7 +669,10 @@ impl ExecError {
                 )
             }
             ExecError::PastTable { function, slot, slots } => {
-                write!(f, "{} is in slot {slot} of a jump table of {slots}", named(function))
+                write!(f, "{} is in slot {slot} of the {slots} the link gave out", named(function))
+            }
+            ExecError::PastCapacity { given, capacity } => {
+                write!(f, "the link gave out {given} slots of a jump table of {capacity}")
             }
             ExecError::TwoInSlot { slot, function, other } => {
                 write!(f, "slot {slot} is named for both {} and {}", named(function), named(other))
@@ -744,15 +767,16 @@ impl ExecTable {
     /// `spans` (`hir_ty_codegen::v2::LinkInputs::spans`). Each function's `Bound` in
     /// [`ExecTable::fns`] is its [`Built::versions`] one with the values of the statics its
     /// code names and the content of the span tables of the positions and lines it names
-    /// ([`placed`]): of its own code, or of the kept one's for one dedupe merged away. `slots`
-    /// is how many slots its jump table has and `slot_of` the slot the link named for a
-    /// function, if any (an incremental image's `blaze_link::Image::slot`); `beside` is what
+    /// ([`placed`]): of its own code, or of the kept one's for one dedupe merged away. `jump`
+    /// is the jump table the link made (of which [`JumpTable::given`] slots are numbered here)
+    /// and `slot_of` the slot the link named for a function, if any (an incremental image's
+    /// `blaze_link::Image::slot`); `beside` is what
     /// [`ExecTable::beside`] says; `tests` are the harness's tests in its order, each with its
     /// function's place in [`Built::roots`].
     pub fn new(
         built: &Built,
         spans: &[(ContentId, Vec<u8>)],
-        slots: u32,
+        jump: JumpTable,
         slot_of: impl Fn(&InstanceKey) -> Option<u32>,
         beside: ContentId,
         tests: impl IntoIterator<Item = (String, usize)>,
@@ -826,6 +850,10 @@ impl ExecTable {
             fns.push((*id, bound));
         }
 
+        let slots = jump.given;
+        if slots > jump.capacity {
+            return Err(ExecError::PastCapacity { given: slots, capacity: jump.capacity });
+        }
         // alloc: once per test binary, a word per slot
         let mut slot_fn = vec![ExecTable::EMPTY; slots as usize];
         for (at, (key, _)) in built.inputs.iter().enumerate() {
@@ -868,7 +896,7 @@ impl ExecTable {
             // alloc: once per test binary, the marks per node
             marks: marks.to_vec(),
         };
-        Ok(ExecTable { fns, slot_fn, beside, tests: roots, graph })
+        Ok(ExecTable { jump, fns, slot_fn, beside, tests: roots, graph })
     }
 }
 

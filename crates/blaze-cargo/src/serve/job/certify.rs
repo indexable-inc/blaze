@@ -162,12 +162,13 @@ impl Building {
         (self.named, self.read, self.seen) = (named, read, seen);
     }
 
-    /// It ended, `passed` or not.
-    fn end(self, passed: bool) -> Ended {
+    /// It ended, `passed` or not, having left `left` at its outputs' paths
+    /// ([`Jobs::left_by`]).
+    fn end(self, passed: bool, left: Vec<(u32, blaze_cas::Key)>) -> Ended {
         let Building { root, shape, inputs, saying, looks, named, read, seen, asked, .. } = self;
         if !passed {
             // alloc: a reason, once a build
-            return Ended { root, shape, built: Err(request::Unwritten::Failed.to_string()) };
+            return Ended { root, shape, left, built: Err(request::Unwritten::Failed.to_string()) };
         }
         // Each look it made at the disk that no watch vouched for is a read of its own, at
         // what that look saw: a file's content, an entry, a listing.
@@ -181,7 +182,7 @@ impl Building {
             // alloc: a reason, once a build
             Err(what) => Err(format!("no request certificate is written: the build said {what}, which no build says with nothing to do")),
         };
-        Ended { root, shape, built }
+        Ended { root, shape, left, built }
     }
 }
 
@@ -190,6 +191,10 @@ impl Building {
 pub(super) struct Ended {
     root: u32,
     shape: ContentId,
+    /// The key its job left at each output path of its plan as it answered, by path id,
+    /// sorted ([`Jobs::left_by`]): what its certificate may name there, and nothing another
+    /// request placed after.
+    left: Vec<(u32, blaze_cas::Key)>,
     /// What it hands the machine, or why it leaves no certificate.
     built: Result<Walked, String>,
 }
@@ -544,6 +549,36 @@ pub(super) enum AtPath {
     /// rename and when that look was asked for (`blaze_cas::PlacedStamp`): `None` where the
     /// store vouched for no look, and the next check hashes the output once.
     Placed { content: ContentId, stamp: Option<(Stamp, u64)> },
+    /// The build left `left` there as it answered, and the jobs' record holds `holds` now
+    /// (none: nothing on record): another request placed the path since, or this build's
+    /// placement there failed. No certificate names another request's file as this answer's
+    /// (one writer, D45).
+    Replaced { left: ContentId, holds: Option<ContentId> },
+}
+
+/// What the jobs' record says of an output's path as the request certificate's check asks
+/// it (one writer, D45): read in place, with no look at the disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Recorded {
+    /// No placement of this daemon is on record there (a start, a path it never placed, one
+    /// whose placement failed): the disk is the evidence, which the check looks at.
+    Unrecorded,
+    /// A placement is in flight there: what the file will hold is not this check's to say.
+    Placing,
+    /// The file placed there, by its content's key, as it was at the jobs' last look.
+    Holds(ContentId),
+}
+
+/// Whether the output a certificate names by `wanted` at a path whose record is `recorded`
+/// is another request's: the record names another key, or a placement is in flight there.
+/// Then the request is not answered without a job: its job places the answer's file again
+/// (a clone from the store) before it answers. Map lookups, no IO.
+pub(super) fn placed_elsewhere(recorded: Recorded, wanted: ContentId) -> bool {
+    match recorded {
+        Recorded::Unrecorded => false,
+        Recorded::Placing => true,
+        Recorded::Holds(key) => key != wanted,
+    }
 }
 
 /// The outputs a build of a plan whose outputs are at `paths` left, as its certificate names
@@ -570,6 +605,12 @@ pub(super) fn outputs_of<'p>(
             )),
             AtPath::Placing => {
                 return Err(format!("no request certificate is written: the output {path} is still being placed"));
+            }
+            AtPath::Replaced { left, holds } => {
+                let holds = holds.map_or_else(|| "nothing".to_owned(), |it| format!("{it:x}")); // alloc: a reason, once
+                return Err(format!(
+                    "no request certificate is written: the output {path} held {left:x} as the build answered, and the daemon's record holds {holds} now: another request placed it since, or its placement failed"
+                ));
             }
             AtPath::Nothing => {}
         }
@@ -927,6 +968,27 @@ impl<S: Steps> Jobs<S> {
     /// Each of `asks` of the check at `at` answered where the loop holds the answer, else
     /// asked of the driver.
     fn certify_ask(&mut self, w: &mut World<'_, S>, id: JobId, at: usize, asks: Vec<Ask>) {
+        // One writer (D45): an output the answer names whose path the jobs' record says holds
+        // another key, or has a placement in flight, is another request's file. The request
+        // goes to its job, which places this answer's file there (a clone from the store)
+        // before it answers; no stamp is taken and no file read for it.
+        #[cfg(test)]
+        let planted = PLANT_HIT_UNRECORDED.get();
+        #[cfg(not(test))]
+        let planted = false;
+        // Once a look at the outputs: a lookup each in the jobs' maps.
+        let looks = !planted && asks.iter().any(|it| matches!(it, Ask::Stamp { .. }));
+        let outputs = if looks { self.certify.checking[at].machine.outputs() } else { &[] };
+        let elsewhere = outputs
+            .iter()
+            .find(|it| it.base == ABSOLUTE && placed_elsewhere(self.recorded(&it.path), it.content));
+        if let Some(output) = elsewhere {
+            let why = request::Why::Output { base: ABSOLUTE, path: output.path.clone(), how: request::How::Placed }; // clone: a reason's name, once
+            let checking = self.certify.checking.swap_remove(at);
+            // alloc: none, nothing was refused
+            self.certify_miss(w, checking, request::Miss { why, refused: Vec::new(), lists: 0 });
+            return;
+        }
         let asked_ns = w.wall_ns;
         self.certify.checking[at].asked_ns = asked_ns;
         for (n, ask) in asks.iter().enumerate() {
@@ -1049,6 +1111,11 @@ impl<S: Steps> Jobs<S> {
     fn certify_hit(&mut self, w: &mut World<'_, S>, checking: Checking, answer: certificate::Answer) {
         let Checking { id, span, root, shape, late, base, drawn, told, ref env, ref work, .. } = checking;
         self.certify_verified(root, shape);
+        #[cfg(test)]
+        super::CERTIFY_WORDS.with_borrow_mut(|it| {
+            let named = answer.outputs.iter().map(|it| format!("{} {}: {:x}", it.base, it.path, it.content)); // alloc: a test's record
+            it.push(format!("hit: the answer names {:?}", named.collect::<Vec<_>>())); // alloc: a test's record
+        });
         let asked = match work {
             Some(work) => slot_asked(work),
             None => self.jobs.get(key_of(id)).and_then(|job| slot_asked(&job.work)),
@@ -1114,6 +1181,46 @@ impl<S: Steps> Jobs<S> {
                 stamp: Some(blaze_cas::PlacedStamp { stamp, looked_ns: verified.looked_ns }),
             });
         }
+    }
+
+    /// [`Recorded`] of the output path `path` in the jobs' record: map lookups, no IO.
+    fn recorded(&self, path: &str) -> Recorded {
+        let Some(&id) = self.paths.ids.get(path) else { return Recorded::Unrecorded };
+        if self.flying.contains_key(&id) {
+            return Recorded::Placing;
+        }
+        match &self.paths.placed[id as usize] {
+            Some(placed) if placed.meta.is_some() => Recorded::Holds(placed.key.0),
+            Some(_) => Recorded::Placing,
+            None => Recorded::Unrecorded,
+        }
+    }
+
+    /// What job `job` left at each output path of checkout `root`'s plan of `shape` as it
+    /// answers, by path id, sorted: the key of its own placement there still in flight or
+    /// queued behind another (the last asked), else the key the jobs' record holds. What its
+    /// certificate may name, written once the build settled ([`Jobs::certify_write`]): a file
+    /// another request placed there in between is not this build's.
+    fn left_by(&self, job: JobId, root: u32, shape: ContentId) -> Vec<(u32, blaze_cas::Key)> {
+        let mut left = Vec::new_in(std::alloc::Global);
+        let Some(plan) = self.roots.plans[root as usize].iter().find(|it| it.shape == shape) else { return left };
+        let mut own = Vec::new_in(std::alloc::Global);
+        own.extend(self.placing.values().filter(|it| it.job == job).map(|it| (it.path, it.key)));
+        own.extend(self.queued.iter().filter(|it| it.job == job).map(|it| (it.path, it.key)));
+        // Stable: of one path's, the queued one, asked last, stays last.
+        own.sort_by_key(|it| it.0);
+        for path in plan.units.plans.iter().flat_map(|it| it.outputs.iter()) {
+            let Some(&id) = self.paths.ids.get(path.as_str()) else { continue };
+            let end = own.partition_point(|it| it.0 <= id);
+            let key = match end.checked_sub(1).map(|at| own[at]) {
+                Some((at, key)) if at == id => Some(key),
+                _ => self.paths.placed[id as usize].as_ref().map(|it| it.key),
+            };
+            left.extend(key.map(|key| (id, key)));
+        }
+        left.sort_unstable_by_key(|it| it.0);
+        left.dedup_by_key(|it| it.0);
+        left
     }
 
     /// The request is not certified: why is said in a span of the check and again in its
@@ -1225,7 +1332,8 @@ impl<S: Steps> Jobs<S> {
             Said::Finish(id, ok, error, _) => {
                 let Some(at) = self.certify.building.iter().position(|it| it.job == *id) else { return };
                 let building = self.certify.building.swap_remove(at);
-                self.certify.ended.push(building.end(*ok && error.is_none()));
+                let left = self.left_by(building.job, building.root, building.shape);
+                self.certify.ended.push(building.end(*ok && error.is_none(), left));
             }
         }
     }
@@ -1238,30 +1346,36 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         for ended in std::mem::take(&mut self.certify.ended) {
-            let Ended { root, shape, built } = ended;
+            let Ended { root, shape, left, built } = ended;
             let span = tracing::info_span!(target: "blaze", "request certificate: written at a build's end", root);
             let _entered = span.enter();
             let walked = match built {
                 Ok(walked) => walked,
                 Err(why) => {
                     tracing::info_span!(target: "blaze", "request certificate: not written", root, why = %why).in_scope(|| {});
+                    #[cfg(test)]
+                    super::CERTIFY_WORDS.with_borrow_mut(|it| it.push(format!("not written: {why}")));
                     continue;
                 }
             };
-            if let Err(why) = self.certify_write(w, root, shape, walked) {
+            if let Err(why) = self.certify_write(w, root, shape, walked, &left) {
                 tracing::info_span!(target: "blaze", "request certificate: not written", root, why = %why).in_scope(|| {});
                 tracing::warn!(target: "blaze", root, "{why}");
+                #[cfg(test)]
+                super::CERTIFY_WORDS.with_borrow_mut(|it| it.push(format!("not written: {why}")));
             }
         }
     }
 
-    /// The certificate of the build `walked` of checkout `root` and shape `shape`, written.
+    /// The certificate of the build `walked` of checkout `root` and shape `shape`, which left
+    /// `left` at its outputs' paths as it answered ([`Jobs::left_by`]), written.
     fn certify_write(
         &mut self,
         w: &mut World<'_, S>,
         root: u32,
         shape: ContentId,
         walked: Walked,
+        left: &[(u32, blaze_cas::Key)],
     ) -> Result<(), String> {
         let env = &walked.inputs.config.invocation.env;
         let mut untraced = Vec::new(); // alloc: none unless a step was untraced
@@ -1342,19 +1456,46 @@ impl<S: Steps> Jobs<S> {
         let Some(plan) = self.roots.plans[root as usize].iter().find(|it| it.shape == shape) else {
             return Err("no request certificate is written: the checkout keeps no plan of the request's shape to name its outputs by".to_owned());
         };
+        // Each named by what this build left there as it answered (`left`), and only while the
+        // jobs' record still holds that: the certificate is written once the build settled,
+        // and a request after it may have placed its own file at a shared path in between (a
+        // run's image where a build's was). Read from the record now, that file was named as
+        // this answer's, with its stamp, and the next request of this shape was answered over
+        // it (one writer, D45; measured 2026-11-14: run, build, run, build, the second build
+        // answered in 11 ms over the run's launcher).
+        #[cfg(test)]
+        let shared = PLANT_CERTIFY_SHARED_RECORD.get();
+        #[cfg(not(test))]
+        let shared = false;
         let paths = &self.paths;
         let outputs = outputs_of(
             plan.units.plans.iter().flat_map(|it| it.outputs.iter()).map(String::as_str),
-            |path| match paths.ids.get(path).and_then(|id| paths.placed[*id as usize].as_ref()) {
-                Some(Placement { key, meta: Some(_), stamp, .. }) => AtPath::Placed {
-                    content: key.0,
-                    stamp: stamp.as_ref().map(|it| (it.stamp, it.looked_ns)),
-                },
-                Some(_) => AtPath::Placing,
-                None => AtPath::Nothing,
+            |path| {
+                let Some(&id) = paths.ids.get(path) else { return AtPath::Nothing };
+                let placed = paths.placed[id as usize].as_ref();
+                let own = match left.binary_search_by_key(&id, |it| it.0) {
+                    Ok(at) => Some(left[at].1),
+                    Err(_) => None,
+                };
+                // The planted bug: whatever is on record now, whoever placed it.
+                let own = if shared { placed.map(|it| it.key) } else { own };
+                let Some(own) = own else { return AtPath::Nothing };
+                match placed {
+                    Some(Placement { key, meta: Some(_), stamp, .. }) if *key == own => AtPath::Placed {
+                        content: key.0,
+                        stamp: stamp.as_ref().map(|it| (it.stamp, it.looked_ns)),
+                    },
+                    Some(Placement { key, meta: None, .. }) if *key == own => AtPath::Placing,
+                    other => AtPath::Replaced { left: own.0, holds: other.map(|it| it.key.0) },
+                }
             },
             |holder, path| w.steps.held_code(holder, path),
         )?;
+        #[cfg(test)]
+        super::CERTIFY_WORDS.with_borrow_mut(|it| {
+            let named = outputs.iter().map(|(it, _)| format!("{} {}: {:x}", it.base, it.path, it.content)); // alloc: a test's record
+            it.push(format!("writing: it left {left:x?} and names {:?}", named.collect::<Vec<_>>())); // alloc: a test's record
+        });
         let said = blaze_protocol::cbor::to_vec(&walked.said)
             .map_err(|error| format!("no request certificate is written: what the build said does not encode: {error}"))?;
         let tool = tool_of(&mut self.certify.tool).map_err(|why| format!("no request certificate is written: {why}"))?;

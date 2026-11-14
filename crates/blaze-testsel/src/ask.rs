@@ -37,6 +37,15 @@ pub const UNLOGGED: FnId = FnId(ContentId([0xff; 32]));
 /// The domain of an ask's id.
 pub const ASK_DOMAIN: &str = "blaze-testsel ask 1";
 
+/// The domain of an environment variable's value as a read's digest ([`env_digest`]).
+pub const ENV_DOMAIN: &str = "blaze-testsel env value 1";
+
+/// The digest of an environment variable's value, as a run's read and an answer now both give
+/// it: a file's and a directory's digests are the trace's own hashes.
+pub fn env_digest(value: &[u8]) -> ContentId {
+    ContentId::of(ENV_DOMAIN, value)
+}
+
 const SHAPE_MAGIC: &[u8; 4] = b"BZTS";
 const VALUE_MAGIC: &[u8; 4] = b"BZTV";
 const VERSION: u8 = 1;

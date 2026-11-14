@@ -171,7 +171,15 @@ one.
   legitimate execution's, as with `RandomState`. A script proved pure may not read it (its
   output could differ between two cold runs).
 - Sandboxed tests: the seed is given (hash maps, `getrandom`), the wall clock is always the
-  system's: tests sleep, time out and check deadlines against it.
+  system's: tests sleep, time out and check deadlines against it. The seed is
+  `Provider::of_suite(host::suite(tool, settings, env))`: the suite's hash of the tool,
+  settings and environment, which every test's base key covers, so it adds no input. Each
+  test's kernel randomness is its own stream, `H(scope seed, SYSTEM, place, block)` with the
+  scope seed `blake3("blaze v2 provider scope 1", seed, test name)` and the place the order the
+  scope's processes first asked in (0: the server's child that took the test's mark); a mark
+  starts the scope over, so a retry is given what its first run was. Not per test: std's hash
+  keys and `fill` in a child, which come from the suite's seed and the child's one test
+  thread, the same for every test (still a function of every test's base key).
 
 A proof of purity (`hir_ty_pure`) stops at `RandomState::new` (`Effects::SEEDED`) and
 `SystemTime::now` (`Effects::WALL`). A proof with `WALL` adds `SOURCE_DATE_EPOCH` to the
@@ -248,7 +256,8 @@ provider, and noted as answered, not as untraceable.
 
 A process's number is its id in the sandbox's PID namespace (the kernel gives them out in
 order, so the same fork order gives the same numbers); in a confined sandbox, which has no
-namespace, its place among those that asked. The state is one count per process
+namespace, its place among those that asked. A process in a test's scope (section B) is
+numbered within the scope instead. The state is one count per stream
 (`blaze_usercode::provider::Answers`, a sans-IO core with a blaze-sim property against its model).
 
 An answered line is no input and is dropped as the trace is assembled; `pure::check` therefore
@@ -376,9 +385,9 @@ Written in lane det-scripts-1110, none of it compiled or run:
 
 - A: `library/std/src/sys/provider/` and its call sites (recorded in `library/UPSTREAM`);
   `blaze_usercode::provider`; the build script's command carries the variable; the purity
-  leaves and the pure key's `SOURCE_DATE_EPOCH`. Not built: the wasm host and the evaluator on
-  `Provider`; a provider for sandboxed tests and proc-macro processes (only `script::prepare`
-  passes one).
+  leaves and the pure key's `SOURCE_DATE_EPOCH`; sandboxed test binaries are given one
+  (`Binary::provider`, refused when missing) with per-test scoped streams in `Answers`. Not
+  built: the wasm host and the evaluator on `Provider`; a provider for proc-macro processes.
 - C: `getrandom`, the devices and the given wall clock answered by the Linux supervisor; the
   `MAP_DROPPABLE` refusal; the interposer's real clock calls. Not built: the exec-stop.
 - D: the window's test and its control.

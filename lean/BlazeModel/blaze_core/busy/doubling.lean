@@ -10,10 +10,10 @@ def blaze_core.busy.doubling.loop_0 (fuel : Nat) (tried : U32) (wait : U64) (dou
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt doubled tried then do
-      let t19 ← Scalar.mul wait (2 : U64)
-      let t18 := Scalar.lt t19 (50000000 : U64)
-      let t17 ← if t18 then Scalar.mul wait (2 : U64) else Result.ok (50000000 : U64)
-      let wait := t17
+      let t0 ← Scalar.mul wait (2 : U64)
+      let t1 := Scalar.lt t0 (50000000 : U64)
+      let t2 ← if t1 then Scalar.mul wait (2 : U64) else Result.ok (50000000 : U64)
+      let wait := t2
       let doubled ← Scalar.add doubled (1 : U32)
       blaze_core.busy.doubling.loop_0 fuel tried wait doubled
     else Result.ok wait
@@ -25,6 +25,6 @@ def blaze_core.busy.doubling (fuel : Nat) (tried : U32) (waited : U64) : Result 
     let doubled := (0 : U32)
     let wait ← blaze_core.busy.doubling.loop_0 fuel tried wait doubled
     let left ← Scalar.sub (1000000000 : U64) waited
-    let t30 := Scalar.lt wait left
-    let t29 := if t30 then wait else left
-    Result.ok (Option.some t29 : Option U64)
+    let t3 := Scalar.lt wait left
+    let t4 := if t3 then wait else left
+    Result.ok (Option.some t4 : Option U64)

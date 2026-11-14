@@ -9,20 +9,20 @@ def blaze_core.busy.bounded (waited : U64) (wait : Option U64) : Result Bool :=
   match wait with
   | Option.none => Result.ok (Scalar.ge waited (1000000000 : U64))
   | Option.some v0 => do
-    let wait_6 := v0
-    let t10 := Scalar.lt waited (1000000000 : U64)
-    let t9 := if t10 then Scalar.gt wait_6 (0 : U64) else t10
-    let t8 := if t9 then Scalar.le wait_6 (50000000 : U64) else t9
-    let t7 ←
-      if t8 then do
-        let t16 := wait_6
-        let t17 ← Scalar.sub (1000000000 : U64) waited
-        Result.ok (Scalar.le t16 t17)
-      else Result.ok t8
-    if t7 then
-      let t20 := Scalar.ge wait_6 (50000 : U64)
-      if t20 then Result.ok t20
+    let wait_1 := v0
+    let t0 := Scalar.lt waited (1000000000 : U64)
+    let t1 := if t0 then Scalar.gt wait_1 (0 : U64) else t0
+    let t2 := if t1 then Scalar.le wait_1 (50000000 : U64) else t1
+    let t3 ←
+      if t2 then do
+        let t4 := wait_1
+        let t5 ← Scalar.sub (1000000000 : U64) waited
+        Result.ok (Scalar.le t4 t5)
+      else Result.ok t2
+    if t3 then
+      let t6 := Scalar.ge wait_1 (50000 : U64)
+      if t6 then Result.ok t6
       else do
-        let t23 ← Scalar.add waited wait_6
-        Result.ok (Scalar.eq t23 (1000000000 : U64))
-    else Result.ok t7
+        let t7 ← Scalar.add waited wait_1
+        Result.ok (Scalar.eq t7 (1000000000 : U64))
+    else Result.ok t3

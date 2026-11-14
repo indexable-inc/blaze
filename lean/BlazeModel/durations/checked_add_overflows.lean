@@ -6,9 +6,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def durations.checked_add_overflows (a : core.time.Duration) (b : core.time.Duration) : Result Bool := do
-  let t3 := core.option.Option.is_none (core.time.Duration.checked_add a b)
-  let t9 ← Scalar.add (core.time.Duration.as_nanos a) (core.time.Duration.as_nanos b)
-  Result.ok (t3 == Scalar.gt t9 (core.time.Duration.as_nanos (core.time.Duration.ofLit 18446744073709551615 999999999)))
+  let t0 := core.option.Option.is_none (core.time.Duration.checked_add a b)
+  let t1 ← Scalar.add (core.time.Duration.as_nanos a) (core.time.Duration.as_nanos b)
+  Result.ok (t0 == Scalar.gt t1 (core.time.Duration.as_nanos (core.time.Duration.ofLit 18446744073709551615 999999999)))
 
 def durations.checked_add_overflows.spec.statement : Prop :=
   ∀ (a : core.time.Duration) (b : core.time.Duration),

@@ -198,7 +198,7 @@ impl Tests {
             ignored: self.ignored,
             measured: 0,
             filtered_out: self.filtered_out,
-            unreached: 0,
+            cached: 0,
             unbuilt: self.unbuilt,
         }
     }

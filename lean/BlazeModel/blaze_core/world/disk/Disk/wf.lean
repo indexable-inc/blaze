@@ -17,21 +17,21 @@ def blaze_core.world.disk.Disk.wf.loop_0 (fuel : Nat) (self : blaze_core.world.d
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.files) then do
-      let t15 ← Slice.index self.files i
-      let t11 ← blaze_core.world.disk.File.wf fuel t15 self.epoch
-      if !t11 then Result.ok false
+      let t0 ← Slice.index self.files i
+      let t1 ← blaze_core.world.disk.File.wf fuel t0 self.epoch
+      if !t1 then Result.ok false
       else do
-        let t21 := Scalar.gt i (0 : Usize)
-        let t20 ←
-          if t21 then do
-            let t23 := self.files
-            let t24 ← Scalar.sub i (1 : Usize)
-            let t26 ← Slice.index t23 t24
-            let t27 := t26.name
-            let t30 ← Slice.index self.files i
-            Result.ok (Scalar.ge t27 t30.name)
-          else Result.ok t21
-        if t20 then Result.ok false
+        let t2 := Scalar.gt i (0 : Usize)
+        let t3 ←
+          if t2 then do
+            let t4 := self.files
+            let t5 ← Scalar.sub i (1 : Usize)
+            let t6 ← Slice.index t4 t5
+            let t7 := t6.name
+            let t8 ← Slice.index self.files i
+            Result.ok (Scalar.ge t7 t8.name)
+          else Result.ok t2
+        if t3 then Result.ok false
         else do
           let i ← Scalar.add i (1 : Usize)
           blaze_core.world.disk.Disk.wf.loop_0 fuel self i

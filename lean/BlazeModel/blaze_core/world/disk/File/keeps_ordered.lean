@@ -15,14 +15,14 @@ def blaze_core.world.disk.File.keeps_ordered.loop_0 (fuel : Nat) (self : blaze_c
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.barriers) then do
-      let t16 ← Slice.index self.barriers i
-      let t13 := Scalar.lt t16.epoch newest
-      let t12 ←
-        if t13 then do
-          let t21 ← Slice.index self.barriers i
-          Result.ok (Scalar.gt t21.covers whole)
-        else Result.ok t13
-      if t12 then Result.ok false
+      let t0 ← Slice.index self.barriers i
+      let t1 := Scalar.lt t0.epoch newest
+      let t2 ←
+        if t1 then do
+          let t3 ← Slice.index self.barriers i
+          Result.ok (Scalar.gt t3.covers whole)
+        else Result.ok t1
+      if t2 then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.File.keeps_ordered.loop_0 fuel self whole newest i

@@ -16,20 +16,20 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.barrier (fuel : Nat) (self : blaze_core.world.disk.Disk) (file : U64) (covers : Usize) : Result blaze_core.world.disk.Disk := do
   let («at», self) ← blaze_core.world.disk.Disk.«open» fuel self file
-  let t11 ← Slice.index self.files «at»
-  let all := Slice.len t11.changes
-  let t13 := Scalar.lt covers all
-  let covered := if t13 then covers else all
-  let t17 := Scalar.gt covered (0 : Usize)
+  let t0 ← Slice.index self.files «at»
+  let all := Slice.len t0.changes
+  let t1 := Scalar.lt covers all
+  let covered := if t1 then covers else all
+  let t2 := Scalar.gt covered (0 : Usize)
   let self ←
-    if t17 then do
+    if t2 then do
       let epoch := self.epoch
-      let t32 := «at»
-      let t25 := ({ covers := covered, epoch := epoch } : blaze_core.world.disk.Barrier)
-      let x0 ← Slice.index self.files t32
-      let x1 ← Vec.push x0.barriers t25
-      let x2 ← Slice.index self.files t32
-      let x3 ← Slice.update self.files t32 { x2 with barriers := x1 }
+      let t3 := «at»
+      let t4 := ({ covers := covered, epoch := epoch } : blaze_core.world.disk.Barrier)
+      let x0 ← Slice.index self.files t3
+      let x1 ← Vec.push x0.barriers t4
+      let x2 ← Slice.index self.files t3
+      let x3 ← Slice.update self.files t3 { x2 with barriers := x1 }
       Result.ok { self with files := x3 }
     else Result.ok self
   Result.ok { self with epoch := Scalar.saturating_add self.epoch (1 : U64) }

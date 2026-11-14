@@ -8,8 +8,8 @@ import BlazeModel.closures.nested.closure0.call
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.nested.closure1.call (t1 : closures.nested.closure1) : Result closures.nested.closure1 := do
-  let x0 ← closures.nested.closure0.call t1.c0
-  let t1 := { t1 with c0 := x0 }
-  let x1 ← closures.nested.closure0.call t1.c0
-  Result.ok { t1 with c0 := x1 }
+def closures.nested.closure1.call (t0 : closures.nested.closure1) : Result closures.nested.closure1 := do
+  let x0 ← closures.nested.closure0.call t0.c0
+  let t0 := { t0 with c0 := x0 }
+  let x1 ← closures.nested.closure0.call t0.c0
+  Result.ok { t0 with c0 := x1 }

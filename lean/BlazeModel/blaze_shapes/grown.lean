@@ -9,5 +9,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_shapes.grown (slot : blaze_shapes.Slot) (more : Vec U8) : Result blaze_shapes.Slot :=
-  let slot_3 := slot
-  blaze_shapes.Slot.grow slot_3 more
+  let slot_1 := slot
+  blaze_shapes.Slot.grow slot_1 more

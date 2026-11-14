@@ -7,6 +7,6 @@ open Blaze
 set_option linter.unusedVariables false
 
 def derives.Own.PartialEq.eq (self : derives.Own) (other : derives.Own) : Result Bool := do
-  let t3 ← Scalar.div self.v (2 : U32)
-  let t5 ← Scalar.div other.v (2 : U32)
-  Result.ok (Scalar.eq t3 t5)
+  let t0 ← Scalar.div self.v (2 : U32)
+  let t1 ← Scalar.div other.v (2 : U32)
+  Result.ok (Scalar.eq t0 t1)

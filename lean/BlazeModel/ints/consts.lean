@@ -6,7 +6,7 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.consts : Result U64 := do
-  let t2 ← Scalar.sub (18446744073709551615 : U64) (Scalar.cast .U64 (4294967295 : U32))
-  let t1 ← Scalar.add t2 (Scalar.cast .U64 (8 : U32))
-  let t9 ← Scalar.add (Scalar.cast .I64 (Scalar.lit .I32 (-2147483648))) (9223372036854775807 : I64)
-  Scalar.add t1 (Scalar.cast .U64 t9)
+  let t0 ← Scalar.sub (18446744073709551615 : U64) (Scalar.cast .U64 (4294967295 : U32))
+  let t1 ← Scalar.add t0 (Scalar.cast .U64 (8 : U32))
+  let t2 ← Scalar.add (Scalar.cast .I64 (Scalar.lit .I32 (-2147483648))) (9223372036854775807 : I64)
+  Scalar.add t1 (Scalar.cast .U64 t2)

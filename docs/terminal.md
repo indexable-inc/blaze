@@ -167,7 +167,7 @@ unchanged. Test executables write libtest's own output, and the run ends with it
 (`blaze_screen::tests_line`), so a pass says how many tests it is a pass of:
 
 ```text
-blaze: tests ok selected=9 ran=8 passed=8 failed=0 ignored=1 measured=0 filtered_out=0 unreached=0 binaries=3 unbuilt=0 elapsed_ms=31800
+blaze: tests ok selected=9 ran=8 passed=8 failed=0 ignored=1 measured=0 filtered_out=0 cached=0 binaries=3 unbuilt=0 elapsed_ms=31800
 ```
 
 ## How it is built

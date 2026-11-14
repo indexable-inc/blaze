@@ -10,6 +10,6 @@ set_option linter.unusedVariables false
 def closures.ticks : Result U32 := do
   let c := (0 : U32)
   let tick := ({ c0 := c } : closures.ticks.closure0)
-  let (t3, tick) ← closures.ticks.closure0.call tick
+  let (t0, tick) ← closures.ticks.closure0.call tick
   let (ret, tick) ← closures.ticks.closure0.call tick
   Result.ok ret

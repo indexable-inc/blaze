@@ -9,7 +9,9 @@ date: 2026-11-13
 The owner, 2026-11-13: "blaze test only reruns tests that have changed". This page is that rule,
 exact: a test runs again when, and only when, something it executed or read is not as it was.
 Built in `crates/blaze-testsel` (`ask`, `index`, `machine`) on blaze-keyed's outside form
-(`crates/blaze-keyed/src/outside.rs`); the runner and the daemon are not wired to it yet.
+(`crates/blaze-keyed/src/outside.rs`), and driven for every `blaze test` by the daemon's runner
+(`crates/blaze-cargo/src/serve/unit/test.rs` through `blaze_testsel::host`). This page turns
+current when `blaze test` run twice on a small crate reports every test `(cached)`.
 
 ## 1. The default
 
@@ -30,6 +32,12 @@ A cached test is a pass, and reads as one everywhere:
 A test that ran and is not kept says why, by name: `test net::fetch ... ok <0.300s> (not kept:
 it read the wall clock)`, and in JSON `"kept": {"no": "clock"}`.
 
+A test that ran although selection was asked says why no kept pass held. The machine carries the
+reason in every run's verdict (`machine::Missed`), and the result carries it as
+`TestResult::ran`. The reasons are `run-all`, `no-head`, `unknown-state`, `no-row`,
+`function-changed` (which function, with its code then and now) and `read-changed` (which read,
+with its digests then and now). JSON always has `"ran"`, and `-v` adds `(ran: ...)` to the line.
+
 ## 2. Soundness: what a kept result covers
 
 The invariant: a test is reported cached only if rerunning it now would give the same result.
@@ -40,12 +48,12 @@ be an ask, or the result is not kept. Each case, decided:
 |---|---|---|
 | The wall clock (`SystemTime`, `Instant` through a traced call) | Not kept (`clock`) | Its value is never equal twice; an ask on it would never hit. |
 | The vDSO or commpage clock, `rdtsc`, raw `syscall` the tracer cannot see | Not kept (`foreign`), once the program marks code that does it | A test that executes such code cannot be traced. The mark (a flag on the instance record for inline asm, a raw syscall or a call into foreign code) is missing today; until it exists, these reads are a known hole, listed in docs/v2/plan/design/trust.md's sense. |
-| Randomness | Kept when the provider answered it | The sandbox answers `getrandom` and `/dev/urandom` from a seed derived from the test's base key, so it is an input of the key, not of the world. Randomness it did not answer (`Untraceable::Random`) is not kept. |
+| Randomness | Kept when the provider answered it | The sandbox answers `getrandom` and `/dev/urandom` from a seed derived from the test's base key (the suite's tool, settings and environment, then the test's name; determinism.md section B), the same whatever ran before it, so it is an input of the key, not of the world. Randomness it did not answer (`Untraceable::Random`) is not kept. |
 | The network | Not kept (`network`), except loopback inside the test's own network namespace | A peer outside the sandbox is a read nobody can answer again. Loopback to a server the test started itself is the test's own code. |
 | Child processes | Kept when traced | Their file, directory and environment reads are traced into the test's (Linux: the tracer follows forks). A child the tracer cannot follow (a macOS protected binary) makes the run `descriptor`: not kept. |
 | Writes outside its own temporary directory | Not kept (`wrote outside`) | A write that outlives the test is an effect another test or run can read. Needs a private overlay of the home and the workspace so the sandbox can say "it wrote outside"; missing today. |
 | A file read through a descriptor the sandbox did not see opened | Not kept (`descriptor`) | The trace's incomplete (X) lines. |
-| Not sandboxed at all | Not kept (`unsandboxed`) | Tests always run sandboxed (target.md); a run that was not is never kept. |
+| Not sandboxed at all | Not kept (`unsandboxed`) | On Linux tests run sandboxed by default (target.md); a package takes its tests out with `tests = false` or `unsandboxed-tests`, a command with `BLAZE_SANDBOX=off`. On macOS they run sandboxed only where the package (`tests = true`) or the workspace (`experimental = ["sandboxed-tests"]`) opts in, because a sandboxed test there can read another test binary's launch token (docs/cargo.md, "The daemon's socket, and a known hole on macOS"); one rule decides it (`tests_sandboxed_by_default` in blaze-units' `load/sandbox.rs`). A run outside is never kept, and its base key carries that it ran outside (`Suite::given_outside`), so a pass kept of a sandboxed run never stands for it. Where no sandbox can be made the run stops (exit 101) and says `BLAZE_SANDBOX=off` first. |
 
 A test that cannot be traced is "not kept", by name and reason, every time it runs. It is never
 an error and never silently rerun under another rule.
@@ -121,13 +129,61 @@ Selection lives in `crates/blaze-testsel`:
 - `table` (kept): `FnId`, `Bound`, `Image` and the unlogged hash.
 - `record` (kept): what a test process says it executed.
 
-What goes, when the runner is wired: `select` (`choose`/`keep` over `blaze_usercode::test::Passes`,
-the history slots and the 16-pass lookback), `selector` (the in-memory postings memo, replaced by
-the postings record), and `api`'s `Unreached` mapping (a cached pass is `passed` with `cached`).
-blaze-program's `TestRecord`, `OutsideRead`, `write_test`, `read_test` and its `ABSENT` are
-deleted now (one concept, one home); its `test_key` becomes the base key.
+Deleted with the wiring: `select` (`choose`/`keep` over `blaze_usercode::test::Passes`, the
+history slots and the 16-pass lookback), `selector` (the in-memory postings memo), `api`'s
+re-exports and its `Unreached` mapping (a cached pass is `passed` with `cached`), and
+blaze-usercode's `Passes`-based selection. blaze-program's `TestRecord`, `OutsideRead`,
+`write_test`, `read_test` and its `ABSENT` are gone (one concept, one home).
 
-What the runner must give the machine, and does not yet: the bound code of each executed function
-after a run (it gives slots; `Image` maps them), the run's traced reads as names and digests (it
-gives `blaze_core::Traced`), whether it was sandboxed, and the program's changed functions between
-two program states (blaze-program's `Delta` has the edited instances, not by `FnId`).
+What the runner gives the machine (`blaze_testsel::host::Driver`): per suite, the tests asked
+by base (`host::base` over the test's id) and name; the program now and the image the suite
+was last filed at (`Program{now, before}`, held in the daemon's `image::Selectors`), from which
+the changed functions are read by `FnId`; the head the suite last wrote; and,
+per run, the bound code of each executed function (slots mapped through `Image`), the traced
+reads as names and digests, whether the run was sandboxed, whether the trace exists, and whether
+codegen marked the test as reaching code the tracer cannot see (`foreign`).
+
+Not given yet, so a pass is refused or costs more rather than kept wrongly: writes outside the
+sandbox's private overlay (not built, so a test that writes outside is not refused for it);
+a raw syscall or the vDSO as `foreign` (codegen marks only what it sees).
+
+Missing, and above the floor: the base hashes the whole environment the test binary is given
+(`run::process_env` over the client's `invocation.env`), not only what blaze declares as
+section 3 says, so a change to any variable of the shell `blaze test` runs from (`PWD`,
+`TERM_SESSION_ID`, `SSH_AUTH_SOCK`, `BLAZE_SANDBOX`) is a new base for every test of every
+suite, and every test runs again though none read it. The floor: a variable is an ask like a
+file. The base holds what blaze sets (toolchain, settings, entry, attributes, arguments, the
+variables blaze declares to tests, and whether the run was sandboxed, as `given_outside`
+already does), and each variable a test read, which the sandbox already traces as an
+environment read, is an ask answered by its value now. A change to a variable no test read
+then reruns nothing, and one read by k tests reruns those k. Against that, today costs every
+kept test per changed variable, an unbounded ratio. Not built.
+
+The head outlives the daemon. Each head a run files is a journal mark per suite
+(`serve/local.rs` `TestHeadMark`: the suite's settings, the head and postings keys, and the
+program state its rows hold at), written by `Jobs::test_heads` only once every put of the
+suite's runs since its last mark is durable, so a crash leaves no mark, the old one, or the new
+one with its head. The store pin `test heads` (`collect::TEST_HEADS`) keeps each marked head and
+its postings, moved from the old head to the new as the mark is, and queued again at each start
+for every mark. A start hands the marks to the runner (`Selectors::restore`) with no image: the
+head is used for a binary of its state, and another binary's is a miss by key (each test looked
+up by its answers), never `UnknownState`. A head the store does not hold for all that
+(`MissingIndex`) fails that one run with an error naming the suite and the key, once: the head is
+not given back and its mark is let go, so the next run starts with no head.
+
+The queue orders each test by its head row's last run (`Selection::last_micros`); a test with no
+row has no expected duration. File digests are taken when the trace is assembled, not at the
+moment each file was read: a pass is kept only when nothing it read (each name the answer rests
+on, and each directory above it) changed since a moment before the run began
+(`blaze_usercode::inputs::Began::moved`, git's racy window), else it is not kept,
+`NotKept::Moved`, whose line the host words from the `Moved` it found, naming the read and
+the name whose stamp moved (the machine keeps its `Copy` verdict); what changes after the assembly the settle's second answers find.
+The test's own executable has one writer, the job's placement, and a dev test binary is started
+from that file with the key the job's record holds there (`Runs::start`'s `placed`,
+`blaze_inproc::host::StartError`), never rewritten by the code memory's host. The server's start
+of it (the exec, and on macOS the loader's reads of the image, which the sandbox there records)
+is no test's read: the program's code is what each test's execution record is of, so the queue
+leaves those lines of no test's scope out (`test::queue`'s `own_start`); a test that opens its
+own executable reads it in its own scope, and that line is kept. Doc tests
+are neither selected nor kept: the CLI runs them after the daemon's results, every time, and
+says so.

@@ -7,16 +7,16 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_shapes.slots (v : Vec blaze_shapes.Slot) (i : Usize) (s : blaze_shapes.Slot) : Result (Bool × Vec blaze_shapes.Slot) := do
-  let t21 := i
-  let x0 ← Slice.index v t21
+  let t0 := i
+  let x0 ← Slice.index v t0
   let (was, x1) := core.option.Option.take x0.undo
-  let x2 ← Slice.index v t21
-  let x3 ← Slice.update v t21 { x2 with undo := x1 }
+  let x2 ← Slice.index v t0
+  let x3 ← Slice.update v t0 { x2 with undo := x1 }
   let v := x3
-  let t13 ← Slice.index v i
-  let none := core.option.Option.is_none t13.undo
+  let t1 ← Slice.index v i
+  let none := core.option.Option.is_none t1.undo
   let x4 ← Slice.update v i s
   let v := x4
-  let t19 := core.option.Option.is_some was
-  let ret := if t19 then none else t19
+  let t2 := core.option.Option.is_some was
+  let ret := if t2 then none else t2
   Result.ok (ret, v)

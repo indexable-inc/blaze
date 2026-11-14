@@ -7,8 +7,8 @@
 //! (`hir_ty_lean::emit`), each crate's proof files read from the view (`lean/` beside its
 //! `Cargo.toml`), and the plan of their check made (`hir_ty_lean::plan`): the files to write
 //! and the runs of Lean to make, each keyed by what its verdict depends on. With `--subset`,
-//! the translator's count over every function in a `#![blaze::sans_io]` module of those
-//! crates. The worker writes no file and starts no process: what it found is a [`Proving`].
+//! the translator's outcome for every function in a `#![blaze::sans_io]` module of those
+//! crates (translated, generic, or refused for what), by path, and their counts. The worker writes no file and starts no process: what it found is a [`Proving`].
 //!
 //! **On the loop** ([`Checking`], a [`Runs`]): the plan's files written under the build
 //! directory's `lean/` and each step run as an [`Effect::Spawn`] of the pinned Lean in
@@ -16,7 +16,9 @@
 //! own release and that directory, writes that directory alone, and has no network
 //! (`sandbox-everything`); a step that has not ended by [`DEADLINE`] is killed and its
 //! theorems are open, naming it (`bounded-progress`). Lean never reads the checkout: the
-//! proof files are written from the texts the plan keyed. A step Lean accepted leaves its
+//! proof files are written from the texts the plan keyed. Every theorem's model is compiled,
+//! proof file or none ([`plan::wanted`]): a model Lean refuses is answered as blaze's bug
+//! ([`ProofRecord::ModelBroken`]), never `Open`. A step Lean accepted leaves its
 //! output beside its module under the step's key (its verdict), and a step whose key is found
 //! there is not run again: an unchanged tree runs Lean not at all. A verdict is written only
 //! after the compiled module it vouches for is ordered before it on the disk
@@ -43,7 +45,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{ApiError, ProofRecord, Proven, Response, Subset, SubsetRefusal};
+use blaze_api::{ApiError, ProofRecord, Proven, Response, Subset, SubsetFunction, SubsetOutcome, SubsetRefusal};
 use blaze_cas::Store;
 use blaze_core::{Command, Completion, Done, Effect, FileName, Sandbox, Tag};
 use blaze_ids::ContentId;
@@ -125,9 +127,9 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
     let functions = functions_of(db, &members, subset);
 
     let mut records = Vec::new();
-    // `what` of each refusal of a core's function, counted below.
-    let mut refusals: Vec<String> = Vec::new();
-    let (mut in_cores, mut translated) = (0u32, 0u32);
+    // Each core's function with its outcome, in the order of `functions` (by path).
+    let mut outcomes: Vec<SubsetFunction> = Vec::new();
+    let (mut in_cores, mut translated, mut generic) = (0u32, 0u32, 0u32);
     let mut theorems: Vec<Vec<Emitted>> = members.iter().map(|_| Vec::new()).collect();
     for function in &functions {
         if job.cancelled() {
@@ -145,11 +147,20 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
         };
         if function.in_core && subset {
             in_cores += 1;
-            match &emitted {
-                Ok(_) => translated += 1,
-                // clone: one refusal's construct, counted once
-                Err(refused) => refusals.push(refused.what.clone()),
-            }
+            let outcome = match &emitted {
+                Ok(_) => {
+                    translated += 1;
+                    SubsetOutcome::Translated
+                }
+                Err(refused) if is_generic_unasked(refused) => {
+                    generic += 1;
+                    SubsetOutcome::Generic
+                }
+                // clone: one refusal's construct, kept once in the answer
+                Err(refused) => SubsetOutcome::Refused { what: refused.what.clone() },
+            };
+            // clone: the answer names each function once
+            outcomes.push(SubsetFunction { path: function.path.clone(), outcome });
         }
         if !function.theorem {
             continue;
@@ -192,7 +203,13 @@ pub(crate) fn prove(job: &Job, db: &Db, emit: bool, subset: bool) -> Result<Prov
             plan,
         });
     }
-    let subset = subset.then(|| Subset { refused: counted(refusals), functions: in_cores, translated });
+    let subset = subset.then(|| Subset {
+        refused: counted(&outcomes),
+        outcomes,
+        functions: in_cores,
+        translated,
+        generic,
+    });
     Ok(Proving { emit, sandbox_off: job.sandbox_off(), out, records, subset, crates })
 }
 
@@ -333,18 +350,37 @@ fn function_of(record: &ProofRecord) -> &str {
         ProofRecord::Open { function, .. }
         | ProofRecord::Proved { function, .. }
         | ProofRecord::Emitted { function, .. }
-        | ProofRecord::Refused { function, .. } => function,
+        | ProofRecord::Refused { function, .. }
+        | ProofRecord::ModelBroken { function, .. } => function,
     }
 }
 
-/// Each `what` with how many functions it refused, most first, then by `what`.
-fn counted(mut whats: Vec<String>) -> Vec<SubsetRefusal> {
+/// Whether the translator's refusal is its answer for a generic function asked for alone:
+/// not a refusal but "translated at each instance a theorem reaches", counted apart. The one
+/// place `blaze prove` tells it, by the translator's own text,
+/// `hir_ty_lean::body::GENERIC_UNASKED` (crates/hir-ty-lean/src/body.rs), which hir-ty-lean
+/// gives whole as the `what` of every such refusal.
+fn is_generic_unasked(refused: &NotTranslated) -> bool {
+    refused.what == hir_ty_lean::body::GENERIC_UNASKED
+}
+
+/// Each refused `what` among `outcomes` with how many functions it refused, most first, then
+/// by `what`.
+fn counted(outcomes: &[SubsetFunction]) -> Vec<SubsetRefusal> {
+    let mut whats: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|it| match &it.outcome {
+            SubsetOutcome::Refused { what } => Some(what.as_str()),
+            SubsetOutcome::Translated | SubsetOutcome::Generic => None,
+        })
+        .collect();
     whats.sort_unstable();
     let mut counted: Vec<SubsetRefusal> = Vec::new();
     for what in whats {
         match counted.last_mut() {
             Some(last) if last.what == what => last.count += 1,
-            _ => counted.push(SubsetRefusal { what, count: 1 }),
+            // clone: one line's construct, once per refusal counted
+            _ => counted.push(SubsetRefusal { what: what.to_owned(), count: 1 }),
         }
     }
     counted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.what.cmp(&b.what)));
@@ -566,6 +602,14 @@ impl Checking {
                         .join(format!("{}.lean", proof_module.replace('.', "/")))
                         .display()
                         .to_string(),
+                },
+                // Lean's place, under the directory the models are written in: a path a
+                // person opens.
+                Verdict::ModelBroken { function, module, at, error } => ProofRecord::ModelBroken {
+                    at: lib.join(at).display().to_string(),
+                    error,
+                    module,
+                    function,
                 },
             });
         }
@@ -961,8 +1005,9 @@ impl Checking {
 impl Runs<Real> for Checking {
     fn start(
         &mut self,
-        _store: &Store,
+        _store: &mut Store,
         _writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        _placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s; Lean is no placed output
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -1082,7 +1127,7 @@ mod tests {
             name,
             text,
             clauses: Vec::new(),
-            shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+            shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
             imports,
         }
     }
@@ -1197,6 +1242,7 @@ mod tests {
                     found.push(match verdict {
                         Verdict::Proved { function, axioms, .. } => (function, format!("proved on {axioms:?}")),
                         Verdict::Open { function, why, .. } => (function, format!("open: {why}")),
+                        Verdict::ModelBroken { function, module, .. } => (function, format!("model broken: {module}")),
                     });
                 }
             }
@@ -1371,6 +1417,9 @@ mod tests {
                 // clone: a test's names
                 ProofRecord::Proved { function, axioms, .. } => (function.clone(), format!("proved on {axioms:?}")),
                 ProofRecord::Open { function, why, .. } => (function.clone(), format!("open: {why}")),
+                ProofRecord::ModelBroken { function, module, .. } => {
+                    (function.clone(), format!("model broken: {module}"))
+                }
                 other => return Err(format!("a record that is no verdict: {other:?}")),
             });
         }
@@ -1431,6 +1480,42 @@ mod tests {
     #[test]
     fn the_oracle_catches_a_refused_step_kept_as_accepted() {
         blaze_sim::control(Config::cases(300), Plant::None, Plant::KeepRefused, "the second check", holds);
+    }
+
+    /// A theorem with no proof file has its model compiled all the same, once: the first check
+    /// gives Lean both models and answers the one Lean accepts open for want of its proof file
+    /// and the one it refuses as blaze's bug, at Lean's place; the second check of the same
+    /// tree answers the same and gives Lean the accepted model zero times. (The refused one is
+    /// run again: a refusal leaves no verdict, `the_oracle_catches_a_refused_step_kept_as_accepted`.)
+    #[test]
+    fn a_model_without_a_proof_file_is_compiled_once_and_its_verdict_found_after() {
+        let (good, bad) = ("BlazeModel.k.m.t0", "BlazeModel.k.m.t1");
+        let theorems = vec![module("k::m::t0", true, Vec::new()), module("k::m::t1", true, Vec::new())];
+        let krate = Krate { name: "k".to_owned(), theorems, proofs: BTreeMap::new() };
+        let does = BTreeMap::from([(bad.to_owned(), Does::Refuse)]);
+        let world = World { crates: vec![krate], does, seed: 7, crash: false };
+        let mut sim = Sim::new(world.seed, Faults::default());
+        // clone: the simulated Lean's own copy of what each module does
+        sim.program(LEAN, lean(Rc::new(world.does.clone())));
+        let (_, accepted) = world.expected();
+        let (first, given) = check(&mut sim, &world, Plant::None, &BTreeSet::new()).unwrap_or_else(|it| panic!("{it:?}"));
+        for model in [good, bad] {
+            assert_eq!(given.iter().filter(|it| *it == model).count(), 1, "{model} in {given:?}");
+        }
+        assert_eq!(first.failed, None);
+        match first.records.as_slice() {
+            [ProofRecord::Open { function, why, .. }, ProofRecord::ModelBroken { function: broken, module, at, error }] => {
+                assert_eq!((function.as_str(), broken.as_str(), module.as_str()), ("k::m::t0", "k::m::t1", bad));
+                assert!(why.starts_with("there is no proof file"), "{why}");
+                assert_eq!((at.as_str(), error.as_str()), ("/b/lean/lib/BlazeModel/k/m/t1.lean:1:0", "error: refused"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(accepted.contains(good) && !accepted.contains(bad), "{accepted:?}");
+        let (second, given) = check(&mut sim, &world, Plant::None, &accepted).unwrap_or_else(|it| panic!("{it:?}"));
+        assert_eq!(second, first);
+        assert_eq!(given.iter().filter(|it| *it == good).count(), 0, "{given:?}");
+        assert!(given.iter().all(|it| !accepted.contains(it)), "{given:?}");
     }
 
     /// A verdict is taken only where it is this key's and whole: one of another key, one cut

@@ -1,24 +1,19 @@
-//! Tests (docs/v2/plan.md section 6.5; #1443, #227, #1330): run only the tests an edit
-//! reached, each in a process of its own forked from its binary, on one queue over all cores.
+//! Tests (docs/v2/plan.md section 6.5; #1443, #227, #1330): each in a process of its own
+//! forked from its binary, on one queue over all cores.
 //!
-//! - [`select`]: whether a test runs. Each test's reached functions are recorded by code hash
-//!   ([`crate::Reached`], from codegen's walk); a pass is kept in the store by the test's
-//!   binary-independent identity and what it read at run time, so a test whose code and inputs
-//!   are as they were when it passed is reported unreached, in every view and worktree at the
-//!   same code. [`select::Why`] says why one runs (`--explain`).
+//! - [`select`]: which tests libtest's flags ask for, a test's attributes, and its suite.
+//!   Whether an asked test runs is blaze-testsel's machine
+//!   (docs/v2/plan/design/test-selection.md), which keeps a pass by what the run executed
+//!   ([`queue::Finished::executed`]) and read ([`queue::Trace::traced`]).
 //! - [`wire`]: the fork server's protocol, and [`fork_server`] its harness side, which blaze's
 //!   generated test harness includes.
 //! - [`queue`]: the sans-IO queue over every binary's fork server: critical first, timeouts,
 //!   retries for flaky tests, fail-fast, output, reads and the execution record per test; or a
 //!   binary run whole as libtest's threads for a package that opts out.
 //!
-//! A request's tests go: [`select::wanted`] and [`select::select`] for each test, a
-//! [`queue::Queue`] of what runs, and for each [`queue::Finished`] what it read
-//! ([`queue::Trace::traced`]) and [`select::record`]; [`report`] gives each result as the agent
-//! API reports it. [`queue::Finished::executed`] is what blaze-testsel keeps a pass by
-//! (`Record::of_hits`, `Record::incomplete`); once cargo selects through it
-//! (`blaze_testsel::select::{choose, keep}`), [`select::select`], [`select::record`] and
-//! [`select::Test::identity`] retire.
+//! A request's tests go: [`select::asked`] for each test, the machine's runs on a
+//! [`queue::Queue`], and for each [`queue::Finished`] what it executed and read given back to
+//! the machine; [`report`] gives each result as the agent API reports it.
 //!
 //! The costs and the fastest known way of each part: docs/v2/plan.md.
 
@@ -33,10 +28,7 @@ use std::{io::Write as _, time::Duration};
 pub use queue::{
     Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, OUTSIDE, Outcome, Queue, Trace,
 };
-pub use select::{
-    Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why,
-    changed_input,
-};
+pub use select::{Attrs, Filter, Ignored, ShouldPanic, Suite, Wanted};
 pub use wire::Executed;
 
 /// The harness side of the fork server: a module `fork_server` for blaze's generated test
@@ -46,8 +38,9 @@ pub use wire::Executed;
 /// variable is set and `test::test_main_env_args` otherwise.
 ///
 /// With `record` (a binary with jump-table slots), the server asks the runtime's
-/// `__blaze_exec_slots` once, maps each test's execution record before its fork, has the child
-/// arm it (`__blaze_exec_arm`) and sends what it executed ([`wire::read_region`]); without, it
+/// `__blaze_exec_table` once (the jump table's slot count and identity, [`wire::Table`]), maps
+/// each test's execution record before its fork, has the child arm it (`__blaze_exec_arm`) and
+/// sends what it executed with that table ([`wire::read_region`]); without, it
 /// names neither export, and every end says [`wire::UNRECORDED`]. Both texts are constants:
 /// nothing is made per binary or per test.
 pub fn fork_server(record: bool) -> &'static str {
@@ -94,8 +87,6 @@ pub enum Reported {
     Passed,
     Failed,
     Ignored,
-    /// Not run: the edit reached none of its code; its last result stands.
-    Unreached,
 }
 
 /// A result in the shape of `blaze_api::TestResult`: the fields map one to one.
@@ -138,7 +129,7 @@ pub fn report(binary: &str, finished: &Finished) -> Option<Report> {
     })
 }
 
-/// A test that did not run: ignored, or skipped because its pass is kept.
+/// A test that did not run: ignored.
 pub fn report_unrun(binary: &str, name: &str, outcome: Reported, took: Option<Duration>) -> Report {
     Report {
         binary: binary.to_owned(), // alloc: the API's report owns its names (the edge)

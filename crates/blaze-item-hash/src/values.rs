@@ -104,6 +104,10 @@ pub mod kinds {
     /// A body's own lowering, as each other step of it reads it: valued by the digest of
     /// what the lowering read (`hir_ty::body_store::Lowered::value`), not by its answer.
     pub const STEP_LOWER: QueryKind = QueryKind(0x180c);
+    /// Another crate's settings, as a read of a field of its `Crate` input (`data`,
+    /// `extra_data`, `cfg_options`, `workspace_data`) stands for them: its content ID
+    /// (`base_db::Crate::content`), never its sources, so a body edit in it moves nothing.
+    pub const CRATE_SETTINGS: QueryKind = QueryKind(0x180d);
 }
 
 const FIELDS_DOMAIN: &str = "blaze v2 item-hash fields 1";
@@ -117,6 +121,7 @@ const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
 const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
 const INHERENT_ASSOC_TYPES_DOMAIN: &str = "blaze v2 item-hash inherent assoc types 1";
+const CRATE_SETTINGS_DOMAIN: &str = "blaze v2 item-hash crate settings 1";
 const ESCAPED_DOMAIN: &str = "blaze v2 item-hash escaped 1";
 const ESCAPED_ITEM_DOMAIN: &str = "blaze v2 item-hash escaped item 1";
 
@@ -126,6 +131,9 @@ pub const ESCAPED_UNHASHED: &str = "a body's escaped items (`blaze_item_hash::va
 /// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
 /// no key is. The settings are one for the build, so the fact names nothing else.
 const BORROWCK_DEBUG_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: borrowck dbg");
+/// The subject of the [`kinds::SETTING`] fact of `FrontSettings::check_relative_bodies`, as
+/// [`BORROWCK_DEBUG_SUBJECT`].
+const CHECK_RELATIVE_SUBJECT: ContentId = ContentId(*b"blaze v2 item-hash: check rel bd");
 
 /// The subject of the [`kinds::FIELD_ORDER`] fact: a tag, which no key is. The plan is one
 /// for the build, so the fact names nothing else.
@@ -184,6 +192,13 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
             None => Some(absent(kind)),
             Some(krate) => Some(crate_root_of(db, krate)),
         }
+    } else if kind == kinds::CRATE_SETTINGS {
+        match key::resolve_crate(db, &fact.subject) {
+            None => Some(absent(kind)),
+            Some(krate) => {
+                Some(Hasher::new(CRATE_SETTINGS_DOMAIN).id(&krate.content(db)).finish())
+            }
+        }
     } else if kind == kinds::STEP_INFER || kind == kinds::STEP_MIR || kind == kinds::STEP_LOWER {
         let step = if kind == kinds::STEP_INFER {
             Step::Infer
@@ -213,7 +228,11 @@ pub fn value(db: &Db, krate: Crate, fact: FactRef) -> Option<ContentId> {
     } else if kind == kinds::FIELD_ORDER {
         (fact.subject == FIELD_ORDER_SUBJECT).then(|| field_order_of(db))
     } else if kind == kinds::SETTING {
-        (fact.subject == BORROWCK_DEBUG_SUBJECT).then(|| borrowck_debug_of(db))
+        match fact.subject {
+            BORROWCK_DEBUG_SUBJECT => Some(borrowck_debug_of(db)),
+            CHECK_RELATIVE_SUBJECT => Some(check_relative_of(db)),
+            _ => None,
+        }
     } else if kind == kinds::INHERENT_ASSOC_TYPES {
         match key::resolve(db, ItemKey(fact.subject)) {
             None => Some(absent(kind)),
@@ -257,6 +276,7 @@ fn field_order_of(db: &Db) -> ContentId {
 pub fn setting(name: &str) -> Option<FactRef> {
     let subject = match name {
         "borrowck_debug" => BORROWCK_DEBUG_SUBJECT,
+        "check_relative_bodies" => CHECK_RELATIVE_SUBJECT,
         _ => return None,
     };
     Some(FactRef { kind: kinds::SETTING, subject, object: FactObject::None })
@@ -271,6 +291,16 @@ fn borrowck_debug_of(db: &Db) -> ContentId {
         Some(it) => h.update(&[1]).part(it.as_bytes()),
         None => h.update(&[0]),
     };
+    h.finish()
+}
+
+/// `RA_CHECK_RELATIVE_BODIES` as the build has it: what a body's tree reads of it
+/// (`BodySyntax::tree` parses again rather than take the thread's kept tree, and checks).
+fn check_relative_of(db: &Db) -> ContentId {
+    let mut h = Hasher::new(SETTING_DOMAIN);
+    h.part(b"check_relative_bodies");
+    let on = base_db::FrontSettings::try_get(db).is_some_and(|it| it.check_relative_bodies(db));
+    h.update(&[u8::from(on)]);
     h.finish()
 }
 
@@ -519,6 +549,16 @@ pub fn crate_root(db: &Db, krate: Crate) -> FactRef {
     }
 }
 
+/// The `CrateSettings` fact of `krate`: what a read of a field of its `Crate` input stands
+/// for, from a body of another crate.
+pub fn crate_settings(db: &Db, krate: Crate) -> FactRef {
+    FactRef {
+        kind: kinds::CRATE_SETTINGS,
+        subject: key::crate_key(db, krate),
+        object: FactObject::None,
+    }
+}
+
 /// The attribute owner a key resolved to, if attributes have one there.
 fn attr_owner(resolved: Resolved) -> Option<AttrDefId> {
     Some(match resolved {
@@ -631,6 +671,27 @@ fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
         h.update(&(features.len() as u64).to_le_bytes());
         for feature in features {
             h.part(feature.as_bytes());
+        }
+    }
+    // The flags of its generic parameters (`#[may_dangle]` on a `Drop` impl's, which the borrow
+    // check reads): `generic_params_attr_flags`, whose reads are this fact.
+    let generic = match owner {
+        AttrDefId::AdtId(it) => Some(hir_def::GenericDefId::AdtId(it)),
+        AttrDefId::FunctionId(it) => Some(hir_def::GenericDefId::FunctionId(it)),
+        AttrDefId::TraitId(it) => Some(hir_def::GenericDefId::TraitId(it)),
+        AttrDefId::TypeAliasId(it) => Some(hir_def::GenericDefId::TypeAliasId(it)),
+        AttrDefId::ImplId(it) => Some(hir_def::GenericDefId::ImplId(it)),
+        _ => None,
+    };
+    if let Some(def) = generic {
+        let (lifetimes, types) = AttrFlags::query_generic_params(db, def);
+        h.update(b"params").update(&(lifetimes.iter().count() as u64).to_le_bytes());
+        for (param, flags) in lifetimes.iter() {
+            h.update(&u32::from(param.into_raw()).to_le_bytes()).update(&flags.bits().to_le_bytes());
+        }
+        h.update(&(types.iter().count() as u64).to_le_bytes());
+        for (param, flags) in types.iter() {
+            h.update(&u32::from(param.into_raw()).to_le_bytes()).update(&flags.bits().to_le_bytes());
         }
     }
     h.finish()

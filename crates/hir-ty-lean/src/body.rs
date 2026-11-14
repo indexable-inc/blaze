@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use base_db::Db;
 use hir_def::{
     AdtId, AttrDefId, attrs::AttrFlags,
-    builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
+    builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ItemContainerId,
     Lookup as _, ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::generics::GenericParams,
@@ -156,6 +156,195 @@ pub enum Ty {
     /// `str`, behind any reference: its bytes (`lean/Blaze/Str.lean`'s `Str`), with the
     /// UTF-8 invariant not carried.
     Str,
+    /// A type of the standard library the model carries and never looks inside
+    /// ([`OPAQUE_TYPES`]): `lean/Blaze/Opaque.lean` declares it with no definition, so what is
+    /// proved of code that holds one holds whatever its values are.
+    Opaque(Opaque),
+    /// A type of memory threads share, or of the threads that share it ([`Shared`]).
+    Shared(Shared),
+}
+
+/// The types of memory threads share and of the threads that share it: `core::sync::atomic`'s
+/// (`lean/Blaze/Atomic.lean`) and `blaze_core::world::threads`'s (`lean/Blaze/Threads.lean`),
+/// each recognised by its definition's path and checked against the Lean model's shape where
+/// the model reads inside it. A function that touches the memory is "shared": its model is a
+/// `Threads.Prog`, docs/v2/plan/design/proofs-for-sans-io.md, section 8.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Shared {
+    /// `core::sync::atomic::Atomic<T>` of an integer `T` (`AtomicU32` is `Atomic<u32>`): Lean's
+    /// `core.sync.atomic.Atomic .U32`, a cell of the shared memory, by value and behind any
+    /// reference alike.
+    Atomic(IntTy),
+    /// `core::sync::atomic::AtomicBool` (`Atomic<bool>`): `core.sync.atomic.AtomicBool`.
+    AtomicBool,
+    /// `core::sync::atomic::Ordering`: `core.sync.atomic.Ordering`, its variants the
+    /// constructors.
+    Ordering,
+    /// `blaze_core::world::threads::Step`: `Threads.Step`.
+    Step,
+    /// `blaze_core::world::threads::Woke`: `Threads.Woke`.
+    Woke,
+    /// `blaze_core::world::threads::Ended<T>`: `Threads.Ended T`.
+    Ended(Box<Ty>),
+}
+
+impl Shared {
+    /// Its path as Rust writes it, for a message.
+    pub fn rust(&self) -> String {
+        match self {
+            Shared::Atomic(int) => format!("core::sync::atomic::Atomic<{}>", format!("{int:?}").to_lowercase()),
+            Shared::AtomicBool => "core::sync::atomic::AtomicBool".to_owned(),
+            Shared::Ordering => "core::sync::atomic::Ordering".to_owned(),
+            Shared::Step => "blaze_core::world::threads::Step".to_owned(),
+            Shared::Woke => "blaze_core::world::threads::Woke".to_owned(),
+            Shared::Ended(inner) => format!("blaze_core::world::threads::Ended<{}>", crate::rust_ty(inner)),
+        }
+    }
+}
+
+/// `core::sync::atomic::Ordering`'s variants, in order, each its discriminant
+/// (`library/core/src/sync/atomic.rs`, `pub enum Ordering`): as `lean/Blaze/Threads.lean`
+/// declares `core.sync.atomic.Ordering`.
+pub(crate) const ATOMIC_ORDERING: [&str; 5] = ["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"];
+
+/// `blaze_core::world::threads::Woke`'s variants, in order, each its discriminant, as
+/// `lean/Blaze/Atomic.lean` declares `Threads.Woke`.
+pub(crate) const WOKE: [&str; 4] = ["Woken", "Changed", "Spurious", "TimedOut"];
+
+/// `blaze_core::world::threads::Ended<T>`'s variants, in order, each its discriminant, and
+/// whether it holds the `T`, as `lean/Blaze/Threads.lean` declares `Threads.Ended`.
+pub(crate) const ENDED: [(&str, bool); 3] = [("Done", true), ("Running", false), ("Asleep", false)];
+
+/// A type of the standard library the model takes as opaque: step 0 of
+/// docs/v2/plan/design/proofs-for-sans-io.md, section 3. One of [`OPAQUE_TYPES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Opaque {
+    IoError,
+    FmtError,
+    Formatter,
+    Arguments,
+    Location,
+    String,
+}
+
+/// An opaque type: what it is, its Lean name (in `lean/Blaze/Opaque.lean`, namespace
+/// `Blaze`), how Rust writes it, and why the model need not look inside it.
+pub struct OpaqueType {
+    pub opaque: Opaque,
+    pub lean: &'static str,
+    pub rust: &'static str,
+    pub why: &'static str,
+}
+
+/// The types the model carries without a structure: a value of one is moved, stored in a
+/// struct, an enum, an `Option`, a `Result` or a `Vec`, passed, returned and lent, and never
+/// inspected (no field, no `==`, no `Clone`, no method but those of [`OPAQUE_FUNCTIONS`]). Each is
+/// a Lean `opaque <name> : Type` (`lean/Blaze/Opaque.lean`): a constant the kernel never
+/// unfolds, so a proof cannot use what it is and holds for every meaning of it. A type is
+/// recognised by its lang item where it has one, else by its definition's path under its
+/// crate, as the pinned nightly's library defines it (`library/core/src/io/error.rs`,
+/// `library/core/src/fmt/mod.rs`); a type not here is refused by name.
+pub const OPAQUE_TYPES: &[OpaqueType] = &[
+    OpaqueType {
+        opaque: Opaque::IoError,
+        lean: "core.io.error.Error",
+        rust: "core::io::error::Error",
+        why: "`std::io::Error` (defined in core, `io::error`): an operating system's error, carried \
+              from the call that failed to the code that reports it",
+    },
+    OpaqueType {
+        opaque: Opaque::FmtError,
+        lean: "core.fmt.Error",
+        rust: "core::fmt::Error",
+        why: "the error of a formatter's write, carried in `fmt::Result`",
+    },
+    OpaqueType {
+        opaque: Opaque::Formatter,
+        lean: "core.fmt.Formatter",
+        rust: "core::fmt::Formatter",
+        why: "the formatter a `Display::fmt` or `Debug::fmt` writes to, lent by `&mut`; its value \
+              stands for the whole state of the writer behind it",
+    },
+    OpaqueType {
+        opaque: Opaque::Arguments,
+        lean: "core.fmt.Arguments",
+        rust: "core::fmt::Arguments",
+        why: "what `format_args!` makes (lang item `format_arguments`), given to a formatter",
+    },
+    OpaqueType {
+        opaque: Opaque::Location,
+        lean: "core.panic.location.Location",
+        rust: "core::panic::location::Location",
+        why: "a place in the source (lang item `panic_location`), carried to a report",
+    },
+    OpaqueType {
+        opaque: Opaque::String,
+        lean: "alloc.string.String",
+        rust: "alloc::string::String",
+        why: "an owned string (lang item `String`), carried only: it gets a model of its bytes \
+              later (step d), and until then nothing reads it",
+    },
+];
+
+impl Opaque {
+    fn entry(self) -> &'static OpaqueType {
+        OPAQUE_TYPES.iter().find(|it| it.opaque == self).expect("every opaque type is in the list")
+    }
+
+    /// Its Lean name, in namespace `Blaze`.
+    pub fn lean(self) -> &'static str {
+        self.entry().lean
+    }
+
+    /// Its path as the library defines it.
+    pub fn rust(self) -> &'static str {
+        self.entry().rust
+    }
+}
+
+/// The standard library's functions the model takes as opaque: a call of one is a call of a
+/// Lean `opaque` constant of its type, declared in a module of its own named by its Rust path
+/// at its instance ([`crate::opaque_module`]), giving a `Result` (it may panic or run forever:
+/// nothing assumes it returns). The model takes it as a function of its arguments, which is
+/// sound only for a Rust function whose result is fixed by them: each entry says why it is.
+/// A function is an inherent method of an [`OPAQUE_TYPES`] type, by that type and its name;
+/// every type its signature has at the instance must be modelled or opaque, else the call is
+/// refused naming the type. Any other call of the standard library with no model is refused by
+/// name (rule NoModel).
+pub const OPAQUE_FUNCTIONS: &[(Opaque, &str, &str)] = &[
+    (
+        Opaque::Formatter,
+        "write_str",
+        "`fmt.rs`: `self.buf.write_str(data)`. A `Formatter` is neither `Clone` nor `Copy` and \
+         is only lent, so each value of it is used once: its opaque value stands for the state \
+         of the writer behind it, what that writer will do included, and the result and the \
+         formatter after are a function of that value and the string",
+    ),
+    (
+        Opaque::Formatter,
+        "write_fmt",
+        "`fmt.rs`: `write(self.buf, fmt)`, or `write_str` of a string known statically. As \
+         `write_str`, with the arguments' values and their `fmt` (called through the \
+         arguments) held in the `Arguments`, which the formatter's single use makes a function \
+         of its inputs",
+    ),
+    (
+        Opaque::IoError,
+        "other",
+        "`alloc/src/io/error.rs`: `Self::new(ErrorKind::Other, error)`, an error of kind `Other` \
+         holding `error` boxed: its kind, message, source and payload are fixed by `error`; only \
+         the box's address differs between two calls, which no model reads",
+    ),
+];
+
+/// A call of an [`OPAQUE_FUNCTIONS`] function at an instance: its Lean name and Rust path, and
+/// its parameters' and result's types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpaqueFn {
+    pub lean: String,
+    pub display: String,
+    pub params: Vec<Ty>,
+    pub result: Ty,
 }
 
 impl Ty {
@@ -177,7 +366,12 @@ impl Ty {
             | Ty::TryFromIntError
             | Ty::Duration
             | Ty::Ordering
-            | Ty::Str => {}
+            | Ty::Str
+            | Ty::Opaque(_)
+            | Ty::Shared(
+                Shared::Atomic(_) | Shared::AtomicBool | Shared::Ordering | Shared::Step | Shared::Woke,
+            ) => {}
+            Ty::Shared(Shared::Ended(inner)) => inner.adts(out),
             Ty::Adt(name) => {
                 out.insert(name.clone());
             }
@@ -286,6 +480,9 @@ pub enum Operand {
     Duration { secs: u64, nanos: u32 },
     /// An `Ordering` constant: its variant, `0` `Less`, `1` `Equal`, `2` `Greater`.
     Ordering(u32),
+    /// A constant of an enum of [`Shared`] (`core::sync::atomic::Ordering::SeqCst`): the
+    /// variant at this index of [`Body::variants`] of the type, which holds nothing.
+    Variant { ty: Ty, variant: u32 },
 }
 
 /// What an operator works on.
@@ -365,6 +562,13 @@ pub enum Callee {
     Model { name: &'static str, monadic: bool, ty: Option<IntTy>, lends_first: bool },
     /// A translated function, by its Lean name.
     Function { name: String },
+    /// A function of the Lean library over the memory threads share, giving a `Threads.Prog`
+    /// (`core.sync.atomic.Atomic.fetch_add`, `Threads.wait`): its caller is shared.
+    Shared { name: String },
+    /// `blaze_core::world::threads::two(schedule, first, second)`: `Threads.two_of schedule`
+    /// of each closure's call model (by its Lean name), at `()`, as a `Threads.Prog`. The
+    /// arguments are the schedule and the two closures.
+    Two { first: String, second: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +637,18 @@ impl Body {
                 Some(vec![variant("Ok", 0, field(ok)), variant("Err", 1, field(err))])
             }
             Ty::Ordering => Some(ORDERING.iter().map(|&(name, it)| variant(name, it, Vec::new())).collect()),
+            Ty::Shared(Shared::Ordering) => Some(
+                (0u128..).zip(ATOMIC_ORDERING).map(|(it, name)| variant(name, it, Vec::new())).collect(),
+            ),
+            Ty::Shared(Shared::Woke) => {
+                Some((0u128..).zip(WOKE).map(|(it, name)| variant(name, it, Vec::new())).collect())
+            }
+            Ty::Shared(Shared::Ended(inner)) => Some(
+                (0u128..)
+                    .zip(ENDED)
+                    .map(|(it, (name, holds))| variant(name, it, if holds { field(inner) } else { Vec::new() }))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -525,6 +741,22 @@ impl Stmt {
                 written(dest, out);
             }
             Stmt::Assert { cond, .. } => cond.reads(out),
+        }
+    }
+
+    /// The places the statement reads a value from (a write of a part of a place reads none).
+    pub fn read_places(&self) -> Vec<&Place> {
+        match self {
+            Stmt::Assign { value, .. } => value.places(),
+            Stmt::Call { args, .. } => args
+                .iter()
+                .filter_map(|it| match it {
+                    Operand::Place(place) => Some(place),
+                    _ => None,
+                })
+                .collect(),
+            Stmt::Assert { cond: Operand::Place(place), .. } => vec![place],
+            Stmt::Assert { .. } => Vec::new(),
         }
     }
 
@@ -773,6 +1005,8 @@ pub(crate) struct Lowered<'db> {
     /// The structs and enums whose derived `==` the body calls, or that a field of one holds:
     /// each gets a Lean `DecidableEq` instance ([`crate::eq_module`]).
     pub(crate) derives: BTreeSet<String>,
+    /// The opaque functions it calls ([`OPAQUE_FUNCTIONS`]), each once.
+    pub(crate) opaques: Vec<OpaqueFn>,
 }
 
 /// Why a `&mut` into a `Vec` (`v[i]`, `&mut v[..]`, `as_mut_slice`) is refused when it is not
@@ -924,6 +1158,56 @@ const ORDERING_MODELS: &[(&str, &str)] = &[
 const STR_MODELS: &[(&str, &str)] =
     &[("len", "Str.len"), ("is_empty", "Str.is_empty"), ("as_bytes", "Str.as_bytes")];
 
+/// The inherent methods of `core::sync::atomic::Atomic<T>` of an integer `T` the Lean library
+/// models (`lean/Blaze/Atomic.lean`, namespace `core.sync.atomic.Atomic`), each a
+/// `Threads.Prog` of the same name taking the same arguments, the `Ordering`s among them.
+const ATOMIC_MODELS: &[&str] = &[
+    "new",
+    "load",
+    "store",
+    "swap",
+    "compare_exchange",
+    "compare_exchange_weak",
+    "fetch_add",
+    "fetch_sub",
+    "fetch_and",
+    "fetch_or",
+    "fetch_xor",
+    "fetch_nand",
+    "fetch_max",
+    "fetch_min",
+];
+
+/// The inherent methods of `core::sync::atomic::AtomicBool` the Lean library models
+/// (`lean/Blaze/Atomic.lean`, namespace `core.sync.atomic.AtomicBool`), as [`ATOMIC_MODELS`].
+const ATOMIC_BOOL_MODELS: &[&str] = &[
+    "new",
+    "load",
+    "store",
+    "swap",
+    "compare_exchange",
+    "compare_exchange_weak",
+    "fetch_and",
+    "fetch_or",
+    "fetch_xor",
+    "fetch_nand",
+    "fetch_not",
+];
+
+/// The inherent methods of an atomic that reach its value other than through the shared
+/// memory (by `&mut`, by value or by raw pointer): outside the model, where every access is an
+/// operation of the memory. Each is refused by name.
+const ATOMIC_UNSHARED: &[&str] =
+    &["get_mut", "into_inner", "as_ptr", "from_ptr", "from_mut", "get_mut_slice", "from_mut_slice"];
+
+/// The inherent methods of an atomic that take a closure: each is its own body in core, at the
+/// closure's instance, translated as any function is ([`Cx::call`]).
+const ATOMIC_WITH_CLOSURE: &[&str] = &["fetch_update", "update", "try_update"];
+
+/// The path of `blaze_core::world::threads`, the threads that share memory and their waits
+/// (`lean/Blaze/Threads.lean`), as [`module_path`] gives it.
+const THREADS: [&str; 3] = ["blaze_core", "world", "threads"];
+
 /// A trait whose standard method the model takes as the value's own structure, when the
 /// type's impl is the standard library's or derived: `Clone::clone` is the value, `==` is
 /// Lean's `=`.
@@ -931,6 +1215,24 @@ const STR_MODELS: &[(&str, &str)] =
 enum Structural {
     Clone,
     PartialEq,
+}
+
+/// The builtin derive `func` is a method of an expansion of, if it is one: `func`'s impl was
+/// written by expanding `#[derive(..)]` (as a build expands every builtin derive, where the
+/// front end's fast path records the impl without expanding it and the trait solver answers
+/// with a `BuiltinDeriveImplId`). The impl's file is the expansion of a macro call, and the
+/// macro called is the standard library's derive of that trait (`lang_items`'
+/// `PartialEqDerive`, `CloneDerive`, ..): a hand-written impl, or one written by any other
+/// macro, is none.
+fn expanded_derive(db: &Db, func: FunctionId) -> Option<BuiltinDeriveImplTrait> {
+    let ItemContainerId::ImplId(imp) = func.lookup(db).container else { return None };
+    let call = imp.lookup(db).id.file_id.macro_file()?;
+    let called = call.lookup(db).def;
+    let lang = hir_def::lang_item::lang_items(db, imp.krate(db));
+    BuiltinDeriveImplTrait::ALL
+        .iter()
+        .copied()
+        .find(|it| it.derive_macro(&lang).is_some_and(|derive| derive.definition(db) == called))
 }
 
 /// Where a function of the standard library is, which tells its model.
@@ -948,6 +1250,9 @@ enum Home {
     Ordering,
     /// An inherent method of `str`.
     Str,
+    /// An inherent method of `core::sync::atomic::Atomic<T>`; `bool` when `T` is `bool`
+    /// (`AtomicBool`).
+    Atomic { bool: bool },
     /// A method of a trait or of an impl of one: the trait's name and the module it is in,
     /// under its crate (`["cmp"]`).
     Trait { name: String, module: Vec<String> },
@@ -1113,13 +1418,15 @@ pub(crate) fn closure_of<'db>(
 }
 
 /// Whether `func` has type or const parameters, its own or its impl's. Lifetimes are dropped:
-/// a function generic only over lifetimes is one function.
+/// a function generic only over lifetimes is one function. A trait's own method (its provided
+/// body) is generic over `Self`, as a generic function is over its parameters.
 pub(crate) fn is_generic(db: &Db, func: FunctionId) -> bool {
     if GenericParams::of(db, func.into()).len_type_or_consts() != 0 {
         return true;
     }
     match func.lookup(db).container {
         ItemContainerId::ImplId(imp) => GenericParams::of(db, imp.into()).len_type_or_consts() != 0,
+        ItemContainerId::TraitId(_) => true,
         _ => false,
     }
 }
@@ -1426,12 +1733,25 @@ fn owner<'db>(
         ItemContainerId::ExternBlockId(_) => {
             return Err("a function without a body (rule Ffi)".to_owned());
         }
-        // A trait's own method: with a body, it is the trait's default, written once for every
-        // `Self`, which is generic over `Self` as a generic function is over its parameters.
-        _ => {
-            return Err("a method of a trait (a default body, generic over `Self`; only an \
-                        impl's method is translated)"
-                .to_owned());
+        // A trait's own method, its provided body: written once for every `Self`, so it is
+        // generic over `Self` as a generic function is over its parameters, and translated at
+        // the instance whose `Self` is the implementor a call resolves to. It is named in the
+        // namespace an impl's method of that type and trait has (`krate.Square.Shape`), where
+        // the impl has no method of its name (it would be called instead); a `Self` with no
+        // module of its own (an integer, `bool`) is named in the trait's module.
+        ItemContainerId::TraitId(trait_id) => {
+            let Some(args) = args else {
+                return Err("a method of a trait (a default body, generic over `Self`, translated at \
+                            each implementor a call reaches)"
+                    .to_owned());
+            };
+            return blaze_memo::attach(db, || {
+                let interner = DbInterner::new_with(db, func.krate(db));
+                let parent = hir_ty::generics::generics(db, func.into()).len_parent();
+                let trait_args: GenericArgs<'db> = GenericArgs::new_from_iter(args.iter().take(parent));
+                let of = TraitRef::new_from_args(interner, trait_id.into(), trait_args);
+                trait_impl_owner(db, trait_id.lookup(db).container, of, args.type_at(0)).map(Some)
+            });
         }
     };
     blaze_memo::attach(db, || {
@@ -1446,7 +1766,7 @@ fn owner<'db>(
             None => (db.impl_self_ty(imp).skip_binder(), db.impl_trait(imp).map(|it| it.skip_binder())),
         };
         if let Some(of) = of {
-            return trait_impl_owner(db, imp, of, self_ty).map(Some);
+            return trait_impl_owner(db, imp.module(db), of, self_ty).map(Some);
         }
         let TyKind::Adt(def, adt_args) = self_ty.kind() else {
             return Err("a method of a type that is not a struct or an enum".to_owned());
@@ -1476,11 +1796,13 @@ fn owner<'db>(
     })
 }
 
-/// [`owner`] of a method of the impl `imp` of the trait `of` for `self_ty`, both at the
-/// instance: refused unless `self_ty` is a struct or enum, an integer or `bool`.
+/// [`owner`] of a method of the trait `of` for `self_ty`, both at the instance, an impl's in
+/// `module` (or the trait's provided body, `module` the trait's): refused unless `self_ty` is
+/// a struct or enum, an integer or `bool`. A primitive has no module, so it is named in
+/// `module`.
 fn trait_impl_owner<'db>(
     db: &'db Db,
-    imp: ImplId,
+    module: ModuleId,
     of: TraitRef<'db>,
     self_ty: HTy<'db>,
 ) -> Result<Owner, String> {
@@ -1500,12 +1822,12 @@ fn trait_impl_owner<'db>(
         }
         // A primitive has no module: its impls are named in the impl's.
         TyKind::Bool => {
-            let mut path = module_path(db, imp.module(db));
+            let mut path = module_path(db, module);
             path.push("bool".to_owned());
             (path.clone(), path)
         }
         _ if int_ty(self_ty).is_some() => {
-            let mut path = module_path(db, imp.module(db));
+            let mut path = module_path(db, module);
             path.push(format!("{:?}", int_ty(self_ty).expect("an integer")).to_lowercase());
             (path.clone(), path)
         }
@@ -1593,6 +1915,8 @@ struct Cx<'db> {
     /// environment that holds a capture by `&mut`, and the place the capture borrows. See
     /// [`Cx::give_back_lent`].
     lent: BTreeMap<Local, Vec<(String, Place)>>,
+    /// The opaque functions called, each once ([`OPAQUE_FUNCTIONS`]).
+    opaques: Vec<OpaqueFn>,
 }
 
 type Refused<T> = Result<T, NotTranslated>;
@@ -1714,7 +2038,23 @@ impl<'db> Cx<'db> {
                             return Ok(Ty::Duration);
                         }
                         ("Ordering", [cmp]) if cmp == "cmp" => return Ok(Ty::Ordering),
+                        ("Atomic", [sync, atomic]) if sync == "sync" && atomic == "atomic" && args.len() == 1 => {
+                            return self.atomic_ty(args.type_at(0), at);
+                        }
+                        ("Ordering", [sync, atomic]) if sync == "sync" && atomic == "atomic" => {
+                            return self.shared_ty(adt, args, Shared::Ordering, at);
+                        }
                         _ => {}
+                    }
+                    if let Some(opaque) = self.opaque_adt(adt) {
+                        return Ok(Ty::Opaque(opaque));
+                    }
+                    // `ControlFlow`, what `Try::branch` gives (`?`): core's own enum, known by
+                    // its variants' lang items, a type per instance as the crate's generic
+                    // enums are, its variants and fields from core's source.
+                    let control_flow = lang.ControlFlowContinue.map(|it| it.lookup(self.db).parent);
+                    if matches!(adt, AdtId::EnumId(it) if Some(it) == control_flow) {
+                        return Ok(Ty::Adt(self.adt(adt, args, at)?));
                     }
                     return match (name, args.len()) {
                         ("Option", 1) => {
@@ -1728,11 +2068,14 @@ impl<'db> Cx<'db> {
                         _ => Err(self.refuse(
                             format!(
                                 "the standard library's type `{name}`, which has no model \
-                                 (rule NoModel)"
+                                 and is not in the list of opaque types (rule NoModel)"
                             ),
                             at,
                         )),
                     };
+                }
+                if module_path(self.db, adt.module(self.db)) == THREADS {
+                    return self.threads_ty(adt, args, at);
                 }
                 if def.destructor(self.interner).is_some() {
                     return Err(self.refuse("a type with a destructor (`impl Drop`)", at));
@@ -1768,6 +2111,134 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse(what, at));
             }
         })
+    }
+
+    /// `core::sync::atomic::Atomic<T>` at `arg`, its `T`: an integer (not 128 bits wide, which
+    /// the Lean model has no atomic of) or `bool`. `AtomicPtr` and any other `T` are refused by
+    /// name.
+    fn atomic_ty(&mut self, arg: HTy<'db>, at: &str) -> Refused<Ty> {
+        if matches!(arg.kind(), TyKind::Bool) {
+            return Ok(Ty::Shared(Shared::AtomicBool));
+        }
+        if matches!(arg.kind(), TyKind::RawPtr(..)) {
+            return Err(self.refuse("the type `AtomicPtr` (an atomic raw pointer; rule RawPointer)", at));
+        }
+        match int_ty(arg) {
+            Some(IntTy::I128 | IntTy::U128) => Err(self.refuse(
+                "an atomic 128-bit integer (`AtomicU128`, `AtomicI128`), which lean/Blaze/Atomic.lean \
+                 has no model of (rule NoModel)",
+                at,
+            )),
+            Some(int) => Ok(Ty::Shared(Shared::Atomic(int))),
+            None => {
+                let shown = rust_of(self.db, arg);
+                Err(self.refuse(
+                    format!("the type `Atomic<{shown}>`, which lean/Blaze/Atomic.lean has no model of (rule NoModel)"),
+                    at,
+                ))
+            }
+        }
+    }
+
+    /// A type of `blaze_core::world::threads` ([`THREADS`]): `Step`, `Woke` or `Ended<T>`,
+    /// each checked against its Lean model. Any other is refused by name.
+    fn threads_ty(&mut self, adt: AdtId, args: GenericArgs<'db>, at: &str) -> Refused<Ty> {
+        let name = match adt {
+            AdtId::EnumId(it) => EnumSignature::of(self.db, it).name.as_str().to_owned(),
+            AdtId::StructId(it) => StructSignature::of(self.db, it).name.as_str().to_owned(),
+            AdtId::UnionId(_) => return Err(self.refuse("a union", at)),
+        };
+        let expected = match name.as_str() {
+            "Step" => Shared::Step,
+            "Woke" => Shared::Woke,
+            // Its `T` is read from its declaration's field, below.
+            "Ended" => Shared::Ended(Box::new(Ty::Unit)),
+            _ => {
+                return Err(self.refuse(
+                    format!(
+                        "the type `blaze_core::world::threads::{name}`, which lean/Blaze/Threads.lean \
+                         has no model of (rule NoModel)"
+                    ),
+                    at,
+                ));
+            }
+        };
+        self.shared_ty(adt, args, expected, at)
+    }
+
+    /// The [`Shared`] type `expected` that `adt` at `args` was recognised as by its path, once
+    /// its declaration is checked to be what the Lean model reads inside it: `Step`'s fields,
+    /// and each enum's variants, in order, their discriminants and what each holds. A
+    /// declaration that differs is refused naming the type, never taken for the model.
+    fn shared_ty(&mut self, adt: AdtId, args: GenericArgs<'db>, expected: Shared, at: &str) -> Refused<Ty> {
+        let kind = self.adt_kind(adt, args, at)?;
+        let unit = |variants: &[Variant], names: &[&str]| {
+            variants.len() == names.len()
+                && variants.iter().zip(names).enumerate().all(|(at, (it, name))| {
+                    it.name == *name && it.discriminant == at as u128 && it.fields.is_empty()
+                })
+        };
+        let found = match (&expected, &kind) {
+            (Shared::Step, AdtKind::Struct(fields)) => {
+                let shape: Vec<(&str, &Ty)> = fields.iter().map(|it| (it.name.as_str(), &it.ty)).collect();
+                (shape == [("second", &Ty::Bool), ("pick", &Ty::Int(IntTy::U8))]).then_some(Shared::Step)
+            }
+            (Shared::Ordering, AdtKind::Enum(variants)) => {
+                unit(variants, &ATOMIC_ORDERING).then_some(Shared::Ordering)
+            }
+            (Shared::Woke, AdtKind::Enum(variants)) => unit(variants, &WOKE).then_some(Shared::Woke),
+            (Shared::Ended(_), AdtKind::Enum(variants)) => {
+                let fits = variants.len() == ENDED.len()
+                    && variants.iter().zip(ENDED).enumerate().all(|(at, (it, (name, holds)))| {
+                        it.name == name && it.discriminant == at as u128 && it.fields.len() == usize::from(holds)
+                    });
+                match variants.first().and_then(|it| it.fields.first()) {
+                    Some(value) if fits => Some(Shared::Ended(Box::new(value.ty.clone()))),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        match found {
+            Some(shared) => Ok(Ty::Shared(shared)),
+            None => Err(self.refuse(
+                format!(
+                    "the type `{}`, whose declaration is not the one its Lean model reads (its \
+                     fields, or its variants in order with their discriminants and fields, differ \
+                     from lean/Blaze/Threads.lean's)",
+                    expected.rust().split('<').next().unwrap_or_default()
+                ),
+                at,
+            )),
+        }
+    }
+
+    /// The [`OPAQUE_TYPES`] type the standard library's struct `adt` is, if it is one: by its
+    /// lang item (`format_arguments`, `panic_location`, `String`), else by its own name and its
+    /// definition's modules under its crate (`io::error` for `Error`, `fmt` for `Error` and
+    /// `Formatter`), which is where the pinned nightly's library defines each (std re-exports
+    /// core's `io::Error`).
+    fn opaque_adt(&self, adt: AdtId) -> Option<Opaque> {
+        let AdtId::StructId(it) = adt else { return None };
+        let lang = self.interner.lang_items();
+        if Some(it) == lang.FormatArguments {
+            return Some(Opaque::Arguments);
+        }
+        if Some(it) == lang.PanicLocation {
+            return Some(Opaque::Location);
+        }
+        if Some(it) == lang.String {
+            return Some(Opaque::String);
+        }
+        let name = StructSignature::of(self.db, it).name.as_str().to_owned();
+        let module = module_path(self.db, adt.module(self.db)).split_off(1);
+        let module: Vec<&str> = module.iter().map(String::as_str).collect();
+        match (name.as_str(), module.as_slice()) {
+            ("Error", ["io", "error"]) => Some(Opaque::IoError),
+            ("Error", ["fmt"]) => Some(Opaque::FmtError),
+            ("Formatter", ["fmt"]) => Some(Opaque::Formatter),
+            _ => None,
+        }
     }
 
     /// The Lean name of the environment of the closure `id` at `args` ([`closure_of`]),
@@ -1835,7 +2306,17 @@ impl<'db> Cx<'db> {
             }
             return Ok(name);
         }
-        let kind = match adt {
+        let kind = self.adt_kind(adt, args, at)?;
+        // A type that holds itself was refused above: its field's declaration is not there yet
+        // and would be asked for again, without end; the depth of a body's types bounds this.
+        self.adts.push(AdtDecl { name: name.clone(), display, kind });
+        Ok(name)
+    }
+
+    /// The fields of the struct `adt` at `args`, or the variants of the enum: each variant's
+    /// name, discriminant and fields.
+    fn adt_kind(&mut self, adt: AdtId, args: GenericArgs<'db>, at: &str) -> Refused<AdtKind> {
+        Ok(match adt {
             AdtId::StructId(it) => AdtKind::Struct(self.fields(VariantId::StructId(it), args, at)?),
             AdtId::EnumId(it) => {
                 let mut variants = Vec::new();
@@ -1862,11 +2343,7 @@ impl<'db> Cx<'db> {
                 AdtKind::Enum(variants)
             }
             AdtId::UnionId(_) => return Err(self.refuse("a union", at)),
-        };
-        // A type that holds itself was refused above: its field's declaration is not there yet
-        // and would be asked for again, without end; the depth of a body's types bounds this.
-        self.adts.push(AdtDecl { name: name.clone(), display, kind });
-        Ok(name)
+        })
     }
 
     /// The fields of `variant` of a struct or enum at `args`; a positional field `i` is named
@@ -2076,6 +2553,16 @@ impl<'db> Cx<'db> {
             (Ty::Unit, _) => Operand::Unit,
             (Ty::Bool, Some(bits)) => Operand::Bool(bits != 0),
             (Ty::Int(int), Some(bits)) => Operand::Int(*int, bits),
+            // A unit variant of an enum of the shared memory's: its discriminant.
+            (Ty::Shared(Shared::Ordering | Shared::Woke), Some(bits)) => {
+                let found = self.variants(ty).and_then(|all| all.iter().position(|it| it.discriminant == bits));
+                match found {
+                    Some(variant) => Operand::Variant { ty: ty.clone(), variant: variant as u32 },
+                    None => {
+                        return Err(self.refuse(format!("a constant of `{}` that is no variant", crate::rust_ty(ty)), at));
+                    }
+                }
+            }
             _ => return Err(self.refuse(format!("a constant of type `{ty:?}`"), at)),
         })
     }
@@ -2351,6 +2838,14 @@ impl<'db> Cx<'db> {
             (VariantId::UnionId(_), _) => Err(self.refuse("a union", at)),
             // `Global` and `RangeFull`, the structs whose type is `()` ([`Cx::ty`]).
             (VariantId::StructId(_), Ty::Unit) if args.is_empty() => Ok(Rvalue::Use(Operand::Unit)),
+            (_, Ty::Opaque(opaque)) => Err(self.refuse(
+                format!(
+                    "a value of the opaque type `{}` built from its fields (an opaque type has no \
+                     structure in the model; rule NoModel)",
+                    opaque.rust()
+                ),
+                at,
+            )),
             (_, other) => Err(self.refuse(format!("a struct or enum value of type `{other:?}`"), at)),
         }
     }
@@ -2612,6 +3107,14 @@ impl<'db> Cx<'db> {
                 _ => {}
             }
         }
+        if let ItemContainerId::ModuleId(module) = callee.lookup(db).container
+            && module_path(db, module) == THREADS
+        {
+            return self.threads_call(&name, generics, args, destination, target, at, out);
+        }
+        if let Some(callee) = self.try_call(callee, generics, &name, at)? {
+            return self.call_with(callee, args, destination, target, at, out);
+        }
         let (callee, generics) = self.dispatch(callee, generics, &name, at)?;
         let container = callee.lookup(db).container;
         let takes_closure = generics
@@ -2619,7 +3122,11 @@ impl<'db> Cx<'db> {
             .any(|it| it.ty().is_some_and(|ty| matches!(ty.kind(), TyKind::Closure(..))));
         let callee = if callee.krate(db).data(db).origin.is_lang()
             && takes_closure
-            && matches!(self.home(container), Home::Option | Home::Result)
+            && match self.home(container) {
+                Home::Option | Home::Result => true,
+                Home::Atomic { .. } => ATOMIC_WITH_CLOSURE.contains(&name.as_str()),
+                _ => false,
+            }
         {
             // `Option`'s and `Result`'s methods that take a closure are their own bodies, at
             // the instance of the closure: the standard library's source, translated as any
@@ -2660,6 +3167,87 @@ impl<'db> Cx<'db> {
             self.crate_callee(callee, generics, &name, at)?
         };
         self.call_with(callee, args, destination, target, at, out)
+    }
+
+    /// A call of a function of `blaze_core::world::threads` ([`THREADS`]), by its name, never
+    /// its body (which runs real threads): `wait` and `wake` are `Threads.wait` and
+    /// `Threads.wake`; `two(schedule, first, second)` runs its two closures as the threads of
+    /// `Threads.two_of`. A closure given to `two` must not lend (hold a capture by `&mut`): two
+    /// threads never share a place but through the memory. Any other function is refused by
+    /// name.
+    #[expect(clippy::too_many_arguments, reason = "one call's whole shape")]
+    fn threads_call(
+        &mut self,
+        name: &str,
+        generics: GenericArgs<'db>,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        target: Option<usize>,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Exit<Cond>> {
+        match name {
+            "wait" | "wake" => {
+                let callee = Callee::Shared { name: format!("Threads.{name}") };
+                self.call_with(callee, args, destination, target, at, out)
+            }
+            "two" => {
+                let closures: Vec<(InternedClosureId<'db>, GenericArgs<'db>)> = generics
+                    .iter()
+                    .filter_map(|it| it.ty())
+                    .filter_map(|ty| match ty.kind() {
+                        TyKind::Closure(id, closure_args) => Some((id.0, closure_args)),
+                        _ => None,
+                    })
+                    .collect();
+                let ([(first, first_args), (second, second_args)], 3) = (closures.as_slice(), args.len()) else {
+                    return Err(self.refuse(
+                        "a call of `blaze_core::world::threads::two` whose threads are not two \
+                         closures (a function or a reference to a closure given as a thread is not \
+                         translated)",
+                        at,
+                    ));
+                };
+                let (first, first_args, second, second_args) = (*first, *first_args, *second, *second_args);
+                let mut names = Vec::with_capacity(2);
+                for (id, closure_args) in [(first, first_args), (second, second_args)] {
+                    let env = self.closure_env(id, closure_args, at)?;
+                    if self.envs.get(&env) == Some(&true) {
+                        return Err(self.refuse(
+                            format!(
+                                "a closure given to `blaze_core::world::threads::two` that captures \
+                                 by unique borrow (`{}`; a thread shares nothing with its caller but \
+                                 the memory; rule SharedLend)",
+                                env.replace('.', "::")
+                            ),
+                            at,
+                        ));
+                    }
+                    let Callee::Function { name } = self.closure_callee(id, closure_args, at)? else {
+                        unreachable!("a closure's callee is its body")
+                    };
+                    names.push(name);
+                }
+                let second_name = names.pop().expect("two names");
+                let first_name = names.pop().expect("two names");
+                let (dest, _) = self.place(destination, at)?;
+                let args = self.operands(args, at)?;
+                out.push(Stmt::Call {
+                    dest,
+                    callee: Callee::Two { first: first_name, second: second_name },
+                    args,
+                    at: at.to_owned(),
+                });
+                self.goto(target, at)
+            }
+            _ => Err(self.refuse(
+                format!(
+                    "a call of `blaze_core::world::threads::{name}`, which lean/Blaze/Threads.lean \
+                     has no model of (rule NoModel)"
+                ),
+                at,
+            )),
+        }
     }
 
     /// A call of `callee` with `args` into `destination`, then the places the closures among
@@ -2703,6 +3291,84 @@ impl<'db> Cx<'db> {
         Ok(Callee::Function { name: named.lean })
     }
 
+    /// A call of the methods `?` runs (`x?` is `Try::branch(x)`, a match on the `ControlFlow` it
+    /// gives, and in its `Break` arm `return FromResidual::from_residual(residual)`): the
+    /// method of the impl static dispatch picks, core's own (for `Option`, `Result`,
+    /// `ControlFlow`), translated from core's source at its instance as any function is; its
+    /// error conversion is the `From::from` its body calls, resolved there at the instance.
+    /// `Try::from_output` and `residual_into_try_type`, which only a `try` block calls, and an
+    /// impl of the crate's own (`Try` is unstable) are refused by name. `None` for any other
+    /// callee.
+    fn try_call(
+        &mut self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        at: &str,
+    ) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let lang = self.interner.lang_items();
+        let is = |item: Option<FunctionId>| item == Some(callee);
+        // A `try` block wraps its value in `Try::from_output` and turns a residual into its
+        // type with `residual_into_try_type`; nothing else calls either.
+        if is(lang.TryTraitFromOutput) || is(lang.ResidualIntoTryType) {
+            return Err(self.refuse(
+                format!("a `try` block (`{name}`; `try` blocks are unstable, rule UnstableTry)"),
+                at,
+            ));
+        }
+        if !is(lang.TryTraitBranch) && !is(lang.TryTraitFromResidual) {
+            return Ok(None);
+        }
+        let shown = rust_of(db, generics.type_at(0));
+        let looked = db
+            .lookup_impl_method_or_why(self.env, callee, generics)
+            .map(|(found, args)| (found.left(), args));
+        match looked {
+            Ok((Some(found), args)) if found.krate(db).data(db).origin.is_lang() => {
+                Ok(Some(self.crate_callee(found, args, name, at)?))
+            }
+            Ok((Some(_), _)) => Err(self.refuse(
+                format!(
+                    "`?` on `{shown}`, a type with its own impl of `Try` or `FromResidual` (the \
+                     traits are unstable, `try_trait_v2`; only core's impls are translated; rule \
+                     UnstableTry)"
+                ),
+                at,
+            )),
+            Ok((None, _)) => Err(self.refuse(
+                format!("a call of `{name}` on `{shown}`, which a built-in derive implements"),
+                at,
+            )),
+            Err(why) => Err(self.refuse(
+                format!("a call of `{name}` on `{shown}`, whose impl is not found: {}", why.describe()),
+                at,
+            )),
+        }
+    }
+
+    /// The call of the standard library's `From::from` at `generics` when static dispatch runs
+    /// core's identity impl (`impl<T> From<T> for T`, whose body gives its argument back): that
+    /// impl's method at its instance, translated from core's source. `None` for any other impl.
+    fn identity_from(&mut self, callee: FunctionId, generics: GenericArgs<'db>, at: &str) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let looked = db.lookup_impl_method_or_why(self.env, callee, generics);
+        let Ok((Some(found), args)) = looked.map(|(found, args)| (found.left(), args)) else {
+            return Ok(None);
+        };
+        let ItemContainerId::ImplId(imp) = found.lookup(db).container else { return Ok(None) };
+        let Some(of) = db.impl_trait(imp) else { return Ok(None) };
+        let self_ty = db.impl_self_ty(imp).skip_binder();
+        let of = of.skip_binder();
+        let identity = matches!(self_ty.kind(), TyKind::Param(_))
+            && of.args.len() == 2
+            && of.args.type_at(1) == self_ty;
+        if !identity || !found.krate(db).data(db).origin.is_lang() {
+            return Ok(None);
+        }
+        Ok(Some(self.crate_callee(found, args, "from", at)?))
+    }
+
     /// What static dispatch runs for a call of `callee` with `generics`: for a method of a
     /// trait (`square.area()`, `Shape::area(&s)`, `<Square as Shape>::area(&s)`,
     /// `Clock::default()`, `a == b` and `a + b` of a type with its own impl, which MIR calls
@@ -2713,8 +3379,10 @@ impl<'db> Cx<'db> {
     /// A method of the standard library's trait that no impl of this program's crates
     /// implements (an integer's `Ord::max`, a derive's `PartialEq::eq`, `From` between
     /// integers) stays the trait's: [`Cx::std_call`] models it by its trait and name, as
-    /// before. A method of a crate's own trait that is not an impl's is refused by what it is:
-    /// a call through a generic bound, through a trait object, or of the trait's default body.
+    /// before, and so does a derive of `Clone` or `PartialEq` whether it was recorded or
+    /// expanded ([`expanded_derive`]). A method of a crate's own trait that no impl overrides
+    /// is the trait's provided body at the instance whose `Self` is the implementor. A call
+    /// through a generic bound or a trait object is refused by what it is.
     fn dispatch(
         &self,
         callee: FunctionId,
@@ -2742,18 +3410,25 @@ impl<'db> Cx<'db> {
             .lookup_impl_method_or_why(env, callee, generics)
             .map(|(found, args)| (found.left(), args));
         match looked {
-            Ok((Some(found), args)) if !found.krate(db).data(db).origin.is_lang() => {
-                match found.lookup(db).container {
-                    ItemContainerId::ImplId(_) => Ok((found, args)),
-                    _ => Err(self.refuse(
-                        format!(
-                            "a call of `{trait_name}::{name}`, the trait's default method, whose \
-                             body is generic over `Self` (only an impl's method is translated)"
-                        ),
-                        at,
-                    )),
-                }
+            // A derive of `Clone` or `PartialEq` that was expanded (as a build expands every
+            // builtin derive, `hir_def::nameres::set_expand_builtin_derives`) is the derive the
+            // fast path records without expanding: the trait's method, which `std_call` models
+            // as the value's own structure ([`Cx::structural`]), never the expansion's body
+            // (which reads `discriminant_value`).
+            Ok((Some(found), _))
+                if of_std
+                    && matches!(
+                        expanded_derive(db, found),
+                        Some(BuiltinDeriveImplTrait::Clone | BuiltinDeriveImplTrait::PartialEq)
+                    ) =>
+            {
+                Ok((callee, generics))
             }
+            // An impl's method, or the trait's provided (default) body, which no impl
+            // overrides: translated at the instance whose `Self` is the implementor
+            // ([`owner`] names it `<type>.<trait>.<method>`), so a required method it calls is
+            // resolved there to the implementor's.
+            Ok((Some(found), args)) if !found.krate(db).data(db).origin.is_lang() => Ok((found, args)),
             // The standard library's: its model is the trait's method's, by name.
             Ok(_) if of_std => Ok((callee, generics)),
             Err(why) if of_std && why.is_expected() => Ok((callee, generics)),
@@ -2803,7 +3478,7 @@ impl<'db> Cx<'db> {
                 match ty.kind() {
                     TyKind::Slice(_) => Home::Slice,
                     TyKind::Str => Home::Str,
-                    TyKind::Adt(def, _) => match def.def_id() {
+                    TyKind::Adt(def, args) => match def.def_id() {
                         AdtId::EnumId(it) => match EnumSignature::of(db, it).name.as_str() {
                             "Option" => Home::Option,
                             "Result" => Home::Result,
@@ -2816,6 +3491,17 @@ impl<'db> Cx<'db> {
                                 && module(it.into()) == ["time"] =>
                         {
                             Home::Duration
+                        }
+                        // `impl AtomicBool` and `impl AtomicU32` (`impl Atomic<u32>`), one per
+                        // primitive in core; `impl<T> AtomicPtr<T>` is no atomic of the model.
+                        AdtId::StructId(it)
+                            if StructSignature::of(db, it).name.as_str() == "Atomic"
+                                && module(it.into()) == ["sync", "atomic"]
+                                && args.len() == 1
+                                && (int_ty(args.type_at(0)).is_some()
+                                    || matches!(args.type_at(0).kind(), TyKind::Bool)) =>
+                        {
+                            Home::Atomic { bool: matches!(args.type_at(0).kind(), TyKind::Bool) }
                         }
                         _ => Home::Other,
                     },
@@ -2849,7 +3535,8 @@ impl<'db> Cx<'db> {
         let no_model = |this: &Self| {
             this.refuse(
                 format!(
-                    "a call of the standard library's `{name}`, which has no model (rule NoModel)"
+                    "a call of the standard library's `{name}`, which has no model and is not \
+                     in the list of opaque functions (rule NoModel)"
                 ),
                 at,
             )
@@ -2900,6 +3587,9 @@ impl<'db> Cx<'db> {
             let (of, _) = self.operand(&args[0], at)?;
             out.push(Stmt::Assign { place: dest, value: Rvalue::Use(of), at: at.to_owned() });
             return Ok(None);
+        }
+        if let Some(callee) = self.opaque_call(callee, generics, name, container, at)? {
+            return Ok(Some((callee, self.operands(args, at)?)));
         }
         match self.home(container) {
             Home::Int(int) => {
@@ -2966,6 +3656,32 @@ impl<'db> Cx<'db> {
                     ));
                 };
                 Ok(Some((model(it, monadic), self.operands(args, at)?)))
+            }
+            Home::Atomic { bool } => {
+                let (table, lean, rust) = match bool {
+                    true => (ATOMIC_BOOL_MODELS, "core.sync.atomic.AtomicBool", "AtomicBool"),
+                    false => (ATOMIC_MODELS, "core.sync.atomic.Atomic", "Atomic"),
+                };
+                if ATOMIC_UNSHARED.contains(&name) {
+                    return Err(self.refuse(
+                        format!(
+                            "a call of `{rust}::{name}`, which reaches the atomic's value by `&mut`, \
+                             by value or by raw pointer, not through the memory threads share (the \
+                             model has only the shared operations; rule NoModel)"
+                        ),
+                        at,
+                    ));
+                }
+                if !table.contains(&name) {
+                    return Err(self.refuse(
+                        format!(
+                            "a call of `{rust}::{name}`, which lean/Blaze/Atomic.lean has no model of \
+                             (rule NoModel)"
+                        ),
+                        at,
+                    ));
+                }
+                Ok(Some((Callee::Shared { name: format!("{lean}.{name}") }, self.operands(args, at)?)))
             }
             Home::Ordering => {
                 let Some(&(_, it)) = ORDERING_MODELS.iter().find(|it| it.0 == name) else {
@@ -3079,7 +3795,25 @@ impl<'db> Cx<'db> {
                                     at,
                                 ));
                             }
-                            _ => return Err(no_model(self)),
+                            // `From::from` of a type into itself (the error conversion of `?`
+                            // when the error types are one) runs core's identity impl, its
+                            // body translated at the instance; another of the standard
+                            // library's impls has no model.
+                            (_, to) => {
+                                if let Some(identity) = self.identity_from(callee, generics, at)? {
+                                    return Ok(Some((identity, operands)));
+                                }
+                                return Err(self.refuse(
+                                    format!(
+                                        "a call of `From::from` from `{}` into `{}`, the standard \
+                                         library's impl, which has no model and is not in the list \
+                                         of opaque functions (rule NoModel)",
+                                        crate::rust_ty(&from),
+                                        crate::rust_ty(&to)
+                                    ),
+                                    at,
+                                ));
+                            }
                         };
                         let callee =
                             Callee::Model { name: callee, monadic: false, ty: Some(to), lends_first: false };
@@ -3118,6 +3852,64 @@ impl<'db> Cx<'db> {
             }
             Home::Module(_) | Home::Other => Err(no_model(self)),
         }
+    }
+
+    /// A call of an inherent method of an [`OPAQUE_TYPES`] type: the [`OPAQUE_FUNCTIONS`]
+    /// function it is, at its instance, put among the opaque functions called; a method not in
+    /// that list is refused by name, for it would look inside the value. `None` for a function
+    /// of no opaque type's inherent impl.
+    fn opaque_call(
+        &mut self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        container: ItemContainerId,
+        at: &str,
+    ) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let ItemContainerId::ImplId(imp) = container else { return Ok(None) };
+        if db.impl_trait(imp).is_some() {
+            return Ok(None);
+        }
+        let TyKind::Adt(def, _) = db.impl_self_ty(imp).skip_binder().kind() else { return Ok(None) };
+        let Some(opaque) = self.opaque_adt(def.def_id()) else { return Ok(None) };
+        if !OPAQUE_FUNCTIONS.iter().any(|it| it.0 == opaque && it.1 == name) {
+            return Err(self.refuse(
+                format!(
+                    "a call of `{}::{name}`, a method of an opaque type that is not in the list of \
+                     opaque functions (an opaque value is carried, never looked inside; rule \
+                     NoModel)",
+                    opaque.rust()
+                ),
+                at,
+            ));
+        }
+        // Its signature at the instance: every type in it modelled or opaque, else refused here
+        // naming the type. A `&mut` is taken at the top of a parameter, as a function's own.
+        let sig = db.callable_item_signature(callee.into()).instantiate(self.interner, generics).skip_norm_wip();
+        let sig = sig.skip_binder();
+        let mut params = Vec::new();
+        for input in sig.inputs().iter() {
+            params.push(self.ty(*input, true, at)?);
+        }
+        let result = self.ty(sig.output(), false, at)?;
+        let args = is_generic(db, callee).then_some(generics);
+        let named = match instance_name(db, callee, args) {
+            Ok(named) => named,
+            Err(why) => return Err(self.refuse(format!("a call of `{name}`, {why}"), at)),
+        };
+        let lean = named.lean.clone();
+        match self.opaques.iter().find(|it| it.lean == lean) {
+            None => self.opaques.push(OpaqueFn { lean: named.lean, display: named.display, params, result }),
+            Some(it) if it.display != named.display => {
+                return Err(self.refuse(
+                    format!("two functions with one Lean name, `{lean}` (`{}` and `{}`)", it.display, named.display),
+                    at,
+                ));
+            }
+            Some(_) => {}
+        }
+        Ok(Some(Callee::Function { name: lean }))
     }
 
     /// Whether `ty` is a `Vec`.
@@ -3464,7 +4256,7 @@ impl<'db> Cx<'db> {
             Err(_) => (None, generics),
         };
         let Some(found) = found else { return Ok(None) };
-        if found.krate(db).data(db).origin.is_lang() {
+        if found.krate(db).data(db).origin.is_lang() || expanded_derive(db, found).is_some() {
             return Ok(None);
         }
         self.crate_callee(found, args, "eq", at).map(Some)
@@ -3518,6 +4310,14 @@ impl<'db> Cx<'db> {
                 if adt.krate(db).data(db).origin.is_lang() {
                     return match self.ty(ty, false, at)? {
                         Ty::Duration | Ty::Ordering | Ty::TryFromIntError | Ty::Unit => Ok(()),
+                        Ty::Opaque(opaque) => Err(self.refuse(
+                            format!(
+                                "{what} of `{}`, an opaque type, whose value is carried and never \
+                                 looked inside (rule NoModel)",
+                                opaque.rust()
+                            ),
+                            at,
+                        )),
                         Ty::Option(_) | Ty::Vec(_) => self.structural(method, args.type_at(0), which, seen, at),
                         Ty::Result(..) => {
                             self.structural(method, args.type_at(0), which, seen, at)?;
@@ -3546,10 +4346,12 @@ impl<'db> Cx<'db> {
                     Structural::Clone => (BuiltinDeriveImplTrait::Clone, "Clone"),
                     Structural::PartialEq => (BuiltinDeriveImplTrait::PartialEq, "PartialEq"),
                 };
+                // Derived: the builtin derive of the trait, recorded or expanded.
                 let derived = match db.lookup_impl_method_or_why(env, method, generics) {
-                    Ok((found, _)) => match found.right() {
-                        Some((id, _)) => id.loc(db).trait_ == wanted,
-                        None => false,
+                    Ok((found, _)) => match (found.left(), found.right()) {
+                        (_, Some((id, _))) => id.loc(db).trait_ == wanted,
+                        (Some(func), _) => expanded_derive(db, func) == Some(wanted),
+                        (None, None) => false,
                     },
                     Err(_) => false,
                 };
@@ -3805,10 +4607,16 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         derives: BTreeSet::new(),
         envs: BTreeMap::new(),
         lent: BTreeMap::new(),
+        opaques: Vec::new(),
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
-        names.insert(index(local), store[binding].name.as_str().to_owned());
+        // A binding the lowering made (`?`'s value and residual, a `for`'s iterator) has no
+        // name in the source: it is a temporary.
+        let name = &store[binding].name;
+        if !name.is_generated() {
+            names.insert(index(local), name.as_str().to_owned());
+        }
     }
     let params: BTreeSet<Local> = mir.param_locals.iter().map(|it| index(*it)).collect();
     for (local, decl) in mir.locals.iter() {
@@ -3944,5 +4752,5 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         adts: cx.adts,
         nodes,
     };
-    Ok(Lowered { body, callees: cx.callees, derives: cx.derives })
+    Ok(Lowered { body, callees: cx.callees, derives: cx.derives, opaques: cx.opaques })
 }

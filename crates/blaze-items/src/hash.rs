@@ -18,7 +18,15 @@
 //! Items that refer to each other are hashed as one unit, as Unison does: the members of a
 //! strongly connected component of the graph of refs are ordered by their content, each ref
 //! inside it is the position of its target, and each member's hash is the unit's and its
-//! position. Components are found by Tarjan's algorithm over the refs of one crate (a cycle
+//! position. Unlike Unison, what validates a type-check result names each ref by its target's
+//! key as well (D46): the signature hash ([`Graph::keyed`]: from outside a component by key and
+//! hash, inside it by position and key) and a fact's form ([`named_filled`]). Rust's types are
+//! nominal: `struct Meters(u32)` and `struct Feet(u32)` have one hash and are two types, so
+//! `f(Meters(1))` type-checks against `fn f(_: Meters)` and not against `fn f(_: Feet)`. The
+//! interface, layout, code and deep hashes stay name-free: what codegen keys a template by is
+//! what the code does, and two types of one shape compile alike; which items a compiled body
+//! calls is bound by key beside its code ([`crate::bound`], the instance keys of
+//! `hir-ty-identity`), never inside it. Components are found by Tarjan's algorithm over the refs of one crate (a cycle
 //! never crosses crates, dependencies being acyclic): from the item alone, or once for all of
 //! the deep graph of a local crate (`members` says when). A component is hashed once for all
 //! its members, and each ref
@@ -50,13 +58,18 @@ use crate::{
     form, key,
 };
 
+// Version 2 of the signature hash: a ref names its target by key as well as by hash (D46), so
+// no row kept under a name-free signature hash is found by one. The interface, layout, code and
+// deep hashes are name-free, as in version 1.
 pub const INTERFACE_DOMAIN: &str = "blaze v2 interface hash 1";
-pub const SIGNATURE_DOMAIN: &str = "blaze v2 signature hash 1";
+pub const SIGNATURE_DOMAIN: &str = "blaze v2 signature hash 2";
 pub const LAYOUT_DOMAIN: &str = "blaze v2 layout hash 1";
 pub const CODE_DOMAIN: &str = "blaze v2 code hash 1";
 pub const DEEP_DOMAIN: &str = "blaze v2 deep hash 1";
 pub const CLOSURE_CODE_DOMAIN: &str = "blaze v2 closure code hash 1";
 pub const COROUTINE_CODE_DOMAIN: &str = "blaze v2 coroutine code hash 1";
+/// A ref named by its target's key and hash ([`keyed`]).
+const KEYED_REF_DOMAIN: &str = "blaze v2 keyed ref 1";
 
 /// Why an item has no hash: a part of it is not of a program rustc accepts (an error type,
 /// MIR that failed to lower, a macro without rules), or it was read before the proc macros its
@@ -361,6 +374,17 @@ impl Graph {
         }
     }
 
+    /// Whether a ref in this graph names its target by key as well as by hash: the signature
+    /// graph, what a body's identity names an item by (D46), so that two items alike but for
+    /// their names (`struct Meters(u32)` and `struct Feet(u32)`) are two targets to whatever
+    /// type-checks against one of them. The interface graph is what codegen reads beside an
+    /// item's key (a callee's instance, an ADT's identity, a template's code), where a shape is
+    /// all a compiled body depends on; a layout is the same for both; the deep graph is what
+    /// inlines.
+    fn keyed(self) -> bool {
+        matches!(self, Graph::Signature)
+    }
+
     /// The hash a ref outside the component is filled with.
     fn fill(self, db: &Db, to: ItemId) -> Result<ContentId, Unhashable> {
         match (self, to) {
@@ -368,7 +392,7 @@ impl Graph {
             (Graph::Layout, ItemId::Adt(_)) => layout_of(db, to),
             (Graph::Layout, _) => interface_of(db, to),
             (Graph::Deep, _) => deep_of(db, to),
-            (Graph::Signature, _) => signature_of(db, to),
+            (Graph::Signature, _) => Ok(keyed(db, to, signature_of(db, to)?)),
         }
     }
 }
@@ -423,18 +447,40 @@ fn code_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let interface = interface_of(db, id)?;
     let mut h = Hasher::new(CODE_DOMAIN);
     h.id(&interface);
-    Ok(Some(filled_into(db, &mut h, body, id)?))
+    Ok(Some(filled_into(db, &mut h, body, id, Names::Free)?))
 }
 
-/// A form's digest with each ref filled by its interface hash: what a fact that spells a form
-/// (a closure's captures, a field's type) stands for.
+/// Whether a filled form names each ref by its target's key as well as by its hash.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Names {
+    /// By hash alone: a code hash, what a template is kept under (what it does).
+    Free,
+    /// By key and hash (D46): a fact's value, which a body's stored type check is checked by.
+    Keyed,
+}
+
+/// A body's code form's digest with each ref filled by its interface hash, name-free: a
+/// closure's or coroutine's code, as [`code_of`] is an item's.
 pub(crate) fn filled(
     db: &Db,
     domain: &'static str,
     sub: form::SubRef<'_>,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
-    filled_into(db, &mut Hasher::new(domain), sub, owner)
+    filled_into(db, &mut Hasher::new(domain), sub, owner, Names::Free)
+}
+
+/// A form's digest with each ref filled by its key and interface hash: what a fact that spells
+/// a form (a closure's captures, a field's type, a constant's type) stands for. A body that read
+/// the fact type-checked against the items it names, so another item of the same shape in one's
+/// place is another value (D46); what the body reads inside one of them is a fact of its own.
+pub(crate) fn named_filled(
+    db: &Db,
+    domain: &'static str,
+    sub: form::SubRef<'_>,
+    owner: ItemId,
+) -> Result<ContentId, Unhashable> {
+    filled_into(db, &mut Hasher::new(domain), sub, owner, Names::Keyed)
 }
 
 fn filled_into(
@@ -442,6 +488,7 @@ fn filled_into(
     h: &mut Hasher,
     sub: form::SubRef<'_>,
     owner: ItemId,
+    names: Names,
 ) -> Result<ContentId, Unhashable> {
     missed(db, sub, owner)?;
     // A form other than the item's own (a field's, a closure's captures, an opaque's auto
@@ -449,9 +496,22 @@ fn filled_into(
     macros_built_for(db, owner.krate(db), || Unhashed::item(db, owner))?;
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {
-        h.id(&interface_of(db, to)?);
+        let hash = interface_of(db, to)?;
+        h.id(&match names {
+            Names::Free => hash,
+            Names::Keyed => keyed(db, to, hash),
+        });
     }
     Ok(h.finish())
+}
+
+/// A ref to `to` whose hash is `hash`, named by `to`'s key as well (D46): a hash alone says
+/// what the target is, not which item it is, and two nominal types of one shape have one
+/// hash. A renamed or moved item keeps its own hashes; every hash that names it moves.
+fn keyed(db: &Db, to: ItemId, hash: ContentId) -> ContentId {
+    let mut h = Hasher::new(KEYED_REF_DOMAIN);
+    h.id(&key::item_key(db, to).0).id(&hash);
+    h.finish()
 }
 
 /// [`filled`] with each ref by its signature hash, for a form a [`form::Cx::leak_free`] wrote:
@@ -467,7 +527,7 @@ pub(crate) fn signature_filled(
     let mut h = Hasher::new(domain);
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {
-        h.id(&signature_of(db, to)?);
+        h.id(&keyed(db, to, signature_of(db, to)?));
     }
     Ok(h.finish())
 }
@@ -638,7 +698,7 @@ fn unit<'db>(db: &'db Db, graph: Graph, first: ItemId) -> Result<Unit<'db>, Unha
         // round hashes every member in one batch.
         for at in 0..n {
             b.update(b"shape").id(&owns[at]);
-            spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |_| 0);
+            spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |_| (0, None));
             b.end();
         }
         let mut color = b.hash(domain);
@@ -670,11 +730,15 @@ fn unit<'db>(db: &'db Db, graph: Graph, first: ItemId) -> Result<Unit<'db>, Unha
             rank[member] = u32::try_from(at).expect("blaze-items: a component past u32::MAX items");
         }
 
+        // A ref to a member is its position and, in a keyed graph, the member's key: so two
+        // members alike but for their names (ordered by key above) spell the whole apart, and a
+        // member renamed moves every member's hash, as a ref from outside to it would.
         b.update(b"cycle").word(n);
         for &at in order.iter() {
             b.id(&owns[at]);
             spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |to| {
-                rank[inside(to).expect("a ref without a fill is to a member")] as usize
+                let to = inside(to).expect("a ref without a fill is to a member");
+                (rank[to] as usize, graph.keyed().then_some(keys[to].0))
             });
         }
         // Each member's position, kept in the unit's run's arena.
@@ -708,13 +772,16 @@ fn spell_fills(
     b: &mut Batch<'_>,
     refs: &[ItemId],
     fills: &[Option<ContentId>],
-    inside: impl Fn(ItemId) -> usize,
+    inside: impl Fn(ItemId) -> (usize, Option<ContentId>),
 ) {
     b.word(refs.len());
     for (&to, fill) in refs.iter().zip(fills) {
         match fill {
             Some(fill) => b.update(&[1]).id(fill),
-            None => b.update(&[0]).word(inside(to)),
+            None => match inside(to) {
+                (at, None) => b.update(&[0]).word(at),
+                (at, Some(key)) => b.update(&[2]).word(at).id(&key),
+            },
         };
     }
 }

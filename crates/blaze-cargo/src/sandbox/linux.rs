@@ -80,7 +80,7 @@ use std::{
 use blaze_core::{Untraceable, exit::Exit, utf8::push_lossy};
 use blaze_hash::HashMap;
 use blaze_usercode::{
-    provider::{Answers, Provider, SOURCE_DATE_EPOCH, Wall},
+    provider::{Answers, Asker, Provider, SOURCE_DATE_EPOCH, Wall},
     trace::{ANSWERED_DEVICE, ANSWERED_RANDOM},
 };
 use std::alloc::Global;
@@ -2431,6 +2431,19 @@ impl Watch {
         number
     }
 
+    /// `thread` of `process`, which asks the provider, as its answers see it: the scope the
+    /// thread runs in (a test's name; [`Answers`] gives a process of a scope a stream of that
+    /// scope, not of its number), the process's id and its number in the run.
+    fn asker<'r>(
+        &mut self,
+        recorder: &'r Recorder,
+        thread: u64,
+        process: u64,
+        procs: &mut Procs,
+    ) -> Asker<'r> {
+        Asker { scope: recorder.scope(thread), id: process, number: self.number(process, procs) }
+    }
+
     /// As the run ends: a random device's file the program read to its end was not enough for
     /// it, and what it did then is not known, so the run read what can't be traced.
     fn devices_read_out(&mut self, recorder: &mut Recorder) {
@@ -2698,11 +2711,11 @@ fn provided(
                 return Some(failed(libc::EINVAL));
             }
             let process = watch.process(recorder, thread, &mut scratch.procs);
-            let number = watch.number(process, &mut scratch.procs);
+            let asker = watch.asker(recorder, thread, process, &mut scratch.procs);
             let len = usize::try_from(len).unwrap_or(RANDOM_MOST).min(RANDOM_MOST);
             scratch.memory.clear();
             scratch.memory.resize(len, 0);
-            watch.provided.as_mut()?.answers.random(number, &mut scratch.memory);
+            watch.provided.as_mut()?.answers.random(asker, &mut scratch.memory);
             recorder.answered(thread, ANSWERED_RANDOM);
             if len == 0 {
                 return Some(value(0));
@@ -2766,14 +2779,14 @@ fn handed_device(
 ) -> bool {
     let thread = u64::from(notif.pid);
     let process = watch.process(recorder, thread, &mut scratch.procs);
-    let number = watch.number(process, &mut scratch.procs);
+    let asker = watch.asker(recorder, thread, process, &mut scratch.procs);
     let Some(provided) = &mut watch.provided else { return false };
     if provided.devices.len() >= DEVICES_MOST {
         return false;
     }
     scratch.memory.clear();
     scratch.memory.resize(DEVICE_BYTES, 0);
-    if provided.answers.device(number, &mut scratch.memory).is_none() {
+    if provided.answers.device(asker, &mut scratch.memory).is_none() {
         return false;
     }
     let Some(file) = raw::memfd(c"blaze-random-device") else { return false };
@@ -2946,6 +2959,13 @@ fn noted(
                 describe(notif, "clock", Some(said), process, recorder, &mut scratch.procs);
             }
             if recorder.marked(thread, process, &scratch.raw) {
+                // A test's child took its mark: its scope's streams start from it, so what the
+                // test is given is a function of its name, not of the order its server forked.
+                if let Some(provided) = &mut watch.provided
+                    && scratch.raw.starts_with(MARK.as_bytes())
+                {
+                    provided.answers.marked(recorder.scope(thread), process);
+                }
                 continue;
             }
         }
@@ -3946,6 +3966,81 @@ head -c 24 /dev/urandom | od -An -tx1
             return;
         };
         assert!(untraced(&lines).contains(&"random"), "{lines:?}");
+    }
+
+    /// A run as a fork server's: the server asks for randomness first (as std's and the C
+    /// library's start do), then one process per test of `names`, in that order, takes the
+    /// test's mark through `mark` (a prefix of a path bash's `[ -r ]` asks `faccessat2` of)
+    /// and runs a program that asks `getrandom` for a name. What each test was given, by
+    /// test.
+    fn forked_tests(
+        name: &str,
+        mark: &str,
+        names: &[&str],
+    ) -> Option<(std::collections::BTreeMap<String, String>, Vec<blaze_usercode::trace::Line>)>
+    {
+        let mut script = String::from("mktemp -u XXXXXXXXXXXX > /dev/null\n{\n");
+        for test in names {
+            script.push_str(&format!(
+                "bash -c '[ -r \"{mark}{test}\" ]; printf \"%s \" \"{test}\"; mktemp -u XXXXXXXXXXXX'\n"
+            ));
+        }
+        script.push_str("} > \"$OUT/said\"");
+        let (said, lines) = provided_run(name, &script, &[test_provider(4).entry()])?;
+        let given = said
+            .lines()
+            .map(|line| {
+                let (test, bytes) = line.split_once(' ').expect("a line is a test and its name");
+                (test.to_owned(), bytes.to_owned())
+            })
+            .collect();
+        Some((given, lines))
+    }
+
+    /// The invariant: in a run given a provider, a process that took a test's mark, and the
+    /// programs it runs, are given the stream of that test's name, whichever tests ran before
+    /// it and whatever the server asked first; and the server's own asks at its start, like
+    /// the tests', are answered, so nothing in the trace is left that can't be traced (which
+    /// would keep no test).
+    #[test]
+    fn a_marked_test_is_given_its_names_randomness_whatever_ran_before_it() {
+        if !["/bin/bash", "/usr/bin/bash"].iter().any(|it| Path::new(it).exists()) {
+            eprintln!("skipped: no bash");
+            return;
+        }
+        let orders: [&[&str]; 3] = [
+            &["tests::adds", "tests::muls", "a::b"],
+            &["a::b", "tests::muls", "tests::adds"],
+            &["tests::muls"],
+        ];
+        let mark = crate::sandbox::MARK;
+        let Some((first, lines)) = forked_tests("marked-1", mark, orders[0]) else { return };
+        assert_eq!(untraced(&lines), Vec::<&str>::new(), "{lines:?}");
+        assert_eq!(first.len(), 3, "{first:?}");
+        assert_ne!(first["tests::adds"], first["tests::muls"], "each test has a stream of its own");
+        for (at, order) in orders.iter().enumerate().skip(1) {
+            let (given, lines) = forked_tests(&format!("marked-{}", at + 1), mark, order).unwrap();
+            assert_eq!(untraced(&lines), Vec::<&str>::new(), "{lines:?}");
+            for (test, bytes) in &given {
+                assert_eq!(&first[test], bytes, "{test} in the order {order:?}");
+            }
+        }
+    }
+
+    /// The control: the same runs with the mark taken away (the path asked is beside
+    /// [`crate::sandbox::MARK`], not under it) number the tests' processes in the order they ran, and a test
+    /// run after others is given other bytes than when it ran first.
+    #[test]
+    fn the_oracle_catches_tests_given_the_stream_of_their_order() {
+        if !["/bin/bash", "/usr/bin/bash"].iter().any(|it| Path::new(it).exists()) {
+            eprintln!("skipped: no bash");
+            return;
+        }
+        let beside = "/.blaze-not-a-test/";
+        let order = ["tests::adds", "tests::muls"];
+        let Some((first, _)) = forked_tests("unmarked-1", beside, &order) else { return };
+        let (turned, _) = forked_tests("unmarked-2", beside, &["tests::muls", "tests::adds"]).unwrap();
+        assert_ne!(first["tests::adds"], turned["tests::adds"], "{first:?} {turned:?}");
     }
 
     /// Whether the launcher's child got randomness, answered or not, before the program it

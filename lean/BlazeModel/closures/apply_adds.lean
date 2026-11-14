@@ -9,12 +9,12 @@ open Blaze
 set_option linter.unusedVariables false
 
 def closures.apply_adds (k : U32) : Result Bool :=
-  let t2 := Scalar.gt k (1000 : U32)
-  if t2 then Result.ok t2
+  let t0 := Scalar.gt k (1000 : U32)
+  if t0 then Result.ok t0
   else do
-    let t4 ←
+    let t1 ←
       closures.apply.closure0_apply_adds ({ c0 := k } : closures.apply_adds.closure0) (3 : U32)
-    let t7 ← Scalar.add (3 : U32) k
-    Result.ok (Scalar.eq t4 t7)
+    let t2 ← Scalar.add (3 : U32) k
+    Result.ok (Scalar.eq t1 t2)
 
 def closures.apply_adds.spec.statement : Prop := ∀ (k : U32), closures.apply_adds k = Result.ok true

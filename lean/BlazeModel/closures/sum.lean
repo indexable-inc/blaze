@@ -10,5 +10,5 @@ set_option linter.unusedVariables false
 
 def closures.sum (fuel : Nat) (xs : Slice U32) : Result U32 := do
   let total := (0 : U32)
-  let t5 ← closures.each.closure0_sum fuel xs ({ c0 := total } : closures.sum.closure0)
-  Result.ok t5.c0
+  let t0 ← closures.each.closure0_sum fuel xs ({ c0 := total } : closures.sum.closure0)
+  Result.ok t0.c0

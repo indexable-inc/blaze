@@ -27,7 +27,11 @@ hir-expand	9
 # `declared_trait_predicates_of` (implied bounds), a `TyLoweringResult<GenericPredicates>` as
 # its siblings `generic_predicates*` and `explicit_*_clauses` are, all `owns`: the predicates
 # and their diagnostics are a real tree until `GenericPredicates` is a flat record.
-hir-ty	70
+# Raised 70 -> 71, merge of the item-store branch 2026-11-14: lower.rs `batched_field_types`, a
+# dependency variant's row of its crate's field-type batch copied out as a
+# `TyLoweringResult<ThinVec<FieldType>>`, as its sibling `field_types_of_variant` is, so a read
+# of it is a fact of the variant's ADT and not of the whole crate (rule 65).
+hir-ty	71
 hir-ty-borrowck	2
 # First counted 2026-11-14: its library is at the crate's top (`[lib] path = "mod.rs"`), which
 # the count of `src/` alone never saw.

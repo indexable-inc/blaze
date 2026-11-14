@@ -1224,7 +1224,6 @@ impl Query for HostMacros {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
-                sandboxed_tests: built.sandboxed_tests,
                 native: built.native,
             }),
             super::Staged::Needs(fetches) => Planned::Needs(fetches),
@@ -1622,14 +1621,19 @@ fn the_sandbox_opt_outs_are_the_manifests() {
     );
 }
 
-// The tests' opt-ins as the plan carries them: the workspace's `sandboxed-tests` experiment,
-// `a`'s `tests = true` with one test out, `b`'s `tests = false`, and `d`, outside the
-// workspace, whose own table is not read.
+// The tests' sandbox as the plan carries it, for a Linux host (`HOST`), which sandboxes tests by
+// default: `c`, which says nothing, is; `a`'s `tests = true` (the default said out loud) with
+// one test out; `b`'s `tests = false`; and `d`, outside the workspace, whose own table is not
+// read. A workspace that still lists `sandboxed-tests` plans the same there, with one note
+// (on macOS it is the opt-in: `sandbox::tests_on`).
 #[test]
 fn the_tests_opt_ins_are_the_manifests() {
     let fixture = Fixture::new();
-    let root = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n\n\
-                [workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n";
+    let root = |experimental: &str| {
+        format!(
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n{experimental}"
+        )
+    };
     let package = |name: &str, extra: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}")
     };
@@ -1641,34 +1645,50 @@ fn the_tests_opt_ins_are_the_manifests() {
     let b = package("b", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
     let c = package("c", "");
     let d = package("d", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
-    let files = [
-        ("ws/Cargo.toml", root),
-        ("ws/a/Cargo.toml", a.as_str()),
-        ("ws/a/src/lib.rs", ""),
-        ("ws/b/Cargo.toml", b.as_str()),
-        ("ws/b/src/lib.rs", ""),
-        ("ws/c/Cargo.toml", c.as_str()),
-        ("ws/c/src/lib.rs", ""),
-        ("d/Cargo.toml", d.as_str()),
-        ("d/src/lib.rs", ""),
-    ];
-    let units = ready(
-        fixture.plan(fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) })),
-    );
-    assert!(units.sandboxed_tests);
+    let plain = root("");
+    let retired = root("\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n");
+    let plan = |root: &str| {
+        let files = [
+            ("ws/Cargo.toml", root),
+            ("ws/a/Cargo.toml", a.as_str()),
+            ("ws/a/src/lib.rs", ""),
+            ("ws/b/Cargo.toml", b.as_str()),
+            ("ws/b/src/lib.rs", ""),
+            ("ws/c/Cargo.toml", c.as_str()),
+            ("ws/c/src/lib.rs", ""),
+            ("d/Cargo.toml", d.as_str()),
+            ("d/src/lib.rs", ""),
+        ];
+        ready(fixture.plan(
+            fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) }),
+        ))
+    };
+    let units = plan(&plain);
+    assert!(units.notes.is_empty(), "{:?}", units.notes);
     let of = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap();
     assert_eq!(
         of("a").tests,
-        TestSandbox { all: false, opted_in: true, tests: vec!["net::reaches".to_owned()] }
+        TestSandbox { tests: vec!["net::reaches".to_owned()], ..TestSandbox::default() }
     );
-    assert_eq!(of("b").tests, TestSandbox { all: true, opted_in: false, tests: Vec::new() });
+    assert_eq!(of("b").tests, TestSandbox { all: true, ..TestSandbox::default() });
     assert_eq!(of("c").tests, TestSandbox::default());
     assert_eq!(of("d").tests, TestSandbox::default());
     for (name, sandboxed) in [("a", true), ("b", false), ("c", true), ("d", true)] {
-        assert_eq!(of(name).tests_sandboxed(units.sandboxed_tests), sandboxed, "{name}");
+        assert_eq!(of(name).tests_sandboxed(), sandboxed, "{name}");
     }
-    assert!(!of("c").tests_sandboxed(false) && of("a").tests_sandboxed(false));
     assert!(units.packages.iter().all(|it| it.checksum.is_none()), "no package is from crates.io");
+
+    let listed = plan(&retired);
+    assert_eq!(listed.packages, units.packages, "the retired experiment changes no package");
+    assert_eq!(listed.notes.len(), 1, "{:?}", listed.notes);
+    assert!(
+        listed.notes[0].starts_with(
+            "`sandboxed-tests` in `experimental` under [workspace.metadata.blaze] of \
+             /home/u/ws/Cargo.toml does nothing on x86_64-unknown-linux-gnu"
+        ),
+        "{}",
+        listed.notes[0]
+    );
 
     let unknown = "[workspace]\nmembers = [\"c\"]\nresolver = \"3\"\n\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-test\"]\n";
     let files =

@@ -9,7 +9,7 @@
 // has no `std`, reaches it as rustc's does (flecs-c's tests).
 //
 // What happens once per binary happens before the first test: the names of the hello, the
-// child-exit queue, the slot count, the measure of one fork. A test costs one socket pair, one
+// child-exit queue, the jump table (its slot count and identity), the measure of one fork. A test costs one socket pair, one
 // fork and one frame; the buffers of the loop and the execution records (with slots) are kept
 // across tests. One server forks one test at a time, so blaze may ask for replicas
 // (`Frame::Replicate`): copies forked before any test runs, each a server on a connection of
@@ -562,7 +562,7 @@ mod unix {
                 let end = end_of(status);
                 let read = child.region.read(&end, &mut hits);
                 let executed = match &read {
-                    Ok(slots) => ExecView::Hits { slots: *slots, hits: Hits::of_bytes(&hits).expect("four bytes a hit") },
+                    Ok(table) => ExecView::Hits { table: *table, hits: Hits::of_bytes(&hits).expect("four bytes a hit") },
                     Err(why) => ExecView::Not(&**why),
                 };
                 encode_ended(&mut out, child.id, end.view(), &child.bytes, executed);

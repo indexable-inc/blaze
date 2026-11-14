@@ -6,4 +6,4 @@ import BlazeModel.closures.option_methods.closure2.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.option_methods.closure2.call (t1 : closures.option_methods.closure2) : U32 := t1.c0
+def closures.option_methods.closure2.call (t0 : closures.option_methods.closure2) : U32 := t0.c0

@@ -34,8 +34,6 @@ pub(crate) enum UnitError {
     /// A test run's directory under the daemon's state, `tests/<tags>`, is no name the driver
     /// can give a file, and why.
     TestDir { dir: String, why: String },
-    /// The test binary `binary`'s selector was given back before its tests were chosen.
-    NoSelector { binary: String },
     /// `cargo run`'s program ended as `how`, neither an exit nor a failure to start.
     RunEnded { how: String },
 }
@@ -85,12 +83,6 @@ impl fmt::Display for UnitError {
                 write!(
                     f,
                     "the test run's directory {dir} is no name blaze's driver can give a file: {why}"
-                )
-            }
-            UnitError::NoSelector { binary } => {
-                write!(
-                    f,
-                    "the test binary `{binary}` gave its selector back before its tests were chosen"
                 )
             }
             UnitError::RunEnded { how } => {

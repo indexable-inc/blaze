@@ -27,21 +27,21 @@ def traits.shapes_agree (side : U32) : Result Bool := do
   let square := ({ side := wide } : traits.Square)
   let tile := (traits.Tile.Rect wide wide : traits.Tile)
   let doubled ← traits.by_add ({ side := wide } : traits.Square) ({ side := wide } : traits.Square)
-  let t18 ← traits.by_method square
-  let t21 ← traits.by_trait_path tile
-  let t17 := Scalar.eq t18 t21
-  let t16 := if t17 then Scalar.eq (traits.by_type_path square) (traits.by_qualified tile) else t17
-  let t15 := if t16 then Scalar.eq traits.by_default.ticks (0 : U64) else t16
-  let t14 ←
-    if t15 then do
-      let t32 := doubled
-      let t37 ← Scalar.mul wide (2 : U64)
-      Result.ok (traits.by_eq t32 ({ side := t37 } : traits.Square))
-    else Result.ok t15
-  if t14 then do
-    let t39 ← traits.Tile.Shape.size (traits.Tile.Empty : traits.Tile)
-    Result.ok (Scalar.eq t39 (0 : U64))
-  else Result.ok t14
+  let t0 ← traits.by_method square
+  let t1 ← traits.by_trait_path tile
+  let t2 := Scalar.eq t0 t1
+  let t3 := if t2 then Scalar.eq (traits.by_type_path square) (traits.by_qualified tile) else t2
+  let t4 := if t3 then Scalar.eq traits.by_default.ticks (0 : U64) else t3
+  let t5 ←
+    if t4 then do
+      let t6 := doubled
+      let t7 ← Scalar.mul wide (2 : U64)
+      Result.ok (traits.by_eq t6 ({ side := t7 } : traits.Square))
+    else Result.ok t4
+  if t5 then do
+    let t8 ← traits.Tile.Shape.size (traits.Tile.Empty : traits.Tile)
+    Result.ok (Scalar.eq t8 (0 : U64))
+  else Result.ok t5
 
 def traits.shapes_agree.spec.statement : Prop :=
   ∀ (side : U32), traits.shapes_agree side = Result.ok true

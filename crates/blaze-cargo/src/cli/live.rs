@@ -68,7 +68,8 @@ const PLAIN_ARGS: [&str; 9] = [
 
 /// Whether the command's tests are run under the screen: a `test` on a terminal the screen
 /// redraws (`caps`), printed for a person (not `-q` or `-v`), that runs its tests (not
-/// `--no-run`, `--reached`, `--ub`, `blaze lock`) with libtest's own output left as the screen
+/// `--no-run`, nor in the daemon, which runs every `test` but `--doc`, `--no-run` and `--ub`
+/// ([`super::in_daemon`]), nor `blaze lock`) with libtest's own output left as the screen
 /// reads it.
 pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
     if asked.command() != Command::Test || asked.lock || !caps.live || shown.quiet || shown.verbose > 0 {
@@ -78,7 +79,7 @@ pub fn wanted(asked: &Invocation, shown: Shown, caps: Caps) -> bool {
         let arg = arg.to_string_lossy();
         !PLAIN_ARGS.iter().any(|plain| arg == *plain || arg.starts_with(&format!("{plain}=")))
     });
-    !asked.flags.no_run && !asked.flags.reached && !asked.flags.ub && reads_args
+    !asked.flags.no_run && !super::in_daemon(asked) && reads_args
 }
 
 /// What the runner is sent.
@@ -428,6 +429,7 @@ impl Runner {
     /// refusal's help names the nearest.
     fn names(&self) -> test::Names {
         let mut names = test::Names::default();
+        let mut listed_all: Vec<String, Global> = Vec::new_in(Global);
         for it in self.binaries.iter().filter(|it| it.json) {
             let executable =
                 PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
@@ -436,10 +438,17 @@ impl Runner {
                 .map_or_else(PathBuf::new, std::path::Path::to_owned);
             let exec = Exec::of(&it.artifact, executable, test::LIST.map(OsString::from), root);
             match test::Spawned.names(&exec) {
-                Ok(listed) => names.names.extend(listed),
+                Ok(listed) => listed_all.extend(listed),
                 Err(why) => names.unlisted.push(format!("{}: {why}", exec.shown())), // alloc: a refusal's help, once
             }
         }
+        // As `test::names_of`: how many tests there are, and those nearest the filters.
+        names.count = listed_all.len();
+        // clone: a refusal's help, once
+        names.nearest = test::nearest(&self.selection.filters, listed_all.iter().map(String::as_str))
+            .into_iter()
+            .map(|(distance, name)| (distance, name.to_owned()))
+            .collect();
         names
     }
 

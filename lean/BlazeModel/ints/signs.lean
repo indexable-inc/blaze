@@ -6,9 +6,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.signs (x : I32) (y : I32) : Result U32 := do
-  let t3 ← Scalar.add (Scalar.unsigned_abs x) (Scalar.abs_diff x y)
-  let t12 := Scalar.signum x
-  let t14 ← Scalar.abs x
-  let t11 ← Scalar.add t12 t14
-  let t10 ← Scalar.add t11 (Scalar.wrapping_abs x)
-  Scalar.add t3 (Scalar.cast .U32 t10)
+  let t0 ← Scalar.add (Scalar.unsigned_abs x) (Scalar.abs_diff x y)
+  let t1 := Scalar.signum x
+  let t2 ← Scalar.abs x
+  let t3 ← Scalar.add t1 t2
+  let t4 ← Scalar.add t3 (Scalar.wrapping_abs x)
+  Scalar.add t0 (Scalar.cast .U32 t4)

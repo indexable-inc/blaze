@@ -52,8 +52,9 @@ pub enum Work {
     Check(Targets),
     /// Then [`crate::Response::Built`] and [`crate::Response::Work`].
     Build(Targets),
-    /// Then a [`crate::Response::TestResult`] per test, [`crate::TestOutcome::Unreached`] for
-    /// each the change reached none of (all run with `all`), and [`crate::Response::Work`].
+    /// Then a [`crate::Response::TestResult`] per test, cached ([`crate::TestResult::cached`])
+    /// for each whose executed code and reads did not change (all run with `all`), and
+    /// [`crate::Response::Work`].
     /// `args` is libtest's selection; with `ub` each test runs in the MIR evaluator, checked
     /// for undefined behavior, and nothing is compiled.
     Test { targets: Targets, filter: Vec<String>, all: bool, args: Vec<String>, ub: Option<Ub> },

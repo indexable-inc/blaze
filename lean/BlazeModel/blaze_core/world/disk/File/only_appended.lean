@@ -15,8 +15,8 @@ def blaze_core.world.disk.File.only_appended.loop_0 (fuel : Nat) (self : blaze_c
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.changes) then do
-      let t13 ← Slice.index self.changes i
-      match t13.change with
+      let t0 ← Slice.index self.changes i
+      match t0.change with
       | blaze_core.world.disk.Change.Append v0 => do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.File.only_appended.loop_0 fuel self i

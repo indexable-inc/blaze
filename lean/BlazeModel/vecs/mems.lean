@@ -8,9 +8,9 @@ set_option linter.unusedVariables false
 def vecs.mems (a : Vec U32) (b : Vec U32) (n : U32) (o : Option U32) (f : Bool) : Result (U32 × Vec U32 × Vec U32 × U32 × Option U32 × Bool) := do
   let old := n
   let n := (5 : U32)
-  let t29 := a
+  let t0 := a
   let a := b
-  let b := t29
+  let b := t0
   let taken := a
   let a := (Vec.new : Vec U32)
   let was := o
@@ -23,10 +23,10 @@ def vecs.mems (a : Vec U32) (b : Vec U32) (n : U32) (o : Option U32) (f : Bool) 
     match was with
     | Option.some v0 => v0
     | Option.none => (0 : U32)
-  let t22 := flag
+  let t1 := flag
   let ret ←
-    if t22 then do
-      let t23 ← Scalar.add old k
-      Scalar.add t23 first
+    if t1 then do
+      let t2 ← Scalar.add old k
+      Scalar.add t2 first
     else Result.ok (Scalar.cast .U32 (Slice.len taken))
   Result.ok (ret, a, b, n, o, f)

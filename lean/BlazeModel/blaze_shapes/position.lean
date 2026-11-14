@@ -9,11 +9,11 @@ def blaze_shapes.position.loop_0 (fuel : Nat) (v : Vec U32) (x : U32) (most : Us
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t8 := Scalar.lt i (Slice.len v)
-    let t7 := if t8 then Scalar.lt i most else t8
-    if t7 then do
-      let t19 ← Slice.index v i
-      if Scalar.eq t19 x then Result.ok (Option.some i : Option Usize)
+    let t0 := Scalar.lt i (Slice.len v)
+    let t1 := if t0 then Scalar.lt i most else t0
+    if t1 then do
+      let t2 ← Slice.index v i
+      if Scalar.eq t2 x then Result.ok (Option.some i : Option Usize)
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_shapes.position.loop_0 fuel v x most i

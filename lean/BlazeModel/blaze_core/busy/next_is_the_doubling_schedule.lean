@@ -9,9 +9,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.busy.next_is_the_doubling_schedule (fuel : Nat) (tried : U32) (waited : U64) : Result Bool := do
-  let t3 ← blaze_core.busy.next tried waited
-  let t6 ← blaze_core.busy.doubling fuel tried waited
-  Result.ok (blaze_core.busy.same t3 t6)
+  let t0 ← blaze_core.busy.next tried waited
+  let t1 ← blaze_core.busy.doubling fuel tried waited
+  Result.ok (blaze_core.busy.same t0 t1)
 
 def blaze_core.busy.next_is_the_doubling_schedule.spec.statement : Prop :=
   ∀ (tried : U32) (waited : U64),

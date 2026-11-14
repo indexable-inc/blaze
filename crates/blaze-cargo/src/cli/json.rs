@@ -297,14 +297,16 @@ fn outcome(out: &mut String, outcome: TestOutcome) {
         TestOutcome::Passed => "passed",
         TestOutcome::Failed => "failed",
         TestOutcome::Ignored => "ignored",
-        TestOutcome::Unreached => "unreached",
     });
 }
 
 /// `blaze-test-result`, blaze's own (cargo has none), without its newline: one
-/// [`TestResult`] of `blaze test --reached` whole, so a harness or an agent reads what ran,
-/// what stood in for a run (`cached`: the run kept, by what, and why when by reach) and what
-/// ran outside the sandbox (`outside`) from fields, not from libtest's text.
+/// [`TestResult`] the daemon ran or kept, whole, so a harness or an agent reads what ran,
+/// what stood in for a run (`cached`: the pass kept, by what, and why when by reach; the
+/// result itself `passed` in 0 ms), a pass not kept (`kept`: `{"no": WORD}`, only then), why
+/// a test ran although selection was asked (`ran`, always: `null` when it did not, else
+/// `{"why": WORD, "ask": .., "before": .., "now": ..}`), and what ran outside the sandbox
+/// (`outside`) from fields, not from libtest's text.
 pub fn test_result(out: &mut String, result: &TestResult) {
     out.push_str(r#"{"reason":"blaze-test-result","binary":"#);
     quote(out, &result.binary);
@@ -337,6 +339,26 @@ pub fn test_result(out: &mut String, result: &TestResult) {
             out.push('}');
         }
     }
+    if let Some(not) = &result.not_kept {
+        out.push_str(r#","kept":{"no":"#);
+        quote(out, &not.no);
+        out.push('}');
+    }
+    out.push_str(r#","ran":"#);
+    match &result.ran {
+        None => out.push_str("null"),
+        Some(ran) => {
+            out.push_str(r#"{"why":"#);
+            quote(out, &ran.why);
+            out.push_str(r#","ask":"#);
+            opt(out, ran.ask.as_deref());
+            out.push_str(r#","before":"#);
+            opt(out, ran.before.as_deref());
+            out.push_str(r#","now":"#);
+            opt(out, ran.now.as_deref());
+            out.push('}');
+        }
+    }
     out.push_str(r#","output":"#);
     // alloc: only for output that is not UTF-8, which is written with U+FFFD in its place
     quote(out, &String::from_utf8_lossy(&result.output));
@@ -365,7 +387,7 @@ pub fn test_summary(
         ("ignored", tally.ignored),
         ("measured", tally.measured),
         ("filtered_out", tally.filtered_out),
-        ("unreached", tally.unreached),
+        ("cached", tally.cached),
         ("binaries", tally.binaries),
         ("unbuilt", tally.unbuilt),
     ] {

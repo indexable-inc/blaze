@@ -11,9 +11,9 @@ set_option linter.unusedVariables false
 def queue.take_keeps_wf (queue_1 : queue.Queue) : Bool :=
   if !(queue.Queue.wf queue_1) then true
   else
-    let queue_8 := queue_1
-    let (t9, queue_8) := queue.Queue.take queue_8
-    queue.Queue.wf queue_8
+    let queue_2 := queue_1
+    let (t0, queue_2) := queue.Queue.take queue_2
+    queue.Queue.wf queue_2
 
 def queue.take_keeps_wf.spec.statement : Prop :=
   ∀ (queue_1 : queue.Queue), queue.take_keeps_wf queue_1 = true

@@ -47,6 +47,10 @@ const ASKED_BOUND: Duration = Duration::from_secs(120);
 /// ([`keep`]).
 pub(crate) const TOOLCHAIN: &str = "toolchain";
 pub(crate) const BSTD: &str = "bstd";
+/// The pin of each test suite's index head and its postings, for as long as the suite's
+/// journal mark names them (`serve::local::TestHeadMark`, `Jobs::test_heads`): a new head
+/// takes the place of the one its mark named, and a mark let go lets its head go.
+pub(crate) const TEST_HEADS: &str = "test heads";
 
 /// Every store key the front-end records of a crate are kept under, from the key its image
 /// is filed under: `hir_def::deps::front_keys` (the image and hir-def's record kinds), then
@@ -102,6 +106,7 @@ fn why_of(name: &str) -> &'static str {
     match name {
         TOOLCHAIN => "the standard library's records, which every build of this toolchain reads",
         BSTD => "bstd's records, which blaze's own crates are built on",
+        TEST_HEADS => "each test suite's index head and postings its journal mark names, which its next run reads",
         _ => "kept by name",
     }
 }

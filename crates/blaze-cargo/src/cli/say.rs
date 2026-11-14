@@ -140,6 +140,13 @@ pub fn warning(what: &str, color: bool) -> String {
     out
 }
 
+/// [`note_into`] as its own text, for a note said once.
+pub fn note(what: &str, color: bool) -> String {
+    let mut out = String::with_capacity(what.len() + 24);
+    note_into(&mut out, what, color);
+    out
+}
+
 /// [`elapsed_into`] as its own text.
 pub fn elapsed(took: Duration) -> String {
     let mut out = String::with_capacity(12);

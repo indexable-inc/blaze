@@ -194,6 +194,7 @@ fn diagnostic(level: Level) -> Response {
 
 fn test_result(outcome: TestOutcome) -> Response {
     Response::TestResult(TestResult {
+        ran: None,
         binary: "tests".to_owned(),
         name: "a_test".to_owned(),
         cached: None,
@@ -202,6 +203,7 @@ fn test_result(outcome: TestOutcome) -> Response {
         millis: 1,
         outside: false,
         executable: 0,
+        not_kept: None,
     })
 }
 
@@ -1141,7 +1143,7 @@ fn best_of_tests_rank_by_failed_then_passed() {
     world.report(jobs[1], test_result(TestOutcome::Passed));
     world.report(jobs[2], test_result(TestOutcome::Passed));
     world.report(jobs[2], test_result(TestOutcome::Passed));
-    world.report(jobs[2], test_result(TestOutcome::Unreached));
+    world.report(jobs[2], test_result(TestOutcome::Ignored));
     world.finish(jobs[0], false, None);
     world.finish(jobs[1], true, None);
     let error = ApiError::new("the sandbox could not start", Some("tests".to_owned()));

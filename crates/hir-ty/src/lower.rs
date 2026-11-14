@@ -3436,12 +3436,10 @@ pub(crate) fn field_types_with_diagnostics<'db>(
     db: &'db Db,
     variant_id: VariantId,
 ) -> Lowered<'db, FieldTypes> {
-    if let Some(krate) = batch::batched_crate(db, variant_id.module(db)) {
-        return batch::CrateFieldTypes::of(db, krate).get(variant_id).unwrap_or_else(|| {
-            panic!("{variant_id:?} is a module-level variant of {krate:?} but not in its batch")
-        });
-    }
-    let result = field_types_of_variant(db, variant_id);
+    let result = match batch::batched_crate(db, variant_id.module(db)) {
+        Some(_) => batched_field_types(db, variant_id),
+        None => field_types_of_variant(db, variant_id),
+    };
     Lowered::new(
         FieldTypes::from_slice(&result.value),
         result.diagnostics(),
@@ -3452,8 +3450,37 @@ pub(crate) fn field_types_with_diagnostics<'db>(
 /// The kind names of the field-type queries, for a test database that marks them fact
 /// boundaries (`blaze_memo::Builder::mark_boundary`): named here, where they are in scope.
 #[cfg(test)]
-pub(crate) const FIELD_TYPES_KINDS: &[&str] =
-    &[field_types_of_variant::KIND_NAME, batch::crate_field_types::KIND_NAME];
+pub(crate) const FIELD_TYPES_KINDS: &[&str] = &[
+    field_types_of_variant::KIND_NAME,
+    batched_field_types::KIND_NAME,
+    batch::crate_field_types::KIND_NAME,
+];
+
+/// A dependency's module-level variant's field types, its row of its crate's batch
+/// (`lower::batch`) copied out: a query of the variant, so a reader reads the variant and not
+/// the batch. A body's step that read the batch itself was kept by the item store under the
+/// whole crate (a read of the batch names no row of it), so a private body's edit of the
+/// dependency reran every dependent body that named one of its types; a read of this is a fact
+/// boundary, the `Signature` fact of the variant's ADT (`blaze_items::goals::fact_of_read`), so
+/// a body's read list names the ADT and not the crate's batch. Its key names the variant's
+/// crate, the arena it is homed at, which is the batch's.
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn batched_field_types<'db>(
+    db: &'db Db,
+    variant_id: VariantId,
+) -> TyLoweringResult<'db, ThinVec<FieldType>> {
+    let krate = batch::batched_crate(db, variant_id.module(db)).unwrap_or_else(|| {
+        panic!("{variant_id:?} is no module-level variant of a dependency crate, so in no batch")
+    });
+    let row = batch::CrateFieldTypes::of(db, krate).get(variant_id).unwrap_or_else(|| {
+        panic!("{variant_id:?} is a module-level variant of {krate:?} but not in its batch")
+    });
+    TyLoweringResult::new(
+        exact_thin(row.value.values().cloned()),
+        row.diagnostics().iter().cloned(),
+        row.defined_anon_consts().iter().copied(),
+    )
+}
 
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn field_types_of_variant<'db>(

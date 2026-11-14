@@ -248,7 +248,8 @@ not run).
   patch`, `file`, `verify` and the store's derive ranges stay in file offsets; the digest is
   of the compact file, its length the real one, and the holes are in the headers it hashes.
   `blaze-inproc`'s hook checks a code overlay against the segment's address, not its file
-  offset, and `host::write_executable` writes the compact file from the image.
+  offset, and the linker's file, which the build places, is the compact one (the host
+  writes no file).
 - **Why not in this pass.** It changes the three writers' headers, the dev run's rule
   (`elf/image.rs` `dev_run`: "is all file bytes"), the code memory's contract and the start
   hook's check in running programs, on three systems. Written without a build or a run, a

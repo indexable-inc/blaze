@@ -17,11 +17,11 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.contents (fuel : Nat) (self : blaze_core.world.disk.Disk) (file : U64) : Result (Option (Vec U8)) := do
-  let t3 ← blaze_core.world.disk.Disk.find fuel self file
-  match t3 with
+  let t0 ← blaze_core.world.disk.Disk.find fuel self file
+  match t0 with
   | Option.some v0 => do
     let «at» := v0
-    let t12 ← Slice.index self.files «at»
-    let t8 ← blaze_core.world.disk.File.contents fuel t12
-    Result.ok (Option.some t8 : Option (Vec U8))
+    let t1 ← Slice.index self.files «at»
+    let t2 ← blaze_core.world.disk.File.contents fuel t1
+    Result.ok (Option.some t2 : Option (Vec U8))
   | Option.none => Result.ok (Option.none : Option (Vec U8))

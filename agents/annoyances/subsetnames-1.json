@@ -1,0 +1,9 @@
+{
+ "id": "subsetnames-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (lane subsetnames)",
+ "where": "crates/blaze-api/src/lib.rs (struct field order), frames/identity.rs every_request_and_response_is_the_bytes_the_old_codec_wrote",
+ "state": "open",
+ "what": "A new field added to an API struct (Subset::generic, after translated) compiles and only fails a VM test round later: the API types must declare fields in CBOR map-key order (shorter key first, then bytewise), a rule the compiler and the check do not say.",
+ "fix": "Reordered the fields. Root fix not built: derive the key order in the codec (or a lint on the API types) so declaration order cannot be wrong."
+}

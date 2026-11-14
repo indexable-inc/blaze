@@ -3,7 +3,7 @@
 //! the linker writes them and the program reads them, and the run side of the jump table that
 //! the generated code and harness call by name:
 //!
-//! - [`log`]: the execution log, `__blaze_exec_slots` and `__blaze_exec_arm`, which the test
+//! - [`log`]: the execution log, `__blaze_exec_table` and `__blaze_exec_arm`, which the test
 //!   harness's recording fork server (`blaze_usercode::test::fork_server(true)`) imports in every
 //!   binary built with jump-table slots, and [`log::publish`], lazy compilation's placer.
 //! - [`blaze_live_counters`]: the counters that code the daemon compiled to count its branches

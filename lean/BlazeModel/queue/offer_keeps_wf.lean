@@ -11,9 +11,9 @@ set_option linter.unusedVariables false
 def queue.offer_keeps_wf (queue_1 : queue.Queue) (item : U32) : Result Bool :=
   if !(queue.Queue.wf queue_1) then Result.ok true
   else do
-    let queue_9 := queue_1
-    let (t10, queue_9) ← queue.Queue.offer queue_9 item
-    Result.ok (queue.Queue.wf queue_9)
+    let queue_2 := queue_1
+    let (t0, queue_2) ← queue.Queue.offer queue_2 item
+    Result.ok (queue.Queue.wf queue_2)
 
 def queue.offer_keeps_wf.spec.statement : Prop :=
   ∀ (queue_1 : queue.Queue) (item : U32), queue.offer_keeps_wf queue_1 item = Result.ok true

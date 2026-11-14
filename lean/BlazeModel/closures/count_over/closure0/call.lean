@@ -6,8 +6,8 @@ import BlazeModel.closures.count_over.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.count_over.closure0.call (t1 : closures.count_over.closure0) (v : U32) : Result (U32 × closures.count_over.closure0) := do
-  let x0 ← Scalar.add t1.c0 (1 : U32)
-  let t1 := { t1 with c0 := x0 }
+def closures.count_over.closure0.call (t0 : closures.count_over.closure0) (v : U32) : Result (U32 × closures.count_over.closure0) := do
+  let x0 ← Scalar.add t0.c0 (1 : U32)
+  let t0 := { t0 with c0 := x0 }
   let ret ← Scalar.div v (2 : U32)
-  Result.ok (ret, t1)
+  Result.ok (ret, t0)

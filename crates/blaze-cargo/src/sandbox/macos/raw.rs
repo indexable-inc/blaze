@@ -139,6 +139,33 @@ pub(super) fn execve(argv: &Strings<'_>, env: &Strings<'_>) {
     unsafe { libc::execve(argv.pointers[0], argv.pointers.as_ptr(), env.pointers.as_ptr()) };
 }
 
+/// `sysctl({CTL_KERN, KERN_PROCARGS2, pid})` into `buffer`: how many bytes it wrote (`pid`'s
+/// argument count, executable path, arguments and environment), or the error it failed with.
+/// Only the test of the hole a sandboxed run carries on macOS reads another process this way
+/// (`tests::a_sandboxed_run_reads_another_processs_environment` in the parent).
+#[cfg(test)]
+pub(super) fn procargs(pid: pid_t, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut name: [c_int; 3] = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut len = buffer.len();
+    // SAFETY: `name` is a live, exclusive array of the 3 integers the call is told of; `buffer`
+    // is live and exclusive for the call, which writes at most `len` (its length) bytes into it
+    // and sets `len`, a live `size_t`, to how many it wrote; nothing is set (null, 0).
+    let got = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if got != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(len)
+}
+
 #[cfg(test)]
 mod tests {
     /// The build-script sandbox rests on the private `sandbox_init_with_parameters` (rule

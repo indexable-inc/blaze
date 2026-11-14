@@ -2511,7 +2511,8 @@ fn one_instance_asked_for_by_two_origins_is_two_functions_of_its_test_binary() {
         live(dependency),
         "two functions across edits: each its own live slot"
     );
-    crate::ExecTable::new(&built, &[], 0, |_| None, ContentId::default(), std::iter::empty())
+    let jump = crate::JumpTable::default();
+    crate::ExecTable::new(&built, &[], jump, |_| None, ContentId::default(), std::iter::empty())
         .unwrap_or_else(|why| panic!("{}", why.describe(&built)));
 }
 

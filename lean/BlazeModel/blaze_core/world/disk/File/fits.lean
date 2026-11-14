@@ -16,9 +16,9 @@ set_option linter.unusedVariables false
 def blaze_core.world.disk.File.fits (self : blaze_core.world.disk.File) (kept : blaze_core.world.disk.Kept) : Result Bool :=
   if Scalar.gt kept.whole (Slice.len self.changes) then Result.ok false
   else
-    let t12 := kept.undone
-    let t11 := if t12 then core.option.Option.is_none self.undo else t12
-    if t11 then Result.ok false
+    let t0 := kept.undone
+    let t1 := if t0 then core.option.Option.is_none self.undo else t0
+    if t1 then Result.ok false
     else
       match kept.torn with
       | blaze_core.world.disk.Torn.Nothing => Result.ok true
@@ -26,8 +26,8 @@ def blaze_core.world.disk.File.fits (self : blaze_core.world.disk.File) (kept : 
         let count := v0
         if Scalar.eq kept.whole (Slice.len self.changes) then Result.ok false
         else do
-          let t29 ← Slice.index self.changes kept.whole
-          match t29.change with
+          let t2 ← Slice.index self.changes kept.whole
+          match t2.change with
           | blaze_core.world.disk.Change.Append v1 =>
             let more := v1
             Result.ok (Scalar.le count (Slice.len more))
@@ -39,11 +39,11 @@ def blaze_core.world.disk.File.fits (self : blaze_core.world.disk.File) (kept : 
         let landed := v4
         if Scalar.eq kept.whole (Slice.len self.changes) then Result.ok false
         else do
-          let t45 ← Slice.index self.changes kept.whole
-          match t45.change with
+          let t3 ← Slice.index self.changes kept.whole
+          match t3.change with
           | blaze_core.world.disk.Change.Sectors v5 v6 => do
-            let more_46 := v6
-            let t47 := Slice.len landed
-            let t49 ← blaze_core.world.disk.sectors (Slice.len more_46)
-            Result.ok (Scalar.eq t47 t49)
+            let more_1 := v6
+            let t4 := Slice.len landed
+            let t5 ← blaze_core.world.disk.sectors (Slice.len more_1)
+            Result.ok (Scalar.eq t4 t5)
           | _ => Result.ok false

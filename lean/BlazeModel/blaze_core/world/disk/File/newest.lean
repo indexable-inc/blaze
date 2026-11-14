@@ -13,28 +13,28 @@ import BlazeModel.blaze_core.world.disk.File.reach
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.world.disk.File.newest.loop_0 (fuel : Nat) (self : blaze_core.world.disk.File) (reach : Usize) (none_8 : Bool) (newest_9 : U64) (i : Usize) : Result (Bool × U64) :=
+def blaze_core.world.disk.File.newest.loop_0 (fuel : Nat) (self : blaze_core.world.disk.File) (reach : Usize) (none_1 : Bool) (newest_1 : U64) (i : Usize) : Result (Bool × U64) :=
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i reach then do
-      let t19 ← Slice.index self.changes i
-      let epoch := t19.epoch
-      let t22 := none_8
-      let t21 := if t22 then t22 else Scalar.gt epoch newest_9
-      let (none_8, newest_9) :=
-        if t21 then
-          let newest_9 := epoch
-          let none_8 := false
-          (none_8, newest_9)
-        else (none_8, newest_9)
+      let t0 ← Slice.index self.changes i
+      let epoch := t0.epoch
+      let t1 := none_1
+      let t2 := if t1 then t1 else Scalar.gt epoch newest_1
+      let (none_1, newest_1) :=
+        if t2 then
+          let newest_1 := epoch
+          let none_1 := false
+          (none_1, newest_1)
+        else (none_1, newest_1)
       let i ← Scalar.add i (1 : Usize)
-      blaze_core.world.disk.File.newest.loop_0 fuel self reach none_8 newest_9 i
-    else Result.ok (none_8, newest_9)
+      blaze_core.world.disk.File.newest.loop_0 fuel self reach none_1 newest_1 i
+    else Result.ok (none_1, newest_1)
 
 def blaze_core.world.disk.File.newest (fuel : Nat) (self : blaze_core.world.disk.File) (kept : blaze_core.world.disk.Kept) (none : Bool) (newest : U64) : Result (Bool × U64) := do
   let reach ← blaze_core.world.disk.File.reach self kept
-  let none_8 := none
-  let newest_9 := newest
+  let none_1 := none
+  let newest_1 := newest
   let i := (0 : Usize)
-  blaze_core.world.disk.File.newest.loop_0 fuel self reach none_8 newest_9 i
+  blaze_core.world.disk.File.newest.loop_0 fuel self reach none_1 newest_1 i

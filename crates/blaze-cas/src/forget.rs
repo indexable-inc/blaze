@@ -4,8 +4,9 @@
 //! whose file is its one home, is worth forgetting the moment nothing needs it, and its pack
 //! holds no more than its header. So one record is forgotten here, its pack kept.
 //!
-//! - **Asked, then due.** [`Store::forget`] queues a key (the place that held it was
-//!   replaced, [`crate::whole`]); [`Store::forget_due`], which the driver calls between
+//! - **Asked, then due.** [`Store::forget`] queues a key (asked by its caller; never by a place
+//!   over the value, which until 2026-11-14 asked it and so lost a value a unit record still
+//!   named, D45); [`Store::forget_due`], which the driver calls between
 //!   builds once a scan was handed back (a build never finds a key and then misses it),
 //!   forgets each queued record no root names, by the collector's own rule asked of one
 //!   record ([`crate::collect::Collecting::unrooted`]): no pin, no path placed from it, no

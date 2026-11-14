@@ -136,6 +136,24 @@ made only of a clone waits for the file to be made, sealed and written back firs
   after the place completed and a `stat` of it (`paths.placed`, in memory), and a daemon that
   starts knows of no placed file, so the next build places again. No hash of the file is
   taken: the check is the recorded length and mtime against a `stat`.
+- **One writer per path** (2026-11-14). An output path is written only by its job's
+  placement (`Jobs::place`, `place_made`, `place_patched`, `place_also`, each under the
+  store's `place` span naming the path). A dev executable's launch (a test binary, `blaze
+  run`) writes nothing: it is started from the placed file with the key the path's record
+  holds (`Jobs::placed_key`, read once the job's placements have ended), and refused naming
+  the path and both keys where that is not its code memory's file
+  (`blaze_inproc::host::StartError::NotPlaced`). So a build after a test run finds the file
+  as placed and places nothing. A request certificate names an output by the key its own
+  build left there as it answered (`Jobs::left_by`), and is not written where the record
+  holds another by the time the build has settled (another request placed it). Its check
+  refuses, from the record alone and with no look at the file, an output whose path's record
+  holds another key or has a placement in flight (`certify::placed_elsewhere`): that request
+  goes to its job, which clones the answer's file back. Alternating two commands that share
+  a path places one file per switch, and a repeat places nothing. A value placed over stays
+  in the store, its record and its home (`blaze_cas::Store::names_step` asks no forget of it
+  since 2026-11-14; until then the first `run` after run, build, run, build failed on
+  "the store has nothing under .. to place"): only the collector, by budget, lets it go, and a
+  unit record whose outputs the store no longer holds is not replayed (`header::check`).
 - **The loop thread.** `FICLONE` runs on a thread off the ring with a span `io clone <file>`;
   the ring's eventfd is written only while its thread is parked. Still in line on the ring's
   thread, each one metadata call: mode, seal, times, readlink, flock, truncate, mmap.

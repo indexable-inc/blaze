@@ -21,7 +21,7 @@ people: `messages` (a build's `--message-format=json` lines), `worked` and `link
 `blaze build` read for how it linked one program), `split_build_output` and `build_finished`
 (its `build-finished` line), `blaze_status` (`blaze status --json`), `blaze_toolchain`
 (`blaze toolchain --json`), `daemon_pid` (the daemon's lock), and `Daemon.command` with `test_results`: any blaze command asked of the daemon,
-and the `blaze-test-result` lines of a `blaze test --reached --message-format=json`
+and the `blaze-test-result` lines of a `blaze test --message-format=json`
 (crates/blaze-cargo/src/cli/json.rs, `test_result`) read into `TestLine`s.
 """
 
@@ -756,8 +756,8 @@ class Ran:
     stderr: str
 
 
-Outcome = Literal["passed", "failed", "ignored", "unreached"]
-OUTCOMES: tuple[Outcome, ...] = ("passed", "failed", "ignored", "unreached")
+Outcome = Literal["passed", "failed", "ignored"]
+OUTCOMES: tuple[Outcome, ...] = ("passed", "failed", "ignored")
 
 
 @dataclass(frozen=True)
@@ -812,7 +812,7 @@ def _cached(line: Mapping[str, object]) -> CachedRun | None:
 
 
 def test_results(stdout: str) -> list[TestLine]:
-    """The `blaze-test-result` lines of what `blaze test --reached --message-format=json`
+    """The `blaze-test-result` lines of what `blaze test --message-format=json`
     printed, in order; a line of that reason missing a field, or with one of another type,
     fails naming it."""
     found: list[TestLine] = []

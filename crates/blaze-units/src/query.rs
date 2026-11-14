@@ -438,7 +438,9 @@ pub enum Planned {
 
 impl Versioned for Planned {
     // 10: a git fetch carries the tree digest it is pinned by (`FetchKind::Git::tree`).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 10");
+    // 11: its `Units` lost `sandboxed_tests`, and `TestSandbox::opted_in` became
+    // `outside_by_host` (tests are sandboxed by default where the host can keep them apart).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 11");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -529,7 +531,9 @@ pub struct Units {
     /// cargo's warnings of the load, each as cargo prints it after `warning: `.
     pub warnings: Vec<String>,
     /// blaze's notes of the load, each as it is printed after `note: `: a setting it accepts
-    /// and does not honour yet, said on every build that sets it.
+    /// and does not honour yet, or one that does nothing on this host (`sandboxed-tests` on
+    /// Linux, where tests are sandboxed anyway), said
+    /// on every build that sets it.
     pub notes: Vec<String>,
     pub target_dir: String,
     pub build_dir: String,
@@ -538,10 +542,6 @@ pub struct Units {
     /// The workspace's `build-script-link-dirs`, absolute or `${NAME}/rest` for a run to expand
     /// (`blaze_cargo::directives::link_dirs`).
     pub link_dirs: Vec<String>,
-    /// The workspace's root manifest lists `sandboxed-tests` in `experimental` under
-    /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
-    /// [`TestSandbox`] takes out.
-    pub sandboxed_tests: bool,
     /// The pinned native inputs (`[workspace.metadata.blaze.native.<name>]`, docs/cargo.md,
     /// "Pinned native inputs") some build script run of this graph is given: one per input and
     /// target, sorted by name then target. The daemon fetches and lays out each before any
@@ -554,7 +554,9 @@ impl Versioned for Units {
     // 14: the pinned native inputs ([`Units::native`]).
     // 15: [`LockWrite`] writes `blaze.lock` too, and says what moved.
     // 16: a git package's tree digest ([`PackagePlan::tree`]).
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 16");
+    // 17: `sandboxed_tests` left and `TestSandbox::opted_in` became `outside_by_host`: tests
+    // are sandboxed by default where the host can keep them apart.
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 17");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -733,11 +735,13 @@ pub struct PackagePlan {
 }
 
 impl PackagePlan {
-    /// Whether the package's tests run sandboxed, when the build runs any so: `tests = true`
-    /// or the workspace's `sandboxed-tests` experiment ([`Units::sandboxed_tests`]), unless
-    /// `tests = false`.
-    pub fn tests_sandboxed(&self, experiment: bool) -> bool {
-        !self.tests.all && (self.tests.opted_in || experiment)
+    /// Whether the package's tests run sandboxed when the command does not take them out
+    /// (`BLAZE_SANDBOX=off`): unless `tests = false`, or the host the plan is for runs tests
+    /// sandboxed only on an opt-in and the package did not get one
+    /// ([`TestSandbox::outside_by_host`]); `unsandboxed-tests` takes out the tests it names
+    /// ([`TestSandbox::outside`]).
+    pub fn tests_sandboxed(&self) -> bool {
+        !self.tests.all && !self.tests.outside_by_host
     }
 }
 
@@ -746,9 +750,12 @@ impl PackagePlan {
 pub struct TestSandbox {
     /// `tests = false`: every test of the package runs outside.
     pub all: bool,
-    /// `tests = true`: every test of the package runs sandboxed but those of `tests`, whether
-    /// or not the workspace opts in.
-    pub opted_in: bool,
+    /// Its tests run outside because the host the plan is for sandboxes tests only where the
+    /// package (`tests = true`) or the workspace (`experimental = ["sandboxed-tests"]`) opts
+    /// in, and neither did: decided by the load, by
+    /// `crate::load::sandbox::tests_sandboxed_by_default`, which says why (macOS today).
+    /// False with `tests = false`, which says it alone.
+    pub outside_by_host: bool,
     /// `unsandboxed-tests`: the tests, by libtest's names, that run outside; sorted, each once.
     pub tests: Vec<String>,
 }

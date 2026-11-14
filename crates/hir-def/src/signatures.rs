@@ -3163,8 +3163,8 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         signatures.chain(variants).collect()
     }
 
-    /// The signature lowerings in `log`: `kept` lowers what `of` reads, `relative` lowers it
-    /// again with its source map.
+    /// The signature lowerings in `log`: `lowered` lowers what `of` reads in a crate no record
+    /// serves, `relative` lowers it again with its source map.
     fn lowerings(log: &[String]) -> Vec<&str> {
         // `lowered` is the query that lowers alone (`kept` routes to it and is no query).
         let lowering = |it: &&String| {

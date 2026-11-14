@@ -1058,6 +1058,14 @@ impl Image {
         self.state.slots
     }
 
+    /// How many slots the jump table has room for: the count its header and its live
+    /// descriptor hold, fixed at the image's first link (an incremental link that would pass
+    /// it is refused), which the program's runtime arms a byte of the execution log for each
+    /// of; [`Image::slots`] of them are given out.
+    pub fn capacity(&self) -> u32 {
+        self.state.capacity
+    }
+
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
         let sym = self.symbols.find_slot(function)?;
         let (piece, offset) = self.state.home(sym)?;

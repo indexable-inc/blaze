@@ -12,7 +12,7 @@ def core.option.Option.u32.map.u32_closure0_count_over (self : Option U32) (f : 
     match self with
     | Option.some v0 => do
       let x := v0
-      let (t5, t6) ← closures.count_over.closure0.call f x
-      Result.ok (Option.some t5 : Option U32)
+      let (t0, t1) ← closures.count_over.closure0.call f x
+      Result.ok (Option.some t0 : Option U32)
     | Option.none => Result.ok (Option.none : Option U32)
   Result.ok (ret, f)

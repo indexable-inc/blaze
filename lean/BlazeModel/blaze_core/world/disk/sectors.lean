@@ -6,8 +6,8 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.sectors (len : Usize) : Result Usize := do
-  let t2 ← Scalar.div len (512 : Usize)
-  let t7 ← Scalar.rem len (512 : Usize)
-  let t6 := Scalar.eq t7 (0 : Usize)
-  let t5 := if t6 then (0 : Usize) else (1 : Usize)
-  Scalar.add t2 t5
+  let t0 ← Scalar.div len (512 : Usize)
+  let t1 ← Scalar.rem len (512 : Usize)
+  let t2 := Scalar.eq t1 (0 : Usize)
+  let t3 := if t2 then (0 : Usize) else (1 : Usize)
+  Scalar.add t0 t3

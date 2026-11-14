@@ -31,29 +31,29 @@ def blaze_core.world.disk.File.sync.loop_1 (fuel : Nat) (self : blaze_core.world
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.barriers) then do
-      let t33 ← Slice.index self.barriers i
-      let t30 := Scalar.gt t33.covers covered
+      let t0 ← Slice.index self.barriers i
+      let t1 := Scalar.gt t0.covers covered
       let (self, i) ←
-        if t30 then do
-          let t37 := covered
-          let t51 := i
-          let x2 ← Slice.index self.barriers t51
-          let x3 ← Scalar.sub x2.covers t37
-          let x4 ← Slice.index self.barriers t51
-          let x5 ← Slice.update self.barriers t51 { x4 with covers := x3 }
+        if t1 then do
+          let t2 := covered
+          let t3 := i
+          let x2 ← Slice.index self.barriers t3
+          let x3 ← Scalar.sub x2.covers t2
+          let x4 ← Slice.index self.barriers t3
+          let x5 ← Slice.update self.barriers t3 { x4 with covers := x3 }
           let self := { self with barriers := x5 }
           let i ← Scalar.add i (1 : Usize)
           Result.ok (self, i)
         else do
-          let (t42, x6) ← Vec.remove self.barriers i
+          let (t4, x6) ← Vec.remove self.barriers i
           let self := { self with barriers := x6 }
           Result.ok (self, i)
       blaze_core.world.disk.File.sync.loop_1 fuel self covered i
     else Result.ok self
 
 def blaze_core.world.disk.File.sync (fuel : Nat) (self : blaze_core.world.disk.File) (covers : Usize) : Result blaze_core.world.disk.File := do
-  let t4 := Scalar.lt covers (Slice.len self.changes)
-  let covered := if t4 then covers else Slice.len self.changes
+  let t5 := Scalar.lt covers (Slice.len self.changes)
+  let covered := if t5 then covers else Slice.len self.changes
   let done := (0 : Usize)
   let self ← blaze_core.world.disk.File.sync.loop_0 fuel self covered done
   let i := (0 : Usize)

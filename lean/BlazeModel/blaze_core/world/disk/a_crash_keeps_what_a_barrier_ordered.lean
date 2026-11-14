@@ -33,45 +33,45 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered (fuel : Nat) (disk : blaze_core.world.disk.Disk) (file : U64) (later : U64) (bytes : Vec U8) (cut : Vec blaze_core.world.disk.Kept) : Result Bool := do
-  let disk_6 := disk
-  let t11 ← blaze_core.world.disk.Disk.wf fuel disk_6
-  let t10 := !t11
-  let t9 ←
-    if t10 then Result.ok t10
+  let disk_1 := disk
+  let t0 ← blaze_core.world.disk.Disk.wf fuel disk_1
+  let t1 := !t0
+  let t2 ←
+    if t1 then Result.ok t1
     else do
-      let t13 ← blaze_core.world.disk.Disk.small fuel disk_6
-      Result.ok (!t13)
-  let t8 := if t9 then t9 else Scalar.eq disk_6.epoch (18446744073709551615 : U64)
-  if t8 then Result.ok true
+      let t3 ← blaze_core.world.disk.Disk.small fuel disk_1
+      Result.ok (!t3)
+  let t4 := if t2 then t2 else Scalar.eq disk_1.epoch (18446744073709551615 : U64)
+  if t4 then Result.ok true
   else do
-    let t20 ← blaze_core.world.disk.Disk.find fuel disk_6 file
-    match t20 with
+    let t5 ← blaze_core.world.disk.Disk.find fuel disk_1 file
+    match t5 with
     | Option.some v0 => do
       let «at» := v0
-      let t30 ← Slice.index disk_6.files «at»
-      let covers := Slice.len t30.changes
-      let disk_6 ← blaze_core.world.disk.Disk.barrier fuel disk_6 file covers
-      let disk_6 ← blaze_core.world.disk.Disk.append fuel disk_6 later bytes
-      let t41 ← blaze_core.world.disk.Disk.allows fuel disk_6 cut
-      if !t41 then Result.ok true
+      let t6 ← Slice.index disk_1.files «at»
+      let covers := Slice.len t6.changes
+      let disk_1 ← blaze_core.world.disk.Disk.barrier fuel disk_1 file covers
+      let disk_1 ← blaze_core.world.disk.Disk.append fuel disk_1 later bytes
+      let t7 ← blaze_core.world.disk.Disk.allows fuel disk_1 cut
+      if !t7 then Result.ok true
       else do
-        let t50 ← blaze_core.world.disk.Disk.find fuel disk_6 file
-        match t50 with
+        let t8 ← blaze_core.world.disk.Disk.find fuel disk_1 file
+        match t8 with
         | Option.some v1 => do
           let ordered := v1
-          let t56 ← blaze_core.world.disk.Disk.find fuel disk_6 later
-          match t56 with
+          let t9 ← blaze_core.world.disk.Disk.find fuel disk_1 later
+          match t9 with
           | Option.some v2 => do
             let appended := v2
-            let t66 ← Slice.index disk_6.files appended
-            let last ← Scalar.sub (Slice.len t66.changes) (1 : Usize)
-            let t71 ← Slice.index disk_6.files appended
-            let t68 := t71
-            let t76 ← Slice.index cut appended
-            let t67 ← blaze_core.world.disk.File.reach t68 t76
-            let t77 := last
-            let t80 ← Slice.index cut ordered
-            Result.ok (blaze_core.world.disk.ordered_first t67 t77 t80.whole covers)
+            let t10 ← Slice.index disk_1.files appended
+            let last ← Scalar.sub (Slice.len t10.changes) (1 : Usize)
+            let t11 ← Slice.index disk_1.files appended
+            let t12 := t11
+            let t13 ← Slice.index cut appended
+            let t14 ← blaze_core.world.disk.File.reach t12 t13
+            let t15 := last
+            let t16 ← Slice.index cut ordered
+            Result.ok (blaze_core.world.disk.ordered_first t14 t15 t16.whole covers)
           | Option.none => Result.ok false
         | Option.none => Result.ok false
     | Option.none => Result.ok true

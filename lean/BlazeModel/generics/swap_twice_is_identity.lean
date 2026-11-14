@@ -10,8 +10,8 @@ set_option linter.unusedVariables false
 
 def generics.swap_twice_is_identity (a : U32) (b : U32) : Bool :=
   let p := generics.Pair.u32.swap (generics.Pair.u32.swap (generics.Pair.u32.new a b))
-  let t8 := Scalar.eq p.a a
-  if t8 then Scalar.eq p.b b else t8
+  let t0 := Scalar.eq p.a a
+  if t0 then Scalar.eq p.b b else t0
 
 def generics.swap_twice_is_identity.spec.statement : Prop :=
   ∀ (a : U32) (b : U32), generics.swap_twice_is_identity a b = true

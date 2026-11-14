@@ -50,6 +50,9 @@ exclude = [
 resolver = "2"
 
 [workspace.metadata.blaze]
+# `sandboxed-tests` sandboxes every member's tests on macOS, where tests are sandboxed only on
+# an opt-in (docs/cargo.md, "Sandboxed tests"), and on the stage 0 at `version` below, which
+# predates sandboxed tests by default. On Linux a blaze since notes that it does nothing there.
 experimental = ["sandboxed-tests"]
 version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,

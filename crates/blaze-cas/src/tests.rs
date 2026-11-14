@@ -2477,8 +2477,9 @@ fn an_output_is_written_where_it_goes_first_and_cloned_once_its_file_is_written_
     assert_eq!(sim.mode(&name("three/build/a")), Some(0o644), "a clone is a written file's mode");
     assert_eq!((own(sim.bytes_written(), &store) - wrote, sim.bytes_forced()), (0, 0));
     // Each path placed again from another value: the whole file stays while a path names it.
-    // Synced, it is its value's one home (`home`), so once the last path lets go it goes with
-    // its record, forgotten between builds, never alone; put again, placing it writes it again.
+    // Synced, it is its value's one home (`home`): once the last path lets go it stays with its
+    // record (a place over it asks no forget, D45), and goes with it once the record is
+    // forgotten, never alone; put again, placing it writes it again.
     store.put(key(9), Kind::Output, b"another value").unwrap();
     flush(&mut sim, &mut store);
     for to in ["one/build/a", "two/build/a"] {
@@ -2487,6 +2488,8 @@ fn an_output_is_written_where_it_goes_first_and_cloned_once_its_file_is_written_
     }
     assert_eq!(place_key(&mut sim, &mut store, key(9), "three/build/a").result, Ok(()));
     assert!(sim.exists(&file), "key 1's home: it goes with its record, never alone");
+    assert_eq!(forgets_due(&mut sim, &mut store).forgotten, Vec::<Key>::new(), "a place over it asks no forget");
+    store.forget(key(1));
     assert_eq!(forgets_due(&mut sim, &mut store).forgotten, vec![key(1)], "no path names it");
     assert!(!sim.exists(&file), "no path names it, and its record is forgotten");
     store.put(key(1), Kind::Output, &out).unwrap();
@@ -2541,40 +2544,61 @@ fn forgets_due(sim: &mut Sim, store: &mut Store) -> crate::forget::Forgot {
     forgot
 }
 
-/// The invariant (`whole`, `forget`): a value that is a file of its own (`file-<content>`, here
-/// machine code) placed at two paths is named by both; once neither holds it and no root
-/// names its key, its record is forgotten and its file removed, for good across an open. The
-/// control: while the second path still names it, the record and the file stay.
+/// The invariant (D45, "what an output path holds"; `whole`, `forget`): a value that is a file
+/// of its own (`file-<content>`, here machine code) placed at two paths and then placed over
+/// at both is kept, its record and its file, across an open, and is placed back from them: a
+/// place over a value asks no forget, so a unit record that names it can still be replayed.
+/// Once its record is asked forgotten and no root names it, it goes for good across an open.
+/// The control: [`PlacePlant::ForgetsOnOverwrite`], the forget a place over it asked until
+/// 2026-11-14, loses the value as its last path is placed over.
 #[test]
-fn a_file_of_its_own_goes_with_its_record_once_no_path_names_it() {
-    let mut sim = Sim::new(43, quiet());
-    let mut store = open(&mut sim, "store");
-    let (code, other) = (noise(8 << 10, 43), noise(8 << 10, 44));
-    store.put(key(1), Kind::Machine, &code).unwrap();
-    store.put(key(2), Kind::Machine, &other).unwrap();
-    flush(&mut sim, &mut store);
-    let file = name(&format!("store/{}", disk::external_file(&content_of(&code))));
-    assert!(sim.exists(&file));
-    for to in ["one/build/a", "two/build/a"] {
-        assert_eq!(place_key(&mut sim, &mut store, key(1), to).result, Ok(()));
+fn a_value_placed_over_is_kept_while_nothing_but_its_path_let_go_of_it() {
+    for plant in [PlacePlant::None, PlacePlant::ForgetsOnOverwrite] {
+        let mut sim = Sim::new(43, quiet());
+        let mut store = open(&mut sim, "store");
+        store.plant = plant;
+        let (code, other) = (noise(8 << 10, 43), noise(8 << 10, 44));
+        store.put(key(1), Kind::Machine, &code).unwrap();
+        store.put(key(2), Kind::Machine, &other).unwrap();
+        flush(&mut sim, &mut store);
+        let file = name(&format!("store/{}", disk::external_file(&content_of(&code))));
+        assert!(sim.exists(&file));
+        for to in ["one/build/a", "two/build/a"] {
+            assert_eq!(place_key(&mut sim, &mut store, key(1), to).result, Ok(()));
+        }
+        assert_eq!(place_key(&mut sim, &mut store, key(2), "one/build/a").result, Ok(()));
+        let forgot = forgets_due(&mut sim, &mut store);
+        assert!(forgot.forgotten.is_empty(), "{plant:?}: two/build/a names it: {forgot:?}");
+        assert_eq!(place_key(&mut sim, &mut store, key(2), "two/build/a").result, Ok(()));
+        let forgot = forgets_due(&mut sim, &mut store);
+        if plant == PlacePlant::ForgetsOnOverwrite {
+            assert_eq!(forgot.forgotten, vec![key(1)], "the control: a place over it forgets it");
+            assert!(bytes_of(&store, &key(1)).is_none(), "the control: the value is gone");
+            continue;
+        }
+        assert!(forgot.forgotten.is_empty(), "a place over it asks no forget: {forgot:?}");
+        assert!(sim.exists(&file), "its record's home stays");
+        assert_eq!(bytes_of(&store, &key(1)).unwrap(), code);
+        // Placed back, as the next request whose record names it does.
+        assert_eq!(place_key(&mut sim, &mut store, key(1), "one/build/a").result, Ok(()));
+        assert_eq!(sim.contents(&name("one/build/a")), code);
+        assert_eq!(place_key(&mut sim, &mut store, key(2), "one/build/a").result, Ok(()));
+        drop(store);
+        let mut store = open(&mut sim, "store");
+        assert_eq!(bytes_of(&store, &key(1)).unwrap(), code, "kept across an open");
+        // Asked forgotten (the collector's or a caller's ask): it goes with its record.
+        store.forget(key(1));
+        let forgot = forgets_due(&mut sim, &mut store);
+        assert_eq!(forgot.forgotten, vec![key(1)]);
+        assert!(bytes_of(&store, &key(1)).is_none(), "a forgotten record is never served");
+        assert!(!sim.exists(&file), "its file goes once the head that says so is durable");
+        assert_eq!(sim.contents(&name("one/build/a")), other);
+        drop(store);
+        let store = open(&mut sim, "store");
+        assert!(bytes_of(&store, &key(1)).is_none(), "forgotten for good");
+        assert_eq!(bytes_of(&store, &key(2)).unwrap(), other);
+        assert_eq!(store.problems(), &[] as &[String]);
     }
-    assert_eq!(place_key(&mut sim, &mut store, key(2), "one/build/a").result, Ok(()));
-    let forgot = forgets_due(&mut sim, &mut store);
-    assert!(forgot.forgotten.is_empty(), "the control: two/build/a names it: {forgot:?}");
-    assert!(sim.exists(&file));
-    assert_eq!(bytes_of(&store, &key(1)).unwrap(), code);
-    assert_eq!(place_key(&mut sim, &mut store, key(2), "two/build/a").result, Ok(()));
-    assert_eq!(store.forgets_waiting(), 1, "no path names it: its record is asked forgotten");
-    let forgot = forgets_due(&mut sim, &mut store);
-    assert_eq!(forgot.forgotten, vec![key(1)]);
-    assert!(bytes_of(&store, &key(1)).is_none(), "a forgotten record is never served");
-    assert!(!sim.exists(&file), "its file goes once the head that says so is durable");
-    assert_eq!(sim.contents(&name("one/build/a")), other);
-    drop(store);
-    let store = open(&mut sim, "store");
-    assert!(bytes_of(&store, &key(1)).is_none(), "forgotten for good");
-    assert_eq!(bytes_of(&store, &key(2)).unwrap(), other);
-    assert_eq!(store.problems(), &[] as &[String]);
 }
 
 #[test]
@@ -2762,8 +2786,11 @@ fn a_placed_file_stays_while_a_place_or_a_path_names_it_and_goes_with_the_last()
     assert_eq!(place_key(&mut sim, &mut store, key(9), "two/build/a").result, Ok(()));
     assert!(sim.exists(&file), "three/build/a, placed from another key of its bytes, names it");
     assert_eq!(place_key(&mut sim, &mut store, key(9), "three/build/a").result, Ok(()));
-    // The home of its keys' records (`home`): it goes with them, forgotten between builds.
+    // The home of its keys' records (`home`): it goes with them, once they are asked forgotten
+    // (a place over them asks no forget, D45) and forgotten between builds.
     assert!(sim.exists(&file), "a home goes with its records, never alone");
+    store.forget(key(1));
+    store.forget(key(2));
     let forgot = forgets_due(&mut sim, &mut store);
     assert!(forgot.forgotten.contains(&key(1)), "no path names it: {forgot:?}");
     assert!(!sim.exists(&file), "no path names it, and its records are forgotten");
@@ -2818,6 +2845,7 @@ fn a_placed_directory_that_cannot_be_looked_through_breaks_the_store() {
     store.put(key(9), Kind::Output, b"another value").unwrap();
     flush(&mut sim, &mut store);
     assert_eq!(place_key(&mut sim, &mut store, key(9), "one/build/a").result, Ok(()));
+    store.forget(key(1));
     assert_eq!(forgets_due(&mut sim, &mut store).forgotten, vec![key(1)]);
     assert!(!sim.exists(&file), "a forgotten home goes");
     store.put(key(1), Kind::Output, &out).unwrap();

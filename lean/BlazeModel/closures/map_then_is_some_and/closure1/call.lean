@@ -6,5 +6,5 @@ import BlazeModel.closures.map_then_is_some_and.closure1.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.map_then_is_some_and.closure1.call (t1 : closures.map_then_is_some_and.closure1) (v : U32) : Bool :=
-  Scalar.gt v t1.c0
+def closures.map_then_is_some_and.closure1.call (t0 : closures.map_then_is_some_and.closure1) (v : U32) : Bool :=
+  Scalar.gt v t0.c0

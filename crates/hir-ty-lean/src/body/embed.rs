@@ -169,6 +169,8 @@ impl<'db> Writer<'_, 'db> {
             Ty::Duration => "core::time::Duration".to_owned(),
             Ty::Ordering => "core::cmp::Ordering".to_owned(),
             Ty::Str => "str".to_owned(),
+            Ty::Opaque(opaque) => opaque.rust().to_owned(),
+            Ty::Shared(shared) => shared.rust(),
         }
     }
 
@@ -241,7 +243,7 @@ impl<'db> Writer<'_, 'db> {
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }
-            Ty::Duration | Ty::Ordering | Ty::Str => {
+            Ty::Duration | Ty::Ordering | Ty::Str | Ty::Opaque(_) | Ty::Shared(_) => {
                 let key = Self::key(ty);
                 return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
             }
@@ -293,7 +295,10 @@ impl<'db> Writer<'_, 'db> {
                     Operand::Place(_) => {
                         return Err(self.cx.refuse("a constant that is a place", at));
                     }
-                    Operand::Str(_) | Operand::Duration { .. } | Operand::Ordering(_) => {
+                    Operand::Str(_)
+                    | Operand::Duration { .. }
+                    | Operand::Ordering(_)
+                    | Operand::Variant { .. } => {
                         return Err(self.cx.refuse(
                             format!("a constant of type `{}`, which the MIR model has no declaration of", Self::key(&ty)),
                             at,
@@ -700,6 +705,7 @@ fn body<'db>(
         derives: BTreeSet::new(),
         envs: BTreeMap::new(),
         lent: BTreeMap::new(),
+        opaques: Vec::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());

@@ -255,8 +255,8 @@ thread_local! {
 pub enum Refusal {
     /// A read of this query or input is neither covered by the identity nor a fact.
     Read(&'static str),
-    /// A fact it read cannot be hashed now.
-    Unhashable,
+    /// A fact it read cannot be hashed now: the first such, by kind and subject.
+    Unhashable(FactRef),
     /// The body has no identity.
     NoIdentity,
     /// What it read could not be captured shareably.
@@ -272,7 +272,7 @@ impl Refusal {
     pub fn name(self) -> &'static str {
         match self {
             Refusal::Read(name) => name,
-            Refusal::Unhashable => "the item store: a fact the step read cannot be hashed now",
+            Refusal::Unhashable(_) => "the item store: a fact the step read cannot be hashed now",
             Refusal::NoIdentity => "the item store: the body has no identity",
             Refusal::Unshareable => {
                 "the item store: the step's read list was not recorded (a snapshot that keeps no read lists)"
@@ -562,7 +562,7 @@ impl Store {
         scratch.facts.sort_unstable();
         scratch.facts.dedup();
         for &fact in &scratch.facts {
-            scratch.values.push(self.facts.value(db, def, fact).ok_or(Refusal::Unhashable)?);
+            scratch.values.push(self.facts.value(db, def, fact).ok_or(Refusal::Unhashable(fact))?);
         }
         if let Err(why) = write(&*self.facts, &mut scratch.answer) {
             tracing::debug!(?def, step = what(step), %why, "a step's result with no stored form");

@@ -215,7 +215,9 @@ pub fn fact_of_read(db: &Db, krate: Crate, read: blaze_memo::Read) -> Option<Fac
         return signature(ItemId::Adt(adt));
     }
     if let Some((variant,)) =
-        of!(ty::field_types_of_variant).or_else(|| of!(ty::ctor_variances_query))
+        of!(ty::field_types_of_variant)
+            .or_else(|| of!(ty::batched_field_types))
+            .or_else(|| of!(ty::ctor_variances_query))
     {
         return signature(ItemId::Adt(variant.adt_id(db)));
     }
@@ -357,6 +359,7 @@ pub const QUERIES: &[&str] = {
         sig::UnionSignature_lowered::KIND_NAME,
         ty::representability::KIND_NAME,
         ty::field_types_of_variant::KIND_NAME,
+        ty::batched_field_types::KIND_NAME,
         ty::ctor_variances_query::KIND_NAME,
         ty::fn_sig_for_enum_variant_constructor::KIND_NAME,
         sig::TraitSignature_served::KIND_NAME,

@@ -14,13 +14,13 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.put (fuel : Nat) (self : blaze_core.world.disk.Disk) (file : blaze_core.world.disk.File) : Result blaze_core.world.disk.Disk := do
   let «at» ← blaze_core.world.disk.Disk.slot fuel self file.name
-  let t7 := Scalar.lt «at» (Slice.len self.files)
-  let t6 ←
-    if t7 then do
-      let t14 ← Slice.index self.files «at»
-      Result.ok (Scalar.eq t14.name file.name)
-    else Result.ok t7
-  if t6 then do
+  let t0 := Scalar.lt «at» (Slice.len self.files)
+  let t1 ←
+    if t0 then do
+      let t2 ← Slice.index self.files «at»
+      Result.ok (Scalar.eq t2.name file.name)
+    else Result.ok t0
+  if t1 then do
     let x0 ← Slice.update self.files «at» file
     Result.ok { self with files := x0 }
   else do

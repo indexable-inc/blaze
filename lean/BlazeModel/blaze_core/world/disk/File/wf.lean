@@ -15,12 +15,12 @@ def blaze_core.world.disk.File.wf.loop_1 (fuel : Nat) (self : blaze_core.world.d
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.barriers) then do
-      let t33 ← Slice.index self.barriers i
-      let barrier := t33
-      let t37 := Scalar.eq barrier.covers (0 : Usize)
-      let t36 := if t37 then t37 else Scalar.gt barrier.covers (Slice.len self.changes)
-      let t35 := if t36 then t36 else Scalar.gt barrier.epoch epoch
-      if t35 then Result.ok false
+      let t0 ← Slice.index self.barriers i
+      let barrier := t0
+      let t1 := Scalar.eq barrier.covers (0 : Usize)
+      let t2 := if t1 then t1 else Scalar.gt barrier.covers (Slice.len self.changes)
+      let t3 := if t2 then t2 else Scalar.gt barrier.epoch epoch
+      if t3 then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.File.wf.loop_1 fuel self epoch i
@@ -31,8 +31,8 @@ def blaze_core.world.disk.File.wf.loop_0 (fuel : Nat) (self : blaze_core.world.d
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.changes) then do
-      let t14 ← Slice.index self.changes i
-      if Scalar.gt t14.epoch epoch then Result.ok false
+      let t4 ← Slice.index self.changes i
+      if Scalar.gt t4.epoch epoch then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.File.wf.loop_0 fuel self epoch i

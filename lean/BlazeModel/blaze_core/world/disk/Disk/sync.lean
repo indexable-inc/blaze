@@ -22,10 +22,10 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.Disk.sync (fuel : Nat) (self : blaze_core.world.disk.Disk) (file : U64) (covers : Usize) : Result blaze_core.world.disk.Disk := do
   let («at», self) ← blaze_core.world.disk.Disk.«open» fuel self file
-  let t15 := «at»
-  let t12 := covers
-  let x0 ← Slice.index self.files t15
-  let x1 ← blaze_core.world.disk.File.sync fuel x0 t12
-  let x2 ← Slice.update self.files t15 x1
+  let t0 := «at»
+  let t1 := covers
+  let x0 ← Slice.index self.files t0
+  let x1 ← blaze_core.world.disk.File.sync fuel x0 t1
+  let x2 ← Slice.update self.files t0 x1
   let self := { self with files := x2 }
   blaze_core.world.disk.Disk.flush fuel self

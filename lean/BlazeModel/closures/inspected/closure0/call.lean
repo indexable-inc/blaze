@@ -6,4 +6,4 @@ import BlazeModel.closures.inspected.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.inspected.closure0.call (t1 : closures.inspected.closure0) (v : U32) : Unit := ()
+def closures.inspected.closure0.call (t0 : closures.inspected.closure0) (v : U32) : Unit := ()

@@ -1,25 +1,26 @@
 use std::{
-    collections::BTreeMap,
     convert::Infallible,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::Arc,
 };
 
-use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
 use blaze_codegen::ExecTable;
-use blaze_core::Traced;
+use blaze_core::{Traced, Untraceable};
 use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
+use blaze_keyed::kind::{Key, TestIndex};
 use blaze_testsel::{
-    Basis, Bound, Cached, Choice, FnId, Ran, Reached, Record, Selector, Subject, Why,
+    Bound, FnId, Record,
+    ask::Basis,
+    machine::{By, Missed, NotKept, Verdict},
 };
 use blaze_usercode::{
-    test::{Attrs, Executed, Lines, Passes, Trace},
+    test::{Executed, Lines, Trace, wire::Table},
     trace::{self, Inputs, Seen},
 };
 
 use super::{
-    image::{Selectors, image, record},
+    image::{Held, Selectors, image, record},
     traced::{Common, Splice},
 };
 
@@ -176,61 +177,55 @@ fn a_warm_splice_allocates_nothing() {
     assert_eq!(base, assembled(&shared));
 }
 
-/// A test whose pass is kept is reported as the agent API marks a cached result: not run now,
-/// and the pass that stands with how long it took and what it was kept by.
+/// A cached test is reported passed, in no time, with the pass that stands (how long its last
+/// run took, and what it was kept by); a run not kept names why in a word and a sentence, and
+/// a failure or a kept run says nothing of keeping.
 #[test]
-fn a_kept_pass_is_reported_cached() {
-    use blaze_api::{Basis, TestOutcome};
+fn a_cached_test_is_a_pass_and_a_run_not_kept_says_why() {
+    use blaze_api::TestOutcome;
 
-    let kept = Cached { took: Duration::from_micros(9_999), basis: blaze_testsel::Basis::Executed };
-    let result = blaze_testsel::api::result("tests/parse", 3, "parse::nested", &kept);
+    let result = super::cached("tests/parse", 3, "parse::nested", Basis::Executed, Some(9_999));
     assert_eq!(
-        (result.outcome, result.millis, result.output.len()),
-        (TestOutcome::Unreached, 0, 0)
+        (result.outcome, result.millis, result.output.len(), result.not_kept),
+        (TestOutcome::Passed, 0, 0, None)
     );
     assert_eq!((result.executable, result.outside), (3, false));
     assert_eq!((result.binary.as_str(), result.name.as_str()), ("tests/parse", "parse::nested"));
     let cached = result.cached.expect("a kept pass is cached");
     assert_eq!(
         (cached.outcome, cached.millis, cached.basis),
-        (TestOutcome::Passed, 9, Basis::Executed)
+        (TestOutcome::Passed, 9, blaze_api::Basis::Executed)
     );
-    let reached = Cached {
-        took: Duration::ZERO,
-        basis: blaze_testsel::Basis::Reached { why: "killed".to_owned() },
+    let cached = super::cached("a", 0, "b", Basis::Reached, None).cached.expect("cached");
+    assert_eq!(cached.millis, 0);
+    assert!(matches!(cached.basis, blaze_api::Basis::Reached { .. }), "{cached:?}");
+
+    let missed = Missed::NoRow;
+    let clock = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Untraceable(Untraceable::Clock), missed };
+    let said = super::not_kept(clock, None).expect("a pass not kept says why");
+    assert_eq!((said.no.as_str(), said.why.as_str()), ("clock", "it read the wall clock"));
+    let failed = Verdict::NotKept { passed: false, micros: 5, why: NotKept::Failed, missed };
+    assert_eq!(super::not_kept(failed, None), None);
+    assert_eq!(super::not_kept(Verdict::Ran { micros: 5, basis: Basis::Executed, missed }, None), None);
+    let unchanged = Verdict::Cached { by: By::Unchanged, basis: Basis::Executed, micros: None };
+    assert_eq!(super::not_kept(unchanged, None), None);
+
+    // A pass not kept for a read that moved names the read and the name whose stamp says so.
+    let moved = Verdict::NotKept { passed: true, micros: 5, why: NotKept::Moved, missed };
+    let what = blaze_usercode::inputs::Moved {
+        read: "/w/data/input.txt".into(),
+        at: "/w/data".into(),
+        why: blaze_usercode::inputs::MovedWhy::Above,
     };
-    let cached =
-        blaze_testsel::api::result("a", 0, "b", &reached).cached.expect("a kept pass is cached");
-    assert_eq!((cached.millis, cached.basis), (0, Basis::Reached { why: "killed".to_owned() }));
-}
-
-/// The store, as a map that refuses to replace a value.
-#[derive(Default)]
-struct Mem {
-    values: BTreeMap<Key, Vec<u8>>,
-    puts: u64,
-}
-
-impl Passes for Mem {
-    fn get(&self, key: &Key) -> Result<Option<&[u8]>, Corrupt> {
-        Ok(self.values.get(key).map(Vec::as_slice))
-    }
-
-    fn put(&mut self, key: Key, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
-        match self.values.get(&key) {
-            Some(kept) if *kept != bytes => {
-                return Err(Mismatch {
-                    key,
-                    kept: ContentId::of("blaze v2 cargo test mem 1", kept),
-                    given: ContentId::of("blaze v2 cargo test mem 1", &bytes),
-                });
-            }
-            Some(_) => {}
-            None => _ = self.values.insert(key, bytes),
-        }
-        self.puts += 1;
-        Ok(Ticket(self.puts))
-    }
+    let said = super::not_kept(moved, Some(&what)).expect("a pass not kept says why");
+    assert_eq!(
+        (said.no.as_str(), said.why.as_str()),
+        (
+            "moved",
+            "/w/data, above /w/data/input.txt which it read, changed after the test began, so its hash \
+             need not be what the test read"
+        )
+    );
 }
 
 fn fn_id(n: u32) -> ContentId {
@@ -240,6 +235,13 @@ fn fn_id(n: u32) -> ContentId {
 fn bound(n: u32, version: u32) -> ContentId {
     ContentId::of("blaze v2 cargo test bound 1", &[n.to_le_bytes(), version.to_le_bytes()].concat())
 }
+
+/// The jump table of [`exec_table`]'s binary: 2 slots given out of a capacity of 64.
+const JUMP: blaze_codegen::JumpTable =
+    blaze_codegen::JumpTable { lineage: [8; 16], generation: 3, capacity: 64, given: 2 };
+
+/// [`JUMP`] as the binary's runtime names it: its capacity is its slot count.
+const NAMED: Table = Table { lineage: [8; 16], generation: 3, slots: 64 };
 
 /// The table of a binary of three functions at `versions`: `0` and `2` in slots 0 and 1, `1`
 /// called directly, and one test `t` that reaches all three.
@@ -253,6 +255,7 @@ fn exec_table(versions: [u32; 3]) -> ExecTable {
     reached.sort_unstable();
     let (graph, roots) = blaze_codegen::exec::TestGraph::listing(3, &[reached]);
     ExecTable {
+        jump: JUMP,
         fns,
         slot_fn,
         beside: ContentId::default(),
@@ -265,20 +268,21 @@ fn exec_table(versions: [u32; 3]) -> ExecTable {
 /// the table, else not whole, saying why.
 #[test]
 fn what_a_test_executed_is_its_record() {
+    let of = |slots: u32| Table { slots, ..NAMED };
     assert_eq!(
-        record(Executed::Hits { slots: 4, hits: vec![1, 3] }),
-        Record::Complete { slots: 4, hits: vec![1, 3] }
+        record(Executed::Hits { table: of(4), hits: vec![1, 3] }),
+        Record::Complete { table: of(4), hits: vec![1, 3] }
     );
     assert_eq!(
-        record(Executed::Hits { slots: 4, hits: Vec::new() }),
-        Record::Complete { slots: 4, hits: Vec::new() }
+        record(Executed::Hits { table: of(4), hits: Vec::new() }),
+        Record::Complete { table: of(4), hits: Vec::new() }
     );
     assert!(matches!(
-        record(Executed::Hits { slots: 4, hits: vec![3, 1] }),
+        record(Executed::Hits { table: of(4), hits: vec![3, 1] }),
         Record::Incomplete { .. }
     ));
     assert!(matches!(
-        record(Executed::Hits { slots: 2, hits: vec![2] }),
+        record(Executed::Hits { table: of(2), hits: vec![2] }),
         Record::Incomplete { .. }
     ));
     let why = "the child was killed after 60s".to_owned();
@@ -293,6 +297,12 @@ fn a_table_is_its_image_slot_for_slot() {
     let made = image("tests/parse", &table).expect("a table");
     assert_eq!((made.len(), made.slots()), (3, 2));
     assert_eq!(made.bound_of(&FnId(fn_id(1))), Some(Bound(bound(1, 0))));
+    // Named as the runtime names it, by its capacity, not by the slots given out: a record
+    // of the binary (the region the runtime arms is the capacity's) reads, one of the
+    // binary's next link does not.
+    assert_eq!(made.table(), NAMED);
+    assert!(made.executed(NAMED, &[1]).is_ok());
+    assert!(made.executed(Table { generation: 4, ..NAMED }, &[1]).is_err());
 
     let mut emptied = exec_table([0, 0, 0]);
     emptied.slot_fn.insert(1, ExecTable::EMPTY);
@@ -305,130 +315,131 @@ fn a_table_is_its_image_slot_for_slot() {
     assert!(why.contains("`tests/parse`"), "{why}");
 }
 
-/// A suite's selector is kept between runs, moved to its binary only when it was relinked, and
-/// held by one run at a time.
+/// A suite's head is held between runs by its settings, with the image of the binary it was
+/// filed at: a run of the same binary reuses the image, a relinked one makes its own and
+/// keeps the held one as the image before (whose changes the head's rows are checked
+/// against), and one run holds it at a time.
 #[test]
-fn a_suite_keeps_its_selector_and_moves_it_to_a_relinked_binary() {
+fn a_suite_holds_its_head_and_the_image_it_was_filed_at() {
     let selectors = Selectors::default();
     let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
     let (first, second) = (
         ContentId::of("blaze v2 cargo test bin 1", b"1"),
         ContentId::of("blaze v2 cargo test bin 1", b"2"),
     );
-    let selector =
-        selectors.take(given, first, || image("t", &exec_table([0, 0, 0]))).expect("made");
-    assert_eq!((selector.given(), selectors.len()), (given, 0));
-    selectors.give(first, selector);
-    assert_eq!(selectors.len(), 1);
-    let selector = selectors
-        .take(given, first, || panic!("the selector's image is of this binary"))
-        .expect("kept");
+    let head = Key::<TestIndex>::from_id(ContentId::of("blaze v2 cargo test head 1", b"h"));
+    let taken = selectors.take(given, first, || image("t", &exec_table([0, 0, 0]))).expect("made");
+    assert!(taken.head.is_none() && taken.before.is_none() && taken.held.is_none());
     assert_eq!(selectors.len(), 0);
-    selectors.give(first, selector);
+    let state = taken.now.state();
+    selectors.give(given, Held { binary: Some(first), state, image: Some(taken.now), head: Some(head), postings: None });
+    assert_eq!(selectors.len(), 1);
+    let taken = selectors
+        .take(given, first, || panic!("the held image is of this binary"))
+        .expect("held");
+    assert_eq!((taken.head, taken.before.is_none(), selectors.len()), (Some(head), true, 0));
+    let held = taken.held.expect("what was held is given back when the run does not end");
+    selectors.give(given, held);
     let mut made = false;
-    let selector = selectors
+    let taken = selectors
         .take(given, second, || {
             made = true;
             image("t", &exec_table([0, 0, 1]))
         })
-        .expect("moved");
+        .expect("relinked");
     assert!(made);
-    assert_eq!(selector.image().bound_of(&FnId(fn_id(2))), Some(Bound(bound(2, 1))));
+    assert_eq!(taken.now.bound_of(&FnId(fn_id(2))), Some(Bound(bound(2, 1))));
+    let before = taken.before.expect("the image the head was filed at");
+    assert_eq!((before.state(), taken.head), (state, Some(head)));
+    assert!(!Arc::ptr_eq(&before, &taken.now));
     let refused = selectors.take(given, first, || Err("no table".to_owned()));
     assert_eq!(
         refused.err().as_deref(),
         Some("no table"),
-        "none is kept while one is taken: a new one's image is asked for"
+        "none is held while one run holds it: a new image is asked for"
     );
 }
 
-fn choose(selector: &mut Selector, store: &Mem, subject: &Subject<'_>) -> Choice {
-    selector.choose(store, subject, false, &mut World::new()).expect("chosen")
-}
-
-/// Through the daemon's path (the image of a table, a server's record, a selector), a pass
-/// kept by what it executed stands until a function it executed changes; one whose record is
-/// not whole stands by what it reaches, saying why.
+/// The invariant: a head restored from its journal mark after a start (no image held) is
+/// used for a binary of the program state it was filed at, and for another binary it is a
+/// miss by key (no head, no image before), never a head whose changes can't be told
+/// (`HostError::UnknownState`). Control: the same mark's head is used for its own state.
 #[test]
-fn a_pass_stands_until_what_it_executed_changes() {
-    let attrs = Attrs::default();
-    let table = exec_table([0, 0, 0]);
-    let reached = table.reached(0);
-    let subject =
-        Subject { name: "t", attrs: &attrs, outside: false, reached: Reached::Known(&reached) };
-    let traced = Traced::default();
+fn a_restored_head_is_used_only_for_the_binary_it_was_filed_at() {
     let given = ContentId::of("blaze v2 cargo test given 1", b"suite");
-
-    let mut store = Mem::default();
-    let mut selector = Selector::new(given, image("t", &table).expect("a table"));
-    assert!(matches!(choose(&mut selector, &store, &subject), Choice::Run { why: Why::New, .. }));
-    // It called slot 0's function, `0`, and not slot 1's, `2`.
-    let executed = record(Executed::Hits { slots: 2, hits: vec![0] });
-    let ran = Ran {
-        passed: true,
-        took: Duration::from_millis(3),
-        traced: Some(&traced),
-        record: &executed,
+    let binary = ContentId::of("blaze v2 cargo test bin 1", b"1");
+    let head = ContentId::of("blaze v2 cargo test head 1", b"h");
+    let postings = Some(ContentId::of("blaze v2 cargo test postings 1", b"p"));
+    let state = image("t", &exec_table([0, 0, 0])).expect("made").state();
+    let restored = || {
+        let selectors = Selectors::default();
+        let mark = crate::serve::local::TestHeadMark { given, head, postings, state };
+        selectors.restore(std::iter::once(mark));
+        assert_eq!(selectors.len(), 1);
+        selectors
     };
-    selector.keep(&mut store, &subject, &ran).expect("kept");
-    let cached = |choice: Choice| match choice {
-        Choice::Cached(it) => it,
-        other => panic!("ran: {other:?}"),
-    };
-    assert_eq!(cached(choose(&mut selector, &store, &subject)).basis, Basis::Executed);
-    selector.advance(image("t", &exec_table([0, 0, 1])).expect("a table"));
-    assert_eq!(cached(choose(&mut selector, &store, &subject)).took, Duration::from_millis(3));
-    selector.advance(image("t", &exec_table([1, 0, 1])).expect("a table"));
-    let choice = choose(&mut selector, &store, &subject);
-    assert!(
-        matches!(choice, Choice::Run { why: Why::Changed(FnId(id)), .. } if id == fn_id(0)),
-        "{choice:?}"
-    );
-
-    let mut store = Mem::default();
-    let mut selector = Selector::new(given, image("t", &table).expect("a table"));
-    let killed = record(Executed::Not("the child was killed".to_owned()));
-    let ran = Ran {
-        passed: true,
-        took: Duration::from_millis(5),
-        traced: Some(&traced),
-        record: &killed,
-    };
-    selector.keep(&mut store, &subject, &ran).expect("kept");
-    let kept = cached(choose(&mut selector, &store, &subject));
-    assert_eq!(kept.basis, Basis::Reached { why: "the child was killed".to_owned() });
-    selector.advance(image("t", &exec_table([0, 1, 0])).expect("a table"));
-    let choice = choose(&mut selector, &store, &subject);
-    assert!(matches!(choice, Choice::Run { why: Why::Unlogged, .. }), "{choice:?}");
+    let selectors = restored();
+    let taken = selectors.take(given, binary, || image("t", &exec_table([0, 0, 0]))).expect("made");
+    assert_eq!((taken.head.map(|it| it.id()), taken.before.is_none()), (Some(head), true), "the control");
+    let selectors = restored();
+    let taken = selectors.take(given, binary, || image("t", &exec_table([0, 0, 1]))).expect("made");
+    assert_ne!(taken.now.state(), state);
+    assert_eq!((taken.head, taken.before.is_none()), (None, true), "another binary's head is a miss by key");
 }
 
 fn of(lines: &[(Seen, String)]) -> Lines {
     lines.iter().map(|it| (it.0, it.1.as_str())).collect()
 }
 
+/// What a test of [`Common`] says moved: a path read whose name is of odd length. A question
+/// of each path alone, as `Began::moved`'s is, so asking it of the shared and the own part
+/// apart finds one exactly when asking it of the whole does.
+fn odd_moved(traced: &Traced) -> Option<blaze_usercode::inputs::Moved> {
+    let odd = |path: &std::path::Path| path.as_os_str().len() % 2 == 1;
+    let files = traced.files.iter().map(|it| &it.0);
+    let path = files.chain(traced.dirs.iter().map(|it| &it.0)).find(|it| odd(it))?;
+    Some(blaze_usercode::inputs::Moved {
+        read: path.clone(),
+        at: path.clone(),
+        why: blaze_usercode::inputs::MovedWhy::Itself,
+    })
+}
+
 /// Through the cache, every kind of trace is what [`Trace::traced`] says it is, result after
-/// result.
+/// result, and moved exactly when the whole of it is.
 #[test]
 fn a_result_is_traced_as_its_trace_says() {
     let mut rng = Rng::new(11);
     let mut common = Common::default();
     let mut world = World::new();
+    // Which read is named can differ between the parts and the whole (the shared part's
+    // first); that one is, and that it moved, is the same.
+    let both = |it: Option<&Traced>, moved: Option<&blaze_usercode::inputs::Moved>| {
+        if let (Some(it), Some(moved)) = (it, moved) {
+            let read = |path: &std::path::PathBuf| *path == moved.read;
+            assert!(it.files.iter().any(|f| read(&f.0)) || it.dirs.iter().any(|d| read(&d.0)), "{moved:?}");
+        }
+        (it.cloned(), moved.is_some())
+    };
     for _ in 0..200 {
         let count = rng.below(32);
         let all = lines(&mut rng, count);
         let Ok(expected) = Trace::Lines(of(&all)).traced(&mut world);
-        let Ok(got) = common.traced(Trace::Lines(of(&all)), &mut world, |it| it.cloned());
-        assert_eq!(got, expected, "{all:?}");
+        let moved = expected.as_ref().and_then(odd_moved).is_some();
+        let Ok(got) = common.traced(Trace::Lines(of(&all)), &mut world, odd_moved, both);
+        assert_eq!(got, (expected, moved), "{all:?}");
     }
     let whole = assembled(&lines(&mut rng, 20));
-    let Ok(got) = common.traced(Trace::Whole(whole.clone()), &mut world, |it| it.cloned());
-    assert_eq!(got, Some(whole));
+    let moved = odd_moved(&whole).is_some();
+    let Ok(got) = common.traced(Trace::Whole(whole.clone()), &mut world, odd_moved, both);
+    assert_eq!(got, (Some(whole), moved));
     let Ok(got) = common.traced(
         Trace::Unknown("the sandbox's record was cut".to_owned()),
         &mut world,
-        |it| it.cloned(),
+        odd_moved,
+        both,
     );
-    assert_eq!(got, None);
+    assert_eq!(got, (None, false));
 }
 
 /// Keep-going (`each`): a test run whose binaries are `edition`'s, refused as a dev test binary
@@ -457,4 +468,65 @@ fn a_binary_that_cant_run_is_named_and_keeps_no_other_from_running() {
             "`stdx` runs under profile `test`, so on the daemon's code memory, and can't",
         ]
     );
+}
+
+/// The invariant: the tests a run runs outside the sandbox are said in one note, a count with
+/// the setting that put them there, a package's counts merged across its binaries, never a list
+/// of every name; none outside says nothing.
+#[test]
+fn the_tests_outside_are_counted_in_one_note_with_the_setting_that_put_them_there() {
+    use super::{OutsideBy, outside_note};
+    assert_eq!(outside_note([("sel", OutsideBy::Named, 0), ("b", OutsideBy::Package, 0)]), None);
+    assert_eq!(
+        outside_note([("sel", OutsideBy::Package, 3)]).as_deref(),
+        Some(
+            "3 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed: 3 of `sel`, whose \
+             `[package.metadata.blaze.sandbox]` sets `tests = false`"
+        )
+    );
+    assert_eq!(
+        outside_note([("sel", OutsideBy::Command, 2), ("b", OutsideBy::Command, 1)]).as_deref(),
+        Some(
+            "3 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed; `BLAZE_SANDBOX=off` is set"
+        )
+    );
+    let mixed = outside_note([
+        ("a", OutsideBy::Named, 1),
+        ("b", OutsideBy::Package, 2),
+        ("a", OutsideBy::Named, 0),
+        ("b", OutsideBy::Package, 4),
+    ])
+    .unwrap();
+    assert_eq!(
+        mixed,
+        "7 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+         records what it reads, is kept as passed: 1 of `a`, named by its `unsandboxed-tests`; \
+         6 of `b`, whose `[package.metadata.blaze.sandbox]` sets `tests = false`"
+    );
+    let one = outside_note([("a", OutsideBy::Named, 1)]).unwrap();
+    assert!(one.starts_with("1 test runs outside the sandbox, so it runs every time"), "{one}");
+    // Outside for want of an opt-in (macOS): the one thing to do and its hole, said once.
+    let host = outside_note([("sel", OutsideBy::Host, 3), ("b", OutsideBy::Package, 1)]).unwrap();
+    assert_eq!(
+        host,
+        format!(
+            "4 tests run outside the sandbox, so they run every time: only a sandboxed run, which \
+             records what it reads, is kept as passed: 3 of `sel`, which does not opt in; 1 of `b`, \
+             whose `[package.metadata.blaze.sandbox]` sets `tests = false`{}",
+            super::MACOS_OPT_IN
+        )
+    );
+    assert!(host.contains("`tests = true` under its `[package.metadata.blaze.sandbox]`"), "{host}");
+    assert!(host.contains("another test binary's launch token"), "{host}");
+    assert!(!one.contains("tests = true"), "said only where tests are outside by the host");
+}
+
+/// What a run whose sandbox failed says begins with the one thing to do, then says why.
+#[test]
+fn a_failed_sandbox_says_first_how_to_run_outside_then_why() {
+    let said = super::unsandboxable("/t/lib could not be started in its sandbox: no user namespaces");
+    assert!(said.starts_with("to run these tests anyway, set `BLAZE_SANDBOX=off`"), "{said}");
+    assert!(said.ends_with("so the run stopped before its other tests: /t/lib could not be started in its sandbox: no user namespaces"), "{said}");
 }

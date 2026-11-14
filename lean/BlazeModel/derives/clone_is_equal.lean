@@ -12,9 +12,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def derives.clone_is_equal (p : derives.Path) (s : derives.Shape) : Bool :=
-  let t4 := core.cmp.PartialEq.eq p p
-  let t3 := if t4 then core.cmp.PartialEq.eq s s else t4
-  if t3 then !(core.cmp.PartialEq.ne s s) else t3
+  let t0 := core.cmp.PartialEq.eq p p
+  let t1 := if t0 then core.cmp.PartialEq.eq s s else t0
+  if t1 then !(core.cmp.PartialEq.ne s s) else t1
 
 def derives.clone_is_equal.spec.statement : Prop :=
   ∀ (p : derives.Path) (s : derives.Shape), derives.clone_is_equal p s = true

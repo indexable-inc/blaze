@@ -9,7 +9,7 @@ open Blaze
 set_option linter.unusedVariables false
 
 def closures.bumps_twice : Result Bool := do
-  let t1 ← closures.bump_twice
-  Result.ok (Scalar.eq t1 (2 : U32))
+  let t0 ← closures.bump_twice
+  Result.ok (Scalar.eq t0 (2 : U32))
 
 def closures.bumps_twice.spec.statement : Prop := closures.bumps_twice = Result.ok true

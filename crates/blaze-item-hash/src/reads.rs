@@ -46,10 +46,10 @@ use blaze_items::{
     goals::{self, FactRefKey, Goals},
     key, kinds as items,
 };
-use blaze_memo::{Builder, KindId, Memo, Read};
+use blaze_memo::{Builder, Fact, KindId, Memo, Read};
 use hir_def::{
-    AdtId, AttrDefId, BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule,
-    ItemContainerId, Lookup, ModuleId, TraitId, TypeAliasId,
+    AdtId, AssocItemId, AttrDefId, BlockIdLt, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId,
+    HasModule, ItemContainerId, Lookup, ModuleId, TraitId, TypeAliasId,
     hir::{ClosureKind, CoroutineKind},
     kinds as def,
 };
@@ -160,6 +160,17 @@ pub const BOUNDARIES: &[Boundary] = boundaries! {
     def::AttrFlags_repr_assume_has => |a, (it,)| a.attrs(AdtId::from(it).into()),
     def::target_features => |a, (it,)| a.attrs(it.into()),
     def::AttrFlags_query | def::blaze_bits | def::unstable_feature => |a, (it,)| a.attrs(it),
+    // The attribute flags of an item's generic parameters, which the borrow check reads for a
+    // `Drop` impl's `#[may_dangle]`: the item's `Attrs` fact, which hashes them
+    // (`values::attrs_of`); the signature form does not.
+    def::generic_params_attr_flags => |a, (it,)| a.attrs(generic_attr_owner(it)),
+
+    // The hygiene key of an associated item's name: the `Fields` fact of its impl or trait
+    // where the key is none (a name a real file or a `macro_rules!` writes), as that fact
+    // spells for each member whether its name is keyed (`values::member_names`); refused by
+    // its kind's name where the key is a context (a `macro` 2.0 name, a proc macro's
+    // `Span::def_site`), which no fact spells stably yet.
+    def::assoc_item_key => |a, (item,)| a.assoc_key(item),
 
     // One fact of one item.
     ty::destructor => |a, (it,)| a.item(items::DROP_CHECK, ItemId::Adt(it)),
@@ -285,27 +296,49 @@ pub const BOUNDARIES: &[Boundary] = boundaries! {
 /// What `read`, a row of the list of `step` of `def`, stands for. A row no rule answers is
 /// refused by its kind's name.
 pub fn fact_of(db: &Db, def: DefWithBodyId, step: Step, read: Read) -> Classified {
-    if let Read::Input { kind, .. } = read {
-        return input(kind);
+    if let Read::Input { kind, fact } = read {
+        return input(db, def, kind, fact);
     }
     let asker = Asker { db, def, own: def.krate(db), step, read };
     BOUNDARIES.iter().find_map(|row| (row.answer)(&asker)).unwrap_or_else(|| asker.items())
 }
 
 /// An input's row: the stored answer a hit took is covered (its fact is the step's own base
-/// key); the field order plan is the build's `FieldOrder` fact. Every other input row (a
-/// fact read around the inputs, an untracked read, a served image entry's fact, a file's
-/// text) is refused by its kind's name, as the classifier refused a read no rule named. The
-/// body's own file text is never a row here: the body's syntax is a boundary, so its text is
-/// behind it.
-fn input(kind: KindId) -> Classified {
+/// key); the field order plan is the build's `FieldOrder` fact; a crate's `Crate` input is
+/// [`crate_row`]'s. Every other input row (a fact read around the inputs, an untracked read, a
+/// served image entry's fact, a file's text, a crate's gift) is refused by its kind's name, as
+/// the classifier refused a read no rule named. The body's own file text is never a row here:
+/// the body's syntax is a boundary, so its text is behind it.
+fn input(db: &Db, def: DefWithBodyId, kind: KindId, fact: Fact) -> Classified {
     if kind == STORED_ANSWER {
         return Classified::Covered;
     }
     if kind == KindId::of(FieldOrder::INPUT_KIND) {
         return Classified::Fact(values::field_order());
     }
+    if kind == KindId::of(Crate::INPUT_KIND) {
+        return crate_row(db, def, fact).unwrap_or(Classified::Refused(kind.name()));
+    }
     Classified::Refused(kind.name())
+}
+
+/// A read of a field of a crate's `Crate` input (`data`, `extra_data`, `cfg_options`,
+/// `workspace_data`, `env`, the list of its gifts): one row per crate, its fact the one the
+/// world made the crate with, whose digest is the crate's content ID (`base_db::Crate::content`).
+/// Covered for the body's own crate, whose identity hashes its inputs
+/// (`identity::crate_inputs`); for a crate the body's crate loads, that crate's
+/// `CrateSettings` fact ([`values::crate_settings`]), valued by its content ID, which holds no
+/// source: a body edit in it moves nothing, where its `Crate` fact hashes every file of it and
+/// of the crates below it (rule 65). `None` (refused by the caller) for a crate the body's
+/// crate does not load. A gift's value is a `CrateSlot` input of its own, refused by that name.
+fn crate_row(db: &Db, def: DefWithBodyId, fact: Fact) -> Option<Classified> {
+    let memo = blaze_memo::Database::memo(db);
+    let own = def.krate(db);
+    if own.input_fact(memo) == fact {
+        return Some(Classified::Covered);
+    }
+    let other = ty::loaded_crates(db, own).iter().copied().find(|it| it.input_fact(memo) == fact)?;
+    Some(Classified::Fact(values::crate_settings(db, other)))
 }
 
 /// What a `const_eval_query` row of a generic evaluation is refused as: the classifier read it
@@ -356,6 +389,25 @@ impl<'db> Asker<'db> {
     /// The `Attrs` fact of `owner`; refused for an owner no key names.
     fn attrs(&self, owner: AttrDefId) -> Classified {
         values::attrs(self.db, owner).map_or_else(|| self.refused(), |it| self.fact(it))
+    }
+
+    /// An `assoc_item_key` row of `item`: the `Fields` fact of its impl or trait where its
+    /// name's key is none; refused by the row's kind's name where it is a context, or for an
+    /// item in neither.
+    fn assoc_key(&self, item: AssocItemId) -> Classified {
+        if hir_def::nameres::assoc_item_key(self.db, item).is_some() {
+            return self.refused();
+        }
+        let container = match item {
+            AssocItemId::FunctionId(it) => it.lookup(self.db).container,
+            AssocItemId::ConstId(it) => it.lookup(self.db).container,
+            AssocItemId::TypeAliasId(it) => it.lookup(self.db).container,
+        };
+        match container {
+            ItemContainerId::ImplId(it) => self.fields(ItemId::Impl(it)),
+            ItemContainerId::TraitId(it) => self.fields(ItemId::Trait(it)),
+            ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => self.refused(),
+        }
     }
 
     /// Lane items' fact of the row as the body's crate sees it; refused by the name lane
@@ -420,6 +472,19 @@ fn alias_bounds_owner(db: &Db, alias: TypeAliasId) -> ItemId {
         ItemContainerId::ModuleId(_) | ItemContainerId::ImplId(_) | ItemContainerId::ExternBlockId(_) => {
             ItemId::Alias(alias)
         }
+    }
+}
+
+/// The item whose attributes a generic definition's parameters' flags are part of.
+fn generic_attr_owner(def: GenericDefId) -> AttrDefId {
+    match def {
+        GenericDefId::AdtId(it) => it.into(),
+        GenericDefId::ConstId(it) => it.into(),
+        GenericDefId::FunctionId(it) => it.into(),
+        GenericDefId::ImplId(it) => it.into(),
+        GenericDefId::StaticId(it) => it.into(),
+        GenericDefId::TraitId(it) => it.into(),
+        GenericDefId::TypeAliasId(it) => it.into(),
     }
 }
 

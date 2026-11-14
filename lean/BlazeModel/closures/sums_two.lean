@@ -10,25 +10,25 @@ open Blaze
 set_option linter.unusedVariables false
 
 def closures.sums_two (fuel : Nat) (xs : Slice U32) : Result Bool := do
-  let t4 := Scalar.ne (Slice.len xs) (2 : Usize)
-  let t3 ←
-    if t4 then Result.ok t4
+  let t0 := Scalar.ne (Slice.len xs) (2 : Usize)
+  let t1 ←
+    if t0 then Result.ok t0
     else do
       let x0 ← Slice.index xs (0 : Usize)
       Result.ok (Scalar.gt x0 (1000 : U32))
   let t2 ←
-    if t3 then Result.ok t3
+    if t1 then Result.ok t1
     else do
       let x1 ← Slice.index xs (1 : Usize)
       Result.ok (Scalar.gt x1 (1000 : U32))
   if t2 then Result.ok t2
   else do
-    let t11 ← closures.sum fuel xs
+    let t3 ← closures.sum fuel xs
     let x2 ← Slice.index xs (0 : Usize)
-    let t15 := x2
+    let t4 := x2
     let x3 ← Slice.index xs (1 : Usize)
-    let t13 ← Scalar.add t15 x3
-    Result.ok (Scalar.eq t11 t13)
+    let t5 ← Scalar.add t4 x3
+    Result.ok (Scalar.eq t3 t5)
 
 def closures.sums_two.spec.statement : Prop :=
   ∀ (xs : Slice U32), ∃ (fuel : Nat), closures.sums_two fuel xs = Result.ok true

@@ -44,6 +44,7 @@
 //!     expect: option, fmt
 //!     float_consts: unary_ops, builtin_impls
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
+//!     fmt_write: fmt
 //!     fn: sized, tuple
 //!     from: sized, result
 //!     future: pin
@@ -63,6 +64,7 @@
 //!     int_overflow: non_zero, from, result, option, iterator
 //!     int_cast: from
 //!     int_methods: int_overflow, int_wrapping
+//!     io_error:
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
@@ -78,6 +80,7 @@
 //!     ord_methods: ord
 //!     ord_ops: ord, clone, copy, derive
 //!     option_clone: option, clone
+//!     option_from: option, from
 //!     panic: fmt
 //!     panic_location: panic
 //!     pat: panic
@@ -94,6 +97,7 @@
 //!     send: sized
 //!     size_of: sized
 //!     sized:
+//!     string: vec, eq
 //!     slice:
 //!     str: sized, result
 //!     str_methods: str, eq
@@ -102,6 +106,7 @@
 //!     time: add, sub, ord_ops, option, int_bounds
 //!     transmute:
 //!     try: infallible
+//!     try_bodies: try, from
 //!     tuple:
 //!     unary_ops:
 //!     unpin: sized
@@ -1161,15 +1166,19 @@ pub mod ops {
     // endregion:async_fn
 
     // region:try
-    mod try_ {
-        use crate::convert::Infallible;
-
+    // Where core defines it (library/core/src/ops/control_flow.rs), so its path is core's.
+    mod control_flow {
         pub enum ControlFlow<B, C = ()> {
             #[lang = "Continue"]
             Continue(C),
             #[lang = "Break"]
             Break(B),
         }
+    }
+    mod try_ {
+        use super::control_flow::ControlFlow;
+        use crate::convert::Infallible;
+
         pub trait FromResidual<R = <Self as Try>::Residual> {
             #[lang = "from_residual"]
             fn from_residual(residual: R) -> Self;
@@ -1236,13 +1245,30 @@ pub mod ops {
             }
         }
 
+        // region:!try_bodies
         impl<#[blaze::linear] T> FromResidual for Option<T> {
+            // endregion:!try_bodies
+            // region:try_bodies
+            // As core writes it (library/core/src/option.rs, rust-lang/rust#99940): the
+            // residual by name, not by the trait's default.
+        impl<#[blaze::linear] T> FromResidual<Option<Infallible>> for Option<T> {
+            // endregion:try_bodies
+            // region:!try_bodies
             fn from_residual(x: Option<Infallible>) -> Self {
                 match x {
                     None => None,
                     Some(_) => loop {},
                 }
             }
+            // endregion:!try_bodies
+            // region:try_bodies
+            // core's own body (library/core/src/option.rs): `Option<!>` has no `Some`.
+            fn from_residual(residual: Option<Infallible>) -> Self {
+                match residual {
+                    None => None,
+                }
+            }
+            // endregion:try_bodies
         }
 
         impl<T> const Residual<T> for Option<Infallible> {
@@ -1272,12 +1298,22 @@ pub mod ops {
         impl<#[blaze::linear] T, E, F: From<E>> FromResidual<Result<Infallible, E>>
             for Result<T, F>
         {
+            // region:!try_bodies
             fn from_residual(residual: Result<Infallible, E>) -> Self {
                 match residual {
                     Err(e) => Err(F::from(e)),
                     Ok(_) => loop {},
                 }
             }
+            // endregion:!try_bodies
+            // region:try_bodies
+            // core's own body (library/core/src/result.rs): `Result<!, E>` has no `Ok`.
+            fn from_residual(residual: Result<Infallible, E>) -> Self {
+                match residual {
+                    Err(e) => Err(From::from(e)),
+                }
+            }
+            // endregion:try_bodies
         }
 
         impl<T, E> const Residual<T> for Result<Infallible, E> {
@@ -1286,7 +1322,8 @@ pub mod ops {
         // endregion:from
         // endregion:result
     }
-    pub use self::try_::{ControlFlow, FromResidual, Residual, Try};
+    pub use self::control_flow::ControlFlow;
+    pub use self::try_::{FromResidual, Residual, Try};
     // endregion:try
 
     // region:add
@@ -1716,6 +1753,14 @@ pub mod fmt {
         pub fn write_str(&mut self, _data: &str) -> Result {
             Ok(())
         }
+
+        // region:fmt_write
+        // What `write!` calls (library/core/src/fmt/mod.rs: `pub fn write_fmt(&mut self, fmt:
+        // Arguments<'_>) -> Result`).
+        pub fn write_fmt(&mut self, _args: Arguments<'_>) -> Result {
+            Ok(())
+        }
+        // endregion:fmt_write
     }
 
     impl DebugTuple {
@@ -2198,6 +2243,15 @@ pub mod option {
         }
     }
     // endregion:closure_methods
+
+    // region:option_from
+    // core's own (library/core/src/option.rs).
+    impl<T> crate::convert::From<T> for Option<T> {
+        fn from(val: T) -> Option<T> {
+            Some(val)
+        }
+    }
+    // endregion:option_from
 }
 // endregion:option
 
@@ -3844,6 +3898,46 @@ pub mod int_cast {
     }
 }
 // endregion:int_cast
+
+// region:io_error
+// `std::io::Error` where the pinned nightly's library defines it: `core::io::error::Error`
+// (library/core/src/io/error.rs, re-exported as `core::io::Error` and by std), its one field a
+// stand-in for the real `Repr`. `other` is alloc's incoherent inherent method
+// (library/alloc/src/io/error.rs), here without its `E: Into<Box<dyn Error + Send + Sync>>`
+// bound, which needs `Box`.
+pub mod io {
+    mod error {
+        pub struct Error {
+            repr: u64,
+        }
+
+        impl Error {
+            pub fn other<E>(_error: E) -> Error {
+                loop {}
+            }
+        }
+    }
+
+    pub use self::error::Error;
+}
+// endregion:io_error
+
+// region:string
+// `alloc::string::String` (lang item `String`, library/alloc/src/string.rs), with its derived
+// `PartialEq` written out.
+pub mod string {
+    #[lang = "String"]
+    pub struct String {
+        vec: crate::vec::Vec<u8>,
+    }
+
+    impl crate::cmp::PartialEq for String {
+        fn eq(&self, _other: &String) -> bool {
+            loop {}
+        }
+    }
+}
+// endregion:string
 
 // region:error
 pub mod error {

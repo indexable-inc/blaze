@@ -19,9 +19,9 @@ def blaze_shapes.drain.loop_0 (fuel : Nat) (v : Vec U32) (n : Usize) (total : U3
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t8 := Scalar.lt done n
-    let t7 := if t8 then !(Slice.is_empty v) else t8
-    if t7 then do
+    let t0 := Scalar.lt done n
+    let t1 := if t0 then !(Slice.is_empty v) else t0
+    if t1 then do
       let (x, v) ← Vec.remove v (0 : Usize)
       let k := (0 : U32)
       let total ← blaze_shapes.drain.loop_1 fuel total x k

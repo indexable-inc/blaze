@@ -8,13 +8,13 @@ set_option linter.unusedVariables false
 def ints.busy.next (tried : U32) (waited : U64) : Result (Option U64) :=
   if Scalar.ge waited (1000000000 : U64) then Result.ok (Option.none : Option U64)
   else do
-    let t10 := (50000 : U64)
-    let t12 := Scalar.lt tried (20 : U32)
-    let t11 := if t12 then tried else (20 : U32)
-    let doubled ← Scalar.shl t10 t11
-    let t15 := Scalar.lt doubled (50000000 : U64)
-    let wait := if t15 then doubled else (50000000 : U64)
+    let t0 := (50000 : U64)
+    let t1 := Scalar.lt tried (20 : U32)
+    let t2 := if t1 then tried else (20 : U32)
+    let doubled ← Scalar.shl t0 t2
+    let t3 := Scalar.lt doubled (50000000 : U64)
+    let wait := if t3 then doubled else (50000000 : U64)
     let left ← Scalar.sub (1000000000 : U64) waited
-    let t22 := Scalar.lt wait left
-    let t21 := if t22 then wait else left
-    Result.ok (Option.some t21 : Option U64)
+    let t4 := Scalar.lt wait left
+    let t5 := if t4 then wait else left
+    Result.ok (Option.some t5 : Option U64)

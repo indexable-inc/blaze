@@ -115,7 +115,6 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
         build_dir: target_dir,
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -175,6 +174,7 @@ impl Checkout {
                 makers: changed.makers,
                 kind: compile::keyed_kind(crate::serve::work::JobKind::Build, &changed.unit),
                 goal: compile::goal_byte(blaze_api::Goal::Edit),
+                build: 0,
                 verified: false,
                 reached: false,
                 pgo: None,

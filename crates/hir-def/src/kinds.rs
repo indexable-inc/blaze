@@ -18,13 +18,16 @@
 //! through [`item_body_syntax`] or [`placed_body_syntax`], keyed by the body.
 
 pub use crate::{
-    attrs::{AttrFlags_query, AttrFlags_repr_assume_has, blaze_bits, target_features, unstable_feature},
+    attrs::{
+        AttrFlags_query, AttrFlags_repr_assume_has, blaze_bits, generic_params_attr_flags,
+        target_features, unstable_feature,
+    },
     diagnostic_item::diagnostic_items,
     expr_store::body::{item_body_syntax, placed_body_syntax},
     lang_item::{crate_lang_items, lang_items},
     nameres::{
         assoc::{ImplItems_of, TraitItems_query_with_diagnostics},
-        crate_recursion_limit, module_impls,
+        assoc_item_key, crate_recursion_limit, module_impls,
     },
     signatures::{
         ConstSignature_lowered, ConstSignature_relative, ConstSignature_served,

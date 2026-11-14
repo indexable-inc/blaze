@@ -6,5 +6,5 @@ import BlazeModel.closures.option_methods.closure7.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.option_methods.closure7.call (t1 : closures.option_methods.closure7) (v : U32) : Bool :=
-  Scalar.gt v t1.c0
+def closures.option_methods.closure7.call (t0 : closures.option_methods.closure7) (v : U32) : Bool :=
+  Scalar.gt v t0.c0

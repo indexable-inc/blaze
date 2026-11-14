@@ -7,9 +7,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_shapes.unpair (x : U64) : U64 :=
-  let t4 := blaze_shapes.pair x
-  let big := t4.1
-  let y := t4.2
-  let t7 := big
-  let t6 := if t7 then t7 else Scalar.eq y (18446744073709551615 : U64)
-  if t6 then y else Scalar.cast .U64 (1099511627776 : Usize)
+  let t0 := blaze_shapes.pair x
+  let big := t0.1
+  let y := t0.2
+  let t1 := big
+  let t2 := if t1 then t1 else Scalar.eq y (18446744073709551615 : U64)
+  if t2 then y else Scalar.cast .U64 (1099511627776 : Usize)

@@ -21,22 +21,22 @@ open Blaze
 set_option linter.unusedVariables false
 
 def generics.instances_agree (a : U32) (b : U64) (s : U8) : Bool :=
-  let t10 := Scalar.eq (generics.pick.u32 a (0 : U32) true) a
-  let t9 := if t10 then Scalar.eq (generics.pick.u64 b (0 : U64) false) (0 : U64) else t10
-  let t8 := if t9 then Scalar.eq (generics.larger.u32 a a) a else t9
-  let t7 :=
-    if t8 then
+  let t0 := Scalar.eq (generics.pick.u32 a (0 : U32) true) a
+  let t1 := if t0 then Scalar.eq (generics.pick.u64 b (0 : U64) false) (0 : U64) else t0
+  let t2 := if t1 then Scalar.eq (generics.larger.u32 a a) a else t1
+  let t3 :=
+    if t2 then
       Scalar.eq (generics.largest.Ver ({ major := a } : generics.Ver) ({ major := (0 : U32) } : generics.Ver)).major a
-    else t8
-  let t6 := if t7 then generics.Pair.u32.Shape.ordered (generics.Pair.u32.new a a) else t7
+    else t2
+  let t4 := if t3 then generics.Pair.u32.Shape.ordered (generics.Pair.u32.new a a) else t3
   let t5 :=
-    if t6 then Scalar.eq (generics.widen ({ v := s } : generics.Small)).v (Scalar.cast .U32 s)
-    else t6
-  let t4 :=
+    if t4 then Scalar.eq (generics.widen ({ v := s } : generics.Small)).v (Scalar.cast .U32 s)
+    else t4
+  let t6 :=
     if t5 then
       Scalar.eq (generics.first_or (Option.some (generics.Pair.u32.new a (Scalar.cast .U32 b)) : Option generics.Pair.u32) (0 : U32)) a
     else t5
-  if t4 then Scalar.eq (generics.first_or (Option.none : Option generics.Pair.u32) a) a else t4
+  if t6 then Scalar.eq (generics.first_or (Option.none : Option generics.Pair.u32) a) a else t6
 
 def generics.instances_agree.spec.statement : Prop :=
   ∀ (a : U32) (b : U64) (s : U8), generics.instances_agree a b s = true

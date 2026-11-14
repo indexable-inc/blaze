@@ -2,9 +2,9 @@
 //! changes across a pair of programs where what it stands for changed and stays where it did
 //! not, and hashing one of this crate's facts again allocates nothing.
 //!
-//! The tests of the read classifier (every read of the steps covered, a fact or a listed
-//! refusal; the rule table; sealed rows) went with it: on blaze-memo a step's read list is
-//! what `blaze_memo::record` lists (docs/v2/plan/design/front-end-on-memo.md rule 5).
+//! The tests of the read classifier (the rule table; sealed rows) went with it: on blaze-memo a
+//! step's read list is what `blaze_memo::record` lists (docs/v2/plan/design/front-end-on-memo.md
+//! rule 5). What the rows of real steps stand for is `super::steps`'.
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method, rpitit_tys};
 use hir_def::{
-    AdtId, DefWithBodyId, ImplId, ModuleDefId,
+    AdtId, DefWithBodyId, HasModule, ImplId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
     nameres::crate_def_map,
 };
@@ -199,13 +199,16 @@ fn fields_changes_with_a_member_name_and_only_then() {
     ]);
 }
 
-/// Why `Fields` exists: lane items' signature hash names a trait's and an impl's items by
-/// place (`blaze_items::form`'s `trait_`), so it stays when one is renamed, and a lookup by
-/// name reads the name. A type's fields and variants that hash names itself (`for const` over
-/// them reads `Field::NAME` and `Variant::NAME`: `form`'s `fields`), so a renamed field changes
-/// the type's signature and its `Fields`, which is over that signature.
+/// A renamed trait item moves both the trait's signature and its `Fields`. The trait's form
+/// names its items by place (`blaze_items::form`'s `trait_`) and the signature hash fills each
+/// by its key as well (D46), so a renamed item, which is another key, moves it; `Fields` holds
+/// the names a lookup by name compares, and moves on its own account (a name a macro's context
+/// keys, which no item key spells, is `Fields`' alone). A type's fields and variants that hash
+/// names itself (`for const` over them reads `Field::NAME` and `Variant::NAME`: `form`'s
+/// `fields`), so a renamed field changes the type's signature and its `Fields`, which is over
+/// that signature.
 #[test]
-fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
+fn a_renamed_trait_item_moves_the_signature_and_the_fields() {
     let signature =
         |db: &Db, name: &str| items_fact(Fact::Signature(key::item_key(db, named(db, name))));
     let value = |db: &Db, fact: FactRef| {
@@ -218,10 +221,10 @@ fn a_renamed_trait_item_keeps_the_signature_and_changes_the_fields() {
         db_of(&format!("{PRELUDE}pub trait T {{ fn m(&self); }} impl T for u8 {{ fn m(&self) {{}} }}")),
         db_of(&format!("{PRELUDE}pub trait T {{ fn n(&self); }} impl T for u8 {{ fn n(&self) {{}} }}")),
     );
-    assert_eq!(
+    assert_ne!(
         value(&before, signature(&before, "T")),
         value(&after, signature(&after, "T")),
-        "a trait's signature names its items by place"
+        "a trait's signature names its items by place and key"
     );
     let fields = fields_of("T");
     assert_ne!(value(&before, fields(&before)), value(&after, fields(&after)));
@@ -498,7 +501,7 @@ fn a_fact_of_this_crates_kind_that_names_nothing_has_no_value() {
 }
 
 /// A store in memory.
-struct Memory {
+pub(super) struct Memory {
     images: Lock<HashMap<ContentId, Arc<Aligned>, Global>>,
 }
 
@@ -756,4 +759,36 @@ fn another_bodys_step_fact_changes_with_its_answer_and_only_then() {
         assert!(was.is_some() && is.is_some(), "{what}: a step fact with no value: {was:?} {is:?}");
         assert_eq!(was != is, changes, "{what}");
     }
+}
+
+/// The invariant of `CrateSettings`: a dependency's settings fact (what a row of its `Crate`
+/// input stands for in a body of another crate, `reads::fact_of`) stays across an edit of a
+/// private body of it and moves with its edition. The control is the edition: a value made of
+/// nothing of the crate would stay there too.
+#[test]
+fn a_crates_settings_fact_moves_with_its_settings_and_not_its_bodies() {
+    let source = |dep_header: &str, body: &str| {
+        format!(
+            "//- /main.rs crate:main deps:dep\npub fn f() -> u32 {{ dep::g() }}\n\
+             //- /dep.rs {dep_header}\npub fn g() -> u32 {{ 1 }}\nfn private() -> u32 {{ {body} }}\n"
+        )
+    };
+    let settings = |text: &str| {
+        let db = super::perturb::db(text);
+        let main = super::perturb::body(&db, "f").krate(&db);
+        let dep = super::perturb::body(&db, "private").krate(&db);
+        values::value(&db, main, values::crate_settings(&db, dep))
+            .expect("a dependency's settings fact has a value")
+    };
+    let base = settings(&source("crate:dep", "1"));
+    assert_eq!(
+        base,
+        settings(&source("crate:dep", "2")),
+        "a private body's edit moved its crate's settings fact"
+    );
+    assert_ne!(
+        base,
+        settings(&source("crate:dep edition:2015", "1")),
+        "the edition of a crate left its settings fact"
+    );
 }

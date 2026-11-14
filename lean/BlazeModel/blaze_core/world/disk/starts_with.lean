@@ -11,9 +11,9 @@ def blaze_core.world.disk.starts_with.loop_0 (fuel : Nat) (bytes : Slice U8) («
   | fuel + 1 =>
     if Scalar.lt i (Slice.len «prefix») then do
       let x0 ← Slice.index bytes i
-      let t20 := x0
+      let t0 := x0
       let x1 ← Slice.index «prefix» i
-      if Scalar.ne t20 x1 then Result.ok false
+      if Scalar.ne t0 x1 then Result.ok false
       else do
         let i ← Scalar.add i (1 : Usize)
         blaze_core.world.disk.starts_with.loop_0 fuel bytes «prefix» i

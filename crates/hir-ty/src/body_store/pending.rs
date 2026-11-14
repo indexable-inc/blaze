@@ -184,7 +184,7 @@ impl Pending {
                 // alloc: one entry per query name, a few dozen
                 Slot::Vacant(slot) => _ = slot.insert(1),
             },
-            Refusal::Unhashable => counts.unhashable += 1,
+            Refusal::Unhashable(_) => counts.unhashable += 1,
             Refusal::NoIdentity => counts.no_identity += 1,
             Refusal::Unshareable => counts.unshareable += 1,
             Refusal::Unencodable => counts.unencodable += 1,

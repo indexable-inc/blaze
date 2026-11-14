@@ -15,12 +15,12 @@ def blaze_core.world.disk.File.ordered.loop_0 (fuel : Nat) (self : blaze_core.wo
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.barriers) then do
-      let t14 ← Slice.index self.barriers i
-      let t11 := Scalar.gt t14.covers most
+      let t0 ← Slice.index self.barriers i
+      let t1 := Scalar.gt t0.covers most
       let most ←
-        if t11 then do
-          let t20 ← Slice.index self.barriers i
-          Result.ok t20.covers
+        if t1 then do
+          let t2 ← Slice.index self.barriers i
+          Result.ok t2.covers
         else Result.ok most
       let i ← Scalar.add i (1 : Usize)
       blaze_core.world.disk.File.ordered.loop_0 fuel self most i

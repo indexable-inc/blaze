@@ -47,32 +47,32 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.disk.a_crash_keeps_a_synced_file (fuel : Nat) (disk : blaze_core.world.disk.Disk) (file : U64) (cut : Vec blaze_core.world.disk.Kept) : Result Bool := do
-  let disk_4 := disk
-  let t8 ← blaze_core.world.disk.Disk.wf fuel disk_4
-  let t7 := !t8
-  let t6 ←
-    if t7 then Result.ok t7
+  let disk_1 := disk
+  let t0 ← blaze_core.world.disk.Disk.wf fuel disk_1
+  let t1 := !t0
+  let t2 ←
+    if t1 then Result.ok t1
     else do
-      let t10 ← blaze_core.world.disk.Disk.small fuel disk_4
-      Result.ok (!t10)
-  if t6 then Result.ok true
+      let t3 ← blaze_core.world.disk.Disk.small fuel disk_1
+      Result.ok (!t3)
+  if t2 then Result.ok true
   else do
-    let t15 ← blaze_core.world.disk.Disk.find fuel disk_4 file
-    match t15 with
+    let t4 ← blaze_core.world.disk.Disk.find fuel disk_1 file
+    match t4 with
     | Option.some v0 => do
       let «at» := v0
-      let t25 ← Slice.index disk_4.files «at»
-      let read ← blaze_core.world.disk.File.contents fuel t25
-      let t30 ← Slice.index disk_4.files «at»
-      let all := Slice.len t30.changes
-      let disk_4 ← blaze_core.world.disk.Disk.sync fuel disk_4 file all
-      let t37 ← blaze_core.world.disk.Disk.allows fuel disk_4 cut
-      if !t37 then Result.ok true
+      let t5 ← Slice.index disk_1.files «at»
+      let read ← blaze_core.world.disk.File.contents fuel t5
+      let t6 ← Slice.index disk_1.files «at»
+      let all := Slice.len t6.changes
+      let disk_1 ← blaze_core.world.disk.Disk.sync fuel disk_1 file all
+      let t7 ← blaze_core.world.disk.Disk.allows fuel disk_1 cut
+      if !t7 then Result.ok true
       else do
-        let disk_4 ← blaze_core.world.disk.Disk.crash fuel disk_4 cut
-        let t51 := read
-        let t57 ← blaze_core.world.disk.Disk.contents fuel disk_4 file
-        blaze_core.world.disk.kept fuel t51 t57
+        let disk_1 ← blaze_core.world.disk.Disk.crash fuel disk_1 cut
+        let t8 := read
+        let t9 ← blaze_core.world.disk.Disk.contents fuel disk_1 file
+        blaze_core.world.disk.kept fuel t8 t9
     | Option.none => Result.ok true
 
 def blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.statement : Prop :=

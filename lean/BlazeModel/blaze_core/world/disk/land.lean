@@ -10,18 +10,18 @@ def blaze_core.world.disk.land.loop_0 (fuel : Nat) (bytes : Vec U8) («at» : Us
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t9 := Scalar.lt sector (Slice.len landed)
-    let t8 := if t9 then Scalar.lt «from» (Slice.len more) else t9
-    if t8 then do
-      let t18 ← Scalar.sub (Slice.len more) «from»
-      let t17 := Scalar.lt t18 (512 : Usize)
-      let to ← if t17 then Result.ok (Slice.len more) else Scalar.add «from» (512 : Usize)
+    let t0 := Scalar.lt sector (Slice.len landed)
+    let t1 := if t0 then Scalar.lt «from» (Slice.len more) else t0
+    if t1 then do
+      let t2 ← Scalar.sub (Slice.len more) «from»
+      let t3 := Scalar.lt t2 (512 : Usize)
+      let to ← if t3 then Result.ok (Slice.len more) else Scalar.add «from» (512 : Usize)
       let x0 ← Slice.index landed sector
-      let t27 := x0
+      let t4 := x0
       let bytes ←
-        if t27 then do
-          let t31 ← Scalar.add «at» «from»
-          blaze_core.world.disk.write fuel bytes t31 more «from» to
+        if t4 then do
+          let t5 ← Scalar.add «at» «from»
+          blaze_core.world.disk.write fuel bytes t5 more «from» to
         else Result.ok bytes
       let «from» := to
       let sector ← Scalar.add sector (1 : Usize)

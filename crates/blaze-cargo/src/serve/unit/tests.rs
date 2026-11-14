@@ -188,7 +188,6 @@ fn build(dir: &std::path::Path) -> Units {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }
@@ -1323,7 +1322,6 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -1640,7 +1638,6 @@ fn script_front_for(
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -1698,6 +1695,7 @@ fn script_front_for(
         makers: one_maker(),
         kind: compile::keyed_kind(crate::serve::work::JobKind::Build, script),
         goal: compile::goal_byte(blaze_api::Goal::Edit),
+        build: 0,
         verified: false,
         reached: false,
         pgo: None,
@@ -2008,7 +2006,6 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2143,7 +2140,6 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2417,6 +2413,7 @@ fn each_maker_of_a_record_moves_its_key() {
             makers,
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2466,6 +2463,7 @@ fn a_units_key_holds_what_of_its_plan_is_read_and_nothing_else() {
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2531,6 +2529,7 @@ fn the_goal_moves_a_units_record_key() {
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal,
+            build: 0,
             verified: false,
             reached: false,
             pgo: None,
@@ -2548,6 +2547,56 @@ fn the_goal_moves_a_units_record_key() {
     assert_ne!(key(&mut front, max), at_edit, "tier 0 code and optimized code under one key");
     assert_ne!(key(&mut front, 0), at_edit);
     assert_ne!(key(&mut front, 0), key(&mut front, max));
+}
+
+/// The invariant: a unit's record key holds what image its unit links (`compile::keyed_build`,
+/// the link's own policy's mode), so a `blaze run`'s launcher program, a `blaze build`'s live
+/// image and a plain file, each another value of the same unit, are under three keys, and a
+/// `build` after a `run` never replays the launcher's file as its live image (2026-11-14: "the
+/// dev executable `hi`'s kept file: the image exports no __blaze_live"). The control is the
+/// key as it was before, with no byte of the mode: the oracle sees the three collide.
+#[test]
+fn what_image_a_unit_links_moves_its_record_key() {
+    use blaze_codegen::plan::Mode;
+    let key = |front: &mut MemFront, build: u8| {
+        let identity = front.lowered.identity(0).unwrap();
+        let u = &front.units.graph.units[0];
+        compile::RecordInputs {
+            identity,
+            places: &test_places(),
+            unit: compile::KeyedUnit::among(u, |at| Ok(&front.units.graph.units[at])).unwrap(),
+            plan: &front.units.plans[0],
+            run_env: &[],
+            script_check_cfgs: Vec::new(),
+            script_link_args: Vec::new(),
+            linked_rustflag_libs: Vec::new(),
+            makers: one_maker(),
+            // `run` and `build` are one kind (`compile::keyed_kind`): only the mode tells them.
+            kind: compile::keyed_kind(crate::serve::work::JobKind::Run, u),
+            goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build,
+            verified: false,
+            reached: false,
+            pgo: None,
+            lint_profile: None,
+            layout: None,
+        }
+        .key(0)
+        .unwrap()
+    };
+    let mut front = orphan_front(false);
+    let modes = [Mode::Output, Mode::Live, Mode::Tiered, Mode::Launched];
+    let keys: Vec<_> = modes.iter().map(|it| key(&mut front, compile::build_byte(*it))).collect();
+    for (at, a) in keys.iter().enumerate() {
+        assert_eq!(key(&mut front, compile::build_byte(modes[at])), *a, "one mode, one key");
+        for b in &keys[at + 1..] {
+            assert_ne!(a, b, "two images of one unit under one key");
+        }
+    }
+    assert!(modes.iter().all(|it| compile::build_byte(*it) != 0), "0 is a unit that links nothing");
+    // The control: the key with no byte of the mode, as before, is one key for all four.
+    let planted: Vec<_> = modes.iter().map(|_| key(&mut front, 0)).collect();
+    assert!(planted.windows(2).all(|it| it[0] == it[1]), "the planted key told the images apart");
 }
 
 /// Rule 21 for the sealed checks of a reached-only crate: when `l` gains `#[blaze::sealed]`,
@@ -2572,6 +2621,7 @@ fn a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it
             makers: one_maker(),
             kind: compile::keyed_kind(crate::serve::work::JobKind::Build, u),
             goal: compile::goal_byte(blaze_api::Goal::Edit),
+            build: 0,
             verified: false,
             reached: true,
             pgo: None,
@@ -3349,7 +3399,8 @@ fn alike_front(lib: &str) -> blaze_lower::Lowered {
 
 /// What [`core_front`]'s `core` is made of: minicore with what its fixtures' closures, `async`
 /// functions and `Send` bound reach.
-const MINI: &[&str] = &["sized", "copy", "clone", "fn", "add", "send", "sync", "future", "drop"];
+const MINI: &[&str] =
+    &["sized", "copy", "clone", "fn", "add", "send", "sync", "future", "drop", "phantom_data"];
 
 /// The front end of a build of one path package `bodies` (unit 0) whose library is `lib`, a
 /// `#![no_std]` crate on a `core` (unit 1, the registry package `mini`) of minicore.
@@ -3410,18 +3461,33 @@ impl Drop for Planted {
 /// their entries into it, as a build that checked and stored the crate leaves them: the
 /// simulation and the store, kept for the test's life, and a reader of it.
 fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Store, blaze_cas::Reader) {
+    built_and_kept_of(seed, || core_front(lib))
+}
+
+/// [`built_and_kept`] of the front end `front` makes, whose unit 0 is the crate whose bodies
+/// are asked.
+fn built_and_kept_of(
+    seed: u64,
+    front: impl FnOnce() -> blaze_lower::Lowered,
+) -> (blaze_core::sim::Sim, blaze_cas::Store, blaze_cas::Reader) {
     let mut sim = blaze_core::sim::Sim::new(seed, blaze_core::sim::Faults::default());
     let mut store = super::deps::tests::opened(&mut sim);
     let reader = store.reader();
     // The session's store reads run as a task's, on the simulation lent to them.
     super::deps::tests::as_task(&mut sim, || {
     let macros = super::deps::tests::no_macros();
-    let first = std::sync::Arc::new(core_front(lib));
+    let first = std::sync::Arc::new(front());
     let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&first);
+    let _ = crate::serve::front_carry::bodies::take_refused();
     let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new())
         .unwrap_or_else(|error| panic!("the first build's keep: {}", error.what));
-    assert!(did.kept > 0, "the first build kept its bodies' entries: {did:?}");
+    let refused = crate::serve::front_carry::bodies::take_refused();
+    assert!(
+        did.kept > 0,
+        "the first build kept none of its bodies' entries: {did:?}; refused, by why (count, first \
+         step refused): {refused:#?}"
+    );
     for it in kept.puts {
         store.put(it.key, it.kind, &it.bytes).unwrap();
     }
@@ -3746,6 +3812,20 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     if first.session != Opened::New {
         return Err(format!("the first serve had a session already: {first:?}"));
     }
+    // The premise of the test and of its control (`bodies::CLEAN_IDENTITIES`), not part of
+    // the oracle, so a panic and never an `Err` the control would count as caught: every step
+    // of every body, `uses` the edit moves among them, is served from the build's entries, so
+    // the edited body's rows are posted when the carry is told its identity did not move. A
+    // step missed here runs fresh at the second serve whatever the carry says, and `uses`'s
+    // inference is the same for `bump(1)` and `bump(2)`: only its MIR differs, so a missed
+    // MIR of `uses` let the planted driver pass unseen.
+    assert_eq!(
+        first.missed,
+        0,
+        "the first serve missed a body's step the build ran, so the carry's posted rows do not \
+         cover every body: {first:?}; refused, by why (count, first step refused): {:#?}",
+        crate::serve::front_carry::bodies::take_refused()
+    );
     // The serve's puts, its session's save among them, put as the loop puts a unit's
     // `Compiled::puts`: a saved session keeps none of its nodes in memory
     // (`blaze_kernel::Session::save`), so the carry reads them from the store.
@@ -3895,5 +3975,325 @@ fn the_oracle_catches_a_session_put_back_without_its_puts() {
 #[test]
 fn the_oracle_catches_a_driver_that_says_identities_unchanged() {
     let _planted = Planted::set(&bodies::CLEAN_IDENTITIES);
-    assert!(carried_serve(8).is_err(), "the oracle passed a carry told no identity moved");
+    let carried = carried_serve(8);
+    assert!(carried.is_err(), "the oracle passed a carry told no identity moved: {carried:?}");
+}
+
+/// A callee's signature edited to name another nominal type of the same shape, its caller's
+/// text unchanged, and a body nothing edits (`other`, whose served steps show the serve works):
+/// what the edit is, and the library before and after.
+struct Renominal {
+    what: &'static str,
+    before: &'static str,
+    after: &'static str,
+}
+
+const RENOMINALS: [Renominal; 3] = [
+    // `f(Meters(1))` against `f(_: Feet)`: rustc rejects the caller.
+    Renominal {
+        what: "a parameter that becomes another newtype of the same shape",
+        before: "#![no_std]\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 pub fn f(_x: Meters) {}\npub fn caller() { f(Meters(1)) }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                pub fn f(_x: Feet) {}\npub fn caller() { f(Meters(1)) }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+    // A type-level marker, `PhantomData<A>` against `PhantomData<B>`: rustc rejects the caller.
+    Renominal {
+        what: "a parameter whose marker type becomes another unit struct",
+        before: "#![no_std]\n\
+                 use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                 pub fn f(_x: PhantomData<A>) {}\npub fn caller() { f(PhantomData::<A>) }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                pub fn f(_x: PhantomData<B>) {}\npub fn caller() { f(PhantomData::<A>) }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+    // A return type with an impl per type: rustc accepts both, and `.m()` must select `Feet`'s
+    // impl after the edit; a stale answer selects `Meters`'s (returns 1 where the program
+    // returns 2), a silent miscompile.
+    Renominal {
+        what: "a return type that becomes another newtype, each with its own impl",
+        before: "#![no_std]\n\
+                 pub trait Tr { fn m(&self) -> u32; }\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                 impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                 pub fn f() -> Meters { Meters(1) }\npub fn caller() -> u32 { f().m() }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                pub trait Tr { fn m(&self) -> u32; }\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                pub fn f() -> Feet { Feet(1) }\npub fn caller() -> u32 { f().m() }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+];
+
+/// The oracle of [`a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller`],
+/// as [`leaks_never_stale`] is of leaks: `case.before` built and kept, then the next build,
+/// a new database of `case.after`, served from those entries (`carried` false); or, as the
+/// daemon does, one database of `case.before` served, edited to `case.after` in its next
+/// revision and served again by the same sessions (`carried` true, as [`carried_serve`]).
+/// `caller`'s inference and MIR must equal those of a database of `case.after` served
+/// nothing, and the served database's item store must have found no served answer that
+/// disagrees with it. The control: `other`, which nothing edits, is served (inference hits),
+/// so a pass is not a serve that served nothing.
+fn renominal_never_stale(seed: u64, case: &Renominal, carried: bool) -> Result<(), String> {
+    let (mut sim, mut store, reader) = built_and_kept(seed, case.before);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
+        let macros = super::deps::tests::no_macros();
+        let sessions = BodySessions::default();
+        let marks = no_marks();
+        let first_text = if carried { case.before } else { case.after };
+        let mut next = std::sync::Arc::new(core_front(first_text));
+        let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        let krate = next.krate(0).unwrap();
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            .map_err(|error| format!("the serve: {}", error.what))?;
+        ask_bodies_steps(&next);
+        let read = served.item_steps().unwrap();
+        let [infer, _, _] = BODY_STEPS;
+        if read[infer].hits == 0 {
+            return Err(format!("the control: no inference was served, so the edit proves nothing: {read:?}"));
+        }
+        if carried {
+            for it in puts.puts {
+                store.put(it.key, it.kind, &it.bytes).map_err(|error| format!("the serve's put: {error:?}"))?;
+            }
+            let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
+            let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
+            // One change, in one edit and one commit, under the batch's span as a build's writes.
+            lowered.batch(blaze_lower::Trigger::named("the test's edit of `f`"), |lowered| {
+                let mut edit = lowered.served_db().edit();
+                edit.set_file_text(root, case.after);
+                _ = edit.commit();
+            });
+            // The commit took the crate's id of the first snapshot: taken again in the new one.
+            let krate = next.krate(0).unwrap();
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+                .map_err(|error| format!("the second serve: {}", error.what))?;
+            ask_bodies_steps(&next);
+        }
+        super::deps::item_errors(&served)
+            .map_err(|error| format!("the served database's item store: {}", error.what))?;
+        let fresh = std::sync::Arc::new(core_front(case.after));
+        let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        ask_bodies_steps(&fresh);
+        let (now, run) = (steps_of(&next, "caller"), steps_of(&fresh, "caller"));
+        match now == run {
+            true => Ok(()),
+            false => Err(format!("`caller` served stale: {now:?}, a database served nothing has {run:?}")),
+        }
+    })
+}
+
+/// A callee whose signature comes to name another nominal type of the same shape (a newtype
+/// for another, `PhantomData<A>` for `PhantomData<B>`, a return type with an impl per type)
+/// reaches its caller, whose text did not change, in the next build and in the daemon's next
+/// revision alike.
+///
+/// The invariant: the caller's inference and MIR, served from the kernel entries a build kept,
+/// equal those of a database of the edited tree served nothing, and the item store finds no
+/// served answer that disagrees with its database. A stale answer accepts a program rustc
+/// rejects, or calls the impl of the type the callee no longer returns.
+#[test]
+fn a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller() {
+    let mut failed: Vec<String> = Vec::new(); // alloc: a test's findings
+    for (at, case) in RENOMINALS.iter().enumerate() {
+        for carried in [false, true] {
+            if let Err(why) = renominal_never_stale(20 + at as u64, case, carried) {
+                failed.push(format!("{} (carried: {carried}): {why}", case.what)); // alloc: as above
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`RENOMINALS`] across a crate boundary: the dependency `dep` (unit 1) before and after, and
+/// the dependent `app` (unit 0), whose text no case edits.
+struct DepRenominal {
+    what: &'static str,
+    dep_before: &'static str,
+    dep_after: &'static str,
+    app: &'static str,
+}
+
+/// The types each case's `dep` declares, and a private body the control edits.
+const DEP_TYPES: &str = "#![no_std]\npub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                         fn private() -> u32 { 1 }\n";
+
+const DEP_RENOMINALS: [DepRenominal; 3] = [
+    DepRenominal {
+        what: "a parameter that becomes another newtype of the same shape",
+        dep_before: "pub fn f(_x: Meters) {}\n",
+        dep_after: "pub fn f(_x: Feet) {}\n",
+        app: "#![no_std]\npub fn caller() { dep::f(dep::Meters(1)) }\npub fn other() -> u32 { 1 }\n",
+    },
+    DepRenominal {
+        what: "a parameter whose marker type becomes another unit struct",
+        dep_before: "pub struct A;\npub struct B;\n\
+                     pub fn f(_x: core::marker::PhantomData<A>) {}\n",
+        dep_after: "pub struct A;\npub struct B;\n\
+                    pub fn f(_x: core::marker::PhantomData<B>) {}\n",
+        app: "#![no_std]\npub fn caller() { dep::f(core::marker::PhantomData::<dep::A>) }\n\
+              pub fn other() -> u32 { 1 }\n",
+    },
+    DepRenominal {
+        what: "a return type that becomes another newtype, each with its own impl",
+        dep_before: "pub trait Tr { fn m(&self) -> u32; }\n\
+                     impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                     impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                     pub fn f() -> Meters { Meters(1) }\n",
+        dep_after: "pub trait Tr { fn m(&self) -> u32; }\n\
+                    impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                    impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                    pub fn f() -> Feet { Feet(1) }\n",
+        app: "#![no_std]\nuse dep::Tr;\npub fn caller() -> u32 { dep::f().m() }\n\
+              pub fn other() -> u32 { 1 }\n",
+    },
+];
+
+/// `dep`'s library: [`DEP_TYPES`] then `rest`.
+fn dep_lib(rest: &str) -> String {
+    format!("{DEP_TYPES}{rest}") // alloc: a test's text
+}
+
+/// The front end of `app` (unit 0, a path package) on `dep` (unit 1, a path package), both
+/// `#![no_std]` on [`core_front`]'s minicore (unit 2).
+fn two_crate_front(app: &str, dep: &str) -> blaze_lower::Lowered {
+    let mini =
+        test_utils::MiniCore::from_flags(MINI.iter().copied()).source_code(test_utils::MiniCore::RAW_SOURCE);
+    bodies_front(&[
+        MemPkg { name: "app", path: true, lib: app, deps: &[(1, "dep"), (2, "core")] },
+        MemPkg { name: "dep", path: true, lib: dep, deps: &[(2, "core")] },
+        MemPkg { name: "mini", path: false, lib: &mini, deps: &[] },
+    ])
+}
+
+/// What `app`'s narrow key holds of `dep` for a check: the key its check outcome is filed under
+/// holds `dep` by this part alone (`blaze_lower::Lowered::narrow_parts`, design section 15).
+fn dep_interface_part(lowered: &blaze_lower::Lowered) -> Result<ContentId, String> {
+    lowered
+        .narrow_parts(0)
+        .into_iter()
+        .find(|(what, _)| what.starts_with("the interface") && what.contains("of the crate dep "))
+        .map(|(_, part)| part)
+        .ok_or_else(|| format!("no interface part of `dep` in `app`'s narrow key: {:?}", lowered.narrow_parts(0)))
+}
+
+/// The cross-crate form of [`renominal_never_stale`]: `app` on `dep_before` built and kept;
+/// then `app` on `dep_after` served from those entries, as the next build (`carried` false) or
+/// as the daemon's next revision of one database (`carried` true). `app`'s `caller` must equal
+/// a database of the edited tree served nothing, the item store must find no served answer
+/// that disagrees, and `app`'s check outcome must not be replayed: the interface part of `dep`
+/// its narrow key holds moves. With `dep_after` the private body's edit alone (`renamed`
+/// false: the control), nothing of `app` may move and both its bodies are served.
+fn dep_renominal(seed: u64, case: &DepRenominal, carried: bool, renamed: bool) -> Result<(), String> {
+    let (dep_before, dep_after) = (dep_lib(case.dep_before), match renamed {
+        true => dep_lib(case.dep_after),
+        false => dep_lib(case.dep_before).replace("fn private() -> u32 { 1 }", "fn private() -> u32 { 2 }"),
+    });
+    let (mut sim, mut store, reader) = built_and_kept_of(seed, || two_crate_front(case.app, &dep_before));
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
+        let macros = super::deps::tests::no_macros();
+        let sessions = BodySessions::default();
+        let marks = no_marks();
+        let interface_before = dep_interface_part(&two_crate_front(case.app, &dep_before))?;
+        let fresh = std::sync::Arc::new(two_crate_front(case.app, &dep_after));
+        let interface_after = dep_interface_part(&fresh)?;
+        match (renamed, interface_after == interface_before) {
+            (true, true) => {
+                return Err("`app`'s check outcome is replayed: its narrow key holds the same interface of `dep`".to_owned());
+            }
+            (false, false) => {
+                return Err("a private body's edit moved the interface of `dep` `app`'s check is keyed by".to_owned());
+            }
+            _ => {}
+        }
+        let mut next = std::sync::Arc::new(two_crate_front(case.app, if carried { &dep_before } else { &dep_after }));
+        let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        let krate = next.krate(0).unwrap();
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            .map_err(|error| format!("the serve: {}", error.what))?;
+        let bodies = ask_bodies_steps(&next);
+        let [infer, _, _] = BODY_STEPS;
+        let read = served.item_steps().unwrap();
+        if read[infer].hits == 0 {
+            return Err(format!("the control: no inference was served, so the edit proves nothing: {read:?}"));
+        }
+        // The counts are of `app`'s bodies alone: `ask_bodies_steps` asks unit 0's, and `dep`'s
+        // bodies are neither served nor asked here, so a run is a body of `app` that missed.
+        // Of the five steps, `Const` (`app` has no `const` item) and `Lower` (the body's
+        // lowering facts) are not compared.
+        if !renamed && !carried {
+            for step in BODY_STEPS {
+                if (read[step].hits as usize, read[step].ran) != (bodies, 0) {
+                    return Err(format!(
+                        "a private body's edit of `dep`, which changes nothing `app` reads, missed \
+                         a body of `app`: step {step}, {} of `app`'s {bodies} bodies served and {} run: {read:?}",
+                        read[step].hits, read[step].ran
+                    ));
+                }
+            }
+        }
+        if carried {
+            for it in puts.puts {
+                store.put(it.key, it.kind, &it.bytes).map_err(|error| format!("the serve's put: {error:?}"))?;
+            }
+            let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
+            let root = lowered.krate(1).unwrap().data(lowered.db()).root_file_id;
+            // One change, in one edit and one commit, under the batch's span as a build's writes.
+            lowered.batch(blaze_lower::Trigger::named("the test's edit of `dep`"), |lowered| {
+                let mut edit = lowered.served_db().edit();
+                edit.set_file_text(root, &dep_after);
+                _ = edit.commit();
+            });
+            // The commit took `app`'s crate id of the first snapshot: taken again in the new one.
+            let krate = next.krate(0).unwrap();
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+                .map_err(|error| format!("the second serve: {}", error.what))?;
+            ask_bodies_steps(&next);
+        }
+        super::deps::item_errors(&served)
+            .map_err(|error| format!("the served database's item store: {}", error.what))?;
+        let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        ask_bodies_steps(&fresh);
+        let (now, run) = (steps_of(&next, "caller"), steps_of(&fresh, "caller"));
+        match now == run {
+            true => Ok(()),
+            false => Err(format!("`caller` served stale: {now:?}, a database served nothing has {run:?}")),
+        }
+    })
+}
+
+/// A dependency's function whose signature comes to name another nominal type of the same
+/// shape reaches the dependent crate, whose text did not change: in the next build and in the
+/// daemon's next revision alike.
+///
+/// The invariant: `app`'s `caller`, served from the entries a build kept, equals a database of
+/// the edited tree served nothing; the item store finds no served answer that disagrees; and
+/// `app`'s check outcome is keyed anew (its narrow key's interface of `dep` moves), so rustc's
+/// rejection of `app` is not replayed away. The control: an edit of a private body of `dep`
+/// moves neither, and `app`'s bodies are all served.
+#[test]
+fn a_dependencys_function_that_names_another_type_of_the_same_shape_reaches_the_dependent() {
+    let mut failed: Vec<String> = Vec::new(); // alloc: a test's findings
+    for (at, case) in DEP_RENOMINALS.iter().enumerate() {
+        for carried in [false, true] {
+            for renamed in [true, false] {
+                if let Err(why) = dep_renominal(40 + at as u64, case, carried, renamed) {
+                    // alloc: as above
+                    failed.push(format!("{} (carried: {carried}, renamed: {renamed}): {why}", case.what));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

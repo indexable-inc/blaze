@@ -20,36 +20,36 @@ set_option linter.unusedVariables false
 
 def blaze_core.world.disk.File.cut (fuel : Nat) (self : blaze_core.world.disk.File) (kept : blaze_core.world.disk.Kept) : Result blaze_core.world.disk.File := do
   let self ← blaze_core.world.disk.File.sync fuel self kept.whole
-  let t7 := !(Slice.is_empty self.changes)
+  let t0 := !(Slice.is_empty self.changes)
   let self ←
-    if t7 then do
+    if t0 then do
       let (next, x0) ← Vec.remove self.changes (0 : Usize)
       let self := { self with changes := x0 }
       match kept.torn with
       | blaze_core.world.disk.Torn.Nothing => Result.ok self
-      | blaze_core.world.disk.Torn.Prefix v1 =>
-        let count := v1
+      | blaze_core.world.disk.Torn.Prefix v0 =>
+        let count := v0
         match next.change with
-        | blaze_core.world.disk.Change.Append v2 => do
-          let more := v2
-          let x3 ← blaze_core.world.disk.extend fuel self.durable more count
-          Result.ok { self with durable := x3 }
-        | blaze_core.world.disk.Change.At v4 v5 => do
-          let «at» := v4
-          let more_24 := v5
-          let t26 := Scalar.lt count (Slice.len more_24)
-          let to := if t26 then count else Slice.len more_24
-          let x6 ← blaze_core.world.disk.write fuel self.durable «at» more_24 (0 : Usize) to
-          Result.ok { self with durable := x6 }
+        | blaze_core.world.disk.Change.Append v1 => do
+          let more := v1
+          let x1 ← blaze_core.world.disk.extend fuel self.durable more count
+          Result.ok { self with durable := x1 }
+        | blaze_core.world.disk.Change.At v2 v3 => do
+          let «at» := v2
+          let more_1 := v3
+          let t1 := Scalar.lt count (Slice.len more_1)
+          let to := if t1 then count else Slice.len more_1
+          let x2 ← blaze_core.world.disk.write fuel self.durable «at» more_1 (0 : Usize) to
+          Result.ok { self with durable := x2 }
         | _ => Result.ok self
-      | blaze_core.world.disk.Torn.Sectors v7 =>
-        let landed := v7
+      | blaze_core.world.disk.Torn.Sectors v4 =>
+        let landed := v4
         match next.change with
-        | blaze_core.world.disk.Change.Sectors v8 v9 => do
-          let at_41 := v8
-          let more_42 := v9
-          let x10 ← blaze_core.world.disk.land fuel self.durable at_41 more_42 landed
-          Result.ok { self with durable := x10 }
+        | blaze_core.world.disk.Change.Sectors v5 v6 => do
+          let at_1 := v5
+          let more_2 := v6
+          let x3 ← blaze_core.world.disk.land fuel self.durable at_1 more_2 landed
+          Result.ok { self with durable := x3 }
         | _ => Result.ok self
     else Result.ok self
   let self := { self with changes := Vec.clear self.changes }
