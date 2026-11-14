@@ -1,0 +1,13 @@
+{
+ "id": "dst-1113-4",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113",
+ "where": "blaze-vm:/root/loop.sh and the smoke before a merge (how-to H-smoke-before-merge)",
+ "what": "The smoke of a branch built through `/root/loop.sh` fails at its first step: `hello cold FAILED: exited 101`, `error: linking .../out/hello: ... is a launched run (`blaze run`), and blaze`s launcher /root/inst/<branch>/blaze-launcher does not read: No such file or directory`. loop.sh builds `-p blaze-thin -p blaze-engine` and installs those two; `blaze run` on main needs `blaze-launcher` beside them. The how-to`s command also calls `blaze run -q -p scripts --bin smoke`, and the VM has no `blaze` on its PATH (exit 127).",
+ "cost": "three smoke runs (one killed by a dropped ix session, one exit 127, one a real FAILED quote) before the first that could pass",
+ "cause": "the launcher became a separate binary after loop.sh was written, and the how-to assumes a released blaze the VM does not have",
+ "class": "a shared build script that installs less than the program now needs, so every lane`s first smoke fails the same way",
+ "prevention": "loop.sh builds and installs blaze-launcher, and the how-to builds the smoke program with cargo on the VM; not done: the script is shared, so I worked around it in my own job",
+ "workaround": "inside the loop.sh call: `cargo build --release -p blaze-launcher`, copy it beside $BLAZE, `cargo build -q -p scripts --bin smoke`, run target/debug/smoke; all as a systemd unit, since an ix session can drop",
+ "state": "open"
+}

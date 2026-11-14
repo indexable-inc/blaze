@@ -12,8 +12,7 @@ use blaze_core::{
     Effect, FileName, run_until_idle,
     sim::{Faults, Rng, Sim},
 };
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::Config as SimConfig;
 
 use super::*;
 use crate::{Config, Kind, Store};
@@ -367,14 +366,16 @@ fn map_one(sim: &mut Sim, direct: &mut Direct, model: &BTreeMap<u64, State>, n: 
     }
 }
 
-#[hegel::test(test_cases = 200)]
-fn the_direct_reader_answers_what_was_put(tc: TestCase) {
-    let seed: u64 = tc.draw(gs::integers());
-    let ops: Vec<u16> = tc.draw(gs::vecs(gs::integers()).max_size(80));
-    let ops: Vec<Op> = ops.into_iter().map(Op::decode).collect();
-    if let Err(why) = run(seed, &ops, Plant::None) {
-        panic!("seed {seed}: {why}\nops: {ops:?}");
-    }
+#[test]
+fn the_direct_reader_answers_what_was_put() {
+    blaze_sim::check(SimConfig::cases(200), |tape| {
+        let seed: u64 = tape.next_u64("sim seed");
+        let ops: Vec<u16> = tape.vec(0..=80, "ops", |tape| tape.int::<u16>("op"));
+        let ops: Vec<Op> = ops.into_iter().map(Op::decode).collect();
+        if let Err(why) = run(seed, &ops, Plant::None) {
+            panic!("seed {seed}: {why}\nops: {ops:?}");
+        }
+    });
 }
 
 /// Each control's plan passes with no bug planted and is refused with it, under every seed.

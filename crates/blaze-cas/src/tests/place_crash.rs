@@ -6,7 +6,7 @@
 //! or gone, may undo a rename onto an output's path, and may tear an output written where it
 //! goes; the oracle is what a build may rely on all the same.
 //! The same harness as the race of two stores (`place_race`): the store's own state machine on
-//! the simulated disk, Hegel drawing the run.
+//! the simulated disk, the case's tape drawing the run.
 //!
 //! The simulation also charges a clone of a file with data not written back the write-back
 //! it forces ([`Sim::bytes_forced`]): on a real disk that is what the clone waits for, the
@@ -18,10 +18,8 @@
 
 use std::collections::BTreeSet;
 
-use hegel::TestCase;
-use hegel::generators as gs;
-
 use blaze_core::sim::SECTOR;
+use blaze_sim::{Config as SimConfig, Tape};
 
 use super::*;
 
@@ -619,46 +617,40 @@ fn forced(case: &Case, plant: PlacePlant) -> Result<u64, String> {
     Ok(world.sim.bytes_forced())
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let byte = |tc: &TestCase| tc.draw(gs::integers::<u8>());
-    match tc.draw(gs::integers::<u8>().max_value(15)) {
+fn op(tape: &Tape) -> Op {
+    let byte = |tape: &Tape, label: &'static str| tape.int::<u8>(label);
+    match tape.int_in(0..=15u8, "op") {
         0 | 1 => Op::Whole {
-            seed: tc.draw(gs::integers()),
+            seed: tape.int::<u64>("whole seed"),
             // Mostly long enough to be cloned from a whole file; sometimes written in place.
-            len: match tc.draw(gs::integers::<u8>().max_value(4)) {
-                0 => tc.draw(gs::integers::<u32>().min_value(1).max_value(3000)),
-                _ => tc.draw(gs::integers::<u32>().min_value(CLONE_FROM as u32).max_value(40 << 10)),
+            len: match tape.int_in(0..=4u8, "whole len kind") {
+                0 => tape.int_in(1..=3000u32, "whole len"),
+                _ => tape.int_in((CLONE_FROM as u32)..=(40 << 10), "whole len"),
             },
         },
         2..5 => Op::Derived {
-            base: byte(tc),
-            seed: tc.draw(gs::integers()),
-            ranges: byte(tc),
-            len: [Len::Same, Len::Same, Len::Shorter, Len::Longer]
-                [usize::from(tc.draw(gs::integers::<u8>().max_value(3)))],
+            base: byte(tape, "base"),
+            seed: tape.int::<u64>("derived seed"),
+            ranges: byte(tape, "ranges"),
+            len: [Len::Same, Len::Same, Len::Shorter, Len::Longer][usize::from(tape.int_in(0..=3u8, "derived len"))],
         },
         5..11 => Op::Place {
-            value: byte(tc),
-            path: byte(tc),
-            steps: match tc.draw(gs::booleans()) {
-                true => Some(tc.draw(gs::integers::<u8>().max_value(12))),
-                false => None,
-            },
+            value: byte(tape, "value"),
+            path: byte(tape, "path"),
+            steps: tape.option("steps", |tape| tape.int_in(0..=12u8, "steps")),
         },
         11 => Op::Settle,
-        12 => Op::Fill { room: tc.draw(gs::integers::<u32>().max_value(60 << 10)) },
+        12 => Op::Fill { room: tape.int_in(0..=60u32 << 10, "room") },
         13 | 14 => Op::Crash,
         _ => Op::Reopen,
     }
 }
 
-#[hegel::composite]
-fn case(tc: &TestCase) -> Case {
+fn case(tape: &Tape) -> Case {
     Case {
-        seed: tc.draw(gs::integers()),
-        latency_us: tc.draw(gs::integers().min_value(1).max_value(2000)),
-        ops: tc.draw(gs::vecs(op()).min_size(1).max_size(24)),
+        seed: tape.next_u64("sim seed"),
+        latency_us: tape.int_in(1..=2000u64, "latency us"),
+        ops: tape.vec(1..=24, "ops", op),
     }
 }
 
@@ -673,11 +665,11 @@ fn case(tc: &TestCase) -> Case {
 /// value written where it goes, or a derived value's base with any of its ranges written),
 /// never bytes of anything else; (4) no clone the store asks for is of a file with data not written back,
 /// so no place waits for a write-back a clone forced; and the store opens.
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_place_gives_its_values_bytes_whole_through_any_crash() {
-    super::model_check::run_cases(96, |tc| {
-        let case = tc.draw(case());
+    blaze_sim::check(SimConfig::cases(96), |tape| {
+        let case = case(tape);
         match forced(&case, PlacePlant::None) {
             Err(why) => panic!("{case:?}: {why}"),
             Ok(0) => {}
