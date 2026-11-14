@@ -166,6 +166,9 @@ impl<'db> Writer<'_, 'db> {
             Ty::Vec(elem) => format!("Vec<{}>", Self::key(elem)),
             Ty::Array(elem, len) => format!("[{}; {len}]", Self::key(elem)),
             Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
+            Ty::Duration => "core::time::Duration".to_owned(),
+            Ty::Ordering => "core::cmp::Ordering".to_owned(),
+            Ty::Str => "str".to_owned(),
         }
     }
 
@@ -238,6 +241,10 @@ impl<'db> Writer<'_, 'db> {
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }
+            Ty::Duration | Ty::Ordering | Ty::Str => {
+                let key = Self::key(ty);
+                return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
+            }
         })
     }
 
@@ -285,6 +292,12 @@ impl<'db> Writer<'_, 'db> {
                     Operand::Unit => "Const.unit".to_owned(),
                     Operand::Place(_) => {
                         return Err(self.cx.refuse("a constant that is a place", at));
+                    }
+                    Operand::Str(_) | Operand::Duration { .. } | Operand::Ordering(_) => {
+                        return Err(self.cx.refuse(
+                            format!("a constant of type `{}`, which the MIR model has no declaration of", Self::key(&ty)),
+                            at,
+                        ));
                     }
                 };
                 Ok((format!("Operand.const {}", arg(&constant)), ty))
@@ -683,6 +696,8 @@ fn body<'db>(
         checks_overflow,
         // The embedding types every local where it is declared, and refuses there.
         unusable: BTreeMap::new(),
+        duration: None,
+        derives: BTreeSet::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());

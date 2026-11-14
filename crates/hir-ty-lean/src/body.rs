@@ -27,7 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use base_db::Db;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
+    AdtId,
+    builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
     Lookup as _, ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
     hir::generics::GenericParams,
@@ -35,7 +36,7 @@ use hir_def::{
     signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
 use hir_ty::{
-    ParamEnvAndCrate,
+    MemoryMap, ParamEnvAndCrate,
     db::HirDatabase as _,
     method_resolution::NoImplMethod,
     mir as m,
@@ -146,6 +147,13 @@ pub enum Ty {
     Vec(Box<Ty>),
     /// `core::num::TryFromIntError`, the error of a `TryFrom` between integers.
     TryFromIntError,
+    /// `core::time::Duration`: `lean/Blaze/Duration.lean`'s `core.time.Duration`.
+    Duration,
+    /// `core::cmp::Ordering`: `lean/Blaze/Ordering.lean`'s `core.cmp.Ordering`.
+    Ordering,
+    /// `str`, behind any reference: its bytes (`lean/Blaze/Str.lean`'s `Str`), with the
+    /// UTF-8 invariant not carried.
+    Str,
 }
 
 impl Ty {
@@ -160,7 +168,14 @@ impl Ty {
     /// The structs and enums it names, by Lean name, into `out`.
     pub fn adts(&self, out: &mut BTreeSet<String>) {
         match self {
-            Ty::Bool | Ty::Int(_) | Ty::Unit | Ty::Never | Ty::TryFromIntError => {}
+            Ty::Bool
+            | Ty::Int(_)
+            | Ty::Unit
+            | Ty::Never
+            | Ty::TryFromIntError
+            | Ty::Duration
+            | Ty::Ordering
+            | Ty::Str => {}
             Ty::Adt(name) => {
                 out.insert(name.clone());
             }
@@ -250,6 +265,13 @@ pub enum Operand {
     Int(IntTy, u128),
     Bool(bool),
     Unit,
+    /// A string constant (a literal): its bytes.
+    Str(Vec<u8>),
+    /// A `Duration` constant (`Duration::ZERO`, `Duration::MAX`): its seconds and its
+    /// nanoseconds, below `1_000_000_000`.
+    Duration { secs: u64, nanos: u32 },
+    /// An `Ordering` constant: its variant, `0` `Less`, `1` `Equal`, `2` `Greater`.
+    Ordering(u32),
 }
 
 /// What an operator works on.
@@ -396,10 +418,17 @@ impl Body {
             Ty::Result(ok, err) => {
                 Some(vec![variant("Ok", 0, field(ok)), variant("Err", 1, field(err))])
             }
+            Ty::Ordering => Some(ORDERING.iter().map(|&(name, it)| variant(name, it, Vec::new())).collect()),
             _ => None,
         }
     }
 }
+
+/// `core::cmp::Ordering`'s variants and their discriminants as a `match` tests them (an
+/// enum's discriminant, sign-extended to 128 bits): `Less = -1`, `Equal = 0`, `Greater = 1`
+/// (`library/core/src/cmp.rs:420`, `#[repr(i8)] pub enum Ordering`).
+pub(crate) const ORDERING: [(&str, u128); 3] =
+    [("Less", -1i128 as u128), ("Equal", 0), ("Greater", 1)];
 
 impl Operand {
     fn reads(&self, out: &mut BTreeSet<Local>) {
@@ -727,6 +756,9 @@ pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
 pub(crate) struct Lowered {
     pub(crate) body: Body,
     pub(crate) callees: Vec<(String, FunctionId)>,
+    /// The structs and enums whose derived `==` the body calls, or that a field of one holds:
+    /// each gets a Lean `DecidableEq` instance ([`crate::eq_module`]).
+    pub(crate) derives: BTreeSet<String>,
 }
 
 /// Why a `&mut` into a `Vec` (`v[i]`, `&mut v[..]`, `as_mut_slice`) is refused when it is not
@@ -837,6 +869,56 @@ const RESULT_MODELS: &[(&str, &str, bool, bool)] = &[
     ("unwrap_or", "core.result.Result.unwrap_or", false, false),
 ];
 
+/// The inherent functions of `core::time::Duration` the Lean library models
+/// (`lean/Blaze/Duration.lean`): the function, its model, and whether the model gives a
+/// `Result` (it panics in Rust).
+const DURATION_MODELS: &[(&str, &str, bool)] = &[
+    ("new", "core.time.Duration.new", true),
+    ("from_secs", "core.time.Duration.from_secs", false),
+    ("from_millis", "core.time.Duration.from_millis", false),
+    ("from_micros", "core.time.Duration.from_micros", false),
+    ("from_nanos", "core.time.Duration.from_nanos", false),
+    ("is_zero", "core.time.Duration.is_zero", false),
+    ("as_secs", "core.time.Duration.as_secs", false),
+    ("subsec_millis", "core.time.Duration.subsec_millis", false),
+    ("subsec_micros", "core.time.Duration.subsec_micros", false),
+    ("subsec_nanos", "core.time.Duration.subsec_nanos", false),
+    ("as_millis", "core.time.Duration.as_millis", false),
+    ("as_micros", "core.time.Duration.as_micros", false),
+    ("as_nanos", "core.time.Duration.as_nanos", false),
+    ("checked_add", "core.time.Duration.checked_add", false),
+    ("checked_sub", "core.time.Duration.checked_sub", false),
+    ("saturating_add", "core.time.Duration.saturating_add", false),
+    ("saturating_sub", "core.time.Duration.saturating_sub", false),
+];
+
+/// The inherent methods of `core::cmp::Ordering` the Lean library models
+/// (`lean/Blaze/Ordering.lean`); none panics.
+const ORDERING_MODELS: &[(&str, &str)] = &[
+    ("is_eq", "core.cmp.Ordering.is_eq"),
+    ("is_ne", "core.cmp.Ordering.is_ne"),
+    ("is_lt", "core.cmp.Ordering.is_lt"),
+    ("is_gt", "core.cmp.Ordering.is_gt"),
+    ("is_le", "core.cmp.Ordering.is_le"),
+    ("is_ge", "core.cmp.Ordering.is_ge"),
+    ("reverse", "core.cmp.Ordering.reverse"),
+    ("then", "core.cmp.Ordering.then"),
+];
+
+/// The inherent methods of `str` the Lean library models (`lean/Blaze/Str.lean`), on its
+/// bytes; none panics.
+const STR_MODELS: &[(&str, &str)] =
+    &[("len", "Str.len"), ("is_empty", "Str.is_empty"), ("as_bytes", "Str.as_bytes")];
+
+/// A trait whose standard method the model takes as the value's own structure, when the
+/// type's impl is the standard library's or derived: `Clone::clone` is the value, `==` is
+/// Lean's `=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Structural {
+    Clone,
+    PartialEq,
+}
+
 /// Where a function of the standard library is, which tells its model.
 enum Home {
     /// An inherent method of this integer type.
@@ -846,6 +928,12 @@ enum Home {
     Slice,
     /// An inherent method of `alloc::vec::Vec`.
     Vec,
+    /// An inherent method of `core::time::Duration`.
+    Duration,
+    /// An inherent method of `core::cmp::Ordering`.
+    Ordering,
+    /// An inherent method of `str`.
+    Str,
     /// A method of a trait or of an impl of one: the trait's name and the module it is in,
     /// under its crate (`["cmp"]`).
     Trait { name: String, module: Vec<String> },
@@ -1117,6 +1205,12 @@ struct Cx<'db> {
     /// where a place names it (with the statement or call that does), not where it is declared,
     /// so one the model never reads (`expect`'s message) is no refusal.
     unusable: BTreeMap<Local, String>,
+    /// `core::time::Duration`, once a type names it: its layout says where a constant's
+    /// fields are.
+    duration: Option<AdtId>,
+    /// The crate's structs and enums whose `==` the model takes as Lean's `=`, by Lean name:
+    /// each derives `PartialEq`, as do the types its fields hold (see [`Cx::structural`]).
+    derives: BTreeSet<String>,
 }
 
 type Refused<T> = Result<T, NotTranslated>;
@@ -1228,6 +1322,15 @@ impl<'db> Cx<'db> {
                         AdtId::StructId(it) => StructSignature::of(self.db, it).name.as_str(),
                         AdtId::UnionId(_) => "a union",
                     };
+                    let module = module_path(self.db, adt.module(self.db)).split_off(1);
+                    match (name, module.as_slice()) {
+                        ("Duration", [time]) if time == "time" => {
+                            self.duration = Some(adt);
+                            return Ok(Ty::Duration);
+                        }
+                        ("Ordering", [cmp]) if cmp == "cmp" => return Ok(Ty::Ordering),
+                        _ => {}
+                    }
                     return match (name, args.len()) {
                         ("Option", 1) => {
                             Ok(Ty::Option(Box::new(self.ty(args.type_at(0), false, at)?)))
@@ -1257,7 +1360,7 @@ impl<'db> Cx<'db> {
             TyKind::RawPtr(..) => return Err(self.refuse("a raw pointer (rule RawPointer)", at)),
             TyKind::Float(_) => return Err(self.refuse("a floating-point number", at)),
             TyKind::Char => return Err(self.refuse("the type `char`", at)),
-            TyKind::Str => return Err(self.refuse("a string (`str`)", at)),
+            TyKind::Str => Ty::Str,
             TyKind::Dynamic(..) => return Err(self.refuse("a trait object (rule DynTrait)", at)),
             TyKind::Param(_) => return Err(self.refuse("a type parameter", at)),
             TyKind::Alias(..) => return Err(self.refuse("an associated or opaque type", at)),
@@ -1464,24 +1567,28 @@ impl<'db> Cx<'db> {
     }
 
     fn operand(&mut self, operand: &m::Operand, at: &str) -> Refused<(Operand, Ty)> {
-        let (bits, ty) = match &operand.kind {
+        match &operand.kind {
             m::OperandKind::Copy(place) | m::OperandKind::Move(place) => {
                 let (place, ty) = self.place(place, at)?;
-                return Ok((Operand::Place(place), ty));
+                Ok((Operand::Place(place), ty))
             }
             m::OperandKind::Constant { konst, ty } => {
                 if operand.fn_def().is_some() {
                     return Err(self.refuse("a function used as a value", at));
                 }
                 let ty = self.ty(ty.as_ref(), false, at)?;
-                let bits = match konst.as_ref().kind() {
-                    ConstKind::Value(value) => {
-                        value.try_to_leaf().map(|leaf| leaf.to_bits_unchecked())
+                let constant = match konst.as_ref().kind() {
+                    ConstKind::Value(value) => match value.try_to_leaf() {
+                        Some(leaf) => self.scalar_constant(&ty, Some(leaf.to_bits_unchecked()), at)?,
+                        None => self.scalar_constant(&ty, None, at)?,
+                    },
+                    ConstKind::Alias(_, alias) => {
+                        let allocation = self.named_const(alias, at)?;
+                        self.constant(&ty, &allocation.memory, &allocation.memory_map, at)?
                     }
-                    ConstKind::Alias(_, alias) => Some(self.named_const(alias, at)?),
-                    _ => None,
+                    _ => self.scalar_constant(&ty, None, at)?,
                 };
-                (bits, ty)
+                Ok((constant, ty))
             }
             m::OperandKind::Allocation { allocation } => {
                 if operand.fn_def().is_some() {
@@ -1489,29 +1596,107 @@ impl<'db> Cx<'db> {
                 }
                 let allocation = allocation.as_ref();
                 let ty = self.ty(allocation.ty, false, at)?;
-                let memory: &[u8] = &allocation.memory;
-                // Every target blaze translates for is little-endian.
+                let constant = self.constant(&ty, &allocation.memory, &allocation.memory_map, at)?;
+                Ok((constant, ty))
+            }
+            m::OperandKind::Static(_) => Err(self.refuse("a static (rule Ffi)", at)),
+        }
+    }
+
+    /// A constant of type `ty` that is its `bits`: `()`, a `bool` or an integer.
+    fn scalar_constant(&self, ty: &Ty, bits: Option<u128>, at: &str) -> Refused<Operand> {
+        Ok(match (ty, bits) {
+            (Ty::Unit, _) => Operand::Unit,
+            (Ty::Bool, Some(bits)) => Operand::Bool(bits != 0),
+            (Ty::Int(int), Some(bits)) => Operand::Int(*int, bits),
+            _ => return Err(self.refuse(format!("a constant of type `{ty:?}`"), at)),
+        })
+    }
+
+    /// The constant of type `ty` whose bytes are `memory`, what it points to in `map`: a
+    /// scalar ([`Cx::scalar_constant`]), a string, a `Duration` or an `Ordering`. Every target
+    /// blaze translates for is little-endian with 8-byte pointers.
+    fn constant(&self, ty: &Ty, memory: &[u8], map: &MemoryMap<'_>, at: &str) -> Refused<Operand> {
+        let word = |at: usize| -> Option<u64> {
+            Some(u64::from_le_bytes(memory.get(at..at + 8)?.try_into().ok()?))
+        };
+        match ty {
+            // `&str`: a pointer to the bytes and their length.
+            Ty::Ref(inner) if **inner == Ty::Str => {
+                let (Some(addr), Some(len)) = (word(0), word(8)) else {
+                    return Err(self.refuse("a string constant that is not a pointer and a length", at));
+                };
+                let bytes = match len {
+                    0 => Vec::new(),
+                    _ => match map.get(addr as usize, len as usize) {
+                        Some(bytes) => bytes.to_vec(),
+                        None => {
+                            return Err(self.refuse("a string constant whose bytes are not in its memory", at));
+                        }
+                    },
+                };
+                Ok(Operand::Str(bytes))
+            }
+            Ty::Duration => {
+                let (secs, nanos) = self.duration_fields(at)?;
+                let secs = memory.get(secs..secs + 8).and_then(|it| it.try_into().ok()).map(u64::from_le_bytes);
+                let nanos =
+                    memory.get(nanos..nanos + 4).and_then(|it| it.try_into().ok()).map(u32::from_le_bytes);
+                match (secs, nanos) {
+                    (Some(secs), Some(nanos)) if nanos < 1_000_000_000 => Ok(Operand::Duration { secs, nanos }),
+                    _ => Err(self.refuse("a `Duration` constant whose nanoseconds are not below a second", at)),
+                }
+            }
+            Ty::Ordering => {
+                // The discriminant, sign-extended from its width (`i8` in core).
+                let Some(&last) = memory.last() else {
+                    return Err(self.refuse("an `Ordering` constant without bytes", at));
+                };
+                let mut bytes = [if last & 0x80 != 0 { 0xff } else { 0 }; 16];
+                if memory.len() > 16 {
+                    return Err(self.refuse("an `Ordering` constant wider than 16 bytes", at));
+                }
+                bytes[..memory.len()].copy_from_slice(memory);
+                let raw = u128::from_le_bytes(bytes);
+                match ORDERING.iter().position(|it| it.1 == raw) {
+                    Some(variant) => Ok(Operand::Ordering(variant as u32)),
+                    None => Err(self.refuse("an `Ordering` constant that is no variant", at)),
+                }
+            }
+            _ => {
                 let bits = (memory.len() <= 16).then(|| {
                     let mut bytes = [0u8; 16];
                     bytes[..memory.len()].copy_from_slice(memory);
                     u128::from_le_bytes(bytes)
                 });
-                (bits, ty)
+                self.scalar_constant(ty, bits, at)
             }
-            m::OperandKind::Static(_) => return Err(self.refuse("a static (rule Ffi)", at)),
-        };
-        let operand = match (&ty, bits) {
-            (Ty::Unit, _) => Operand::Unit,
-            (Ty::Bool, Some(bits)) => Operand::Bool(bits != 0),
-            (Ty::Int(int), Some(bits)) => Operand::Int(*int, bits),
-            _ => return Err(self.refuse(format!("a constant of type `{ty:?}`"), at)),
-        };
-        Ok((operand, ty))
+        }
     }
 
-    /// The bits of the named constant `alias` (`u32::MAX`, a crate's `const`), by evaluating
-    /// it in its own environment, as at most 16 little-endian bytes.
-    fn named_const(&self, alias: hir_ty::next_solver::AliasConst<'db>, at: &str) -> Refused<u128> {
+    /// Where `Duration`'s fields are in its bytes: `secs`, a `u64`, then `nanos`, a `u32`
+    /// (`library/core/src/time.rs:81`; core's `nanos` is a `Nanoseconds(u32)`, whose bytes are
+    /// its `u32`'s), by the struct's layout.
+    fn duration_fields(&self, at: &str) -> Refused<(usize, usize)> {
+        let db = self.db;
+        let Some(adt) = self.duration else {
+            return Err(self.refuse("a `Duration` constant before its type", at));
+        };
+        let env = ParamEnvAndCrate { param_env: db.trait_environment(adt.into()), krate: adt.krate(db) };
+        let Ok(layout) = db.layout_of_adt(adt, GenericArgs::empty().store(), env.store()) else {
+            return Err(self.refuse("a `Duration` constant, whose type has no layout", at));
+        };
+        let offset = |field: usize| layout.fields.offset(field).bytes() as usize;
+        Ok((offset(0), offset(1)))
+    }
+
+    /// The allocation of the named constant `alias` (`u32::MAX`, `Duration::ZERO`, a crate's
+    /// `const`), by evaluating it in its own environment.
+    fn named_const(
+        &self,
+        alias: hir_ty::next_solver::AliasConst<'db>,
+        at: &str,
+    ) -> Refused<hir_ty::next_solver::Allocation<'db>> {
         let id = match alias.kind {
             AliasConstKind::Free { def_id: FreeConstAliasId(id) }
             | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } => id,
@@ -1525,17 +1710,10 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse("an inherent constant named through `Self`", at));
             }
         };
-        let Ok(allocation) = self.db.const_eval(id, alias.args, None) else {
-            return Err(self.refuse("a constant that does not evaluate", at));
-        };
-        let memory: &[u8] = &allocation.memory;
-        if memory.len() > 16 {
-            return Err(self.refuse("a constant wider than 16 bytes", at));
+        match self.db.const_eval(id, alias.args, None) {
+            Ok(allocation) => Ok(allocation),
+            Err(_) => Err(self.refuse("a constant that does not evaluate", at)),
         }
-        // Every target blaze translates for is little-endian.
-        let mut bytes = [0u8; 16];
-        bytes[..memory.len()].copy_from_slice(memory);
-        Ok(u128::from_le_bytes(bytes))
     }
 
     fn op_ty(&self, ty: &Ty, at: &str) -> Refused<OpTy> {
@@ -1963,15 +2141,24 @@ impl<'db> Cx<'db> {
                 if let Some(int) = int_ty(ty) {
                     return Home::Int(int);
                 }
+                let module = |adt: AdtId| module_path(db, adt.module(db)).split_off(1);
                 match ty.kind() {
                     TyKind::Slice(_) => Home::Slice,
+                    TyKind::Str => Home::Str,
                     TyKind::Adt(def, _) => match def.def_id() {
                         AdtId::EnumId(it) => match EnumSignature::of(db, it).name.as_str() {
                             "Option" => Home::Option,
                             "Result" => Home::Result,
+                            "Ordering" if module(it.into()) == ["cmp"] => Home::Ordering,
                             _ => Home::Other,
                         },
                         adt if is_vec(db, adt) => Home::Vec,
+                        AdtId::StructId(it)
+                            if StructSignature::of(db, it).name.as_str() == "Duration"
+                                && module(it.into()) == ["time"] =>
+                        {
+                            Home::Duration
+                        }
                         _ => Home::Other,
                     },
                     _ => Home::Other,
@@ -2101,10 +2288,105 @@ impl<'db> Cx<'db> {
             }
             Home::Vec => self.vec_call(name, args, destination, at, out),
             Home::Slice => self.slice_call(name, args, at),
+            Home::Duration => {
+                let Some(&(_, it, monadic)) = DURATION_MODELS.iter().find(|it| it.0 == name) else {
+                    return Err(self.refuse(
+                        format!("a call of `Duration::{name}`, which has no model (rule NoModel)"),
+                        at,
+                    ));
+                };
+                Ok(Some((model(it, monadic), self.operands(args, at)?)))
+            }
+            Home::Ordering => {
+                let Some(&(_, it)) = ORDERING_MODELS.iter().find(|it| it.0 == name) else {
+                    return Err(self.refuse(
+                        format!("a call of `Ordering::{name}`, which has no model (rule NoModel)"),
+                        at,
+                    ));
+                };
+                Ok(Some((model(it, false), self.operands(args, at)?)))
+            }
+            Home::Str => {
+                let Some(&(_, it)) = STR_MODELS.iter().find(|it| it.0 == name) else {
+                    return Err(self.refuse(
+                        format!(
+                            "a call of the `str` method `{name}`, which has no model (rule \
+                             NoModel; a `str` is its bytes, and only `len`, `is_empty`, \
+                             `as_bytes`, `==` and `!=` are modelled)"
+                        ),
+                        at,
+                    ));
+                };
+                Ok(Some((model(it, false), self.operands(args, at)?)))
+            }
             Home::Trait { name: of, module } => {
                 let module: Vec<&str> = module.iter().map(String::as_str).collect();
+                let self_ty = generics.type_at(0);
                 match (module.as_slice(), of.as_str(), name) {
+                    (["clone"], "Clone", "clone") => {
+                        self.structural(callee, self_ty, Structural::Clone, &mut BTreeSet::new(), at)?;
+                        // The clone of a value whose `Clone` is a copy of its structure is the
+                        // value: the argument, a `&T`, is `T`'s value in the model.
+                        let (dest, _) = self.place(destination, at)?;
+                        let (of, _) = self.operand(&args[0], at)?;
+                        out.push(Stmt::Assign { place: dest, value: Rvalue::Use(of), at: at.to_owned() });
+                        Ok(None)
+                    }
+                    (["cmp"], "PartialEq", "eq" | "ne") => {
+                        if generics.type_at(1) != self_ty {
+                            return Err(self.refuse(
+                                format!(
+                                    "a call of `PartialEq::{name}` between two types (only `==` of \
+                                     one type with itself is modelled; rule NoModel)"
+                                ),
+                                at,
+                            ));
+                        }
+                        let eq = self.interner.lang_items().PartialEq_eq;
+                        let Some(eq) = eq else { return Err(no_model(self)) };
+                        // `a == b` of two `&T` runs the standard library's `impl PartialEq<&B>
+                        // for &A`, which calls `T`'s own `eq` (cmp.rs, `PartialEq::eq(*self,
+                        // *other)`): when `T` is the crate's type with a hand-written impl, that
+                        // impl's method is called as the function it is, a reference being its
+                        // value in the model.
+                        if name == "eq"
+                            && let Some(own) = self.own_eq(eq, self_ty, at)?
+                        {
+                            return Ok(Some((own, self.operands(args, at)?)));
+                        }
+                        self.structural(eq, self_ty, Structural::PartialEq, &mut BTreeSet::new(), at)?;
+                        let it = if name == "eq" { "core.cmp.PartialEq.eq" } else { "core.cmp.PartialEq.ne" };
+                        Ok(Some((model(it, false), self.operands(args, at)?)))
+                    }
+                    (["cmp"], "Ord", "cmp") | (["cmp"], "PartialOrd", "partial_cmp" | "lt" | "le" | "gt" | "ge") => {
+                        self.order_call(of.as_str(), name, self_ty, generics, args, at).map(Some)
+                    }
                     (["cmp"], "Ord", "max" | "min" | "clamp") => self.int_order(name, args, at).map(Some),
+                    ([ops, ..], "Add" | "Sub" | "AddAssign" | "SubAssign", "add" | "sub" | "add_assign" | "sub_assign")
+                        if *ops == "ops" =>
+                    {
+                        let peeled = |ty: HTy<'db>| match ty.kind() {
+                            TyKind::Ref(_, inner, _) => inner,
+                            _ => ty,
+                        };
+                        let on_duration = |this: &mut Self, ty: HTy<'db>| -> Refused<bool> {
+                            Ok(this.ty(peeled(ty), false, at)? == Ty::Duration)
+                        };
+                        if !on_duration(self, self_ty)? || !on_duration(self, generics.type_at(1))? {
+                            return Err(no_model(self));
+                        }
+                        // `+` and `-` panic where `checked_add` and `checked_sub` give `None`
+                        // (time.rs:1345, 1365); `+=` and `-=` are them, written back
+                        // (time.rs:1353, 1373).
+                        let (it, lends_first) = match name {
+                            "add" => ("core.time.Duration.add", false),
+                            "sub" => ("core.time.Duration.sub", false),
+                            "add_assign" => ("core.time.Duration.add_assign", true),
+                            _ => ("core.time.Duration.sub_assign", true),
+                        };
+                        let callee = Callee::Model { name: it, monadic: true, ty: None, lends_first };
+                        Ok(Some((callee, self.operands(args, at)?)))
+                    }
                     (["convert"], "From", "from") | (["convert"], "Into", "into") => {
                         let operands = self.operands(args, at)?;
                         let from = self.operand(&args[0], at)?.1;
@@ -2395,23 +2677,247 @@ impl<'db> Cx<'db> {
         at: &str,
     ) -> Refused<(Callee, Vec<Operand>)> {
         let mut operands = Vec::with_capacity(args.len());
+        let mut on_duration = false;
         for arg in args {
             let (operand, ty) = self.operand(arg, at)?;
-            if !matches!(ty.value(), Ty::Int(_)) {
-                return Err(self.refuse(
-                    format!("a call of the standard library's `{name}` on a `{ty:?}`, which has no model (rule NoModel)"),
-                    at,
-                ));
+            match ty.value() {
+                Ty::Int(_) => {}
+                // `Ord::max` and `Ord::min`, the trait's default methods, of `Duration`, whose
+                // `Ord` is derived (cmp.rs:1101, 1140); `clamp` of one is not modelled.
+                Ty::Duration if name != "clamp" => on_duration = true,
+                _ => {
+                    return Err(self.refuse(
+                        format!("a call of the standard library's `{name}` on a `{ty:?}`, which has no model (rule NoModel)"),
+                        at,
+                    ));
+                }
             }
             operands.push(operand);
         }
-        let (name, monadic) = match name {
-            "max" => ("Scalar.max", false),
-            "min" => ("Scalar.min", false),
+        let (name, monadic) = match (name, on_duration) {
+            ("max", true) => ("core.time.Duration.max", false),
+            ("min", true) => ("core.time.Duration.min", false),
+            ("max", _) => ("Scalar.max", false),
+            ("min", _) => ("Scalar.min", false),
             // `clamp` panics when its least is above its most.
             _ => ("Scalar.ord_clamp", true),
         };
         Ok((Callee::Model { name, monadic, ty: None, lends_first: false }, operands))
+    }
+
+    /// `Ord::cmp`, `PartialOrd::partial_cmp`, `lt`, `le`, `gt` or `ge` (the operators `<`,
+    /// `<=`, `>`, `>=` of a type that is not a primitive) of `self_ty` with itself: of an
+    /// integer (`impl Ord for u32`, cmp.rs:2305 and 2316, and the trait's default `lt`..,
+    /// cmp.rs:1502-1556) or of a `Duration` (derived, lexicographic on its seconds then its
+    /// nanoseconds). Any other order, a derived one of the crate's types among them, is
+    /// refused by name.
+    fn order_call(
+        &mut self,
+        of: &str,
+        name: &str,
+        self_ty: HTy<'db>,
+        generics: GenericArgs<'db>,
+        args: &[m::Operand],
+        at: &str,
+    ) -> Refused<(Callee, Vec<Operand>)> {
+        let mut peeled = self_ty;
+        while let TyKind::Ref(_, inner, _) = peeled.kind() {
+            peeled = inner;
+        }
+        let ty = self.ty(peeled, false, at)?;
+        let same = match of {
+            "Ord" => true,
+            _ => generics.type_at(1) == self_ty,
+        };
+        let it = match (&ty, name) {
+            (_, _) if !same => None,
+            (Ty::Int(_), "cmp") => Some("Scalar.cmp"),
+            (Ty::Int(_), "partial_cmp") => Some("Scalar.partial_cmp"),
+            (Ty::Int(_), "lt") => Some("Scalar.lt"),
+            (Ty::Int(_), "le") => Some("Scalar.le"),
+            (Ty::Int(_), "gt") => Some("Scalar.gt"),
+            (Ty::Int(_), "ge") => Some("Scalar.ge"),
+            (Ty::Duration, "cmp") => Some("core.time.Duration.cmp"),
+            (Ty::Duration, "partial_cmp") => Some("core.time.Duration.partial_cmp"),
+            (Ty::Duration, "lt") => Some("core.time.Duration.lt"),
+            (Ty::Duration, "le") => Some("core.time.Duration.le"),
+            (Ty::Duration, "gt") => Some("core.time.Duration.gt"),
+            (Ty::Duration, "ge") => Some("core.time.Duration.ge"),
+            _ => None,
+        };
+        let Some(it) = it else {
+            let shown = crate::rust_ty(&ty);
+            let why = match ty {
+                Ty::Adt(_) => ", whose order is derived or the crate's own (a derived order has no model)",
+                _ => "",
+            };
+            return Err(self.refuse(
+                format!("a call of `{of}::{name}` on `{shown}`{why}, which has no model (rule NoModel)"),
+                at,
+            ));
+        };
+        Ok((Callee::Model { name: it, monadic: false, ty: None, lends_first: false }, self.operands(args, at)?))
+    }
+
+    /// The crate's own `PartialEq::eq` of the type under the references `self_ty` is, when
+    /// `self_ty` is a reference and that type's impl is a hand-written one of the crate: the
+    /// function [`Cx::call`] would call for `==` of the type itself. `None` otherwise.
+    fn own_eq(&mut self, eq: FunctionId, self_ty: HTy<'db>, at: &str) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let mut peeled = self_ty;
+        while let TyKind::Ref(_, inner, _) = peeled.kind() {
+            peeled = inner;
+        }
+        let TyKind::Adt(def, _) = peeled.kind() else { return Ok(None) };
+        if peeled == self_ty || def.def_id().krate(db).data(db).origin.is_lang() {
+            return Ok(None);
+        }
+        let env = ParamEnvAndCrate {
+            param_env: db.trait_environment(self.mir.owner.generic_def(db)),
+            krate: self.krate,
+        };
+        let generics = GenericArgs::new_from_slice(&[peeled.into(), peeled.into()]);
+        let found = match db.lookup_impl_method_or_why(env, eq, generics) {
+            Ok((found, _)) => found.left(),
+            Err(_) => None,
+        };
+        let Some(found) = found else { return Ok(None) };
+        if found.krate(db).data(db).origin.is_lang() {
+            return Ok(None);
+        }
+        if let Err(why) = owner(db, found) {
+            return Err(self.refuse(format!("a call of `eq`, {why}"), at));
+        }
+        let lean = function_lean_name(db, found);
+        if !self.callees.iter().any(|(_, it)| *it == found) {
+            self.callees.push((lean.clone(), found));
+        }
+        Ok(Some(Callee::Function { name: lean }))
+    }
+
+    /// Refused unless `ty`'s `Clone` (`which` is [`Structural::Clone`]) is a copy of its value
+    /// or its `PartialEq` is the equality of its value, as the standard library's are for
+    /// integers, `bool`, `()`, tuples, references, `str`, slices, arrays, `Vec`, `Option`,
+    /// `Result`, `Duration`, `Ordering` and `TryFromIntError` of such types, and as a derive
+    /// makes it for a struct or enum whose fields are such types. `method` is the trait's
+    /// method (`Clone::clone`, `PartialEq::eq`), looked up for each of the crate's types:
+    /// its impl must be the built-in derive (rustc's derive of `Clone` or `PartialEq`, which
+    /// clones or compares field by field), not a hand-written one. A float's `==` is not
+    /// equality of its value (`NaN != NaN`). Each of the crate's types whose `==` is taken is
+    /// put in `self.derives`; `seen` stops a type that holds itself.
+    fn structural(
+        &mut self,
+        method: FunctionId,
+        ty: HTy<'db>,
+        which: Structural,
+        seen: &mut BTreeSet<AdtId>,
+        at: &str,
+    ) -> Refused<()> {
+        let db = self.db;
+        let what = match which {
+            Structural::Clone => "`Clone::clone`",
+            Structural::PartialEq => "`==`",
+        };
+        match ty.kind() {
+            TyKind::Bool | TyKind::Str | TyKind::Never => Ok(()),
+            _ if int_ty(ty).is_some() => Ok(()),
+            TyKind::Tuple(fields) => {
+                for field in fields.iter() {
+                    self.structural(method, field, which, seen, at)?;
+                }
+                Ok(())
+            }
+            TyKind::Ref(_, inner, mutability) => {
+                if which == Structural::Clone && mutability.is_mut() {
+                    return Err(self.refuse("`Clone::clone` of a `&mut` reference", at));
+                }
+                self.structural(method, inner, which, seen, at)
+            }
+            TyKind::Slice(elem) | TyKind::Array(elem, _) => self.structural(method, elem, which, seen, at),
+            TyKind::Float(_) => Err(self.refuse(
+                format!("{what} of a floating-point number (rule NoModel; `NaN != NaN`)"),
+                at,
+            )),
+            TyKind::Adt(def, args) => {
+                let adt = def.def_id();
+                if adt.krate(db).data(db).origin.is_lang() {
+                    return match self.ty(ty, false, at)? {
+                        Ty::Duration | Ty::Ordering | Ty::TryFromIntError | Ty::Unit => Ok(()),
+                        Ty::Option(_) | Ty::Vec(_) => self.structural(method, args.type_at(0), which, seen, at),
+                        Ty::Result(..) => {
+                            self.structural(method, args.type_at(0), which, seen, at)?;
+                            self.structural(method, args.type_at(1), which, seen, at)
+                        }
+                        other => Err(self.refuse(
+                            format!("{what} of `{}`, which has no model (rule NoModel)", crate::rust_ty(&other)),
+                            at,
+                        )),
+                    };
+                }
+                let lean = self.ty(ty, false, at)?;
+                let Ty::Adt(lean) = lean else {
+                    return Err(self.refuse(format!("{what} of `{lean:?}`"), at));
+                };
+                if !seen.insert(adt) {
+                    return Ok(());
+                }
+                let shown = lean.replace('.', "::");
+                let env = ParamEnvAndCrate {
+                    param_env: db.trait_environment(self.mir.owner.generic_def(db)),
+                    krate: self.krate,
+                };
+                let generics = match which {
+                    Structural::Clone => GenericArgs::new_from_slice(&[ty.into()]),
+                    Structural::PartialEq => GenericArgs::new_from_slice(&[ty.into(), ty.into()]),
+                };
+                let (wanted, trait_name) = match which {
+                    Structural::Clone => (BuiltinDeriveImplTrait::Clone, "Clone"),
+                    Structural::PartialEq => (BuiltinDeriveImplTrait::PartialEq, "PartialEq"),
+                };
+                let derived = match db.lookup_impl_method_or_why(env, method, generics) {
+                    Ok((found, _)) => match found.right() {
+                        Some((id, _)) => id.loc(db).trait_ == wanted,
+                        None => false,
+                    },
+                    Err(_) => false,
+                };
+                if !derived {
+                    return Err(self.refuse(
+                        format!(
+                            "{what} of `{shown}`, whose `{trait_name}` is not derived (a hand-written \
+                             impl is called as a function, not taken apart field by field; rule \
+                             NoModel)"
+                        ),
+                        at,
+                    ));
+                }
+                let variants: Vec<VariantId> = match adt {
+                    AdtId::StructId(it) => vec![VariantId::StructId(it)],
+                    AdtId::EnumId(it) => it
+                        .enum_variants(db)
+                        .variants
+                        .iter()
+                        .map(|(_, &(variant, _))| VariantId::EnumVariantId(variant))
+                        .collect(),
+                    AdtId::UnionId(_) => return Err(self.refuse("a union", at)),
+                };
+                for variant in variants {
+                    let fields: Vec<HTy<'db>> =
+                        db.field_types(variant).iter().map(|(_, field)| field.ty().skip_binder()).collect();
+                    for field in fields {
+                        self.structural(method, field, which, seen, at)?;
+                    }
+                }
+                if which == Structural::PartialEq {
+                    self.derives.insert(lean);
+                }
+                Ok(())
+            }
+            _ => Err(self.refuse(
+                format!("{what} of `{}`, which has no model (rule NoModel)", blaze_query::db::attach(db, || format!("{ty:?}"))),
+                at,
+            )),
+        }
     }
 
     fn operands(&mut self, operands: &[m::Operand], at: &str) -> Refused<Vec<Operand>> {
@@ -2562,6 +3068,8 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         callees: Vec::new(),
         checks_overflow,
         unusable: BTreeMap::new(),
+        duration: None,
+        derives: BTreeSet::new(),
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
@@ -2698,5 +3206,5 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         adts: cx.adts,
         nodes,
     };
-    Ok(Lowered { body, callees: cx.callees })
+    Ok(Lowered { body, callees: cx.callees, derives: cx.derives })
 }
