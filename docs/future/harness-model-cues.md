@@ -35,6 +35,15 @@ Unknown models retain a provider mark without a guessed strength. The glyphs reu
 policy, add no asset IO, and cost one small vector per visible model. Device headers fold their own
 agents and running items without changing process state; device groups start expanded.
 
+A saved chat whose provider process was lost is ready to resume, with no failure label or mark;
+real nonzero exits and lost terminal/run processes keep their failure state. The UI distinguishes
+conversation availability from provider process lifetime without changing the process protocol.
+
+Command-O search and the composer bind Draft selection/IME state through one TextEdit/caret path
+and respect the same Ghostty blink preference. The shared renderer reports whether a visible caret
+is blinking; that keeps the calm frame clock running for every field, including overlays, without
+a feature-specific list of owners. Hidden and steady carets do not request animation.
+
 Agents report a live mood through `await updateEmotion(emotion, reason?)`. Each row shows its emoji
 and a reason on hover. The native app owns this ephemeral state, scoped to a session and device;
 it never persists or replays moods. A distinct uncertain, frustrated or blocked report emits a soft cue

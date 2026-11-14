@@ -1948,16 +1948,7 @@ impl App {
                     txt.entity().set(MarkdownText::default());
                 }
                 txt.text(&shown);
-                let mut te = txt.entity().try_cloned::<&TextEdit>().unwrap_or_default();
-                // The caret blinks as the terminal's cursor does (Ghostty's cursor-style-blink), solid again as it moves.
-                let blink = self.look.themes[usize::from(self.dark)].blink;
-                let moved = (te.caret, te.anchor, te.mark_lo, te.mark_hi) != (caret, anchor, lo, hi) || (focused && !te.focused);
-                let since = if moved { self.time } else { te.since };
-                let next = TextEdit { caret, anchor, mark_lo: lo, mark_hi: hi, focused, blink, since, ..te };
-                if next != te {
-                    te = next;
-                    txt.entity().set(te);
-                }
+                self.sync_draft_caret(txt, [caret, anchor, lo, hi], focused);
                 // Grown past its most, it scrolls on its FieldScroll (step_chat_inputs), the caret kept in view.
             }
         }
@@ -2339,14 +2330,7 @@ impl App {
         if moving {
             self.poke();
         }
-        // A focused input's caret (or a name's being renamed) fades on the clock: keep drawing.
-        if self.focused
-            && self.look.themes[usize::from(self.dark)].blink
-            && (self.renaming()
-                || (self.chat_focused() && !self.tree_focus && self.palette.is_none() && !self.genui_editing()))
-        {
-            self.poke_why("caret blink");
-        }
+        // Visible caret animation is owned by the renderer's shared caret primitive, including overlays and rename fields.
         // A cell's controls: its field's typing, a dragged slider, an open select.
         self.step_genui();
         // A press off the picker's open menu closes it.
@@ -4126,6 +4110,21 @@ fn tooltip(v: View<'_>, s: &str) {
         }
     } else if had.is_none_or(|t| t.text.as_str() != s) {
         v.set(Tooltip { text: s.into() });
+    }
+}
+
+impl App {
+    /// Every Draft editor uses the same TextEdit/caret primitive and Ghostty blink preference, with no overlay-specific cursor.
+    pub(in crate::app) fn sync_draft_caret(&self, text: View<'_>, units: [u32; 4], focused: bool) {
+        let old = text.entity().try_cloned::<&TextEdit>().unwrap_or_default();
+        let [caret, anchor, mark_lo, mark_hi] = units;
+        let moved = [old.caret, old.anchor, old.mark_lo, old.mark_hi] != units || (focused && !old.focused);
+        let next = TextEdit {
+            caret, anchor, mark_lo, mark_hi, focused,
+            blink: self.look.themes[usize::from(self.dark)].blink,
+            since: if moved { self.time } else { old.since }, ..old
+        };
+        if next != old { text.set(next); }
     }
 }
 

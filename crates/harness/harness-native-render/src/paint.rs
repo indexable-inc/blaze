@@ -89,6 +89,8 @@ pub struct Painter {
     carets: crate::caret::Carets,
     /// A caret painted in the last frame is still sweeping ([`Painter::end_frame`]): the host draws another.
     pub gliding: bool,
+    /// A visible focused caret needs the calm frame clock. The renderer owns this for every field, including overlays.
+    pub caret_blinking: bool,
     /// Words painted this frame carry a moving [`Sheen`].
     sheening: bool,
     /// Words painted in the last frame carried a moving [`Sheen`] ([`Painter::end_frame`]): the host keeps drawing, at its
@@ -327,6 +329,7 @@ impl Painter {
             arrivals: crate::arrive::Arrivals::default(),
             arriving: false,
             carets: crate::caret::Carets::default(),
+            caret_blinking: false,
             gliding: false,
             sheening: false,
             shimmering: false,
@@ -522,7 +525,9 @@ impl Painter {
         self.blocks_live = self.blocks.end_frame();
         self.lantern_live = self.lanterns.end_frame();
         self.arriving = self.arrivals.end_frame();
-        self.gliding = self.carets.end_frame();
+        let carets = self.carets.end_frame();
+        self.gliding = carets.gliding;
+        self.caret_blinking = carets.blinking;
         self.shimmering = std::mem::take(&mut self.sheening);
         if self.cache.overflowed() {
             self.cache.clear();
