@@ -42,7 +42,7 @@ use std::{
     convert::Infallible,
     fmt::Write as _,
     io,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -59,6 +59,7 @@ use super::{
 };
 use crate::{
     Completion, Done, Driver, Effect, FileName, Tag,
+    atomic::AtomicU32,
     sim::{Faults, Sim},
 };
 

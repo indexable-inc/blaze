@@ -31,7 +31,6 @@ use std::{
     io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     ptr,
-    sync::atomic::AtomicU32,
     time::Duration,
 };
 
@@ -42,6 +41,7 @@ use super::{
     reaping::Children,
     until,
 };
+use crate::atomic::AtomicU32;
 
 /// `FUTEX_BITSET_MATCH_ANY`: a wake of any bit ends the wait.
 const FUTEX_ANY: u32 = u32::MAX;
@@ -457,7 +457,7 @@ mod tests {
 
     use std::sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     };
 
     use super::*;

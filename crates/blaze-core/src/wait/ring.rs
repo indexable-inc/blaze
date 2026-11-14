@@ -618,7 +618,7 @@ impl WaitRing {
     }
 
     /// Wakes one waiter on `word` through the ring: false where it could not be submitted.
-    fn futex_wake(&mut self, word: &AtomicU32) -> bool {
+    fn futex_wake(&mut self, word: &crate::atomic::AtomicU32) -> bool {
         _ = self.take();
         let sqe = Sqe {
             opcode: OP_FUTEX_WAKE,
@@ -739,7 +739,7 @@ impl Futex for Futexes {
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
@@ -750,7 +750,7 @@ impl Futex for Futexes {
     }
 
     #[inline(never)]
-    fn wake(&self, word: &AtomicU32) {
+    fn wake(&self, word: &crate::atomic::AtomicU32) {
         let woke = RING
             .try_with(|cell| match cell.try_borrow_mut() {
                 Ok(mut held) => held.as_mut().is_some_and(|ring| ring.futex_wake(word)),

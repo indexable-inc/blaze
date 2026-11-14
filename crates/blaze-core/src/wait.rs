@@ -234,7 +234,7 @@ pub fn wake_shared(word: &std::sync::atomic::AtomicU64) {
 /// Elsewhere std's park, until that system's address wait lands. Only one thread parks on a
 /// `Parker`; nothing signals it.
 pub struct Parker {
-    word: std::sync::atomic::AtomicU32,
+    word: crate::atomic::AtomicU32,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
@@ -242,7 +242,7 @@ pub struct Parker {
 impl Parker {
     pub fn new() -> Parker {
         Parker {
-            word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
+            word: crate::atomic::AtomicU32::new(parking::EMPTY),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
@@ -383,14 +383,14 @@ struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl parking::Futex for ThreadPark<'_> {
-    fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
+    fn prepare(&self, _: &crate::atomic::AtomicU32) {
         *self.0.lock() = Some(std::thread::current());
     }
 
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &std::sync::atomic::AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
@@ -407,7 +407,7 @@ impl parking::Futex for ThreadPark<'_> {
         })
     }
 
-    fn wake(&self, _: &std::sync::atomic::AtomicU32) {
+    fn wake(&self, _: &crate::atomic::AtomicU32) {
         if let Some(thread) = self.0.lock().as_ref() {
             thread.unpark();
         }
