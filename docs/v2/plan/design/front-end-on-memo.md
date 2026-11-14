@@ -167,6 +167,22 @@ arenas, so a type naming crate X's ADT outlives X's dropped arena. **No sound re
 table.** Smallest change: each interned node carries its home `ArenaId` (4 bytes, the max over its
 arguments' homes, computed once at intern time), and the table is split per arena.
 
+**A start gives what it found.** A slot gift (`ImageSlot`, `PagesSlot`, `DefMapSlot`,
+`SurfaceSlot`) drops its crate's arena and every arena above it, so a gift given after queries
+ran throws them away. A crate lowered in this session stays lowered (`deps::Lowered`). A crate a
+fresh database will serve is one whose found record (plan key unchanged, this front end) names
+an image filed under the crate's key alone: the record holds that key (`found::Found::base`,
+layout 2), and blaze-cargo's `deps::find` knows it before any query runs. `deps::makers` gives
+those images, with their impl tables and kept roots, in the commit of the session's makers
+(`deps::serve_found`). The first serve walks each crate's key as always: equal to the base, the
+crate is kept (no fetch, no gift, no commit); another, it is fetched under the key walked, or
+withdrawn, before any task reads it. A crate filed by its reads is left to that serve, which
+values them. Floor: one making of each served arena per start; the store asked once a crate.
+Not yet at it: a fresh start's `give_surfaces` commit still drops every arena once more (each
+crate's `SurfaceSlot` gift moves from none). End state: the surface is a tracked query of the
+crate's own arena with the memo's cutoff, no gift, so nothing drops an arena for a surface,
+and a cfg write drops only the arenas whose surface moved.
+
 ## C. Lanes
 
 Lanes only write, in the one port worktree, each in its own whole files. The main agent compiles.

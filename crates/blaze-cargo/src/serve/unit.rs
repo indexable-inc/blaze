@@ -613,14 +613,15 @@ impl Steps for Real {
                             &input.macros,
                             &input.config.invocation.env,
                         )?;
+                        // The found records first: the makers' commit gives the images they
+                        // name (`deps::makers`), so a crate that will be served has its image
+                        // before any query of it runs, and its arena is not made again for it.
+                        deps::find(&mut lowered, &input.store)?;
                         deps::makers(&mut lowered, &mut made, &input.config.invocation.env)?;
                         Some(made)
                     }
                     false => None,
                 };
-                if fresh {
-                    deps::find(&mut lowered, &input.store)?;
-                }
                 lowered.give_surfaces();
                 // Before any key is resolved: two crates of one key would take each other's items.
                 blaze_items::key::check_crate_keys(lowered.db()).map_err(|clash| {

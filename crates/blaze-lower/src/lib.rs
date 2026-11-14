@@ -287,10 +287,10 @@ pub struct Lowered {
     /// which [`slot_of`] takes in place of parsing the crate's files: let go for a crate in
     /// the write that changes a file of its source root, its settings or its root's text.
     carried: blaze_hash::HashMap<CrateKey, code::OwnNarrow, Global>,
-    /// What a found record said each crate's image is filed under ([`Lowered::take_found`]),
-    /// let go as `carried` is, and whole when any file of the front end moves (a crate's plan
-    /// key covers every crate below it).
-    found: blaze_hash::HashMap<CrateKey, ContentId, Global>,
+    /// What a found record said of each crate ([`Lowered::take_found`]): the key its image is
+    /// filed under and the crate's key it was stored under. Let go as `carried` is, and whole
+    /// when any file of the front end moves (a crate's plan key covers every crate below it).
+    found: blaze_hash::HashMap<CrateKey, FoundSaid, Global>,
     /// How cargo passes each crate's root, which the build's naming of files reads and each
     /// crate's identity covers.
     spellings: std::sync::Arc<Spellings>,
@@ -800,6 +800,15 @@ pub struct Given {
     pub key: CrateKey,
     pub krate_id: ContentId,
     pub image: hir_def::deps::Image,
+}
+
+/// What a found record said of a crate ([`Lowered::take_found`]).
+#[derive(Clone, Copy, Debug)]
+struct FoundSaid {
+    /// The key its image is filed under.
+    filed: ContentId,
+    /// The crate's key the serve that stored it walked ([`Lowered::found_images`] asks under it).
+    base: ContentId,
 }
 
 /// How cargo passes each crate root of the build (`Spelling`), which what the program says of
@@ -1605,14 +1614,18 @@ impl Lowered {
     /// ([`Lowered::carry_own_surface`]: none of its files is parsed for it). Call
     /// [`Lowered::give_surfaces`] after the last one. Both are let go in the write that
     /// moves a file of the front end or applies a run below the crate.
+    ///
+    /// `base` is the crate's key the record says its image was stored under
+    /// (`hir_def::deps::found::Found::base`), which [`Lowered::found_images`] asks under.
     pub fn take_found(
         &mut self,
         krate: Crate,
         filed: ContentId,
+        base: ContentId,
         own_surface: Option<&[u8]>,
     ) -> Result<(), LowerError> {
         let key = krate.key(&self.db);
-        self.found.insert(key, filed);
+        self.found.insert(key, FoundSaid { filed, base });
         let Some(own) = own_surface else { return Ok(()) };
         // alloc: once a find, a crate of the closure each
         let mut seen = blaze_hash::HashMap::new_in(Global);
@@ -1625,7 +1638,39 @@ impl Lowered {
     /// What a found record said `krate`'s image is filed under ([`Lowered::take_found`]), while
     /// no write moved it.
     pub fn found_filed(&self, krate: Crate) -> Option<ContentId> {
-        self.found.get(&krate.key(&self.db)).copied()
+        self.found.get(&krate.key(&self.db)).map(|it| it.filed)
+    }
+
+    /// The image of each crate a found record was taken of ([`Lowered::take_found`]) whose
+    /// image is filed under its key alone (the record's filed key is its base: the crate read
+    /// nothing), from `images` in `mode` ([`hir_def::deps::serve_found`]), each with its
+    /// stable id: what a start gives in the commit of the session's makers, before any query
+    /// of the crate runs, with the rest of each one's slots (blaze-cargo's `deps::makers`), so
+    /// the first serve keeps it and its arena is not made again for it. One filed by its
+    /// reads is left to that serve, which values them. Reads this snapshot and writes nothing.
+    pub fn found_images(
+        &mut self,
+        // dyn: the driver's store, one call per crate per front end
+        images: &dyn hir_def::deps::ImageStore,
+        mode: hir_def::deps::Mode,
+    ) -> Result<Vec<Given, Global>, LowerError> {
+        let mut asked: Vec<(Crate, ContentId), Global> = Vec::with_capacity_in(self.found.len(), Global);
+        asked.extend(
+            self.found
+                .iter()
+                .filter(|(_, said)| said.filed == said.base)
+                .filter_map(|(&key, said)| Some((self.db.crate_at(key)?, said.base))),
+        );
+        // By crate, so the gifts, their facts and what is said of them are in one order.
+        asked.sort_unstable_by_key(|&(krate, _)| krate);
+        let found =
+            hir_def::deps::serve_found(&self.db, &asked, images, mode).map_err(LowerError::new)?;
+        let mut given: Vec<Given, Global> = Vec::with_capacity_in(found.len(), Global);
+        for (krate, image) in found {
+            let krate_id = self.stable_id(krate);
+            given.push(Given { krate, key: krate.key(&self.db), krate_id, image });
+        }
+        Ok(given)
     }
 
     /// The files of `krate`'s source root under its package's directory, each by its path
@@ -2380,7 +2425,7 @@ struct Beside<'a> {
     identities: &'a mut blaze_hash::HashMap<CrateKey, ContentId, Global>,
     narrowed: &'a mut blaze_hash::HashMap<CrateKey, Narrow, Global>,
     carried: &'a mut blaze_hash::HashMap<CrateKey, code::OwnNarrow, Global>,
-    found: &'a mut blaze_hash::HashMap<CrateKey, ContentId, Global>,
+    found: &'a mut blaze_hash::HashMap<CrateKey, FoundSaid, Global>,
     surfaces_due: &'a mut bool,
 }
 
@@ -2876,6 +2921,10 @@ impl Lowered {
     /// roots), so no snapshot holds an image without them. When `with` refuses, the edit is
     /// dropped: nothing of the serve is in the world, and the error names the serve and
     /// carries `with`'s text. A caller with nothing more to give passes `|_, _| Ok(())`.
+    ///
+    /// A crate `lowered` holds live and lowered ([`hir_def::deps::Lowered`]) is not asked of
+    /// the store: it stays lowered. The caller notes in `lowered` what this serve walked, once
+    /// it has committed.
     pub fn serve_deps(
         &mut self,
         crates: &[Crate],
@@ -2883,13 +2932,14 @@ impl Lowered {
         // dyn: the driver's store, one call per crate per front end
         images: &dyn hir_def::deps::ImageStore,
         mode: hir_def::deps::Mode,
+        lowered: &hir_def::deps::Lowered,
         with: impl FnOnce(&mut base_db::Edit<'_>, &[Given]) -> Result<(), String>,
     ) -> Result<(hir_def::deps::Served, Vec<Given>), LowerError> {
         // Worked out from this snapshot (keys, the store's lookups), and the images found
         // given as inputs of the next one, each in its crate's own arena: never set into the
         // snapshot that read them.
-        let (served, found) =
-            hir_def::deps::serve(&self.db, crates, build, images, mode).map_err(LowerError::new)?;
+        let (served, found) = hir_def::deps::serve_keeping(&self.db, crates, build, images, mode, lowered)
+            .map_err(LowerError::new)?;
         // alloc: once per serve, an entry a crate given an image
         let found: Vec<Given> = found
             .into_iter()

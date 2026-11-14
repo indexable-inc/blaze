@@ -446,6 +446,12 @@ fn a_path_twice_is_refused() {
 
 #[test]
 fn stable_ids_renumber_by_first_use() {
+    // A pretty print puts a bare id on a line of its own with a comma after it; the same id
+    // on one line is the same label, and what is no id keeps its text.
+    assert_eq!(
+        stable_ids("BlockId(\n    3.0:26,\n) BlockId(3.0:26) BlockId(\n    3.0:4,\n) Some(\n    \"x\",\n)"),
+        "BlockId(\n    #0,\n) BlockId(#0) BlockId(\n    #1,\n) Some(\n    \"x\",\n)",
+    );
     assert_eq!(
         stable_ids(
             "Crate(Id(10240)) FileId(EditionedFileId(Id(13312))) Crate(Id(10240)) FunctionId(8c03) Idx::<FieldData>(0) FunctionId(\"f\")"

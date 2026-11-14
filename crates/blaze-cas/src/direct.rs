@@ -52,28 +52,44 @@
 //! (`hir_def::nameres::frozen::entries::Entries::get`, one key a call), and one build put a
 //! file's records side by side (`serve::unit::deps::Asked::take` sorts them by file, and the
 //! commit writes a pack through the page cache, `Cache::Kept`). So a record of a pack is not
-//! read alone: a record the system does not hold is read with its window, the blocks of
-//! [`AROUND`] bytes it lies in (from a multiple of it, never past what the pack commits) less
-//! those at its ends the system holds ([`Direct::window`]; its bytes there are taken from the
-//! mapping), through the page cache, and the pack is then mapped (once a reader, again only as
-//! it grows). A record asked after that whose pages the system holds ([`Residency`]: `mincore`
-//! of its pages in the mapping; the simulation's model of a cache) is taken from the mapping,
-//! checked as a read one is, and copied to the caller: no read, no ring, no wait. Against the
-//! floor (each byte of the records asked read from the device once, and no wait for a record
-//! in memory): `n` records put together by one build and asked one by one, in any order, cost
-//! one read and one wait per block they lie in, each block read once (the tests' bound), plus a
-//! map per pack; a record held costs one `mincore` (one call, no I/O), its check and a copy of
-//! its bytes. A block's other bytes are read for records that may never be asked: at most
-//! [`AROUND`] a read, the cost of the choice. A page let go between `mincore` and the copy is read by the fault, in the
-//! copy: a synchronous read of that page, the one wait no span names (rare; measured by none).
+//! read alone. A pack is mapped before any record of it is read: a mapping reads nothing, and
+//! only through it can the system be asked which pages it holds ([`Residency`]: `mincore` of
+//! the record's pages in the mapping; the simulation's model of a cache). So a record whose
+//! pages the system holds is taken from the mapping, checked as a read one is, and copied to
+//! the caller, on the pack's first touch as on any other: no read, no ring, no wait. One the
+//! system does not hold is read with its window, the blocks of [`AROUND`] bytes it lies in
+//! (from a multiple of it, never past what the pack commits) less those at its ends the system
+//! holds ([`Direct::window`]; its bytes there are taken from the mapping), through the page
+//! cache. Against the floor (each byte of the records asked read from the device once, and no
+//! wait for a record in memory): `n` records put together by one build and asked one by one,
+//! in any order, cost one read and one wait per block the system did not hold, each block read
+//! once (the tests' bound), plus one round of maps; a record held costs one `mincore` (one
+//! call, no I/O), its check and a copy of its bytes. A block's other bytes are read for records
+//! that may never be asked: at most [`AROUND`] a read, the cost of the choice. A page let go
+//! between `mincore` and the copy is read by the fault, in the copy: a synchronous read of that
+//! page, the one wait no span names (rare; measured by none).
+//!
+//! **Maps, once a store.** The mappings of a store's packs are shared by every reader of it
+//! ([`Maps`], kept by the store), so a pack is mapped once a process, not once a thread. The
+//! packs are known before any record is (the head lists them), so the first call that finds a
+//! pack unmapped maps, in the same round, every pack of the store's views no reader mapped yet
+//! (up to [`MAP_AHEAD_MOST`], [`MAPS_A_ROUND`] a wait): after a restart the first ask pays one
+//! round of concurrent maps and no later ask of any thread waits on one. A call's records are
+//! then asked of the system, and those it does not hold are read in one round of concurrent
+//! reads: a batch of `n` records in `n` unmapped packs costs one round of maps and one of
+//! reads, two waits, where asking them one at a time cost `2n`.
 //!
 //! **Mapping.** [`MAP_FROM`] is 16 KiB, the macOS page: below it, a copy (about 1.6 µs at most, and
 //! 16 KiB of footprint until the frame is reset) beats a mapping's fault (about 0.7 µs a page,
 //! after a first mapping of the file at about 15 µs); from it on, a mapping costs no footprint at
 //! all, which is the order the owner set (time, then memory). These are measured on the Mac only;
 //! Linux's 4 KiB pages and an uncached disk are not measured. A pack is mapped once a process (its
-//! mapping kept in the file table, made again only when a record lies past its end, as the pack
-//! grew), and an external value's file once a read.
+//! mapping kept in the store's [`Maps`] and lent to each reader's file table, made again only
+//! when a record lies past its end, as the pack grew), and an external value's file once a
+//! read. A map is an effect on the caller's driver like a read (an open on the ring, then the
+//! `mmap` at its completion, on io_uring; a hop to the driver's file threads on kqueue), so it
+//! is a wait, named by its span `store direct maps` (its files, the first's name, the bytes
+//! mapped); the `mmap` itself reads no page.
 //!
 //! **The collector.** Only a pack's committed bytes are read or mapped, and the store cuts a pack
 //! only back to what it committed, never below (`write_pack`), so no truncate takes bytes a read
@@ -165,6 +181,14 @@ pub(crate) enum Plant {
     /// Each record asked is a read of its own: no window around it, and no record served from
     /// the pages the system holds.
     OneByOne,
+    /// A pack's first touch reads its record's window before the page cache is asked: the
+    /// order before 2026-11-14, when residency was asked only of a mapping a read had made.
+    ReadBeforeMap,
+    /// Each file a round maps is mapped in a wait of its own: the packs of a batch one after
+    /// another.
+    MapEach,
+    /// A pack's mapping is taken from the shared table under another pack's name.
+    OtherPacksMapping,
 }
 
 /// The sans-IO core: the reads a batch of records needs, and what came of them.
@@ -197,7 +221,9 @@ mod plan {
     /// Tags a plan uses from its base.
     pub(crate) const TAGS: u64 = CALLS << PART_BITS;
 
-    /// The part number a call's one mapping asks with: never a read's.
+    /// The part number a call's first mapping asks with, its `i`th `MAP_PART - i`: counted
+    /// down from the top while reads count up from 0, and never a read's (`plan` asserts the
+    /// two do not meet).
     const MAP_PART: u64 = (1 << PART_BITS) - 1;
 
     /// A record wanted: `len` bytes at `at` of the caller's file `file`, read as part of the
@@ -271,6 +297,8 @@ mod plan {
         // alloc: as `wants`
         parts: Vec<Part>,
         left: usize,
+        /// Mappings this call asked for, each with a tag of its own ([`Plan::map_tag`]).
+        maps: u64,
         #[cfg(test)]
         pub(crate) plant: Plant,
     }
@@ -289,6 +317,7 @@ mod plan {
                 // alloc: empty
                 parts: Vec::new(),
                 left: 0,
+                maps: 0,
                 #[cfg(test)]
                 plant: Plant::None,
             }
@@ -302,6 +331,7 @@ mod plan {
             self.runs.clear();
             self.parts.clear();
             self.left = 0;
+            self.maps = 0;
         }
 
         /// `len` bytes at `at` of file `file` wanted, and no more read for it: the want's
@@ -388,9 +418,10 @@ mod plan {
                 run.parts = self.parts.len() as u32 - run.first;
             }
             assert!(
-                (self.parts.len() as u64) < MAP_PART,
-                "a call of the store's direct reader reads {} parts, more than its tags name",
-                self.parts.len()
+                (self.parts.len() as u64) < MAP_PART - self.maps,
+                "a call of the store's direct reader reads {} parts and maps {} files, more than its tags name",
+                self.parts.len(),
+                self.maps
             );
             self.runs.last().map_or(0, |run| run.into + run.len)
         }
@@ -429,9 +460,30 @@ mod plan {
             Tag(self.tags + (self.call << PART_BITS) + part)
         }
 
-        /// The tag this call's mapping asks with.
-        pub(crate) fn map_tag(&self) -> Tag {
-            self.tag(MAP_PART)
+        /// The tag of this call's next mapping, and its number among the call's mappings.
+        /// Asked before the call's reads are planned ([`Plan::plan`] asserts the two ranges do
+        /// not meet).
+        pub(crate) fn map_tag(&mut self) -> (usize, Tag) {
+            let n = self.maps;
+            assert!(
+                n < MAP_PART && self.parts.is_empty(),
+                "a call of the store's direct reader maps {n} files, or maps after its reads were planned"
+            );
+            self.maps += 1;
+            (n as usize, self.tag(MAP_PART - n))
+        }
+
+        /// The number of this call's mapping `tag` names.
+        pub(crate) fn map_of(&self, tag: Tag) -> Option<usize> {
+            let rel = tag.0.checked_sub(self.tags).filter(|it| *it < TAGS)?;
+            let back = MAP_PART - (rel & MAP_PART);
+            (rel >> PART_BITS == self.call && back < self.maps).then_some(back as usize)
+        }
+
+        /// Blocks of `block` bytes (from a multiple of it) this call's runs read: the device
+        /// blocks a round costs, each once.
+        pub(crate) fn blocks(&self, block: u64) -> u64 {
+            self.runs.iter().map(|run| (run.at + run.len).div_ceil(block) - run.at / block).sum()
         }
 
         /// Whether `tag` is one of the reader's, of this call or an earlier one.
@@ -570,8 +622,29 @@ pub struct Counts {
     pub longest_wait_ns: u64,
     /// The longest run read, in bytes: a maximum, not a sum.
     pub longest_run: u64,
+    /// Blocks of [`AROUND`] bytes read from the device (each a block a round's runs cover,
+    /// [`plan::Plan::blocks`]): what the page cache did not hold.
+    pub blocks_read: u64,
+    /// Blocks of the record a pack was first asked for in this process (its first touch)
+    /// lies in, asked of the page cache after the pack was mapped.
+    pub first_touch_blocks: u64,
+    /// Of those, the blocks the page cache held: served with no device read. With
+    /// `first_touch_blocks`, how much of a restart the page cache served.
+    pub first_touch_held: u64,
+    /// Of `waits`, those on a round of mappings (each one span `store direct maps`).
+    pub map_waits: u64,
+    /// The most reads one wait waited on: the width of the widest round of reads. A maximum.
+    pub widest_reads: u64,
+    /// The most files one wait mapped: the width of the widest round of maps. A maximum.
+    pub widest_maps: u64,
 }
 
+static BLOCKS_READ: AtomicU64 = AtomicU64::new(0);
+static FIRST_TOUCH_BLOCKS: AtomicU64 = AtomicU64::new(0);
+static FIRST_TOUCH_HELD: AtomicU64 = AtomicU64::new(0);
+static MAP_WAITS: AtomicU64 = AtomicU64::new(0);
+static WIDEST_READS: AtomicU64 = AtomicU64::new(0);
+static WIDEST_MAPS: AtomicU64 = AtomicU64::new(0);
 static RECORDS: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -605,6 +678,12 @@ pub fn counts() -> Counts {
         waits: get(&WAITS),
         longest_wait_ns: get(&LONGEST_WAIT_NS),
         longest_run: get(&LONGEST_RUN),
+        blocks_read: get(&BLOCKS_READ),
+        first_touch_blocks: get(&FIRST_TOUCH_BLOCKS),
+        first_touch_held: get(&FIRST_TOUCH_HELD),
+        map_waits: get(&MAP_WAITS),
+        widest_reads: get(&WIDEST_READS),
+        widest_maps: get(&WIDEST_MAPS),
     }
 }
 
@@ -619,6 +698,12 @@ fn count(own: &mut u64, all: &AtomicU64, n: u64) {
 /// and a build's is the largest of its samples'. [`counts`] reads the same two, since that call.
 pub fn take_longest() -> (u64, u64) {
     (LONGEST_WAIT_NS.swap(0, Ordering::Relaxed), LONGEST_RUN.swap(0, Ordering::Relaxed))
+}
+
+/// The process's widest round of reads and of maps since the last call, each then started
+/// again from 0, as [`take_longest`]'s two.
+pub fn take_widest() -> (u64, u64) {
+    (WIDEST_READS.swap(0, Ordering::Relaxed), WIDEST_MAPS.swap(0, Ordering::Relaxed))
 }
 
 /// `n` kept in a reader's own maximum and the process's, where it is larger.
@@ -646,6 +731,12 @@ impl Counts {
             waits: self.waits - before.waits,
             longest_wait_ns: self.longest_wait_ns,
             longest_run: self.longest_run,
+            blocks_read: self.blocks_read - before.blocks_read,
+            first_touch_blocks: self.first_touch_blocks - before.first_touch_blocks,
+            first_touch_held: self.first_touch_held - before.first_touch_held,
+            map_waits: self.map_waits - before.map_waits,
+            widest_reads: self.widest_reads,
+            widest_maps: self.widest_maps,
         }
     }
 
@@ -665,6 +756,12 @@ impl Counts {
         self.waits += other.waits;
         self.longest_wait_ns = self.longest_wait_ns.max(other.longest_wait_ns);
         self.longest_run = self.longest_run.max(other.longest_run);
+        self.blocks_read += other.blocks_read;
+        self.first_touch_blocks += other.first_touch_blocks;
+        self.first_touch_held += other.first_touch_held;
+        self.map_waits += other.map_waits;
+        self.widest_reads = self.widest_reads.max(other.widest_reads);
+        self.widest_maps = self.widest_maps.max(other.widest_maps);
     }
 }
 
@@ -773,6 +870,90 @@ fn in_core(bytes: &[u8]) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn in_core(_bytes: &[u8]) -> bool {
     false
+}
+
+/// The most files one wait of a round of maps maps ([`Direct::map_round`]): each holds a
+/// descriptor from its open until its map, so a round stays well inside a process's limit of
+/// open files; a store with more unmapped packs takes a wait every this many.
+pub const MAPS_A_ROUND: usize = 256;
+
+/// The most pack mappings a store's table ([`Maps`]) is filled to ahead of any ask of them: a
+/// mapping costs a range of address space and a kernel map entry, and no page.
+pub const MAP_AHEAD_MOST: usize = 1024;
+
+/// The mappings of a store's packs, shared by every direct reader of it (the daemon keeps one
+/// a thread a store): a pack is mapped once a process, and its mapping lent to each reader that
+/// asks a record of it, so no thread waits to map a pack another mapped. The store keeps it
+/// ([`crate::Store::reader`] hands it to each reader made). Filled by a reader's round of maps
+/// ([`Direct::map_round`]); a pack its views no longer hold is dropped at the next round.
+#[derive(Default)]
+pub struct Maps {
+    packs: blaze_hash::SharedMap<FileName, PackMap>,
+}
+
+/// A pack's mapping in [`Maps`], and whether a record of it was asked yet in this process.
+struct PackMap {
+    mapping: Mapping,
+    asked: std::sync::atomic::AtomicBool,
+}
+
+impl Maps {
+    /// The pack `file`'s mapping, when it reaches `end`, and whether this is the process's
+    /// first ask of a record of it (the pack's first touch).
+    fn lend(&self, file: &FileName, end: u64) -> Option<(Mapping, bool)> {
+        let packs = self.packs.pin();
+        let pack = packs.get(file).filter(|it| it.mapping.bytes().len() as u64 >= end)?;
+        let first = !pack.asked.swap(true, Ordering::Relaxed);
+        // clone: a refcount
+        Some((pack.mapping.clone(), first))
+    }
+
+    /// The planted bug's lend: a mapping of another pack reaching `end`.
+    #[cfg(test)]
+    fn other_than(&self, file: &FileName, end: u64) -> Option<(Mapping, bool)> {
+        let packs = self.packs.pin();
+        let (_, other) = packs.iter().find(|(name, it)| *name != file && it.mapping.bytes().len() as u64 >= end)?;
+        // clone: a refcount
+        Some((other.mapping.clone(), false))
+    }
+
+    /// Whether the table maps `file`, at any length.
+    fn has(&self, file: &FileName) -> bool {
+        self.packs.pin().contains_key(file)
+    }
+
+    /// Whether this is the process's first ask of a record of the pack `file` (marked asked).
+    fn first_ask(&self, file: &FileName) -> bool {
+        self.packs.pin().get(file).is_some_and(|it| !it.asked.swap(true, Ordering::Relaxed))
+    }
+
+    /// `mapping` kept as `file`'s, unless the table holds one at least as long (a pack only
+    /// grows): two readers that mapped one pack at once keep one, the other's dropped with it.
+    fn keep(&self, file: FileName, mapping: Mapping) {
+        let packs = self.packs.pin();
+        if packs.get(&file).is_some_and(|it| it.mapping.bytes().len() >= mapping.bytes().len()) {
+            return;
+        }
+        let asked = packs.get(&file).is_some_and(|it| it.asked.load(Ordering::Relaxed));
+        packs.insert(file, PackMap { mapping, asked: std::sync::atomic::AtomicBool::new(asked) });
+    }
+
+    fn len(&self) -> usize {
+        self.packs.len()
+    }
+
+    /// Every mapping dropped. The tests' use: the simulation's mapping is a copy of the file
+    /// when mapped, so one taken while a byte was rotted would keep it after the disk is put
+    /// back; dropping them all models a page cache that let the rotted page go.
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        self.packs.pin().clear();
+    }
+
+    /// Every pack `live` says no to dropped from the table.
+    fn retain(&self, live: impl Fn(&FileName) -> bool) {
+        self.packs.pin().retain(|file, _| live(file));
+    }
 }
 
 /// Why a record was not read. Each names the key, the file and the offset, and the rule that
@@ -923,6 +1104,10 @@ struct Open {
     name: FileName,
     used: u64,
     mapping: Option<Mapping>,
+    /// Its mapping was lent to this reader by an ask that was the process's first of a record
+    /// of the pack ([`Maps::lend`]): the next record resolved from it counts its blocks
+    /// ([`Direct::first_touch`]).
+    first: bool,
 }
 
 /// What a key was found to be, before its bytes are read.
@@ -932,6 +1117,84 @@ enum Where {
     /// A segment's value, verified and copied to the reader's scratch at `at`.
     Held { at: usize, len: usize },
     Want(Want),
+    /// A record of a pack no reader of the store has mapped far enough: resolved, to `Held`
+    /// or `Want`, once the call's one round of maps is done ([`Direct::resolve_pending`]).
+    Pending(PackAsk),
+}
+
+/// A record of a pack, located: what [`Direct::resolve`] needs to take it from the pack's
+/// mapping or want it read.
+struct PackAsk {
+    key: Key,
+    file: FileName,
+    slot: u32,
+    loc: Loc,
+    tier: usize,
+    live: bool,
+    /// The bytes its pack commits.
+    usable: u64,
+    /// Its number among the round's targets.
+    target: u32,
+}
+
+/// A file a round maps ([`Direct::map_round`]).
+struct MapAsk {
+    file: FileName,
+    /// Its place in the reader's table, for a file a record of the call lies in; `None` for a
+    /// pack mapped ahead of any ask, into the store's shared table alone.
+    slot: Option<u32>,
+    /// The least length the mapping must have: past the last record the call asks of it.
+    end: u64,
+    /// A pack (kept in the store's shared table), or a value's file of its own (kept in the
+    /// reader's table alone).
+    pack: bool,
+    done: Option<Done>,
+}
+
+/// Why a file the call needed was not mapped: each record of it fails, naming the map.
+enum MapMiss {
+    /// Nothing completed for the driver's stall bound.
+    Stalled(Duration),
+    /// The map failed: the driver's error.
+    Failed(String),
+    /// The driver answered the map with another effect's answer.
+    Answered(Done),
+    /// The round ended with the map not answered.
+    Unanswered,
+    /// The mapping is shorter than the record asked of it.
+    Short { asked: u64, read: u64 },
+}
+
+impl MapMiss {
+    fn failed(&self, key: Key, file: &FileName) -> Failed {
+        // clone: the error's file name
+        let file = file.clone();
+        match self {
+            MapMiss::Stalled(waited) => Failed::Stalled { key, file, at: 0, waited: *waited },
+            MapMiss::Short { asked, read } => Failed::Short { key, file, at: 0, asked: *asked, read: *read },
+            // alloc: the error's message
+            miss => Failed::Read { key, file, at: 0, why: format!("mapping its file: {miss}") },
+        }
+    }
+}
+
+impl fmt::Display for MapMiss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MapMiss::Stalled(waited) => write!(f, "nothing completed for {waited:?} (blaze_core::IDLE_STALL)"),
+            MapMiss::Failed(why) => f.write_str(why),
+            MapMiss::Answered(other) => write!(f, "the driver answered a map with {other:?}"),
+            MapMiss::Unanswered => f.write_str("the round ended with the map not answered"),
+            MapMiss::Short { asked, read } => write!(f, "mapped {read} bytes, short of the {asked} asked"),
+        }
+    }
+}
+
+/// What a wait of the reader waits on: a round of reads, or of maps (how many files).
+#[derive(Clone, Copy)]
+enum Waiting {
+    Reads,
+    Maps(usize),
 }
 
 /// A record of a pack to read.
@@ -989,8 +1252,14 @@ pub struct Direct {
     others: Vec<Completion>,
     // alloc: `read`'s one answer, kept between calls
     one: Vec<Placed>,
-    mapped: Option<Done>,
-    mapping: bool,
+    /// The files a round maps, and what came of each ([`Direct::map_round`]); kept and
+    /// cleared per round.
+    to_map: Vec<MapAsk, Global>,
+    /// Maps of the round not yet completed.
+    maps_left: usize,
+    /// The call's number ([`plan::Plan::map_tag`]) of the round's first map: `to_map[i]` is
+    /// the call's map `map_base + i`.
+    map_base: usize,
     // alloc: the call's second-round values (chunked, a file of their own), as `targets`
     follows: Vec<(u32, Follow)>,
     // alloc: a value made whole in the second round, kept and cleared between calls
@@ -1008,11 +1277,9 @@ pub struct Direct {
     /// The scratch a round's runs (records and the windows around them) are read into, and
     /// each value copied out of to the caller: kept between calls up to [`REGION_KEPT`].
     region: Vec<u8, Global>,
-    /// The furthest byte a round read of each file, `(slot, end)`: kept and cleared per round.
-    reach: Vec<(u32, u64), Global>,
-    /// The files a round read and could not then map, `(slot, why)`: each record read from one
+    /// The files of the reader's table a round could not map, `(slot, why)`: each record of one
     /// fails, naming the map. Kept and cleared per round.
-    unmapped: Vec<(u32, Failed), Global>,
+    unmapped: Vec<(u32, MapMiss), Global>,
     /// A record put together from its pack's mapping and the bytes read of it (`Want::head`),
     /// kept and cleared between records.
     stitch: Vec<u8, Global>,
@@ -1052,8 +1319,9 @@ impl Direct {
             others: Vec::new(),
             // alloc: empty
             one: Vec::new(),
-            mapped: None,
-            mapping: false,
+            to_map: Vec::new_in(Global),
+            maps_left: 0,
+            map_base: 0,
             // alloc: empty
             follows: Vec::new(),
             // alloc: empty
@@ -1067,7 +1335,6 @@ impl Direct {
             chunk_round: false,
             residency,
             region: Vec::new_in(Global),
-            reach: Vec::new_in(Global),
             unmapped: Vec::new_in(Global),
             stitch: Vec::new_in(Global),
             counts: Counts::default(),
@@ -1083,6 +1350,26 @@ impl Direct {
             return true;
         }
         false
+    }
+
+    /// Whether a pack's first touch reads before it asks the page cache (the planted bug
+    /// `Plant::ReadBeforeMap`).
+    fn plant_read_before_map(&self) -> bool {
+        #[cfg(test)]
+        if self.plant == Plant::ReadBeforeMap {
+            return true;
+        }
+        false
+    }
+
+    /// How many files one wait of a round maps: [`MAPS_A_ROUND`], or one (the planted bug
+    /// `Plant::MapEach`).
+    fn maps_a_wait(&self) -> usize {
+        #[cfg(test)]
+        if self.plant == Plant::MapEach {
+            return 1;
+        }
+        MAPS_A_ROUND
     }
 
     #[cfg(test)]
@@ -1165,12 +1452,29 @@ impl Direct {
                 self.targets.push(target);
             }
         }
+        // The packs of the call's records no reader had mapped, all in one round, and then
+        // each record asked of the page cache: one wait for every pack the call first touches.
+        self.to_map.clear();
+        for target in &self.targets {
+            let Where::Pending(ask) = target else { continue };
+            let end = ask.loc.offset + RECORD_HEADER + ask.loc.stored;
+            // Bounded: one entry per file of the call.
+            match self.to_map.iter_mut().find(|it| it.slot == Some(ask.slot)) {
+                Some(it) => it.end = it.end.max(end),
+                // clone: a refcount
+                None => self.to_map.push(MapAsk { file: ask.file.clone(), slot: Some(ask.slot), end, pack: true, done: None }),
+            }
+        }
+        if !self.to_map.is_empty() {
+            self.map_round(driver, &shared);
+            self.resolve_pending(&shared);
+        }
         let total = self.plan.plan();
         let mut region = std::mem::take(&mut self.region);
         region.clear();
         let fetched = self.fetch(driver, &mut region, 0, total);
         if matches!(fetched, Fetched::Read) {
-            self.after_read(driver);
+            self.after_read();
         }
         self.assemble(&shared, into, &region, &fetched, places);
         region.clear();
@@ -1180,34 +1484,168 @@ impl Direct {
         self.region = region;
     }
 
-    /// After a round's reads: what they read is in the page cache (told to the model, where
-    /// it is one), and each file they read is mapped to past the furthest byte read, so the
-    /// records beside them are taken from the mapping by the calls after this one.
-    fn after_read<D: Driver>(&mut self, driver: &mut D) {
-        self.reach.clear();
+    /// After a round's reads: what they read is in the page cache, told to the model where it
+    /// is one (the kernel's needs no telling). Each file they read was mapped before (the
+    /// round's maps come first), so the records beside them are taken from the mapping by the
+    /// calls after this one.
+    fn after_read(&mut self) {
         for (slot, at, len) in self.plan.read() {
             self.residency.read(&self.files[slot as usize].name, at, len);
-            // Bounded: one entry per file of the call.
-            match self.reach.iter_mut().find(|it| it.0 == slot) {
-                Some(it) => it.1 = it.1.max(at + len),
-                None => self.reach.push((slot, at + len)),
+        }
+    }
+
+    /// Maps, in one round of concurrent maps (one wait, one span `store direct maps`), every
+    /// file of `self.to_map`, and with them every pack of the store's views no reader of it has
+    /// mapped yet (up to [`MAP_AHEAD_MOST`] in the store's table): the packs a restarted
+    /// build will touch are known (the head lists them) though the records it will ask are
+    /// not, so the first ask maps them all and no later ask of any thread waits on a map. A
+    /// mapping reads nothing: no page of a pack is read for being mapped. Each asked file's
+    /// mapping goes to the reader's table (and a pack's to the store's, [`Maps`]); each that
+    /// failed is recorded in `self.unmapped`, so each record of it fails naming the map. A pack
+    /// mapped ahead that failed is said in the log and mapped again when a record of it is
+    /// asked, which then fails by name if it fails again.
+    fn map_round<D: Driver>(&mut self, driver: &mut D, shared: &Shared) {
+        if self.to_map.iter().any(|it| it.pack) {
+            self.ahead(shared);
+        }
+        let mut to_map = std::mem::take(&mut self.to_map);
+        let first = to_map.first().map(|it| it.file.clone()); // clone: a refcount, for the span
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store direct maps",
+            files = to_map.len() as u64,
+            asked = to_map.iter().filter(|it| it.slot.is_some()).count() as u64,
+            file = first.as_ref().map(FileName::as_str),
+            bytes = tracing::field::Empty,
+        );
+        let _in = span.enter();
+        let mut stalled = None;
+        let step = self.maps_a_wait().max(1);
+        let mut at = 0;
+        // Bounded: each turn asks the next `step` maps, and ends at the first stall.
+        while at < to_map.len() && stalled.is_none() {
+            let upto = (at + step).min(to_map.len());
+            for (n, ask) in to_map[at..upto].iter_mut().enumerate() {
+                // The round's maps are numbered in its order from the call's first of the
+                // round (`map_base`): `drive` reads each back to its place in `to_map`.
+                let (number, tag) = self.plan.map_tag();
+                if at + n == 0 {
+                    self.map_base = number;
+                }
+                assert_eq!(number, self.map_base + at + n, "a round's maps are the call's, numbered in order");
+                // clone: a refcount
+                self.effects.push(Effect::Map { file: ask.file.clone(), extent: Extent::Whole, tag });
+                ask.done = None;
+            }
+            self.maps_left = upto - at;
+            self.to_map = to_map;
+            let driven = self.drive(driver, Waiting::Maps(upto - at));
+            to_map = std::mem::take(&mut self.to_map);
+            if let Err(waited) = driven {
+                stalled = Some(waited);
+                self.maps_left = 0;
+            }
+            at = upto;
+        }
+        let mut bytes = 0;
+        for ask in to_map.drain(..) {
+            let missed = match ask.done {
+                Some(Done::Mapped(mapping)) => {
+                    let len = mapping.bytes().len() as u64;
+                    count(&mut self.counts.maps, &MAPS, 1);
+                    bytes += len;
+                    if ask.pack {
+                        // clone: a refcount, kept in the store's table
+                        self.reader.maps.keep(ask.file.clone(), mapping.clone());
+                    }
+                    match ask.slot {
+                        Some(_) if len < ask.end => Some(MapMiss::Short { asked: ask.end, read: len }),
+                        Some(slot) => {
+                            let first = ask.pack && self.reader.maps.first_ask(&ask.file);
+                            let open = &mut self.files[slot as usize];
+                            open.first |= first;
+                            open.mapping = Some(mapping);
+                            None
+                        }
+                        None => None,
+                    }
+                }
+                Some(Done::Failed(why)) => Some(MapMiss::Failed(why.0)),
+                Some(other) => Some(MapMiss::Answered(other)),
+                None => Some(match stalled {
+                    Some(waited) => MapMiss::Stalled(waited),
+                    None => MapMiss::Unanswered,
+                }),
+            };
+            let Some(miss) = missed else { continue };
+            match ask.slot {
+                Some(slot) => self.unmapped.push((slot, miss)),
+                None => tracing::warn!(
+                    target: "blaze",
+                    file = ask.file.as_str(),
+                    why = %miss,
+                    "a pack mapped ahead of any ask was not mapped: a record of it asked later maps it again, and fails by name if that fails"
+                ),
             }
         }
-        if self.one_by_one() {
+        span.record("bytes", bytes);
+        self.to_map = to_map;
+        self.prune(shared);
+    }
+
+    /// Every pack of the store's views (its own tiers' and its live layer's) that is not
+    /// retired, not in the store's table of mappings and not asked already, added to the
+    /// round's maps, while the table and the round together stay within [`MAP_AHEAD_MOST`].
+    fn ahead(&mut self, shared: &Shared) {
+        let room = MAP_AHEAD_MOST.saturating_sub(self.reader.maps.len() + self.to_map.len());
+        if room == 0 {
             return;
         }
-        let reach = std::mem::take(&mut self.reach);
-        for &(slot, end) in &reach {
-            let key = self.targets.iter().find_map(|target| match target {
-                Where::Want(want) if want.slot == slot => Some(want.key),
-                _ => None,
-            });
-            let key = key.expect("a file a round read holds a record the round wanted");
-            if let Err(failed) = self.mapping_of(driver, &key, slot, end) {
-                self.unmapped.push((slot, failed));
+        let asked = self.to_map.len();
+        let guard = blaze_reclaim::enter();
+        let held = Held::task(&guard);
+        // Bounded: the views' packs, at most `room` taken.
+        'views: for live in [false, true] {
+            let Some(view) = view_of(shared, held, live) else { continue };
+            for tier in &view.tiers {
+                for pack in &tier.packs {
+                    if self.to_map.len() - asked >= room {
+                        break 'views;
+                    }
+                    if pack.gone || pack.usable == 0 || self.reader.maps.has(&pack.file) {
+                        continue;
+                    }
+                    // Bounded: the asked files, a few a call.
+                    if self.to_map[..asked].iter().any(|it| it.file == pack.file) {
+                        continue;
+                    }
+                    self.to_map.push(MapAsk {
+                        // clone: a refcount
+                        file: pack.file.clone(),
+                        slot: None,
+                        end: pack.usable,
+                        pack: true,
+                        done: None,
+                    });
+                }
             }
         }
-        self.reach = reach;
+    }
+
+    /// The store's table of mappings without the packs its views no longer hold (retired by
+    /// the collector, or of a writer the live layer no longer lists): dropping the mapping lets
+    /// the unlinked file's blocks go once no reader holds a clone of it.
+    fn prune(&mut self, shared: &Shared) {
+        let guard = blaze_reclaim::enter();
+        let held = Held::task(&guard);
+        let views = [view_of(shared, held, false), view_of(shared, held, true)];
+        // Bounded: each kept mapping looked up among the views' packs, once a round of maps
+        // (at most MAP_AHEAD_MOST mappings), with no table built for it.
+        self.reader.maps.retain(|file| {
+            views.iter().flatten().any(|view| {
+                view.tiers.iter().any(|tier| tier.packs.iter().any(|it| !it.gone && it.file == *file))
+            })
+        });
     }
 
     /// The call's second round: each chunked value's chunks read by key and put together in
@@ -1446,7 +1884,7 @@ impl Direct {
             (loc, file, slot, found.tier, live)
         };
         let end = loc.offset + RECORD_HEADER + loc.stored;
-        let pack = self.mapping_of(driver, key, slot, end)?;
+        let pack = self.mapping_of(driver, &shared, key, slot, end, true)?;
         let record = &pack.bytes()[loc.offset as usize..end as usize];
         let (header, sealed) = checked_header(record, key, loc, self.checks())
             .map_err(|what| Failed::Corrupt { key: *key, file: file.clone(), at: loc.offset, what })?; // clone: the error's file name
@@ -1467,7 +1905,7 @@ impl Direct {
                     Some((_, Some(mapping))) => (mapping, 0),
                     Some((name, None)) => {
                         let slot = self.slot(&name);
-                        (self.mapping_of(driver, key, slot, header.raw)?, 0)
+                        (self.mapping_of(driver, &shared, key, slot, header.raw, false)?, 0)
                     }
                     None => {
                         return Err(Failed::Corrupt {
@@ -1557,8 +1995,9 @@ impl Direct {
         self.answers.clear();
         self.order.clear();
         self.held.clear();
-        self.mapped = None;
-        self.mapping = false;
+        self.to_map.clear();
+        self.maps_left = 0;
+        self.unmapped.clear();
         self.follows.clear();
         self.chunk_round = false;
     }
@@ -1581,7 +2020,7 @@ impl Direct {
         }
         count(&mut self.counts.files_opened, &FILES_OPENED, 1);
         // clone: a refcount
-        self.files.push(Open { name: name.clone(), used: self.tick, mapping: None });
+        self.files.push(Open { name: name.clone(), used: self.tick, mapping: None, first: false });
         (self.files.len() - 1) as u32
     }
 
@@ -1667,46 +2106,147 @@ impl Direct {
         count(&mut self.counts.asked, &ASKED, 1);
         let len = RECORD_HEADER + loc.stored;
         let end = loc.offset + len;
-        let (one_by_one, checks) = (self.one_by_one(), self.checks());
-        // A record whose pages the system holds is taken from its pack's mapping: checked as a
-        // read one is, with no read and no wait. The mapping is the one the read of a record
-        // beside it made (`after_read`); a record past its end is read, and maps further.
+        // The target this is: `read_round` pushes each as it is located.
+        let target = self.targets.len() as u32;
+        if self.one_by_one() {
+            let n = self.plan.want(slot, loc.offset, len);
+            return Where::Want(Want { key: *key, file, slot, n, target, loc, tier: found.tier, live, head: 0, tail: 0 });
+        }
+        let usable = look.view().tiers[found.tier].packs[loc.pack as usize].usable;
+        let ask = PackAsk { key: *key, file, slot, loc, tier: found.tier, live, usable, target };
+        // The pack mapped first, then its pages asked of the system: a record whose pages the
+        // system holds is never read from the device, on the pack's first touch as on any
+        // other. A pack this reader, or another of the store's, mapped already is asked now; one
+        // no reader mapped waits for the call's one round of maps (`map_round`).
+        match self.adopt(slot, end) {
+            true => self.resolve(look.view(), ask),
+            false => Where::Pending(ask),
+        }
+    }
+
+    /// Whether the file at `slot` is mapped to at least `end` in this reader's table: its own
+    /// mapping, or the store's shared one ([`Maps`]) taken into the table now.
+    fn adopt(&mut self, slot: u32, end: u64) -> bool {
+        let open = &mut self.files[slot as usize];
+        if open.mapping.as_ref().is_some_and(|it| it.bytes().len() as u64 >= end) {
+            return true;
+        }
+        let maps = &self.reader.maps;
+        // The planted bug: the table's mapping of some other pack, where it has one.
+        #[cfg(test)]
+        let lent = match self.plant {
+            Plant::OtherPacksMapping => maps.other_than(&open.name, end),
+            _ => None,
+        };
+        #[cfg(not(test))]
+        let lent = None;
+        let Some((mapping, first)) = lent.or_else(|| maps.lend(&open.name, end)) else { return false };
+        open.mapping = Some(mapping);
+        open.first |= first;
+        true
+    }
+
+    /// `ask`, a record of a pack mapped to past its end in the reader's table: taken from the
+    /// mapping when the system holds its pages (checked as a read one is, with no read and no
+    /// wait), else wanted with its window ([`Direct::window`]) for the call's one round of
+    /// reads. `view` is the one its key was found in.
+    fn resolve(&mut self, view: &View, ask: PackAsk) -> Where {
+        let PackAsk { key, file, slot, loc, tier, live, usable, target } = ask;
+        let len = RECORD_HEADER + loc.stored;
+        let end = loc.offset + len;
+        let open = &mut self.files[slot as usize];
         // clone: a refcount
-        let mapping = self.files[slot as usize].mapping.clone().filter(|_| !one_by_one);
-        if let Some(mapping) = mapping
-            && let Some(record) = mapping.bytes().get(loc.offset as usize..end as usize)
-            && self.residency.holds(&file, record, loc.offset)
-        {
+        let mapping = open.mapping.clone().expect("a record is resolved once its pack is mapped past it");
+        let first = std::mem::take(&mut open.first);
+        let record = &mapping.bytes()[loc.offset as usize..end as usize];
+        if first {
+            self.first_touch(&file, &mapping, loc.offset, end, usable);
+        }
+        // The planted bug: a pack's first touch read from the device, the system not asked.
+        let read_first = first && self.plant_read_before_map();
+        if !read_first && self.residency.holds(&file, record, loc.offset) {
             count(&mut self.counts.records, &RECORDS, 1);
             count(&mut self.counts.hits, &HITS, 1);
             count(&mut self.counts.hit_bytes, &HIT_BYTES, len);
-            let at = self.held.len();
-            // The target this is: `read_round` pushes each as it is located.
-            let n = self.targets.len() as u32;
-            return match finish(look.view(), found.tier, *key, loc, &file, record, checks, &mut self.held) {
+            let (at, checks) = (self.held.len(), self.checks());
+            return match finish(view, tier, key, loc, &file, record, checks, &mut self.held) {
                 Ok((len, follow)) => {
                     if let Some(follow) = follow {
-                        self.follows.push((n, follow));
+                        self.follows.push((target, follow));
                     }
                     Where::Held { at, len }
                 }
                 Err(failed) => Where::Failed(failed),
             };
         }
-        let (n, head, tail) = match one_by_one {
-            true => (self.plan.want(slot, loc.offset, len), 0, 0),
-            false => {
-                let usable = look.view().tiers[found.tier].packs[loc.pack as usize].usable;
-                let (from, to) = self.window(&file, slot, loc.offset, end, usable);
-                // The part of the record the window holds; the rest lies in blocks the system
-                // holds, and is taken from the mapping (`take`).
-                let (part_at, part_end) = (loc.offset.max(from), end.min(to));
-                let n = self.plan.around(slot, part_at, part_end - part_at, from, to);
-                (n, part_at - loc.offset, end - part_end)
-            }
+        let (from, to) = match read_first {
+            // The planted bug: the record's whole window, as when no mapping was asked first.
+            true => (loc.offset - loc.offset % AROUND, ((end - 1) - (end - 1) % AROUND + AROUND).min(usable)),
+            false => self.window(&file, slot, loc.offset, end, usable),
         };
-        let target = self.targets.len() as u32;
-        Where::Want(Want { key: *key, file, slot, n, target, loc, tier: found.tier, live, head, tail })
+        // The part of the record the window holds; the rest lies in blocks the system holds,
+        // and is taken from the mapping (`take`).
+        let (part_at, part_end) = (loc.offset.max(from), end.min(to));
+        let n = self.plan.around(slot, part_at, part_end - part_at, from, to);
+        Where::Want(Want { key, file, slot, n, target, loc, tier, live, head: part_at - loc.offset, tail: end - part_end })
+    }
+
+    /// The first ask of a record of a pack in this process: each block of [`AROUND`] bytes the
+    /// record at `at .. end` lies in, counted, and counted again when the system holds it
+    /// (`Counts::first_touch_blocks`, `Counts::first_touch_held`).
+    fn first_touch(&mut self, file: &FileName, mapping: &Mapping, at: u64, end: u64, usable: u64) {
+        let limit = usable.min(mapping.bytes().len() as u64);
+        let mut block = at - at % AROUND;
+        // Bounded: each turn passes one block of the record's.
+        while block < end {
+            let bytes = &mapping.bytes()[block as usize..(block + AROUND).min(limit) as usize];
+            count(&mut self.counts.first_touch_blocks, &FIRST_TOUCH_BLOCKS, 1);
+            if self.residency.holds(file, bytes, block) {
+                count(&mut self.counts.first_touch_held, &FIRST_TOUCH_HELD, 1);
+            }
+            block += AROUND;
+        }
+    }
+
+    /// The call's records of packs no reader had mapped far enough (`Where::Pending`), each
+    /// resolved now that the call's round of maps is done: or failed, naming the map, where its
+    /// pack could not be mapped.
+    fn resolve_pending(&mut self, shared: &Shared) {
+        let guard = blaze_reclaim::enter();
+        let held = Held::task(&guard);
+        let (own, live) = (view_of(shared, held, false), view_of(shared, held, true));
+        for at in 0..self.targets.len() {
+            if !matches!(self.targets[at], Where::Pending(_)) {
+                continue;
+            }
+            let Where::Pending(ask) = std::mem::replace(&mut self.targets[at], Where::Absent) else {
+                unreachable!("matched just above")
+            };
+            let end = ask.loc.offset + RECORD_HEADER + ask.loc.stored;
+            let view = if ask.live { live } else { own };
+            let miss = self.unmapped.iter().find(|it| it.0 == ask.slot).map(|it| it.1.failed(ask.key, &ask.file));
+            let target = if let Some(failed) = miss {
+                Where::Failed(failed)
+            } else if let Some(view) = view {
+                // The round mapped the pack past `end`, or recorded why not (`map_round`).
+                match self.adopt(ask.slot, end) {
+                    true => self.resolve(view, ask),
+                    false => {
+                        let read = self.files[ask.slot as usize].mapping.as_ref().map_or(0, |it| it.bytes().len() as u64);
+                        Where::Failed(Failed::Short { key: ask.key, file: ask.file, at: 0, asked: end, read })
+                    }
+                }
+            } else {
+                Where::Failed(Failed::Corrupt {
+                    key: ask.key,
+                    file: ask.file,
+                    at: ask.loc.offset,
+                    // alloc: the error's message
+                    what: "the live layer it was found in is gone".into(),
+                })
+            };
+            self.targets[at] = target;
+        }
     }
 
     /// The window a record at `at .. end` of the pack at `slot` (`usable` bytes committed) is
@@ -1774,11 +2314,24 @@ impl Direct {
         let files = &self.files;
         // clone: a refcount per read
         self.plan.issue(registered.region(), |slot| files[slot as usize].name.clone(), &mut self.effects);
+        let blocks = self.plan.blocks(AROUND);
         count(&mut self.counts.runs, &RUNS, self.plan.runs());
         count(&mut self.counts.reads, &READS, self.plan.parts());
         count(&mut self.counts.bytes, &BYTES, total as u64);
+        count(&mut self.counts.blocks_read, &BLOCKS_READ, blocks);
         most(&mut self.counts.longest_run, &LONGEST_RUN, self.plan.longest_run());
-        let stalled = self.drive(driver).err();
+        most(&mut self.counts.widest_reads, &WIDEST_READS, self.plan.parts());
+        // A device read's span: how many reads at once, the blocks and bytes they read, and
+        // the records they were for.
+        let span = tracing::info_span!(
+            target: "blaze",
+            "store direct reads",
+            reads = self.plan.parts(),
+            blocks,
+            records = self.plan.wanted(),
+            bytes = self.plan.asked_bytes(),
+        );
+        let stalled = span.in_scope(|| self.drive(driver, Waiting::Reads)).err();
         if stalled.is_none() && !self.plan.abandoned() {
             drop(registered);
             return Fetched::Read;
@@ -1796,47 +2349,50 @@ impl Direct {
         }
     }
 
-    /// Runs the call's effects until its reads and its mapping have completed, or until nothing
-    /// has completed for [`IDLE_STALL`]: how long it waited, then.
-    /// Each is one wait, counted in [`Counts::waits`] and its length kept in
+    /// Runs the call's effects until its reads and its maps have completed, or until nothing
+    /// has completed for [`IDLE_STALL`]: how long it waited, then. Each is one wait, inside
+    /// its caller's span (`store direct reads` or `store direct maps`, which say what it waits
+    /// for), counted in [`Counts::waits`] (and [`Counts::map_waits`]) and its length kept in
     /// [`Counts::longest_wait_ns`] by the driver's clock.
-    fn drive<D: Driver>(&mut self, driver: &mut D) -> Result<(), Duration> {
-        let span = tracing::info_span!(
-            target: "blaze",
-            "store direct reads",
-            reads = self.plan.left(),
-            records = self.plan.wanted(),
-            bytes = self.plan.asked_bytes(),
-            map = self.mapping,
-        );
-        let _in = span.enter();
+    fn drive<D: Driver>(&mut self, driver: &mut D, waiting: Waiting) -> Result<(), Duration> {
         let began = driver.now();
-        let driven = self.drive_inner(driver);
+        let driven = self.drive_inner(driver, waiting);
         let took = driver.now().saturating_sub(began);
         count(&mut self.counts.waits, &WAITS, 1);
+        if let Waiting::Maps(files) = waiting {
+            count(&mut self.counts.map_waits, &MAP_WAITS, 1);
+            most(&mut self.counts.widest_maps, &WIDEST_MAPS, files as u64);
+        }
         let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
         most(&mut self.counts.longest_wait_ns, &LONGEST_WAIT_NS, took);
         driven
     }
 
-    fn drive_inner<D: Driver>(&mut self, driver: &mut D) -> Result<(), Duration> {
+    fn drive_inner<D: Driver>(&mut self, driver: &mut D, waiting: Waiting) -> Result<(), Duration> {
+        let on = match waiting {
+            Waiting::Reads => WaitOn::Io("store direct reads: a record's bytes"),
+            Waiting::Maps(_) => WaitOn::Io("store direct maps: a pack's mapping"),
+        };
         driver.submit(&mut self.effects);
         let mut since = driver.now();
         // Bounded: each turn completes one of the call's effects, or waits out part of the
         // stall, which ends it.
-        while self.plan.left() > 0 || self.mapping {
+        while self.plan.left() > 0 || self.maps_left > 0 {
             let stall = Deadline::after(since, IDLE_STALL);
             let out = &mut self.out;
-            let got = wait(WaitOn::Io("store direct reads: a record's bytes"), None, || driver.poll(out, stall));
+            let got = wait(on, None, || driver.poll(out, stall));
             if got > 0 {
                 since = driver.now();
             } else if stall.passed(driver.now()) {
                 return Err(driver.now().saturating_sub(since));
             }
             for completion in self.out.drain(..) {
-                if self.mapping && completion.tag == self.plan.map_tag() {
-                    self.mapping = false;
-                    self.mapped = Some(completion.done);
+                if let Some(n) = self.plan.map_of(completion.tag)
+                    && let Some(ask) = n.checked_sub(self.map_base).and_then(|at| self.to_map.get_mut(at))
+                    && ask.done.is_none()
+                {
+                    ask.done = Some(completion.done);
+                    self.maps_left -= 1;
                     continue;
                 }
                 let Some(completion) = self.plan.complete(completion) else { continue };
@@ -1850,43 +2406,39 @@ impl Direct {
         Ok(())
     }
 
-    /// The mapping of the file at `slot`, at least `end` bytes long: the table's, or a new one.
-    fn mapping_of<D: Driver>(&mut self, driver: &mut D, key: &Key, slot: u32, end: u64) -> Result<Mapping, Failed> {
-        let open = &self.files[slot as usize];
-        if let Some(mapping) = &open.mapping
-            && mapping.bytes().len() as u64 >= end
-        {
-            return Ok(mapping.clone()); // clone: a refcount
-        }
-        let file = open.name.clone(); // clone: a refcount
-        // clone: a refcount
-        self.effects.push(Effect::Map { file: file.clone(), extent: Extent::Whole, tag: self.plan.map_tag() });
-        self.mapping = true;
-        if let Err(waited) = self.drive(driver) {
-            self.mapping = false;
-            return Err(Failed::Stalled { key: *key, file, at: 0, waited });
-        }
-        let mapping = match self.mapped.take() {
-            Some(Done::Mapped(mapping)) => mapping,
-            Some(Done::Failed(why)) => return Err(Failed::Read { key: *key, file, at: 0, why: why.0 }),
-            other => {
-                return Err(Failed::Read {
-                    key: *key,
-                    file,
-                    at: 0,
-                    // alloc: the error's message
-                    why: format!("the driver answered a map with {other:?}"),
-                });
+    /// The mapping of the file at `slot`, at least `end` bytes long: the reader's table's, the
+    /// store's shared one (a `pack`), or a new one, made in a round of its own
+    /// ([`Direct::map_round`], which maps the store's other unmapped packs with a pack). A value
+    /// read in place this way is no record resolved from its pack, so it counts no first touch.
+    fn mapping_of<D: Driver>(
+        &mut self,
+        driver: &mut D,
+        shared: &Shared,
+        key: &Key,
+        slot: u32,
+        end: u64,
+        pack: bool,
+    ) -> Result<Mapping, Failed> {
+        let file = self.files[slot as usize].name.clone(); // clone: a refcount
+        if !self.adopt(slot, end) {
+            self.to_map.clear();
+            self.unmapped.clear();
+            // clone: a refcount
+            self.to_map.push(MapAsk { file: file.clone(), slot: Some(slot), end, pack, done: None });
+            self.map_round(driver, shared);
+            if let Some((_, miss)) = self.unmapped.iter().find(|it| it.0 == slot) {
+                return Err(miss.failed(*key, &file));
             }
-        };
-        count(&mut self.counts.maps, &MAPS, 1);
-        let len = mapping.bytes().len() as u64;
-        if len < end {
-            return Err(Failed::Short { key: *key, file, at: 0, asked: end, read: len });
         }
-        // clone: a refcount, kept in the table
-        self.files[slot as usize].mapping = Some(mapping.clone());
-        Ok(mapping)
+        let open = &mut self.files[slot as usize];
+        open.first = false;
+        match &open.mapping {
+            Some(mapping) if mapping.bytes().len() as u64 >= end => Ok(mapping.clone()), // clone: a refcount
+            other => {
+                let read = other.as_ref().map_or(0, |it| it.bytes().len() as u64);
+                Err(Failed::Short { key: *key, file, at: 0, asked: end, read })
+            }
+        }
     }
 
     /// Each target's value checked, from the round's `region` or the reader's scratch, and
@@ -1929,6 +2481,7 @@ impl Direct {
                     let view = if want.live { live } else { own };
                     Some(self.take(view, &want, into, region, fetched))
                 }
+                Where::Pending(_) => unreachable!("a round resolves every record pending on its maps before it reads"),
             };
             self.answers[n] = answer;
         }
@@ -1996,14 +2549,6 @@ impl Direct {
             plan::Missed::Short { at, asked, read } => Failed::Short { key, file: file(), at, asked, read },
             plan::Missed::Unfinished { at } => Failed::Stalled { key, file: file(), at, waited: Duration::ZERO },
         })?;
-        if let Some((_, why)) = self.unmapped.iter().find(|it| it.0 == want.slot) {
-            return Err(Failed::Read {
-                key,
-                file: file(),
-                at: loc.offset,
-                why: format!("its pack, read, could not then be mapped for the records beside it: {why}"),
-            });
-        }
         let Some(view) = view else {
             // alloc: the error's message
             let what = "the live layer it was found in is gone".into();

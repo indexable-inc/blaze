@@ -814,6 +814,148 @@ fn a_crate_served_after_it_was_resolved_keeps_its_module_ids() {
     assert_eq!(frozen::differences(), Vec::<String>::new());
 }
 
+/// A database that resolved `core` and `lib` (their def maps asked) and was then served with
+/// their images in the store, through `lowered` as a driver keeps it (noted at a first serve
+/// that found the store empty): whether `core` and `lib` stayed lowered in the arenas they
+/// had, or the names of those switched to their image or made again.
+fn served_after_lowering(note: bool) -> Result<(), String> {
+    let (memory, _) = stored(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
+    let mut lowered = Lowered::default();
+    let empty = Memory::default();
+    let crates = all(&db);
+    // The first serve, of a store with no image: every crate lowered.
+    let (served, found) = super::serve_keeping(&db, &crates, BUILD, &empty, Mode::Serve, &lowered)?;
+    assert!(found.is_empty() && served.hits.is_empty(), "an empty store serves nothing");
+    let mut keys: Vec<base_db::CrateKey> = all(&db).iter().map(|krate| krate.key(&db)).collect();
+    keys.sort_unstable();
+    if note {
+        lowered.note(&db, keys.iter().copied());
+    }
+    for name in ["core", "lib"] {
+        _ = crate::nameres::crate_def_map(&db, crate_named(&db, name));
+    }
+    let before = ["core", "lib"].map(|name| crate_named(&db, name));
+    // The store has their images now (the cold build's end), and the driver serves again.
+    let crates = all(&db);
+    let (_, found) = super::serve_keeping(&db, &crates, BUILD, &memory, Mode::Serve, &lowered)?;
+    give_next(&mut db, found, &[]);
+    let mut moved = Vec::new();
+    for (name, was) in ["core", "lib"].into_iter().zip(before) {
+        let now = crate_named(&db, name);
+        if now != was || is_served(&db, now) {
+            moved.push(name);
+        }
+    }
+    match moved.is_empty() {
+        true => Ok(()),
+        false => Err(format!("{moved:?} left their lowered arenas for their images")),
+    }
+}
+
+/// The invariant: a crate lowered in its arena stays lowered while that arena lives, though
+/// the store now has its image: a later serve neither gives it the image nor drops its arena
+/// (R3; the first edit after a cold build dropped 24 arenas giving std its images). The
+/// control (the cause removed): with nothing noted lowered, as before, `core` and `lib` are
+/// switched to their images and their arenas made again.
+#[test]
+fn a_crate_lowered_in_its_arena_stays_lowered_when_its_image_is_stored() {
+    let _turn = TURN.lock();
+    served_after_lowering(true).unwrap_or_else(|why| panic!("{why}"));
+    let planted = served_after_lowering(false).expect_err("a lowered crate switched to its image was not caught");
+    assert!(planted.contains("left their lowered arenas"), "{planted}");
+}
+
+/// A restart as the driver makes one (blaze-cargo's `unit.rs`, fresh path): the cold build
+/// stored `core` and `lib` and their found records (the crate's key its image was stored
+/// under, `found::Found::base`); the restart's database is given those images before any
+/// query runs (`at_start`, the makers' commit: [`serve_found`]) or, the plant, not (the order
+/// before 2026-11-14: the first serve gives them, after queries ran). Then a query of each,
+/// and the first serve, as the driver runs them. Each crate's arena is noted after the start
+/// and after every step; a crate made again past the start is said by name.
+fn a_start_given_found_images(at_start: bool) -> Result<(), String> {
+    let which = ["core", "lib"];
+    // The cold build: what it stored, and the key each crate's image was stored under.
+    let memory = Memory::default();
+    let bases = {
+        let mut db = fixture::db(FIXTURE).into_db();
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve)?;
+        let stored = store(&db, &served, &memory, Which::Sealed).map_err(|why| format!("{why:?}"))?;
+        which.map(|name| {
+            let key = crate_named(&db, name).key(&db);
+            let base = served.keys[&key];
+            // `serve_found`'s case: a crate that read nothing is filed under its key alone.
+            assert_eq!(stored.filed.get(&key), Some(&base), "{name} is filed under its key alone");
+            base
+        })
+    };
+    let mut db = fixture::db(FIXTURE).into_db();
+    if at_start {
+        // alloc: a test's two crates
+        let found: Vec<(Crate, ContentId)> =
+            which.iter().zip(bases).map(|(name, base)| (crate_named(&db, name), base)).collect();
+        let given = super::serve_found(&db, &found, &memory, Mode::Serve)?;
+        assert_eq!(given.len(), which.len(), "each found record's image is found");
+        give_next(&mut db, given, &[]);
+    }
+    // Each crate's arenas, from the one after the start: a second is the arena made again.
+    let arena = |db: &TestDB, name: &str| crate_named(db, name).gid().arena();
+    // alloc: a test's few arenas
+    let mut made: Vec<(&str, Vec<blaze_memo::ArenaId>)> =
+        which.iter().map(|&name| (name, vec![arena(&db, name)])).collect();
+    let note = |db: &TestDB, made: &mut Vec<(&str, Vec<blaze_memo::ArenaId>)>| {
+        for (name, arenas) in made.iter_mut() {
+            let now = arena(db, name);
+            if arenas.last() != Some(&now) {
+                arenas.push(now);
+            }
+        }
+    };
+    // A query of each before the serve, as a start's surfaces and identities are asked.
+    for name in which {
+        _ = crate::nameres::crate_def_map(&db, crate_named(&db, name));
+    }
+    note(&db, &mut made);
+    let crates = all(&db);
+    let (served, found) =
+        super::serve_keeping(&db, &crates, BUILD, &memory, Mode::Serve, &Lowered::default())?;
+    // What the serve gave of the two (`main`, a member, has no image and is asked as before).
+    let gave = names(&db, &found.iter().map(|it| it.0).filter(|krate| which.iter().any(|name| crate_named(&db, name) == *krate)).collect::<Vec<_>>());
+    if !found.is_empty() {
+        give_next(&mut db, found, &[]);
+    }
+    note(&db, &mut made);
+    for name in which {
+        _ = crate::nameres::crate_def_map(&db, crate_named(&db, name));
+        assert!(is_served(&db, crate_named(&db, name)), "{name} is read from its image");
+    }
+    note(&db, &mut made);
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+    // alloc: a test's names
+    let again: Vec<&str> = made.iter().filter(|(_, arenas)| arenas.len() > 1).map(|(name, _)| *name).collect();
+    match again.is_empty() && gave.is_empty() {
+        true => Ok(()),
+        false => Err(format!(
+            "{again:?} made their arenas again past the start (the first serve gave {gave:?} their images)"
+        )),
+    }
+}
+
+/// The invariant: a start that will serve a crate gives its image before any query of it
+/// runs, so the crate's arena is made once: the first serve, whose walk keys the crate under
+/// the found record's base, keeps it (asks the store nothing, gives nothing) and no commit
+/// makes the arena again. The control (the plant: the images given by the first serve, after
+/// queries ran, the order before 2026-11-14): `core` and `lib` are made again.
+#[test]
+fn a_start_that_serves_a_crate_makes_its_arena_once() {
+    let _turn = TURN.lock();
+    a_start_given_found_images(true).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_start_given_found_images(false).expect_err("a crate made again past the start was not caught");
+    assert!(planted.contains("made their arenas again past the start"), "{planted}");
+    assert!(planted.contains("\"core\"") && planted.contains("\"lib\""), "{planted}");
+}
+
 #[test]
 fn an_unresolved_import_of_a_dependency_is_still_reported() {
     let _turn = TURN.lock();

@@ -424,6 +424,68 @@ impl From<StoreError> for String {
     }
 }
 
+/// The crates a database holds lowered: each crate a [`serve`] walked that it gave no image,
+/// by key, with its id at that serve (R3: a database that asked for a crate before and holds
+/// its state is not served it again). The driver's, kept with the database across its serves.
+///
+/// The invariant: a crate whose id is the one noted (so its arena is the one the serve left:
+/// a crate's id names one arena for the database's life, base-db `id_space`) and that is
+/// still served no image is *live and lowered*, and a serve does not ask the store for it:
+/// it stays lowered, whatever its image key says. Only a crate with no arena noted yet, or
+/// whose arena was made again since (a new id, its memo gone with the old arena), takes an
+/// image. Sound because the memo answers a carried arena from its current inputs: an image
+/// key that moved while the arena was carried moved for an input none of its queries read
+/// (a dependency's surface, which the key covers), and a lowered crate and its image answer
+/// the same for every query read through a stable id (its def map, lang items, diagnostic
+/// items and signatures by item key: `tests::a_served_dependency_resolves_as_a_fresh_one`).
+/// Where they differ is the in-session ids of block scopes (an image's are paged,
+/// `ScopeSlot::Paged`) and [`super::is_served`] itself, which only the arena's own entries
+/// read: switching a live crate to its image is exactly what would show that difference, and
+/// drop the crate's arena and its dependents' for it (the first edit after a cold build:
+/// 24 arenas, 3.2 s).
+///
+/// The floor this serves: an edit of a workspace crate after the build that lowered the
+/// sealed dependencies redoes and re-reads nothing of them.
+pub struct Lowered {
+    /// The database the ids are of: another nonce is another id space, where none holds.
+    nonce: Option<Nonce>,
+    by_key: HashMap<CrateKey, Crate, Global>,
+}
+
+impl Default for Lowered {
+    fn default() -> Lowered {
+        Lowered { nonce: None, by_key: HashMap::new_in(Global) }
+    }
+}
+
+impl Lowered {
+    /// Notes each of `crates` as `db`'s snapshot has it: lowered where it is given no image,
+    /// else not. A crate the snapshot no longer has is forgotten.
+    pub fn note(&mut self, db: &Db, crates: impl IntoIterator<Item = CrateKey>) {
+        if self.nonce != Some(db.nonce()) {
+            self.by_key.clear();
+            self.nonce = Some(db.nonce());
+        }
+        for key in crates {
+            match db.crate_at(key) {
+                Some(krate) if !super::is_served(db, krate) => {
+                    self.by_key.insert(key, krate);
+                }
+                _ => {
+                    self.by_key.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Whether `krate` is live and lowered in `db`: noted unserved with this very id.
+    pub fn holds(&self, db: &Db, krate: Crate) -> bool {
+        self.nonce == Some(db.nonce())
+            && !super::is_served(db, krate)
+            && self.by_key.get(&krate.key(db)) == Some(&krate)
+    }
+}
+
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
 /// keep for it, by `build`, the blaze reading: `mode` says what is done with each image.
 ///
@@ -451,6 +513,21 @@ pub fn serve(
     images: &dyn ImageStore,
     mode: Mode,
 ) -> Result<(Served, Vec<(Crate, Image), Global>), String> {
+    serve_keeping(db, crates, build, images, mode, &Lowered::default())
+}
+
+/// [`serve`], asking the store for no crate `lowered` holds live and lowered
+/// ([`Lowered::holds`]), whether it is one of `crates` or a dependency of one: it is neither
+/// given an image nor withdrawn, and is keyed in [`Served::keys`] as any crate walked.
+pub fn serve_keeping(
+    db: &Db,
+    crates: &[Crate],
+    build: ContentId,
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+    mode: Mode,
+    lowered: &Lowered,
+) -> Result<(Served, Vec<(Crate, Image), Global>), String> {
     let keys = keys(db, crates, build);
     // What this snapshot gives each crate is its own slot ([`super::image_of`]): a crate kept
     // under the same key and mode is given the same image again by the driver.
@@ -458,7 +535,7 @@ pub fn serve(
         super::image_of(db, *krate).is_some_and(|it| it.base == *key && it.mode == mode)
     };
     let mut order: Vec<(Crate, ContentId)> = (keys.iter())
-        .filter(|(krate, key)| !kept(krate, key))
+        .filter(|(krate, key)| !kept(krate, key) && !lowered.holds(db, **krate))
         .map(|(&krate, &key)| (krate, key))
         // alloc: setup: once per serve
         .collect();
@@ -499,7 +576,7 @@ pub fn serve(
                 withdrawn.push(krate);
             }
         };
-        let Hit { bytes, parts, filed, pages: def_pages, whole } = match found? {
+        let hit = match found? {
             Found::Hit(hit) => hit,
             Found::Miss { stale: true } => {
                 stale.push(krate);
@@ -516,31 +593,7 @@ pub fn serve(
                 continue;
             }
         };
-        let lang_items = Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode };
-        let diagnostic_items =
-            Frozen { bytes: PartBytes::of(&bytes, &parts, Part::DiagnosticItems), mode };
-        // Under `Mode::Check` and `Mode::Verify` the def map's record whole, which what the
-        // crate resolves to (`Check`) or what was read of its pages (`Verify`) is compared
-        // with; never when serving, which holds no byte of it past a read.
-        let def_map = whole.map(|whole| {
-            let range = 0..whole.bytes().len();
-            Frozen { bytes: PartBytes::In { buffer: whole, range }, mode }
-        });
-        // Read from pages in `Mode::Serve` and `Mode::Verify`; `Mode::Check` resolves the
-        // crate and compares what it resolves to with its pages.
-        let pages = (mode != Mode::Check).then_some(def_pages);
-        let image = Image {
-            base,
-            key: filed,
-            bytes,
-            parts,
-            mode,
-            lang_items,
-            diagnostic_items,
-            def_map,
-            pages,
-        };
-        given.push((krate, image));
+        given.push((krate, hit.image(base, mode)));
         hits.push(krate);
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
@@ -608,6 +661,85 @@ struct Hit {
     filed: ContentId,
     pages: Paged,
     whole: Option<ImageBuf>,
+}
+
+impl Hit {
+    /// The image this hit is, of a crate walked under `base`, given in `mode`.
+    fn image(self, base: ContentId, mode: Mode) -> Image {
+        let Hit { bytes, parts, filed, pages: def_pages, whole } = self;
+        let lang_items = Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode };
+        let diagnostic_items =
+            Frozen { bytes: PartBytes::of(&bytes, &parts, Part::DiagnosticItems), mode };
+        // Under `Mode::Check` and `Mode::Verify` the def map's record whole, which what the
+        // crate resolves to (`Check`) or what was read of its pages (`Verify`) is compared
+        // with; never when serving, which holds no byte of it past a read.
+        let def_map = whole.map(|whole| {
+            let range = 0..whole.bytes().len();
+            Frozen { bytes: PartBytes::In { buffer: whole, range }, mode }
+        });
+        // Read from pages in `Mode::Serve` and `Mode::Verify`; `Mode::Check` resolves the
+        // crate and compares what it resolves to with its pages.
+        let pages = (mode != Mode::Check).then_some(def_pages);
+        Image { base, key: filed, bytes, parts, mode, lang_items, diagnostic_items, def_map, pages }
+    }
+}
+
+/// The image of each of `found`, a crate and the key a found record says its image was
+/// stored under (`super::found::Found::base`), for a start to give before any query of the
+/// crate runs (docs/v2/plan/design/front-end-on-memo.md, "A start gives what it found"): so the
+/// first [`serve_keeping`], whose walk keys the crate under that same key, finds it kept
+/// (`image_of(..).base` is its key, the mode is its mode), asks the store nothing and gives
+/// nothing, and the crate's arena is not made again for it.
+///
+/// No key is walked here, and no slot's reads are valued: an image is asked under the
+/// record's key alone ([`filed::under_key_alone`]), the case of a crate that read nothing.
+/// One filed by its reads is no hit here (the record's `filed` is not its `base`, and the
+/// caller passes none such) and is left to the first serve, as a crate with no record is. A
+/// crate that is not [`super::eligible`] is skipped: only an eligible one is keyed by a serve,
+/// and an image no serve keys would never be checked against its key.
+///
+/// The record is no proof ([`super::found`], "What a record is not"): what is given here is checked
+/// by the first serve that walks the crate. Its key there equal to `base`, the image is the
+/// one the serve would have found under that key; another, and the serve fetches anew under
+/// its own key or withdraws the image, as for any crate whose key moved, before any task
+/// reads the crate (a unit's crates are walked by its serve before its task runs).
+///
+/// An image that does not read under its key, or pages that name files not the crate's, are
+/// the same errors [`serve`] says, naming the crate.
+pub fn serve_found(
+    db: &Db,
+    found: &[(Crate, ContentId)],
+    // dyn: the driver's store, one call per crate per session
+    images: &dyn ImageStore,
+    mode: Mode,
+) -> Result<Vec<(Crate, Image), Global>, String> {
+    let _span = tracing::info_span!(target: "blaze", "found images", asked = found.len() as u64)
+        .entered();
+    let mut given: Vec<(Crate, Image), Global> = Vec::with_capacity_in(found.len(), Global);
+    for &(krate, base) in found {
+        if !super::eligible(db, krate) {
+            continue;
+        }
+        let bytes = filed::under_key_alone(db, krate, base, |at| {
+            images.get(&at).map_err(|why| {
+                // alloc: error text
+                format!("reading the image of crate {} (key {at:?}): {why}", krate.named(db))
+            })
+        })?;
+        let Some(bytes) = bytes else { continue };
+        match open(db, krate, base, bytes, images, mode)? {
+            Found::Hit(hit) => given.push((krate, hit.image(base, mode))),
+            // Said by `open`, by name; the first serve makes it from source as it would.
+            Found::Miss { .. } | Found::OldLayout => {}
+        }
+    }
+    tracing::info!(
+        target: "blaze",
+        asked = found.len() as u64,
+        given = given.len() as u64,
+        "found images: crates given their image before any query of theirs ran"
+    );
+    Ok(given)
 }
 
 type Fetched = Result<Found, String>;
