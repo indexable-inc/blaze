@@ -4163,6 +4163,22 @@ fn a_step_is_built_from_its_fields() {
     assert!(out.text.contains("Threads.Step.mk false (0 : U8)"), "{}", out.text);
 }
 
+/// A `Step`'s fields are read as the Lean structure's: `step.second` and `step.pick` (as
+/// `blaze_core::wait::parking::answers` reads whose step each of a schedule's is).
+#[test]
+fn a_steps_fields_are_read() {
+    let fixture = atomics_fixture(
+        "steps",
+        "use blaze_core::world::threads::Step;\n\
+         pub fn is_second(steps: &[Step], at: usize) -> bool { steps[at].second }\n\
+         pub fn pick_of(step: Step) -> u8 { step.pick }\n",
+    );
+    let out = emitted_from(&fixture, "steps", "is_second");
+    assert!(out.text.contains(".second"), "{}", out.text);
+    let out = emitted_from(&fixture, "steps", "pick_of");
+    assert!(out.text.contains("step.pick"), "{}", out.text);
+}
+
 /// What the model of shared memory does not have is refused by name: `AtomicPtr`, an access
 /// of an atomic not through the shared memory, an operation `lean/Blaze/Atomic.lean` does not
 /// define, a function of `blaze_core::world::threads` with no model, and a closure given to

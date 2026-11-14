@@ -576,6 +576,33 @@ theorem two_exec_alone {α β : Type} (Inv : Nat → Prog α → Prog β → Wor
       rw [Prog.exec_op (by decide) hs]
       exact he
 
+/-- `two_exec` for a schedule whose every step is the first thread's, with any picks: only the
+first thread's steps need keep `Inv`. -/
+theorem two_exec_first {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop)
+    (first : ∀ n a b w pick, Inv (n + 1) a b w → Advance 1 pick a w (fun a' w' => Inv n a' b w')) :
+    ∀ (schedule : List Step) (a : Prog α) (b : Prog β) (w : World),
+      (∀ s ∈ schedule, s.second = false) → Inv schedule.length a b w →
+      ∃ a' b' w', Inv 0 a' b' w' ∧ (two schedule a b).exec w = (two [] a' b').exec w' := by
+  intro schedule
+  induction schedule with
+  | nil => intro a b w _ h; exact ⟨a, b, w, h, rfl⟩
+  | cons step rest ih =>
+    intro a b w hs h
+    simp only [List.length_cons] at h
+    have hst : step.second = false := hs step (by simp)
+    have hr : ∀ s ∈ rest, s.second = false := fun s hm => hs s (by simp [hm])
+    simp only [two, hst, Bool.false_eq_true, ite_false]
+    have ha := first rest.length a b w step.pick.val.toNat h
+    cases a with
+    | done r => exact ih (.done r) b w hr ha
+    | op tg k o next =>
+      obtain ⟨rfl, got, w', hs', hP⟩ := ha
+      obtain ⟨a', b', w'', hI, he⟩ := ih _ _ _ hr hP
+      refine ⟨a', b', w'', hI, ?_⟩
+      simp only [turn, bne_self_eq_false, Bool.false_eq_true, ite_false]
+      rw [Prog.exec_op (by decide) hs']
+      exact he
+
 /-- For every schedule: with `Inv` kept by each thread's step (`first`, `second`) and every end
 in `Inv 0` satisfying `Post` (`last`), the run of `two schedule a b` from `Inv` ends, and how
 each thread stood and the world satisfy `Post`. -/
