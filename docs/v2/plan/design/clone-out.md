@@ -143,7 +143,13 @@ made only of a clone waits for the file to be made, sealed and written back firs
   holds (`Jobs::placed_key`, read once the job's placements have ended), and refused naming
   the path and both keys where that is not its code memory's file
   (`blaze_inproc::host::StartError::NotPlaced`). So a build after a test run finds the file
-  as placed and places nothing.
+  as placed and places nothing. A request certificate names an output by the key its own
+  build left there as it answered (`Jobs::left_by`), and is not written where the record
+  holds another by the time the build has settled (another request placed it). Its check
+  refuses, from the record alone and with no look at the file, an output whose path's record
+  holds another key or has a placement in flight (`certify::placed_elsewhere`): that request
+  goes to its job, which clones the answer's file back. Alternating two commands that share
+  a path places one file per switch, and a repeat places nothing.
 - **The loop thread.** `FICLONE` runs on a thread off the ring with a span `io clone <file>`;
   the ring's eventfd is written only while its thread is parked. Still in line on the ring's
   thread, each one metadata call: mode, seal, times, readlink, flock, truncate, mmap.

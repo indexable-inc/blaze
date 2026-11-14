@@ -113,6 +113,14 @@ thread_local! {
     /// placed or looked at ([`Jobs::place_now`]), as a shortcut that vouches for a path without
     /// the record's key would: another command's value at a shared path stays there.
     pub(super) static PLANT_VOUCH_ANY_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a request certificate's check takes an output for the answer's with
+    /// no word from the jobs' record ([`certify::placed_elsewhere`] not asked), so the disk
+    /// alone vouches, as it did until 2026-11-14.
+    pub(super) static PLANT_HIT_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a certificate names each output as the jobs' record holds it when it is
+    /// written, after the build settled, not as its own build left it, as it did until
+    /// 2026-11-14: a file another request placed there meanwhile is named as this answer's.
+    pub(super) static PLANT_CERTIFY_SHARED_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
     /// its message. What a test reads of a table only the history's thread writes.
     pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record

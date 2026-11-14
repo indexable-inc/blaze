@@ -859,7 +859,11 @@ impl Steps for Fake {
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new(), broke: Vec::new() };
         Ok(FrontEnd {
-            front: Arc::new(FakeFront { kind: job.kind }),
+            front: Arc::new(FakeFront {
+                kind: job.kind,
+                runs: job.kind == JobKind::Run
+                    || job.config.invocation.command == blaze_units::query::Command::Run,
+            }),
             writer,
             puts: Vec::new(),
             misses: Vec::new(),
@@ -918,6 +922,9 @@ impl Steps for Fake {
 
 pub(super) struct FakeFront {
     kind: JobKind,
+    /// Its request runs the program: a `Run`, or a build asked as cargo's `run` (what the
+    /// client sends for `blaze run`, whose program it starts itself).
+    runs: bool,
 }
 
 /// A front end's inputs: the build scripts' runs applied to it, in the order applied, whether
@@ -1526,7 +1533,7 @@ impl Front<Fake> for FakeFront {
             outputs.push(Output { path: SCRIPT_AT.into(), key, executable: true, made: None });
         }
         if unit == 3 && OUTPUT.get() {
-            let app = match RUN_IMAGE.get() && self.kind == JobKind::Run {
+            let app = match RUN_IMAGE.get() && self.runs {
                 true => RUN_APP,
                 false => APP,
             };
@@ -5372,7 +5379,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
     };
 
     let cancelled = Arc::new(AtomicBool::new(false));
-    let front = Arc::new(FakeFront { kind: JobKind::Check });
+    let front = Arc::new(FakeFront { kind: JobKind::Check, runs: false });
     let inputs = Arc::new(FakeInputs { runs: vec![4, 7], ..FakeInputs::default() });
     let reading =
         || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
@@ -5443,7 +5450,7 @@ fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
         Step::of(
             &cancelled,
             Does::Compile {
-                front: Arc::new(FakeFront { kind: JobKind::Build }),
+                front: Arc::new(FakeFront { kind: JobKind::Build, runs: false }),
                 back: Default::default(),
                 hops: Arc::from(Vec::new()),
             },
@@ -5695,6 +5702,145 @@ fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
     let steps = alternate(320, true);
     let caught = steps.iter().any(|(request, contents, _, _)| &contents[..] != image_of(request));
     assert!(caught, "the planted bug's steps went unseen: {:?}", steps.iter().map(|it| it.0).collect::<Vec<_>>());
+}
+
+/// The invariant (one writer, D43), at the request certificate: a request is answered with
+/// no job only where, for every output path its answer names, the jobs' record holds that
+/// answer's key. Two shapes of one checkout whose program shares [`APP_AT`] (cargo's `run`, a
+/// launcher's image; cargo's `build`, the program's own): after every answer the file there
+/// and its record are the answering command's. A switch places that one file once (its job:
+/// the certificate refuses it by the record, with no look at the file); a repeat after a
+/// settled one is the certificate's, placing nothing. The race the measurement hit
+/// (2026-11-14, run, build, run, build: the second build answered in 11 ms over the run's
+/// launcher) is forced: the build's certificate is written only after the next run placed.
+#[test]
+fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
+    for seed in 330..336 {
+        let steps = shared_path_certified(seed, false, false);
+        for (at, (command, certified, contents, recorded, placed, _)) in steps.iter().enumerate() {
+            let own = image_of(command);
+            let key = ContentId::of("blaze serve tests output", own).0;
+            assert_eq!(&contents[..], own, "seed {seed}: step {at} ({command}) answered with another's file at {APP_AT}");
+            assert_eq!(*recorded, Some(key), "seed {seed}: step {at} ({command}): the record of {APP_AT} is not its key");
+            if at == 0 {
+                continue;
+            }
+            // The floor: one placement where the command before placed the other image, none
+            // where it placed this one.
+            let changed = image_of(steps[at - 1].0) != own;
+            assert_eq!(*placed, usize::from(changed), "seed {seed}: step {at} ({command}) placed {APP_AT} {placed} times");
+            assert!(!(changed && *certified), "seed {seed}: step {at} ({command}) was the certificate's over the other's file");
+        }
+        // The certificate is in play: each command's repeat after its own settled answer is
+        // its certificate's.
+        let repeats: Vec<_> = steps.iter().map(|it| it.1).collect();
+        assert!(repeats[5] && repeats[7], "seed {seed}: a repeat was not the certificate's: {repeats:?}");
+    }
+}
+
+/// The planted-bug control: a certificate that names each output as the jobs' record holds it
+/// when it is written ([`super::job::PLANT_CERTIFY_SHARED_RECORD`], as until 2026-11-14) names
+/// the run's image as the build's, and the next build is answered over it with no job: the
+/// oracle sees the run's file after a build.
+#[test]
+fn the_oracle_catches_a_certificate_named_by_the_record_at_its_write() {
+    let steps = shared_path_certified(330, true, false);
+    let caught = steps.iter().any(|(command, _, contents, ..)| &contents[..] != image_of(command));
+    assert!(caught, "the planted bug's answers went unseen: {:?}", steps.iter().map(|it| (it.0, it.1)).collect::<Vec<_>>());
+}
+
+/// The invariant: the record's word costs no IO. The run asked after the build placed its
+/// image (step 3) is refused by the record with no read of the file; the control, the check
+/// with no word from the record ([`super::job::PLANT_HIT_UNRECORDED`]), reads and hashes it.
+#[test]
+fn a_certificate_whose_outputs_record_holds_another_key_misses_with_no_read_of_it() {
+    let real = shared_path_certified(331, false, false);
+    let planted = shared_path_certified(331, false, true);
+    assert_eq!(&planted[3].2[..], RUN_APP, "the planted check still ends with the run's own file");
+    assert!(
+        planted[3].5 >= real[3].5 + APP.len() as u64,
+        "the record spared no read of {APP_AT}: {} bytes read with it, {} without",
+        real[3].5,
+        planted[3].5
+    );
+}
+
+/// A build of `/w` asked as cargo asks `command` (`build`, or `run`, which the client sends for
+/// `blaze run` and whose program it starts itself): two request shapes of one checkout, each
+/// with its own certificate, whose program is at one path ([`APP_AT`]).
+fn cargo_asked(command: &str) -> Request {
+    let cargo = blaze_api::Cargo {
+        cwd: "/w".into(),
+        env: command_env(),
+        args: Vec::new(),
+        root: "/w".into(),
+        color: false,
+        files: Vec::new(),
+        width: None,
+        command: command.into(),
+        refused: None,
+        verbose: 0,
+        prebuilt: true,
+    };
+    Request::Build { view: ViewRef::Head("/w".into()), targets: Targets { cargo: Some(cargo), ..agent() } }
+}
+
+/// One answer of [`shared_path_certified`]: the cargo command asked, whether its certificate
+/// answered it (no lowering: no job), the file at [`APP_AT`] once it answered, the key the
+/// jobs' record holds for that path then, how many times it placed that path, and the bytes
+/// the driver read for it.
+type Certified = (&'static str, bool, Vec<u8>, Option<[u8; 32]>, usize, u64);
+
+/// `run`, `run`, `build`, `run`, `build`, `build`, `run`, `run` of one checkout on one daemon,
+/// a run's image of the program another value than a build's ([`RUN_IMAGE`]). The first run
+/// writes the lock file, so the second's view is the one every later request reads and its
+/// certificate is the run's from then on. The store's syncs are held from the first `build`
+/// until the `run` after it answered, so that build's certificate is written only after the
+/// run placed its image at the shared path; every other answer is settled before the next
+/// request. `shared`:
+/// [`super::job::PLANT_CERTIFY_SHARED_RECORD`]; `unrecorded`: [`super::job::PLANT_HIT_UNRECORDED`].
+fn shared_path_certified(seed: u64, shared: bool, unrecorded: bool) -> Vec<Certified> {
+    use super::job::{PLACED_PATHS, PLANT_CERTIFY_SHARED_RECORD, PLANT_HIT_UNRECORDED};
+    OUTPUT.set(true);
+    RUN_IMAGE.set(true);
+    PLANT_CERTIFY_SHARED_RECORD.set(shared);
+    PLANT_HIT_UNRECORDED.set(unrecorded);
+    let mut sim = Sim::new(seed, Faults::default());
+    checkout(&mut sim, "[package]\nname = \"app\"\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, seed);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let mut out = Vec::new();
+    for (at, command) in ["run", "run", "build", "run", "build", "build", "run", "run"].into_iter().enumerate() {
+        if at == 2 {
+            daemon.driver().hold_syncs(store_dir());
+        }
+        PLACED_PATHS.with_borrow_mut(Vec::clear);
+        let lowered = || ANEW.get() + INTO_KEPT.get();
+        let (before, lowerings) = (daemon.driver().bytes_read(), lowered());
+        let id = client.send(&mut daemon, cargo_asked(command));
+        let got = client.wait(&mut daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "seed {seed}: step {at} ({command}): {got:#?}");
+        let read = daemon.driver().bytes_read() - before;
+        // A job lowers its view (a plan kept or not); a certificate's answer is no job.
+        let certified = lowered() == lowerings;
+        let placed = PLACED_PATHS.with_borrow(|it| it.iter().filter(|it| *it == APP_AT).count());
+        out.push((command, certified, daemon.driver().contents(&app), daemon.placed_key(APP_AT), placed, read));
+        if at == 3 {
+            daemon.driver().release_held(Duration::ZERO);
+        }
+        // The first build's settling waits for the syncs held: it ends after the run after it.
+        if at != 2 {
+            settle(&mut daemon, &mut client);
+            turn_until(&mut daemon, |it| it.settled());
+        }
+    }
+    PLANT_HIT_UNRECORDED.set(false);
+    PLANT_CERTIFY_SHARED_RECORD.set(false);
+    RUN_IMAGE.set(false);
+    OUTPUT.set(false);
+    out
 }
 
 /// The image a command's request makes of the program at [`APP_AT`] under [`RUN_IMAGE`].

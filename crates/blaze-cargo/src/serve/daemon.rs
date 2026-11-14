@@ -2213,6 +2213,12 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.jobs.next_deadline()
     }
 
+    /// The key the jobs' record holds for the output at `path` ([`super::job::Jobs::placed_key`]).
+    #[cfg(test)]
+    pub(super) fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        self.jobs.placed_key(path)
+    }
+
     /// Asks the store to place `key` at `to` as a build would: store traffic that is no step of
     /// its commit, for a test that it does not count as the commit's progress.
     #[cfg(test)]
