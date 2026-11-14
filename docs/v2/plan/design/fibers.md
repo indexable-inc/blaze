@@ -105,7 +105,7 @@ picks the core.
 ### Invariants and their tests
 
 `sched/tests.rs` drives the core with a simulated driver over random interleavings drawn by
-Hegel. The inputs are spawns with random hints and criticality, parallel maps on counters,
+blaze-sim. The inputs are spawns with random hints and criticality, parallel maps on counters,
 waits on jobs, keys and times, claims, ends, key flights by jobs and by the driver, query
 misses, `set_critical`, `core_idle` (requested and spurious) and clock advances. They run on
 random nested shapes: 1 to 2 sockets × 1 to 2 nodes × 1 to 2 L3 groups × 1 to 2 physical cores
@@ -249,7 +249,7 @@ lands once the self-build passes.
 
 Tests (`crates/blaze-graph/src/sched/fiber_tests.rs`), all on the real driver:
 `a_waiting_job_holds_no_thread` (a chain of 1000 jobs, each waiting for its child, on one
-core), `every_job_of_a_dag_of_waits_runs_once_on_fibers` (Hegel: random DAGs of waits with
+core), `every_job_of_a_dag_of_waits_runs_once_on_fibers` (blaze-sim: random DAGs of waits with
 parallel maps whose items wait for other jobs, on 1 to 4 cores, every node and item once),
 `a_dag_with_maps_runs_every_node_and_item_once`,
 `a_cycle_of_waits_on_fibers_is_refused_naming_both_jobs`,

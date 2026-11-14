@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: admission by footprint (lane admit-footprint-1106, 2026-11-06) - the plane admits against the process footprint plus grants not yet realized, not grants alone; freed-but-kept allocator memory is purged before work is refused or the daemon dies; a task that alone passes the ceiling fails with a typed error naming it; grants are graded against peaks; every task span names its kind, crate and unit; proved by a Hegel DST with planted bugs.
+summary: admission by footprint (lane admit-footprint-1106, 2026-11-06) - the plane admits against the process footprint plus grants not yet realized, not grants alone; freed-but-kept allocator memory is purged before work is refused or the daemon dies; a task that alone passes the ceiling fails with a typed error naming it; grants are graded against peaks; every task span names its kind, crate and unit; proved by a blaze-sim DST with planted bugs.
 date: 2026-11-06
 ---
 # Admission by footprint
@@ -88,7 +88,7 @@ The plane gains two inputs:
 
 ## Proof
 
-`crates/blaze-graph/src/footprint/tests.rs` is a Hegel DST. It drives the real `Plane` and
+`crates/blaze-graph/src/footprint/tests.rs` is a blaze-sim DST. It drives the real `Plane` and
 `past_ceiling` against a simulated allocator. The allocator keeps freed memory until a purge, and
 leaves a random part of it stuck for good. The test draws random peaks, some of them over their
 grant, and a ceiling.

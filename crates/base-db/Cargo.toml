@@ -42,8 +42,8 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-hegeltest.workspace = true
 
 [lints]
 workspace = true

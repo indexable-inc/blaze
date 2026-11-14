@@ -73,7 +73,7 @@ rcgen = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

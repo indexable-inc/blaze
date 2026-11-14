@@ -330,16 +330,18 @@ const NODES: u32 = 12;
 const CALLS: usize = 4;
 const USES: usize = 2;
 
-fn graph_of(tc: &hegel::TestCase) -> Graph {
-    use hegel::generators as gs;
-    let members: Vec<bool> = tc.draw(gs::vecs(gs::booleans()).min_size(CRATES as usize).max_size(CRATES as usize));
-    let count: u32 = tc.draw(gs::integers().min_value(1).max_value(NODES));
-    let roots: u32 = tc.draw(gs::integers().min_value(1).max_value(count));
+fn graph_of(tape: &blaze_sim::Tape) -> Graph {
+    let crates = CRATES as usize;
+    let members: Vec<bool> = tape.vec(crates..=crates, "members", |tape| tape.bool("a workspace member"));
+    let count: u32 = tape.int_in(1..=NODES, "nodes");
+    let roots: u32 = tape.int_in(1..=count, "roots");
     let mut nodes: Vec<Node> = Vec::with_capacity_in(count as usize, Global);
     for _ in 0..count {
-        let krate: u32 = tc.draw(gs::integers().max_value(CRATES - 1));
-        let calls: Vec<u32> = tc.draw(gs::vecs(gs::integers().max_value(count - 1)).max_size(CALLS));
-        let uses: Vec<u8> = tc.draw(gs::vecs(gs::integers().max_value(Capability::ALL.len() as u8 - 1)).max_size(USES));
+        let krate: u32 = tape.int_in(0..=CRATES - 1, "crate");
+        let calls: Vec<u32> = tape.vec(0..=CALLS, "calls", |tape| tape.int_in(0..=count - 1, "callee"));
+        let uses: Vec<u8> = tape.vec(0..=USES, "uses", |tape| {
+            tape.int_in(0..=Capability::ALL.len() as u8 - 1, "capability")
+        });
         let uses: Vec<(Capability, Box<str>)> =
             uses.into_iter().map(|it| (Capability::ALL[it as usize], "does it".into())).collect();
         nodes.push(Node { krate, uses: uses.into_boxed_slice(), calls: calls.into_boxed_slice() });
@@ -350,12 +352,14 @@ fn graph_of(tc: &hegel::TestCase) -> Graph {
 /// The invariant: a capability a reached node uses is its own crate's, never its caller's,
 /// once per (crate, capability) of a crate outside the workspace, with a witness that is a
 /// real chain of calls from a root and the shortest there is.
-#[hegel::test]
-fn attribution_is_the_models(tc: hegel::TestCase) {
-    let graph = graph_of(&tc);
-    if let Err(why) = agrees(&graph) {
-        panic!("{why}: {graph:?}");
-    }
+#[test]
+fn attribution_is_the_models() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let graph = graph_of(tape);
+        if let Err(why) = agrees(&graph) {
+            panic!("{why}: {graph:?}");
+        }
+    });
 }
 
 /// The control: with the bug planted (a capability attributed to the caller's crate), the

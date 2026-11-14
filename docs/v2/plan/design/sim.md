@@ -104,13 +104,16 @@ facade), on a native engine bstd cannot depend on, and on code blaze does not ow
 
 ## Order
 
-1. **The interface crate** (this change): `crates/blaze-sim` with tape, engine, driver, kit and
-   its own proof, on the green head.
-2. **Ports, in parallel, each a whole port of its crates' tests**: the fresh core's crates
-   (blaze-keyed, -findings, -expansion, -program, -mutants, -remote, -memo); `Sim` and its
-   tests (its `Rng` becomes the tape, `Sim::new` takes one, `seeds` becomes a client of the
-   engine); every other `#[hegel::test]`. Then `vendor/hegeltest` is deleted and `hegel` banned.
-3. **After**: `blaze-check`'s random and PCT schedules draw from the tape (one case then
+1. **The interface crate** (done, on main in #2124): `crates/blaze-sim` with tape, engine,
+   driver, kit and its own proof.
+2. **Ports** (done): every crate's tests call `blaze_sim::check` and `blaze_sim::control`. The
+   fresh core's crates (blaze-keyed, -findings, -expansion, -program, -mutants, -remote, -memo)
+   draw their simulations' schedules from the tape; a test on `Sim` draws its seed from the tape
+   as `"sim seed"`. `vendor/hegeltest` is deleted.
+3. **Next**: `Sim`'s own generator becomes the tape (its `Rng` is the tape, `Sim::new` takes
+   one, `seeds` becomes a client of the engine), so its latencies, delivery order, tears and
+   failures are shrunk with the plan.
+4. **After**: `blaze-check`'s random and PCT schedules draw from the tape (one case then
    interleaves threads and crashes a disk); `Sim`'s disk takes the three-layer crash model
    (writes durable only through a sync, directory entries only through their directory's);
    several processes and two versions on one disk; plants passed in as a type parameter, so no
@@ -126,3 +129,9 @@ body with a known least failing tape ends on exactly that tape; one configuratio
 verdict, twice, byte for byte; a body that reads something outside its tape is reported as
 that; a check that drew nothing, discarded everything or missed a reach point fails by name;
 `Flight` delivers oldest first when calm and reaches every order when seeded.
+
+## What the first night found
+
+On fixed seeds, the store's ported tests found two bugs that were on main: a batch read handed
+one file's bytes to its neighbour, and a derive chain two deep left its lower base in `placed/`.
+Both were fixed, each with its case pinned, in the same change.

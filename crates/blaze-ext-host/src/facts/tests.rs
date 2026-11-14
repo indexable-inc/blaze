@@ -8,7 +8,7 @@
 //! daemon does across edits.
 
 use blaze_ids::ContentId;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 
 use super::*;
 
@@ -144,37 +144,11 @@ struct Plan {
     ops: Vec<Op>,
 }
 
-/// Where a plan's choices come from: Hegel, or a seed for the controls.
-trait Draws {
-    fn below(&mut self, n: u64) -> u64;
-}
-
-struct Drawn<'t>(&'t TestCase);
-
-impl Draws for Drawn<'_> {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(0).max_value(n - 1))
-    }
-}
-
-/// SplitMix64: the controls' draws, the same on every run.
-struct Seeded(u64);
-
-impl Draws for Seeded {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (z ^ (z >> 31)) % n
-    }
-}
-
-fn calls_of(draws: &mut impl Draws, n: usize) -> Vec<u32> {
+fn calls_of(tape: &Tape, n: usize) -> Vec<u32> {
     let mut calls = Vec::new();
-    for _ in 0..draws.below(4) {
+    for _ in 0..tape.below(4, "calls") {
         // Any item, itself and earlier ones included: recursion is the case under test.
-        let callee = draws.below(n as u64) as u32;
+        let callee = tape.below(n as u64, "callee") as u32;
         if !calls.contains(&callee) {
             calls.push(callee);
         }
@@ -182,17 +156,17 @@ fn calls_of(draws: &mut impl Draws, n: usize) -> Vec<u32> {
     calls
 }
 
-fn plan(draws: &mut impl Draws) -> Plan {
-    let n = 1 + draws.below(10) as usize;
-    let seeds = (0..n).map(|_| 1u16 << draws.below(16)).collect();
-    let calls = (0..n).map(|_| calls_of(draws, n)).collect();
+fn plan(tape: &Tape) -> Plan {
+    let n = 1 + tape.below(10, "items") as usize;
+    let seeds = (0..n).map(|_| 1u16 << tape.below(16, "seed bit")).collect();
+    let calls = (0..n).map(|_| calls_of(tape, n)).collect();
     let mut ops = vec![Op::Solve];
-    for _ in 0..draws.below(12) {
-        let node = draws.below(n as u64) as usize;
-        ops.push(match draws.below(4) {
-            0 => Op::Edit { node, seed: 1u16 << draws.below(16) },
-            1 => Op::Rewire { node, calls: calls_of(draws, n) },
-            2 => Op::Switch { turn: draws.below(2) as u32 * 3 },
+    for _ in 0..tape.below(12, "ops") {
+        let node = tape.below(n as u64, "node") as usize;
+        ops.push(match tape.below(4, "op") {
+            0 => Op::Edit { node, seed: 1u16 << tape.below(16, "seed bit") },
+            1 => Op::Rewire { node, calls: calls_of(tape, n) },
+            2 => Op::Switch { turn: tape.below(2, "extension") as u32 * 3 },
             _ => Op::Solve,
         });
         ops.push(Op::Solve);
@@ -262,41 +236,32 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// earlier solve kept, every fact of every item equals the least fixpoint of its function
 /// over the call graph as it stands; a solve with nothing kept gives the same bytes; and a
 /// solve after no change computes nothing.
-#[hegel::test]
-fn facts_equal_the_reference_fixpoint_after_any_edits(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan: {plan:?}");
-    }
+#[test]
+fn facts_equal_the_reference_fixpoint_after_any_edits() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let plan = plan(tape);
+        if let Err(broke) = run(&plan, Plant::None) {
+            panic!("{broke}\nplan: {plan:?}");
+        }
+    });
 }
 
-const CONTROL_SEEDS: u64 = 200;
+/// A control's cases: the 200 seeded plans the controls looped by hand before.
+const CONTROL: Config = Config::cases(200);
 
-/// A plant the oracle must catch on one of the seeded plans; the same plans pass unplanted.
-fn control(plant: Plant) {
-    for seed in 0..CONTROL_SEEDS {
-        let plan = plan(&mut Seeded(seed));
-        if let Err(broke) = run(&plan, Plant::None) {
-            panic!("seed {seed}, no plant: {broke}");
-        }
-        if let Err(why) = run(&plan, plant) {
-            eprintln!("{plant:?} caught at seed {seed}: {why}");
-            return;
-        }
-    }
-    panic!(
-        "the oracle caught {plant:?} at none of seeds 0..{CONTROL_SEEDS}: it, or the draws, are too weak"
-    );
+/// The plan `tape` draws, run with `plant`: any finding of the oracle counts, as before.
+fn planted(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(&plan(tape), plant).map_err(Broke::Oracle)
 }
 
 #[test]
 fn the_oracle_catches_a_fact_not_recomputed_when_a_callee_s_fact_changed() {
-    control(Plant::CalleeFactsOutOfKey);
+    blaze_sim::control(CONTROL, Plant::None, Plant::CalleeFactsOutOfKey, "", planted);
 }
 
 #[test]
 fn the_oracle_catches_a_cache_hit_across_two_extensions_code_identities() {
-    control(Plant::ExtensionOutOfKey);
+    blaze_sim::control(CONTROL, Plant::None, Plant::ExtensionOutOfKey, "", planted);
 }
 
 fn chain() -> World {

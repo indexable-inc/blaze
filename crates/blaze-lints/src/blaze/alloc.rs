@@ -480,13 +480,15 @@ mod tests {
     use super::fits;
 
     /// Stopping early answers as summing every walk did.
-    #[hegel::test]
-    fn fits_as_the_sum_of_the_walks_says(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let lengths: Vec<usize> = tc.draw(gs::vecs(gs::integers().max_value(79)).max_size(11));
-        let longest: usize = tc.draw(gs::integers().max_value(299));
-        let summed = lengths.iter().sum::<usize>() <= longest;
-        assert_eq!(fits(lengths.iter().map(|&it| 0..it), longest), summed);
+    #[test]
+    fn fits_as_the_sum_of_the_walks_says() {
+        blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+            let lengths: Vec<usize> =
+                tape.vec(0..=11, "lengths", |tape| tape.int_in(0..=79usize, "length"));
+            let longest: usize = tape.int_in(0..=299, "longest");
+            let summed = lengths.iter().sum::<usize>() <= longest;
+            assert_eq!(fits(lengths.iter().map(|&it| 0..it), longest), summed);
+        });
     }
 
     #[test]

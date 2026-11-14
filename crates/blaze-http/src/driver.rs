@@ -214,9 +214,15 @@ impl Loop {
         Tag(tag)
     }
 
-    /// Starts `request` as `id`, unique among this loop's requests; with `until`, a deadline of
+    /// Queues `request` as `id`, unique among this loop's requests; with `until`, a deadline of
     /// its asker's on the driver's clock, past which it ends in [`Told::TimedOut`]. An id in
     /// use ends it at once in [`Event::Failed`] ([`Kind::InUse`]), leaving the other be.
+    ///
+    /// It starts in the client at the next [`Loop::step`], after the client's clock is moved to
+    /// that step's `now`, never here: the client times a request from its own clock, which
+    /// stands where the last step left it, and a driver that waited since (to its deadline, or
+    /// until an asker woke it) would start the request already late by that wait, its timeout
+    /// spent before it asked anything.
     pub fn ask(&mut self, id: RequestId, request: Request, until: Option<Duration>) {
         if self.running.contains_key(&id) || self.queued.iter().any(|(it, ..)| *it == id) {
             let error = Error { url: request.url, kind: Kind::InUse };
@@ -224,7 +230,6 @@ impl Loop {
             return;
         }
         self.queued.push_back((id, request, until));
-        self.fill();
     }
 
     /// The asker of `id` took `bytes` of its body.
@@ -232,13 +237,13 @@ impl Loop {
         self.client.consumed(id, bytes);
     }
 
-    /// The asker of `id` went away: it tells nothing more.
+    /// The asker of `id` went away: it tells nothing more. A queued request that takes its
+    /// place starts at the next [`Loop::step`] ([`Loop::ask`]).
     pub fn cancel(&mut self, id: RequestId) {
         self.queued.retain(|(it, ..)| *it != id);
         if self.running.remove(&id).is_some() {
             self.client.cancel(id);
         }
-        self.fill();
     }
 
     /// [`Told::Woke`] of `key` once `after` has passed.
@@ -248,6 +253,7 @@ impl Loop {
     }
 
     /// Starts queued requests while fewer than `most` are in the client: whether it started any.
+    /// Called only from [`Loop::step`], after the client's clock is moved to now.
     fn fill(&mut self) -> bool {
         let mut any = false;
         while self.running.len() < self.most {
@@ -263,9 +269,12 @@ impl Loop {
         any
     }
 
-    /// The time is `now` on the driver's clock: what was due happens, the client's IO is turned
-    /// into effects and moved to `out` (with this loop's own), and its deadline is armed.
-    pub fn step(&mut self, now: Duration, out: &mut Vec<Effect>) {
+    /// The time is `now` on the driver's clock: the client's clock moves to it and what was due
+    /// by then happens (a request past its deadline ends). A driver calls it as each wait ends,
+    /// before it hands the loop what came in ([`Loop::complete`], [`Loop::consumed`]), so that
+    /// what those start (a redirect's hop, a retry, a stall's clock) is timed from now and not
+    /// from before the wait; [`Loop::step`] calls it first.
+    pub fn advance(&mut self, now: Duration) {
         self.now = self.now.max(now);
         self.client.advance_clock(self.now);
         let now = self.now;
@@ -286,6 +295,13 @@ impl Loop {
             }
             !over
         });
+    }
+
+    /// The time is `now` on the driver's clock: what was due happens ([`Loop::advance`]),
+    /// queued requests start on the client's clock as it now stands, the client's IO is turned
+    /// into effects and moved to `out` (with this loop's own), and its deadline is armed.
+    pub fn step(&mut self, now: Duration, out: &mut Vec<Effect>) {
+        self.advance(now);
         // Each pass drains what the client asked; doing it may tell the client more (a send on
         // a connection not open is broken at once), and an end lets a queued request start.
         loop {
@@ -729,6 +745,9 @@ fn serve(driver: &mut impl Driver, mut core: Loop, inbox: &Inbox) {
         }
         driver.submit(&mut effects);
         driver.poll(&mut done, core.deadline());
+        // The wait just ended: what came in during it (these completions, then the messages at
+        // the top of the next turn) is timed from now.
+        core.advance(driver.now());
         for completion in done.drain(..) {
             core.complete(completion);
         }

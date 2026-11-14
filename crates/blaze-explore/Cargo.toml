@@ -46,7 +46,7 @@ blaze-rng.workspace = true
 # The probe's simulation pins its certificate by its hash.
 blaze-sha256.workspace = true
 # The probe's simulation test.
-hegeltest.workspace = true
+blaze-sim.workspace = true
 # A stop that never comes, for the ops' tests.
 crossbeam-channel.workspace = true
 

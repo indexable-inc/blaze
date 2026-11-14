@@ -164,8 +164,8 @@ blaze-codegen-code.workspace = true
 blaze-cas = { workspace = true, features = ["test-hooks"] }
 lzma-rust2 = { workspace = true, features = ["std", "xz", "encoder"] }
 tempfile.workspace = true
-# The property test of the no-op lane (`serve/job/noop/tests.rs`).
-hegeltest.workspace = true
+# The property tests and simulations (the no-op lane's `serve/job/noop/tests.rs`, ..).
+blaze-sim.workspace = true
 # The request machine's planted bugs, for the controls of `serve/job/certify/tests.rs`.
 blaze-certify = { workspace = true, features = ["plants"] }
 # minicore, the `core` of the gpu dependency's end-to-end test (`serve/unit/tests/gpu.rs`).

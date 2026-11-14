@@ -1,6 +1,7 @@
 // The fixtures here are read only through their descriptors.
 #![allow(dead_code)]
 
+use blaze_sim::Config;
 
 use crate::prelude::*;
 use crate::{Field, FieldKind, Interp, Kind, Out, Slot, Stage, Table, ValueTy};
@@ -122,63 +123,68 @@ fn a_vertex_stage_runs_on_the_host() {
 
 /// `smoothstep` is 0 and 1 at and past its edges, never leaves 0 to 1, and never decreases;
 /// `lerp` is exact at its ends.
-#[hegel::test]
-fn smoothstep_and_lerp_keep_their_ends(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let f = |lo: f32, hi: f32| gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false);
-    let e0 = tc.draw(f(-100.0, 100.0));
-    let e1 = e0 + tc.draw(f(1e-3, 100.0));
-    let x = tc.draw(f(-300.0, 300.0));
-    let dx = tc.draw(f(0.0, 50.0));
-    let (y, y2) = (smoothstep(e0, e1, x), smoothstep(e0, e1, x + dx));
-    assert!((0.0..=1.0).contains(&y), "smoothstep({e0}, {e1}, {x}) = {y}");
-    assert!(y2 + 1e-6 >= y, "smoothstep decreased from {x} ({y}) to {} ({y2})", x + dx);
-    assert_eq!(smoothstep(e0, e1, e0 - dx), 0.0);
-    assert_eq!(smoothstep(e0, e1, e1 + dx), 1.0);
-    let (a, b) = (tc.draw(f(-1e3, 1e3)), tc.draw(f(-1e3, 1e3)));
-    assert_eq!(lerp(a, b, 0.0), a);
-    assert_eq!(lerp(vec3(a, b, a), vec3(b, a, b), 0.0), vec3(a, b, a));
+#[test]
+fn smoothstep_and_lerp_keep_their_ends() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let e0 = tape.f32_in(-100.0..=100.0, "e0");
+        let e1 = e0 + tape.f32_in(1e-3..=100.0, "e1 past e0");
+        let x = tape.f32_in(-300.0..=300.0, "x");
+        let dx = tape.f32_in(0.0..=50.0, "dx");
+        let (y, y2) = (smoothstep(e0, e1, x), smoothstep(e0, e1, x + dx));
+        assert!((0.0..=1.0).contains(&y), "smoothstep({e0}, {e1}, {x}) = {y}");
+        assert!(y2 + 1e-6 >= y, "smoothstep decreased from {x} ({y}) to {} ({y2})", x + dx);
+        assert_eq!(smoothstep(e0, e1, e0 - dx), 0.0);
+        assert_eq!(smoothstep(e0, e1, e1 + dx), 1.0);
+        let (a, b) = (tape.f32_in(-1e3..=1e3, "a"), tape.f32_in(-1e3..=1e3, "b"));
+        assert_eq!(lerp(a, b, 0.0), a);
+        assert_eq!(lerp(vec3(a, b, a), vec3(b, a, b), 0.0), vec3(a, b, a));
+    });
 }
 
 /// `asuint` is the bit pattern: bit 31 the sign (set for -0, which `<` can't see), the exponent and
 /// mantissa below it, so it round-trips through `f32::from_bits` exactly.
-#[hegel::test]
-fn asuint_is_the_bits(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let x = tc.draw(gs::floats::<f32>().allow_nan(false));
-    let u = asuint(x);
-    assert_eq!(f32::from_bits(u), x);
-    assert_eq!(u >> 31, u32::from(x.is_sign_negative()), "{x}'s sign bit");
-    assert_eq!(asuint(1.0), 127 << 23);
-    assert_eq!(asuint(-0.0) >> 31, 1);
-    assert_eq!(asuint(0.0), 0);
+#[test]
+fn asuint_is_the_bits() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        // Any `f32` but NaN: the infinities stay in.
+        let x = tape.f32("x");
+        tape.assume(!x.is_nan());
+        let u = asuint(x);
+        assert_eq!(f32::from_bits(u), x);
+        assert_eq!(u >> 31, u32::from(x.is_sign_negative()), "{x}'s sign bit");
+        assert_eq!(asuint(1.0), 127 << 23);
+        assert_eq!(asuint(-0.0) >> 31, 1);
+        assert_eq!(asuint(0.0), 0);
+    });
 }
 
 /// `frac` is what `floor` leaves, 0 to 1 also for negatives; `sign` is -1, 0 or 1 and 0 at 0 and
 /// NaN (where `signum` would say 1 and NaN), per component on a vector.
-#[hegel::test]
-fn frac_and_sign_are_slangs(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let x = tc.draw(gs::floats::<f32>().min_value(-1e4).max_value(1e4).allow_nan(false).allow_infinity(false));
-    let f = frac(x);
-    assert!((0.0..=1.0).contains(&f), "frac({x}) = {f}");
-    assert_eq!(x - f, x.floor());
-    assert_eq!(frac(-0.25), 0.75);
-    let s = sign(x);
-    assert_eq!(s, if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 });
-    assert_eq!((sign(0.0), sign(-0.0), sign(f32::NAN)), (0.0, 0.0, 0.0));
-    assert_eq!(vec3(x, 0.0, -2.0).sign(), vec3(s, 0.0, -1.0));
+#[test]
+fn frac_and_sign_are_slangs() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let x = tape.f32_in(-1e4..=1e4, "x");
+        let f = frac(x);
+        assert!((0.0..=1.0).contains(&f), "frac({x}) = {f}");
+        assert_eq!(x - f, x.floor());
+        assert_eq!(frac(-0.25), 0.75);
+        let s = sign(x);
+        assert_eq!(s, if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 });
+        assert_eq!((sign(0.0), sign(-0.0), sign(f32::NAN)), (0.0, 0.0, 0.0));
+        assert_eq!(vec3(x, 0.0, -2.0).sign(), vec3(s, 0.0, -1.0));
+    });
 }
 
 /// `lerp` with a vector `t` blends each component by its own `t`, as the scalar `lerp` would.
-#[hegel::test]
-fn lerp_by_a_vector_is_per_component(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let f = |lo: f32, hi: f32| gs::floats::<f32>().min_value(lo).max_value(hi).allow_nan(false).allow_infinity(false);
-    let (a, b) = (vec2(tc.draw(f(-1e3, 1e3)), tc.draw(f(-1e3, 1e3))), vec2(tc.draw(f(-1e3, 1e3)), tc.draw(f(-1e3, 1e3))));
-    let t = vec2(tc.draw(f(0.0, 1.0)), tc.draw(f(0.0, 1.0)));
-    assert_eq!(lerp(a, b, t), vec2(lerp(a.x, b.x, t.x), lerp(a.y, b.y, t.y)));
-    assert_eq!(lerp(a, b, vec2(0.0, 0.0)), a);
+#[test]
+fn lerp_by_a_vector_is_per_component() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let a = vec2(tape.f32_in(-1e3..=1e3, "a.x"), tape.f32_in(-1e3..=1e3, "a.y"));
+        let b = vec2(tape.f32_in(-1e3..=1e3, "b.x"), tape.f32_in(-1e3..=1e3, "b.y"));
+        let t = vec2(tape.f32_in(0.0..=1.0, "t.x"), tape.f32_in(0.0..=1.0, "t.y"));
+        assert_eq!(lerp(a, b, t), vec2(lerp(a.x, b.x, t.x), lerp(a.y, b.y, t.y)));
+        assert_eq!(lerp(a, b, vec2(0.0, 0.0)), a);
+    });
 }
 
 /// Float to integer vectors go toward zero (Slang's `int2(v)`), back exactly; `clamp` on an integer
@@ -321,15 +327,16 @@ fn halves_round_trip_and_round_to_even() {
 }
 
 /// Any `f32` in a half's range comes back within half a half's ulp of itself.
-#[hegel::test]
-fn f32tof16_is_the_nearest_half(tc: hegel::TestCase) {
-    use hegel::generators as gs;
-    let x = tc.draw(gs::floats::<f32>().min_value(-65504.0).max_value(65504.0).allow_nan(false));
-    let back = f16tof32(f32tof16(x));
-    // The gap between halves at x: 2^(e - 10) for a normal, 2^-24 for a subnormal.
-    let e = x.abs().log2().floor().max(-14.0);
-    let ulp = 2f32.powf(e - 10.0);
-    assert!((back - x).abs() <= ulp / 2.0, "{x} came back as {back} (ulp {ulp})");
+#[test]
+fn f32tof16_is_the_nearest_half() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let x = tape.f32_in(-65504.0..=65504.0, "x");
+        let back = f16tof32(f32tof16(x));
+        // The gap between halves at x: 2^(e - 10) for a normal, 2^-24 for a subnormal.
+        let e = x.abs().log2().floor().max(-14.0);
+        let ulp = 2f32.powf(e - 10.0);
+        assert!((back - x).abs() <= ulp / 2.0, "{x} came back as {back} (ulp {ulp})");
+    });
 }
 
 /// A Thread gives back the ids the kernel ABI made it with.

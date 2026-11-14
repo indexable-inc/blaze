@@ -16,9 +16,8 @@
 use std::alloc::Global;
 
 use blaze_mem::{Frame, Tag};
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds};
 use crate::image::{
     Color, Depth, Image, ImageError, Limits, decode, decode_bytes, encode,
     zlib::{Crc, Inflate, compress},
@@ -28,59 +27,63 @@ use crate::image::{
 /// frame's peak with this much room.
 const ALIGN_SLACK: usize = 64;
 
-/// `len` bytes from `seed`: random, in runs, or a ramp.
-fn content(seed: u64, len: usize, mode: u64) -> Vec<u8> {
-    let mut rng = Seeds::new(seed);
+/// `len` bytes drawn from the tape: random, in runs, or a ramp.
+fn content(tape: &Tape, len: usize, mode: u64) -> Vec<u8> {
     match mode {
-        0 => (0..len).map(|_| rng.next_u64() as u8).collect(),
+        0 => (0..len).map(|_| tape.next_u64("byte") as u8).collect(),
         1 => {
             let mut out = Vec::with_capacity(len);
             while out.len() < len {
-                let byte = rng.next_u64() as u8;
-                let run = 1 + rng.below(300) as usize;
+                let byte = tape.next_u64("run byte") as u8;
+                let run = 1 + tape.below(300, "run len") as usize;
                 out.extend(std::iter::repeat_n(byte, run.min(len - out.len())));
             }
             out
         }
         _ => {
-            let step = rng.below(7) as usize + 1;
+            let step = tape.below(7, "ramp step") as usize + 1;
             (0..len).map(|i| (i * step) as u8).collect()
         }
     }
 }
 
-fn draw_image(d: &mut impl Draw) -> Image<Global> {
-    let color = d.pick(&Color::ALL);
-    let depth = d.pick(&Depth::ALL);
-    let width = d.int(1, 24) as u32;
-    let height = d.int(1, 24) as u32;
+fn draw_image(tape: &Tape) -> Image<Global> {
+    let color = *tape.one_of(&Color::ALL, "color");
+    let depth = *tape.one_of(&Depth::ALL, "depth");
+    let width = tape.int_in(1..=24u64, "width") as u32;
+    let height = tape.int_in(1..=24u64, "height") as u32;
     let len = (width * height * color.channels() * depth.bytes()) as usize;
-    let pixels = content(d.int(0, u64::MAX), len, d.int(0, 2));
+    let mode = tape.int_in(0..=2u64, "content mode");
+    let pixels = content(tape, len, mode);
     Image::new(width, height, color, depth, pixels).expect("a drawn image's pixels are its size")
 }
 
-#[hegel::test(test_cases = 300)]
-fn decode_of_encode_is_the_image(tc: TestCase) {
-    let image = draw_image(&mut Drawn(&tc));
-    let png = encode(&image, Global).unwrap_or_else(|e| panic!("encode {image:?}: {e}"));
-    let back = decode(&png, Global, Limits::DEFAULT).unwrap_or_else(|e| panic!("decode of encode {image:?}: {e}"));
-    assert!(back == image, "decode(encode({image:?})) is {back:?}, with other pixels");
-    let again = encode(&image, Global).unwrap_or_else(|e| panic!("encode {image:?} again: {e}"));
-    assert_eq!(png, again, "encode {image:?} twice gave different bytes");
+#[test]
+fn decode_of_encode_is_the_image() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let image = draw_image(tape);
+        let png = encode(&image, Global).unwrap_or_else(|e| panic!("encode {image:?}: {e}"));
+        let back = decode(&png, Global, Limits::DEFAULT).unwrap_or_else(|e| panic!("decode of encode {image:?}: {e}"));
+        assert!(back == image, "decode(encode({image:?})) is {back:?}, with other pixels");
+        let again = encode(&image, Global).unwrap_or_else(|e| panic!("encode {image:?} again: {e}"));
+        assert_eq!(png, again, "encode {image:?} twice gave different bytes");
+    });
 }
 
-#[hegel::test(test_cases = 60)]
-fn deflate_round_trips_through_inflate(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let len = d.int(0, 100_000) as usize;
-    let data = content(d.int(0, u64::MAX), len, d.int(0, 2));
-    let z = compress(&data, Global).unwrap_or_else(|e| panic!("compress {len} bytes: {e}"));
-    let mut out = vec![0u8; len + 1];
-    let mut inflate = Inflate::new();
-    inflate.feed(&z, false, &mut out).unwrap_or_else(|e| panic!("inflate {len} bytes: {e}"));
-    assert!(inflate.done(), "the stream of {len} bytes did not end");
-    assert_eq!(inflate.written(), len, "the stream of {len} bytes inflated to {}", inflate.written());
-    assert!(out[..len] == data[..], "the stream of {len} bytes inflated to other bytes");
+#[test]
+fn deflate_round_trips_through_inflate() {
+    blaze_sim::check(Config::cases(60), |tape| {
+        let len = tape.int_in(0..=100_000u64, "len") as usize;
+        let mode = tape.int_in(0..=2u64, "content mode");
+        let data = content(tape, len, mode);
+        let z = compress(&data, Global).unwrap_or_else(|e| panic!("compress {len} bytes: {e}"));
+        let mut out = vec![0u8; len + 1];
+        let mut inflate = Inflate::new();
+        inflate.feed(&z, false, &mut out).unwrap_or_else(|e| panic!("inflate {len} bytes: {e}"));
+        assert!(inflate.done(), "the stream of {len} bytes did not end");
+        assert_eq!(inflate.written(), len, "the stream of {len} bytes inflated to {}", inflate.written());
+        assert!(out[..len] == data[..], "the stream of {len} bytes inflated to other bytes");
+    });
 }
 
 /// Every chunk's CRC recomputed, as far as the chunks parse.
@@ -99,30 +102,35 @@ fn fix_crcs(bytes: &mut [u8]) {
     }
 }
 
-fn hostile(d: &mut impl Draw) -> Vec<u8> {
-    match d.int(0, 2) {
-        0 => content(d.int(0, u64::MAX), d.int(0, 600) as usize, 0),
+fn hostile(tape: &Tape) -> Vec<u8> {
+    match tape.int_in(0..=2u64, "hostile kind") {
+        0 => {
+            let len = tape.int_in(0..=600u64, "len") as usize;
+            content(tape, len, 0)
+        }
         1 => {
             let mut bytes = crate::image::png::SIGNATURE.to_vec();
-            bytes.extend(content(d.int(0, u64::MAX), d.int(0, 600) as usize, d.int(0, 1)));
+            let len = tape.int_in(0..=600u64, "len") as usize;
+            let mode = tape.int_in(0..=1u64, "content mode");
+            bytes.extend(content(tape, len, mode));
             bytes
         }
         _ => {
-            let image = draw_image(d);
+            let image = draw_image(tape);
             let mut bytes = encode(&image, Global).expect("a drawn image encodes");
-            for _ in 0..d.int(1, 8) {
+            for _ in 0..tape.int_in(1..=8u64, "mutations") {
                 if bytes.is_empty() {
                     break;
                 }
-                let at = d.int(0, bytes.len() as u64 - 1) as usize;
-                match d.int(0, 3) {
-                    0 => bytes[at] ^= 1 << d.int(0, 7),
-                    1 => bytes[at] = d.int(0, 255) as u8,
+                let at = tape.int_in(0..=bytes.len() as u64 - 1, "at") as usize;
+                match tape.int_in(0..=3u64, "mutation") {
+                    0 => bytes[at] ^= 1 << tape.int_in(0..=7u64, "bit"),
+                    1 => bytes[at] = tape.int_in(0..=255u64, "byte") as u8,
                     2 => bytes.truncate(at),
-                    _ => bytes.insert(at, d.int(0, 255) as u8),
+                    _ => bytes.insert(at, tape.int_in(0..=255u64, "byte") as u8),
                 }
             }
-            if d.coin() {
+            if tape.coin("fix crcs") {
                 fix_crcs(&mut bytes);
             }
             bytes
@@ -130,27 +138,32 @@ fn hostile(d: &mut impl Draw) -> Vec<u8> {
     }
 }
 
-#[hegel::test(test_cases = 1000)]
-fn decode_of_any_bytes_never_panics_nor_passes_its_limit(tc: TestCase) {
-    let mut d = Drawn(&tc);
-    let bytes = hostile(&mut d);
-    let limits = Limits { width: d.int(1, 64) as u32, height: d.int(1, 64) as u32, bytes: d.int(1, 20_000) as usize };
-    let frame = Frame::with_reserve(4 * limits.bytes + (1 << 16), Tag::Other).expect("a test frame is made");
-    match decode(&bytes, &frame, limits) {
-        Ok(image) => {
-            assert!(
-                image.width() <= limits.width && image.height() <= limits.height,
-                "decode gave {image:?}, past {limits:?}"
-            );
+#[test]
+fn decode_of_any_bytes_never_panics_nor_passes_its_limit() {
+    blaze_sim::check(Config::cases(1000), |tape| {
+        let bytes = hostile(tape);
+        let limits = Limits {
+            width: tape.int_in(1..=64u64, "width limit") as u32,
+            height: tape.int_in(1..=64u64, "height limit") as u32,
+            bytes: tape.int_in(1..=20_000u64, "bytes limit") as usize,
+        };
+        let frame = Frame::with_reserve(4 * limits.bytes + (1 << 16), Tag::Other).expect("a test frame is made");
+        match decode(&bytes, &frame, limits) {
+            Ok(image) => {
+                assert!(
+                    image.width() <= limits.width && image.height() <= limits.height,
+                    "decode gave {image:?}, past {limits:?}"
+                );
+            }
+            Err(_) => {}
         }
-        Err(_) => {}
-    }
-    assert!(
-        frame.peak() <= limits.bytes + ALIGN_SLACK,
-        "decode of {} bytes asked its allocator for {} bytes at once, past its limit {limits:?}",
-        bytes.len(),
-        frame.peak()
-    );
+        assert!(
+            frame.peak() <= limits.bytes + ALIGN_SLACK,
+            "decode of {} bytes asked its allocator for {} bytes at once, past its limit {limits:?}",
+            bytes.len(),
+            frame.peak()
+        );
+    });
 }
 
 const GREY_1X1: [u8; 67] = [

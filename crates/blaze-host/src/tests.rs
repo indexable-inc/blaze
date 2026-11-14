@@ -39,7 +39,7 @@ use blaze_keyed::{
     record::{self, Fact, FactKind, Owner, StableId},
     store::{Compacted, Generation, Put, Read, RootRef, Store, StoreError},
 };
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::{
     HostError, Request,
@@ -744,11 +744,10 @@ enum Edit {
     None,
 }
 
-#[hegel::composite]
-fn edit(tc: &hegel::TestCase) -> Edit {
-    let unit = u32::from(tc.draw(gs::integers::<u8>().max_value(1)));
-    let at = usize::from(tc.draw(gs::integers::<u8>().max_value(2)));
-    match tc.draw(gs::integers::<u8>().max_value(2)) {
+fn edit(tape: &Tape) -> Edit {
+    let unit = u32::from(tape.int_in(0..=1u8, "unit"));
+    let at = usize::from(tape.int_in(0..=2u8, "at"));
+    match tape.int_in(0..=2u8, "edit") {
         0 => Edit::Sig(unit, at),
         1 => Edit::Body(unit, at),
         _ => Edit::None,
@@ -761,9 +760,14 @@ fn edit(tc: &hegel::TestCase) -> Edit {
 /// and byte for byte, the record a fresh build proves for its item (a record found by address
 /// is only what redoing it makes). Its planted-bug controls are the scenario tests' (each
 /// removes the cause and watches the effect go) and the audit's.
-#[hegel::test(test_cases = 40)]
-fn any_edits_file_what_a_fresh_build_files(tc: hegel::TestCase) {
-    let edits: Vec<Edit> = tc.draw(gs::vecs(edit()).max_size(6));
+#[test]
+fn any_edits_file_what_a_fresh_build_files() {
+    blaze_sim::check(Config::cases(40), any_edits);
+}
+
+/// One case of `any_edits_file_what_a_fresh_build_files`.
+fn any_edits(tape: &Tape) {
+    let edits: Vec<Edit> = tape.vec(0..=6, "edits", edit);
     let bench = Bench::new("blaze-host-edits");
     let store = bench.store();
     let mut state = world();

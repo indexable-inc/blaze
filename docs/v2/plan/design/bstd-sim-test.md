@@ -46,7 +46,7 @@ bstd's alone: a sans-IO core driven on `Sim` directly runs under it too (its own
 - `Seeds`: which seeds (`first`, `count`, 256 from 0 by default), how many restarts before the
   faults heal, and which `Fault` kinds are left out (`Seeds::DEFAULT.without(Fault::Crashes)`).
   The default seeds are fixed, so a green run is green again (deterministic-output); more are
-  asked for from outside (`BLAZE_SIM_SEEDS=10000`), as `HEGEL_TEST_CASES` is.
+  asked for from outside (`BLAZE_SIM_SEEDS=10000`), as for a `blaze_sim::check`.
 - `Plan::of(seed, &seeds)`: what one seed injects, drawn from the seed as a swarm (each kind off
   on some seeds, so a rare one is not drowned): `fail_one_in` (an effect fails: a short append,
   a sync that makes nothing durable), `max_latency` (late, shuffled completions) and
@@ -81,8 +81,9 @@ bstd's alone: a sans-IO core driven on `Sim` directly runs under it too (its own
 
 **Lost alternative.** A Hegel test that draws the seed and the faults: it shrinks, but Hegel is
 a dev-dependency with a native engine, bstd cannot depend on it, and one integer that replays
-is what a user can paste. Blaze's own DSTs keep Hegel for operation sequences and may call
-`seeds::one` with a drawn seed. A proc-macro attribute: refused by library-over-language.
+is what a user can paste. Blaze's own DSTs now draw their operation sequences from a blaze-sim
+tape (Hegel is gone from the tree), and `seeds` is to become a client of that engine
+([sim.md](sim.md), "Order"). A proc-macro attribute: refused by library-over-language.
 
 ## Cost
 

@@ -15,7 +15,7 @@
 //! The crate owns no IO, clock or thread, and allocates only in the allocator it is handed, so
 //! the compiler runs it in const evaluation and a test runs it as it is.
 
-// Under test the crate has std, which Hegel's test macro expands into.
+// Under test the crate has std, which its tests and blaze-sim's checks run on.
 #![cfg_attr(not(test), no_std)]
 #![feature(allocator_ext)]
 #![feature(register_tool, custom_inner_attributes)]

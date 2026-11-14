@@ -22,10 +22,6 @@ exclude = [
     "harness",
     # The standard library's own workspace (docs/toolchain.md).
     "library",
-    # Hegel, built only as a dependency of blaze's tests (vendor/hegeltest/SOURCE.md).
-    "vendor/hegeltest",
-    "vendor/hegeltest-c",
-    "vendor/hegeltest-macros",
     # Patched below; its own tests need dev-dependencies blaze has no use for.
     "vendor/sonic-rs",
     # Patched below; its own tests and benches need dev-dependencies blaze has no use for.
@@ -740,9 +736,6 @@ addr2line = { version = "0.26", default-features = false }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.19.0"
 expect-test = "1.5.1"
-# Property tests: Hegel, Hypothesis's engine, linked as a Rust crate; test-only, imported as `hegel`
-# (docs/contributing.md, vendor/hegeltest/SOURCE.md).
-hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
 indexmap = { version = "2.14.2", features = ["serde"] }
 # hir-ty's MIR provider table, which hir-ty-mir registers into.
 inventory = "0.3.25"

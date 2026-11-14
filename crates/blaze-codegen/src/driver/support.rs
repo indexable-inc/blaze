@@ -294,7 +294,7 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
@@ -375,19 +375,20 @@ mod tests {
 
     /// The refinement: after any sequence of edits of what items refer to, each set holds
     /// what its roots reach in the graph as it is, as a walk of the whole graph finds it.
-    #[hegel::test(test_cases = 200)]
-    fn the_sets_are_what_the_roots_reach(tc: hegel::TestCase) {
-        let count: usize = tc.draw(gs::integers::<usize>().max_value(24));
-        let mut edits = Vec::with_capacity(count);
-        for _ in 0..count {
-            let item = tc.draw(gs::integers::<u32>().max_value(ITEMS - 1));
-            let outs: Vec<u32> =
-                tc.draw(gs::vecs(gs::integers::<u32>().max_value(ITEMS - 1)).max_size(4));
-            edits.push((item, outs));
-        }
-        if let Some(found) = first_difference(&edits, false) {
-            panic!("{found}");
-        }
+    #[test]
+    fn the_sets_are_what_the_roots_reach() {
+        blaze_sim::check(Config::cases(200), |tape| {
+            let count: usize = tape.int_in(0..=24usize, "edits");
+            let mut edits = Vec::with_capacity(count);
+            for _ in 0..count {
+                let item = tape.int_in(0..=ITEMS - 1, "item");
+                let outs: Vec<u32> = tape.vec(0..=4, "outs", |tape| tape.int_in(0..=ITEMS - 1, "target"));
+                edits.push((item, outs));
+            }
+            if let Some(found) = first_difference(&edits, false) {
+                panic!("{found}");
+            }
+        })
     }
 
     /// The control: 0 refers to 2, 2 to 3, 3 to 4, and 4 back to 2 and to 5. Then 0 refers to

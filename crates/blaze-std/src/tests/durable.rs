@@ -25,9 +25,9 @@
 use std::{num::NonZero, time::Duration};
 
 use blaze_core::sim::Faults;
-use hegel::TestCase;
+use blaze_sim::{Config, Tape};
 
-use super::{Draw, Drawn, Seeds, check, control, path, root};
+use super::{check, control, path, root};
 use crate::{
     Cx, Plant,
     disk::DiskCounts,
@@ -78,18 +78,23 @@ struct Plan {
     acts: Vec<Act>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let seed = d.int(0, u64::MAX);
-    let latency_us = d.pick(&[0, 50, 2_000]);
-    let acts = (0..d.int(1, 40))
+fn plan(tape: &Tape) -> Plan {
+    let seed = tape.next_u64("sim seed");
+    let latency_us = *tape.one_of(&[0, 50, 2_000], "latency us");
+    let acts = (0..tape.int_in(1..=40u64, "acts"))
         .map(|_| {
-            let at = d.int(0, 2) as usize;
-            let durable = d.pick(&DURABLE);
-            match d.int(0, 13) {
-                0..=4 => Act::Publish { at, len: d.int(0, 48) as usize, durable },
-                5 => Act::Clone { at, from: d.int(0, 2) as usize, durable },
-                6 => Act::Copy { at, from: d.int(0, 2) as usize, chunk: d.int(1, 32) as usize, durable },
-                7 => Act::Derive { at, from: d.int(0, 2) as usize, offset: d.int(0, 56), len: d.int(0, 16) as usize },
+            let at = tape.int_in(0..=2u64, "at") as usize;
+            let durable = *tape.one_of(&DURABLE, "durable");
+            match tape.int_in(0..=13u64, "act") {
+                0..=4 => Act::Publish { at, len: tape.int_in(0..=48u64, "len") as usize, durable },
+                5 => Act::Clone { at, from: tape.int_in(0..=2u64, "from") as usize, durable },
+                6 => Act::Copy { at, from: tape.int_in(0..=2u64, "from") as usize, chunk: tape.int_in(1..=32u64, "chunk") as usize, durable },
+                7 => Act::Derive {
+                    at,
+                    from: tape.int_in(0..=2u64, "from") as usize,
+                    offset: tape.int_in(0..=56u64, "offset"),
+                    len: tape.int_in(0..=16u64, "len") as usize,
+                },
                 8 => Act::Remove { at, durable },
                 9 | 10 => Act::Read { at },
                 _ => Act::Crash,
@@ -317,22 +322,22 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
 /// synced, and of what was not, the last synced state or an unsynced change cut short; a
 /// clone of a `Flushed` forces no writeback; nothing told `No` or `Started` waits for the
 /// device; and `Started` keeps through a crash no more than `No` does.
-#[hegel::test(test_cases = 200)]
-fn files_keep_what_their_calls_said_through_crashes(tc: TestCase) {
-    check(plan(&mut Drawn(&tc)), run);
+#[test]
+fn files_keep_what_their_calls_said_through_crashes() {
+    blaze_sim::check(Config::cases(200), |tape| check(plan(tape), run));
 }
 
 #[test]
 fn the_oracle_catches_a_publish_that_reports_done_before_its_rename() {
-    control(Plant::PublishBeforeRename, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::PublishBeforeRename, plan, run);
 }
 
 #[test]
 fn the_oracle_catches_a_durable_yes_that_skipped_the_directory_sync() {
-    control(Plant::DurableSkipsNameSync, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::DurableSkipsNameSync, plan, run);
 }
 
 #[test]
 fn the_oracle_catches_a_flushed_handed_out_before_the_flush_completed() {
-    control(Plant::FlushedBeforeFlush, |seeds: &mut Seeds| plan(seeds), run);
+    control(Plant::FlushedBeforeFlush, plan, run);
 }

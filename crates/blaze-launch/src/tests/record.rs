@@ -2,16 +2,15 @@
 //! what is not one; and a record placed: each kind of fixup against each kind of place.
 
 use blaze_protocol::cbor;
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::KEPT;
 use crate::place::{Bound, place, place_static, pool};
 use crate::record::{Datum, Fixup, Kind, LAYOUT, Place, Record, To, Unwind, What};
 use crate::wire::{Arch, List, WireError};
 
-fn pick(tc: &TestCase, max: usize) -> usize {
-    tc.draw(gs::integers::<usize>().max_value(max))
+fn pick(tape: &Tape, max: usize, label: &'static str) -> usize {
+    tape.int_in(0..=max, label)
 }
 
 /// A record with what it borrows owned, so a drawn one outlives its draw.
@@ -90,72 +89,83 @@ impl Owned {
     }
 }
 
-fn owned(tc: &TestCase) -> Owned {
-    let what = match pick(tc, 4) {
+fn owned(tape: &Tape) -> Owned {
+    let what = match pick(tape, 4, "what") {
         0..=2 => What::Code,
-        _ => What::Static { mutable: tc.draw(gs::booleans()), thread_local: tc.draw(gs::booleans()) },
+        _ => What::Static { mutable: tape.bool("mutable"), thread_local: tape.bool("thread local") },
     };
-    let bytes: Vec<u8> = (0..8 + pick(tc, 300)).map(|at| at as u8).collect();
-    let places: Vec<(u8, String)> = (0..pick(tc, 6))
-        .map(|at| (pick(tc, 3) as u8, ["write", "_NSGetArgv", "λ"][at % 3].repeat(1 + pick(tc, 2))))
+    let bytes: Vec<u8> = (0..8 + pick(tape, 300, "bytes")).map(|at| at as u8).collect();
+    let places: Vec<(u8, String)> = (0..pick(tape, 6, "places"))
+        .map(|at| {
+            let kind = pick(tape, 3, "place kind") as u8;
+            (kind, ["write", "_NSGetArgv", "λ"][at % 3].repeat(1 + pick(tape, 2, "name repeats")))
+        })
         .collect();
-    let data: Vec<(u8, u32, Vec<u8>, bool)> = (0..pick(tc, 4))
-        .map(|at| (at as u8, 1 << pick(tc, 6), vec![at as u8; 8 + pick(tc, 40)], tc.draw(gs::booleans())))
+    let data: Vec<(u8, u32, Vec<u8>, bool)> = (0..pick(tape, 4, "data"))
+        .map(|at| {
+            let align: u32 = 1 << pick(tape, 6, "datum align");
+            let bytes = vec![at as u8; 8 + pick(tape, 40, "datum bytes")];
+            (at as u8, align, bytes, tape.bool("writable"))
+        })
         .collect();
-    let to = |tc: &TestCase, data_before: usize, own: bool| match pick(tc, 2) {
-        0 if !places.is_empty() => To::Place(pick(tc, places.len() - 1) as u32),
-        1 if data_before > 0 => To::Data(pick(tc, data_before - 1) as u32),
+    let to = |tape: &Tape, data_before: usize, own: bool| match pick(tape, 2, "to") {
+        0 if !places.is_empty() => To::Place(pick(tape, places.len() - 1, "to place") as u32),
+        1 if data_before > 0 => To::Data(pick(tape, data_before - 1, "to datum") as u32),
         _ if own => To::Own,
         _ if !places.is_empty() => To::Place(0),
         _ => To::Data(0),
     };
-    let addend = |tc: &TestCase| [0, -4, 16, i64::MIN, i64::MAX][pick(tc, 4)];
-    let fixups = (0..pick(tc, 12))
+    let addend = |tape: &Tape| [0, -4, 16, i64::MIN, i64::MAX][pick(tape, 4, "addend")];
+    let fixups = (0..pick(tape, 12, "fixups"))
         .map(|_| Fixup {
-            at: pick(tc, bytes.len() - 8) as u32,
-            kind: Kind::ALL[pick(tc, Kind::ALL.len() - 1)],
-            to: to(tc, data.len(), true),
-            addend: addend(tc),
+            at: pick(tape, bytes.len() - 8, "fixup at") as u32,
+            kind: Kind::ALL[pick(tape, Kind::ALL.len() - 1, "fixup kind")],
+            to: to(tape, data.len(), true),
+            addend: addend(tape),
         })
         .collect();
     // Shared by every datum after the first: against a place, or the first datum.
     let data_fixups = match places.is_empty() && data.len() < 2 {
         true => Vec::new(),
-        false => (0..pick(tc, 3))
-            .map(|_| Fixup { at: 0, kind: Kind::Abs64, to: to(tc, 1, false), addend: addend(tc) })
+        false => (0..pick(tape, 3, "data fixups"))
+            .map(|_| Fixup { at: 0, kind: Kind::Abs64, to: to(tape, 1, false), addend: addend(tape) })
             .collect(),
     };
     Owned {
-        arm: tc.draw(gs::booleans()),
+        arm: tape.bool("arm"),
         what,
-        align: 1 << pick(tc, 12),
+        align: 1 << pick(tape, 12, "align"),
         bytes,
-        zeroed: (what != What::Code && tc.draw(gs::booleans())).then(|| pick(tc, 1 << 20) as u64),
+        zeroed: (what != What::Code && tape.bool("zeroed")).then(|| pick(tape, 1 << 20, "zeroed size") as u64),
         fixups,
         places,
         data,
         data_fixups,
-        unwind: tc.draw(gs::booleans()).then(|| {
+        unwind: tape.bool("unwind").then(|| {
             (
-                pick(tc, 4) as u32,
-                -(pick(tc, 8) as i32),
-                pick(tc, 30) as u16,
-                vec![0x0c; pick(tc, 8)],
-                vec![0x0e; pick(tc, 40)],
-                tc.draw(gs::booleans()),
-                tc.draw(gs::booleans()),
+                pick(tape, 4, "code align") as u32,
+                -(pick(tape, 8, "data align") as i32),
+                pick(tape, 30, "return address") as u16,
+                vec![0x0c; pick(tape, 8, "cie")],
+                vec![0x0e; pick(tape, 40, "fde")],
+                tape.bool("personality"),
+                tape.bool("lsda"),
             )
         }),
-        name: ["", "hello::main", "<T as core::fmt::Debug>::fmt"][pick(tc, 2)].to_owned(),
+        name: ["", "hello::main", "<T as core::fmt::Debug>::fmt"][pick(tape, 2, "name")].to_owned(),
     }
 }
 
 /// The invariant: a record is written as one item in the core deterministic encoding (so one
 /// record has one encoding, and its hash is its id), and reads back as the record it was;
 /// any cut of it is refused, never read as a shorter record.
-#[hegel::test(test_cases = 400)]
-fn every_record_is_deterministic_cbor_and_reads_back(tc: TestCase) {
-    let owned = owned(&tc);
+#[test]
+fn every_record_is_deterministic_cbor_and_reads_back() {
+    blaze_sim::check(Config::cases(400), record_reads_back);
+}
+
+fn record_reads_back(tape: &Tape) {
+    let owned = owned(tape);
     let lists = owned.lists();
     let record = owned.record(&lists);
     let mut bytes = Vec::new();
@@ -167,7 +177,7 @@ fn every_record_is_deterministic_cbor_and_reads_back(tc: TestCase) {
     let mut again = Vec::new();
     Record::decode(&bytes).expect("read").encode(&mut again);
     assert_eq!(again, bytes, "a record read and written again is other bytes");
-    let cut = pick(&tc, bytes.len() - 1);
+    let cut = pick(tape, bytes.len() - 1, "cut");
     assert!(Record::decode(&bytes[..cut]).is_err(), "{owned:?} cut at {cut} was read");
 }
 

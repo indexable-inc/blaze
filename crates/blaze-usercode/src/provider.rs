@@ -218,7 +218,7 @@ impl Answers {
 #[cfg(test)]
 mod tests {
     use blaze_ids::ContentId;
-    use hegel::generators as gs;
+    use blaze_sim::{Config, Tape};
 
     use super::*;
 
@@ -335,9 +335,9 @@ mod tests {
         Ok(())
     }
 
-    fn asks(tc: &hegel::TestCase) -> Vec<(u8, u8)> {
-        let who: Vec<u8> = tc.draw(gs::vecs(gs::integers()).max_size(48));
-        let lens: Vec<u8> = tc.draw(gs::vecs(gs::integers()).max_size(48));
+    fn asks(tape: &Tape) -> Vec<(u8, u8)> {
+        let who: Vec<u8> = tape.vec(0..=48, "who", |tape| tape.int::<u8>("process"));
+        let lens: Vec<u8> = tape.vec(0..=48, "lens", |tape| tape.int::<u8>("len"));
         // A few processes, so they interleave.
         who.into_iter().map(|it| it % 4).zip(lens).collect()
     }
@@ -345,11 +345,9 @@ mod tests {
     /// The invariant: what a process is given by `getrandom` is its own stream's bytes in
     /// order, a function of the seed and the process alone, however the asks of the run's
     /// processes interleave and however each cut its own.
-    #[hegel::test]
-    fn a_process_is_given_its_own_stream_whoever_else_asks(tc: hegel::TestCase) {
-        if let Err(why) = answers_are_the_models(Plant::Nothing, &asks(&tc)) {
-            panic!("{why}");
-        }
+    #[test]
+    fn a_process_is_given_its_own_stream_whoever_else_asks() {
+        blaze_sim::check(Config::DEFAULT, |tape| answers_are_the_models(Plant::Nothing, &asks(tape)));
     }
 
     #[test]
