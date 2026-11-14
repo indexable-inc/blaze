@@ -3320,7 +3320,8 @@ fn alike_front(lib: &str) -> blaze_lower::Lowered {
 
 /// What [`core_front`]'s `core` is made of: minicore with what its fixtures' closures, `async`
 /// functions and `Send` bound reach.
-const MINI: &[&str] = &["sized", "copy", "clone", "fn", "add", "send", "sync", "future", "drop"];
+const MINI: &[&str] =
+    &["sized", "copy", "clone", "fn", "add", "send", "sync", "future", "drop", "phantom_data"];
 
 /// The front end of a build of one path package `bodies` (unit 0) whose library is `lib`, a
 /// `#![no_std]` crate on a `core` (unit 1, the registry package `mini`) of minicore.
@@ -3859,4 +3860,136 @@ fn the_oracle_catches_a_session_put_back_without_its_puts() {
 fn the_oracle_catches_a_driver_that_says_identities_unchanged() {
     let _planted = Planted::set(&bodies::CLEAN_IDENTITIES);
     assert!(carried_serve(8).is_err(), "the oracle passed a carry told no identity moved");
+}
+
+/// A callee's signature edited to name another nominal type of the same shape, its caller's
+/// text unchanged, and a body nothing edits (`other`, whose served steps show the serve works):
+/// what the edit is, and the library before and after.
+struct Renominal {
+    what: &'static str,
+    before: &'static str,
+    after: &'static str,
+}
+
+const RENOMINALS: [Renominal; 3] = [
+    // `f(Meters(1))` against `f(_: Feet)`: rustc rejects the caller.
+    Renominal {
+        what: "a parameter that becomes another newtype of the same shape",
+        before: "#![no_std]\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 pub fn f(_x: Meters) {}\npub fn caller() { f(Meters(1)) }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                pub fn f(_x: Feet) {}\npub fn caller() { f(Meters(1)) }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+    // A type-level marker, `PhantomData<A>` against `PhantomData<B>`: rustc rejects the caller.
+    Renominal {
+        what: "a parameter whose marker type becomes another unit struct",
+        before: "#![no_std]\n\
+                 use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                 pub fn f(_x: PhantomData<A>) {}\npub fn caller() { f(PhantomData::<A>) }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                use core::marker::PhantomData;\npub struct A;\npub struct B;\n\
+                pub fn f(_x: PhantomData<B>) {}\npub fn caller() { f(PhantomData::<A>) }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+    // A return type with an impl per type: rustc accepts both, and `.m()` must select `Feet`'s
+    // impl after the edit; a stale answer selects `Meters`'s (returns 1 where the program
+    // returns 2), a silent miscompile.
+    Renominal {
+        what: "a return type that becomes another newtype, each with its own impl",
+        before: "#![no_std]\n\
+                 pub trait Tr { fn m(&self) -> u32; }\n\
+                 pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                 impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                 impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                 pub fn f() -> Meters { Meters(1) }\npub fn caller() -> u32 { f().m() }\n\
+                 pub fn other() -> u32 { 1 }\n",
+        after: "#![no_std]\n\
+                pub trait Tr { fn m(&self) -> u32; }\n\
+                pub struct Meters(pub u32);\npub struct Feet(pub u32);\n\
+                impl Tr for Meters { fn m(&self) -> u32 { 1 } }\n\
+                impl Tr for Feet { fn m(&self) -> u32 { 2 } }\n\
+                pub fn f() -> Feet { Feet(1) }\npub fn caller() -> u32 { f().m() }\n\
+                pub fn other() -> u32 { 1 }\n",
+    },
+];
+
+/// The oracle of [`a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller`],
+/// as [`leaks_never_stale`] is of leaks: `case.before` built and kept, then the next build,
+/// a new database of `case.after`, served from those entries (`carried` false); or, as the
+/// daemon does, one database of `case.before` served, edited to `case.after` in its next
+/// revision and served again by the same sessions (`carried` true, as [`carried_serve`]).
+/// `caller`'s inference and MIR must equal those of a database of `case.after` served
+/// nothing, and the served database's item store must have found no served answer that
+/// disagrees with it. The control: `other`, which nothing edits, is served (inference hits),
+/// so a pass is not a serve that served nothing.
+fn renominal_never_stale(seed: u64, case: &Renominal, carried: bool) -> Result<(), String> {
+    let (mut sim, mut store, reader) = built_and_kept(seed, case.before);
+    // The session's store reads run as a task's, on the simulation lent to them.
+    super::deps::tests::as_task(&mut sim, || -> Result<(), String> {
+        let macros = super::deps::tests::no_macros();
+        let sessions = BodySessions::default();
+        let marks = no_marks();
+        let first_text = if carried { case.before } else { case.after };
+        let mut next = std::sync::Arc::new(core_front(first_text));
+        let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        let krate = next.krate(0).unwrap();
+        let (puts, _) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+            .map_err(|error| format!("the serve: {}", error.what))?;
+        ask_bodies_steps(&next);
+        let read = served.item_steps().unwrap();
+        let [infer, _, _] = BODY_STEPS;
+        if read[infer].hits == 0 {
+            return Err(format!("the control: no inference was served, so the edit proves nothing: {read:?}"));
+        }
+        if carried {
+            for it in puts.puts {
+                store.put(it.key, it.kind, &it.bytes).map_err(|error| format!("the serve's put: {error:?}"))?;
+            }
+            let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
+            let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
+            lowered
+                .served_db()
+                .batch(base_db::Trigger::named("the test's edit of `f`"), |db| db.set_file_text(root, case.after));
+            super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
+                .map_err(|error| format!("the second serve: {}", error.what))?;
+            ask_bodies_steps(&next);
+        }
+        super::deps::item_errors(&served)
+            .map_err(|error| format!("the served database's item store: {}", error.what))?;
+        let fresh = std::sync::Arc::new(core_front(case.after));
+        let _fresh = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
+        ask_bodies_steps(&fresh);
+        let (now, run) = (steps_of(&next, "caller"), steps_of(&fresh, "caller"));
+        match now == run {
+            true => Ok(()),
+            false => Err(format!("`caller` served stale: {now:?}, a database served nothing has {run:?}")),
+        }
+    })
+}
+
+/// A callee whose signature comes to name another nominal type of the same shape (a newtype
+/// for another, `PhantomData<A>` for `PhantomData<B>`, a return type with an impl per type)
+/// reaches its caller, whose text did not change, in the next build and in the daemon's next
+/// revision alike.
+///
+/// The invariant: the caller's inference and MIR, served from the kernel entries a build kept,
+/// equal those of a database of the edited tree served nothing, and the item store finds no
+/// served answer that disagrees with its database. A stale answer accepts a program rustc
+/// rejects, or calls the impl of the type the callee no longer returns.
+#[test]
+fn a_callee_that_names_another_type_of_the_same_shape_reaches_the_caller() {
+    let mut failed: Vec<String> = Vec::new(); // alloc: a test's findings
+    for (at, case) in RENOMINALS.iter().enumerate() {
+        for carried in [false, true] {
+            if let Err(why) = renominal_never_stale(20 + at as u64, case, carried) {
+                failed.push(format!("{} (carried: {carried}): {why}", case.what)); // alloc: as above
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
