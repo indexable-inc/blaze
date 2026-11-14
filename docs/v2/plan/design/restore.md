@@ -498,7 +498,7 @@ blaze-cargo's `serve::collect::front_keys`: a new record kind adds its key there
 every name of every module, against the resolved crate) with its control
 `the_oracle_catches_a_name_left_out_of_its_table`; `the_same_pages_from_two_databases` with
 `the_pages_of_another_source_are_other_bytes`; `a_previous_or_foreign_layout_is_refused_by_name`;
-`a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it` (Hegel: random edits
+`a_crate_read_from_pages_answers_as_the_one_resolved_under_edits_above_it` (blaze-sim: random edits
 of the crate above) with `the_oracle_catches_a_name_left_out_under_edits`;
 `a_lookup_reads_a_bounded_number_of_pages` (40 and 4,000 items: at most six pages each) with
 `a_whole_scope_reads_more_pages_than_a_name`;

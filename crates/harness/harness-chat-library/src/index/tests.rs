@@ -1,5 +1,5 @@
 use super::*;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 fn memory() -> Index {
     Index::from_connection(Connection::open_in_memory().unwrap(), PathBuf::from("<simulated chat index>")).unwrap()
@@ -78,10 +78,12 @@ fn provider_renames_patch_search_without_reparsing_unchanged_transcripts() {
 
 /// The invariant: one unreadable source is reported and loses its old searchable contents, while other source
 /// updates commit and remain searchable. The schedule chooses which source fails; all IO is injected.
-#[hegel::test(test_cases = 16)]
-fn a_failed_source_does_not_hide_other_chats_or_serve_stale_text(tc: hegel::TestCase) {
-    let fail: u64 = tc.draw(gs::integers().max_value(2));
-    failed_source(fail, Plant::None).unwrap();
+#[test]
+fn a_failed_source_does_not_hide_other_chats_or_serve_stale_text() {
+    blaze_sim::check(Config::cases(16), |tape| {
+        let fail: u64 = tape.int_in(0..=2u64, "the failing source");
+        failed_source(fail, Plant::None).unwrap();
+    });
 }
 
 fn failed_source(fail: u64, plant: Plant) -> Result<(), String> {
@@ -151,22 +153,19 @@ fn restore(bytes: &[u8]) -> Index {
 /// disappeared sources leave no matches, and restoring a committed SQLite image returns exactly the same sessions
 /// and rankings as a fresh index of the source snapshot. SQLite's transaction/serialization boundary is trusted;
 /// this simulation tests our replacement/deletion decisions without filesystem, sleeps or an OS process.
-#[hegel::test(test_cases = 32)]
-fn incremental_refresh_and_reopen_equal_a_fresh_index(tc: hegel::TestCase) {
-    let seed: u64 = tc.draw(gs::integers());
-    simulate(seed, false).unwrap();
+#[test]
+fn incremental_refresh_and_reopen_equal_a_fresh_index() {
+    blaze_sim::check(Config::cases(32), |tape| simulate(tape, false).unwrap());
 }
 
-fn simulate(mut seed: u64, keep_removed_source: bool) -> Result<(), String> {
+fn simulate(tape: &Tape, keep_removed_source: bool) -> Result<(), String> {
     let mut index = memory();
     let mut expected: BTreeMap<u64, (String, String, u64)> = BTreeMap::new();
     for revision in 1..=40 {
-        // A fixed seeded schedule is independent of wall time, SQL rowids and hash iteration order.
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let n = seed % 7;
-        if seed % 5 == 0 {
+        // The schedule is the tape's, independent of wall time, SQL rowids and hash iteration order: which of seven
+        // chats changes, and whether it is removed (one revision in five) rather than written.
+        let n = tape.below(7, "which chat");
+        if tape.one_in(5, "the chat is removed") {
             expected.remove(&n);
         } else {
             expected.insert(n, (format!("topic {n}"), format!("needle{n} revision {revision}"), revision));
@@ -205,7 +204,7 @@ fn simulate(mut seed: u64, keep_removed_source: bool) -> Result<(), String> {
 
 #[test]
 fn the_oracle_catches_a_removed_source_kept_in_the_index() {
-    assert!(simulate(0x1234_5678_9abc_def0, true).is_err());
+    assert!(simulate(&Tape::seeded(0x1234_5678_9abc_def0), true).is_err());
 }
 
 #[test]

@@ -1,14 +1,12 @@
 //! The collector's deterministic simulation (docs/gc.md, "The store's budget and collector"):
 //! the store and its [`Collector`] on the simulation, with builds, reads, pins, periods' ends
-//! whose scans come back late, crashes inside commits and failed effects drawn by Hegel, and a
-//! plain model beside the run.
+//! whose scans come back late, crashes inside commits and failed effects drawn from the case's
+//! `blaze_sim` tape, and a plain model beside the run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config as SimConfig, Tape};
 
-use super::model_check::run_cases;
 use super::*;
 use crate::collect::{
     CollectBatch, Collector, Facts, Pace, PeriodScan, Pin, Plant, Standing, Step,
@@ -90,34 +88,33 @@ enum Op {
     ForgetDue,
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let key = || tc.draw(gs::integers::<u64>().max_value(KEYS - 1));
-    match tc.draw(gs::integers::<u8>().max_value(29)) {
-        0..5 => Op::Put(key(), tc.draw(gs::integers::<u8>().min_value(1).max_value(60))),
+fn op(tape: &Tape) -> Op {
+    let key = || tape.int_in(0..=KEYS - 1, "key");
+    match tape.int_in(0..=29u8, "op") {
+        0..5 => Op::Put(key(), tape.int_in(1..=60u8, "count")),
         5..8 => Op::Use(key()),
         8 => Op::Hold(key()),
         9 => Op::Release,
         10 | 11 => Op::Pin(
-            tc.draw(gs::integers::<u8>().max_value(2)),
-            tc.draw(gs::vecs(gs::integers::<u64>().max_value(KEYS - 1)).max_size(6)),
+            tape.int_in(0..=2u8, "pin slot"),
+            tape.vec(0..=6, "pinned keys", |tape| tape.int_in(0..=KEYS - 1, "pinned key")),
         ),
         12 | 13 => Op::Flush,
         14 => Op::BuildBegin,
         15 => Op::BuildEnd,
         16 | 17 => Op::ScanTake,
         18 | 19 => Op::ScanRun,
-        20..23 => Op::Collect(tc.draw(gs::integers::<u8>().min_value(1).max_value(40))),
+        20..23 => Op::Collect(tape.int_in(1..=40u8, "collect steps")),
         23 | 24 => Op::Work,
-        25 => Op::Tick(tc.draw(gs::integers::<u32>().min_value(1).max_value(30))),
-        26 => match tc.draw(gs::integers::<u8>().max_value(3)) {
+        25 => Op::Tick(tape.int_in(1..=30u32, "tick s")),
+        26 => match tape.int_in(0..=3u8, "crash kind") {
             0 => Op::Crash,
             1 => Op::Reopen,
-            _ => Op::CrashInCommit(tc.draw(gs::integers::<u8>().max_value(40))),
+            _ => Op::CrashInCommit(tape.int_in(0..=40u8, "crash in commit after")),
         },
         28 => Op::Forget(key()),
         29 => Op::ForgetDue,
-        _ => Op::Moves(tc.draw(gs::integers::<u8>().min_value(1).max_value(8))),
+        _ => Op::Moves(tape.int_in(1..=8u8, "move steps")),
     }
 }
 
@@ -730,19 +727,19 @@ fn injected(why: &str) -> bool {
 /// misses it); after any crash the store opens and reads every record that was durable and
 /// pinned; what a reader pinned reads as it did; the collector begins no commit while a build
 /// is under way and no step of it copies more than its bound; and a store left to itself
-/// ends under its budget or says it is over. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// ends under its budget or says it is over. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn the_collector_forgets_nothing_a_root_names() {
-    run_cases(64, |tc| {
-        let ops = tc.draw(gs::vecs(op()).min_size(1).max_size(60));
-        let seed = tc.draw(gs::integers());
+    blaze_sim::check(SimConfig::cases(64), |tape| {
+        let ops = tape.vec(1..=60, "ops", op);
+        let seed = tape.next_u64("sim seed");
         let faults = Faults {
-            fail_one_in: [0, 0, 0, 23][tc.draw(gs::integers::<usize>().max_value(3))],
-            max_latency: Duration::from_micros(tc.draw(gs::integers::<u64>().max_value(5000))),
+            fail_one_in: [0, 0, 0, 23][tape.index(4, "fail one in")],
+            max_latency: Duration::from_micros(tape.int_in(0..=5000u64, "max latency us")),
             ..Faults::default()
         };
         // Half the runs with the store's index tables built off its thread.
-        let plants = Plants { index_off_thread: tc.draw(gs::booleans()), ..Plants::default() };
+        let plants = Plants { index_off_thread: tape.bool("index off thread"), ..Plants::default() };
         if let Err(why) = runs(&ops, seed, faults.clone(), plants)
             && !injected(&why)
         {
@@ -1287,16 +1284,12 @@ enum ImageOp {
     Reopen,
 }
 
-#[hegel::composite]
-fn image_op(tc: &TestCase) -> ImageOp {
-    match tc.draw(gs::integers::<u8>().max_value(9)) {
-        0 | 1 => ImageOp::Edit {
-            drop: tc.draw(gs::integers::<u8>().max_value(4)),
-            add: tc.draw(gs::integers::<u8>().max_value(5)),
-        },
-        2 | 3 => ImageOp::Make { flush: tc.draw(gs::booleans()), crash: tc.draw(gs::booleans()) },
-        4 | 5 => ImageOp::Place { crash: tc.draw(gs::booleans()) },
-        6 => ImageOp::Settle { crash: tc.draw(gs::booleans()) },
+fn image_op(tape: &Tape) -> ImageOp {
+    match tape.int_in(0..=9u8, "image op") {
+        0 | 1 => ImageOp::Edit { drop: tape.int_in(0..=4u8, "files dropped"), add: tape.int_in(0..=5u8, "files added") },
+        2 | 3 => ImageOp::Make { flush: tape.bool("flush"), crash: tape.bool("crash") },
+        4 | 5 => ImageOp::Place { crash: tape.bool("crash") },
+        6 => ImageOp::Settle { crash: tape.bool("crash") },
         7 => ImageOp::Flush,
         8 => ImageOp::Crash,
         _ => ImageOp::Reopen,
@@ -1532,12 +1525,12 @@ fn image_runs(ops: &[ImageOp], seed: u64, early_release: bool) -> Result<Imaged,
 /// image is written until the image after it is durable ([`FileSet`]), in memory and in what a
 /// start reads back, and a start finds the durable image's set listed, as the run that placed
 /// it left it. A full collection (three periods' ends, then a lap that forgets every record no
-/// root names) runs after every step. `HEGEL_TEST_CASES=<n>` runs it longer.
+/// root names) runs after every step. `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn a_collect_keeps_every_text_the_durable_image_names() {
-    run_cases(16, |tc| {
-        let ops = tc.draw(gs::vecs(image_op()).min_size(1).max_size(16));
-        let seed = tc.draw(gs::integers());
+    blaze_sim::check(SimConfig::cases(16), |tape| {
+        let ops = tape.vec(1..=16, "image ops", image_op);
+        let seed = tape.next_u64("sim seed");
         if let Err(why) = image_runs(&ops, seed, false) {
             panic!("seed {seed}, {ops:?}: {why}");
         }

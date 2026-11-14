@@ -1,11 +1,8 @@
-//! On Hegel and blaze-rng's seeded rng, to move to blaze-sim: this file replaced main's
-//! blaze-sim tests of the driver it rewrote (read-addressed records, D39).
-//!
-//! The driver under deterministic simulation (rule 43, 64): three crates of four items in two
-//! files each, edited at random; every request runs the real driver, the real record formats,
-//! the real [`Universe::answer`] and the real outside machine, with the host's answers delivered
-//! in a seeded random order, puts landing when delivered, and the process killed at random
-//! points.
+//! The driver under deterministic simulation (rule 43, 64), on blaze-sim: three crates of four
+//! items in two files each, edited as the tape chooses; every request runs the real driver, the
+//! real record formats, the real [`Universe::answer`] and the real outside machine, with the
+//! host's answers delivered in an order the tape chooses (a [`Flight`]), puts landing when
+//! delivered, and the process killed at points the tape chooses.
 //!
 //! The model's tasks read what they are handed and ask by value-dependent shapes: a surface asks
 //! a dependency's second signature when its first one's digest is odd, a body asks a second
@@ -36,8 +33,7 @@ use std::{
 
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
-use blaze_rng::SplitMix64;
-use hegel::generators as gs;
+use blaze_sim::{Broke, Config, Flight, Nanos, Tape};
 
 use crate::{
     PLANT, Plant,
@@ -416,39 +412,42 @@ impl Sim {
     }
 
     /// Runs `f` over the universe `refs` and `made` name, its tables read from the store.
-    fn with_universe<R>(&self, asker: u32, refs: &[TableRef], made: &[Fact], f: impl FnOnce(Universe<'_>) -> R) -> Result<R, String> {
+    /// What goes wrong is the driver's (a table it names, the order it gives): the oracle's.
+    fn with_universe<R>(&self, asker: u32, refs: &[TableRef], made: &[Fact], f: impl FnOnce(Universe<'_>) -> R) -> Result<R, Broke> {
         let mut held: Vec<(u32, Owner, Aligned, Vec<Fact>)> = Vec::new();
         for table in refs {
             // A table with no surface yet (the asker's own, before its surface settles) is
             // not in the universe.
             let Some(surface) = table.surface else { continue };
             let Some(bytes) = self.get(Surface::TAG, surface.id()) else {
-                return Err(format!("unit {}'s table names a surface the store does not hold", table.unit));
+                return Err(Broke::Oracle(format!("unit {}'s table names a surface the store does not hold", table.unit)));
             };
             let made = match table.manifest {
                 None => made.to_vec(),
                 Some(manifest) => {
                     let Some(root) = self.get(UnitManifest::TAG, manifest.id()) else {
-                        return Err(format!("unit {}'s table names a manifest the store does not hold", table.unit));
+                        return Err(Broke::Oracle(format!("unit {}'s table names a manifest the store does not hold", table.unit)));
                     };
-                    let opened: &ManifestRoot = record::open::<UnitManifest>(root, &manifest).map_err(|e| e.to_string())?;
-                    opened.made.follow(root).map_err(|e| e.to_string())?.to_vec()
+                    let opened: &ManifestRoot = record::open::<UnitManifest>(root, &manifest).map_err(|e| Broke::Oracle(e.to_string()))?;
+                    opened.made.follow(root).map_err(|e| Broke::Oracle(e.to_string()))?.to_vec()
                 }
             };
             held.push((table.unit, table.owner, bytes.clone(), made));
         }
         let mut tables = Vec::new();
         for (unit, owner, surface, made) in &held {
-            tables.push(Table::of(*unit, *owner, surface, made).map_err(|why| format!("{why:?}"))?);
+            tables.push(Table::of(*unit, *owner, surface, made).map_err(|why| Broke::Oracle(format!("{why:?}")))?);
         }
         if tables.windows(2).any(|pair| pair[0].owner >= pair[1].owner) {
-            return Err("a universe not sorted by owner".into());
+            return Err(Broke::Oracle("a universe not sorted by owner".into()));
         }
         let late = self.world.late();
         Ok(f(Universe { asker, tables: &tables, outside: &late }))
     }
 
-    fn perform(&mut self, effect: &Effect<'_>) -> Result<Answer, String> {
+    /// What goes wrong is the driver's (a task it starts, a universe it hands out): the
+    /// oracle's.
+    fn perform(&mut self, effect: &Effect<'_>) -> Result<Answer, Broke> {
         Ok(match *effect {
             Effect::Get { ticket, tag, key, .. } => Answer::Got(ticket, self.get(tag, key).cloned()),
             Effect::Outside { ticket, .. } => Answer::Answers(ticket, vec![self.world.digest()]),
@@ -458,12 +457,12 @@ impl Sim {
                         .map(|id| universe.answer(id).map_err(|why| format!("an ask the universe refuses: {why:?}")))
                         .collect::<Result<Vec<ContentId>, String>>()
                 })?;
-                Answer::Answers(ticket, answers?)
+                Answer::Answers(ticket, answers.map_err(Broke::Oracle)?)
             }
             Effect::Run { ticket, task, universe, made, .. } => {
                 self.in_flight += 1;
                 if self.in_flight > WORKERS {
-                    return Err(format!("{} tasks at once: more tasks than workers", self.in_flight));
+                    return Err(Broke::Oracle(format!("{} tasks at once: more tasks than workers", self.in_flight)));
                 }
                 let (world, earlier) = (self.world, self.requests.saturating_sub(1));
                 match task {
@@ -475,28 +474,32 @@ impl Sim {
                     Task::Surface { unit, key } => {
                         let c = unit as usize;
                         if key != world.surface_key(c) {
-                            return Err(format!("unit {c}'s surface asked under another key"));
+                            return Err(Broke::Oracle(format!("unit {c}'s surface asked under another key")));
                         }
-                        let bytes = self.with_universe(unit, universe, made, |universe| {
-                            surface_task(&world, c, true, earlier, &mut |id: &ContentId| {
-                                universe.answer(id).map_err(|why| format!("{why:?}"))
-                            })
-                        })??;
+                        let bytes = self
+                            .with_universe(unit, universe, made, |universe| {
+                                surface_task(&world, c, true, earlier, &mut |id: &ContentId| {
+                                    universe.answer(id).map_err(|why| format!("{why:?}"))
+                                })
+                            })?
+                            .map_err(Broke::Oracle)?;
                         Answer::Wrote(ticket, Aligned::copy_from(&bytes))
                     }
                     Task::Body { unit, item, key } => {
                         let c = unit as usize;
                         let Some(i) = (0..ITEMS).find(|&i| stable(c, i) == item) else {
-                            return Err(format!("a body task for no item of unit {c}"));
+                            return Err(Broke::Oracle(format!("a body task for no item of unit {c}")));
                         };
                         if key != world.body_key(c, i) {
-                            return Err(format!("unit {c} item {i}'s body asked under another key"));
+                            return Err(Broke::Oracle(format!("unit {c} item {i}'s body asked under another key")));
                         }
-                        let bytes = self.with_universe(unit, universe, made, |universe| {
-                            body_task(&world, c, i, true, earlier, &mut |id: &ContentId| {
-                                universe.answer(id).map_err(|why| format!("{why:?}"))
-                            })
-                        })??;
+                        let bytes = self
+                            .with_universe(unit, universe, made, |universe| {
+                                body_task(&world, c, i, true, earlier, &mut |id: &ContentId| {
+                                    universe.answer(id).map_err(|why| format!("{why:?}"))
+                                })
+                            })?
+                            .map_err(Broke::Oracle)?;
                         Answer::Wrote(ticket, Aligned::copy_from(&bytes))
                     }
                 }
@@ -539,26 +542,32 @@ impl Sim {
     }
 
     /// One request, to its outcome and what it ran; `None` when it was killed.
-    fn request<M: Memo>(&mut self, memo: &mut M, rng: &mut SplitMix64, kill: Option<u32>) -> Result<Option<Outcome>, String> {
+    fn request<M: Memo>(&mut self, memo: &mut M, tape: &Tape, kill: Option<u32>) -> Result<Option<Outcome>, Broke> {
         self.in_flight = 0;
         self.requests += 1;
         let plans: Vec<UnitPlan<'static>> =
             (0..UNITS).map(|c| UnitPlan { deps: DEPS[c], last: self.last[c], namespace: Namespace::LOCAL, owner: owner(c) }).collect();
-        let outcome = proof::scope(|snap| self.drive(snap, memo, rng, kill, &plans))?;
+        let outcome = proof::scope(|snap| self.drive(snap, memo, tape, kill, &plans))?;
         if let Some(outcome) = &outcome {
             self.last = self.check_end(outcome, M::AUDIT)?.map(Some);
         }
         Ok(outcome)
     }
 
-    fn drive<M: Memo>(&mut self, snap: Snapshot<'_>, memo: &mut M, rng: &mut SplitMix64, kill: Option<u32>, plans: &[UnitPlan<'_>]) -> Result<Option<Outcome>, String> {
+    /// The host's answers are a [`Flight`]: each step the tape chooses whether one is delivered
+    /// before the driver is asked again, and which; calm asks the driver first and delivers the
+    /// oldest when it waits.
+    fn drive<M: Memo>(&mut self, snap: Snapshot<'_>, memo: &mut M, tape: &Tape, kill: Option<u32>, plans: &[UnitPlan<'_>]) -> Result<Option<Outcome>, Broke> {
         let plan = Plan { certificate: certificate(), namespace: Namespace::LOCAL, units: plans };
-        let mut driver = Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| format!("{error:?}"))?;
-        let mut queue: Vec<Answer> = Vec::new();
+        let mut driver =
+            Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| Broke::Harness(format!("{error:?}")))?;
+        let mut flight: Flight<Answer> = Flight::new();
         let mut performed = 0u32;
         for _ in 0..50_000 {
-            if !queue.is_empty() && rng.coin() {
-                let answer = queue.swap_remove(rng.index(queue.len()));
+            if !flight.is_empty() && tape.coin("deliver early") {
+                let Some(answer) = flight.deliver(tape, Nanos(0)) else {
+                    return Err(Broke::Harness("answers are in flight, yet none is due".into()));
+                };
                 self.deliver(&mut driver, answer);
                 continue;
             }
@@ -572,6 +581,8 @@ impl Sim {
                 Step::Do(effect) => {
                     performed += 1;
                     if kill == Some(performed) {
+                        // A kill: what was in flight is gone, unanswered puts with it.
+                        flight.kill();
                         return Ok(None);
                     }
                     Act::Asked(self.perform(&effect)?)
@@ -583,43 +594,44 @@ impl Sim {
                     if let Outcome::Certified { .. } = outcome
                         && driver.certified().is_none()
                     {
-                        return Err("a certified outcome with no certificate proof".into());
+                        return Err(Broke::Oracle("a certified outcome with no certificate proof".into()));
                     }
                     return Ok(Some(outcome));
                 }
-                Act::Asked(answer) => queue.push(answer),
-                Act::Wait if queue.is_empty() => return Err("the driver waits with nothing asked".into()),
+                Act::Asked(answer) => flight.ask(answer),
                 Act::Wait => {
-                    let answer = queue.swap_remove(rng.index(queue.len()));
+                    let Some(answer) = flight.deliver(tape, Nanos(0)) else {
+                        return Err(Broke::Oracle("the driver waits with nothing asked".into()));
+                    };
                     self.deliver(&mut driver, answer);
                 }
             }
         }
-        Err("no outcome in 50000 steps".into())
+        Err(Broke::Harness("no outcome in 50000 steps".into()))
     }
 
     /// The oracle at a request's end: the manifests the certificate names, each checked
     /// against a from-scratch build.
-    fn check_end(&self, outcome: &Outcome, audit: bool) -> Result<[Key<UnitManifest>; UNITS], String> {
+    fn check_end(&self, outcome: &Outcome, audit: bool) -> Result<[Key<UnitManifest>; UNITS], Broke> {
         let checks: Checks = match outcome {
             Outcome::Certified { checks } => *checks,
             Outcome::Built { ran, filed: Filed::Certificate } => ran.checks,
             Outcome::Built { ran, filed: Filed::Audited } if audit => ran.checks,
-            other => return Err(format!("the request ended {other:?}")),
+            other => return Err(Broke::Oracle(format!("the request ended {other:?}"))),
         };
         if checks.rechecks != 0 {
-            return Err(format!("{} checks of an item already proved: a check after a proof", checks.rechecks));
+            return Err(Broke::Oracle(format!("{} checks of an item already proved: a check after a proof", checks.rechecks)));
         }
         let address = outside::address(certificate(), SHAPE, &[self.world.digest()]);
         let Some(bytes) = self.get(Certificate::TAG, address.id()) else {
-            return Err("an answer whose certificate the store does not hold".into());
+            return Err(Broke::Oracle("an answer whose certificate the store does not hold".into()));
         };
-        let root = record::open::<Certificate>(bytes, &address).map_err(|e| e.to_string())?;
-        let payload = root.payload.follow(bytes).map_err(|e| e.to_string())?;
+        let root = record::open::<Certificate>(bytes, &address).map_err(|e| Broke::Oracle(e.to_string()))?;
+        let payload = root.payload.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))?;
         if payload.len() != 32 * UNITS {
-            return Err("a certificate naming another number of manifests".into());
+            return Err(Broke::Oracle("a certificate naming another number of manifests".into()));
         }
-        let fresh = fresh(&self.world)?;
+        let fresh = fresh(&self.world).map_err(Broke::Harness)?;
         let mut manifests = [Key::from_id(ContentId([0; 32])); UNITS];
         for c in 0..UNITS {
             let mut id = [0u8; 32];
@@ -630,64 +642,65 @@ impl Sim {
         Ok(manifests)
     }
 
-    fn true_now(&self, c: usize, body: bool, reads: &[Fact], what: &str) -> Result<(), String> {
+    /// A read the model cannot answer is the harness's; one not true now, the oracle's.
+    fn true_now(&self, c: usize, body: bool, reads: &[Fact], what: &str) -> Result<(), Broke> {
         for read in reads {
-            if self.world.value(c, body, &read.id)? != read.digest {
-                return Err(format!("unit {c}'s {what} holds a read that is not true now: not what a fresh build files"));
+            if self.world.value(c, body, &read.id).map_err(Broke::Harness)? != read.digest {
+                return Err(Broke::Oracle(format!("unit {c}'s {what} holds a read that is not true now: not what a fresh build files")));
             }
         }
         Ok(())
     }
 
-    fn check_unit(&self, c: usize, manifest: Key<UnitManifest>, fresh: &Fresh) -> Result<(), String> {
+    fn check_unit(&self, c: usize, manifest: Key<UnitManifest>, fresh: &Fresh) -> Result<(), Broke> {
         let Some(bytes) = self.get(UnitManifest::TAG, manifest.id()) else {
-            return Err(format!("unit {c}'s manifest is named but the store does not hold it"));
+            return Err(Broke::Oracle(format!("unit {c}'s manifest is named but the store does not hold it")));
         };
-        let root: &ManifestRoot = record::open::<UnitManifest>(bytes, &manifest).map_err(|e| e.to_string())?;
+        let root: &ManifestRoot = record::open::<UnitManifest>(bytes, &manifest).map_err(|e| Broke::Oracle(e.to_string()))?;
         if root.key != fresh.text.id() {
-            return Err(format!("unit {c}'s manifest is of another text: not what a fresh build files"));
+            return Err(Broke::Oracle(format!("unit {c}'s manifest is of another text: not what a fresh build files")));
         }
         let Some(surface) = self.get(Surface::TAG, root.surface) else {
-            return Err(format!("unit {c}'s surface is named but the store does not hold it"));
+            return Err(Broke::Oracle(format!("unit {c}'s surface is named but the store does not hold it")));
         };
-        if result_of(surface)? != fresh.surface || root.surface_result != fresh.surface {
-            return Err(format!("unit {c}'s surface is not what a fresh build files"));
+        if result_of(surface).map_err(Broke::Oracle)? != fresh.surface || root.surface_result != fresh.surface {
+            return Err(Broke::Oracle(format!("unit {c}'s surface is not what a fresh build files")));
         }
-        let surface_root = blaze_format::open::<Traced>(surface).map_err(|e| e.to_string())?;
-        self.true_now(c, false, surface_root.reads.follow(surface).map_err(|e| e.to_string())?, "surface")?;
-        let dictionary = root.dictionary.follow(bytes).map_err(|e| e.to_string())?;
+        let surface_root = blaze_format::open::<Traced>(surface).map_err(|e| Broke::Oracle(e.to_string()))?;
+        self.true_now(c, false, surface_root.reads.follow(surface).map_err(|e| Broke::Oracle(e.to_string()))?, "surface")?;
+        let dictionary = root.dictionary.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))?;
         self.true_now(c, true, dictionary, "dictionary")?;
-        if root.made.follow(bytes).map_err(|e| e.to_string())? != &fresh.made[..] {
-            return Err(format!("unit {c}'s made table is not what a fresh build files"));
+        if root.made.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))? != &fresh.made[..] {
+            return Err(Broke::Oracle(format!("unit {c}'s made table is not what a fresh build files")));
         }
         let mut items = BTreeSet::new();
-        for file in root.files.follow(bytes).map_err(|e| e.to_string())? {
+        for file in root.files.follow(bytes).map_err(|e| Broke::Oracle(e.to_string()))? {
             let Some(chunk) = self.get(crate::kind::UnitChunk::TAG, file.chunk) else {
-                return Err(format!("unit {c}'s chunk is named but the store does not hold it"));
+                return Err(Broke::Oracle(format!("unit {c}'s chunk is named but the store does not hold it")));
             };
             let chunk_root: &ChunkRoot =
-                record::open::<crate::kind::UnitChunk>(chunk, &Key::from_id(file.chunk)).map_err(|e| e.to_string())?;
-            for entry in chunk_root.entries.follow(chunk).map_err(|e| e.to_string())? {
+                record::open::<crate::kind::UnitChunk>(chunk, &Key::from_id(file.chunk)).map_err(|e| Broke::Oracle(e.to_string()))?;
+            for entry in chunk_root.entries.follow(chunk).map_err(|e| Broke::Oracle(e.to_string()))? {
                 let item = StableId(entry.item);
                 let Some((key, result)) = fresh.bodies.get(&item) else {
-                    return Err(format!("unit {c}'s manifest names an item it does not have"));
+                    return Err(Broke::Oracle(format!("unit {c}'s manifest names an item it does not have")));
                 };
                 if entry.key != key.id() {
-                    return Err(format!("unit {c}'s entry is under another key: not what a fresh build files"));
+                    return Err(Broke::Oracle(format!("unit {c}'s entry is under another key: not what a fresh build files")));
                 }
                 let Some(record) = self.get(Body::TAG, entry.address) else {
-                    return Err(format!("unit {c}'s body is named but the store does not hold it"));
+                    return Err(Broke::Oracle(format!("unit {c}'s body is named but the store does not hold it")));
                 };
-                if result_of(record)? != *result || entry.result != *result {
-                    return Err(format!("unit {c}'s body is not what a fresh build files"));
+                if result_of(record).map_err(Broke::Oracle)? != *result || entry.result != *result {
+                    return Err(Broke::Oracle(format!("unit {c}'s body is not what a fresh build files")));
                 }
-                let body_root = blaze_format::open::<Traced>(record).map_err(|e| e.to_string())?;
-                self.true_now(c, true, body_root.reads.follow(record).map_err(|e| e.to_string())?, "body")?;
+                let body_root = blaze_format::open::<Traced>(record).map_err(|e| Broke::Oracle(e.to_string()))?;
+                self.true_now(c, true, body_root.reads.follow(record).map_err(|e| Broke::Oracle(e.to_string()))?, "body")?;
                 items.insert(item);
             }
         }
         if items.len() != ITEMS {
-            return Err(format!("unit {c}'s manifest names {} items of {ITEMS}", items.len()));
+            return Err(Broke::Oracle(format!("unit {c}'s manifest names {} items of {ITEMS}", items.len())));
         }
         Ok(())
     }
@@ -730,24 +743,23 @@ enum Op {
 
 const REQUEST: Op = Op::Request { kill: None };
 
-/// Runs `ops` from an empty store, each process with a memo from `make`: the outcomes of the
-/// requests that finished, and the simulation.
-fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn() -> M) -> Result<(Vec<Outcome>, Sim), String> {
+/// Runs `ops` from an empty store, each process with a memo from `make`, the host's schedule
+/// drawn from `tape`: the outcomes of the requests that finished, and the simulation.
+fn run<M: Memo>(ops: &[Op], tape: &Tape, plant: Plant, kills: bool, make: impl Fn() -> M) -> Result<(Vec<Outcome>, Sim), Broke> {
     PLANT.set(plant);
     let result = (|| {
         let mut sim = Sim::new();
-        let mut rng = SplitMix64::new(seed);
         let mut memo = make();
         let mut outcomes = Vec::new();
         let mut answered = false;
         for &op in ops {
             match op {
-                Op::Request { kill } => match sim.request(&mut memo, &mut rng, kill.filter(|_| kills))? {
+                Op::Request { kill } => match sim.request(&mut memo, tape, kill.filter(|_| kills))? {
                     Some(outcome) => {
                         let settled = matches!(outcome, Outcome::Certified { .. })
                             || (M::AUDIT && matches!(outcome, Outcome::Built { filed: Filed::Audited, .. }));
                         if answered && !settled {
-                            return Err(format!("a request with no edit after an answer ended {outcome:?}"));
+                            return Err(Broke::Oracle(format!("a request with no edit after an answer ended {outcome:?}")));
                         }
                         answered = true;
                         outcomes.push(outcome);
@@ -770,19 +782,23 @@ fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn(
     result
 }
 
-#[hegel::composite]
-fn op(tc: &hegel::TestCase) -> Op {
-    let c = tc.draw(gs::integers::<u8>().max_value(2)) as usize;
-    let i = tc.draw(gs::integers::<u8>().max_value(3)) as usize;
-    let v = tc.draw(gs::integers::<u8>().max_value(3));
-    match tc.draw(gs::integers::<u8>().max_value(8)) {
+fn op(tape: &Tape) -> Op {
+    let c = tape.int_in(0..=2u8, "unit") as usize;
+    let i = tape.int_in(0..=3u8, "item") as usize;
+    let v = tape.int_in(0..=3u8, "value");
+    match tape.int_in(0..=8u8, "op") {
         0 | 1 => Op::Body(c, i, v),
         2 | 3 => Op::Sig(c, i, v),
         4 => Op::Env(i % 2, (v > 0).then_some(v)),
         5 => Op::Restart,
-        6 => Op::Request { kill: Some(u32::from(tc.draw(gs::integers::<u8>().max_value(120))) + 1) },
+        6 => Op::Request { kill: Some(u32::from(tape.int_in(0..=120u8, "kill at")) + 1) },
         _ => REQUEST,
     }
+}
+
+/// Up to 30 ops, each its own span.
+fn ops(tape: &Tape) -> Vec<Op> {
+    tape.vec(0..=30, "ops", op)
 }
 
 const CAP: u64 = 1 << 20;
@@ -791,45 +807,43 @@ const CAP: u64 = 1 << 20;
 /// host's answers, every unit's manifest a finished request names holds what a from-scratch
 /// build by value makes, the store holds all it names, no check follows a proof, at most
 /// `max(workers, 1)` tasks run, and a request after an answer with no edit is certified.
-#[hegel::test(test_cases = 200)]
-fn the_driver_builds_what_a_fresh_build_builds(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None, true, || RecordsOnly) {
-        panic!("{why}");
-    }
+#[test]
+fn the_driver_builds_what_a_fresh_build_builds() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || RecordsOnly).map(|_| ())
+    });
 }
 
 /// The invariant: the same under `Resident`, a memo kept across requests of one process.
-#[hegel::test(test_cases = 200)]
-fn a_resident_driver_builds_what_a_fresh_build_builds(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None, true, || Resident::new(CAP)) {
-        panic!("{why}");
-    }
+#[test]
+fn a_resident_driver_builds_what_a_fresh_build_builds() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || Resident::new(CAP)).map(|_| ())
+    });
 }
 
 /// The invariant: `Audit`, which redoes every hit and compares bytes, never faults without a
 /// plant: every record found at an address is the one its work makes again.
-#[hegel::test(test_cases = 200)]
-fn audit_never_faults_without_a_plant(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = run(&ops, seed, Plant::None, true, || Audit) {
-        panic!("{why}");
-    }
+#[test]
+fn audit_never_faults_without_a_plant() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        run(&ops, tape, Plant::None, true, || Audit).map(|_| ())
+    });
 }
 
-fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    let (plain, plain_sim) = run(ops, seed, plant, false, || RecordsOnly)?;
-    let (resident, resident_sim) = run(ops, seed, plant, false, || Resident::new(CAP))?;
+/// Both memos run `ops` on the same schedule: each on its own tape of `seed`.
+fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), Broke> {
+    let (plain, plain_sim) = run(ops, &Tape::seeded(seed), plant, false, || RecordsOnly)?;
+    let (resident, resident_sim) = run(ops, &Tape::seeded(seed), plant, false, || Resident::new(CAP))?;
     if plain != resident {
-        return Err(format!("outcomes differ: records-only {plain:?}, resident {resident:?}"));
+        return Err(Broke::Oracle(format!("outcomes differ: records-only {plain:?}, resident {resident:?}")));
     }
     let bytes = |sim: &Sim| sim.disk.iter().map(|(key, bytes)| (*key, bytes.to_vec())).collect::<Vec<_>>();
     if bytes(&plain_sim) != bytes(&resident_sim) {
-        return Err("the stores differ between records-only and resident".into());
+        return Err(Broke::Oracle("the stores differ between records-only and resident".into()));
     }
     Ok(())
 }
@@ -837,38 +851,39 @@ fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
 /// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes (what
 /// ran and the check counters included) and the same records written, for any edits and
 /// restarts.
-#[hegel::test(test_cases = 200)]
-fn resident_refines_records_only(tc: hegel::TestCase) {
-    let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
-    let seed = tc.draw(gs::integers::<u64>());
-    if let Err(why) = refines(&ops, seed, Plant::None) {
-        panic!("{why}");
-    }
+#[test]
+fn resident_refines_records_only() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let ops = ops(tape);
+        let seed = tape.next_u64("schedule seed");
+        refines(&ops, seed, Plant::None)
+    });
 }
 
-/// `ops` pass as the code is, and with `plant` some seed's run is refused saying one of `says`.
-fn caught(ops: &[Op], plant: Plant, says: &[&str], check: impl Fn(&[Op], u64, Plant) -> Result<(), String>) {
-    let mut caught = false;
-    for seed in 0..16 {
-        check(ops, seed, Plant::None).unwrap_or_else(|why| panic!("unplanted, seed {seed}: {why}"));
-        if let Err(why) = check(ops, seed, plant) {
-            assert!(says.iter().any(|says| why.contains(says)), "{plant:?}: {why}");
-            caught = true;
-        }
-    }
-    assert!(caught, "the oracle missed {plant:?}");
+/// What a finding in one of a control's words is marked with, so one string names them all.
+const SAID: &str = "in the control's words: ";
+
+/// `ops` pass in every case as the code is, and with `plant` some case is refused by the oracle
+/// saying one of `says`: [`blaze_sim::control`] over 16 schedules, as many as the seeds the
+/// loop it replaced ran.
+#[track_caller]
+fn caught(ops: &[Op], plant: Plant, says: &[&str], check: impl Fn(&[Op], &Tape, Plant) -> Result<(), Broke>) {
+    blaze_sim::control(Config::cases(16), Plant::None, plant, SAID, |tape, plant| match check(ops, tape, plant) {
+        Err(Broke::Oracle(why)) if says.iter().any(|says| why.contains(says)) => Err(Broke::Oracle(format!("{SAID}{why}"))),
+        ran => ran,
+    });
 }
 
-fn plain(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    run(ops, seed, plant, true, || RecordsOnly).map(|_| ())
+fn plain(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || RecordsOnly).map(|_| ())
 }
 
-fn audited(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    run(ops, seed, plant, true, || Audit).map(|_| ())
+fn audited(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || Audit).map(|_| ())
 }
 
-fn resident(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
-    run(ops, seed, plant, true, || Resident::new(CAP)).map(|_| ())
+fn resident(ops: &[Op], tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(ops, tape, plant, true, || Resident::new(CAP)).map(|_| ())
 }
 
 /// Every edit of every item, each followed by a request: what most controls run.
@@ -968,11 +983,11 @@ fn the_oracle_catches_a_lookup_under_a_held_mark() {
 fn last_request(ops: &[Op], before_last: impl FnOnce(&mut Sim)) -> (Outcome, (u32, u32)) {
     let (init, last) = ops.split_at(ops.len() - 1);
     assert_eq!(last, [REQUEST]);
-    let (_, mut sim) = run(init, 7, Plant::None, false, || RecordsOnly).unwrap();
+    let (_, mut sim) = run(init, &Tape::seeded(7), Plant::None, false, || RecordsOnly).unwrap();
     before_last(&mut sim);
     let missing = sim.missing().unwrap();
     let mut memo = RecordsOnly;
-    let outcome = sim.request(&mut memo, &mut SplitMix64::new(11), None).unwrap().unwrap();
+    let outcome = sim.request(&mut memo, &Tape::seeded(11), None).unwrap().unwrap();
     (outcome, missing)
 }
 
@@ -1074,16 +1089,17 @@ fn every_case_is_reached() {
     ] {
         cases.insert(name, 0);
     }
-    let mut rng = SplitMix64::new(3);
+    // The plans of every run, from one tape; each run's schedule from a tape of its own seed.
+    let plans = Tape::seeded(3);
     for seed in 0..48 {
         let mut ops = vec![REQUEST];
         for _ in 0..24 {
-            let (c, i, v) = (rng.index(UNITS), rng.index(ITEMS), rng.below(4) as u8);
-            ops.push(match rng.below(10) {
+            let (c, i, v) = (plans.index(UNITS, "unit"), plans.index(ITEMS, "item"), plans.below(4, "value") as u8);
+            ops.push(match plans.below(10, "op") {
                 0..=3 => Op::Body(c, i, v),
                 4..=6 => Op::Sig(c, i, v),
                 7 => Op::Env(i % 2, (v > 0).then_some(v)),
-                8 => Op::Request { kill: Some(rng.below(60) as u32 + 1) },
+                8 => Op::Request { kill: Some(plans.below(60, "kill at") as u32 + 1) },
                 _ => REQUEST,
             });
             if matches!(ops.last(), Some(Op::Env(..))) {
@@ -1091,7 +1107,8 @@ fn every_case_is_reached() {
             }
             ops.push(REQUEST);
         }
-        let (outcomes, _) = run(&ops, seed, Plant::None, true, || RecordsOnly).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        let (outcomes, _) =
+            run(&ops, &Tape::seeded(seed), Plant::None, true, || RecordsOnly).unwrap_or_else(|why| panic!("seed {seed}: {why}"));
         let requests = ops.iter().filter(|op| matches!(op, Op::Request { .. })).count();
         *cases.get_mut("killed").unwrap() += (requests - outcomes.len()) as u32;
         for outcome in outcomes {
@@ -1168,10 +1185,10 @@ fn a_fact_routes_by_its_owner_and_kind() {
     assert!(record::route(&unrouted).is_err());
 }
 
-fn drawn_id(tc: &hegel::TestCase) -> ContentId {
+fn drawn_id(tape: &Tape) -> ContentId {
     let mut id = [0u8; 32];
     for chunk in id.chunks_mut(8) {
-        chunk.copy_from_slice(&tc.draw(gs::integers::<u64>()).to_le_bytes());
+        chunk.copy_from_slice(&tape.int::<u64>("id").to_le_bytes());
     }
     ContentId(id)
 }
@@ -1179,25 +1196,27 @@ fn drawn_id(tc: &hegel::TestCase) -> ContentId {
 /// The invariant: a segment reference [`crate::store::SegmentRef::new`] made decodes from its
 /// row to itself; a row of another length, with its padding not zero, or naming an index off
 /// [`crate::store::ALIGN`], is refused.
-#[hegel::test(test_cases = 200)]
-fn a_segment_ref_round_trips(tc: hegel::TestCase) {
+#[test]
+fn a_segment_ref_round_trips() {
     use crate::store::{ALIGN, ENTRY, FOOTER, HEADER, SegmentId, SegmentRef, WireError};
 
-    let digest = SegmentId(drawn_id(&tc));
-    let index_at = tc.draw(gs::integers::<u64>().min_value(HEADER as u64 / ALIGN).max_value(1 << 24)) * ALIGN;
-    let count = tc.draw(gs::integers::<u32>().max_value(1 << 20));
-    let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
-    let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
-    let row = made.encode();
-    assert_eq!(SegmentRef::decode(&row), Ok(made));
-    assert_eq!((made.digest(), made.size(), made.index_at(), made.count()), (digest, len, index_at, count));
-    assert!(matches!(SegmentRef::decode(&row[..SegmentRef::ROW - 1]), Err(WireError::Length { .. })));
-    let mut padded = row;
-    padded[SegmentRef::ROW - 1] = 1;
-    assert_eq!(SegmentRef::decode(&padded), Err(WireError::Padding { at: 52 }));
-    assert!(matches!(SegmentRef::new(digest, len + 1, index_at + 1, count), Err(WireError::Index { .. })));
-    assert!(matches!(SegmentRef::new(digest, len + 1, index_at, count), Err(WireError::Index { .. })));
-    assert!(SegmentRef::new(digest, len, HEADER as u64 - ALIGN, count).is_err(), "an index inside the header");
+    blaze_sim::check(Config::cases(200), |tape| {
+        let digest = SegmentId(drawn_id(tape));
+        let index_at = tape.int_in(HEADER as u64 / ALIGN..=(1u64 << 24), "index at") * ALIGN;
+        let count = tape.int_in(0..=(1u32 << 20), "count");
+        let len = index_at + u64::from(count) * ENTRY as u64 + FOOTER as u64;
+        let made = SegmentRef::new(digest, len, index_at, count).unwrap_or_else(|why| panic!("{why}"));
+        let row = made.encode();
+        assert_eq!(SegmentRef::decode(&row), Ok(made));
+        assert_eq!((made.digest(), made.size(), made.index_at(), made.count()), (digest, len, index_at, count));
+        assert!(matches!(SegmentRef::decode(&row[..SegmentRef::ROW - 1]), Err(WireError::Length { .. })));
+        let mut padded = row;
+        padded[SegmentRef::ROW - 1] = 1;
+        assert_eq!(SegmentRef::decode(&padded), Err(WireError::Padding { at: 52 }));
+        assert!(matches!(SegmentRef::new(digest, len + 1, index_at + 1, count), Err(WireError::Index { .. })));
+        assert!(matches!(SegmentRef::new(digest, len + 1, index_at, count), Err(WireError::Index { .. })));
+        assert!(SegmentRef::new(digest, len, HEADER as u64 - ALIGN, count).is_err(), "an index inside the header");
+    });
 }
 
 /// A segment length is taken at both ends of its range and refused one past each.
@@ -1213,63 +1232,67 @@ fn a_segment_len_is_bounded_at_both_ends() {
 
 /// The invariant: a statement decodes from its 200 bytes to itself; bytes cut short or
 /// extended, a tier byte that names no tier, or padding not zero, are refused.
-#[hegel::test(test_cases = 200)]
-fn a_statement_round_trips(tc: hegel::TestCase) {
+#[test]
+fn a_statement_round_trips() {
     use crate::kind::Tier;
     use crate::store::{SegmentId, SegmentLen, Statement, WireError};
 
-    let len = tc.draw(gs::integers::<u64>().min_value(SegmentLen::LEAST).max_value(SegmentLen::MOST));
-    let mut signature = [0u8; 64];
-    signature[..32].copy_from_slice(&drawn_id(&tc).0);
-    signature[32..].copy_from_slice(&drawn_id(&tc).0);
-    let statement = Statement {
-        namespace: Namespace(tc.draw(gs::integers::<u64>())),
-        segment: SegmentId(drawn_id(&tc)),
-        len: SegmentLen::new(len).unwrap_or_else(|why| panic!("{why}")),
-        toolchain: drawn_id(&tc),
-        records: tc.draw(gs::integers::<u32>()),
-        tier: if tc.draw(gs::integers::<u8>().max_value(1)) == 1 { Tier::Fast } else { Tier::Top },
-        issued: tc.draw(gs::integers::<u64>()),
-        signer: drawn_id(&tc).0,
-        signature,
-    };
-    let bytes = statement.encode();
-    assert_eq!(&bytes[..Statement::BODY], &statement.body()[..]);
-    assert_eq!(Statement::decode(&bytes), Ok(statement));
-    let cut = usize::from(tc.draw(gs::integers::<u16>().max_value(Statement::LEN as u16 - 1)));
-    assert_eq!(Statement::decode(&bytes[..cut]), Err(WireError::Length { len: cut, wanted: Statement::LEN }));
-    let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
-    extended.extend_from_slice(&bytes);
-    extended.push(0);
-    assert_eq!(Statement::decode(&extended), Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN }));
-    let mut tier = bytes;
-    tier[92] = 2;
-    assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
-    let mut padded = bytes;
-    padded[94] = 1;
-    assert_eq!(Statement::decode(&padded), Err(WireError::Padding { at: 94 }));
+    blaze_sim::check(Config::cases(200), |tape| {
+        let len = tape.int_in(SegmentLen::LEAST..=SegmentLen::MOST, "len");
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&drawn_id(tape).0);
+        signature[32..].copy_from_slice(&drawn_id(tape).0);
+        let statement = Statement {
+            namespace: Namespace(tape.int::<u64>("namespace")),
+            segment: SegmentId(drawn_id(tape)),
+            len: SegmentLen::new(len).unwrap_or_else(|why| panic!("{why}")),
+            toolchain: drawn_id(tape),
+            records: tape.int::<u32>("records"),
+            tier: if tape.int_in(0..=1u8, "tier") == 1 { Tier::Fast } else { Tier::Top },
+            issued: tape.int::<u64>("issued"),
+            signer: drawn_id(tape).0,
+            signature,
+        };
+        let bytes = statement.encode();
+        assert_eq!(&bytes[..Statement::BODY], &statement.body()[..]);
+        assert_eq!(Statement::decode(&bytes), Ok(statement));
+        let cut = usize::from(tape.int_in(0..=Statement::LEN as u16 - 1, "cut"));
+        assert_eq!(Statement::decode(&bytes[..cut]), Err(WireError::Length { len: cut, wanted: Statement::LEN }));
+        let mut extended = Vec::with_capacity_in(Statement::LEN + 1, Global);
+        extended.extend_from_slice(&bytes);
+        extended.push(0);
+        assert_eq!(Statement::decode(&extended), Err(WireError::Length { len: Statement::LEN + 1, wanted: Statement::LEN }));
+        let mut tier = bytes;
+        tier[92] = 2;
+        assert_eq!(Statement::decode(&tier), Err(WireError::Tier { found: 2 }));
+        let mut padded = bytes;
+        padded[94] = 1;
+        assert_eq!(Statement::decode(&padded), Err(WireError::Padding { at: 94 }));
+    });
 }
 
 /// The invariant: on a machine that is no trusted writer every package is filed in the
 /// machine's own namespace, whatever its origin: a fully local private build names no shared
 /// namespace. On a trusted writer, registry and toolchain packages are public and the rest the
 /// organisation's.
-#[hegel::test(test_cases = 200)]
-fn an_untrusted_machine_files_everything_locally(tc: hegel::TestCase) {
+#[test]
+fn an_untrusted_machine_files_everything_locally() {
     use crate::kind::{Origin, namespace_of};
 
-    let origin = match tc.draw(gs::integers::<u8>().max_value(2)) {
-        0 => Origin::Registry { checksum: drawn_id(&tc) },
-        1 => Origin::Toolchain,
-        _ => Origin::Private,
-    };
-    let org = Namespace(tc.draw(gs::integers::<u64>()));
-    assert_eq!(namespace_of(origin, org, false), Namespace::LOCAL);
-    let trusted = namespace_of(origin, org, true);
-    match origin {
-        Origin::Registry { .. } | Origin::Toolchain => assert_eq!(trusted, Namespace::PUBLIC),
-        Origin::Private => assert_eq!(trusted, org),
-    }
+    blaze_sim::check(Config::cases(200), |tape| {
+        let origin = match tape.int_in(0..=2u8, "origin") {
+            0 => Origin::Registry { checksum: drawn_id(tape) },
+            1 => Origin::Toolchain,
+            _ => Origin::Private,
+        };
+        let org = Namespace(tape.int::<u64>("org"));
+        assert_eq!(namespace_of(origin, org, false), Namespace::LOCAL);
+        let trusted = namespace_of(origin, org, true);
+        match origin {
+            Origin::Registry { .. } | Origin::Toolchain => assert_eq!(trusted, Namespace::PUBLIC),
+            Origin::Private => assert_eq!(trusted, org),
+        }
+    });
 }
 
 /// `TAGS` names every kind once: no tag twice, no name twice, each kind at its own tag.

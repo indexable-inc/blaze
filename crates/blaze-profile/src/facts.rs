@@ -625,21 +625,21 @@ mod tests {
     /// Every row lands in exactly one run, in order, and a run holds more than `most` bytes of
     /// text only when it is a single row: what keeps one flush's `key_parts` under the 2 GiB a
     /// `Utf8` column holds (#1726).
-    #[hegel::test(test_cases = 300)]
-    fn runs_keep_every_row_once_in_order_under_the_cap(tc: hegel::TestCase) {
-        use hegel::generators as gs;
-        let sizes: Vec<usize> =
-            tc.draw(gs::vecs(gs::integers::<usize>().max_value(1 << 12)).max_size(200));
-        let most = tc.draw(gs::integers::<usize>().max_value(1 << 13));
-        let rows: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
-        let mut seen = Vec::new();
-        for run in runs(&rows, |it| it.1, most) {
-            assert!(!run.is_empty(), "a run holds a row");
-            let bytes: usize = run.iter().map(|it| it.1).sum();
-            assert!(run.len() == 1 || bytes <= most, "{bytes} bytes in {} rows over {most}", run.len());
-            seen.extend(run.iter().map(|it| it.0));
-        }
-        assert_eq!(seen, (0..rows.len()).collect::<Vec<_>>());
+    #[test]
+    fn runs_keep_every_row_once_in_order_under_the_cap() {
+        blaze_sim::check(blaze_sim::Config::cases(300), |tape| {
+            let sizes: Vec<usize> = tape.vec(0..=200, "sizes", |tape| tape.int_in(0..=1usize << 12, "size"));
+            let most = tape.int_in(0..=1usize << 13, "most");
+            let rows: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
+            let mut seen = Vec::new();
+            for run in runs(&rows, |it| it.1, most) {
+                assert!(!run.is_empty(), "a run holds a row");
+                let bytes: usize = run.iter().map(|it| it.1).sum();
+                assert!(run.len() == 1 || bytes <= most, "{bytes} bytes in {} rows over {most}", run.len());
+                seen.extend(run.iter().map(|it| it.0));
+            }
+            assert_eq!(seen, (0..rows.len()).collect::<Vec<_>>());
+        });
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use std::alloc::Global;
 
-use hegel::generators as gs;
+use blaze_sim::Config;
 use syntax::TextRange;
 
 use super::uniform::{Shape, Term, classify};
@@ -30,78 +30,87 @@ const TEMPLATE: &str = "self . # . hash ( state )";
 
 /// The invariant: a body with one term per field, each the same template over its field, is
 /// [`Shape::Uniform`] and covers every field in declaration order.
-#[hegel::test(test_cases = 64)]
-fn one_template_over_every_field_is_uniform(tc: hegel::TestCase) {
-    let n: usize = tc.draw(gs::integers().min_value(2).max_value(12));
-    let owned = names(n);
-    let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let order: Vec<usize> = (0..n).collect();
-    let found = classify(&fields, &fields, &[], &terms(&order, TEMPLATE), 2, false);
-    assert_eq!(found.shape, Shape::Uniform, "{found:?}");
-    assert_eq!(found.template, TEMPLATE);
-    assert!(found.in_order(n), "{found:?}");
-    assert!(found.missing.is_empty() && found.odd.is_empty() && found.crossed.is_empty());
+#[test]
+fn one_template_over_every_field_is_uniform() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let n: usize = tape.int_in(2..=12, "fields");
+        let owned = names(n);
+        let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let order: Vec<usize> = (0..n).collect();
+        let found = classify(&fields, &fields, &[], &terms(&order, TEMPLATE), 2, false);
+        assert_eq!(found.shape, Shape::Uniform, "{found:?}");
+        assert_eq!(found.template, TEMPLATE);
+        assert!(found.in_order(n), "{found:?}");
+        assert!(found.missing.is_empty() && found.odd.is_empty() && found.crossed.is_empty());
+    });
 }
 
 /// The invariant: deleting one field's term from a uniform body of three fields or more gives
 /// [`Shape::AlmostUniform`] naming exactly that field missing; leaving the same field out with
 /// its reason gives [`Shape::Uniform`] back.
-#[hegel::test(test_cases = 64)]
-fn one_term_deleted_is_almost_uniform_naming_the_field(tc: hegel::TestCase) {
-    let n: usize = tc.draw(gs::integers().min_value(3).max_value(12));
-    let gone: usize = tc.draw(gs::integers().min_value(0).max_value(n - 1));
-    let owned = names(n);
-    let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let order: Vec<usize> = (0..n).filter(|it| *it != gone).collect();
-    let body = terms(&order, TEMPLATE);
-    let found = classify(&fields, &fields, &[], &body, 2, false);
-    assert_eq!(found.shape, Shape::AlmostUniform, "{found:?}");
-    assert_eq!(found.missing.as_slice(), &[gone], "{found:?}");
-    let excused = classify(&fields, &fields, &[gone], &body, 2, false);
-    assert_eq!(excused.shape, Shape::Uniform, "a field left out with its reason: {excused:?}");
+#[test]
+fn one_term_deleted_is_almost_uniform_naming_the_field() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let n: usize = tape.int_in(3..=12, "fields");
+        let gone: usize = tape.index(n, "gone");
+        let owned = names(n);
+        let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let order: Vec<usize> = (0..n).filter(|it| *it != gone).collect();
+        let body = terms(&order, TEMPLATE);
+        let found = classify(&fields, &fields, &[], &body, 2, false);
+        assert_eq!(found.shape, Shape::AlmostUniform, "{found:?}");
+        assert_eq!(found.missing.as_slice(), &[gone], "{found:?}");
+        let excused = classify(&fields, &fields, &[gone], &body, 2, false);
+        assert_eq!(excused.shape, Shape::Uniform, "a field left out with its reason: {excused:?}");
+    });
 }
 
 /// The invariant: the order of the terms does not change the verdict; a permuted uniform body
 /// is [`Shape::Uniform`] over the same fields, and in declaration order only when unpermuted.
-#[hegel::test(test_cases = 64)]
-fn permuting_the_terms_keeps_uniform(tc: hegel::TestCase) {
-    let n: usize = tc.draw(gs::integers().min_value(2).max_value(8));
-    let order: Vec<usize> = tc.draw(gs::permutations((0..n).collect::<Vec<usize>>()));
-    let owned = names(n);
-    let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let found = classify(&fields, &fields, &[], &terms(&order, TEMPLATE), 2, false);
-    assert_eq!(found.shape, Shape::Uniform, "{found:?}");
-    let mut covered = found.covered.to_vec();
-    covered.sort_unstable();
-    assert_eq!(covered, (0..n).collect::<Vec<usize>>());
-    let sorted = order.iter().enumerate().all(|(at, &it)| at == it);
-    assert_eq!(found.in_order(n), sorted, "{order:?}");
+#[test]
+fn permuting_the_terms_keeps_uniform() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let n: usize = tape.int_in(2..=8, "fields");
+        let mut order: Vec<usize> = (0..n).collect::<Vec<usize>>();
+        tape.shuffle(&mut order, "order");
+        let owned = names(n);
+        let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let found = classify(&fields, &fields, &[], &terms(&order, TEMPLATE), 2, false);
+        assert_eq!(found.shape, Shape::Uniform, "{found:?}");
+        let mut covered = found.covered.to_vec();
+        covered.sort_unstable();
+        assert_eq!(covered, (0..n).collect::<Vec<usize>>());
+        let sorted = order.iter().enumerate().all(|(at, &it)| at == it);
+        assert_eq!(found.in_order(n), sorted, "{order:?}");
+    });
 }
 
 /// The invariant: one term of another template among three or more is odd, never covered, and
 /// the body is [`Shape::AlmostUniform`]; a term labelled with one field that reads another is
 /// crossed.
-#[hegel::test(test_cases = 64)]
-fn an_odd_term_and_a_crossed_term_are_named(tc: hegel::TestCase) {
-    let n: usize = tc.draw(gs::integers().min_value(4).max_value(10));
-    let odd: usize = tc.draw(gs::integers().min_value(0).max_value(n - 1));
-    let owned = names(n);
-    let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
-    let order: Vec<usize> = (0..n).collect();
-    let mut body = terms(&order, TEMPLATE);
-    body[odd].template = "other ( self . # )".to_owned();
-    let found = classify(&fields, &fields, &[], &body, 2, false);
-    assert_eq!(found.shape, Shape::AlmostUniform, "{found:?}");
-    assert_eq!(found.odd.as_slice(), &[odd]);
-    assert!(!found.covered.contains(&odd));
+#[test]
+fn an_odd_term_and_a_crossed_term_are_named() {
+    blaze_sim::check(Config::cases(64), |tape| {
+        let n: usize = tape.int_in(4..=10, "fields");
+        let odd: usize = tape.index(n, "odd");
+        let owned = names(n);
+        let fields: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let order: Vec<usize> = (0..n).collect();
+        let mut body = terms(&order, TEMPLATE);
+        body[odd].template = "other ( self . # )".to_owned();
+        let found = classify(&fields, &fields, &[], &body, 2, false);
+        assert_eq!(found.shape, Shape::AlmostUniform, "{found:?}");
+        assert_eq!(found.odd.as_slice(), &[odd]);
+        assert!(!found.covered.contains(&odd));
 
-    let mut body = terms(&order, TEMPLATE);
-    let (label, read) = (odd, (odd + 1) % n);
-    body[label].owner = Some(label);
-    body[label].reads[0] = read;
-    let found = classify(&fields, &fields, &[], &body, 2, false);
-    assert_eq!(found.crossed.as_slice(), &[(label, read)], "{found:?}");
-    assert_eq!(found.shape, Shape::AlmostUniform);
+        let mut body = terms(&order, TEMPLATE);
+        let (label, read) = (odd, (odd + 1) % n);
+        body[label].owner = Some(label);
+        body[label].reads[0] = read;
+        let found = classify(&fields, &fields, &[], &body, 2, false);
+        assert_eq!(found.crossed.as_slice(), &[(label, read)], "{found:?}");
+        assert_eq!(found.shape, Shape::AlmostUniform);
+    });
 }
 
 const MAIN: &str = r#"

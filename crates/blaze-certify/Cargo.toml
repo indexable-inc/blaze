@@ -35,7 +35,7 @@ blaze-report.workspace = true
 blaze-vfs.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

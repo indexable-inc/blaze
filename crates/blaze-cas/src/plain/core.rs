@@ -1503,7 +1503,7 @@ impl Plain {
     /// other slot blanked) is written, and has succeeded, before it, so no write of a flip can
     /// fail once its generation is on disk. A flip that commits and then stops would leave a
     /// durable generation whose news (the losses an open found and retired, a commit's
-    /// outcome) dies with the process (Hegel's seed 875559: an open's fresh flip retired the
+    /// outcome) dies with the process (seed 875559 of the property tests' former engine: an open's fresh flip retired the
     /// orphans a power cut left, its slot landed beside a failed cache tag write, it stopped,
     /// and the next open found them retired and reported none).
     fn write_slot(&self, effects: &mut Vec<Effect>) {

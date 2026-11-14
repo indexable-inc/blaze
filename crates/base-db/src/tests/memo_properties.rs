@@ -3,8 +3,7 @@
 
 use crate::FileId;
 use blaze_query::db::{Database as _, Durability};
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::{Config, Tape};
 
 use crate::{Db, FileText};
 
@@ -37,31 +36,30 @@ enum Op {
     SyntheticWrite,
 }
 
-fn text(tc: &TestCase) -> String {
-    tc.draw(gs::text().alphabet("ab\n").max_size(40))
+fn text(tape: &Tape) -> String {
+    tape.text_from("ab\n", 0..=40, "text")
 }
 
-#[hegel::composite]
-fn op(tc: &TestCase) -> Op {
-    let file = tc.draw(gs::integers().max_value(FILES - 1));
-    match tc.draw(gs::integers::<u8>().max_value(7)) {
-        0 | 1 => Op::Set(file, text(tc)),
-        2..6 => Op::Read { file, through: tc.draw(gs::booleans()) },
+fn op(tape: &Tape) -> Op {
+    let file = tape.int_in(0..=FILES - 1, "file");
+    match tape.int_in(0..=7u8, "op") {
+        0 | 1 => Op::Set(file, text(tape)),
+        2..6 => Op::Read { file, through: tape.bool("through") },
         6 => Op::Evict,
         _ => Op::SyntheticWrite,
     }
 }
 
-fn gives_what_recomputing_gives(tc: &TestCase) {
+fn gives_what_recomputing_gives(tape: &Tape) {
     let mut db = Db::for_tests();
     db.storage_mut().set_value_budget(blaze_mem::Tag::Query, Some(BUDGET));
     let mut model = Vec::new();
     for file in 0..FILES {
-        let text = text(tc);
+        let text = text(tape);
         db.set_file_text(FileId::from_raw(file), &text);
         model.push(text);
     }
-    for op in tc.draw(gs::vecs(op()).max_size(60)) {
+    for op in tape.vec(0..=60, "ops", op) {
         match op {
             Op::Set(file, text) => {
                 db.set_file_text(FileId::from_raw(file), &text);
@@ -82,15 +80,8 @@ fn gives_what_recomputing_gives(tc: &TestCase) {
     }
 }
 
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set.
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
-}
-
-/// `HEGEL_TEST_CASES=<n>` runs it longer.
+/// `BLAZE_SIM_SEEDS=<n>` runs it longer.
 #[test]
 fn memos_and_evictions_give_what_recomputing_gives() {
-    run_cases(64, |tc| gives_what_recomputing_gives(&tc));
+    blaze_sim::check(Config::cases(64), gives_what_recomputing_gives);
 }

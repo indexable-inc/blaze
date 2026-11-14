@@ -98,7 +98,7 @@ for layer 1's output where a region lifts.
   in a typed outcome that says how far it got. The best term found so far is valid and gets used,
   and `blaze explain` reports that the bound stopped it.
 - The rule set is data with one owner. Each rule carries the IEEE conditions it holds under, and a
-  Hegel property test checks each rule numerically over its domain.
+  blaze-sim property test checks each rule numerically over its domain.
 
 ## What is built
 

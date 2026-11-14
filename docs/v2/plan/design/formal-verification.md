@@ -74,8 +74,8 @@ hold for code that is not proved.
   code whose shape is still changing wastes the proof, just as `testing` says about unit
   tests.
 - **One kernel and crash model, shared.** The semantics of fsync, rename, mmap and torn
-  writes are written once, as a Lean model. `hegel::sim`'s simulated kernel follows the same
-  model. Two checks keep the model honest:
+  writes are written once, as a Lean model. The three-layer disk that `Sim` is to take
+  ([sim.md](sim.md), "Order") follows the same model. Two checks keep the model honest:
   1. **DST traces checked against the model.** The sim's trace of effects and crash states
      is replayed through the Lean model, compiled to an executable, which must allow every
      state the sim produced.
@@ -123,7 +123,7 @@ proves every clause it proved: two provers are two trust bases and two lowerings
   - a loop's `invariant` as an obligation, and termination from `decreases`: the Lean
     statement of a function with a loop is partial correctness, and `decreases`, `recommends`
     and a loop's `ensures` are refused by name;
-  - a counterexample from the solver's model: contracts part 2's Hegel run is the one source.
+  - a counterexample from the solver's model: contracts part 2's blaze-sim run is the one source.
 
 ## Shared pieces (all phases)
 
@@ -193,14 +193,14 @@ agents as data over the agent API ([roadmap §8](../../plan.md)):
          | Failed { tactic_error }
          | Unknown { heartbeats }
          | Refused { rule, at },     -- the VerifyRefused rule and the construct
-  counterexample?,                   -- from contracts part 2's Hegel run, which goes first
+  counterexample?,                   -- from contracts part 2's blaze-sim run, which goes first
   model: path of the generated Lean }
 ```
 
 - **The goal state is the main value for an agent.** An agent edits the proof file, reruns,
   and sees the goals that are left.
 - **`Open` and `Unknown` never count as success.**
-- **Hegel goes first.** A Hegel counterexample (contracts part 2) is reported before any
+- **The property test goes first.** A blaze-sim counterexample (contracts part 2) is reported before any
   proof is attempted, so nobody spends effort proving a false spec.
 
 ## v0: safe Rust, functional translation
@@ -251,7 +251,7 @@ used, `sort_unstable_by_key`, and `chunk_by`.
 - **Starting point.** It begins from a fork of Aeneas's Lean library (its `Std`, the monad,
   and the `progress` tactic), so SymCrypt-style proof scripts and agent prompts carry over.
 - **Trust.** It is part of the trust base. Each model function carries the pinned library
-  path it stands for, and a Hegel differential test compares the Lean model, compiled, with
+  path it stands for, and a blaze-sim differential test compares the Lean model, compiled, with
   the real std function that blaze built, on drawn inputs.
 
 **Refused.** Each names the item, the rule and the construct (`hir_ty_lean::NotTranslated`
@@ -282,7 +282,7 @@ transitive walk, so a refusal names the shortest call chain to the construct.
   something to prove correct.
 - **An LLBC emitter is a second, small back end** on the same structured-MIR query. It writes
   Charon's JSON at Charon's pinned version, so upstream Aeneas can run on a corpus. Its
-  output is checked two ways: (a) both Lean models run on Hegel-drawn inputs and must agree,
+  output is checked two ways: (a) both Lean models run on blaze-sim-drawn inputs and must agree,
   including on panics; and (b) for small functions, a Lean equivalence theorem between the two.
   This is the translator's test oracle in CI.
 - **It is not the bootstrap.** Charon's LLBC tracks rustc's MIR closely, and blaze's MIR
@@ -292,7 +292,7 @@ transitive walk, so a refusal names the shortest call chain to the construct.
 
 **How the translator is checked.**
 - The LLBC oracle above.
-- Differential execution: blaze-built Rust against the compiled Lean model on Hegel-drawn
+- Differential execution: blaze-built Rust against the compiled Lean model on blaze-sim-drawn
   inputs, for every function in the corpus.
 - Later, v4's soundness proof.
 
@@ -1177,7 +1177,8 @@ lifetime-logic port is a separate effort of similar size.
 - **Weak memory is needed for the fix.** Proving the fixed protocol with its actual
   `Relaxed`, `Release` and `Acquire` orderings needs step two.
 - **The DST must catch it too.** The same bug is a planted case that the DST must catch
-  under `hegel::sim`'s scheduled atomics. The proof and the DST pin the same invariant.
+  under `blaze-check`'s interleaved atomics today, and in one case that interleaves the threads
+  and crashes a disk once the tape drives both ([sim.md](sim.md), "Order"). The proof and the DST pin the same invariant.
 
 **Refused:** `SeqCst` mixed with weaker accesses to the same location until the RC11 SC
 condition is modelled. Also refused: memory-model questions RC11 leaves open, such as
@@ -1198,7 +1199,8 @@ the code took to write. This is why it is only for small, stable rings, and why 
 **Scope.** A crash-aware concurrent logic, in the style of
 [Perennial](https://github.com/mit-pdos/perennial) (crash framing and logically atomic crash
 specs; [GoJournal, OSDI 2021](https://www.usenix.org/conference/osdi21/presentation/chajed)).
-It sits over the Lean model of the kernel that `hegel::sim` shares: what fsync and
+It sits over the Lean model of the kernel that `Sim`'s three-layer disk
+([sim.md](sim.md), "Order") shares: what fsync and
 `F_FULLFSYNC` make durable, renames made durable before their data, errseq, ENOSPC, and what a
 crash keeps of a dirty mapped page. The code under proof is a sans-IO core on blaze-core's
 effects, so the model's effects are the core's effects.

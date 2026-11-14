@@ -73,7 +73,7 @@ tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", 
 libc.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

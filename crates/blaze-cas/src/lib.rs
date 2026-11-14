@@ -900,6 +900,10 @@ pub(crate) enum PlacePlant {
     RenameBeforeRanges,
     /// A derive leaves out its last range.
     SkipsARange,
+    /// A place of a derived value names only its nearest base's whole file, as before
+    /// 2026-11-13: a base further down the chain that the place made is left in `placed/`
+    /// with nothing naming it (`tests::place_crash`'s oracle `bounded`).
+    NamesNearestBaseOnly,
     /// A derived value's whole file left by an earlier run is kept as the store opens and
     /// cloned from as it is.
     KeepsDerived,
@@ -1047,14 +1051,39 @@ struct Whole {
 
 /// What a place in flight names ([`whole::Names`]), applied at its answer: `file`, the whole
 /// file of `placed/` it is made from (none: it is made from no whole file, so its path names
-/// none once it is answered); `base`, a derived value's base's whole file, named while the
-/// place is in flight; `key`, the key placed ([`Store::place`]; none for a maker's runs, a
-/// patch or a second path).
-#[derive(Clone, Copy, Debug)]
+/// none once it is answered); `base`, a derived value's chain of bases' whole files, nearest
+/// first ([`base_chain`]), each named while the place is in flight and let go of at its
+/// answer (empty for any other place); `key`, the key placed ([`Store::place`]; none for a
+/// maker's runs, a patch or a second path).
+#[derive(Clone, Debug)]
 struct Naming {
     file: Option<ContentId>,
-    base: Option<ContentId>,
+    base: Vec<ContentId>,
     key: Option<Key>,
+}
+
+/// The whole files of the chain of bases a derived value made from `base` is made from,
+/// nearest first: `base`'s, and while that is a derived value's, its base's in turn, down to
+/// the first that is no derived value's, or to a base the store keeps no whole file of.
+/// What a place of the derived value may make ([`Store::derive_file`] makes a base not there
+/// from its own base), so what it names. Bounded by [`derived::CHAIN_MOST`] (a longer chain is
+/// refused by the derive) and by a file met twice (a chain that loops, refused the same way).
+fn base_chain(look: Look<'_>, base: &Key) -> Vec<ContentId> {
+    // alloc: a few ids, once per derived value's place
+    let mut chain = Vec::new_in(Global);
+    let mut at = *base;
+    for _ in 0..=derived::CHAIN_MOST {
+        let Ok(Ok(whole)) = whole_of(look, &at) else { break };
+        if chain.contains(&whole.id) {
+            break;
+        }
+        chain.push(whole.id);
+        match whole.base {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    chain
 }
 
 /// The write of the listing of the store's names (`placed/names`, [`Store::names_step`]).
@@ -3870,9 +3899,10 @@ impl Store {
         enum Plan {
             Clone(FileName, u64, ContentId),
             File(ContentId, u64),
-            /// The file a recipe gives, of this length, and its base's whole file, where the
-            /// store keeps one ([`Kind::Derived`]).
-            Derived(u64, Option<ContentId>),
+            /// The file a recipe gives, of this length, and the whole files of its chain of
+            /// bases, nearest first, down to the first that is no derived value's
+            /// ([`Kind::Derived`], [`base_chain`]).
+            Derived(u64, Vec<ContentId>),
             Write(Vec<u8>),
             Refused(String),
         }
@@ -3918,10 +3948,7 @@ impl Store {
             // A recipe is never placed as its own bytes: what is placed is the file it gives.
             Some(Ok((found, header))) if header.kind == Kind::Derived => {
                 match look.read(found, key).map(|entry| derived::decode(entry.bytes)) {
-                    Ok(Ok(recipe)) => Plan::Derived(
-                        recipe.len,
-                        whole_of(look, &recipe.base).ok().and_then(Result::ok).map(|it| it.id),
-                    ),
+                    Ok(Ok(recipe)) => Plan::Derived(recipe.len, base_chain(look, &recipe.base)),
                     // alloc: the error of a value that is no recipe
                     Ok(Err(why)) => Plan::Refused(format!("the derived value {key:?} holds {why}")),
                     // alloc: the error of a corrupt value
@@ -3953,11 +3980,24 @@ impl Store {
             self.plant_linked.insert(to.clone(), file);
         }
         let tag = held.unwrap_or_else(|| self.tags.fresh());
-        // The base's whole file a derived value's place clones is named while it is in flight.
-        let mut base = None;
+        // The whole files of a derived value's chain of bases, each of which its place may
+        // make (`Store::derive_file` makes a base that is not there from its own base, down
+        // the chain), are named while it is in flight and let go of at its answer, so none
+        // is left in `placed/` with nothing naming it.
+        // alloc: empty, allocates nothing but for a derived value's place
+        let mut base = Vec::new_in(Global);
         let plan = match plan {
-            Plan::Derived(len, of) => {
-                base = of;
+            Plan::Derived(len, chain) => {
+                // The planted bug: only the nearest base is named, as before 2026-11-13.
+                #[cfg(test)]
+                let chain = {
+                    let mut chain = chain;
+                    if self.plant == PlacePlant::NamesNearestBaseOnly {
+                        chain.truncate(1);
+                    }
+                    chain
+                };
+                base = chain;
                 self.derived.insert(key.0, len);
                 Plan::File(key.0, len)
             }
@@ -4040,7 +4080,7 @@ impl Store {
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
         self.place_spans.insert(tag, Self::place_span(&to));
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         self.publish(tag, to, Content::Sparse(file), 0, effects);
         self.names_step(effects);
         tag
@@ -4078,7 +4118,7 @@ impl Store {
         let tag = self.tags.fresh();
         // As [`Store::place`]'s: open until the answer, with no parent.
         self.place_spans.insert(tag, Self::place_span(&to));
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         self.starts(&to, started);
         if self.place_by.is_none() && self.broken.is_none() {
             self.waiting_for_look();
@@ -4114,7 +4154,7 @@ impl Store {
         span.record("how", "link");
         self.place_spans.insert(tag, span);
         // Another name of a file made from runs: its path names no whole file once answered.
-        self.begin_naming(tag, Naming { file: None, base: None, key: None });
+        self.begin_naming(tag, Naming { file: None, base: Vec::new_in(Global), key: None });
         if let Some(writing) = self.writing.get(&first) {
             if let Some(was) = &writing.also {
                 // alloc: an error, once per place refused
@@ -4222,7 +4262,7 @@ impl Store {
     }
 
     /// The place `tag` begun, naming what [`Naming`] says until its answer: its whole file
-    /// and its base's are named by a place in flight ([`whole::Names::making`]), so nothing
+    /// and each of its chain of bases' are named by a place in flight ([`whole::Names::making`]), so nothing
     /// removes them meanwhile.
     fn begin_naming(&mut self, tag: Tag, naming: Naming) {
         for file in naming.file.iter().chain(&naming.base) {
@@ -4258,7 +4298,9 @@ impl Store {
             // A naming exists only as `begin_naming` counted it, so neither fails; were the
             // books to disagree, the store stops naming the path and the file.
             let not_begun = |it: whole::NotBegun| format!("the place of {to}: {it}");
-            if let Some(base) = base {
+            // Each base of a derived value's chain, as `begin_naming` counted it: let go of
+            // once, whether the place made it or found it there.
+            for base in base {
                 if let Err(it) = self.names.made_from(base) {
                     // clone: the error that breaks the store
                     let dir = self.tiers[0].dir.clone();

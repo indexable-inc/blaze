@@ -101,7 +101,7 @@ blaze-codegen-code.workspace = true
 
 [dev-dependencies]
 # tests/revisions/oracle.rs: the drawn sequences of the real driver's oracle.
-hegeltest.workspace = true
+blaze-sim.workspace = true
 blaze-alloc-count.workspace = true
 # as_rustc's tests: what blaze answers `rustc -vV` is a compiler the code identity takes.
 blaze-codegen-code.workspace = true

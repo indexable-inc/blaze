@@ -9,8 +9,7 @@ use blaze_sql::Checked;
 use blaze_sql::ddl::create_table;
 use blaze_sql::desc::{Backend, RustTy, Slot, Storage, ValueRef};
 use blaze_sql::schema::{Column, Schema, Table};
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use crate::{Connection, Error, Found, SchemaDifference, Statement, Step};
 
@@ -471,25 +470,21 @@ fn reads_back(row: &Kinds, plant: Option<Plant>) -> Result<(), String> {
     if got == want { Ok(()) } else { Err(format!("wrote {want:?}, read {got:?}")) }
 }
 
-#[hegel::composite]
-fn kinds(tc: &TestCase) -> Kinds {
+fn kinds(tape: &Tape) -> Kinds {
     Kinds {
-        flag: tc.draw(gs::booleans()),
-        amount: tc.draw(gs::integers::<i64>()),
-        ratio: tc.draw(gs::floats::<f64>().allow_nan(false).allow_infinity(false)),
-        label: tc.draw(gs::text().max_size(64)),
-        data: tc.draw(gs::binary().max_size(64)),
+        flag: tape.bool("flag"),
+        amount: tape.int("amount"),
+        ratio: tape.f64_finite("ratio"),
+        label: tape.text(0..=64, "label"),
+        data: tape.bytes(0..=64, "data"),
     }
 }
 
 /// The invariant: any `i64`, finite `f64`, string (NUL and all) and byte string, bound and
 /// stored in a STRICT table, reads back equal through `column`.
-#[hegel::test]
-fn any_value_binds_and_reads_back_equal(tc: TestCase) {
-    let row = tc.draw(kinds());
-    if let Err(difference) = reads_back(&row, None) {
-        panic!("{difference}");
-    }
+#[test]
+fn any_value_binds_and_reads_back_equal() {
+    blaze_sim::check(Config::DEFAULT, |tape| reads_back(&tape.span("row", kinds), None));
 }
 
 #[test]

@@ -118,11 +118,13 @@ impl Patterns {
             item: re(r"^\s*(?:pub(?:\([^)]*\))? )?(?:const |async |unsafe )*(?:fn|struct|enum|trait|type) (\w+)"),
             control: re(r"^\s*fn (the_oracle_catches_\w+)\("),
             // `#[bstd::test]` (in bstd itself, `#[crate::test]`) runs its test on the simulation
-            // without the file naming it (docs/v2/plan/design/bstd-sim-test.md).
-            sim: re(r"\bsim::|\bSim\b|hegel::sim|#\[(?:bstd|crate)::test\b"),
+            // without the file naming it (docs/v2/plan/design/bstd-sim-test.md); a blaze-sim
+            // simulation holds its answers in a `Flight` (docs/v2/plan/design/sim.md). The engine
+            // alone (`blaze_sim::check`) marks a property test, which is tested, not simulated.
+            sim: re(r"\bsim::|\bSim\b|\bFlight\b|#\[(?:bstd|crate)::test\b"),
             effect: re(r"^\s*#\[blaze::(nopanic|noalloc|nonblocking|pure)(?:\((.*)\))?\]"),
             trusted: re(r#"trusted\s*=\s*"([^"]*)""#),
-            test_attr: re(r"^\s*#\[(?:test|hegel::test|bstd::test|crate::test|tokio::test)\b"),
+            test_attr: re(r"^\s*#\[(?:test|bstd::test|crate::test|tokio::test)\b"),
             function: re(r"^\s*(?:pub(?:\([^)]*\))? )?(?:const |async |unsafe )*fn (\w+)"),
             pointer: re(r"\[`([^`]+)`\]|Lean `([^`]+)`"),
             row: re(r"^- \*\*`([^`]+)`\*\* \*([a-z-]+)\*"),
@@ -831,8 +833,8 @@ fn selftest(p: &Patterns) {
     let text = "use x;\n\n\
         /// The invariant: a read hands back the bytes put,\n\
         /// whatever the faults.\n\
-        #[hegel::test(test_cases = 200)]\n\
-        fn reads_hand_back_what_was_put(tc: TestCase) {}\n\n\
+        #[test]\n\
+        fn reads_hand_back_what_was_put() { blaze_sim::check(Config::cases(200), |tape| {}); }\n\n\
         #[test]\nfn the_oracle_catches_a_failed_load_kept() {}\n\n\
         /// The reference model: a map from key to bytes.\n\
         pub(crate) struct Model { }\n";
@@ -890,7 +892,18 @@ fn selftest(p: &Patterns) {
         Ok(_) => expect(false, "a statement on no item is refused"),
         Err(e) => expect(e.contains("a.rs:1"), &format!("the refusal names the place: {e}")),
     }
-    expect(entries[0].level == "tested" && entries[1].level.is_empty(), &format!("levels: {entries:?}"));
+    expect(
+        entries[0].level == "tested" && entries[1].level.is_empty(),
+        &format!("a property test on the tape is tested, a model has no level: {entries:?}"),
+    );
+    let (plain, _) = scanned(p, "a.rs", "/// The invariant: x.\n#[test]\nfn t() { assert_eq!(f(1), 2); }\n");
+    expect(plain[0].level == "tested", &format!("a plain test is tested: {plain:?}"));
+    let (flight, _) = scanned(
+        p,
+        "a.rs",
+        "use blaze_sim::{Config, Flight};\n\n/// The invariant: x.\n#[test]\nfn t() { blaze_sim::check(Config::cases(64), |tape| { let mut flight = Flight::new(); }); }\n",
+    );
+    expect(flight[0].level == "simulated", &format!("a test that holds a `Flight` is simulated: {flight:?}"));
     let (simmed, _) = scanned(p, "a.rs", "use blaze_core::sim::Sim;\n\n/// The invariant: x.\nfn t() {}\n");
     expect(simmed[0].level == "simulated", &format!("a file on the simulation is simulated: {simmed:?}"));
     let (seeded, _) = scanned(p, "a.rs", "/// The invariant: x.\n#[bstd::test(without(Crashes))]\nfn t(cx: &Cx, io: Io) {}\n");

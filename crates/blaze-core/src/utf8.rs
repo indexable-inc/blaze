@@ -13,22 +13,23 @@ pub fn push_lossy(into: &mut String, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::push_lossy;
 
-    #[hegel::test]
-    fn push_lossy_is_from_utf8_lossy(tc: TestCase) {
-        let before = tc.draw(gs::text().max_size(8));
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(63));
-        let text = tc.draw(gs::text().max_size(16));
-        let mut out = before.clone();
-        push_lossy(&mut out, &bytes);
-        assert_eq!(&out[before.len()..], &*String::from_utf8_lossy(&bytes));
-        let mut out = String::new();
-        push_lossy(&mut out, text.as_bytes());
-        assert_eq!(out, text);
+    #[test]
+    fn push_lossy_is_from_utf8_lossy() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let before = tape.text(0..=8, "before");
+            let bytes: Vec<u8> = tape.bytes(0..=63, "bytes");
+            let text = tape.text(0..=16, "text");
+            let mut out = before.clone();
+            push_lossy(&mut out, &bytes);
+            assert_eq!(&out[before.len()..], &*String::from_utf8_lossy(&bytes));
+            let mut out = String::new();
+            push_lossy(&mut out, text.as_bytes());
+            assert_eq!(out, text);
+        })
     }
 
     #[test]

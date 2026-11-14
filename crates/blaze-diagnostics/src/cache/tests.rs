@@ -685,14 +685,16 @@ fn header_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-#[hegel::test]
-fn any_bytes_read_as_before_the_cursor(tc: hegel::TestCase) {
-    let mut bytes = tc.draw(hegel::generators::binary().max_size(23));
-    let magic = tc.draw(hegel::generators::booleans());
-    if magic && bytes.len() >= 4 {
-        bytes[..4].copy_from_slice(&MAGIC);
-    }
-    assert_eq!(header(&bytes), header_reference(&bytes));
+#[test]
+fn any_bytes_read_as_before_the_cursor() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let mut bytes = tape.bytes(0..=23, "bytes");
+        let magic = tape.bool("magic");
+        if magic && bytes.len() >= 4 {
+            bytes[..4].copy_from_slice(&MAGIC);
+        }
+        assert_eq!(header(&bytes), header_reference(&bytes));
+    });
 }
 
 /// The copy of `absolute` this file had before it called hir-def's.
@@ -728,8 +730,15 @@ fn a_path_is_absolute_as_the_old_copy_said() {
     }
 }
 
-#[hegel::test]
-fn any_path_is_absolute_as_the_old_copy_said(tc: hegel::TestCase) {
-    let path = tc.draw(hegel::generators::from_regex("[/\\\\a-zA-Z0-9:._~é$]{0,6}"));
-    assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+/// Paths of up to six characters, each a slash, a backslash, an ASCII letter or digit, or one of
+/// `:._~é$`.
+const PATH_CHARACTERS: &str =
+    "/\\abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:._~é$";
+
+#[test]
+fn any_path_is_absolute_as_the_old_copy_said() {
+    blaze_sim::check(blaze_sim::Config::DEFAULT, |tape| {
+        let path = tape.text_from(PATH_CHARACTERS, 0..=6, "path");
+        assert_eq!(hir_def::deps::absolute(&path), absolute_reference(&path));
+    });
 }

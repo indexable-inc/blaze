@@ -33,8 +33,7 @@ impl Tags {
 
 #[cfg(test)]
 mod tests {
-    use hegel::TestCase;
-    use hegel::generators as gs;
+    use blaze_sim::Config;
 
     use super::*;
 
@@ -73,19 +72,21 @@ mod tests {
         assert_eq!(tags.next(), Tag(5 << 32));
     }
 
-    #[hegel::test]
-    fn hands_out_what_the_copies_did(tc: TestCase) {
-        let base: u64 = tc.draw(gs::integers().max_value((u64::MAX >> 1) - 1));
-        let start: u64 = tc.draw(gs::integers());
-        let asks: usize = tc.draw(gs::integers().min_value(1).max_value(63));
-        let probe: u64 = tc.draw(gs::integers());
-        let mut tags = Tags { base, next: start };
-        let mut reference = Reference { base, next: start };
-        for _ in 0..asks {
-            let tag = tags.next();
-            assert_eq!(tag, reference.next());
-            assert!(tags.owns(tag));
-        }
-        assert_eq!(tags.owns(Tag(probe)), reference.owns(Tag(probe)));
+    #[test]
+    fn hands_out_what_the_copies_did() {
+        blaze_sim::check(Config::DEFAULT, |tape| {
+            let base: u64 = tape.int_in(0..=(u64::MAX >> 1) - 1, "base");
+            let start: u64 = tape.int("start");
+            let asks: usize = tape.int_in(1..=63, "asks");
+            let probe: u64 = tape.int("probe");
+            let mut tags = Tags { base, next: start };
+            let mut reference = Reference { base, next: start };
+            for _ in 0..asks {
+                let tag = tags.next();
+                assert_eq!(tag, reference.next());
+                assert!(tags.owns(tag));
+            }
+            assert_eq!(tags.owns(Tag(probe)), reference.owns(Tag(probe)));
+        })
     }
 }

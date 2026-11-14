@@ -1,6 +1,6 @@
 //! What a body may assume of its free regions from its signature, as rustc's
 //! `UniversalRegionRelations` collects it: a where clause `Self: 'b` on a type with lifetimes
-//! split into its outlives components (`hegeltest`'s `BoxedGenerator::boxed`, `Self:
+//! split into its outlives components (the vendored property-test engine's `BoxedGenerator::boxed`, `Self:
 //! 'b` with `Self = BoxedGenerator<'a, T>` that `'a: 'b`), and a reference to an associated
 //! type in the signature that the type outlives it, tested as the callee's projection
 //! normalizes (`sonic-rs`'s `Index for Array`, `&Self::Output` returning

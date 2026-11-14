@@ -375,12 +375,12 @@ dependencies = [
  "blaze-lint-defs",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "blaze-vfs",
  "cfg",
  "crossbeam-channel",
  "crossbeam-queue",
  "hashbrown 0.17.1",
- "hegeltest",
  "indexmap",
  "intern",
  "inventory",
@@ -605,7 +605,6 @@ dependencies = [
  "crossbeam-queue",
  "flate2",
  "futures-util",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -657,11 +656,11 @@ dependencies = [
  "blaze-mem",
  "blaze-reclaim",
  "blaze-serde",
+ "blaze-sim",
  "blaze-spin",
  "blaze-v2-proof",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
  "libc",
  "lz4_flex",
  "serde",
@@ -687,8 +686,8 @@ dependencies = [
  "blaze-protocol",
  "blaze-record",
  "blaze-report",
+ "blaze-sim",
  "blaze-vfs",
- "hegeltest",
 ]
 
 [[package]]
@@ -737,9 +736,8 @@ dependencies = [
  "blaze-core",
  "blaze-protocol",
  "blaze-report",
- "blaze-rng",
  "blaze-screen",
- "hegeltest",
+ "blaze-sim",
  "libc",
  "serde",
  "sonic-rs",
@@ -774,11 +772,11 @@ dependencies = [
  "blaze-query",
  "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-store-check",
  "crossbeam-channel",
  "crossbeam-queue",
  "hashbrown 0.17.1",
- "hegeltest",
  "serde",
  "serde_json",
  "tracing",
@@ -810,7 +808,6 @@ dependencies = [
  "blaze-sys",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
  "libc",
  "parking_lot",
  "windows-sys 0.61.2",
@@ -846,10 +843,10 @@ dependencies = [
  "blaze-query",
  "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "cfg",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -949,12 +946,12 @@ dependencies = [
  "blaze-registry",
  "blaze-report",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-thin",
  "blaze-units",
  "blaze-vfs",
  "cfg",
  "flate2",
- "hegeltest",
  "hir",
  "hir-ty-codegen",
  "intern",
@@ -1046,7 +1043,7 @@ dependencies = [
  "blaze-lints",
  "blaze-mem",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir",
  "hir-def",
  "hir-expand",
@@ -1247,13 +1244,13 @@ dependencies = [
  "blaze-reclaim",
  "blaze-rng",
  "blaze-serde",
+ "blaze-sim",
  "blaze-spin",
  "corosensei",
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-queue",
  "expect-test",
- "hegeltest",
  "libc",
  "serde",
  "serde_json",
@@ -1310,9 +1307,9 @@ dependencies = [
  "blaze-graph",
  "blaze-ids",
  "blaze-keyed",
+ "blaze-sim",
  "blaze-vfs",
  "crossbeam-queue",
- "hegeltest",
  "tracing",
 ]
 
@@ -1341,9 +1338,9 @@ name = "blaze-hub"
 version = "0.0.0"
 dependencies = [
  "blaze-protocol",
+ "blaze-sim",
  "blaze-std",
  "blaze-vfs",
- "hegeltest",
  "serde",
 ]
 
@@ -1378,7 +1375,7 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1507,8 +1504,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-format",
  "blaze-ids",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1516,7 +1512,7 @@ name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
  "blaze-protocol",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1533,7 +1529,7 @@ dependencies = [
  "blaze-launch",
  "blaze-link",
  "blaze-report",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1597,8 +1593,8 @@ dependencies = [
  "blaze-live",
  "blaze-mem",
  "blaze-sha256",
+ "blaze-sim",
  "gimli",
- "hegeltest",
  "object 0.40.0",
  "smallvec",
  "tracing",
@@ -1636,11 +1632,11 @@ dependencies = [
  "blaze-query",
  "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
  "cfg",
  "either",
  "expect-test",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -1791,8 +1787,8 @@ dependencies = [
  "blaze-check",
  "blaze-reclaim",
  "blaze-rng",
+ "blaze-sim",
  "crossbeam-channel",
- "hegeltest",
  "libc",
  "parking_lot",
  "windows-sys 0.61.2",
@@ -1882,8 +1878,8 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-sql",
- "hegeltest",
 ]
 
 [[package]]
@@ -1910,11 +1906,11 @@ dependencies = [
  "blaze-mem",
  "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-v2-proof",
  "bytes",
  "crossbeam-channel",
  "crossbeam-queue",
- "hegeltest",
  "ix-prof",
  "libc",
  "parquet",
@@ -1971,12 +1967,12 @@ dependencies = [
  "blaze-reclaim",
  "blaze-report",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
  "crossbeam-channel",
  "crossbeam-queue",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "indexmap",
  "serde",
  "smallvec",
@@ -2211,9 +2207,9 @@ dependencies = [
  "blaze-front-items",
  "blaze-ids",
  "blaze-kernel",
+ "blaze-sim",
  "blaze-store-check",
  "blaze-vfs",
- "hegeltest",
  "serde",
  "serde_json",
  "syntax",
@@ -2245,15 +2241,15 @@ dependencies = [
 name = "blaze-sql"
 version = "0.0.0"
 dependencies = [
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
 name = "blaze-sqlite"
 version = "0.0.0"
 dependencies = [
+ "blaze-sim",
  "blaze-sql",
- "hegeltest",
  "libsqlite3-sys",
 ]
 
@@ -2277,8 +2273,8 @@ dependencies = [
  "blaze-report",
  "blaze-rng",
  "blaze-sha256",
+ "blaze-sim",
  "blaze-spin",
- "hegeltest",
  "http",
  "miniz_oxide",
  "objc2-core-foundation",
@@ -2368,9 +2364,8 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-protocol",
- "blaze-rng",
+ "blaze-sim",
  "blaze-usercode",
- "hegeltest",
 ]
 
 [[package]]
@@ -2432,8 +2427,8 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-keyed",
+ "blaze-sim",
  "cfg",
- "hegeltest",
  "intern",
  "syntax",
 ]
@@ -2488,8 +2483,8 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-vfs",
- "hegeltest",
  "libc",
  "memchr",
  "postcard",
@@ -3237,27 +3232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dashu-base"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "861a614e79388a4c72aa66b0bdabc91e3a4f30d53e0c8d962953e207d75884d0"
-dependencies = [
- "num-modular",
-]
-
-[[package]]
-name = "dashu-int"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64a0490b40a6a3f6427970035f17f76fd59c01d3cd9f9140809672863a0d64c8"
-dependencies = [
- "cfg-if",
- "dashu-base",
- "num-modular",
- "static_assertions",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3775,8 +3749,8 @@ dependencies = [
 name = "gpu"
 version = "0.0.0"
 dependencies = [
+ "blaze-sim",
  "gpu-macros",
- "hegeltest",
 ]
 
 [[package]]
@@ -3856,40 +3830,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hegeltest"
-version = "0.50.3"
-dependencies = [
- "hegeltest-c",
- "hegeltest-macros",
- "parking_lot",
-]
-
-[[package]]
-name = "hegeltest-c"
-version = "0.48.0"
-dependencies = [
- "dashu-int",
- "hashbrown 0.17.1",
- "libm",
- "miniz_oxide",
- "once_cell",
- "rand",
- "rustc-hash 2.1.3",
- "rustix",
- "toml",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hegeltest-macros"
-version = "0.50.3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "hir"
 version = "0.0.0"
 dependencies = [
@@ -3949,6 +3889,7 @@ dependencies = [
  "blaze-phf",
  "blaze-query",
  "blaze-record",
+ "blaze-sim",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
@@ -3957,7 +3898,6 @@ dependencies = [
  "expect-test",
  "fst",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir-expand",
  "indexmap",
  "intern",
@@ -4025,9 +3965,9 @@ dependencies = [
  "blaze-macro-eval",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-units",
  "blaze-vfs",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -4187,6 +4127,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-serde",
+ "blaze-sim",
  "blaze-stencil",
  "blaze-store-check",
  "blaze-v2-proof",
@@ -4197,7 +4138,6 @@ dependencies = [
  "cranelift-object",
  "either",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -4310,9 +4250,9 @@ dependencies = [
  "blaze-core",
  "blaze-ids",
  "blaze-query",
+ "blaze-sim",
  "cfg",
  "expect-test",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4374,6 +4314,7 @@ dependencies = [
  "blaze-mem",
  "blaze-query",
  "blaze-rng",
+ "blaze-sim",
  "blaze-units",
  "cfg",
  "const-ast",
@@ -4381,7 +4322,6 @@ dependencies = [
  "either",
  "expect-test",
  "hashbrown 0.17.1",
- "hegeltest",
  "hir",
  "hir-def",
  "hir-expand",
@@ -4442,8 +4382,8 @@ dependencies = [
  "blaze-items",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "either",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4469,7 +4409,7 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -4917,11 +4857,11 @@ dependencies = [
  "blaze-http",
  "blaze-inproc-rt",
  "blaze-sha256",
+ "blaze-sim",
  "crossbeam-channel",
  "crossbeam-queue",
  "flate2",
  "gimli",
- "hegeltest",
  "libc",
  "object 0.40.0",
  "rcgen",
@@ -5331,12 +5271,6 @@ checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
 dependencies = [
  "num-traits",
 ]
-
-[[package]]
-name = "num-modular"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
 
 [[package]]
 name = "num-traits"
@@ -6685,12 +6619,6 @@ dependencies = [
  "psm",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stdx"

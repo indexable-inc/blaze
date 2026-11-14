@@ -899,10 +899,10 @@ fn a_no_std_proc_macro_expands() {
 }
 
 /// `#[blaze::contract_test]` (docs/v2/plan/design/contracts.md, part 2): a function whose
-/// `ensures` is wrong for one input gets a generated Hegel test that fails, naming the function
-/// and the clause, with the shrunk case as a test to paste; a contract that holds passes, and
-/// `skip` generates nothing. The crate's manifest names `vendor/hegeltest` by its absolute path,
-/// and blaze's own lock pins hegeltest's registry dependencies to the versions blaze builds.
+/// `ensures` is wrong for one input gets a generated blaze-sim test that fails, naming the
+/// function and the clause, with the least case as a test to paste; a contract that holds
+/// passes, and `skip` generates nothing. The crate's manifest names `crates/blaze-sim` by its
+/// absolute path, and blaze's own lock pins blaze-sim's dependencies to the versions blaze builds.
 #[test]
 fn generated_test_finds_planted_bug() {
     let case = Case::new("generated_test_finds_planted_bug");
@@ -911,9 +911,9 @@ fn generated_test_finds_planted_bug() {
         "Cargo.toml",
         &format!(
             "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dev-dependencies]\n\
-             hegeltest = {{ path = {:?}, default-features = false, features = [\"static-engine\"] }}\n\n\
+             blaze-sim = {{ path = {:?} }}\n\n\
              [profile.test]\ncontract-checks = false\n\n[workspace]\n",
-            root.join("vendor/hegeltest").display().to_string()
+            root.join("crates/blaze-sim").display().to_string()
         ),
     );
     case.write("Cargo.lock", &fs::read_to_string(root.join("Cargo.lock")).unwrap());

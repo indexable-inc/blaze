@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use base_db::{Crate, Db, all_crates};
 use expect_test::expect_file;
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Broke, Config, Tape};
 use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_expand::fixture;
 // Links the crate that provides the MIR queries.
@@ -79,69 +79,45 @@ impl Machine<Op, Test> for Vm {
     }
 }
 
-/// A source of draws: Hegel's, or a seed's.
-trait Draw {
-    /// In `lo..=hi`.
-    fn int(&mut self, lo: u64, hi: u64) -> u64;
-}
-
-struct Drawn<'a>(&'a TestCase);
-
-impl Draw for Drawn<'_> {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
-    }
-}
-
-/// SplitMix64, for the controls' seeded programs.
-struct Seeded(u64);
-
-impl Draw for Seeded {
-    fn int(&mut self, lo: u64, hi: u64) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        lo + z % (hi - lo + 1)
-    }
-}
-
 /// A structured program whose every jump has a label of its kind: `labels` are those in
 /// scope, `true` for a loop.
-fn program(d: &mut impl Draw, depth: u32, labels: &mut Vec<bool>) -> Program {
+fn program(tape: &Tape, depth: u32, labels: &mut Vec<bool>) -> Program {
     let mut out = Vec::new();
-    for _ in 0..d.int(0, 4) {
-        let var = d.int(0, 2) as usize;
-        let kind = if depth == 0 { d.int(0, 4) } else { d.int(0, 11) };
+    for _ in 0..tape.int_in(0..=4u64, "nodes") {
+        let var = tape.int_in(0..=2u64, "var") as usize;
+        let kind = if depth == 0 { tape.int_in(0..=4u64, "kind") } else { tape.int_in(0..=11u64, "kind") };
         match kind {
-            0 => out.push(Node::Do(Op::Add(var, d.int(1, 3)))),
-            1 => out.push(Node::Do(Op::Set(var, d.int(0, 5)))),
-            2 | 3 => out.push(Node::Do(Op::Trace(d.int(0, 9)))),
-            4 => out.push(Node::Do(Op::PanicIf(var, d.int(0, 40)))),
+            0 => out.push(Node::Do(Op::Add(var, tape.int_in(1..=3, "add")))),
+            1 => out.push(Node::Do(Op::Set(var, tape.int_in(0..=5, "set")))),
+            2 | 3 => out.push(Node::Do(Op::Trace(tape.int_in(0..=9, "trace")))),
+            4 => out.push(Node::Do(Op::PanicIf(var, tape.int_in(0..=40, "panic at")))),
             5 | 6 => {
-                let on = if d.int(0, 1) == 0 { Test::Low(var) } else { Test::Less(var, d.int(1, 6)) };
-                let arms = (0..d.int(1, 2))
-                    .map(|value| (u128::from(value), program(d, depth - 1, labels)))
+                let on = if tape.int_in(0..=1u64, "test") == 0 {
+                    Test::Low(var)
+                } else {
+                    Test::Less(var, tape.int_in(1..=6, "less than"))
+                };
+                let arms = (0..tape.int_in(1..=2u64, "arms"))
+                    .map(|value| (u128::from(value), program(tape, depth - 1, labels)))
                     .collect();
-                out.push(Node::Branch { on, arms, otherwise: program(d, depth - 1, labels) });
+                out.push(Node::Branch { on, arms, otherwise: program(tape, depth - 1, labels) });
             }
             7 => {
                 labels.push(false);
-                out.push(Node::Block(program(d, depth - 1, labels)));
+                out.push(Node::Block(program(tape, depth - 1, labels)));
                 labels.pop();
             }
             8 => {
                 // The loop is in a block, which a `Break` in its body leaves.
                 labels.push(false);
                 labels.push(true);
-                let mut body = program(d, depth - 1, labels);
+                let mut body = program(tape, depth - 1, labels);
                 labels.pop();
                 labels.pop();
                 // A turn moves a variable, so most loops end.
                 body.push(Node::Do(Op::Add(var, 1)));
                 out.push(Node::Block(vec![Node::Branch {
-                    on: Test::Less(var, d.int(2, 8)),
+                    on: Test::Less(var, tape.int_in(2..=8, "loop bound")),
                     arms: vec![(0, vec![Node::Break(0)])],
                     otherwise: vec![Node::Loop(body)],
                 }]));
@@ -157,7 +133,7 @@ fn program(d: &mut impl Draw, depth: u32, labels: &mut Vec<bool>) -> Program {
                 }
             }
             _ => {
-                out.push(if d.int(0, 3) == 0 { Node::End(End::Panic) } else { Node::Return });
+                out.push(if tape.int_in(0..=3u64, "end") == 0 { Node::End(End::Panic) } else { Node::Return });
                 return out;
             }
         }
@@ -223,28 +199,28 @@ fn agrees(written: &Program, plant: Plant) -> Result<(), String> {
 /// The refinement: structured control flow reconstructed from a control-flow graph runs as
 /// the graph does, from every state, to the same end, variables and trace; and what
 /// `reconstruct` returns is well formed and a fixed point of lowering and reconstructing.
-#[hegel::test(test_cases = 300)]
-fn structured_code_runs_as_its_graph(tc: TestCase) {
-    let written = program(&mut Drawn(&tc), 3, &mut Vec::new());
-    if let Err(broke) = agrees(&written, Plant::None) {
-        panic!("{broke}\nwritten {written:?}");
-    }
+#[test]
+fn structured_code_runs_as_its_graph() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let written = program(tape, 3, &mut Vec::new());
+        if let Err(broke) = agrees(&written, Plant::None) {
+            panic!("{broke}\nwritten {written:?}");
+        }
+    })
 }
 
-const CONTROL_SEEDS: u64 = 400;
+const CONTROL_SEEDS: u32 = 400;
 
-/// Whether the oracle catches `plant` in one of the seeded programs.
-fn caught(plant: Plant) -> bool {
-    (0..CONTROL_SEEDS).any(|seed| {
-        let written = program(&mut Seeded(seed), 3, &mut Vec::new());
-        agrees(&written, plant).is_err()
-    })
+/// One drawn program held to the oracle with `plant`: any finding is the oracle's.
+fn agrees_drawn(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let written = program(tape, 3, &mut Vec::new());
+    agrees(&written, plant).map_err(|broke| Broke::Oracle(format!("{broke}\nwritten {written:?}")))
 }
 
 #[test]
 fn the_seeded_programs_agree_unplanted() {
-    for seed in 0..CONTROL_SEEDS {
-        let written = program(&mut Seeded(seed), 3, &mut Vec::new());
+    for seed in 0..u64::from(CONTROL_SEEDS) {
+        let written = program(&Tape::seeded(seed), 3, &mut Vec::new());
         if let Err(broke) = agrees(&written, Plant::None) {
             panic!("seed {seed}: {broke}\nwritten {written:?}");
         }
@@ -253,12 +229,13 @@ fn the_seeded_programs_agree_unplanted() {
 
 #[test]
 fn the_oracle_catches_a_continue_made_a_break() {
-    assert!(caught(Plant::ContinueAsBreak));
+    // Any finding catches it, as before: `says` is empty.
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::ContinueAsBreak, "", agrees_drawn);
 }
 
 #[test]
 fn the_oracle_catches_an_else_branch_dropped_at_a_join() {
-    assert!(caught(Plant::ElseDropped));
+    blaze_sim::control(Config::cases(CONTROL_SEEDS), Plant::None, Plant::ElseDropped, "", agrees_drawn);
 }
 
 #[test]

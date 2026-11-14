@@ -78,7 +78,7 @@ digest is the pin's algorithm over the listing.
   Only `crates/<package>/<id>.md` is read, and duplicate ids are refused.
 - **Matching.** A version is affected when no `patched` range and no `unaffected` range admits
   it, by cargo's semver rules. A pre-release is admitted only by a comparator of the same
-  `major.minor.patch`. A Hegel refinement test checks this against a brute-force model, with a
+  `major.minor.patch`. A blaze-sim refinement test checks this against a brute-force model, with a
   planted bug the test must catch.
 - **Policy** (`[workspace.metadata.blaze.audit]`):
   - `database = "<dir>"` names the database; `BLAZE_AUDIT_DB` overrides it.
@@ -96,7 +96,7 @@ digest is the pin's algorithm over the listing.
 - **Not checked.** The report lists what it did not check, never as a pass: no database set, a
   registry with no index on disk, and reachability.
 - **Order.** The output is sorted by (severity, package, version, rule, advisory) and
-  deduplicated. A Hegel test shuffles the lock's packages and checks that the report does not
+  deduplicated. A blaze-sim test shuffles the lock's packages and checks that the report does not
   change.
 
 ## Commands and output

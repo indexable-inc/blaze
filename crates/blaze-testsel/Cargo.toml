@@ -28,8 +28,7 @@ blaze-alloc-count.workspace = true
 # `Aligned`: the simulated store's records, 16-aligned as the real store's are.
 blaze-format.workspace = true
 blaze-protocol.workspace = true
-blaze-rng.workspace = true
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

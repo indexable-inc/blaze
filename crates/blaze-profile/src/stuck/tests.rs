@@ -4,7 +4,7 @@
 //! long CPU-bound task that must never be flagged. The model knows which tasks can never run
 //! again; the oracle holds the watchdog's reports to it.
 
-use hegel::{TestCase, generators as gs};
+use blaze_sim::{Config, Tape};
 use std::alloc::Global;
 
 use super::*;
@@ -45,67 +45,67 @@ enum Force {
     WaiterBehindLostWake,
 }
 
-fn secs(tc: &TestCase, lo: u64, hi: u64) -> u64 {
-    S * tc.draw(gs::integers::<u64>().min_value(lo).max_value(hi))
+fn secs(tape: &Tape, lo: u64, hi: u64, label: &'static str) -> u64 {
+    S * tape.int_in(lo..=hi, label)
 }
 
-fn looks(tc: &TestCase, hi: u64) -> u64 {
-    LOOK * tc.draw(gs::integers::<u64>().max_value(hi))
+fn looks(tape: &Tape, hi: u64, label: &'static str) -> u64 {
+    LOOK * tape.int_in(0..=hi, label)
 }
 
-fn scenario(tc: &TestCase, force: Force) -> Vec<Sim, Global> {
+fn scenario(tape: &Tape, force: Force) -> Vec<Sim, Global> {
     let mut sims = Vec::new_in(Global);
     // Plants first, so honest waiters may land behind them.
-    if force == Force::LostWake || tc.draw(gs::booleans()) {
-        sims.push(Sim { start: looks(tc, 20), blocks: Blocks::Quiet { wakes: None }, work: S });
+    if force == Force::LostWake || tape.bool("a lost wake") {
+        sims.push(Sim { start: looks(tape, 20, "start"), blocks: Blocks::Quiet { wakes: None }, work: S });
     }
-    if tc.draw(gs::booleans()) {
-        let start = looks(tc, 20);
-        let deadline = start + looks(tc, 60);
+    if tape.bool("a deadline with no wake") {
+        let start = looks(tape, 20, "start");
+        let deadline = start + looks(tape, 60, "deadline");
         sims.push(Sim { start, blocks: Blocks::Sleep { deadline, wakes: None }, work: S });
     }
-    if tc.draw(gs::booleans()) {
-        let start = looks(tc, 20);
+    if tape.bool("a two-lock cycle") {
+        let start = looks(tape, 20, "start");
         let a = sims.len();
         sims.push(Sim { start, blocks: Blocks::Lock(a + 1), work: S });
         sims.push(Sim { start, blocks: Blocks::Lock(a), work: S });
     }
-    if tc.draw(gs::booleans()) {
-        let start = looks(tc, 20);
+    if tape.bool("a three-task join cycle") {
+        let start = looks(tape, 20, "start");
         let a = sims.len();
         sims.push(Sim { start, blocks: Blocks::Join(a + 1), work: S });
         sims.push(Sim { start, blocks: Blocks::Join(a + 2), work: S });
         sims.push(Sim { start, blocks: Blocks::Join(a), work: S });
     }
-    if force == Force::LongCpu || tc.draw(gs::booleans()) {
-        sims.push(Sim { start: looks(tc, 20), blocks: Blocks::Not, work: 1400 * S });
+    if force == Force::LongCpu || tape.bool("a long cpu task") {
+        sims.push(Sim { start: looks(tape, 20, "start"), blocks: Blocks::Not, work: 1400 * S });
     }
     if force == Force::WaiterBehindLostWake {
-        let start = looks(tc, 20);
+        let start = looks(tape, 20, "start");
         let h = sims.len();
         sims.push(Sim { start, blocks: Blocks::Quiet { wakes: None }, work: S });
-        sims.push(Sim { start: start + looks(tc, 4), blocks: Blocks::Lock(h), work: S });
+        sims.push(Sim { start: start + looks(tape, 4, "waiter after"), blocks: Blocks::Lock(h), work: S });
     }
-    let honest = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let honest = tape.int_in(1..=6usize, "honest tasks");
     for _ in 0..honest {
-        let mut start = looks(tc, 20);
-        let blocks = match tc.draw(gs::integers::<u8>().max_value(4)) {
+        let mut start = looks(tape, 20, "start");
+        let blocks = match tape.int_in(0..=4u8, "blocks") {
             1 => {
-                let deadline = start + looks(tc, 60);
-                let wakes = start + secs(tc, 0, (deadline - start) / S);
+                let deadline = start + looks(tape, 60, "deadline");
+                let wakes = start + secs(tape, 0, (deadline - start) / S, "wakes after");
                 Blocks::Sleep { deadline, wakes: Some(wakes) }
             }
             // A signal with no deadline wakes within its bound, less a look.
-            2 => Blocks::Quiet { wakes: Some(start + secs(tc, 0, 110)) },
+            2 => Blocks::Quiet { wakes: Some(start + secs(tape, 0, 110, "wakes after")) },
             3 | 4 if !sims.is_empty() => {
-                let h = tc.draw(gs::integers::<usize>().max_value(sims.len() - 1));
+                let h = tape.index(sims.len(), "holder");
                 // The holder holds from its start: a waiter comes no earlier.
                 start = start.max(sims[h].start);
-                if tc.draw(gs::booleans()) { Blocks::Lock(h) } else { Blocks::Join(h) }
+                if tape.bool("lock or join") { Blocks::Lock(h) } else { Blocks::Join(h) }
             }
             _ => Blocks::Not,
         };
-        let work = secs(tc, 0, if tc.draw(gs::booleans()) { 2000 } else { 30 });
+        let work = secs(tape, 0, if tape.bool("long work") { 2000 } else { 30 }, "work");
         sims.push(Sim { start, blocks, work });
     }
     sims
@@ -232,8 +232,8 @@ fn seen_at(sims: &[Sim], resolves: &[Option<u64>], now: u64) -> Vec<TaskSeen, Gl
 }
 
 /// Runs the scenario under the watchdog with `flaw` planted and checks the oracle.
-fn simulate(tc: &TestCase, flaw: Flaw, force: Force) -> Result<(), String> {
-    let sims = scenario(tc, force);
+fn simulate(tape: &Tape, flaw: Flaw, force: Force) -> Result<(), String> {
+    let sims = scenario(tape, force);
     let resolves = resolves(&sims);
     let mut watch = Watch::new();
     watch.flaw = flaw;
@@ -322,31 +322,35 @@ fn oracle(sims: &[Sim], resolves: &[Option<u64>], said: &[(u64, Stuck)]) -> Resu
 /// any of the planted faults, every task that can never run again is reported within its bound
 /// with the edge that explains it, no task that later makes progress by itself is reported, and
 /// every reported cycle is a real one.
-#[hegel::test(test_cases = 300)]
-fn the_watchdog_says_exactly_the_tasks_that_never_run_again(tc: TestCase) {
-    if let Err(why) = simulate(&tc, Flaw::None, Force::Nothing) {
-        panic!("{why}");
-    }
+#[test]
+fn the_watchdog_says_exactly_the_tasks_that_never_run_again() {
+    blaze_sim::check(Config::cases(300), |tape| simulate(tape, Flaw::None, Force::Nothing));
 }
 
 /// The control: today's guard, which counts being inside a job's code as progress, never says a
 /// lost wake.
-#[hegel::test(test_cases = 50)]
-fn the_oracle_catches_a_watchdog_that_counts_job_code_as_progress(tc: TestCase) {
-    assert!(simulate(&tc, Flaw::JobCodeIsProgress, Force::LostWake).is_err());
+#[test]
+fn the_oracle_catches_a_watchdog_that_counts_job_code_as_progress() {
+    blaze_sim::check(Config::cases(50), |tape| {
+        assert!(simulate(tape, Flaw::JobCodeIsProgress, Force::LostWake).is_err());
+    });
 }
 
 /// The control: a watchdog that flags by elapsed time alone fails a long CPU-bound task.
-#[hegel::test(test_cases = 50)]
-fn the_oracle_catches_a_watchdog_that_flags_by_elapsed_time(tc: TestCase) {
-    assert!(simulate(&tc, Flaw::ElapsedOnly, Force::LongCpu).is_err());
+#[test]
+fn the_oracle_catches_a_watchdog_that_flags_by_elapsed_time() {
+    blaze_sim::check(Config::cases(50), |tape| {
+        assert!(simulate(tape, Flaw::ElapsedOnly, Force::LongCpu).is_err());
+    });
 }
 
 /// The control: a watchdog that drops the holder says a lock waiter without the edge that
 /// explains it.
-#[hegel::test(test_cases = 50)]
-fn the_oracle_catches_a_watchdog_that_drops_the_holder(tc: TestCase) {
-    assert!(simulate(&tc, Flaw::DropHolder, Force::WaiterBehindLostWake).is_err());
+#[test]
+fn the_oracle_catches_a_watchdog_that_drops_the_holder() {
+    blaze_sim::check(Config::cases(50), |tape| {
+        assert!(simulate(tape, Flaw::DropHolder, Force::WaiterBehindLostWake).is_err());
+    });
 }
 
 /// A test's process judged by its own CPU with its own quiet bound: still for the bound, it is

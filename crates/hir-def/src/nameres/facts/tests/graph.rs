@@ -13,8 +13,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base_db::Crate;
 use blaze_mem::{Frame, Tag, frame};
-use hegel::generators as gs;
-use hegel::{Hegel, Settings, TestCase};
+use blaze_sim::Config;
 use hir_expand::fixture;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
@@ -49,14 +48,6 @@ fn crates() -> (TestDB, Crate, Crate) {
     assert_eq!(all.len(), 2, "the fixture has two crates");
     let (this, other) = (all[0], all[1]);
     (db, this, other)
-}
-
-/// Runs `property` over `cases` cases, or `HEGEL_TEST_CASES` of them where that is set (a long
-/// run).
-fn run_cases(cases: u64, property: impl FnMut(TestCase)) {
-    let cases =
-        std::env::var("HEGEL_TEST_CASES").ok().and_then(|it| it.parse().ok()).unwrap_or(cases);
-    Hegel::new(property).settings(Settings::new().test_cases(cases).database(None)).run();
 }
 
 #[derive(Default)]
@@ -283,15 +274,12 @@ fn tarjan(nodes: u32, edges: &[(u32, u32)]) -> BTreeSet<Vec<u32>> {
 
 #[test]
 fn pearce_equals_tarjan() {
-    run_cases(1024, |tc| {
-        let nodes: u32 = tc.draw(gs::integers().min_value(1).max_value(47));
-        let edges: Vec<(u32, u32)> = tc.draw(
-            gs::vecs(gs::tuples!(
-                gs::integers().max_value(nodes - 1),
-                gs::integers().max_value(nodes - 1)
-            ))
-            .max_size(159),
-        );
+    // A long run: `BLAZE_SIM_SEEDS` asks for more cases.
+    blaze_sim::check(Config::cases(1024), |tape| {
+        let nodes: u32 = tape.int_in(1..=47, "nodes");
+        let edges: Vec<(u32, u32)> = tape.vec(0..=159, "edges", |tape| {
+            (tape.int_in(0..=nodes - 1, "src"), tape.int_in(0..=nodes - 1, "dst"))
+        });
         task(|frame| {
             let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
             check_well_formed(&partition, nodes);
@@ -910,8 +898,8 @@ impl<'w> Model<'w> {
 #[test]
 fn partition_allows_every_read_of_a_brute_force_resolver() {
     let (_db, this, other) = crates();
-    run_cases(2048, |tc| {
-        let bytes: Vec<u8> = tc.draw(gs::binary().max_size(191));
+    blaze_sim::check(Config::cases(2048), |tape| {
+        let bytes: Vec<u8> = tape.bytes(0..=191, "bytes");
         let world = world(&bytes, this, other);
         let mut model = Model::new(&world);
         model.run();

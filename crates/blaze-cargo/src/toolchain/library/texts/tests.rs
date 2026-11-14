@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use blaze_core::{Done, Effect, FileName, Tag, sim::{Faults, Sim}};
 use blaze_ids::ContentId;
+use blaze_sim::{Config, Tape};
 use blaze_vfs::Mode;
-use hegel::generators as gs;
 
 use super::*;
 
@@ -18,17 +18,15 @@ fn every_text_is_its_id(listing: &Listing, bytes: &[u8]) -> bool {
     })
 }
 
-fn draw_files(tc: &hegel::TestCase) -> Vec<(String, Mode, Vec<u8>)> {
+fn draw_files(tape: &Tape) -> Vec<(String, Mode, Vec<u8>)> {
     let parts = ["a", "b", "core", "src", "lib.rs", "x.md", "é"];
-    let n = tc.draw(gs::integers::<usize>().max_value(12));
+    let n = tape.int_in(0..=12usize, "files");
     let mut files: Vec<(String, Mode, Vec<u8>)> = Vec::new();
     for _ in 0..n {
-        let depth = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
-        let path: Vec<&str> = (0..depth)
-            .map(|_| parts[tc.draw(gs::integers::<usize>().max_value(parts.len() - 1))])
-            .collect();
-        let mode = if tc.draw(gs::booleans()) { Mode::Executable } else { Mode::Regular };
-        files.push((path.join("/"), mode, tc.draw(gs::binary().max_size(600))));
+        let depth = tape.int_in(1..=3usize, "depth");
+        let path: Vec<&str> = (0..depth).map(|_| *tape.one_of(&parts, "part")).collect();
+        let mode = if tape.bool("executable") { Mode::Executable } else { Mode::Regular };
+        files.push((path.join("/"), mode, tape.bytes(0..=600, "text")));
     }
     blaze_ids::names::sort_by_name(&mut files, |it| it.0.as_bytes());
     files.dedup_by(|a, b| a.0 == b.0);
@@ -44,9 +42,13 @@ fn borrowed(files: &[(String, Mode, Vec<u8>)]) -> Vec<(String, Mode, &[u8])> {
 /// id, and the file the listing and texts encode again is the same bytes (rule
 /// persisted-state-round-trips). Control:
 /// `the_oracle_catches_a_text_changed_under_its_listing`.
-#[hegel::test]
-fn texts_round_trip_and_every_text_hashes_to_its_listed_id(tc: hegel::TestCase) {
-    let files = draw_files(&tc);
+#[test]
+fn texts_round_trip_and_every_text_hashes_to_its_listed_id() {
+    blaze_sim::check(Config::DEFAULT, texts_round_trip);
+}
+
+fn texts_round_trip(tape: &Tape) {
+    let files = draw_files(tape);
     let bytes = encode(DIGEST, &borrowed(&files));
     let listing = decode(DIGEST, &bytes).expect("what was encoded decodes");
     assert_eq!(listing.entries.len(), files.len());

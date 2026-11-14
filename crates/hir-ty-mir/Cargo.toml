@@ -58,9 +58,9 @@ syntax-bridge.workspace = true
 [dev-dependencies]
 cov-mark.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 blaze-alloc-count.workspace = true
 blaze-format.workspace = true
+blaze-sim.workspace = true
 blaze-units.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
