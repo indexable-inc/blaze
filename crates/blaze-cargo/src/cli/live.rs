@@ -429,6 +429,7 @@ impl Runner {
     /// refusal's help names the nearest.
     fn names(&self) -> test::Names {
         let mut names = test::Names::default();
+        let mut listed_all: Vec<String, Global> = Vec::new_in(Global);
         for it in self.binaries.iter().filter(|it| it.json) {
             let executable =
                 PathBuf::from(it.artifact.executable.as_deref().unwrap_or(&it.artifact.path));
@@ -437,10 +438,17 @@ impl Runner {
                 .map_or_else(PathBuf::new, std::path::Path::to_owned);
             let exec = Exec::of(&it.artifact, executable, test::LIST.map(OsString::from), root);
             match test::Spawned.names(&exec) {
-                Ok(listed) => names.names.extend(listed),
+                Ok(listed) => listed_all.extend(listed),
                 Err(why) => names.unlisted.push(format!("{}: {why}", exec.shown())), // alloc: a refusal's help, once
             }
         }
+        // As `test::names_of`: how many tests there are, and those nearest the filters.
+        names.count = listed_all.len();
+        // clone: a refusal's help, once
+        names.nearest = test::nearest(&self.selection.filters, listed_all.iter().map(String::as_str))
+            .into_iter()
+            .map(|(distance, name)| (distance, name.to_owned()))
+            .collect();
         names
     }
 
