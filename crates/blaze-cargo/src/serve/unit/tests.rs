@@ -3391,9 +3391,15 @@ fn built_and_kept(seed: u64, lib: &str) -> (blaze_core::sim::Sim, blaze_cas::Sto
     let first = std::sync::Arc::new(core_front(lib));
     let session = super::deps::session(&first, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     ask_bodies_steps(&first);
+    let _ = crate::serve::front_carry::bodies::take_refused();
     let (kept, did) = super::deps::keep_bodies_of(&first, &all_in_view, &BodySessions::default(), &reader, Vec::new())
         .unwrap_or_else(|error| panic!("the first build's keep: {}", error.what));
-    assert!(did.kept > 0, "the first build kept its bodies' entries: {did:?}");
+    let refused = crate::serve::front_carry::bodies::take_refused();
+    assert!(
+        did.kept > 0,
+        "the first build kept none of its bodies' entries: {did:?}; refused, by why (count, first \
+         step refused): {refused:#?}"
+    );
     for it in kept.puts {
         store.put(it.key, it.kind, &it.bytes).unwrap();
     }

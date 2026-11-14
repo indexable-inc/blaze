@@ -164,7 +164,8 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
         fact_of_read(&db, fixture::test_crate(&db), name, key)
     };
     for name in [
-        "ImplSignature::kept",
+        "ImplSignature::served",
+        "ImplSignature::lowered",
         "ImplItems::of",
         "impl_trait_of_impl",
         "impl_has_unconstrained_params",
@@ -172,7 +173,12 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
     ] {
         assert_eq!(read(name, imp.as_id()), signature(ItemId::Impl(imp)), "{name}");
     }
-    for name in ["StructSignature::kept", "field_types_of_variant", "variances_of_query"] {
+    for name in [
+        "StructSignature::served",
+        "StructSignature::lowered",
+        "field_types_of_variant",
+        "variances_of_query",
+    ] {
         assert_eq!(read(name, struct_.as_id()), signature(ItemId::Adt(s)), "{name}");
     }
     assert_eq!(read("representability", enum_.as_id()), signature(ItemId::Adt(e)));
@@ -180,7 +186,9 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
     for name in [ctor, "ctor_variances_query", "AttrFlags::query"] {
         assert_eq!(read(name, variant.as_id()), signature(ItemId::Adt(e)), "{name}: its enum");
     }
-    for name in ["TraitSignature::kept", "supertraits_info", "AttrFlags::query"] {
+    for name in
+        ["TraitSignature::served", "TraitSignature::lowered", "supertraits_info", "AttrFlags::query"]
+    {
         assert_eq!(read(name, tr.as_id()), signature(ItemId::Trait(tr)), "{name}");
     }
     assert_eq!(read("ItemBounds::of", alias.as_id()), signature(ItemId::Trait(tr)), "its trait");
@@ -201,7 +209,9 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
 
     // A key whose page holds another struct, another crate-wide table, a query keyed by
     // several arguments, and a name no query has stand for nothing.
-    assert_eq!(read("ImplSignature::kept", tr.as_id()), None);
+    assert_eq!(read("ImplSignature::served", tr.as_id()), None);
+    // A name no query has any more: `kept` became `served` and `lowered` (f25aa5be3c).
+    assert_eq!(read("ImplSignature::kept", imp.as_id()), None);
     assert_eq!(read("fn_sig_for_fn", struct_.as_id()), None);
     assert_eq!(read("TraitImpls::for_crate", krate.as_id()), None);
     assert_eq!(read("no such query", imp.as_id()), None);
@@ -542,7 +552,7 @@ fn a_warm_read_and_value_allocate_nothing() {
     let Fixture { imp, .. } = fixture(&db);
     let fact = fact_ref(&Fact::Signature(item_key(&db, ItemId::Impl(imp))));
     let krate = fixture::test_crate(&db);
-    let read = || fact_of_read(&db, krate, "ImplSignature::kept", imp.as_id());
+    let read = || fact_of_read(&db, krate, "ImplSignature::served", imp.as_id());
     let warm = (read(), Goals.value(&db, Some(krate), fact));
     assert_at_most(0, "a read's fact and a fact's value, warm", || {
         std::hint::black_box((read(), Goals.value(&db, Some(krate), fact)))

@@ -3102,13 +3102,13 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         signatures.chain(variants).collect()
     }
 
-    /// The signature lowerings in `log`: `kept` lowers what `of` reads, `relative` lowers it
-    /// again with its source map.
+    /// The signature lowerings in `log`: `lowered` lowers what `of` reads in a crate no record
+    /// serves, `relative` lowers it again with its source map.
     fn lowerings(log: &[String]) -> Vec<&str> {
         let lowering = |it: &&String| {
-            it.contains("Signature::kept")
+            it.contains("Signature::lowered")
                 || it.contains("Signature::relative")
-                || it.contains("VariantFields::kept")
+                || it.contains("VariantFields::lowered")
                 || it.contains("VariantFields::relative")
                 || it.contains("EnumVariants::of")
         };
@@ -3143,8 +3143,8 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         let mut lowerings = lowerings(&log);
         lowerings.sort_unstable();
         assert_eq!(lowerings.len(), 2, "{log:#?}");
-        assert!(lowerings[0].contains("StructSignature::kept"), "{lowerings:?}");
-        assert!(lowerings[1].contains("VariantFields::kept"), "{lowerings:?}");
+        assert!(lowerings[0].contains("StructSignature::lowered"), "{lowerings:?}");
+        assert!(lowerings[1].contains("VariantFields::lowered"), "{lowerings:?}");
     }
 
     #[test]

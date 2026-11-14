@@ -1715,6 +1715,36 @@ pub(crate) mod bodies {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Each refusal a keep counted in [`Did::refused`] on this thread, by why: how many,
+        /// and the first step it refused. What a test whose premise is a kept entry says when
+        /// none was kept (rule errors-name-the-thing).
+        static REFUSED: std::cell::RefCell<BTreeMap<String, (usize, String)>> =
+            const { std::cell::RefCell::new(BTreeMap::new()) };
+    }
+
+    #[cfg(test)]
+    fn refused_for_test(why: &str, example: std::fmt::Arguments<'_>) {
+        REFUSED.with(|it| {
+            let mut it = it.borrow_mut();
+            // alloc: a test's record of a refusal, one entry per reason
+            let entry = it.entry(why.to_owned()).or_insert_with(|| (0, example.to_string()));
+            entry.0 += 1;
+        });
+    }
+
+    /// The refusals counted on this thread since the last call, by why, each with its count and
+    /// first step, most first; and forgets them.
+    #[cfg(test)]
+    pub(crate) fn take_refused() -> Vec<(String, usize, String)> {
+        let taken = REFUSED.with(|it| std::mem::take(&mut *it.borrow_mut()));
+        // alloc: a test's message
+        let mut out: Vec<(String, usize, String)> = taken.into_iter().map(|(why, (n, example))| (why, n, example)).collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
     /// The refusal `error` carries, if it is one: a step that refused its input
     /// (`StepError::Refused`, which the kernel gives as [`KernelError::Compute`]), or a step
     /// whose step it asked for refused ([`KernelError::Child`] down to one).
@@ -1751,6 +1781,8 @@ pub(crate) mod bodies {
         let mut did = Did::default();
         for it in &claim.refused {
             did.refused += 1;
+            #[cfg(test)]
+            refused_for_test(&it.why, format_args!("{:?} of {:?}", it.step, it.def));
             tracing::debug!(target: "blaze", def = ?it.def, step = ?it.step, "a run the item store refused to trace, kept as no entry: {}", it.why);
         }
         // alloc: once a keep, the steps it keeps by crate, in order (rule 25)
@@ -1849,6 +1881,8 @@ pub(crate) mod bodies {
                     Err(error) => match refusal(&error) {
                         Some(why) => {
                             did.refused += 1;
+                            #[cfg(test)]
+                            refused_for_test(why, format_args!("{of:?} of {key:?}"));
                             tracing::debug!(target: "blaze", "{of:?} of {key:?} kept as no entry, its step refused: {why}");
                         }
                         None => return Err(error.into()),

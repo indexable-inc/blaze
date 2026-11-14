@@ -138,17 +138,26 @@ fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
 /// changes what it finds changes the impl's signature.
 pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option<Fact> {
     let signature = |id: ItemId| Some(Fact::Signature(key::item_key(db, id)));
+    // `XSignature::served` (read from the crate's record) and `XSignature::lowered` (lowered
+    // from syntax) are the two routes to the one value `XSignature::of` gives: the signature.
     match name {
-        "ImplSignature::kept"
+        "ImplSignature::served"
+        | "ImplSignature::lowered"
         | "ImplItems::of"
         | "impl_trait_of_impl"
         | "impl_self_ty_of_impl"
         | "impl_has_unconstrained_params" => signature(ItemId::Impl(arg(db, key)?)),
-        "StructSignature::kept" | "fn_sig_for_struct_constructor" => {
+        "StructSignature::served"
+        | "StructSignature::lowered"
+        | "fn_sig_for_struct_constructor" => {
             signature(ItemId::Adt(AdtId::StructId(arg(db, key)?)))
         }
-        "EnumSignature::kept" => signature(ItemId::Adt(AdtId::EnumId(arg(db, key)?))),
-        "UnionSignature::kept" => signature(ItemId::Adt(AdtId::UnionId(arg(db, key)?))),
+        "EnumSignature::served" | "EnumSignature::lowered" => {
+            signature(ItemId::Adt(AdtId::EnumId(arg(db, key)?)))
+        }
+        "UnionSignature::served" | "UnionSignature::lowered" => {
+            signature(ItemId::Adt(AdtId::UnionId(arg(db, key)?)))
+        }
         "representability" => signature(ItemId::Adt(arg(db, key)?)),
         "field_types_of_variant" | "ctor_variances_query" => {
             signature(ItemId::Adt(arg::<VariantId>(db, key)?.adt_id(db)))
@@ -157,11 +166,14 @@ pub(crate) fn fact_of_read(db: &Db, krate: Crate, name: &str, key: Id) -> Option
             let variant: EnumVariantId = arg(db, key)?;
             signature(ItemId::Adt(AdtId::EnumId(variant.lookup(db).parent)))
         }
-        "TraitSignature::kept"
+        "TraitSignature::served"
+        | "TraitSignature::lowered"
         | "TraitItems::query_with_diagnostics"
         | "supertraits_info"
         | "dyn_compatibility_of_trait_query" => signature(ItemId::Trait(arg(db, key)?)),
-        "FunctionSignature::kept" | "fn_sig_for_fn" => signature(ItemId::Function(arg(db, key)?)),
+        "FunctionSignature::served" | "FunctionSignature::lowered" | "fn_sig_for_fn" => {
+            signature(ItemId::Function(arg(db, key)?))
+        }
         // An impl method's types for the `impl Trait`s of the trait method it implements: a
         // fact of their own, never its signature, which the goals finding them read (the
         // bounds of its own `impl Trait`s): see `Fact::RpititTys`.

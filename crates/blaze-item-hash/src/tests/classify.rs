@@ -541,14 +541,12 @@ pub fn copies<M: Make>(m: &M) { let a = m.make(); let b = a; let _ = (a, b); }
 /// Reads the closure test allows to be refused, each with why. A refused read keeps its step
 /// out of the store; it is never a wrong answer. Each is to be made a fact or covered by the
 /// request named, never by widening a rule here.
+/// These have a rule that refuses some reads of them; a query with no rule at all is in
+/// [`UNRULED`].
 const REFUSALS: &[(&str, &str)] = &[
     ("closure_exprs", "read for another body's closures"),
-    // A walk of every module of a published crate outside `inherent_assoc_types` (which is
-    // its own fact now, `InherentAssocTypes`).
-    ("modules", "a walk of every module of a published crate (DefMap::table)"),
     // Positions: the identity has no spans. A signature's source map is no longer here: its
     // signature is the `Signature` fact and no answer holds a position (`reads::RULES`).
-    ("Body::source_map", "a source map: positions"),
     ("Body::relative", "a source map: positions"),
     // Gone from this list with a rule each (2026-11-13, claude-opus-5-5): `const_eval_query`
     // with arguments and `anon_const_eval_query` (read through), `table` (its reader
@@ -557,6 +555,29 @@ const REFUSALS: &[(&str, &str)] = &[
     // another body's MIR a step fact of that body). A read refused below one of them is
     // refused by its own name, which this list then has to give a reason for.
 ];
+
+/// The queries a body's steps read that [`RULES`] names on purpose by no rule, each by name and
+/// the file it is declared in (as [`RULES`] keys them, so another query given a listed name is
+/// not taken for it) and why: every read of one is refused by its own name. A query lands here
+/// only with that reason; a query no rule names and not here is a gap
+/// (`every_tracked_query_a_step_reads_is_named_by_a_rule`).
+const UNRULED: &[(&str, &str, &str)] = &[
+    // Positions: the identity has no spans.
+    ("Body::source_map", "hir-def/src/expr_store/body.rs", "a source map: positions"),
+    // A walk of every module of a published crate outside `inherent_assoc_types` (which is
+    // its own fact now, `InherentAssocTypes`).
+    (
+        "modules",
+        "hir-def/src/nameres/delta/publish.rs",
+        "a walk of every module of a published crate (DefMap::table)",
+    ),
+];
+
+/// Whether `read`, of `name`, is of a query [`UNRULED`] lists.
+fn unruled(db: &Db, read: blaze_query::db::DatabaseKeyIndex, name: &str) -> bool {
+    let file = blaze_query::db::Database::storage(db).ingredient_file(read.ingredient_index());
+    UNRULED.iter().any(|&(it, at, _)| reads::cmp_listed(it, name).is_eq() && file.ends_with(at))
+}
 
 /// Lane item-hash's side, with a body's identity its debug name (one database only) and every
 /// classification kept.
@@ -691,17 +712,70 @@ fn steps_seen_in(db: Db) -> (Db, Vec<Seen>) {
 
 #[test]
 fn every_read_of_the_steps_is_covered_a_fact_or_a_listed_refusal() {
-    let (_db, seen) = steps_seen();
+    let (db, seen) = steps_seen();
     assert!(seen.iter().any(|it| it.step == Step::Infer), "no inference read was classified");
     let mut unlisted: Vec<(Step, &str)> = seen
         .iter()
         .filter(|it| it.class == Classified::Refused)
         .filter(|it| !REFUSALS.iter().any(|&(name, _)| reads::cmp_listed(name, it.name).is_eq()))
+        .filter(|it| !unruled(&db, it.read, it.name))
         .map(|it| (it.step, it.name))
         .collect();
     unlisted.sort_unstable();
     unlisted.dedup();
     assert!(unlisted.is_empty(), "reads refused with no reason in REFUSALS: {unlisted:#?}");
+}
+
+/// The invariant: every tracked query of the front end is named by a read rule: as a fact, as
+/// covered by the identity, or as refused with its reason; a query no rule names fails here, not
+/// in a build's notes.
+///
+/// The front end has no list of its queries to walk: an ingredient is numbered when it is first
+/// used, process-wide (`blaze_query`'s `ingredient::register`), so which are registered depends
+/// on which tests ran before. The queries enumerated are therefore those the steps read
+/// directly over [`STEPS`], one entry per (name, declaring file): what a rule is looked up by.
+/// An interned read is covered whatever it is (`reads::classify`), so it is not enumerated.
+/// Each must have a rule (`reads::rule_of`, by name and file) or be in [`UNRULED`]; and each
+/// [`UNRULED`] entry must still be read, so the list holds no query that is gone. The control:
+/// a query split or renamed under the rules (`XSignature::kept` into `served` and `lowered`,
+/// f25aa5be3c, which refused every body) is read here under its new name and has no rule.
+#[test]
+fn every_tracked_query_a_step_reads_is_named_by_a_rule() {
+    let (db, seen) = steps_seen();
+    let storage = blaze_query::db::Database::storage(&db);
+    let mut queries: Vec<(&str, &str, blaze_query::db::DatabaseKeyIndex)> = seen // alloc: test
+        .iter()
+        .filter(|it| it.kind != blaze_query::db::ReadKind::Interned)
+        .map(|it| (it.name, storage.ingredient_file(it.read.ingredient_index()), it.read))
+        .collect();
+    queries.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    queries.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));
+    assert!(
+        queries.iter().any(|&(name, ..)| name.starts_with("FunctionSignature::")),
+        "the steps read no signature query, so this enumerates too little: {queries:#?}"
+    );
+    let unnamed: Vec<(&str, &str)> = queries // alloc: test
+        .iter()
+        .filter(|&&(name, _, read)| {
+            reads::rule_of(&db, read, name).is_none() && !unruled(&db, read, name)
+        })
+        .map(|&(name, file, _)| (name, file))
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "queries the steps read that no rule in reads::RULES names, nor UNRULED with a reason \
+         (each read of one refuses its body's step): {unnamed:#?}"
+    );
+    let gone: Vec<&str> = UNRULED // alloc: test
+        .iter()
+        .filter(|&&(it, at, _)| {
+            !queries.iter().any(|&(name, file, _)| {
+                reads::cmp_listed(it, name).is_eq() && file.ends_with(at)
+            })
+        })
+        .map(|&(it, ..)| it)
+        .collect();
+    assert!(gone.is_empty(), "UNRULED lists queries the steps no longer read: {gone:?}");
 }
 
 /// A rule that names an ingredient no read of the steps is of is checked by the fact pairs

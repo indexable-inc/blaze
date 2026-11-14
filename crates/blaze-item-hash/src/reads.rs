@@ -276,24 +276,33 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("Body::has_lowering_errors", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::of", "hir-def/src/expr_store/body.rs", Rule::OwnBody),
     ("Body::relative", "hir-def/src/expr_store/body.rs", Rule::LowerOnly),
-    ("ConstSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    // A signature (or a variant's fields) as `of` reads it: `served`, read from its crate's
+    // record (`None` for a crate no record serves), or `lowered`, lowered alone from its
+    // syntax. Each is the one value `of` gives, the item's signature, by two routes, so both
+    // are its `Signature` fact (`Items` asks `blaze_items::goals::fact_of_read`, which names
+    // both); whether a record serves the crate changes no answer a body reads from it.
+    ("ConstSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     // A signature lowered again with its source map (`relative`, `with_source_map`): the
-    // signature is `kept`'s (`Kept::with_map`), which the `Signature` fact hashes; the map is
+    // signature is `of`'s (`Kept::with_map`), which the `Signature` fact hashes; the map is
     // where each part is written, and no answer holds a position (inference and MIR name
     // expressions and type references by id, `mir::persist`'s spans are ids, a location
     // literal is a slot), so nothing of it reaches a kept value.
     ("ConstSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
+    ("ConstSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     ("ConstSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Const)),
     ("CrateResolution::module", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("DefMapPair", "hir-def/src/nameres.rs", Rule::Names),
-    ("EnumSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("EnumSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("EnumSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("EnumVariants::of", "hir-def/src/signatures.rs", Rule::Fields(Of::Enum)),
     ("ExprScopes::body_expr_scopes", "hir-def/src/expr_store/scope.rs", Rule::OwnBody),
-    ("FunctionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("FunctionSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
     ("FunctionSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
+    ("FunctionSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("FunctionSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Function)),
     ("ImplItems::of", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Impl)),
-    ("ImplSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("ImplSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("ImplSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("InherentImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("InherentImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
     ("InherentImpls::for_module", "hir-ty/src/method_resolution.rs", Rule::ModuleCrate),
@@ -311,10 +320,12 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("ScopeInput::legacy_macro", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("ScopeInput::name", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("ScopeInput::traits", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
-    ("StaticSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StaticSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
+    ("StaticSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
     ("StaticSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Static)),
-    ("StructSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("StructSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("StructSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("TraitImpls::blanket_in_crate_and_deps", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Trait)),
     ("TraitImpls::for_block", "hir-ty/src/method_resolution.rs", Rule::Block),
     ("TraitImpls::for_crate", "hir-ty/src/method_resolution.rs", Rule::WholeCrate),
@@ -325,14 +336,18 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("TraitImpls::in_crate_and_deps_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitImpls::in_crate_for_trait_and_self_ty", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::TraitSelfTy)),
     ("TraitItems::query_with_diagnostics", "hir-def/src/nameres/assoc.rs", Rule::Fields(Of::Trait)),
-    ("TraitSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
-    ("TypeAliasSignature::kept", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TraitSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("TraitSignature::served", "hir-def/src/signatures.rs", Rule::Items),
+    ("TypeAliasSignature::lowered", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
     ("TypeAliasSignature::relative", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
+    ("TypeAliasSignature::served", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
     ("TypeAliasSignature::with_source_map", "hir-def/src/signatures.rs", Rule::Signature(Of::Alias)),
-    ("UnionSignature::kept", "hir-def/src/signatures.rs", Rule::Items),
+    ("UnionSignature::lowered", "hir-def/src/signatures.rs", Rule::Items),
+    ("UnionSignature::served", "hir-def/src/signatures.rs", Rule::Items),
     ("UnstableFeatures::query", "hir-def/src/unstable_features.rs", Rule::OwnCrate(Else::CrateRoot)),
     ("VariantFields::field_visibilities", "hir-def/src/visibility.rs", Rule::Signature(Of::Variant)),
-    ("VariantFields::kept", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
+    ("VariantFields::lowered", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
+    ("VariantFields::served", "hir-def/src/signatures.rs", Rule::Fields(Of::Variant)),
     // What dropping an ADT needs live, walked to a recursion limit: its fields' types, its
     // `Drop` impl (`destructor`, the ADT's `DropCheck`) and that impl's arguments, and the
     // solver's drop glue of each field, each a fact read through.
