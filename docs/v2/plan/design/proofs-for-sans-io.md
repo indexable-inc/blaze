@@ -86,6 +86,28 @@ draws an answer, with `allows(pick(..))` proved once.
 - `Locks`, `Net`, processes: as `Sim` has them.
 - Later, `Atomics` (section 8).
 
+**What a crash allows**, as `Sim::crash` has it today, which is the rule `Fs::allows` states
+(read 2026-11-13; the world is not written yet):
+
+- A file is its durable bytes and, in order, the changes made since the last sync that
+  covered it. A crash keeps the durable bytes and a prefix of the changes, each file's own;
+  of the first change not kept, any set of its 512-byte sectors may have landed.
+- A barrier (`Effect::Barrier`) orders: if a crash keeps any change, of any file, made after
+  a barrier completed, it keeps every change that barrier covers. That couples files, so
+  `allows` is one predicate over the whole disk: there is a count kept per file such that
+  each is a prefix, the disk is what those prefixes and torn sectors give, and no kept
+  change is newer than a barrier whose changes are not all kept.
+- A whole-file write or a rename that waited for no sync may be undone as a whole: the name
+  holds what it held before, a renamed file is back under its old name.
+- A completed whole-file write or rename that did wait is kept whole; one in flight is not
+  there.
+
+A core's crash theorem is then of one shape: for every disk `allows` permits of the world
+the core's own run left, recovery from that disk gives a state whose well-formedness and
+whose durable promises (what was reported durable is there, nothing torn is served) hold.
+The lemmas a proof uses are the consequences of the rule above (what a sync or a barrier
+before a commit record guarantees about the bytes it names), proved once beside the world.
+
 Worlds are written in the translator's subset as it stands (index loops, `Vec`, sorted
 `Vec` maps), so the first crash proof does not wait for iterators and closures. End state:
 `Sim` is rebuilt on these types, so the kernel's rules have one home
