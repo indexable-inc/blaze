@@ -13,8 +13,9 @@
 //!   record) and the machine that turns a demand, an edit's delta or a tier-up into a
 //!   [`change::PlacementChange`] of bytes proportional to the edit. One driver applies it now:
 //!   the file writer ([`change::apply`]). Nothing is relinked.
-//! - [`reach`] and [`record::TestRecord`]: tests are programs; a result is keyed by what the
-//!   test reaches (calls and statics' values), its outside reads and its arguments.
+//! - [`reach`]: tests are programs; a result's base key is the test's identity
+//!   ([`reach::test_key`]), and what it can run is its reach (calls and statics' values). The
+//!   result record, its asks and the suite index are blaze-testsel's.
 //!
 //! **The row rule** (one definition; every path derives from it). Each function has a tier: a
 //! dependency's is the top tier; a workspace function's is the fast tier unless it was tiered
@@ -40,7 +41,7 @@
 //!   [`program::Program::top_tier`] is the rows held at the top tier: a whole build seeded
 //!   with it as `Delta::tier_up` (new nodes at the fast tier) has the same tiers, so the same
 //!   rows.
-//! - A tier changes no behaviour, so a test's key is over the tier-free plan keys of what it
+//! - A tier changes no behaviour, so a test's reach is over the tier-free plan keys of what it
 //!   can run ([`reach`]); a tier-up never runs a test again.
 //!
 //! Nothing here does IO, reads a clock, or reacts to a file change: a build happens when asked,

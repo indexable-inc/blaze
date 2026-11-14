@@ -1849,6 +1849,26 @@ impl GenericDef {
     pub fn bound_source(self, db: &Db, bound_index: u32) -> Option<BoundSource> {
         bound_source(db, GenericDefId::try_from(self).ok()?, bound_index)
     }
+
+    /// The bounds written on the item that its header already implies
+    /// (`#![feature(blaze_implied_bounds)]`): `T: X` on `impl<T: X> C<T>` where `struct C<A:
+    /// X>`. Empty without the feature.
+    pub fn written_implied_bounds(self, db: &Db) -> Vec<InFile<AstPtr<ast::TypeBound>>> {
+        let Ok(def) = GenericDefId::try_from(self) else {
+            // alloc: empty, allocates nothing
+            return Vec::new();
+        };
+        let found = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+            hir_ty::written_implied_predicates(db, def)
+        });
+        found
+            .into_iter()
+            .filter_map(|index| match bound_source(db, def, index)? {
+                BoundSource::Written(ptr) => Some(ptr),
+                _ => None,
+            })
+            .collect() // alloc: a lint's findings, one per bound said twice
+    }
 }
 
 pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Option<BoundSource> {
@@ -1867,6 +1887,25 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         }
         // A `where const { .. }` condition is no bound on a type: nothing points at it yet.
         PredicateSource::WhereConst { .. } => return None,
+        // `#![feature(blaze_implied_bounds)]`: the bound where the type or trait the header
+        // names declares it, the `index`th of its sources but its implied ones.
+        PredicateSource::Implied { from, index } => {
+            let declared = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+                hir_ty::predicate_sources(db, from)
+            });
+            let position = declared
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| {
+                    !matches!(
+                        it,
+                        PredicateSource::ImpliedTrait(_) | PredicateSource::Implied { .. }
+                    )
+                })
+                .nth(index as usize)?
+                .0;
+            return bound_source(db, from, position as u32);
+        }
         PredicateSource::Written { def, index } => {
             let (params, _, source_map) = GenericParams::with_source_map(db, def);
             let bound = match *params.where_predicates().get(index as usize)? {

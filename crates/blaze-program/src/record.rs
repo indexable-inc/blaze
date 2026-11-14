@@ -1,5 +1,5 @@
 //! The records: an instance's [`Plan`] (by its plan key), its [`InstanceCode`] (by its instance
-//! key), a static's [`StaticValue`] and a test's [`TestRecord`].
+//! key), a static's [`StaticValue`] and a test's base key ([`TestKey`]).
 //!
 //! **The code record** is position-independent: no address is in its bytes. Every place an
 //! address goes is a [`Reloc`] naming its target by stable identity ([`Target`]: a function or a
@@ -629,70 +629,6 @@ impl StaticValue {
     }
 }
 
-/// The key of a test's result: see [`crate::reach::test_key`].
+/// The base key of a test's result (the core's `TestRun`): see [`crate::reach::test_key`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
 pub struct TestKey(pub Digest);
-
-/// One read a test made outside the program (a file, an environment variable), by name, with
-/// the digest of what it read (`None`: it found nothing).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct OutsideRead {
-    pub what: Vec<u8, Global>,
-    pub digest: Option<Digest>,
-}
-
-/// A test's result, filed under its [`TestKey`]: whether it passed, what it printed, and the
-/// outside reads it made, which must still read the same for the result to stand.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TestRecord {
-    pub key: TestKey,
-    pub passed: bool,
-    pub output: Vec<u8, Global>,
-    pub reads: Vec<OutsideRead, Global>,
-}
-
-impl TestRecord {
-    /// Whether the result stands: every outside read reads the same `now`.
-    pub fn holds(&self, mut now: impl FnMut(&[u8]) -> Option<Digest>) -> bool {
-        self.reads.iter().all(|read| now(&read.what) == read.digest)
-    }
-}
-
-impl Payload for TestRecord {
-    const NAME: &'static str = "blaze program test result";
-
-    fn encode_body(&self, out: &mut Out) {
-        out.digest(&self.key.0);
-        out.bool(self.passed);
-        out.bytes(&self.output);
-        out.count(self.reads.len());
-        for read in &self.reads {
-            out.bytes(&read.what);
-            match &read.digest {
-                None => out.u8(0),
-                Some(digest) => {
-                    out.u8(1);
-                    out.digest(digest);
-                }
-            }
-        }
-    }
-
-    fn decode_body(input: &mut In<'_>) -> Result<TestRecord, CodecError> {
-        let key = TestKey(input.digest()?);
-        let passed = input.bool()?;
-        let output = input.bytes_owned()?;
-        let count = input.count(5)?;
-        let mut reads = Vec::with_capacity_in(count, Global);
-        for _ in 0..count {
-            let what = input.bytes_owned()?;
-            let digest = match input.u8()? {
-                0 => None,
-                1 => Some(input.digest()?),
-                _ => return Err(input.error("an outside read's digest of a tag no digest has")),
-            };
-            reads.push(OutsideRead { what, digest });
-        }
-        Ok(TestRecord { key, passed, output, reads })
-    }
-}

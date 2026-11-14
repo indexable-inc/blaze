@@ -138,14 +138,23 @@ pub(crate) fn built_nothing(job: &Job, unit: usize) -> bool {
         && of(job, unit).is_some_and(Pure::all_hit)
 }
 
-/// The most instances a build script's purity proof may walk before it stops with an error
-/// naming the script: the bound on the walk (rule 18). A step is a body instance the walk
-/// reaches, each once ([`hir_ty_pure::ScriptProof::steps`]), whatever the daemon had cached
-/// and whichever task ran what, so a script is proved or refused alike on a cold, warm or busy
-/// daemon. How many a proof took is the `steps` of its `build script proof` span: the margin
-/// under this bound is read from the profiles. No real proof's count is quoted here yet;
-/// calibrate it from the largest (cranelift-codegen's and wasmtime's among them).
-const PROOF_STEPS: u64 = 1 << 20;
+/// The most instances a build script's purity proof may walk: the bound on the walk (rule
+/// 18). A step is a body instance the walk reaches, each once
+/// ([`hir_ty_pure::ScriptProof::steps`]), whatever the daemon had cached and whichever task
+/// ran what, so a script is proved or not alike on a cold, warm or busy daemon. A walk that
+/// passes the bound ends there and the script is not proved ([`past_bound`]): it is built and
+/// run in the sandbox as any script, and the build's report says so. It is never a failed
+/// build: the proof only saves a script's build and run, so it may not cost more than them.
+///
+/// Measured, a cold build of reth's 30 packages on 128 cores (2026-11-13, main at e6635c9ba7,
+/// `build script proof` and `build script run` spans): 58 proofs that ended took 226.5 s
+/// (median 2.9 s, most 16.7 s, about 1.4 ms an instance) against 170.9 s for the 58 runs
+/// (median 0.22 s); they walked 3,149 to 13,734 instances. Under the old bound of 2^20 the
+/// proof of `reth-mdbx-sys`'s script (bindgen) had not ended after 361 s, and the daemon was
+/// killed at a footprint of 214 GiB, the walk's allocations the most of it. 2^12 keeps the
+/// scripts of the size of `proc-macro2`'s and `libc`'s (3,149 to 3,729 instances) and ends a
+/// larger walk after at most about 6 s.
+const PROOF_STEPS: u64 = 1 << 12;
 
 /// The most rows of the front end a purity proof may bring up to date (each run or verified,
 /// each time it is reached): a bound on the query engine under the proof, not on the script,
@@ -189,11 +198,11 @@ fn work_out(
                 span.ended(blaze_profile::span::ScriptProved { steps: u64::from(proof.steps) });
                 proof
             }
-            // alloc: an error, once
+            // alloc: once per script past the bound: what the build's report says of it
             Ok((Ok((proof, _)), _)) => {
-                return Err(refused(job, compile, &format!("it walked {}", proof.steps)));
+                return Ok(past_bound(&format!("it walked {}", proof.steps)));
             }
-            Ok((Err(out), _)) => return Err(refused(job, compile, &format!("it {out}"))), // alloc: an error, once
+            Ok((Err(out), _)) => return Ok(past_bound(&format!("it {out}"))), // alloc: as above
             Err(out) => {
                 let what = format!(
                     "did not end: the query engine under it {out}, past the {ENGINE_FUEL} rows a proof may bring up to \
@@ -267,14 +276,14 @@ fn work_out(
     Ok(Purity::Pure(Pure { proof, runs }))
 }
 
-/// The error of the purity proof of the script compiled by unit `compile`, which walked more
-/// instances than [`PROOF_STEPS`]: `how` says how far it got.
-fn refused(job: &Job, compile: usize, how: &str) -> ApiError {
-    // alloc: an error, once
-    let what = format!(
-        "walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 18): {how}"
-    );
-    proof_error(job, compile, &what)
+/// What the pure path says of a script whose proof walked more instances than
+/// [`PROOF_STEPS`]: not proved, so built and run in the sandbox as any script; `how` says how
+/// far the walk got.
+fn past_bound(how: &str) -> Purity {
+    // alloc: once per script past the bound: what the build's report says of it
+    Purity::Impure(format!(
+        "not proved pure: its proof walks more than the {PROOF_STEPS} instances a proof's walk may reach (rule 18): {how}"
+    ))
 }
 
 /// The error of the purity proof of the script compiled by unit `compile`, naming the script;

@@ -1,0 +1,14 @@
+{
+ "id": "testsel-machine-unchecked-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane test selection (blaze test reruns only changed tests)",
+ "where": "crates/blaze-testsel/src/{ask,index,machine}.rs, crates/blaze-testsel/src/machine/tests.rs, crates/blaze-program/src/record.rs",
+ "what": "A write-only lane wrote about 2,000 lines of new Rust (a sans-IO machine, two record formats and a simulation) without one compile, so every borrow, lifetime capture and API assumption is checked by reading only; and in one step it deleted a block from a .rs file with a one-off Python script, which the lane brief forbids (only Edit and Write on .rs files).",
+ "cost": "every blaze-keyed and blaze-testsel signature re-read by hand; the main agent's first compile will find what reading missed",
+ "cause": "the write-only lane rule gives a lane no type checker, and a large deletion is slow through Edit, which tempts a script",
+ "class": "a lane writing code it cannot type-check; a mechanical edit made by text, not by name resolution",
+ "prevention": "a read-only `blaze check -p <crate>` a lane may run (no build, no test) through the build VM queue; deletions through Edit even when long",
+ "workaround": "read every called signature before using it; the Python deletion was a plain removal of the TestRecord block, checked by printing the file after",
+ "fix": "give write-only lanes a check-only queue entry on blaze-vm",
+ "state": "open"
+}

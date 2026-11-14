@@ -27,8 +27,8 @@ use crate::Plant;
 use crate::change::{PlacementChange, Section, Sink, apply};
 use crate::key::{DebugInfo, InstanceKey, ItemId, Node, Panic, PlanKey, Settings, Symbol, Tier};
 use crate::program::{Arch, Delta, Machine, Program, ProgramError, Records};
-use crate::reach::{reach, test_key};
-use crate::record::{CodeHead, InstanceCode, Plan, RelocKind, TestKey};
+use crate::reach::{reach, reach_digest};
+use crate::record::{CodeHead, InstanceCode, Plan, RelocKind};
 use crate::codec::{Digest, Hasher, Payload};
 use crate::walk::{Answer, Ask, Fresh, Front, Prior, Seed, Walk, WalkConfig, Walked, shard_of};
 
@@ -845,12 +845,13 @@ impl World {
         delta
     }
 
-    fn test_keys(&self) -> Vec<TestKey> {
+    /// Each test's reach digest: what a reached-basis result and a mutant verdict are kept under.
+    fn test_reaches(&self) -> Vec<Digest> {
         let mut out = Vec::new();
         for test in &self.model.tests {
             let entry = fn_symbol(&self.model, *test, &[]);
             let reached = reach(&self.program, &entry, self.plant);
-            out.push(test_key(&entry, &reached, b""));
+            out.push(reach_digest(&reached));
         }
         out
     }
@@ -899,7 +900,7 @@ impl World {
 
     /// One edit, walked, placed and checked by every oracle.
     pub(super) fn step(&mut self, edit: Edit) -> Result<(), String> {
-        let tests_before = self.test_keys();
+        let tests_before = self.test_reaches();
         let reaches_before = self.model_reaches();
         let delta = self.edit(edit);
         let store_before: BTreeSet<InstanceKey> = self.store.code.keys().copied().collect();
@@ -950,16 +951,16 @@ impl World {
         self.last_delta = delta;
         self.last_makes = makes;
 
-        // A test's key moved exactly when what it reaches changed; a tier-up changes nothing a
-        // test observes, so it moves no key.
-        let tests_after = self.test_keys();
+        // A test's reach digest moved exactly when what it reaches changed; a tier-up changes
+        // nothing a test observes, so it moves no digest.
+        let tests_after = self.test_reaches();
         let reaches_after = self.model_reaches();
         for index in 0..tests_after.len() {
             let moved = tests_before[index] != tests_after[index];
             let changed = reaches_before[index] != reaches_after[index];
             if moved != changed {
                 return Err(format!(
-                    "test {index}: its key {} but what it reaches {}",
+                    "test {index}: its reach digest {} but what it reaches {}",
                     if moved { "moved" } else { "stayed" },
                     if changed { "changed" } else { "did not" }
                 ));
@@ -1349,7 +1350,6 @@ fn records_round_trip_through_the_core_framing() {
     use blaze_keyed::proof;
 
     use crate::keyed;
-    use crate::record::{OutsideRead, TestRecord};
 
     let world = World::new(&Tape::seeded(3), Plant::None).unwrap_or_else(|why| panic!("{why}"));
     proof::scope(|snap| {
@@ -1381,19 +1381,5 @@ fn records_round_trip_through_the_core_framing() {
             Some((chunk, &bytes[..]))
         });
         assert_eq!(read, Ok(world.program.clone()));
-    });
-    let result = TestRecord {
-        key: TestKey(Digest::of("blaze program test result key 1", b"t")),
-        passed: true,
-        output: b"ok".to_vec(),
-        reads: vec![
-            OutsideRead { what: b"env:HOME".to_vec(), digest: None },
-            OutsideRead { what: b"file:data.txt".to_vec(), digest: Some(Digest::of("blaze program test file 1", b"x")) },
-        ],
-    };
-    let filed = Aligned::copy_from(&keyed::write_test(&result));
-    proof::scope(|snap| {
-        let holds = proof::hit(snap, keyed::test_key(&result.key), &filed).unwrap_or_else(|error| panic!("{error}")).holds();
-        assert_eq!(keyed::read_test(&holds, &filed), Ok(result));
     });
 }
