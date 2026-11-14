@@ -480,8 +480,11 @@ impl Checking {
         match self.proving.sandbox_off {
             true => Sandbox::Off,
             false => Sandbox::On {
+                // What it may write it may read, and the sandbox refuses a directory named
+                // both ways (the read-only entry would cover the writable one): Lean's
+                // release is the one thing it only reads.
                 // clone: a command owns its paths, once per run of Lean
-                read: vec![self.release.clone(), self.proving.out.clone()],
+                read: vec![self.release.clone()],
                 write: vec![self.proving.out.clone()],
                 network: false,
                 trace: false,
