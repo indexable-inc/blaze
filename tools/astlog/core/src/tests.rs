@@ -745,3 +745,16 @@ applied = [100000, true]
     );
     Ok(())
 }
+
+#[test]
+fn a_negated_match_filters_rows_it_holds_for() -> TestResult {
+    let rules = r#"
+(rule (item f) (match rust "(function_item) @f"))
+(rule (calls-nothing f)
+  (item f)
+  (not (match rust "(function_item body: (block (expression_statement (call_expression)))) @f")))
+"#;
+    let text = only_node_text("sample.rs", "fn a() { b(); }\nfn b() {}\n", rules, "calls-nothing")?;
+    assert_eq!(text, "fn b() {}");
+    Ok(())
+}
