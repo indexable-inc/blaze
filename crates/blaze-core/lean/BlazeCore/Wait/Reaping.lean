@@ -36,7 +36,7 @@ theorem reaps_running (between during : Option I32) (told : Bool)
     reaps .None .Running between during told deadline = .ok true := by
   cases between <;> cases during <;> cases told <;> cases deadline <;>
   simp [reaps, run, reap.Script_Still, Script.Children.reap_now, Script.Children.exited.Still,
-    Script.looked, Child.reap_now, Child.exit, Child.waited, ReapPlant.PartialEq.eq,
+    Script.looked, Child.reap_now, Child.exit, Child.waited, core.cmp.PartialEq.eq,
     core.result.Result.Option_i32_WaitError.Try.branch,
     core.result.Result.Waited_unit_WaitError.Try.branch,
     core.result.Result.Option_i32_Error.map_err.WaitError_closure0_wait_reaping_reap_Script_Still,
