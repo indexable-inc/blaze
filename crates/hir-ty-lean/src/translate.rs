@@ -79,6 +79,7 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Result(ok, err) => app("core.result.Result", vec![lean_ty(ok), lean_ty(err)]),
         Ty::Ref(inner) | Ty::RefMut(inner) => lean_ty(inner),
         Ty::Slice(elem) => app("Slice", vec![lean_ty(elem)]),
+        Ty::Vec(elem) => app("Vec", vec![lean_ty(elem)]),
         Ty::Array(elem, len) => app("Arr", vec![lean_ty(elem), atom(len.to_string())]),
         Ty::TryFromIntError => name("core.num.TryFromIntError"),
     }
@@ -562,7 +563,10 @@ impl<'a> Translate<'a> {
                 .and_then(|all| all.get(*variant as usize).cloned())
                 .and_then(|it| it.fields.get(*index as usize).cloned())
                 .map_or(Ty::Never, |it| it.ty),
-            (Elem::Index(_) | Elem::ConstIndex(_), Ty::Slice(elem) | Ty::Array(elem, _)) => {
+            (
+                Elem::Index(_) | Elem::ConstIndex(_),
+                Ty::Slice(elem) | Ty::Vec(elem) | Ty::Array(elem, _),
+            ) => {
                 (**elem).clone()
             }
             _ => Ty::Never,
@@ -849,6 +853,10 @@ impl<'a> Translate<'a> {
                 "Arr.replicate",
                 vec![atom(len.to_string()), self.operand(of, lets, at)?],
             )),
+            Rvalue::EmptyVec(elem) => Rhs::Pure(Term::Typed(
+                Box::new(name("Vec.new")),
+                Box::new(app("Vec", vec![lean_ty(elem)])),
+            )),
             Rvalue::WithOverflow { .. } => {
                 return Err(self.refuse(
                     "an overflowing operation whose check and result were not found after it",
@@ -880,7 +888,9 @@ impl<'a> Translate<'a> {
                 }
                 let call = app(name, terms);
                 if *lends_first {
-                    return self.call(call, *monadic, false, &[0], dest, args, lets, at);
+                    // A method that returns `()` gives back only what it was lent.
+                    let unit = matches!(self.ty_of(dest, dest.elems.len()), Ty::Unit);
+                    return self.call(call, *monadic, unit, &[0], dest, args, lets, at);
                 }
                 self.write(dest, if *monadic { Rhs::Act(call) } else { Rhs::Pure(call) }, lets, at)
             }
@@ -1253,10 +1263,23 @@ pub(crate) fn type_decl(adt: &crate::body::AdtDecl) -> Decl {
     }
 }
 
+/// The first component of every global name a model can refer to besides its crate's: the
+/// library's namespaces and types. A variable of one of these names would shadow it, so
+/// `Slice.len v` would read a field of the variable `Slice`.
+const GLOBAL_ROOTS: &[&str] = &[
+    "Blaze", "Scalar", "ScalarTy", "Slice", "Array", "Vec", "Option", "Result", "Error", "core",
+    "Bool", "Nat", "Int", "List", "Prop", "Unit", "U8", "U16", "U32", "U64", "U128", "Usize",
+    "I8", "I16", "I32", "I64", "I128", "Isize",
+];
+
 /// Each local's Lean variable: its binding's name, told apart by the local's number where two
-/// locals share one; `ret` for the return slot; `t{n}` for a temporary.
+/// locals share one, or where it is the name of the crate (the root of its global names, as
+/// `queue` is of `queue.Queue.wf`) or of a library namespace; `ret` for the return slot;
+/// `t{n}` for a temporary.
 fn local_names(body: &Body) -> (Vec<String>, BTreeSet<String>) {
-    let mut taken: BTreeSet<String> = ["fuel".to_owned()].into();
+    let krate = body.name.split('.').next().unwrap_or(&body.name);
+    let mut taken: BTreeSet<String> =
+        ["fuel", krate].into_iter().chain(GLOBAL_ROOTS.iter().copied()).map(str::to_owned).collect();
     let mut names = Vec::with_capacity(body.locals.len());
     let mut temps = BTreeSet::new();
     for (at, local) in body.locals.iter().enumerate() {

@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-94 theorems: 81 in `lean`, 13 in `lean/analysis`.
+97 theorems: 84 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -925,4 +925,24 @@ theorem blaze_core.busy.next_is_bounded.spec.proof :
 ```lean
 theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
     blaze_core.busy.next_is_the_doubling_schedule.spec.statement
+```
+
+## V15
+
+**`queue.new_is_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function new_is_wf holds of its model: a new bounded queue (a `Vec` and a limit) is well formed for every limit.
+
+```lean
+theorem queue.new_is_wf.spec.proof : queue.new_is_wf.spec.statement
+```
+
+**`queue.offer_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function offer_keeps_wf holds of its model: from every queue and item, offer does not panic and leaves a well-formed queue well formed (its `Vec::push` never passes the limit).
+
+```lean
+theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
+```
+
+**`queue.take_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function take_keeps_wf holds of its model: from every queue, take (a `Vec::pop`) leaves a well-formed queue well formed.
+
+```lean
+theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
 ```

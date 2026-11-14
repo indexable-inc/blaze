@@ -37,8 +37,8 @@ use hir_ty::{
     db::HirDatabase as _,
     mir as m,
     next_solver::{
-        AliasConstKind, ConstKind, DbInterner, FreeConstAliasId, InherentAssocConstId, Ty as HTy,
-        TyKind,
+        AliasConstKind, ConstKind, DbInterner, FreeConstAliasId, GenericArgs, InherentAssocConstId,
+        Ty as HTy, TyKind,
     },
 };
 use rustc_type_ir::{
@@ -138,6 +138,9 @@ pub enum Ty {
     RefMut(Box<Ty>),
     Slice(Box<Ty>),
     Array(Box<Ty>, u64),
+    /// `alloc::vec::Vec<T>` in the global allocator: its elements, as a slice's value. A `Vec`
+    /// in another allocator is refused: a bounded allocator's push can fail.
+    Vec(Box<Ty>),
     /// `core::num::TryFromIntError`, the error of a `TryFrom` between integers.
     TryFromIntError,
 }
@@ -167,6 +170,7 @@ impl Ty {
             | Ty::Ref(inner)
             | Ty::RefMut(inner)
             | Ty::Slice(inner)
+            | Ty::Vec(inner)
             | Ty::Array(inner, _) => inner.adts(out),
         }
     }
@@ -294,6 +298,9 @@ pub enum Rvalue {
     Variant { ty: Ty, variant: u32, args: Vec<Operand> },
     Array(Vec<Operand>),
     Repeat(Operand, u64),
+    /// The empty `Vec` of this element type: `Vec::new()`, `Vec::with_capacity(n)`, `vec![]`,
+    /// `Vec::clear`'s and `mem::take`'s default. The capacity is not observable in the subset.
+    EmptyVec(Ty),
     /// Runtime MIR's `(a op b, overflowed)`; [`fold`] makes the pair, its assert and the read
     /// of its `.0` one checked [`Rvalue::Bin`].
     WithOverflow { op: BinOp, ty: IntTy, left: Operand, right: Operand },
@@ -426,7 +433,7 @@ impl Rvalue {
             Rvalue::Bin { left, right, .. } | Rvalue::WithOverflow { left, right, .. } => {
                 vec![left, right]
             }
-            Rvalue::Len(_) | Rvalue::Discriminant(..) => Vec::new(),
+            Rvalue::Len(_) | Rvalue::Discriminant(..) | Rvalue::EmptyVec(_) => Vec::new(),
             Rvalue::Tuple(all) | Rvalue::Array(all) | Rvalue::Variant { args: all, .. } => {
                 all.iter().collect()
             }
@@ -686,6 +693,11 @@ pub(crate) struct Lowered {
     pub(crate) callees: Vec<(String, FunctionId)>,
 }
 
+/// Why a `&mut` into a `Vec` (`v[i]`, `&mut v[..]`, `as_mut_slice`) is refused when it is not
+/// a place: it was stored, or the local holding it was assigned twice.
+const UNLENT_VEC: &str = "a `&mut` into a `Vec` that is not a temporary of one borrow (stored, \
+    chosen at run time or assigned twice)";
+
 /// Core's panic entry points: a call of one is a panic.
 const PANICS: &[&str] = &[
     "panic",
@@ -796,6 +808,8 @@ enum Home {
     Option,
     Result,
     Slice,
+    /// An inherent method of `alloc::vec::Vec`.
+    Vec,
     /// A method of a trait or of an impl of one: the trait's name and the module it is in,
     /// under its crate (`["cmp"]`).
     Trait { name: String, module: Vec<String> },
@@ -827,6 +841,16 @@ fn int_ty(ty: HTy<'_>) -> Option<IntTy> {
         },
         _ => return None,
     })
+}
+
+/// Whether `adt` is `alloc::vec::Vec`: the struct `Vec` of the module `vec` of a crate of the
+/// language (`alloc`; `core` in a test's minicore). It is no lang item, so its definition's
+/// path says what it is.
+fn is_vec(db: &Db, adt: AdtId) -> bool {
+    let AdtId::StructId(it) = adt else { return false };
+    adt.krate(db).data(db).origin.is_lang()
+        && StructSignature::of(db, it).name.as_str() == "Vec"
+        && module_path(db, adt.module(db))[1..] == ["vec"]
 }
 
 fn crate_name(db: &Db, krate: base_db::Crate) -> String {
@@ -938,6 +962,32 @@ fn index(local: m::LocalId) -> Local {
     local.into_raw().into_u32()
 }
 
+/// What a `&mut` temporary stands for: a place and, for the `&mut T` that `IndexMut::index_mut`
+/// gives of a `Vec`, the local the index is copied into at that call, so the temporary is the
+/// place `v[i]` with `i` as it was when it was borrowed.
+#[derive(Clone, Debug)]
+struct Alias {
+    place: m::StoredPlace,
+    index: Option<Local>,
+}
+
+/// One step of a place being resolved through the `&mut` temporaries it names: MIR's, or the
+/// index an [`Alias`] adds.
+#[derive(Clone, Copy, Debug)]
+enum Proj {
+    Mir(m::PlaceElem),
+    Index(Local),
+}
+
+/// A call of a function of the standard library, as [`Cx::std_call`] reads it: the function,
+/// its generic arguments, its name and where it is.
+struct Std<'a, 'db> {
+    callee: FunctionId,
+    generics: GenericArgs<'db>,
+    name: &'a str,
+    container: ItemContainerId,
+}
+
 struct Cx<'db> {
     db: &'db Db,
     interner: DbInterner<'db>,
@@ -946,7 +996,7 @@ struct Cx<'db> {
     store: &'db ExpressionStore,
     locals: Vec<LocalDecl>,
     /// A `&mut` temporary and the place it stands for.
-    alias: BTreeMap<Local, m::StoredPlace>,
+    alias: BTreeMap<Local, Alias>,
     adts: Vec<AdtDecl>,
     callees: Vec<(String, FunctionId)>,
     checks_overflow: bool,
@@ -1040,6 +1090,26 @@ impl<'db> Cx<'db> {
                     return Err(self.refuse("the type `Box` (a heap allocation)", at));
                 }
                 if adt.krate(self.db).data(self.db).origin.is_lang() {
+                    let lang = self.interner.lang_items();
+                    let (global, full) = (lang.GlobalAlloc, lang.RangeFull);
+                    let is_global =
+                        |it: AdtId| matches!(it, AdtId::StructId(it) if Some(it) == global);
+                    if is_vec(self.db, adt) && args.len() == 2 {
+                        let in_global = matches!(args.type_at(1).kind(), TyKind::Adt(alloc, _)
+                            if is_global(alloc.def_id()));
+                        if !in_global {
+                            return Err(self.refuse(
+                                "a `Vec` in an allocator other than `Global` (its push can fail)",
+                                at,
+                            ));
+                        }
+                        return Ok(Ty::Vec(Box::new(self.ty(args.type_at(0), false, at)?)));
+                    }
+                    // `alloc::alloc::Global`, the global allocator, what `new_in` takes, and
+                    // `RangeFull`, the `..` of `&v[..]`: units, which say nothing at run time.
+                    if is_global(adt) || matches!(adt, AdtId::StructId(it) if Some(it) == full) {
+                        return Ok(Ty::Unit);
+                    }
                     let name = match adt {
                         AdtId::EnumId(it) => EnumSignature::of(self.db, it).name.as_str(),
                         AdtId::StructId(it) => StructSignature::of(self.db, it).name.as_str(),
@@ -1175,29 +1245,44 @@ impl<'db> Cx<'db> {
     /// The place `stored` is, a `&mut` temporary in it replaced by what it borrows, and its
     /// type.
     fn place(&self, stored: &m::StoredPlace, at: &str) -> Refused<(Place, Ty)> {
-        let mut local = stored.local;
-        let mut elems: Vec<m::PlaceElem> = stored.projection.as_slice().to_vec();
+        let mut local = index(stored.local);
+        let mut elems: Vec<Proj> =
+            stored.projection.as_slice().iter().map(|it| Proj::Mir(*it)).collect();
         // Each hop goes to a local assigned before, so the locals bound the hops.
         for _ in 0..=self.locals.len() {
-            let Some(target) = self.alias.get(&index(local)) else { break };
-            let rest: &[m::PlaceElem] = match elems.split_first() {
-                Some((m::ProjectionElem::Deref, rest)) => rest,
+            let Some(target) = self.alias.get(&local) else { break };
+            let rest: &[Proj] = match elems.split_first() {
+                Some((Proj::Mir(m::ProjectionElem::Deref), rest)) => rest,
                 None => &[],
                 Some(_) => return Err(self.refuse("a projection of a `&mut` reference", at)),
             };
-            let mut next = target.projection.as_slice().to_vec();
+            let mut next: Vec<Proj> =
+                target.place.projection.as_slice().iter().map(|it| Proj::Mir(*it)).collect();
+            next.extend(target.index.map(Proj::Index));
             next.extend_from_slice(rest);
-            local = target.local;
+            local = index(target.place.local);
             elems = next;
         }
-        if let Some(what) = self.unusable.get(&index(local)) {
+        if let Some(what) = self.unusable.get(&local) {
             return Err(self.refuse(what.clone(), at));
         }
-        let mut ty = self.locals[index(local) as usize].ty.clone();
+        let mut ty = self.locals[local as usize].ty.clone();
         let mut out = Vec::with_capacity(elems.len());
         let mut at_elem = 0;
         while at_elem < elems.len() {
-            let elem = elems[at_elem];
+            let elem = match elems[at_elem] {
+                Proj::Mir(elem) => elem,
+                Proj::Index(by) => {
+                    let (Ty::Vec(elem) | Ty::Slice(elem)) = &ty else {
+                        return Err(self.refuse(format!("an index of a `{ty:?}`"), at));
+                    };
+                    let elem = (**elem).clone();
+                    out.push(Elem::Index(by));
+                    at_elem += 1;
+                    ty = elem;
+                    continue;
+                }
+            };
             at_elem += 1;
             let (elem, next) = match (elem, &ty) {
                 (m::ProjectionElem::Deref, Ty::Ref(inner) | Ty::RefMut(inner)) => {
@@ -1225,7 +1310,8 @@ impl<'db> Cx<'db> {
                     (Elem::Field(found.name.clone()), found.ty.clone())
                 }
                 (m::ProjectionElem::Downcast(VariantId::EnumVariantId(variant)), _) => {
-                    let Some(m::ProjectionElem::Field(field)) = elems.get(at_elem).copied() else {
+                    let Some(Proj::Mir(m::ProjectionElem::Field(field))) = elems.get(at_elem).copied()
+                    else {
                         return Err(self.refuse("a downcast not followed by a field", at));
                     };
                     at_elem += 1;
@@ -1239,12 +1325,14 @@ impl<'db> Cx<'db> {
                     };
                     (Elem::VariantField { variant, index: field.0 }, found.ty)
                 }
-                (m::ProjectionElem::Index(by), Ty::Slice(elem) | Ty::Array(elem, _)) => {
-                    (Elem::Index(index(by)), (**elem).clone())
-                }
+                // A `Vec` is indexed here when a `&mut` into it (`as_mut_slice`) stands for it.
+                (
+                    m::ProjectionElem::Index(by),
+                    Ty::Slice(elem) | Ty::Vec(elem) | Ty::Array(elem, _),
+                ) => (Elem::Index(index(by)), (**elem).clone()),
                 (
                     m::ProjectionElem::ConstantIndex { offset, from_end: false, .. },
-                    Ty::Slice(elem) | Ty::Array(elem, _),
+                    Ty::Slice(elem) | Ty::Vec(elem) | Ty::Array(elem, _),
                 ) => (Elem::ConstIndex(offset), (**elem).clone()),
                 (m::ProjectionElem::ConstantIndex { .. } | m::ProjectionElem::Subslice { .. }, _) => {
                     return Err(self.refuse("a slice pattern", at));
@@ -1259,7 +1347,7 @@ impl<'db> Cx<'db> {
             out.push(elem);
             ty = next;
         }
-        Ok((Place { local: index(local), elems: out }, ty))
+        Ok((Place { local, elems: out }, ty))
     }
 
     fn operand(&mut self, operand: &m::Operand, at: &str) -> Refused<(Operand, Ty)> {
@@ -1435,7 +1523,7 @@ impl<'db> Cx<'db> {
             m::Rvalue::Len(place) => {
                 let (place, ty) = self.place(place, at)?;
                 match ty.value() {
-                    Ty::Slice(_) => Rvalue::Len(place),
+                    Ty::Slice(_) | Ty::Vec(_) => Rvalue::Len(place),
                     Ty::Array(_, len) => Rvalue::Use(Operand::Int(IntTy::Usize, *len as u128)),
                     other => return Err(self.refuse(format!("the length of a `{other:?}`"), at)),
                 }
@@ -1503,6 +1591,8 @@ impl<'db> Cx<'db> {
                 Ok(Rvalue::Variant { ty: ty.clone(), variant: variant.index(self.db) as u32, args })
             }
             (VariantId::UnionId(_), _) => Err(self.refuse("a union", at)),
+            // `Global` and `RangeFull`, the structs whose type is `()` ([`Cx::ty`]).
+            (VariantId::StructId(_), Ty::Unit) if args.is_empty() => Ok(Rvalue::Use(Operand::Unit)),
             (_, other) => Err(self.refuse(format!("a struct or enum value of type `{other:?}`"), at)),
         }
     }
@@ -1536,6 +1626,22 @@ impl<'db> Cx<'db> {
                     }
                 {
                     return Ok(());
+                }
+                // A `&mut` temporary is its place only while it is the one name of the borrow:
+                // moved into a local that is assigned again, a write through that local would
+                // not reach the place.
+                if let m::Rvalue::Use(m::Operand {
+                    kind: m::OperandKind::Move(from) | m::OperandKind::Copy(from),
+                    ..
+                }) = rvalue
+                    && from.projection.is_empty()
+                    && self.alias.contains_key(&index(from.local))
+                {
+                    return Err(self.refuse(
+                        "a `&mut` reference that is not a temporary of one borrow (stored, chosen \
+                         at run time or assigned twice)",
+                        &at,
+                    ));
                 }
                 let (place, ty) = self.place(place, &at)?;
                 if let Some(value) = self.rvalue(rvalue, &ty, &at)? {
@@ -1595,9 +1701,26 @@ impl<'db> Cx<'db> {
             if name == "catch_unwind" {
                 return Err(self.refuse("`catch_unwind` (rule CatchUnwind)", at));
             }
-            let (callee, args) = self.std_call(&name, container, args, destination, at)?;
-            let (dest, _) = self.place(destination, at)?;
-            out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
+            // The `&mut` this call gives is a temporary that stands for the place it borrows
+            // (`find_aliases`): the call is that borrow, and the index it takes is copied here.
+            if destination.projection.is_empty()
+                && let Some(alias) = self.alias.get(&index(destination.local)).cloned()
+            {
+                if let Some(fresh) = alias.index {
+                    let (by, _) = self.operand(&args[1], at)?;
+                    out.push(Stmt::Assign {
+                        place: Place::local(fresh),
+                        value: Rvalue::Use(by),
+                        at: at.to_owned(),
+                    });
+                }
+                return self.goto(target, at);
+            }
+            let std = Std { callee, generics, name: &name, container };
+            if let Some((callee, args)) = self.std_call(std, args, destination, at, out)? {
+                let (dest, _) = self.place(destination, at)?;
+                out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
+            }
             return self.goto(target, at);
         } else {
             if !generics.is_empty() {
@@ -1650,6 +1773,7 @@ impl<'db> Cx<'db> {
                             "Result" => Home::Result,
                             _ => Home::Other,
                         },
+                        adt if is_vec(db, adt) => Home::Vec,
                         _ => Home::Other,
                     },
                     _ => Home::Other,
@@ -1660,17 +1784,19 @@ impl<'db> Cx<'db> {
         }
     }
 
-    /// The model of a call of the standard library's function `name` in `container`, and the
-    /// arguments the model takes. Each is recognised by where the callee is and its name, never
-    /// by its body; one with no model is refused by name (rule NoModel).
+    /// The model of a call of the standard library's function `std`, and the arguments the
+    /// model takes; `None` when the call is statements, put in `out` (`mem::replace`, a
+    /// `Vec`'s deref). Each is recognised by where the callee is and its name, or by the lang
+    /// item it is, never by its body; one with no model is refused by name (rule NoModel).
     fn std_call(
         &mut self,
-        name: &str,
-        container: ItemContainerId,
+        std: Std<'_, 'db>,
         args: &[m::Operand],
         destination: &m::StoredPlace,
         at: &str,
-    ) -> Refused<(Callee, Vec<Operand>)> {
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Option<(Callee, Vec<Operand>)>> {
+        let Std { callee, generics, name, container } = std;
         let model = |name: &'static str, monadic: bool| Callee::Model {
             name,
             monadic,
@@ -1695,10 +1821,35 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse(what.clone(), at));
             }
         }
+        // `Index::index`, `Deref::deref` and their `&mut` twins, of a `Vec`: by the lang item
+        // the callee is. A `&mut` one that `find_aliases` made a place of never gets here.
+        let lang = self.interner.lang_items();
+        let is = |item: Option<FunctionId>| item == Some(callee);
+        let (index_mut, deref_mut) = (is(lang.IndexMut_index_mut), is(lang.DerefMut_deref_mut));
+        if is(lang.Index_index) || index_mut || is(lang.Deref_deref) || deref_mut {
+            if !self.is_vec_ty(generics.type_at(0)) {
+                return Err(no_model(self));
+            }
+            let by_element = match is(lang.Index_index) || index_mut {
+                true => self.vec_index(generics.type_at(1), at)?,
+                false => false,
+            };
+            if index_mut || deref_mut {
+                return Err(self.refuse(UNLENT_VEC, at));
+            }
+            if by_element {
+                return Ok(Some((model("Slice.index", true), self.operands(args, at)?)));
+            }
+            // `&v[..]` and `*v`: the `Vec` as a slice, which is its value.
+            let (dest, _) = self.place(destination, at)?;
+            let (of, _) = self.operand(&args[0], at)?;
+            out.push(Stmt::Assign { place: dest, value: Rvalue::Use(of), at: at.to_owned() });
+            return Ok(None);
+        }
         match self.home(container) {
             Home::Int(int) => {
                 if let Some(&(_, it, monadic)) = INT_MODELS.iter().find(|it| it.0 == name) {
-                    return Ok((model(it, monadic), self.operands(args, at)?));
+                    return Ok(Some((model(it, monadic), self.operands(args, at)?)));
                 }
                 if let Some(&(_, checked, wrapping)) = INT_INHERITED.iter().find(|it| it.0 == name)
                 {
@@ -1707,16 +1858,16 @@ impl<'db> Cx<'db> {
                     } else {
                         model(wrapping, false)
                     };
-                    return Ok((callee, self.operands(args, at)?));
+                    return Ok(Some((callee, self.operands(args, at)?)));
                 }
                 if let Some(&(_, it)) = INT_FROM_BYTES.iter().find(|it| it.0 == name) {
                     let callee =
                         Callee::Model { name: it, monadic: false, ty: Some(int), lends_first: false };
-                    return Ok((callee, self.operands(args, at)?));
+                    return Ok(Some((callee, self.operands(args, at)?)));
                 }
                 // A signed `div_ceil` rounds toward positive infinity and is not modelled.
                 if name == "div_ceil" && !int.signed() {
-                    return Ok((model("Scalar.div_ceil", true), self.operands(args, at)?));
+                    return Ok(Some((model("Scalar.div_ceil", true), self.operands(args, at)?)));
                 }
                 Err(no_model(self))
             }
@@ -1739,7 +1890,7 @@ impl<'db> Cx<'db> {
                     };
                     let mut operands = self.operands(&args[..1], at)?;
                     operands.push(default);
-                    return Ok((model(unwrap_or, false), operands));
+                    return Ok(Some((model(unwrap_or, false), operands)));
                 }
                 let Some(&(_, it, monadic, lends_first)) = table.iter().find(|it| it.0 == name)
                 else {
@@ -1748,13 +1899,14 @@ impl<'db> Cx<'db> {
                 // `expect`'s message is what the panic prints, which the model does not keep.
                 let args = if name == "expect" { &args[..1] } else { args };
                 let callee = Callee::Model { name: it, monadic, ty: None, lends_first };
-                Ok((callee, self.operands(args, at)?))
+                Ok(Some((callee, self.operands(args, at)?)))
             }
-            Home::Slice if name == "len" => Ok((model("Slice.len", false), self.operands(args, at)?)),
+            Home::Vec => self.vec_call(name, args, destination, at, out),
+            Home::Slice => self.slice_call(name, args, at),
             Home::Trait { name: of, module } => {
                 let module: Vec<&str> = module.iter().map(String::as_str).collect();
                 match (module.as_slice(), of.as_str(), name) {
-                    (["cmp"], "Ord", "max" | "min" | "clamp") => self.int_order(name, args, at),
+                    (["cmp"], "Ord", "max" | "min" | "clamp") => self.int_order(name, args, at).map(Some),
                     (["convert"], "From", "from") | (["convert"], "Into", "into") => {
                         let operands = self.operands(args, at)?;
                         let from = self.operand(&args[0], at)?.1;
@@ -1766,7 +1918,7 @@ impl<'db> Cx<'db> {
                         };
                         let callee =
                             Callee::Model { name: callee, monadic: false, ty: Some(to), lends_first: false };
-                        Ok((callee, operands))
+                        Ok(Some((callee, operands)))
                     }
                     (["convert"], "TryFrom", "try_from") | (["convert"], "TryInto", "try_into") => {
                         let operands = self.operands(args, at)?;
@@ -1784,16 +1936,257 @@ impl<'db> Cx<'db> {
                             ty: Some(*to),
                             lends_first: false,
                         };
-                        Ok((callee, operands))
+                        Ok(Some((callee, operands)))
                     }
                     _ => Err(no_model(self)),
                 }
             }
             Home::Module(module) if module == ["cmp"] && matches!(name, "max" | "min") => {
-                self.int_order(name, args, at)
+                self.int_order(name, args, at).map(Some)
             }
-            Home::Slice | Home::Module(_) | Home::Other => Err(no_model(self)),
+            Home::Module(module) if module == ["mem"] => self.mem_call(name, args, destination, at, out),
+            Home::Module(module) if module == ["vec"] && name == "from_elem" => {
+                let operands = self.operands(args, at)?;
+                let elem = self.operand(&args[0], at)?.1;
+                self.cloned_is_copied(&elem, "`vec![x; n]`", at)?;
+                Ok(Some((model("Vec.from_elem", false), operands)))
+            }
+            Home::Module(_) | Home::Other => Err(no_model(self)),
         }
+    }
+
+    /// Whether `ty` is a `Vec`.
+    fn is_vec_ty(&self, ty: HTy<'db>) -> bool {
+        matches!(ty.kind(), TyKind::Adt(def, _) if is_vec(self.db, def.def_id()))
+    }
+
+    /// What a `Vec` is indexed by: `true` for an element (`usize`), `false` for the whole of
+    /// it (`..`); any other range, a subslice, is refused.
+    fn vec_index(&self, by: HTy<'db>, at: &str) -> Refused<bool> {
+        let full = self.interner.lang_items().RangeFull;
+        match by.kind() {
+            TyKind::Uint(UintTy::Usize) => Ok(true),
+            TyKind::Adt(def, _) if matches!(def.def_id(), AdtId::StructId(it) if Some(it) == full) => {
+                Ok(false)
+            }
+            _ => Err(self.refuse(
+                "an index of a `Vec` by a range other than `..` (a subslice, which has no model)",
+                at,
+            )),
+        }
+    }
+
+    /// Refused unless a clone of `elem` is a copy of it, as for an integer or a `bool`: `what`
+    /// clones each element it makes.
+    fn cloned_is_copied(&self, elem: &Ty, what: &str, at: &str) -> Refused<()> {
+        fn copied(ty: &Ty) -> bool {
+            match ty {
+                Ty::Bool | Ty::Int(_) | Ty::Unit => true,
+                Ty::Tuple(all) => all.iter().all(copied),
+                _ => false,
+            }
+        }
+        if copied(elem.value()) {
+            return Ok(());
+        }
+        Err(self.refuse(
+            format!(
+                "{what} of a `{elem:?}`, which clones each element (only an integer's, a \
+                 `bool`'s or a tuple of them is a copy the model makes)"
+            ),
+            at,
+        ))
+    }
+
+    /// An inherent method of `Vec`: its model, or the statements it is.
+    fn vec_call(
+        &mut self,
+        name: &str,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Option<(Callee, Vec<Operand>)>> {
+        let model = |name: &'static str, monadic: bool, lends_first: bool| Callee::Model {
+            name,
+            monadic,
+            ty: None,
+            lends_first,
+        };
+        let callee = match name {
+            // The capacity and the allocator (`Global`, a unit) are not kept: each is empty.
+            "new" | "with_capacity" | "new_in" | "with_capacity_in" => {
+                let (dest, ty) = self.place(destination, at)?;
+                let Ty::Vec(elem) = ty else {
+                    return Err(self.refuse(format!("`Vec::{name}` making a `{ty:?}`"), at));
+                };
+                out.push(Stmt::Assign { place: dest, value: Rvalue::EmptyVec(*elem), at: at.to_owned() });
+                return Ok(None);
+            }
+            // The `Vec` as a slice, which is its value.
+            "as_slice" => {
+                let (dest, _) = self.place(destination, at)?;
+                let (of, _) = self.operand(&args[0], at)?;
+                out.push(Stmt::Assign { place: dest, value: Rvalue::Use(of), at: at.to_owned() });
+                return Ok(None);
+            }
+            "len" => model("Slice.len", false, false),
+            "is_empty" => model("Slice.is_empty", false, false),
+            "push" => model("Vec.push", true, true),
+            "pop" => model("Vec.pop", false, true),
+            "clear" => model("Vec.clear", false, true),
+            "truncate" => model("Vec.truncate", false, true),
+            "insert" => model("Vec.insert", true, true),
+            "remove" => model("Vec.remove", true, true),
+            "swap_remove" => model("Vec.swap_remove", true, true),
+            "extend_from_slice" => {
+                if let (_, Ty::Vec(elem)) = self.operand(&args[0], at)? {
+                    self.cloned_is_copied(&elem, "`extend_from_slice`", at)?;
+                }
+                model("Vec.extend_from_slice", true, true)
+            }
+            "capacity" => {
+                return Err(self.refuse(
+                    "`Vec::capacity`, which the model does not keep (a `Vec` is its elements; \
+                     its capacity is not observable in the subset)",
+                    at,
+                ));
+            }
+            "as_mut_slice" => return Err(self.refuse(UNLENT_VEC, at)),
+            _ => {
+                return Err(self.refuse(
+                    format!("a call of `Vec::{name}`, which has no model (rule NoModel)"),
+                    at,
+                ));
+            }
+        };
+        Ok(Some((callee, self.operands(args, at)?)))
+    }
+
+    /// A method of a slice: its model.
+    fn slice_call(&mut self, name: &str, args: &[m::Operand], at: &str) -> Refused<Option<(Callee, Vec<Operand>)>> {
+        let (name, monadic, lends_first) = match name {
+            "len" => ("Slice.len", false, false),
+            "is_empty" => ("Slice.is_empty", false, false),
+            "first" => ("Slice.first", false, false),
+            "last" => ("Slice.last", false, false),
+            "get" => {
+                if self.operand(&args[1], at)?.1.value() != &Ty::Int(IntTy::Usize) {
+                    return Err(self.refuse("`get` by a range (a subslice, which has no model)", at));
+                }
+                ("Slice.get", false, false)
+            }
+            "swap" => ("Slice.swap", true, true),
+            _ => {
+                return Err(self.refuse(
+                    format!("a call of the slice method `{name}`, which has no model (rule NoModel)"),
+                    at,
+                ));
+            }
+        };
+        let callee = Callee::Model { name, monadic, ty: None, lends_first };
+        Ok(Some((callee, self.operands(args, at)?)))
+    }
+
+    /// `core::mem::replace`, `swap` and `take`: moves between the places lent, as statements.
+    fn mem_call(
+        &mut self,
+        name: &str,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Option<(Callee, Vec<Operand>)>> {
+        let lent = |this: &mut Self, arg: &m::Operand| -> Refused<(Place, Ty)> {
+            match this.operand(arg, at)? {
+                (Operand::Place(place), ty) => Ok((place, ty.value().clone())),
+                _ => Err(this.refuse("a `&mut` argument that is not a place", at)),
+            }
+        };
+        let assign = |place: Place, value: Rvalue| Stmt::Assign { place, value, at: at.to_owned() };
+        let (dest, _) = self.place(destination, at)?;
+        match name {
+            "replace" => {
+                let (place, _) = lent(self, &args[0])?;
+                let (value, _) = self.operand(&args[1], at)?;
+                out.push(assign(dest, Rvalue::Use(Operand::Place(place.clone()))));
+                out.push(assign(place, Rvalue::Use(value)));
+            }
+            "swap" => {
+                let (a, ty) = lent(self, &args[0])?;
+                let (b, _) = lent(self, &args[1])?;
+                let held = self.locals.len() as Local;
+                self.locals.push(LocalDecl { name: None, ty });
+                out.push(assign(Place::local(held), Rvalue::Use(Operand::Place(a.clone()))));
+                out.push(assign(a, Rvalue::Use(Operand::Place(b.clone()))));
+                out.push(assign(b, Rvalue::Use(Operand::Place(Place::local(held)))));
+                out.push(assign(dest, Rvalue::Use(Operand::Unit)));
+            }
+            "take" => {
+                let (place, ty) = lent(self, &args[0])?;
+                // `T::default()` of the types whose default the standard library gives.
+                let default = match &ty {
+                    Ty::Int(int) => Rvalue::Use(Operand::Int(*int, 0)),
+                    Ty::Bool => Rvalue::Use(Operand::Bool(false)),
+                    Ty::Unit => Rvalue::Use(Operand::Unit),
+                    Ty::Option(_) => Rvalue::Variant { ty: ty.clone(), variant: 0, args: Vec::new() },
+                    Ty::Vec(elem) => Rvalue::EmptyVec((**elem).clone()),
+                    other => {
+                        return Err(self.refuse(
+                            format!("`mem::take` of a `{other:?}`, whose default has no model"),
+                            at,
+                        ));
+                    }
+                };
+                out.push(assign(dest, Rvalue::Use(Operand::Place(place.clone()))));
+                out.push(assign(place, default));
+            }
+            _ => {
+                return Err(self.refuse(
+                    format!("a call of `mem::{name}`, which has no model (rule NoModel)"),
+                    at,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The place a call of the standard library lends a `&mut` into, if the `&mut` it gives is
+    /// one: `IndexMut::index_mut` of a `Vec` by an element (the element, with `true`: the
+    /// index is copied at the call), or by `..`, `DerefMut::deref_mut` and `as_mut_slice` of a
+    /// `Vec` (the `Vec`, its own slice). The `&mut` it is given must be a local.
+    fn lends_into(&self, func: &m::Operand, args: &[m::Operand]) -> Option<(m::StoredPlace, bool)> {
+        let (CallableDefId::FunctionId(callee), generics) = func.fn_def()? else { return None };
+        let db = self.db;
+        if !callee.krate(db).data(db).origin.is_lang() {
+            return None;
+        }
+        let lang = self.interner.lang_items();
+        let indexed = if Some(callee) == lang.IndexMut_index_mut {
+            if !self.is_vec_ty(generics.type_at(0)) {
+                return None;
+            }
+            self.vec_index(generics.type_at(1), "").ok()?
+        } else if Some(callee) == lang.DerefMut_deref_mut {
+            if !self.is_vec_ty(generics.type_at(0)) {
+                return None;
+            }
+            false
+        } else if matches!(self.home(callee.lookup(db).container), Home::Vec)
+            && FunctionSignature::of(db, callee).name.as_str() == "as_mut_slice"
+        {
+            false
+        } else {
+            return None;
+        };
+        let (m::OperandKind::Move(from) | m::OperandKind::Copy(from)) = &args.first()?.kind else {
+            return None;
+        };
+        let is_mut = matches!(self.locals.get(index(from.local) as usize).map(|it| &it.ty), Some(Ty::RefMut(_)));
+        if !from.projection.is_empty() || !is_mut {
+            return None;
+        }
+        Some((from.as_ref().project(m::ProjectionElem::Deref).store(), indexed))
     }
 
     /// `Ord::max`, `Ord::min`, `Ord::clamp`, `cmp::max` or `cmp::min` of integers.
@@ -1842,7 +2235,8 @@ impl<'db> Cx<'db> {
     fn find_aliases(&mut self, reached: &[m::BasicBlockId]) {
         let mir = self.mir;
         let mut assigned: BTreeMap<Local, u32> = BTreeMap::new();
-        let mut candidate: BTreeMap<Local, m::StoredPlace> = BTreeMap::new();
+        // What each candidate stands for, and whether it is a `Vec`'s element by an index.
+        let mut candidate: BTreeMap<Local, (m::StoredPlace, bool)> = BTreeMap::new();
         let is_mut_ref =
             |local: Local, locals: &[LocalDecl]| matches!(locals[local as usize].ty, Ty::RefMut(_));
         for &block in reached {
@@ -1869,23 +2263,34 @@ impl<'db> Cx<'db> {
                     _ => None,
                 };
                 if let Some(target) = target {
+                    candidate.insert(local, (target, false));
+                }
+            }
+            if let Some(m::Terminator {
+                kind: m::TerminatorKind::Call { func, args, destination, .. }, ..
+            }) = &data.terminator
+                && destination.projection.is_empty()
+            {
+                let local = index(destination.local);
+                *assigned.entry(local).or_default() += 1;
+                if let Some(target) = self.lends_into(func, args) {
                     candidate.insert(local, target);
                 }
             }
-            if let Some(m::Terminator { kind: m::TerminatorKind::Call { destination, .. }, .. }) =
-                &data.terminator
-                && destination.projection.is_empty()
-            {
-                *assigned.entry(index(destination.local)).or_default() += 1;
-            }
         }
         let params: BTreeSet<Local> = mir.param_locals.iter().map(|it| index(*it)).collect();
-        for (local, target) in candidate {
+        for (local, (place, indexed)) in candidate {
             if assigned.get(&local) == Some(&1)
                 && !params.contains(&local)
                 && is_mut_ref(local, &self.locals)
             {
-                self.alias.insert(local, target);
+                // The index, copied at the call into a local of its own that nothing else
+                // assigns, so a later write of the index's own local does not move the place.
+                let index = indexed.then(|| {
+                    self.locals.push(LocalDecl { name: None, ty: Ty::Int(IntTy::Usize) });
+                    (self.locals.len() - 1) as Local
+                });
+                self.alias.insert(local, Alias { place, index });
             }
         }
     }

@@ -66,6 +66,7 @@
 //!     iterators: iterator, fn
 //!     iterators_more: iterators, clone
 //!     manually_drop: drop
+//!     mem_take: default, option
 //!     matches:
 //!     mul:
 //!     non_null: pat
@@ -99,6 +100,7 @@
 //!     unary_ops:
 //!     unpin: sized
 //!     unsize: sized
+//!     vec: allocator_api, index, reach, deref_mut, option, default, fn, clone
 //!     write: fmt
 //!     todo: panic
 //!     unimplemented: panic
@@ -568,6 +570,15 @@ pub mod mem {
     }
     // endregion:drop
 
+    // region:mem_take
+    pub const fn swap<T>(x: &mut T, y: &mut T) {
+        loop {}
+    }
+    pub fn take<T: crate::default::Default>(dest: &mut T) -> T {
+        loop {}
+    }
+    // endregion:mem_take
+
     // region:transmute
     #[rustc_intrinsic]
     pub const fn transmute<Src, Dst>(src: Src) -> Dst;
@@ -863,6 +874,7 @@ pub mod ops {
         // endregion:slice
     }
     pub use self::index::{Index, IndexMut};
+    pub use self::index::SliceIndex; // :vec
     // endregion:index
 
     // region:range
@@ -1778,6 +1790,10 @@ pub mod fmt {
 
 // region:slice
 pub mod slice {
+    // region:vec
+    pub use crate::ops::SliceIndex;
+    // endregion:vec
+
     #[lang = "slice"]
     impl<T> [T] {
         #[lang = "slice_len_fn"]
@@ -1794,6 +1810,23 @@ pub mod slice {
             if let [first, ..] = self { Some(first) } else { None }
         }
         // endregion:reach
+
+        // region:vec
+        pub fn get<I>(&self, index: I) -> Option<&I::Output>
+        where
+            I: SliceIndex<Self>,
+        {
+            loop {}
+        }
+
+        pub const fn last(&self) -> Option<&T> {
+            loop {}
+        }
+
+        pub const fn swap(&mut self, a: usize, b: usize) {
+            loop {}
+        }
+        // endregion:vec
 
         // region:iterator
         pub fn iter(&self) -> crate::iter::Iter<'_, T> {
@@ -1831,6 +1864,14 @@ pub mod option {
     // region:copy
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
+
+    // region:mem_take
+    impl<T> crate::default::Default for Option<T> {
+        fn default() -> Option<T> {
+            None
+        }
+    }
+    // endregion:mem_take
 
     // The methods that hand a payload on or panic, which admit a linear one.
     impl<#[blaze::linear] T> Option<T> {
@@ -3598,8 +3639,152 @@ pub mod alloc {
         }
         // endregion:global_allocator
     }
+
+    // region:vec
+    #[lang = "global_alloc_ty"]
+    pub struct Global;
+    unsafe impl Allocator for Global {
+        fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError> {
+            loop {}
+        }
+        unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {}
+    }
+    // endregion:vec
 }
 // endregion:allocator_api
+
+// region:vec
+pub mod vec {
+    use crate::alloc::{Allocator, Global};
+    use crate::ops::{Deref, DerefMut, Index, IndexMut};
+    use crate::slice::SliceIndex;
+
+    pub struct Vec<T, A: Allocator = Global> {
+        ptr: *mut T,
+        cap: usize,
+        len: usize,
+        alloc: A,
+    }
+
+    impl<T> Vec<T> {
+        pub const fn new() -> Self {
+            loop {}
+        }
+        pub fn with_capacity(capacity: usize) -> Self {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> Vec<T, A> {
+        pub const fn new_in(alloc: A) -> Self {
+            loop {}
+        }
+        pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+            loop {}
+        }
+        pub const fn capacity(&self) -> usize {
+            loop {}
+        }
+        pub fn truncate(&mut self, len: usize) {
+            loop {}
+        }
+        pub const fn as_slice(&self) -> &[T] {
+            loop {}
+        }
+        pub const fn as_mut_slice(&mut self) -> &mut [T] {
+            loop {}
+        }
+        pub fn swap_remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn insert(&mut self, index: usize, element: T) {
+            loop {}
+        }
+        pub fn remove(&mut self, index: usize) -> T {
+            loop {}
+        }
+        pub fn retain<F>(&mut self, mut f: F)
+        where
+            F: FnMut(&T) -> bool,
+        {
+            loop {}
+        }
+        pub fn push(&mut self, value: T) {
+            loop {}
+        }
+        pub fn pop(&mut self) -> Option<T> {
+            loop {}
+        }
+        pub fn clear(&mut self) {
+            loop {}
+        }
+        pub const fn len(&self) -> usize {
+            loop {}
+        }
+        pub const fn is_empty(&self) -> bool {
+            loop {}
+        }
+    }
+
+    impl<T: Clone, A: Allocator> Vec<T, A> {
+        pub fn extend_from_slice(&mut self, other: &[T]) {
+            loop {}
+        }
+    }
+
+    pub fn from_elem<T: Clone>(elem: T, n: usize) -> Vec<T> {
+        loop {}
+    }
+
+    impl<T, A: Allocator> Deref for Vec<T, A> {
+        type Target = [T];
+        fn deref(&self) -> &[T] {
+            loop {}
+        }
+    }
+
+    impl<T, A: Allocator> DerefMut for Vec<T, A> {
+        fn deref_mut(&mut self) -> &mut [T] {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> Index<I> for Vec<T, A> {
+        type Output = I::Output;
+        fn index(&self, index: I) -> &Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T, I: SliceIndex<[T]>, A: Allocator> IndexMut<I> for Vec<T, A> {
+        fn index_mut(&mut self, index: I) -> &mut Self::Output {
+            loop {}
+        }
+    }
+
+    impl<T> crate::default::Default for Vec<T> {
+        fn default() -> Vec<T> {
+            loop {}
+        }
+    }
+
+    // region:drop
+    impl<T, A: Allocator> Drop for Vec<T, A> {
+        fn drop(&mut self) {}
+    }
+    // endregion:drop
+}
+
+#[macro_export]
+macro_rules! vec {
+    () => (
+        $crate::vec::Vec::new()
+    );
+    ($elem:expr; $n:expr) => (
+        $crate::vec::from_elem($elem, $n)
+    );
+}
+// endregion:vec
 
 pub mod prelude {
     pub mod v1 {
@@ -3642,6 +3827,7 @@ pub mod prelude {
             env, option_env,                              // :env
             cfg,                                          // :cfg
             matches,                                      // :matches
+            vec, vec::Vec,                                // :vec
         };
     }
 

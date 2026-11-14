@@ -163,6 +163,7 @@ impl<'db> Writer<'_, 'db> {
             Ty::Ref(inner) => format!("&{}", Self::key(inner)),
             Ty::RefMut(inner) => format!("&mut {}", Self::key(inner)),
             Ty::Slice(elem) => format!("[{}]", Self::key(elem)),
+            Ty::Vec(elem) => format!("Vec<{}>", Self::key(elem)),
             Ty::Array(elem, len) => format!("[{}; {len}]", Self::key(elem)),
             Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
         }
@@ -231,6 +232,9 @@ impl<'db> Writer<'_, 'db> {
             Ty::RefMut(inner) => format!("Ty.ref true {}", arg(&self.ty(inner, at)?)),
             Ty::Slice(elem) => format!("Ty.slice {}", arg(&self.ty(elem, at)?)),
             Ty::Array(elem, len) => format!("Ty.array {} {len}", arg(&self.ty(elem, at)?)),
+            Ty::Vec(_) => {
+                return Err(self.cx.refuse("the type `Vec`, which the MIR semantics has no model of", at));
+            }
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }

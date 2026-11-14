@@ -1727,3 +1727,161 @@ fn blaze_cores_busy_models_are_its_sources() {
     let refines = emitted(FLAGS, "blaze_core", "next_is_the_doubling_schedule", &source);
     assert!(refines.shape.fuel && refines.text.contains("∃ (fuel : Nat)"), "{}", refines.text);
 }
+
+// ---- `Vec<T>` (docs/v2/plan/design/proofs-for-sans-io.md, section 3 step d). ----
+
+/// What the `vecs` and `queue` fixtures enable: `Vec`, its macro and `Default`, slices and
+/// their indexing, `mem::{replace, swap, take}`, `Option` and drops.
+const VEC_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, vec, mem_take, drop, index, slice, range, option";
+
+/// One function per group of `Vec` operations: making, reading, writing through `&mut`,
+/// writing through an element, `mem`, and `Vec` nested in other types.
+const VECS: &str = "use core::alloc::Global;
+pub struct Pair { pub a: u32, pub b: u32 }
+pub fn making(n: usize) -> usize {
+    let a: Vec<u32> = Vec::new();
+    let b: Vec<u32> = Vec::with_capacity(n);
+    let c: Vec<u32> = Vec::new_in(Global);
+    let d: Vec<u32, Global> = Vec::with_capacity_in(n, Global);
+    let e: Vec<u32> = vec![];
+    let f = vec![7u8; n];
+    a.len() + b.len() + c.len() + d.len() + e.len() + f.len()
+}
+pub fn reading(v: &Vec<usize>, i: usize) -> usize {
+    let mut total = v[i];
+    match v.get(i) { Some(x) => total += *x, None => {} }
+    match v.first() { Some(x) => total += *x, None => {} }
+    match v.last() { Some(x) => total += *x, None => {} }
+    if v.is_empty() { total += 1; }
+    let s: &[usize] = v;
+    let t = &v[..];
+    total + v.as_slice().len() + s.len() + t.len() + v.len()
+}
+pub fn writing(v: &mut Vec<u32>, w: &[u32], x: u32, i: usize) -> Option<u32> {
+    v.push(x);
+    v.insert(0, x);
+    v.swap(0, i);
+    let r = v.remove(i);
+    let s = v.swap_remove(0);
+    v.truncate(3);
+    v.extend_from_slice(w);
+    v.push(r + s);
+    let top = v.pop();
+    v.clear();
+    top
+}
+pub fn elements(v: &mut Vec<u32>, pairs: &mut Vec<Pair>, i: usize, x: u32) {
+    v[i] = x;
+    v[i] += 1;
+    pairs[i].a = x;
+    let mut j = i;
+    pairs[j].b = pairs[j].a;
+    j = 0;
+    pairs[j].a = 3;
+}
+pub fn mems(a: &mut Vec<u32>, b: &mut Vec<u32>, n: &mut u32, o: &mut Option<u32>, f: &mut bool) -> u32 {
+    let old = core::mem::replace(n, 5);
+    core::mem::swap(a, b);
+    let taken = core::mem::take(a);
+    let was = core::mem::take(o);
+    let flag = core::mem::take(f);
+    let k = core::mem::take(n);
+    let first = match was { Some(x) => x, None => 0 };
+    if flag { old + k + first } else { taken.len() as u32 }
+}
+pub fn nested(rows: &mut Vec<Vec<u32>>, i: usize, x: u32, spare: Option<Vec<u32>>) -> usize {
+    rows[i].push(x);
+    let n = rows[i].len();
+    match spare { Some(v) => n + v.len(), None => n }
+}
+";
+
+/// Each group of `Vec` operations becomes its `Blaze.Vec` model: `Vec` is a slice's value,
+/// the reads are pure, `push`, `insert`, `remove`, `swap_remove`, `extend_from_slice` and
+/// `swap` a `Result`, and a `&mut` into an element (`v[i] = x`, `v[i].a = x`) writes the
+/// element in place.
+#[test]
+fn vec_operations_become_their_models() {
+    let cases: [(&str, &[&str]); 6] = [
+        ("making", &["(Vec.new : Vec U32)", "Vec.from_elem (7 : U8) n", "Slice.len"]),
+        ("reading", &[
+            "← Slice.index v i", "Slice.get v i", "Slice.first v", "Slice.last v",
+            "Slice.is_empty v",
+        ]),
+        ("writing", &[
+            "← Vec.push", "← Vec.insert", "← Slice.swap", "← Vec.remove", "← Vec.swap_remove",
+            "Vec.truncate", "← Vec.extend_from_slice", "Vec.pop", "Vec.clear",
+        ]),
+        ("elements", &["Slice.update", "Slice.index"]),
+        ("mems", &["(Vec.new : Vec U32)", "(0 : U32)", "false"]),
+        ("nested", &["← Vec.push", "Vec (Vec U32)", "Option (Vec U32)"]),
+    ];
+    for (name, models) in cases {
+        let out = golden(VEC_FLAGS, "vecs", name, VECS);
+        for model in models {
+            assert!(out.text.contains(model), "`{name}` has `{model}`:\n{}", out.text);
+        }
+    }
+}
+
+/// What the `Vec` subset leaves out is refused by name: its capacity, a closure, a range
+/// `get`, a `Vec` in another allocator, a generic `Vec` function, `mem::take` of a type with
+/// no modelled default, and a `&mut` into a `Vec` chosen at run time.
+#[test]
+fn what_the_vec_subset_leaves_out_is_refused_by_name() {
+    let cases = [
+        ("pub fn f(v: &Vec<u32>) -> usize { v.capacity() }\n", "Vec::capacity"),
+        ("pub fn f(v: &mut Vec<u32>) { v.retain(|x| *x > 0) }\n", "closure"),
+        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..1) { Some(s) => s.len(), None => 0 } }\n", "`Range`"),
+        ("pub fn f<T>(v: Vec<T>) -> usize { v.len() }\n", "generic function"),
+        (
+            "pub struct P { pub x: u32 }\n\
+             impl Default for P { fn default() -> P { P { x: 0 } } }\n\
+             pub fn f(p: &mut P) -> u32 { let q = core::mem::take(p); q.x }\n",
+            "mem::take",
+        ),
+        (
+            "pub fn f(v: &mut Vec<u32>, i: usize, c: bool) { let r = if c { &mut v[i] } else { &mut v[0] }; *r = 1; }\n",
+            "`&mut`",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(VEC_FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
+    }
+}
+
+/// A bounded queue over a `Vec`, the state machine V15 is for: its well-formedness and three
+/// theorem functions, whose statements `lean/BlazeModel/queue/proved.lean` proves.
+const QUEUE: &str = "pub struct Queue { items: Vec<u32>, limit: usize }
+impl Queue {
+    pub fn new(limit: usize) -> Queue { Queue { items: Vec::new(), limit } }
+    pub fn wf(&self) -> bool { self.items.len() <= self.limit }
+    /// Adds `item` unless the queue is full; whether it was added.
+    pub fn offer(&mut self, item: u32) -> bool {
+        if self.items.len() < self.limit { self.items.push(item); true } else { false }
+    }
+    /// Takes the newest item, if any.
+    pub fn take(&mut self) -> Option<u32> { self.items.pop() }
+}
+#[blaze::theorem] pub fn new_is_wf(limit: usize) -> bool { Queue::new(limit).wf() }
+#[blaze::theorem] pub fn offer_keeps_wf(queue: Queue, item: u32) -> bool {
+    if !queue.wf() { return true; }
+    let mut queue = queue; queue.offer(item); queue.wf()
+}
+#[blaze::theorem] pub fn take_keeps_wf(queue: Queue) -> bool {
+    if !queue.wf() { return true; }
+    let mut queue = queue; queue.take(); queue.wf()
+}
+";
+
+#[test]
+fn a_queue_over_a_vec_states_its_theorems() {
+    for name in ["new_is_wf", "offer_keeps_wf", "take_keeps_wf"] {
+        let out = golden(VEC_FLAGS, "queue", name, QUEUE);
+        let statement = format!("queue.{name}.spec.statement");
+        assert_eq!(out.statement.as_deref(), Some(statement.as_str()));
+    }
+}

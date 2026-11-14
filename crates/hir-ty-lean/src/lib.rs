@@ -67,11 +67,14 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Scalar", include_str!("../../../lean/Blaze/Scalar.lean")),
     ("Blaze.Slice", include_str!("../../../lean/Blaze/Slice.lean")),
     ("Blaze.Std", include_str!("../../../lean/Blaze/Std.lean")),
+    ("Blaze.Vec", include_str!("../../../lean/Blaze/Vec.lean")),
     ("Blaze.ScalarOps", include_str!("../../../lean/Blaze/ScalarOps.lean")),
     ("Blaze.Machine", include_str!("../../../lean/Blaze/Machine.lean")),
     ("Blaze", include_str!("../../../lean/Blaze.lean")),
     // What a proof file imports and no model does: the tactic a statement is tried with first.
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
+    // The `@[spec]`s of `Blaze.Vec`'s operations, which `Blaze.Auto` must come before.
+    ("Blaze.VecAuto", include_str!("../../../lean/Blaze/VecAuto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's
@@ -308,6 +311,7 @@ fn rust_ty(ty: &body::Ty) -> String {
         Ty::Ref(inner) => format!("&{}", rust_ty(inner)),
         Ty::RefMut(inner) => format!("&mut {}", rust_ty(inner)),
         Ty::Slice(inner) => format!("[{}]", rust_ty(inner)),
+        Ty::Vec(inner) => format!("Vec<{}>", rust_ty(inner)),
         Ty::Array(inner, len) => format!("[{}; {len}]", rust_ty(inner)),
         Ty::TryFromIntError => "core::num::TryFromIntError".to_owned(),
     }
