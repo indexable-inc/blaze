@@ -1,0 +1,20 @@
+{
+ "id": "proofs-1113-20",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "hir-ty-lean plan.rs `conclude`, found by blaze-cargo`s simulation of `blaze prove` (serve/unit/prove.rs)",
+ "what": "Landing round 20: `cargo test -p blaze-cargo --lib prove` failed 3 of 7 on a tree whose only change near it was two more modules in the translator`s Lean library: `blaze-sim: .. failed at seed 236: Blaze.Auto was given to Lean twice in one check`. Replayed with the oracle saying more: Lean refuses the library module `Blaze.Auto`, which only a proof file imports; the first crate`s one theorem that needs it has a broken model, so `conclude` said `ModelBroken` before it looked at the proof`s needs, the library`s refusal was lost, and the second crate gave `Blaze.Auto` to Lean again.",
+ "cost": "one landing round redone (about 25 minutes)",
+ "cause": "`conclude` looked for a refused library module only inside each theorem`s own walk, which a broken model ends early; and the simulation`s 300 seeds had not drawn that case while the library had 19 modules (a library step`s outcome is drawn per step, so two more steps shift every later draw)",
+ "whys": [
+  "a refused library module was run twice in one check",
+  "its refusal was not kept: the theorem that needed it was answered for another reason first",
+  "`conclude` asked of a library module only on the way to a theorem`s verdict",
+  "a rule about the whole plan (a library module refused is blaze`s bug) was written inside a per-theorem loop"
+ ],
+ "class": "a rule about the whole of something checked only on the paths that happen to reach it",
+ "prevention": "built: `conclude` says a refused or late library module first, over the plan`s steps, before any theorem; a unit test of the case; the simulation`s oracle says what was given before and what Lean did other than accept. The simulation found it only when its draws shifted: a must_reach for `a library module only a proof file needs is refused` would have found it the day the test was written (not built).",
+ "workaround": "",
+ "fix": "d61c3a3b32",
+ "state": "fixed"
+}
