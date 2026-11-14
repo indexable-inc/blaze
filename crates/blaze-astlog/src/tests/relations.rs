@@ -539,6 +539,22 @@ fn def_parent_joins_a_def_and_its_owner_both_ways_and_variant_count_counts_an_en
     assert_eq!(texts(&outcome, "variants"), [["lib::E", "3"]]);
 }
 
+/// `count` reads a sema atom as it reads a relation: the defs each owner owns, by `def-parent`
+/// from the bound owner, none being a count of 0.
+#[test]
+fn count_counts_the_rows_a_sema_atom_gives_for_what_is_bound() {
+    let (db, files) = view(OWNED, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (owns p n) (def-path p "lib::E") (count n (def-parent d p)))
+        (rule (owns p n) (def-path p "lib::inner") (count n (def-parent d p)))
+        (rule (owns p n) (def-path p "lib::inner::g") (count n (def-parent d p)))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut owns = texts(&outcome, "owns");
+    owns.sort();
+    assert_eq!(owns, [["lib::E", "3"], ["lib::inner", "1"], ["lib::inner::g", "0"]]);
+}
+
 /// `type-kind` names a type's shape, and `type-def` the ADT or the `dyn` trait it is; a
 /// reference is its own kind until `peel-refs` strips it.
 #[test]

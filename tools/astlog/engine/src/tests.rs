@@ -548,14 +548,42 @@ fn a_negated_builtin_holds_when_the_builtin_gives_no_row() -> Result<(), Error<G
 }
 
 #[test]
-fn a_negated_builtin_with_an_unbound_variable_or_a_counted_builtin_is_refused() {
+fn a_negated_builtin_with_an_unbound_variable_or_a_count_of_an_atom_with_an_unbound_input_is_refused() {
     let unbound =
         Program::<Graph>::parse("(rule (r a) (edge a b) (not (text-capture a \"(\\\\d)\" g)))")
             .expect_err("`g` is bound by nothing to the left");
     assert!(matches!(unbound, Error::UnsafeNegation { ref var, .. } if var == "g"), "{unbound}");
-    let counted = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text a t)))")
-        .expect_err("a builtin is no finite relation to count");
-    assert!(counted.to_string().contains("(count ...) cannot read the builtin `text`"), "{counted}");
+    let builtin = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (text x t)))")
+        .expect_err("`text` needs its node, and `x` is bound by nothing before the count");
+    assert!(
+        matches!(builtin, Error::UnboundBuiltinArg { ref name, ref arg, .. } if name == "text" && arg == "x"),
+        "{builtin}"
+    );
+    let source = Program::<Graph>::parse("(rule (r a n) (edge a b) (count n (succ x y)))")
+        .expect_err("`succ` needs its first column, and `x` is bound by nothing before the count");
+    assert!(
+        matches!(source, Error::UnboundSourceArg { ref name, ref arg, .. } if name == "succ" && arg == "x"),
+        "{source}"
+    );
+}
+
+/// A count reads a source atom or a builtin as it reads a relation: the distinct rows that agree
+/// with what is bound, none being a count of 0.
+#[test]
+fn count_counts_the_distinct_rows_of_a_source_atom_or_a_builtin() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (fanout a n) (edge a x) (count n (edge a b)))
+         (rule (next a n) (edge a x) (count n (succ a b)))
+         (rule (busy a m) (fanout a n) (count m (lt 1 n)))
+         (rule (named a n) (edge a x) (count n (text-capture a \"(\\\\d)\" d)))",
+    )?;
+    // `edge` answers (1, 2) twice: one distinct row.
+    let sets = semi_naive(&program, &Edges(vec![(1, 2), (1, 2), (1, 3), (2, 3), (12, 1)]))?;
+    assert_eq!(rows(&sets, "fanout"), [["1", "#2"], ["2", "#1"], ["12", "#1"]]);
+    assert_eq!(rows(&sets, "next"), [["1", "#1"], ["2", "#1"], ["12", "#1"]]);
+    assert_eq!(rows(&sets, "busy"), [["1", "#1"], ["2", "#0"], ["12", "#0"]]);
+    assert_eq!(rows(&sets, "named"), [["1", "#1"], ["2", "#1"], ["12", "#1"]]);
+    Ok(())
 }
 
 #[test]

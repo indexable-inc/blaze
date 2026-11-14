@@ -177,13 +177,32 @@ pub struct SourceAtom<A> {
     pub line: usize,
 }
 
-/// `(count c (relation args...))`: `c` is the number of rows of a lower-stratum relation that
-/// agree with the arguments already bound; the others are local to the count.
+/// `(count c (atom args...))`: `c` is the number of distinct rows of the atom that agree with
+/// the arguments already bound; the others are local to the count. The atom is a lower-stratum
+/// relation, a builtin or a source atom; a builtin's and a source atom's inputs are bound before
+/// the count, as anywhere else.
 #[derive(Debug)]
-pub struct CountAtom {
+pub struct CountAtom<A> {
     pub result: Term,
-    pub inner: AppAtom,
+    pub inner: Counted<A>,
     pub line: usize,
+}
+
+/// What a `(count ...)` counts.
+#[derive(Debug)]
+pub enum Counted<A> {
+    /// A relation, or a builtin by its name.
+    App(AppAtom),
+    Source(SourceAtom<A>),
+}
+
+impl<A> Counted<A> {
+    pub fn args(&self) -> &[Term] {
+        match self {
+            Counted::App(app) => &app.args,
+            Counted::Source(source) => &source.args,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -197,7 +216,7 @@ pub enum BodyAtom<A> {
     /// `(not (source-atom args...))`: succeeds for a binding iff the source gives no row for
     /// it. Every argument is bound by then, so it is a filter and needs no stratum.
     NegatedSource(SourceAtom<A>),
-    Count(CountAtom),
+    Count(CountAtom<A>),
 }
 
 #[derive(Debug)]
@@ -454,8 +473,13 @@ impl<L: Language> Program<L> {
                     BodyAtom::Negation(neg) if builtin(&neg.name).is_none() => {
                         edges.push((&rule.name, &neg.name, true));
                     }
-                    BodyAtom::Count(count) => edges.push((&rule.name, &count.inner.name, true)),
+                    BodyAtom::Count(CountAtom { inner: Counted::App(app), .. })
+                        if builtin(&app.name).is_none() =>
+                    {
+                        edges.push((&rule.name, &app.name, true));
+                    }
                     BodyAtom::App(_)
+                    | BodyAtom::Count(_)
                     | BodyAtom::Negation(_)
                     | BodyAtom::Source(_)
                     | BodyAtom::NegatedSource(_) => {}
@@ -536,10 +560,12 @@ fn check_atoms<A, S: std::error::Error + 'static>(
     arities: &HashMap<&str, usize, Global>,
 ) -> Result<(), Error<S>> {
     for atom in atoms {
-        let (relation, filter) = match atom {
-            BodyAtom::Negation(neg) => (neg, "(not ...)"),
-            BodyAtom::Count(count) => (&count.inner, "(count ...)"),
-            BodyAtom::Source(_) | BodyAtom::NegatedSource(_) => continue,
+        let relation = match atom {
+            BodyAtom::Negation(neg) => neg,
+            BodyAtom::Count(CountAtom { inner: Counted::App(app), .. }) => app,
+            BodyAtom::Source(_)
+            | BodyAtom::NegatedSource(_)
+            | BodyAtom::Count(CountAtom { inner: Counted::Source(_), .. }) => continue,
             BodyAtom::App(app) => {
                 if let Some((arity, _)) = builtin(&app.name) {
                     check_builtin(app, arity)?;
@@ -553,19 +579,11 @@ fn check_atoms<A, S: std::error::Error + 'static>(
             }
         };
         // A negated builtin is a test of bound values (every variable is bound to its left, as
-        // `check_modes` requires of any negation), so it holds when the builtin gives no row.
-        if let (BodyAtom::Negation(neg), Some((arity, _))) = (atom, builtin(&relation.name)) {
-            check_builtin(neg, arity)?;
+        // `check_modes` requires of any negation), so it holds when the builtin gives no row. A
+        // counted one counts the rows it gives for its bound inputs, which are finite.
+        if let Some((arity, _)) = builtin(&relation.name) {
+            check_builtin(relation, arity)?;
             continue;
-        }
-        // A counted atom must name a defined relation (not a builtin: builtins are filters,
-        // not finite relations to scan) with matching arity.
-        if builtin(&relation.name).is_some() {
-            return DslSnafu {
-                line: relation.line,
-                message: format!("{filter} cannot read the builtin `{}`", relation.name),
-            }
-            .fail();
         }
         let expected = *arities.get(relation.name.as_str()).ok_or_else(|| {
             UnknownRelationSnafu { name: relation.name.clone(), line: relation.line }.build()
@@ -712,56 +730,14 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
     body: &[BodyAtom<A>],
 ) -> Result<HashSet<&str, Global>, Error<S>> {
     let mut bound: HashSet<&str, Global> = HashSet::new_in(Global);
-    let is_bound = |bound: &HashSet<&str, Global>, term: &Term| match term {
-        Term::Var(var) => bound.contains(var.as_str()),
-        Term::Text(_) | Term::Int(_) => true,
-    };
     for (at, atom) in body.iter().enumerate() {
         match atom {
             BodyAtom::App(app) => {
-                if let Some((_, needs)) = builtin(&app.name) {
-                    for &need in needs {
-                        if let Term::Var(var) = &app.args[need]
-                            && !bound.contains(var.as_str())
-                        {
-                            return UnboundBuiltinArgSnafu {
-                                line: app.line,
-                                name: app.name.clone(),
-                                arg: var.clone(),
-                            }
-                            .fail();
-                        }
-                    }
-                }
+                builtin_ready(app, &bound)?;
                 bound.extend(vars(&app.args));
             }
             BodyAtom::Source(source) => {
-                let ok = match source.needs {
-                    Needs::Nothing => true,
-                    Needs::All(cols) => cols.iter().all(|&c| is_bound(&bound, &source.args[c])),
-                    Needs::Any(cols) => cols.iter().any(|&c| is_bound(&bound, &source.args[c])),
-                };
-                if !ok {
-                    let cols = match source.needs {
-                        Needs::All(cols) | Needs::Any(cols) => cols,
-                        Needs::Nothing => &[],
-                    };
-                    let arg = cols
-                        .iter()
-                        .map(|&c| term_display(&source.args[c]))
-                        .collect::<Vec<_>>()
-                        .join(if matches!(source.needs, Needs::Any(_)) {
-                            "` or `"
-                        } else {
-                            "`, `"
-                        });
-                    return UnboundSourceArgSnafu {
-                        line: source.line,
-                        name: source.name.clone(),
-                        arg,
-                    }
-                    .fail();
-                }
+                source_ready(source, &bound)?;
                 bound.extend(vars(&source.args));
             }
             BodyAtom::Negation(neg) => {
@@ -780,9 +756,14 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                 }
             }
             BodyAtom::Count(count) => {
+                // A counted builtin or source atom is asked with what is bound before the count.
+                match &count.inner {
+                    Counted::App(app) => builtin_ready(app, &bound)?,
+                    Counted::Source(source) => source_ready(source, &bound)?,
+                }
                 // Unbound inner variables are local to the count; one mentioned again after it
                 // would read as a join with nothing it can join.
-                for var in vars(&count.inner.args) {
+                for var in vars(count.inner.args()) {
                     if !bound.contains(var) && mentioned(&body[at + 1..], var) {
                         return DslSnafu {
                             line: count.line,
@@ -797,7 +778,7 @@ pub(crate) fn check_modes<A, S: std::error::Error + 'static>(
                     // Unbound, it would be both the number and a column counted over. The
                     // column is local to the count and unset once the rows are counted, so the
                     // result has nothing to equal and the rule derives nothing.
-                    if !bound.contains(var.as_str()) && vars(&count.inner.args).any(|it| it == var) {
+                    if !bound.contains(var.as_str()) && vars(count.inner.args()).any(|it| it == var) {
                         return DslSnafu {
                             line: count.line,
                             message: format!(
@@ -821,12 +802,56 @@ fn mentioned<A>(body: &[BodyAtom<A>], var: &str) -> bool {
             BodyAtom::Source(source) | BodyAtom::NegatedSource(source) => &source.args,
             BodyAtom::App(app) | BodyAtom::Negation(app) => &app.args,
             BodyAtom::Count(count) => {
-                return count.result == Term::Var(var.to_owned())
-                    || vars(&count.inner.args).any(|v| v == var);
+                return matches!(&count.result, Term::Var(it) if it == var)
+                    || vars(count.inner.args()).any(|v| v == var);
             }
         };
         vars(args).any(|v| v == var)
     })
+}
+
+/// An error when an input of `app`, if it is a builtin, is unbound.
+fn builtin_ready<S: std::error::Error + 'static>(
+    app: &AppAtom,
+    bound: &HashSet<&str, Global>,
+) -> Result<(), Error<S>> {
+    let Some((_, needs)) = builtin(&app.name) else { return Ok(()) };
+    for &need in needs {
+        if let Term::Var(var) = &app.args[need]
+            && !bound.contains(var.as_str())
+        {
+            return UnboundBuiltinArgSnafu { line: app.line, name: app.name.clone(), arg: var.clone() }
+                .fail();
+        }
+    }
+    Ok(())
+}
+
+/// An error when the columns a source atom demands are unbound.
+fn source_ready<A, S: std::error::Error + 'static>(
+    source: &SourceAtom<A>,
+    bound: &HashSet<&str, Global>,
+) -> Result<(), Error<S>> {
+    let is_bound = |term: &Term| match term {
+        Term::Var(var) => bound.contains(var.as_str()),
+        Term::Text(_) | Term::Int(_) => true,
+    };
+    let (cols, ok, sep) = match source.needs {
+        Needs::Nothing => return Ok(()),
+        Needs::All(cols) => (cols, cols.iter().all(|&c| is_bound(&source.args[c])), "`, `"),
+        Needs::Any(cols) => (cols, cols.iter().any(|&c| is_bound(&source.args[c])), "` or `"),
+    };
+    if ok {
+        return Ok(());
+    }
+    let mut arg = std::string::String::new();
+    for (at, &c) in cols.iter().enumerate() {
+        if at > 0 {
+            arg.push_str(sep);
+        }
+        arg.push_str(&term_display(&source.args[c]));
+    }
+    UnboundSourceArgSnafu { line: source.line, name: source.name.clone(), arg }.fail()
 }
 
 /// The variable names among `args`.
@@ -1029,16 +1054,21 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
         let [result, inner] = args else {
             return DslSnafu {
                 line: form.line(),
-                message: "count form is (count <var> (<relation> args...))".to_owned(),
+                message: "count form is (count <var> (<atom> args...))".to_owned(),
             }
             .fail();
         };
-        let BodyAtom::App(app) = parse_body_atom::<L>(inner)? else {
-            return DslSnafu {
-                line: form.line(),
-                message: "(count ...) may only count a relation atom".to_owned(),
+        let inner = match parse_body_atom::<L>(inner)? {
+            BodyAtom::App(app) => Counted::App(app),
+            BodyAtom::Source(source) => Counted::Source(source),
+            _ => {
+                return DslSnafu {
+                    line: form.line(),
+                    message: "(count ...) may only count a relation, a builtin or a source atom"
+                        .to_owned(),
+                }
+                .fail();
             }
-            .fail();
         };
         let [result] = terms::<L::Error>(std::slice::from_ref(result))?.try_into().map_err(
             |_: Vec<Term>| {
@@ -1046,7 +1076,7 @@ fn parse_body_atom<L: Language>(form: &Sexpr) -> Result<BodyAtom<L::Atom>, LErro
                     .build()
             },
         )?;
-        return Ok(BodyAtom::Count(CountAtom { result, inner: app, line: form.line() }));
+        return Ok(BodyAtom::Count(CountAtom { result, inner, line: form.line() }));
     }
     if builtin(name).is_none()
         && let Some(parsed) = L::parse_atom(name, args, form.line())?

@@ -152,13 +152,13 @@ argument.
 | `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters: `in-macro-input` holds for a node of an expansion that came from the macro's input, `in-macro-expansion` for one the macro made; `in-test` for one under `#[cfg(test)]` or an attribute whose path ends in `test` (`#[tokio::test(...)]`); `cfg-off` for one under an item, variant or field whose `#[cfg]` removed it, and a `#[cfg]` on anything else in between is refused, naming it |
 
 Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`, `same-text`,
-`same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
-args...))` binds `c` to the number of distinct rows of a lower-stratum relation that agree with the
-bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
+`same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (atom
+args...))` binds `c` to the number of distinct rows of the atom that agree with the bound arguments,
+none being 0. The atom is a lower-stratum relation, a builtin or a source atom; a builtin's inputs
+and a source atom's demanded columns are bound before the count, as anywhere else. `(lt a b)` and `(le a b)` compare integers; integer literals are bare numbers.
 `(not (atom ...))` negates a source atom or a builtin as well as a relation: every variable bound to its left,
 it needs no stratum, and it is how a rule excludes macro-made matches. `(not (text-match x "re"))`
-holds when the regex finds nothing in `x`. `(count ...)` over a builtin is refused; a builtin is
-no finite relation.
+holds when the regex finds nothing in `x`.
 
 Text builtins take a node or text first and need it bound. A regex is a string literal,
 compiled when the file is read; one that does not compile, or whose compiled program is past

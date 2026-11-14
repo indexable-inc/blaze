@@ -23,7 +23,7 @@ pub use crate::eval::{
     Binding, Database, Evaluator, Facts, Limits, MAX_ROWS, Relation, Row, Value,
 };
 pub use crate::program::{
-    Action, AppAtom, BodyAtom, CountAtom, Language, Lint, Needs, Parsed, Program, Rewrite, Rule,
+    Action, AppAtom, BodyAtom, CountAtom, Counted, Language, Lint, Needs, Parsed, Program, Rewrite, Rule,
     Segment, Severity, SourceAction, SourceAtom, Template, TemplateSyntax, Term, TextAction,
     TextKind, parse_template, terms,
 };
