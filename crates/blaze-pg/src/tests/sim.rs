@@ -905,7 +905,14 @@ impl<'p> Run<'p> {
                     Said::Prepared(statement, end_of(&error))
                 }
                 Event::Row { id, columns } => {
-                    Said::Row(id, columns.iter().map(Owned::of).collect())
+                    let mut values = Vec::with_capacity(columns.len());
+                    for value in columns.iter() {
+                        match value {
+                            Ok(value) => values.push(Owned::of(value)),
+                            Err(error) => oracle!("a value of {id}'s row does not decode: {error}"),
+                        }
+                    }
+                    Said::Row(id, values)
                 }
                 Event::Done { id, changed } => Said::Ended(id, End::Done(changed)),
                 Event::Failed { id, error } => Said::Ended(id, end_of(&error)),

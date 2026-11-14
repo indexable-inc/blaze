@@ -15,9 +15,10 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::ast::{
     self, Assignment, CallArgs, CaseArm, ChainLink, ChainOp, CompareOp, Delete, Expr, ExprKind,
-    Insert, Join, JoinKind, Name, OrderTerm, ResultColumn, Select, Span, SqlType, Statement,
-    TableRef, UnaryOp, Update,
+    Insert, Join, JoinKind, Name, OrderTerm, ResultColumn, Select, Span, Statement, TableRef,
+    UnaryOp, Update,
 };
+use crate::desc::Storage;
 use crate::lex::keyword;
 use crate::parse::{MAX_DEPTH, STACK_MOST, SyntaxErrorKind, TEXT_MOST, parse};
 use crate::print;
@@ -120,8 +121,8 @@ const COMPARE: [CompareOp; 8] = [
     CompareOp::IsNot,
 ];
 
-const TYPES: [SqlType; 5] =
-    [SqlType::Boolean, SqlType::Integer, SqlType::Real, SqlType::Text, SqlType::Blob];
+const TYPES: [Storage; 5] =
+    [Storage::Boolean, Storage::Integer, Storage::Real, Storage::Text, Storage::Blob];
 
 /// An expression `depth` levels down (the top is 1); at [`TREE_DEPTH`] only leaves.
 fn expr(tape: &Tape, depth: u32) -> Ex {

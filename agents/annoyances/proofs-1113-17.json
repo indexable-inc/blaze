@@ -1,0 +1,21 @@
+{
+ "id": "proofs-1113-17",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "base-db / blaze-lower, the durability of a toolchain crate`s `Crate.data`; found through hir-ty-pure`s sealed summaries; follows proofs-1113-16",
+ "what": "With the span naming the crate (commit 41eadc32ce), the same run (`blaze check -p blaze-query-macros`, a release blaze of proofs-1113 8e8ffbf2fe, home /root/wt/proofs-1113/home4, profile read while the check still ran): of 4,322 spans `sealed summary reads below HIGH`, the read is `Crate.data` of `core (Lang(Core))` in 2,589, of `alloc (Lang(Alloc))` in 382, of libc, std, toml, serde_spanned, toml_parser, winnow, toml_datetime and itoa in 47 more; 1,304 name a row, not an input. So the data of toolchain and registry crates is read at a durability below HIGH, and every summary of a function of core that reads it is found not sealed.",
+ "cost": "see proofs-1113-16: this is what makes 4,300 library summaries rows, which is what passes the read bound",
+ "cause": "not found. By the code a library crate`s fields are made HIGH (blaze-lower lib.rs:1160 for a package whose root is a library`s, base-db input.rs `graph_durability` for a `Lang` origin) and a set without a durability keeps the one the field has (blaze-query db/input.rs:393). Which write lowers it, or which path makes these crates with less, is not known: my guess, not checked, is the crates of the proc-macro side (the instances are core`s, alloc`s, proc_macro`s, syn`s).",
+ "whys": [
+  "library summaries are found to read below HIGH",
+  "the read is the `data` of core, alloc and registry crates",
+  "those fields are below HIGH at run time though the code that makes them says HIGH",
+  "nothing checks, where a crate is made or written, that a library crate`s fields are HIGH",
+  "the rule (a library crate`s inputs are HIGH) is stated in doc comments at three places and enforced at none"
+ ],
+ "class": "an invariant other code relies on (a sealed crate reads nothing below HIGH) that is stated where the value is made and checked nowhere it is used: when one path breaks it, the cost appears far away and names an ID",
+ "prevention": "one check in base-db: a crate whose origin is `Lang`, `Rustc` or `Library` has every field at HIGH after any write of it (a typed refusal naming the crate, the field and the write), run in debug builds and in a test over a lowered workspace with a proc macro; and `blaze explain` saying a crate`s durability. Not built: outside this lane.",
+ "workaround": "none",
+ "fix": "",
+ "state": "open"
+}
