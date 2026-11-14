@@ -449,7 +449,10 @@ fn waits(
         Err(_) => return false,
     };
     let Some(deadline) = deadline else {
-        return waited == Waited::Ready(());
+        return match waited {
+            Waited::Ready(()) => true,
+            Waited::Deadline => false,
+        };
     };
     if end > deadline.get().saturating_add(late) {
         return false;
