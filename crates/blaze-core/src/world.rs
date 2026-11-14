@@ -10,7 +10,9 @@
 //! (a sync covers at least what it owes, a failed write lands what it may), and what a crash
 //! does to what is in flight. [`blocking`] is one call that waits: the kernel may end it early,
 //! for a signal or for nothing, and never says ready before the event or anything else after
-//! it.
+//! it. [`threads`] is threads that share atomic words: [`threads::two`] runs two closures as
+//! two threads, one atomic operation at a time in the order a schedule gives, and is the one
+//! world here that starts threads (its meaning is `Blaze.Threads.two`, section 8).
 //!
 //! Three things read the one text. A proof: `blaze prove` translates a world's functions as it
 //! does a core's, so a core's theorem quantifies over every answer the world allows and needs
@@ -31,3 +33,4 @@ pub mod asks;
 pub mod blocking;
 pub mod clock;
 pub mod disk;
+pub mod threads;

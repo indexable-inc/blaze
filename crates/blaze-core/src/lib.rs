@@ -35,6 +35,7 @@
 // The seed's: WASI's positional reads and writes (`std::os::wasi::fs::FileExt`).
 #![cfg_attr(target_os = "wasi", feature(wasi_ext))]
 
+pub mod atomic;
 pub mod busy;
 #[cfg(target_os = "linux")]
 pub mod cgroup;
