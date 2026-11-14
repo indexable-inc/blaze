@@ -197,6 +197,8 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::native_contracts", Warn, "detects nightly's `#[core::contracts::requires]` and `#[core::contracts::ensures]` on a function of a crate with `#![feature(blaze_verify)]`, whose native `requires` and `ensures` clauses say the contract in the signature")
         .externally_loaded(),
+    l("blaze::implied_bound_written", Warn, "detects a bound written on a function or impl of a crate with `#![feature(blaze_implied_bounds)]` that the types and traits its header names already declare")
+        .externally_loaded(),
     l("blaze::thread_local_in_waiting_fn", Allow, "detects a thread-local read in, or inlinable into, a function that may park the fiber, which can keep the first thread's address after resuming on another")
         .externally_loaded(),
     l("blaze::lenient_deserialize", Allow, "detects a struct or enum deriving serde's `Deserialize` without `#[serde(deny_unknown_fields)]`, which silently drops a field of its input it doesn't know")
@@ -543,6 +545,9 @@ pub(super) const BLAZE: &[Lint] = &[
     l("blaze::dependency_capability_unreached", Warn, "detects a dependency's code that nothing the workspace builds reaches yet and that uses a capability the workspace does not grant it")
         .externally_loaded(),
     l("blaze::workspace_unsafe", Allow, "detects a workspace crate with `unsafe` code whose root does not say why with `#![blaze::trust(unsafe, reason = \"..\")]`")
+        .externally_loaded(),
+    // Nightly-only speed advice, after the rest so the order stays `Lint::ALL`'s.
+    l("blaze::loop_match_candidate", Allow, "detects a `loop` over a local state that sets the next state from a `match` on it, with transitions to constant states that nightly's `#[loop_match]` would make direct jumps")
         .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),

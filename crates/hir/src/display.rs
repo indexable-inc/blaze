@@ -672,6 +672,9 @@ impl<'db> HirDisplay<'db> for TypeParam {
                             false,
                         );
                     }
+                    // An anonymous `_` (`#![feature(blaze_anon_params)]`), with the bounds
+                    // its position implies after it, as a named one's.
+                    TypeParamProvenance::Anonymous => write!(f, "_")?,
                 },
                 TypeOrConstParamData::ConstParamData(p) => {
                     write!(f, "{}", p.name.display(f.db, f.edition()))?;

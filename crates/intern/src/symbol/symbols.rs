@@ -742,6 +742,8 @@ define_symbols! {
     blaze_comptime,
     blaze_const_exprs,
     blaze_verify,
+    blaze_implied_bounds,
+    blaze_anon_params,
     mut_ref,
     type_changing_struct_update,
     RangeMin,

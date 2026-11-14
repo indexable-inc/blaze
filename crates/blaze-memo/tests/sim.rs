@@ -1,6 +1,7 @@
 //! The memo under deterministic simulation (rules 43, 64): worker tasks on their own threads,
-//! one running at a time, the next picked by a seeded draw at every flight and at points inside
-//! the queries' bodies; a second asker of a running key blocks until it ends, and a wait that
+//! one running at a time, the next picked by a draw from the case's tape at every flight and at
+//! points inside the queries' bodies (drawn only by the worker holding the baton, or by the
+//! driver while no worker runs, so the tape's choices come in one order); a second asker of a running key blocks until it ends, and a wait that
 //! would close a cycle across tasks gives way (the scheduler's rule), exactly as `Scheduled`
 //! does on the pool. Between rounds the driver edits crates and makes the next snapshot.
 //!
@@ -20,7 +21,7 @@
 //!   one per arena per `Memo::next`.
 //!
 //! Each `the_oracle_catches_*` test plants one bug (`Plant`) and shows the oracle refuses some
-//! seed's run; a failing seed is printed and replays alone.
+//! case's run; a failing case's tape is printed and replays alone.
 
 mod common;
 
@@ -37,7 +38,7 @@ use blaze_memo::{
     Reads, record,
     take_counts,
 };
-use blaze_rng::SplitMix64;
+use blaze_sim::{Broke, Tape};
 
 use common::{CRATES, DEPTH, Db, LEAVES, Model, RING, Runs, World, new_runs, twice};
 
@@ -71,20 +72,22 @@ struct State {
     runnable: Vec<bool>,
     blocked_on: Vec<Option<FlightKey>>,
     held: Vec<(FlightKey, usize)>,
-    rng: SplitMix64,
+    /// The case's tape: who runs next is drawn from it, under this lock, by the baton's holder
+    /// or by the driver while no worker runs.
+    tape: Tape,
     stuck: Option<String>,
     /// The first panic of a worker this round: the round's verdict.
     panicked: Option<String>,
 }
 
-/// The baton: one worker runs at a time; who runs next is the seeded draw's.
+/// The baton: one worker runs at a time; who runs next is the tape's draw.
 struct Sim {
     state: Lock<State>,
     turn: Signal,
 }
 
 impl Sim {
-    fn new(seed: u64) -> Sim {
+    fn new(tape: &Tape) -> Sim {
         Sim {
             state: Lock::new(
                 "blaze-memo sim state",
@@ -93,7 +96,7 @@ impl Sim {
                     runnable: vec![true; WORKERS],
                     blocked_on: vec![None; WORKERS],
                     held: Vec::new(),
-                    rng: SplitMix64::new(seed),
+                    tape: tape.clone(),
                     stuck: None,
                     panicked: None,
                 },
@@ -102,17 +105,21 @@ impl Sim {
         }
     }
 
-    /// Hands the baton to a runnable worker (maybe this one).
+    /// Hands the baton to a runnable worker (maybe this one). Called only by the baton's
+    /// holder, or by the driver while no worker runs, or once the run is stopped; a stopped run
+    /// draws nothing, since the workers that wake to stop call this in the kernel's order.
     fn pass(&self, state: &mut LockGuard<'_, State>) {
         let candidates: Vec<usize> = (0..WORKERS).filter(|w| state.runnable[*w]).collect();
-        if candidates.is_empty() {
+        if state.stuck.is_some() {
+            state.running = NONE;
+        } else if candidates.is_empty() {
             let blocked = state.blocked_on.iter().any(Option::is_some);
-            if blocked && state.stuck.is_none() {
+            if blocked {
                 state.stuck = Some(format!("deadlock: every live worker waits ({:?})", state.held));
             }
             state.running = NONE;
         } else {
-            let at = state.rng.index(candidates.len());
+            let at = state.tape.index(candidates.len(), "next thread");
             state.running = candidates[at];
         }
         self.turn.notify_all();
@@ -137,14 +144,14 @@ impl Sim {
         self.wait_turn(&mut state, me);
     }
 
-    /// Every worker runnable again, nothing held, the draws from `seed`: a snapshot's round.
-    fn reset(&self, seed: u64) {
+    /// Every worker runnable again, nothing held: a snapshot's round, its schedule drawn on from
+    /// the same tape.
+    fn reset(&self) {
         let mut state = self.state.lock();
         assert!(state.held.is_empty(), "a key held past its round: {:?}", state.held);
         state.running = NONE;
         state.runnable = vec![true; WORKERS];
         state.blocked_on = vec![None; WORKERS];
-        state.rng = SplitMix64::new(seed);
         state.stuck = None;
         state.panicked = None;
     }
@@ -292,14 +299,14 @@ enum Ask {
     Record(u32, u32),
 }
 
-fn draw(rng: &mut SplitMix64) -> Ask {
-    let c = 1 + rng.below(u64::from(CRATES)) as u32;
-    match rng.below(5) {
-        0 => Ask::Value(c, rng.index(LEAVES)),
-        1 => Ask::Total(c, rng.below(u64::from(DEPTH) + 1) as u32),
-        2 => Ask::Ring(c, rng.below(u64::from(RING)) as u32),
-        3 => Ask::Reach(c, rng.below(LEAVES as u64) as u32),
-        _ => Ask::Record(c, rng.below(u64::from(DEPTH) + 1) as u32),
+fn draw(tape: &Tape) -> Ask {
+    let c = 1 + tape.below(u64::from(CRATES), "ask crate") as u32;
+    match tape.below(5, "ask") {
+        0 => Ask::Value(c, tape.index(LEAVES, "leaf")),
+        1 => Ask::Total(c, tape.below(u64::from(DEPTH) + 1, "total depth") as u32),
+        2 => Ask::Ring(c, tape.below(u64::from(RING), "ring member") as u32),
+        3 => Ask::Reach(c, tape.below(LEAVES as u64, "reach from") as u32),
+        _ => Ask::Record(c, tape.below(u64::from(DEPTH) + 1, "record depth") as u32),
     }
 }
 
@@ -365,20 +372,19 @@ fn worker(me: usize, sim: &Sim, db: &SimDb<'_>, world: &World, model: &Model<'_>
     Ok(take_counts())
 }
 
-fn run(seed: u64, plant: Plant) -> Result<(), String> {
-    run_with(seed, plant, None)
+fn run(tape: &Tape, plant: Plant) -> Result<(), String> {
+    run_with(tape, plant, None)
 }
 
-fn run_with(seed: u64, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), String> {
-    let mut rng = SplitMix64::new(seed);
+fn run_with(tape: &Tape, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), String> {
     let values: Vec<Vec<u64>> = (0..=CRATES)
-        .map(|_| (0..LEAVES).map(|_| rng.below(8)).collect())
+        .map(|_| (0..LEAVES).map(|_| tape.below(8, "leaf value")).collect())
         .collect();
     let mut world = World::new(values);
     let mut memo: Option<Memo> = None;
     // One flight for the session, as the pool's is: a snapshot made by `Memo::next` keeps its
     // predecessor's config.
-    let sim = Arc::new(Sim::new(0));
+    let sim = Arc::new(Sim::new(tape));
     let config = Config {
         arenas: CRATES + 1,
         reads: Reads::Kept,
@@ -387,20 +393,20 @@ fn run_with(seed: u64, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), St
         plant,
     };
     for snapshot in 0..SNAPSHOTS {
-        sim.reset(rng.next_u64());
+        sim.reset();
         let mut checks = take_counts().checks;
         let current = match memo.take() {
             None => world.first(config.clone()),
             Some(old) => {
                 // Edit one or two crates, then make the next snapshot from the old one.
-                let mut changed: Vec<u32> = (0..1 + rng.below(2))
-                    .map(|_| 1 + rng.below(u64::from(CRATES)) as u32)
+                let mut changed: Vec<u32> = (0..1 + tape.below(2, "crates edited"))
+                    .map(|_| 1 + tape.below(u64::from(CRATES), "edited crate") as u32)
                     .collect();
                 changed.sort_unstable();
                 changed.dedup();
                 for c in &changed {
-                    let l = rng.index(LEAVES);
-                    world.values[*c as usize][l] += 1 + rng.below(4);
+                    let l = tape.index(LEAVES, "edited leaf");
+                    world.values[*c as usize][l] += 1 + tape.below(4, "edit step");
                 }
                 let (next, dropped) = world.next(&old, &changed);
                 checks += take_counts().checks;
@@ -423,7 +429,7 @@ fn run_with(seed: u64, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), St
         let model = Model { values: &world.values };
         let runs = new_runs();
         let asks: Vec<Vec<Ask>> =
-            (0..WORKERS).map(|_| (0..ASKS).map(|_| draw(&mut rng)).collect()).collect();
+            (0..WORKERS).map(|_| (0..ASKS).map(|_| draw(tape)).collect()).collect();
         let results: Vec<Result<Counts, String>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..WORKERS)
                 .map(|me| {
@@ -475,26 +481,17 @@ fn run_with(seed: u64, plant: Plant, panic_at: Option<PanicAt>) -> Result<(), St
     Ok(())
 }
 
-/// The invariant at the top of this file, over many seeds.
+/// The invariant at the top of this file, over many cases.
 #[test]
 fn every_interleaving_answers_as_the_evaluator() {
-    for seed in 0..64 {
-        if let Err(why) = run(seed, Plant::None) {
-            panic!("seed {seed}: {why}");
-        }
-    }
+    blaze_sim::check(blaze_sim::Config::cases(64), |tape| run(tape, Plant::None));
 }
 
+/// Without `plant` every case passes; with it some case fails, saying `says`.
 fn caught(plant: Plant, says: &str) {
-    let mut caught = false;
-    for seed in 0..16 {
-        run(seed, Plant::None).unwrap_or_else(|why| panic!("seed {seed} without a plant: {why}"));
-        if let Err(why) = run(seed, plant) {
-            assert!(why.contains(says), "{plant:?}, seed {seed}: {why}");
-            caught = true;
-        }
-    }
-    assert!(caught, "the oracle missed {plant:?}");
+    blaze_sim::control(blaze_sim::Config::cases(16), Plant::None, plant, says, |tape, plant| {
+        run(tape, plant).map_err(Broke::Oracle)
+    });
 }
 
 #[test]
@@ -531,20 +528,21 @@ fn the_oracle_catches_a_member_run_twice() {
 #[test]
 fn a_worker_panic_is_the_verdict() {
     let mut seen = 0;
-    for seed in 0..16 {
+    blaze_sim::check(blaze_sim::Config::cases(16), |tape| -> Result<(), String> {
+        let pause = tape.int_in(1u32..=3, "panic at pause");
         for worker in 0..WORKERS {
-            let at = PanicAt { worker, pause: 1 + (seed as u32 % 3) };
-            match run_with(seed, Plant::None, Some(at)) {
+            let at = PanicAt { worker, pause };
+            match run_with(tape, Plant::None, Some(at)) {
                 Ok(()) => {}
                 Err(why) => {
-                    assert!(
-                        why.contains(&format!("worker {worker} panicked: {INJECTED}")),
-                        "seed {seed}, {at:?}: the verdict is not the injected panic: {why}"
-                    );
+                    if !why.contains(&format!("worker {worker} panicked: {INJECTED}")) {
+                        return Err(format!("{at:?}: the verdict is not the injected panic: {why}"));
+                    }
                     seen += 1;
                 }
             }
         }
-    }
+        Ok(())
+    });
     assert!(seen > 0, "no injected panic was reached");
 }

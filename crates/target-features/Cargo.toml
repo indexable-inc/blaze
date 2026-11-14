@@ -18,7 +18,7 @@ blaze-ids.workspace = true
 blaze-phf.workspace = true
 
 [dev-dependencies]
-hegeltest.workspace = true
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

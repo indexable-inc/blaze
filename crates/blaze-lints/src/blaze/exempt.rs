@@ -138,6 +138,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::BorrowWorkaround
         | Lint::NllWorkaround
         | Lint::NativeContracts
+        | Lint::ImpliedBoundWritten
         // Kept with `#[expect(..)]` on the item: what a format accepts is the type's choice.
         | Lint::LenientDeserialize
         // Kept with `#[expect(..)]` on the macro's function or the script: a macro and a
@@ -317,7 +318,9 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::DependencyUnsafe
         | Lint::TrustGrantUnused
         | Lint::DependencyCapabilityUnreached
-        | Lint::WorkspaceUnsafe => None,
+        | Lint::WorkspaceUnsafe
+        // Off by default; held by `#[expect(blaze::loop_match_candidate, reason = ..)]`.
+        | Lint::LoopMatchCandidate => None,
     }
 }
 

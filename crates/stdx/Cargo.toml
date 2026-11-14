@@ -19,8 +19,8 @@ tracing.workspace = true
 # Think twice before adding anything here
 
 [dev-dependencies]
+blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-hegeltest.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 stacker.workspace = true

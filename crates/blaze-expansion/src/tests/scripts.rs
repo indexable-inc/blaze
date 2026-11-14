@@ -16,10 +16,9 @@ use blaze_keyed::{
     kind::{CodeKey, Key, Kind, ScriptInputs, ScriptRun, Settings, UnitManifest},
     proof::{self, Checks, Snapshot},
 };
-use blaze_rng::SplitMix64;
-use hegel::TestCase;
+use blaze_sim::{Broke, Config, Tape};
 
-use super::support::{Broke, Draw, Drawn, MemStore, NAMESPACE, control, filing, tool};
+use super::support::{CONTROL, MemStore, NAMESPACE, filing, tool};
 use crate::{
     Digest, NOTHING, Subject, What,
     machine::{Found, file, lookup, payload, settle},
@@ -64,20 +63,20 @@ struct Plan {
     edits: Vec<Edit>,
 }
 
-fn plan(d: &mut impl Draw) -> Plan {
-    let edits = (0..d.int(1, 14))
-        .map(|_| match d.int(0, 5) {
+fn plan(tape: &Tape) -> Plan {
+    let edits = (0..tape.int_in(1..=14u64, "edits"))
+        .map(|_| match tape.int_in(0..=5u8, "edit") {
             0..=2 => {
-                let path = d.under(PATHS.len());
+                let path = tape.index(PATHS.len(), "path");
                 // Only the optional file is ever absent: the script needs the others.
-                let to = match PATHS[path] == OPT && d.coin() {
+                let to = match PATHS[path] == OPT && tape.coin("removed") {
                     true => None,
-                    false => Some(d.int(0, 2)),
+                    false => Some(tape.int_in(0..=2u64, "to")),
                 };
                 Edit::File { path, to }
             }
-            3 => Edit::Cc(d.int(0, 2)),
-            4 => Edit::Profile(d.int(0, 2)),
+            3 => Edit::Cc(tape.int_in(0..=2u64, "cc")),
+            4 => Edit::Profile(tape.int_in(0..=2u64, "profile")),
             _ => Edit::Code,
         })
         .collect();
@@ -346,29 +345,33 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), Broke> {
 
 /// The invariant: a script reruns exactly when its code or a read or declared answer
 /// changed, its `OUT_DIR` comes back byte for byte, and its undeclared reads are reported.
-#[hegel::test(test_cases = 200)]
-fn a_script_reruns_exactly_when_what_it_read_changed(tc: TestCase) {
-    let plan = plan(&mut Drawn(&tc));
-    if let Err(broke) = run(&plan, Plant::None) {
-        panic!("{broke}\nplan {plan:?}");
-    }
+#[test]
+fn a_script_reruns_exactly_when_what_it_read_changed() {
+    blaze_sim::check(Config::cases(200), |tape| {
+        let plan = plan(tape);
+        tape.note(format_args!("plan {plan:?}"));
+        run(&plan, Plant::None)
+    });
 }
 
-fn seeded(rng: &mut SplitMix64, plant: Plant) -> Result<(), Broke> {
-    run(&plan(rng), plant)
+/// A drawn plan under `plant`: what each control runs.
+fn planned(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    run(&plan(tape), plant)
 }
 
+/// The header outside the package changes and the record still answers: `gen.rs` is stale.
 #[test]
 fn the_oracle_catches_a_traced_read_dropped() {
-    control(Plant::TraceDropped, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::TraceDropped, "OUT_DIR restored as", planned);
 }
 
+/// A read only the trace names changes and the record still answers: `gen.rs` is stale.
 #[test]
 fn the_oracle_catches_reads_taken_from_the_declarations() {
-    control(Plant::DeclarationsOnly, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::DeclarationsOnly, "OUT_DIR restored as", planned);
 }
 
 #[test]
 fn the_oracle_catches_out_dir_not_restored_byte_for_byte() {
-    control(Plant::ModeLost, seeded);
+    blaze_sim::control(CONTROL, Plant::None, Plant::ModeLost, "OUT_DIR restored as", planned);
 }

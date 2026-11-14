@@ -176,14 +176,17 @@ impl Code for TypeParamProvenance {
             TypeParamProvenance::TypeParamList => 0,
             TypeParamProvenance::TraitSelf => 1,
             TypeParamProvenance::ArgumentImplTrait => 2,
+            // Added after the other three: a record of the earlier layout has none.
+            TypeParamProvenance::Anonymous => 3,
         });
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a type param provenance out of range")? {
+        Ok(match r.tag(4, "a type param provenance out of range")? {
             0 => TypeParamProvenance::TypeParamList,
             1 => TypeParamProvenance::TraitSelf,
-            _ => TypeParamProvenance::ArgumentImplTrait,
+            2 => TypeParamProvenance::ArgumentImplTrait,
+            _ => TypeParamProvenance::Anonymous,
         })
     }
 }

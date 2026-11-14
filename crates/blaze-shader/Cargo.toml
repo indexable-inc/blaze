@@ -33,8 +33,8 @@ intern.workspace = true
 naga = { version = "=30.0.1", features = ["msl-out", "spv-out", "wgsl-out"] }
 
 [dev-dependencies]
+blaze-sim.workspace = true
 expect-test.workspace = true
-hegeltest.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

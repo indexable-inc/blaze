@@ -485,7 +485,7 @@ name = "blaze-audit"
 version = "0.0.0"
 dependencies = [
  "blaze-fetch",
- "hegeltest",
+ "blaze-sim",
  "semver",
  "serde",
  "serde_json",
@@ -673,7 +673,7 @@ dependencies = [
 name = "blaze-cast"
 version = "0.0.0"
 dependencies = [
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -821,7 +821,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
  "smallvec",
 ]
 
@@ -880,7 +880,7 @@ name = "blaze-diff"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -891,7 +891,7 @@ dependencies = [
  "blaze-diff",
  "blaze-hash",
  "blaze-query",
- "hegeltest",
+ "blaze-sim",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -976,8 +976,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-keyed",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1066,9 +1065,9 @@ dependencies = [
  "blaze-format",
  "blaze-ids",
  "blaze-sha256",
+ "blaze-sim",
  "crossbeam-channel",
  "filetime",
- "hegeltest",
  "papaya",
  "serde",
  "serde_json",
@@ -1086,8 +1085,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-keyed",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1125,8 +1123,8 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
  "blaze-serde",
+ "blaze-sim",
  "blaze-v2-proof",
- "hegeltest",
  "serde",
  "zstd",
 ]
@@ -1140,8 +1138,8 @@ dependencies = [
  "blaze-ids",
  "blaze-kernel",
  "blaze-report",
+ "blaze-sim",
  "blaze-store-check",
- "hegeltest",
  "hir-expand",
  "span",
  "syntax",
@@ -1266,9 +1264,9 @@ name = "blaze-hash"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-sim",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
- "hegeltest",
  "indexmap",
  "papaya",
  "serde",
@@ -1345,7 +1343,7 @@ dependencies = [
  "blaze-radix",
  "blaze-rng",
  "blaze-serde",
- "hegeltest",
+ "blaze-sim",
  "postcard",
  "serde",
  "serde_json",
@@ -1426,8 +1424,8 @@ dependencies = [
  "blaze-items",
  "blaze-mem",
  "blaze-query",
+ "blaze-sim",
  "cfg",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -1481,8 +1479,8 @@ dependencies = [
  "blaze-ids",
  "blaze-record",
  "blaze-report",
+ "blaze-sim",
  "blaze-store-check",
- "hegeltest",
 ]
 
 [[package]]
@@ -1491,8 +1489,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-format",
  "blaze-ids",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1652,7 +1649,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1677,10 +1674,10 @@ dependencies = [
  "blaze-ids",
  "blaze-items",
  "blaze-query",
+ "blaze-sim",
  "blaze-units",
  "blaze-vfs",
  "cfg",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty-mir",
@@ -1748,13 +1745,13 @@ dependencies = [
  "blaze-ids",
  "blaze-resolve",
  "blaze-serde",
+ "blaze-sim",
  "blaze-source",
  "cargo-platform",
  "cargo-util-schemas",
  "dunce",
  "edition",
  "glob",
- "hegeltest",
  "pathdiff",
  "semver",
  "serde",
@@ -1793,8 +1790,7 @@ dependencies = [
  "blaze-keyed",
  "blaze-mem",
  "blaze-memo-macros",
- "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1829,7 +1825,7 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-program",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1876,7 +1872,7 @@ name = "blaze-phf"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1920,7 +1916,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-keyed",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1933,7 +1929,7 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-serde",
- "hegeltest",
+ "blaze-sim",
  "serde",
  "serde_json",
 ]
@@ -1988,7 +1984,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-rng",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2050,9 +2046,8 @@ dependencies = [
  "blaze-http",
  "blaze-ids",
  "blaze-keyed",
- "blaze-rng",
  "blaze-sha256",
- "hegeltest",
+ "blaze-sim",
  "http",
  "ring",
  "serde",
@@ -2100,7 +2095,7 @@ name = "blaze-rng"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2109,8 +2104,8 @@ version = "0.0.0"
 dependencies = [
  "blaze-protocol",
  "blaze-report",
+ "blaze-sim",
  "expect-test",
- "hegeltest",
  "serde",
  "serde_json",
  "unicode-width 0.2.3",
@@ -2157,7 +2152,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -2168,8 +2163,8 @@ dependencies = [
  "blaze-hash",
  "blaze-items",
  "blaze-query",
+ "blaze-sim",
  "expect-test",
- "hegeltest",
  "hir-def",
  "hir-expand",
  "hir-ty",
@@ -2179,6 +2174,13 @@ dependencies = [
  "naga",
  "rustc_abi",
  "rustc_type_ir",
+]
+
+[[package]]
+name = "blaze-sim"
+version = "0.0.0"
+dependencies = [
+ "blaze-rng",
 ]
 
 [[package]]
@@ -2309,7 +2311,7 @@ name = "blaze-store-check"
 version = "0.0.0"
 dependencies = [
  "blaze-ids",
- "hegeltest",
+ "blaze-sim",
  "serde",
  "serde_json",
 ]
@@ -2342,10 +2344,14 @@ dependencies = [
  "blaze-api",
  "blaze-cas",
  "blaze-core",
+ "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-protocol",
+ "blaze-rng",
  "blaze-usercode",
+ "hegeltest",
 ]
 
 [[package]]
@@ -2631,8 +2637,8 @@ name = "cfg"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
+ "blaze-sim",
  "expect-test",
- "hegeltest",
  "intern",
  "syntax",
  "syntax-bridge",
@@ -5567,10 +5573,10 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+ "blaze-sim",
  "crossbeam-channel",
  "edition",
  "expect-test",
- "hegeltest",
  "rustc-literal-escaper",
  "rustc_lexer",
  "smallvec",
@@ -6659,8 +6665,8 @@ name = "stdx"
 version = "0.0.0"
 dependencies = [
  "blaze-core",
+ "blaze-sim",
  "crossbeam-channel",
- "hegeltest",
  "itertools 0.15.0",
  "libc",
  "stacker",
@@ -6803,7 +6809,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-phf",
- "hegeltest",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -7163,7 +7169,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
- "hegeltest",
+ "blaze-sim",
  "intern",
  "rustc_lexer",
  "span",

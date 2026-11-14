@@ -3,8 +3,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
-use hegel::TestCase;
-use hegel::generators as gs;
+use blaze_sim::{Config, Tape};
 
 use super::*;
 
@@ -32,63 +31,64 @@ fn reference(rows: usize, pairs: &[(u32, u32)]) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// Rows and pairs with every row below them, some rows empty and some with many pairs.
-#[hegel::composite]
-fn rows_and_pairs(tc: &TestCase) -> (usize, Vec<(u32, u32)>) {
-    let rows: usize = tc.draw(gs::integers().min_value(1).max_value(79));
-    let pairs = tc.draw(
-        gs::vecs(gs::tuples!(
-            gs::integers::<u32>().max_value(rows as u32 - 1),
-            gs::integers::<u32>()
-        ))
-        .max_size(399),
-    );
+fn rows_and_pairs(tape: &Tape) -> (usize, Vec<(u32, u32)>) {
+    let rows: usize = tape.int_in(1..=79, "rows");
+    let pairs = tape.vec(0..=399, "pairs", |tape| {
+        (tape.int_in(0..=rows as u32 - 1, "row"), tape.int::<u32>("item"))
+    });
     (rows, pairs)
 }
 
-#[hegel::test]
-fn build_is_the_reference_counting_sort(tc: TestCase) {
-    let (rows, pairs) = tc.draw(rows_and_pairs());
-    let csr = Csr::build(rows, pairs.iter().copied());
-    let (starts, items) = reference(rows, &pairs);
-    assert_eq!(csr.starts(), &starts[..]);
-    assert_eq!(csr.items(), &items[..]);
-    assert_eq!(csr.rows(), rows);
-    for row in 0..rows {
-        let want: Vec<u32> =
-            pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
-        assert_eq!(csr.row(row), &want[..]);
-        assert_eq!(csr.get(row), Some(&want[..]));
-    }
-    assert_eq!(csr.get(rows), None);
+#[test]
+fn build_is_the_reference_counting_sort() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (rows, pairs) = rows_and_pairs(tape);
+        let csr = Csr::build(rows, pairs.iter().copied());
+        let (starts, items) = reference(rows, &pairs);
+        assert_eq!(csr.starts(), &starts[..]);
+        assert_eq!(csr.items(), &items[..]);
+        assert_eq!(csr.rows(), rows);
+        for row in 0..rows {
+            let want: Vec<u32> =
+                pairs.iter().filter(|it| it.0 as usize == row).map(|it| it.1).collect();
+            assert_eq!(csr.row(row), &want[..]);
+            assert_eq!(csr.get(row), Some(&want[..]));
+        }
+        assert_eq!(csr.get(rows), None);
+    });
 }
 
-#[hegel::test]
-fn a_rebuild_is_a_build(tc: TestCase) {
-    let (rows, pairs) = tc.draw(rows_and_pairs());
-    let (rows2, pairs2) = tc.draw(rows_and_pairs());
-    let mut csr = Csr::build(rows, pairs.iter().copied());
-    let mut cursors = Vec::new();
-    csr.rebuild(rows2, pairs2.iter().copied(), &mut cursors);
-    assert_eq!(csr, Csr::build(rows2, pairs2.iter().copied()));
+#[test]
+fn a_rebuild_is_a_build() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (rows, pairs) = rows_and_pairs(tape);
+        let (rows2, pairs2) = rows_and_pairs(tape);
+        let mut csr = Csr::build(rows, pairs.iter().copied());
+        let mut cursors = Vec::new();
+        csr.rebuild(rows2, pairs2.iter().copied(), &mut cursors);
+        assert_eq!(csr, Csr::build(rows2, pairs2.iter().copied()));
+    });
 }
 
-#[hegel::test]
-fn a_graph_is_its_edges_sorted(tc: TestCase) {
-    let (nodes, pairs) = tc.draw(rows_and_pairs());
-    let edges: Vec<(u32, u32)> = pairs.iter().map(|&(s, t)| (s, t % nodes as u32)).collect();
-    let graph = Csr::graph(nodes, edges.iter().copied());
-    let mut sorted = edges.clone();
-    sorted.sort_unstable();
-    let (starts, _) = reference(nodes, &sorted);
-    assert_eq!(graph.starts(), &starts[..]);
-    assert!(graph.items().iter().eq(sorted.iter().map(|it| &it.1)));
+#[test]
+fn a_graph_is_its_edges_sorted() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let (nodes, pairs) = rows_and_pairs(tape);
+        let edges: Vec<(u32, u32)> = pairs.iter().map(|&(s, t)| (s, t % nodes as u32)).collect();
+        let graph = Csr::graph(nodes, edges.iter().copied());
+        let mut sorted = edges.clone();
+        sorted.sort_unstable();
+        let (starts, _) = reference(nodes, &sorted);
+        assert_eq!(graph.starts(), &starts[..]);
+        assert!(graph.items().iter().eq(sorted.iter().map(|it| &it.1)));
 
-    let mut set = graph;
-    set.dedup_rows();
-    sorted.dedup();
-    let (starts, _) = reference(nodes, &sorted);
-    assert_eq!(set.starts(), &starts[..]);
-    assert!(set.items().iter().eq(sorted.iter().map(|it| &it.1)));
+        let mut set = graph;
+        set.dedup_rows();
+        sorted.dedup();
+        let (starts, _) = reference(nodes, &sorted);
+        assert_eq!(set.starts(), &starts[..]);
+        assert!(set.items().iter().eq(sorted.iter().map(|it| &it.1)));
+    });
 }
 
 #[test]

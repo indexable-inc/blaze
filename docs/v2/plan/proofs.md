@@ -899,7 +899,7 @@ theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local))
     PreservesWhen FrameZero (removeDeadStoresChecked cert)
 ```
 
-## V12
+## V13
 
 **`theorems.bump_keeps_wf.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function bump_keeps_wf holds of its model: from a counter with hits at most its limit, bump does not panic and leaves hits at most the limit.
 

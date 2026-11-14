@@ -12,7 +12,8 @@
 //! - a verdict decided statically is true of the model (equivalent: the mutation changes nothing;
 //!   not reached: no test executes it);
 //! - no more mutants are in flight than slots, and nothing is started at or after the deadline;
-//! - two hosts with different completion orders give the same verdicts;
+//! - two hosts with different completion orders (each drawn from the tape) give the same
+//!   verdicts;
 //! - after an edit, a mutant whose body and reaching tests are unchanged is not made again.
 //!
 //! What a mutation changes is the model's own: a hash of the body, the site and the mutation
@@ -22,6 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_ids::ContentId;
+use blaze_sim::{Flight, Nanos, Tape};
 use blaze_keyed::machine::Machine;
 use blaze_program::key::{BodyKey, ItemId};
 use blaze_program::record::TestKey;
@@ -43,28 +45,9 @@ const MS: u64 = 1_000_000;
 /// A budget no session reaches.
 const AMPLE: u64 = 1 << 50;
 
-pub(super) struct Rng(u64);
-
-impl Rng {
-    pub(super) fn new(seed: u64) -> Rng {
-        Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
-
-    fn chance(&mut self, num: u64, den: u64) -> bool {
-        self.below(den) < num
-    }
+/// True `num` times in `den`, drawn from the tape; calm (a draw of 0) is false.
+fn chance(tape: &Tape, num: u64, den: u64, label: &'static str) -> bool {
+    tape.below(den, label) >= den.saturating_sub(num)
 }
 
 struct Fun {
@@ -125,57 +108,57 @@ fn body_of(index: usize, version: u32) -> BodyKey {
     BodyKey(ContentId::of("blaze mutants world body", &bytes))
 }
 
-fn site(rng: &mut Rng, index: u32) -> Site {
-    let kind = match rng.below(9) {
+fn site(tape: &Tape, index: u32) -> Site {
+    let kind = match tape.below(9, "site kind") {
         0 => SiteKind::Return {
             default: Some(b"0".to_vec()),
-            args: if rng.chance(1, 2) { vec![(0, b"a".to_vec())] } else { Vec::new() },
-            fields: if rng.chance(1, 2) { vec![(0, b"len".to_vec())] } else { Vec::new() },
+            args: if chance(tape, 1, 2, "returns an arg") { vec![(0, b"a".to_vec())] } else { Vec::new() },
+            fields: if chance(tape, 1, 2, "returns a field") { vec![(0, b"len".to_vec())] } else { Vec::new() },
         },
         1 => SiteKind::Branch,
-        2 => SiteKind::Compare { op: CMPS[rng.below(6) as usize], ty: TyClass::Int { signed: true, bits: 32 } },
-        3 => SiteKind::Arith { op: ARITHS[rng.below(10) as usize], ty: TyClass::Int { signed: false, bits: 64 } },
+        2 => SiteKind::Compare { op: CMPS[tape.index(6, "compare")], ty: TyClass::Int { signed: true, bits: 32 } },
+        3 => SiteKind::Arith { op: ARITHS[tape.index(10, "arith")], ty: TyClass::Int { signed: false, bits: 64 } },
         4 => SiteKind::Const {
-            value: rng.below(5) as i128,
+            value: tape.below(5, "const") as i128,
             ty: TyClass::Int { signed: false, bits: 8 },
-            absorb: if rng.chance(1, 2) { Absorb::Clamp { lo: 0, hi: 2 } } else { Absorb::None },
+            absorb: if chance(tape, 1, 2, "clamped") { Absorb::Clamp { lo: 0, hi: 2 } } else { Absorb::None },
         },
-        5 => SiteKind::Effect(Effectful::Call { pure: rng.chance(1, 2), result_used: rng.chance(1, 2) }),
+        5 => SiteKind::Effect(Effectful::Call { pure: chance(tape, 1, 2, "pure"), result_used: chance(tape, 1, 2, "result used") }),
         6 => SiteKind::Effect(Effectful::Write),
         7 => SiteKind::EarlyReturn,
         _ => SiteKind::Construct { variant: 0, alternatives: vec![(0, b"A".to_vec()), (1, b"B".to_vec())] },
     };
-    let role = if rng.chance(1, 6) { ARID_ROLES[rng.below(10) as usize] } else { Role::Behaviour };
+    let role = if chance(tape, 1, 6, "arid site") { ARID_ROLES[tape.index(10, "arid role")] } else { Role::Behaviour };
     let text = b"left op right".to_vec();
     Site {
         kind,
         at: MirLoc { block: index, statement: 0 },
-        pos: ItemPos { line: 1 + rng.below(4) as u32, col: 4 },
+        pos: ItemPos { line: 1 + tape.below(4, "line") as u32, col: 4 },
         role,
-        read: rng.chance(5, 6),
+        read: chance(tape, 5, 6, "read"),
         token: (5, 7),
         text,
     }
 }
 
 impl World {
-    pub(super) fn new(rng: &mut Rng) -> World {
-        let count = 2 + rng.below(5) as usize;
+    pub(super) fn new(tape: &Tape) -> World {
+        let count = 2 + tape.below(5, "functions") as usize;
         let mut funs = Vec::new();
         for index in 0..count {
-            let sites = (0..1 + rng.below(6) as u32).map(|at| site(rng, at)).collect();
+            let sites = (0..1 + tape.below(6, "sites") as u32).map(|at| site(tape, at)).collect();
             let mut marks = Vec::new();
-            if rng.chance(1, 8) {
+            if chance(tape, 1, 8, "marked") {
                 marks.push(Mark {
-                    operator: Operator::ALL[rng.below(13) as usize],
-                    line: Some(1 + rng.below(4) as u32),
+                    operator: Operator::ALL[tape.index(13, "marked operator")],
+                    line: Some(1 + tape.below(4, "marked line") as u32),
                     reason: b"the model says so".to_vec(),
                 });
             }
             let mut calls = Vec::new();
             for callee in index + 1..count {
-                if rng.chance(1, 3) {
-                    calls.push((callee, rng.chance(1, 3)));
+                if chance(tape, 1, 3, "calls") {
+                    calls.push((callee, chance(tape, 1, 3, "inlined")));
                 }
             }
             funs.push(Fun {
@@ -183,24 +166,24 @@ impl World {
                     item: item_of(index),
                     body: body_of(index, 0),
                     path: format!("world::f{index}").into_bytes(),
-                    role: if rng.chance(1, 10) { Role::Generated } else { Role::Behaviour },
+                    role: if chance(tape, 1, 10, "generated") { Role::Generated } else { Role::Behaviour },
                     sites,
                     inliners: Vec::new(),
                     marks,
-                    make_ns: MS + rng.below(4 * MS),
+                    make_ns: MS + tape.below(4 * MS, "make ns"),
                 },
                 version: 0,
                 calls,
             });
         }
         let mut tests = Vec::new();
-        for _ in 0..1 + rng.below(4) {
+        for _ in 0..1 + tape.below(4, "tests") {
             tests.push(Test {
-                entry: rng.below(count as u64) as usize,
-                observes: (0..FACETS).filter(|_| rng.chance(1, 2)).collect(),
+                entry: tape.index(count, "entry"),
+                observes: (0..FACETS).filter(|_| chance(tape, 1, 2, "observes")).collect(),
                 version: 0,
-                program: rng.below(2) as u8,
-                recorded_ns: MS + rng.below(19 * MS),
+                program: tape.below(2, "program") as u8,
+                recorded_ns: MS + tape.below(19 * MS, "recorded ns"),
             });
         }
         let mut world = World { funs, tests, facts: Vec::new(), infos: Vec::new() };
@@ -209,16 +192,16 @@ impl World {
     }
 
     /// An edit: one function's body, and maybe one test.
-    fn edit(&mut self, rng: &mut Rng) -> usize {
-        let k = rng.below(self.funs.len() as u64) as usize;
+    fn edit(&mut self, tape: &Tape) -> usize {
+        let k = tape.index(self.funs.len(), "edited function");
         let fun = &mut self.funs[k];
         fun.version += 1;
         fun.facts.body = body_of(k, fun.version);
-        if rng.chance(1, 2) {
-            let t = rng.below(self.tests.len() as u64) as usize;
+        if chance(tape, 1, 2, "a test edited") {
+            let t = tape.index(self.tests.len(), "edited test");
             let test = &mut self.tests[t];
             test.version += 1;
-            test.observes = (0..FACETS).filter(|_| rng.chance(1, 2)).collect();
+            test.observes = (0..FACETS).filter(|_| chance(tape, 1, 2, "observes")).collect();
         }
         self.refresh();
         k
@@ -249,7 +232,7 @@ impl World {
     }
 
     /// The facts and test infos the planner reads, made again after an edit. A test's key
-    /// covers the bodies it executes, as `blaze_program::reach::test_key` covers the instance
+    /// covers the bodies it executes, as `blaze_program::reach::reach_digest` covers the instance
     /// keys it reaches.
     fn refresh(&mut self) {
         for index in 0..self.funs.len() {
@@ -377,10 +360,11 @@ type Identity = (ItemId, BodyKey, u32, Mutation, Vec<TestKey>);
 
 struct Host<'w> {
     world: &'w World,
-    rng: Rng,
+    /// Where the host's choices come from: the latencies' jitter, and which of the completions
+    /// due at one time comes first.
+    tape: &'w Tape,
     now: u64,
-    seq: u64,
-    events: BTreeMap<(u64, u64, u64), (Ticket, Completion)>,
+    events: Flight<(Ticket, Completion)>,
     in_flight: u32,
     slots: u32,
     deadline: u64,
@@ -390,9 +374,7 @@ struct Host<'w> {
 
 impl Host<'_> {
     fn at(&mut self, delay: u64, ticket: Ticket, completion: Completion) {
-        let tie = self.rng.next();
-        self.seq += 1;
-        self.events.insert((self.now.saturating_add(delay), tie, self.seq), (ticket, completion));
+        self.events.ask_at(Nanos(self.now.saturating_add(delay)), (ticket, completion));
     }
 
     fn handle(&mut self, effect: Effect, store: &mut BTreeMap<VerdictKey, Vec<u8>>) -> Result<(), String> {
@@ -427,14 +409,14 @@ impl Host<'_> {
                 for inliner in &inliners {
                     cost += self.world.funs[self.world.fun_of(*inliner)?].facts.make_ns;
                 }
-                cost += self.rng.below(50_000);
+                cost += self.tape.below(50_000, "make jitter");
                 self.finish_by(cost, ticket, Completion::Made);
             }
             Effect::Patch { ticket, mutant, deadline, .. } => {
                 if !self.mutants.contains_key(&mutant) || deadline != self.deadline {
                     return Err(format!("a patch for mutant {} that was not made", mutant.0));
                 }
-                let cost = PATCH_NS + self.rng.below(20_000);
+                let cost = PATCH_NS + self.tape.below(20_000, "patch jitter");
                 self.finish_by(cost, ticket, Completion::Patched);
             }
             Effect::Run { ticket, mutant, test, program, timeout_ns, deadline } => {
@@ -488,7 +470,7 @@ fn drive(
     world: &World,
     mut session: Session,
     store: &mut BTreeMap<VerdictKey, Vec<u8>>,
-    seed: u64,
+    tape: &Tape,
     slots: u32,
     start: u64,
     wall: u64,
@@ -496,10 +478,9 @@ fn drive(
 ) -> Result<Outcome, String> {
     let mut host = Host {
         world,
-        rng: Rng::new(seed),
+        tape,
         now: start,
-        seq: 0,
-        events: BTreeMap::new(),
+        events: Flight::new(),
         in_flight: 0,
         slots,
         deadline: start + wall,
@@ -516,9 +497,13 @@ fn drive(
             }
             return session.finish().map_err(|error| error.to_string());
         }
-        match host.events.pop_first() {
-            Some(((when, _, _), (ticket, completion))) => {
+        // The earliest completion; of those due at that time, the tape picks which.
+        match host.events.earliest() {
+            Some(Nanos(when)) => {
                 host.now = when;
+                let Some((ticket, completion)) = host.events.deliver(tape, Nanos(when)) else {
+                    return Err(format!("a completion is due at {when}, yet none was delivered"));
+                };
                 session.complete(when, ticket, completion).map_err(|error| error.to_string())?;
             }
             None => {
@@ -657,12 +642,12 @@ impl LineTable for Lines {
     }
 }
 
-/// Every session of one seed: a full one twice under different hosts, one after an edit over
+/// Every session of one tape: a full one twice under different hosts, one after an edit over
 /// the first's store, one over the edited function's changed line, and one with a tight budget.
-pub(super) fn run_seed(seed: u64, plant: Plant) -> Result<(), String> {
-    let mut rng = Rng::new(seed);
-    let mut world = World::new(&mut rng);
-    let slots = 1 + rng.below(4) as u32;
+/// The world, the edit and every host's schedule are drawn from the one tape.
+pub(super) fn run(tape: &Tape, plant: Plant) -> Result<(), String> {
+    let mut world = World::new(tape);
+    let slots = 1 + tape.below(4, "more slots") as u32;
     let full = Config { per_function: u32::MAX, per_line: u32::MAX, budget: Budget { wall_ns: AMPLE, slots }, patch_ns: PATCH_NS };
     let items: Vec<ItemId> = world.facts.iter().map(|facts| facts.item).collect();
 
@@ -675,10 +660,10 @@ pub(super) fn run_seed(seed: u64, plant: Plant) -> Result<(), String> {
         }
     }
     let mut store = BTreeMap::new();
-    let a = drive(&world, Session::new(first.clone(), 0), &mut store, seed * 2 + 1, slots, 0, AMPLE, None)?;
+    let a = drive(&world, Session::new(first.clone(), 0), &mut store, tape, slots, 0, AMPLE, None)?;
     check(&world, &a, true)?;
     complete(&world, &a)?;
-    let b = drive(&world, Session::new(first, 0), &mut BTreeMap::new(), seed * 2 + 2, slots, 0, AMPLE, None)?;
+    let b = drive(&world, Session::new(first, 0), &mut BTreeMap::new(), tape, slots, 0, AMPLE, None)?;
     if a.verdicts != b.verdicts {
         return Err("two hosts gave different verdicts".into());
     }
@@ -698,9 +683,9 @@ pub(super) fn run_seed(seed: u64, plant: Plant) -> Result<(), String> {
     }
 
     let filed = identities(&world, &a)?;
-    let k = world.edit(&mut rng);
+    let k = world.edit(tape);
     let second = plan_of(&world)?;
-    let c = drive(&world, Session::new(second, 10 * MS), &mut store, seed * 2 + 3, slots, 10 * MS, AMPLE, Some(&filed))?;
+    let c = drive(&world, Session::new(second, 10 * MS), &mut store, tape, slots, 10 * MS, AMPLE, Some(&filed))?;
     check(&world, &c, true)?;
     complete(&world, &c)?;
 
@@ -708,7 +693,7 @@ pub(super) fn run_seed(seed: u64, plant: Plant) -> Result<(), String> {
     let change = Change { functions: vec![Changed { item: world.funs[k].facts.item, lines: Some(vec![line]) }] };
     let (session, _) = mutants(&Request::Change(&change), &world.universe(), &machine(slots), 0, plant)
         .map_err(|error| error.to_string())?;
-    let d = drive(&world, session, &mut store, seed * 2 + 4, slots, 0, crate::select::EDIT_WALL_NS, None)?;
+    let d = drive(&world, session, &mut store, tape, slots, 0, crate::select::EDIT_WALL_NS, None)?;
     check(&world, &d, false)?;
     let mut ran = 0;
     for (at, verdict, _) in &d.verdicts {
@@ -728,10 +713,10 @@ pub(super) fn run_seed(seed: u64, plant: Plant) -> Result<(), String> {
         return Err(format!("{ran} mutants of one changed function, over the cap of 4"));
     }
 
-    let wall = 5 * MS + rng.below(25 * MS);
+    let wall = 5 * MS + tape.below(25 * MS, "tight wall");
     let tight = Config { budget: Budget { wall_ns: wall, slots }, ..full };
     let third = plan(&Scope::Items(&items), &world.universe(), &tight, plant).map_err(|error| error.to_string())?;
-    let e = drive(&world, Session::new(third, 0), &mut BTreeMap::new(), seed * 2 + 5, slots, 0, wall, None)?;
+    let e = drive(&world, Session::new(third, 0), &mut BTreeMap::new(), tape, slots, 0, wall, None)?;
     check(&world, &e, false)?;
     Ok(())
 }

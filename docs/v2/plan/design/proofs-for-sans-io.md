@@ -249,6 +249,6 @@ Not started. The first target is formal-verification.md's (the flight recorder's
 
 ## Checks
 
-Ledger rows V12 to V16 (objectives.json): the first proved invariant with its test deleted;
+Ledger rows V13 to V17 (objectives.json): the first proved invariant with its test deleted;
 the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
 the count of invariants at `proved`; atomics.

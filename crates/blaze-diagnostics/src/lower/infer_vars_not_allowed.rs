@@ -160,6 +160,54 @@ fn impl_trait<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> Option<String> {
     Some(out)
 }
 
+/// blaze: with `#![feature(blaze_anon_params)]`, why this `_` is not an anonymous type
+/// parameter (docs/v2/plan/design/implied-bounds.md), the rule that refused it by its position.
+/// `None` without the feature, so the error is rustc's.
+fn anon_params_note(
+    cx: &Cx<'_, '_>,
+    item: ast::Item<'_>,
+    at: TextRange,
+    is_return: bool,
+) -> Option<&'static str> {
+    if !cx.krate.is_unstable_feature_enabled(cx.db, &intern::sym::blaze_anon_params) {
+        return None;
+    }
+    let within = |ty: Option<ast::Type<'_>>| {
+        ty.is_some_and(|ty| ty.syntax().text_range().contains_range(at))
+    };
+    let in_header = match item {
+        ast::Item::Fn(it) => {
+            it.param_list().is_some_and(|it| it.syntax().text_range().contains_range(at))
+        }
+        ast::Item::Impl(it) => within(it.self_ty()) || within(it.trait_()),
+        _ => false,
+    };
+    Some(match item {
+        // In a parameter type or an impl header a `_` is refused only where a const goes.
+        _ if in_header => {
+            "`blaze_anon_params`: a `_` const argument is not an anonymous const parameter; \
+             give the item a named `const` parameter"
+        }
+        ast::Item::Fn(_) if is_return => {
+            "`blaze_anon_params`: a `_` is an anonymous type parameter only in a parameter \
+             type; a return type is chosen by the function, not the caller, so write the \
+             type or `impl Trait`"
+        }
+        ast::Item::Const(_) | ast::Item::Static(_) => {
+            "`blaze_anon_params`: a constant or static has no parameters, so its type cannot \
+             have an anonymous one"
+        }
+        ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) => {
+            "`blaze_anon_params`: a field type cannot have an anonymous parameter, since the \
+             type's parameters are its interface; name the parameter"
+        }
+        _ => {
+            "`blaze_anon_params`: a `_` is an anonymous type parameter only in a function's \
+             parameter types or an impl's self type or trait"
+        }
+    })
+}
+
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found> {
     let node = cx.syntax_view(d.node);
     let file = node.file_id;
@@ -199,6 +247,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found>
             .any(|it| ast::Variant::can_cast(it.kind()));
         let kind = if in_variant { "variant" } else { item_descr(item) };
         let mut diag = bad_placeholder(cx, file, &[at], kind);
+        if let Some(note) = anon_params_note(cx, item, at, false) {
+            diag.note(note);
+        }
         site_fact(cx, &mut diag, node);
         // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Items)];
@@ -261,6 +312,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found>
                 );
             }
         }
+    }
+    if let Some(note) = anon_params_note(cx, item, at, is_return) {
+        diag.note(note);
     }
     site_fact(cx, &mut diag, node);
     // alloc: the error's parts, for an error hir found
