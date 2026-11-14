@@ -13,9 +13,9 @@ import BlazeModel.blaze_core.handoff.hands
 open Blaze
 set_option linter.unusedVariables false
 
-def blaze_core.handoff.no_hand_back_is_missed (schedule : Vec Threads.Step) (flagged : Bool) : Threads.Prog Bool :=
+def blaze_core.handoff.no_hand_back_is_missed (schedule : Slice Threads.Step) (flagged : Bool) : Threads.Prog Bool :=
   blaze_core.handoff.hands schedule flagged
 
 def blaze_core.handoff.no_hand_back_is_missed.spec.statement : Prop :=
-  ∀ (schedule : Vec Threads.Step) (flagged : Bool),
+  ∀ (schedule : Slice Threads.Step) (flagged : Bool),
     (blaze_core.handoff.no_hand_back_is_missed schedule flagged).valueWeak = Result.ok true
