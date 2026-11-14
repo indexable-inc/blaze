@@ -571,6 +571,7 @@ dependencies = [
  "blaze-query",
  "blaze-record",
  "blaze-registry",
+ "blaze-remote",
  "blaze-report",
  "blaze-screen",
  "blaze-serde",
@@ -637,6 +638,7 @@ dependencies = [
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-mem",
  "blaze-reclaim",
  "blaze-serde",
@@ -645,8 +647,10 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "hegeltest",
+ "libc",
  "lz4_flex",
  "serde",
+ "serde_json",
  "tracing",
  "zstd",
 ]
@@ -950,6 +954,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-expansion"
+version = "0.0.0"
+dependencies = [
+ "blaze-build-script",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-rng",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-explore"
 version = "0.0.0"
 dependencies = [
@@ -1047,6 +1064,16 @@ dependencies = [
  "tempfile",
  "tracing",
  "unicode-normalization",
+]
+
+[[package]]
+name = "blaze-findings"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-rng",
+ "hegeltest",
 ]
 
 [[package]]
@@ -1567,6 +1594,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-core",
  "blaze-diagnostics",
+ "blaze-findings",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
@@ -1741,6 +1769,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-memo"
+version = "0.0.0"
+dependencies = [
+ "blaze-core",
+ "blaze-graph",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-mem",
+ "blaze-memo-macros",
+ "blaze-rng",
+ "hegeltest",
+]
+
+[[package]]
+name = "blaze-memo-macros"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "blaze-metadata"
 version = "0.0.0"
 dependencies = [
@@ -1753,6 +1806,16 @@ dependencies = [
  "blaze-units",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "blaze-mutants"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-program",
+ "hegeltest",
 ]
 
 [[package]]
@@ -1823,6 +1886,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "blaze-program"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-keyed",
+ "hegeltest",
 ]
 
 [[package]]
@@ -1941,6 +2015,25 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "blaze-remote"
+version = "0.0.0"
+dependencies = [
+ "blaze-cas",
+ "blaze-format",
+ "blaze-http",
+ "blaze-ids",
+ "blaze-keyed",
+ "blaze-rng",
+ "blaze-sha256",
+ "hegeltest",
+ "http",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -6129,6 +6222,7 @@ name = "scripts"
 version = "0.0.0"
 dependencies = [
  "blaze-script",
+ "blaze-sha256",
  "regex",
  "serde_json",
  "toml",
