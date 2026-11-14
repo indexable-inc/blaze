@@ -571,6 +571,15 @@ const UNRULED: &[(&str, &str, &str)] = &[
         "hir-def/src/nameres/delta/publish.rs",
         "a walk of every module of a published crate (DefMap::table)",
     ),
+    // The hygiene context of an item's name written by a macro, keyed by the expansion and the
+    // item's syntax id, not by an item: what a body's method and associated-item lookups compare
+    // names under (`def_site::assoc_item_key`). No fact names it yet; it becomes the item's
+    // `Signature` once the signature form writes its name's key.
+    (
+        "expanded_item_key",
+        "hir-def/src/nameres/def_site.rs",
+        "the hygiene key of a name a macro wrote: no fact names it yet",
+    ),
 ];
 
 /// Whether `read`, of `name`, is of a query [`UNRULED`] lists.
@@ -2024,7 +2033,9 @@ fn a_sealed_library_row_is_its_crates_fact_and_changes_with_it() {
         subject: key::crate_key(&db, core),
         object: FactObject::None,
     };
-    assert_eq!(facts, [crate_fact, values::field_order(), values::setting("borrowck_debug").unwrap()]);
+    let setting = |name| values::setting(name).unwrap();
+    let settings = [setting("borrowck_debug"), setting("check_relative_bodies")];
+    assert_eq!(facts, [crate_fact, values::field_order(), settings[0], settings[1]]);
 
     // Another library: the `Crate` fact's value changes.
     let value = |db: &Db, facts: &[FactRef]| {

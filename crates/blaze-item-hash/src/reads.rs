@@ -373,6 +373,11 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     // with it.
     ("borrowck_debug", "base-db/src/settings.rs", Rule::Setting),
     ("cfg_options", "base-db/src/input.rs", Rule::CrateInput),
+    // `RA_CHECK_RELATIVE_BODIES`: a body's tree is parsed again, not taken from the thread's
+    // cache, and checked against its file's. No answer depends on it (it checks, or stops the
+    // build), but a step reads it (`BodySyntax::tree`, through `body_syntax`), so it is the
+    // build's `Setting` fact of that name, as `borrowck_debug` is.
+    ("check_relative_bodies", "base-db/src/settings.rs", Rule::Setting),
     ("children", "hir-def/src/nameres.rs", Rule::Names),
     ("children", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("closure_exprs", "hir-ty/src/db.rs", Rule::OwnStore),
@@ -437,6 +442,10 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("fn_sig_for_fn", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_struct_constructor", "hir-ty/src/lower.rs", Rule::Items),
     ("generic_defaults_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::GenericDef)),
+    // The attribute flags of an item's generic parameters (`AttrFlags::query_generic_params`),
+    // read by the borrow check for a `Drop` impl's `#[may_dangle]`: the item's `Attrs` fact,
+    // which hashes them (`values::attrs_of`); the signature form does not.
+    ("generic_params_attr_flags", "hir-def/src/attrs.rs", Rule::Attrs(Of::GenericDef)),
     ("generic_predicates_of", "hir-ty/src/lower.rs", Rule::Items),
     ("generics_require_sized_self", "hir-ty/src/dyn_compatibility.rs", Rule::Signature(Of::GenericDef)),
     ("goal_crate_key", "blaze-items/src/goals.rs", Rule::OwnCrate(Else::WholeCrate)),
@@ -530,6 +539,11 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("row", "hir-def/src/nameres/facts/queries.rs", Rule::Names),
     ("rpit_hidden_types", "hir-ty/src/opaques.rs", Rule::Items),
     ("rpitit_item_bounds", "hir-ty/src/rpitit.rs", Rule::Items),
+    // An `async` block's MIR after the runtime passes, which the borrow check of the body it is
+    // written in reads: not in the body's `STEP_MIR` value (that hashes the built MIR alone,
+    // `body_store::value::mir_hash`), so read through: its built MIR (`OwnStep`) and what the
+    // passes read (layouts, goals), each classified for this body.
+    ("runtime_mir_body_for_coroutine_query", "hir-ty/src/providers.rs", Rule::Through),
     ("scope", "hir-def/src/nameres.rs", Rule::Names),
     ("scope", "hir-def/src/nameres/delta/publish.rs", Rule::Names),
     ("scope_memo", "hir-def/src/nameres/frozen/pages.rs", Rule::Names),
@@ -724,6 +738,19 @@ fn apply(
             arg::<FunctionId>(db, key).and_then(|it| values::attrs(db, it.into()))
         }
         Rule::Attrs(Of::Adt) => arg::<AdtId>(db, key).and_then(|it| values::attrs(db, it.into())),
+        Rule::Attrs(Of::GenericDef) => arg::<GenericDefId>(db, key).and_then(|it| {
+            // The item whose attributes a generic definition's parameters' flags are part of.
+            let item: AttrDefId = match it {
+                GenericDefId::AdtId(it) => it.into(),
+                GenericDefId::ConstId(it) => it.into(),
+                GenericDefId::FunctionId(it) => it.into(),
+                GenericDefId::ImplId(it) => it.into(),
+                GenericDefId::StaticId(it) => it.into(),
+                GenericDefId::TraitId(it) => it.into(),
+                GenericDefId::TypeAliasId(it) => it.into(),
+            };
+            values::attrs(db, item)
+        }),
         Rule::Attrs(_) => arg::<AttrDefId>(db, key).and_then(|it| values::attrs(db, it)),
         Rule::DropCheck => {
             arg::<AdtId>(db, key).map(|adt| item_fact(db, items::DROP_CHECK, ItemId::Adt(adt)))
@@ -846,9 +873,11 @@ pub fn sealed(
     let Some(&found) = found else { return false };
     facts.push(whole_crate(db, found)); // alloc: the step's scratch list, reused
     facts.push(values::field_order()); // alloc: as above
-    match values::setting("borrowck_debug") {
-        Some(fact) => facts.push(fact), // alloc: as above
-        None => return false,
+    for name in ["borrowck_debug", "check_relative_bodies"] {
+        match values::setting(name) {
+            Some(fact) => facts.push(fact), // alloc: as above
+            None => return false,
+        }
     }
     true
 }
