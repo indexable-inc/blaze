@@ -1,0 +1,14 @@
+{
+ "id": "proofs-1113-3",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "the daemon's start on a home that holds state (blaze serve; the store's buffer pool), blaze-vm",
+ "what": "`blaze prove -p blaze-core --json` with a release build of 7c585447d4 on a home another build of this lane had written 20 minutes before (BLAZE_HOME=/root/wt/proofs-1113/home: journal 2.4 MB, a daemon image, a store; written by a debug build of the tree before its merge with main 9c1311df11) started a daemon that never listened. The client gave up after 60 s: `the daemon (blaze serve, pid 3400734) was started and did not listen at .../v2.sock: it was reading its state (the VFS journal, the daemon image and the store) for 60s, inside wait (function=signal store.pool.unpinned, awaits=signal store.pool.unpinned, 0.0s open)`. The daemon stayed: 6 min 26 s after its start it had used 5 s of CPU and none in a 3 s sample, 156 threads asleep (two named `store pool load pool`), nothing of its own in serve.log, nothing in the home's `stalls/`. It held serve.lock, so the next command's daemon waited 300 s and ended (`still holds .../serve.lock after 300s`), and `blaze stop` could not reach it (`nothing listens at ...v2.sock`). SIGTERM did not end it within a second; `kill -9` did.",
+ "cost": "one 25-minute VM cycle of the dogfood run; the same command on a fresh home is the rerun",
+ "cause": "not known. Not measured: whether main's own build hangs on that home, whether the state's layout differed between the two builds, what held the pool's frames. No stack was taken (no gdb or eu-stack on the VM) and the home was not kept past the rerun's start (it is still at /root/wt/proofs-1113/home until the lane is cleaned up).",
+ "whys": "a daemon that cannot finish reading its state waits on a signal with no bound a watchdog sees: the stall report and the typed failure both live in the serving loop, which had not started; the client knows only that nothing listened; the daemon's own deadline for its start is not there, so the lock outlives the failure",
+ "class": "a wait before the daemon serves (reading the journal, the image, the store) has no deadline and no watchdog, so a start that cannot finish is a silent process holding the state's lock",
+ "prevention": "the start is one bounded step: the daemon gives itself the deadline the client already has (60 s), and at it writes what it was waiting on to serve.log, lets go of serve.lock and exits with a typed code; the watchdog thread starts before the state is read. Not built.",
+ "workaround": "kill the pid the client's error names, and use a fresh BLAZE_HOME",
+ "state": "open"
+}
