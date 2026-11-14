@@ -69,6 +69,8 @@ mod journal;
 mod kept;
 #[cfg(test)]
 mod pages;
+#[cfg(test)]
+mod world;
 pub mod seeds;
 
 use std::{cell::Cell, mem, path::PathBuf, time::Duration};
@@ -117,8 +119,9 @@ const RACE_ONE_IN: u64 = 3;
 pub const SCRIBBLE: u8 = 0x5A;
 
 /// What a write from memory lands, or is torn, in: a drive's sector, each written whole or
-/// not at all, in any order, when the power goes or the write fails.
-pub const SECTOR: usize = 512;
+/// not at all, in any order, when the power goes or the write fails. The disk world's, which
+/// states the rule this simulation is held to.
+pub use crate::world::disk::SECTOR;
 
 type EndId = blaze_mem::Handle<End>;
 
@@ -228,6 +231,18 @@ struct Undo {
     from: Option<FileName>,
 }
 
+/// What a crash keeps of one file's changes not synced ([`Sim::crash_cut`]).
+#[derive(Debug)]
+struct Cut {
+    name: FileName,
+    /// How many of them, from the first, are kept whole.
+    kept: usize,
+    /// The part of the next that landed, as changes.
+    torn: Vec<Op>,
+    /// Whether the write or rename that put the file under its name without a sync is undone.
+    undone: bool,
+}
+
 impl Default for SimFile {
     fn default() -> SimFile {
         // alloc: none, two empty vectors.
@@ -311,6 +326,13 @@ impl SimFile {
     /// Its dirty data written to the device, none of it durable.
     fn write_back(&mut self) {
         self.back = self.ops.len();
+    }
+
+    /// The drive's cache flushed: what its barriers cover is durable.
+    fn flushed(&mut self) {
+        if let Some(covered) = self.barriers.iter().map(|(covers, _)| *covers).max() {
+            self.sync(covered);
+        }
     }
 
     /// The first `covers` of its changes made durable.
@@ -775,6 +797,15 @@ impl Sim {
     /// Every lock goes with the processes that held them, another process's too
     /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
+        let cut = self.crash_cut();
+        self.crash_with(cut);
+    }
+
+    /// The first half of a crash: everything in flight and everything a process holds is
+    /// gone, and what each file keeps is drawn, the files in the order of their names.
+    /// [`Sim::crash_with`] makes the disk of it. The two are apart so that the disk world's
+    /// refinement test (`sim/world.rs`) can ask the world whether it allows the cut drawn.
+    fn crash_cut(&mut self) -> Vec<Cut> {
         seeds::crashed(self);
         // A write from memory in flight may have landed any of its sectors, unsynced: the cut
         // below keeps or tears them as it does every change since the last sync.
@@ -817,37 +848,33 @@ impl Sim {
         self.stamp_epochs();
         // By name, so the seed's numbers go to the same files whatever the table's order.
         // alloc: a crash, not an op.
-        let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
+        let mut files: Vec<(&FileName, &SimFile)> = self.files.iter().collect();
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        // The writes and renames that waited for no sync and are undone, by name. A file with
-        // nothing to undo draws no number here, so a run without them is as it was.
-        // alloc: a crash, not an op.
-        let mut undone: Vec<(FileName, Undo)> = Vec::new();
         // What each file keeps of its changes not synced, drawn file by file as before
-        // barriers were modelled (a run with none draws the same numbers): how many, and the
-        // part of the next that landed.
+        // barriers were modelled (a run with none draws the same numbers): whether its write
+        // or rename that waited for no sync is undone (a file with nothing to undo draws no
+        // number for it, so a run without them is as it was), how many changes, and the part
+        // of the next that landed.
         // alloc: a crash, not an op.
-        let mut cuts: Vec<(usize, Vec<Op>)> = Vec::with_capacity(files.len());
-        for (name, file) in &mut files {
-            match file.undo.take() {
-                // clone: a crash, not an op: the name the undo is of.
-                Some(undo) if self.rng.one_in(3) => undone.push(((*name).clone(), *undo)),
-                _ => {}
-            }
+        let mut cuts: Vec<Cut> = Vec::with_capacity(files.len());
+        for (name, file) in &files {
+            let undone = file.undo.is_some() && self.rng.one_in(3);
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
             let torn = file.ops.get(kept).map(|op| op.torn(&mut self.rng)).unwrap_or_default();
-            cuts.push((kept, torn));
+            // clone: a crash, not an op: the name the cut is of.
+            cuts.push(Cut { name: (*name).clone(), kept, torn, undone });
         }
         // A barrier's promise: a change made after it completed is on the disk only if what
         // it covers is. So whatever is kept of a later epoch than a barrier keeps that
         // barrier's changes whole, which may in turn be of an epoch later than another's.
-        let newest = |files: &[(&FileName, &mut SimFile)], cuts: &[(usize, Vec<Op>)]| {
+        let newest = |files: &[(&FileName, &SimFile)], cuts: &[Cut]| {
             files
                 .iter()
                 .zip(cuts)
-                .filter_map(|((_, file), (kept, torn))| {
+                .filter_map(|((_, file), cut)| {
                     // A change torn in part is on the disk in part: it counts as kept.
-                    let reach = (*kept + usize::from(!torn.is_empty())).min(file.stamps.len());
+                    let reach =
+                        (cut.kept + usize::from(!cut.torn.is_empty())).min(file.stamps.len());
                     file.stamps[..reach].iter().max().copied()
                 })
                 .max()
@@ -855,8 +882,11 @@ impl Sim {
         // Bounded: each round keeps more of some file or ends.
         for _ in 0..=files.iter().map(|(_, file)| file.barriers.len()).sum::<usize>() {
             let Some(newest) = newest(&files, &cuts) else { break };
+            if self.planted(host::Plant::BarriersNotKept) {
+                break;
+            }
             let mut forced = false;
-            for ((_, file), (kept, torn)) in files.iter().zip(&mut cuts) {
+            for ((_, file), cut) in files.iter().zip(&mut cuts) {
                 let covered = file
                     .barriers
                     .iter()
@@ -864,10 +894,10 @@ impl Sim {
                     .map(|(covers, _)| *covers)
                     .max()
                     .unwrap_or(0);
-                if covered > *kept {
-                    *kept = covered;
+                if covered > cut.kept {
+                    cut.kept = covered;
                     // The change after what a barrier covers may still be torn; none before.
-                    torn.clear();
+                    cut.torn.clear();
                     forced = true;
                 }
             }
@@ -875,7 +905,18 @@ impl Sim {
                 break;
             }
         }
-        for ((_, file), (kept, torn)) in files.into_iter().zip(cuts) {
+        cuts
+    }
+
+    /// The second half of a crash: the disk a power cut that kept `cuts` leaves.
+    fn crash_with(&mut self, cuts: Vec<Cut>) {
+        // The writes and renames that waited for no sync and are undone, by name.
+        // alloc: a crash, not an op.
+        let mut undone: Vec<(FileName, Undo)> = Vec::new();
+        for Cut { name, kept, torn, undone: undo } in cuts {
+            let file = self.files.get_mut(&name).expect("a cut is of the files there are");
+            // Whatever a crash did not undo is on the disk under its name from here on.
+            let taken = file.undo.take();
             file.sync(kept);
             for op in torn {
                 op.apply(&mut file.durable);
@@ -884,6 +925,9 @@ impl Sim {
             file.back = 0;
             file.stamps.clear();
             file.barriers.clear();
+            if undo && let Some(taken) = taken {
+                undone.push((name, *taken));
+            }
         }
         for (name, Undo { was, from }) in undone {
             let file = self.files.remove(&name);
@@ -893,11 +937,16 @@ impl Sim {
             {
                 self.files.insert(from, file);
             }
-            // What the name held before is back, as far as it was synced.
+            // What the name held before is back, as far as it was synced: no change of it,
+            // and so no stamp or barrier of one, is left.
             if let Some(mut was) = was {
                 was.ops.clear();
                 was.back = 0;
                 was.undo = None;
+                if !self.planted(host::Plant::PutBackWithBarriers) {
+                    was.stamps.clear();
+                    was.barriers.clear();
+                }
                 self.files.insert(name, was);
             }
         }
@@ -1366,9 +1415,7 @@ impl Sim {
     /// and what every barrier before it covers went with it. Durable now.
     fn flushed(&mut self) {
         for file in self.files.values_mut() {
-            if let Some(covered) = file.barriers.iter().map(|(covers, _)| *covers).max() {
-                file.sync(covered);
-            }
+            file.flushed();
         }
     }
 
@@ -2085,6 +2132,11 @@ impl Sim {
             Effect::Rename { from, to, .. } => match self.files.remove(&from) {
                 Some(mut sim) => {
                     self.flushed();
+                    // The file being renamed is out of the table here, and the flush is of
+                    // the whole drive: what its own barriers cover went too.
+                    if !self.planted(host::Plant::RenameFlushesOthers) {
+                        sim.flushed();
+                    }
                     // The new name is on the disk: nothing of the name is left to undo.
                     sim.undo = None;
                     *file_mut(&mut self.files, &to) = sim;

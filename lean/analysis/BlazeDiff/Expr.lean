@@ -25,14 +25,15 @@ no two `ite`s differ by how they decide. -/
 def pick (p : Prop) (a b : ℝ) : ℝ :=
   @ite ℝ p (Classical.propDecidable p) a b
 
--- `if_pos : c → ite c t e = t`, `if_neg : ¬c → ite c t e = e` (the instance is implicit).
+-- `ite_eq_left : c → ite c t e = t`, `ite_eq_right : ¬c → ite c t e = e` (the instance is
+-- implicit).
 theorem pick_pos {p : Prop} (h : p) (a b : ℝ) : pick p a b = a := by
   unfold pick
-  exact if_pos h
+  exact ite_eq_left h
 
 theorem pick_neg {p : Prop} (h : ¬p) (a b : ℝ) : pick p a b = b := by
   unfold pick
-  exact if_neg h
+  exact ite_eq_right h
 
 /-- A float operation of one argument (`eval::apply`); 0 for any other operation. -/
 def evalUn : Op → ℝ → ℝ

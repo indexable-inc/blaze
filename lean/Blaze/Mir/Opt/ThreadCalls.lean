@@ -42,18 +42,18 @@ theorem findFrame_retargetStack (τ : FnId → BlockId → BlockId) (id : Nat) :
       have left : findFrame (retargetStack τ (fr :: rest)) id =
           some (retargetFrame τ (headFn (rest.map ctlOf)) fr) :=
         (findFrame_cons (retargetFrame τ (headFn (rest.map ctlOf)) fr) (retargetStack τ rest) id).trans
-          (if_pos h')
+          (ite_eq_left h')
       have right : findFrame (fr :: rest) id = some fr :=
-        (findFrame_cons fr rest id).trans (if_pos h)
+        (findFrame_cons fr rest id).trans (ite_eq_left h)
       rw [left, right]
       try rfl
     · have h' : ¬ (retargetFrame τ (headFn (rest.map ctlOf)) fr).id = id := h
       have left : findFrame (retargetStack τ (fr :: rest)) id =
           findFrame (retargetStack τ rest) id :=
         (findFrame_cons (retargetFrame τ (headFn (rest.map ctlOf)) fr) (retargetStack τ rest) id).trans
-          (if_neg h')
+          (ite_eq_right h')
       have right : findFrame (fr :: rest) id = findFrame rest id :=
-        (findFrame_cons fr rest id).trans (if_neg h)
+        (findFrame_cons fr rest id).trans (ite_eq_right h)
       rw [left, right]
       exact ih
 
@@ -69,17 +69,17 @@ theorem setFrame_retargetStack (τ : FnId → BlockId → BlockId) (id : Nat) (s
       have left : setFrame (retargetStack τ (fr :: rest)) id slots =
           (retargetFrame τ (headFn (rest.map ctlOf)) fr).withLocals slots :: retargetStack τ rest :=
         (setFrame_cons (retargetFrame τ (headFn (rest.map ctlOf)) fr) (retargetStack τ rest) id
-          slots).trans (if_pos h')
+          slots).trans (ite_eq_left h')
       have right : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
-        (setFrame_cons fr rest id slots).trans (if_pos h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_left h)
       exact left.trans (congrTo (retargetStack τ) right).symm
     · have h' : ¬ (retargetFrame τ (headFn (rest.map ctlOf)) fr).id = id := h
       have left : setFrame (retargetStack τ (fr :: rest)) id slots =
           retargetFrame τ (headFn (rest.map ctlOf)) fr :: setFrame (retargetStack τ rest) id slots :=
         (setFrame_cons (retargetFrame τ (headFn (rest.map ctlOf)) fr) (retargetStack τ rest) id
-          slots).trans (if_neg h')
+          slots).trans (ite_eq_right h')
       have right : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
-        (setFrame_cons fr rest id slots).trans (if_neg h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_right h)
       have hd : headFn ((setFrame rest id slots).map ctlOf) = headFn (rest.map ctlOf) :=
         congrTo headFn (setFrame_ctl id slots rest)
       have last : retargetFrame τ (headFn (rest.map ctlOf)) fr :: retargetStack τ (setFrame rest id slots) =
@@ -190,20 +190,20 @@ theorem assertOn_rt (τ : FnId → BlockId → BlockId) (st : State) (fn : FnId)
   | Value.bool b => by
     by_cases h : b = expected
     · have left : assertOn st expected kind target (Value.bool b) = st.jump target :=
-        (assertOn_bool st expected kind target b).trans (if_pos h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_left h)
       have right : assertOn (st.mapStack (retargetStack τ)) expected kind (τ fn target)
             (Value.bool b) =
           (st.mapStack (retargetStack τ)).jump (τ fn target) :=
         (assertOn_bool (st.mapStack (retargetStack τ)) expected kind (τ fn target) b).trans
-          (if_pos h)
+          (ite_eq_left h)
       exact RedirectsT.cast left right (jump_rt τ st fn hfn target)
     · have left : assertOn st expected kind target (Value.bool b) = Outcome.panic kind :=
-        (assertOn_bool st expected kind target b).trans (if_neg h)
+        (assertOn_bool st expected kind target b).trans (ite_eq_right h)
       have right : assertOn (st.mapStack (retargetStack τ)) expected kind (τ fn target)
             (Value.bool b) =
           Outcome.panic kind :=
         (assertOn_bool (st.mapStack (retargetStack τ)) expected kind (τ fn target) b).trans
-          (if_neg h)
+          (ite_eq_right h)
       exact RedirectsT.cast left right (Or.inl rfl)
   | Value.unit => Or.inl rfl
   | Value.int _ _ => Or.inl rfl
@@ -226,19 +226,19 @@ theorem enter_retarget (τ : FnId → BlockId → BlockId) (st : State) (fn : Fn
         Outcome.ok (Next.state (enterState (st.mapStack (retargetStack τ)) id sig args dest
           (mapTarget (τ st.topFn) target))) :=
       (State.enter_eq (st.mapStack (retargetStack τ)) id sig args dest
-        (mapTarget (τ st.topFn) target)).trans (if_pos hl)
+        (mapTarget (τ st.topFn) target)).trans (ite_eq_left hl)
     have right : st.enter id sig args dest target =
         Outcome.ok (Next.state (enterState st id sig args dest target)) :=
-      (State.enter_eq st id sig args dest target).trans (if_pos hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_left hl)
     exact left.trans
       (congrTo (Outcome.map (Next.map (State.mapStack (retargetStack τ)))) right).symm
   · have left : (st.mapStack (retargetStack τ)).enter id sig args dest
           (mapTarget (τ st.topFn) target) =
         Outcome.undefined Undefined.illFormed :=
       (State.enter_eq (st.mapStack (retargetStack τ)) id sig args dest
-        (mapTarget (τ st.topFn) target)).trans (if_neg hl)
+        (mapTarget (τ st.topFn) target)).trans (ite_eq_right hl)
     have right : st.enter id sig args dest target = Outcome.undefined Undefined.illFormed :=
-      (State.enter_eq st id sig args dest target).trans (if_neg hl)
+      (State.enter_eq st id sig args dest target).trans (ite_eq_right hl)
     exact left.trans
       (congrTo (Outcome.map (Next.map (State.mapStack (retargetStack τ)))) right).symm
 

@@ -350,6 +350,22 @@
    "why": "A key hit with no check is unsound for real Rust: `a + b`, `?`, `for`, a deref and auto traits look up what the text does not name, and blaze-unitkey (read 2026-11-13) covers none of them; the simulation could not see it because its model's reads were the key's names. A list of implicit lookups would be a patch per missed case, each a silent stale answer (rules 21, 54). It also removes a copy of every reused record and a re-key of every unit above an interface edit.",
    "recommended": "The test-engine session proposed it and an outside reviewer said adopt with changes; the main agent of the port (claude-fable-5-2) agrees and builds it. The owner has not ruled; it is his to reverse.",
    "state": "Built: blaze-keyed rewritten with its simulation and an audit policy, blaze-host on it, blaze-unitkey keyed from own text; tests pass on blaze-vm (2026-11-14). blaze-front and the command are not on it yet."
+  },
+  {
+   "id": "D40",
+   "date": "2026-11-13",
+   "decision": "For sans-IO code, a Lean proof takes the place of the deterministic-simulation test: once Lean has checked an invariant's proof in the gate, the test that stood for it is deleted. This reverses \"DST stays the requirement\" of docs/v2/plan/design/formal-verification.md for code the translator reads. What a proof does not cover keeps a test: one conformance test per world model against each real driver, and a run of each translated function as its Lean model and as built code on the same drawn inputs until the translation is proved. Code that is not proved keeps its simulation test, on blaze's own engine (D37, blaze-sim).",
+   "why": "Decided by the owner, 2026-11-13 20:17: \"can we make a system so that we can remove these DST stuff and formally verify? ... if things are jank u can imprvoe the lean/ formal veification system this is for dog fooding ... this should be useable by anyone instead of doing dst :) for anything sans io rust\".",
+   "recommended": "Yes, as the owner's decision; recorded by claude-fable-5-2. The residual tests are my reading of what the proof leaves out, not his words.",
+   "state": "design written and reviewed from outside the work (docs/v2/plan/design/proofs-for-sans-io.md); ledger rows V13 to V17; first done for blaze-core's ETXTBSY retry schedule on proofs-1113 (two theorems proved, one sampled test deleted)"
+  },
+  {
+   "id": "D41",
+   "date": "2026-11-13",
+   "decision": "How D40 is built. (1) A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its Lean statement is total correctness (for every argument it returns `true`, and returns). (2) A state machine is proved a step at a time over a well-formedness predicate written in Rust, and one Lean lemma gives every run. (3) A world is a Rust predicate `allows(asked, answer)` with `apply`, not a script of choices and not a kernel model written by hand in Lean. (4) Both Lean packages move from 4.20.0 to 4.35.0. (5) `blaze prove` is its own command; generated models are build outputs, and the tree holds proofs.",
+   "why": "claude-fable-5-2, main agent. (1) cargo still builds blaze's crates, so they cannot carry clause syntax, and a property test and a theorem are then one function. (1) to (3) as changed by an outside review the same evening (an Opus 5.5 advise agent given the spec and the code): a statement that let a non-returning core pass would prove less than the test it replaces; a choice script proves nothing about the answers it cannot produce; a per-step goal is what automation closes. (4) 4.35.0 ships grind, mvcgen with Std.Do, and verified maps; the move cost three String API fixes and renames.",
+   "recommended": "Yes.",
+   "state": "on proofs-1113: (4) done; (1) the attribute and total statements, the translator's methods and integer primitives, `Blaze.Machine`, `blaze_auto`; (5) `blaze prove` with its plan and its sandboxed driver written; (2) used once by hand (a counter); (3) not started"
   }
  ]
 }

@@ -45,6 +45,7 @@ mod intent;
 mod layout;
 mod memo;
 mod perf;
+mod prove;
 // Lane packs-1112: `Places` is also the export's guard against a record that holds a
 // directory of this machine (`serve::packs::home_places`).
 pub(crate) mod portable;
@@ -208,6 +209,11 @@ impl Steps for Real {
     type KeptFront = KeptLowered;
     type Linked = codegen::Linked;
     type Runs = UnitRuns;
+    type Proving = prove::Proving;
+
+    fn check_proofs(proving: prove::Proving, lean: Option<&str>, tags: u64) -> UnitRuns {
+        UnitRuns::Proofs(prove::Checking::new(proving, lean, tags))
+    }
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = self.fetcher.fetch(fetch)?;
@@ -2664,6 +2670,13 @@ impl Front<Real> for JobFront {
         cancellable(|| intent::ahead(&self.0, &reader, filter))?
     }
 
+    fn prove(&self, reader: UnitReader, emit: bool, subset: bool) -> Result<prove::Proving, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| prove::prove(&self.0, reader.db(), emit, subset))?
+    }
+
     fn codegen_inputs(&self, reader: UnitReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         // Read from the units' records in the store: the front end is not asked.
         drop(reader);
@@ -2721,12 +2734,13 @@ impl Kept for codegen::Linked {
     }
 }
 
-/// User code of a job, run on the loop: a build script's run, the build's tests, or its
-/// program.
+/// User code of a job, run on the loop: a build script's run, the build's tests, its
+/// program, or Lean over its proofs.
 pub enum UnitRuns {
     Script(script::ScriptRun),
     Tests(test::TestRun),
     Program(run::Program),
+    Proofs(prove::Checking),
 }
 
 impl Runs<Real> for UnitRuns {
@@ -2741,6 +2755,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.start(store, writer, effects, out),
             UnitRuns::Tests(it) => it.start(store, writer, effects, out),
             UnitRuns::Program(it) => it.start(store, writer, effects, out),
+            UnitRuns::Proofs(it) => it.start(store, writer, effects, out),
         }
     }
 
@@ -2749,6 +2764,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.owns(tag),
             UnitRuns::Tests(it) => it.owns(tag),
             UnitRuns::Program(it) => it.owns(tag),
+            UnitRuns::Proofs(it) => it.owns(tag),
         }
     }
 
@@ -2764,6 +2780,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Tests(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Program(it) => it.complete(completion, store, writer, effects, out),
+            UnitRuns::Proofs(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -2772,6 +2789,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.cancel(effects),
             UnitRuns::Tests(it) => it.cancel(effects),
             UnitRuns::Program(it) => it.cancel(effects),
+            UnitRuns::Proofs(it) => it.cancel(effects),
         }
     }
 
@@ -2780,6 +2798,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.take_puts(),
             UnitRuns::Tests(it) => it.take_puts(),
             UnitRuns::Program(it) => it.take_puts(),
+            UnitRuns::Proofs(it) => it.take_puts(),
         }
     }
 }

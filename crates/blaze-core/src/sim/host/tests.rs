@@ -535,6 +535,9 @@ fn each_planted_bug_is_caught() {
                 clock_and_random(seed, Some(plant)).is_err()
             }
             Plant::RemovesFull => dirs(seed, Some(plant)).is_err(),
+            Plant::BarriersNotKept | Plant::RenameFlushesOthers | Plant::PutBackWithBarriers => {
+                unreachable!("{plant:?} is the disk's, caught by its own controls (sim/world.rs)")
+            }
         })
     };
     for plant in [

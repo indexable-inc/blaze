@@ -18,6 +18,8 @@ pub enum Term {
     /// `e.field`; a tuple's `e.1`, `e.2`.
     Proj(Box<Term>, String),
     Tuple(Vec<Term>),
+    /// `[a, b, ..]`.
+    List(Vec<Term>),
     /// `(e : T)`.
     Typed(Box<Term>, Box<Term>),
     /// `{ e with f := v, .. }`.
@@ -35,6 +37,7 @@ pub enum Term {
     Let(Pat, Box<Term>, Box<Term>),
     Do(Vec<DoElem>),
     Forall(Vec<Binder>, Box<Term>),
+    Exists(Vec<Binder>, Box<Term>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,7 +244,12 @@ fn pat(pattern: &Pat) -> String {
 /// Whether `term` prints as one token or a bracketed group: usable as an argument as it is.
 fn is_atomic(term: &Term) -> bool {
     match term {
-        Term::Name(_) | Term::Tuple(_) | Term::Typed(..) | Term::Update(..) | Term::Structure(_) => {
+        Term::Name(_)
+        | Term::Tuple(_)
+        | Term::List(_)
+        | Term::Typed(..)
+        | Term::Update(..)
+        | Term::Structure(_) => {
             true
         }
         Term::Atom(text) => !text.starts_with('-') && !text.contains(' '),
@@ -303,6 +311,9 @@ pub fn inline(term: &Term) -> String {
             [one] => argument(one),
             _ => format!("({})", items.iter().map(inline).collect::<Vec<_>>().join(", ")),
         },
+        Term::List(items) => {
+            format!("[{}]", items.iter().map(inline).collect::<Vec<_>>().join(", "))
+        }
         Term::Typed(value, ty) => format!("({} : {})", inline(value), inline(ty)),
         Term::Update(base, changed) => format!("{{ {} with {} }}", inline(base), fields(changed)),
         Term::Structure(all) => format!("{{ {} }}", fields(all)),
@@ -337,6 +348,7 @@ pub fn inline(term: &Term) -> String {
             format!("do {}", elems.join("; "))
         }
         Term::Forall(bound, body) => format!("∀ {}, {}", binders(bound), inline(body)),
+        Term::Exists(bound, body) => format!("∃ {}, {}", binders(bound), inline(body)),
     }
 }
 
@@ -345,7 +357,7 @@ fn is_block(term: &Term) -> bool {
     match term {
         Term::Let(..) | Term::Do(_) | Term::Match(..) => true,
         Term::If(_, then, otherwise) => is_block(then) || is_block(otherwise),
-        Term::Forall(_, body) => is_block(body),
+        Term::Forall(_, body) | Term::Exists(_, body) => is_block(body),
         Term::Infix(Infix::Implies, _, right) => is_block(right),
         _ => false,
     }
@@ -418,6 +430,9 @@ impl Printer {
             }
             Term::Forall(bound, body) if is_block(term) || !fits(&inline(term), indent) => {
                 self.after(indent, &format!("∀ {},", binders(bound)), body);
+            }
+            Term::Exists(bound, body) if is_block(term) || !fits(&inline(term), indent) => {
+                self.after(indent, &format!("∃ {},", binders(bound)), body);
             }
             Term::Infix(Infix::Implies, left, right)
                 if is_block(term) || !fits(&inline(term), indent) =>

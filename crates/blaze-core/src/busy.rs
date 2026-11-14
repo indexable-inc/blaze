@@ -31,6 +31,74 @@ pub const fn next(tried: u32, waited: u64) -> Option<u64> {
     Some(if wait < left { wait } else { left })
 }
 
+/// What the schedule promises of the wait it gives after waits that came to `waited`
+/// nanoseconds: nothing once they have come to [`MOST_NS`]; else a wait that is positive, at
+/// most [`CAP_NS`], at most what is left of [`MOST_NS`], and at least [`FIRST_NS`] unless it
+/// is the last one, cut to end on the bound exactly.
+pub const fn bounded(waited: u64, wait: Option<u64>) -> bool {
+    match wait {
+        None => waited >= MOST_NS,
+        Some(wait) => {
+            waited < MOST_NS
+                && wait > 0
+                && wait <= CAP_NS
+                && wait <= MOST_NS - waited
+                && (wait >= FIRST_NS || waited + wait == MOST_NS)
+        }
+    }
+}
+
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/Busy.lean): from any state, the
+/// wait [`next`] gives is [`bounded`]. So every wait of an exec is positive and never passes
+/// what is left of [`MOST_NS`]: the waits of [`while_busy`] end, on the bound exactly, in at
+/// most `MOST_NS / FIRST_NS + 1` tries from wherever they are (rule bounded-progress), and no
+/// arithmetic of [`next`] overflows or panics. Proved for every `tried` and `waited`, where
+/// the test it stands beside followed one run from the start. Its control is
+/// `the_oracle_catches_a_last_wait_not_cut`.
+#[blaze::theorem]
+pub fn next_is_bounded(tried: u32, waited: u64) -> bool {
+    bounded(waited, next(tried, waited))
+}
+
+/// The reference model: the schedule as the loop its words describe, the first wait doubled
+/// once for each wait made, kept to the cap each time, and cut to what is left of the bound.
+/// [`next`] is this with the doubling done by one shift.
+pub const fn doubling(tried: u32, waited: u64) -> Option<u64> {
+    if waited >= MOST_NS {
+        return None;
+    }
+    let mut wait = FIRST_NS;
+    let mut doubled = 0;
+    while doubled < tried {
+        wait = if wait * 2 < CAP_NS { wait * 2 } else { CAP_NS };
+        doubled += 1;
+    }
+    let left = MOST_NS - waited;
+    Some(if wait < left { wait } else { left })
+}
+
+/// Whether two schedules give the same wait.
+pub const fn same(wait: Option<u64>, reference: Option<u64>) -> bool {
+    match wait {
+        None => match reference {
+            None => true,
+            Some(_) => false,
+        },
+        Some(wait) => match reference {
+            Some(reference) => wait == reference,
+            None => false,
+        },
+    }
+}
+
+/// The refinement (proved: crates/blaze-core/lean/BlazeCore/Busy.lean): [`next`] is
+/// [`doubling`], for every number of tries (past the shift's limit of 20 too) and every time
+/// waited (past the bound too). Its control is `the_oracle_catches_a_doubling_never_capped`.
+#[blaze::theorem]
+pub fn next_is_the_doubling_schedule(tried: u32, waited: u64) -> bool {
+    same(next(tried, waited), doubling(tried, waited))
+}
+
 /// Waits out one wait of the schedule, `ns` from [`next`]: the sleep of blaze's sandbox
 /// launcher before its exec, which stays off io_uring (its seccomp filter refuses it to what it
 /// launches) and may make nothing between its fork and its exec. A syscall alone.
@@ -83,5 +151,40 @@ pub fn while_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> 
         .map_err(io::Error::from)?;
         tried += 1;
         waited += ns;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wait that runs past the bound, where the schedule cuts its last wait to end on it:
+    /// [`bounded`] refuses it, so [`next_is_bounded`] is not true of every schedule.
+    #[test]
+    fn the_oracle_catches_a_last_wait_not_cut() {
+        assert!(bounded(MOST_NS - 10, next(30, MOST_NS - 10)));
+        assert!(!bounded(MOST_NS - 10, Some(CAP_NS)));
+        assert!(!bounded(0, Some(0)));
+        assert!(!bounded(0, None));
+    }
+
+    /// A doubling that is never kept to the cap is not the reference's wait.
+    #[test]
+    fn the_oracle_catches_a_doubling_never_capped() {
+        assert!(same(next(11, 0), doubling(11, 0)));
+        assert!(!same(Some(FIRST_NS << 11), doubling(11, 0)));
+        assert!(!same(None, doubling(11, 0)));
+    }
+
+    /// The theorem functions run as built code on a few arguments: what Lean proves of their
+    /// models for every argument.
+    #[test]
+    fn the_theorems_hold_where_they_are_run() {
+        for tried in [0, 1, 9, 10, 19, 20, 21, 79] {
+            for waited in [0, 1, FIRST_NS, MOST_NS - CAP_NS, MOST_NS - 1, MOST_NS, MOST_NS + 1, u64::MAX] {
+                assert!(next_is_bounded(tried, waited), "{tried} tries, {waited} ns");
+                assert!(next_is_the_doubling_schedule(tried, waited), "{tried} tries, {waited} ns");
+            }
+        }
     }
 }

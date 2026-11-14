@@ -328,6 +328,27 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{} {}: {}\n", paint(GREEN, "new"), found.level.name(), found.message);
             }
         }
+        Response::Proven(proven) => {
+            if let Some(why) = &proven.failed {
+                put!(out, "{} {why}\n", paint(RED, "no proof checked:"));
+            }
+            for record in &proven.records {
+                match record {
+                    blaze_api::ProofRecord::Proved { function, theorem, .. } => {
+                        put!(out, "{} {function}: {theorem}\n", paint(GREEN, "proved"))
+                    }
+                    blaze_api::ProofRecord::Open { function, proof_file, .. } => {
+                        put!(out, "{} {function}: {proof_file}\n", paint(RED, "open"))
+                    }
+                    blaze_api::ProofRecord::Emitted { function, statement, .. } => {
+                        put!(out, "{} {function}: {statement}\n", paint(CYAN, "emitted"))
+                    }
+                    blaze_api::ProofRecord::Refused { function, what, .. } => {
+                        put!(out, "{} {function}: {what}\n", paint(RED, "refused"))
+                    }
+                }
+            }
+        }
     }
 }
 

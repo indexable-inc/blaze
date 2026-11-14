@@ -22,8 +22,8 @@ use crate::{
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 37;
-const RESPONSES: usize = 45;
+const REQUESTS: usize = 38;
+const RESPONSES: usize = 46;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -353,6 +353,13 @@ impl Gen {
                 client: self.text(),
                 targets: self.targets(),
                 wait_ms: self.wide(),
+            },
+            37 => Request::Prove {
+                emit: self.yes(),
+                lean: self.maybe_text(),
+                view: self.view(0),
+                subset: self.yes(),
+                targets: self.targets(),
             },
             _ => Request::Stop,
         }
@@ -867,6 +874,36 @@ impl Gen {
                 failed: self.maybe(|g| ApiError::from(g.report(depth))),
                 unchanged: self.many(depth, Gen::found),
             }),
+            44 => Response::Proven(crate::Proven {
+                failed: self.maybe(|g| g.text()),
+                subset: self.maybe(|g| crate::Subset {
+                    refused: g.many(depth, |g| crate::SubsetRefusal { what: g.text(), count: g.u32() }),
+                    functions: g.u32(),
+                    translated: g.u32(),
+                }),
+                records: self.many(depth, |g| match g.below(4) {
+                    0 => crate::ProofRecord::Open {
+                        why: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                        proof_file: g.text(),
+                    },
+                    1 => crate::ProofRecord::Proved {
+                        key: g.id(),
+                        model: g.text(),
+                        axioms: g.texts(depth),
+                        theorem: g.text(),
+                        function: g.text(),
+                    },
+                    2 => crate::ProofRecord::Emitted {
+                        path: g.text(),
+                        module: g.text(),
+                        function: g.text(),
+                        statement: g.text(),
+                    },
+                    _ => crate::ProofRecord::Refused { at: g.text(), what: g.text(), function: g.text() },
+                }),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -1084,6 +1121,7 @@ fn request_index(request: &Request) -> usize {
         Request::Stop => 34,
         Request::Store { .. } => 35,
         Request::Diagnostics { .. } => 36,
+        Request::Prove { .. } => 37,
     }
 }
 
@@ -1134,7 +1172,8 @@ fn response_index(response: &Response) -> usize {
         Response::Report { .. } => 41,
         Response::Doing(_) => 42,
         Response::Diagnostics(_) => 43,
-        Response::Of { .. } => 44,
+        Response::Proven(_) => 44,
+        Response::Of { .. } => 45,
     }
 }
 

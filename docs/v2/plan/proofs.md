@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-90 theorems: 77 in `lean`, 13 in `lean/analysis`.
+100 theorems: 87 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -67,11 +67,11 @@ theorem State.read_write_other (st st' : State) (p q : Pointer) (v : Value)
 
 ## V7
 
-**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 4 steps or more.
+**`BlazeGraph.LedgerMir.fnv1a_from_model_agrees`** (`BlazeGraph.LedgerMir`, `lean`): The functional model of fnv1a_from and the semantics of its MIR body give the same outcome, for every seed and slice, with 4 * len + 5 steps or more.
 
 ```lean
 theorem fnv1a_from_model_agrees (hash : U64) (bytes : Slice U8) (extra : Nat) :
-    run P (4 * bytes.val.length + 4 + extra) (entry hash bytes) =
+    run P (4 * bytes.val.length + 5 + extra) (entry hash bytes) =
       Outcome.map (Value.int ScalarTy.U64)
         (Outcome.ofResult
           (blaze_graph.ledger.fnv1a_from (bytes.val.length + 1) hash bytes))
@@ -98,7 +98,7 @@ theorem agrees (x : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (x limit : U32) (extra : Nat) :
-    run P (extra + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
+    run P (extra + 1 + 1 + 1) (at_ 0 Slot.uninit Slot.uninit x limit) =
       Outcome.ok (Value.int ScalarTy.U32 (early.clamp x limit))
 ```
 
@@ -106,7 +106,7 @@ theorem agrees (x limit : U32) (extra : Nat) :
 
 ```lean
 theorem agrees (n : U32) (extra : Nat) :
-    run P (loopFuel 2 2 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
+    run P (loopFuel 2 3 n.val.toNat + extra + 1) (at_ 0 Slot.uninit n Slot.uninit Slot.uninit) =
       Outcome.map (Value.int ScalarTy.U32)
         (Outcome.ofResult (loops.count (n.val.toNat + 1) n))
 ```
@@ -170,7 +170,7 @@ theorem validate_sound (a b : Program) (h : validate a b = true) (fuel : Nat) (s
 ```lean
 theorem execStmt_ctl (adts : List AdtDecl) (st : State) :
     ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.ctl = st.ctl) (execStmt adts st s)
-  | Statement.assign p rv =>
+  | Statement.assign _ rv =>
     Outcome.all_bind (evalRvalue_ctl adts st rv) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         Outcome.All.imp (State.write_ctl r.2 ptr r.1) (fun _ h => Eq.trans h hr)))
@@ -897,4 +897,84 @@ theorem removeDead_call (cert : List (List (List (List Local))))
 ```lean
 theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local)))) :
     PreservesWhen FrameZero (removeDeadStoresChecked cert)
+```
+
+## V13
+
+**`theorems.bump_keeps_wf.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function bump_keeps_wf holds of its model: from a counter with hits at most its limit, bump does not panic and leaves hits at most the limit.
+
+```lean
+theorem theorems.bump_keeps_wf.spec.proof : theorems.bump_keeps_wf.spec.statement
+```
+
+**`theorems.counting_ends.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function counting_ends holds of its model: for every n some fuel makes the loop return, with i equal to n.
+
+```lean
+theorem theorems.counting_ends.spec.proof : theorems.counting_ends.spec.statement
+```
+
+**`blaze_core.busy.next_is_bounded.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_bounded holds of its model: for every number of tries and every time waited, busy::next does not panic and its wait is positive, at most the cap and at most what is left of the bound (so the waits of an exec that met ETXTBSY end, on the bound exactly).
+
+```lean
+theorem blaze_core.busy.next_is_bounded.spec.proof :
+    blaze_core.busy.next_is_bounded.spec.statement
+```
+
+**`blaze_core.busy.next_is_the_doubling_schedule.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_the_doubling_schedule holds of its model: for every number of tries and every time waited, busy::next (one shift) gives the wait of busy::doubling (the loop that doubles and caps), which returns.
+
+```lean
+theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
+    blaze_core.busy.next_is_the_doubling_schedule.spec.statement
+```
+
+## V14
+
+**`blaze_core.world.clock.a_timer_never_fires_early.spec.proof`** (`BlazeCore.World.Clock`, `lean`): The statement blaze generates from blaze-core's theorem function a_timer_never_fires_early holds of its model: for every clock, wait and reading, a timer the clock world allows fired waited at least its time (or its deadline did not fit a u64 and the reading is the last there is), the clock after the reading allows none before it, and nothing overflows or panics.
+
+```lean
+theorem blaze_core.world.clock.a_timer_never_fires_early.spec.proof :
+    blaze_core.world.clock.a_timer_never_fires_early.spec.statement
+```
+
+**`BlazeCore.World.DiskAllows.allows_orders`** (`BlazeCore.World.DiskAllows`, `lean`): Of the disk world's model as the translator emits it from disk.rs: a cut `Disk::allows` accepts has one share per file, and if it keeps, whole or in part, a change of any file made after a barrier of any file completed, it keeps whole every change that barrier covers.
+
+```lean
+theorem allows_orders (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) (H : Disk.allows fuel d cut = Result.ok true) :
+    cut.val.length = d.files.val.length ∧
+      ∀ j1 (h1 : j1 < d.files.val.length) (h1c : j1 < cut.val.length)
+        j2 (h2 : j2 < d.files.val.length) (h2c : j2 < cut.val.length),
+        ∀ b ∈ (d.files.val[j1]).barriers.val,
+        ∀ c (hc : c < (d.files.val[j2]).changes.val.length),
+          c < reachOf d.files.val[j2] cut.val[j2] →
+          b.epoch.val < ((d.files.val[j2]).changes.val[c]).epoch.val →
+          b.covers.val ≤ (cut.val[j1]).whole.val
+```
+
+**`BlazeCore.World.DiskAllows.allows_total`** (`BlazeCore.World.DiskAllows`, `lean`): `Disk::allows` neither panics nor runs out of fuel, for every disk and every cut.
+
+```lean
+theorem allows_total (fuel : Nat) (d : Disk) (cut : Slice Kept)
+    (h : 73786976294838206464 ≤ fuel) :
+    ∃ b, Disk.allows fuel d cut = Result.ok b
+```
+
+## V15
+
+**`queue.new_is_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function new_is_wf holds of its model: a new bounded queue (a `Vec` and a limit) is well formed for every limit.
+
+```lean
+theorem queue.new_is_wf.spec.proof : queue.new_is_wf.spec.statement
+```
+
+**`queue.offer_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function offer_keeps_wf holds of its model: from every queue and item, offer does not panic and leaves a well-formed queue well formed (its `Vec::push` never passes the limit).
+
+```lean
+theorem queue.offer_keeps_wf.spec.proof : queue.offer_keeps_wf.spec.statement
+```
+
+**`queue.take_keeps_wf.spec.proof`** (`BlazeModel.queue.proved`, `lean`): The statement blaze generates from the theorem function take_keeps_wf holds of its model: from every queue, take (a `Vec::pop`) leaves a well-formed queue well formed.
+
+```lean
+theorem queue.take_keeps_wf.spec.proof : queue.take_keeps_wf.spec.statement
 ```

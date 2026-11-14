@@ -107,9 +107,9 @@ theorem removeDeadChecked_preserves : Preserves removeDeadChecked := by
   intro prog n id base args r h _ _
   show (if checkDead prog = true then removeDeadBlocks prog else prog).call n id base args = r
   by_cases hc : checkDead prog = true
-  · rw [if_pos hc]
+  · rw [ite_eq_left hc]
     exact (removeDeadBlocks_call prog hc n id base args).trans h
-  · rw [if_neg hc]
+  · rw [ite_eq_right hc]
     exact h
 
 /-! The composition. -/

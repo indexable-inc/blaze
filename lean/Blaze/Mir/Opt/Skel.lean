@@ -30,21 +30,21 @@ theorem setFrame_skel (id : Nat) (slots : List Slot) :
   | cons fr rest ih =>
     by_cases h : fr.id = id
     · have e : setFrame (fr :: rest) id slots = fr.withLocals slots :: rest :=
-        (setFrame_cons fr rest id slots).trans (if_pos h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_left h)
       exact congrTo (List.map bare) e
     · have e : setFrame (fr :: rest) id slots = fr :: setFrame rest id slots :=
-        (setFrame_cons fr rest id slots).trans (if_neg h)
+        (setFrame_cons fr rest id slots).trans (ite_eq_right h)
       exact (congrTo (List.map bare) e).trans (congrTo (fun t => bare fr :: t) ih)
 
 theorem State.setSlots_skel (st : State) (f : Nat) (slots : List Slot) :
     (st.setSlots f slots).skel = st.skel := by
   by_cases hf : f = 0
   · have e : st.setSlots f slots = { base := slots, stack := st.stack, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_pos hf)
+      (State.setSlots_def st f slots).trans (ite_eq_left hf)
     exact congrTo State.skel e
   · have e : st.setSlots f slots =
         { base := st.base, stack := setFrame st.stack f slots, next := st.next } :=
-      (State.setSlots_def st f slots).trans (if_neg hf)
+      (State.setSlots_def st f slots).trans (ite_eq_right hf)
     exact (congrTo State.skel e).trans (setFrame_skel f slots st.stack)
 
 theorem State.setSlotIn_skel (st : State) (p : Pointer) (slot : Slot) :
@@ -136,7 +136,7 @@ theorem evalRvalue_skel (adts : List AdtDecl) (st : State) :
 /-- A statement leaves the frames, but for what their locals hold, as they were. -/
 theorem execStmt_skel (adts : List AdtDecl) (st : State) :
     ∀ (s : Statement), Outcome.All (fun (st' : State) => st'.skel = st.skel) (execStmt adts st s)
-  | Statement.assign p rv =>
+  | Statement.assign _ rv =>
     Outcome.all_bind (evalRvalue_skel adts st rv) (fun r hr =>
       Outcome.all_bind (Outcome.all_true _) (fun ptr _ =>
         Outcome.All.imp (State.write_skel r.2 ptr r.1) (fun _ h => Eq.trans h hr)))
