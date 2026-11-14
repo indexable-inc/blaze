@@ -53,3 +53,9 @@ prefab ProfileControl : ui.Row {
   Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
   Padding: {l: $chat_pick_gap, r: $chat_pick_gap, t: 0, b: 0}
 }
+
+prefab Emotion : ui.Line {
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+  TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0}
+}

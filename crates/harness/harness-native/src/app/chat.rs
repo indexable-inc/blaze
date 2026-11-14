@@ -40,7 +40,7 @@ mod steps;
 
 pub(super) use rename::Rename;
 pub(super) use steps::live_face;
-pub(super) use pick::effort_meter;
+pub(super) use pick::{effort_meter, model_icon};
 
 pub(super) use genui::Live as GenLive;
 pub(super) use peek::Live as PeekLive;
@@ -1975,7 +1975,7 @@ impl App {
             // say.
             let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
             let listed = (listed.s.as_str(), listed.effort.as_str());
-            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended, st.ctx_open);
+            self.fill_chat_pick(bar, sid, t, model::kind_name(o), st.pick, &mut st.pick_nav, &mut st.effort, listed, ended);
         }
         if let Some(foot) = pv.part("foot") {
             self.fill_chat_activity(foot, e, t, ended);
@@ -2752,19 +2752,21 @@ impl App {
             eprintln!("harness-native: chat:ctx:{rest} names no session");
             return;
         };
-        if let Some(st) = self.chat.borrow_mut().get_mut(&sid) {
-            st.ctx_open = !st.ctx_open;
-        }
+        // Loading this chat's normal view fetches its detailed breakdown; all other rows use small summaries.
+        if let Some(entity) = self.entity_of(sid) { self.select(Some(entity)); self.tree_focus = false; }
+        let mut states = self.chat.borrow_mut();
+        let was = states.get(&sid).is_some_and(|st| st.ctx_open);
+        for st in states.values_mut() { st.ctx_open = false; }
+        states.entry(sid).or_default().ctx_open = !was;
+        drop(states);
         self.poke();
     }
 
-    /// Escape: the focused chat's opened context popover closes. Whether one was open.
-    fn chat_ctx_close(&mut self) -> bool {
-        let Some((_, _, sid)) = self.focused_chat() else { return false };
-        let closed = self.chat.borrow_mut().get_mut(&sid).is_some_and(|st| std::mem::take(&mut st.ctx_open));
-        if closed {
-            self.poke();
-        }
+    /// Escape or a device collapse closes every pinned inline context card, including another row's.
+    pub(in crate::app) fn chat_ctx_close(&mut self) -> bool {
+        let mut closed = false;
+        for st in self.chat.borrow_mut().values_mut() { closed |= std::mem::take(&mut st.ctx_open); }
+        if closed { self.poke(); }
         closed
     }
 

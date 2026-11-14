@@ -82,7 +82,8 @@ fn maker(cur: Option<&ModelChoice>, model: &str, agent: &str) -> &'static str {
     let is = |pre: &[&str]| names.iter().any(|n| pre.iter().any(|p| n.to_ascii_lowercase().starts_with(p)));
     if is(&["claude", "opus", "sonnet", "haiku", "fable"]) {
         "claude"
-    } else if is(&["gpt", "o1", "o3", "o4", "codex"]) {
+    } else if is(&["gpt", "o1", "o3", "o4", "codex"])
+        || names.iter().any(|name| matches!(name.to_ascii_lowercase().as_str(), "astra" | "sol" | "terra" | "luna")) {
         "codex"
     } else {
         match agent {
@@ -152,6 +153,7 @@ fn effort_word(e: &str) -> String {
 enum Capability {
     Light,
     Balanced,
+    Advanced,
     Frontier,
 }
 
@@ -163,7 +165,9 @@ impl Capability {
     fn named(names: [&str; 3]) -> Option<Self> {
         let mut words = names.into_iter().flat_map(|s| s.split(['-', ' ', '_']));
         words.find_map(|word| match word.to_ascii_lowercase().as_str() {
-            "opus" | "fable" | "astra" => Some(Self::Frontier),
+            // The provider catalogue describes Fable as its most capable model and Opus for everyday complex tasks.
+            "fable" | "astra" => Some(Self::Frontier),
+            "opus" => Some(Self::Advanced),
             "sol" | "terra" | "sonnet" => Some(Self::Balanced),
             "haiku" | "luna" => Some(Self::Light),
             _ => None,
@@ -174,9 +178,57 @@ impl Capability {
         match self {
             Self::Light => "Light",
             Self::Balanced => "Balanced",
+            Self::Advanced => "Advanced",
             Self::Frontier => "Frontier",
         }
     }
+}
+
+/// A provider identity plus the same curated capability used for sorting; effort never changes this glyph.
+#[derive(Clone, Copy)]
+enum ModelProvider { Claude, Codex }
+
+#[derive(Clone, Copy)]
+struct ModelIcon {
+    provider: ModelProvider,
+    capability: Option<Capability>,
+}
+
+impl ModelIcon {
+    fn of(model: Option<&ModelChoice>, name: &str, agent: &str) -> Option<Self> {
+        let provider = match maker(model, name, agent) {
+            "claude" => ModelProvider::Claude,
+            "codex" => ModelProvider::Codex,
+            _ => return None,
+        };
+        Some(Self {
+            provider,
+            capability: model.and_then(Capability::of).or_else(|| Capability::named([name, "", ""])),
+        })
+    }
+
+    fn prefab(self) -> &'static str {
+        match (self.provider, self.capability) {
+            (ModelProvider::Claude, Some(Capability::Light)) => "hn.ModelIconClaudeLight",
+            (ModelProvider::Claude, Some(Capability::Balanced)) => "hn.ModelIconClaudeBalanced",
+            (ModelProvider::Claude, Some(Capability::Advanced)) => "hn.ModelIconClaudeAdvanced",
+            (ModelProvider::Claude, Some(Capability::Frontier)) => "hn.ModelIconClaudeFrontier",
+            (ModelProvider::Claude, None) => "hn.ModelIconClaudeUnknown",
+            (ModelProvider::Codex, Some(Capability::Light)) => "hn.ModelIconCodexLight",
+            (ModelProvider::Codex, Some(Capability::Balanced)) => "hn.ModelIconCodexBalanced",
+            (ModelProvider::Codex, Some(Capability::Advanced)) => "hn.ModelIconCodexAdvanced",
+            (ModelProvider::Codex, Some(Capability::Frontier)) => "hn.ModelIconCodexFrontier",
+            (ModelProvider::Codex, None) => "hn.ModelIconCodexUnknown",
+        }
+    }
+}
+
+fn icon(slot: View<'_>, spec: Option<ModelIcon>) {
+    view::for_each_of(slot, spec.map(|s| ("glyph", s.prefab(), ())), |_, (), _| {});
+}
+
+pub(in crate::app) fn model_icon(slot: View<'_>, family: &str, agent: &str) {
+    icon(slot, (!family.is_empty()).then(|| ModelIcon::of(None, family, agent)).flatten());
 }
 
 /// A sidebar's quiet model profile and its full explanation. The transcript and daemon listing resolve exactly as
@@ -312,6 +364,34 @@ fn efforts_of(t: &Transcript, kind: &str, kept: &BTreeMap<String, Vec<ModelChoic
 }
 
 impl App {
+    /// Every visible agent owns its context meter and popover, so inspecting one never depends on pane focus.
+    pub(in crate::app) fn fill_sidebar_context(&self, row: View<'_>, sid: u64, t: &Transcript, kind: &str, working: bool, summary: Option<model::AgentContext>) {
+        let w = self.world.world_ref();
+        let summary = summary.filter(|c| c.window > 0).map(|c| harness_proto::event::ContextUse { used: c.used, window: c.window, ..Default::default() });
+        let rich = t.context.as_ref().filter(|c| c.window > 0);
+        // An unselected chat needs only its current summary. A loaded transcript supplies the breakdown when current.
+        let context = match (rich, summary.as_ref()) {
+            (Some(rich), Some(summary)) if rich.used != summary.used || rich.window != summary.window => Some(summary),
+            (rich, summary) => rich.or(summary),
+        };
+        let Some(slot) = row.part("context") else { return };
+        let shown = (context.is_some() || working).then_some(("meter", "hn.SidebarContext", ()));
+        view::for_each_of(slot, shown, |v, (), _| {
+            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), tone(w, "ink"));
+            breathe(v, working);
+            v.action(&format!("chat:ctx:{sid}"));
+            if let Some(percent) = v.part("percent") {
+                percent.text(&context.map_or_else(String::new, |c| format!("{:.0}%", c.used as f64 * 100.0 / c.window as f64)));
+            }
+            let tip = context.map_or_else(|| "Context usage has not arrived yet".to_owned(), |c| format!("Context · {} / {} tokens\nClick for this agent's breakdown", tokens(c.used), tokens(c.window)));
+            v.set(Tooltip { text: tip.as_str().into() });
+        });
+        let (open, menu) = self.chat.borrow().get(&sid).map_or((false, false), |s| (s.ctx_open, s.pick.is_some()));
+        if let Some(pop) = row.part("context_pop") {
+            super::context::fill_context_pop(pop, slot.part("meter"), context, if t.agent.is_empty() { kind } else { &t.agent }, menu || !self.side_open || self.palette.is_some(), open, (self.pointer.x, self.pointer.y));
+        }
+    }
+
     /// The inline row follows a pending effort immediately, using the same state as the menu and keyboard shortcut.
     pub(in crate::app) fn sidebar_profile(
         &self, sid: u64, transcript: Option<&Transcript>, kind: &str, kept: &BTreeMap<String, Vec<ModelChoice>>,
@@ -324,47 +404,16 @@ impl App {
         sidebar_label(&label, &effort)
     }
 
-    /// The status bar's picker, context meter and plan meter for chat `sid` (`bar`: hn.ChatPane's foot.status; transcript
-    /// `t`, an agent of kind `kind`, `listed` the daemon's `(model, effort)` for it, `ended` when no agent runs it), and
-    /// its menu while `open`.
+    /// The selected row's model/effort menu, hosted outside tree clipping and anchored to its inline control.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fill_chat_pick(
         &self, bar: View<'_>, sid: u64, t: &Transcript, kind: &str, open: Option<Pick>, nav: &mut PickNav, eff: &mut EffortState,
-        listed: (&str, &str), ended: bool, ctx_open: bool,
+        listed: (&str, &str), ended: bool,
     ) {
         let w = self.world.world_ref();
         let kept = self.link.agent_models();
         let Label { models, cur, name, effort: said, .. } = Label::of(t, kind, &kept, listed);
         let effort = eff.shown(t, ended, said, self.time);
-        let context = t.context.as_ref().filter(|c| c.window > 0);
-        let Some(meter_slot) = bar.part("meter") else { return };
-        let ink = tone(w, "ink");
-        // One ring: how full the context is, breathing while the agent works (the composer's one sign of work: Return sends,
-        // Escape stops). Before the first turn says how full, a working agent's ring is an empty track.
-        let working = t.busy && !ended;
-        let shown = (context.is_some() || working).then_some(("context", "hn.ChatContext", ()));
-        view::for_each_of(meter_slot, shown, |v, (), _| {
-            meter(v, context.map_or((0, 1), |c| (c.used, c.window)), ink);
-            breathe(v, working);
-            // A press opens the popover to the whole account (context.rs), another closes it.
-            let action = Action { name: format!("chat:ctx:{sid}").as_str().into() };
-            if v.entity().try_cloned::<&Action>() != Some(action.clone()) {
-                v.entity().set(action);
-            }
-        });
-        let agent = if t.agent.is_empty() { kind } else { t.agent.as_str() };
-        // Under the pointer, the meter's popover (context.rs), anchored to the ring; never over the open menu.
-        if let Some(pop) = bar.part("pop") {
-            super::context::fill_context_pop(
-                pop,
-                meter_slot.part("context"),
-                context,
-                agent,
-                open.is_some(),
-                ctx_open,
-                (self.pointer.x, self.pointer.y),
-            );
-        }
         // The menu belongs to the selected sidebar row, beside the model or effort control that opened it.
         let trigger = open.and_then(|page| sidebar_control(w, sid, page));
         let Some(menu) = bar.part("menu") else { return };
@@ -397,6 +446,12 @@ impl App {
             return;
         }
         self.genui_blur();
+        let w = self.world.world_ref();
+        if let Some(e) = self.entity_of(sid) {
+            for parent in std::iter::successors(w.entity_from_id(e).parent(), |p| p.parent()).take(64) {
+                if parent.has(model::Device::id()) { model::set_folded(w, *parent.id(), false); break; }
+            }
+        }
         self.side_open = true;
         let mut states = self.chat.borrow_mut();
         for (s, st) in states.iter_mut() {
@@ -920,6 +975,7 @@ struct Choice {
     detail: String,
     on: bool,
     action: String,
+    icon: Option<ModelIcon>,
 }
 
 /// What the menu is built from: chat `sid`'s own models (`own`, of agent kind `kind`), every kind's kept lists, the
@@ -1069,6 +1125,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                     meta,
                     detail,
                     on,
+                    icon: ModelIcon::of(Some(m), &m.model, kind),
                     action: if own {
                         format!("chat:set:{}:model:{}", c.sid, m.id)
                     } else {
@@ -1085,6 +1142,7 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
                     meta: String::new(),
                     detail: "Earlier versions of these models.".to_owned(),
                     on: false,
+                    icon: None,
                     action: format!("chat:older:{}:{kind}", c.sid),
                 },
             });
@@ -1159,6 +1217,9 @@ fn model_rows(w: WorldRef<'_>, list: View<'_>, c: &MenuCtx<'_>, hovered: Option<
         Entry::Item { data: c, .. } => {
             harness_native_ui_view::menu::light(v.entity(), hot == Some(i));
             v.action(&c.action);
+            if let Some(lead) = v.part("lead") {
+                view::for_each_of(lead, c.icon.map(|spec| ("model", "hn.ModelIconSlot", spec)), |slot, spec, _| icon(slot, Some(spec)));
+            }
             if let Some(l) = v.part("label") {
                 l.text(&c.label);
             }
@@ -1258,6 +1319,9 @@ mod tests {
         assert_eq!(model_order(&models, &words, None), [2, 0, 3, 1, 4, 6, 5]);
         assert_eq!(model_order(&models, &words, Some("GPT-6-Sol")), [2, 0, 3, 5, 1, 4, 6]);
         assert_eq!(Capability::of(&models[4]), None, "an unfamiliar family has no guessed capability");
+        let claude: Vec<ModelChoice> = ["Fable 5.2", "Haiku 5.5", "Opus 5.5", "Sonnet 5.5"]
+            .into_iter().map(|name| ModelChoice { id: name.to_owned(), name: name.to_owned(), ..ModelChoice::default() }).collect();
+        assert_eq!(model_order(&claude, &claude.iter().map(row_words).collect::<Vec<_>>(), None), [0, 2, 3, 1]);
     }
 
     use harness_proto::event::{Body, Event};
