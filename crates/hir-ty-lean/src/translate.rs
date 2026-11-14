@@ -89,6 +89,8 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::PhantomData => name("core.marker.PhantomData"),
         Ty::Duration => name("core.time.Duration"),
         Ty::Ordering => name("core.cmp.Ordering"),
+        Ty::Range { elem, inclusive: false } => app("core.ops.Range", vec![lean_ty(elem)]),
+        Ty::Range { elem, inclusive: true } => app("core.ops.RangeInclusive", vec![lean_ty(elem)]),
         Ty::Str => name("Str"),
         Ty::Opaque(opaque) => name(opaque.lean()),
         Ty::Shared(shared) => match shared {
@@ -767,6 +769,10 @@ impl<'a> Translate<'a> {
                     .map_or(Ty::Never, |it| it.ty.clone()),
                 _ => Ty::Never,
             },
+            (Elem::Field(field), Ty::Range { elem, .. }) => match field.as_str() {
+                "exhausted" => Ty::Bool,
+                _ => (**elem).clone(),
+            },
             (Elem::VariantField { variant, index }, ty) => self
                 .body
                 .variants(ty)
@@ -1134,6 +1140,15 @@ impl<'a> Translate<'a> {
                 "Arr.replicate",
                 vec![atom(len.to_string()), self.operand(of, lets, at)?],
             )),
+            Rvalue::Range { inclusive, start, end } => {
+                let new = if *inclusive { "core.ops.RangeInclusive.new" } else { "core.ops.Range.new" };
+                let (start, end) = (self.operand(start, lets, at)?, self.operand(end, lets, at)?);
+                Rhs::Pure(app(new, vec![start, end]))
+            }
+            Rvalue::Step { second, pick } => {
+                let (second, pick) = (self.operand(second, lets, at)?, self.operand(pick, lets, at)?);
+                Rhs::Pure(app("Threads.Step.mk", vec![second, pick]))
+            }
             Rvalue::EmptyVec(elem) => Rhs::Pure(Term::Typed(
                 Box::new(name("Vec.new")),
                 Box::new(app("Vec", vec![lean_ty(elem)])),

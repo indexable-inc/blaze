@@ -169,6 +169,8 @@ impl<'db> Writer<'_, 'db> {
             Ty::PhantomData => "core::marker::PhantomData".to_owned(),
             Ty::Duration => "core::time::Duration".to_owned(),
             Ty::Ordering => "core::cmp::Ordering".to_owned(),
+            Ty::Range { elem, inclusive: false } => format!("core::ops::Range<{}>", Self::key(elem)),
+            Ty::Range { elem, inclusive: true } => format!("core::ops::RangeInclusive<{}>", Self::key(elem)),
             Ty::Str => "str".to_owned(),
             Ty::Opaque(opaque) => opaque.rust().to_owned(),
             Ty::Shared(shared) => shared.rust(),
@@ -244,7 +246,13 @@ impl<'db> Writer<'_, 'db> {
             Ty::TryFromIntError => {
                 return Err(self.cx.refuse("the type `TryFromIntError`, which the MIR model has no declaration of", at));
             }
-            Ty::PhantomData | Ty::Duration | Ty::Ordering | Ty::Str | Ty::Opaque(_) | Ty::Shared(_) => {
+            Ty::PhantomData
+            | Ty::Duration
+            | Ty::Ordering
+            | Ty::Range { .. }
+            | Ty::Str
+            | Ty::Opaque(_)
+            | Ty::Shared(_) => {
                 let key = Self::key(ty);
                 return Err(self.cx.refuse(format!("the type `{key}`, which the MIR model has no declaration of"), at));
             }

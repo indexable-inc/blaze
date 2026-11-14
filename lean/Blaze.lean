@@ -3,6 +3,7 @@ import Blaze.Scalar
 import Blaze.Slice
 import Blaze.Std
 import Blaze.Vec
+import Blaze.Range
 import Blaze.ScalarOps
 import Blaze.Ordering
 import Blaze.Duration

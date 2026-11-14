@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-127 theorems: 114 in `lean`, 13 in `lean/analysis`.
+130 theorems: 117 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1092,6 +1092,25 @@ theorem blaze_shapes.hunts_find_the_hit.spec.proof : blaze_shapes.hunts_find_the
 
 ```lean
 theorem traits.provided_agree.spec.proof : traits.provided_agree.spec.statement
+```
+
+**`ranges.contains_at_the_ends.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function contains_at_the_ends holds of its model: a..b holds a exactly when a < b and never holds b; a..=b holds a and b exactly when a <= b; start and end read back what the range was made of.
+
+```lean
+theorem ranges.contains_at_the_ends.spec.proof : ranges.contains_at_the_ends.spec.statement
+```
+
+**`ranges.a_subslice_is_its_part.spec.proof`** (`BlazeModel.ranges.proved`, `lean`): The statement blaze generates from the fixture's theorem function a_subslice_is_its_part holds of its model: for every Vec and a < b <= len, &v[a..b] does not panic, has b - a elements, and its first is v[a].
+
+```lean
+theorem ranges.a_subslice_is_its_part.spec.proof : ranges.a_subslice_is_its_part.spec.statement
+```
+
+**`defaults.derived_default_is_each_fields.spec.proof`** (`BlazeModel.defaults.proved`, `lean`): The statement blaze generates from the fixture's theorem function derived_default_is_each_fields holds of its model: a derived Default of a struct is each field's default (a hand-written one's own value among them), an enum's is its #[default] variant, and an array's holds its element's default in each place.
+
+```lean
+theorem defaults.derived_default_is_each_fields.spec.proof :
+    defaults.derived_default_is_each_fields.spec.statement
 ```
 
 ## V16

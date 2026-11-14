@@ -69,6 +69,8 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Slice", include_str!("../../../lean/Blaze/Slice.lean")),
     ("Blaze.Std", include_str!("../../../lean/Blaze/Std.lean")),
     ("Blaze.Vec", include_str!("../../../lean/Blaze/Vec.lean")),
+    // `Range` and `RangeInclusive` as values, and a slice indexed by a range.
+    ("Blaze.Range", include_str!("../../../lean/Blaze/Range.lean")),
     ("Blaze.ScalarOps", include_str!("../../../lean/Blaze/ScalarOps.lean")),
     ("Blaze.Ordering", include_str!("../../../lean/Blaze/Ordering.lean")),
     ("Blaze.Duration", include_str!("../../../lean/Blaze/Duration.lean")),
@@ -420,6 +422,8 @@ pub(crate) fn rust_ty(ty: &body::Ty) -> String {
         Ty::PhantomData => "core::marker::PhantomData".to_owned(),
         Ty::Duration => "core::time::Duration".to_owned(),
         Ty::Ordering => "core::cmp::Ordering".to_owned(),
+        Ty::Range { elem, inclusive: false } => format!("core::ops::Range<{}>", rust_ty(elem)),
+        Ty::Range { elem, inclusive: true } => format!("core::ops::RangeInclusive<{}>", rust_ty(elem)),
         Ty::Str => "str".to_owned(),
         Ty::Opaque(opaque) => opaque.rust().to_owned(),
         Ty::Shared(shared) => shared.rust(),
