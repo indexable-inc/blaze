@@ -4,7 +4,7 @@
 //!
 //! What it uses today, and nothing else ([`use_proved_contracts`]): where a body does
 //! `r = f(..)`, `f` a direct call of a non-generic function whose `ensures` Lean proves
-//! ([`hir_ty_lean::proved`]: a proof file the pinned Lean checked, nothing less), and that
+//! (a proof file the pinned Lean checked, by `hir_ty_lean::plan`: nothing less), and that
 //! `ensures` bounds the
 //! return by a literal (`r < K`, `r <= K`), the bounds check of an index into an array of
 //! constant length `len >= K` (`K > len` for `<=`) whose index is `r`, or a copy or unsigned

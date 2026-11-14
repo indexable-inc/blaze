@@ -13,9 +13,10 @@
 //! holds a verdict for is not run again: the key covers the Lean release, the module's text
 //! and the key of every step it imports, so an unchanged tree runs Lean not at all.
 //!
-//! What it fixes of the first driver, which ran one theorem at a time: the library was
-//! compiled once per theorem; and a proof file that proves two theorems imports two models,
-//! of which only the one being checked had been written.
+//! The first driver, deleted for this on 2026-11-13, ran Lean itself, one theorem at a time,
+//! with no sandbox and no deadline: the library was compiled once per theorem, and a proof
+//! file that proves two theorems imports two models, of which only the one being checked had
+//! been written.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,9 +27,87 @@ use base_db::ContentId;
 
 use crate::{
     Emitted, LIBRARY, TRANSLATOR,
-    driver::{ALLOWED_AXIOMS, LEAN_VERSION, ProofKey, Prover, printed_axioms},
     lean::{Decl, Module, ident},
 };
+
+/// The Lean release blaze proves with: `lean/lean-toolchain` pins the same. Part of every
+/// step's key, so of every [`ProofKey`]. A driver runs no other: a proof is only as good as
+/// the checker it names.
+pub const LEAN_VERSION: &str = "4.35.0";
+
+/// The axioms a proof may rest on: Lean's three. `sorryAx` (a `sorry`) and
+/// `Lean.ofReduceBool` (native evaluation: `native_decide`, `bv_decide`) are not among them.
+/// blaze's library states no axiom of its own.
+pub const ALLOWED_AXIOMS: &[&str] = &["propext", "Classical.choice", "Quot.sound"];
+
+/// Which prover stands behind a proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Prover {
+    /// The Lean kernel, at [`LEAN_VERSION`].
+    Lean,
+}
+
+/// The identity of a Lean proof: how it was proved, and the key of the step that checked it
+/// ([`Step::key`]), a blake3 over everything the verdict depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProofKey {
+    pub how: Prover,
+    pub id: ContentId,
+}
+
+/// A clause of a function, for a caller that uses a proved fact
+/// (docs/v2/plan/design/contracts.md, part 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Clause {
+    /// The function's `requires`, holding at every call site.
+    Requires,
+    /// The function's `ensures`, given its `requires`.
+    Ensures,
+}
+
+impl Clause {
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Clause::Requires => "requires",
+            Clause::Ensures => "ensures",
+        }
+    }
+}
+
+/// A clause that is not proved, and why: never a pass, never another prover's answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotProved {
+    /// The function, `krate::module::name`.
+    pub function: String,
+    pub clause: Clause,
+    pub why: String,
+}
+
+impl fmt::Display for NotProved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`'s `{}` is not proved: {}", self.function, self.clause.keyword(), self.why)
+    }
+}
+
+impl std::error::Error for NotProved {}
+
+/// The axioms `#print axioms` listed in `output` for `theorem`: `None` when it did not.
+pub(crate) fn printed_axioms(output: &str, theorem: &str) -> Option<Vec<String>> {
+    let none = format!("'{theorem}' does not depend on any axioms");
+    if output.contains(&none) {
+        return Some(Vec::new());
+    }
+    let head = format!("'{theorem}' depends on axioms: [");
+    let start = output.find(&head)? + head.len();
+    let end = start + output[start..].find(']')?;
+    Some(
+        output[start..end]
+            .split(',')
+            .map(|it| it.trim().to_owned())
+            .filter(|it| !it.is_empty())
+            .collect(),
+    )
+}
 
 /// What is asked: the theorems of one crate and its proof files.
 #[derive(Clone, Copy, Debug)]
@@ -120,7 +199,8 @@ pub struct Planned {
     pub function: String,
     /// `<name>.spec.statement`.
     pub statement: String,
-    /// `<name>.spec`: the theorem the check states.
+    /// `<name>.spec.checked`: the theorem the check states, by the proof file's
+    /// `<name>.spec.proof`.
     pub theorem: String,
     /// The module its proof is looked for in ([`proof_module`]).
     pub proof_module: String,
@@ -510,7 +590,10 @@ fn plan_with(ask: Ask<'_>, #[cfg(test)] plant: Plant) -> Result<Plan, PlanError>
     let mut theorems = Vec::with_capacity(ask.theorems.len());
     for (emitted, model) in ask.theorems.iter().zip(models) {
         let statement = emitted.statement.as_deref().expect("checked above");
-        let theorem = format!("{}.spec", emitted.name);
+        // Not `<name>.spec`: with that name a proof file that lacks `<name>.spec.proof` is
+        // told `proof` is no field of the theorem being stated, where Lean should say the
+        // proof is not there.
+        let theorem = format!("{}.spec.checked", emitted.name);
         let proof_module = proof_module(&emitted.function);
         let check = planner.proof(&proof_module).map(|proof| {
             let module = format!("BlazeCheck.{}", emitted.name);
@@ -898,14 +981,14 @@ mod tests {
         let mut ran = vec![Ran::Accepted(String::new()); plan.steps.len()];
         let (a, _) = step(&plan, "BlazeCheck.k.m.a");
         let (b, _) = step(&plan, "BlazeCheck.k.m.b");
-        ran[a] = Ran::Accepted("'k.m.a.spec' depends on axioms: [propext, Quot.sound]\n".to_owned());
-        ran[b] = Ran::Accepted("'k.m.b.spec' depends on axioms: [propext, sorryAx]\n".to_owned());
+        ran[a] = Ran::Accepted("'k.m.a.spec.checked' depends on axioms: [propext, Quot.sound]\n".to_owned());
+        ran[b] = Ran::Accepted("'k.m.b.spec.checked' depends on axioms: [propext, sorryAx]\n".to_owned());
         let verdicts = conclude(&plan, &ran).unwrap();
         let Verdict::Proved { key, axioms, model, .. } = &verdicts[0] else { panic!("{verdicts:?}") };
         assert_eq!((key.id, model.as_str()), (plan.steps[a].key, "BlazeModel/k/m/a.lean"));
         assert_eq!(axioms, &["propext", "Quot.sound"]);
         assert!(matches!(&verdicts[1], Verdict::Open { why: Why::Sorry, .. }), "{verdicts:?}");
-        ran[b] = Ran::Accepted("'k.m.b.spec' depends on axioms: [Lean.ofReduceBool]\n".to_owned());
+        ran[b] = Ran::Accepted("'k.m.b.spec.checked' depends on axioms: [Lean.ofReduceBool]\n".to_owned());
         let verdicts = conclude(&plan, &ran).unwrap();
         assert!(matches!(&verdicts[1], Verdict::Open { why: Why::Axiom { axiom }, .. } if axiom == "Lean.ofReduceBool"));
         ran[b] = Ran::Accepted("no axioms printed".to_owned());

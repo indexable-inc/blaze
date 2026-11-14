@@ -24,7 +24,7 @@ use hir_ty::db::HirDatabase as _;
 use hir_ty_mir::mir::budget::{self, Pass};
 
 use crate::{
-    Emitted, body::*, driver, emit, embed_mir, embed_mir_body, embed_mir_body_as, lean,
+    Emitted, body::*, emit, embed_mir, embed_mir_body, embed_mir_body_as, lean, plan,
     structured::{
         self, Cfg, CfgBlock, End, Ended, Exit, Machine, Node, Plant, ill_formed, lower,
         reconstruct, reconstruct_planted, run_cfg, run_structured,
@@ -936,59 +936,100 @@ fn the_oracle_catches_an_xor_made_an_add() {
     assert!(is_the_fold(&body).is_err());
 }
 
-// ---- The driver. ----
+// ---- The proof check: the plan (`plan`), run here by a test's own driver. ----
 
 #[test]
-fn the_axioms_lean_prints_are_read_and_held_to_the_allowed_ones() {
+fn the_axioms_lean_prints_are_read() {
     let listed = "'m.f.spec' depends on axioms: [propext,\n Classical.choice,\n Quot.sound]\n";
-    let axioms = driver::printed_axioms(listed, "m.f.spec").expect("listed");
+    let axioms = plan::printed_axioms(listed, "m.f.spec").expect("listed");
     assert_eq!(axioms, ["propext", "Classical.choice", "Quot.sound"]);
-    assert_eq!(driver::judge("m::f", "m.f.spec", &axioms), Ok(()));
     let none = "'m.f.spec' does not depend on any axioms\n";
-    assert_eq!(driver::printed_axioms(none, "m.f.spec"), Some(Vec::new()));
-    assert_eq!(driver::printed_axioms("warning: unused\n", "m.f.spec"), None);
-    let sorry = driver::printed_axioms("'m.f.spec' depends on axioms: [sorryAx]", "m.f.spec");
-    assert!(matches!(
-        driver::judge("m::f", "m.f.spec", &sorry.expect("listed")),
-        Err(crate::LeanError::Sorry { .. })
-    ));
-    let native = ["propext".to_owned(), "Lean.ofReduceBool".to_owned()];
-    match driver::judge("m::f", "m.f.spec", &native) {
-        Err(crate::LeanError::Axiom { axiom, .. }) => assert_eq!(axiom, "Lean.ofReduceBool"),
-        other => panic!("native evaluation is refused: {other:?}"),
-    }
+    assert_eq!(plan::printed_axioms(none, "m.f.spec"), Some(Vec::new()));
+    assert_eq!(plan::printed_axioms("warning: unused\n", "m.f.spec"), None);
 }
 
-#[test]
-fn a_proof_key_covers_the_model_the_proof_and_the_check() {
-    let db = db(&fnv1a_fixture());
-    let out = emit(&db, fnv1a(&db)).expect("translated");
-    let key = crate::proof_key(&out, "check", "proof");
-    assert_eq!(key, crate::proof_key(&out, "check", "proof"));
-    assert_eq!(key.how, crate::Prover::Lean);
-    assert_ne!(key, crate::proof_key(&out, "check", "another proof"));
-    assert_ne!(key, crate::proof_key(&out, "another check", "proof"));
-    let mut changed = out.clone();
-    changed.text.push_str("-- changed\n");
-    assert_ne!(key, crate::proof_key(&changed, "check", "proof"));
-}
-
-/// End to end, with the pinned Lean from `BLAZE_LEAN_PROVER`; without it the test fails,
-/// never skips.
-#[test]
-fn lean_checks_the_first_proof_and_its_axioms() {
-    let db = db(&fnv1a_fixture());
-    let out = blaze_core::temp::TempDir::for_test("blaze-hir-ty-lean-");
-    let config = crate::Config::from_env(out.path().to_path_buf()).unwrap_or_else(|err| panic!("{err}"));
-    let proof = crate::ProofFile {
-        root: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-graph/lean"),
-        module: "BlazeGraph.Ledger".to_owned(),
+/// A plan's driver for tests: the files written under `out` (`lib` for [`plan::Root::Out`],
+/// `proofs` for [`plan::Root::Proofs`]) and each step a check needs run with the Lean
+/// `BLAZE_LEAN_PROVER` names, as the daemon's driver does but with no sandbox and no deadline:
+/// test code, over blaze's own proofs. Without the variable the test fails, never skips.
+fn run_plan(planned: &plan::Plan, out: &std::path::Path) -> Vec<plan::Ran> {
+    let lean = std::env::var_os("BLAZE_LEAN_PROVER")
+        .expect("BLAZE_LEAN_PROVER names the `lean` of the release lean/lean-toolchain pins");
+    let version = std::process::Command::new(&lean).arg("--version").output().expect("Lean starts");
+    let version = String::from_utf8_lossy(&version.stdout).into_owned();
+    assert!(version.contains(&format!("version {}", crate::LEAN_VERSION)), "{version}");
+    let dir = |root: plan::Root| match root {
+        plan::Root::Out => out.join("lib"),
+        plan::Root::Proofs => out.join("proofs"),
     };
-    let proved = crate::check(&db, fnv1a(&db), &proof, &config);
-    drop(out);
-    let proved = proved.unwrap_or_else(|err| panic!("{err}"));
-    assert_eq!(proved.theorem, "blaze_graph.ledger.fnv1a_from.spec");
-    assert!(proved.axioms.iter().all(|it| crate::ALLOWED_AXIOMS.contains(&it.as_str())));
+    for write in &planned.writes {
+        let path = dir(write.root).join(&write.path);
+        std::fs::create_dir_all(path.parent().expect("a file is in a directory")).unwrap();
+        std::fs::write(&path, &write.text).unwrap();
+    }
+    let search = std::env::join_paths([dir(plan::Root::Out), dir(plan::Root::Proofs)]).unwrap();
+    let mut ran = vec![plan::Ran::NotRun; planned.steps.len()];
+    for at in plan::wanted(planned) {
+        let step = &planned.steps[at];
+        if step.needs.iter().any(|need| !matches!(ran[*need], plan::Ran::Accepted(_))) {
+            continue;
+        }
+        let root = dir(step.root);
+        let mut command = std::process::Command::new(&lean);
+        command.env_clear().env("LEAN_PATH", &search).current_dir(&root).arg("--root=.");
+        if let Some(olean) = step.olean() {
+            command.arg("-o").arg(root.join(olean));
+        }
+        let output = command.arg(step.file()).output().expect("Lean starts");
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        ran[at] = match output.status.success() {
+            true => plan::Ran::Accepted(text),
+            false => plan::Ran::Rejected(text),
+        };
+    }
+    ran
+}
+
+/// End to end, with the pinned Lean: the plan of blaze-core's two theorems, whose one proof
+/// file proves both and imports `Blaze.Auto`, run step by step, proves both on the allowed
+/// axioms. With the proof file's last theorem cut off, the file still compiles: the theorem
+/// it no longer proves is open at its check, in Lean's own words naming the proof it lacks,
+/// and the other is proved as before.
+#[test]
+fn lean_checks_blaze_cores_proofs_by_the_plan() {
+    let source = busy_fixture();
+    let names = ["next_is_bounded", "next_is_the_doubling_schedule"];
+    let theorems: Vec<Emitted> = names.iter().map(|name| emitted(FLAGS, "blaze_core", name, &source)).collect();
+    let proof = include_str!("../../blaze-core/lean/BlazeCore/Busy.lean");
+    let proofs = BTreeMap::from([("BlazeCore.Busy".to_owned(), proof.to_owned())]);
+    let planned = plan::plan(plan::Ask { theorems: &theorems, proofs: &proofs }).unwrap_or_else(|err| panic!("{err}"));
+    let out = blaze_core::temp::TempDir::for_test("blaze-hir-ty-lean-plan-");
+    let ran = run_plan(&planned, out.path());
+    let verdicts = plan::conclude(&planned, &ran).unwrap_or_else(|err| panic!("{err}"));
+    for (verdict, name) in verdicts.iter().zip(names) {
+        match verdict {
+            plan::Verdict::Proved { theorem, axioms, key, .. } => {
+                assert_eq!(theorem, &format!("blaze_core.busy.{name}.spec.checked"));
+                assert!(axioms.iter().all(|it| crate::ALLOWED_AXIOMS.contains(&it.as_str())), "{axioms:?}");
+                assert_eq!(key.how, crate::Prover::Lean);
+            }
+            plan::Verdict::Open { why, .. } => panic!("`{name}` is not proved: {why}"),
+        }
+    }
+    // The proof file without its last theorem: the check of that theorem finds no proof.
+    let cut = proof.find("theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof").expect("its last theorem");
+    let proofs = BTreeMap::from([("BlazeCore.Busy".to_owned(), proof[..cut].to_owned())]);
+    let planned = plan::plan(plan::Ask { theorems: &theorems, proofs: &proofs }).unwrap_or_else(|err| panic!("{err}"));
+    let other = blaze_core::temp::TempDir::for_test("blaze-hir-ty-lean-plan-cut-");
+    let verdicts = plan::conclude(&planned, &run_plan(&planned, other.path())).unwrap();
+    assert!(matches!(&verdicts[0], plan::Verdict::Proved { .. }), "{:?}", verdicts[0]);
+    match &verdicts[1] {
+        plan::Verdict::Open { why: why @ plan::Why::Rejected { kind: plan::Kind::Check, .. }, .. } => {
+            assert!(why.to_string().contains("next_is_the_doubling_schedule.spec.proof"), "{why}");
+        }
+        other => panic!("the theorem with no proof is open at its check: {other:?}"),
+    }
 }
 
 // ---- MIR, embedded (`body::embed`): what `lean/Blaze/Mir` runs. ----

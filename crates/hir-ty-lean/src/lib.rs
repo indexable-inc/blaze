@@ -14,12 +14,15 @@
 //!    `def <fn>.spec.statement : Prop`, the theorem its clauses state. It imports the library
 //!    and the modules of the functions it calls, nothing else. Emitting twice gives the same
 //!    bytes.
-//! 4. [`check`]: the pinned Lean ([`LEAN_VERSION`], from `BLAZE_LEAN_PROVER`) compiles the
-//!    library, the models and the crate's proof file, then a check module that states
-//!    `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof` and prints its axioms. The
-//!    proof file names the statement and never restates it, so a statement that changed is
-//!    an elaboration error naming the theorem. Proved means: Lean accepts it, and its axioms
-//!    are among [`ALLOWED_AXIOMS`] (so no `sorry`, no native evaluation).
+//! 4. [`plan`]: the check of the proofs, a sans-IO core. From a crate's theorems and the text
+//!    of its proof files, the files to write and the runs of the pinned Lean
+//!    ([`LEAN_VERSION`]) to make: the library, the models, the proof files, and for each
+//!    theorem a check module that states `theorem <fn>.spec.checked : <fn>.spec.statement :=
+//!    <fn>.spec.proof` and prints its axioms. The proof file names the statement and never
+//!    restates it, so a statement that changed is an elaboration error naming the theorem.
+//!    Proved means: Lean accepts it, and its axioms are among [`ALLOWED_AXIOMS`] (so no
+//!    `sorry`, no native evaluation). Who runs Lean is the plan's driver (the daemon, for
+//!    `blaze prove`), in blaze's sandbox; nothing in this crate starts a process.
 //!
 //! Beside the functional translation, [`embed_mir`] writes a function's MIR itself as a term
 //! of the deep embedding in `lean/Blaze/Mir` ([`body::embed`]): the executable semantics the
@@ -32,7 +35,6 @@
 //! it allocates on the global heap throughout.
 
 pub mod body;
-mod driver;
 pub mod lean;
 pub mod plan;
 mod spec;
@@ -47,10 +49,7 @@ use base_db::Db;
 use hir_def::{AttrDefId, DefWithBodyId, FunctionId, attrs::AttrFlags};
 use hir_ty::InferenceResult;
 
-pub use driver::{
-    ALLOWED_AXIOMS, Clause, Config, LEAN_VERSION, LeanError, NotProved, ProofFile, ProofKey,
-    Proofs, Proved, Prover, check, check_emitted, proof_key, proved,
-};
+pub use plan::{ALLOWED_AXIOMS, Clause, LEAN_VERSION, NotProved, ProofKey, Prover};
 pub use body::embed::Embedded as EmbeddedMir;
 pub use spec::Spec;
 
