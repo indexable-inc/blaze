@@ -203,7 +203,7 @@ pub enum Trace {
 pub const OUTSIDE: &str = "it ran outside the sandbox, which alone records what a test reads";
 
 impl Trace {
-    /// What was read, hashed as `inputs` has it now: what [`super::select::record`] keeps a
+    /// What was read, hashed as `inputs` has it now: what blaze-testsel's machine keeps a
     /// pass by. To be asked as the result comes, before anything else changes the files.
     pub fn traced<I: Inputs>(&self, inputs: &mut I) -> Result<Option<Traced>, I::Error> {
         match self {

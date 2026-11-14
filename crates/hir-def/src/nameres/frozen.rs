@@ -48,13 +48,14 @@ use thin_vec::ThinVec;
 use tt::{Delimiter, DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree};
 
 use crate::{
-    AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, DefWithBodyId,
+    AdtId, AstId, AttrDefId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, DefWithBodyId,
     EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc, ExternCrateId,
     ExternCrateLoc, FunctionLoc, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
     ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId, UseLoc,
     builtin_derive::BuiltinDeriveImplTrait,
     builtin_type::BuiltinType,
+    diagnostic_item::DiagnosticItems,
     expr_store::Body,
     item_scope::{
         DeriveMacroInvocation, GlobAmbiguity, GlobId, ImportId, ImportOrDef, ImportOrExternCrate,
@@ -135,6 +136,9 @@ pub struct DefMapSlot;
 
 /// The kind of a crate's slot holding its entry of [`FrozenLangItems`].
 pub struct LangItemsSlot;
+
+/// The kind of a crate's slot holding its entry of [`FrozenDiagnosticItems`].
+pub struct DiagnosticItemsSlot;
 
 /// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
 /// is resolved again when an `include!` loads a file, and only the last one is the crate's.
@@ -400,7 +404,7 @@ pub struct Unreadable {
     pub krate: Crate,
     /// Its display name, if it has one.
     pub name: Option<String>,
-    /// What was frozen: `"def map"` or `"lang items"`.
+    /// What was frozen: `"def map"`, `"lang items"` or `"diagnostic items"`.
     pub kind: &'static str,
     /// Why the bytes do not read, naming the file where it is one.
     pub why: String,
@@ -455,6 +459,124 @@ pub fn encode_lang_items(db: &Db, krate: Crate) -> R<Vec<u8>> {
 pub fn check_lang_items(db: &Db, krate: Crate) {
     let Some(frozen) = frozen_lang_items(db, krate) else { return };
     check_frozen(db, krate, "lang items", &frozen, || encode_lang_items(db, krate));
+}
+
+/// What [`Unreadable`] and a difference call a crate's frozen diagnostic items.
+const DIAGNOSTIC_ITEMS: &str = "diagnostic items";
+
+/// The crates whose diagnostic items are frozen (the image's
+/// [`Part::DiagnosticItems`](crate::deps::Part::DiagnosticItems)), set by whoever has the
+/// bytes: read outside queries alone. A query reads its crate's own ([`DiagnosticItemsSlot`]).
+#[blaze_query::input(singleton, debug)]
+pub struct FrozenDiagnosticItems {
+    #[returns(ref)]
+    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
+}
+
+/// Has finding the diagnostic items of a crate use `maps`.
+pub fn set_diagnostic_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
+    use blaze_query::db::{Durability, Setter};
+    // clone: the handle of the map set before, to tell which crates' bytes move
+    let was = FrozenDiagnosticItems::try_get(&*db).map(|it| it.maps(&*db).clone());
+    crate::deps::given::give_changed::<DiagnosticItemsSlot, Frozen>(db, was.as_deref(), &maps);
+    let maps = Arc::new_in(maps, Global);
+    match FrozenDiagnosticItems::try_get(db) {
+        Some(it) => {
+            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
+        }
+        None => {
+            _ = FrozenDiagnosticItems::new(db, Durability::HIGH, maps);
+        }
+    }
+}
+
+/// The frozen diagnostic items of `krate`, by value, as [`frozen_def_map`] is.
+#[blaze_query::tracked(returns(as_ref))]
+fn frozen_diagnostic_items(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
+    krate.given::<DiagnosticItemsSlot, Frozen>(db).cloned()
+}
+
+/// What [`crate_diagnostic_items`](crate::diagnostic_item::crate_diagnostic_items) reads for
+/// `krate` instead of walking its modules, when they are frozen: the table its image holds,
+/// decoded at its size. Reads no page of the crate's def map but its head (which names its
+/// modules, and which a served crate's dependent has read already) and no item's
+/// attributes. Under [`Mode::Check`] the crate's are found by the walk and
+/// [`check_diagnostic_items`] compares. Bytes that do not decode stop the query with
+/// [`Unreadable`], naming the crate and the part: never a walk of the crate in their place.
+pub(crate) fn served_diagnostic_items(db: &Db, krate: Crate) -> Option<DiagnosticItems> {
+    let frozen = frozen_diagnostic_items(db, krate).filter(|it| it.mode != Mode::Check)?;
+    // The value is the record's, found by content: told to the engine (`row::STORED`).
+    blaze_query::db::report_stored_read(db);
+    let read = || {
+        let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
+        let items = dec.diagnostic_items()?;
+        dec.finish()?;
+        Ok::<_, String>(items)
+    };
+    match read() {
+        Ok(items) => Some(items),
+        Err(why) => Unreadable::of(db, krate, DIAGNOSTIC_ITEMS, why).throw(),
+    }
+}
+
+/// The bytes of the diagnostic items of `krate` as they are now: found by the walk, or read
+/// in [`Mode::Serve`] and [`Mode::Verify`]. After the files ([`Enc::finish`]): the number of
+/// names, then each name and the item it names ([`Enc::attr_owner`]) in the byte order of the
+/// names, then the number of duplicates and each duplicate's name, the item kept and the
+/// other, in the order the walk found them (the def map's, which is the same in every
+/// process): no byte depends on a hash map's order.
+///
+/// An item that cannot be named across sessions refuses the crate's image, naming the item:
+/// its row is never left out (a table with a row missing would answer "no such item" for a
+/// name the crate gives).
+pub fn encode_diagnostic_items(db: &Db, krate: Crate) -> R<Vec<u8>> {
+    let items = crate::diagnostic_item::crate_diagnostic_items(db, krate);
+    let mut enc = Enc::new(db, krate);
+    let named = |name: &Symbol, why: String| {
+        format!(
+            "the diagnostic item `{}` names an item another session cannot name ({why}): every row of the table is written, none left out",
+            name.as_str()
+        )
+    };
+    // The rows in the order of their names: once per crate per image write, a few hundred
+    // borrows. Not a frame's: this runs outside any query too (a store's task, a test).
+    let mut rows = Vec::with_capacity_in(items.by_name.len(), Global);
+    rows.extend(items.by_name.iter());
+    // Names are the map's keys, so no two rows tie.
+    rows.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    enc.usize(rows.len())?;
+    for &(name, &owner) in &rows {
+        enc.symbol(name)?;
+        enc.attr_owner(owner).map_err(|why| named(name, why))?;
+    }
+    enc.usize(items.duplicates.len())?;
+    for (name, kept, other) in &items.duplicates {
+        enc.symbol(name)?;
+        enc.attr_owner(*kept).map_err(|why| named(name, why))?;
+        enc.attr_owner(*other).map_err(|why| named(name, why))?;
+    }
+    enc.finish()
+}
+
+/// Records a difference between the frozen diagnostic items of `krate` and the live ones in
+/// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
+pub fn check_diagnostic_items(db: &Db, krate: Crate) {
+    let Some(frozen) = frozen_diagnostic_items(db, krate) else { return };
+    check_frozen(db, krate, DIAGNOSTIC_ITEMS, &frozen, || encode_diagnostic_items(db, krate));
+}
+
+/// A test's frozen diagnostic items of `krate` given or taken away (`None`) outside a serve.
+#[cfg(test)]
+pub(crate) fn give_diagnostic_items(db: &mut Db, krate: Crate, frozen: Option<Frozen>) {
+    let mut maps = FrozenDiagnosticItems::try_get(&*db)
+        .map(|it| (**it.maps(&*db)).clone())
+        .unwrap_or_default();
+    match frozen {
+        Some(frozen) => maps.insert(krate, frozen),
+        None => maps.remove(&krate),
+    };
+    set_diagnostic_items(db, maps);
 }
 
 /// The bytes of the `DefMap` of `krate` as name resolution computes it, or why it cannot be
@@ -1392,6 +1514,68 @@ impl Enc<'_> {
             LangItemTarget::MacroId(it) => {
                 self.u8(4);
                 self.macro_id(it)
+            }
+        }
+    }
+
+    /// An item that has attributes, named as its kind of id is everywhere else in the bytes:
+    /// a module (one of a block's by its body, [`Enc::module`]), an item as [`Enc::def`] names
+    /// it (an item of a trait, an impl or a body by its container), an impl, an `extern`
+    /// block, an `extern crate` and a `use` by their module and their place in its file. Every
+    /// kind of [`AttrDefId`] is named; none is left out.
+    pub fn attr_owner(&mut self, it: AttrDefId) -> R {
+        match it {
+            AttrDefId::ModuleId(it) => {
+                self.u8(0);
+                self.module(it)
+            }
+            AttrDefId::AdtId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::AdtId(it))
+            }
+            AttrDefId::FunctionId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::FunctionId(it))
+            }
+            AttrDefId::EnumVariantId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::EnumVariantId(it))
+            }
+            AttrDefId::StaticId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::StaticId(it))
+            }
+            AttrDefId::ConstId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::ConstId(it))
+            }
+            AttrDefId::TraitId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::TraitId(it))
+            }
+            AttrDefId::TypeAliasId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::TypeAliasId(it))
+            }
+            AttrDefId::MacroId(it) => {
+                self.u8(1);
+                self.def(ModuleDefId::MacroId(it))
+            }
+            AttrDefId::ImplId(it) => {
+                self.u8(2);
+                self.impl_id(it)
+            }
+            AttrDefId::ExternBlockId(it) => {
+                self.u8(3);
+                self.extern_block(it)
+            }
+            AttrDefId::ExternCrateId(it) => {
+                self.u8(4);
+                self.extern_crate(it)
+            }
+            AttrDefId::UseId(it) => {
+                self.u8(5);
+                self.use_id(it)
             }
         }
     }
@@ -3000,6 +3184,67 @@ impl Dec<'_> {
             // alloc: error path
             it => return Err(format!("lang item {it}")),
         })
+    }
+
+    /// What [`Enc::attr_owner`] wrote.
+    pub fn attr_owner(&mut self) -> R<AttrDefId> {
+        Ok(match self.u8()? {
+            0 => AttrDefId::ModuleId(self.module()?),
+            1 => match self.def()? {
+                ModuleDefId::AdtId(it) => AttrDefId::AdtId(it),
+                ModuleDefId::FunctionId(it) => AttrDefId::FunctionId(it),
+                ModuleDefId::EnumVariantId(it) => AttrDefId::EnumVariantId(it),
+                ModuleDefId::StaticId(it) => AttrDefId::StaticId(it),
+                ModuleDefId::ConstId(it) => AttrDefId::ConstId(it),
+                ModuleDefId::TraitId(it) => AttrDefId::TraitId(it),
+                ModuleDefId::TypeAliasId(it) => AttrDefId::TypeAliasId(it),
+                ModuleDefId::MacroId(it) => AttrDefId::MacroId(it),
+                ModuleDefId::ModuleId(_) | ModuleDefId::BuiltinType(_) => {
+                    return Err(String::from(
+                        "an item with attributes written as an item that is a module or a builtin type, which `Enc::attr_owner` never writes",
+                    ));
+                }
+            },
+            2 => AttrDefId::ImplId(self.impl_id()?),
+            3 => AttrDefId::ExternBlockId(self.extern_block()?),
+            4 => AttrDefId::ExternCrateId(self.extern_crate()?),
+            5 => AttrDefId::UseId(self.use_id()?),
+            it => return Err(format!("item with attributes {it}")),
+        })
+    }
+
+    /// What [`encode_diagnostic_items`] wrote after the files: the memo's value, made once at
+    /// its size.
+    fn diagnostic_items(&mut self) -> R<DiagnosticItems> {
+        let (n, room) = self.len_and_room()?;
+        let mut by_name = HashMap::with_capacity_in(room, Global);
+        let mut last: Option<Symbol> = None;
+        for _ in 0..n {
+            let name = self.symbol()?;
+            if last.as_ref().is_some_and(|it| it.as_str() >= name.as_str()) {
+                return Err(format!(
+                    "the diagnostic item `{}` out of the order of names, or written twice",
+                    name.as_str()
+                ));
+            }
+            by_name.insert(name, self.attr_owner()?);
+            last = Some(name);
+        }
+        let (n, room) = self.len_and_room()?;
+        let mut duplicates = Vec::with_capacity_in(room, Global);
+        for _ in 0..n {
+            let name = self.symbol()?;
+            let kept = self.attr_owner()?;
+            let other = self.attr_owner()?;
+            if by_name.get(&name) != Some(&kept) {
+                return Err(format!(
+                    "the duplicate diagnostic item `{}` keeps an item its table does not name",
+                    name.as_str()
+                ));
+            }
+            duplicates.push((name, kept, other));
+        }
+        Ok(DiagnosticItems { by_name, duplicates })
     }
 
     pub fn body_owner(&mut self) -> R<DefWithBodyId> {

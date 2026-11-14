@@ -54,6 +54,8 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wired_tests;
 
 /// The test of an effect about the suite (its index, the read table, the program).
 pub const NO_TEST: u32 = u32::MAX;
@@ -68,8 +70,7 @@ const PUT_HEAD: Ticket = Ticket(u64::MAX - 5);
 /// One test asked.
 #[derive(Clone, Copy, Debug)]
 pub struct Test<'a> {
-    /// Its base key: the core's `TestRun` key over its identity (blaze-program's
-    /// `reach::test_key`).
+    /// Its base key: the core's `TestRun` key over its identity ([`crate::host::base`]).
     pub base: Key<TestRun>,
     /// Its libtest name: what an error and a verdict's line name it by.
     pub name: &'a str,
@@ -140,6 +141,12 @@ pub struct Ran<'a> {
     /// What it read that cannot be traced.
     pub untraceable: &'a [Untraceable],
     pub sandboxed: bool,
+    /// The sandbox said what it read: false for a sandboxed run whose trace is missing, whose
+    /// reads are then not known.
+    pub traced: bool,
+    /// Codegen marks the test as reaching code the tracer cannot see (a process start, the
+    /// network, assembly: `TestOf::outside`).
+    pub foreign: bool,
 }
 
 /// What a run executed, each function with its bound code when it ran.
@@ -206,19 +213,42 @@ pub enum NotKept {
     Raced { at: u32 },
     /// Its key has every one of `MAX_SHAPES` shapes filed with another.
     TooManyShapes,
+    /// It ran sandboxed and the sandbox did not say what it read.
+    Untraced,
+    /// It reaches code the tracer cannot see, as codegen marks it.
+    Foreign,
 }
 
 impl NotKept {
+    /// The reason in a sentence: what `(not kept: ..)` says.
     pub fn name(self) -> &'static str {
         match self {
             NotKept::Failed => "failed",
             NotKept::Unsandboxed => "not sandboxed",
+            NotKept::Untraced => "the sandbox did not say what it read",
+            NotKept::Foreign => "it reaches code the tracer cannot see (a process start, the network or assembly)",
             NotKept::Untraceable(Untraceable::Clock) => "it read the wall clock",
             NotKept::Untraceable(Untraceable::Random) => "it read randomness the sandbox did not answer",
             NotKept::Untraceable(Untraceable::Network) => "it used the network",
             NotKept::Untraceable(Untraceable::Descriptor) => "it read through a descriptor the sandbox did not see opened",
             NotKept::Raced { .. } => "what it read changed while it ran",
             NotKept::TooManyShapes => "it has too many shapes",
+        }
+    }
+
+    /// The reason as one word: what JSON's `"kept": {"no": ..}` says.
+    pub fn code(self) -> &'static str {
+        match self {
+            NotKept::Failed => "failed",
+            NotKept::Unsandboxed => "unsandboxed",
+            NotKept::Untraced => "untraced",
+            NotKept::Foreign => "foreign",
+            NotKept::Untraceable(Untraceable::Clock) => "clock",
+            NotKept::Untraceable(Untraceable::Random) => "random",
+            NotKept::Untraceable(Untraceable::Network) => "network",
+            NotKept::Untraceable(Untraceable::Descriptor) => "descriptor",
+            NotKept::Raced { .. } => "raced",
+            NotKept::TooManyShapes => "too-many-shapes",
         }
     }
 }
@@ -410,7 +440,8 @@ struct IndexPut {
 
 /// One request's selection (the module docs).
 pub struct Selection<'s, A: AllocatorClone> {
-    snap: Snapshot<'s>,
+    /// `None` once [`Selection::detach`]ed: no record is checked against it after.
+    snap: Option<Snapshot<'s>>,
     alloc: A,
     start: Start<'s>,
     stage: Stage,
@@ -487,7 +518,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             });
         }
         let mut selection = Selection {
-            snap,
+            snap: Some(snap),
             start,
             stage: Stage::Head,
             head_out: Out::Skip,
@@ -523,6 +554,97 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             selection.begin_tests();
         }
         Ok(selection)
+    }
+
+    /// The selection out of its snapshot, to wait for its runs across the host's turns (a
+    /// snapshot is one scope's, [`proof::scope`]). Only once every test has its verdict or is
+    /// to run (the host answered every lookup; with `workers` at least the tests asked, every
+    /// run is out at the first [`Step::Wait`]): nothing after reads a record under the
+    /// snapshot. A test that missed is filed from its first shape slot again
+    /// ([`Filer::new`]), at most `MAX_SHAPES` slot reads more than filing it from its lookup.
+    pub fn detach(self) -> Result<Selection<'static, A>, SelectError> {
+        if matches!(self.stage, Stage::Head | Stage::Prelude) {
+            return Err(SelectError::Misused("a selection detached before its index head was read"));
+        }
+        if self.tests.iter().any(|test| test.phase == Phase::Look) {
+            return Err(SelectError::Misused("a selection detached while a test is being looked up"));
+        }
+        let mut tests = Vec::with_capacity_in(self.tests.len(), self.alloc.clone());
+        for test in self.tests {
+            tests.push(TestState {
+                base: test.base,
+                name: test.name,
+                phase: test.phase,
+                issued: test.issued,
+                row: test.row,
+                lookup: None,
+                filer: test.filer,
+                shape: test.shape,
+                then: test.then,
+                put: test.put,
+                address: test.address,
+                micros: test.micros,
+                verdict: test.verdict,
+                keep: test.keep,
+            });
+        }
+        let start = self.start;
+        Ok(Selection {
+            snap: None,
+            alloc: self.alloc,
+            start: Start {
+                tool: start.tool,
+                suite: start.suite,
+                program: start.program,
+                head: start.head,
+                certified: None,
+                run_all: start.run_all,
+                workers: start.workers,
+                compact_at: start.compact_at,
+            },
+            stage: self.stage,
+            head_out: self.head_out,
+            postings_out: self.postings_out,
+            changes_out: self.changes_out,
+            table_out: self.table_out,
+            head: self.head,
+            postings: self.postings,
+            changed: self.changed,
+            candidate: self.candidate,
+            tests,
+            names: self.names,
+            ready: self.ready,
+            runs: self.runs,
+            runs_at: self.runs_at,
+            running: self.running,
+            open: self.open,
+            seen: self.seen,
+            moved: self.moved,
+            checks: self.checks,
+            cost: self.cost,
+            index_puts: self.index_puts,
+            put_at: self.put_at,
+            put_issued: self.put_issued,
+            new_head: self.new_head,
+            failed: self.failed,
+            report: self.report,
+        })
+    }
+
+    /// How many tests were asked.
+    pub fn tests(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Test `at`'s verdict, once it has one: a runner reports each test as it is settled
+    /// rather than at the request's end. The report's verdicts are these.
+    pub fn verdict(&self, at: u32) -> Option<Verdict> {
+        self.tests.get(at as usize).and_then(|test| test.verdict)
+    }
+
+    /// The snapshot records are checked under, while the selection has one.
+    fn snap(&self) -> Result<Snapshot<'s>, SelectError> {
+        self.snap.ok_or(SelectError::Misused("a record read after the selection was detached from its snapshot"))
     }
 
     /// The request's outcome, once [`Step::Exit`].
@@ -696,7 +818,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         let Some(bytes) = record else {
             return Err(SelectError::MissingIndex { key: key.id() });
         };
-        let hit = proof::hit(self.snap, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
+        let hit = proof::hit(self.snap()?, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let payload = hit.payload().map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let layout = HeadLayout::decode(payload).map_err(|why| SelectError::IndexLayout { key: key.id(), why })?;
         let mut owned = Vec::with_capacity_in(payload.len(), self.alloc.clone());
@@ -735,7 +857,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             return Err(SelectError::MissingIndex { key });
         };
         let key = Key::<TestPostings>::from_id(key);
-        let hit = proof::hit(self.snap, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
+        let hit = proof::hit(self.snap()?, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let payload = hit.payload().map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let layout = PostingsLayout::decode(payload).map_err(|why| SelectError::IndexLayout { key: key.id(), why })?;
         let mut owned = Vec::with_capacity_in(payload.len(), self.alloc.clone());
@@ -812,7 +934,11 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
                     self.runs.push(at as u32);
                 }
                 _ => {
-                    self.tests[at].lookup = Some(Box::new_in(Lookup::new(self.snap, base), self.alloc.clone()));
+                    let Some(snap) = self.snap else {
+                        self.failed = Some(SelectError::Misused("a test looked up after the selection was detached"));
+                        return;
+                    };
+                    self.tests[at].lookup = Some(Box::new_in(Lookup::new(snap, base), self.alloc.clone()));
                     self.tests[at].phase = Phase::Look;
                     self.ready.push(at as u32);
                     self.cost.lookups += 1;
@@ -1044,6 +1170,14 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         }
         if !ran.sandboxed {
             self.not_kept(at, true, NotKept::Unsandboxed);
+            return Ok(());
+        }
+        if ran.foreign {
+            self.not_kept(at, true, NotKept::Foreign);
+            return Ok(());
+        }
+        if !ran.traced {
+            self.not_kept(at, true, NotKept::Untraced);
             return Ok(());
         }
         if let Some(untraceable) = ran.untraceable.iter().min() {

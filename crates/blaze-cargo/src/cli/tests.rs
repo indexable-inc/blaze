@@ -72,15 +72,24 @@ fn each_command_its_request() {
     assert_eq!(targets.features, ["a", "b"]);
     assert_eq!(targets.profile, "dev");
 
+    // `test` runs in the daemon, which reruns only the tests whose executed code or reads
+    // changed: selection is the default.
     let test = request_of(&invocation(words(os(&["blaze", "t", "parse", "--", "--exact"]))));
-    let Request::Build { targets, .. } = test else { panic!("{test:?}") };
-    assert_eq!(targets.profile, "test");
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached", "parse"]))));
-    let Request::Test { filter, all, targets, .. } = reached else { panic!("{reached:?}") };
+    let Request::Test { filter, all, args, targets, .. } = test else { panic!("{test:?}") };
     assert_eq!((filter, all), (vec!["parse".to_owned()], false));
-    // `--reached` is blaze's: cargo's command line does not have it.
+    assert_eq!((args, targets.profile.as_str()), (vec!["--exact".to_owned()], "test"));
+
+    let run_all = request_of(&invocation(words(os(&["blaze", "test", "--run-all", "parse"]))));
+    let Request::Test { filter, all, targets, .. } = run_all else { panic!("{run_all:?}") };
+    assert_eq!((filter, all), (vec!["parse".to_owned()], true));
+    // `--run-all` is blaze's: cargo's command line does not have it.
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+
+    // What the daemon does not run stays the CLI's: listing the binaries, and the doc tests.
+    let no_run = request_of(&invocation(words(os(&["blaze", "test", "--no-run"]))));
+    assert!(matches!(no_run, Request::Build { .. }), "{no_run:?}");
+    let doc = request_of(&invocation(words(os(&["blaze", "test", "--doc"]))));
+    assert!(matches!(doc, Request::Build { .. }), "{doc:?}");
 
     let check =
         request_of(&invocation(words(os(&["blaze", "check", "--baselines", "b", "--fix"]))));
@@ -112,13 +121,9 @@ fn ub_runs_every_selected_test_in_the_daemon() {
     assert_eq!(ub, Some(Ub { seed: Some(7), schedules: None }));
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
 
-    let both = request_of(&invocation(words(os(&["blaze", "test", "--ub", "--reached"]))));
-    let Request::Test { all, ub, .. } = both else { panic!("{both:?}") };
-    assert_eq!((all, ub), (false, Some(Ub { seed: None, schedules: None })));
-
-    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached"]))));
-    let Request::Test { ub, .. } = reached else { panic!("{reached:?}") };
-    assert_eq!(ub, None, "opt-in");
+    let selected = request_of(&invocation(words(os(&["blaze", "test"]))));
+    let Request::Test { all, ub, .. } = selected else { panic!("{selected:?}") };
+    assert_eq!((all, ub), (false, None), "`--ub` is opt-in");
 
     let asked = invocation(words(os(&["blaze", "test", "--ub", "--no-run"])));
     let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false, None).unwrap();
@@ -136,6 +141,7 @@ fn ub_results_print_as_libtest_prints_them() {
                 .to_vec(),
         millis: 0,
         cached: None,
+        not_kept: None,
         outside: false,
         executable: 0,
     };
@@ -167,6 +173,7 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
         output: Vec::new(),
         millis: 1,
         cached: None,
+        not_kept: None,
         outside,
         executable: 0,
     };
@@ -178,7 +185,7 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     ];
     let (then, out, err) = driven(
         &mut FakeApi::answering(responses.clone()),
-        &["blaze", "test", "--reached"],
+        &["blaze", "test"],
         &mut Fake::default(),
     );
     assert_eq!(then, Then::Exit(0));
@@ -195,13 +202,13 @@ fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
     assert!(
         last.starts_with(
             "blaze: tests ok selected=3 ran=3 passed=3 failed=0 ignored=0 measured=0 filtered_out=0 \
-             unreached=0 binaries=1 unbuilt=0 elapsed_ms="
+             cached=0 binaries=1 unbuilt=0 elapsed_ms="
         ),
         "{err}"
     );
     let (_, _, quiet) = driven(
         &mut FakeApi::answering(responses),
-        &["blaze", "test", "--reached", "-q"],
+        &["blaze", "test", "-q"],
         &mut Fake::default(),
     );
     assert!(!quiet.contains("note:"), "cargo's notes are silent under -q: {quiet}");
@@ -370,7 +377,7 @@ fn under_fail_fast_a_failing_test_executable_stops_the_tests() {
     assert!(
         lines[3].starts_with(
             "blaze: tests failed selected=1 ran=1 passed=0 failed=1 ignored=0 measured=0 filtered_out=0 \
-             unreached=0 binaries=1 unbuilt=0 elapsed_ms="
+             cached=0 binaries=1 unbuilt=0 elapsed_ms="
         ),
         "{err}"
     );
@@ -419,7 +426,7 @@ fn a_test_run_that_ran_nothing_is_refused_through_the_whole_command() {
     assert_eq!(then, Then::Exit(0), "{err}");
     assert!(err.lines().last().unwrap().starts_with("blaze: tests ok selected=0 ran=0 "), "{err}");
 
-    // The daemon's own runs (`--reached`, `--ub`): no result at all is a run of none too.
+    // The daemon's own runs (`blaze test`, `--ub`): no result at all is a run of none too.
     let none = vec![Response::Done { ok: true }];
     let (then, _, err) =
         driven(&mut FakeApi::answering(none.clone()), &["blaze", "test", "--ub", "parsse"], &mut Fake::default());

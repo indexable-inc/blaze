@@ -110,8 +110,9 @@ a build first needs it.
 `blaze help <command>` lists the flags a command takes: cargo's, read as cargo's clap reads them
 (`crates/blaze-cargo/src/cli/args.rs`), with clap's errors and exit code 1 for a command line
 cargo would refuse. `-C DIRECTORY` (with `-Z unstable-options`) and the global flags before
-the command work as in cargo. `test` alone takes four flags of blaze's own (extensions,
-[below](#which-tests-run)): `--reached`, `--ub`, `--ub-seed N` and `--ub-schedules K`; `test`
+the command work as in cargo. `test` alone takes four flags of blaze's own
+([below](#which-tests-run)): `--run-all`, `--ub`, `--ub-seed N` and `--ub-schedules K`
+(`--reached`, which once opted into selection, is refused naming the default and `--run-all`); `test`
 and `bench` take `--no-tests fail|pass`
 ([what a run of no test is](#a-run-that-ran-no-test-is-refused)). `build`,
 `check`, `run`, `test` and `bench` take `--refused N|all`: how many of the functions blaze could
@@ -304,9 +305,10 @@ failed (with what reruns each), then each test executable or doc test that never
 failure that held it back: its own compile's, or the unit it was skipped behind
 (`blaze_api::Unchecked::tests`). The exit status is then 101. `--fail-fast` stops at the first
 test executable that fails, with its exit code, as cargo does without `--no-fail-fast`.
-That runs every test, outside any sandbox, as cargo does. blaze's `--reached` runs only the
-tests an edit can have changed, in the daemon, and `--ub` runs them in blaze's evaluator
-([below](#which-tests-run)). Doc tests are blaze's own build of each example (below).
+`blaze test`'s tests run in the daemon, which reruns only a test whose executed code or reads
+changed and reports the rest cached; `--run-all` runs every one, and `--ub` runs them in
+blaze's evaluator ([below](#which-tests-run)). Doc tests, `--no-run` and `blaze bench` run as
+above. Doc tests are blaze's own build of each example (below).
 
 ### Lock files
 
@@ -468,7 +470,7 @@ arguments as a part of theirs.
 
 ### Sandboxed tests (an experiment, opt-in)
 
-Tests run in a sandbox only where the daemon runs them (`blaze test --reached`,
+Tests run in a sandbox only where the daemon runs them (`blaze test`,
 [below](#which-tests-run)) and the workspace opts in, in its root manifest:
 
 ```toml
@@ -972,28 +974,56 @@ reports/BSWASI.md.
 
 ### Which tests run
 
-Plain `blaze test` runs every test, as `cargo test` does ([above](#what-a-build-does)). Two
-flags of blaze's own (extensions, opt-in; `crates/blaze-cargo/src/cli/args.rs`) have the daemon
-run them instead and send each result, which the client prints in libtest's format:
+`blaze test` reruns a test only when something it executed or read changed. The daemon runs
+the tests and sends each result, which the client prints in libtest's format. Each test runs
+in a process of its own, forked from its binary's fork server, on one queue over every binary
+and every core (`crates/blaze-usercode/src/test/queue.rs`). blaze-testsel's machine
+(`crates/blaze-testsel`, [v2/plan/design/test-selection.md](v2/plan/design/test-selection.md))
+decides which run (`crates/blaze-cargo/src/serve/unit/test.rs` performs what it asks). A pass
+is kept in the store under two things: the functions the test executed, each with its bound
+code (a byte per function slot that the runtime writes on the slot's first call), and what it
+read, in the sandbox. When none of those changed, the test is not run. Its kept pass stands,
+and the client marks it cached with the time its kept run took:
 
-- `--reached` runs only the tests an edit can have changed. Each test runs in a process of
-  its own, forked from its binary's fork server, on one queue over every binary and every
-  core, the longest expected first (`crates/blaze-usercode/src/test/queue.rs`). Its pass is
-  kept in the store under the functions it executed (a byte per function slot the runtime
-  writes on the slot's first call) and, in the sandbox, what it read; a test whose executed
-  functions and reads are as they were when it passed is not run, and is reported cached with
-  its last pass (`crates/blaze-testsel`). A test that ran outside the sandbox is never kept,
-  and the client names those last, on stderr. With a JSON `--message-format` each result is a
-  `blaze-test-result` line on stdout instead of libtest's text: `name`, `binary`,
-  `executable`, `outcome`, `millis`, `outside`, `output`, and `cached` (null for a test that
-  ran; else the kept run's `basis`, `executed` or `reached`, its `why`, `millis` and
-  `outcome`), as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. The design is
-  [v2/plan/lanes/usercode/tests.md](v2/plan.md) and
-  [v2/plan/design/compile-time.md](v2/plan/design/compile-time.md), idea 3.
-- `--ub` runs the tests picked (every one, or with `--reached` those it would run) in blaze's
-  MIR evaluator under the checker of undefined behavior (`crates/hir-ty-ub`), compiling
-  nothing; `--ub-seed N` and `--ub-schedules K` set its seed and how many thread schedules it
-  tries. `--ub` with `--no-run` is refused.
+```text
+test parse::empty ... ok <0.012s> (cached)
+test result: ok. 41 passed (38 cached); 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+```
+
+A pass is kept only when rerunning it now would give the same result, so a test that passed
+and is not kept says why, and runs again next time:
+
+- `(not kept: not sandboxed)`: it ran outside the sandbox. The client also names these last,
+  on stderr.
+- `(not kept: the sandbox did not say what it read)`: the trace is missing.
+- `(not kept: it reaches code the tracer cannot see (a process start, the network or assembly))`:
+  codegen marks it as reaching such code.
+- `(not kept: it read the wall clock)`, `(not kept: it read randomness the sandbox did not answer)`,
+  `(not kept: it used the network)` and `(not kept: it read through a descriptor the sandbox did not see opened)`.
+- `(not kept: what it read changed while it ran)`.
+
+A failure is never kept: it runs every time. A suite's index head is held in the daemon's
+memory. After a restart each test is looked up by what it executed and read, which gives the
+same answer and costs a lookup per test.
+
+`--run-all` runs every test asked and still keeps what each run learns. `--reached`, the flag
+that once opted into selection, is refused, naming the default and `--run-all`.
+
+With a JSON `--message-format` each result is a `blaze-test-result` line on stdout instead of
+libtest's text, as `crates/blaze-cargo/src/cli/json.rs` (`test_result`) writes it. Its fields
+are `name`, `binary`, `executable`, `outcome`, `millis`, `outside` and `output`, then:
+
+- `cached`: null for a test that ran. For a cached test it holds the kept run's `basis`
+  (`executed` or `reached`), its `why`, its `millis` and its `outcome`, and the result itself
+  has outcome `passed` and `millis` 0.
+- `kept`: only for a pass that is not kept, as `{"no": "clock"}`. Its word is one of
+  `unsandboxed`, `untraced`, `foreign`, `clock`, `random`, `network`, `descriptor`, `raced` or
+  `too-many-shapes`.
+
+`--ub` runs the tests picked (every one) in blaze's MIR evaluator under the checker of
+undefined behavior (`crates/hir-ty-ub`), compiling nothing. `--ub-seed N` and
+`--ub-schedules K` set its seed and how many thread schedules it tries. `--ub` with `--no-run`
+is refused.
 
 ### A run that ran no test is refused
 
@@ -1006,22 +1036,23 @@ and, when a name filter left every test out, the nearest tests that exist:
 error: no test ran: `blaze test adds_wrng` matched none of the 20 tests in 4 test executables
 note: the nearest that exist: tests::adds_wrong
 note: a run of no test is refused; `--no-tests pass` allows one, as cargo does
-blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 unreached=0 binaries=4 unbuilt=0 elapsed_ms=412 why="no test ran"
+blaze: tests failed selected=0 ran=0 passed=0 failed=0 ignored=0 measured=0 filtered_out=20 cached=0 binaries=4 unbuilt=0 elapsed_ms=412 why="no test ran"
 ```
 
 The rule is one function over the run's counts (`refusal` in
 `crates/blaze-cargo/src/cli/test.rs`), the same on a terminal, off one and for the daemon's
 runs. Not refused: `--no-run` and libtest's `--list` and `--help`, which are meant to run
-nothing; under `--reached` a run whose tests were selected and not reached, which is that
-flag's answer; and `--no-tests pass` (`fail` is the default), which is cargo's behaviour, for a
+nothing; a run whose tests were all cached, whose kept passes stand; and `--no-tests pass`
+(`fail` is the default), which is cargo's behaviour, for a
 script that runs one filter over many packages, or `--doc` over packages without doc tests,
 and expects 0 where nothing matched. A test executable without libtest's harness that prints
 no `test result` line is one test, its exit status the verdict.
 
 Every run that runs tests ends by saying its counts, so a pass says what it is a pass of: on a
 terminal `8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered` ([terminal.md](terminal.md));
-off one a `blaze: tests ok|failed` line on stderr with `selected` (passed, failed, measured,
-ignored and unreached), `ran` (passed, failed and measured), each count, `binaries`, `unbuilt`
+off one a `blaze: tests ok|failed` line on stderr with `selected` (passed, failed, measured
+and ignored), `ran` (failed, measured and the passed that were not cached), each count
+(`cached`: the passed whose kept pass stood), `binaries`, `unbuilt`
 and `elapsed_ms`; and with a JSON `--message-format` a `blaze-test-summary` line on stdout with
 the same fields, `ok` and `why` (`test_summary` in `crates/blaze-cargo/src/cli/json.rs`). Off
 a terminal each test executable's stdout comes through blaze, which writes it on unchanged and
@@ -1491,7 +1522,7 @@ it, for that request alone:
 |---|---|---|
 | `CI`, `TF_BUILD` | `CI` not empty, `false` or `0`, or `TF_BUILD` set: a build may not change `Cargo.lock` or `blaze.lock` (`--no-locked` lets it; [Lock files](#lock-files)) | unset: a build writes them and says so |
 | `BLAZE_LOCK` | `write`: builds may change `Cargo.lock` and `blaze.lock` whatever `CI` or `lock = "required"` says, unless `--locked` or `--frozen` is typed (for harnesses of throwaway workspaces; [Lock files](#lock-files)); any other value is an error | unset |
-| `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts and proc macros, and tests under `--reached`, outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
+| `BLAZE_SANDBOX` | `off` (or `0`) runs build scripts, proc macros and tests outside the sandbox ([above](#build-scripts-and-proc-macros-run-in-a-sandbox)) | sandboxed |
 | `BLAZE_ELIDE` | `verify` also compiles and runs a build script blaze elided as inert, and checks it said what elision did; any other value is an error | unset: an inert script is not run |
 | `BLAZE_PROC_MACRO_CACHE` | `check` expands again each expansion the store kept and compares; any other value is an error | unset: a kept expansion is used |
 | `BLAZE_SCRIPT_CACHE` | `check` runs again each build script run the store kept and compares, failing the build where they differ; a result another checkout verified that differs is recorded as depending on where its roots are, so no checkout is given it again; any other value is an error | unset: a kept run is used |

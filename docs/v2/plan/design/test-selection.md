@@ -9,7 +9,9 @@ date: 2026-11-13
 The owner, 2026-11-13: "blaze test only reruns tests that have changed". This page is that rule,
 exact: a test runs again when, and only when, something it executed or read is not as it was.
 Built in `crates/blaze-testsel` (`ask`, `index`, `machine`) on blaze-keyed's outside form
-(`crates/blaze-keyed/src/outside.rs`); the runner and the daemon are not wired to it yet.
+(`crates/blaze-keyed/src/outside.rs`), and driven for every `blaze test` by the daemon's runner
+(`crates/blaze-cargo/src/serve/unit/test.rs` through `blaze_testsel::host`). This page turns
+current when `blaze test` run twice on a small crate reports every test `(cached)`.
 
 ## 1. The default
 
@@ -121,13 +123,23 @@ Selection lives in `crates/blaze-testsel`:
 - `table` (kept): `FnId`, `Bound`, `Image` and the unlogged hash.
 - `record` (kept): what a test process says it executed.
 
-What goes, when the runner is wired: `select` (`choose`/`keep` over `blaze_usercode::test::Passes`,
-the history slots and the 16-pass lookback), `selector` (the in-memory postings memo, replaced by
-the postings record), and `api`'s `Unreached` mapping (a cached pass is `passed` with `cached`).
-blaze-program's `TestRecord`, `OutsideRead`, `write_test`, `read_test` and its `ABSENT` are
-deleted now (one concept, one home); its `test_key` becomes the base key.
+Deleted with the wiring: `select` (`choose`/`keep` over `blaze_usercode::test::Passes`, the
+history slots and the 16-pass lookback), `selector` (the in-memory postings memo), `api`'s
+re-exports and its `Unreached` mapping (a cached pass is `passed` with `cached`), and
+blaze-usercode's `Passes`-based selection. blaze-program's `TestRecord`, `OutsideRead`,
+`write_test`, `read_test` and its `ABSENT` are gone (one concept, one home).
 
-What the runner must give the machine, and does not yet: the bound code of each executed function
-after a run (it gives slots; `Image` maps them), the run's traced reads as names and digests (it
-gives `blaze_core::Traced`), whether it was sandboxed, and the program's changed functions between
-two program states (blaze-program's `Delta` has the edited instances, not by `FnId`).
+What the runner gives the machine (`blaze_testsel::host::Driver`): per suite, the tests asked
+by base (`host::base` over the test's id) and name; the program now and the image the suite
+was last filed at (`Program{now, before}`, held in the daemon's `image::Selectors`), from which
+the changed functions are read by `FnId`; the head the suite last wrote, held in memory; and,
+per run, the bound code of each executed function (slots mapped through `Image`), the traced
+reads as names and digests, whether the run was sandboxed, whether the trace exists, and whether
+codegen marked the test as reaching code the tracer cannot see (`foreign`).
+
+Not given yet, so a pass is refused or costs more rather than kept wrongly: writes outside the
+sandbox's private overlay (not built, so a test that writes outside is not refused for it);
+a raw syscall or the vDSO as `foreign` (codegen marks only what it sees); a head after a daemon
+restart (every test is then looked up by its answers, the same verdict at a lookup per test);
+the expected-duration hint for the queue (every test is queued at zero). File digests are taken
+when the trace is assembled, not at the moment each file was read.

@@ -95,7 +95,7 @@ fn the_unlogged_hash_is_of_what_has_no_slot_in_any_order() {
 }
 
 #[test]
-fn sets_are_sorted_round_trip_and_name_what_changed() {
+fn sets_are_sorted_and_the_reached_set_leaves_out_what_has_no_slot() {
     let fns: Vec<Version> = (0..10).map(|n| version(n, 0)).collect();
     let slots: Vec<u32> = (0..8).rev().collect();
     let image = Image::new(fns, slots, ContentId::default()).unwrap();
@@ -105,25 +105,51 @@ fn sets_are_sorted_round_trip_and_name_what_changed() {
     let mut want: Vec<Version> = [7, 4, 0].iter().map(|n| version(*n, 0)).collect();
     want.sort();
     assert_eq!(set.fns, want);
-    let bytes = set.encode();
-    let view = SetView::decode(&bytes).unwrap();
-    assert_eq!(view.to_set(), set);
-    assert_eq!(view.len(), 3);
-    assert!(SetView::decode(&bytes[..bytes.len() - 1]).is_err());
-    assert!(SetView::decode(b"blaze v2 fnset 2").is_err());
-    assert_eq!(image.changed(&view), None);
     // The reached set leaves out what has no slot (8 and 9).
     assert_eq!(image.reached(&[9, 8, 7, 4, 0, 4]).unwrap(), set);
+}
 
-    let edited: Vec<Version> = (0..10).map(|n| version(n, u32::from(n == 4))).collect();
-    let now = Image::new(edited, (0..8).rev().collect(), ContentId::default()).unwrap();
-    assert_eq!(now.changed(&view), Some(Change::Changed(id(4))));
-    let fewer: Vec<Version> = (0..10).filter(|n| *n != 7).map(|n| version(n, 0)).collect();
-    let gone = Image::new(fewer, (0..7).collect(), ContentId::default()).unwrap();
-    assert_eq!(gone.changed(&view), Some(Change::Gone(id(7))));
-    let unlogged: Vec<Version> = (0..10).map(|n| version(n, u32::from(n == 9))).collect();
-    let deps = Image::new(unlogged, (0..8).rev().collect(), ContentId::default()).unwrap();
-    assert_eq!(deps.changed(&view), Some(Change::Unlogged));
+/// The invariant: `changed_since` names exactly the functions whose bound code differs between
+/// two binaries (gone and new ones included), and `UNLOGGED` exactly when the unlogged hash
+/// moved; the program state is equal exactly when nothing is named.
+#[test]
+fn changes_since_a_state_are_the_functions_whose_bound_moved() {
+    let image = |versions: &[Option<u32>]| {
+        let fns: Vec<Version> =
+            versions.iter().enumerate().filter_map(|(n, v)| v.map(|v| version(n as u32, v))).collect();
+        let slots = (fns.len() as u32).min(4);
+        Image::new(fns, (0..slots).collect(), ContentId::default()).unwrap()
+    };
+    let changes = |now: &Image, then: &Image| {
+        let mut out = Vec::new_in(std::alloc::Global);
+        now.changed_since(then, &mut out);
+        let mut out = out.to_vec();
+        out.sort();
+        out
+    };
+    let before = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
+    assert_eq!(changes(&before, &before), Vec::new());
+    let same = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]);
+    assert_eq!(same.state(), before.state());
+
+    let edited = image(&[Some(0), Some(1), Some(0), Some(0), Some(0), Some(0)]);
+    assert_eq!(changes(&edited, &before), vec![id(1)]);
+    assert_ne!(edited.state(), before.state());
+    // An undone edit is the old state.
+    assert_eq!(changes(&before, &edited), vec![id(1)]);
+
+    // Function 1 gone and 6 new: the first four functions have slots, so 4 moves from the
+    // unlogged code to a slot, and the unlogged hash moves too.
+    let gone_and_new = image(&[Some(0), None, Some(0), Some(0), Some(0), Some(0), Some(0)]);
+    let mut want = vec![id(1), id(6), crate::ask::UNLOGGED];
+    want.sort();
+    assert_eq!(changes(&gone_and_new, &before), want);
+
+    // Function 5 has no slot: its edit moves the unlogged hash too.
+    let unlogged = image(&[Some(0), Some(0), Some(0), Some(0), Some(0), Some(1)]);
+    let mut want = vec![id(5), crate::ask::UNLOGGED];
+    want.sort();
+    assert_eq!(changes(&unlogged, &before), want);
 }
 
 /// The unlogged hash as it was first written: 64-byte compares, a call per identity and bound.

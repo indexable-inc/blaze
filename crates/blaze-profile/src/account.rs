@@ -88,8 +88,8 @@ impl Writer {
             // driver as it opens the store, as a plan's setting is.
             "EntryStore" | "KeptDefs" => Writer::Plan,
             "BuiltinDerives" | "CandidateSlice" | "CrateResolution" | "DepImages"
-            | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenImpls"
-            | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
+            | "DirectorySlot" | "FieldOrder" | "FrozenDefMaps" | "FrozenDiagnosticItems"
+            | "FrozenImpls" | "FrozenLangItems" | "ImplIdentities" | "InherentSlice" | "KeptConsts"
             | "PagedDefMaps" | "FrozenKept" | "ScopeInput" | "ServedBodies"
             | "SliceDirectory" | "SourceNames" | "TraitImplsSlice" => Writer::Derived,
             // `CrateSlot` (base-db: one input a thing given to one crate) is written by a
@@ -110,7 +110,7 @@ impl Writer {
             // What blaze publishes of the crate from its own results, and the slot a served or
             // withdrawn dependency's entry has beside each of its maps.
             "CrateResolution" | "DirectorySlot" | "ImageSlot" | "DefMapSlot" | "LangItemsSlot"
-            | "PagesSlot" | "ImplTablesSlot" | "SurfaceSlot" | "RuntimeSlot"
+            | "DiagnosticItemsSlot" | "PagesSlot" | "ImplTablesSlot" | "SurfaceSlot" | "RuntimeSlot"
             | "KeptSlot" => Writer::Derived,
             _ => Writer::Unattributed,
         }

@@ -2,8 +2,10 @@
 //! (`ops/cargo_test.rs`): each test executable in cargo's order, then the doc tests, stopping
 //! every one by default, the failures listed at the end with each test executable that never
 //! built and the failure that held it back; `--fail-fast` stops at the first that fails, as
-//! cargo does; `--no-run` lists them. And blaze's
-//! `--reached` (an extension, opt-in): the daemon's [`TestResult`]s in libtest's format.
+//! cargo does; `--no-run` lists them. The tests the daemon runs and selects (only a test whose
+//! executed code or reads changed reruns; `--run-all` runs every one asked): its
+//! [`TestResult`]s in libtest's format, each cached test marked `(cached)` and each pass not
+//! kept with why ([`from_daemon`]).
 //!
 //! A run that ran no test is refused (`useful-not-parity`; cargo and libtest end 0 with
 //! `test result: ok. 0 passed`): every path counts what ran into one [`Tally`], [`refusal`]
@@ -608,7 +610,9 @@ pub fn counts_of(line: &str) -> Option<Tally> {
         before[before.len() - digits..].parse::<u32>().ok()
     };
     Some(Tally {
-        passed: count(" passed;")?,
+        // ` passed;`, or blaze's ` passed (38 cached);`.
+        passed: count(" passed")?,
+        cached: count(" cached);").unwrap_or(0),
         failed: count(" failed;")?,
         ignored: count(" ignored;")?,
         measured: count(" measured;")?,
@@ -708,8 +712,6 @@ pub struct Selection {
     pub lists: bool,
     /// `--no-tests pass`: a run of none is a pass.
     pub pass: bool,
-    /// `--reached`: a test the edit did not reach is selected and does not run.
-    pub reached: bool,
 }
 
 impl Selection {
@@ -740,13 +742,7 @@ impl Selection {
                 filters.push(word.into_owned()); // alloc: as above
             }
         }
-        Selection {
-            typed,
-            filters,
-            lists,
-            pass: asked.flags.no_tests_pass,
-            reached: asked.flags.reached,
-        }
+        Selection { typed, filters, lists, pass: asked.flags.no_tests_pass }
     }
 }
 
@@ -768,17 +764,14 @@ const NEAREST: usize = 3;
 /// The rule for a run of none (`useful-not-parity`, where cargo and libtest end 0): a `test`
 /// or `bench` that built, in which nothing failed, and that ran no test is refused, naming
 /// what it selected and the nearest tests that exist. Not refused: a command that is meant to
-/// run nothing ([`Selection::lists`]), `--no-tests pass`, and under `--reached` a run whose
-/// tests were all selected and unreached, which is that flag's answer. `names` is asked only
-/// when the run is refused.
+/// run nothing ([`Selection::lists`]) and `--no-tests pass`. A cached test is a pass whose
+/// kept run stands ([`Tally::cached`]), so a run whose tests were all cached is not one of
+/// none. `names` is asked only when the run is refused.
 pub fn refusal(selection: &Selection, tally: &Tally, names: impl FnOnce() -> Names) -> Option<Refusal> {
     if selection.lists || selection.pass {
         return None;
     }
-    if tally.ran() > 0 || tally.failed > 0 || tally.unbuilt > 0 {
-        return None;
-    }
-    if selection.reached && tally.unreached > 0 {
+    if tally.ran() > 0 || tally.cached > 0 || tally.failed > 0 || tally.unbuilt > 0 {
         return None;
     }
     let typed = &selection.typed;
@@ -848,8 +841,8 @@ fn nearest<'a>(filters: &[String], names: &'a [String]) -> Vec<&'a str> {
     scored.into_iter().take(NEAREST).map(|(_, name)| name).collect()
 }
 
-/// The counts of the results the daemon sent (`--reached`, `--ub`): one executable for each
-/// index it numbered.
+/// The counts of the results the daemon sent: one executable for each index it numbered. A
+/// cached test is a pass, and counted in [`Tally::cached`] too.
 pub fn tally_of(results: &[TestResult]) -> Tally {
     let mut tally = Tally::default();
     let mut executables: Vec<u32> = results.iter().map(|it| it.executable).collect(); // alloc: once a request
@@ -861,7 +854,9 @@ pub fn tally_of(results: &[TestResult]) -> Tally {
             TestOutcome::Passed => tally.passed += 1,
             TestOutcome::Failed => tally.failed += 1,
             TestOutcome::Ignored => tally.ignored += 1,
-            TestOutcome::Unreached => tally.unreached += 1,
+        }
+        if result.cached.is_some() {
+            tally.cached += 1;
         }
     }
     tally
@@ -928,13 +923,14 @@ const EXECUTABLES: u32 = 1 << 20;
 /// No executable seen at this index yet.
 const UNSEEN: u32 = u32::MAX;
 
-/// `blaze test --reached`: the results the daemon sent, by test executable in the order they
-/// came, as libtest's pretty format prints them (with a JSON `--message-format`, a
-/// `blaze-test-result` line each); whether every one that ran passed. A test the
-/// edit did not reach is not run, and is named as such (blaze's word, not libtest's). Last, on
-/// stderr, the tests that ran outside the sandbox (docs/cargo.md: their passes are never kept).
+/// The results the daemon sent, by test executable in the order they came, as libtest's pretty
+/// format prints them (with a JSON `--message-format`, a `blaze-test-result` line each);
+/// whether every one that ran passed. A cached test, whose kept pass stands, is marked
+/// `(cached)` with the time its kept run took, and a pass not kept says why (blaze's words, not
+/// libtest's). Last, on stderr, the tests that ran outside the sandbox (docs/cargo.md: their
+/// passes are never kept).
 // dyn: the CLI's output writers, written once per test result printed.
-pub fn reached(
+pub fn from_daemon(
     results: &[TestResult],
     speaking: Speaking<'_>,
     out: &mut dyn Write,
@@ -1056,7 +1052,9 @@ pub fn outside(text: &mut String, results: &[TestResult], color: bool) {
 }
 
 /// One executable's results as libtest's `PrettyFormatter` writes them, into `text`; whether
-/// none failed.
+/// none failed. A cached test's line is `test NAME ... ok <0.012s> (cached)`, with the time its
+/// kept run took; a pass not kept ends `(not kept: WHY)`; the summary counts the cached among
+/// the passed: `41 passed (38 cached)`.
 pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool {
     let paint = |text: &mut String, style: &str, said: &str| {
         if color {
@@ -1067,7 +1065,7 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
             text.push_str("\x1b[0m");
         }
     };
-    let (mut passed, mut failed, mut ignored, mut unreached, mut millis) =
+    let (mut passed, mut failed, mut ignored, mut cached, mut millis) =
         (0usize, 0usize, 0usize, 0usize, 0u64);
     let mut names = 0;
     for result in results {
@@ -1075,29 +1073,33 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
             TestOutcome::Passed => passed += 1,
             TestOutcome::Failed => failed += 1,
             TestOutcome::Ignored => ignored += 1,
-            TestOutcome::Unreached => unreached += 1,
         }
-        if result.outcome != TestOutcome::Unreached {
-            millis += result.millis;
-            names += result.name.len();
-        }
+        cached += usize::from(result.cached.is_some());
+        millis += result.millis;
+        names += result.name.len();
     }
-    let ran = results.len() - unreached;
-    let noun = if ran == 1 { "test" } else { "tests" };
-    text.reserve(names + ran * 32 + 160);
+    let noun = if results.len() == 1 { "test" } else { "tests" };
+    text.reserve(names + results.len() * 48 + 160);
     // Writing to a String cannot fail.
-    let _ = write!(text, "\nrunning {ran} {noun}\n");
+    let _ = write!(text, "\nrunning {} {noun}\n", results.len());
     for result in results {
         let (style, said) = match result.outcome {
             TestOutcome::Passed => ("\x1b[32m", "ok"),
             TestOutcome::Failed => ("\x1b[31m", "FAILED"),
             TestOutcome::Ignored => ("\x1b[33m", "ignored"),
-            TestOutcome::Unreached => continue,
         };
         text.push_str("test ");
         text.push_str(&result.name);
         text.push_str(" ... ");
         paint(&mut *text, style, said);
+        if let Some(kept) = &result.cached {
+            let _ = write!(text, " <{:.3}s> (cached)", kept.millis as f64 / 1000.0);
+        }
+        if let Some(not) = &result.not_kept {
+            text.push_str(" (not kept: ");
+            text.push_str(&not.why);
+            text.push(')');
+        }
         text.push('\n');
     }
     if failed > 0 {
@@ -1128,14 +1130,15 @@ pub fn libtest(text: &mut String, results: &[&TestResult], color: bool) -> bool 
         true => paint(&mut *text, "\x1b[32m", "ok"),
         false => paint(&mut *text, "\x1b[31m", "FAILED"),
     }
+    let _ = write!(text, ". {passed} passed");
+    if cached > 0 {
+        let _ = write!(text, " ({cached} cached)");
+    }
     let _ = write!(
         text,
-        ". {passed} passed; {failed} failed; {ignored} ignored; 0 measured; 0 filtered out"
+        "; {failed} failed; {ignored} ignored; 0 measured; 0 filtered out; finished in {:.2}s\n\n",
+        millis as f64 / 1000.0
     );
-    if unreached > 0 {
-        let _ = write!(text, "; {unreached} unreached");
-    }
-    let _ = write!(text, "; finished in {:.2}s\n\n", millis as f64 / 1000.0);
     ok
 }
 

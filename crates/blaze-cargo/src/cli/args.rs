@@ -343,15 +343,23 @@ const MANIFEST: &[Flag] = &[
     Flag::new("manifest-path", Some('m'), Takes::Value, "PATH"),
     Flag::pointing(Some("path"), None, Points::Arg("--manifest-path")),
 ];
-/// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
-/// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
+/// `--run-all` and `--ub*` are blaze's: `blaze test` reruns only a test whose executed code or
+/// reads changed (docs/cargo.md, "Which tests run"), and `--run-all` runs every test asked,
+/// still keeping what each run learns; the `--ub` tests run in blaze's MIR evaluator, checked
+/// for undefined behavior (`hir-ty-ub`). `--reached`, the flag that once opted into selection,
+/// is refused naming both: selection is the default, and never a flag accepted and ignored.
 const TEST_ONLY: &[Flag] = &[
     Flag::switch("doc"),
-    Flag::switch("reached"),
+    Flag::switch("run-all"),
+    Flag::pointing(Some("reached"), None, Points::Says(REACHED_GONE)),
     Flag::switch("ub"),
     Flag::new("ub-seed", None, Takes::Value, "N"),
     Flag::new("ub-schedules", None, Takes::Value, "K"),
 ];
+
+/// What `--reached` is refused with.
+pub const REACHED_GONE: &str = "`blaze test` already reruns only the tests whose executed code or \
+     reads changed, by default; `--run-all` runs every test asked";
 
 /// `--no-tests fail|pass` is blaze's, for `test` and `bench`: what a run that ran no test is.
 /// `fail` (the default) refuses it, naming the selection that matched nothing
@@ -417,7 +425,7 @@ fn blaze_only(flag: &Flag) -> bool {
     matches!(
         flag.long,
         Some(
-            "reached"
+            "run-all"
                 | "ub"
                 | "ub-seed"
                 | "ub-schedules"
@@ -659,7 +667,9 @@ pub struct Flags {
     /// lists what failed and what each failure left unbuilt. Passed on to the daemon.
     /// `--keep-going` and `--no-fail-fast` are accepted and change nothing.
     pub fail_fast: bool,
-    pub reached: bool,
+    /// `--run-all`: every test asked runs, none reported cached; what each run learns is still
+    /// kept.
+    pub run_all: bool,
     /// `--no-tests pass`: a run that ran no test is a pass, as cargo and libtest have it.
     /// Without it such a run is refused ([`super::test::refusal`]).
     pub no_tests_pass: bool,
@@ -729,7 +739,7 @@ impl Flags {
             "no-run" => self.no_run = true,
             "fail-fast" => self.fail_fast = true,
             "no-fail-fast" | "keep-going" => {}
-            "reached" => self.reached = true,
+            "run-all" => self.run_all = true,
             // `check_value` held it to `fail` and `pass` first.
             "no-tests" => self.no_tests_pass = value.is_some_and(|it| it.eq_ignore_ascii_case("pass")),
             "ub" => self.ub = true,

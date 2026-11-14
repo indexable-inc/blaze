@@ -135,6 +135,8 @@ blaze-usercode.workspace = true
 blaze-codegen.workspace = true
 blaze-store-check.workspace = true
 blaze-testsel.workspace = true
+# Test selection's keys, records and snapshot (`serve/unit/test.rs`, `serve/unit/test/image.rs`).
+blaze-keyed.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 # The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).
