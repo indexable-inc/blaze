@@ -37,7 +37,7 @@ use hir_def::{
 };
 use hir_ty::{
     MemoryMap, ParamEnvAndCrate,
-    db::HirDatabase as _,
+    db::{ClosureKey, HirDatabase as _, InternedClosureId},
     method_resolution::NoImplMethod,
     mir as m,
     next_solver::{
@@ -49,7 +49,7 @@ use hir_ty::{
 };
 use rustc_type_ir::{
     IntTy as RIntTy, TypeVisitableExt as _, UintTy,
-    inherent::{AdtDef as _, GenericArgs as _, IntoKind as _},
+    inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
 };
 
 use crate::{
@@ -206,6 +206,13 @@ impl AdtDecl {
         };
         fields.iter().for_each(|it| it.ty.adts(&mut out));
         out
+    }
+
+    /// Whether it is a closure's environment that holds a capture by `&mut` ([`Ty::RefMut`] is
+    /// a field's type only there): a value of it lends, and a function it is given to gives it
+    /// back as it gives back a `&mut` ([`crate::translate::translate`]).
+    pub fn lends(&self) -> bool {
+        matches!(&self.kind, AdtKind::Struct(fields) if fields.iter().any(|it| matches!(it.ty, Ty::RefMut(_))))
     }
 }
 
@@ -1017,6 +1024,18 @@ pub const GENERIC_UNASKED: &str =
 
 /// A `#[blaze::theorem]` function with type or const parameters: a theorem's statement is
 /// closed, so it is refused, never stated per instance.
+/// The refusal of a closure that holds a capture by `&mut` (it lends a place of its caller)
+/// where the translator cannot see when the borrow ends: stored in a struct, a tuple or another
+/// local, or returned. Where it is only built, called and given to calls, every call that takes
+/// it gives it back, and the place it borrows takes its capture's value after each
+/// ([`Cx::give_back_lent`]).
+pub const KEPT_LENDING: &str = "a closure that changes what it captures, kept past the call it is passed to";
+
+/// The refusal of a function that returns a closure (`-> impl Fn(u32) -> u32`, or a generic
+/// function's instance at a closure): v0's closures are built, called and given to calls
+/// within the function that builds them.
+pub const RETURNED_CLOSURE: &str = "a closure returned from a function (an `impl Fn` return)";
+
 pub const GENERIC_THEOREM: &str = "a generic `#[blaze::theorem]` function (a theorem's statement \
     is closed: it states one function, so its type and const parameters are given in it)";
 
@@ -1043,13 +1062,54 @@ pub(crate) struct Instance<'db> {
     /// clauses (as codegen resolves them): the crate of the function the chain of instances
     /// began at, which sees every impl its arguments' types have.
     pub(crate) krate: base_db::Crate,
+    /// For a closure's body, the closure: `func` and `args` are then the function the closure
+    /// is written in and that function's arguments (the closure's parent arguments), and the
+    /// body is the closure's MIR (`HirDatabase::mir_body_for_closure`, monomorphized at
+    /// `args`), whose parameter 0 is the closure itself (by `&`, `&mut` or value, as its kind
+    /// takes it) and the rest its arguments.
+    pub(crate) closure: Option<InternedClosureId<'db>>,
 }
 
 impl<'db> Instance<'db> {
     /// `func` itself, at no arguments.
     pub(crate) fn of(db: &Db, func: FunctionId) -> Instance<'db> {
-        Instance { func, args: None, krate: func.krate(db) }
+        Instance { func, args: None, krate: func.krate(db), closure: None }
     }
+}
+
+/// The closure `id` with the parent arguments `parent` (those of the function it is written
+/// in): that function, the arguments its instance has (`None` when it has no type or const
+/// parameter), the closure's place among the closures of the function's body, and the names
+/// of the closure's environment: Lean's, `<the function's instance>.closure<n>`, and Rust's,
+/// `{closure#<n> in <the function's instance>}` (see [`segment`]).
+pub(crate) struct ClosureOf<'db> {
+    pub(crate) func: FunctionId,
+    pub(crate) args: Option<GenericArgs<'db>>,
+    pub(crate) env: Named,
+    /// The function's Lean name's components after the crate, joined by `_`: what a closure's
+    /// [`ty_segment`] ends with.
+    pub(crate) owner_segment: String,
+    pub(crate) nth: u32,
+}
+
+pub(crate) fn closure_of<'db>(
+    db: &'db Db,
+    id: InternedClosureId<'db>,
+    parent: &[GenericArg<'db>],
+) -> Result<ClosureOf<'db>, String> {
+    let loc = id.loc(db);
+    let Some(func) = loc.owner.as_function() else {
+        return Err("a closure in a constant, a static or an enum's discriminant".to_owned());
+    };
+    let args = is_generic(db, func).then(|| GenericArgs::new_from_slice(parent));
+    let owner = instance_name(db, func, args)?;
+    let nth = ClosureKey::nth(db, loc);
+    let owner_segment = owner.lean.split('.').skip(1).collect::<Vec<_>>().join("_");
+    let env = Named {
+        lean: format!("{}.closure{nth}", owner.lean),
+        display: format!("{{closure#{nth} in {}}}", owner.display),
+    };
+    Ok(ClosureOf { func, args, env, owner_segment, nth })
 }
 
 /// Whether `func` has type or const parameters, its own or its impl's. Lifetimes are dropped:
@@ -1085,6 +1145,14 @@ pub(crate) fn is_generic(db: &Db, func: FunctionId) -> bool {
 ///   arguments (`Option_u32`; `Vec`'s `Global` allocator is not written), and a const argument
 ///   as `c` and its value's bits in decimal (`c4`). Only ASCII letters, digits and `_`, never
 ///   first a digit: a legal file name on Linux and macOS and a Lean identifier.
+/// - A closure is named by the function instance it is written in and its place among that
+///   function's closures (`ClosureKey::nth`, which counts the closure expressions of the body
+///   in source order, nested ones too): the `n`th closure of `krate::demo` has the environment
+///   `krate.demo.closure<n>` (a structure, module `<name>.type`), whose body is
+///   `krate.demo.closure<n>.call`; in a generic function's instance, `krate.pick.u32.closure0`.
+///   As a type argument it is `closure<n>_` then that function's Lean name after the crate,
+///   each `.` a `_` (`apply` at `krate::demo`'s closure 0 is `krate.apply.closure0_demo`); in
+///   Rust, `{closure#<n> in krate::demo}`.
 /// - Injective as far as the names say: a struct or enum is written by its own name, not its
 ///   path, and a type's name may hold `_`. Two instances that would get one Lean name are a
 ///   refusal where both are imported, never one replacing the other: each module's text names
@@ -1166,7 +1234,11 @@ fn ty_segment<'db>(db: &'db Db, ty: HTy<'db>) -> Result<String, String> {
         TyKind::Param(_) => return Err("a type parameter".to_owned()),
         TyKind::Alias(..) => return Err("an associated or opaque type".to_owned()),
         TyKind::FnDef(..) | TyKind::FnPtr(..) => return Err("a function used as a value".to_owned()),
-        TyKind::Closure(..) | TyKind::CoroutineClosure(..) => return Err("a closure".to_owned()),
+        TyKind::Closure(id, args) => {
+            let of = closure_of(db, id.0, args.as_closure().parent_args())?;
+            format!("closure{}_{}", of.nth, of.owner_segment)
+        }
+        TyKind::CoroutineClosure(..) => return Err("an `async` closure (rule Async)".to_owned()),
         TyKind::Coroutine(..) | TyKind::CoroutineWitness(..) => {
             return Err("`async` or a coroutine (rule Async)".to_owned());
         }
@@ -1221,6 +1293,10 @@ fn rust_of<'db>(db: &'db Db, ty: HTy<'db>) -> String {
             path.push(adt_own_name(db, adt).unwrap_or_else(|it| it));
             format!("{}{}", path.join("::"), rust_args(db, written_args(db, adt, args)))
         }
+        TyKind::Closure(id, args) => match closure_of(db, id.0, args.as_closure().parent_args()) {
+            Ok(of) => of.env.display,
+            Err(_) => blaze_query::db::attach(db, || format!("{ty:?}")),
+        },
         _ => blaze_query::db::attach(db, || format!("{ty:?}")),
     }
 }
@@ -1510,6 +1586,13 @@ struct Cx<'db> {
     /// The crate's structs and enums whose `==` the model takes as Lean's `=`, by Lean name:
     /// each derives `PartialEq`, as do the types its fields hold (see [`Cx::structural`]).
     derives: BTreeSet<String>,
+    /// The closures' environments declared, by Lean name, and whether each lends (holds a
+    /// capture by `&mut`).
+    envs: BTreeMap<String, bool>,
+    /// The locals that hold a closure that lends, each with what it lends: the field of its
+    /// environment that holds a capture by `&mut`, and the place the capture borrows. See
+    /// [`Cx::give_back_lent`].
+    lent: BTreeMap<Local, Vec<(String, Place)>>,
 }
 
 type Refused<T> = Result<T, NotTranslated>;
@@ -1573,7 +1656,10 @@ impl<'db> Cx<'db> {
                         at,
                     ));
                 }
-                let inner = Box::new(self.ty(inner, false, at)?);
+                // A closure that changes what it captures may be lent by a reference at the top
+                // of a local's type (`&mut f`, given to `call_mut`), as it may be held there.
+                let closure_top = top && matches!(inner.kind(), TyKind::Closure(..));
+                let inner = Box::new(self.ty(inner, closure_top, at)?);
                 if is_mut { Ty::RefMut(inner) } else { Ty::Ref(inner) }
             }
             TyKind::Slice(elem) => Ty::Slice(Box::new(self.ty(elem, false, at)?)),
@@ -1664,8 +1750,15 @@ impl<'db> Cx<'db> {
             TyKind::FnDef(..) | TyKind::FnPtr(..) => {
                 return Err(self.refuse("a function used as a value", at));
             }
-            TyKind::Closure(..) | TyKind::CoroutineClosure(..) => {
-                return Err(self.refuse("a closure", at));
+            TyKind::Closure(id, args) => {
+                let name = self.closure_env(id.0, args, at)?;
+                if !top && self.envs.get(&name) == Some(&true) {
+                    return Err(self.refuse(KEPT_LENDING, at));
+                }
+                Ty::Adt(name)
+            }
+            TyKind::CoroutineClosure(..) => {
+                return Err(self.refuse("an `async` closure (rule Async)", at));
             }
             TyKind::Coroutine(..) | TyKind::CoroutineWitness(..) => {
                 return Err(self.refuse("`async` or a coroutine (rule Async)", at));
@@ -1675,6 +1768,54 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse(what, at));
             }
         })
+    }
+
+    /// The Lean name of the environment of the closure `id` at `args` ([`closure_of`]),
+    /// declared on first use: a structure with a field `c<i>` per capture, in the order MIR's
+    /// closure type has them (`tupled_upvars_ty`, which is the order of the operands that build
+    /// it), each of the capture's type: the value for a capture by value, the referent for a
+    /// capture by `&` (a reference is its value), and for a capture by `&mut` a [`Ty::RefMut`],
+    /// the one place a `&mut` is taken inside another type: such an environment lends (see
+    /// [`Cx::lent`]).
+    fn closure_env(
+        &mut self,
+        id: InternedClosureId<'db>,
+        args: GenericArgs<'db>,
+        at: &str,
+    ) -> Refused<String> {
+        let closure = args.as_closure();
+        let of = match closure_of(self.db, id, closure.parent_args()) {
+            Ok(of) => of,
+            Err(why) => return Err(self.refuse(why, at)),
+        };
+        let Named { lean: name, display } = of.env;
+        if let Some(it) = self.adts.iter().find(|it| it.name == name) {
+            if it.display != display {
+                return Err(self.refuse(
+                    format!("two types with one Lean name, `{name}` (`{}` and `{display}`)", it.display),
+                    at,
+                ));
+            }
+            return Ok(name);
+        }
+        let mut fields = Vec::new();
+        let mut lends = false;
+        for (at_field, capture) in closure.tupled_upvars_ty().tuple_fields().iter().enumerate() {
+            let ty = match capture.kind() {
+                TyKind::Ref(_, inner, mutability) if mutability.is_mut() => {
+                    lends = true;
+                    // A closure that lends may be borrowed by another closure that calls it:
+                    // the place it lends is given back through both ([`Cx::give_back_lent`]).
+                    let closure = matches!(inner.kind(), TyKind::Closure(..));
+                    Ty::RefMut(Box::new(self.ty(inner, closure, at)?))
+                }
+                _ => self.ty(capture, false, at)?,
+            };
+            fields.push(Field { name: format!("c{at_field}"), ty });
+        }
+        self.envs.insert(name.clone(), lends);
+        self.adts.push(AdtDecl { name: name.clone(), display, kind: AdtKind::Struct(fields) });
+        Ok(name)
     }
 
     /// The Lean name of the crate's struct or enum `adt` at `args` ([`adt_path`]), declared on
@@ -2260,6 +2401,20 @@ impl<'db> Cx<'db> {
                         &at,
                     ));
                 }
+                if let m::Rvalue::Aggregate(m::AggregateKind::Closure(_), operands) = rvalue {
+                    return self.closure_value(place, operands, &at, out);
+                }
+                // A closure that lends is given to calls only: a copy of it would lend twice.
+                if let m::Rvalue::Use(m::Operand {
+                    kind: m::OperandKind::Move(from) | m::OperandKind::Copy(from),
+                    ..
+                }) = rvalue
+                    && let (from, _) = self.place(from, &at)?
+                    && from.elems.iter().all(|it| matches!(it, Elem::Deref))
+                    && self.lent.contains_key(&from.local)
+                {
+                    return Err(self.refuse(KEPT_LENDING, &at));
+                }
                 let (place, ty) = self.place(place, &at)?;
                 if let Some(value) = self.rvalue(rvalue, &ty, &at)? {
                     out.push(Stmt::Assign { place, value, at });
@@ -2277,6 +2432,131 @@ impl<'db> Cx<'db> {
             }
         }
         Ok(())
+    }
+
+    /// A closure built into `place` from `operands`, its captures in its environment's order: a
+    /// value of the environment's structure. A capture by `&mut` is the place it borrows (the
+    /// temporary that borrows it stands for it, `find_aliases`), whose value the field holds;
+    /// the local is then one that lends ([`Cx::lent`]), and must be a local of its own.
+    fn closure_value(
+        &mut self,
+        place: &m::StoredPlace,
+        operands: &[m::Operand],
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<()> {
+        let (dest, ty) = self.place(place, at)?;
+        let Ty::Adt(env) = &ty else {
+            return Err(self.refuse(format!("a closure built into a place of type `{ty:?}`"), at));
+        };
+        let Some(AdtKind::Struct(fields)) =
+            self.adts.iter().find(|it| it.name == *env).map(|it| it.kind.clone())
+        else {
+            return Err(self.refuse("a closure whose environment is not declared", at));
+        };
+        if fields.len() != operands.len() {
+            return Err(self.refuse("a closure built from more or fewer captures than it has", at));
+        }
+        let mut values = Vec::with_capacity(fields.len());
+        let mut lent = Vec::new();
+        for (field, operand) in fields.into_iter().zip(operands) {
+            let (value, _) = self.operand(operand, at)?;
+            if matches!(field.ty, Ty::RefMut(_)) {
+                let Operand::Place(borrowed) = &value else {
+                    return Err(self.refuse("a capture by `&mut` that is not a place", at));
+                };
+                lent.push((field.name.clone(), borrowed.clone()));
+            }
+            values.push((field.name, value));
+        }
+        if !lent.is_empty() {
+            if !dest.elems.is_empty() {
+                return Err(self.refuse(KEPT_LENDING, at));
+            }
+            match self.lent.get(&dest.local) {
+                Some(before) if *before != lent => {
+                    return Err(self.refuse(
+                        "a local that holds closures lending two different places",
+                        at,
+                    ));
+                }
+                _ => {
+                    self.lent.insert(dest.local, lent);
+                }
+            }
+        }
+        out.push(Stmt::Assign {
+            place: dest,
+            value: Rvalue::Struct { adt: env.clone(), fields: values },
+            at: at.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// After a call given `args`: each place a closure among them lends takes its capture's
+    /// value, the field of the closure as the call gave it back. The borrow checker keeps the
+    /// place unread and unwritten from the closure's construction to its last use, so the
+    /// writes before the last call are never seen, and the last one leaves the place what the
+    /// closure made it: where the borrow ends, the place holds what Rust's has.
+    ///
+    /// A place lent may itself be a closure that lends (a closure that calls another it
+    /// captures by `&mut`): it takes its value, then what it lends takes the value it holds, and
+    /// so on down; each closure was built from those before it, so the chain ends.
+    fn give_back_lent(&self, args: &[Operand], at: &str, out: &mut Vec<Stmt>) {
+        let mut todo: Vec<Local> = args
+            .iter()
+            .filter_map(|arg| match arg {
+                Operand::Place(place) if place.elems.iter().all(|it| matches!(it, Elem::Deref)) => {
+                    Some(place.local)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut given = BTreeSet::new();
+        while let Some(local) = todo.pop() {
+            let Some(lent) = self.lent.get(&local) else { continue };
+            if !given.insert(local) {
+                continue;
+            }
+            for (field, borrowed) in lent {
+                out.push(Stmt::Assign {
+                    place: borrowed.clone(),
+                    value: Rvalue::Use(Operand::Place(Place {
+                        local,
+                        elems: vec![Elem::Field(field.clone())],
+                    })),
+                    at: at.to_owned(),
+                });
+                if borrowed.elems.iter().all(|it| matches!(it, Elem::Deref)) {
+                    todo.push(borrowed.local);
+                }
+            }
+        }
+    }
+
+    /// A call of `Fn::call`, `FnMut::call_mut` or `FnOnce::call_once` whose `Self` is a closure:
+    /// the closure's body at its instance, given MIR's arguments as they are (the closure, by
+    /// `&`, `&mut` or value as the trait's method takes it, then the closure's arguments one
+    /// by one). The body takes the closure as its kind does; a reference is its value in the
+    /// model, and a body that takes it by `&mut` gives it back, so every pairing of method and
+    /// kind MIR has means what Rust's does.
+    fn closure_callee(
+        &mut self,
+        id: InternedClosureId<'db>,
+        args: GenericArgs<'db>,
+        at: &str,
+    ) -> Refused<Callee> {
+        let db = self.db;
+        let of = match closure_of(db, id, args.as_closure().parent_args()) {
+            Ok(of) => of,
+            Err(why) => return Err(self.refuse(why, at)),
+        };
+        let name = format!("{}.call", of.env.lean);
+        let instance = Instance { func: of.func, args: of.args, krate: self.env.krate, closure: Some(id) };
+        if !self.callees.iter().any(|(_, it)| *it == instance) {
+            self.callees.push((name.clone(), instance));
+        }
+        Ok(Callee::Function { name })
     }
 
     fn call(
@@ -2310,9 +2590,42 @@ impl<'db> Cx<'db> {
             }
         };
         let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
+        let lang = self.interner.lang_items();
+        if [lang.Fn_call, lang.FnMut_call_mut, lang.FnOnce_call_once].contains(&Some(callee)) {
+            match generics.type_at(0).kind() {
+                TyKind::Closure(id, closure_args) => {
+                    let callee = self.closure_callee(id.0, closure_args, at)?;
+                    return self.call_with(callee, args, destination, target, at, out);
+                }
+                TyKind::FnDef(..) | TyKind::FnPtr(..) => {
+                    return Err(self.refuse("a function used as a value", at));
+                }
+                TyKind::Ref(..) => {
+                    return Err(self.refuse(
+                        "a call of a closure through a reference to it (`&F` or `&mut F` as the \
+                         type called; the standard library's impl that forwards it is not \
+                         translated)",
+                        at,
+                    ));
+                }
+                // A trait object is refused by `dispatch`, a parameter has none at an instance.
+                _ => {}
+            }
+        }
         let (callee, generics) = self.dispatch(callee, generics, &name, at)?;
         let container = callee.lookup(db).container;
-        let callee = if callee.krate(db).data(db).origin.is_lang() {
+        let takes_closure = generics
+            .iter()
+            .any(|it| it.ty().is_some_and(|ty| matches!(ty.kind(), TyKind::Closure(..))));
+        let callee = if callee.krate(db).data(db).origin.is_lang()
+            && takes_closure
+            && matches!(self.home(container), Home::Option | Home::Result)
+        {
+            // `Option`'s and `Result`'s methods that take a closure are their own bodies, at
+            // the instance of the closure: the standard library's source, translated as any
+            // function's.
+            self.crate_callee(callee, generics, &name, at)?
+        } else if callee.krate(db).data(db).origin.is_lang() {
             if PANICS.contains(&name.as_str()) {
                 return Ok(Exit::End(End::Panic));
             }
@@ -2346,9 +2659,24 @@ impl<'db> Cx<'db> {
             }
             self.crate_callee(callee, generics, &name, at)?
         };
+        self.call_with(callee, args, destination, target, at, out)
+    }
+
+    /// A call of `callee` with `args` into `destination`, then the places the closures among
+    /// `args` lend given back ([`Cx::give_back_lent`]).
+    fn call_with(
+        &mut self,
+        callee: Callee,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        target: Option<usize>,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Exit<Cond>> {
         let (dest, _) = self.place(destination, at)?;
         let args = self.operands(args, at)?;
-        out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
+        out.push(Stmt::Call { dest, callee, args: args.clone(), at: at.to_owned() });
+        self.give_back_lent(&args, at, out);
         self.goto(target, at)
     }
 
@@ -2368,7 +2696,7 @@ impl<'db> Cx<'db> {
             Ok(named) => named,
             Err(why) => return Err(self.refuse(format!("a call of `{name}`, {why}"), at)),
         };
-        let instance = Instance { func: callee, args, krate: self.env.krate };
+        let instance = Instance { func: callee, args, krate: self.env.krate, closure: None };
         if !self.callees.iter().any(|(_, it)| *it == instance) {
             self.callees.push((named.lean.clone(), instance));
         }
@@ -2526,8 +2854,20 @@ impl<'db> Cx<'db> {
                 at,
             )
         };
-        // A closure or a function given to the callee is what is outside the subset, more
-        // than the callee (`Option::map`, a closure's own `call`): it is named first.
+        // A closure given to the callee is translated only for `Option`'s and `Result`'s
+        // methods ([`Cx::call`]): elsewhere (`Vec::retain`, an iterator's `map`) it is named.
+        if generics.iter().any(|it| it.ty().is_some_and(|ty| matches!(ty.kind(), TyKind::Closure(..))))
+        {
+            return Err(self.refuse(
+                format!(
+                    "a closure given to the standard library's `{name}` (only `Option`'s and \
+                     `Result`'s methods that take a closure are translated)"
+                ),
+                at,
+            ));
+        }
+        // A function given to the callee is what is outside the subset, more than the callee
+        // (`Option::and_then(g)`): it is named first.
         for arg in args {
             if let m::OperandKind::Copy(place) | m::OperandKind::Move(place) = &arg.kind
                 && let Some(what) = self.unusable.get(&index(place.local))
@@ -3299,6 +3639,16 @@ impl<'db> Cx<'db> {
                     {
                         Some(from.as_ref().project(m::ProjectionElem::Deref).store())
                     }
+                    // A closure's capture by `&mut`, copied out of its environment at the
+                    // start of its body (`cap = move (*_1).i`): it stands for what the field
+                    // borrows, so a write through it is a write of the field, which the body
+                    // gives back with the environment.
+                    m::Rvalue::Use(m::Operand {
+                        kind: m::OperandKind::Move(from) | m::OperandKind::Copy(from),
+                        ..
+                    }) if mir.capture_copies.iter().any(|(it, _)| *it == place.local) => {
+                        Some(from.as_ref().project(m::ProjectionElem::Deref).store())
+                    }
                     _ => None,
                 };
                 if let Some(target) = target {
@@ -3362,10 +3712,12 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         at: format!("fn {unnamed}"),
     };
     // A function with type or const parameters is translated at an instance only, and a theorem
-    // at none: its statement is closed.
+    // at none: its statement is closed. A closure is at its function's instance.
     let args = match is_generic(db, func) {
         false => None,
-        true if AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM) => {
+        true if instance.closure.is_none()
+            && AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM) =>
+        {
             return Err(refuse_unnamed(GENERIC_THEOREM));
         }
         true => match instance.args {
@@ -3373,7 +3725,17 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
             None => return Err(refuse_unnamed(GENERIC_UNASKED)),
         },
     };
-    let named = match instance_name(db, func, args) {
+    let named = match instance.closure {
+        None => instance_name(db, func, args),
+        Some(closure) => {
+            let parent: Vec<GenericArg<'db>> = args.map(|it| it.iter().collect()).unwrap_or_default();
+            closure_of(db, closure, &parent).map(|of| Named {
+                lean: format!("{}.call", of.env.lean),
+                display: of.env.display,
+            })
+        }
+    };
+    let named = match named {
         Ok(named) => named,
         Err(why) => return Err(refuse_unnamed(&why)),
     };
@@ -3385,10 +3747,11 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         at: fn_text.clone(),
     };
     let sig = FunctionSignature::of(db, func);
-    if sig.is_async() {
+    // What the signature says is the function's, not a closure's in it.
+    if instance.closure.is_none() && sig.is_async() {
         return Err(refuse("an `async` function (rule Async)".to_owned()));
     }
-    if sig.is_unsafe() {
+    if instance.closure.is_none() && sig.is_unsafe() {
         return Err(refuse("an `unsafe fn` (rule Unsafe)".to_owned()));
     }
     if !sig.has_body() {
@@ -3399,9 +3762,15 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
     // crate its chain began at, as codegen resolves them; a function's own, in its own
     // environment.
     let instance_env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: instance.krate };
-    let built = match args {
-        None => db.mir_body(def.into()),
-        Some(args) => db.monomorphized_mir_body(def.into(), args.store(), instance_env.store()),
+    let built = match (instance.closure, args) {
+        (None, None) => db.mir_body(def.into()),
+        (None, Some(args)) => {
+            db.monomorphized_mir_body(def.into(), args.store(), instance_env.store())
+        }
+        (Some(closure), None) => db.mir_body_for_closure(closure),
+        (Some(closure), Some(args)) => {
+            db.monomorphized_mir_body_for_closure(closure, args.store(), instance_env.store())
+        }
     };
     let mir = match built {
         Ok(mir) => mir,
@@ -3434,6 +3803,8 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         unusable: BTreeMap::new(),
         duration: None,
         derives: BTreeSet::new(),
+        envs: BTreeMap::new(),
+        lent: BTreeMap::new(),
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
@@ -3454,9 +3825,12 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         debug_assert_eq!(index(local) as usize, cx.locals.len());
         cx.locals.push(LocalDecl { name: names.get(&index(local)).cloned(), ty });
     }
-    // Every closure is built into a local of its type, which `place` refuses where it is built.
-    if !mir.closures.is_empty() && !cx.unusable.values().any(|it| it == "a closure") {
-        return Err(refuse("a closure".to_owned()));
+    // A closure that lends, returned, outlives the call it is made in.
+    if matches!(cx.locals[0].ty.value(), Ty::Adt(name) if cx.envs.get(name) == Some(&true)) {
+        return Err(refuse(KEPT_LENDING.to_owned()));
+    }
+    if matches!(cx.locals[0].ty.value(), Ty::Adt(name) if cx.envs.contains_key(name)) {
+        return Err(refuse(RETURNED_CLOSURE.to_owned()));
     }
     if matches!(cx.locals[0].ty, Ty::RefMut(_)) {
         return Err(refuse(

@@ -698,6 +698,8 @@ fn body<'db>(
         unusable: BTreeMap::new(),
         duration: None,
         derives: BTreeSet::new(),
+        envs: BTreeMap::new(),
+        lent: BTreeMap::new(),
     };
     let mut writer = Writer { cx, program, built: mir.phase == m::MirPhase::Built };
     let mut locals = Vec::with_capacity(mir.locals.len());
