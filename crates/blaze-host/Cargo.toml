@@ -1,0 +1,41 @@
+[package]
+name = "blaze-host"
+description = "The host of the keyed driver (docs/v2/plan/design/host.md): one process runs a request to its outcome, performing every effect of blaze-keyed's driver on a real store and a real worker pool, with the front end given as a `Front`; the request's outside reads answered from the disk with a leaf memory of stamps"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The deadline wait (`wait::{Parker, Deadline, Monotonic}`) and a file's `Stamp`.
+blaze-core.workspace = true
+# `Aligned`: a record's bytes at the format's alignment.
+blaze-format.workspace = true
+# The worker pool (`pool::Pool`, its `Scope`) and its shape (`topology::Topology`).
+blaze-graph.workspace = true
+# `ContentId`: keys, digests and outside answers.
+blaze-ids.workspace = true
+# The driver, its vocabulary, the store, pool, memo and front interfaces.
+blaze-keyed.workspace = true
+# `FILE_DOMAIN`, a file's content id, and `racy`, when a stamp vouches for nothing.
+blaze-vfs.workspace = true
+# `SegQueue`: the finished tasks, pushed by workers and taken by the request's thread.
+crossbeam-queue.workspace = true
+# The spans every wait opens.
+tracing.workspace = true
+
+[dev-dependencies]
+# The real store the end-to-end tests run on.
+blaze-cas.workspace = true
+# The property test: any edit sequence files what a fresh build files.
+hegeltest.workspace = true
+
+[lints]
+workspace = true

@@ -38,7 +38,7 @@ use std::alloc::Global;
 use std::fmt;
 
 use blaze_ids::{ContentId, Hasher};
-use blaze_keyed::kind::{Body, Key, Kind, ToolId};
+use blaze_keyed::kind::{Kind, ToolId};
 use blaze_keyed::machine::{Machine, Qos};
 use blaze_keyed::record::StableId;
 
@@ -247,8 +247,10 @@ impl Scheduler {
     }
 
     /// The key of a per-body pass's record for a body: what the host looks up before it wants
-    /// the work. No level is in it.
-    pub fn key_of(&self, pass: PassId, body: Key<Body>, beyond: &[ContentId], view: &View) -> Result<ContentId, SchedError> {
+    /// the work. No level is in it. `body` is the body record's result digest
+    /// (`blaze_keyed::record::result_digest`): what the pass reads of the body, so an edit that
+    /// leaves the body's check equal leaves the findings' key equal.
+    pub fn key_of(&self, pass: PassId, body: ContentId, beyond: &[ContentId], view: &View) -> Result<ContentId, SchedError> {
         let decl = self.decl(pass)?;
         let inputs = PerBody { tool: self.tool, body, pass: decl.reference().keyed(), beyond };
         let key = match decl.over {
