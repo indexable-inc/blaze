@@ -49,6 +49,12 @@
 //! holder runs its section through [`Sim::critical_section`], or [`Sim::hold_for`] when other
 //! actors step while it holds, and once in a while it stalls on the virtual clock).
 //!
+//! A waker, asked for ([`Sim::give_wakers`]): other threads' wakes are entries of the timeline
+//! ([`Sim::wake_at`]) that land before a poll looks, between its look and its park, or while it
+//! is parked, as the seed and the times place them; [`Sim::lose_wakes_while_parked`] plants a
+//! lost wake; [`Sim::other_process`] is a second process on the machine, such as a test's
+//! server beside a loop that polls on its own (`sim/wake.rs`).
+//!
 //! UDP sockets, the standard streams, the wall clock, random bytes and directories made empty
 //! are the host's (`sim/host.rs`): datagrams lost, doubled and reordered at [`Sim::datagrams`]'
 //! rates, the input the test's ([`Sim::stdin`]) and the output kept for it ([`Sim::output`]).
@@ -69,6 +75,7 @@ mod journal;
 mod kept;
 #[cfg(test)]
 mod pages;
+mod wake;
 #[cfg(test)]
 mod world;
 pub mod seeds;
@@ -79,7 +86,7 @@ use blaze_hash::HashMap;
 use blaze_mem::{Slab, Tag as MemTag};
 use std::alloc::Global;
 
-pub use self::{host::Datagrams, journal::Journal};
+pub use self::{host::Datagrams, journal::Journal, wake::Landed};
 use crate::{
     Access, Address, Cache, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName,
     IoError, LockMode, Meta, RECV_MOST, Span, Tag, spans,
@@ -566,6 +573,9 @@ pub struct Sim {
     /// (`crate::descriptors`): a file opened once, the least recently read closed past the
     /// bound, an unlinked file read as the bytes it held.
     descriptors: kept::Descriptors,
+    /// The waker it hands out, the other threads' acts due and the other processes beside the
+    /// poller (`sim/wake.rs`), once a test asked for them ([`Sim::give_wakers`]).
+    wakes: Option<Box<wake::Wakes>>,
 }
 
 /// A delay drawn up to the simulation's latency.
@@ -656,6 +666,7 @@ impl Sim {
             epoch: 0,
             armed: None,
             descriptors: kept::Descriptors::new(crate::descriptors::MOST),
+            wakes: None,
         };
         // The disk's clock is the wall clock from the start, so its first stamps are of then.
         sim.disk.at(sim.wall_ns());
@@ -845,6 +856,7 @@ impl Sim {
         self.ends.clear();
         self.receiving.clear();
         self.host_crash();
+        self.crash_wakes();
         self.stamp_epochs();
         // By name, so the seed's numbers go to the same files whatever the table's order.
         // alloc: a crash, not an op.
@@ -2811,32 +2823,151 @@ impl Driver for Sim {
     /// Waits in virtual time: the clock moves to the first completion when none is ready, or
     /// to `until` where that comes first (then nothing is moved). The wait goes through
     /// [`wait::until`], interrupted at [`Faults::interrupt_one_in`]'s rate as a kernel's is.
-    /// With nothing in flight that will complete, it returns at once.
+    /// With nothing in flight that will complete, it returns at once, unless its waker was
+    /// handed out ([`Sim::give_wakers`]): then it keeps the rule on [`Driver::waker`], and
+    /// other threads' wakes ([`Sim::wake_at`]) land before it looks, between the look and the
+    /// park, or while it is parked (`sim/wake.rs`).
     fn poll(&mut self, out: &mut Vec<Completion>, until: Deadline) -> usize {
         if seeds::off(self) {
             return 0;
         }
+        let before = out.len();
+        match self.wakes.is_some() {
+            true => self.poll_with_wakes(out, before, until),
+            false => self.poll_without_wakes(out, until),
+        }
+        seeds::polled(self, &out[before..]);
+        out.len() - before
+    }
+
+    fn in_flight(&self) -> usize {
+        let ending = self.told.iter().filter(|it| {
+            !matches!(
+                it.completion.done,
+                Done::Changed { .. }
+                    | Done::Journaled(_)
+                    | Done::Accepted { .. }
+                    | Done::Pressed { .. }
+            )
+        });
+        self.pending.len()
+            + self.held_sends.len()
+            + (self.watches.len() - self.ending)
+            + self.listens.len()
+            + self.receiving.len()
+            + self.pressures.len()
+            + self.host_in_flight()
+            + ending.count()
+    }
+
+    fn now(&self) -> Duration {
+        self.now
+    }
+
+    /// The seed's wall clock start plus the virtual clock: the clock the disk stamps change
+    /// times by ([`journal::Disk::at`]), so a look just after a write sees a racy stamp.
+    fn wall_ns(&self) -> u64 {
+        self.wall_ns()
+    }
+
+    /// The simulation's waker, once a test asked for one ([`Sim::give_wakers`]); from this
+    /// call on a poll keeps the rule a native driver keeps.
+    fn waker(&self) -> Option<crate::Waker> {
+        self.wakes().map(wake::Wakes::waker)
+    }
+}
+
+/// The most turns one poll takes inside the simulation before it hands its caller anything:
+/// each turn moves the clock to an event, runs an act or hands another process its
+/// completions, so a poll past this is two other processes answering each other at one
+/// instant forever (rule bounded-progress).
+const POLL_TURNS_MOST: u32 = 1 << 20;
+
+impl Sim {
+    /// When the first completion is due, of what is in flight.
+    fn first_due(&self) -> Option<Duration> {
         let first = self.pending.next_deadline().map(Duration::from_nanos);
-        let Some(first) = first
-            .into_iter()
-            .chain(self.first_landing())
-            .chain(self.told.iter().map(|it| it.at))
-            .min()
-        else {
-            return 0;
-        };
+        first.into_iter().chain(self.first_landing()).chain(self.told.iter().map(|it| it.at)).min()
+    }
+
+    /// The poll of a simulation that keeps no waker: as it always was.
+    fn poll_without_wakes(&mut self, out: &mut Vec<Completion>, until: Deadline) {
+        let Some(first) = self.first_due() else { return };
         if first > self.now {
             self.now = self.wait(first, until);
             self.disk.at(self.wall_ns());
             if self.now < first {
-                return 0;
+                return;
             }
         }
+        self.collect(out);
+    }
+
+    /// The poll of a simulation whose waker may be handed out: the look, the park and the
+    /// wait, with other threads' acts landing between them (`sim/wake.rs`), and other
+    /// processes' completions handed to them, until the caller has a completion, a wake or
+    /// its deadline.
+    fn poll_with_wakes(&mut self, out: &mut Vec<Completion>, before: usize, until: Deadline) {
+        for _ in 0..POLL_TURNS_MOST {
+            // Acts due by now: each before the look or after it, as the seed draws.
+            self.run_posts(wake::Lands::Drawn);
+            let woke = self.wakes().is_some_and(wake::Wakes::take);
+            self.collect(out);
+            self.hand_to_others(out, before);
+            if out.len() > before || woke {
+                return;
+            }
+            // The look saw nothing; what is due now and was not before it lands before the
+            // park, and the park sees it.
+            self.run_posts(wake::Lands::BeforePark);
+            if self.wakes().is_some_and(wake::Wakes::take) {
+                return;
+            }
+            let posted = self.wakes().and_then(wake::Wakes::next_due);
+            let target = match self.first_due().into_iter().chain(posted).min() {
+                Some(target) => target,
+                // No waker handed out: nothing will end a wait, as with none.
+                None if !self.wakes().is_some_and(wake::Wakes::given) => return,
+                None if until.finite().is_none() => panic!(
+                    "the simulation: a poll parked with its waker handed out, no deadline, nothing in \
+                     flight that completes and no wake scheduled (Sim::wake_at) at {:?}: a native \
+                     driver's never returns (rule bounded-progress)",
+                    self.now
+                ),
+                // Parked to the deadline, which the wait reaches first.
+                None => Duration::MAX,
+            };
+            if target > self.now {
+                self.now = self.wait(target, until);
+                self.disk.at(self.wall_ns());
+                if self.now < target {
+                    // The deadline.
+                    return;
+                }
+            }
+            if posted.is_some_and(|at| at <= self.now) {
+                self.run_posts(wake::Lands::Parked);
+                if self.wakes().is_some_and(wake::Wakes::take) {
+                    // What completed at the same instant comes with it.
+                    self.collect(out);
+                    self.hand_to_others(out, before);
+                    return;
+                }
+            }
+        }
+        panic!(
+            "the simulation: a poll turned {POLL_TURNS_MOST} times at {:?} with nothing for its caller: \
+             other processes' effects answer each other at one instant (rule bounded-progress)",
+            self.now
+        );
+    }
+
+    /// Moves what is due by now into `out`: effects ready, datagrams landed, what was told.
+    fn collect(&mut self, out: &mut Vec<Completion>) {
         let mut ready = mem::take(&mut self.ready);
         self.pending.advance(wheel::ticks(self.now), |_, pending| ready.push(pending));
         // In the order they were due; shuffled so it is the seed's.
         self.rng.shuffle(&mut ready);
-        let before = out.len();
         for pending in ready.drain(..) {
             if !self.recording.is_empty() {
                 let file = match &pending.effect {
@@ -2874,38 +3005,6 @@ impl Driver for Sim {
         }
         self.told = later;
         self.later = told;
-        seeds::polled(self, &out[before..]);
-        out.len() - before
-    }
-
-    fn in_flight(&self) -> usize {
-        let ending = self.told.iter().filter(|it| {
-            !matches!(
-                it.completion.done,
-                Done::Changed { .. }
-                    | Done::Journaled(_)
-                    | Done::Accepted { .. }
-                    | Done::Pressed { .. }
-            )
-        });
-        self.pending.len()
-            + self.held_sends.len()
-            + (self.watches.len() - self.ending)
-            + self.listens.len()
-            + self.receiving.len()
-            + self.pressures.len()
-            + self.host_in_flight()
-            + ending.count()
-    }
-
-    fn now(&self) -> Duration {
-        self.now
-    }
-
-    /// The seed's wall clock start plus the virtual clock: the clock the disk stamps change
-    /// times by ([`journal::Disk::at`]), so a look just after a write sees a racy stamp.
-    fn wall_ns(&self) -> u64 {
-        self.wall_ns()
     }
 }
 
