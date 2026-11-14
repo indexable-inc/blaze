@@ -26,6 +26,7 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         Lint::HotAlloc
         | Lint::HotAllocCall
         | Lint::ImplicitAllocator
+        | Lint::UnwrittenAllocator
         | Lint::Parallelizable
         | Lint::SerialDependence
         | Lint::FiberBoundary
@@ -195,6 +196,10 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::TmpPath
         | Lint::NarrowedLen
         | Lint::ProcessStatic
+        // A default kept for every implementor says why in its `/// The default:` doc line;
+        // a read one at a time says why with `#[expect(..)]`.
+        | Lint::DefaultRefuses
+        | Lint::OneAtATime
         // Kept with `#[expect(..)]` on the item: whether wrapping is meant is the code's
         // choice, said once with its reason.
         | Lint::TruncatingCast

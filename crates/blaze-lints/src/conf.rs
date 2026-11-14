@@ -194,6 +194,8 @@ fn checked(table: &toml::Table) -> Result<(), String> {
     for kind in Kind::ALL {
         disallowed(table, kind)?;
     }
+    // Read only to refuse a list that does not read; the global heap for a list dropped here.
+    one_at_a_time(table, std::alloc::Global)?;
     match table.get("profile") {
         None | Some(toml::Value::String(_)) => {}
         Some(other) => {
@@ -352,6 +354,63 @@ pub fn disallowed(table: &toml::Table, kind: Kind) -> Result<Vec<Disallowed>, St
     Ok(entries)
 }
 
+/// The key of `blaze::one_at_a_time`'s list: the functions that read one record, each with the
+/// batched form that reads many in one call.
+pub const ONE_AT_A_TIME_KEY: &str = "one-at-a-time";
+
+/// An entry of [`ONE_AT_A_TIME_KEY`]: `{ path = "blaze_cas::direct::Direct::read", batched =
+/// "read_many" }`. Both keys are required: a function with no batched form is not listed,
+/// since a finding with no fix to make is noise.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct OneAtATime {
+    /// The single-record function, as a path from a crate's root; a trait's method names every
+    /// implementation of it too.
+    pub path: String,
+    /// The batched form, as the finding names it: `read_many`.
+    pub batched: String,
+}
+
+const ONE_AT_A_TIME_FIELDS: [&str; 2] = ["path", "batched"];
+
+/// The entries of `table`'s [`ONE_AT_A_TIME_KEY`]; an entry that does not read is the error,
+/// naming it, never skipped. The list is in `alloc`, the caller's.
+pub fn one_at_a_time<A: std::alloc::Allocator + Clone>(
+    table: &toml::Table,
+    alloc: A,
+) -> Result<Vec<OneAtATime, A>, String> {
+    let key = ONE_AT_A_TIME_KEY;
+    let Some(list) = table.get(key) else { return Ok(Vec::new_in(alloc)) };
+    let error =
+        |what: String| format!("error reading Clippy's configuration file: {what} in `{key}`");
+    let list = list
+        .as_array()
+        .ok_or_else(|| error(format!("invalid type: {}, expected a list", list.type_str())))?;
+    let mut entries = Vec::with_capacity_in(list.len(), alloc);
+    for item in list {
+        let toml::Value::Table(fields) = item else {
+            return Err(error(format!(
+                "invalid type: {}, expected a table with `path` and `batched`",
+                item.type_str()
+            )));
+        };
+        if let Some(unknown) = fields.keys().find(|it| !ONE_AT_A_TIME_FIELDS.contains(&it.as_str())) {
+            return Err(error(format!(
+                "unknown field `{unknown}`, expected one of {}",
+                ONE_AT_A_TIME_FIELDS.join(", ")
+            )));
+        }
+        let string = |name: &str| match fields.get(name) {
+            Some(toml::Value::String(it)) if !it.is_empty() => Ok(it.clone()),
+            Some(other) => Err(error(format!(
+                "invalid value: {other}, expected a string that is not empty for `{name}`"
+            ))),
+            None => Err(error(format!("an entry with no `{name}`"))),
+        };
+        entries.push(OneAtATime { path: string("path")?, batched: string("batched")? });
+    }
+    Ok(entries)
+}
+
 /// The names clippy looks for, in the order it takes them.
 const NAMES: [&str; 2] = [".clippy.toml", "clippy.toml"];
 
@@ -505,6 +564,14 @@ impl Conf {
     /// The entries of the list `kind`.
     pub fn disallowed(&self, kind: Kind) -> Result<Vec<Disallowed>, String> {
         disallowed(&self.table, kind)
+    }
+
+    /// The entries of [`ONE_AT_A_TIME_KEY`], which the load checked read, in `alloc`.
+    pub fn one_at_a_time<A: std::alloc::Allocator + Clone>(
+        &self,
+        alloc: A,
+    ) -> Result<Vec<OneAtATime, A>, String> {
+        one_at_a_time(&self.table, alloc)
     }
 
     /// Whether the Rust version kept to has what came in `version`: clippy's `Msrv::meets`,

@@ -940,6 +940,59 @@ impl Steps for Fake {
     fn held_code(&self, holder: crate::serve::work::CodeHolder, program: &str) -> Option<crate::serve::work::HeldCode> {
         solo::held_code(holder, program)
     }
+
+    // What the fakes have and do not, each said here: the trait gives no default, so a fake
+    // never inherits an answer the real steps do not give (`blaze::default_refuses`).
+
+    /// The fakes' units name no pinned native input, and lay none out.
+    fn native(
+        &self,
+        input: &blaze_units::query::NativeInput,
+        _: &std::sync::atomic::AtomicBool,
+    ) -> Result<std::path::PathBuf, ApiError> {
+        Err(ApiError::new(
+            format!("pinned native input `{}`: the fakes lay out none", input.name),
+            Some(input.pin.clone()), // clone: an error's place, once
+        ))
+    }
+
+    /// The fakes' store keeps every record a fake front end offers.
+    fn kept_refusal(&self, _: &mut FakeInputs) -> Option<String> {
+        None
+    }
+
+    /// A fake front end has no database, so no run log.
+    fn kept_run_log(&self, _: &FakeInputs) -> blaze_query::db::Taken {
+        blaze_query::db::Taken::default()
+    }
+
+    /// A fake front end holds nothing a build's end lets go.
+    fn release_kept(&self, _: &mut FakeInputs, _: &std::sync::atomic::AtomicBool) {}
+
+    /// The fakes run no launched program's first call with a front end.
+    fn serve_needs(&self, _: &mut FakeInputs, _: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
+        Vec::new_in(std::alloc::Global)
+    }
+
+    /// No task of the fakes serves launched runs' first calls, so none is woken.
+    fn wake_needs(&self) {}
+
+    /// No launcher connects to the fakes' launch host (`launched_restart` plays its marks,
+    /// not its connections).
+    fn launchers_connected(&self) -> usize {
+        0
+    }
+
+    /// The fakes build no dev executable on the daemon's code memory: a program the fakes
+    /// built runs its file.
+    fn launch(
+        &self,
+        _: &str,
+        _: u32,
+        _: Option<[u8; 32]>,
+    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
+        Ok(None)
+    }
 }
 
 pub(super) struct FakeFront {
@@ -1064,6 +1117,29 @@ impl Writer<Fake> for FakeWriter {
     fn read_seen(&self) -> Result<Vec<crate::serve::work::Seen>, String> {
         Ok(Vec::new())
     }
+
+    /// The fakes lower no Rust source, so no key of theirs holds one by its code text: the
+    /// no-op lane's edit that changes no code is not theirs to vouch for.
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
+        Err("the fakes lower no Rust source, so no key of theirs holds one by its code text".to_owned())
+    }
+
+    /// A fake front end has no database, so no run log.
+    fn run_log(&self) -> blaze_query::db::Taken {
+        blaze_query::db::Taken::default()
+    }
+
+    /// The fakes find nothing wrong only once a whole build ran.
+    fn finished(&mut self, _: bool, _: &[u32]) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
+        Ok(Vec::new_in(std::alloc::Global))
+    }
+
+    /// A fake front end makes nothing a build's end lets go, so a unit found kept is not
+    /// counted.
+    fn found_kept(&mut self, _: usize) {}
+
+    /// As [`FakeWriter::found_kept`]: a compile that ended is not counted.
+    fn compiled(&mut self, _: usize) {}
 
     fn apply(&mut self) -> Result<bool, ApiError> {
         if self.asked.is_empty() {
@@ -1661,6 +1737,12 @@ impl Front<Fake> for FakeFront {
             rendered: format!("error: {what}\n"),
             ..warning_of_app(&what)
         }
+    }
+
+    /// The fakes' units have no crate or name a phase span gives: their tasks' spans name
+    /// none.
+    fn subject(&self, _: usize) -> Option<(String, String)> {
+        None
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<FakeRuns, ApiError> {
@@ -6325,6 +6407,53 @@ fn status_says_the_daemons_pid() {
         _ => None,
     });
     assert_eq!(pid, Some(std::process::id()), "{got:#?}");
+}
+
+/// A loop stuck in a dispatch says which part of the daemon held it: the stuck line
+/// (`stop::stuck`), taken from inside the server's dispatch of a status request, names the
+/// loop's piece and the completion's part, read from the open span's own fields. Until
+/// 2026-11-14 the line said `loop turn: completions: a piece` and nothing more, so a 124 s
+/// stall in a dispatch named neither the piece nor whose completion it was. The control: drop
+/// `completion = handler.name()` from the dispatch's span, or `fields` from `SpanSaid`'s line,
+/// and the second assertion fails.
+///
+/// The invariant: a stuck line names, for each open span, its identifying fields, and the
+/// dispatch's span names its completion's part.
+#[test]
+fn a_stuck_line_inside_a_dispatch_names_the_piece_and_the_completions_part() {
+    use super::daemon::{Handler, STUCK_AT_DISPATCH};
+    const THREAD: &str = "daemon loop stuck line test";
+    blaze_profile::install();
+    let said = std::thread::Builder::new()
+        .name(THREAD.into())
+        .spawn(|| {
+            let mut sim = Sim::new(11, Faults::default());
+            checkout(&mut sim, "[package]\nname = \"app\"\n");
+            let steps = Arc::new(Fake::default());
+            let mut daemon = start(sim, &steps, 11);
+            STUCK_AT_DISPATCH.with_borrow_mut(|it| it.at = Some(Handler::Server));
+            let mut client = dial(&mut daemon);
+            let id = client.send(&mut daemon, Request::Status);
+            let got = client.wait(&mut daemon, id);
+            assert!(got.iter().any(|it| matches!(it, Response::Status(_))), "{got:#?}");
+            STUCK_AT_DISPATCH.with_borrow_mut(|it| it.said.take())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let Some(said) = said else { panic!("no dispatch to the server took the stuck line") };
+    let line = said
+        .lines()
+        .find(|it| it.trim_start().starts_with(THREAD))
+        .unwrap_or_else(|| panic!("the stuck line names no thread `{THREAD}`: {said}"));
+    assert!(
+        line.contains("loop turn: completions: a piece") && line.contains("piece=dispatch of one completion"),
+        "the stuck line names the loop's piece: {line}"
+    );
+    assert!(
+        line.contains(&format!("completion={}", Handler::Server.name())),
+        "the stuck line names whose completion the dispatch was in: {line}"
+    );
 }
 
 /// The loop's time between its turns is a `wait` span naming what ends it (rule 15). Before

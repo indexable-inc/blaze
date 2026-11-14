@@ -829,6 +829,80 @@ impl Woken {
     }
 }
 
+/// The part of the daemon a completion goes to ([`Daemon::handler_of`]), which the turn's span
+/// of its dispatch names (`completion = ...`), so a turn stuck in one dispatch says whose
+/// completion it was in. Until 2026-11-14 the span said only `dispatch of one completion`: a
+/// stuck loop's line named the piece and not which of fourteen parts held it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Handler {
+    Images,
+    Pressure,
+    Server,
+    Vfs,
+    Db,
+    Places,
+    SoloRows,
+    Peers,
+    Store,
+    Std,
+    Heads,
+    Jobs,
+    LateRead,
+    /// A tag no part owns: nothing is done with it.
+    Unowned,
+}
+
+impl Handler {
+    /// The part's name, as the dispatch span's `completion` field says it: a static string, so
+    /// naming it allocates nothing on the loop's hot path.
+    pub(super) const fn name(self) -> &'static str {
+        match self {
+            Handler::Images => "images",
+            Handler::Pressure => "memory pressure",
+            Handler::Server => "server",
+            Handler::Vfs => "vfs",
+            Handler::Db => "db",
+            Handler::Places => "places",
+            Handler::SoloRows => "solo rows",
+            Handler::Peers => "peers",
+            Handler::Store => "store",
+            Handler::Std => "std store",
+            Handler::Heads => "heads",
+            Handler::Jobs => "jobs",
+            Handler::LateRead => "late store read",
+            Handler::Unowned => "unowned",
+        }
+    }
+}
+
+/// The stuck line ([`super::stop::stuck`]) as it reads from inside one dispatch, taken by a test
+/// that names the part ([`StuckAtDispatch::at`]): what a watchdog would print of a loop stuck
+/// there.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct StuckAtDispatch {
+    /// The part whose first dispatch takes the line.
+    pub(super) at: Option<Handler>,
+    /// The line taken, once.
+    pub(super) said: Option<String>,
+}
+
+#[cfg(test)]
+impl StuckAtDispatch {
+    fn say(&mut self, handler: Handler) {
+        if self.at == Some(handler) && self.said.is_none() {
+            self.said = Some(super::stop::stuck(std::process::id(), 0, 0));
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's [`StuckAtDispatch`]: the loop runs on the test's thread in the simulation.
+    pub(super) static STUCK_AT_DISPATCH: std::cell::RefCell<StuckAtDispatch> =
+        std::cell::RefCell::new(StuckAtDispatch::default());
+}
+
 /// The daemon on driver `D`, building with `S`: `blaze serve`'s is `Daemon<Native, Real>`, the
 /// simulation's `Daemon<Sim, Fake>`.
 pub struct Daemon<D: Driver, S: Steps> {
@@ -2553,8 +2627,19 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.tick();
         drop(tick);
         for completion in done.drain(..) {
-            let _dispatch = piece("dispatch of one completion");
-            self.dispatch(completion);
+            // The piece names whose completion it is (`Handler::name`, a static string), so a
+            // turn stuck in one dispatch says which part of the daemon holds it.
+            let handler = self.handler_of(completion.tag);
+            let _dispatch = spanned.then(|| {
+                tracing::info_span!(
+                    target: "blaze",
+                    "loop turn: completions: a piece",
+                    piece = "dispatch of one completion",
+                    completion = handler.name()
+                )
+                .entered()
+            });
+            self.dispatch(handler, completion);
         }
         // What the loop's own store reads were handed as they dispatched (`World::reads`) is
         // kept for the next turn, which takes it without a wait.
@@ -3265,17 +3350,41 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         }
     }
 
-    /// A completion to its part, by the block of tags it is in: compares on the tag alone,
-    /// no part asked and no lock taken.
-    fn dispatch(&mut self, completion: Completion) {
-        match completion.tag.0 {
-            _ if self.images.owns(completion.tag) => {
+    /// The part of the daemon a completion of `tag` goes to, by the block of tags it is in:
+    /// compares on the tag alone, no part asked and no lock taken. [`Daemon::dispatch`] hands
+    /// it there; the turn's span of that dispatch names it first ([`Handler::name`]).
+    fn handler_of(&self, tag: Tag) -> Handler {
+        match tag.0 {
+            _ if self.images.owns(tag) => Handler::Images,
+            _ if tag == PRESSURE => Handler::Pressure,
+            SERVER..VFS => Handler::Server,
+            VFS..DB => Handler::Vfs,
+            DB..STORE => Handler::Db,
+            PLACES..PLACES_END => Handler::Places,
+            SOLO_ROWS..SOLO_ROWS_END => Handler::SoloRows,
+            PEERS..PEERS_END => Handler::Peers,
+            STORE..FLUSHES | LOADS..STD_LOADS => Handler::Store,
+            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => Handler::Std,
+            FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => Handler::Heads,
+            JOBS..JOBS_END | RUNS..RUNS_END => Handler::Jobs,
+            super::direct::HOME_TAGS.. => Handler::LateRead,
+            _ => Handler::Unowned,
+        }
+    }
+
+    /// A completion to `handler`, the part of the daemon [`Daemon::handler_of`] found for its
+    /// tag.
+    fn dispatch(&mut self, handler: Handler, completion: Completion) {
+        #[cfg(test)]
+        STUCK_AT_DISPATCH.with_borrow_mut(|it| it.say(handler));
+        match handler {
+            Handler::Images => {
                 let was = self.images.done();
                 self.images.complete(&mut self.vfs, completion, &mut self.effects);
                 self.images_ended(was);
             }
-            _ if completion.tag == PRESSURE => self.pressure(completion),
-            SERVER..VFS => {
+            Handler::Pressure => self.pressure(completion),
+            Handler::Server => {
                 let mut arrived = self.spare.arrived.pop().unwrap_or_default();
                 self.server.complete(completion, &mut self.effects, &mut arrived);
                 for it in arrived.drain(..) {
@@ -3289,17 +3398,17 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                     self.fail(why);
                 }
             }
-            VFS..DB => {
+            Handler::Vfs => {
                 let tickets = self.vfs.complete(completion, &mut self.effects);
                 if !tickets.is_empty() {
                     self.durable(&tickets);
                 }
             }
-            DB..STORE => self.db.complete(completion, &mut self.effects),
-            PLACES..PLACES_END => self.start_placed(completion),
-            SOLO_ROWS..SOLO_ROWS_END => self.solo_taken(completion),
+            Handler::Db => self.db.complete(completion, &mut self.effects),
+            Handler::Places => self.start_placed(completion),
+            Handler::SoloRows => self.solo_taken(completion),
             // Lane packs-1112: a peer's request, answered from the store.
-            PEERS..PEERS_END => {
+            Handler::Peers => {
                 if let Some(peers) = &mut self.peers {
                     peers.complete(completion, &self.store, &mut self.effects);
                     if let Some(why) = peers.take_failed() {
@@ -3309,7 +3418,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             }
             // The store's own effects, and its pool's loads (a commit loading the page a pack's
             // index is on, or one of the reads not yet on `direct`).
-            STORE..FLUSHES | LOADS..STD_LOADS => {
+            Handler::Store => {
                 debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
                 self.job_effects += 1;
                 self.store.complete(completion, &mut self.effects);
@@ -3336,7 +3445,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 }
                 self.said(said);
             }
-            STD_STORE..STD_STORE_END | STD_LOADS..STD_LOADS_END => {
+            Handler::Std => {
                 debug_assert!(self.std.owns(completion.tag), "the shared store's tags are its");
                 self.std.complete(completion, &mut self.effects);
                 if let Some(broken) = self.std.broken()
@@ -3351,13 +3460,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 self.jobs.looked(&mut world!(self, said));
                 self.said(said);
             }
-            FLUSHES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
+            Handler::Heads => {
                 debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
                 let mut out = self.spare.out.pop().unwrap_or_default();
                 self.heads.complete(&mut self.vfs, self.driver.wall_ns(), completion, &mut self.effects, &mut out);
                 self.outs(out);
             }
-            JOBS..JOBS_END | RUNS..RUNS_END => {
+            Handler::Jobs => {
                 debug_assert!(self.jobs.owns(completion.tag), "the jobs' tags are theirs");
                 self.job_effects += 1;
                 let mut said = self.spare.said.pop().unwrap_or_default();
@@ -3367,10 +3476,10 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // A task's store read on the lent driver (`direct::lend`) that ended after its
             // read gave up waiting: the read failed then (`direct::Failed::Stalled`), naming
             // the record, and gave its buffer up to the kernel; nothing waits for this.
-            super::direct::HOME_TAGS.. => {
+            Handler::LateRead => {
                 tracing::info!(target: "blaze", tag = completion.tag.0, "a store read's late completion, its read already failed as stalled");
             }
-            _ => {}
+            Handler::Unowned => {}
         }
     }
 
