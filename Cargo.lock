@@ -566,6 +566,7 @@ dependencies = [
  "blaze-item-hash",
  "blaze-items",
  "blaze-kernel",
+ "blaze-keyed",
  "blaze-launch",
  "blaze-launch-host",
  "blaze-lazy",
@@ -2353,14 +2354,12 @@ name = "blaze-testsel"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-api",
- "blaze-cas",
  "blaze-core",
  "blaze-format",
- "blaze-hash",
  "blaze-ids",
  "blaze-keyed",
  "blaze-protocol",
+ "blaze-rng",
  "blaze-sim",
  "blaze-usercode",
 ]
