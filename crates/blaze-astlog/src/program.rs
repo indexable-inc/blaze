@@ -70,6 +70,10 @@ pub enum Atom {
     IntValue,
     /// `(str-value n s)`: the text a string literal means, unescaped.
     StrValue,
+    /// `(def-parent d p)`: the def that owns `d`, or each def `p` owns.
+    DefParent,
+    /// `(variant-count e n)`: how many variants the enum `e` has.
+    VariantCount,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +134,8 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "descendant" => (Atom::Descendant, 2, all0),
         "int-value" => (Atom::IntValue, 2, all0),
         "str-value" => (Atom::StrValue, 2, all0),
+        "def-parent" => (Atom::DefParent, 2, Needs::Any(&[0, 1])),
+        "variant-count" => (Atom::VariantCount, 2, all0),
         "in-macro-input" => (Atom::Filter(Filter::InMacroInput), 1, all0),
         "in-macro-expansion" => (Atom::Filter(Filter::InMacroExpansion), 1, all0),
         "in-unsafe" => (Atom::Filter(Filter::InUnsafe), 1, all0),

@@ -561,6 +561,72 @@ impl<'a, F: Files> Sema<'a, F> {
         Some(segments.join("::"))
     }
 
+    /// The def that owns `def`: a variant's enum, a field's struct, union or variant, an
+    /// associated item's impl or trait, an impl's or an item's module, a module's parent.
+    /// `None` for a crate's root.
+    fn def_parent(&self, def: Def) -> Option<Def> {
+        let db = self.db;
+        let item = |it: ModuleDef| -> Option<Def> {
+            let container = match it {
+                ModuleDef::Function(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::Const(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::TypeAlias(it) => it.as_assoc_item(db).map(|it| it.container(db)),
+                ModuleDef::EnumVariant(it) => {
+                    return Some(Def::Item(ModuleDef::Adt(hir::Adt::Enum(it.parent_enum(db)))));
+                }
+                ModuleDef::Module(it) => return it.parent(db).map(|it| Def::Item(ModuleDef::Module(it))),
+                _ => None,
+            };
+            Some(match container {
+                Some(AssocItemContainer::Impl(it)) => Def::Impl(it),
+                Some(AssocItemContainer::Trait(it)) => Def::Item(ModuleDef::Trait(it)),
+                None => Def::Item(ModuleDef::Module(it.module(db)?)),
+            })
+        };
+        match def {
+            Def::Item(it) => item(it),
+            Def::Field(it) => Some(Def::Item(match it.parent_def(db) {
+                hir::Variant::Struct(it) => ModuleDef::Adt(hir::Adt::Struct(it)),
+                hir::Variant::Union(it) => ModuleDef::Adt(hir::Adt::Union(it)),
+                hir::Variant::EnumVariant(it) => ModuleDef::EnumVariant(it),
+            })),
+            Def::Impl(it) => Some(Def::Item(ModuleDef::Module(it.module(db)))),
+        }
+    }
+
+    /// The defs `owner` owns, each one whose [`Self::def_parent`] is `owner`.
+    fn def_children(&self, owner: Def) -> Vec<Def> {
+        let db = self.db;
+        let assoc = |items: Vec<hir::AssocItem>| -> Vec<Def> {
+            items
+                .into_iter()
+                .map(|it| {
+                    Def::Item(match it {
+                        hir::AssocItem::Function(it) => ModuleDef::Function(it),
+                        hir::AssocItem::Const(it) => ModuleDef::Const(it),
+                        hir::AssocItem::TypeAlias(it) => ModuleDef::TypeAlias(it),
+                    })
+                })
+                .collect()
+        };
+        match owner {
+            Def::Item(ModuleDef::Module(it)) => {
+                let mut out: Vec<Def> = it.declarations(db).into_iter().map(Def::Item).collect();
+                out.extend(it.impl_defs(db).into_iter().map(Def::Impl));
+                out
+            }
+            Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) => {
+                it.variants(db).into_iter().map(|it| Def::Item(ModuleDef::EnumVariant(it))).collect()
+            }
+            Def::Item(ModuleDef::Adt(hir::Adt::Struct(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
+            Def::Item(ModuleDef::Adt(hir::Adt::Union(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
+            Def::Item(ModuleDef::EnumVariant(it)) => it.fields(db).into_iter().map(Def::Field).collect(),
+            Def::Item(ModuleDef::Trait(it)) => assoc(it.items(db)),
+            Def::Impl(it) => assoc(it.items(db)),
+            Def::Item(_) | Def::Field(_) => Vec::new(),
+        }
+    }
+
     /// An impl's last segment, as rustc's paths show one: `<impl Type>` or
     /// `<impl Trait<Args> for Type>`. It names the impl and resolves to nothing
     /// ([`crate::program::names_an_impl`]).
@@ -1239,6 +1305,45 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                 });
                 if let Some(value) = value {
                     out.push(vec![node(self.syn(at)), text(&value)]);
+                }
+            }
+            Atom::DefParent => match &inputs[0] {
+                Some(_) => {
+                    let Some(def) = self.need_def(&inputs[0], "def-parent", line)? else { return Ok(()) };
+                    if let Some(owner) = self.def_parent(def) {
+                        out.push(vec![node(self.def(def)), node(self.def(owner))]);
+                    }
+                }
+                None => {
+                    let owner = match &inputs[1] {
+                        Some(Value::Node(at @ Node::Def(_))) => self.def_at(*at),
+                        Some(Value::Node(at @ Node::Syn { .. })) => {
+                            self.view_of(*at).and_then(|it| self.defines(it))
+                        }
+                        other => {
+                            return WrongValueSnafu {
+                                line,
+                                name: "def-parent",
+                                needs: "a def",
+                                arg: "its second argument",
+                                what: other.as_ref().map_or("unbound", Value::what),
+                            }
+                            .fail()
+                            .map_err(Error::from);
+                        }
+                    };
+                    let Some(owner) = owner else { return Ok(()) };
+                    let p = node(self.def(owner));
+                    for def in self.def_children(owner) {
+                        out.push(vec![node(self.def(def)), p.clone()]);
+                    }
+                }
+            },
+            Atom::VariantCount => {
+                let Some(def) = self.need_def(&inputs[0], "variant-count", line)? else { return Ok(()) };
+                if let Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) = def {
+                    let count = i64::try_from(it.variants(self.db).len()).expect("fewer than 2^63 variants");
+                    out.push(vec![node(self.def(def)), Value::Int(count)]);
                 }
             }
         }

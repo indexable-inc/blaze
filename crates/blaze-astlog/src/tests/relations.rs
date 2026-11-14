@@ -478,3 +478,63 @@ pub const BIG: u64 = 18446744073709551615;
     assert_eq!(texts(&outcome, "pats"), [["-2", "-2"], ["3", "3"]]);
     assert_eq!(texts(&outcome, "strs"), [["neg\ttab"], ["raw \"q\""], ["x"]]);
 }
+
+const OWNED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub enum E { A, B(u8), C { x: u8 } }
+pub struct S { pub f: u8 }
+pub trait T { fn t(&self); }
+impl S { pub fn m(&self) {} }
+impl T for S { fn t(&self) {} }
+pub mod inner { pub fn g() {} }
+"#;
+
+/// `def-parent` goes up from a def to what owns it, and down from an owner to each def it owns;
+/// `variant-count` counts an enum's variants and nothing else's.
+#[test]
+fn def_parent_joins_a_def_and_its_owner_both_ways_and_variant_count_counts_an_enum() {
+    let (db, files) = view(OWNED, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (up d p) (def-path d "lib::E::B") (def-parent d p))
+        (rule (up d p) (def-path d "lib::E::C::x") (def-parent d p))
+        (rule (up d p) (def-path d "lib::S::m") (def-parent d p))
+        (rule (up d p) (def-path d "lib::T::t") (def-parent d p))
+        (rule (up d p) (def-path d "lib::inner::g") (def-parent d p))
+        (rule (up d p) (def-path d "lib::inner") (def-parent d p))
+        (rule (up d p) (syntax n "IMPL") (defines n d) (def-parent d p))
+        (rule (root p) (def-path d "lib") (def-parent d p))
+        (rule (down p d) (def-path p "lib::E") (def-parent d p))
+        (rule (down p d) (def-path p "lib::S") (def-parent d p))
+        (rule (down p d) (def-path p "lib::inner") (def-parent d p))
+        (rule (down p d) (def-path p "lib::T") (def-parent d p))
+        (rule (variants e n) (def-path e "lib::E") (variant-count e n))
+        (rule (variants e n) (def-path e "lib::S") (variant-count e n))
+    "#;
+    let outcome = query(&db, &files, rules).unwrap();
+    let mut up = texts(&outcome, "up");
+    up.sort();
+    let want = [
+        ["lib::<impl S>", "lib"],
+        ["lib::<impl T for S>", "lib"],
+        ["lib::E::B", "lib::E"],
+        ["lib::E::C::x", "lib::E::C"],
+        ["lib::S::m", "lib::<impl S>"],
+        ["lib::T::t", "lib::T"],
+        ["lib::inner", "lib"],
+        ["lib::inner::g", "lib::inner"],
+    ];
+    assert_eq!(up, want);
+    assert!(texts(&outcome, "root").is_empty(), "a crate's root has no owner");
+    let mut down = texts(&outcome, "down");
+    down.sort();
+    let want = [
+        ["lib::E", "lib::E::A"],
+        ["lib::E", "lib::E::B"],
+        ["lib::E", "lib::E::C"],
+        ["lib::S", "lib::S::f"],
+        ["lib::T", "lib::T::t"],
+        ["lib::inner", "lib::inner::g"],
+    ];
+    assert_eq!(down, want);
+    assert_eq!(texts(&outcome, "variants"), [["lib::E", "3"]]);
+}
