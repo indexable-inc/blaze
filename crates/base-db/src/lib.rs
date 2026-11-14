@@ -549,28 +549,23 @@ impl IncludedFile {
     pub fn read_now(path: &std::path::Path, looks: &Looks) -> Result<std::sync::Arc<[u8]>, ReadError> {
         let looked_ns = blaze_core::system_wall_ns();
         let stamp = blaze_vfs::outside::stat(path);
-        let (read, answer) = IncludedFile::read_answered(path, &stamp);
-        if let Some(answer) = answer {
+        let read = std::fs::read(path);
+        if let Some(answer) = IncludedFile::answer_of(read.as_deref(), &stamp) {
             looks.push_stamped(path, LookKind::File, answer, stamp, looked_ns);
         }
-        read
+        read.map(Into::into).map_err(|it| ReadError::of(&it))
     }
 
-    /// The file at `path` read now, whose stamp before the read was `stamp`, and the answer
-    /// its look says ([`IncludedFile::read_now`]; `None`: a read whose answer this crate does
-    /// not make, pushed nowhere).
-    fn read_answered(
-        path: &std::path::Path,
-        stamp: &blaze_core::Stamp,
-    ) -> (Result<std::sync::Arc<[u8]>, ReadError>, Option<Option<[u8; 32]>>) {
-        let read = std::fs::read(path);
-        let answer = match &read {
+    /// The answer the look of a read says, the file's stamp before the read being `stamp`
+    /// ([`IncludedFile::read_now`]; `None`: a read whose answer this crate does not make,
+    /// pushed nowhere).
+    fn answer_of(read: Result<&[u8], &std::io::Error>, stamp: &blaze_core::Stamp) -> Option<Option<[u8; 32]>> {
+        match read {
             // A regular file alone hashes as its bytes; a pipe or a device read here does not.
             Ok(bytes) if stamp.is_file() => Some(Some(blaze_ids::b3::hash(bytes))),
             Err(error) if not_there(error) => Some(None),
             Ok(_) | Err(_) => None,
-        };
-        (read.map(Into::into).map_err(|it| ReadError::of(&it)), answer)
+        }
     }
 
     /// [`IncludedFile::content`] of the file at `path` as it is on disk now
@@ -604,11 +599,15 @@ impl IncludedFile {
             }
             return id;
         }
-        let (read, answer) = IncludedFile::read_answered(path, &stamp);
+        let read = std::fs::read(path);
+        let answer = IncludedFile::answer_of(read.as_deref(), &stamp);
         if let Some(answer) = answer {
             looks.push_stamped(path, LookKind::File, answer, stamp, looked_ns);
         }
-        let id = IncludedFile::content_of(read.as_deref());
+        let id = match &read {
+            Ok(bytes) => IncludedFile::content_of(Ok(bytes)),
+            Err(error) => IncludedFile::content_of(Err(&ReadError::of(error))),
+        };
         // Kept under the stamp from before the read: a write during the read moves it, so the
         // next ask reads again. A stamp that can't be asked is never kept.
         if !stamp.is_unknown() {

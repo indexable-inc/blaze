@@ -103,7 +103,7 @@
 //! counts it read.
 
 use std::{
-    alloc::Global,
+    alloc::{Allocator, Global},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -967,13 +967,13 @@ impl Recording {
     /// ran is racy and never holds. The rest are in a view, or looks ([`Walk::looks`]).
     pub(super) fn vouch_reads(
         &mut self,
-        read: Result<(Vec<PathBuf>, Vec<PathBuf>), String>,
+        read: Result<(&[PathBuf], &[PathBuf]), &str>,
         disk: &impl Stamps,
     ) {
         let (files, listed) = match read {
             Ok(read) => read,
             Err(why) => {
-                self.read = Err(why);
+                self.read = Err(why.to_owned());
                 return;
             }
         };
@@ -981,16 +981,16 @@ impl Recording {
         // A listing of a directory above one of them is swept too: an entry made there moves it.
         let above = |path: &Path| self.dirs.iter().any(|dir| dir.starts_with(path));
         let mut swept = Vec::new_in(Global);
-        swept.extend(files.into_iter().filter(|it| under(it)).map(|path| (path, LookKind::Entry)));
+        swept.extend(files.iter().filter(|it| under(it)).map(|path| (path.as_path(), LookKind::Entry)));
         swept.extend(
-            listed.into_iter().filter(|it| under(it) || above(it)).map(|path| (path, LookKind::Listing)),
+            listed.iter().filter(|it| under(it) || above(it)).map(|path| (path.as_path(), LookKind::Listing)),
         );
         swept.sort_unstable();
         swept.dedup();
         let looked_ns = self.looked_ns;
         self.outputs.extend(swept.into_iter().map(|(path, kind)| Stamped {
-            stamp: disk.stamp(&path, kind),
-            path,
+            stamp: disk.stamp(path, kind),
+            path: path.to_owned(), // clone: kept with the answer, once a build kept
             kind,
             looked_ns,
         }));
@@ -1065,9 +1065,9 @@ impl Recording {
         // 2026-11-14 a watch vouched for each directory outside every view, and a look of
         // other than a file kept none: a build script that listed a directory was a walk in
         // every build.
-        let leaves = match leaves_of(&walk.looks) {
+        let leaves = match leaves_of(&walk.looks, Global) {
             Ok(leaves) => leaves,
-            Err(_) if planted(Plant::KeepsALook) => Box::default(),
+            Err(_) if planted(Plant::KeepsALook) => Vec::new_in(Global),
             Err(at) => return Err(Unkept::Looked(at)),
         };
         Ok(LastAnswer {
@@ -1086,11 +1086,11 @@ impl Recording {
 /// The looks of a walk as leaves, when every one kept a stamp and saw one thing
 /// ([`blaze_vfs::outside::Looks::twice`] finds none); else the path of the first look that is
 /// not so, for the reason.
-fn leaves_of(looks: &[blaze_vfs::outside::Look]) -> Result<Box<[Stamped]>, PathBuf> {
+fn leaves_of<A: Allocator + Clone>(looks: &[blaze_vfs::outside::Look], alloc: A) -> Result<Vec<Stamped, A>, PathBuf> {
     if let Some((first, _)) = blaze_vfs::outside::Looks::twice(looks).next() {
         return Err(first.path.clone()); // clone: a reason, once
     }
-    let mut leaves = Vec::with_capacity_in(looks.len(), Global);
+    let mut leaves = Vec::with_capacity_in(looks.len(), alloc);
     for look in looks {
         if look.stamp.is_unknown() {
             return Err(look.path.clone()); // clone: a reason, once
@@ -1102,7 +1102,7 @@ fn leaves_of(looks: &[blaze_vfs::outside::Look]) -> Result<Box<[Stamped]>, PathB
             looked_ns: look.looked_ns,
         });
     }
-    Ok(leaves.into_boxed_slice())
+    Ok(leaves)
 }
 
 /// The most request shapes a checkout keeps an answer of ([`Answers`]): the plans it keeps

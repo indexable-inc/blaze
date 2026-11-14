@@ -642,9 +642,11 @@ impl Daemon {
         if let Some(mut recording) = recording {
             // And the paths the steps read, as they say once the walk ended: the header, and
             // the build script's `OUT_DIR`, under the directory of outputs, stamped now.
+            let files = [PathBuf::from(HEADER), PathBuf::from(world.out_dir_path())];
+            let listed: &[PathBuf] = &[];
             let read = match world.names {
-                true => Ok((vec![PathBuf::from(HEADER), PathBuf::from(world.out_dir_path())], Vec::new())),
-                false => Err("a build script's run was not found kept".to_owned()),
+                true => Ok((files.as_slice(), listed)),
+                false => Err("a build script's run was not found kept"),
             };
             recording.vouch_reads(read, &self.disk);
             // A build that makes something says so, which one with nothing to do does not.
@@ -1052,7 +1054,8 @@ fn a_refusal_names_the_input() {
 /// nothing under its outputs, with no output: kept, or why not.
 fn kept(inputs: Inputs, looks: Vec<Look>) -> Last {
     let mut recording = Recording::new(inputs, BASE_NS, Vec::new(), []);
-    recording.vouch_reads(Ok((Vec::new(), Vec::new())), &Disk::new());
+    let none: &[PathBuf] = &[];
+    recording.vouch_reads(Ok((none, none)), &Disk::new());
     recording.end(Walk { passed: true, made_nothing: true, looks, worked: None })
 }
 
@@ -1277,7 +1280,8 @@ fn the_answers_kept_are_bounded_and_weighed() {
     };
     let kept = || {
         let mut recording = Recording::new(inputs.clone(), BASE_NS, vec![PathBuf::from(OUT[0])], [output.clone()]);
-        recording.vouch_reads(Ok((Vec::new(), Vec::new())), &daemon.disk);
+        let none: &[PathBuf] = &[];
+        recording.vouch_reads(Ok((none, none)), &daemon.disk);
         recording.end(Walk { passed: true, made_nothing: true, looks: Vec::new(), worked: None })
     };
     let mut answers: Answers<u32> = Answers::new();

@@ -194,7 +194,7 @@ use self::slab::{Table, Tagged};
 use super::{
     heads::Heads,
     image::{Images, Parts},
-    mounts::{Mounts, Sweep},
+    mounts::{Mounts, Stale, Sweep},
     observe::Ended,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
@@ -3462,7 +3462,7 @@ struct Job<S: Steps> {
     /// until its first view is made ready, which reads them again ([`Jobs::prepare`]): one
     /// sweep serves the certificate's check and the build. `None`: no sweep at the start (a
     /// job that began after its check missed), so `prepare` asks one.
-    swept: Option<Box<[String]>>,
+    swept: Option<Stale>,
     stage: Stage<S>,
     /// The value of the node its stage waits on, given before the node settles.
     value: Option<(NodeId, Value<S>)>,
@@ -5194,7 +5194,7 @@ impl<S: Steps> Jobs<S> {
         // stamps are in ([`Jobs::swept`]): the certificate's check is keyed by the locals'
         // contents, and the build reads them, so both wait for what is on the disk now.
         let Some(sweep) = w.mounts.sweep() else {
-            return self.begin_swept(w, id, view, work, idle, Box::default());
+            return self.begin_swept(w, id, view, work, idle, Stale::default());
         };
         match self.own_tag(Own::Sweep { job: id }) {
             Ok(tag) => {
@@ -5203,7 +5203,7 @@ impl<S: Steps> Jobs<S> {
                     "a start waits for the stamps of the paths outside the view",
                     leaves = sweep.leaves(),
                 );
-                w.effects.push(Effect::Stamp { files: sweep.names(), tag });
+                w.effects.push(sweep.effect(tag));
                 // alloc: none unless a local is mounted, then one a start in flight
                 self.sweeping.push(Sweeping { id, view, work, idle, sweep, _waits });
             }
@@ -5219,7 +5219,7 @@ impl<S: Steps> Jobs<S> {
         view: Option<Opened>,
         work: Work,
         idle: bool,
-        stale: Box<[String]>,
+        stale: Stale,
     ) {
         // A build or a check is checked against its certificate here, before it is a job
         // ([`Jobs::certify_begin`]): answered, or waiting for looks at its outputs, it is
@@ -5236,7 +5236,7 @@ impl<S: Steps> Jobs<S> {
     /// gone (cancelled) is let be.
     fn swept(&mut self, w: &mut World<'_, S>, id: JobId, done: Done) {
         let judged = |sweep: &Sweep| match &done {
-            Done::Stamped(stamps) => sweep.stale(stamps),
+            Done::Stamped(stamps) => sweep.stale(stamps).map_err(|it| it.to_string()),
             // alloc: an error, once a sweep
             Done::Failed(error) => Err(format!("stamping the {} leaves of the paths outside the view: {error}", sweep.leaves())),
             // alloc: as above
@@ -5278,7 +5278,7 @@ impl<S: Steps> Jobs<S> {
         work: Work,
         idle: bool,
         walks: Option<(String, ContentId)>,
-        swept: Option<Box<[String]>>,
+        swept: Option<Stale>,
     ) {
         let refused = self.refused.take();
         #[cfg(test)]
@@ -5404,7 +5404,7 @@ impl<S: Steps> Jobs<S> {
                     "a view waits for the stamps of the paths outside the view",
                     leaves = sweep.leaves(),
                 );
-                w.effects.push(Effect::Stamp { files: sweep.names(), tag });
+                w.effects.push(sweep.effect(tag));
                 if let Some(job) = self.jobs.get_mut(key_of(id)) {
                     job.stage = Stage::Sweep(Box::new(SweepWait { opened, sweep, _waits }));
                 }
@@ -5415,12 +5415,12 @@ impl<S: Steps> Jobs<S> {
 
     /// Job `id`'s view `opened` made ready with its sweep in: `stale`, the local mounts to
     /// read again first (off the loop, [`Does::Locals`]), or none, and the view is opened.
-    fn prepare_swept(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, stale: Box<[String]>) {
-        if stale.is_empty() {
+    fn prepare_swept(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, stale: Stale) {
+        if stale.ats.is_empty() {
             return self.open(w, id, opened, HashSet::new_in(Global));
         }
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
-        let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats: stale }); // clone: a refcount, once
+        let work = Step::of(&job.cancelled, Does::Locals { steps: w.steps.clone(), ats: stale.ats }); // clone: a refcount, once
         let fresh = lone(w.plane, NodeKind::Fetch, "paths outside the view, read again", Pool::Io, None, kinds::FETCH);
         job.stage = Stage::Locals(fresh.first(), opened);
         self.add(w, id, fresh, Some(work), false);
@@ -9867,7 +9867,14 @@ impl<S: Steps> Jobs<S> {
                 target: "blaze",
                 "no-op answer: the paths the build's steps read under its outputs",
             )
-            .in_scope(|| recorded.recording.vouch_reads(writer.read_outside(), &Disk));
+            .in_scope(|| {
+                let read = writer.read_outside();
+                let read = match &read {
+                    Ok((files, listed)) => Ok((files.as_slice(), listed.as_slice())),
+                    Err(why) => Err(why.as_str()),
+                };
+                recorded.recording.vouch_reads(read, &Disk)
+            });
         }
         // The documentation's front end is not kept: it sets `cfg(doc)`.
         let documenting = match documents {

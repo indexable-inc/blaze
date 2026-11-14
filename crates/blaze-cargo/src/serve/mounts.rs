@@ -74,10 +74,38 @@ pub struct Sweep {
     locals: Vec<SweptLocal>,
 }
 
+/// The local mounts a [`Sweep`] found must be read again before a job reads them, sorted by
+/// place ([`Sweep::stale`]): each with no leaves, and each with a leaf whose stamp no longer
+/// holds. Empty (its `Default`): none is.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Stale {
+    /// Where each is mounted.
+    pub ats: Box<[String]>,
+}
+
+/// A sweep's answer refused ([`Sweep::stale`]): the driver answered `answered` stamps for the
+/// `asked` leaves named, so no stamp can be matched to its leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepError {
+    pub asked: usize,
+    pub answered: usize,
+}
+
+impl std::fmt::Display for SweepError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the sweep of the paths outside the view asked {} stamps of the driver and was answered {}",
+            self.asked, self.answered
+        )
+    }
+}
+
 impl Sweep {
-    /// The names the driver stamps, a refcount: the effect and the sweep share them.
-    pub fn names(&self) -> std::sync::Arc<blaze_core::Names> {
-        std::sync::Arc::clone(&self.names)
+    /// The effect that asks the driver for the stamps of the sweep's names, tagged `tag`; the
+    /// effect and the sweep share the names (a refcount).
+    pub fn effect(&self, tag: blaze_core::Tag) -> blaze_core::Effect {
+        blaze_core::Effect::Stamp { files: std::sync::Arc::clone(&self.names), tag }
     }
 
     /// How many leaves are asked.
@@ -86,11 +114,11 @@ impl Sweep {
     }
 
     /// Where each local mount is that must be read again before a job reads it, sorted by
-    /// place, by `stamps`, the driver's answer for [`Sweep::names`] in order: one with no
-    /// leaves, and one any of whose leaves' stamp no longer holds
+    /// place, by `stamps`, the driver's answer for [`Sweep::effect`]'s names in order: one with
+    /// no leaves, and one any of whose leaves' stamp no longer holds
     /// ([`blaze_vfs::outside::holds`]). An answer of another length is refused, naming both
     /// lengths. A span with the counts: locals, leaves, stale.
-    pub fn stale(&self, stamps: &[blaze_core::Stamp]) -> Result<Box<[String]>, String> {
+    pub fn stale(&self, stamps: &[blaze_core::Stamp]) -> Result<Stale, SweepError> {
         let span = tracing::info_span!(
             target: "blaze",
             "sweep the stamps of the paths outside the view mounted where they are",
@@ -100,12 +128,7 @@ impl Sweep {
         )
         .entered();
         if stamps.len() != self.names.len() {
-            // alloc: an error, once a sweep
-            return Err(format!(
-                "the sweep of the paths outside the view asked {} stamps of the driver and was answered {}",
-                self.names.len(),
-                stamps.len()
-            ));
+            return Err(SweepError { asked: self.names.len(), answered: stamps.len() });
         }
         let mut stale = Vec::new_in(Global);
         let mut at = 0;
@@ -123,7 +146,7 @@ impl Sweep {
             }
         }
         span.record("stale", stale.len());
-        Ok(stale.into_boxed_slice())
+        Ok(Stale { ats: stale.into_boxed_slice() })
     }
 }
 
@@ -536,14 +559,15 @@ mod tests {
             return Err(format!("the sweep asked {asked:?}"));
         }
         let mut stamps: Vec<blaze_core::Stamp> = [1, 2, 5].map(|ino| leaf("/", ino).stamp).to_vec();
-        if *sweep.stale(&stamps)? != ["/b"] {
+        let stale = |stamps: &[blaze_core::Stamp]| sweep.stale(stamps).map_err(|it| it.to_string());
+        if *stale(&stamps)?.ats != ["/b"] {
             return Err("with nothing moved, other than `/b` stale".to_owned());
         }
         stamps[2].mtime_ns += 1;
-        if *sweep.stale(&stamps)? != ["/b", "/c"] {
+        if *stale(&stamps)?.ats != ["/b", "/c"] {
             return Err("with `/c` moved, other than `/b` and `/c` stale".to_owned());
         }
-        if sweep.stale(&stamps[..2]).is_ok() {
+        if sweep.stale(&stamps[..2]) != Err(SweepError { asked: 3, answered: 2 }) {
             return Err("an answer of another length was taken".to_owned());
         }
         Ok(())

@@ -22,7 +22,10 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::{
+    alloc::{Allocator, Global},
+    path::Path,
+};
 
 use blaze_api::ApiError;
 use blaze_vfs::Mode;
@@ -59,13 +62,21 @@ pub fn read(at: &str, probe: bool) -> Result<LocalRead, ApiError> {
 /// Every directory and file under `root` (itself included) that [`read_tree`] reads, with its
 /// `lstat` stamp, in the order walked; `.git` and what `skip` names left out as `read_tree`
 /// leaves them. Refused past [`MOST_FILES`] files, naming `at`.
-fn leaves_of(at: &str, root: &Path, skip: impl Fn(&str) -> bool) -> Result<Vec<LocalLeaf>, ApiError> {
+fn leaves_of<A: Allocator + Clone>(
+    at: &str,
+    root: &Path,
+    skip: impl Fn(&str) -> bool,
+    alloc: A,
+) -> Result<Vec<LocalLeaf, A>, ApiError> {
     let failed = |what: String| ApiError::new(what, Some(at.to_owned()));
     let path_of = |path: &Path| {
         path.to_str().map(str::to_owned).ok_or_else(|| failed(format!("`{}`, under `{at}`, is not UTF-8", path.display())))
     };
-    let mut leaves = vec![LocalLeaf { path: path_of(root)?, stamp: blaze_vfs::outside::lstat(root) }];
-    let mut dirs = vec![(root.to_owned(), String::new())];
+    let mut leaves = Vec::new_in(alloc);
+    leaves.push(LocalLeaf { path: path_of(root)?, stamp: blaze_vfs::outside::lstat(root) });
+    // The directories left to list: the walk's own, gone when it ends.
+    let mut dirs = Vec::new_in(Global);
+    dirs.push((root.to_owned(), String::new()));
     let mut files = 0usize;
     // Bounded: each turn takes one directory, and every directory is pushed once.
     while let Some((dir, under)) = dirs.pop() {
@@ -126,7 +137,7 @@ pub fn read_at(at: &str) -> Result<LocalRead, ApiError> {
             // Stamped before any file is read: a write after a stamp moves it, so the next job
             // reads the local again.
             let leaves = match plain() {
-                true => Some(leaves_of(at, path, blaze_vfs::watch::fixed_out)?.into_boxed_slice()),
+                true => Some(leaves_of(at, path, blaze_vfs::watch::fixed_out, Global)?.into_boxed_slice()),
                 false => None,
             };
             let files = read_tree(path, blaze_vfs::watch::fixed_out)
