@@ -22,24 +22,35 @@
 //! that key; a serve that makes another key takes the crate as any crate with no record is
 //! taken, from its declared files, which read their text when first asked. So a stale record
 //! costs a miss and can never serve an image of other inputs.
+//!
+//! What a start does with it (`super::serve_found`): the record also holds the crate's key as
+//! the serve that stored it walked it ([`Found::base`]), so a database made freshly is given
+//! the image filed under that key alone (a crate that read nothing: the record's filed key is
+//! its base; one filed by its reads is left to the first serve, whose walk values them) before
+//! any query of the crate runs, in the commit that gives the session's makers. The first serve
+//! after walks the crate's key from the database as always: equal to the base, the crate is
+//! kept as given (its arena is not made again for it); another, it is fetched again under the
+//! key walked, or withdrawn, as a crate whose key moved always was. So the rule above holds
+//! for every use: no task reads a crate before a serve's own key of it has checked its image.
 
 use blaze_ids::{ContentId, Hasher};
 
 use super::key::absolute;
 
-/// The domain of the key a crate's found record is kept under ([`found_key`]).
-pub const FOUND_DOMAIN: &str = "blaze v2 found record 2";
+/// The domain of the key a crate's found record is kept under ([`found_key`]). 3: the record
+/// holds the crate's key ([`Found::base`]).
+pub const FOUND_DOMAIN: &str = "blaze v2 found record 3";
 
 /// The record's layout: its first word. A record of another layout is under another key
 /// ([`found_key`] covers it) and, were it read all the same, is refused by name
 /// ([`FoundError::Layout`]).
 ///
-/// 1: the layout word (`u32`), the filed key (32 bytes), the families (`u32`, [`family`]),
-/// one byte saying whether the
+/// 2: the layout word (`u32`), the filed key (32 bytes), the families (`u32`, [`family`]),
+/// the crate's key ([`Found::base`], 32 bytes), one byte saying whether the
 /// crate's own surface follows (0 or 1) and, when it does, its length (`u32`) and bytes, the count of files (`u32`), then
 /// each file as its path's length (`u32`), the path's bytes and its content ID (32 bytes),
-/// by path. Every integer little-endian.
-pub const LAYOUT: u32 = 1;
+/// by path. Every integer little-endian. 1 had no crate's key.
+pub const LAYOUT: u32 = 2;
 
 /// Where the found record of the crate whose plan key is `plan` is, as front end `front_end`
 /// (its code identity, the image key's `build`) wrote it: the plan key (which covers what the
@@ -80,6 +91,10 @@ pub struct Found {
     filed: ContentId,
     /// Which record families the writer put under the filed key ([`family`]).
     families: u32,
+    /// The crate's key ([`super::keys`], `deps::Image`'s base) as the serve that stored the
+    /// image walked it: the key a start fetches the image under, its reads' values checked
+    /// ([`super::serve_found`]), and that the first serve after compares its own walk with.
+    base: ContentId,
     /// The crate's own surface as the lowering keeps it (`blaze_lower`'s
     /// `Lowered::own_surface`: the crate's own part of what a front end above may read of
     /// it, before its dependencies' are folded in), when it has one; opaque here, read by
@@ -165,11 +180,13 @@ fn under_package(path: &str) -> bool {
 }
 
 impl Found {
-    /// The record of a crate whose image is filed under `filed` with `families` beside it
+    /// The record of a crate of key `base` ([`Found::base`]) whose image is filed under
+    /// `filed` with `families` beside it
     /// ([`family`]; the image's own bit among them), whose own surface is
     /// `own_surface` and whose package holds `files`, in any order: sorted here. Refused for a path not under the package and for
     /// two files of one path.
     pub fn new(
+        base: ContentId,
         filed: ContentId,
         families: u32,
         own_surface: Option<Vec<u8>>,
@@ -189,12 +206,17 @@ impl Found {
                 return Err(FoundError::Order { path: path.clone() });
             }
         }
-        Ok(Found { filed, families, own_surface, files })
+        Ok(Found { filed, families, base, own_surface, files })
     }
 
     /// The key the crate's image is filed under.
     pub fn filed(&self) -> ContentId {
         self.filed
+    }
+
+    /// The crate's key as the serve that stored its image walked it.
+    pub fn base(&self) -> ContentId {
+        self.base
     }
 
     /// The families the writer put ([`family`]).
@@ -225,10 +247,11 @@ impl Found {
         let paths: usize = self.files.iter().map(|(path, _)| path.len()).sum();
         // alloc: the record's bytes, handed to the store's put
         let own = self.own_surface.as_ref().map_or(0, Vec::len);
-        let mut out = Vec::with_capacity(4 + 32 + 4 + 5 + own + 4 + self.files.len() * 36 + paths);
+        let mut out = Vec::with_capacity(4 + 32 + 4 + 32 + 5 + own + 4 + self.files.len() * 36 + paths);
         out.extend_from_slice(&LAYOUT.to_le_bytes());
         out.extend_from_slice(&self.filed.0);
         out.extend_from_slice(&self.families.to_le_bytes());
+        out.extend_from_slice(&self.base.0);
         match &self.own_surface {
             None => out.push(0),
             Some(own) => {
@@ -271,6 +294,7 @@ impl Found {
         if families & !family::ALL != 0 || families & family::IMAGE == 0 {
             return Err(FoundError::Families { found: families });
         }
+        let base = id(take(32, "crate's key")?);
         let own_surface = match take(1, "surface flag")?[0] {
             0 => None,
             1 => {
@@ -301,7 +325,7 @@ impl Found {
         if at != bytes.len() {
             return Err(FoundError::Trailing { at });
         }
-        Ok(Found { filed, families, own_surface, files })
+        Ok(Found { filed, families, base, own_surface, files })
     }
 }
 
@@ -368,12 +392,15 @@ mod tests {
         let filed = id(filed);
         let kept: usize = tape.int_in(0..=32, "kept");
         let surface = tape.bool("surface").then(|| id(50).0[..kept].to_vec());
-        let found =
-            Found::new(filed, family::ALL, surface.clone(), files.clone()).expect("generated paths are under the package");
+        let base: u64 = tape.int_in(10..=13, "base");
+        let base = id(base);
+        let found = Found::new(base, filed, family::ALL, surface.clone(), files.clone())
+            .expect("generated paths are under the package");
         let bytes = found.encode().unwrap();
         let read = Found::decode(&bytes).unwrap();
         assert_eq!(read, found);
         assert_eq!(read.filed(), filed);
+        assert_eq!(read.base(), base);
         assert_eq!(read.families(), family::ALL);
         assert!(read.has(family::ITEM_PAGES | family::IMAGE));
         assert_eq!(read.own_surface(), surface.as_deref());
@@ -388,14 +415,16 @@ mod tests {
             let by = turn % other.len();
             other.rotate_left(by);
         }
-        assert_eq!(Found::new(filed, family::ALL, surface.clone(), other).unwrap().encode().unwrap(), bytes);
-        // And the bytes tell records apart: another filed key, or one file's content.
-        assert_ne!(Found::new(id(99), family::ALL, surface.clone(), sorted.clone()).unwrap().encode().unwrap(), bytes);
+        assert_eq!(Found::new(base, filed, family::ALL, surface.clone(), other).unwrap().encode().unwrap(), bytes);
+        // And the bytes tell records apart: another filed key, another crate's key, or one
+        // file's content.
+        assert_ne!(Found::new(base, id(99), family::ALL, surface.clone(), sorted.clone()).unwrap().encode().unwrap(), bytes);
+        assert_ne!(Found::new(id(97), filed, family::ALL, surface.clone(), sorted.clone()).unwrap().encode().unwrap(), bytes);
         let other_surface = if surface.is_some() { None } else { Some(id(51).0.to_vec()) };
-        assert_ne!(Found::new(filed, family::ALL, other_surface, sorted.clone()).unwrap().encode().unwrap(), bytes);
+        assert_ne!(Found::new(base, filed, family::ALL, other_surface, sorted.clone()).unwrap().encode().unwrap(), bytes);
         if let Some(first) = sorted.first_mut() {
             first.1 = id(98);
-            assert_ne!(Found::new(filed, family::ALL, surface, sorted).unwrap().encode().unwrap(), bytes);
+            assert_ne!(Found::new(base, filed, family::ALL, surface, sorted).unwrap().encode().unwrap(), bytes);
         }
     }
 
@@ -405,7 +434,7 @@ mod tests {
     fn a_record_cut_anywhere_is_refused() {
         blaze_sim::check(Config::DEFAULT, |tape| {
             let surface = tape.bool("surface").then(|| id(50).0.to_vec());
-            let found = Found::new(id(1), family::ALL, surface, drawn(tape)).unwrap();
+            let found = Found::new(id(3), id(1), family::ALL, surface, drawn(tape)).unwrap();
             let bytes = found.encode().unwrap();
             let cut: usize = tape.index(bytes.len(), "cut");
             assert!(
@@ -422,29 +451,40 @@ mod tests {
 
     #[test]
     fn a_previous_or_foreign_layout_is_refused_by_name() {
-        let mut bytes = Found::new(id(1), family::ALL, None, vec![("src/lib.rs".to_owned(), id(2))]).unwrap().encode().unwrap();
+        let mut bytes =
+            Found::new(id(3), id(1), family::ALL, None, vec![("src/lib.rs".to_owned(), id(2))]).unwrap().encode().unwrap();
         bytes[0] = 0;
         let refused = Found::decode(&bytes).unwrap_err();
         assert_eq!(refused, FoundError::Layout { found: 0 });
-        assert!(refused.to_string().contains("its layout is 0 and this blaze reads layout 1"), "{refused}");
-        bytes[0] = 2;
-        assert_eq!(Found::decode(&bytes), Err(FoundError::Layout { found: 2 }));
+        assert!(refused.to_string().contains("its layout is 0 and this blaze reads layout 2"), "{refused}");
+        // The previous layout (no crate's key) and a later one.
         bytes[0] = 1;
-        bytes[40] = 7;
+        assert_eq!(Found::decode(&bytes), Err(FoundError::Layout { found: 1 }));
+        bytes[0] = 3;
+        assert_eq!(Found::decode(&bytes), Err(FoundError::Layout { found: 3 }));
+        bytes[0] = 2;
+        // The surface flag, after the layout, the filed key, the families and the crate's key.
+        bytes[72] = 7;
         assert_eq!(Found::decode(&bytes), Err(FoundError::SurfaceFlag { found: 7 }));
         // A family this layout does not know, or no image: refused written and read.
-        assert_eq!(Found::new(id(1), 1 << 9 | family::IMAGE, None, Vec::new()), Err(FoundError::Families { found: 1 << 9 | 1 }));
-        assert_eq!(Found::new(id(1), family::ITEM_PAGES, None, Vec::new()), Err(FoundError::Families { found: family::ITEM_PAGES }));
-        let pages_only = Found::new(id(1), family::IMAGE | family::DEF_MAP_PAGES, None, Vec::new()).unwrap();
+        assert_eq!(Found::new(id(3), id(1), 1 << 9 | family::IMAGE, None, Vec::new()), Err(FoundError::Families { found: 1 << 9 | 1 }));
+        assert_eq!(Found::new(id(3), id(1), family::ITEM_PAGES, None, Vec::new()), Err(FoundError::Families { found: family::ITEM_PAGES }));
+        let pages_only = Found::new(id(3), id(1), family::IMAGE | family::DEF_MAP_PAGES, None, Vec::new()).unwrap();
         assert!(!pages_only.has(family::ITEM_PAGES), "an image written before item pages is a miss of them");
         let mut unknown = pages_only.encode().unwrap();
         unknown[37] = 0x80;
         assert_eq!(Found::decode(&unknown), Err(FoundError::Families { found: 0x8003 }));
         // And a record of another layout is never asked for: its key is another.
         let (plan, front_end) = (id(7), id(70));
-        let mut other = Hasher::new(FOUND_DOMAIN);
-        other.id(&plan).id(&front_end).update(&2u32.to_le_bytes());
-        assert_ne!(found_key(plan, front_end), other.finish());
+        for layout in [1u32, 3] {
+            let mut other = Hasher::new(FOUND_DOMAIN);
+            other.id(&plan).id(&front_end).update(&layout.to_le_bytes());
+            assert_ne!(found_key(plan, front_end), other.finish(), "layout {layout}");
+        }
+        // Nor one of the domain the previous layout was kept under.
+        let mut previous = Hasher::new("blaze v2 found record 2");
+        previous.id(&plan).id(&front_end).update(&1u32.to_le_bytes());
+        assert_ne!(found_key(plan, front_end), previous.finish());
         assert_ne!(found_key(plan, front_end), found_key(id(8), front_end));
         // Another front end's record is never asked for.
         assert_ne!(found_key(plan, front_end), found_key(plan, id(71)));
@@ -454,16 +494,28 @@ mod tests {
     #[test]
     fn a_path_that_is_not_under_the_package_is_refused_written_and_read() {
         for path in ["/home/u/p/src/lib.rs", "C:\\p\\lib.rs", "C:/p/lib.rs", "../x.rs", "src/../../x.rs", "src//x.rs", "src/", "", "./x.rs", "a\\b.rs", "a\0b"] {
-            let refused = Found::new(id(1), family::ALL, None, vec![(path.to_owned(), id(2))]);
+            let refused = Found::new(id(3), id(1), family::ALL, None, vec![(path.to_owned(), id(2))]);
             assert_eq!(refused, Err(FoundError::NotUnderPackage { path: path.to_owned() }), "{path:?}");
             // The same bytes a writer without the rule would have written.
-            let unchecked = Found { filed: id(1), families: family::IMAGE, own_surface: None, files: vec![(path.to_owned(), id(2))] };
+            let unchecked = Found {
+                filed: id(1),
+                families: family::IMAGE,
+                base: id(3),
+                own_surface: None,
+                files: vec![(path.to_owned(), id(2))],
+            };
             let read = Found::decode(&unchecked.encode().unwrap());
             assert_eq!(read, Err(FoundError::NotUnderPackage { path: path.to_owned() }), "{path:?} read");
         }
         let twice = vec![("a.rs".to_owned(), id(1)), ("a.rs".to_owned(), id(2))];
-        assert_eq!(Found::new(id(1), family::ALL, None, twice), Err(FoundError::Order { path: "a.rs".to_owned() }));
-        let unsorted = Found { filed: id(1), families: family::IMAGE, own_surface: None, files: vec![("b.rs".to_owned(), id(1)), ("a.rs".to_owned(), id(2))] };
+        assert_eq!(Found::new(id(3), id(1), family::ALL, None, twice), Err(FoundError::Order { path: "a.rs".to_owned() }));
+        let unsorted = Found {
+            filed: id(1),
+            families: family::IMAGE,
+            base: id(3),
+            own_surface: None,
+            files: vec![("b.rs".to_owned(), id(1)), ("a.rs".to_owned(), id(2))],
+        };
         assert_eq!(
             Found::decode(&unsorted.encode().unwrap()),
             Err(FoundError::Order { path: "a.rs".to_owned() }),

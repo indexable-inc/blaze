@@ -761,6 +761,12 @@ impl Db {
         if made.renewed {
             self.nonce = Nonce::new();
         }
+        // The old snapshot is released by the assignment below: with it, every entry the
+        // dropped arenas held (a sealed std crate's def maps, bodies and types among them).
+        // Its own span, so a commit's time splits into making the next snapshot (`db commit
+        // make`, in `world::commit`) and freeing what the old one dropped.
+        let _release = tracing::info_span!(target: "blaze", "db commit release", dropped = made.dropped.len() as u64)
+            .entered();
         // The old snapshot released here (unless a reader holds it), so the file sets the edit
         // changed where they are are written in place in the new one's inputs, before any
         // query runs on it: nothing after this point can fail, so a commit that panicked
@@ -772,6 +778,7 @@ impl Db {
         self.files.publish_included(seq);
         self.files.forget();
         world.forget();
+        drop(_release);
         Committed { crates, dropped: made.dropped, moved: true }
     }
 

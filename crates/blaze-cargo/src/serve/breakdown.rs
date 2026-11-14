@@ -23,7 +23,10 @@
 //!   bytes`, `pool loaded bytes`, `pool prefetched bytes`, `pool evicted bytes` and `pool
 //!   pinned bound waits`, and the tasks' direct reads ([`blaze_cas::direct::counts`]):
 //!   `direct records read`, `direct bytes read`, `direct reads`, `direct runs`, `direct files
-//!   opened`, `direct maps`, `direct mapped bytes` and `direct leaked bytes`;
+//!   opened`, `direct maps`, `direct mapped bytes` and `direct leaked bytes`, and what reads
+//!   and maps cost a restart: `direct device blocks`, `direct first touch blocks`, `direct
+//!   blocks found in memory at first touch`, `direct map waits`, `direct widest read round`
+//!   and `direct widest map round`;
 //!   `stack bytes` (what the live fibers' stacks hold, [`blaze_graph::sched::stack::resident`])
 //!   and `threads` (the process's threads, each with a stack and heaps of its own).
 //!
@@ -163,6 +166,18 @@ pub(super) fn plot(memory: &Snapshot, heap: u64, shown: &mut Shown) {
     let (longest_wait_ns, longest_run) = blaze_cas::direct::take_longest();
     plot_named("direct longest wait ns", longest_wait_ns);
     plot_named("direct longest run bytes", longest_run);
+    // What the device was asked for, in blocks of `blaze_cas::direct::AROUND` (a read's span
+    // `store direct reads` says its own), against what a restart found in memory: each pack's
+    // first touch counts the blocks its record lies in, and those the page cache held. The
+    // waits that were maps (each a span `store direct maps`), and the widest round of each,
+    // as the interval's maxima (`take_widest`): a batch's reads or maps are one round.
+    plot_named("direct device blocks", direct.blocks_read);
+    plot_named("direct first touch blocks", direct.first_touch_blocks);
+    plot_named("direct blocks found in memory at first touch", direct.first_touch_held);
+    plot_named("direct map waits", direct.map_waits);
+    let (widest_reads, widest_maps) = blaze_cas::direct::take_widest();
+    plot_named("direct widest read round", widest_reads);
+    plot_named("direct widest map round", widest_maps);
     // The part of the footprint past the heaps that is not an allocator's: the fibers' stacks,
     // and the threads that each hold a stack and heaps of their own.
     blaze_profile::plot(Plot::StackBytes, blaze_graph::sched::stack::resident());

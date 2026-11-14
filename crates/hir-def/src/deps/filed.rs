@@ -328,6 +328,25 @@ pub(super) fn search<T>(
     }
 }
 
+/// [`search`]'s first step alone: the value `found` finds under `key` itself, the crate having
+/// read nothing (no slot is walked, so no read is valued and no query of the crate runs), with
+/// the logs noted as [`search`] notes them for such a value (no `env!` variable, no expansion,
+/// no file outside the VFS). `None`, and nothing noted, when there is none: whether the
+/// crate's reads find one is [`search`]'s to say, which a start leaves to the first serve
+/// ([`super::serve::serve_found`]).
+pub(super) fn under_key_alone<T>(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    found: impl FnOnce(ContentId) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String> {
+    let Some(it) = found(key)? else { return Ok(None) };
+    let krate_key = krate.key(db);
+    db.files().included_are_served(krate_key, Vec::new());
+    db.files().expansions_are_read(krate_key, ReadBy::Served(key), Vec::new());
+    Ok(Some(it))
+}
+
 /// Keeps `list`, the read-list of the reads of `krate` ([`reads::write_list`]), in the first
 /// slot of `key` that holds it or is free. Two writers that keep other reads in one slot at
 /// once each see the other's and move on.

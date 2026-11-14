@@ -55,9 +55,9 @@ pub use crate::deps::{
     },
     reads::{READS_DOMAIN, Reads, SLOTS, image_key, slot},
     serve::{
-        ImageStore, KEPT_DOMAIN, PAGES_DOMAIN, ReadThrough, Refused, Served, StoreError, Stored,
-        StoredOf, Which, filing_keys, front_keys, image_parts, kept_key, pages_key, serve, store,
-        withdrawn,
+        ImageStore, KEPT_DOMAIN, Lowered, PAGES_DOMAIN, ReadThrough, Refused, Served, StoreError,
+        Stored, StoredOf, Which, filing_keys, front_keys, image_parts, kept_key, pages_key, serve,
+        serve_found, serve_keeping, store, withdrawn,
     },
 };
 pub use crate::nameres::frozen::Mode;

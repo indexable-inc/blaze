@@ -3073,6 +3073,13 @@ fn a_cfg_write(plant: Plant) -> Result<(), String> {
     evaluate_in(&db, &keys);
     db.plant(plant);
     let before = arenas_of(&db, keys);
+    // The arenas themselves (index and generation): a crate made again keeps its index (the
+    // order did not move) under a new generation, so an index alone cannot show a remake.
+    let made = |db: &Db, key: CrateKey| {
+        use blaze_memo::Id as _;
+        db.krate(key).gid().arena()
+    };
+    let (top_was, other_was) = (made(&db, top), made(&db, other));
     let committed = db.commit_with(|edit| {
         edit.set_crate_cfg_options(lib, cfg(&[flag("from_build_script")]));
     });
@@ -3089,8 +3096,9 @@ fn a_cfg_write(plant: Plant) -> Result<(), String> {
         ));
     }
     assert_eq!(db.krate(lib).cfg_options(&db), &cfg(&[flag("from_build_script")]));
-    assert_eq!(arena_of(&db, other), before[2], "`other` kept its arena");
-    assert_ne!(arena_of(&db, top), before[1], "`top`, its dependent, made again");
+    assert_eq!(made(&db, other), other_was, "`other` kept its arena");
+    assert_ne!(made(&db, top), top_was, "`top`, its dependent, made again");
+    assert_eq!(made(&db, top).index(), before[1], "`top` made again at its index");
     Ok(())
 }
 
@@ -3105,6 +3113,50 @@ fn a_cfg_write_drops_its_crate_and_dependents_alone() {
     a_cfg_write(Plant::None).unwrap_or_else(|why| panic!("{why}"));
     let planted = a_cfg_write(Plant::ListMarksSession).expect_err("a cfg write that dropped the session was not caught");
     assert!(planted.contains("dropped arenas"), "{planted}");
+}
+
+/// Two source roots committed with no crate, then under `plant` a crate graph whose `lib` is
+/// sealed and rooted in root 1, beside `top` on root 0 depending on it: the root's arena,
+/// carried from the first commit unsealed, must be made again sealed, so the snapshot is
+/// built (a sealed arena borrows only sealed ones) and `lib`'s root's arena is dropped; the
+/// panic's text when the build refuses it.
+fn a_root_sealed_after_it_was_made(plant: Plant) -> Result<(), String> {
+    let mut db = test_db();
+    let (lib_file, top_file) = (FileId::from_raw(0), FileId::from_raw(1));
+    put_root(&mut db, 0, &[(top_file, "/top/lib.rs", "pub fn caller() {}")]);
+    put_root(&mut db, 1, &[(lib_file, "/lib/lib.rs", "pub fn callee() {}")]);
+    db.plant(plant);
+    let mut graph = CrateGraphBuilder::default();
+    let lib = add(&mut graph, lib_file, CfgOptions::default(), Env::default());
+    graph.seal(lib, ContentId::of("base-db root sealed later test pin", b"lib"));
+    let top = add(&mut graph, top_file, CfgOptions::default(), Env::default());
+    depend(&mut graph, top, lib, "lib");
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.commit_with(|edit| {
+            edit.set_crate_graph(graph);
+        })
+    }));
+    let committed = built.map_err(|payload| match payload.downcast_ref::<String>() {
+        Some(text) => text.clone(), // clone: the panic's text, for the oracle
+        None => "a commit panicked with no text".to_owned(),
+    })?;
+    // Roots are at 2 and 3 (session 0, list 1): root 1's, which `lib` is rooted in, is 3.
+    assert!(committed.dropped.contains(&3), "the root sealed now was made again: {:?}", committed.dropped);
+    assert!(!committed.dropped.contains(&0), "sealing a root dropped the session: {:?}", committed.dropped);
+    Ok(())
+}
+
+/// The invariant: an arena whose seal moved since it was made (a source root a sealed crate
+/// came to be rooted in, with no write of the root) is made again with its new seal, so no
+/// sealed arena borrows an unsealed one, and nothing else is dropped for it. While the crate
+/// list was the session's, every crate listed dropped every arena and hid this. The control:
+/// with `Plant::SealCarried` (the seal not compared) the snapshot's build refuses the sealed
+/// `lib` borrowing its unsealed root.
+#[test]
+fn a_root_sealed_after_it_was_made_is_made_again_sealed() {
+    a_root_sealed_after_it_was_made(Plant::None).unwrap_or_else(|why| panic!("{why}"));
+    let planted = a_root_sealed_after_it_was_made(Plant::SealCarried).expect_err("a root carried with its old seal was not caught");
+    assert!(planted.contains("is sealed but its dependency"), "{planted}");
 }
 
 /// [`two_roots`] with `a`'s and `c`'s arenas holding a query's value, then a crate `d` added

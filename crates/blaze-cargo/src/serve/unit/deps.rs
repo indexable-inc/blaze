@@ -273,6 +273,9 @@ pub(crate) fn images(
     if moved.is_empty() {
         // `keyed` holds every key walked already.
         session.walked.note(at, build, noted.iter());
+        // A crate walked here unserved is lowered in its arena as it is now (one made again
+        // under an unmoved key among them).
+        session.lowered.note(lowered.db(), noted.iter().copied());
         return Ok(None);
     }
     moved.sort_unstable();
@@ -288,7 +291,9 @@ pub(crate) fn images(
     // the edit, so nothing of it is written.
     let images = &*session.images;
     let served = lowered
-        .serve_deps(&moved, build, images, mode, |edit, given| give_slots(edit, given, images, mode))
+        .serve_deps(&moved, build, images, mode, &session.lowered, |edit, given| {
+            give_slots(edit, given, images, mode)
+        })
         .map(|(served, _)| served)
         .map_err(super::lower_error);
     let served = match served {
@@ -305,6 +310,9 @@ pub(crate) fn images(
     // record that a later serve at this view could skip on with the old keys (rule 21).
     session.keyed.extend(by_key);
     session.walked.note(at, build, noted.iter());
+    // As the serve's commit left them: a crate given an image is noted served, one given none
+    // lowered in the arena it has now.
+    session.lowered.note(lowered.db(), noted.iter().copied());
     // Written: what was walked stands again only once [`serve`] is done and stamps its view.
     session.walked.at = None;
     let Served { nonce, keys, hits, stale, old_layout, build, lookups, stored, withdrawn } = served;
@@ -373,6 +381,11 @@ pub(crate) struct Session {
     /// again exactly the crates whose key moved since. By the crate's key: a serve's commit
     /// kills the ids of the crates it served.
     keyed: HashMap<CrateKey, ContentId, Global>,
+    /// The crates the database holds lowered ([`hir_def::deps::Lowered`]): each crate [`images`]
+    /// walked that it gave no image, with its id then. A serve asks the store for none whose
+    /// arena is still that one, whatever its key says: a crate lowered in this session stays
+    /// lowered, and only one with no arena noted yet, or made again since, takes an image.
+    lowered: hir_def::deps::Lowered,
     /// The crates [`images`] keyed and the database's view they were keyed at, or that the
     /// [`serve`] that served them left: a later serve of those crates at the same view (no
     /// write came between, so each key is the one `keyed` holds) walks nothing.
@@ -594,6 +607,7 @@ pub(crate) fn session(
         refused: HashMap::new_in(Global),
         env: read,
         keyed: HashMap::new_in(Global),
+        lowered: hir_def::deps::Lowered::default(),
         walked: Walked::new(),
         lookups: Lookups::default(),
     })
@@ -900,7 +914,20 @@ pub(crate) fn store(
                     Some(root.to_owned()),
                 )
             })?;
-            let bytes = Found::new(filed, stored.families | tables, lowered.own_surface(krate), files)
+            // The crate's key the serve walked, which its image was stored under: a start
+            // gives the image back under it before any query runs ([`find`]), and the first
+            // serve keeps it only while its own walk says the same key. A stored crate the
+            // serve walked no key of is a bug of the serve's: said, naming the crate.
+            let base = kept
+                .and_then(|kept| kept.served.keys.get(&krate.key(db)))
+                .copied()
+                .ok_or_else(|| {
+                    ApiError::new(
+                        format!("the crate {} was stored and the serve walked no key of it", named()),
+                        Some(root.to_owned()),
+                    )
+                })?;
+            let bytes = Found::new(base, filed, stored.families | tables, lowered.own_surface(krate), files)
                 .and_then(|found| found.encode())
                 .map_err(|why| {
                     ApiError::new(
@@ -1050,7 +1077,7 @@ pub(crate) fn find(lowered: &mut Lowered, store: &blaze_cas::Reader) -> Result<(
             )
         })?;
         lowered
-            .take_found(krate, found.filed(), found.own_surface())
+            .take_found(krate, found.filed(), found.base(), found.own_surface())
             .map_err(super::lower_error)?;
         hits += 1;
     }
@@ -1756,6 +1783,13 @@ impl hir_def::nameres::frozen::entries::Entries for Images {
 /// Known before any query runs, they are written before any: the one commit drops arenas that
 /// hold nothing. Each is a fact of the build or the mode alone, so a later serve that gave one
 /// again would move nothing; none does.
+///
+/// And in the same commit, the image (with its impl tables and kept roots) of each crate
+/// whose found record [`find`] took, filed under the crate's key alone
+/// ([`Lowered::found_images`]): a start that will serve a crate gives its image before any
+/// query of the crate runs, where until 2026-11-14 the first serve gave it after the key walk
+/// had filled the crate's arena, and the gift's commit dropped that arena and every one above
+/// it (the restart's 3.1 s `db commit`, a guess at its share). Call [`find`] first.
 pub(crate) fn makers(
     lowered: &mut Lowered,
     session: &mut Session,
@@ -1774,7 +1808,25 @@ pub(crate) fn makers(
     // same fact, and nothing evaluated is dropped for it.
     let held_fact = entries::store_fact(ContentId::of("blaze-cargo entry holder", b"session images"));
     let consts_fact = consts::session_fact(mode);
+    // The images the found records name ([`find`], which runs first), each with its impl
+    // tables and kept roots ([`give_slots`]), in this same commit: before any query of the
+    // crate runs, so the first serve, whose walk keys the crate under the record's base, keeps
+    // it (`hir_def::deps::serve_found`) and makes its arena again for nothing. A crate whose
+    // image is filed by its reads is left to that serve.
+    let images = &*session.images;
+    let found = lowered.found_images(images, mode).map_err(super::lower_error)?;
     let mut edit = lowered.served_db().edit();
+    for given in &found {
+        // clone: an image's handle, once per crate given one
+        hir_def::deps::give_image(&mut edit, given.krate, given.krate_id, given.image.clone());
+    }
+    give_slots(&mut edit, &found, images, mode).map_err(|why| {
+        // alloc: error path
+        ApiError::new(
+            format!("giving the images {} found records named: {why}", found.len()),
+            None,
+        )
+    })?;
     blaze_item_hash::identity::give_build(&mut edit, build);
     edit.set_given(
         None,

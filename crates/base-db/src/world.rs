@@ -11,20 +11,26 @@
 //! and rebuilds those arenas' table rows.
 //!
 //! Arenas: index 0 is the session arena (settings, process environment, library and local
-//! roots, named paths, the crate list's digest ([`List`]: of each listed crate's item key and
-//! root path, not of its content ID), and the files of no source root); indices
-//! `1..=roots` are the source roots' (each root's files in an open arena of its own, by root
-//! id, [`Layout`]); then a crate's index is `roots + 1 +` its place in [`Crates::order`], every
-//! crate after the crates it depends on. Each crate arena borrows its dependencies, the
-//! session and its root file's root; a root another crate reaches (a `#[path]` module across
-//! packages) is borrowed by the entries that name or read it. A crate's attribute files live
-//! in its own arena. A crate whose sources are pinned ([`crate::CrateData::sealed`]) and whose
-//! dependencies are all sealed is sealed, and so is the root it is rooted in. Sealing changes
-//! what a commit drops not at all: a write to a sealed crate (a build script's env, a gift,
-//! a maker) drops that crate's arena and every arena that borrowed from it, its dependents,
-//! never the session's; only what the session arena holds moving drops it (a crate's cfg,
-//! which is in its item key, so in the list), and with it every arena. A commit's span names
-//! each arena it marked and why ([`describe`]).
+//! roots, named paths, the session's makers, and the files of no source root); index 1
+//! ([`LIST_ARENA`]) is the crate list's, an open arena borrowing only the session whose one
+//! input ([`AllCrates`], an ordinary input whose handle the table keeps in
+//! `Table::list_input`, not a singleton, which the engine keeps in the session alone) holds
+//! the list's digest ([`List`]: of each listed crate's item key and root path, not of its
+//! content ID); indices `FIRST_ROOT..FIRST_ROOT + roots` are the source roots' (each root's
+//! files in an open arena of its own, by root id, [`Layout`]); then a crate's index is
+//! `FIRST_ROOT + roots +` its place in [`Crates::order`], every crate after the crates it
+//! depends on. Each crate arena borrows its dependencies, the session and its root file's
+//! root, and not the list: an entry that reads the list (a lookup by key that finds no crate,
+//! `all_crates`) borrows it when it reads it. A root another crate reaches (a `#[path]`
+//! module across packages) is borrowed by the entries that name or read it. A crate's
+//! attribute files live in its own arena. A crate whose sources are pinned
+//! ([`crate::CrateData::sealed`]) and whose dependencies are all sealed is sealed, and so is
+//! the root it is rooted in. Sealing changes what a commit drops not at all: a write to a
+//! sealed crate (a build script's env, a gift, a maker) drops that crate's arena and every
+//! arena that borrowed from it, its dependents, never the session's. A crate's cfg, in its
+//! item key and so in the list, drops the list's arena, the crate's and its dependents' and
+//! what read the list; only what the session arena holds moving drops the session, and with
+//! it every arena. A commit's span names each arena it marked and why ([`describe`]).
 //!
 //! Cost (rule 67). A commit is O(entries written) to mark, O(crates + roots) to lay the arenas
 //! out again (the order, each root's arena: a vector walk, within the `Memo::next` floor of
@@ -327,7 +333,8 @@ pub(crate) struct Unique {
 pub(crate) struct Crates {
     /// By key; `None` for no crate (never reused).
     entries: Vec<Option<CrateEntry>, Global>,
-    /// Every crate, each after those it depends on: its arena's index is 1 + its place.
+    /// Every crate, each after those it depends on: its arena's index is
+    /// [`FIRST_ROOT`] + the number of roots + its place ([`Layout`]).
     pub(crate) order: Vec<CrateKey, Global>,
     by_unique: HashMap<Unique, CrateKey, Global>,
     /// Each crate attribute file's crate.
@@ -1236,6 +1243,9 @@ pub enum Plant {
     /// A moved crate list marks the session arena, not the list's own ([`LIST_ARENA`]): what
     /// a commit did while the list was a singleton of the session, which every arena borrows.
     ListMarksSession,
+    /// An arena whose seal moved is carried with the seal it was made with, not made again:
+    /// what a commit did before seals were compared ([`Cause::Sealed`]).
+    SealCarried,
 }
 
 /// The world: everything but the files ([`Files`], shared with the snapshot's readers).
@@ -1407,6 +1417,9 @@ pub(crate) struct Table {
     pub(crate) clash: Option<[CrateKey; 2]>,
     /// The digest of that [`List`] ([`AllCrates`]); `None` before the first session.
     pub(crate) list: Option<ContentId>,
+    /// The crate list's input in [`LIST_ARENA`] ([`crate::list_input`]), carried with that
+    /// arena; `None` before the first session.
+    pub(crate) list_input: Option<AllCrates>,
     /// Each crate's other `OUT_DIR`s, as its arena was made with them ([`out_dirs_of`]).
     pub(crate) out_dirs: OutDirs,
     /// Each crate's located gifts ([`crate::Edit::give_located`]), by key index: its kind, the
@@ -1470,7 +1483,8 @@ impl Table {
     /// Puts `rows`, made for the arenas a commit made again, in the table, whose rows of those
     /// arenas are cleared: nothing here fails, so a commit applies its rows whole or not at all.
     fn apply(&mut self, rows: Rows) {
-        let Rows { texts, raws, file_roots, roots, crates, arena_files, arena_roots } = rows;
+        // The list's input is put by `commit`, which knows whether its arena was carried.
+        let Rows { texts, raws, file_roots, roots, crates, arena_files, arena_roots, list: _ } = rows;
         for (file, text) in texts {
             put(&mut self.texts, file.index() as usize, Some(text));
         }
@@ -1519,6 +1533,8 @@ pub(crate) struct Rows {
     /// What was placed in each arena made, by its index: the rows a remake of it clears.
     arena_files: Vec<(u32, FileId), Global>,
     arena_roots: Vec<(u32, SourceRootId), Global>,
+    /// The crate list's input, where this commit made the list's arena ([`LIST_ARENA`]).
+    list: Option<AllCrates>,
 }
 
 impl Rows {
@@ -1759,6 +1775,12 @@ pub(crate) enum Cause {
     AttrFile(FileId),
     /// A file read outside the VFS that the crate read was written.
     Included,
+    /// The arena is sealed now (`true`) or no longer (`false`), as [`Layout::of`] decides it,
+    /// and the old snapshot's was not: a root a sealed crate came to be rooted in, or a crate
+    /// whose dependency's seal moved. A carried arena keeps the seal it was made with, so
+    /// one whose seal moved is made again ([`blaze_memo::Builder::build`] refuses a sealed
+    /// arena borrowing an unsealed one).
+    Sealed(bool),
 }
 
 /// What of the session an edit wrote first.
@@ -1841,8 +1863,14 @@ impl Writes {
                 Undo::Content(key, _) => (*key, CrateWrite::Content),
                 Undo::AttrFiles(key, _) => (*key, CrateWrite::AttrFiles),
                 Undo::Gift(key, kind, was) => {
-                    let now = crates.get(*key).gifts.iter().find(|it| it.kind == *kind).map(|it| it.name);
-                    let name = now.or_else(|| was.as_ref().map(|it| it.name)).unwrap_or("a gift");
+                    let now = crates.get(*key).gifts.iter().find(|it| it.kind == *kind);
+                    // A located kind's first gift marks nothing ([`Crates::give_located`]): it is
+                    // no cause, and naming it would hide the write of a bundle given in the same
+                    // edit that did mark (a dependency's image beside its lang items).
+                    if was.is_none() && now.is_some_and(|it| it.located) && world.plant != Plant::LocatedMarks {
+                        continue;
+                    }
+                    let name = now.map(|it| it.name).or_else(|| was.as_ref().map(|it| it.name)).unwrap_or("a gift");
                     (*key, CrateWrite::Gift(name))
                 }
                 Undo::Maker(Some(key), id, was) => match maker_at(&crates.get(*key).makers, *id, was) {
@@ -1936,6 +1964,21 @@ fn marked(
         let now = layout.at.get(index as usize).copied().flatten();
         if was != now {
             mark(&mut marked, Some(index), Cause::IndexMoved);
+        }
+    }
+    // An arena whose seal moved is made again with its new seal: the memo checks a sealed
+    // arena's borrows once, when the snapshot is built, against each arena's seal as made.
+    // A root's seal moves with no write of the root (a sealed crate rooted in it listed, or
+    // one there unsealed), which nothing above marks; while the crate list was the session's,
+    // a crate listed dropped every arena and hid it.
+    if world.plant != Plant::SealCarried {
+        let span = old.sealed.len().max(layout.sealed.len());
+        for index in 1..span as u32 {
+            let was = old.sealed.get(index as usize).copied().unwrap_or(false);
+            let now = layout.sealed.get(index as usize).copied().unwrap_or(false);
+            if was != now {
+                mark(&mut marked, Some(index), Cause::Sealed(now));
+            }
         }
     }
     // The arena a root was placed in: its own (`Layout`); none for a root the old snapshot did
@@ -2089,6 +2132,8 @@ fn write_cause(world: &World, cause: Cause, out: &mut dyn std::io::Write) -> std
         Cause::Root(root, Some(file)) => write!(out, "file {} of root {} written", file.index(), root.0),
         Cause::AttrFile(file) => write!(out, "attribute file {} written", file.index()),
         Cause::Included => out.write_all(b"a file read outside the VFS written"),
+        Cause::Sealed(true) => out.write_all(b"sealed now"),
+        Cause::Sealed(false) => out.write_all(b"no longer sealed"),
     }
 }
 
@@ -2230,13 +2275,21 @@ pub(crate) fn commit(
     carried_at.extend((0..tracked as u32).map(|index| builder.has(index)));
 
     let mut rows = Rows::default();
+    // The dropped arenas made again from the world: their inputs, slots and the makers given
+    // them run (`make_given`). Its own span, apart from the old snapshot's release (`db commit
+    // release`), so a slow commit says which it was.
+    let making = tracing::info_span!(target: "blaze", "db commit make", arenas = tracing::field::Empty).entered();
+    let mut remade = 0_u64;
     for index in 0..layout.len() {
         if builder.has(index) {
             continue;
         }
+        remade += 1;
         remake(world, files, &layout, &mut builder, &mut rows, base, index, list.digest, &out_dirs);
     }
+    making.record("arenas", remade);
     let memo = builder.build();
+    drop(making);
 
     // The lists, read from the rows made and the carried table before anything is written:
     // O(crates).
@@ -2292,6 +2345,7 @@ pub(crate) fn commit(
     }
     table.at_index.resize(layout.at.len(), None);
     table.sealed.clone_from(&layout.sealed);
+    let made_list = rows.list;
     table.apply(rows);
     table.all = all;
     table.root_crates = root_crates;
@@ -2304,6 +2358,10 @@ pub(crate) fn commit(
         (table.by_prefix, table.clash) = by_prefix(&list.item_keys);
         table.item_keys = list.item_keys;
         table.list = Some(list.digest);
+        // The arena was made in this commit, and with it its one input.
+        table.list_input = Some(made_list.unwrap_or_else(|| {
+            panic!("base-db: the crate list's arena ({LIST_ARENA}) was made, and no crate-list input with it")
+        }));
     }
     table.out_dirs = out_dirs;
     // Every crate's located gifts, made whole: a few `Arc`s a crate.
@@ -2356,9 +2414,11 @@ fn remake(
         let inputs = builder.arena(LIST_ARENA, Tag::Query);
         inputs.borrows(session);
         inputs.open();
+        // An input of the list's arena, its handle kept in the table (`Table::list_input`):
+        // not a singleton, which the engine keeps in the session arena alone.
         const LIST: &str = "blaze v2 crate list 1";
         let list = InputId(list);
-        AllCrates::set(&inputs, facts::singleton(LIST, list), list);
+        rows.list = Some(AllCrates::new(&inputs, facts::singleton(LIST, list), list));
         return;
     }
     if index == 0 {

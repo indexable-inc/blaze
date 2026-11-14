@@ -308,15 +308,25 @@ pub fn stable_ids(out: &str) -> String {
         } else {
             &out[ident_start(start - 1)..start - 1]
         };
-        // An id is `arena.generation:place`, or, in a type named `..Id`, hex digits alone.
-        let end = out[start..]
+        // An id is `arena.generation:place`, or, in a type named `..Id`, hex digits alone. A
+        // pretty print (`{:#?}`) puts a bare id on a line of its own, with a comma after it:
+        // `BlockId(\n    3.0:26,\n)`.
+        let from = match is_field {
+            true => start,
+            false => out.len() - out[start..].trim_start().len(),
+        };
+        let end = out[from..]
             .find(|c: char| !(c.is_ascii_hexdigit() || c == '.' || c == ':'))
-            .map_or(out.len(), |it| start + it);
-        let raw = &out[start..end];
+            .map_or(out.len(), |it| from + it);
+        let raw = &out[from..end];
         let hex = !raw.is_empty() && raw.bytes().all(|c| c.is_ascii_hexdigit());
+        /// Whether `rest` ends a bare id: `)`, or a pretty print's `,` and then `)`.
+        fn closes(rest: &str) -> bool {
+            rest.starts_with(')') || rest.strip_prefix(',').is_some_and(|it| it.trim_start().starts_with(')'))
+        }
         let is_id = match is_field {
             true => (memo_id(raw) || hex) && out[end..].starts_with([',', ' ', '}']),
-            false => (memo_id(raw) || (hex && name.ends_with("Id"))) && out[end..].starts_with(')'),
+            false => (memo_id(raw) || (hex && name.ends_with("Id"))) && closes(&out[end..]),
         };
         if !is_id {
             at = start;
@@ -327,7 +337,7 @@ pub fn stable_ids(out: &str) -> String {
             *count += 1;
             *count - 1
         });
-        result.push_str(&out[copied..start]);
+        result.push_str(&out[copied..from]);
         write!(result, "#{label}").unwrap();
         copied = end;
         at = end;

@@ -385,9 +385,10 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-/// The crate graph's list: the singleton of its content ID in the list's own open arena
-/// (`world::LIST_ARENA`), which every reader of the list reads, beside the list itself in the
-/// snapshot's table ([`all_crates`], [`source_root_crates`], a [`listed_by_prefix`] that
+/// The crate graph's list: one input of its content ID in the list's own open arena
+/// (`world::LIST_ARENA`), which every reader of the list reads ([`list_input`]: its handle is
+/// kept in the snapshot's table, as a crate's is; not a singleton, which the engine keeps in
+/// the session arena alone), beside the list itself in the snapshot's table ([`all_crates`], [`source_root_crates`], a [`listed_by_prefix`] that
 /// found none). The list's content is of each listed crate's item key and root file's path in
 /// order (`world::List`, [`CRATE_GRAPH_DOMAIN`]), so a crate added, taken out, put elsewhere
 /// or written where its item key moves ([`crate_item_key`]: its cfg, edition, dependencies,
@@ -395,10 +396,17 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
 /// crate declares it, and the session does not hold it. A write of a crate's env, workspace
 /// data or lints, or of what of its data and extra data the item key leaves out, moves its
 /// content ID, not the list: it drops that crate's arena and its dependents' alone.
-#[blaze_memo::input(singleton, debug)]
+#[blaze_memo::input(debug)]
 pub(crate) struct AllCrates {
     #[returns(copy)]
     content: InputId,
+}
+
+/// The snapshot's crate-list input ([`AllCrates`], in `world::LIST_ARENA`): `None` before the
+/// first commit made the list's arena. A lookup of the table; reading its `content` is the
+/// read of the list (a borrow of the list's arena).
+fn list_input(db: &Db) -> Option<AllCrates> {
+    db.snap().table.list_input
 }
 
 /// The domain of the crate list's digest (`world::List`): each listed crate's item key and
@@ -407,7 +415,7 @@ pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 2";
 
 /// The content ID of [`all_crates`].
 pub fn all_crates_content(db: &Db) -> ContentId {
-    match AllCrates::try_get(db) {
+    match list_input(db) {
         Some(all) => all.content(db).id(),
         None => {
             let mut hasher = Hasher::new(CRATE_GRAPH_DOMAIN);
@@ -421,7 +429,7 @@ pub fn all_crates_content(db: &Db) -> ContentId {
 ///
 /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
 pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
-    match AllCrates::try_get(db) {
+    match list_input(db) {
         Some(all) => {
             // The read: the list's content, of the list's own arena (`world::LIST_ARENA`).
             _ = all.content(db);
@@ -480,7 +488,7 @@ pub fn listed_by_prefix(db: &Db, prefix: u64) -> Option<Crate> {
             Some(krate)
         }
         Err(_) => {
-            if let Some(all) = AllCrates::try_get(db) {
+            if let Some(all) = list_input(db) {
                 _ = all.content(db);
             }
             None
@@ -524,7 +532,7 @@ impl Located for LocatedForTests {}
 /// content) and the root ([`SourceRootInput::content`]: a file moved into or out of it is in
 /// its content). One index of the snapshot's table.
 pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
-    let Some(all) = AllCrates::try_get(db) else { return &[] };
+    let Some(all) = list_input(db) else { return &[] };
     _ = all.content(db);
     _ = db.source_root(id).content(db);
     db.snap().table.root_crates.get(&id).map_or(&[], |it| &it[..])
