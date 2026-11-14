@@ -153,6 +153,8 @@ export const tree_chevron = 9
 export const tree_kind = 12
 export const tree_kind_gap = 6
 export const tree_trail_max = 84
+// Stable effort column, with room for the seven-stop Codex meter and its padding.
+export const tree_effort_w = 30
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
 // gutter (tree_mark across: a check in tone_success, a cross in tone_error).

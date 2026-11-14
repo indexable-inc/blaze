@@ -260,7 +260,7 @@ hn {
         Overlay
         Fill: $tone_clear
         Stroke: {dark: $tone_ink_muted.dark, light: $tone_ink_muted.light}
-        Vector: {d: "M6 1 A5 5 0 0 1 6.5 1.03", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
+        Vector: {d: "", view_x: 0, view_y: 0, view_w: 12, view_h: 12, stroke_w: $chat_ring_stroke}
       }
     }
   }
