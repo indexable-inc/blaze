@@ -187,9 +187,11 @@ pub fn touch(
         used_ns: now_ns,
         profiles: kept,
     };
-    match overwrite(dir, &record)? {
-        Overwritten::Yes => {}
-        Overwritten::NoRecord => write(dir, &record)?,
+    let (path, bytes) = (path_of(dir), encode(&record));
+    match overwrite(&path, &bytes) {
+        Ok(Overwritten::Yes) => {}
+        Ok(Overwritten::NoRecord) => write_whole(&path, &bytes)?,
+        Err(error) => return Err(format!("writing {} in place: {error}", path.display())),
     }
     Ok(unread)
 }
@@ -202,28 +204,23 @@ enum Overwritten {
 /// Writes `record` over `dir`'s existing record file, in place: written from its start, cut to
 /// its length, synced. No entry of `dir` is made, renamed or removed, so `dir`'s stamp does not
 /// move (see the module's doc for why that matters and what a racing reader sees).
-fn overwrite(dir: &Path, record: &Record) -> Result<Overwritten, String> {
+fn overwrite(path: &Path, bytes: &[u8]) -> std::io::Result<Overwritten> {
     #[cfg(test)]
     if PLANT_TOUCH_RENAMES.get() {
         return Ok(Overwritten::NoRecord);
     }
-    let path = path_of(dir);
-    let bytes = encode(record);
-    let file = match std::fs::OpenOptions::new().write(true).open(&path) {
+    let file = match std::fs::OpenOptions::new().write(true).open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Overwritten::NoRecord);
         }
-        Err(error) => return Err(format!("opening {}: {error}", path.display())),
+        Err(error) => return Err(error),
     };
-    let written = (|| -> std::io::Result<()> {
-        let mut file = &file;
-        file.write_all(&bytes)?;
-        file.set_len(bytes.len() as u64)?;
-        // durable: review: the collector decides what to delete from these files; a torn one must not be read
-        file.sync_all()
-    })();
-    written.map_err(|error| format!("writing {} in place: {error}", path.display()))?;
+    let mut writer = &file;
+    writer.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    // durable: review: the collector decides what to delete from these files; a torn one must not be read
+    file.sync_all()?;
     Ok(Overwritten::Yes)
 }
 
