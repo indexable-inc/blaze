@@ -27,18 +27,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use base_db::Db;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
-    ModuleId, TraitId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
+    Lookup as _, ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
+    hir::generics::GenericParams,
     item_tree::FieldsShape,
     signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
 use hir_ty::{
+    ParamEnvAndCrate,
     db::HirDatabase as _,
+    method_resolution::NoImplMethod,
     mir as m,
     next_solver::{
         AliasConstKind, ConstKind, DbInterner, FreeConstAliasId, GenericArgs, InherentAssocConstId,
-        Ty as HTy, TyKind,
+        TraitRef, Ty as HTy, TyKind,
     },
 };
 use rustc_type_ir::{
@@ -943,25 +946,41 @@ const LEAN_DERIVED: &[&str] = &[
     "ext_iff",
 ];
 
-/// The type whose inherent impl holds `func`: its path and the names Lean's declaration of
-/// it takes (a struct's fields, an enum's variants). `None` for a function of a module; `Err`
-/// names the kind of impl whose functions are not translated.
-fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<String>)>, &'static str> {
+/// The namespace a method's Lean name is in, and the names Lean's declarations have already
+/// put there, which a method of the same name must not take (a struct's fields, an enum's
+/// variants): for a method of an inherent impl the type's path (`krate.Counter`); for a method
+/// of a trait impl the type's path and the trait's name (`krate.Square.Shape`), so two traits
+/// with a method of one name on one type are two namespaces. A trait impl here has no type or
+/// const parameters and its trait's arguments other than `Self` are `Self`
+/// (`impl PartialEq for Point`), so the type and the trait's name say which impl it is: two
+/// traits of one name from two modules on one type are refused where both are imported
+/// ([`crate::emit`]). `None` for a function of a module; `Err` names the kind of function that
+/// is not translated.
+fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<String>)>, String> {
     let imp = match func.lookup(db).container {
         ItemContainerId::ModuleId(_) => return Ok(None),
         ItemContainerId::ImplId(imp) => imp,
-        ItemContainerId::ExternBlockId(_) => return Err("a function without a body (rule Ffi)"),
-        _ => return Err("a method of a trait"),
+        ItemContainerId::ExternBlockId(_) => {
+            return Err("a function without a body (rule Ffi)".to_owned());
+        }
+        // A trait's own method: with a body, it is the trait's default, written once for every
+        // `Self`, which is generic over `Self` as a generic function is over its parameters.
+        _ => {
+            return Err("a method of a trait (a default body, generic over `Self`; only an \
+                        impl's method is translated)"
+                .to_owned());
+        }
     };
     blaze_query::db::attach(db, || {
-        if db.impl_trait(imp).is_some() {
-            return Err("a method of a trait impl");
+        let self_ty = db.impl_self_ty(imp).skip_binder();
+        if let Some(of) = db.impl_trait(imp) {
+            return trait_impl_owner(db, imp, of.skip_binder(), self_ty).map(Some);
         }
-        let TyKind::Adt(def, args) = db.impl_self_ty(imp).skip_binder().kind() else {
-            return Err("a method of a type that is not a struct or an enum");
+        let TyKind::Adt(def, args) = self_ty.kind() else {
+            return Err("a method of a type that is not a struct or an enum".to_owned());
         };
         if !args.is_empty() {
-            return Err("a method of a generic type");
+            return Err("a method of a generic type".to_owned());
         }
         let adt = def.def_id();
         let mut taken = BTreeSet::new();
@@ -983,12 +1002,71 @@ fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<Stri
                 }
                 EnumSignature::of(db, it).name.as_str().to_owned()
             }
-            AdtId::UnionId(_) => return Err("a method of a union"),
+            AdtId::UnionId(_) => return Err("a method of a union".to_owned()),
         };
         let mut path = module_path(db, adt.module(db));
         path.push(own);
         Ok(Some((path, taken)))
     })
+}
+
+/// [`owner`] of a method of the impl `imp` of the trait `of` for `self_ty`: refused unless
+/// the impl is one function per method (no type or const parameters, lifetimes aside), its
+/// trait's arguments other than `Self` are `Self`, and `self_ty` is a struct or enum without
+/// arguments, an integer or `bool`.
+fn trait_impl_owner<'db>(
+    db: &'db Db,
+    imp: ImplId,
+    of: TraitRef<'db>,
+    self_ty: HTy<'db>,
+) -> Result<(Vec<String>, BTreeSet<String>), String> {
+    let trait_id = of.def_id.0;
+    let trait_name = TraitSignature::of(db, trait_id).name.as_str().to_owned();
+    if GenericParams::of(db, imp.into()).len_type_or_consts() != 0 {
+        return Err(format!(
+            "a method of a trait impl of `{trait_name}` with type or const parameters (a generic \
+             impl; translated by instance, not yet)"
+        ));
+    }
+    if of.args.iter().skip(1).any(|arg| arg.ty() != Some(self_ty)) {
+        return Err(format!(
+            "a method of an impl of the generic trait `{trait_name}` with an argument other than \
+             `Self` (an impl is named by its type and its trait's name, which do not tell two \
+             such impls apart)"
+        ));
+    }
+    let (mut path, own) = match self_ty.kind() {
+        TyKind::Adt(def, args) => {
+            let adt = def.def_id();
+            if !args.is_empty() {
+                return Err(format!("a method of a trait impl of `{trait_name}` for a generic type"));
+            }
+            let own = match adt {
+                AdtId::StructId(it) => StructSignature::of(db, it).name.as_str().to_owned(),
+                AdtId::EnumId(it) => EnumSignature::of(db, it).name.as_str().to_owned(),
+                AdtId::UnionId(_) => {
+                    return Err(format!("a method of a trait impl of `{trait_name}` for a union"));
+                }
+            };
+            (module_path(db, adt.module(db)), own)
+        }
+        // A primitive has no module: its impls are named in the impl's.
+        TyKind::Bool => (module_path(db, imp.module(db)), "bool".to_owned()),
+        _ if int_ty(self_ty).is_some() => {
+            let own = format!("{:?}", int_ty(self_ty).expect("an integer")).to_lowercase();
+            (module_path(db, imp.module(db)), own)
+        }
+        _ => {
+            return Err(format!(
+                "a method of a trait impl of `{trait_name}` for a type that is not a struct, an \
+                 enum, an integer or `bool`"
+            ));
+        }
+    };
+    path.push(own);
+    path.push(trait_name);
+    // Nothing is declared in `<type>.<trait>` but the impl's methods.
+    Ok((path, BTreeSet::new()))
 }
 
 fn index(local: m::LocalId) -> Local {
@@ -1023,6 +1101,8 @@ struct Std<'a, 'db> {
 
 struct Cx<'db> {
     db: &'db Db,
+    /// The function's crate: where its calls of a trait's methods are resolved.
+    krate: base_db::Crate,
     interner: DbInterner<'db>,
     display: String,
     mir: &'db m::MirBody<'db>,
@@ -1726,6 +1806,7 @@ impl<'db> Cx<'db> {
             }
         };
         let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
+        let (callee, generics) = self.dispatch(callee, generics, &name, at)?;
         let container = callee.lookup(db).container;
         let callee = if callee.krate(db).data(db).origin.is_lang() {
             if PANICS.contains(&name.as_str()) {
@@ -1756,9 +1837,8 @@ impl<'db> Cx<'db> {
             }
             return self.goto(target, at);
         } else {
-            if !generics.is_empty() {
-                return Err(self.refuse(format!("a call of the generic function `{name}`"), at));
-            }
+            // What the callee is (a method of a generic impl) says more than that it was given
+            // arguments: it is named first.
             match container {
                 ItemContainerId::ExternBlockId(_) => {
                     return Err(self.refuse(format!("a call of the extern function `{name}` (rule Ffi)"), at));
@@ -1768,6 +1848,9 @@ impl<'db> Cx<'db> {
                         return Err(self.refuse(format!("a call of `{name}`, {why}"), at));
                     }
                 }
+            }
+            if !generics.is_empty() {
+                return Err(self.refuse(format!("a call of the generic function `{name}`"), at));
             }
             let lean = function_lean_name(db, callee);
             if !self.callees.iter().any(|(_, it)| *it == callee) {
@@ -1779,6 +1862,88 @@ impl<'db> Cx<'db> {
         let args = self.operands(args, at)?;
         out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
         self.goto(target, at)
+    }
+
+    /// What static dispatch runs for a call of `callee` with `generics`: for a method of a
+    /// trait (`square.area()`, `Shape::area(&s)`, `<Square as Shape>::area(&s)`,
+    /// `Clock::default()`, `a == b` and `a + b` of a type with its own impl, which MIR calls
+    /// as the trait's method with `Self` among the arguments), the method of the impl the
+    /// trait solver picks for those arguments in this function's environment, as codegen
+    /// picks it. A call of a function that is no trait's method is itself.
+    ///
+    /// A method of the standard library's trait that no impl of this program's crates
+    /// implements (an integer's `Ord::max`, a derive's `PartialEq::eq`, `From` between
+    /// integers) stays the trait's: [`Cx::std_call`] models it by its trait and name, as
+    /// before. A method of a crate's own trait that is not an impl's is refused by what it is:
+    /// a call through a generic bound, through a trait object, or of the trait's default body.
+    fn dispatch(
+        &self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        at: &str,
+    ) -> Refused<(FunctionId, GenericArgs<'db>)> {
+        let db = self.db;
+        let ItemContainerId::TraitId(of) = callee.lookup(db).container else {
+            return Ok((callee, generics));
+        };
+        let trait_name = TraitSignature::of(db, of).name.as_str().to_owned();
+        let of_std = callee.krate(db).data(db).origin.is_lang();
+        if matches!(generics.type_at(0).kind(), TyKind::Dynamic(..)) {
+            return Err(self.refuse(
+                format!(
+                    "a call of `{trait_name}::{name}` through a trait object (`dyn \
+                     {trait_name}`; rule DynTrait)"
+                ),
+                at,
+            ));
+        }
+        let env = ParamEnvAndCrate {
+            param_env: db.trait_environment(self.mir.owner.generic_def(db)),
+            krate: self.krate,
+        };
+        let looked = db
+            .lookup_impl_method_or_why(env, callee, generics)
+            .map(|(found, args)| (found.left(), args));
+        match looked {
+            Ok((Some(found), args)) if !found.krate(db).data(db).origin.is_lang() => {
+                match found.lookup(db).container {
+                    ItemContainerId::ImplId(_) => Ok((found, args)),
+                    _ => Err(self.refuse(
+                        format!(
+                            "a call of `{trait_name}::{name}`, the trait's default method, whose \
+                             body is generic over `Self` (only an impl's method is translated)"
+                        ),
+                        at,
+                    )),
+                }
+            }
+            // The standard library's: its model is the trait's method's, by name.
+            Ok(_) if of_std => Ok((callee, generics)),
+            Err(why) if of_std && why.is_expected() => Ok((callee, generics)),
+            Ok((Some(found), _)) => Err(self.refuse(
+                format!(
+                    "a call of `{trait_name}::{name}`, which runs the standard library's `{}`",
+                    FunctionSignature::of(db, found).name.as_str()
+                ),
+                at,
+            )),
+            Ok((None, _)) => Err(self.refuse(
+                format!("a call of `{trait_name}::{name}`, which a built-in derive implements"),
+                at,
+            )),
+            Err(NoImplMethod::Generic | NoImplMethod::Param) => Err(self.refuse(
+                format!(
+                    "a call of `{trait_name}::{name}` through a generic bound (the impl is chosen \
+                     by the instance; generics by instance are not translated yet)"
+                ),
+                at,
+            )),
+            Err(why) => Err(self.refuse(
+                format!("a call of `{trait_name}::{name}`, whose impl is not found: {}", why.describe()),
+                at,
+            )),
+        }
     }
 
     /// Where the standard library's function in `container` is.
@@ -2386,6 +2551,7 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
     let store = ExpressionStore::of(db, mir.owner.expression_store_owner(db));
     let mut cx = Cx {
         db,
+        krate,
         interner: DbInterner::new_with(db, krate),
         display: display.clone(),
         mir,
