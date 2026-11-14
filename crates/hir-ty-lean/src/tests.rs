@@ -652,7 +652,7 @@ fn what_v0_does_not_translate_is_refused_by_name() {
     let cases = [
         ("pub fn f(p: *const u32) -> u32 { 0 }\n", "raw pointer"),
         ("pub unsafe fn f() -> u32 { 0 }\n", "`unsafe fn`"),
-        ("pub fn f() -> u32 { let g = |x: u32| x; g(1) }\n", "closure"),
+        ("pub fn f(g: &dyn Fn(u32) -> u32) -> u32 { 0 }\n", "trait object"),
         ("pub fn f(x: f32) -> f32 { x }\n", "floating-point"),
         ("pub fn f(c: char) -> u32 { 0 }\n", "the type `char`"),
         ("pub fn f<T>(x: T) -> T { x }\n", crate::body::GENERIC_UNASKED),
@@ -1659,19 +1659,17 @@ fn blazes_own_small_functions_translate_with_their_theorems() {
     }
 }
 
-/// A method that takes a closure or a function stays refused, by the construct outside the
-/// subset: the closure or the function value, named at the call it is given to.
+/// A method given a function stays refused, by the construct outside the subset: the function
+/// value, named at the call it is given to. (A closure given to one is its instance: the
+/// `closures` fixture.)
 #[test]
-fn a_closure_taking_method_is_refused_by_name() {
-    let cases = [
-        (
-            "pub fn f(a: Option<u32>) -> Option<u32> { a.and_then(g) }\n\
-             fn g(x: u32) -> Option<u32> { Some(x) }\n",
-            "a function used as a value",
-            "and_then",
-        ),
-        ("pub fn f(a: Option<u32>) -> u32 { a.unwrap_or_else(|| 3) }\n", "a closure", "unwrap_or_else"),
-    ];
+fn a_function_taking_method_is_refused_by_name() {
+    let cases = [(
+        "pub fn f(a: Option<u32>) -> Option<u32> { a.and_then(g) }\n\
+         fn g(x: u32) -> Option<u32> { Some(x) }\n",
+        "a function used as a value",
+        "and_then",
+    )];
     for (source, what, call) in cases {
         let err = refused(OPTION_FLAGS, "f", source);
         assert!(err.what.contains(what), "`{call}` is refused for {what}: {err}");
@@ -2663,7 +2661,7 @@ fn a_generic_function_is_translated_at_each_instance() {
 
 /// What instances do not reach is refused by name: a generic theorem function, a generic
 /// function asked for alone, a call through a trait object, a chain of instances deeper than
-/// the bound, a closure as a type argument, `Into::into` through the standard library's
+/// the bound, `Into::into` through the standard library's
 /// blanket impl, two types of one Lean name, and an associated type the solver cannot
 /// normalize.
 #[test]
@@ -2683,10 +2681,6 @@ fn what_instances_do_not_reach_is_refused_by_name() {
              pub fn f() -> u32 { grow(1u32, 3) }\n"
                 .to_owned(),
             "a chain of instances deeper than 32",
-        ),
-        (
-            "pub fn g<F: Fn(u32) -> u32>(h: F) -> u32 { 0 }\npub fn f() -> u32 { g(|x: u32| x) }\n".to_owned(),
-            "a closure",
         ),
         (
             "pub struct Small { pub v: u8 }\npub struct Big { pub v: u32 }\n\
@@ -2739,4 +2733,198 @@ fn an_associated_type_is_normalized_at_the_instance_and_an_opaque_one_refused() 
     // An opaque `impl Trait` is not revealed: refused where its value is first held.
     let err = emit(&db, function(&db, "main", "f")).expect_err("an opaque type is refused");
     assert_eq!(err.what, "an associated or opaque type");
+}
+
+// ---- Closures (docs/v2/plan/design/proofs-for-sans-io.md, section 3, step c). ----
+
+/// What the `closures` fixture enables: `Fn`, `FnMut` and `FnOnce`, `Option`'s and `Result`'s
+/// methods that take a closure with core's own bodies, and slices.
+const CLOSURE_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, closure_methods, index, slice, int_bounds";
+
+const CLOSURES: &str = "pub fn apply<F: Fn(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
+pub fn apply_once<F: FnOnce(u32) -> u32>(f: F, x: u32) -> u32 { f(x) }
+pub fn add_k(k: u32) -> u32 {
+    let f = |x: u32| x + k;
+    f(3)
+}
+pub fn apply_add(k: u32) -> u32 { apply(|x| x + k, 3) }
+pub fn moved(k: u32, b: bool) -> u32 { apply_once(move |x| if b { x + k } else { x }, 3) }
+pub fn nothing_captured(x: u32) -> u32 { apply(|y| y / 2, x) }
+pub fn option_methods(a: Option<u32>, k: u32) -> (Option<u32>, u32, u32, Option<u32>, Option<u32>, u32, bool, bool, Option<u32>, Result<u32, u8>) {
+    (
+        a.map(|v| v / 2),
+        a.map_or(k, |v| v & k),
+        a.map_or_else(|| k, |v| v | k),
+        a.and_then(|v| if v > k { Some(v - k) } else { None }),
+        a.or_else(|| Some(k)),
+        a.unwrap_or_else(|| k),
+        a.is_some_and(|v| v > k),
+        a.is_none_or(|v| v == k),
+        a.filter(|v| *v > k),
+        a.ok_or_else(|| 7u8),
+    )
+}
+pub fn inspected(a: Option<u32>, r: Result<u32, u8>) -> (Option<u32>, Result<u32, u8>) {
+    (a.inspect(|v| { let _ = *v; }), r.inspect(|v| { let _ = *v; }))
+}
+fn res(ok: bool, v: u32, e: u8) -> Result<u32, u8> { if ok { Ok(v) } else { Err(e) } }
+pub fn result_methods(ok: bool, v: u32, e: u8, k: u32) -> (Result<u32, u8>, Result<u32, u32>, Result<u32, u8>, Result<u32, u8>, u32, u32, u32, bool, bool) {
+    (
+        res(ok, v, e).map(|v| v / 2),
+        res(ok, v, e).map_err(|e| e as u32),
+        res(ok, v, e).and_then(|v| if v > k { Ok(v) } else { Err(0) }),
+        res(ok, v, e).or_else(|e| if e == 0 { Ok(k) } else { Err(e) }),
+        res(ok, v, e).unwrap_or_else(|e| e as u32),
+        res(ok, v, e).map_or(k, |v| v ^ k),
+        res(ok, v, e).map_or_else(|e| e as u32, |v| v),
+        res(ok, v, e).is_ok_and(|v| v > k),
+        res(ok, v, e).is_err_and(|e| e == 0),
+    )
+}
+pub fn bump_twice() -> u32 {
+    let mut n = 0;
+    let mut bump = || n += 1;
+    bump();
+    bump();
+    n
+}
+pub fn ticks() -> u32 {
+    let mut c = 0;
+    let mut tick = move || { c += 1; c };
+    tick();
+    tick()
+}
+pub fn each<F: FnMut(u32)>(xs: &[u32], mut f: F) {
+    let mut i = 0;
+    while i < xs.len() {
+        f(xs[i]);
+        i += 1;
+    }
+}
+pub fn sum(xs: &[u32]) -> u32 {
+    let mut total = 0;
+    each(xs, |x| total += x);
+    total
+}
+pub fn count_over(a: Option<u32>, k: u32) -> u32 {
+    let mut seen = 0;
+    let doubled = a.map(|v| { seen += 1; v / 2 });
+    match doubled { Some(v) if v > k => seen + 1, _ => seen }
+}
+pub fn nested() -> u32 {
+    let mut n = 0;
+    let mut inner = || n += 1;
+    let mut outer = || { inner(); inner() };
+    outer();
+    n
+}
+#[blaze::theorem]
+pub fn apply_adds(k: u32) -> bool {
+    k > 1000 || apply(|x| x + k, 3) == 3 + k
+}
+#[blaze::theorem]
+pub fn map_then_is_some_and(x: u32) -> bool {
+    if x == u32::MAX {
+        return true;
+    }
+    let next = Some(x).map(|v| v + 1);
+    next.is_some_and(|v| v > x)
+}
+#[blaze::theorem]
+pub fn bumps_twice() -> bool { bump_twice() == 2 }
+#[blaze::theorem]
+pub fn sums_two(xs: &[u32]) -> bool {
+    xs.len() != 2 || xs[0] > 1000 || xs[1] > 1000 || sum(xs) == xs[0] + xs[1]
+}
+";
+
+/// A closure is a structure of its captures, in MIR's order, and its body a function of that
+/// structure and its arguments; a call through `Fn`, `FnMut` or `FnOnce` on the closure's type
+/// is a call of that body. `Option`'s and `Result`'s methods that take a closure are their own
+/// bodies at the closure's instance. A closure that changes a capture by `&mut` is given back
+/// by every call, and the place it borrows takes the capture's value after each.
+#[test]
+fn a_closure_is_a_function_of_its_captures() {
+    let cases: [(&str, &[&str], &[&str]); 9] = [
+        ("add_k", &["closures.add_k.closure0.call"], &["BlazeModel.closures.add_k.closure0.type"]),
+        ("apply_add", &["closures.apply.closure0_apply_add"], &["BlazeModel.closures.apply_add.closure0.call"]),
+        ("moved", &["closures.apply_once.closure0_moved"], &["BlazeModel.closures.moved.closure0.call"]),
+        ("nothing_captured", &["closures.apply.closure0_nothing_captured"], &[]),
+        (
+            "option_methods",
+            &["core.option.Option.u32.map.u32_closure0_option_methods"],
+            &["BlazeModel.core.option.Option.u32.filter.closure9_option_methods"],
+        ),
+        ("result_methods", &["core.result.Result.u32_u8.map.u32_closure0_result_methods"], &[]),
+        ("inspected", &[], &[]),
+        ("bump_twice", &["closures.bump_twice.closure0.call"], &[]),
+        ("sum", &["closures.each.closure0_sum"], &["BlazeModel.closures.sum.closure0.call"]),
+    ];
+    for (name, calls, modules) in cases {
+        let out = golden(CLOSURE_FLAGS, "closures", name, CLOSURES);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules.iter() {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    for name in ["ticks", "count_over", "nested"] {
+        golden(CLOSURE_FLAGS, "closures", name, CLOSURES);
+    }
+    for name in ["apply_adds", "map_then_is_some_and", "bumps_twice", "sums_two"] {
+        let out = golden(CLOSURE_FLAGS, "closures", name, CLOSURES);
+        assert_eq!(out.statement.as_deref(), Some(format!("closures.{name}.spec.statement").as_str()));
+    }
+}
+
+/// What closures leave out is refused by name: a trait object of `Fn` (by reference and
+/// boxed), a function pointer, a closure returned from a function, an iterator's adapter, a
+/// call through a reference to a closure, and a closure that changes what it captures kept
+/// past the call it is passed to (in a struct, a tuple, another local, or returned).
+#[test]
+fn what_closures_leave_out_is_refused_by_name() {
+    let kept = crate::body::KEPT_LENDING;
+    let cases: [(&str, &str, &str); 10] = [
+        ("fn", "pub fn f(g: &dyn Fn(u32) -> u32) -> u32 { 0 }\n", "a trait object (rule DynTrait)"),
+        (
+            "fn",
+            "#[lang = \"owned_box\"]\npub struct Box<T: ?Sized>(*mut T);\n\
+             pub fn f(g: Box<dyn Fn(u32) -> u32>) -> u32 { 0 }\n",
+            "the type `Box` (a heap allocation)",
+        ),
+        ("fn", "pub fn f(g: fn(u32) -> u32) -> u32 { g(1) }\n", "a function used as a value"),
+        ("fn", "pub fn f(k: u32) -> impl Fn(u32) -> u32 { move |x| x + k }\n", crate::body::RETURNED_CLOSURE),
+        (
+            "fn, slice, iterators, option",
+            "pub fn f(xs: &[u32]) -> bool { xs.iter().map(|x| *x + 1).next().is_some() }\n",
+            // As before closures: the iterator is refused where it is made.
+            "a call of the slice method `iter`, which has no model (rule NoModel)",
+        ),
+        (
+            "fn",
+            "pub fn g<G: Fn() -> u32>(h: G) -> u32 { h() }\n\
+             pub fn f(k: u32) -> u32 { let c = || k; g(&c) }\n",
+            "a call of a closure through a reference to it",
+        ),
+        (
+            "fn",
+            "pub struct Keep<F> { pub f: F }\npub fn f() -> u32 { let mut n = 0; let k = Keep { f: || n += 1 }; let mut g = k.f; g(); n }\n",
+            kept,
+        ),
+        ("fn", "pub fn f() -> u32 { let mut n = 0; let t = (|| n += 1, 1u32); n }\n", kept),
+        ("fn", "pub fn f() -> u32 { let mut n = 0; let g = || n += 1; let mut h = g; h(); n }\n", kept),
+        (
+            "fn",
+            "pub fn id<F>(f: F) -> F { f }\npub fn f() -> u32 { let mut n = 0; let mut g = id(|| n += 1); g(); n }\n",
+            kept,
+        ),
+    ];
+    for (extra, source, what) in cases {
+        let flags = format!("sized, copy, add, ord, eq, builtin_impls, {extra}");
+        let err = refused(&flags, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    }
 }

@@ -84,6 +84,9 @@ pub(super) enum Plant {
     /// A file a crash puts back under its name keeps the barriers, and the epochs, of the
     /// changes it lost.
     PutBackWithBarriers,
+    /// A sync that completes makes durable one change fewer than it covered, when it covers
+    /// at least one.
+    SyncCoversLess,
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.

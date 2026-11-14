@@ -78,9 +78,14 @@ conformance with a real driver is `allows(observed)` (objective V4).
 - `disk::Disk` (built 2026-11-14): per file its durable bytes and, in order, the changes made
   since the last sync that covered them; `sync`, `barrier`, `flush`, whole-file writes and
   renames that wait for the drive and that do not, removal; and the crash rule below.
-- Not built: a full disk, short reads, modes and links; what is asked and not yet answered
-  (today a caller tells the disk each completion and, for a sync, how many changes it
-  covers); locks, the network, processes; `Atomics` (section 8).
+- `asks::World` (built 2026-11-14): over the disk, what is asked and not yet answered, and
+  which answer the kernel may give to each: a sync or barrier told done covers at least what
+  it owes (the changes there when it was asked and still not durable), a failed append or
+  write from memory lands what it may. A crash's witness adds the sectors that writes in
+  flight landed, in any order, each at most once.
+- Not built: a full disk, short reads, modes and links; a file's identity under a rename
+  while a sync of its name is in flight (nothing is promised then); locks, the network,
+  processes; `Atomics` (section 8).
 
 **A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
 kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
