@@ -326,6 +326,7 @@ name = "astlog-core"
 version = "0.0.0"
 dependencies = [
  "ast-merge-langs",
+ "astlog-engine",
  "blaze-hash",
  "edit-applier",
  "ignore",
@@ -333,6 +334,16 @@ dependencies = [
  "snafu",
  "tempfile",
  "tree-sitter",
+]
+
+[[package]]
+name = "astlog-engine"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "hegeltest",
+ "regex",
+ "snafu",
 ]
 
 [[package]]

@@ -7,8 +7,9 @@
 
 use crate::error::{DslSnafu, Error};
 
+/// One form as read: a fact source parses its own atoms from these.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Sexpr {
+pub enum Sexpr {
     Atom { text: String, line: usize },
     Str { text: String, line: usize },
     List { items: Vec<Self>, line: usize },
@@ -16,7 +17,7 @@ pub(crate) enum Sexpr {
 
 impl Sexpr {
     #[must_use]
-    pub(crate) const fn line(&self) -> usize {
+    pub const fn line(&self) -> usize {
         match self {
             Self::Atom { line, .. } | Self::Str { line, .. } | Self::List { line, .. } => *line,
         }
@@ -53,7 +54,7 @@ impl Reader<'_> {
         }
     }
 
-    fn read_string(&mut self) -> Result<Sexpr, Error> {
+    fn read_string<S: std::error::Error + 'static>(&mut self) -> Result<Sexpr, Error<S>> {
         let line = self.line;
         self.bump();
         let mut text = String::new();
@@ -102,7 +103,7 @@ impl Reader<'_> {
         Sexpr::Atom { text, line }
     }
 
-    fn read_form(&mut self) -> Result<Option<Sexpr>, Error> {
+    fn read_form<S: std::error::Error + 'static>(&mut self) -> Result<Option<Sexpr>, Error<S>> {
         self.skip_trivia();
         let Some(&c) = self.chars.peek() else {
             return Ok(None);
@@ -137,7 +138,7 @@ impl Reader<'_> {
 ///
 /// Returns [`Error::Dsl`] on unbalanced parentheses, unterminated strings, or
 /// unknown string escapes.
-pub(crate) fn parse(src: &str) -> Result<Vec<Sexpr>, Error> {
+pub(crate) fn parse<S: std::error::Error + 'static>(src: &str) -> Result<Vec<Sexpr>, Error<S>> {
     let mut reader = Reader { chars: src.chars().peekable(), line: 1 };
     let mut forms = Vec::new();
     while let Some(form) = reader.read_form()? {

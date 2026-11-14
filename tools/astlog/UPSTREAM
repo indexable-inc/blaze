@@ -27,3 +27,12 @@ Changed on the way in, so a sync is the diff of ix between two commits applied o
 - edit-applier: no `#[expect]` of clippy's `suspicious_operation_groupings`, a nursery lint
   blaze does not turn on. cli: `load` takes a `&Path`.
 - core/tests/rules.rs, rules/tests/rust-locks/bad.expected and scan.py are blaze's own.
+- engine (crate astlog-engine) is blaze's own, split out of core on 2026-11-13 so blaze's
+  front end shares the language without linking tree-sitter. core's program.rs, eval.rs and
+  sexpr.rs moved there and were rewritten: semi-naive evaluation with indexed joins in place
+  of the naive one (kept as engine/src/naive.rs, test-only), stratified `not` and `count`,
+  integer literals with `lt`/`le`, `delete`/`insert-before`/`insert-after` beside `replace`,
+  mode and head-variable checks at load, and a per-source template syntax. `no-descendant`
+  and `attached-sibling` became tree-sitter source atoms, and an absent optional capture is
+  now the `CaptureAbsent` error instead of an unbound column. An ix sync into these files is
+  a port, not a patch.
