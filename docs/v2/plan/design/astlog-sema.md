@@ -76,7 +76,11 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
-  item, imported when needed), `(add-use n "krate::path")` (n any node of the file), and
+  item. A bare name is written as the new item's name and the item is imported: beside the
+  private `use` that brought the old item, which goes once no read the request leaves remains,
+  or else at the end of the module's `use`s. A retargeted `use` leaf is that import, moved the
+  same way. Refused, naming it: a new name that already means something else there, a
+  retargeted `use` a read still needs, a `pub use`, a use-tree prefix or glob), `(add-use n "krate::path")` (n any node of the file), and
   `add-param`, `remove-param` and `reorder-params` (d a fn; every call changes with it; see
   "Changing a fn's parameters"). Templates
   splice `$var`; `$$` is a literal `$`. A template is parsed with each metavariable as a hole,

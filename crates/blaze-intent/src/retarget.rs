@@ -146,14 +146,7 @@ impl<'t> Retarget<'_, 't> {
             for child in list.use_trees() {
                 kept.extend(self.keep(child, root, moved)?);
             }
-            return Ok(match (prefix, kept.as_slice()) {
-                (_, []) => None,
-                (Some(prefix), [one]) if one != "self" && !one.starts_with('{') => {
-                    Some(format!("{prefix}::{one}"))
-                }
-                (Some(prefix), _) => Some(format!("{prefix}::{{{}}}", kept.join(", "))),
-                (None, _) => Some(format!("{{{}}}", kept.join(", "))),
-            });
+            return Ok(joined(prefix, &kept));
         }
         let written = tree.syntax().text().to_owned();
         if tree.star_token().is_some() {
@@ -228,6 +221,87 @@ impl<'t> Retarget<'_, 't> {
             }
         }
         false
+    }
+}
+
+/// A use tree with the prefix `prefix` and the leaves `kept`, as written: `None` when none stays.
+fn joined(prefix: Option<&str>, kept: &[String]) -> Option<String> {
+    match (prefix, kept) {
+        (_, []) => None,
+        (Some(prefix), [one]) if one != "self" && !one.starts_with('{') => {
+            Some(format!("{prefix}::{one}"))
+        }
+        (Some(prefix), _) => Some(format!("{prefix}::{{{}}}", kept.join(", "))),
+        (None, _) => Some(format!("{{{}}}", kept.join(", "))),
+    }
+}
+
+/// `tree` as written without `leaf`, one of its leaves; `None` when nothing of it stays.
+fn without(tree: ast::UseTree<'_>, leaf: ast::UseTree<'_>) -> Option<String> {
+    if tree == leaf {
+        return None;
+    }
+    let Some(list) = tree.use_tree_list() else { return Some(tree.syntax().text().to_owned()) };
+    let kept: Vec<String> = list.use_trees().filter_map(|child| without(child, leaf)).collect();
+    joined(tree.path().map(|it| it.syntax().text()), &kept)
+}
+
+/// `item`, a `use` of the file `root`, with `dropped`, one leaf of its tree, taken out and a
+/// `use` of each of `imports` after it, each with the item's attributes and visibility. An
+/// item with nothing left and nothing imported goes with its line.
+///
+/// # Errors
+///
+/// A comment inside the tree, which taking a leaf out would drop.
+pub fn reimport<'t>(
+    item: ast::Use<'t>,
+    root: ast::Node<'t>,
+    dropped: Option<ast::UseTree<'t>>,
+    imports: &[String],
+) -> Result<Rewrite, String> {
+    let Some(tree) = item.use_tree() else { return Err("a `use` item without a tree".to_owned()) };
+    if dropped.is_some()
+        && tree.syntax().descendants_with_tokens().any(|it| it.kind() == SyntaxKind::COMMENT)
+    {
+        return Err(format!(
+            "`{}` has a comment inside its tree, which taking an import out would drop: move it \
+             out of the braces",
+            item.syntax().text()
+        ));
+    }
+    let use_token = item.use_token().ok_or("a `use` item without `use`")?;
+    let range = item.syntax().text_range();
+    let head = &item.syntax().text()[..usize::from(use_token.text_range().start() - range.start())];
+    let mut lines = Vec::new();
+    match dropped {
+        None => lines.push(item.syntax().text().to_owned()),
+        Some(leaf) => lines.extend(without(tree, leaf).map(|kept| format!("{head}use {kept};"))),
+    }
+    lines.extend(imports.iter().map(|path| format!("{head}use {path};")));
+    if lines.is_empty() {
+        return Ok(Rewrite { range: with_line(root, range), text: String::new() });
+    }
+    let indent = indent_of(root, range.start());
+    Ok(Rewrite { range, text: lines.join(&format!("\n{indent}")) })
+}
+
+/// `range` with the line break before it and its indent, when nothing else is on its line
+/// before it; else with the line break after it, for an item on the file's first line.
+fn with_line(root: ast::Node<'_>, range: TextRange) -> TextRange {
+    let text = root.file().text();
+    let start = usize::from(range.start());
+    let lead = text[..start].rfind('\n');
+    let line = lead.map_or(0, |it| it + 1);
+    if !text[line..start].trim_start_matches([' ', '\t']).is_empty() {
+        return range;
+    }
+    match lead {
+        Some(at) => TextRange::new(syntax::TextSize::of(&text[..at]), range.end()),
+        None => {
+            let end = usize::from(range.end());
+            let after = text[end..].strip_prefix('\n').map_or(end, |_| end + 1);
+            TextRange::new(range.start(), syntax::TextSize::of(&text[..after]))
+        }
     }
 }
 

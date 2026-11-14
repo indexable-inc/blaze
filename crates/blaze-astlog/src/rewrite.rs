@@ -31,6 +31,8 @@ use crate::program::{Action, Program};
 use crate::sema::{Node, Sema};
 use crate::splice::{self, Parens};
 
+mod imports;
+
 type Res<T> = Result<T, Error>;
 
 /// Run `rules` over the view and return what it derives, as the API's
@@ -144,6 +146,7 @@ pub(crate) fn edit_with<F: Files>(
         let literal = literal_paths(&facts, &program)?;
         let mut text = Vec::new(); // alloc: the text edits of one request
         let mut more: Vec<Edit> = edits.to_vec();
+        let mut moved = imports::Moved::default();
         for planned in planned {
             let by = Origin { rule: planned.rule, line: planned.line };
             match planned.action {
@@ -154,10 +157,12 @@ pub(crate) fn edit_with<F: Files>(
                     text.push(Made { edit, by });
                 }
                 PlannedAction::Source { value, args, .. } => {
-                    source_edit(&facts, by, *value, &args, &mut text, &mut more)?;
+                    let out = Out { text: &mut text, edits: &mut more, moved: &mut moved };
+                    source_edit(&facts, by, *value, &args, out)?;
                 }
             }
         }
+        imports::finish(&facts, moved, &mut text, &mut more)?;
         let text = without_overlap(files, text)?;
         blaze_intent::apply_with_text(db, files, &more, &text).map_err(|error| {
             SourceError::Edit { what: error.what.clone(), at: error.at.clone() }.into()
@@ -460,14 +465,22 @@ fn named_at<'a, F: Files>(
     Ok(named.display(facts.db, scope.krate().edition(facts.db)).to_string())
 }
 
-fn source_edit<'p, F: Files>(
-    facts: &Sema<'_, F>,
+/// Where a source action's results go: text edits, blaze-intent's edits, and what retargets
+/// moved, for the imports.
+struct Out<'o, 'a, 'p> {
+    text: &'o mut Vec<Made<'p>>,
+    edits: &'o mut Vec<Edit>,
+    moved: &'o mut imports::Moved<'a, 'p>,
+}
+
+fn source_edit<'a, 'p, F: Files>(
+    facts: &Sema<'a, F>,
     by: Origin<'p>,
     action: Action,
     args: &[Value<Node>],
-    text: &mut Vec<Made<'p>>,
-    edits: &mut Vec<Edit>,
+    out: Out<'_, 'a, 'p>,
 ) -> Res<()> {
+    let Out { text, edits, moved } = out;
     // `(action n "text")`: the node or def, and the text.
     let pair = || match args {
         [Value::Node(target), Value::Text(to)] => Ok((target, to)),
@@ -521,10 +534,21 @@ fn source_edit<'p, F: Files>(
                 unplaceable(by, call, "retargets a path a macro made")
             })?;
             let def = facts.items_at(to, by.line)?;
-            let Some(def) = def.first() else {
+            let Some(&def) = def.first() else {
                 return Err(unplaceable(by, place(facts.files, &file, range.start()), "names no item"));
             };
-            let named = named_at(facts, by, path, &file, range, *def, to)?;
+            if path.ancestors().any(|it| it.kind() == SyntaxKind::USE_TREE) {
+                return imports::leaf(facts, by, path, (&file, range), def, moved);
+            }
+            let named = named_at(facts, by, path, &file, range, def, to)?;
+            // A bare name came through an import, or is the module's own: the new item's
+            // name goes in its place, imported (`imports`).
+            let bare = ast::Path::cast(path).is_some_and(|it| it.qualifier().is_none());
+            let import = bare && named.contains("::");
+            let named = match import {
+                true => named.rsplit("::").next().unwrap_or_default().to_owned(),
+                false => named,
+            };
             // The path up to the item's name: its last segment's generic arguments stay.
             let Some(name) = ast::Path::cast(path).and_then(|it| it.segment()).and_then(|it| it.name_ref())
             else {
@@ -535,6 +559,10 @@ fn source_edit<'p, F: Files>(
                 ));
             };
             let end = range.start() + (name.syntax().text_range().end() - path.text_range().start());
+            moved.covered.push((file.clone(), TextRange::new(range.start(), end)));
+            if bare {
+                moved.bare.push(imports::Bare { path, to: def, import, by });
+            }
             text.push(Made {
                 edit: TextEdit {
                     path: file,

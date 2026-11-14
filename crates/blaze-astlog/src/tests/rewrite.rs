@@ -335,6 +335,105 @@ fn retarget_writes_the_new_item_as_the_paths_module_names_it() {
     assert!(text.contains("{ new(1) }") && text.contains("{ crate::new(2) }"), "{text}");
 }
 
+const MOVED: &str = r#"
+//- /lib.rs crate:lib edition:2021
+macro_rules! id {
+    ($($t:tt)*) => { $($t)* };
+}
+pub mod m {
+    pub fn old(x: u32) -> u32 { x }
+    pub fn new(x: u32) -> u32 { x }
+}
+mod alone {
+    use crate::m::old;
+    pub fn f() -> u32 { old(1) + old(2) }
+}
+mod listed {
+    use crate::m::{self, old};
+    pub fn f() -> u32 { old(1) + m::old(2) }
+}
+mod still_read {
+    use crate::m::old;
+    pub fn f() -> u32 { old(1) + id!(old(3)) }
+    pub fn keep() -> fn(u32) -> u32 { old }
+}
+"#;
+
+/// The paths of `lib::m::old` in a fn other than `keep`, or anywhere (`use` paths included).
+const IN_FN: &str = r#"
+    (rule (old-path p) (path p "lib::m::old"))
+    (rule (kept p) (old-path p) (syntax n "FN") (defines n d) (def-name d "keep") (ancestor n p))
+    (rule (in-fn p) (old-path p) (syntax n "FN") (ancestor n p))
+"#;
+
+/// A bare name the retarget moves came through a `use` of the old item: the new item is
+/// imported where that `use` is, and the `use` goes when nothing else reads what it imports,
+/// whether or not the rule retargets the `use` too. A read the rules leave keeps the `use`,
+/// and the import goes beside it; a retargeted `use` a read still needs is refused.
+#[test]
+fn a_bare_retarget_imports_the_new_item_and_drops_the_use_nothing_else_reads() {
+    let (db, files) = view(MOVED, 0, &["lib.rs"]);
+    let run = |only: &str| {
+        let rules = format!("{IN_FN}(rewrite moved (old-path p) {only} (retarget p \"lib::m::new\"))");
+        edit(&db, &files, &rules, &[])
+    };
+    let alone = "mod alone {\n    use crate::m::new;\n    pub fn f() -> u32 { new(1) + new(2) }\n}";
+    // The import is the path the module names the item by: `m` is imported here.
+    let listed = "mod listed {\n    use crate::m::{self};\n    use m::new;\n    \
+                  pub fn f() -> u32 { new(1) + m::new(2) }\n}";
+    // Only the reads whose syntax is in a fn other than `keep`: no `use` is retargeted, and
+    // nor is the path in `id!`'s input, whose syntax is the expansion's.
+    let applied = run("(in-fn p) (not (kept p))").unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(alone) && text.contains(listed), "{text}");
+    let kept = "mod still_read {\n    use crate::m::old;\n    use crate::m::new;\n    \
+                pub fn f() -> u32 { new(1) + id!(old(3)) }\n    \
+                pub fn keep() -> fn(u32) -> u32 { old }\n}";
+    assert!(text.contains(kept), "{text}");
+    // Every path, `use`s included: each `use` goes, the last read with it.
+    let applied = run("").unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains(alone) && text.contains(listed), "{text}");
+    let all = "mod still_read {\n    use crate::m::new;\n    \
+               pub fn f() -> u32 { new(1) + id!(new(3)) }\n    \
+               pub fn keep() -> fn(u32) -> u32 { new }\n}";
+    assert!(text.contains(all), "{text}");
+    // The `use` of `still_read`, but not `keep`'s read of it.
+    let error = refused(run("(not (kept p))"));
+    assert!(
+        error.contains("retargets the import `crate::m::old`, which `old` at lib.rs:19 still reads"),
+        "{error}"
+    );
+}
+
+/// The new item's name already means something else where the bare name is: importing it
+/// would clash with that or shadow it, so the retarget is refused, naming both.
+#[test]
+fn a_bare_retarget_whose_new_name_is_taken_is_refused_naming_what_has_it() {
+    let fixture = r#"
+//- /lib.rs crate:lib edition:2021
+pub mod m {
+    pub fn old(x: u32) -> u32 { x }
+    pub fn new(x: u32) -> u32 { x }
+}
+mod taken {
+    use crate::m::old;
+    fn new() {}
+    pub fn f() -> u32 { new(); old(1) }
+}
+"#;
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (old-path p) (path p "lib::m::old"))
+        (rewrite moved (old-path p) (retarget p "lib::m::new"))
+    "#;
+    let error = refused(edit(&db, &files, rules, &[]));
+    assert!(
+        error.contains("`new` already names `lib::taken::new` here, so `lib::m::new` can't be imported"),
+        "{error}"
+    );
+}
+
 const PARAMS: &str = r#"
 //- /lib.rs crate:lib edition:2021
 pub fn mix(a: u32, b: u32, unused: u32) -> u32 { a - b }
