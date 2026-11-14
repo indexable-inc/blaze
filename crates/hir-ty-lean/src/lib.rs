@@ -161,9 +161,15 @@ fn accepted(db: &Db, func: FunctionId) -> Result<(), NotTranslated> {
         return Err(refuse("a function that does not type-check"));
     }
     let checked = hir_ty_borrowck::borrowck(db, def);
-    if !checked.diagnostics.is_empty() || checked.not_checked.is_some() || checked.skipped.is_some()
-    {
-        return Err(refuse("a function the borrow checker did not accept"));
+    // What the borrow checker said, first: an error names the thing it is about.
+    let why = match (checked.diagnostics.first(), checked.not_checked, checked.skipped.as_ref()) {
+        (Some(first), _, _) => Some(format!("{}: {}", first.code, first.message)),
+        (None, Some(not), _) => Some(format!("not checked: {not:?}")),
+        (None, None, Some(skipped)) => Some(format!("skipped: {skipped}")),
+        (None, None, None) => None,
+    };
+    if let Some(why) = why {
+        return Err(refuse(&format!("a function the borrow checker did not accept ({why})")));
     }
     Ok(())
 }
@@ -283,6 +289,11 @@ fn emit_in<'db>(
     stack.pop();
     let func = instance.func;
     let model = translate::translate(body, &shapes)?;
+    // A closure's body states nothing: `requires`, `ensures` and `#[blaze::theorem]` are its
+    // function's.
+    if instance.closure.is_some() {
+        return Ok(module_of(body, model, None, imports));
+    }
     let params: Vec<String> = model.params.iter().map(|it| it.name.clone()).collect();
     let spec = spec::lower(db, func, &params)?;
     if instance.args.is_some() && spec.is_some() {

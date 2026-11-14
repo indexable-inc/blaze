@@ -22,6 +22,7 @@
 //!     borrow_mut: borrow
 //!     cell: copy, drop
 //!     clone: sized
+//!     closure_methods: option, result, fn
 //!     coerce_pointee: derive, sized, unsize, coerce_unsized, dispatch_from_dyn
 //!     reborrow: derive, copy
 //!     const_param_ty: derive, eq
@@ -2057,6 +2058,7 @@ pub mod option {
             }
         }
         // region:fn
+        // region:!closure_methods
         pub fn and_then<U, F>(self, _f: F) -> Option<U>
         where
             F: FnOnce(T) -> Option<U>,
@@ -2082,8 +2084,120 @@ pub mod option {
         {
             loop {}
         }
+        // endregion:!closure_methods
         // endregion:fn
     }
+
+    // region:closure_methods
+    // core's own bodies (library/core/src/option.rs), without the `[const]` and `Destruct`
+    // bounds core adds for const evaluation.
+    impl<T> Option<T> {
+        pub fn is_some_and(self, f: impl FnOnce(T) -> bool) -> bool {
+            match self {
+                None => false,
+                Some(x) => f(x),
+            }
+        }
+
+        pub fn is_none_or(self, f: impl FnOnce(T) -> bool) -> bool {
+            match self {
+                None => true,
+                Some(x) => f(x),
+            }
+        }
+
+        pub fn map<U, F>(self, f: F) -> Option<U>
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(x) => Some(f(x)),
+                None => None,
+            }
+        }
+
+        pub fn inspect<F: FnOnce(&T)>(self, f: F) -> Self {
+            if let Some(ref x) = self {
+                f(x);
+            }
+
+            self
+        }
+
+        pub fn map_or<U, F>(self, default: U, f: F) -> U
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(t) => f(t),
+                None => default,
+            }
+        }
+
+        pub fn map_or_else<U, D, F>(self, default: D, f: F) -> U
+        where
+            D: FnOnce() -> U,
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Some(t) => f(t),
+                None => default(),
+            }
+        }
+
+        pub fn ok_or_else<E, F>(self, err: F) -> crate::result::Result<T, E>
+        where
+            F: FnOnce() -> E,
+        {
+            match self {
+                Some(v) => crate::result::Result::Ok(v),
+                None => crate::result::Result::Err(err()),
+            }
+        }
+
+        pub fn and_then<U, F>(self, f: F) -> Option<U>
+        where
+            F: FnOnce(T) -> Option<U>,
+        {
+            match self {
+                Some(x) => f(x),
+                None => None,
+            }
+        }
+
+        pub fn filter<P>(self, predicate: P) -> Self
+        where
+            P: FnOnce(&T) -> bool,
+        {
+            if let Some(x) = self {
+                if predicate(&x) {
+                    return Some(x);
+                }
+            }
+            None
+        }
+
+        pub fn or_else<F>(self, f: F) -> Option<T>
+        where
+            F: FnOnce() -> Option<T>,
+        {
+            match self {
+                x @ Some(_) => x,
+                None => f(),
+            }
+        }
+
+        pub fn unwrap_or_else<F>(self, f: F) -> T
+        where
+            F: FnOnce() -> T,
+        {
+            match self {
+                Some(x) => x,
+                None => f(),
+            }
+        }
+    }
+    // endregion:closure_methods
 }
 // endregion:option
 
@@ -2170,6 +2284,84 @@ pub mod result {
         }
         // endregion:fn
     }
+
+    // region:closure_methods
+    // core's own bodies (library/core/src/result.rs), without the `[const]` and `Destruct`
+    // bounds core adds for const evaluation.
+    impl<T, E> Result<T, E> {
+        pub fn is_ok_and<F>(self, f: F) -> bool
+        where
+            F: FnOnce(T) -> bool,
+        {
+            match self {
+                Err(_) => false,
+                Ok(x) => f(x),
+            }
+        }
+
+        pub fn is_err_and<F>(self, f: F) -> bool
+        where
+            F: FnOnce(E) -> bool,
+        {
+            match self {
+                Ok(_) => false,
+                Err(e) => f(e),
+            }
+        }
+
+        pub fn map<U, F>(self, op: F) -> Result<U, E>
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => Ok(op(t)),
+                Err(e) => Err(e),
+            }
+        }
+
+        pub fn map_or<U, F>(self, default: U, f: F) -> U
+        where
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => f(t),
+                Err(_) => default,
+            }
+        }
+
+        pub fn map_or_else<U, D, F>(self, default: D, f: F) -> U
+        where
+            D: FnOnce(E) -> U,
+            F: FnOnce(T) -> U,
+        {
+            match self {
+                Ok(t) => f(t),
+                Err(e) => default(e),
+            }
+        }
+
+        pub fn inspect<F>(self, f: F) -> Self
+        where
+            F: FnOnce(&T),
+        {
+            if let Ok(ref t) = self {
+                f(t);
+            }
+
+            self
+        }
+
+        pub fn and_then<U, F>(self, op: F) -> Result<U, E>
+        where
+            F: FnOnce(T) -> Result<U, E>,
+        {
+            match self {
+                Ok(t) => op(t),
+                Err(e) => Err(e),
+            }
+        }
+    }
+    // endregion:closure_methods
 
     // The methods that hand the `Ok` payload on and drop or print the `Err` one, which admit a
     // linear `Ok` payload only.

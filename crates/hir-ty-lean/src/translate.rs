@@ -1455,8 +1455,15 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     if !returns_unit {
         returned.push(0);
     }
+    // A `&mut` parameter is given back, and so is a closure that lends (its environment holds
+    // a capture by `&mut`), taken by value: what it changes is the caller's.
+    let lends = |ty: &Ty| match ty {
+        Ty::RefMut(_) => true,
+        Ty::Adt(name) => body.adts.iter().any(|it| it.name == *name && it.lends()),
+        _ => false,
+    };
     for (at, &param) in body.params.iter().enumerate() {
-        if matches!(body.locals[param as usize].ty, Ty::RefMut(_)) {
+        if lends(&body.locals[param as usize].ty) {
             mut_params.push(at);
             returned.push(param);
         }
