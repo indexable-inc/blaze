@@ -1866,8 +1866,6 @@ fn options() -> Options {
         color: false,
         build: blaze_api::Build::default(),
         settings: Vec::new(),
-        // A table of its own: each daemon drives one, and tests run at once.
-        outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
         stall: blaze_profile::Watchdog::BOUND,
         #[cfg(unix)]
         activated: None,

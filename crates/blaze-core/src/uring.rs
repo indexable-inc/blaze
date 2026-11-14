@@ -72,6 +72,9 @@ use blaze_radix as radix;
 use std::alloc::Global;
 
 use self::ops::{Cold, Hot, Id, Kind};
+/// What the process's fanotify watches have read and dropped: the cost of one group per watch
+/// (`crate::fanotify`'s floor), readable from a running daemon.
+pub use crate::fanotify::{WatchCounts, watch_counts};
 use crate::{
     Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names,
     PSI_TRIGGER, RECV_MOST, Stamp, Tag,
@@ -1321,6 +1324,91 @@ impl Offload {
     }
 }
 
+/// The most walks out on the [`Walker`] at once, starts and grows together: what its channels
+/// hold, so a send on either never waits and allocates nothing. A start past it is refused,
+/// naming its directory; a grow past it waits in [`Uring::ungrown`] for a walk to end.
+const STARTS: usize = 64;
+
+/// A watch whose start is a walk off the ring (inotify's, [`crate::watch::Walk`]), until the
+/// walk is done: in [`Uring::starting`] by its tag.
+struct Starting {
+    dir: FileName,
+    /// An [`Effect::Journal`]'s first batch, told once the watch is in place.
+    first: Option<Done>,
+    /// The list of flushes of the watch it will be, kept from one that ended.
+    flushes: Vec<Tag>,
+    /// Unwatched meanwhile: ended (with [`Done::Unwatched`]) as its walk is done, never put in
+    /// place.
+    stop: bool,
+}
+
+/// A watch's start the [`Walker`] is done with.
+struct Started {
+    tag: Tag,
+    tree: io::Result<crate::watch::Tree>,
+}
+
+/// A walk for the [`Walker`]: a watch's start, or a grow of a watch in place, by the
+/// [`Watching`] it is of (its handle's bits).
+enum Walking {
+    Start(Tag, crate::watch::Walk),
+    Grow(Tag, u64, crate::watch::Grow),
+}
+
+/// What the [`Walker`] is done with.
+enum Walked {
+    Started(Started),
+    Grown(Grown),
+}
+
+/// A grow the [`Walker`] is done with, to merge into its watch ([`Uring::merge`]).
+struct Grown {
+    tag: Tag,
+    watching: u64,
+    grown: crate::watch::Grown,
+}
+
+/// The thread that runs inotify's walks, each of a tree that may take seconds, so the ring's
+/// thread never does (one took 128 s on 2026-11-14 and ended the daemon): a watch's start
+/// ([`crate::watch::Walk`]) and the watches of a directory made under one
+/// ([`crate::watch::Grow`]). Made for the first. Its channels are bounded by [`STARTS`] and it
+/// wakes the ring as work off the ring does ([`Offload`]).
+struct Walker {
+    inbox: crossbeam_channel::Sender<Walking>,
+    done: crossbeam_channel::Receiver<Walked>,
+}
+
+impl Walker {
+    fn new(root: Arc<Path>, wake: Arc<Wake>, gate: crate::watch::Gate) -> io::Result<Walker> {
+        let (inbox, jobs) = crossbeam_channel::bounded::<Walking>(STARTS);
+        let (told, done) = crossbeam_channel::bounded(STARTS);
+        std::thread::Builder::new().name("blaze-watch-walk".into()).spawn(move || {
+            // The buffers of every grow's walk, kept for the next.
+            let mut walker = crate::watch::Walker::default();
+            let bytes = root.as_os_str().as_bytes();
+            // Ends as the driver drops its end of the inbox.
+            while let Ok(job) = jobs.recv() {
+                crate::watch::pass(&gate);
+                // Each walk's span is its own (`crate::watch`), naming the directory and the
+                // count of directories it watched.
+                let walked = match job {
+                    Walking::Start(tag, walk) => {
+                        Walked::Started(Started { tag, tree: walk.run(&root) })
+                    }
+                    Walking::Grow(tag, watching, grow) => {
+                        Walked::Grown(Grown { tag, watching, grown: grow.run(bytes, &mut walker) })
+                    }
+                };
+                if told.send(walked).is_err() {
+                    return;
+                }
+                wake_ring(&wake);
+            }
+        })?;
+        Ok(Walker { inbox, done })
+    }
+}
+
 /// What became of a request whose completion was reaped.
 enum Step {
     /// The rest of it asked for again.
@@ -1797,6 +1885,29 @@ pub struct Uring {
     buffers: Vec<Vec<u8>>,
     /// The tables of watches that ended, with their lists of flushes, for the next watch.
     trees: Vec<(crate::watch::Spare, Vec<Tag>)>,
+    /// Watches whose start is out on the [`Walker`], by tag.
+    starting: HashMap<Tag, Starting, Global>,
+    /// Effects that wait for a start ([`Uring::holds`]), in the order they were submitted:
+    /// counted in flight, and submitted as a start is put in place.
+    held: Vec<Effect>,
+    /// Starts the walker told, to be put in place ([`Uring::put_in_place`]).
+    started: Vec<Started>,
+    /// Grows the walker told, to be merged ([`Uring::put_in_place`]).
+    grown: Vec<Grown>,
+    /// How many grows are out on the walker: with `starting`, at most [`STARTS`].
+    grows_out: usize,
+    /// Watches with directories to grow and no room on the walker for them yet, by tag and
+    /// [`Watching`] handle's bits: each handed over as a walk ends.
+    ungrown: Vec<(Tag, u64)>,
+    /// Made for the first inotify walk.
+    walker: Option<Walker>,
+    /// A test's hold on the walker, given it as it is made ([`crate::watch::Gate`]).
+    #[cfg(test)]
+    walk_gate: crate::watch::Gate,
+    /// A test's: a walk of an inotify start runs on the ring's thread, as before 2026-11-14,
+    /// for tests of what follows a start (a slot's reuse, a warm watch's allocations).
+    #[cfg(test)]
+    walks_here: bool,
     /// Made for the first [`Effect::Stamp`].
     stampers: Option<Stampers>,
     offload: Offload,
@@ -1882,6 +1993,17 @@ impl Uring {
             spawn_dirs,
             buffers: Vec::with_capacity(SPARES), // alloc: setup, once per driver.
             trees: Vec::with_capacity(SPARES),   // alloc: setup, once per driver.
+            starting: HashMap::with_capacity_in(STARTS, Global),
+            held: Vec::new_in(Global),
+            started: Vec::with_capacity_in(STARTS, Global),
+            grown: Vec::with_capacity_in(STARTS, Global),
+            grows_out: 0,
+            ungrown: Vec::with_capacity_in(STARTS, Global),
+            walker: None,
+            #[cfg(test)]
+            walk_gate: None,
+            #[cfg(test)]
+            walks_here: false,
             stampers: None,
             host: crate::host::Host::new(Arc::new(HostSink {
                 // clone: setup, a channel's handle and a count of the wake, for the host.
@@ -2258,11 +2380,98 @@ impl Uring {
         }
     }
 
-    /// The completions the threads off the ring have sent.
+    /// The completions the threads off the ring have sent, and the starts the walker is done
+    /// with (put in place by [`Uring::put_in_place`]).
     fn take_offloaded(&mut self) {
         while let Ok(completion) = self.offload.receiver.try_recv() {
             self.offload.out -= 1;
             self.ready.push(completion);
+        }
+        if let Some(walker) = &self.walker {
+            while let Ok(walked) = walker.done.try_recv() {
+                self.offload.out -= 1;
+                match walked {
+                    Walked::Started(started) => self.started.push(started),
+                    Walked::Grown(grown) => {
+                        self.grows_out -= 1;
+                        self.grown.push(grown);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether `effect` waits for a watch's start: a look at the disk at or under the directory
+    /// of a watch whose walk is out, or a flush of such a watch.
+    ///
+    /// The invariant: a look under a watched directory asked after its watch is answered only
+    /// once the watch is in place, so a change made after the look was answered is heard
+    /// (what a watcher's start relies on: blaze-vfs's `Watcher::start` sweeps its stamps right
+    /// after its journal, and a watch is confirmed by a stat asked after it). A flush of it
+    /// waits too, so it is answered by the watch it asked of. Tested by
+    /// `a_look_under_a_starting_watch_waits_for_its_walk`, whose control holds nothing.
+    fn holds(&self, effect: &Effect) -> bool {
+        if self.starting.is_empty() {
+            return false;
+        }
+        if let Effect::Flush { watch, .. } = effect {
+            #[cfg(test)]
+            if crate::watch::HOLDS_NOTHING.get() {
+                return false;
+            }
+            return self.starting.contains_key(watch);
+        }
+        crate::watch::looks_under(effect, |name| {
+            self.starting.values().any(|it| crate::watch::is_under(name, it.dir.as_str()))
+        })
+    }
+
+    /// Each start the walker is done with: put in place (its read in flight, a journal's first
+    /// batch told), ended where it was unwatched meanwhile, or failed naming why. Then what was
+    /// held for a start goes, in the order it was asked; what waits for a start still out is
+    /// held again. Then each grow the walker is done with is merged ([`Uring::merge`]).
+    fn put_in_place(&mut self) {
+        if !self.grown.is_empty() {
+            let mut grown = std::mem::take(&mut self.grown);
+            for it in grown.drain(..) {
+                self.merge(it);
+            }
+            self.grown = grown;
+        }
+        if self.started.is_empty() {
+            return;
+        }
+        let mut started = std::mem::take(&mut self.started);
+        for Started { tag, tree } in started.drain(..) {
+            let Some(mut start) = self.starting.remove(&tag) else {
+                unreachable!("the start of {tag:?}, which no watch is starting")
+            };
+            match tree {
+                Ok(tree) if start.stop => {
+                    let spare = tree.end();
+                    if self.trees.len() < SPARES {
+                        start.flushes.clear();
+                        self.trees.push((spare, start.flushes));
+                    }
+                    self.ready.push(Completion { tag, done: Done::Unwatched });
+                }
+                Ok(tree) => self.in_place(tag, tree, start),
+                Err(error) => {
+                    let why = IoError(format!("watching {}: {error}", start.dir));
+                    self.ready.push(Completion { tag, done: Done::Failed(why) });
+                }
+            }
+        }
+        self.started = started;
+        if self.held.is_empty() {
+            return;
+        }
+        let mut held = std::mem::take(&mut self.held);
+        // Counted in flight as they were held; `submit` counts each again.
+        self.in_flight -= held.len();
+        self.submit(&mut held);
+        if self.held.is_empty() {
+            self.held = held;
         }
     }
 
@@ -2363,20 +2572,26 @@ fn gone(conn: Conn) -> io::Error {
 }
 
 /// Answers the flushes of the watch `watch`, whose read has completed and is not yet asked
-/// again, so nothing else reads its descriptor: what is still queued on it is told first.
-fn flushed(
-    ready: &mut Vec<Completion>,
+/// again, so nothing else reads its descriptor: what is still queued on it is told first. While
+/// a grow of the watch is out or directories wait for one ([`crate::watch::Tree::pending`]),
+/// what it will find came before the flushes, so they wait for its merge ([`Uring::merge`]).
+fn flushed<A: std::alloc::Allocator + std::alloc::AllocatorNightly, B: std::alloc::Allocator>(
+    ready: &mut Vec<Completion, B>,
     watch: Tag,
     tree: &mut crate::watch::Tree,
     buffer: &mut [u8],
-    flushes: &mut Vec<Tag>,
+    flushes: &mut Vec<Tag, A>,
     journal: Option<&FileName>,
 ) {
-    if flushes.is_empty() {
+    if flushes.is_empty() || tree.pending() {
         return;
     }
     let drained =
         tree.drain(buffer, |done| ready.push(Completion { tag: watch, done: told(journal, done) }));
+    // The drain heard directories made: answered once they are grown.
+    if drained.is_ok() && tree.pending() {
+        return;
+    }
     for tag in flushes.drain(..) {
         let done = match &drained {
             Ok(()) => Done::Flushed,
@@ -2533,13 +2748,29 @@ fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Fixed> {
 
 impl Driver for Uring {
     fn submit(&mut self, effects: &mut Vec<Effect>) {
+        // The one now of every timer in this submit: each one's `after` counts from when it was
+        // asked, which is this call, so timers asked together fire in the order of their
+        // `after`s whatever the thread is kept from running between two of them. With a clock
+        // read per timer, a preemption longer than the gap between two `after`s orders them by
+        // when each was read instead (`more_than_the_ring_holds` fired 2, 0, 1 under a load of
+        // about 55 on 2026-11-14).
+        let now = wheel::ticks(self.start.elapsed());
         for effect in effects.drain(..) {
+            if self.holds(&effect) {
+                self.in_flight += 1;
+                self.held.push(effect);
+                continue;
+            }
             let tag = effect.tag();
             match effect {
                 Effect::Unwatch { .. } => {
                     match self.watches.get(&tag).copied() {
                         Some(id) => self.stop(id),
-                        None => self.refuse(tag, format!("nothing is watched as {tag:?}")), // alloc: an error.
+                        None => match self.starting.get_mut(&tag) {
+                            // Ended once its walk is done: the walker holds its tables till then.
+                            Some(starting) => starting.stop = true,
+                            None => self.refuse(tag, format!("nothing is watched as {tag:?}")),
+                        },
                     }
                     continue;
                 }
@@ -2635,16 +2866,14 @@ impl Driver for Uring {
                     self.locks.lock(&self.root, &file, mode, tag).map(Some)
                 }
                 Effect::Unlock { lock, .. } => self.locks.unlock(lock).map(Some),
-                Effect::Watch { dir, .. } => self.watch(tag, dir, false).map(|()| None),
+                Effect::Watch { dir, .. } => self.watch(tag, dir, None).map(|()| None),
                 Effect::Pressure { .. } => self.pressure(tag).map(|()| None),
                 // Linux keeps no journal across a restart: the first batch says what of the
-                // cursor is lost, and the watch is live from its start.
+                // cursor is lost, told once the watch is in place, and the watch is live from
+                // then.
                 Effect::Journal { dir, since, .. } => {
                     let first = crate::journal::first_on_linux(&dir, &since);
-                    self.watch(tag, dir, true).map(|()| {
-                        self.ready.push(Completion { tag, done: first });
-                        None
-                    })
+                    self.watch(tag, dir, Some(first)).map(|()| None)
                 }
                 // No name to stamp: answered here, with no stamper woken for it.
                 Effect::Stamp { files, .. } if files.is_empty() => {
@@ -2736,9 +2965,7 @@ impl Driver for Uring {
                         .map(|()| Some(Done::Truncated))
                 }
                 Effect::Timer { after, .. } => {
-                    let due =
-                        wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                    self.timers.insert(due, tag);
+                    self.timers.insert(now.saturating_add(wheel::ticks(after)), tag);
                     Ok(None)
                 }
                 Effect::Map { file, extent, .. } => self.map(tag, &file, extent).map(|()| None),
@@ -2810,6 +3037,7 @@ impl Driver for Uring {
         let before = out.len();
         self.reap();
         self.fire_timers();
+        self.put_in_place();
         out.append(&mut self.ready);
         // With nothing in flight only a waker can end the wait, so it is waited for once one
         // has been handed out; with neither, nothing can come and the poll only looks (the
@@ -2830,6 +3058,9 @@ impl Driver for Uring {
                 // below, and the kernel is not entered to wait.
                 self.offload.wake.parked.store(true, Ordering::SeqCst);
                 self.take_offloaded();
+                // A start the walker finished is put in place before the kernel is entered:
+                // its eventfd's count was read, so nothing else would end the wait for it.
+                self.put_in_place();
                 // A waker's ask ends the poll with what there is, which may be nothing: what
                 // it woke the loop for is in a queue of the caller's own.
                 let asked = self.offload.wake.asked.swap(false, Ordering::SeqCst);
@@ -2847,6 +3078,7 @@ impl Driver for Uring {
                 }
                 self.reap();
                 self.fire_timers();
+                self.put_in_place();
                 out.append(&mut self.ready);
                 if until.passed(clock.now()) {
                     break;
@@ -4201,6 +4433,161 @@ mod tests {
         unsweep(&root);
     }
 
+    /// The invariant (`Uring::holds`): with inotify, whose start is a walk of the tree, the
+    /// submit that starts a watch walks nothing (the start is out on the walker as it returns),
+    /// and a stat of the watched directory asked right after the watch, as a watcher confirms
+    /// one, is answered only once the watch is in place. The walker waits at a gate the test
+    /// holds, so the stat is asked while the watch is provably not in place: the driver holds
+    /// it until the test lets the walk through, and the control, nothing held, answers it
+    /// before.
+    #[test]
+    fn a_look_under_a_starting_watch_waits_for_its_walk() {
+        fn in_place_at_stat(holds_nothing: bool) -> bool {
+            let root = dir(&format!("uring-starting-{holds_nothing}"));
+            std::fs::create_dir_all(root.join("src/deep")).unwrap();
+            let src = FileName::new("src").unwrap();
+            let mut driver = Uring::new(&root).unwrap();
+            let (open, gate) = crossbeam_channel::unbounded();
+            driver.walk_gate = Some(gate);
+            crate::watch::FANOTIFY_REFUSED.set(true);
+            crate::watch::HOLDS_NOTHING.set(holds_nothing);
+            driver.submit(&mut vec![
+                Effect::Watch { dir: src.clone(), tag: Tag(1) },
+                Effect::Stat { file: src.clone(), tag: Tag(2) },
+            ]);
+            crate::watch::FANOTIFY_REFUSED.set(false);
+            assert!(
+                driver.starting.contains_key(&Tag(1)) && !driver.watches.contains_key(&Tag(1)),
+                "the submit walked the tree"
+            );
+            // A held stat is answered only after the walk, which waits at the gate: let it
+            // through. A stat not held is answered with the gate shut, so before the walk.
+            let held = driver.held.iter().any(|it| it.tag() == Tag(2));
+            if held {
+                open.send(()).unwrap();
+            }
+            let (mut out, mut at_stat) = (Vec::new(), None);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while at_stat.is_none() {
+                assert!(Instant::now() < deadline, "the stat never came (held: {held})");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+                for it in out.drain(..) {
+                    match (it.tag.0, it.done) {
+                        (2, Done::Stat(Some(_))) => {
+                            at_stat = Some(driver.watches.contains_key(&Tag(1)));
+                        }
+                        (1, Done::Changed { .. }) => {}
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            // Every walk through from here, the start's among them where it waits still.
+            drop(open);
+            crate::watch::HOLDS_NOTHING.set(false);
+            let mut ended = false;
+            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+                match (it.tag.0, it.done) {
+                    (1, Done::Unwatched) => ended = true,
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            })
+            .expect("the effects end");
+            assert!(ended && driver.in_flight() == 0);
+            drop(driver);
+            std::fs::remove_dir_all(root).unwrap();
+            at_stat.expect("polled until the stat came")
+        }
+        assert!(in_place_at_stat(false), "the stat was answered before the watch was in place");
+        assert!(!in_place_at_stat(true), "the control was not caught");
+    }
+
+    /// The invariant (`crate::watch`, "A directory made in"): under inotify a directory made
+    /// under a watched one is watched off the loop, and a file made in it before its watch is
+    /// in place is told, by the grow's own listing, before a flush asked after it is answered.
+    /// The walker waits at a gate the test holds, so the file is made while the new directory
+    /// provably has no watch. The control (`GROW_DROPS_FOUND`) drops what the walk finds: the
+    /// file is then never told.
+    #[test]
+    fn a_file_made_in_a_new_directory_before_its_watch_is_heard() {
+        /// Asks a flush of the watch 1 as `tag` and polls until it is answered, each name a
+        /// change of the watch told into `heard`.
+        fn flush(driver: &mut Uring, tag: Tag, heard: &mut Vec<FileName>) {
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(1), tag }]);
+            poll_heard(driver, heard, |it, _| it == Some(tag));
+        }
+        /// Polls until `enough` says yes, asked of each flush answered and of what was heard
+        /// so far, or thirty seconds pass.
+        fn poll_heard(
+            driver: &mut Uring,
+            heard: &mut Vec<FileName>,
+            mut enough: impl FnMut(Option<Tag>, &[FileName]) -> bool,
+        ) {
+            let (mut out, deadline) = (Vec::new(), Instant::now() + Duration::from_secs(30));
+            loop {
+                assert!(Instant::now() < deadline, "never came; heard {heard:?}");
+                driver.poll(&mut out, Deadline::after(driver.now(), Duration::from_millis(50)));
+                let mut done = false;
+                for it in out.drain(..) {
+                    match it.done {
+                        Done::Changed { files, .. } => heard.extend(files),
+                        Done::Flushed => done |= enough(Some(it.tag), heard),
+                        other => panic!("{:?}: {other:?}", it.tag),
+                    }
+                }
+                if done || enough(None, heard) {
+                    return;
+                }
+            }
+        }
+        fn heard_it(drops_found: bool) -> bool {
+            let root = dir(&format!("uring-grow-{drops_found}"));
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let file = FileName::new("src/new/deeper/lib.rs").unwrap();
+            let mut driver = Uring::new(&root).unwrap();
+            let (open, gate) = crossbeam_channel::unbounded();
+            driver.walk_gate = Some(gate);
+            crate::watch::FANOTIFY_REFUSED.set(true);
+            crate::watch::GROW_DROPS_FOUND.set(drops_found);
+            driver.submit(&mut vec![Effect::Watch { dir: FileName::new("src").unwrap(), tag: Tag(1) }]);
+            crate::watch::FANOTIFY_REFUSED.set(false);
+            // The start's walk through; the watch is in place once a flush after it is answered.
+            open.send(()).unwrap();
+            let mut heard = Vec::new();
+            flush(&mut driver, Tag(2), &mut heard);
+            std::fs::create_dir(root.join("src/new")).unwrap();
+            let new = FileName::new("src/new").unwrap();
+            poll_heard(&mut driver, &mut heard, |_, heard| heard.contains(&new));
+            assert_eq!(driver.grows_out, 1, "the new directory's grow is out, at the gate");
+            // Made while `src/new` has no watch: the grow waits at the gate.
+            std::fs::create_dir(root.join("src/new/deeper")).unwrap();
+            std::fs::write(root.join(file.as_str()), b"fn f() {}").unwrap();
+            open.send(()).unwrap();
+            flush(&mut driver, Tag(3), &mut heard);
+            let told = heard.contains(&file);
+            crate::watch::GROW_DROPS_FOUND.set(false);
+            drop(open);
+            let mut ended = false;
+            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(1) }], |it, _| {
+                match (it.tag.0, it.done) {
+                    (1, Done::Unwatched) => ended = true,
+                    (1, Done::Changed { .. }) => {}
+                    other => panic!("{other:?}"),
+                }
+            })
+            .expect("the effects end");
+            assert!(ended && driver.in_flight() == 0);
+            drop(driver);
+            std::fs::remove_dir_all(root).unwrap();
+            told
+        }
+        assert!(
+            heard_it(false),
+            "a file made in a new directory before its watch was in place was never told"
+        );
+        assert!(!heard_it(true), "the control was not caught");
+    }
+
     /// A journal on Linux first says the changes since a saved cursor are lost (and nothing is
     /// for no cursor), then tells a file written as a live batch, before a flush asked after
     /// it; it ends at an unwatch, as a watch does.
@@ -4375,6 +4762,8 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("file"), b"bytes").unwrap();
         let mut driver = Uring::new(&root).unwrap();
+        // A watch's read in flight as it is submitted, whatever watches it.
+        driver.walks_here = true;
         let file = FileName::new("file").unwrap();
         // Kept open from here, so each request on it is its own alone.
         run_until_idle(
@@ -4529,6 +4918,8 @@ mod tests {
         let root = dir("uring-warm-watch");
         std::fs::create_dir_all(root.join("src")).unwrap();
         let mut driver = Uring::new(&root).unwrap();
+        // In place as it is submitted, so the file written right after is heard.
+        driver.walks_here = true;
         let src = FileName::new("src").unwrap();
         let mut out = Vec::with_capacity(64);
         for round in 0..2 * WARM {

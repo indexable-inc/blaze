@@ -660,15 +660,15 @@ enum Unchecked {
     Failed(String),
 }
 
-/// A path dependency outside the view that no watch vouches for, named: it is read again by
-/// the build before its config takes its mount, and until then its content id is not known.
-fn stale_local<S: Steps>(w: &World<'_, S>) -> Option<String> {
-    let stale = w.mounts.stale_locals(vouched_local, super::super::fetch::local::vouched_file, super::super::fetch::local::absent);
+/// A path dependency outside the view whose leaves' stamps no longer hold, named, of `stale`
+/// (the start's sweep, [`crate::serve::mounts::Sweep::stale`], taken off the loop): it is read
+/// again by the build before its config takes its mount, and until then its content id is
+/// not known.
+fn stale_local(stale: &[String]) -> Option<String> {
     let at = stale.first()?;
     // alloc: a reason, once a request
     Some(format!(
-        "a path outside the view is read again before it can be vouched for: {at} ({}); {} such in all",
-        blaze_vfs::outside::why_looked(std::path::Path::new(at)),
+        "a path outside the view is read again before it can be vouched for: {at}, a stamp of it moved or it has none; {} such in all",
         stale.len(),
     ))
 }
@@ -792,6 +792,7 @@ impl<S: Steps> Jobs<S> {
         view: Option<Opened>,
         work: Work,
         idle: bool,
+        stale: &[String],
     ) -> Option<(Option<Opened>, Work, Option<(String, ContentId)>)> {
         self.refused = None;
         // A job that waited for the library and ended otherwise left its id here.
@@ -828,7 +829,7 @@ impl<S: Steps> Jobs<S> {
             }
             return Some((view, work, None));
         };
-        if let Some(why) = stale_local(w) {
+        if let Some(why) = stale_local(stale) {
             self.refused = Some(why);
             return Some((view, work, None));
         }
@@ -869,7 +870,15 @@ impl<S: Steps> Jobs<S> {
         self.certify.late.swap_remove(at);
         // clone: the config owns the library's place, once a request
         let Some(library) = self.library.clone() else { return false };
-        if let Some(why) = stale_local(w) {
+        // The start's sweep, kept on the job until its first view is made ready: a job that
+        // waited for the library has made none.
+        let stale = self.jobs.get(key_of(id)).and_then(|job| job.swept.as_deref());
+        let why = match stale {
+            Some(stale) => stale_local(stale),
+            // alloc: a reason, once a request
+            None => Some("its start's sweep of the paths outside the view is not held".to_owned()),
+        };
+        if let Some(why) = why {
             tracing::info_span!(target: "blaze", "request certificate: not checked", job = %id, why = %why).in_scope(|| {});
             return false;
         }
@@ -1249,7 +1258,9 @@ impl<S: Steps> Jobs<S> {
         match (late, work) {
             (false, Some(work)) => {
                 self.refused = Some(why);
-                self.begin_job(w, id, view, work, idle, walks);
+                // Checked, so its start's sweep found no local mount stale
+                // ([`Jobs::certify_begin`] refuses one): the build makes its view ready on it.
+                self.begin_job(w, id, view, work, idle, walks, Some(Box::default()));
             }
             // The job that waited for the library goes on to its build: its view is opened.
             (true, _) => self.prepare(w, id),
@@ -1623,8 +1634,9 @@ impl<S: Steps> Jobs<S> {
         let root_dir = cargo.root.as_str();
         // Every path dependency is read where it is on the disk, and none has a column a
         // client can look at yet: no slot while one is mounted.
-        if let Some(at) = w.mounts.stale_locals(|_, _| false, |_, _| false, |_| false).into_iter().next() {
-            return Err(slot::Unslotted::Local(at));
+        // Every local is named so: an unknown stamp holds none ([`blaze_vfs::outside::holds`]).
+        if let Some(at) = w.mounts.first_local() {
+            return Err(slot::Unslotted::Local(at.to_owned()));
         }
         let Some(head) = self.roots.ids.iter().find(|(_, id)| **id == root).map(|(head, _)| &**head) else {
             return Err(slot::Unslotted::Moved { read: ContentId([0; 32]), column: None });
