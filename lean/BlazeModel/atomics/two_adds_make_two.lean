@@ -5,15 +5,24 @@ import Blaze
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.two_adds_make_two : Threads.Prog Bool := do
-  let n ← core.sync.atomic.Atomic.new (0 : U32)
+def atomics.two_adds_make_two.at_3 (n : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
   let t0 ←
-    core.sync.atomic.Atomic.fetch_add n (1 : U32) (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
+    core.sync.atomic.Atomic.load n (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
+  Threads.Prog.done (Result.ok (Scalar.eq t0 (2 : U32)))
+
+def atomics.two_adds_make_two.at_2 (n : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
   let t1 ←
     core.sync.atomic.Atomic.fetch_add n (1 : U32) (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
+  atomics.two_adds_make_two.at_3 n
+
+def atomics.two_adds_make_two.at_1 (n : core.sync.atomic.Atomic .U32) : Threads.Prog Bool := do
   let t2 ←
-    core.sync.atomic.Atomic.load n (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
-  Threads.Prog.done (Result.ok (Scalar.eq t2 (2 : U32)))
+    core.sync.atomic.Atomic.fetch_add n (1 : U32) (core.sync.atomic.Ordering.SeqCst : core.sync.atomic.Ordering)
+  atomics.two_adds_make_two.at_2 n
+
+def atomics.two_adds_make_two : Threads.Prog Bool := do
+  let n ← core.sync.atomic.Atomic.new (0 : U32)
+  atomics.two_adds_make_two.at_1 n
 
 def atomics.two_adds_make_two.spec.statement : Prop :=
   atomics.two_adds_make_two.value = Result.ok true

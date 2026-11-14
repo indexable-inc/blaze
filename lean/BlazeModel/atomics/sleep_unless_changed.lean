@@ -5,8 +5,11 @@ import Blaze
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.sleep_unless_changed (word : core.sync.atomic.Atomic .U32) (seen : U32) : Threads.Prog Bool := do
-  let t0 ← Threads.wait word seen false
+def atomics.sleep_unless_changed.at_1 (t0 : Threads.Woke) : Threads.Prog Bool :=
   match t0 with
   | Threads.Woke.Changed => Threads.Prog.done (Result.ok false)
   | _ => Threads.Prog.done (Result.ok true)
+
+def atomics.sleep_unless_changed (word : core.sync.atomic.Atomic .U32) (seen : U32) : Threads.Prog Bool := do
+  let t0 ← Threads.wait word seen false
+  atomics.sleep_unless_changed.at_1 t0

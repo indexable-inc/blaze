@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-120 theorems: 107 in `lean`, 13 in `lean/analysis`.
+121 theorems: 108 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1127,6 +1127,12 @@ theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
 
 ```lean
 theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
+```
+
+**`atomics.parks_once.spec.proof`** (`BlazeModel.atomics.parks`, `lean`): The statement blaze generates from the fixture's theorem function parks_once holds of the park and unpark it translates (an AtomicU32 token word: two compare-exchanges, a futex wait loop, a swap and a wake): for every schedule of the two threads and every pick of the world's, no run ends with the unpark returned and the park asleep; where both returned the token was taken and the word is empty, or a timed park left first and the token is still there; and an untimed park returns only with a token. Proved over the program points the translator names (park.at_n, park_loop.loop_0.at_n, unpark.at_1), with no model text copied.
+
+```lean
+theorem atomics.parks_once.spec.proof : atomics.parks_once.spec.statement
 ```
 
 **`atomics.adds_until_done.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function adds_until_done holds of its model, a program over shared cells: a compare-exchange loop that returns its Ok value returns what the cell held and leaves the sum.

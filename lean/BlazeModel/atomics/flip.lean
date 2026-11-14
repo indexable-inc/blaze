@@ -5,10 +5,13 @@ import Blaze
 open Blaze
 set_option linter.unusedVariables false
 
-def atomics.flip (flag : core.sync.atomic.AtomicBool) : Threads.Prog Bool := do
-  let before ←
-    core.sync.atomic.AtomicBool.swap flag true (core.sync.atomic.Ordering.AcqRel : core.sync.atomic.Ordering)
+def atomics.flip.at_1 (flag : core.sync.atomic.AtomicBool) (before : Bool) : Threads.Prog Bool :=
   let t0 := before
   if t0 then
     core.sync.atomic.AtomicBool.load flag (core.sync.atomic.Ordering.Acquire : core.sync.atomic.Ordering)
   else Threads.Prog.done (Result.ok t0)
+
+def atomics.flip (flag : core.sync.atomic.AtomicBool) : Threads.Prog Bool := do
+  let before ←
+    core.sync.atomic.AtomicBool.swap flag true (core.sync.atomic.Ordering.AcqRel : core.sync.atomic.Ordering)
+  atomics.flip.at_1 flag before
