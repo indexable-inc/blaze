@@ -83,9 +83,26 @@ conformance with a real driver is `allows(observed)` (objective V4).
   it owes (the changes there when it was asked and still not durable), a failed append or
   write from memory lands what it may. A crash's witness adds the sectors that writes in
   flight landed, in any order, each at most once.
+- `blocking::Blocking` (built 2026-11-14): one call that waits for an event with a time limit
+  or none. The kernel may end it for a signal, for nothing or before its limit at any moment,
+  and the caller reads the clock some time after; it never says ready before the event, never
+  anything else once the event has come, and a limited call is read at most a stated lateness
+  past its limit (one bound for the delay before the call starts and after it ends).
+- `threads` (section 8): the cells threads share and who sleeps in a futex wait of which.
 - Not built: a full disk, short reads, modes and links; a file's identity under a rename
   while a sync of its name is in flight (nothing is promised then); locks, the network,
-  processes; `Atomics` (section 8).
+  processes.
+
+**A loop is proved by running it against its world.** A core that loops until the kernel
+lets it stop (a retry loop, a state machine driven to its end) takes its world as one value:
+a trait with the calls it makes and the clock it reads. The theorem's function gives the
+real loop a kernel that answers from a list, each answer one the world allows where it is
+given, and states what holds when the loop ends; a run whose list ends first, or holds an
+answer the world refuses, is none of the theorem's. For every list is every run. The first:
+`wait/retry.rs`, `a_wait_ends_by_its_deadline`, the whole retry loop of every blocking wait
+against `Blocking`, proved 2026-11-14 by one induction on the loop's fuel over an invariant
+that ties the retry's last reading to the world's clock; its simulation test and that
+test's simulated kernel are deleted. How-to: `agents/howto/H-prove-a-loop-against-a-world.json`.
 
 **A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
 kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
