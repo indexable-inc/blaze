@@ -96,7 +96,7 @@ def blaze_core.world.asks.World.tell.loop_0 (fuel : Nat) (self : blaze_core.worl
       | Option.some v1 => do
         let name := v1
         let t11 := blaze_core.world.asks.done told
-        let t12 ← if t11 then blaze_core.world.asks.renames asked.ask name else Result.ok t11
+        let t12 := if t11 then blaze_core.world.asks.renames asked.ask name else t11
         let self ←
           if t12 then do
             let t13 := (0 : Usize)

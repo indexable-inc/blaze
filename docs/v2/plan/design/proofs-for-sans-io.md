@@ -343,8 +343,19 @@ meaning and in this one where it refuses.
   release and an acquire and lost without them; coherence; a weak compare-and-swap that fails
   on a stale read.
 - The Rust `two` takes turns and makes the real operation, so it runs the sequentially
-  consistent world only and refuses the runs that world refuses; the weak world has no Rust
-  runner yet.
+  consistent world only and refuses the runs that world refuses.
+- Which world a theorem is stated in is said by its code (decision D46): `threads::two` is
+  the sequentially consistent world, `threads::two_weak` the weak one, and a theorem that
+  reaches `two_weak` has its statement over `Prog.valueWeak`. To build: the Rust `two_weak`,
+  which is the weak world's step run (each scheduled atomic a list of messages in the run's
+  world, each thread a view, a read's message and a store's place chosen by the step's pick,
+  rule R1 refused by a panic that names it; when the run ends every word holds its newest
+  message's value), held to the Lean world by its litmus runs restated in Rust with the same
+  schedules and the same answers; the translator's entry for it and the statement's choice;
+  the induction over a schedule for the weak world (`two_exec` over `execWeak`); and the
+  first proof, `handoff::Wake`: a sender's relaxed store of its slot and its `wake`, and the
+  driver's `drain` and relaxed read of the slot, for every schedule and every stale read:
+  the driver saw the slot or the sender was told to wake it. `Prog.valueAny` goes with it.
 
 **Trusted.** That the kernel's wait is atomic with its comparison and a wake finds every
 sleeper, and that what a waker wrote before a wake that found no sleeper is seen by a wait
