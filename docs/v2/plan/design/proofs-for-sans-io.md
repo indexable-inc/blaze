@@ -73,7 +73,8 @@ predicate, so nothing has to show that a script of choices reaches every allowed
 conformance with a real driver is `allows(observed)` (objective V4).
 
 - `clock::Clock` (built 2026-11-14): monotonic time; the next reading is never earlier, and a
-  timer is told fired at a reading not before its deadline.
+  timer is told fired at a reading not before its deadline. Its theorem
+  `a_timer_never_fires_early` is proved (`BlazeCore/World/Clock.lean`).
 - `disk::Disk` (built 2026-11-14): per file its durable bytes and, in order, the changes made
   since the last sync that covered them; `sync`, `barrier`, `flush`, whole-file writes and
   renames that wait for the drive and that do not, removal; and the crash rule below.
@@ -116,6 +117,16 @@ types, so the kernel's rules have one home (`one-concept-one-home`).
 
 Worlds are written in the translator's subset as it stands (index loops, `Vec`), so a crash
 proof does not wait for iterators and closures.
+
+**The lemmas beside the disk** are Lean theorems about the generated models, proved once and
+used by every core's crash proof. Proved: `allows_orders` and `allows_total`
+(`BlazeCore/World/DiskAllows.lean`): a cut `allows` accepts that keeps, whole or in part, a
+change made after a barrier completed keeps whole all that barrier covers. Stated as theorem
+functions in disk.rs, run on drawn disks and cuts, not yet proved: a synced file survives
+every allowed crash; a file that is only appended to is cut to a prefix that holds all its
+durable bytes; a barrier and a later append are ordered. A loop of a model is specified as
+an equation that holds with enough fuel, by induction on the fuel, and one constant fuel
+serves a whole theorem, since a slice is at most 2^64 - 1 long.
 
 Losing alternatives. A script of choices (`Vec<u64>`) read by a generator: sound only if
 every allowed answer has a script, which no proof checks, so a bound off by one quietly
