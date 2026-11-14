@@ -35,6 +35,7 @@ pub fn all() -> Vec<(&'static str, Vec<u8>, Value)> {
         mode: "chat".into(),
         model: Some("opus".into()),
         effort: None,
+        context: None,
         past: false,
     };
     vec![
@@ -213,6 +214,20 @@ mod tests {
             assert_eq!(crate::cbor::encode(&back), bytes, "{name}: decoded and encoded again, the same bytes");
         }
         assert!(stale.is_empty(), "stale fixtures {stale:?}: rerun with HARNESS_PROTO_BLESS=1 and commit them");
+    }
+
+    /// Older list rows omit context; a new row round-trips its bounded summary without transcript details.
+    #[test]
+    fn session_context_summary_is_optional_and_round_trips() {
+        let old = SessionInfo::default();
+        let encoded = crate::cbor::encode(&old);
+        assert_eq!(crate::cbor::decode::<SessionInfo>(&encoded).unwrap().context, None);
+        assert!(serde_json::to_value(&old).unwrap().get("context").is_none());
+        let summary = crate::msg::ContextSummary { used: 12000, window: 200000, updated_ms: 42 };
+        let row = SessionInfo { context: Some(summary), ..old };
+        let encoded = crate::cbor::encode(&row);
+        assert_eq!(crate::cbor::decode::<SessionInfo>(&encoded).unwrap(), row);
+        assert_eq!(serde_json::to_value(&row).unwrap()["context"], json!({"used": 12000, "window": 200000, "updated_ms": 42}));
     }
 
     /// Each typed message decodes back to itself.

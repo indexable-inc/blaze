@@ -153,6 +153,8 @@ export const tree_chevron = 9
 export const tree_kind = 12
 export const tree_kind_gap = 6
 export const tree_trail_max = 84
+// Stable effort column, with room for the seven-stop Codex meter and its padding.
+export const tree_effort_w = 30
 // The tree's indent guides (hn.Hang's slots): a hairline down the middle of each ancestor's chevron gutter, in
 // tone_guide (Islands' tree-indent-guide-border), for as many levels as tree_guides; a done mark in a childless row's
 // gutter (tree_mark across: a check in tone_success, a cross in tone_error).
@@ -407,8 +409,10 @@ export const spring_press_omega = 38
 export const spring_press_zeta = 0.62
 
 // A kind's icon and the brand marks (hn.Kind): ink only, so they turn with the appearance; no brand's colour.
-export mut tone_kind_claude: Fill = $tone_ink_muted
-export mut tone_kind_codex: Fill = $tone_ink_muted
+export mut tone_kind_claude: Fill = {dark: {0.88, 0.52, 0.36, 1}, light: {0.69, 0.31, 0.18, 1}}
+export mut tone_kind_codex: Fill = {dark: {0.55, 0.77, 0.68, 1}, light: {0.17, 0.46, 0.37, 1}}
+export const model_icon_size = 14
+export const model_icon_stroke = 1.25
 export mut tone_kind_cursor: Fill = $tone_ink_muted
 
 prefab Strong {
@@ -1055,3 +1059,35 @@ export const web_url_h = 26
 export const web_menu_w = 240
 export const web_popup_w = 360
 export const web_popup_h = 480
+
+// Hover help: a quiet raised plate with a strong title and wrapping support, no motion.
+export const tooltip_max_w = 340
+export const tooltip_pad_x = 12
+export const tooltip_pad_y = 10
+export const tooltip_gap = 4
+export const tooltip_offset = 14
+
+// ---- native questions: typography first, generous targets and one bounded options well -------------------------------
+export const question_gap = 16
+export const question_heading_gap = 6
+export const question_option_gap = 4
+export const question_option_pad = 12
+export const question_option_min_h = 52
+export const question_options_max_h = 320
+export const question_radius = 8
+export const question_border = 1
+export const question_title_size = 19
+export const question_title_line = 26
+export const question_label_size = 14
+export const question_label_line = 20
+export const question_detail_size = 12
+export const question_detail_line = 18
+export const question_eyebrow_size = 11
+export const question_eyebrow_line = 16
+export const question_field_h = 42
+export const question_submit_h = 36
+export const question_submit_min_w = 112
+export const question_action_gap = 10
+export const question_receipt_gap = 4
+
+export const question_max_w = 660

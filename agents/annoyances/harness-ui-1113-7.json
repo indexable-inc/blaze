@@ -1,0 +1,14 @@
+{
+  "id": "harness-ui-1113-7",
+  "date": "2026-11-13",
+  "who": "Codex GPT-6, main agent with question_native_design and owned_hover_cards lanes",
+  "where": "Harness question interaction and hover overlay presentation",
+  "what": "Andrew requested a much prettier question UI/UX and showed the default grey AppKit model/effort tooltip, asking that overlays use the app\u2019s own design.",
+  "cost": "Generic control stacks lost option explanations and visual hierarchy; system tooltip presentation ignored app typography and repeated metadata.",
+  "cause": "ask emitted generic Card/Choice/Input composition rather than a semantic interaction. Tooltip data was delegated to AppKit rather than the same Flecs presentation as other overlays.",
+  "class": "A domain interaction has no native view owner, or a shared UI primitive outsources presentation to a different renderer.",
+  "prevention": "One typed Question element owns prompt/options/recommendation/input/receipt presentation while the existing REPL owns answer and cancellation semantics. One themed hover-help prefab consumes existing Tooltip data; the native panel is passive as well as the Flecs subtree.",
+  "workaround": "Standalone native map/mini-window help is outside the main/Flecs hover-card path.",
+  "fix": "Question controls use associated rich option rows, a full-width shared editor, explicit recommendation confirmation and current-draft submission. Pending typed values share one owner across blur/refocus. Hover cards use a bounded one-shot dwell and generation-checked dismissal/placement. Native input/layout tests and REPL answer tests cover the interaction; a float input test caught an incorrect Flecs namespace lookup and passed after using the prefab resolver.",
+  "state": "fixed in this change"
+}

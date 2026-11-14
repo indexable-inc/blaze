@@ -336,6 +336,17 @@ pub enum Reply {
     Record(Value),
 }
 
+/// The latest context event's fixed-size summary. Full provider breakdowns stay in the attached chat transcript.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextSummary {
+    pub used: u64,
+    /// Zero when the provider did not report a window.
+    pub window: u64,
+    /// Timestamp of the authoritative context event in the existing chat log.
+    #[serde(default)]
+    pub updated_ms: u64,
+}
+
 /// One session as `list`, `screen` and `attach` describe it: a live one, or a past one from the index.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct SessionInfo {
@@ -370,6 +381,9 @@ pub struct SessionInfo {
     /// A chat's reasoning effort, as its launch chose or its agent said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Latest context usage without attaching the transcript. Absent on older daemons and before the first context event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSummary>,
     /// It ended before this daemon started (set by `list`).
     #[serde(default)]
     pub past: bool,

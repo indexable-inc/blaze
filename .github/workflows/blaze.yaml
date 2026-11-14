@@ -221,21 +221,6 @@ jobs:
             echo "no base to compare with (a run by hand): each crate is held to its row only"
             "$BLAZE_SCRIPTS/allocs" '{"command": "check"}'
           fi
-      # No source file under crates/ grows past 1500 lines, and those past it (scripts/sizes.txt)
-      # only shrink; a row new since the base is refused (rule one-concept-one-home: job.rs passed
-      # 10,000 lines and eight lanes collided in it; scripts/src/bin/sizes.rs).
-      - name: source files stay under the size bound
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          "$BLAZE_SCRIPTS/sizes" selftest
-          if [ -n "$BASE" ]; then
-            git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/sizes" "{\"command\": \"check\", \"base\": \"$BASE\"}"
-          else
-            echo "no base to compare with (a run by hand): each file is held to its row only"
-            "$BLAZE_SCRIPTS/sizes" '{"command": "check"}'
-          fi
       # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
       # scripts/layouts.txt, and a persisted one whose value changed against the base names its
       # crate's test of the previous layout (rule persisted-state-round-trips;

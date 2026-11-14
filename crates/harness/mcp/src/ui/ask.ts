@@ -1,12 +1,12 @@
-import { MAX_LABEL, MAX_OPTIONS } from './element.ts';
+import { MAX_LABEL, MAX_OPTIONS, MAX_QUESTION as ASK_MAX } from './element.ts';
 
 /*
  * `ask(text, options)`: put a question to the person watching, in the calling cell's own UI. It is drawn with the same elements
- * (a Card holding a Choice or Select of the options, and an Input when the person may type) and its answer comes back the same way
+ * (the native Question view, with rich options and the shared text editor) and its answer comes back the same way
  * every control's does (the app's ui_event, index.ts `dispatch`): there is no other channel. Copied from den's repl/src/ask.ts, which
  * asks through den's hub instead; the rules are den's but one: here a question always waits. The cell waits for the
  * answer, however long it takes, until the cell stops with an error (its timeout), which withdraws the question. A `default` is
- * the option recommended: it shows picked, with an OK that gives it; it is never taken for the person. Only `block: false` (with
+ * the option recommended: it is marked, with an explicit action to use it; it is never taken for the person. Only `block: false` (with
  * a default) goes ahead: it returns the default at once, the cell carries on, and the question stays up; if the person later
  * answers something else, the cell's logs say so. The question is one line (at most ASK_MAX characters): what it rests on goes in
  * `detail`, or is shown above it. Where it goes: below whatever the cell already shows, and it stays there answered.
@@ -37,7 +37,7 @@ export interface AskPlan {
 }
 
 /** The most characters a question runs to: one line a person reads at a glance. */
-export const ASK_MAX = 140;
+export { ASK_MAX };
 
 /** The question for `text` and `options`, checked: every mistake is the caller's, so each throws before anything is shown. */
 export function planAsk(text: string, options: AskOptions = {}): AskPlan {
@@ -68,6 +68,7 @@ export function planAsk(text: string, options: AskOptions = {}): AskPlan {
   if (!block && preset === undefined) throw new TypeError('ask: a question that does not wait needs a default to go ahead with');
   if (options.detail !== undefined && typeof options.detail !== 'string') throw new TypeError('ask: detail takes a string');
   if (options.allowText !== undefined && typeof options.allowText !== 'boolean') throw new TypeError('ask: allowText takes true or false');
+  if (choices.length === 0 && options.allowText === false) throw new TypeError('ask: a question needs options or a free-text answer');
   return {
     text, ...(options.detail === undefined ? {} : { detail: options.detail }),
     options: choices, ...(preset === undefined ? {} : { default: preset }),
@@ -75,17 +76,12 @@ export function planAsk(text: string, options: AskOptions = {}): AskPlan {
   };
 }
 
-/** The most options shown side by side as a Choice; more drop from a Select. */
-export const CHOICE_MAX = 6;
-
 /**
- * The question as a component: its words as the Card's title, its detail, each option's detail, then a Choice (or a Select) of the
- * options and, when the person may type, an Input with a Send button. A blocking question with a default shows it picked and an OK
- * that gives it. Once answered it shows the answer and takes nothing more. `answer` hears the label picked or the words typed.
+ * The native Question view owns visual hierarchy, option explanations, field and submit action. This component owns
+ * the one-shot answer and controlled text; waiting/cancellation/late delivery remain in index.ts.
  */
 export const ASK_SOURCE = `<script>
-  let { text, detail, options, details, preset, ahead, allowText, answer } = $props();
-  let picked = $state(preset ?? null);
+  let { text, detail, options, preset, ahead, allowText, answer } = $props();
   let typed = $state('');
   let said = $state(undefined);
   const give = (value) => {
@@ -95,35 +91,15 @@ export const ASK_SOURCE = `<script>
     answer(words);
   };
 </script>
-<Card title={text} gap={8}>
-  {#if detail}<Text tone="muted">{detail}</Text>{/if}
-  {#if said !== undefined}
-    <Row gap={6}><Text tone="muted">Answered</Text><Badge tone="accent">{said}</Badge></Row>
-  {:else}
-    {#each details as line}<Text tone="muted">{line}</Text>{/each}
-    {#if ahead}<Text tone="muted">Went ahead with {ahead}; pick another to change it.</Text>{/if}
-    {#if options.length > ${CHOICE_MAX}}
-      <Select options={options} bind:selected={picked} placeholder="Pick one" onchange={give} />
-    {:else if options.length > 0}
-      <Choice options={options} bind:selected={picked} onchange={give} />
-    {/if}
-    {#if preset && !ahead}<Button tone="accent" onclick={() => give(picked)}>OK</Button>{/if}
-    {#if allowText}
-      <Row gap={6}>
-        <Input bind:value={typed} placeholder="Type an answer" onsubmit={give} />
-        <Button tone="accent" disabled={!typed.trim()} onclick={() => give(typed)}>Send</Button>
-      </Row>
-    {/if}
-  {/if}
-</Card>`;
+<Question {text} {detail} {options} recommended={preset} {ahead} {allowText}
+  value={typed} answer={said} onchange={(value) => typed = value} onchoose={give} onsubmit={give} />`;
 
 /** The props the question's component is mounted with, besides the elements and `answer`. */
 export function askProps(plan: AskPlan): Record<string, unknown> {
   const preset = plan.default === undefined ? undefined : plan.options[plan.default]!.label;
   return {
     text: plan.text, detail: plan.detail,
-    options: plan.options.map(option => option.label),
-    details: plan.options.filter(option => option.detail).map(option => `${option.label}: ${option.detail}`),
+    options: plan.options,
     preset, ahead: plan.block ? undefined : preset, allowText: plan.allowText,
   };
 }

@@ -30,6 +30,7 @@ mod archive;
 mod browser;
 mod chat;
 mod external;
+pub(crate) mod emotion;
 mod library;
 mod floats;
 mod fold;
@@ -44,6 +45,7 @@ mod row_menu;
 mod side_drag;
 mod sidebar;
 mod stats;
+mod tooltip;
 pub use stats::TICK as STATS_TICK;
 mod ghostty;
 mod world;
@@ -62,6 +64,7 @@ const SCENE: &[(&str, &str)] = &[
     ("scene/widgets/parts.flecs", include_str!("../scene/widgets/parts.flecs")),
     ("scene/widgets/row.flecs", include_str!("../scene/widgets/row.flecs")),
     ("scene/widgets/tree.flecs", include_str!("../scene/widgets/tree.flecs")),
+    ("scene/widgets/model_icons.flecs", include_str!("../scene/widgets/model_icons.flecs")),
     ("scene/widgets/rows.flecs", include_str!("../scene/widgets/rows.flecs")),
     ("scene/widgets/panes.flecs", include_str!("../scene/widgets/panes.flecs")),
     ("scene/widgets/archive.flecs", include_str!("../scene/widgets/archive.flecs")),
@@ -150,7 +153,8 @@ struct Pick {
 
 struct Palette {
     mode: Mode,
-    query: String,
+    query: chat::Draft,
+    query_drag: Option<(crate::pane::Unit, (usize, usize))>,
     at: usize,
     /// The query history was last searched for, and when (the app's clock) the query last changed: the daemon is asked
     /// once typing has paused for [`PALETTE_DEBOUNCE`].
@@ -159,13 +163,14 @@ struct Palette {
 }
 
 impl Palette {
-    fn new() -> Self {
+    fn new(now: f32) -> Self {
         Self {
             mode: Mode::Commands,
-            query: String::new(),
+            query: chat::Draft::default(),
+            query_drag: None,
             at: 0,
             searched: String::new(),
-            changed: 0.0,
+            changed: now,
         }
     }
 }
@@ -347,6 +352,8 @@ pub struct App {
     browser: browser::Browser,
     /// A sidebar row's menu while it is open (a right press or a control-click on the row; src/app/row_menu.rs).
     row_menu: Option<row_menu::RowMenu>,
+    /// The one themed hover-help card and its event-driven dwell (app/tooltip.rs).
+    hover_help: tooltip::HoverHelp,
 }
 
 /// The fill of the theme's role `name` (`success`: `hn.Theme.success`).
@@ -423,6 +430,7 @@ pub fn scene_world() -> Result<World, String> {
     harness_native_ui_prims::register(&world);
     harness_native_api::register(&world);
     model::register(&world);
+    world.component::<emotion::AgentEmotion>();
     crate::pane::register(&world);
     crate::look::register(&world);
     archive::register(&world);
@@ -645,6 +653,7 @@ impl App {
             look,
             screen: None,
             floats: Vec::new(), // alloc: empty until an overlay's window shows
+            hover_help: tooltip::HoverHelp::default(),
             maps: Vec::new(), // alloc: empty until a cell draws a Map
             browser: browser::Browser::new(browser_wake, web_clip, web_pane),
             row_menu: None,
@@ -661,17 +670,6 @@ impl App {
         };
         app.set_stats(stats);
         Ok(app)
-    }
-
-    /// The tooltip of the node under the pointer (or the nearest ancestor that has one); empty for none.
-    pub fn tooltip(&self) -> String {
-        let w = self.world.world_ref();
-        let Some(t) = w.entity_named(APP).target(Hovered::id(), 0) else { return String::new() };
-        std::iter::successors(Some(t), |n| n.parent())
-            .take(6)
-            .find_map(|n| n.try_cloned::<&harness_native_ui_input_api::Tooltip>())
-            .map(|t| t.text.as_str().to_owned())
-            .unwrap_or_default()
     }
 
     pub fn zoom(&self) -> f32 {
@@ -963,6 +961,12 @@ impl App {
         } else {
             "connecting".to_owned()
         };
+        let collapsed = model::folded(dev);
+        device.action(&format!("device:toggle:{}", *dev.id()));
+        device.set(harness_native_ui_input_api::Tooltip { text: format!("{} {host} · {} this device's sessions and agents", if collapsed { "Expand" } else { "Collapse" }, if collapsed { "Show" } else { "Hide" }).as_str().into() });
+        if let Some(disclosure) = device.part("disclosure") {
+            disclosure.icon(if collapsed { "" } else { "" });
+        }
         if let Some(n) = device.part("name") {
             n.text(&host);
         }
@@ -1005,8 +1009,9 @@ impl App {
             }
             let model::Row { e, depth } = r;
             let o = w.entity_from_id(e);
-            let status = me.status_of(e);
+            me.sync_agent_emotion(row, o);
             let code = o.try_cloned::<&model::ExitCode>().map(|c| c.code).filter(|&c| c != 0);
+            let status = row_status(me.status_of(e), o.has(model::ChatMode::id()), code);
             // Ended by an interrupt or a terminate (128 + SIGINT, 128 + SIGTERM): stopped on purpose, not a failure.
             let stopped = matches!(code, Some(130 | 143));
             let failed = status == "killed" || (code.is_some() && !stopped);
@@ -1016,7 +1021,7 @@ impl App {
             let sleeps = me.run_of(e).is_none() && depth > 0 && status == "running" && !o.has(model::Busy::id());
             let look = if selected {
                 "on"
-            } else if status == "running" && !sleeps {
+            } else if matches!(status, "running" | "ready") && !sleeps {
                 "rest"
             } else {
                 "done"
@@ -1086,6 +1091,7 @@ impl App {
                     n => n.to_string(),
                 };
                 let (meta, why) = match (status, code) {
+                    ("ready", _) => (String::new(), format!("{folder} · Ready to resume · conversation saved")),
                     ("killed", _) => ("killed".to_owned(), format!("{folder} \u{b7} killed {when} ago")),
                     (_, Some(c)) if stopped => ("stopped".to_owned(), format!("{folder} \u{b7} stopped (exit {c}) {when} ago")),
                     (_, Some(c)) => (format!("exit {c}"), format!("{folder} \u{b7} exited with code {c} {when} ago")),
@@ -1101,14 +1107,16 @@ impl App {
                 // Its name being renamed (chat/rename.rs): the field's words in its place, alone
                 // on the row (no trailing words or shortcut).
                 let edit = me.rename_shown(e);
-                let (profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
+                let sid = o.try_cloned::<&model::Object>().map(|ob| ob.id);
+                let (mut profile, profile_tip, profile_effort) = if edit.is_none() && o.has(model::ChatMode::id()) {
                     let listed = o.try_cloned::<&model::AgentModel>().unwrap_or_default();
                     let chats = me.chats.borrow();
                     let transcript = o.try_cloned::<&model::Object>().and_then(|ob| chats.get(&ob.id));
-                    chat::sidebar_model(transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()))
+                    me.sidebar_profile(sid.expect("chat row has no session identity"), transcript, kind, &agent_models, (listed.s.as_str(), listed.effort.as_str()), status != "running")
                 } else {
                     (String::new(), String::new(), None)
                 };
+                if profile.is_empty() && edit.is_none() && o.has(model::ChatMode::id()) { profile = "Model".to_owned(); }
                 let (name, meta, hint) = match &edit {
                     Some((shown, _)) => (shown.clone(), String::new(), String::new()),
                     None => (name, meta, hint),
@@ -1131,6 +1139,42 @@ impl App {
                     ]
                     .concat(),
                 );
+                if let Some(controls) = row.part("profile") {
+                    if let Some(icon) = controls.part("label").and_then(|p| p.part("icon")) {
+                        chat::model_icon(icon, &profile, kind);
+                    }
+                    if let Some(sid) = sid.filter(|_| edit.is_none() && o.has(model::ChatMode::id())) {
+                        let chats = me.chats.borrow();
+                        let empty = model::chat::Transcript::default();
+                        me.fill_sidebar_context(controls, sid, chats.get(&sid).unwrap_or(&empty), kind, busy, o.try_cloned::<&model::AgentContext>());
+                    } else {
+                        for name in ["context", "context_pop"] {
+                            if let Some(slot) = controls.part(name) { view::for_each_of(slot, std::iter::empty::<(&str, &str, ())>(), |_, (), _| {}); }
+                        }
+                    }
+                    let editable = sid.is_some_and(|sid| me.external_session(sid).is_none()) && !profile.is_empty();
+                    for (part, page) in [("label", "model"), ("effort", "effort")] {
+                        if let Some(control) = controls.part(part) {
+                            let active = editable && (part != "effort" || profile_effort.is_some());
+                            if active {
+                                control.add(harness_native_ui_input_api::Pressable::id()).action(&format!("chat:pick:{}:{page}", sid.unwrap()));
+                            } else {
+                                control.entity().remove(harness_native_ui_input_api::Pressable::id());
+                                control.action("");
+                            }
+                            let mut lines = profile_tip.lines();
+                            let model = lines.next().unwrap_or(&profile);
+                            let effort = profile_tip.lines().find(|line| line.ends_with("thinking effort"));
+                            let description = if part == "effort" {
+                                format!("{}\n{model}", effort.unwrap_or("Thinking effort"))
+                            } else {
+                                profile_tip.lines().filter(|line| !line.ends_with("thinking effort")).collect::<Vec<_>>().join("\n")
+                            };
+                            let hint = if !active { "Read-only transcript" } else if part == "effort" { "Click to choose · swipe to adjust" } else { "Choose model · ⌘/" };
+                            control.set(harness_native_ui_input_api::Tooltip { text: format!("{description}\n{hint}").as_str().into() });
+                        }
+                    }
+                }
                 if let Some(slot) = row.part("profile").and_then(|p| p.part("effort")) {
                     view::for_each_of(slot, profile_effort.map(|level| ("meter", "hn.ChatEffort", level)), |meter, level, _| {
                         chat::effort_meter(meter, Some(level), tone(w, "ink_muted"), tone(w, "ink_faint"));
@@ -1514,7 +1558,7 @@ impl App {
         }
         // While searching, every run the world holds that is not listed yet (in the tree, or found in older history by
         // the daemon's search), newest first.
-        let q = self.palette.as_ref().map(|p| p.query.trim().to_lowercase()).unwrap_or_default();
+        let q = self.palette.as_ref().map(|p| p.query.text.trim().to_lowercase()).unwrap_or_default();
         if !q.is_empty() {
             let mut runs: Vec<(u64, u64)> = Vec::new();
             self.world.new_query::<&model::Run>().each_entity(|e, r| {
@@ -1576,7 +1620,7 @@ impl App {
             self.hint("ZoomOut"),
             Do::Zoom(-1),
         ));
-        let q = self.palette.as_ref().map(|p| p.query.to_lowercase()).unwrap_or_default();
+        let q = self.palette.as_ref().map(|p| p.query.text.to_lowercase()).unwrap_or_default();
         out.retain(|(_, _, name, _, _)| fuzzy(&name.to_lowercase(), &q));
         out
     }
@@ -1586,7 +1630,7 @@ impl App {
         // world (as a page would) and so the palette's entries.
         let (time, mut wait) = (self.time, false);
         if let Some(p) = self.palette.as_mut() {
-            let q = p.query.trim().to_owned();
+            let q = p.query.text.trim().to_owned();
             if q != p.searched {
                 if (p.mode == Mode::Chats || q.chars().count() >= 2) && time - p.changed >= PALETTE_DEBOUNCE {
                     if p.mode == Mode::Chats {
@@ -1604,7 +1648,7 @@ impl App {
             self.poke();
         }
         let w = self.world.world_ref();
-        let want = self.palette.as_ref().map(|p| (p.mode, p.at, p.query.clone()));
+        let want = self.palette.as_ref().map(|p| (p.mode, p.at, p.query.text.clone()));
         // The overlay on screen is no longer wanted (closed, or the other mode opened): it goes out on its springs.
         if let Some((id, mode)) = self.ids.palette
             && want.as_ref().is_none_or(|(m, ..)| *m != mode)
@@ -1637,11 +1681,7 @@ impl App {
             self.sync_chat_library(card, at, &query);
             return;
         }
-        let shown =
-            if query.is_empty() { "Search objects and commands\u{2026}".to_owned() } else { query };
-        if let Some(t) = card.and_then(|c| c.part("query")).and_then(|q| q.part("text")) {
-            t.text(&shown);
-        }
+        if let Some(card) = card { self.sync_palette_field(card, "Search objects and commands…"); }
         let entries = self.entries();
         let at = at.min(entries.len().saturating_sub(1));
         let (clear, chosen) = (tone(w, "clear"), tone(w, "selection"));
@@ -1747,7 +1787,7 @@ impl App {
         if let Some(m) = self.world.world_ref().try_lookup("ui_matched::hn_picker") {
             m.destruct();
         }
-        self.palette = Some(Palette { mode: Mode::New, at, ..Palette::new() });
+        self.palette = Some(Palette { mode: Mode::New, at, ..Palette::new(self.time) });
         self.poke();
     }
 
@@ -2112,6 +2152,13 @@ impl App {
         }
         self.forward_clicks();
         self.actions();
+        if self.sync_tooltip(dt) {
+            // A hover card shapes only when its source changes; settle its wrapping before this frame paints it.
+            for _ in 0..3 {
+                self.typeset();
+                self.progress(0.0);
+            }
+        }
         harness_native_ui_input::end_frame(self.world.world_ref());
         self.pointer.went_down = false;
         self.pointer.went_up = false;
@@ -2279,6 +2326,7 @@ impl App {
             || paint.shimmering
             || paint.blocks_live
             || paint.lantern_live
+            || paint.caret_blinking
             || matches!(paint.kip_wake, harness_native_render::kips::Wake::Calm(_))
     }
 
@@ -2348,6 +2396,17 @@ impl App {
             {
                 self.tree_focus = true;
                 self.toggle_fold_of(e, alt);
+            } else if let Some(id) = a.strip_prefix("device:toggle:").and_then(|s| s.parse::<u64>().ok()) {
+                let w = self.world.world_ref();
+                let dev = w.entity_from_id(id);
+                if dev.is_alive() && dev.has(model::Device::id()) {
+                    model::set_folded(w, id, !model::folded(dev));
+                    // Group folds are immediate; preserve each session's own fold and every running process.
+                    self.fold = fold::TreeFold::default();
+                    self.chat_pick_close();
+                    self.chat_ctx_close();
+                    self.row_menu_close();
+                }
             } else if a == "archive:open" {
                 self.open_archive();
             } else if a == "nav:back" {
@@ -2528,17 +2587,8 @@ impl App {
 
     /// Text typed into the open palette (a key no binding takes): its query.
     fn palette_type(&mut self, chars: &str) {
-        let time = self.time;
-        let Some(p) = self.palette.as_mut().filter(|p| p.mode != Mode::New) else { return };
-        let typed: String = chars
-            .chars()
-            .filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c))
-            .collect();
-        if !typed.is_empty() {
-            p.query.push_str(&typed);
-            p.at = 0;
-            p.changed = time;
-        }
+        let typed: String = chars.chars().filter(|c| !c.is_control() && !('\u{F700}'..='\u{F8FF}').contains(c)).collect();
+        self.palette_draft(|d| { d.marked = None; if !typed.is_empty() { d.insert(&typed); } });
     }
 
     /// The sidebar node (the device row's parent).
@@ -2550,6 +2600,7 @@ impl App {
     /// clicks; the main card takes the window and the traffic lights fade out) or bring it back.
     fn toggle_sidebar(&mut self) {
         self.side_open = !self.side_open;
+        if !self.side_open { self.chat_pick_close(); self.chat_ctx_close(); }
         self.poke();
     }
 
@@ -2713,7 +2764,7 @@ impl App {
     /// Open the palette (the shot's `HARNESS_NATIVE_SHOT_PALETTE`).
     pub fn open_palette(&mut self) {
         crate::audio::cue("open");
-        self.palette = Some(Palette::new());
+        self.palette = Some(Palette::new(self.time));
         self.poke();
     }
 
@@ -2721,7 +2772,7 @@ impl App {
     pub fn palette_query(&mut self, q: &str) {
         let time = self.time;
         if let Some(p) = self.palette.as_mut() {
-            p.query = q.to_owned();
+            p.query = chat::Draft { text: q.to_owned(), caret: q.len(), anchor: q.len(), ..chat::Draft::default() };
             p.changed = time;
         }
         self.poke();
@@ -2747,6 +2798,11 @@ fn done_mark(status: &str, code: Option<i32>, depth: usize) -> &'static str {
         _ if code.is_some() => "fail",
         _ => "",
     }
+}
+
+/// Process loss does not lose a durable chat. Preserve actual failures and lost terminals/runs; an idle chat resumes on send.
+fn row_status(status: &'static str, chat: bool, code: Option<i32>) -> &'static str {
+    if chat && status == "lost" && code.is_none() { "ready" } else { status }
 }
 
 /// The share of its work the running step of transcript `t` says it has done ("\u{2026} \u{b7} 132/388" in its words: a
@@ -3064,6 +3120,18 @@ fn scene_sound(w: WorldRef<'_>) -> Result<SceneSound, String> {
 mod tests {
     use super::*;
 
+    /// A daemon restart loses a provider process, not the saved conversation. Real exits and lost non-chat work remain visible.
+    #[test]
+    fn restored_chat_rows_are_ready_and_actual_failures_stay_failures() {
+        let ready = row_status("lost", true, None);
+        assert_eq!(ready, "ready");
+        assert_eq!(done_mark(ready, None, 1), "", "a resumable child chat has no failure mark");
+        assert_eq!(row_status("lost", false, None), "lost");
+        assert_eq!(row_status("lost", true, Some(1)), "lost");
+        assert_eq!(row_status("killed", true, None), "killed");
+        assert_eq!(row_status("exited", true, Some(1)), "exited");
+    }
+
     /// The tree as the daemon's `list` and `runs` tell it, at change `n` (the title and the newest run move each time).
     fn tree(n: usize) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
         let sessions = (1..=3)
@@ -3073,6 +3141,92 @@ mod tests {
             .map(|r| serde_json::json!({"id": format!("r{}", n + r), "status": "done", "cmd": "echo hi", "session": "s1", "stages": []}))
             .collect();
         (sessions, runs)
+    }
+
+    /// The invariant: a device fold hides every descendant, including a selected agent, without changing runtime,
+    /// selection or individual session folds. Restoring the device restores the exact row list; devices are independent.
+    #[test]
+    fn device_header_fold_hides_agents_and_restores_the_group() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let w = world.world_ref();
+        let local = w.entity_named(model::LOCAL).set(model::Device { host: "local".into(), sock: "/local.sock".into() });
+        let other = w.entity().set(model::Device { host: "server".into(), sock: "/server.sock".into() });
+        let session = w.entity().child_of(local).set(model::Object { id: 1 }).add((model::Kind::id(), model::Claude::id())).add((model::Status::id(), model::Running::id()));
+        let agent = w.entity().child_of(session).set(model::Object { id: 2 }).add((model::Kind::id(), model::Codex::id())).add((model::Status::id(), model::Running::id()));
+        model::set_folded(w, *session.id(), false);
+        model::select(w, Some(*agent.id()));
+        let rows = model::rows(w);
+        let inventory = model::tree(w);
+        assert_eq!(rows.iter().map(|r| r.e).collect::<Vec<_>>(), [*session.id(), *agent.id()]);
+        assert!(!model::folded(local) && !model::folded(other), "device groups start expanded");
+        model::set_folded(w, *local.id(), true);
+        assert!(model::rows(w).is_empty(), "the selected agent cannot escape its collapsed device");
+        assert_eq!(model::tree(w), inventory, "folding affects presentation, not inventory");
+        assert_eq!(model::selected(w).map(|e| *e.id()), Some(*agent.id()));
+        assert!(!model::folded(session), "the session's own disclosure stays open");
+        for e in [session, agent] {
+            assert!(e.is_alive() && e.target(model::Status::id(), 0).is_some_and(|s| *s.id() == *w.component_id::<model::Running>()));
+        }
+        assert!(!model::folded(other));
+        model::set_folded(w, *local.id(), false);
+        assert_eq!(model::rows(w), rows);
+        model::set_folded(w, *other.id(), true);
+        assert_eq!(model::rows(w), rows, "another device's fold leaves this group alone");
+        assert!(!model::folded(local));
+    }
+
+    /// List metadata covers all agents without attaching any transcript; a legacy daemon's absent field stays unknown.
+    #[test]
+    fn list_context_updates_every_agent_without_transcript_subscriptions() {
+        let world = scene_world().unwrap_or_else(|e| panic!("{e}"));
+        let mail = model::Mailbox::default();
+        let (_, _, chats) = model::install(world.world_ref(), "test", "/nonexistent", mail.clone());
+        let rows = |used: u64| vec![
+            serde_json::json!({"id": 1, "kind": "claude", "mode": "chat", "status": "running", "context": {"used": used, "window": 200000, "updated_ms": 100}}),
+            serde_json::json!({"id": 2, "kind": "codex", "mode": "chat", "status": "running", "context": {"used": 30000, "window": 160000, "updated_ms": 200}}),
+        ];
+        mail.send(model::Msg::List(rows(10000)));
+        world.progress_time(1.0 / 60.0);
+        let context = |sid: u64| {
+            let mut found = None;
+            world.new_query::<&model::Object>().each_entity(|e, o| {
+                if o.id == sid { found = e.try_cloned::<&model::AgentContext>(); }
+            });
+            found
+        };
+        assert_eq!(context(1), Some(model::AgentContext { used: 10000, window: 200000, updated_ms: 100 }));
+        assert_eq!(context(2), Some(model::AgentContext { used: 30000, window: 160000, updated_ms: 200 }));
+        assert!(chats.borrow().is_empty(), "summary metadata needs no full transcript events");
+        mail.send(model::Msg::List(rows(12000)));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.used), Some(12000));
+        assert_eq!(context(2).map(|c| c.used), Some(30000));
+        // The list fingerprint must cover every field reconciliation reads, including nested context and unrelated
+        // metadata-only edits. Keep the rest identical so no other field can accidentally invalidate the cache for it.
+        let mut changed = rows(12000);
+        changed[0]["context"]["updated_ms"] = serde_json::json!(101);
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.updated_ms), Some(101));
+        changed[0]["context"]["window"] = serde_json::json!(240000);
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1).map(|c| c.window), Some(240000));
+        let mut first = None;
+        world.new_query::<&model::Object>().each_entity(|e, o| { if o.id == 1 { first = Some(*e.id()); } });
+        let first = world.entity_from_id(first.expect("the first agent remains listed"));
+        changed[0]["effort"] = serde_json::json!("high");
+        mail.send(model::Msg::List(changed.clone()));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(first.try_cloned::<&model::AgentModel>().map(|m| m.effort.as_str().to_owned()).as_deref(), Some("high"));
+        changed[0]["label"] = serde_json::json!("Renamed chat");
+        mail.send(model::Msg::List(changed));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(first.try_cloned::<&model::Name>().map(|n| n.s.as_str().to_owned()).as_deref(), Some("Renamed chat"));
+        mail.send(model::Msg::List(vec![serde_json::json!({"id": 1, "kind": "claude", "mode": "chat", "status": "running"})]));
+        world.progress_time(1.0 / 60.0);
+        assert_eq!(context(1), None, "old daemons omit usage, rather than reporting zero percent");
+        assert!(chats.borrow().is_empty());
     }
 
     /// Property `stalled-inbox-holds-one-tree`: while no frame takes the mail (a window out of sight, so its display link
@@ -3255,8 +3409,9 @@ mod tests {
             "hn.StepFail", "hn.StepNote", "hn.StepGrid",
             "hn.StepKind.exec", "hn.StepKind.read", "hn.StepKind.edit", "hn.StepKind.write", "hn.StepKind.delete", "hn.StepKind.search", "hn.StepKind.list",
             "hn.StepKind.build", "hn.StepKind.net", "hn.StepKind.sql", "hn.StepKind.spawn", "hn.StepKind.wait", "hn.StepKind.cell", "hn.StepKind.tool", "ex.TableDemo",
-            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.ChatPick", "hn.ChatControlInk.rest", "hn.ChatControlInk.hot",
-            "hn.ChatControlInk.off", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
+            "hn.chat_status.thinking", "hn.chat_status.thought", "hn.PaletteField", "hn.tree.ProfileControl", "hn.ChatEffort", "hn.ChatEffortBar", "ui.caret",
+            "hn.ModelIconSlot", "hn.ModelIconClaudeLight", "hn.ModelIconClaudeBalanced", "hn.ModelIconClaudeAdvanced", "hn.ModelIconClaudeFrontier", "hn.ModelIconClaudeUnknown",
+            "hn.ModelIconCodexLight", "hn.ModelIconCodexBalanced", "hn.ModelIconCodexAdvanced", "hn.ModelIconCodexFrontier", "hn.ModelIconCodexUnknown", "hn.SidebarContext",
             "hn.ChatContext", "hn.ChatPlan", "hn.ChatWorking", "hn.ChatAside", "hn.ChatAsideWorking", "hn.ChatNote", "hn.ChatError",
             "hn.ChatItem", "hn.ChatItemNumber", "hn.ChatItemTask",
             "hn.ChatPeek", "hn.ChatPeekAnchor", "hn.PeekSite", "hn.PeekSiteGlyph", "hn.PeekTitle", "hn.PeekState", "hn.PeekMeta", "hn.PeekBody", "hn.PeekCode",

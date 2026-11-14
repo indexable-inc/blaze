@@ -1837,6 +1837,14 @@ impl Plain {
                     // empty; there is no migration, the store is rebuilt from what made it.
                     return Err(StoreError::Format { what: format::HEAD_SLOT, found, wanted: FORMAT });
                 }
+                if let HeadRead::Version { slot, found } = read {
+                    // A store of the previous layout (rule 26): refused by name, never read as
+                    // empty; there is no migration, the store is rebuilt from what made it.
+                    return Err(format!(
+                        "{}: its slot {slot} is of format {found}, and this blaze reads format {FORMAT}: a store of another layout; remove the directory and blaze rebuilds it",
+                        self.head
+                    ));
+                }
                 if bytes.len() < HEAD_LEN {
                     // A plain head (or nothing) short of its length: made at its full length
                     // and synced before anything else is written, so no flip ever extends or

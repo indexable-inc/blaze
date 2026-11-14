@@ -585,6 +585,12 @@ blaze-remote = { path = "crates/blaze-remote" }
 blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
 blaze-sha256 = { path = "crates/blaze-sha256" }
+# Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
+blaze-sql = { path = "crates/blaze-sql" }
+blaze-sqlite = { path = "crates/blaze-sqlite" }
+blaze-pg = { path = "crates/blaze-pg" }
+# C SQLite itself, built from the amalgamation; blaze-sqlite is its only user and takes nothing of rusqlite.
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 # bstd, blaze's own standard library (docs/v2/plan/design/std.md).
 blaze-std = { path = "crates/blaze-std" }
 blaze-items = { path = "crates/blaze-items" }

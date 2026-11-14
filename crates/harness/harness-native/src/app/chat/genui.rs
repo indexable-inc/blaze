@@ -26,6 +26,7 @@ mod layout;
 mod map;
 mod media;
 mod props;
+mod question;
 mod surface;
 
 pub use common::{GenFeel, GenOn, Prims};
@@ -39,7 +40,8 @@ const MAX_ROWS: usize = 200;
 const MAX_COLS: usize = 12;
 
 /// Each element the app draws and its prefab: the kernel's `ELEMENT_NAMES` (mcp/src/ui/element.ts).
-const ELEMENTS: [(&str, &str); 54] = [
+const ELEMENTS: [(&str, &str); 55] = [
+    ("Question", "hn.GenQuestion"),
     ("Column", "hn.GenColumn"),
     ("Row", "hn.GenRow"),
     ("Text", "hn.GenText"),
@@ -261,6 +263,7 @@ fn own_refusal(world: WorldRef<'_>, node: &Value, within: &Within, live: Option<
     let kind = node["type"].as_str().unwrap_or("");
     match kind {
         k if props::TIER3.contains(&k) => props::check(node, within).or_else(|| surface::failed(node, live)),
+        "Question" => question::check(node),
         "Chart" => chart::check(world, node),
         "Canvas" => canvas::check(world, node),
         "Browser" => browser::check(node),
@@ -333,6 +336,7 @@ fn element(v: View<'_>, node: &Value, depth: usize, b: &mut Budget<'_, '_>) {
     let kind = node["type"].as_str().unwrap_or("");
     let kids: Vec<&Value> = node["children"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     match kind {
+        "Question" => question::element(v, node, b),
         "Grid" | "Stack" | "Layer" | "Wrap" | "Scroll" | "Split" | "Tabs" | "Disclosure" | "Accordion" => {
             layout::element(v, node, kind, &kids, depth, &within, b);
         }
@@ -1456,6 +1460,34 @@ pub(super) fn texts(ui: &Value) -> Vec<Words> {
                 }
                 kids(from, out);
             }
+            "Question" => {
+                if let Some(answer) = prop(node, "answer").as_str().filter(|s| !s.is_empty()) {
+                    out.push(line("receipt/question", words(node, "text"), false));
+                    out.push(line("receipt/answer", answer.to_owned(), false));
+                } else {
+                    out.push(line("heading/title", words(node, "text"), false));
+                    out.push(line("heading/detail", words(node, "detail"), false));
+                    let recommended = prop(node, "recommended").as_str();
+                    for (i, option) in prop(node, "options").as_array().into_iter().flatten().take(question::MAX_OPTIONS).enumerate() {
+                        if let Some(label) = option["label"].as_str() {
+                            out.push(line(&format!("options/o{i}/head/label"), label.to_owned(), false));
+                            if let Some(detail) = option["detail"].as_str() {
+                                out.push(line(&format!("options/o{i}/detail"), detail.to_owned(), false));
+                            }
+                            if Some(label) == recommended {
+                                out.push(line(&format!("options/o{i}/head/recommendation"), "Recommended".to_owned(), false));
+                            }
+                        }
+                    }
+                    if prop(node, "allowText") == &Value::Bool(true) {
+                        out.push(line("response/body/text", words(node, "value"), false));
+                    }
+                    let ahead = question::ahead_text(node);
+                    if !ahead.is_empty() {
+                        out.push(line("ahead", ahead, false));
+                    }
+                }
+            }
             "Text" => out.push(line("", words(node, "text"), false)),
             "Badge" => out.push(line("text", words(node, "text"), false)),
             "Stat" => out.extend(["label", "value", "note"].map(|part| line(part, words(node, part), false))),
@@ -1521,4 +1553,25 @@ pub(super) fn texts(ui: &Value) -> Vec<Words> {
         walk(node, Some(&format!("body/g{i}")), 0, &mut out);
     }
     out
+}
+
+
+#[cfg(test)]
+mod question_text_tests {
+    use super::*;
+
+    #[test]
+    fn question_copy_and_selection_follow_the_drawn_state() {
+        let mut ui = serde_json::json!({"type":"Question", "props": {
+            "text":"Where should this run?", "detail":"Choose a target.",
+            "options":[{"label":"Staging", "detail":"No customer traffic"},{"label":"Production", "detail":"Serves customers"}],
+            "recommended":"Staging", "allowText":true, "value":"My target"
+        }, "children":[]});
+        assert_eq!(plain(&ui), "Where should this run?\nChoose a target.\nStaging\nNo customer traffic\nRecommended\nProduction\nServes customers\nMy target");
+        let words = texts(&ui);
+        assert!(words.iter().any(|t| t.path == "body/g0/options/o0/detail" && t.src == "No customer traffic"));
+        ui["props"]["answer"] = serde_json::json!("Production");
+        assert_eq!(plain(&ui), "Where should this run?\nProduction");
+        assert_eq!(texts(&ui).into_iter().map(|t| t.path).collect::<Vec<_>>(), ["body/g0/receipt/question", "body/g0/receipt/answer"]);
+    }
 }

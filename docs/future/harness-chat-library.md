@@ -33,7 +33,11 @@ rendering the matching excerpt through the transcript's Markdown blocks (heading
 fenced code). Excerpt whitespace survives search; preview text never repeats in each result row.
 Indexing and keyboard hints sit in the footer. Unknown terms return no matches; an indexing/error
 state is distinct. The bounded preview reuses the excerpt already returned by search, with no
-additional transcript IO on selection. Work remains O(visible results + selected excerpt bytes).
+additional transcript IO on selection. Its search field shares the chat Draft editor: a real insertion caret,
+selection, pointer placement, word movement, clipboard operations and IME composition, with one query value.
+The bounded result page is scroll content with the same native physics and overlay scroller as chat inputs;
+keyboard selection reveals its row, and the preview scrolls independently. An open overlay consumes input
+before the underlying chat or tree. Work remains O(result page + selected excerpt bytes), bounded to forty rows.
 
 Costs: initial discovery O(files + indexed bytes); refresh O(files + changed bytes), query uses FTS
 postings instead of rereading conversations. Full transcript parsing is O(selected bytes). The

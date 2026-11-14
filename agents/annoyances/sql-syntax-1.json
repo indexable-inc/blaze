@@ -1,0 +1,10 @@
+{
+ "id": "sql-syntax-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane sql-syntax",
+ "where": "crates/blaze-sql/src/lib.rs",
+ "what": "the crate is `#![no_std]` even under test, unlike the other no_std crates (`#![cfg_attr(not(test), no_std)]`), so each test module needs `extern crate std;` and explicit `std::` imports, and hegel macros that expand to `::std` paths may not resolve",
+ "cost": "test code written with Hegel::new instead of #[hegel::test] to avoid the macro paths; unverified until compiled",
+ "cause": "lib.rs was written as a contract file before its tests",
+ "state": "open: lib.rs could take `#![cfg_attr(not(test), no_std)]`"
+}

@@ -60,6 +60,7 @@ pub(super) struct Library {
     source_errors: HashMap<String, String>,
     highlight: std::cell::RefCell<Option<String>>,
     worker_failed: bool,
+    scroll: std::cell::RefCell<[view::field::FieldScroll; 2]>,
 }
 
 impl Library {
@@ -102,6 +103,7 @@ impl Library {
         self.query = query.to_owned();
         self.hits.clear();
         self.highlight.get_mut().take();
+        *self.scroll.get_mut() = Default::default();
         self.searching = true;
         self.send(Command::Query(query.to_owned()));
     }
@@ -237,11 +239,12 @@ impl App {
         }
         self.library.start(self.link.waker());
         self.library.query("");
-        self.palette = Some(Palette { mode: Mode::Chats, ..Palette::new() });
+        self.palette = Some(Palette { mode: Mode::Chats, ..Palette::new(self.time) });
         self.poke();
     }
 
     pub(super) fn poll_chat_library(&mut self) {
+        self.step_library_scrolling();
         let (snapshot, opened, refreshed) = {
             let mut mail = self.library.mail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (mail.state.take(), mail.opened.take(), mail.refreshed.take())
@@ -290,6 +293,48 @@ impl App {
         }
     }
 
+    fn library_body(&self) -> Option<View<'_>> {
+        let (id, mode) = self.ids.palette?;
+        (mode == Mode::Chats && self.palette.as_ref().is_some_and(|p| p.mode == Mode::Chats)).then_some(())?;
+        View::of(self.world.entity_from_id(id)).part("card")?.part("body")
+    }
+
+    /// Overlay scrolls use the same native physics and overlay scroller as text areas; a selected row is the reveal target.
+    fn step_library_scrolling(&mut self) {
+        let Some(body) = self.library_body() else { return };
+        let entries = self.library_entries();
+        let at = self.library_selected(&entries, self.palette.as_ref().map_or(0, |p| p.at));
+        let selected = entries.get(at).and_then(|row| body.part("results")?.part("items")?.part(&row.0));
+        let line = selected.and_then(|r| r.entity().try_cloned::<&Laid>()).map(|l| [l.y, l.y + l.h]);
+        let points_per_pixel = 1.0 / f64::from(self.grid.scale.max(0.5));
+        let mut moving = false;
+        {
+            let mut scroll = self.library.scroll.borrow_mut();
+            for (i, name) in ["results", "preview"].into_iter().enumerate() {
+                if let Some(area) = body.part(name) { moving |= scroll[i].step(area.entity(), if i == 0 { line } else { None }, points_per_pixel); }
+            }
+        }
+        if moving { self.poke(); }
+    }
+
+    /// A modal overlay owns the wheel, including at a scroll boundary; its underlying tree/chat never sees the gesture.
+    pub(super) fn library_wheel(&mut self, ev: &sidebar::Wheel) -> bool {
+        if self.palette.is_none() { return false; }
+        let z = self.zoom();
+        let took = self.library_body().and_then(|body| {
+            ["results", "preview"].into_iter().enumerate().find_map(|(i, name)| {
+                let area = body.part(name)?;
+                let laid = area.entity().try_cloned::<&Laid>()?;
+                laid.contains(self.pointer.x, self.pointer.y).then_some((i, area))
+            })
+        }).is_some_and(|(i, area)| {
+            let k = if ev.precise { 1.0 / z } else { 1.0 };
+            self.library.scroll.borrow_mut()[i].wheel(area.entity(), [ev.dx * k, ev.dy * k], ev.precise, ev.phase, ev.momentum)
+        });
+        if took { self.poke(); }
+        true
+    }
+
     pub(super) fn external_source_error(&self, key: &str) -> Option<&str> {
         self.library.source_errors.get(key).map(String::as_str)
     }
@@ -324,7 +369,7 @@ impl App {
     }
 
     pub(super) fn library_entries(&self) -> Vec<(String, PalGlyph, String, String, Do)> {
-        let query = self.palette.as_ref().map_or("", |p| p.query.trim());
+        let query = self.palette.as_ref().map_or("", |p| p.query.text.trim());
         let mut ranked = Vec::new(); // alloc: only the open overlay's bounded results
         let mut ids = std::collections::HashSet::new(); // alloc: dedupe known Harness ids
         let q = query.to_lowercase();
@@ -374,9 +419,7 @@ impl App {
 
     pub(super) fn sync_chat_library(&self, card: Option<View<'_>>, at: usize, query: &str) {
         let Some(card) = card else { return };
-        if let Some(text) = card.part("query").and_then(|q| q.part("text")) {
-            text.text(if query.is_empty() { "Search chats…" } else { query });
-        }
+        self.sync_palette_field(card, "Search chats…");
         let Some(body) = card.part("body") else { return };
         let Some(results) = body.part("results") else { return };
         let Some(items) = results.part("items") else { return };
@@ -403,11 +446,9 @@ impl App {
             empty.text(if !entries.is_empty() { "" } else if query.is_empty() { "Finding your local chats…" } else { "No chats found.\nTry a title, chat ID, or phrase." });
         }
         let w = self.world.world_ref();
-        let row_height = view::prefab(w, "hn.ChatLibraryRow").and_then(|p| p.try_cloned::<&Size>()).expect("hn.ChatLibraryRow has no Size").h.value;
-        let padding = results.entity().try_cloned::<&harness_native_ui_layout_api::Padding>().unwrap_or_default();
-        let visible = results.entity().try_cloned::<&Laid>().map_or(8, |l| ((l.h - padding.t - padding.b) / row_height).floor().max(1.0) as usize).min(8);
-        let start = at.saturating_sub(visible - 1);
-        view::for_each_of(items, entries.iter().enumerate().skip(start).take(visible).map(|(i, row)| (row.0.clone(), "hn.ChatLibraryRow", (i, row))), |row, (i, (key, glyph, title, meta, _)), _| {
+        // The result page is bounded by LIMIT. Keep every row in the scroll content, so wheel, scroller and keys
+        // use one coordinate space instead of replacing an eight-row slice beneath the pointer.
+        view::for_each_of(items, entries.iter().enumerate().map(|(i, row)| (row.0.clone(), "hn.ChatLibraryRow", (i, row))), |row, (i, (key, glyph, title, meta, _)), _| {
             row.action(&format!("library:choose:{key}"));
             set_if(row, tone(w, if i == at { "selection" } else { "clear" }));
             if let Some(icon) = row.part("glyph") {
@@ -422,7 +463,10 @@ impl App {
             }
         });
         if let Some(preview) = body.part("preview") {
-            if changed { preview.set(harness_native_ui_layout_api::ScrollState::default()); }
+            if changed {
+                preview.set(harness_native_ui_layout_api::ScrollState::default());
+                self.library.scroll.borrow_mut()[1] = Default::default();
+            }
             if let Some(content) = preview.part("content") {
                 let hit = selected.and_then(|row| self.library.hits.iter().find(|h| h.session.key == row.0));
                 if let Some(source) = content.part("source") {

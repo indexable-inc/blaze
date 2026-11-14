@@ -42,3 +42,20 @@ prefab Trail : ui.Line {
   Truncate: {mode: Tail}
   TextStyle: {size: $size_caption, line: 14, role: 0, bold: 0}
 }
+
+// A row's inline model/effort hit target: the same height and quiet wash as the composer controls.
+prefab ProfileControl : ui.Row {
+  Cursor: {shape: Arrow}
+  Fill: $tone_clear
+  Shape: {radius: $chat_pick_radius, n: 4, border: 0, feather: 0}
+  HoverLook: {dark: $tone_hover.dark, light: $tone_hover.light, pad: 0, radius: -1}
+  Flex: {axis: Row, gap: 0, align: Center, justify: Center, wrap: false}
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fixed, value: $chat_pick_h, min: 0, max: 0}}
+  Padding: {l: 1, r: 1, t: 0, b: 0}
+}
+
+prefab Emotion : ui.Line {
+  Size: {w: {kind: Fit, value: 0, min: 0, max: 0}, h: {kind: Fit, value: 0, min: 0, max: 0}}
+  Padding: {l: 0, r: $tree_kind_gap, t: 0, b: 0}
+  TextStyle: {size: $size_row, line: $line_row, role: 0, bold: 0}
+}
