@@ -8,10 +8,10 @@ open Blaze
 set_option linter.unusedVariables false
 
 def orderings.cmp_agrees (a : U32) (b : U32) : Bool :=
-  let t4 :=
+  let t0 :=
     core.cmp.PartialEq.eq (core.cmp.Ordering.reverse (orderings.compare a b)) (orderings.compare b a)
-  let t3 := if t4 then core.cmp.Ordering.is_lt (orderings.compare a b) == Scalar.lt a b else t4
-  if t3 then Scalar.eq (orderings.sign (orderings.compare a a)) (0 : I32) else t3
+  let t1 := if t0 then core.cmp.Ordering.is_lt (orderings.compare a b) == Scalar.lt a b else t0
+  if t1 then Scalar.eq (orderings.sign (orderings.compare a a)) (0 : I32) else t1
 
 def orderings.cmp_agrees.spec.statement : Prop :=
   ∀ (a : U32) (b : U32), orderings.cmp_agrees a b = true

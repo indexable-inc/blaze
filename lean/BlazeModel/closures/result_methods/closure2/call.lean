@@ -6,6 +6,6 @@ import BlazeModel.closures.result_methods.closure2.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.result_methods.closure2.call (t1 : closures.result_methods.closure2) (v : U32) : core.result.Result U32 U8 :=
-  if Scalar.gt v t1.c0 then (core.result.Result.Ok v : core.result.Result U32 U8)
+def closures.result_methods.closure2.call (t0 : closures.result_methods.closure2) (v : U32) : core.result.Result U32 U8 :=
+  if Scalar.gt v t0.c0 then (core.result.Result.Ok v : core.result.Result U32 U8)
   else (core.result.Result.Err (0 : U8) : core.result.Result U32 U8)

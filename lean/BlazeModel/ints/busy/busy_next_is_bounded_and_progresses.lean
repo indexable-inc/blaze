@@ -7,27 +7,27 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.busy.busy_next_is_bounded_and_progresses (tried : U32) (waited : U64) : Result Bool := do
-  let t3 ← ints.busy.next tried waited
-  match t3 with
+  let t0 ← ints.busy.next tried waited
+  match t0 with
   | Option.none => Result.ok (Scalar.ge waited (1000000000 : U64))
   | Option.some v0 => do
     let w := v0
-    let t13 := Scalar.lt waited (1000000000 : U64)
-    let t12 := if t13 then Scalar.gt w (0 : U64) else t13
-    let t11 := if t12 then Scalar.le w (50000000 : U64) else t12
-    let t10 ←
-      if t11 then do
-        let t19 := w
-        let t20 ← Scalar.sub (1000000000 : U64) waited
-        Result.ok (Scalar.le t19 t20)
-      else Result.ok t11
-    if t10 then
-      let t23 := Scalar.ge w (50000 : U64)
-      if t23 then Result.ok t23
+    let t1 := Scalar.lt waited (1000000000 : U64)
+    let t2 := if t1 then Scalar.gt w (0 : U64) else t1
+    let t3 := if t2 then Scalar.le w (50000000 : U64) else t2
+    let t4 ←
+      if t3 then do
+        let t5 := w
+        let t6 ← Scalar.sub (1000000000 : U64) waited
+        Result.ok (Scalar.le t5 t6)
+      else Result.ok t3
+    if t4 then
+      let t7 := Scalar.ge w (50000 : U64)
+      if t7 then Result.ok t7
       else do
-        let t26 ← Scalar.add waited w
-        Result.ok (Scalar.eq t26 (1000000000 : U64))
-    else Result.ok t10
+        let t8 ← Scalar.add waited w
+        Result.ok (Scalar.eq t8 (1000000000 : U64))
+    else Result.ok t4
 
 def ints.busy.busy_next_is_bounded_and_progresses.spec.statement : Prop :=
   ∀ (tried : U32) (waited : U64),

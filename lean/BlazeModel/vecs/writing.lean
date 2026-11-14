@@ -13,8 +13,8 @@ def vecs.writing (v : Vec U32) (w : Slice U32) (x : U32) (i : Usize) : Result (O
   let (s, v) ← Vec.swap_remove v (0 : Usize)
   let v := Vec.truncate v (3 : Usize)
   let v ← Vec.extend_from_slice v w
-  let t28 ← Scalar.add r s
-  let v ← Vec.push v t28
+  let t0 ← Scalar.add r s
+  let v ← Vec.push v t0
   let (top, v) := Vec.pop v
   let v := Vec.clear v
   Result.ok (top, v)

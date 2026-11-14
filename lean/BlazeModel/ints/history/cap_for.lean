@@ -6,5 +6,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.history.cap_for (store_bytes : U64) : Result U64 := do
-  let t2 ← Scalar.div store_bytes (4 : U64)
-  Scalar.ord_clamp t2 (8388608 : U64) (268435456 : U64)
+  let t0 ← Scalar.div store_bytes (4 : U64)
+  Scalar.ord_clamp t0 (8388608 : U64) (268435456 : U64)

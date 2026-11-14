@@ -8,8 +8,8 @@ set_option linter.unusedVariables false
 
 def ints.history.cap_for_is_between_least_and_most (store_bytes : U64) : Result Bool := do
   let cap ← ints.history.cap_for store_bytes
-  let t4 := Scalar.le (8388608 : U64) cap
-  if t4 then Result.ok (Scalar.le cap (268435456 : U64)) else Result.ok t4
+  let t0 := Scalar.le (8388608 : U64) cap
+  if t0 then Result.ok (Scalar.le cap (268435456 : U64)) else Result.ok t0
 
 def ints.history.cap_for_is_between_least_and_most.spec.statement : Prop :=
   ∀ (store_bytes : U64), ints.history.cap_for_is_between_least_and_most store_bytes = Result.ok true

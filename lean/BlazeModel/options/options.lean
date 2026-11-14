@@ -7,9 +7,9 @@ set_option linter.unusedVariables false
 
 def options.options (a : Option U32) (b : Option U32) : Result U32 := do
   let n := (0 : U32)
-  let t5 := core.option.Option.is_some a
-  let n ← if t5 then Scalar.add n (1 : U32) else Result.ok n
-  let t9 := core.option.Option.is_none b
-  let n ← if t9 then Scalar.add n (2 : U32) else Result.ok n
-  let t12 ← Scalar.add n (core.option.Option.unwrap_or a (7 : U32))
-  Scalar.add t12 (core.option.Option.unwrap_or b (0 : U32))
+  let t0 := core.option.Option.is_some a
+  let n ← if t0 then Scalar.add n (1 : U32) else Result.ok n
+  let t1 := core.option.Option.is_none b
+  let n ← if t1 then Scalar.add n (2 : U32) else Result.ok n
+  let t2 ← Scalar.add n (core.option.Option.unwrap_or a (7 : U32))
+  Scalar.add t2 (core.option.Option.unwrap_or b (0 : U32))

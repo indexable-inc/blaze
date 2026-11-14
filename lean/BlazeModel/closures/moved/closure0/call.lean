@@ -6,7 +6,7 @@ import BlazeModel.closures.moved.closure0.type
 open Blaze
 set_option linter.unusedVariables false
 
-def closures.moved.closure0.call (t1 : closures.moved.closure0) (x : U32) : Result U32 :=
-  let t3 := t1.c0
-  let t5 := t1.c1
-  if t3 then Scalar.add x t5 else Result.ok x
+def closures.moved.closure0.call (t0 : closures.moved.closure0) (x : U32) : Result U32 :=
+  let t1 := t0.c0
+  let t2 := t0.c1
+  if t1 then Scalar.add x t2 else Result.ok x

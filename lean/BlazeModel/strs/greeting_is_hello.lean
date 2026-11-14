@@ -13,9 +13,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def strs.greeting_is_hello (first : Bool) : Bool :=
-  let t4 := Scalar.eq (strs.size strs.greeting) (5 : Usize)
-  let t3 := if t4 then strs.is_hello strs.greeting else t4
-  let t2 := if t3 then !(strs.blank (strs.pick first)) else t3
+  let t0 := Scalar.eq (strs.size strs.greeting) (5 : Usize)
+  let t1 := if t0 then strs.is_hello strs.greeting else t0
+  let t2 := if t1 then !(strs.blank (strs.pick first)) else t1
   if t2 then strs.blank strs.empty else t2
 
 def strs.greeting_is_hello.spec.statement : Prop :=

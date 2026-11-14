@@ -15,12 +15,12 @@ def blaze_core.world.disk.Change.apply (fuel : Nat) (self : blaze_core.world.dis
     Vec.extend_from_slice bytes more
   | blaze_core.world.disk.Change.At v1 v2 =>
     let «at» := v1
-    let more_10 := v2
-    blaze_core.world.disk.write fuel bytes «at» more_10 (0 : Usize) (Slice.len more_10)
+    let more_1 := v2
+    blaze_core.world.disk.write fuel bytes «at» more_1 (0 : Usize) (Slice.len more_1)
   | blaze_core.world.disk.Change.Sectors v3 v4 =>
     let «at» := v3
-    let more_10 := v4
-    blaze_core.world.disk.write fuel bytes «at» more_10 (0 : Usize) (Slice.len more_10)
+    let more_1 := v4
+    blaze_core.world.disk.write fuel bytes «at» more_1 (0 : Usize) (Slice.len more_1)
   | blaze_core.world.disk.Change.Cut v5 =>
     let len := v5
     blaze_core.world.disk.resize fuel bytes len

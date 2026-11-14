@@ -38,12 +38,12 @@ open Blaze
 set_option linter.unusedVariables false
 
 def closures.option_methods (a : Option U32) (k : U32) : Result (Option U32 × U32 × U32 × Option U32 × Option U32 × U32 × Bool × Bool × Option U32 × core.result.Result U32 U8) := do
-  let t3 ←
+  let t0 ←
     core.option.Option.u32.map.u32_closure0_option_methods a ({  } : closures.option_methods.closure0)
-  let t6 :=
+  let t1 :=
     core.option.Option.u32.map_or.u32_closure1_option_methods a k ({ c0 := k } : closures.option_methods.closure1)
-  let t11 :=
+  let t2 :=
     core.option.Option.u32.map_or_else.u32_closure2_option_methods_closure3_option_methods a ({ c0 := k } : closures.option_methods.closure2) ({ c0 := k } : closures.option_methods.closure3)
-  let t17 ←
+  let t3 ←
     core.option.Option.u32.and_then.u32_closure4_option_methods a ({ c0 := k } : closures.option_methods.closure4)
-  Result.ok (t3, t6, t11, t17, core.option.Option.u32.or_else.closure5_option_methods a ({ c0 := k } : closures.option_methods.closure5), core.option.Option.u32.unwrap_or_else.closure6_option_methods a ({ c0 := k } : closures.option_methods.closure6), core.option.Option.u32.is_some_and.closure7_option_methods a ({ c0 := k } : closures.option_methods.closure7), core.option.Option.u32.is_none_or.closure8_option_methods a ({ c0 := k } : closures.option_methods.closure8), core.option.Option.u32.filter.closure9_option_methods a ({ c0 := k } : closures.option_methods.closure9), core.option.Option.u32.ok_or_else.u8_closure10_option_methods a ({  } : closures.option_methods.closure10))
+  Result.ok (t0, t1, t2, t3, core.option.Option.u32.or_else.closure5_option_methods a ({ c0 := k } : closures.option_methods.closure5), core.option.Option.u32.unwrap_or_else.closure6_option_methods a ({ c0 := k } : closures.option_methods.closure6), core.option.Option.u32.is_some_and.closure7_option_methods a ({ c0 := k } : closures.option_methods.closure7), core.option.Option.u32.is_none_or.closure8_option_methods a ({ c0 := k } : closures.option_methods.closure8), core.option.Option.u32.filter.closure9_option_methods a ({ c0 := k } : closures.option_methods.closure9), core.option.Option.u32.ok_or_else.u8_closure10_option_methods a ({  } : closures.option_methods.closure10))

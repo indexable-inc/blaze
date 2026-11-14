@@ -8,5 +8,5 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.world.clock.Clock.fires (self : blaze_core.world.clock.Clock) (deadline : U64) (reading : U64) : Bool :=
-  let t4 := blaze_core.world.clock.Clock.allows self reading
-  if t4 then Scalar.ge reading deadline else t4
+  let t0 := blaze_core.world.clock.Clock.allows self reading
+  if t0 then Scalar.ge reading deadline else t0

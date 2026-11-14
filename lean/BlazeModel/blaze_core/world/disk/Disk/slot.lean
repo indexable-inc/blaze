@@ -15,13 +15,13 @@ def blaze_core.world.disk.Disk.slot.loop_0 (fuel : Nat) (self : blaze_core.world
   match fuel with
   | 0 => Result.div
   | fuel + 1 => do
-    let t7 := Scalar.lt i (Slice.len self.files)
-    let t6 ←
-      if t7 then do
-        let t13 ← Slice.index self.files i
-        Result.ok (Scalar.lt t13.name name)
-      else Result.ok t7
-    if t6 then do
+    let t0 := Scalar.lt i (Slice.len self.files)
+    let t1 ←
+      if t0 then do
+        let t2 ← Slice.index self.files i
+        Result.ok (Scalar.lt t2.name name)
+      else Result.ok t0
+    if t1 then do
       let i ← Scalar.add i (1 : Usize)
       blaze_core.world.disk.Disk.slot.loop_0 fuel self name i
     else Result.ok i

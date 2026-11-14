@@ -7,8 +7,8 @@ set_option linter.unusedVariables false
 
 def durations.sub_then_add (a : core.time.Duration) (b : core.time.Duration) : Result Bool :=
   if core.time.Duration.le a b then do
-    let t7 ← core.time.Duration.add (core.time.Duration.saturating_sub b a) a
-    Result.ok (core.cmp.PartialEq.eq t7 b)
+    let t0 ← core.time.Duration.add (core.time.Duration.saturating_sub b a) a
+    Result.ok (core.cmp.PartialEq.eq t0 b)
   else Result.ok true
 
 def durations.sub_then_add.spec.statement : Prop :=

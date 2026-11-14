@@ -6,10 +6,10 @@ open Blaze
 set_option linter.unusedVariables false
 
 def options.unwraps (a : Option U32) (r : core.result.Result U32 U8) (s : core.result.Result U32 U8) : Result U32 := do
-  let t6 ← core.option.Option.unwrap a
-  let t8 ← core.option.Option.expect a
-  let t5 ← Scalar.add t6 t8
-  let t12 ← core.result.Result.unwrap r
-  let t4 ← Scalar.add t5 t12
-  let t14 ← core.result.Result.expect s
-  Scalar.add t4 t14
+  let t0 ← core.option.Option.unwrap a
+  let t1 ← core.option.Option.expect a
+  let t2 ← Scalar.add t0 t1
+  let t3 ← core.result.Result.unwrap r
+  let t4 ← Scalar.add t2 t3
+  let t5 ← core.result.Result.expect s
+  Scalar.add t4 t5

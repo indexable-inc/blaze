@@ -7,15 +7,15 @@ open Blaze
 set_option linter.unusedVariables false
 
 def ints.rebase.a_clear_edit_lies_wholly_before_or_after (a0 : U64) (a1 : U64) (b0 : U64) (b1 : U64) : Bool :=
-  let t8 := Scalar.gt a0 a1
-  let t7 := if t8 then t8 else Scalar.gt b0 b1
-  let t6 := if t7 then t7 else ints.rebase.clash a0 a1 b0 b1
-  let t5 :=
-    if t6 then t6
+  let t0 := Scalar.gt a0 a1
+  let t1 := if t0 then t0 else Scalar.gt b0 b1
+  let t2 := if t1 then t1 else ints.rebase.clash a0 a1 b0 b1
+  let t3 :=
+    if t2 then t2
     else
-      let t17 := Scalar.le a1 b0
-      if t17 then Scalar.lt a0 b1 else t17
-  if t5 then t5 else Scalar.ge a0 b1
+      let t4 := Scalar.le a1 b0
+      if t4 then Scalar.lt a0 b1 else t4
+  if t3 then t3 else Scalar.ge a0 b1
 
 def ints.rebase.a_clear_edit_lies_wholly_before_or_after.spec.statement : Prop :=
   ∀ (a0 : U64) (a1 : U64) (b0 : U64) (b1 : U64),

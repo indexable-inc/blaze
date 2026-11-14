@@ -30,33 +30,33 @@ def blaze_core.world.disk.Disk.crash.loop_0 (fuel : Nat) (self : blaze_core.worl
   match fuel with
   | 0 => Result.div
   | fuel + 1 =>
-    let t9 := Scalar.lt i (Slice.len self.files)
-    let t8 := if t9 then Scalar.lt i (Slice.len cut) else t9
-    if t8 then do
-      let t75 := i
-      let x0 ← Slice.index self.files t75
+    let t0 := Scalar.lt i (Slice.len self.files)
+    let t1 := if t0 then Scalar.lt i (Slice.len cut) else t0
+    if t1 then do
+      let t2 := i
+      let x0 ← Slice.index self.files t2
       let (undo, x1) := core.option.Option.take x0.undo
-      let x2 ← Slice.index self.files t75
-      let x3 ← Slice.update self.files t75 { x2 with undo := x1 }
+      let x2 ← Slice.index self.files t2
+      let x3 ← Slice.update self.files t2 { x2 with undo := x1 }
       let self := { self with files := x3 }
       let x4 ← Slice.index cut i
-      let t22 := x4.undone
+      let t3 := x4.undone
       let undone ←
-        if t22 then
+        if t3 then
           match undo with
-          | Option.some v5 => do
-            let undo_25 := v5
-            let t31 ← Slice.index self.files i
-            Vec.push undone ({ name := t31.name, undo := undo_25 } : blaze_core.world.disk.Undone)
+          | Option.some v0 => do
+            let undo_1 := v0
+            let t4 ← Slice.index self.files i
+            Vec.push undone ({ name := t4.name, undo := undo_1 } : blaze_core.world.disk.Undone)
           | Option.none => Result.ok undone
         else Result.ok undone
-      let t76 := i
-      let x6 ← Slice.index cut i
-      let t39 := x6
-      let x7 ← Slice.index self.files t76
-      let x8 ← blaze_core.world.disk.File.cut fuel x7 t39
-      let x9 ← Slice.update self.files t76 x8
-      let self := { self with files := x9 }
+      let t5 := i
+      let x5 ← Slice.index cut i
+      let t6 := x5
+      let x6 ← Slice.index self.files t5
+      let x7 ← blaze_core.world.disk.File.cut fuel x6 t6
+      let x8 ← Slice.update self.files t5 x7
+      let self := { self with files := x8 }
       let i ← Scalar.add i (1 : Usize)
       blaze_core.world.disk.Disk.crash.loop_0 fuel self cut undone i
     else Result.ok (self, undone)
@@ -66,28 +66,28 @@ def blaze_core.world.disk.Disk.crash.loop_1 (fuel : Nat) (self : blaze_core.worl
   | 0 => Result.div
   | fuel + 1 =>
     if !(Slice.is_empty undone) then do
-      let (t50, undone) ← Vec.remove undone (0 : Usize)
-      let name := t50.name
-      let undo_49 := t50.undo
+      let (t7, undone) ← Vec.remove undone (0 : Usize)
+      let name := t7.name
+      let undo_2 := t7.undo
       let (file, self) ← blaze_core.world.disk.Disk.take fuel self name
       let self ←
-        match undo_49.«from» with
-        | Option.some v10 =>
-          let «from» := v10
+        match undo_2.«from» with
+        | Option.some v1 =>
+          let «from» := v1
           match file with
-          | Option.some v11 => do
-            let file_57 := v11
-            let t60 ← blaze_core.world.disk.Disk.find fuel self «from»
-            if core.option.Option.is_none t60 then
-              let file_57 := { file_57 with name := «from» }
-              blaze_core.world.disk.Disk.put fuel self file_57
+          | Option.some v2 => do
+            let file_1 := v2
+            let t8 ← blaze_core.world.disk.Disk.find fuel self «from»
+            if core.option.Option.is_none t8 then
+              let file_1 := { file_1 with name := «from» }
+              blaze_core.world.disk.Disk.put fuel self file_1
             else Result.ok self
           | Option.none => Result.ok self
         | Option.none => Result.ok self
       let self ←
-        match undo_49.was with
-        | Option.some v12 =>
-          let was := v12
+        match undo_2.was with
+        | Option.some v3 =>
+          let was := v3
           blaze_core.world.disk.Disk.put fuel self (blaze_core.world.disk.File.whole name was)
         | Option.none => Result.ok self
       blaze_core.world.disk.Disk.crash.loop_1 fuel self undone

@@ -8,9 +8,9 @@ open Blaze
 set_option linter.unusedVariables false
 
 def blaze_core.busy.next_is_bounded (tried : U32) (waited : U64) : Result Bool := do
-  let t3 := waited
-  let t4 ← blaze_core.busy.next tried waited
-  blaze_core.busy.bounded t3 t4
+  let t0 := waited
+  let t1 ← blaze_core.busy.next tried waited
+  blaze_core.busy.bounded t0 t1
 
 def blaze_core.busy.next_is_bounded.spec.statement : Prop :=
   ∀ (tried : U32) (waited : U64), blaze_core.busy.next_is_bounded tried waited = Result.ok true

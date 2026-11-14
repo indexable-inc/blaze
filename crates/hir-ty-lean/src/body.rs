@@ -1860,6 +1860,13 @@ impl<'db> Cx<'db> {
                     if let Some(opaque) = self.opaque_adt(adt) {
                         return Ok(Ty::Opaque(opaque));
                     }
+                    // `ControlFlow`, what `Try::branch` gives (`?`): core's own enum, known by
+                    // its variants' lang items, a type per instance as the crate's generic
+                    // enums are, its variants and fields from core's source.
+                    let control_flow = lang.ControlFlowContinue.map(|it| it.lookup(self.db).parent);
+                    if matches!(adt, AdtId::EnumId(it) if Some(it) == control_flow) {
+                        return Ok(Ty::Adt(self.adt(adt, args, at)?));
+                    }
                     return match (name, args.len()) {
                         ("Option", 1) => {
                             Ok(Ty::Option(Box::new(self.ty(args.type_at(0), false, at)?)))
@@ -2792,6 +2799,9 @@ impl<'db> Cx<'db> {
                 _ => {}
             }
         }
+        if let Some(callee) = self.try_call(callee, generics, &name, at)? {
+            return self.call_with(callee, args, destination, target, at, out);
+        }
         let (callee, generics) = self.dispatch(callee, generics, &name, at)?;
         let container = callee.lookup(db).container;
         let takes_closure = generics
@@ -2881,6 +2891,84 @@ impl<'db> Cx<'db> {
             self.callees.push((named.lean.clone(), instance));
         }
         Ok(Callee::Function { name: named.lean })
+    }
+
+    /// A call of the methods `?` runs (`x?` is `Try::branch(x)`, a match on the `ControlFlow` it
+    /// gives, and in its `Break` arm `return FromResidual::from_residual(residual)`): the
+    /// method of the impl static dispatch picks, core's own (for `Option`, `Result`,
+    /// `ControlFlow`), translated from core's source at its instance as any function is; its
+    /// error conversion is the `From::from` its body calls, resolved there at the instance.
+    /// `Try::from_output` and `residual_into_try_type`, which only a `try` block calls, and an
+    /// impl of the crate's own (`Try` is unstable) are refused by name. `None` for any other
+    /// callee.
+    fn try_call(
+        &mut self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        at: &str,
+    ) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let lang = self.interner.lang_items();
+        let is = |item: Option<FunctionId>| item == Some(callee);
+        // A `try` block wraps its value in `Try::from_output` and turns a residual into its
+        // type with `residual_into_try_type`; nothing else calls either.
+        if is(lang.TryTraitFromOutput) || is(lang.ResidualIntoTryType) {
+            return Err(self.refuse(
+                format!("a `try` block (`{name}`; `try` blocks are unstable, rule UnstableTry)"),
+                at,
+            ));
+        }
+        if !is(lang.TryTraitBranch) && !is(lang.TryTraitFromResidual) {
+            return Ok(None);
+        }
+        let shown = rust_of(db, generics.type_at(0));
+        let looked = db
+            .lookup_impl_method_or_why(self.env, callee, generics)
+            .map(|(found, args)| (found.left(), args));
+        match looked {
+            Ok((Some(found), args)) if found.krate(db).data(db).origin.is_lang() => {
+                Ok(Some(self.crate_callee(found, args, name, at)?))
+            }
+            Ok((Some(_), _)) => Err(self.refuse(
+                format!(
+                    "`?` on `{shown}`, a type with its own impl of `Try` or `FromResidual` (the \
+                     traits are unstable, `try_trait_v2`; only core's impls are translated; rule \
+                     UnstableTry)"
+                ),
+                at,
+            )),
+            Ok((None, _)) => Err(self.refuse(
+                format!("a call of `{name}` on `{shown}`, which a built-in derive implements"),
+                at,
+            )),
+            Err(why) => Err(self.refuse(
+                format!("a call of `{name}` on `{shown}`, whose impl is not found: {}", why.describe()),
+                at,
+            )),
+        }
+    }
+
+    /// The call of the standard library's `From::from` at `generics` when static dispatch runs
+    /// core's identity impl (`impl<T> From<T> for T`, whose body gives its argument back): that
+    /// impl's method at its instance, translated from core's source. `None` for any other impl.
+    fn identity_from(&mut self, callee: FunctionId, generics: GenericArgs<'db>, at: &str) -> Refused<Option<Callee>> {
+        let db = self.db;
+        let looked = db.lookup_impl_method_or_why(self.env, callee, generics);
+        let Ok((Some(found), args)) = looked.map(|(found, args)| (found.left(), args)) else {
+            return Ok(None);
+        };
+        let ItemContainerId::ImplId(imp) = found.lookup(db).container else { return Ok(None) };
+        let Some(of) = db.impl_trait(imp) else { return Ok(None) };
+        let self_ty = db.impl_self_ty(imp).skip_binder();
+        let of = of.skip_binder();
+        let identity = matches!(self_ty.kind(), TyKind::Param(_))
+            && of.args.len() == 2
+            && of.args.type_at(1) == self_ty;
+        if !identity || !found.krate(db).data(db).origin.is_lang() {
+            return Ok(None);
+        }
+        Ok(Some(self.crate_callee(found, args, "from", at)?))
     }
 
     /// What static dispatch runs for a call of `callee` with `generics`: for a method of a
@@ -3263,7 +3351,25 @@ impl<'db> Cx<'db> {
                                     at,
                                 ));
                             }
-                            _ => return Err(no_model(self)),
+                            // `From::from` of a type into itself (the error conversion of `?`
+                            // when the error types are one) runs core's identity impl, its
+                            // body translated at the instance; another of the standard
+                            // library's impls has no model.
+                            (_, to) => {
+                                if let Some(identity) = self.identity_from(callee, generics, at)? {
+                                    return Ok(Some((identity, operands)));
+                                }
+                                return Err(self.refuse(
+                                    format!(
+                                        "a call of `From::from` from `{}` into `{}`, the standard \
+                                         library's impl, which has no model and is not in the list \
+                                         of opaque functions (rule NoModel)",
+                                        crate::rust_ty(&from),
+                                        crate::rust_ty(&to)
+                                    ),
+                                    at,
+                                ));
+                            }
                         };
                         let callee =
                             Callee::Model { name: callee, monadic: false, ty: Some(to), lends_first: false };
@@ -4059,7 +4165,12 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
     };
     let mut names: BTreeMap<Local, String> = BTreeMap::new();
     for (binding, &local) in mir.binding_locals.iter() {
-        names.insert(index(local), store[binding].name.as_str().to_owned());
+        // A binding the lowering made (`?`'s value and residual, a `for`'s iterator) has no
+        // name in the source: it is a temporary.
+        let name = &store[binding].name;
+        if !name.is_generated() {
+            names.insert(index(local), name.as_str().to_owned());
+        }
     }
     let params: BTreeSet<Local> = mir.param_locals.iter().map(|it| index(*it)).collect();
     for (local, decl) in mir.locals.iter() {
