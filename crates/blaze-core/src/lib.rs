@@ -1525,12 +1525,16 @@ pub trait Driver {
     /// A handle another thread ends this driver's wait with ([`Waker`]), where the driver has
     /// one: what a thread that finished work the loop reads from a queue of its own (a plane
     /// task's end) calls after it queued it, so the loop turns then and not at its next
-    /// deadline. `None` says the driver has none (the simulation, which runs no thread; a
-    /// driver not yet given one): its caller then bounds its wait by a deadline of its own and
-    /// says so in the wait's name.
+    /// deadline. `None` says the driver has none (the simulation unless a test asked it for one
+    /// with [`sim::Sim::give_wakers`]; a driver not yet given one): its caller then bounds its
+    /// wait by a deadline of its own and says so in the wait's name.
     ///
     /// The rule every driver with a waker keeps, the one place it is stated (the io_uring and
-    /// kqueue drivers point here, and each has a test `a_wake_ends_a_wait_parked_in_the_kernel`):
+    /// kqueue drivers point here, and each has a test `a_wake_ends_a_wait_parked_in_the_kernel`;
+    /// the simulation keeps it too, with another thread's wake an entry of its timeline,
+    /// [`sim::Sim::wake_at`], landing before the poll looks, between the look and the park, or
+    /// while it is parked, and `a_wake_ends_the_poll_wherever_it_lands` in `sim/wake.rs` its
+    /// test):
     /// once a waker is handed out, a poll with nothing in flight parks until a wake or its
     /// deadline; and a wake made at any point (before the poll, before it parks, while it is
     /// parked in the kernel) ends that poll, or the next if none is under way. A driver keeps

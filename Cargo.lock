@@ -1321,6 +1321,7 @@ dependencies = [
  "base64",
  "blaze-core",
  "blaze-sha256",
+ "blaze-sim",
  "bytes",
  "flate2",
  "http",

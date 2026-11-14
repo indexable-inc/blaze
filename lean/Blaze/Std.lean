@@ -15,6 +15,7 @@ namespace Blaze.core.result
 inductive Result (T E : Type) : Type where
   | Ok (f0 : T) : Result T E
   | Err (f0 : E) : Result T E
+  deriving DecidableEq
 
 end Blaze.core.result
 
@@ -23,6 +24,7 @@ namespace Blaze.core.num
 /-- `core::num::TryFromIntError`: a `TryFrom` between integers whose value does not fit. Its one
 field in core is private and `()`. -/
 structure TryFromIntError : Type where
+  deriving DecidableEq
 
 end Blaze.core.num
 

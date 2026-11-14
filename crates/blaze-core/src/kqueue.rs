@@ -1818,12 +1818,20 @@ mod tests {
     }
 
     /// Listens, connects, sends each way, hangs up each end and stops listening.
+    /// A TCP `at` of port 0 is listened on at a port the system picks, read back from the
+    /// listener, and connected to there.
     fn round_trip(root: &Path, at: Address) {
         let mut driver = Kqueue::new(root, 1).unwrap();
-        let mut effects = vec![
-            Effect::Listen { at: at.clone(), tag: Tag(1) },
-            Effect::Connect { at, tag: Tag(2) },
-        ];
+        // The listen is made as it is submitted.
+        driver.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+        let at = match at {
+            Address::Tcp(_) => {
+                let bound = driver.listens.iter().find_map(|(_, it)| it.listener.local_addr());
+                Address::Tcp(bound.expect("the TCP listen is made and bound"))
+            }
+            other => other,
+        };
+        let mut effects = vec![Effect::Connect { at, tag: Tag(2) }];
         let (mut server, mut client) = (None, None);
         let mut ends = Vec::new();
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
@@ -1886,11 +1894,10 @@ mod tests {
 
     #[test]
     fn a_tcp_round_trip() {
-        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let at = free.local_addr().unwrap();
-        drop(free);
+        // Port 0, so the listen holds the port it is given: a port found free, let go of and
+        // listened on later races whoever binds it between.
         let root = dir("tcp");
-        round_trip(&root, Address::Tcp(at));
+        round_trip(&root, Address::Tcp("127.0.0.1:0".parse().unwrap()));
         std::fs::remove_dir_all(root).unwrap();
     }
 

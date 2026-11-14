@@ -82,6 +82,9 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Vec(elem) => app("Vec", vec![lean_ty(elem)]),
         Ty::Array(elem, len) => app("Arr", vec![lean_ty(elem), atom(len.to_string())]),
         Ty::TryFromIntError => name("core.num.TryFromIntError"),
+        Ty::Duration => name("core.time.Duration"),
+        Ty::Ordering => name("core.cmp.Ordering"),
+        Ty::Str => name("Str"),
     }
 }
 
@@ -827,6 +830,17 @@ impl<'a> Translate<'a> {
             Operand::Int(ty, bits) => int_lit(*ty, *bits),
             Operand::Bool(value) => atom(if *value { "true" } else { "false" }),
             Operand::Unit => atom("()"),
+            Operand::Str(bytes) => app(
+                "Str.ofBytes",
+                vec![Term::List(bytes.iter().map(|it| atom(it.to_string())).collect())],
+            ),
+            Operand::Duration { secs, nanos } => {
+                app("core.time.Duration.ofLit", vec![atom(secs.to_string()), atom(nanos.to_string())])
+            }
+            Operand::Ordering(variant) => {
+                let (variant, _) = crate::body::ORDERING[*variant as usize];
+                name(format!("core.cmp.Ordering.{variant}"))
+            }
         })
     }
 
@@ -835,6 +849,7 @@ impl<'a> Translate<'a> {
         match ty {
             Ty::Adt(adt) => format!("{adt}.{}", variant.name),
             Ty::Option(_) => format!("Option.{}", variant.name),
+            Ty::Ordering => format!("core.cmp.Ordering.{}", variant.name),
             _ => format!("core.result.Result.{}", variant.name),
         }
     }
@@ -1395,7 +1410,7 @@ pub(crate) fn type_decl(adt: &crate::body::AdtDecl) -> Decl {
 /// library's namespaces and types. A variable of one of these names would shadow it, so
 /// `Slice.len v` would read a field of the variable `Slice`.
 const GLOBAL_ROOTS: &[&str] = &[
-    "Blaze", "Scalar", "ScalarTy", "Slice", "Array", "Vec", "Option", "Result", "Error", "core",
+    "Blaze", "Scalar", "ScalarTy", "Slice", "Array", "Vec", "Option", "Result", "Error", "core", "Str",
     "Bool", "Nat", "Int", "List", "Prop", "Unit", "U8", "U16", "U32", "U64", "U128", "Usize",
     "I8", "I16", "I32", "I64", "I128", "Isize",
 ];

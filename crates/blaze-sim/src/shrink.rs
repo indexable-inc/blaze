@@ -439,11 +439,8 @@ impl Shrinker {
     fn build_delete_span(&mut self, at: usize) -> Built {
         let len = self.best.len();
         let Some(span) = self.spans.get(at) else { return Built::PassOver };
-        #[expect(
-            blaze::as_cast,
-            reason = "a span's bounds are `u32` positions in a tape, and a `usize` holds every `u32` on every target"
-        )]
-        let (start, end) = ((span.start as usize).min(len), (span.end as usize).min(len));
+        let covered = span.range();
+        let (start, end) = (covered.start.min(len), covered.end.min(len));
         if start >= end {
             self.move_on(Fate::Dropped);
             return Built::Moved;
