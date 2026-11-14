@@ -821,7 +821,8 @@ impl Default for Disk {
     }
 }
 
-/// The invariant: a crash keeps a synced file. From every well-formed disk within the bounds,
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a crash keeps a
+/// synced file. From every well-formed disk within the bounds,
 /// once a sync of `file` that covers all its changes has completed, whatever cut a crash is
 /// allowed to make, `file` is there after it and reads as it did before ([`kept`]): no change
 /// of it is lost or torn, no write or rename of another file that is undone takes its name,
@@ -844,7 +845,8 @@ pub fn a_crash_keeps_a_synced_file(disk: Disk, file: u64, cut: Vec<Kept>) -> boo
     kept(&read, &disk.contents(file))
 }
 
-/// The invariant: a crash cuts an appended file to a prefix. From every well-formed disk
+/// The invariant (proved: crates/blaze-core/lean/BlazeCore/World/Disk.lean): a crash cuts an
+/// appended file to a prefix. From every well-formed disk
 /// within the bounds, for a file whose changes not synced are all appends and that no crash
 /// may undo, whatever cut a crash is allowed to make, the file is there after it, begins with
 /// all its durable bytes and is a prefix of what it read as before ([`cut_to_a_prefix`]). So

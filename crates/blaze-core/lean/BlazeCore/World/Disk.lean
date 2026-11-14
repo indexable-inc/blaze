@@ -2,12 +2,16 @@ import Blaze.Auto
 import BlazeCore.World.DiskAllows
 import BlazeCore.World.DiskMap
 import BlazeModel.blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered
+import BlazeCore.World.DiskCrash
 
 /-!
 `blaze_core::world::disk` (crates/blaze-core/src/world/disk.rs): the disk world's crash
 theorems, proved over the generated models with the specifications of `DiskMap` (the disk's
 functions as a sorted map of files) and `DiskAllows` (what a cut the disk allows keeps).
 
+- `a_crash_cuts_an_appended_file_to_a_prefix` and `a_crash_keeps_a_synced_file`: proved in
+  `DiskCrash` (over `DiskBytes`, what a sync and a crash do to one file) and named at the end
+  of this file.
 - `a_crash_keeps_what_a_barrier_ordered`: from every well-formed disk within the bounds, below
   the last epoch, once a barrier of `file` that covers all its changes has completed and bytes
   were then appended to `later`, a cut the disk allows that keeps any part of that append keeps
@@ -154,3 +158,15 @@ theorem blaze_core.world.disk.a_crash_keeps_what_a_barrier_ordered.spec.proof :
             Slice.index_ok disk.files at0 hat, hbar, happ, hal, hfind1, hfind2,
             Slice.index_ok D.files appended hap, hsub, Slice.index_ok cut appended hcap, hr,
             Slice.index_ok cut ordered hcor, key]
+
+/-- A crash cuts a file that was only appended to down to a prefix that holds all its durable
+bytes: proved in `BlazeCore.World.DiskCrash`, named here as `blaze prove` looks for it. -/
+theorem blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.proof :
+    blaze_core.world.disk.a_crash_cuts_an_appended_file_to_a_prefix.spec.statement :=
+  BlazeCore.World.DiskCrash.appended_proof
+
+/-- A crash keeps a synced file: proved in `BlazeCore.World.DiskCrash`, named here as
+`blaze prove` looks for it. -/
+theorem blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.proof :
+    blaze_core.world.disk.a_crash_keeps_a_synced_file.spec.statement :=
+  BlazeCore.World.DiskCrash.synced_proof
