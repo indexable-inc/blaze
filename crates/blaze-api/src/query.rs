@@ -7,8 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One value of a derived row.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// One value of a derived row. No `Ord`: its fields are in key order, not the order a reader
+/// wants rows in; `blaze_astlog` sorts by place.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Cell {
     /// Code: its range in its view file (`start..end`), its 1-based line, the file, its text.
     /// A node of a macro's expansion whose text is the call's input is the input's range.

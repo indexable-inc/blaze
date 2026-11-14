@@ -35,3 +35,24 @@ pub enum SourceError {
     #[snafu(display("{what}"))]
     Edit { what: String, at: Option<String> },
 }
+
+/// `error` as the API reports it: its words, and its place in the view when it has one (an
+/// unplaceable match's or an overlap's `path:line`, the edits' own); a rules file's own errors
+/// name their rules line in the words.
+pub fn api_error(error: &Error) -> blaze_api::ApiError {
+    let at = match error {
+        astlog_engine::Error::Source { source } => match source {
+            SourceError::Unplaceable { place, .. } | SourceError::Overlap { place, .. } => {
+                Some(place.clone())
+            }
+            SourceError::Edit { at, .. } => at.clone(),
+            SourceError::PatternParse { .. }
+            | SourceError::PatternShape { .. }
+            | SourceError::UnknownKind { .. }
+            | SourceError::DefPath { .. }
+            | SourceError::WrongValue { .. } => None,
+        },
+        _ => None,
+    };
+    blaze_api::ApiError::new(error.to_string(), at)
+}

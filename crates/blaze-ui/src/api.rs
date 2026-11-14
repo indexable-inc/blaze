@@ -328,6 +328,58 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
                 put!(out, "{} {}: {}\n", paint(GREEN, "new"), found.level.name(), found.message);
             }
         }
+        Response::Rows(rows) => rows_into(out, rows, color),
+    }
+}
+
+/// A rules query's answer: each finding as `level: message` and its place, then each relation's
+/// name and row count, a row a line, its cells tab-separated.
+fn rows_into(out: &mut String, rows: &blaze_api::query::Rows, color: bool) {
+    use blaze_api::query::{Cell, Severity};
+    let paint = |code, text| Painted(code, text, color);
+    for finding in &rows.findings {
+        let level = match finding.severity {
+            Severity::Error => paint(RED, "error"),
+            Severity::Warning => paint(YELLOW, "warning"),
+        };
+        put!(out, "{level}: {}\n", finding.message);
+        match &finding.at {
+            Some(Cell::Code { path, line: Some(line), .. }) => put!(out, "  --> {path}:{line}\n"),
+            Some(Cell::Code { path, line: None, .. }) => put!(out, "  --> {path}\n"),
+            Some(Cell::Expanded { call, .. }) => put!(out, "  --> {call} (a macro made it)\n"),
+            Some(_) | None => {}
+        }
+    }
+    for relation in &rows.relations {
+        let count = relation.rows.len();
+        put!(out, "{} {} ({}): {count} rows\n", Painted(GREEN, Status("Derived"), color), relation.name, relation.columns.join(", "));
+        for row in &relation.rows {
+            out.push_str("  ");
+            for (at, cell) in row.iter().enumerate() {
+                if at > 0 {
+                    out.push('\t');
+                }
+                match cell {
+                    Cell::Code { path, line: Some(line), text, .. } => {
+                        put!(out, "{path}:{line} {}", one_line(text))
+                    }
+                    Cell::Code { path, line: None, text, .. } => put!(out, "{path} {}", one_line(text)),
+                    Cell::Expanded { call, text } => put!(out, "{call} (made) {}", one_line(text)),
+                    Cell::Def { path } => out.push_str(path),
+                    Cell::Type { text } | Cell::Text(text) => out.push_str(text),
+                    Cell::Int(int) => put!(out, "{int}"),
+                }
+            }
+            out.push('\n');
+        }
+    }
+}
+
+/// Code text on one line: its first line, `…` when there were more.
+fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
+    match text.split_once('\n') {
+        Some((first, _)) => format!("{}…", first.trim_end()).into(),
+        None => text.into(),
     }
 }
 
@@ -1123,6 +1175,36 @@ mod tests {
         );
         let root = ContentId([2; 32]);
         assert_eq!(lines(&Response::Announced { root }, false), format!("   Announced {root}\n"));
+    }
+
+    #[test]
+    fn a_rules_query_lists_its_findings_by_place_then_each_relations_rows() {
+        use blaze_api::query::{Cell, Finding, Relation, Rows, Severity};
+        let code = |line, text: &str| Cell::Code {
+            end: 0,
+            line: Some(line),
+            path: "src/lib.rs".to_owned(),
+            text: text.to_owned(),
+            start: 0,
+        };
+        let rows = Rows {
+            findings: vec![Finding {
+                at: Some(code(3, "a.lock()")),
+                message: "lock held".to_owned(),
+                relation: "held".to_owned(),
+                severity: Severity::Warning,
+            }],
+            relations: vec![Relation {
+                name: "held".to_owned(),
+                rows: vec![vec![code(3, "a.lock()\n.unwrap()"), Cell::Int(2)]],
+                columns: vec!["e".to_owned(), "n".to_owned()],
+            }],
+        };
+        assert_eq!(
+            lines(&Response::Rows(rows), false),
+            "warning: lock held\n  --> src/lib.rs:3\n     Derived held (e, n): 1 rows\n  \
+             src/lib.rs:3 a.lock()…\t2\n"
+        );
     }
 
     #[test]

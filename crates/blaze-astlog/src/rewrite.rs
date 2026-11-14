@@ -11,9 +11,12 @@
 
 use std::alloc::Global;
 
+use std::cmp::Ordering;
+
 use astlog_engine::{Facts as _, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
 use base_db::Db;
 use blaze_api::Edit;
+use blaze_api::query::{self as api, Cell, Finding, Relation, Rows};
 use blaze_hash::HashMap;
 use blaze_intent::{Applied, Files, TextEdit};
 use hir::{FindPathConfig, ModuleDef};
@@ -26,67 +29,35 @@ use crate::error::{Error, OverlapSnafu, SourceError, UnplaceableSnafu};
 use crate::program::{Action, Program};
 use crate::sema::{Node, Sema};
 
-/// One cell of a row, as data.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum Cell {
-    /// Code: its view file, its 1-based line, its range there, its text.
-    Code { path: String, line: Option<usize>, start: u32, end: u32, text: String },
-    /// A node of a macro's expansion with no range of the macro's input.
-    Expanded { call: String, text: String },
-    /// An item, by its def path.
-    Def { path: String },
-    /// A type, as the front end prints it.
-    Type { text: String },
-    Text(String),
-    Int(i64),
-}
-
-/// One derived row.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Row {
-    pub cells: Vec<Cell>,
-}
-
-/// One lint's row, rendered.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Finding {
-    pub relation: String,
-    pub severity: Severity,
-    pub message: String,
-    /// The row's first code cell.
-    pub at: Option<Cell>,
-}
-
-/// What a query found: each relation's columns and rows, by name, and the lints' findings.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Outcome {
-    pub relations: Vec<(String, Vec<String>, Vec<Row>)>,
-    pub findings: Vec<Finding>,
-}
-
 type Res<T> = Result<T, Error>;
 
-/// Run `rules` over the view and return what it derives. Rewrites are not planned.
+/// Run `rules` over the view and return what it derives, as the API's
+/// [`blaze_api::Response::Rows`] carries it: relations by name, each's rows by place, then the
+/// findings by place. Rewrites are not planned.
 ///
 /// # Errors
 ///
 /// The rules' load errors, and a relation's failure, each naming its rules line.
-pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Outcome> {
+pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Rows> {
     let program = Program::parse(rules)?;
     let facts = Sema::new(db, files)?;
     let rewrites = Program { rules: program.rules, rewrites: Vec::new(), lints: program.lints };
     let (database, _) = blaze_query::db::attach(db, || astlog_engine::run(&rewrites, &facts))?;
-    let mut relations = Vec::new();
+    let mut relations = Vec::new(); // alloc: one per relation, the answer's own
     for (name, relation) in &database.relations {
-        let mut rows: Vec<Row> = relation
+        let mut rows: Vec<Vec<Cell>> = relation
             .rows()
             .iter()
-            .map(|row| Row { cells: row.iter().map(|value| cell(&facts, value)).collect() })
+            .map(|row| row.iter().map(|value| cell(&facts, value)).collect())
             .collect();
-        rows.sort_by(|a, b| a.cells.cmp(&b.cells));
-        relations.push((name.clone(), relation.columns.clone(), rows));
+        rows.sort_by(|a, b| by_place(a, b));
+        relations.push(Relation {
+            name: name.clone(),
+            rows,
+            columns: relation.columns.clone(),
+        });
     }
-    let mut findings = Vec::new();
+    let mut findings = Vec::new(); // alloc: one per lint row, the answer's own
     for lint in &rewrites.lints {
         let Some(relation) = database.relations.get(&lint.relation) else { continue };
         for row in relation.rows() {
@@ -96,15 +67,48 @@ pub fn query<F: Files>(db: &Db, files: &F, rules: &str) -> Res<Outcome> {
                 matches!(it, Cell::Code { .. } | Cell::Expanded { .. })
             });
             findings.push(Finding {
-                relation: lint.relation.clone(),
-                severity: lint.severity,
-                message,
                 at,
+                message,
+                relation: lint.relation.clone(),
+                severity: match lint.severity {
+                    Severity::Error => api::Severity::Error,
+                    Severity::Warning => api::Severity::Warning,
+                },
             });
         }
     }
-    findings.sort_by(|a, b| (&a.at, &a.message).cmp(&(&b.at, &b.message)));
-    Ok(Outcome { relations, findings })
+    findings.sort_by(|a, b| {
+        by_place(a.at.as_slice(), b.at.as_slice()).then_with(|| a.message.cmp(&b.message))
+    });
+    Ok(Rows { findings, relations })
+}
+
+/// Rows in reading order: code by file, then offset, before every other kind of cell.
+fn by_place(a: &[Cell], b: &[Cell]) -> Ordering {
+    let mut b = b.iter();
+    for a in a {
+        let Some(b) = b.next() else { return Ordering::Greater };
+        let order = place_key(a).cmp(&place_key(b));
+        if order.is_ne() {
+            return order;
+        }
+    }
+    match b.next() {
+        Some(_) => Ordering::Less,
+        None => Ordering::Equal,
+    }
+}
+
+/// A cell's kind, then its fields in reading order.
+fn place_key(cell: &Cell) -> (u8, &str, u32, u32, &str, i64) {
+    match cell {
+        Cell::Code { end, path, text, start, .. } => (0, path, *start, *end, text, 0),
+        Cell::Expanded { call, text } => (1, call, 0, 0, text, 0),
+        Cell::Def { path } => (2, path, 0, 0, "", 0),
+        Cell::Type { text } => (3, text, 0, 0, "", 0),
+        Cell::Text(text) => (4, text, 0, 0, "", 0),
+        Cell::Int(int) => (5, "", 0, 0, "", *int),
+    }
 }
 
 /// Run `rules` over the view and apply every rewrite's actions, with `edits` before them, as
@@ -174,10 +178,11 @@ fn locate<'a, F: Files>(facts: &Sema<'a, F>, node: ast::Node<'a>) -> Result<(Str
 }
 
 /// The 1-based line of an offset of a view file's text, when the view has the file.
-fn line_of<F: Files>(files: &F, path: &str, at: TextSize) -> Option<usize> {
+fn line_of<F: Files>(files: &F, path: &str, at: TextSize) -> Option<u32> {
     let (_, bytes) = files.file(path)?;
     let before = bytes.get(..usize::from(at))?;
-    Some(1 + memchr::memchr_iter(b'\n', before).count())
+    // Fewer newlines than the `u32` offset `at`, so the count stays in `u32`.
+    Some(memchr::memchr_iter(b'\n', before).fold(1, |line, _| line + 1))
 }
 
 /// `path:line` of an offset of a view file's text; the path alone when the view lacks it.
@@ -201,11 +206,11 @@ fn cell<F: Files>(facts: &Sema<'_, F>, value: &Value<Node>) -> Cell {
                 Ok((path, range)) => {
                     let line = line_of(facts.files, &path, range.start());
                     Cell::Code {
-                        path,
-                        line,
-                        start: u32::from(range.start()),
                         end: u32::from(range.end()),
+                        line,
+                        path,
                         text,
+                        start: u32::from(range.start()),
                     }
                 }
                 Err(call) => Cell::Expanded { call, text },

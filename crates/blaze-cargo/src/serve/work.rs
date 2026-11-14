@@ -1416,6 +1416,10 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// before it is posted (`Jobs::next`). What they change, for the session to commit
     /// ([`Response::Edited`]).
     fn edit(&self, reader: S::Reader, edits: &[Edit]) -> Result<Edited, Failed>;
+    /// On a worker: an astlog rules file run over the view's front end (`blaze_astlog::query`),
+    /// building nothing more, as [`Self::edit`] does, and writing nothing
+    /// ([`Response::Rows`]).
+    fn query(&self, reader: S::Reader, rules: &str) -> Result<blaze_api::query::Rows, Failed>;
     /// On a worker, for `Work::Ahead`: the units (by their place in the plan's graph) of the
     /// test binaries holding a test `filter` selects, as libtest selects, to build ahead of a
     /// run that has not been asked for; the view's proc macros and build scripts' runs were

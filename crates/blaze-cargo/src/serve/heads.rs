@@ -161,6 +161,7 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Doc { view, .. }
         | Request::Lock { view, .. }
         | Request::Diagnostics { view, .. }
+        | Request::Query { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
         Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
@@ -176,8 +177,8 @@ pub fn named(request: &Request) -> Vec<&str> {
 }
 
 /// Whether `request` runs user code (build scripts, proc macros, tests, a binary), whose checks
-/// of their inputs outside views read the watches' round. A reach, an edit and a build ahead
-/// build their views' proc macros and run their build scripts before they read them.
+/// of their inputs outside views read the watches' round. A reach, an edit, a rules query and a
+/// build ahead build their views' proc macros and run their build scripts before they read them.
 pub fn runs_user_code(request: &Request) -> bool {
     matches!(
         request,
@@ -191,6 +192,7 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::Doc { .. }
             | Request::Reach { .. }
             | Request::Edit { .. }
+            | Request::Query { .. }
             | Request::WillTest { .. }
             | Request::WillSave { .. }
     )

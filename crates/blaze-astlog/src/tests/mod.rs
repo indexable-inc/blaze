@@ -8,7 +8,7 @@ use base_db::{Db, FileId};
 use blaze_intent::Files;
 use hir_expand::fixture;
 
-use crate::{Cell, Outcome};
+use blaze_api::query::{Cell, Rows as Outcome};
 
 /// The view: its files by path, with their text.
 pub(crate) struct View {
@@ -46,13 +46,14 @@ pub(crate) fn view(fixture: &str, outside: usize, paths: &[&str]) -> (Db, View) 
 /// The rows of `relation`, each as its cells' code text (or def path, type, text, number).
 #[track_caller]
 pub(crate) fn texts(outcome: &Outcome, relation: &str) -> Vec<Vec<String>> {
-    let Some((_, _, rows)) = outcome.relations.iter().find(|it| it.0 == relation) else {
-        panic!("no relation `{relation}` in {:?}", outcome.relations.iter().map(|it| &it.0).collect::<Vec<_>>());
+    let Some(found) = outcome.relations.iter().find(|it| it.name == relation) else {
+        panic!("no relation `{relation}` in {:?}", outcome.relations.iter().map(|it| &it.name).collect::<Vec<_>>());
     };
-    rows.iter()
+    found
+        .rows
+        .iter()
         .map(|row| {
-            row.cells
-                .iter()
+            row.iter()
                 .map(|cell| match cell {
                     Cell::Code { text, .. } | Cell::Expanded { text, .. } | Cell::Type { text } => {
                         text.clone()
@@ -68,10 +69,12 @@ pub(crate) fn texts(outcome: &Outcome, relation: &str) -> Vec<Vec<String>> {
 
 /// The lines of the code cells of `relation`'s rows' first column.
 #[track_caller]
-pub(crate) fn lines(outcome: &Outcome, relation: &str) -> Vec<usize> {
-    let (_, _, rows) = outcome.relations.iter().find(|it| it.0 == relation).expect("the relation");
-    rows.iter()
-        .map(|row| match &row.cells[0] {
+pub(crate) fn lines(outcome: &Outcome, relation: &str) -> Vec<u32> {
+    let found = outcome.relations.iter().find(|it| it.name == relation).expect("the relation");
+    found
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
             Cell::Code { line: Some(line), .. } => *line,
             other => panic!("not code with a line: {other:?}"),
         })

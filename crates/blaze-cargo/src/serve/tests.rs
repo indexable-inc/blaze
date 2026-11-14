@@ -1600,6 +1600,15 @@ impl Front<Fake> for FakeFront {
         Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
     }
 
+    fn query(
+        &self,
+        FakeReader(read): FakeReader,
+        _: &str,
+    ) -> Result<blaze_api::query::Rows, Failed> {
+        EDITED.with_borrow_mut(|it| it.push(read.runs.clone()));
+        Ok(blaze_api::query::Rows { findings: Vec::new(), relations: Vec::new() })
+    }
+
     fn ahead(&self, FakeReader(read): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
         AHEAD_READ.with_borrow_mut(|it| it.push(read.runs.clone()));
         Ok(if filter.iter().all(|it| "a::adds".contains(&**it)) { vec![0] } else { Vec::new() })

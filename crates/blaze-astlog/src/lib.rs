@@ -16,7 +16,7 @@ pub mod sema;
 #[cfg(test)]
 mod tests;
 
-pub use error::{Error, SourceError};
+pub use error::{Error, SourceError, api_error};
 pub use program::{Blaze, Program};
-pub use rewrite::{Cell, Finding, Outcome, Row, edit, query};
+pub use rewrite::{edit, query};
 pub use sema::{Def, Node, Sema};

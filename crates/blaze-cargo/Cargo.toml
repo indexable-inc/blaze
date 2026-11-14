@@ -73,6 +73,9 @@ blaze-explore = { workspace = true, optional = true }
 arrow-array.workspace = true
 blaze-inproc.workspace = true
 blaze-intent.workspace = true
+# Astlog rules over the front end: `Request::Query`'s rows and `Edit::Rules`' rewrites. The
+# daemon links its engine only; tree-sitter stays in `tools/astlog`.
+blaze-astlog.workspace = true
 # `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
 # baselines the client checks a run's counts against.
 blaze-lints.workspace = true

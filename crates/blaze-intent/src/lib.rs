@@ -210,6 +210,15 @@ pub fn apply_with_text<F: Files>(
                 replace::replace(&mut cx, &asked)?;
                 replaced = true;
             }
+            Edit::Rules { .. } => {
+                return Err(ApiError::new(
+                    "an astlog rules edit reaches blaze_intent::apply: `blaze_astlog::edit` runs \
+                     the rules and hands their edits here, so the daemon routes a request with \
+                     one to it"
+                        .to_owned(),
+                    None,
+                ));
+            }
             _ => {
                 others_made = true;
                 let path =
