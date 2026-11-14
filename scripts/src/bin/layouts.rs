@@ -11,7 +11,7 @@
 //! row is refused, so the list stays whole; a persisted constant whose value differs from the
 //! base's is refused unless its row names a test that the crate defines and whose name says
 //! previous, old or earlier and layout, format, version, schema or magic. No compiler: it reads
-//! the text, a gate step of the `scripts` job (.github/workflows/blaze.yaml), beside `sizes`.
+//! the text, a gate step of the `scripts` job (.github/workflows/blaze.yaml).
 //!
 //! The instance: the layouts of the store's records changed (hir-ty's check_cache pages, the
 //! frozen name tables) with a test of the previous layout each time; others (blaze-kernel's
