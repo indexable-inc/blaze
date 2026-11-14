@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. DST stays on everything. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. For sans-IO code a proof takes the place of the simulation test (decision D38, proofs-for-sans-io.md); what is not proved keeps its simulation test. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -58,6 +58,13 @@ to them rather than repeating them:
   end, and nothing runs rustc. Neither prover was ruled out by rustc. Lean won on capability.
 
 ### DST on everything, proofs on small stable cores
+
+Changed on 2026-11-13 (decision D38, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
+sans-IO code the translator reads, a proof Lean has checked in the gate takes the place of
+the simulation test, which is deleted; that doc says what stands for what a proof does not
+cover (a conformance test per world model, and each translated function run as its Lean model
+and as built code). The first two points below are as they were decided on 2026-11-04 and
+hold for code that is not proved.
 
 - **DST stays the requirement.** The testing skill's `dst-not-review` rule holds for all
   concurrent, durable, crash-recovering, billing and data-deleting code, proved or not. A
