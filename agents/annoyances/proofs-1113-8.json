@@ -1,0 +1,20 @@
+{
+ "id": "proofs-1113-8",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "blaze prove, the plan of a theorem with no proof file (crates/hir-ty-lean/src/plan.rs)",
+ "what": "`blaze prove -p blaze-core --json` said of a new theorem `Open: there is no proof file` and I copied its 40 emitted models into lean/BlazeModel and committed them. Two did not compile: `lake build BlazeModel` then said `World/allows.lean:119:6: Redundant alternative` and `World/lands.lean:37:6: Unknown constant ...lands.loop_0`. The models were on the landing branch, whose Lean build I ran only after the smoke.",
+ "cost": "one more landing round (a revert on the landing branch, a release build, a smoke, two proves: about 12 minutes), and a proof lane started against models two of which do not build",
+ "cause": "a theorem with no proof file is answered Open before Lean has seen its models, so an Open answer says nothing about whether the translator emitted Lean that compiles; and copying models into the tree runs no Lean",
+ "whys": [
+  "the models were refused by Lean only at the full build: nothing compiled them when they were emitted",
+  "blaze prove stops at `no proof file` before the step that compiles the model",
+  "the plan treats compiling the model as part of checking the proof, so with no proof there is nothing to do",
+  "an Open answer therefore mixes two states: the model is fine and waits for a proof; the model is broken and no proof could be written"
+ ],
+ "class": "an answer that is reached before the check that would contradict it has run: a status that skips a step and does not say so",
+ "prevention": "blaze prove compiles a theorem`s model whether or not a proof file exists, and answers `the generated model does not build: a bug in blaze`s translator` with Lean`s error in place of Open; not built (the translator lane holds plan.rs today). Until then: `leanvm.sh <wt> <lane> 4.35.0 build BlazeModel` on copied models before committing them (added to H-proof-loop`s recipe in words here)",
+ "workaround": "run `lake build BlazeModel` on the models copied from a run before checking them in",
+ "fix": "",
+ "state": "open"
+}
