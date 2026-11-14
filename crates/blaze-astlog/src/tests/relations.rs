@@ -84,6 +84,23 @@ fn in_test_holds_inside_a_test_fn_only() {
 }
 
 #[test]
+fn in_test_reads_a_test_attributes_path_apart_from_its_arguments() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   #[tokio::test(flavor = \"multi_thread\")]\n\
+                   async fn threaded() { let _ = 1 + 2; }\n\
+                   #[cfg(test)]\n\
+                   mod tests { fn helper() { let _ = 3 + 4; } }\n\
+                   #[testing::other(test)]\n\
+                   fn lookalike() { let _ = 5 + 6; }\n\
+                   #[cfg(not(test))]\n\
+                   fn shipped() { let _ = 7 + 8; }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (tested e) (syntax e "BIN_EXPR") (in-test e))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    assert_eq!(texts(&outcome, "tested"), [["1 + 2"], ["3 + 4"]], "`test` as an argument names no test");
+}
+
+#[test]
 fn cfg_off_holds_inside_an_item_its_cfg_removes_only() {
     let (db, files) = lib();
     let rules = r#"(rule (off e) (syntax e "BIN_EXPR") (cfg-off e))"#;

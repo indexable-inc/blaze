@@ -609,11 +609,22 @@ impl<'a, F: Files> Sema<'a, F> {
         })
     }
 
-    /// Whether `item` carries `#[cfg(test)]` or a `#[test]`-like attribute (`test`, `tokio::test`).
+    /// Whether `item` carries `#[cfg(test)]` or an attribute whose path's last segment is
+    /// `test` (`#[test]`, `#[tokio::test(flavor = "multi_thread")]`): the path is read apart
+    /// from the arguments, so `#[other(test)]` is no test.
     fn test_item(item: ast::Node<'_>) -> bool {
         item.children().filter(|it| it.kind() == SyntaxKind::ATTR).any(|attr| {
-            let text: String = attr.text().chars().filter(|c| !c.is_whitespace()).collect();
-            text == "#[test]" || text.ends_with("::test]") || text == "#[cfg(test)]"
+            let Some(meta) = attr.children().next() else { return false };
+            if meta.kind() == SyntaxKind::CFG_META {
+                let text: String = meta.text().chars().filter(|c| !c.is_whitespace()).collect();
+                return text == "cfg(test)";
+            }
+            let last = meta
+                .children()
+                .find(|it| it.kind() == SyntaxKind::PATH)
+                .and_then(|path| path.children().find(|it| it.kind() == SyntaxKind::PATH_SEGMENT))
+                .and_then(|segment| segment.children().find(|it| it.kind() == SyntaxKind::NAME_REF));
+            last.is_some_and(|it| it.text() == "test")
         })
     }
 
