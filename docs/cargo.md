@@ -371,6 +371,14 @@ the same resolve (another encoding or spacing) is the same, as cargo's `--locked
 - `[native.<name>] pin` and `[native.<name>.targets]`: each pinned native input's pin file and
   every target's sha256 ([Pinned native inputs](#pinned-native-inputs)): every input the root
   manifest declares and every target its pin names, whatever this build needs.
+- `[git."<url>"]`, `<commit> = "blake3:<hex>"`: the digest of each git source's tree at the
+  commit `Cargo.lock` locks. A commit id is SHA-1 and pins nothing, so a git dependency with
+  no row here is refused (rule `weak_source_pin`), and a fetched tree that is not its digest
+  is refused before it is mounted. `blaze audit pin` records them on trust at first use; review
+  the diff. `blaze lock` keeps them as they are.
+- `[advisories] tree` (with `url` and `commit` when fetched): the digest of the RustSec
+  database `blaze audit` reads, checked before it is parsed
+  (docs/v2/plan/design/audit.md).
 
 A pinned input that disagrees with `blaze.lock` (a pin file edited, another blaze release) is a
 lock change like a moved package: refused where changes are refused, written and said elsewhere.

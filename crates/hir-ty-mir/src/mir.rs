@@ -27,6 +27,7 @@ mod framed;
 pub mod handles;
 pub mod home;
 pub mod location;
+pub mod loop_match;
 mod lower;
 mod monomorphization;
 mod optimize;
@@ -86,8 +87,9 @@ pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::normalize_or_keep;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use optimize::{
-    BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, caller_location,
-    heap_held, owner_of, passes_not_ported, relied_on_own_no_unwind,
+    BOX_IN_PLACE_MIN, CallerLocation, CloneId, MAX_COPIES, MAX_COPIES_PER_BODY, Reaching,
+    caller_location, heap_held, owner_of, passes_at, passes_not_ported, plant_facts_at_tier_zero,
+    relied_on_own_no_unwind,
     set_interpreter_mir_opt_level, source_span, specialized_mir_body, written_checked_at,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};

@@ -424,7 +424,8 @@ fn fetch_key(fetch: &Fetch) -> Key {
     match &fetch.kind {
         FetchKind::Crate { sha256 } => hasher.part(b"crate").part(sha256.as_bytes()),
         FetchKind::IndexFile => hasher.part(b"index"),
-        FetchKind::Git { commit } => hasher.part(b"git").part(commit.as_bytes()),
+        // The pin is an input: a fetch checked against another digest is another fetch.
+        FetchKind::Git { commit, tree } => hasher.part(b"git").part(commit.as_bytes()).part(tree.as_bytes()),
         FetchKind::Local { probe } => hasher.part(b"local").part(&[u8::from(*probe)]),
     };
     Key(hasher.finish().0)

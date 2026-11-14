@@ -608,6 +608,7 @@ pub(super) fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units 
             is_member,
             default_run: None,
             checksum: None,
+            tree: None,
             tests: TestSandbox::default(),
             const_macros: None,
         };

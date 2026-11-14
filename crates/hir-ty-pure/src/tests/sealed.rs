@@ -12,7 +12,7 @@ use blaze_query::db::{Database as _, Durability};
 use hir_def::FunctionId;
 use hir_ty::{
     ParamEnvAndCrate,
-    facts::{FactItem, Facts, facts_of},
+    facts::{FactItem, Facts, Proofs, facts_of},
     next_solver::{GenericArgs, ParamEnv},
 };
 use hir_ty_mir::mir::dispatch::Body;
@@ -62,7 +62,7 @@ fn rows_after_the_facts(instances: usize, all_rows: bool) -> u64 {
     let facts = || {
         blaze_query::db::attach(&db, || {
             for name in ["leaf", "root"] {
-                _ = facts_of(&db, FactItem::Fn(fn_named(&db, ladder, name)));
+                _ = facts_of(&db, FactItem::Fn(fn_named(&db, ladder, name)), Proofs::Spent);
             }
         });
     };
@@ -117,7 +117,8 @@ fn facts(db: &Db) -> Vec<(&'static str, Facts)> {
             .iter()
             .map(|&(krate, name)| {
                 let func = fn_named(db, crate_named(db, krate), name);
-                (name, facts_of(db, FactItem::Fn(func)).clone()) // clone: a test's answer
+                // clone: a test's answer
+                (name, facts_of(db, FactItem::Fn(func), Proofs::Spent).clone())
             })
             .collect() // alloc: a test's answer
     })

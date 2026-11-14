@@ -16,7 +16,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag},
-    store::{FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, Verifier},
+    store::{FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, StoreFile, Verifier},
 };
 
 use super::{
@@ -38,12 +38,6 @@ const STALL: Duration = Duration::from_secs(120);
 /// the system's).
 fn os(call: &'static str, what: &'static str, error: &std::io::Error) -> StoreError {
     StoreError::Os { call, what, errno: error.raw_os_error().unwrap_or(0) }
-}
-
-/// The store's core stopped with `why` (a reason naming the file and the step, made where it
-/// failed): carried as it is.
-fn broken(why: String) -> StoreError {
-    StoreError::Broken { why }
 }
 
 /// A directory of segments, `<digest hex>.seg`, each beside its `<digest hex>.statement` (a
@@ -183,12 +177,12 @@ impl Driven<Native> {
     /// The plain store in `root/plain`, made if missing, on the native driver over `root`. It
     /// reads and writes the namespaces `settings` name ([`Settings::reads`],
     /// [`Settings::writes`]): everything [`Namespace::LOCAL`] by default.
-    pub fn open(root: &Path, settings: &Settings) -> Result<Driven<Native>, String> {
+    pub fn open(root: &Path, settings: &Settings) -> Result<Driven<Native>, StoreError> {
         let dir = FileName::new("plain").expect("a relative name");
         let at = root.join(dir.as_str());
-        std::fs::create_dir_all(&at).map_err(|e| format!("{}: {e}", at.display()))?;
+        std::fs::create_dir_all(&at).map_err(|e| os("mkdir", "the plain store's directory", &e))?;
         exclude_from_backup(&at)?;
-        let driver = blaze_core::native(root, 2).map_err(|e| format!("the native driver over {}: {e}", root.display()))?;
+        let driver = blaze_core::native(root, 2).map_err(|e| os("making the native driver", "the store's root", &e))?;
         let nonce = nonce();
         let cfg = PlainConfig {
             dir,
@@ -225,20 +219,20 @@ impl Driven<Native> {
         Ok(Some(placed.tag))
     }
 
-    fn open_files(&mut self) -> Result<(), String> {
+    fn open_files(&mut self) -> Result<(), StoreError> {
         for file in self.core.mapped_files() {
             if self.files.contains_key(file) {
                 continue;
             }
             let path = self.root.join(file.as_str());
-            let opened = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let opened = std::fs::File::open(&path).map_err(|e| os("open", "a mapped segment, for pread", &e))?;
             self.files.insert(file.clone(), opened);
         }
         Ok(())
     }
 
     /// [`Driven::commit_with`], then the new segments opened for `pread`.
-    pub fn commit(&mut self, batches: Vec<Batch>) -> Result<Committed, String> {
+    pub fn commit(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
         let committed = self.commit_with(batches)?;
         self.open_files()?;
         Ok(committed)
@@ -247,7 +241,7 @@ impl Driven<Native> {
 
 impl<D: Driver> Driven<D> {
     /// The store `cfg` names, opened on `driver` (whose root is `root`).
-    pub fn with(driver: D, root: &Path, cfg: PlainConfig) -> Result<Driven<D>, String> {
+    pub fn with(driver: D, root: &Path, cfg: PlainConfig) -> Result<Driven<D>, StoreError> {
         let mut it = Driven {
             driver,
             root: root.to_owned(),
@@ -260,16 +254,33 @@ impl<D: Driver> Driven<D> {
         it.core.open(&mut it.effects);
         it.run("opening the plain store")?;
         if !it.core.ready() {
-            return Err(format!("the plain store in {} did not open: its driver went idle first", it.core.dir()));
+            // Its driver went idle first.
+            return Err(StoreError::Unfinished { what: "an open" });
         }
         for lost in &it.core.report().lost {
             tracing::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
         }
+        // Handed: this open returns with its report ([`Driven::report`]), so the marks of the
+        // losses it names may be cleared by this process's next flip (or
+        // [`Driven::acknowledge`]). An open that fails hands nothing, and the marks stay for
+        // the next.
+        it.core.handed();
         Ok(it)
     }
 
+    /// One flip that clears the "lost, not yet reported" marks of the losses this open
+    /// reported, for a process that makes no commit or compaction of its own (whose flip
+    /// would clear them at no cost): `false` when there were none.
+    pub fn acknowledge(&mut self) -> Result<bool, StoreError> {
+        if !self.core.acknowledge(&mut self.effects) {
+            return Ok(false);
+        }
+        self.run("clearing the marks of reported losses")?;
+        Ok(true)
+    }
+
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
-    fn run(&mut self, what: &'static str) -> Result<(), String> {
+    fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
         let _span = tracing::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
         loop {
@@ -281,7 +292,8 @@ impl<D: Driver> Driven<D> {
             if self.driver.poll(&mut self.done, stall) > 0 {
                 since = self.driver.now();
             } else if stall.passed(self.driver.now()) {
-                return Err(format!("the plain store in {} stalled {what}: {} effects in flight for {} s", self.core.dir(), self.driver.in_flight(), STALL.as_secs()));
+                // Effects in flight and no completion for [`STALL`].
+                return Err(StoreError::Stalled { waited_for: what });
             }
             let wall = self.driver.wall_ns();
             for completion in self.done.drain(..) {
@@ -293,7 +305,7 @@ impl<D: Driver> Driven<D> {
             }
         }
         match self.core.broken() {
-            Some(why) => Err(why.to_owned()),
+            Some(why) => Err(why.clone()),
             None => Ok(()),
         }
     }
@@ -331,7 +343,7 @@ impl<D: Driver> Driven<D> {
         self.core.put(key, namespace, tag, value)
     }
 
-    pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, PutError> {
+    pub fn root(&mut self, name: &str, keys: &[Key]) -> Result<Key, StoreError> {
         self.core.root(name, keys)
     }
 
@@ -341,34 +353,34 @@ impl<D: Driver> Driven<D> {
 
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
-    pub fn commit_with(&mut self, batches: Vec<Batch>) -> Result<Committed, String> {
+    pub fn commit_with(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
         let now = self.driver.wall_ns();
-        self.core.commit(batches, now, &mut self.effects).map_err(|it| it.to_string())?;
+        self.core.commit(batches, now, &mut self.effects)?;
         self.run("committing")?;
         match self.core.take_committed() {
             Some(outcome) => outcome,
-            None => Err(format!("the plain store in {} ended a commit without an outcome", self.core.dir())),
+            None => Err(StoreError::Unfinished { what: "a commit" }),
         }
     }
 
     /// Up to `slices` compaction slices, each bounded by [`super::SLICE_BYTES`], until one says
     /// there is no more. Lowers the calling thread first ([`lower_this_thread`]): call it after
     /// the command has answered, or from its own invocation, never before a build's first read.
-    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced>, String> {
+    pub fn compact(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
         lower_this_thread()?;
         self.slices(slices)
     }
 
     /// [`Driven::compact`] on the calling thread as it is: for a caller that runs it beside
     /// builds on a thread it lowered itself.
-    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced>, String> {
+    pub(crate) fn slices(&mut self, slices: u32) -> Result<Vec<Sliced>, StoreError> {
         let mut out = Vec::new_in(Global);
         for _ in 0..slices {
             if !self.core.compact(&mut self.effects) {
-                return Err(format!("the plain store in {} is not ready to compact", self.core.dir()));
+                return Err(StoreError::Busy { phase: self.core.what() });
             }
             self.run("compacting")?;
-            let sliced = self.core.take_sliced().ok_or_else(|| format!("the plain store in {} ended a slice without an outcome", self.core.dir()))?;
+            let sliced = self.core.take_sliced().ok_or(StoreError::Unfinished { what: "a compaction slice" })?;
             out.push(sliced);
             if !sliced.more || sliced.aborted || sliced.segments == 0 {
                 break;
@@ -436,10 +448,10 @@ impl<D: Driver> Driven<D> {
             let seg = Segment::of(&described, want.size());
             let file = FileName::new(&format!("{}/seg-{:016x}", self.core.dir().as_str(), seg.id)).expect("a store's file");
             self.effects.push(Effect::WriteUnsynced { file: file.clone(), bytes, tag: EffectTag(OWN_TAGS + i as u64) });
-            self.run("writing a fetched segment").map_err(broken)?;
+            self.run("writing a fetched segment")?;
             for completion in self.own.drain(..) {
                 if let Done::Failed(error) = completion.done {
-                    return Err(broken(format!("{file}: writing a fetched segment: {}", error.0)));
+                    return Err(StoreError::Io { doing: "writing a fetched segment", file: StoreFile::Segment { id: seg.id }, error: error.0 });
                 }
             }
             ids.push(seg.id);
@@ -448,14 +460,14 @@ impl<D: Driver> Driven<D> {
         if adopted.is_empty() {
             return Ok(ids);
         }
-        self.core.adopt(adopted, &mut self.effects).map_err(|it| broken(it.to_string()))?;
-        self.run("naming fetched segments").map_err(broken)?;
+        self.core.adopt(adopted, &mut self.effects)?;
+        self.run("naming fetched segments")?;
         Ok(ids)
     }
 
     /// Marks segments as pushed to a shared bucket: compaction never rewrites them.
-    pub fn publish(&mut self, ids: Vec<u64>) -> Result<(), String> {
-        self.core.publish(ids, &mut self.effects).map_err(|it| it.to_string())?;
+    pub fn publish(&mut self, ids: Vec<u64>) -> Result<(), StoreError> {
+        self.core.publish(ids, &mut self.effects)?;
         self.run("marking segments published")
     }
 }
@@ -463,25 +475,25 @@ impl<D: Driver> Driven<D> {
 /// Lowers the calling thread for background work: utility QoS on macOS
 /// (`pthread_set_qos_class_self_np`); nice 19 and the idle IO class on Linux, both per thread
 /// there. One way: an unprivileged thread cannot raise itself again.
-pub fn lower_this_thread() -> Result<(), String> {
+pub fn lower_this_thread() -> Result<(), StoreError> {
     #[cfg(target_vendor = "apple")]
     {
         // SAFETY: one call about the calling thread, no memory passed.
         let rc = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
         if rc != 0 {
-            return Err(format!("pthread_set_qos_class_self_np(QOS_CLASS_UTILITY): errno {rc}"));
+            return Err(StoreError::Os { call: "pthread_set_qos_class_self_np(QOS_CLASS_UTILITY)", what: "the calling thread", errno: rc });
         }
     }
     #[cfg(target_os = "linux")]
     {
         // SAFETY: one system call about the calling thread (who 0 is the caller), no memory passed.
         if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) } != 0 {
-            return Err(format!("setpriority(PRIO_PROCESS, 0, 19): {}", std::io::Error::last_os_error()));
+            return Err(os("setpriority(PRIO_PROCESS, 0, 19)", "the calling thread", &std::io::Error::last_os_error()));
         }
         // IOPRIO_WHO_PROCESS = 1, IOPRIO_CLASS_IDLE = 3 in bits 13 and up.
         // SAFETY: as above.
         if unsafe { libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13) } != 0 {
-            return Err(format!("ioprio_set(IOPRIO_CLASS_IDLE): {}", std::io::Error::last_os_error()));
+            return Err(os("ioprio_set(IOPRIO_CLASS_IDLE)", "the calling thread", &std::io::Error::last_os_error()));
         }
     }
     Ok(())
@@ -491,18 +503,19 @@ pub fn lower_this_thread() -> Result<(), String> {
 /// sets (`com.apple.metadata:com_apple_backup_excludeItem`, a binary plist of the string
 /// `com.apple.backupd`), which follows the directory if it moves. `CACHEDIR.TAG` (written by
 /// the first commit) covers the tools that honour it elsewhere.
-fn exclude_from_backup(dir: &Path) -> Result<(), String> {
+fn exclude_from_backup(dir: &Path) -> Result<(), StoreError> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::ffi::OsStrExt;
         const NAME: &std::ffi::CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
         const VALUE: &[u8] = b"bplist00_\x10\x11com.apple.backupd\x08\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1c";
-        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| format!("{}: a path with a NUL", dir.display()))?;
+        // A path the system gave holds no NUL; one that does is refused as the kernel would.
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| StoreError::Os { call: "setxattr", what: "the plain store's directory (a path with a NUL)", errno: libc::EINVAL })?;
         // SAFETY: both strings are NUL-terminated and live across the call; `VALUE` is
         // `VALUE.len()` bytes; position 0, no options.
         let rc = unsafe { libc::setxattr(path.as_ptr(), NAME.as_ptr(), VALUE.as_ptr().cast(), VALUE.len(), 0, 0) };
         if rc != 0 {
-            return Err(format!("{}: setxattr({}): {}", dir.display(), NAME.to_string_lossy(), std::io::Error::last_os_error()));
+            return Err(os("setxattr(com.apple.metadata:com_apple_backup_excludeItem)", "the plain store's directory", &std::io::Error::last_os_error()));
         }
     }
     let _ = dir;
@@ -550,7 +563,9 @@ impl Opened {
         let settings = Settings::read(root)?;
         match settings.form {
             Form::Packs => crate::Driven::open(root).map(Opened::Packs),
-            Form::Plain => Driven::open(root, &settings).map(Opened::Plain),
+            // The packs' open says its failure as text; the plain store's typed error is
+            // printed beside it.
+            Form::Plain => Driven::open(root, &settings).map(Opened::Plain).map_err(|it| it.to_string()),
         }
     }
 }

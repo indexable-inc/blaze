@@ -9,7 +9,7 @@ use hir_expand::name::Name;
 use hir_ty::{
     ParamEnvAndCrate,
     db::HirDatabase,
-    facts::{Fact, FactItem, facts_of},
+    facts::{Fact, FactItem, Proofs, Tier, facts_of, proofs_at},
     next_solver::{GenericArgs, TyKind},
 };
 use hir_ty_mir::mir::{
@@ -183,7 +183,7 @@ fn bodies(name: &str, check: impl FnOnce(&Db, FunctionId, &MirBody<'_>, &MirBody
 }
 
 fn relied(db: &Db, krate: Crate, name: &str, fact: Fact) -> [u8; 32] {
-    facts_of(db, FactItem::Fn(fn_named(db, krate, name))).relied(fact)
+    facts_of(db, FactItem::Fn(fn_named(db, krate, name)), Proofs::Spent).relied(fact)
 }
 
 #[test]
@@ -199,9 +199,9 @@ fn a_call_of_a_function_that_cannot_panic_loses_its_unwind_edge() {
         assert!(after.inlined.relied.contains(&quiet), "the body records what it relied on");
         assert!(before.inlined.relied.is_empty(), "a body nothing changed records nothing");
         // The caller cannot panic either: the fact goes up the call graph by the same walk.
-        assert!(facts_of(db, FactItem::Fn(func)).spendable(Fact::NoUnwind));
-        assert!(relied_on_own_no_unwind(db, after));
-        assert!(!relied_on_own_no_unwind(db, before));
+        assert!(facts_of(db, FactItem::Fn(func), Proofs::Spent).spendable(Fact::NoUnwind));
+        assert!(relied_on_own_no_unwind(db, after, proofs_at(release().tier)));
+        assert!(!relied_on_own_no_unwind(db, before, proofs_at(release().tier)));
     });
 }
 
@@ -220,7 +220,7 @@ fn an_unwind_edge_stays_where_nothing_proves_the_callee() {
         bodies(name, |db, func, before, after| {
             assert_eq!(call_edges(before), call_edges(after), "`{name}`: {why}");
             assert!(call_edges(after).contains(&true), "`{name}` has the edge: {why}");
-            let own = facts_of(db, FactItem::Fn(func));
+            let own = facts_of(db, FactItem::Fn(func), Proofs::Spent);
             assert_eq!(own.spendable(Fact::NoUnwind), proved, "`{name}`: {why}");
             // No callee's fact was relied on: at most the body's own.
             let recorded: &[[u8; 32]] = if proved { &[own.relied(Fact::NoUnwind)] } else { &[] };
@@ -231,7 +231,16 @@ fn an_unwind_edge_stays_where_nothing_proves_the_callee() {
 
 #[test]
 fn a_repeated_call_of_a_pure_function_takes_the_firsts_result() {
+    // The premises, each its own failure: the body is built at the tier `SpendFacts` runs at,
+    // and the callee is proved pure under the proofs that tier spends.
+    assert_eq!(release().tier, Tier::Optimizing, "`SpendFacts` runs only at the optimizing tier");
+    let pure = |db: &Db, name: &str| {
+        let func = fn_named(db, crate_named(db, "kernel"), name);
+        let facts = facts_of(db, FactItem::Fn(func), proofs_at(release().tier));
+        assert!(facts.spendable(Fact::Pure), "the premise: `{name}` is proved pure: {facts:?}");
+    };
     bodies("twice", |db, _, before, after| {
+        pure(db, "quiet");
         assert_eq!(named_calls(before), 2);
         assert_eq!(named_calls(after), 1, "the second call is a copy of the first's result");
         let quiet = relied(db, crate_named(db, "kernel"), "quiet", Fact::Pure);
@@ -239,7 +248,10 @@ fn a_repeated_call_of_a_pure_function_takes_the_firsts_result() {
     });
     // A pure function that may panic merges too: the first call returned, so the second
     // would have.
-    bodies("twice_loud", |_, _, _, after| assert_eq!(named_calls(after), 1));
+    bodies("twice_loud", |db, _, _, after| {
+        pure(db, "loud");
+        assert_eq!(named_calls(after), 1);
+    });
     // Different arguments are different calls.
     bodies("twice_differs", |_, _, _, after| assert_eq!(named_calls(after), 2));
 }
@@ -368,7 +380,7 @@ fn program_lifetime_is_accepted_of_plain_and_static_shapes() {
             let adt = adt_named(&db, krate, name);
             let refused = program_lifetime::shape(&db, adt);
             assert!(refused.is_none(), "{}", refused.as_ref().map_or_else(String::new, |it| it.said()));
-            let facts = facts_of(&db, FactItem::Adt(adt));
+            let facts = facts_of(&db, FactItem::Adt(adt), Proofs::Spent);
             assert!(facts.holds(Fact::ProgramLifetime), "`{name}` has the fact");
             // Declared and checked, not inferred: no pass changes code on it yet.
             assert!(!facts.spendable(Fact::ProgramLifetime));
@@ -376,7 +388,9 @@ fn program_lifetime_is_accepted_of_plain_and_static_shapes() {
         // The fact is declared: a type nobody marked has none, whatever its shape.
         let unmarked = adt_named(&db, krate, "Unmarked");
         assert!(program_lifetime::shape(&db, unmarked).is_none());
-        assert!(!facts_of(&db, FactItem::Adt(unmarked)).holds(Fact::ProgramLifetime));
+        assert!(
+            !facts_of(&db, FactItem::Adt(unmarked), Proofs::Spent).holds(Fact::ProgramLifetime)
+        );
     });
 }
 
@@ -400,7 +414,8 @@ fn program_lifetime_is_refused_naming_the_reason() {
             let said = refused.said();
             assert!(said.contains(&format!("`{name}` is `#[blaze::program_lifetime]`, but")), "{said}");
             assert!(said.contains(says), "{said}");
-            assert!(!facts_of(&db, FactItem::Adt(adt)).holds(Fact::ProgramLifetime), "{said}");
+            let facts = facts_of(&db, FactItem::Adt(adt), Proofs::Spent);
+            assert!(!facts.holds(Fact::ProgramLifetime), "{said}");
         }
     });
 }
@@ -458,7 +473,144 @@ fn a_late_bound_lifetime_in_a_parameters_projection_is_scanned() {
             if let crate::FnPurity::Impure(refusal) = crate::fn_purity_generic(&db, func) {
                 panic!("`{name}` is pure: {}", refusal.said());
             }
-            assert!(facts_of(&db, FactItem::Fn(func)).holds(Fact::Pure), "`{name}` is pure");
+            let facts = facts_of(&db, FactItem::Fn(func), Proofs::Spent);
+            assert!(facts.holds(Fact::Pure), "`{name}` is pure");
         }
     });
+}
+
+/// Branches, index checks and arithmetic, behind a guard whose drop gives every call an
+/// unwind edge, over a call tree four deep: everything `SpendFacts` asks a summary and a
+/// proof for, in the body and in its callees, and calls `Inline` would take.
+const PROVABLE: &str = r#"
+//- /lib.rs crate:kernel deps:std
+pub struct Guard(u32);
+
+impl Drop for Guard {
+    fn drop(&mut self) {}
+}
+
+pub fn guarded(v: &[u32; 4], a: usize) -> u32 {
+    if a < 4 { v[a] } else { 0 }
+}
+
+#[inline(never)]
+fn pick(v: &[u32; 4], a: usize) -> u32 {
+    if a < 4 { v[a] / 2 + 1 } else { 0 }
+}
+
+fn deep_three(v: &[u32; 4], a: usize) -> u32 {
+    pick(v, a) + guarded(v, a / 2)
+}
+
+fn deep_two(v: &[u32; 4], a: usize) -> u32 {
+    if a > 2 { deep_three(v, a - 1) } else { deep_three(v, a) * 2 }
+}
+
+fn deep_one(v: &[u32; 4], a: usize) -> u32 {
+    deep_two(v, a) + deep_two(v, a / 3)
+}
+
+pub fn checked(v: &[u32; 4], a: usize) -> u32 {
+    let _guard = Guard(0);
+    if a % 2 == 0 { pick(v, a) } else { deep_one(v, a / 2) * 3 + guarded(v, a) }
+}
+"#;
+
+/// How many effect summaries and proofs building `checked`'s optimized MIR with `options`
+/// made, in a database of its own, `planted` with `SpendFacts` left in tier 0's list.
+fn summaries_and_proofs(options: MirOptions, planted: bool) -> (u64, u64) {
+    let db = db_with(PROVABLE);
+    let func = fn_named(&db, crate_named(&db, "kernel"), "checked");
+    blaze_query::db::attach(&db, || {
+        hir_ty_mir::mir::plant_facts_at_tier_zero(planted);
+        let (((), proofs), summaries) = crate::walk::plant::counting_summaries(|| {
+            crate::walk::plant::counting_proofs(|| {
+                db.optimized_mir_body(func.into(), options)
+                    .unwrap_or_else(|error| panic!("`checked` with {options:?}: {error:?}"));
+            })
+        });
+        hir_ty_mir::mir::plant_facts_at_tier_zero(false);
+        (summaries, proofs)
+    })
+}
+
+/// The invariant: building a tier 0 body runs no pass whose input is a whole-program summary:
+/// `checked`'s optimized MIR at tier 0, at level 2 with the inliner asked for (as the library's
+/// bodies were under a tier 0 unit), over a call tree four deep, computes zero effect
+/// summaries and runs the prover zero times. The control is the planted bug, `SpendFacts`
+/// left in tier 0's list: the same build then makes summaries, so the zero is the list's and
+/// not the fixture's. The optimizing tier makes them and spends proofs.
+#[test]
+fn a_tier_zero_body_computes_no_effect_summary() {
+    let zero = MirOptions { inline: true, tier: Tier::Zero, ..release() };
+    assert_eq!(proofs_at(Tier::Zero), Proofs::None, "tier 0 spends no proof");
+    assert_eq!(summaries_and_proofs(zero, false), (0, 0), "a tier 0 body asked for summaries");
+    let (planted, _) = summaries_and_proofs(zero, true);
+    assert!(planted > 0, "the planted bug (`SpendFacts` at tier 0) is not caught");
+    let optimizing = MirOptions { tier: Tier::Optimizing, ..zero };
+    let (summaries, proofs) = summaries_and_proofs(optimizing, false);
+    assert!(summaries > 0 && proofs > 0, "the optimizing tier spends facts: {summaries}, {proofs}");
+}
+
+/// The invariant: what each tier runs is what `passes_at` declares and the design says
+/// (docs/v2/plan/design/tiers.md): nothing that reads past the body at tier 0, rustc's
+/// inliner for the library as shipped, every pass at the optimizing tier, and no pass on facts
+/// anywhere but there.
+#[test]
+fn each_tier_runs_the_passes_its_declaration_lists() {
+    use hir_ty_mir::mir::{Reaching::*, passes_at};
+    assert!(passes_at(Tier::Zero).is_empty(), "{:?}", passes_at(Tier::Zero));
+    assert_eq!(passes_at(Tier::Shipped), &[Inline, Specialize]);
+    assert_eq!(
+        passes_at(Tier::Optimizing),
+        &[Inline, Devirtualize, SpendFactsUnwind, SpendFactsRepeats, Specialize]
+    );
+    for tier in [Tier::Zero, Tier::Shipped, Tier::Optimizing] {
+        let facts =
+            passes_at(tier).iter().any(|it| matches!(it, SpendFactsUnwind | SpendFactsRepeats));
+        assert_eq!(facts, tier == Tier::Optimizing, "{tier:?} spends facts");
+        assert_eq!(proofs_at(tier) == Proofs::Spent, facts, "{tier:?}'s proofs follow its passes");
+    }
+}
+
+/// The invariant: the summary of one instance under `Proofs::None` and under
+/// `Proofs::Spent` are two rows, each the same whichever is asked first: `guarded`'s index
+/// check is a panic only where no proof is spent.
+#[test]
+fn a_summary_under_each_proofs_mode_is_its_own_row() {
+    use crate::{
+        effects::Rule,
+        walk::{Def, Instance, summary_at},
+    };
+    use hir_ty_mir::mir::dispatch::Body;
+
+    let both = |none_first: bool| {
+        let db = db_with(PROVABLE);
+        let func = fn_named(&db, crate_named(&db, "kernel"), "guarded");
+        blaze_query::db::attach(&db, || {
+            let (env, args) = crate::function::generic(&db, func);
+            let instance = Instance { def: Def::Body(Body::Fn(func)), args };
+            // clone: a handle and a test's key
+            let of = |proofs| summary_at(&db, proofs, env.clone(), instance.clone());
+            if none_first {
+                let none = of(Proofs::None);
+                (none, of(Proofs::Spent))
+            } else {
+                let spent = of(Proofs::Spent);
+                (of(Proofs::None), spent)
+            }
+        })
+    };
+    let (none, spent) = both(true);
+    assert!(none.kinds.has(Rule::Panic), "unproved, the index check panics: {:?}", none.kinds);
+    assert!(
+        !spent.kinds.has(Rule::Panic),
+        "proved, the index check is discharged: {:?}",
+        spent.kinds
+    );
+    assert_ne!(none, spent, "one mode's row was read for the other's");
+    let (none_after, spent_after) = both(false);
+    assert_eq!(none, none_after, "the `None` row depends on which mode was asked first");
+    assert_eq!(spent, spent_after, "the `Spent` row depends on which mode was asked first");
 }

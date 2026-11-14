@@ -12,8 +12,8 @@ hashbrown, tokio, the common fixed-seed hashers, `core::fmt`, iterators, slices'
 The other `blaze::` lints (the group `blaze::internal`) check conventions of blaze's own code
 base; they are allowed unless a workspace turns them on.
 
-The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `packable`, `pod_serialized_by_field`,
-`soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
+The group `blaze::pedantic_perf` (`deep_drop_at_exit`, `loop_match_candidate`, `packable`,
+`pod_serialized_by_field`, `soa_candidate`, `vecreport`) is speed advice that trades something else away or can't see whether the code is hot; it is
 allowed unless a workspace or crate turns it on (`pedantic_perf = "warn"`; `vecreport`, which
 the release build reports, only by its flags). `checkfree`,
 `nopanic`, `noalloc`, `nonblocking`, `undeclared_effect` and `unfulfilled_effect` are in
@@ -1130,6 +1130,58 @@ it refuses: the check cannot show the absence of a cycle through it.
 **How to fix it.** Take the locks in one order everywhere; drop the guard before the call.
 
 **Allowing it.** `#[expect(blaze::lock_order, reason = "..")]` on the function.
+
+## `loop_match_candidate`
+
+In `blaze::pedantic_perf`, allowed by default.
+
+**What it catches.** A hand-written state machine: a `loop` whose whole body is one of
+
+- `state = match state { .. };`, each arm's value the next state, or the same `match` alone in a
+  labeled block (`state = 'next: { match state { .. } };`, the form below with the attributes
+  left off), where a `break 'next VALUE` ending an arm is a transition too;
+- `match state { A => { ..; state = B; } .. }`, each arm ending in an assignment to `state`.
+
+`state` is a local (not a field, not a closure's capture) of a type rustc's `loop_match` takes:
+an integer, a float, `bool`, `char`, or an enum whose variants have no fields. No arm has a
+guard, nothing else writes `state`, and at least one transition goes to a constant: a literal, a
+fieldless variant or a module's `const`. The finding counts the transitions and how many are
+constant. A loop that has `#[loop_match]` already is left alone, as is any shape it can't tell.
+A state whose type needs drop (an enum with a `Drop` impl) is left alone too: rustc does not
+drop the old state inside a `#[loop_match]` while blaze does, so the rewrite would change what
+the loop does under one of the two compilers.
+
+**Why it matters.** Each step goes back to the top of the loop and through the `match` again, an
+indirect jump or a chain of compares the branch predictor has to guess. With `#[loop_match]`,
+rustc compiles a constant transition into a direct jump to its arm, the way a C `goto` or a
+computed-goto interpreter does.
+
+**How to fix it.** On nightly, with `#![feature(loop_match)]` on the crate:
+
+```rust
+#[loop_match]
+'machine: loop {
+    state = 'blk: {
+        match state {
+            State::A => {
+                work();
+                #[const_continue]
+                break 'blk State::B;
+            }
+            State::B => break 'machine,
+        }
+    };
+}
+```
+
+A `break` out of the loop needs the loop's label, since Rust refuses an unlabeled `break` inside
+the labeled block (E0695).
+
+**Why it is off.** `loop_match` is an incomplete nightly feature: rustc warns
+`incomplete_features`, and stable Rust rejects the attributes. The lint also can't see whether
+the loop is hot.
+
+**Allowing it.** `#[expect(blaze::loop_match_candidate, reason = "..")]` on the function.
 
 ## `undeclared_effect`, `unfulfilled_effect`, `negative_effect`
 
@@ -4135,3 +4187,76 @@ Not built: `reimplements_library_fn`. A hand-written `is_none` is equal to `Opti
 once the callee is inlined; that needs a per-instance query in the front end for MIR with small
 callees inlined and overflow checks normalised (core builds without them), and an enumeration
 of library items by path.
+
+## Trust
+
+The group `blaze::trust` holds a workspace's dependencies (every crate that is not a member)
+to what the root manifest grants them, so a compromised or malicious new version of one fails
+the build that pulls it in. A dependency may not run `unsafe` code or use an ambient
+capability unless `[workspace.metadata.blaze.trust]` grants it by name, with a reason:
+
+```toml
+[workspace.metadata.blaze.trust]
+serde_json = { allow = [], reason = "parses JSON; no IO" }
+libc = { allow = ["unsafe", "ffi"], reason = "the C library's bindings" }
+left-pad = { allow = ["fs"], reason = "reads its config", version = "=1.4.0" }
+```
+
+The capabilities are `unsafe`, `ffi`, `fs` (files and the standard streams), `net`,
+`process`, `env`, `clock`, `thread`, `global_state`, `random`, `build_script` and
+`proc_macro`. `version = "=x"` pins the grant: another version is granted nothing until a
+person reads what it does and moves the pin. std, core, alloc, bstd, proc_macro and test are
+the toolchain's and need no entry. `blaze audit grants` prints the table a workspace needs
+today, each capability with its witness as a comment and `reason = ""` left for a person to
+write (an empty reason is refused).
+
+What a dependency uses is read off the effect walk: the union over every function a workspace
+crate reaches, each capability attributed to the crate where the call into the toolchain (or
+the thing itself) is written, never to its caller. `unsafe`, a build script and a proc macro
+count wherever they are in the crate. What the walk cannot see (a `dyn` it cannot resolve, a
+body that does not lower, a foreign function without a model) counts as every capability, and
+the finding says what could not be seen. Each finding names the crate, the capability and one
+shortest chain of calls from the workspace to it. The lints run only where the driver read the
+root manifest's grants; they are reported once per workspace, at its first library.
+Design: [trust.md](v2/plan/design/trust.md).
+
+## `dependency_capability`
+
+**The mistake.** A dependency touches files, opens a socket, runs a process, reads the
+environment or the clock, spawns threads, keeps global state, draws randomness, calls foreign
+code, has a build script or is a proc macro, and the workspace did not grant it that. With no
+table at all, the workspace is told once, naming `blaze audit grants`.
+
+**The right form.** Read what it does there. If it is trusted with it, add the capability to its
+`allow` with a `reason`; if not, pin an older version or drop it. `deny` by default.
+
+## `dependency_unsafe`
+
+**The mistake.** A dependency has `unsafe` code (an `unsafe` block, `unsafe fn`, `unsafe impl`
+or `trait`, `asm!`, an `extern` block, `#[no_mangle]`, `#[export_name]`, `#[link_section]`)
+the workspace did not grant it, reached or not.
+
+**The right form.** Read it; grant `"unsafe"` with a `reason`, or drop the dependency. `deny`
+by default.
+
+## `dependency_capability_unreached`
+
+**The mistake.** A dependency's code that nothing the workspace builds reaches yet uses a
+capability it is not granted: the next call the workspace adds may reach it.
+
+**The right form.** Grant it before a call does, or keep the workspace from calling it. `warn`
+by default.
+
+## `trust_grant_unused`
+
+**The mistake.** A grant for no dependency, for a version the build does not have, or of a
+capability its dependency no longer uses: a stale grant lets a future version use it unseen.
+
+**The right form.** Remove what the grant no longer needs. `warn` by default.
+
+## `workspace_unsafe`
+
+**The mistake.** A workspace crate runs `unsafe` code and its root does not say why.
+
+**The right form.** `#![blaze::trust(unsafe, reason = "..")]` at the crate root, or make the code
+safe. Internal, allowed by default; blaze's own ratchet warns.

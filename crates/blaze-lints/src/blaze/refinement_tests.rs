@@ -59,9 +59,10 @@ fn linted(main: &str, flags: &str) -> String {
     lint(&fixture, flags)
 }
 
-/// The findings of `blaze::refinement` alone.
+/// The crate's findings with clippy's off; the tests count `blaze::refinement`'s alone.
+/// `blaze::unreachable` stays at its level: no flag may lower it (the check refuses the crate).
 fn refinement(main: &str) -> String {
-    linted(main, "-A clippy::all -A blaze::unreachable")
+    linted(main, "-A clippy::all")
 }
 
 fn count(out: &str) -> usize {

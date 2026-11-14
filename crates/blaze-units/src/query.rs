@@ -437,7 +437,8 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 9");
+    // 10: a git fetch carries the tree digest it is pinned by (`FetchKind::Git::tree`).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 10");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -457,8 +458,10 @@ pub enum FetchKind {
     Crate { sha256: String },
     /// One file of a sparse index (`config.json`, a package's entry), as served: a file.
     IndexFile,
-    /// A git repository's tree at `commit`: a directory.
-    Git { commit: String },
+    /// A git repository's tree at `commit`: a directory. `tree` is the digest `blaze.lock`
+    /// pins it by (`blake3:<hex>`, [`blaze_audit::tree`]): the fetcher refuses a tree that is
+    /// not it, as the commit id alone (SHA-1) pins nothing.
+    Git { commit: String, tree: String },
     /// A path outside the view and every source, read from the disk where it is: what a
     /// `path` dependency outside the checkout is, or a manifest above one that its workspace
     /// search looks for. `at` is the path the load read. Its files are a root keyed by their
@@ -550,7 +553,8 @@ impl Versioned for Units {
     // 13: `CARGO_PRIMARY_PACKAGE` left the plans' variables ([`Units::is_primary`]).
     // 14: the pinned native inputs ([`Units::native`]).
     // 15: [`LockWrite`] writes `blaze.lock` too, and says what moved.
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 15");
+    // 16: a git package's tree digest ([`PackagePlan::tree`]).
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 16");
 }
 
 /// One pinned native input for one target: an archive named by its digest, which blaze fetches,
@@ -715,6 +719,10 @@ pub struct PackagePlan {
     /// download was checked against); `None` for any other source. How `blaze_global::Rule`
     /// names a public crate (`Origin::CratesIo`).
     pub checksum: Option<[u8; 32]>,
+    /// For a git package, the digest of its checkout's tree as `blaze.lock` pins it
+    /// (`blake3:<hex>`), which the fetcher checked; `None` for any other source. What seals a
+    /// git package (`sealed::pin`): its commit alone does not.
+    pub tree: Option<String>,
     /// What a member's `[package.metadata.blaze.sandbox]` says of its tests; nothing for any
     /// other package.
     pub tests: TestSandbox,
@@ -908,7 +916,8 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 7");
+    // 8: [`PackagePlan::tree`].
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 8");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on

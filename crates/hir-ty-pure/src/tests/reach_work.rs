@@ -5,7 +5,8 @@
 //! here over bodies Hegel draws (chains of guards, sums and guarded indexing), over a planted
 //! pathological chain of the kind that hung the walk (wide comparisons whose facts chain, and
 //! sums of them), and against a control that skips the budget check, which the oracle
-//! catches. The near-linear claim is held as: doubling the chain at most triples its work.
+//! catches. The near-linear claim is held per step: doubling the chain raises its work per
+//! step by at most a quarter.
 
 use hegel::{TestCase, generators as gs};
 use hir_def::DefWithBodyId;
@@ -146,9 +147,14 @@ fn the_work_oracle_catches_a_proof_run_past_its_bound() {
     assert!(what.contains("past its bound"), "{what}");
 }
 
-/// Near-linear: a chain twice as long does at most three times the work. Linear work
-/// doubles; the factor's slack is for the logarithm of the sorted indexes and the edges'
-/// copies of a state that grows along the chain, so a quadratic cost (four times) fails.
+/// Near-linear: the work per statement is bounded as the body grows. A chain twice as long
+/// does at most `K = 5/4` times the work per step of the shorter, measured against the
+/// steps (what the bound is of), not `n`. `K = 1` is linear; the quarter is what the design
+/// leaves: a write's path in a state's slot tree grows by a level per sixteenfold locals, the
+/// first write after a copy moves an index's list of chunks (`f / 64` pointers), liveness is a
+/// word per 64 locals per edge, and the shape of the body changes a little with its length.
+/// A cost linear in the state per step (an edge copying its slots or facts, a join scanning
+/// every slot) makes the ratio about 2 and fails.
 #[test]
 fn work_grows_near_linearly_with_the_body() {
     let short = work_checked(&chain(12)).unwrap_or_else(|what| panic!("{what}"));
@@ -159,5 +165,6 @@ fn work_grows_near_linearly_with_the_body() {
         short.steps, short.work, short.bound, long.steps, long.work, long.bound
     );
     assert!(short.stopped.is_none() && long.stopped.is_none(), "{said}\n{short:?}\n{long:?}");
-    assert!(long.work <= 3 * short.work, "{said}");
+    // work(24) / steps(24) <= 5/4 * work(12) / steps(12), in integers.
+    assert!(4 * long.work * short.steps <= 5 * short.work * long.steps, "{said}");
 }
