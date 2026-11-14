@@ -1917,22 +1917,15 @@ fn vec_operations_become_their_models() {
     }
 }
 
-/// What the `Vec` subset leaves out is refused by name: its capacity, a closure, a range
-/// `get`, a `Vec` in another allocator, a generic `Vec` function, `mem::take` of a type with
-/// no modelled default, and a `&mut` into a `Vec` chosen at run time.
+/// What the `Vec` subset leaves out is refused by name: its capacity, a closure, `get` by an
+/// inclusive range, a generic `Vec` function, and a `&mut` into a `Vec` chosen at run time.
 #[test]
 fn what_the_vec_subset_leaves_out_is_refused_by_name() {
     let cases = [
         ("pub fn f(v: &Vec<u32>) -> usize { v.capacity() }\n", "Vec::capacity"),
         ("pub fn f(v: &mut Vec<u32>) { v.retain(|x| *x > 0) }\n", "closure"),
-        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..1) { Some(s) => s.len(), None => 0 } }\n", "`Range`"),
+        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..=1) { Some(s) => s.len(), None => 0 } }\n", "`get` by a range other than `a..b`"),
         ("pub fn f<T>(v: Vec<T>) -> usize { v.len() }\n", "generic function"),
-        (
-            "pub struct P { pub x: u32 }\n\
-             impl Default for P { fn default() -> P { P { x: 0 } } }\n\
-             pub fn f(p: &mut P) -> u32 { let q = core::mem::take(p); q.x }\n",
-            "mem::take",
-        ),
         (
             "pub fn f(v: &mut Vec<u32>, i: usize, c: bool) { let r = if c { &mut v[i] } else { &mut v[0] }; *r = 1; }\n",
             "`&mut`",
@@ -2586,7 +2579,7 @@ fn what_ordering_has_beyond_the_model_is_refused_by_name() {
 /// What the `derives` fixture enables: derived `Clone` and `PartialEq`, and `Vec`'s and
 /// `Option`'s.
 const DERIVE_FLAGS: &str =
-    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, vec, vec_eq, option_clone, ord_ops, phantom_data";
+    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, vec, vec_eq, option_clone, ord_ops, phantom_data, discriminant";
 
 /// A struct, an enum and a struct of a `Vec` and an `Option` of them, each deriving `Clone`
 /// and `PartialEq`, a struct with its own impls, and a theorem function.
@@ -4113,6 +4106,20 @@ fn atomics_are_programs_over_shared_memory() {
     }
 }
 
+/// A `Step` built from its fields, `Step { second: false, pick: 0 }`, is a value of the Lean
+/// structure `Threads.Step`, its fields in order, and can be pushed on a `Vec<Step>` (as
+/// `blaze_core::wait::parking::settles` builds its schedule).
+#[test]
+fn a_step_is_built_from_its_fields() {
+    let fixture = atomics_fixture(
+        "steps",
+        "use blaze_core::world::threads::Step;\n\
+         pub fn first_step(steps: &mut Vec<Step>) { steps.push(Step { second: false, pick: 0 }); }\n",
+    );
+    let out = emitted_from(&fixture, "steps", "first_step");
+    assert!(out.text.contains("Threads.Step.mk false (0 : U8)"), "{}", out.text);
+}
+
 /// What the model of shared memory does not have is refused by name: `AtomicPtr`, an access
 /// of an atomic not through the shared memory, an operation `lean/Blaze/Atomic.lean` does not
 /// define, a function of `blaze_core::world::threads` with no model, and a closure given to
@@ -4210,7 +4217,7 @@ fn a_named_constant_is_its_evaluated_value() {
 // ---- Derived orders. ----
 
 const ORDER_FLAGS: &str =
-    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, option, option_clone, ord_ops, ord_methods";
+    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, option, option_clone, ord_ops, ord_methods, discriminant";
 
 /// A struct and enums deriving `PartialOrd` and `Ord`: one of the struct inside the enum, an
 /// enum whose discriminants are not in declaration order, and the trait's methods and
@@ -4421,5 +4428,387 @@ fn a_derived_debug_writes_through_a_linear_builder() {
     for step in ["core.fmt.builders.DebugStruct.formatter", "core.fmt.builders.DebugTuple.formatter", "core.fmt.Debug.dyn"] {
         let (_, why) = crate::body::OPAQUE_STEPS.iter().find(|it| it.0 == step).expect("listed");
         assert!(why.contains("assumption of formatting"), "{why}");
+    }
+}
+
+// ---- A derive's own method asked for alone (V15, piece 1). ----
+
+/// The database of `fixture` with its builtin derives expanded, as a build expands them.
+fn expanded_db(fixture: &str) -> Db {
+    let mut expanded = db(fixture);
+    hir_def::nameres::set_expand_builtin_derives(&mut expanded, true);
+    expanded
+}
+
+/// The crate `krate` of `db`.
+#[track_caller]
+fn krate_of(db: &Db, krate: &str) -> Crate {
+    all_crates(db)
+        .iter()
+        .copied()
+        .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|name| name.crate_name().as_str() == krate))
+        .expect("the fixture has the crate")
+}
+
+/// The method of an impl in `krate` whose path, as the translator names it in a model or a
+/// refusal, is `path` (`main::W::PartialEq::eq`).
+#[track_caller]
+fn method(db: &Db, krate: &str, path: &str) -> FunctionId {
+    for func in methods(db, krate) {
+        let named = match emit(db, func) {
+            Ok(out) => out.function,
+            Err(err) => err.function,
+        };
+        if named == path {
+            return func;
+        }
+    }
+    panic!("no method `{path}` in `{krate}`")
+}
+
+/// Every method of every impl in `krate`, in the def map's order.
+fn methods(db: &Db, krate: &str) -> Vec<FunctionId> {
+    let mut out = Vec::new_in(std::alloc::Global);
+    for (_, data) in crate_def_map(db, krate_of(db, krate)).modules(db) {
+        for imp in data.scope(db).impls() {
+            for (_, item) in imp.impl_items(db).items.iter() {
+                if let hir_def::AssocItemId::FunctionId(it) = item {
+                    out.push(*it);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// What `blaze prove`'s subset counts of each impl method of `krate` in `source`, its derives
+/// expanded: for each, by its path, `translated` (`emit` gives a model), `generic`
+/// (`GENERIC_UNASKED`) or why it is refused.
+fn subset_of_methods(flags: &str, krate: &str, source: &str) -> Vec<(String, String)> {
+    let db = expanded_db(&fixture_of(flags, krate, source));
+    let mut outcomes = Vec::new_in(std::alloc::Global);
+    for func in methods(&db, krate) {
+        let outcome = match emit(&db, func) {
+            Ok(out) => {
+                // The same bytes again (`deterministic-output`).
+                assert_eq!(emit(&db, func).map(|it| it.text).ok(), Some(out.text.clone()));
+                (out.function, "translated".to_owned())
+            }
+            Err(err) if err.what == crate::body::GENERIC_UNASKED => (err.function, "generic".to_owned()),
+            Err(err) => (err.function, err.what),
+        };
+        outcomes.push(outcome);
+    }
+    outcomes.sort();
+    outcomes
+}
+
+/// A derive's own method, asked for alone as `blaze prove`'s subset asks for every function, is
+/// the model a call of it gets: `clone` the value, `eq` `core.cmp.PartialEq.eq`, `cmp` and
+/// `partial_cmp` the type's order module's; a derived `Debug::fmt` is its expansion over the
+/// builders. Every method of the `derives`, `orders` and `fmts` fixtures is translated, an
+/// enum's too (its expansion reads `core::intrinsics::discriminant_value`, which the model never
+/// looks at: the method is its call's model), but those of a generic impl (`Waited<T>`'s and
+/// `Tagged<K>`'s, printed `derives::clone` and `derives::eq`), translated at each instance a
+/// theorem reaches.
+#[test]
+fn a_derived_method_alone_is_the_model_its_call_gets() {
+    const T: &str = "translated";
+    const G: &str = "generic";
+    let fixtures: [(&str, &str, &str, &[(&str, &str)]); 3] = [
+        ("derives", DERIVE_FLAGS, DERIVES, &[
+            ("derives::Own::Clone::clone", T),
+            ("derives::Own::PartialEq::eq", T),
+            ("derives::Path::Clone::clone", T),
+            ("derives::Path::PartialEq::eq", T),
+            ("derives::Point::Clone::clone", T),
+            ("derives::Point::PartialEq::eq", T),
+            ("derives::Shape::Clone::clone", T),
+            ("derives::Shape::PartialEq::eq", T),
+            ("derives::clone", G),
+            ("derives::clone", G),
+            ("derives::eq", G),
+            ("derives::eq", G),
+        ]),
+        ("orders", ORDER_FLAGS, ORDERS, &[
+            ("orders::Id::Clone::clone", T),
+            ("orders::Id::Ord::cmp", T),
+            ("orders::Id::PartialEq::eq", T),
+            ("orders::Id::PartialOrd::partial_cmp", T),
+            ("orders::Key::Clone::clone", T),
+            ("orders::Key::Ord::cmp", T),
+            ("orders::Key::PartialEq::eq", T),
+            ("orders::Key::PartialOrd::partial_cmp", T),
+            ("orders::Pair::Clone::clone", T),
+            ("orders::Pair::Ord::cmp", T),
+            ("orders::Pair::PartialEq::eq", T),
+            ("orders::Pair::PartialOrd::partial_cmp", T),
+            ("orders::Signed::Clone::clone", T),
+            ("orders::Signed::Ord::cmp", T),
+            ("orders::Signed::PartialEq::eq", T),
+            ("orders::Signed::PartialOrd::partial_cmp", T),
+        ]),
+        ("fmts", FMT_FLAGS, FMTS, &[
+            ("fmts::Hand::Debug::fmt", T),
+            ("fmts::Meters::Debug::fmt", T),
+            ("fmts::Point::Debug::fmt", T),
+            ("fmts::Shape::Debug::fmt", T),
+        ]),
+    ];
+    let mut wrong = String::new();
+    for (krate, flags, source, expected) in fixtures {
+        let got = subset_of_methods(flags, krate, source);
+        let expected: Vec<(String, String)> = expected.iter().map(|(a, b)| ((*a).to_owned(), (*b).to_owned())).collect();
+        if got != expected {
+            wrong.push_str(&format!("`{krate}`: {got:?}\n"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong}");
+    // The models, against their goldens.
+    let cases = [
+        ("derives", DERIVE_FLAGS, DERIVES, "derives::Point::PartialEq::eq", "core.cmp.PartialEq.eq"),
+        ("derives", DERIVE_FLAGS, DERIVES, "derives::Shape::Clone::clone", ":= self"),
+        ("orders", ORDER_FLAGS, ORDERS, "orders::Pair::Ord::cmp", "orders.Pair.impl.cmp"),
+        ("orders", ORDER_FLAGS, ORDERS, "orders::Pair::PartialOrd::partial_cmp", "orders.Pair.impl.partial_cmp"),
+    ];
+    for (krate, flags, source, path, says) in cases {
+        let db = expanded_db(&fixture_of(flags, krate, source));
+        let out = emit(&db, method(&db, krate, path)).unwrap_or_else(|err| panic!("{err}"));
+        assert!(out.text.contains(says), "`{path}` says `{says}`:\n{}", out.text);
+        assert_goldens(&out);
+    }
+}
+
+/// Where a call of a derived method is refused, the method asked for alone is refused with the
+/// call's reason: `==` of a struct whose field's `PartialEq` is hand-written.
+#[test]
+fn a_derived_method_alone_is_refused_where_its_call_is() {
+    let source = "#[derive(PartialEq)]\npub struct W { pub o: Own }\npub struct Own { pub v: u32 }\n\
+                  impl PartialEq for Own { fn eq(&self, other: &Own) -> bool { self.v == other.v } }\n\
+                  pub fn same(a: &W, b: &W) -> bool { a == b }\n";
+    let db = expanded_db(&fixture_of(DERIVE_FLAGS, "main", source));
+    let alone = emit(&db, method(&db, "main", "main::W::PartialEq::eq")).expect_err("`W`'s `eq` is refused");
+    let call = emit(&db, function(&db, "main", "same")).expect_err("`a == b` of `W` is refused");
+    assert!(alone.what.contains("`==` of `main::Own`"), "{alone}");
+    assert_eq!(alone.what, call.what);
+}
+
+// ---- `Range` and `RangeInclusive` as values, and a slice by a range (V15, piece 2). ----
+
+/// What the `ranges` fixture enables: the ranges with their `contains`, `Clone` and `==`,
+/// slices and `Vec`s indexed by them.
+const RANGE_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, range, clone, vec, index, slice, option";
+
+/// Ranges made, read, compared and asked whether they hold a value, and a `Vec` and a slice
+/// cut by one, with the theorems of their ends and of a subslice.
+const RANGES: &str = "use core::ops::{Range, RangeInclusive};
+pub fn span(a: u32, b: u32) -> Range<u32> { a..b }
+pub fn closed(a: u32, b: u32) -> RangeInclusive<u32> { a..=b }
+pub fn span_start(r: &Range<u32>) -> u32 { r.start }
+pub fn span_end(r: Range<u32>) -> u32 { r.end }
+pub fn closed_start(r: &RangeInclusive<u32>) -> u32 { *r.start() }
+pub fn closed_end(r: &RangeInclusive<u32>) -> u32 { *r.end() }
+pub fn in_span(r: &Range<u32>, x: u32) -> bool { r.contains(&x) }
+pub fn in_closed(r: &RangeInclusive<u32>, x: u32) -> bool { r.contains(&x) }
+pub fn span_empty(r: &Range<u32>) -> bool { r.is_empty() }
+pub fn closed_empty(r: &RangeInclusive<u32>) -> bool { r.is_empty() }
+pub fn copy_span(r: &Range<u32>) -> Range<u32> { r.clone() }
+pub fn same_span(a: &Range<u32>, b: &Range<u32>) -> bool { a == b }
+pub fn same_closed(a: &RangeInclusive<u32>, b: &RangeInclusive<u32>) -> bool { a == b }
+pub fn cut_len(v: &Vec<u32>, a: usize, b: usize) -> usize { v[a..b].len() }
+pub fn part(s: &[u32], a: usize, b: usize) -> &[u32] { &s[a..b] }
+pub fn part_of(v: &Vec<u32>, r: Range<usize>) -> Option<&[u32]> { v.get(r) }
+#[blaze::theorem]
+pub fn contains_at_the_ends(a: u32, b: u32) -> bool {
+    in_span(&span(a, b), a) == (a < b)
+        && !in_span(&span(a, b), b)
+        && in_closed(&closed(a, b), a) == (a <= b)
+        && in_closed(&closed(a, b), b) == (a <= b)
+        && span_start(&span(a, b)) == a
+        && closed_end(&closed(a, b)) == b
+}
+#[blaze::theorem]
+pub fn a_subslice_is_its_part(v: Vec<u32>, a: usize, b: usize) -> bool {
+    if a < b && b <= v.len() {
+        let s = part(&v, a, b);
+        s.len() == b - a && s[0] == v[a]
+    } else {
+        true
+    }
+}
+";
+
+/// `a..b` and `a..=b` are values of `core.ops.Range` and `core.ops.RangeInclusive`, their
+/// fields and `start()`, `end()` projections, `contains` and `is_empty` of integers the
+/// nightly's tests, `clone` the value and `==` Lean's; `&v[a..b]` is `Slice.index_range`, and
+/// `v.get(r)` `Slice.get_range`.
+#[test]
+fn ranges_are_values_and_cut_slices() {
+    let cases: [(&str, &str); 17] = [
+        ("span", "core.ops.Range.new a b"),
+        ("closed", "core.ops.RangeInclusive.new a b"),
+        ("span_start", "r.start"),
+        ("span_end", "r.«end»"),
+        ("closed_start", "core.ops.RangeInclusive.start r"),
+        ("closed_end", "core.ops.RangeInclusive.«end» r"),
+        ("in_span", "core.ops.Range.contains r x"),
+        ("in_closed", "core.ops.RangeInclusive.contains r x"),
+        ("span_empty", "core.ops.Range.is_empty r"),
+        ("closed_empty", "core.ops.RangeInclusive.is_empty r"),
+        ("copy_span", ":= r"),
+        ("same_span", "core.cmp.PartialEq.eq a b"),
+        ("same_closed", "core.cmp.PartialEq.eq a b"),
+        ("cut_len", "Slice.index_range"),
+        ("part", "Slice.index_range s"),
+        ("part_of", "Slice.get_range v r"),
+        ("contains_at_the_ends", "ranges.in_closed"),
+    ];
+    for (name, says) in cases {
+        let out = golden(RANGE_FLAGS, "ranges", name, RANGES);
+        assert!(out.text.contains(says), "`{name}` says `{says}`:\n{}", out.text);
+    }
+    for theorem in ["contains_at_the_ends", "a_subslice_is_its_part"] {
+        let out = golden(RANGE_FLAGS, "ranges", theorem, RANGES);
+        assert_eq!(out.statement, Some(format!("ranges.{theorem}.spec.statement")));
+    }
+}
+
+/// What the range model leaves out is refused by name: iterating one (`for i in a..b` stops
+/// at `IntoIterator::into_iter`), its `len`, a range of a type that is not an integer, a slice
+/// by an inclusive range, and `get` by one.
+#[test]
+fn what_the_range_model_leaves_out_is_refused_by_name() {
+    let flags = "sized, copy, add, ord, eq, fn, builtin_impls, range, clone, vec, index, slice, option, iterators";
+    let cases = [
+        (
+            "pub fn f(n: u32) -> u32 { let mut s = 0u32; for i in 0..n { s = s + i; } s }\n",
+            "a call of the standard library's `into_iter`",
+        ),
+        ("pub fn f(s: &[u32]) -> usize { s[0..=1].len() }\n", "`index`"),
+        ("pub fn f(v: &Vec<u32>) -> usize { match v.get(0..=1) { Some(s) => s.len(), None => 0 } }\n", "`get` by a range other than `a..b`"),
+        ("pub fn f(r: &core::ops::Range<u32>) -> Option<u32> { let mut r = r.clone(); r.next() }\n", "`next`"),
+    ];
+    for (source, what) in cases {
+        let err = refused(flags, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
+    }
+}
+
+// ---- `Default::default` (V15, piece 3). ----
+
+/// What the `defaults` fixture enables: `Default` and its derive, and the types whose default
+/// the standard library gives.
+const DEFAULT_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, default, derive, clone, option, vec, phantom_data, time, record, string, mem_take, option_methods";
+
+/// Defaults of the standard library's types, a derived `Default` of a struct of them and of
+/// an enum with a `#[default]` variant, a hand-written one, and the theorems of their fields.
+const DEFAULTS: &str = "use core::marker::PhantomData;
+use core::time::Duration;
+pub struct Clock { pub ticks: u64 }
+impl Default for Clock { fn default() -> Clock { Clock { ticks: 7 } } }
+#[derive(Default)]
+pub struct Settings {
+    pub count: u32,
+    pub on: bool,
+    pub limit: Option<u8>,
+    pub items: Vec<u32>,
+    pub pair: (u8, bool),
+    pub clock: Clock,
+    pub marker: PhantomData<u8>,
+}
+#[derive(Default)]
+pub enum Mode { Busy(u32), #[default] Idle, Off }
+pub fn zero() -> i64 { Default::default() }
+pub fn no() -> bool { Default::default() }
+pub fn unit() -> () { Default::default() }
+pub fn nothing() -> Option<u32> { Default::default() }
+pub fn empty() -> Vec<u8> { Default::default() }
+pub fn pair() -> (u8, bool) { Default::default() }
+pub fn marker() -> PhantomData<u32> { Default::default() }
+pub fn no_wait() -> Duration { Default::default() }
+pub fn zeros() -> [u16; 3] { Default::default() }
+pub fn none() -> [Clock; 0] { Default::default() }
+pub fn clocks() -> [Clock; 3] { Default::default() }
+pub fn clock() -> Clock { Default::default() }
+pub fn clock_and(n: u8) -> (Clock, u8) { let (c, _) = <(Clock, u8)>::default(); (c, n) }
+pub fn settings() -> Settings { Settings::default() }
+pub fn mode() -> Mode { Mode::default() }
+pub fn text() -> core::string::String { Default::default() }
+pub fn taken(s: &mut Settings) -> Settings { core::mem::take(s) }
+pub fn or_zero(x: Option<u32>) -> u32 { x.unwrap_or_default() }
+#[blaze::theorem]
+pub fn derived_default_is_each_fields() -> bool {
+    let s = settings();
+    s.count == 0
+        && !s.on
+        && match s.limit { None => true, Some(_) => false }
+        && s.items.len() == 0
+        && s.pair.0 == 0
+        && !s.pair.1
+        && s.clock.ticks == 7
+        && match mode() { Mode::Idle => true, _ => false }
+        && clocks()[2].ticks == 7
+}
+";
+
+/// `Default::default()` of the standard library's types is the value its impl's body gives,
+/// written in place; of the crate's type it is that type's own `default`, a derived one being
+/// its expansion; `String`'s is core's body, `String::new()`, an opaque function.
+#[test]
+fn a_default_is_its_impls_value() {
+    let cases: [(&str, &str); 19] = [
+        ("zero", ":= (0 : I64)"),
+        ("no", ":= false"),
+        ("unit", ":= ()"),
+        ("nothing", ":= (Option.none : Option U32)"),
+        ("empty", "(Vec.new : Vec U8)"),
+        ("pair", "((0 : U8), false)"),
+        ("marker", "core.marker.PhantomData"),
+        ("no_wait", "core.time.Duration"),
+        ("zeros", "Arr.replicate 3 (0 : U16)"),
+        ("none", "Arr"),
+        ("clocks", "defaults.Clock.Default.default"),
+        ("clock", "defaults.Clock.Default.default"),
+        ("clock_and", "defaults.Clock.Default.default"),
+        ("settings", "defaults.Settings.Default.default"),
+        ("mode", "defaults.Mode.Default.default"),
+        ("text", "string.String.Default.default"),
+        ("taken", "defaults.Settings.Default.default"),
+        ("or_zero", "(0 : U32)"),
+        ("derived_default_is_each_fields", "defaults.settings"),
+    ];
+    let mut wrong = String::new();
+    for (name, says) in cases {
+        match std::panic::catch_unwind(|| golden_expanded(DEFAULT_FLAGS, "defaults", name, DEFAULTS)) {
+            Ok(out) if out.text.contains(says) => {}
+            Ok(out) => wrong.push_str(&format!("`{name}` says `{says}`:\n{}\n", out.text)),
+            Err(_) => wrong.push_str(&format!("`{name}` is not translated (above)\n")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong}");
+    // The derived impls' bodies: each field's default, the `#[default]` variant.
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "settings", DEFAULTS);
+    let derived = out.imports.iter().find(|it| it.module == "BlazeModel.defaults.Settings.Default.default").expect("imported");
+    assert!(derived.text.contains("defaults.Clock.Default.default"), "{}", derived.text);
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "text", DEFAULTS);
+    assert!(out.imports.iter().any(|it| it.text.contains("\nopaque core.string.String.new : Result alloc.string.String\n")), "String::new is opaque");
+    let out = golden_expanded(DEFAULT_FLAGS, "defaults", "derived_default_is_each_fields", DEFAULTS);
+    assert_eq!(out.statement.as_deref(), Some("defaults.derived_default_is_each_fields.spec.statement"));
+}
+
+/// A default with no model is refused by name: of a recorded (unexpanded) derive, of a float.
+#[test]
+fn a_default_with_no_model_is_refused_by_name() {
+    let cases = [
+        ("#[derive(Default)]\npub struct P { pub x: u32 }\npub fn f(p: &mut P) -> P { core::mem::take(p) }\n", "`mem::take` of `main::P`"),
+        ("#[derive(Default)]\npub struct P { pub x: u32 }\npub fn f() -> (P, u8) { Default::default() }\n", "`Default::default` of `main::P`"),
+    ];
+    for (source, what) in cases {
+        let err = refused(DEFAULT_FLAGS, "f", source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert_eq!(err.function, "main::f");
     }
 }

@@ -23,7 +23,10 @@
 //!
 //! Anything outside v0 is a [`NotTranslated`] naming the construct and where it is.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    alloc::Global,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+};
 
 use base_db::Db;
 use hir_def::{
@@ -158,6 +161,11 @@ pub enum Ty {
     Duration,
     /// `core::cmp::Ordering`: `lean/Blaze/Ordering.lean`'s `core.cmp.Ordering`.
     Ordering,
+    /// `core::ops::Range<T>`, or with `inclusive` `core::ops::RangeInclusive<T>`:
+    /// `lean/Blaze/Range.lean`'s `core.ops.Range` and `core.ops.RangeInclusive`, structures of
+    /// the nightly's fields (`start` and `end`, and the inclusive one's `exhausted`). A value,
+    /// never an iterator: a `for` over one is refused at `IntoIterator::into_iter`.
+    Range { elem: Box<Ty>, inclusive: bool },
     /// `str`, behind any reference: its bytes (`lean/Blaze/Str.lean`'s `Str`), with the
     /// UTF-8 invariant not carried.
     Str,
@@ -535,6 +543,13 @@ pub const OPAQUE_FUNCTIONS: &[(Opaque, &str, &str)] = &[
          holding `error` boxed: its kind, message, source and payload are fixed by `error`; only \
          the box's address differs between two calls, which no model reads",
     ),
+    (
+        Opaque::String,
+        "new",
+        "`alloc/src/string.rs:450-451`: `String { vec: Vec::new() }`, a `const fn` of no argument: every \
+         call gives the empty string, so one value stands for all of them. It is what \
+         `String::default` runs (string.rs:2826-2831)",
+    ),
 ];
 
 /// The opaque functions the model adds where Rust has no function of its own, by Lean name
@@ -616,7 +631,8 @@ impl Ty {
             | Ty::RefMut(inner)
             | Ty::Slice(inner)
             | Ty::Vec(inner)
-            | Ty::Array(inner, _) => inner.adts(out),
+            | Ty::Array(inner, _)
+            | Ty::Range { elem: inner, .. } => inner.adts(out),
         }
     }
 }
@@ -767,6 +783,13 @@ pub enum Rvalue {
     Variant { ty: Ty, variant: u32, args: Vec<Operand> },
     Array(Vec<Operand>),
     Repeat(Operand, u64),
+    /// `start..end` (MIR's aggregate of `Range`'s fields), or with `inclusive`
+    /// `RangeInclusive::new(start, end)` (range.rs:400, `Self { start, end, exhausted: false }`):
+    /// `core.ops.Range.new` and `core.ops.RangeInclusive.new` (`lean/Blaze/Range.lean`).
+    Range { inclusive: bool, start: Operand, end: Operand },
+    /// `Step { second, pick }`, the world's choice of which thread runs next ([`Shared::Step`]):
+    /// `Threads.Step.mk second pick` (`lean/Blaze/Threads.lean`'s `structure Step`).
+    Step { second: Operand, pick: Operand },
     /// The empty `Vec` of this element type: `Vec::new()`, `Vec::with_capacity(n)`, `vec![]`,
     /// `Vec::clear`'s and `mem::take`'s default. The capacity is not observable in the subset.
     EmptyVec(Ty),
@@ -925,9 +948,10 @@ impl Rvalue {
             | Rvalue::Neg { of, .. }
             | Rvalue::Cast { of, .. }
             | Rvalue::Repeat(of, _) => vec![of],
-            Rvalue::Bin { left, right, .. } | Rvalue::WithOverflow { left, right, .. } => {
-                vec![left, right]
-            }
+            Rvalue::Bin { left, right, .. }
+            | Rvalue::WithOverflow { left, right, .. }
+            | Rvalue::Range { start: left, end: right, .. }
+            | Rvalue::Step { second: left, pick: right } => vec![left, right],
             Rvalue::Len(_) | Rvalue::Discriminant(..) | Rvalue::EmptyVec(_) => Vec::new(),
             Rvalue::Tuple(all) | Rvalue::Array(all) | Rvalue::Variant { args: all, .. } => {
                 all.iter().collect()
@@ -1471,6 +1495,43 @@ fn expanded_derive(db: &Db, func: FunctionId) -> Option<BuiltinDeriveImplTrait> 
         .find(|it| it.derive_macro(&lang).is_some_and(|derive| derive.definition(db) == called))
 }
 
+/// A method of a derived impl whose calls are modelled by its trait and name, never by its
+/// body ([`Cx::dispatch`] routes a call of it to the trait's method): the trait's method it
+/// implements and the impl's trait arguments (`Self`, then `Rhs` for `PartialEq` and
+/// `PartialOrd`).
+#[derive(Clone, Copy)]
+struct DerivedMethod<'db> {
+    method: FunctionId,
+    generics: GenericArgs<'db>,
+}
+
+/// The derive `func` is a method of, when it is one whose calls are modelled by the trait
+/// (`Clone`, `PartialEq`, `PartialOrd`, `Ord`, as [`Cx::dispatch`] picks them) and its impl
+/// is not generic. Asked for alone, such a method is the model a call of it gets, under the
+/// conditions the call is held to ([`Cx::derived_body`]): its expanded body reads
+/// `discriminant_value` for an enum, and is never what the model of a call is. A derived
+/// `Debug::fmt`, `Hash::hash` or `Default::default` is none: a call of it is its body.
+fn derived_method<'db>(db: &'db Db, func: FunctionId) -> Option<DerivedMethod<'db>> {
+    let derived = expanded_derive(db, func)?;
+    if !matches!(
+        derived,
+        BuiltinDeriveImplTrait::Clone
+            | BuiltinDeriveImplTrait::PartialEq
+            | BuiltinDeriveImplTrait::PartialOrd
+            | BuiltinDeriveImplTrait::Ord
+    ) {
+        return None;
+    }
+    let ItemContainerId::ImplId(imp) = func.lookup(db).container else { return None };
+    if GenericParams::of(db, imp.into()).len_type_or_consts() != 0 {
+        return None;
+    }
+    let of = db.impl_trait(imp)?.skip_binder();
+    let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+    let method = trait_method(db, of.def_id.0, &name)?;
+    Some(DerivedMethod { method, generics: of.args })
+}
+
 /// The method `name` of the trait `of`.
 fn trait_method(db: &Db, of: TraitId, name: &str) -> Option<FunctionId> {
     of.trait_items(db).items.iter().find_map(|(item, id)| match id {
@@ -1490,6 +1551,8 @@ enum Home {
     Vec,
     /// An inherent method of `core::time::Duration`.
     Duration,
+    /// An inherent method of `core::ops::Range` or, `inclusive`, of `RangeInclusive`.
+    Range { inclusive: bool },
     /// An inherent method of `core::cmp::Ordering`.
     Ordering,
     /// An inherent method of `str`.
@@ -2283,6 +2346,16 @@ impl<'db> Cx<'db> {
                     if matches!(adt, AdtId::StructId(it) if Some(it) == lang.PhantomData) {
                         return Ok(Ty::PhantomData);
                     }
+                    // `Range<T>` and `RangeInclusive<T>` (lang items `Range`, `RangeInclusive`):
+                    // structures of their fields, `lean/Blaze/Range.lean`.
+                    let (range, inclusive) = (lang.Range, lang.RangeInclusiveStruct);
+                    if let AdtId::StructId(it) = adt
+                        && (Some(it) == range || Some(it) == inclusive)
+                        && args.len() == 1
+                    {
+                        let elem = Box::new(self.ty(args.type_at(0), false, at)?);
+                        return Ok(Ty::Range { elem, inclusive: Some(it) == inclusive });
+                    }
                     let name = match adt {
                         AdtId::EnumId(it) => EnumSignature::of(self.db, it).name.as_str(),
                         AdtId::StructId(it) => StructSignature::of(self.db, it).name.as_str(),
@@ -2734,6 +2807,14 @@ impl<'db> Cx<'db> {
                     };
                     (Elem::Field(found.name.clone()), found.ty.clone())
                 }
+                // A range's fields in the nightly's order (range.rs:86, 362): `start`, `end`,
+                // and the inclusive one's `exhausted`.
+                (m::ProjectionElem::Field(field), Ty::Range { elem, inclusive }) => match (field.0, *inclusive) {
+                    (0, _) => (Elem::Field("start".to_owned()), (**elem).clone()),
+                    (1, _) => (Elem::Field("end".to_owned()), (**elem).clone()),
+                    (2, true) => (Elem::Field("exhausted".to_owned()), Ty::Bool),
+                    _ => return Err(self.refuse("a field a range does not have", at)),
+                },
                 (m::ProjectionElem::Downcast(VariantId::EnumVariantId(variant)), _) => {
                     let Some(Proj::Mir(m::ProjectionElem::Field(field))) = elems.get(at_elem).copied()
                     else {
@@ -3132,6 +3213,24 @@ impl<'db> Cx<'db> {
                 Ok(Rvalue::Variant { ty: ty.clone(), variant: variant.index(self.db) as u32, args })
             }
             (VariantId::UnionId(_), _) => Err(self.refuse("a union", at)),
+            // `start..end`: `Range`'s fields in order (range.rs:86). A `RangeInclusive`'s are
+            // private: it is made by `RangeInclusive::new` ([`Cx::range_call`]).
+            (VariantId::StructId(_), Ty::Range { inclusive: false, .. }) if args.len() == 2 => {
+                let mut args = args.into_iter();
+                let (Some(start), Some(end)) = (args.next(), args.next()) else {
+                    return Err(self.refuse("a range without its two bounds", at));
+                };
+                Ok(Rvalue::Range { inclusive: false, start, end })
+            }
+            // `Step { second, pick }`: its fields in order, the shape [`Cx::shared_ty`] checked
+            // (`second: bool`, `pick: u8`).
+            (VariantId::StructId(_), Ty::Shared(Shared::Step)) if args.len() == 2 => {
+                let mut args = args.into_iter();
+                let (Some(second), Some(pick)) = (args.next(), args.next()) else {
+                    return Err(self.refuse("a `Step` without its two fields", at));
+                };
+                Ok(Rvalue::Step { second, pick })
+            }
             // `Global` and `RangeFull`, the structs whose type is `()` ([`Cx::ty`]).
             (VariantId::StructId(_), Ty::Unit) if args.is_empty() => Ok(Rvalue::Use(Operand::Unit)),
             (VariantId::StructId(_), Ty::PhantomData) if args.is_empty() => {
@@ -3802,6 +3901,12 @@ impl<'db> Cx<'db> {
                             _ => Home::Other,
                         },
                         adt if is_vec(db, adt) => Home::Vec,
+                        AdtId::StructId(it) if Some(it) == self.interner.lang_items().Range => {
+                            Home::Range { inclusive: false }
+                        }
+                        AdtId::StructId(it) if Some(it) == self.interner.lang_items().RangeInclusiveStruct => {
+                            Home::Range { inclusive: true }
+                        }
                         AdtId::StructId(it)
                             if StructSignature::of(db, it).name.as_str() == "Duration"
                                 && module(it.into()) == ["time"] =>
@@ -3885,6 +3990,16 @@ impl<'db> Cx<'db> {
         let is = |item: Option<FunctionId>| item == Some(callee);
         let (index_mut, deref_mut) = (is(lang.IndexMut_index_mut), is(lang.DerefMut_deref_mut));
         if is(lang.Index_index) || index_mut || is(lang.Deref_deref) || deref_mut {
+            // `&v[a..b]` and `&s[a..b]` of a `Vec` or a slice: the elements from `a` up to `b`,
+            // a panic unless `a <= b <= len` (`SliceIndex<[T]> for Range<usize>`, index.rs:405-413;
+            // a `Vec` derefs to its slice). A `&mut` one lends a part of the `Vec`, not made.
+            let on = generics.type_at(0);
+            if is(lang.Index_index)
+                && (self.is_vec_ty(on) || matches!(on.kind(), TyKind::Slice(_)))
+                && self.is_usize_range(generics.type_at(1))
+            {
+                return Ok(Some((model("Slice.index_range", true), self.operands(args, at)?)));
+            }
             if !self.is_vec_ty(generics.type_at(0)) {
                 return Err(no_model(self));
             }
@@ -3938,17 +4053,10 @@ impl<'db> Cx<'db> {
                     _ => (RESULT_MODELS, "core.result.Result.unwrap_or"),
                 };
                 if name == "unwrap_or_default" {
-                    // `T::default()` of the integers and `bool`, which are their zero and `false`.
-                    let default = match self.place(destination, at)?.1 {
-                        Ty::Int(int) => Operand::Int(int, 0),
-                        Ty::Bool => Operand::Bool(false),
-                        other => {
-                            return Err(self.refuse(
-                                format!("`unwrap_or_default` of a `{other:?}`, whose default has no model"),
-                                at,
-                            ));
-                        }
-                    };
+                    // `T::default()`, which the standard library calls only for `None` or `Err`
+                    // (option.rs, `match self { Some(x) => x, None => T::default() }`): a
+                    // default that is a value, never a call, so taking it first changes nothing.
+                    let default = self.default_value(generics.type_at(0), "`unwrap_or_default`", at)?;
                     let mut operands = self.operands(&args[..1], at)?;
                     operands.push(default);
                     return Ok(Some((model(unwrap_or, false), operands)));
@@ -3963,6 +4071,7 @@ impl<'db> Cx<'db> {
                 Ok(Some((callee, self.operands(args, at)?)))
             }
             Home::Vec => self.vec_call(name, args, destination, at, out),
+            Home::Range { inclusive } => self.range_call(inclusive, name, args, destination, at, out),
             Home::Slice => self.slice_call(name, args, at),
             Home::Duration => {
                 let Some(&(_, it, monadic)) = DURATION_MODELS.iter().find(|it| it.0 == name) else {
@@ -4025,6 +4134,11 @@ impl<'db> Cx<'db> {
                 let module: Vec<&str> = module.iter().map(String::as_str).collect();
                 let self_ty = generics.type_at(0);
                 match (module.as_slice(), of.as_str(), name) {
+                    (["default"], "Default", "default") => {
+                        let (dest, _) = self.place(destination, at)?;
+                        self.default_into(callee, self_ty, dest, "`Default::default`", at, out)?;
+                        Ok(None)
+                    }
                     (["clone"], "Clone", "clone") => {
                         self.structural(callee, self_ty, Structural::Clone, &mut BTreeSet::new(), at)?;
                         // The clone of a value whose `Clone` is a copy of its structure is the
@@ -4162,7 +4276,7 @@ impl<'db> Cx<'db> {
             Home::Module(module) if module == ["cmp"] && matches!(name, "max" | "min") => {
                 self.int_order(name, args, at).map(Some)
             }
-            Home::Module(module) if module == ["mem"] => self.mem_call(name, args, destination, at, out),
+            Home::Module(module) if module == ["mem"] => self.mem_call(name, generics, args, destination, at, out),
             Home::Module(module) if module == ["vec"] && name == "from_elem" => {
                 let operands = self.operands(args, at)?;
                 let elem = self.operand(&args[0], at)?.1;
@@ -4387,6 +4501,79 @@ impl<'db> Cx<'db> {
         matches!(ty.kind(), TyKind::Adt(def, _) if is_vec(self.db, def.def_id()))
     }
 
+    /// Whether `ty` is `core::ops::Range<usize>`, what slices a slice (`a..b`).
+    fn is_usize_range(&self, ty: HTy<'db>) -> bool {
+        let range = self.interner.lang_items().Range;
+        matches!(ty.kind(), TyKind::Adt(def, args)
+            if matches!(def.def_id(), AdtId::StructId(it) if Some(it) == range)
+                && args.len() == 1
+                && matches!(args.type_at(0).kind(), TyKind::Uint(UintTy::Usize)))
+    }
+
+    /// An inherent method of `Range` or (`inclusive`) `RangeInclusive`, by the nightly's
+    /// source (library/core/src/ops/range.rs): `RangeInclusive::new` the structure with
+    /// `exhausted: false` (range.rs:400), `start()` and `end()` its fields (range.rs:425,
+    /// 450), and `contains` and `is_empty` of an integer range their `lean/Blaze/Range.lean`
+    /// models (range.rs:127, 156, 539, 577). A range of another type compares by its
+    /// `PartialOrd`, which is not modelled; any other method is refused by name.
+    fn range_call(
+        &mut self,
+        inclusive: bool,
+        name: &str,
+        args: &[m::Operand],
+        destination: &m::StoredPlace,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Option<(Callee, Vec<Operand>)>> {
+        let rust = if inclusive { "RangeInclusive" } else { "Range" };
+        let model = |name: &'static str| Callee::Model { name, monadic: false, ty: None, lends_first: false };
+        let it = match (inclusive, name) {
+            (true, "new") => {
+                let (dest, _) = self.place(destination, at)?;
+                let operands = self.operands(args, at)?;
+                let [start, end]: [Operand; 2] = operands
+                    .try_into()
+                    .map_err(|_| self.refuse("`RangeInclusive::new` without its two bounds", at))?;
+                out.push(Stmt::Assign { place: dest, value: Rvalue::Range { inclusive, start, end }, at: at.to_owned() });
+                return Ok(None);
+            }
+            (true, "start") => "core.ops.RangeInclusive.start",
+            (true, "end") => "core.ops.RangeInclusive.end",
+            (_, "contains" | "is_empty") => {
+                let (_, of) = self.operand(&args[0], at)?;
+                let elem = match of.value() {
+                    Ty::Range { elem, .. } => (**elem).clone(),
+                    other => return Err(self.refuse(format!("`{rust}::{name}` of a `{other:?}`"), at)),
+                };
+                let item = match name {
+                    "contains" => Some(self.operand(&args[1], at)?.1.value().clone()),
+                    _ => None,
+                };
+                if !matches!(elem, Ty::Int(_)) || item.as_ref().is_some_and(|it| *it != elem) {
+                    return Err(self.refuse(
+                        format!(
+                            "`{rust}::{name}` of a range of `{}`, which compares by its `PartialOrd` \
+                             (only a range of an integer, compared with one of its type, is \
+                             modelled; rule NoModel)",
+                            crate::rust_ty(&elem)
+                        ),
+                        at,
+                    ));
+                }
+                match (inclusive, name) {
+                    (false, "contains") => "core.ops.Range.contains",
+                    (false, _) => "core.ops.Range.is_empty",
+                    (true, "contains") => "core.ops.RangeInclusive.contains",
+                    (true, _) => "core.ops.RangeInclusive.is_empty",
+                }
+            }
+            _ => {
+                return Err(self.refuse(format!("a call of `{rust}::{name}`, which has no model (rule NoModel)"), at));
+            }
+        };
+        Ok(Some((model(it), self.operands(args, at)?)))
+    }
+
     /// What a `Vec` is indexed by: `true` for an element (`usize`), `false` for the whole of
     /// it (`..`); any other range, a subslice, is refused.
     fn vec_index(&self, by: HTy<'db>, at: &str) -> Refused<bool> {
@@ -4497,12 +4684,20 @@ impl<'db> Cx<'db> {
             "is_empty" => ("Slice.is_empty", false, false),
             "first" => ("Slice.first", false, false),
             "last" => ("Slice.last", false, false),
-            "get" => {
-                if self.operand(&args[1], at)?.1.value() != &Ty::Int(IntTy::Usize) {
-                    return Err(self.refuse("`get` by a range (a subslice, which has no model)", at));
+            "get" => match self.operand(&args[1], at)?.1.value() {
+                Ty::Int(IntTy::Usize) => ("Slice.get", false, false),
+                // `get(a..b)`: `Some` of the subslice when `a <= b <= len`, else `None`
+                // (index.rs:335-345).
+                Ty::Range { elem, inclusive: false } if **elem == Ty::Int(IntTy::Usize) => {
+                    ("Slice.get_range", false, false)
                 }
-                ("Slice.get", false, false)
-            }
+                _ => {
+                    return Err(self.refuse(
+                        "`get` by a range other than `a..b` of `usize` (a subslice, which has no model)",
+                        at,
+                    ));
+                }
+            },
             "swap" => ("Slice.swap", true, true),
             _ => {
                 return Err(self.refuse(
@@ -4519,6 +4714,7 @@ impl<'db> Cx<'db> {
     fn mem_call(
         &mut self,
         name: &str,
+        generics: GenericArgs<'db>,
         args: &[m::Operand],
         destination: &m::StoredPlace,
         at: &str,
@@ -4550,23 +4746,14 @@ impl<'db> Cx<'db> {
                 out.push(assign(dest, Rvalue::Use(Operand::Unit)));
             }
             "take" => {
-                let (place, ty) = lent(self, &args[0])?;
-                // `T::default()` of the types whose default the standard library gives.
-                let default = match &ty {
-                    Ty::Int(int) => Rvalue::Use(Operand::Int(*int, 0)),
-                    Ty::Bool => Rvalue::Use(Operand::Bool(false)),
-                    Ty::Unit => Rvalue::Use(Operand::Unit),
-                    Ty::Option(_) => Rvalue::Variant { ty: ty.clone(), variant: 0, args: Vec::new() },
-                    Ty::Vec(elem) => Rvalue::EmptyVec((**elem).clone()),
-                    other => {
-                        return Err(self.refuse(
-                            format!("`mem::take` of a `{other:?}`, whose default has no model"),
-                            at,
-                        ));
-                    }
+                // `replace(dest, T::default())` (mem/mod.rs): the old value out, `T`'s default
+                // ([`Cx::default_into`]) in.
+                let (place, _) = lent(self, &args[0])?;
+                let Some(method) = self.default_method() else {
+                    return Err(self.refuse("`mem::take` without core's `Default` trait", at));
                 };
                 out.push(assign(dest, Rvalue::Use(Operand::Place(place.clone()))));
-                out.push(assign(place, default));
+                self.default_into(method, generics.type_at(0), place, "`mem::take`", at, out)?;
             }
             _ => {
                 return Err(self.refuse(
@@ -4887,6 +5074,169 @@ impl<'db> Cx<'db> {
         }
     }
 
+    /// The body of a derived impl's method asked for alone ([`derived_method`]): one block
+    /// that calls the trait's method on the parameters, modelled as [`Cx::std_call`] models a
+    /// call of it in any caller (the value for `clone`, Lean's `=` for `eq`, the type's
+    /// derived order for `partial_cmp` and `cmp`), and returns what it gives. Refused where
+    /// such a call is, with the call's reason.
+    fn derived_body(&mut self, derived: DerivedMethod<'db>, at: &str) -> Refused<CfgBlock<Stmt, Cond>> {
+        let db = self.db;
+        let DerivedMethod { method, generics } = derived;
+        let name = FunctionSignature::of(db, method).name.as_str().to_owned();
+        let mut args = Vec::new_in(Global);
+        args.extend(
+            self.mir
+                .param_locals
+                .iter()
+                .map(|it| m::Operand { kind: m::OperandKind::Copy(m::Place::from(*it).store()), span: None }),
+        );
+        let destination = m::Place::from(m::return_slot()).store();
+        let std = Std { callee: method, generics, name: &name, container: method.lookup(db).container };
+        let mut statements = Vec::new_in(Global);
+        if let Some((callee, args)) = self.std_call(std, &args, &destination, at, &mut statements)? {
+            let (dest, _) = self.place(&destination, at)?;
+            statements.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
+        }
+        Ok(CfgBlock { statements, exit: Exit::Return })
+    }
+
+    /// core's `Default::default`, the trait's method.
+    fn default_method(&self) -> Option<FunctionId> {
+        trait_method(self.db, self.interner.lang_items().Default?, "default")
+    }
+
+    /// `T::default()` (`ty` is `T`) into `dest`, `what` naming the call that asks for it in a
+    /// refusal. The standard library's defaults are values, each its impl's body: an integer's
+    /// `0` and `bool`'s `false` (default.rs:150-186, `default_impl! { u8, 0, .. }`), `()`'s `()`
+    /// (default.rs:150), `PhantomData` (marker.rs:859-862, `Self`), a `Duration`'s zero (its
+    /// `Default` is derived, time.rs:79, of `secs: 0` and `nanos: Nanoseconds(0)`), `Option`'s
+    /// `None` (option.rs:2304-2316), `Vec`'s empty `Vec` (vec/mod.rs:4484-4490, `Vec::new()`), a
+    /// tuple's tuple of its elements' (tuple.rs:116-120, `($({ let x: $T = Default::default();
+    /// x},)+)`, in order) and an array's (array/mod.rs:509-528, `[T; 0]` empty with no bound on
+    /// `T`, and `[$t::default(), ..]` for `N` up to 32: one call per element, in order). A type
+    /// of the crate is its own impl's `default`, called as the function it is (a derived one is
+    /// its expansion: each field's `Default::default()`, or the `#[default]` variant), and
+    /// `String`'s is its body in alloc (string.rs:2826-2831, `String::new()`), an opaque
+    /// function. Anything else is refused by name.
+    fn default_into(
+        &mut self,
+        method: FunctionId,
+        ty: HTy<'db>,
+        dest: Place,
+        what: &str,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<()> {
+        let db = self.db;
+        let model = self.ty(ty, false, at)?;
+        let value = match (&model, ty.kind()) {
+            (Ty::Option(_), _) => Rvalue::Variant { ty: model.clone(), variant: 0, args: Vec::new_in(Global) },
+            (Ty::Vec(elem), _) => Rvalue::EmptyVec((**elem).clone()),
+            (Ty::Tuple(_), TyKind::Tuple(elems)) => {
+                let mut ops = Vec::new_in(Global);
+                for elem in elems.iter() {
+                    ops.push(self.default_operand(method, elem, what, at, out)?);
+                }
+                Rvalue::Tuple(ops)
+            }
+            (Ty::Array(_, 0), _) => Rvalue::Array(Vec::new_in(Global)),
+            (Ty::Array(_, n @ 1..=32), TyKind::Array(elem, _)) => {
+                // One call of the element's default per element; a default that is a value is
+                // that value repeated, which is the same array.
+                if let Ok(value) = self.default_value(elem, what, at) {
+                    Rvalue::Repeat(value, *n)
+                } else {
+                    let mut ops = Vec::new_in(Global);
+                    for _ in 0..*n {
+                        ops.push(self.default_operand(method, elem, what, at, out)?);
+                    }
+                    Rvalue::Array(ops)
+                }
+            }
+            (Ty::Array(_, n), _) => {
+                return Err(self.refuse(
+                    format!(
+                        "{what} of an array of {n} elements (the standard library implements \
+                         `Default` for arrays of at most 32, array/mod.rs:528)"
+                    ),
+                    at,
+                ));
+            }
+            (Ty::Adt(_) | Ty::Opaque(Opaque::String), _) => {
+                let shown = rust_of(db, ty);
+                let generics = GenericArgs::new_from_slice(&[ty.into()]);
+                let looked = db
+                    .lookup_impl_method_or_why(self.env, method, generics)
+                    .map(|(found, args)| (found.left(), args));
+                let callee = match looked {
+                    Ok((Some(found), args)) => self.crate_callee(found, args, "default", at)?,
+                    Ok((None, _)) => {
+                        return Err(self.refuse(
+                            format!(
+                                "{what} of `{shown}`, whose `Default` a built-in derive implements \
+                                 without its expansion (only an expanded derive is translated)"
+                            ),
+                            at,
+                        ));
+                    }
+                    Err(why) => {
+                        return Err(self.refuse(
+                            format!("{what} of `{shown}`, whose impl of `Default` is not found: {}", why.describe()),
+                            at,
+                        ));
+                    }
+                };
+                out.push(Stmt::Call { dest, callee, args: Vec::new_in(Global), at: at.to_owned() });
+                return Ok(());
+            }
+            _ => Rvalue::Use(self.default_value(ty, what, at)?),
+        };
+        out.push(Stmt::Assign { place: dest, value, at: at.to_owned() });
+        Ok(())
+    }
+
+    /// `T::default()` when it is a value with no call in it ([`Cx::default_into`]): an integer's
+    /// zero, `false`, `()`, `PhantomData`, a zero `Duration`, `None`, or an empty `Vec`. Anything
+    /// else is refused by name.
+    fn default_value(&mut self, ty: HTy<'db>, what: &str, at: &str) -> Refused<Operand> {
+        let model = self.ty(ty, false, at)?;
+        match model {
+            Ty::Int(int) => Ok(Operand::Int(int, 0)),
+            Ty::Bool => Ok(Operand::Bool(false)),
+            Ty::Unit => Ok(Operand::Unit),
+            Ty::PhantomData => Ok(Operand::PhantomData),
+            Ty::Duration => Ok(Operand::Duration { secs: 0, nanos: 0 }),
+            other => Err(self.refuse(
+                format!(
+                    "{what} of `{}`, whose default is not a value the model writes in place (rule \
+                     NoModel)",
+                    crate::rust_ty(&other)
+                ),
+                at,
+            )),
+        }
+    }
+
+    /// `T::default()` as an operand: the value ([`Cx::default_value`]), or a fresh local
+    /// [`Cx::default_into`] fills.
+    fn default_operand(
+        &mut self,
+        method: FunctionId,
+        ty: HTy<'db>,
+        what: &str,
+        at: &str,
+        out: &mut Vec<Stmt>,
+    ) -> Refused<Operand> {
+        if let Ok(value) = self.default_value(ty, what, at) {
+            return Ok(value);
+        }
+        let model = self.ty(ty, false, at)?;
+        let held = self.locals.len() as Local;
+        self.locals.push(LocalDecl { name: None, ty: model });
+        self.default_into(method, ty, Place::local(held), what, at, out)?;
+        Ok(Operand::Place(Place::local(held)))
+    }
+
     /// The crate's own `PartialEq::eq` of the type under the references `self_ty` is, when
     /// `self_ty` is a reference and that type's impl is a hand-written one of the crate: the
     /// function [`Cx::call`] would call for `==` of the type itself. `None` otherwise.
@@ -4971,7 +5321,11 @@ impl<'db> Cx<'db> {
                             ),
                             at,
                         )),
-                        Ty::Option(_) | Ty::Vec(_) => self.structural(method, args.type_at(0), which, seen, at),
+                        // A range's `Clone` and `PartialEq` are derived over its fields
+                        // (range.rs:84, 200, 360): its element's, and `exhausted`'s, a `bool`.
+                        Ty::Option(_) | Ty::Vec(_) | Ty::Range { .. } => {
+                            self.structural(method, args.type_at(0), which, seen, at)
+                        }
                         Ty::Result(..) => {
                             self.structural(method, args.type_at(0), which, seen, at)?;
                             self.structural(method, args.type_at(1), which, seen, at)
@@ -5299,6 +5653,27 @@ pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowe
         return Err(refuse(
             "a function that returns a `&mut` reference (it needs a backward function)".to_owned(),
         ));
+    }
+    // A derived impl's own method asked for alone is the model a call of it gets, never its
+    // expanded body.
+    if instance.closure.is_none()
+        && args.is_none()
+        && let Some(derived) = derived_method(db, func)
+    {
+        let blocks = vec![cx.derived_body(derived, &fn_text)?];
+        let nodes = match structured::reconstruct(&Cfg { blocks, entry: 0 }) {
+            Ok(nodes) => fold(nodes),
+            Err(err) => return Err(refuse(err.to_string())),
+        };
+        let body = Body {
+            name: named.lean,
+            display,
+            locals: cx.locals,
+            params: mir.param_locals.iter().map(|it| index(*it)).collect(),
+            adts: cx.adts,
+            nodes,
+        };
+        return Ok(Lowered { body, callees: cx.callees, derives: cx.derives, orders: cx.orders, opaques: cx.opaques });
     }
     // The blocks reached without unwinding, in the order first reached.
     let mut number: BTreeMap<u32, usize> = BTreeMap::new();

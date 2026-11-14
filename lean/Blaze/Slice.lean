@@ -68,6 +68,57 @@ def update (s : Slice α) (i : Usize) (v : α) : Result (Slice α) :=
     Result.ok ⟨s.val.set i.val.toNat v, by simpa using s.hlen⟩
   else Result.fail Error.bounds
 
+/-- The elements of `s` from `start` up to `stop`: those at `start`, `start + 1`, .., `stop - 1`
+that it has. -/
+def cut (s : Slice α) (start stop : Nat) : Slice α :=
+  ⟨(s.val.take stop).drop start, by
+    have h := s.hlen
+    simp only [List.length_drop, List.length_take]
+    omega⟩
+
+/-- Up to its length, a cut has `stop - start` elements. -/
+theorem cut_length (s : Slice α) (start stop : Nat) (h : stop ≤ s.val.length) :
+    (cut s start stop).val.length = stop - start := by
+  simp only [cut, List.length_drop, List.length_take]
+  omega
+
+/-- The element at `i` of a cut is the element at `start + i` of the slice, below `stop`. -/
+theorem cut_getElem? (s : Slice α) (start stop i : Nat) (h : start + i < stop) :
+    (cut s start stop).val[i]? = s.val[start + i]? := by
+  simp only [cut, List.getElem?_drop, List.getElem?_take]
+  simp [h]
+
+/-- `&s[start..end]` (library/core/src/slice/index.rs:405-413, `SliceIndex<[T]> for
+ops::Range<usize>`'s `index`: `if let Some(new_len) = usize::checked_sub(self.end, self.start) &&
+self.end <= slice.len()` gives the elements from `start` up to `end`, else
+`slice_index_fail(self.start, self.end, slice.len())` panics): an index out of bounds unless
+`start <= end <= len`. -/
+def subslice (s : Slice α) (start stop : Usize) : Result (Slice α) :=
+  if start.val ≤ stop.val ∧ stop.val.toNat ≤ s.val.length then
+    Result.ok (cut s start.val.toNat stop.val.toNat)
+  else Result.fail Error.bounds
+
+/-- In bounds, a subslice is the cut. -/
+@[simp] theorem subslice_ok (s : Slice α) (start stop : Usize)
+    (h : start.val ≤ stop.val ∧ stop.val.toNat ≤ s.val.length) :
+    subslice s start stop = Result.ok (cut s start.val.toNat stop.val.toNat) := by
+  unfold subslice
+  rw [ite_eq_left h]
+
+/-- Out of bounds, a subslice panics. -/
+@[simp] theorem subslice_fail (s : Slice α) (start stop : Usize)
+    (h : ¬ (start.val ≤ stop.val ∧ stop.val.toNat ≤ s.val.length)) :
+    subslice s start stop = Result.fail Error.bounds := by
+  unfold subslice
+  rw [ite_eq_right h]
+
+/-- `s.get(start..end)` (index.rs:335-345, `SliceIndex<[T]> for ops::Range<usize>`'s `get`, by the
+same test as `index`): `Some` of the subslice in bounds, else `None`. -/
+def get_subslice (s : Slice α) (start stop : Usize) : Option (Slice α) :=
+  if start.val ≤ stop.val ∧ stop.val.toNat ≤ s.val.length then
+    some (cut s start.val.toNat stop.val.toNat)
+  else none
+
 end Slice
 
 /-- `[T; n]`. -/

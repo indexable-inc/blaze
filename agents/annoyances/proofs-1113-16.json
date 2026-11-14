@@ -1,0 +1,21 @@
+{
+ "id": "proofs-1113-16",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "hir-ty-pure, sealed summaries (crates/hir-ty-pure/src/sealed.rs), on `blaze check -p blaze-query-macros`; follows proofs-1113-12",
+ "what": "Reproduced proofs-1113-12 on blaze-vm with a release blaze of main 5128d77767 (tree 0449a5be1f, home /root/wt/proofs-1113/home4): 313 s, then the same panic (`summary_in` .. held 413598968 reads in one run). What the run`s own profile says (DuckDB over home4/v2/profile): 4,336 spans `sealed summary reads below HIGH`, their durations summing to 1,131 s (819 on the thread that ran the long row, 632.6 s, the longest 157.4 s); the read each names first (by key order) is `Crate.data` of crate ids 22528 (1,569 spans), 22556 (1,025) and 22530 (351), `runtime_mir_body_query` of a function (424) and `AttrFlags::query` of a trait (375); the instances are core`s (406 of those naming 22528), alloc`s (260), std`s, proc_macro`s, proc_macro2`s, syn`s. Stack samples of that thread under `walk::summarized` (1,584 over 161 s): 389 below `drop_glue`, 293 below the locals` `no_pointer` walk, 130 `call`, 120 `name_of` (198,029 `find_path` spans), 107 `dyn_drop`. So summaries of library functions are found not sealed, one after another, and each is made again as a row.",
+ "cost": "blaze cannot check its own proc-macro crate blaze-query-macros, so `blaze prove` answers nothing for blaze-cas, blaze-profile, blaze-graph, blaze-remote and blaze-http; an hour of profile queries to get from the panic to these rows",
+ "cause": "partly found. By sealed.rs`s own description a run that read below HIGH leaves what it settled unshared, and its callees are asked again from its row, each on its own witness: where every function of a large call graph reads below HIGH, each one`s whole cone is summarized in a task scope, thrown away, and summarized again from each callee down, and the row that asked holds every read of every attempt (413 million). NOT found: which crates 22528, 22556 and 22530 are and why a library function`s summary reads their `Crate.data` below HIGH (base-db gives a library crate`s data HIGH, input.rs `graph_durability`), since the span names an id, not a crate. My guess, not checked: they are crates of the proc-macro side of the graph.",
+ "whys": [
+  "a row held 413 million reads and passed its bound",
+  "it held the reads of thousands of task-scoped summaries made under it, each made more than once",
+  "each was first tried as sealed, found to read below HIGH, dropped, and made again as a row whose callees start the same way",
+  "library functions` summaries read some crate`s data below HIGH, which the design assumes is rare",
+  "the span that says so names the read by id, so nobody could see which crate it was"
+ ],
+ "class": "a fast path whose fallback redoes the work and whose precondition (library code reads only HIGH) silently stopped holding: the cost of the miss grows with the call graph, and the report of the miss names an id",
+ "prevention": "the read a sealed summary names says the crate`s name and why it is below HIGH (`Witness::cause_text` beside `read_text`, and the crate`s display name for an input of a crate); a sealed crate`s summaries read nothing of a crate outside their cover, held by a test on a proc-macro crate that uses syn; and a run found below HIGH keeps what it settled for its row instead of making it again. Not built: the effects analysis`s.",
+ "workaround": "none for the five crates",
+ "fix": "",
+ "state": "open"
+}

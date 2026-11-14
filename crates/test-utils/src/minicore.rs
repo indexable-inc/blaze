@@ -227,6 +227,24 @@ pub mod marker {
     impl<T: PointeeSized> Copy for PhantomData<T> {}
     // endregion:copy
 
+    // region:default
+    impl<T: PointeeSized> crate::default::Default for PhantomData<T> {
+        fn default() -> Self {
+            Self
+        }
+    }
+    // endregion:default
+
+    // region:eq
+    // `marker.rs`: equal whatever `T` is.
+    impl<T: PointeeSized> crate::cmp::PartialEq for PhantomData<T> {
+        fn eq(&self, _other: &PhantomData<T>) -> bool {
+            true
+        }
+    }
+    impl<T: PointeeSized> crate::cmp::Eq for PhantomData<T> {}
+    // endregion:eq
+
     // endregion:phantom_data
 
     // region:discriminant
@@ -322,6 +340,16 @@ pub mod default {
     }
     impl Default for () {
         fn default() -> Self {}
+    }
+    impl<T> Default for [T; 0] {
+        fn default() -> [T; 0] {
+            []
+        }
+    }
+    impl<T: Default> Default for [T; 3] {
+        fn default() -> [T; 3] {
+            [T::default(), T::default(), T::default()]
+        }
     }
     // endregion:builtin_impls
 }
@@ -615,6 +643,15 @@ pub mod mem {
     }
     // endregion:offset_of
 }
+
+// region:discriminant
+pub mod intrinsics {
+    /// `core::intrinsics::discriminant_value` (`library/core/src/intrinsics/mod.rs`): what a
+    /// derived `==` and a derived order of an enum read first.
+    #[rustc_intrinsic]
+    pub const fn discriminant_value<T>(v: &T) -> <T as crate::marker::DiscriminantKind>::Discriminant;
+}
+// endregion:discriminant
 
 pub mod ptr {
     // region:int_cast
@@ -922,7 +959,66 @@ pub mod ops {
             pub const fn new(start: Idx, end: Idx) -> Self {
                 Self { start, end, exhausted: false }
             }
+            pub const fn start(&self) -> &Idx {
+                &self.start
+            }
+            pub const fn end(&self) -> &Idx {
+                &self.end
+            }
         }
+
+        // region:ord
+        impl<Idx: crate::cmp::PartialOrd<Idx>> Range<Idx> {
+            pub fn contains<U>(&self, item: &U) -> bool
+            where
+                Idx: crate::cmp::PartialOrd<U>,
+                U: ?Sized + crate::cmp::PartialOrd<Idx>,
+            {
+                loop {}
+            }
+            pub fn is_empty(&self) -> bool {
+                loop {}
+            }
+        }
+        impl<Idx: crate::cmp::PartialOrd<Idx>> RangeInclusive<Idx> {
+            pub fn contains<U>(&self, item: &U) -> bool
+            where
+                Idx: crate::cmp::PartialOrd<U>,
+                U: ?Sized + crate::cmp::PartialOrd<Idx>,
+            {
+                loop {}
+            }
+            pub fn is_empty(&self) -> bool {
+                loop {}
+            }
+        }
+        // endregion:ord
+
+        // region:clone
+        impl<Idx: crate::clone::Clone> crate::clone::Clone for Range<Idx> {
+            fn clone(&self) -> Self {
+                loop {}
+            }
+        }
+        impl<Idx: crate::clone::Clone> crate::clone::Clone for RangeInclusive<Idx> {
+            fn clone(&self) -> Self {
+                loop {}
+            }
+        }
+        // endregion:clone
+
+        // region:eq
+        impl<Idx: crate::cmp::PartialEq> crate::cmp::PartialEq for Range<Idx> {
+            fn eq(&self, _other: &Self) -> bool {
+                loop {}
+            }
+        }
+        impl<Idx: crate::cmp::PartialEq> crate::cmp::PartialEq for RangeInclusive<Idx> {
+            fn eq(&self, _other: &Self) -> bool {
+                loop {}
+            }
+        }
+        // endregion:eq
 
         #[lang = "RangeToInclusive"]
         pub struct RangeToInclusive<Idx> {
@@ -3020,6 +3116,14 @@ pub mod time {
         nanos: u32, // Always 0 <= nanos < NANOS_PER_SEC
     }
 
+    // region:default
+    impl crate::default::Default for Duration {
+        fn default() -> Duration {
+            Duration { secs: 0, nanos: 0 }
+        }
+    }
+    // endregion:default
+
     impl Duration {
         pub const ZERO: Duration = Duration::from_nanos(0);
         pub const MAX: Duration = Duration::new(u64::MAX, NANOS_PER_SEC - 1);
@@ -3954,6 +4058,20 @@ pub mod string {
             loop {}
         }
     }
+
+    impl String {
+        pub const fn new() -> String {
+            loop {}
+        }
+    }
+
+    // region:default
+    impl crate::default::Default for String {
+        fn default() -> String {
+            String::new()
+        }
+    }
+    // endregion:default
 }
 // endregion:string
 
