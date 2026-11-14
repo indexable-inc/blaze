@@ -361,12 +361,23 @@ induction on the schedule), and read the theorem off the states with no step lef
 proof, of the park's order of atomics written by hand, has seven points for the park, three
 for the unpark and 21 reachable states (`lean/Blaze/Tests/ThreadsParkProof.lean`).
 
-Built 2026-11-14: both worlds, the method and that proof, the Rust `two` with scheduled
-atomics behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`),
-and `no_unpark_is_lost` stated over the real `park` and `unpark` and run on drawn schedules
-(`wait/parking.rs`). Next: the translator (a function that reaches an atomic operation
-emitted as a `Prog`), then that theorem proved of the models `blaze prove` emits, and the
-park's simulation test deleted; then a multi-cell structure against the weak world.
+Built 2026-11-14, all of it: both worlds; the method; the Rust `two` with scheduled atomics
+behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`); the
+translator (a function that reaches an atomic operation, `two`, `wait` or `wake`, or a
+function that does, is emitted as a `Threads.Prog`, and a shared theorem's statement is that
+its program's value is `ok true`); and the first proof of real lock-free code,
+`no_unpark_is_lost` (`wait/parking.rs`, `BlazeCore/Wait/Parking.lean`): the real `park` and
+`unpark` as two threads, every schedule, every choice of the kernel's, the retry's count and
+the error path of a clock that stands still: 8 kinds of park point, 3 of the unpark, 26
+reachable states. The park's simulation test ran an unpark whole between two of the park's
+atomics and so never tried a park's step between the unpark's swap and its wake; it stays
+for what the theorem does not state, that a park ends by its deadline and promptly after its
+wake on a clock that moves.
+
+Next: a clock in the threads world and that promptness theorem; models that name a thread's
+program points, so a proof does not copy the model's continuations
+(agents/annoyances/proofs-1113-11.json); a multi-cell structure against the weak world.
+How-to: `agents/howto/H-prove-two-threads.json`.
 
 ## Costs
 
