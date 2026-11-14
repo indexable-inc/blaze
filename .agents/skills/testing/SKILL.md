@@ -158,9 +158,8 @@ still fail, and prints one line that replays it.
 - A check fails by name when its cases drew nothing, were all discarded, or never reached a
   point it lists (`Config::must_reach`, `tape.reached(..)`). Mark the state a bug needs with a
   reach point, so a green run shows the run got there.
-- Hegel (vendor/hegeltest, `#[hegel::test]`) is being removed crate by crate (ledger row V12).
-  Write no new Hegel test; a test you change moves to `blaze_sim::check` in the same change.
-  Never proptest, quickcheck, arbitrary or bolero.
+- Hegel is gone from the tree (ledger row V12): every property test and simulation is a
+  `blaze_sim::check`. Never proptest, quickcheck, arbitrary or bolero.
 
 ## Deterministic simulation tests (DST)
 
@@ -224,9 +223,7 @@ time as an actor under `Sim`, until the two share a tape.
 
 ### Where it is going: one tape
 
-[docs/v2/plan/design/sim.md](../../../docs/v2/plan/design/sim.md), in its order: every Hegel
-test and hand-rolled simulation loop moves to `blaze_sim::check` (the fresh core's crates
-first); `Sim`'s generator becomes the tape, so its latencies, delivery order, tears and
+[docs/v2/plan/design/sim.md](../../../docs/v2/plan/design/sim.md), in its order: `Sim`'s generator becomes the tape, so its latencies, delivery order, tears and
 failures are shrunk with the plan; `blaze-check`'s sampled schedules draw from the tape, so one
 case interleaves threads and crashes a disk; `Sim`'s disk takes the three-layer crash model (a
 write durable only through a sync, a directory entry only through its directory's), with

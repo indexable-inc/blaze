@@ -667,7 +667,7 @@ One property over the revision tests' two drivers: after any sequence of edits, 
 restarts and kills, what an incremental build gives is what a clean build of the same sources
 gives, the work is bounded by what the step changed, and nothing panicked, was contained or was
 recomputed for no recorded reason. The sequences are drawn, not listed
-(`crates/blaze-engine/tests/revisions/generate.rs`): Hegel draws a workspace (the package `app`,
+(`crates/blaze-engine/tests/revisions/generate.rs`): a blaze-sim tape draws a workspace (the package `app`,
 a `#![no_std]` library with a struct, a trait with a provided method and two impls, a call
 through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
 `main.rs`; and, each drawn, `up` with a generic `app` instantiates, `mid`, a library built over
@@ -689,7 +689,7 @@ turn that changes nothing or only comments and layout; the one function for a bo
     BLAZE_ORACLE_CASES=200 cargo +nightly-<date> test --release -p blaze-engine --test revisions -- --ignored oracle::any_turn_sequence --nocapture
 
 - **Simulated** (`any_turn_sequence_builds_as_clean` in `v2/edits/revisions.rs`): the library
-  alone, 40 sequences in about 45 s in the suite, `HEGEL_TEST_CASES=<n>` for more. A stop or a
+  alone, 40 sequences in about 45 s in the suite, `BLAZE_SIM_SEEDS=<n>` for more. A stop or a
   kill is a new database and memo over the kept store; a second checkout is a second database
   over the same store; an interrupted build is a build whose records are dropped. Its control
   plants a stale store entry (`the_oracle_catches_a_stale_store_entry`).
@@ -715,7 +715,7 @@ does not tear on `kill -9`, and the simulation has no daemon. The store's and th
 simulation tests hold that below the daemon (`blaze-query/src/tests/restore.rs`,
 `blaze-cargo/src/serve/tests.rs`).
 
-A failure prints the sequence, Hegel shrinks it, and each failing sequence is written as a case
+A failure prints the sequence, blaze-sim shrinks it to its least tape, and each failing sequence is written as a case
 directory under `BLAZE_ORACLE_OUT` (the last written is the smallest). To keep it: move the
 directory into `cases/` under a name that says the property, list it in `sim!` or `real!`, and
 give the failing check a `known` row naming its cause until it is fixed.
