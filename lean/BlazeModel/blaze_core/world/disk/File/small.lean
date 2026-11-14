@@ -15,8 +15,8 @@ def blaze_core.world.disk.File.small.loop_0 (fuel : Nat) (self : blaze_core.worl
   | 0 => Result.div
   | fuel + 1 =>
     if Scalar.lt i (Slice.len self.changes) then do
-      let t24 ← Slice.index self.changes i
-      match t24.change with
+      let t28 ← Slice.index self.changes i
+      match t28.change with
       | blaze_core.world.disk.Change.Append v0 =>
         let more := v0
         let fits := Scalar.le (Slice.len more) (1099511627776 : Usize)
@@ -26,18 +26,18 @@ def blaze_core.world.disk.File.small.loop_0 (fuel : Nat) (self : blaze_core.worl
           blaze_core.world.disk.File.small.loop_0 fuel self i
       | blaze_core.world.disk.Change.At v1 v2 =>
         let «at» := v1
-        let more_31 := v2
-        let t32 := Scalar.le «at» (1099511627776 : Usize)
-        let fits := if t32 then Scalar.le (Slice.len more_31) (1099511627776 : Usize) else t32
+        let more_35 := v2
+        let t36 := Scalar.le «at» (1099511627776 : Usize)
+        let fits := if t36 then Scalar.le (Slice.len more_35) (1099511627776 : Usize) else t36
         if !fits then Result.ok false
         else do
           let i ← Scalar.add i (1 : Usize)
           blaze_core.world.disk.File.small.loop_0 fuel self i
       | blaze_core.world.disk.Change.Sectors v3 v4 =>
         let «at» := v3
-        let more_31 := v4
-        let t32 := Scalar.le «at» (1099511627776 : Usize)
-        let fits := if t32 then Scalar.le (Slice.len more_31) (1099511627776 : Usize) else t32
+        let more_35 := v4
+        let t36 := Scalar.le «at» (1099511627776 : Usize)
+        let fits := if t36 then Scalar.le (Slice.len more_35) (1099511627776 : Usize) else t36
         if !fits then Result.ok false
         else do
           let i ← Scalar.add i (1 : Usize)
@@ -52,8 +52,9 @@ def blaze_core.world.disk.File.small.loop_0 (fuel : Nat) (self : blaze_core.worl
     else Result.ok true
 
 def blaze_core.world.disk.File.small (fuel : Nat) (self : blaze_core.world.disk.File) : Result Bool :=
-  let t4 := Scalar.gt (Slice.len self.durable) (1099511627776 : Usize)
-  let t3 := if t4 then t4 else Scalar.gt (Slice.len self.changes) (65536 : Usize)
+  let t5 := Scalar.gt (Slice.len self.durable) (1099511627776 : Usize)
+  let t4 := if t5 then t5 else Scalar.gt (Slice.len self.changes) (65536 : Usize)
+  let t3 := if t4 then t4 else Scalar.gt (Slice.len self.barriers) (65536 : Usize)
   if t3 then Result.ok false
   else
     let i := (0 : Usize)
