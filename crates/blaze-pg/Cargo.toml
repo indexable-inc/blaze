@@ -1,0 +1,25 @@
+[package]
+name = "blaze-pg"
+description = "blaze's Postgres client core: the frontend/backend protocol 3.0 as a sans-IO state machine (bytes and time in; bytes to send, events and the next deadline out), with SCRAM-SHA-256, the extended query protocol in binary format, and the server's parameter and row descriptions compared with the caller's"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+base64.workspace = true
+blaze-sha256.workspace = true
+blaze-sql.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
