@@ -1,0 +1,14 @@
+{
+ "id": "dst-1113-15",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, dst-1113; the cause read out of the code by a Claude Opus 5.5 lane",
+ "where": "crates/blaze-lints: `blaze/test_code.rs` (`is_test_code`, `is_test_def`), `blaze/env_read.rs`, `blaze/goose_fields.rs`; seen with `blaze check -p blaze-sim --all-targets` on blaze-vm, blaze built from dd5e84a0ae, e1f6f24432 and 78c4ba8c7e",
+ "what": "An `#[expect(blaze::<lint>, reason = \"..\")]` on production code silences the finding and is then reported `warning: this lint expectation is unfulfilled`, for `blaze::write_only_field`, `constant_argument`, `parallel_collections`, `env_read` and `untyped_index`. Three runs on crates/blaze-sim: expectation present, no finding and an unfulfilled warning; expectation deleted, the finding is back. So the crate cannot reach zero findings for these lints by an expectation.",
+ "cost": "two extra rounds on blaze-sim (I deleted expectations that were doing their job), and four warnings left in a crate that is otherwise clean",
+ "cause": "`--all-targets` lints a library twice, plain and built with `--test`. In the test build the crate's `target_kind` is `Test` (its `manifest_kind` stays `Lib`), and lints that ask `target_kind` whether code is test code take the whole library for test code and judge nothing in it; the engine still records every `#[expect]` there and reports it unfulfilled. `untyped_index` differs: its facts fold every body of the crate (`goose_fields`), test bodies included in the test build, so its verdict on a production field differs between the two builds (read from the code, the changed fact not identified).",
+ "whys": "what code is (production or test) was answered from how the crate is being built; each lint asked for itself (27 files through `is_test_code`, four more directly); nothing states that a production item's verdict must be the same in both builds, so no test compares them; findings repeated across the two builds print once, which hid that most lints already ran twice and these did not",
+ "class": "a lint whose verdict on production code depends on whether the crate's tests are compiled in",
+ "prevention": "one home for the question (`test_code::target_of`, by the manifest target) and whole-crate folds that leave test bodies out of production facts; then the property as a test over the lints' fixtures: the findings on code outside `#[cfg(test)]` are equal in the plain build and the test build. The first part is written on branch lints-both-builds-1114 (four lints, with a test each); the fold for `untyped_index` and the property test are not.",
+ "workaround": "none in user code; blaze-sim keeps the true expectations and carries the unfulfilled warnings until the engine fix lands",
+ "state": "open"
+}
