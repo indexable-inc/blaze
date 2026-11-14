@@ -351,6 +351,10 @@ pub(crate) fn report_here(verdict: &Verdict, at: &Location<'_>) -> String {
     blaze::error_debug,
     reason = "a setting that is not Unicode has no `Display`: `Debug`'s escaped form is the one that shows its bytes as they are"
 )]
+#[expect(
+    blaze::env_read,
+    reason = "the driver is the entry point: the three settings are read here once, as a `Given`, and handed to `check_given`"
+)]
 fn given_by_the_person() -> Given {
     let read = |setting: &'static str| match std::env::var(setting) {
         Ok(value) => Some(value),

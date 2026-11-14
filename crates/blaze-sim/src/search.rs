@@ -267,7 +267,8 @@ pub enum Origin {
     Overran,
 }
 
-/// Which part of a search a case belongs to.
+/// Which part of a search a case belongs to: the tests' view of the order of a search's stages.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Given,
@@ -278,6 +279,9 @@ pub enum Phase {
 
 /// The case to run next.
 pub struct Proposal<'s> {
+    /// The part of the search this case belongs to: the tests' view of the order of a search's
+    /// stages, read by nothing else, so it exists only in test builds.
+    #[cfg(test)]
     pub phase: Phase,
     pub prefix: &'s [u64],
     pub tail: Tail,
@@ -509,11 +513,17 @@ impl Search {
                     .tape
                     .as_deref()
                     .expect("a search of a given tape holds the tape");
-                Next::Run(Proposal { phase: Phase::Given, prefix, tail: Tail::Calm })
+                Next::Run(Proposal {
+                    #[cfg(test)]
+                    phase: Phase::Given,
+                    prefix,
+                    tail: Tail::Calm,
+                })
             }
             Stage::Generate => {
                 let seed = self.seed_of(self.ran);
                 Next::Run(Proposal {
+                    #[cfg(test)]
                     phase: Phase::Generate,
                     prefix: &[],
                     tail: Tail::Seeded(SplitMix64::new(seed)),
@@ -534,11 +544,19 @@ impl Search {
                 };
                 #[cfg(not(test))]
                 let tail = Tail::Calm;
-                Next::Run(Proposal { phase: Phase::Shrink, prefix: shrinker.candidate(), tail })
+                Next::Run(Proposal {
+                    #[cfg(test)]
+                    phase: Phase::Shrink,
+                    prefix: shrinker.candidate(),
+                    tail,
+                })
             }
-            Stage::Final => {
-                Next::Run(Proposal { phase: Phase::Final, prefix: &self.least, tail: Tail::Calm })
-            }
+            Stage::Final => Next::Run(Proposal {
+                #[cfg(test)]
+                phase: Phase::Final,
+                prefix: &self.least,
+                tail: Tail::Calm,
+            }),
             Stage::Done => {
                 Next::Done(self.verdict.as_ref().expect("a done search holds its verdict"))
             }

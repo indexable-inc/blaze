@@ -33,6 +33,8 @@ pub fn print(values: &[u64]) -> String {
 
 /// `print`, writing a run of zeros as `0*n` from `least_run` zeros on. `print` is 2; a control
 /// passes 1, the planted bug its test catches.
+#[blaze::pure]
+#[blaze::nonblocking]
 pub(crate) fn print_runs(values: &[u64], least_run: usize) -> String {
     let kept = values.iter().rposition(|&value| value != 0).map_or(0, |last| last + 1);
     let values = &values[..kept];

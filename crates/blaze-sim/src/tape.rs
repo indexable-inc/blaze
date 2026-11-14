@@ -315,6 +315,10 @@ impl Tape {
     /// label.
     #[blaze::pure]
     #[blaze::nonblocking]
+    #[expect(
+        blaze::constant_argument,
+        reason = "the general constructor of a recorded tape: tests build recorded seeded tapes with it (`Tail::Seeded`), and the driver gives each case its tail through `reset`, so the crate's own non-test callers all pass `Tail::Calm`"
+    )]
     pub fn new(prefix: &[u64], tail: Tail, most_choices: u32) -> Tape {
         Tape::make(prefix, tail, most_choices, Recording::Kept)
     }
@@ -561,6 +565,10 @@ impl Tape {
 
     /// `body`'s draws as one span. The lock is held only to note the start and the end, never
     /// while `body` runs; a span `body` leaves by a panic stays open until `finish` closes it.
+    #[expect(
+        blaze::parallel_collections,
+        reason = "`open` is not kept the length of `spans`: it is the stack of the spans still open, each an index into `spans`, pushed as a span opens and popped as it closes"
+    )]
     pub fn span<R>(&self, label: &'static str, body: impl FnOnce(&Tape) -> R) -> R {
         if self.recording == Recording::Skipped {
             return body(self);
