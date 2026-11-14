@@ -40,6 +40,8 @@ pub enum Atom {
     Resolves,
     DefPath,
     TypeOf,
+    /// A type with every leading `&` and `&mut` stripped.
+    PeelRefs,
     TypeMatches(TypePattern),
     /// The trait's def path, as written.
     Implements(String),
@@ -78,6 +80,7 @@ fn shape(head: &str) -> Option<(Atom, usize, Needs)> {
         "resolves" => (Atom::Resolves, 2, all0),
         "def-path" => (Atom::DefPath, 2, Needs::Any(&[0, 1])),
         "type-of" => (Atom::TypeOf, 2, all0),
+        "peel-refs" => (Atom::PeelRefs, 2, all0),
         "callee" => (Atom::Callee, 2, all0),
         "enclosing-fn" => (Atom::Enclosing(Enclosing::Fn), 2, all0),
         "enclosing-impl" => (Atom::Enclosing(Enclosing::Impl), 2, all0),

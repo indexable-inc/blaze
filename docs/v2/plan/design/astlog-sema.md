@@ -25,6 +25,26 @@ A refactor written once, run by a person or an agent:
 (lint fixable warning "unwrap in a Result fn: `$recv`")
 ```
 
+And one over the type behind any references, by the names the std prelude gives:
+
+```lisp
+;; `x.len() == 0` on a Vec or a String, through any `&`, as `x.is_empty()`
+(rule (empty-test e x)
+  (expr e "$x.len() == 0")
+  (type-of x t)
+  (peel-refs t u)
+  (type-matches u "Vec<_>"))
+(rule (empty-test e x)
+  (expr e "$x.len() == 0")
+  (type-of x t)
+  (peel-refs t u)
+  (type-matches u "String"))
+
+(rewrite is-empty (empty-test e x)
+  (not (in-macro-expansion e))
+  (replace e "$x.is_empty()"))
+```
+
 - **One language.** astlog's reader, program checker and evaluator move into `tools/astlog/engine`
   (crate `astlog-engine`), generic over a fact source. The tree-sitter source stays in
   `tools/astlog/core` (crate `astlog-core`, its tests and the `astlog` CLI unchanged). The blaze
@@ -92,6 +112,7 @@ argument.
 | `(def-path d p)` | `d` or `p` | the def path from the crate name; or the def at that path, a module included |
 | `(type-of n t)` | `n` | the type of an expression or a pattern |
 | `(type-matches t "pat")` | `t` | holds when the type matches; `$name` in the pattern binds a type argument |
+| `(peel-refs t u)` | `t` | `t` with every leading `&` and `&mut` stripped, or `t` itself |
 | `(implements t "krate::Trait")` | `t` | holds when the type implements the trait |
 | `(callee n d)` | `n` | the fn a call or method call runs, through trait dispatch where the front end knows the impl |
 | `(enclosing-fn n d)`, `(enclosing-impl n d)`, `(enclosing-module n d)` | `n` | the innermost such item |
@@ -109,6 +130,22 @@ args...))` binds `c` to the number of distinct rows of a lower-stratum relation 
 bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
 `(not (atom ...))` negates a source atom as well as a relation: every variable bound to its left,
 it needs no stratum, and it is how a rule excludes macro-made matches.
+
+## Type patterns
+
+A `type-matches` pattern is `_` (any type), `$name` (any type, bound; one name used twice binds
+equal types), a def path from a crate's name with generic arguments on its last segment
+(`std::vec::Vec<$a>`, `lib::Pair<$a, $a>`), a single name with or without arguments
+(`Vec<$a>`, `u32`, `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, `[T]` or `[T; N]`. Arguments
+match the type's first type arguments, so `Vec<$a>` is `Vec<T, A>` for any allocator; one left
+out matches anything. A single name is resolved first. A builtin type's name (`u32`, `str`)
+is that type. A name the std prelude of a view crate gives (`Vec`, `String`, `Option`,
+`Result`, `Box`) is that item, looked up in the prelude module itself, so a crate's own
+`struct Vec<T>` does not match `Vec<$a>`; write `mycrate::Vec<$a>` for that one. Any other
+single name matches an ADT of that name by text, with its arguments. A form the matcher does
+not read is a load error that says what to write instead: `impl Trait` and `dyn Trait` point
+at `(implements t ...)`, a raw or fn pointer at `$t`, a path from `crate::` at the crate's
+name.
 
 ## The evaluator
 
@@ -141,7 +178,8 @@ cycle. The old naive evaluator stays as the reference model for a property test 
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
 - Rules across checkouts: the target is the daemon's view of one workspace.
-- Prelude resolution of single-segment pattern names; they match by text.
+- Prelude resolution of single-segment names in code patterns; they match by text. Type
+  patterns resolve them (see Type patterns).
 - A `use` added for a template path `find_path` can only spell through an import; it is written
   as `find_path` spells it.
 - Precedence outside expressions. A metavariable spliced as a type (`&dyn A + B`), a pattern

@@ -74,6 +74,8 @@ pub struct Sema<'a, F: Files> {
     def_ids: RefCell<HashMap<Def, u32, Global>>,
     types: RefCell<Vec<Type<'a>>>,
     paths: RefCell<HashMap<String, Vec<ModuleDef>, Global>>,
+    /// What the view crates' std preludes name by each single name a type pattern asked for.
+    prelude: RefCell<HashMap<String, Vec<ModuleDef>, Global>>,
 }
 
 type Res<T> = Result<T, Error>;
@@ -110,6 +112,7 @@ impl<'a, F: Files> Sema<'a, F> {
             def_ids: RefCell::new(HashMap::new_in(Global)),
             types: RefCell::new(Vec::new()),
             paths: RefCell::new(HashMap::new_in(Global)),
+            prelude: RefCell::new(HashMap::new_in(Global)),
             view,
         };
         let mut seen: Vec<FileId> = Vec::new(); // alloc: the view's files, once a run
@@ -303,6 +306,31 @@ impl<'a, F: Files> Sema<'a, F> {
         Some(module)
     }
 
+    /// The types the std prelude of a view crate names `name`: looked up in the prelude module
+    /// itself, so a crate's own item of that name (`struct Vec<T>`) is never one of them.
+    fn prelude_items(&self, name: &str) -> Vec<ModuleDef> {
+        if let Some(seen) = self.prelude.borrow().get(name) {
+            return seen.clone(); // clone: a def or two
+        }
+        let db = self.db;
+        let mut found: Vec<ModuleDef> = Vec::new(); // alloc: a def or two, once a name
+        for krate in &self.view {
+            let root = hir_def::ModuleId::from(krate.root_module(db));
+            let Some((prelude, _)) = root.prelude(db) else { continue };
+            let prelude = hir::Module::from(prelude);
+            let items = prelude.resolve_mod_path(db, [hir::Name::new_root(name)]);
+            for item in items.into_iter().flatten() {
+                let def = item.into_module_def();
+                if matches!(def, ModuleDef::Adt(_)) && !found.contains(&def) {
+                    found.push(def);
+                }
+            }
+        }
+        // clone: a def or two, once a name
+        self.prelude.borrow_mut().insert(name.to_owned(), found.clone());
+        found
+    }
+
     fn assoc_items(&self, owner: ModuleDef) -> Vec<ModuleDef> {
         let db = self.db;
         let items: Vec<AssocItem> = match owner {
@@ -478,7 +506,8 @@ impl<'a, F: Files> Sema<'a, F> {
         out: &mut Vec<Option<Node>>,
     ) -> Res<bool> {
         let db = self.db;
-        let Some(shape) = pattern.shape(node) else { return Ok(false) };
+        // `TypePattern::parse` refused every pattern with a node `shape` refuses.
+        let Ok(shape) = pattern.shape(node) else { return Ok(false) };
         Ok(match shape {
             TypeShape::Wild => true,
             TypeShape::Var(var) => {
@@ -498,29 +527,21 @@ impl<'a, F: Files> Sema<'a, F> {
                     ModuleDef::BuiltinType(it) => ty.as_builtin() == Some(*it),
                     _ => false,
                 });
-                if !is {
-                    return Ok(false);
-                }
-                let have: Vec<Type<'a>> = ty.type_arguments().collect();
-                if args.len() > have.len() {
-                    return Ok(false);
-                }
-                for (arg, have) in args.into_iter().zip(have) {
-                    if !self.type_matches(pattern, arg, have, out)? {
-                        return Ok(false);
-                    }
-                }
-                true
+                is && self.arguments_match(pattern, args, ty, out)?
             }
-            TypeShape::Name(name) => {
-                if let Some(builtin) = ty.as_builtin() {
-                    builtin.name().as_str() == name
-                } else if let Some(adt) = ty.as_adt() {
-                    adt.name(db).as_str() == name
-                } else {
-                    self.display(ty) == name
-                }
+            TypeShape::Builtin(name) => ty.as_builtin().is_some_and(|it| it.name().as_str() == name),
+            TypeShape::Named { name, args } => {
+                let prelude = self.prelude_items(name);
+                let is = match prelude.is_empty() {
+                    false => prelude.iter().any(|def| matches!(def, ModuleDef::Adt(adt) if ty.as_adt() == Some(*adt))),
+                    true => match ty.as_adt() {
+                        Some(adt) => adt.name(db).as_str() == name,
+                        None => args.is_empty() && self.display(ty) == name,
+                    },
+                };
+                is && self.arguments_match(pattern, args, ty, out)?
             }
+            TypeShape::Never => ty.is_never(),
             TypeShape::Ref { mutable, inner } => match ty.as_reference() {
                 Some((pointee, mutability)) if mutability.is_mut() == mutable => {
                     self.type_matches(pattern, inner, pointee, out)?
@@ -548,6 +569,27 @@ impl<'a, F: Files> Sema<'a, F> {
                 None => false,
             },
         })
+    }
+
+    /// Whether the pattern's generic arguments `args` match `ty`'s first type arguments: one
+    /// left out matches any (`Vec<$a>` is `Vec<T, A>` with any allocator `A`).
+    fn arguments_match(
+        &self,
+        pattern: &TypePattern,
+        args: Vec<ast::Node<'_>>,
+        ty: Type<'a>,
+        out: &mut Vec<Option<Node>>,
+    ) -> Res<bool> {
+        let have: Vec<Type<'a>> = ty.type_arguments().collect(); // alloc: a type's few arguments
+        if args.len() > have.len() {
+            return Ok(false);
+        }
+        for (arg, have) in args.into_iter().zip(have) {
+            if !self.type_matches(pattern, arg, have, out)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Whether any attribute of `item` is `name` (its path's first segment). Read from the
@@ -867,6 +909,21 @@ impl<'a, F: Files> Facts for Sema<'a, F> {
                 if let Some(ty) = ty {
                     out.push(vec![node(self.syn(at)), node(self.ty(ty))]);
                 }
+            }
+            Atom::PeelRefs => {
+                let wrong = |what: &'static str| -> Error {
+                    WrongValueSnafu { line, name: "peel-refs", needs: "a type", arg: "its first argument", what }
+                        .build()
+                        .into()
+                };
+                let Some(Value::Node(at)) = inputs[0] else {
+                    return Err(wrong(inputs[0].as_ref().map_or("unbound", Value::what)));
+                };
+                let Some(mut ty) = self.ty_at(at) else { return Err(wrong("a syntax node or a def")) };
+                while let Some((pointee, _)) = ty.as_reference() {
+                    ty = pointee;
+                }
+                out.push(vec![node(at), node(self.ty(ty))]);
             }
             Atom::TypeMatches(pattern) => {
                 let Some(Value::Node(at)) = inputs[0] else {

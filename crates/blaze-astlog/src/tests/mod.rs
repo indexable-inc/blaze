@@ -1,9 +1,11 @@
 //! Rules against a real front end: fixtures lowered by `hir_expand::fixture`, the view's files
 //! given as blaze-intent's [`Files`].
 
+mod examples;
 mod query;
 mod relations;
 mod rewrite;
+mod types;
 
 use base_db::{Db, FileId};
 use blaze_intent::Files;

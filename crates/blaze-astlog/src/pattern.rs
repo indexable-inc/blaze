@@ -197,16 +197,30 @@ fn placeholder(text: &str) -> Option<(&str, bool)> {
 }
 
 /// The segments of a path written from a crate's name, or `None` for a path that is not one.
+/// Only the segments' names make the def path: the last segment's generic arguments are
+/// matched apart, by structure, and may hold metavariables (`std::vec::Vec<$a>`). A
+/// metavariable as a segment's name, or generic arguments before the last segment
+/// (`Vec::<$t>::new`), make the path one matched by structure.
 fn def_path(path: ast::Node<'_>) -> Option<String> {
-    let text = path.text();
-    if placeholder_in(text) || text.starts_with('<') {
+    if path.text().starts_with('<') {
         return None;
     }
     let mut segments = Vec::new(); // alloc: a pattern path's few segments, once a load
-    for segment in path.descendants().filter(|it| it.kind() == SyntaxKind::PATH_SEGMENT) {
+    let mut at = Some(path);
+    while let Some(node) = at {
+        let segment = node.children().find(|it| it.kind() == SyntaxKind::PATH_SEGMENT)?;
+        let last = segments.is_empty();
+        if !last && segment.children().any(|it| it.kind() == SyntaxKind::GENERIC_ARG_LIST) {
+            return None;
+        }
         let name = segment.children().find(|it| it.kind() == SyntaxKind::NAME_REF)?;
+        if placeholder_in(name.text()) {
+            return None;
+        }
         segments.push(name.text());
+        at = node.children().find(|it| it.kind() == SyntaxKind::PATH);
     }
+    segments.reverse();
     if segments.len() < 2 || matches!(segments[0], "crate" | "self" | "super" | "Self") {
         return None;
     }
@@ -257,43 +271,45 @@ impl Pattern {
         let mut marks = HashMap::new_in(Global);
         let mut paths: Vec<String> = Vec::new();
         let mut literal: Option<&str> = None;
-        let mut walk = root.preorder_with_tokens();
-        while let Some(event) = walk.next() {
-            let WalkEvent::Enter(element) = event else { continue };
-            match element {
-                syntax::NodeOrToken::Node(node) => {
-                    if let Some((name, _)) = placeholder(node.text()) {
-                        let index = vars.iter().position(|it| it.name == name).ok_or_else(|| {
-                            shape(format!("`{name}` is a metavariable the rewrite lost"))
-                        })?;
-                        marks.insert(node.id(), Mark::Var(index));
-                        walk.skip_subtree();
-                    } else if matches!(
-                        node.kind(),
-                        SyntaxKind::UNDERSCORE_EXPR | SyntaxKind::INFER_TYPE | SyntaxKind::WILDCARD_PAT
-                    ) {
-                        marks.insert(node.id(), Mark::Wild);
-                        walk.skip_subtree();
-                    } else if node.kind() == SyntaxKind::PATH
-                        && node.parent().is_none_or(|it| it.kind() != SyntaxKind::PATH)
-                        && let Some(path) = def_path(node)
-                    {
-                        marks.insert(node.id(), Mark::DefPath(paths.len()));
-                        paths.push(path);
-                        // The last segment's generic arguments still match by structure.
-                        walk.skip_subtree();
-                        if let Some(args) = last_generic_args(node) {
-                            note_literals(args, &mut literal);
+        // The pattern, then each def path's last generic arguments, which match by structure
+        // and so hold metavariables, wildcards and def paths of their own.
+        let mut starts = vec![root]; // alloc: a pattern's def paths with arguments, once a load
+        while let Some(start) = starts.pop() {
+            let mut walk = start.preorder_with_tokens();
+            while let Some(event) = walk.next() {
+                let WalkEvent::Enter(element) = event else { continue };
+                match element {
+                    syntax::NodeOrToken::Node(node) => {
+                        if let Some((name, _)) = placeholder(node.text()) {
+                            let index = vars.iter().position(|it| it.name == name).ok_or_else(|| {
+                                shape(format!("`{name}` is a metavariable the rewrite lost"))
+                            })?;
+                            marks.insert(node.id(), Mark::Var(index));
+                            walk.skip_subtree();
+                        } else if matches!(
+                            node.kind(),
+                            SyntaxKind::UNDERSCORE_EXPR | SyntaxKind::INFER_TYPE | SyntaxKind::WILDCARD_PAT
+                        ) {
+                            marks.insert(node.id(), Mark::Wild);
+                            walk.skip_subtree();
+                        } else if node.kind() == SyntaxKind::PATH
+                            && node.parent().is_none_or(|it| it.kind() != SyntaxKind::PATH)
+                            && let Some(path) = def_path(node)
+                        {
+                            marks.insert(node.id(), Mark::DefPath(paths.len()));
+                            paths.push(path);
+                            walk.skip_subtree();
+                            starts.extend(last_generic_args(node));
                         }
                     }
-                }
-                syntax::NodeOrToken::Token(token) => {
-                    if matches!(
-                        token.kind(),
-                        SyntaxKind::IDENT | SyntaxKind::INT_NUMBER | SyntaxKind::STRING
-                    ) && placeholder(token.text()).is_none()
-                    {
-                        keep_longest(&mut literal, token.text());
+                    syntax::NodeOrToken::Token(token) => {
+                        if matches!(
+                            token.kind(),
+                            SyntaxKind::IDENT | SyntaxKind::INT_NUMBER | SyntaxKind::STRING
+                        ) && placeholder(token.text()).is_none()
+                        {
+                            keep_longest(&mut literal, token.text());
+                        }
                     }
                 }
             }
@@ -347,14 +363,6 @@ impl Pattern {
 fn keep_longest<'a>(literal: &mut Option<&'a str>, text: &'a str) {
     if literal.is_none_or(|it| text.len() > it.len()) {
         *literal = Some(text);
-    }
-}
-
-fn note_literals<'a>(node: ast::Node<'a>, literal: &mut Option<&'a str>) {
-    for token in node.descendants_with_tokens().filter_map(syntax::NodeOrToken::into_token) {
-        if token.kind() == SyntaxKind::IDENT && placeholder(token.text()).is_none() {
-            keep_longest(literal, token.text());
-        }
     }
 }
 
@@ -468,8 +476,10 @@ impl<'t> Cx<'_, '_, 't> {
 }
 
 /// A type pattern for `type-matches`: `_`, `$name`, a def path with generic arguments
-/// (`core::result::Result<_, $e>`), a builtin or other single name (by text), `&T`, `&mut T`,
-/// a tuple, a slice or an array.
+/// (`core::result::Result<_, $e>`), a single name with or without them (`Vec<$a>`, `u32`,
+/// `Bag`), `&T`, `&mut T`, `(T)`, `!`, a tuple, a slice or an array. A single name the std
+/// prelude names is that item, resolved; a builtin type's name is that type; any other single
+/// name matches a type of that name, by text.
 pub struct TypePattern {
     pub text: String,
     pub line: usize,
@@ -491,7 +501,12 @@ pub enum TypeShape<'p> {
     Var(usize),
     /// The `n`th def path, and the pattern's generic arguments of its last segment.
     Def(usize, Vec<ast::Node<'p>>),
-    Name(&'p str),
+    /// A builtin type by its name (`u32`, `str`).
+    Builtin(&'p str),
+    /// Any other single name and its generic arguments: what the std prelude names by it,
+    /// or else a type of that name.
+    Named { name: &'p str, args: Vec<ast::Node<'p>> },
+    Never,
     Ref { mutable: bool, inner: ast::Node<'p> },
     Tuple(Vec<ast::Node<'p>>),
     Slice(ast::Node<'p>),
@@ -525,24 +540,17 @@ impl TypePattern {
         let mut stack = vec![type_pattern.root()];
         while let Some(node) = stack.pop() {
             match type_pattern.shape(node) {
-                Some(TypeShape::Def(_, args) | TypeShape::Tuple(args)) => stack.extend(args),
-                Some(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner)) => {
+                Ok(TypeShape::Def(_, args) | TypeShape::Named { args, .. } | TypeShape::Tuple(args)) => {
+                    stack.extend(args);
+                }
+                Ok(TypeShape::Ref { inner, .. } | TypeShape::Slice(inner) | TypeShape::Array(inner)) => {
                     stack.push(inner);
                 }
-                Some(TypeShape::Wild | TypeShape::Var(_) | TypeShape::Name(_)) => {}
-                None => {
-                    return PatternShapeSnafu {
-                        line,
-                        form: "type",
-                        text,
-                        message: format!(
-                            "`{}` is a {:?}, which `type-matches` does not read",
-                            node.text(),
-                            node.kind()
-                        ),
-                    }
-                    .fail()
-                    .map_err(Error::from);
+                Ok(TypeShape::Wild | TypeShape::Var(_) | TypeShape::Builtin(_) | TypeShape::Never) => {}
+                Err(message) => {
+                    return PatternShapeSnafu { line, form: "type", text, message }
+                        .fail()
+                        .map_err(Error::from);
                 }
             }
         }
@@ -553,41 +561,133 @@ impl TypePattern {
         node_at(self.parse.root(), self.root)
     }
 
-    /// What a node of this pattern asks of a type.
-    pub fn shape<'p>(&'p self, node: ast::Node<'p>) -> Option<TypeShape<'p>> {
+    /// What a node of this pattern asks of a type. [`TypePattern::parse`] refuses every
+    /// pattern with a node this refuses.
+    ///
+    /// # Errors
+    ///
+    /// What to write instead of `node`, a form the matcher does not read.
+    pub fn shape<'p>(&'p self, node: ast::Node<'p>) -> Result<TypeShape<'p>, String> {
         let text = node.text();
         if let Some((name, _)) = placeholder(text) {
-            return self.vars.iter().position(|it| it == name).map(TypeShape::Var);
+            return self.vars.iter().position(|it| it == name).map(TypeShape::Var).ok_or_else(|| {
+                // alloc: an error, once a load
+                format!("`${name}` is a metavariable the pattern's parse lost: write it as `$name`")
+            });
         }
+        let readable = "write `_`, `$name`, a def path such as `std::vec::Vec<$a>`, a single name \
+                        such as `Vec<$a>` or `u32`, `&T`, `&mut T`, `!`, a tuple, a slice or an array";
+        // alloc: each refusal below is an error, once a load
         match node.kind() {
-            SyntaxKind::INFER_TYPE => Some(TypeShape::Wild),
-            SyntaxKind::PATH_TYPE => {
-                let path = node.children().find(|it| it.kind() == SyntaxKind::PATH)?;
-                let args: Vec<ast::Node<'p>> = last_generic_args(path)
-                    .map(|list| {
-                        list.children()
-                            .filter(|it| it.kind() == SyntaxKind::TYPE_ARG)
-                            .filter_map(|it| it.children().next())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                match def_path(path) {
-                    Some(written) => {
-                        let index = self.paths.iter().position(|it| *it == written)?;
-                        Some(TypeShape::Def(index, args))
-                    }
-                    None if args.is_empty() && !text.contains("::") => Some(TypeShape::Name(text)),
-                    None => None,
-                }
-            }
-            SyntaxKind::REF_TYPE => Some(TypeShape::Ref {
-                mutable: node.child_token(SyntaxKind::MUT_KW).is_some(),
-                inner: node.children().last()?,
-            }),
-            SyntaxKind::TUPLE_TYPE => Some(TypeShape::Tuple(node.children().collect())),
-            SyntaxKind::SLICE_TYPE => Some(TypeShape::Slice(node.children().next()?)),
-            SyntaxKind::ARRAY_TYPE => Some(TypeShape::Array(node.children().next()?)),
-            _ => None,
+            SyntaxKind::INFER_TYPE => Ok(TypeShape::Wild),
+            SyntaxKind::NEVER_TYPE => Ok(TypeShape::Never),
+            SyntaxKind::PAREN_TYPE => match node.children().next() {
+                Some(inner) => self.shape(inner),
+                None => Err(format!("`{text}` holds no type: {readable}")),
+            },
+            SyntaxKind::PATH_TYPE => self.path_shape(node),
+            SyntaxKind::REF_TYPE => match node.children().last() {
+                Some(inner) => Ok(TypeShape::Ref {
+                    mutable: node.child_token(SyntaxKind::MUT_KW).is_some(),
+                    inner,
+                }),
+                None => Err(format!("`{text}` refers to no type: write `&T` or `&mut T`")),
+            },
+            SyntaxKind::TUPLE_TYPE => Ok(TypeShape::Tuple(node.children().collect())),
+            SyntaxKind::SLICE_TYPE => match node.children().next() {
+                Some(inner) => Ok(TypeShape::Slice(inner)),
+                None => Err(format!("`{text}` has no element type: write `[T]`")),
+            },
+            SyntaxKind::ARRAY_TYPE => match node.children().next() {
+                Some(inner) => Ok(TypeShape::Array(inner)),
+                None => Err(format!("`{text}` has no element type: write `[T; N]`")),
+            },
+            SyntaxKind::IMPL_TRAIT_TYPE | SyntaxKind::DYN_TRAIT_TYPE => Err(format!(
+                "`{text}` names a trait, not one type: match the type with `$t` and add \
+                 `(implements t \"krate::Trait\")`"
+            )),
+            SyntaxKind::PTR_TYPE | SyntaxKind::FN_PTR_TYPE => Err(format!(
+                "`{text}` is a raw pointer or fn pointer type, which `type-matches` does not take \
+                 apart: match it whole with `$t` or `_`"
+            )),
+            _ => Err(format!("`{text}` is no type form `type-matches` reads: {readable}")),
         }
     }
+
+    /// A path type's shape: a def path, a builtin's name, or another single name.
+    fn path_shape<'p>(&'p self, node: ast::Node<'p>) -> Result<TypeShape<'p>, String> {
+        let text = node.text();
+        // alloc: each refusal below is an error, once a load
+        let Some(path) = node.children().find(|it| it.kind() == SyntaxKind::PATH) else {
+            return Err(format!("`{text}` is a path type with no path: write a def path such as `std::vec::Vec<$a>`"));
+        };
+        let args = type_args(path).map_err(|arg| {
+            format!(
+                "`{arg}` in `{text}` is no type argument `type-matches` reads: write a type, `_` or \
+                 `$name` for each type argument, and leave lifetimes and associated types out"
+            )
+        })?;
+        if let Some(written) = def_path(path) {
+            return match self.paths.iter().position(|it| *it == written) {
+                Some(index) => Ok(TypeShape::Def(index, args)),
+                None => Err(format!("`{written}` is a def path the pattern's parse did not record")),
+            };
+        }
+        let qualified = path.children().any(|it| it.kind() == SyntaxKind::PATH);
+        let name = path
+            .children()
+            .find(|it| it.kind() == SyntaxKind::PATH_SEGMENT)
+            .and_then(|it| it.children().find(|it| it.kind() == SyntaxKind::NAME_REF))
+            .map(ast::Node::text);
+        match (qualified, name) {
+            (false, Some(name)) if placeholder_in(name) => Err(format!(
+                "`{text}`: a metavariable stands for a whole type and takes no generic arguments; \
+                 write `$t` alone, or a def path with `$name` among its arguments (`std::vec::Vec<$a>`)"
+            )),
+            (false, Some(name)) if is_builtin(name) => match args.is_empty() {
+                true => Ok(TypeShape::Builtin(name)),
+                false => Err(format!(
+                    "`{text}`: `{name}` is a builtin type and takes no generic arguments; write `{name}`"
+                )),
+            },
+            (false, Some("Self")) => Err(format!(
+                "`{text}`: `Self` names no one type outside an impl; write the type's def path"
+            )),
+            (false, Some(name)) => Ok(TypeShape::Named { name, args }),
+            _ => {
+                let first = path.descendants().find(|it| it.kind() == SyntaxKind::PATH_SEGMENT);
+                Err(match first.map(ast::Node::text) {
+                    Some(first @ ("crate" | "self" | "super" | "Self")) => format!(
+                        "`{text}` starts at `{first}`: write the def path from the crate's name \
+                         (`mycrate::module::Type`), as a crate depending on it would"
+                    ),
+                    _ => format!(
+                        "`{text}` is no def path: write the type's path from its crate's name with \
+                         generic arguments only on the last segment (`std::vec::Vec<$a>`), or a \
+                         single name (`Vec<$a>`)"
+                    ),
+                })
+            }
+        }
+    }
+}
+
+/// Whether `name` is a builtin type's (`u32`, `str`, `bool`).
+fn is_builtin(name: &str) -> bool {
+    hir_def::builtin_type::BuiltinType::all_builtin_types().iter().any(|(it, _)| it.as_str() == name)
+}
+
+/// The type arguments of a path's last segment, or the text of the first generic argument
+/// that is neither a type nor a lifetime (a const, an associated type's binding).
+fn type_args(path: ast::Node<'_>) -> Result<Vec<ast::Node<'_>>, &str> {
+    let Some(list) = last_generic_args(path) else { return Ok(Vec::new()) };
+    let mut args = Vec::new(); // alloc: a pattern path's few arguments, once a match step
+    for arg in list.children() {
+        match arg.kind() {
+            SyntaxKind::TYPE_ARG => args.extend(arg.children().next()),
+            SyntaxKind::LIFETIME_ARG => {}
+            _ => return Err(arg.text()),
+        }
+    }
+    Ok(args)
 }
