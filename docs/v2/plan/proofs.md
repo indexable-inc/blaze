@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-109 theorems: 96 in `lean`, 13 in `lean/analysis`.
+114 theorems: 101 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1050,4 +1050,55 @@ theorem blaze_core.wait.retry.a_stopped_clock_ends_the_wait.spec.proof :
 ```lean
 theorem blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.proof :
     blaze_core.wait.retry.a_wait_ends_by_its_deadline.spec.statement
+```
+
+**`blaze_core.wait.reaping.a_reaped_child_is_reported.spec.proof`** (`BlazeCore.Wait.Reaping`, `lean`): The statement blaze generates from blaze-core's theorem function a_reaped_child_is_reported holds of its model: for a child that runs or has exited with any status, every moment its exit comes relative to the reap's calls (between the first look and the wait, during the wait, or never), the kernel told the exit or the deadline where both come in one wait, and every deadline or none, the real reap against the children's world never fails, reports a child it reaped with the status it exited with and leaves it reaped, and where it ends at its deadline there was one, the child is not reaped and had not exited when the wait began.
+
+```lean
+theorem blaze_core.wait.reaping.a_reaped_child_is_reported.spec.proof :
+    blaze_core.wait.reaping.a_reaped_child_is_reported.spec.statement
+```
+
+## V17
+
+**`Blaze.Threads.two_ends`** (`Blaze.ThreadsAuto`, `lean`): The induction principle for two threads run by a schedule (Blaze.Threads.two): an invariant over the two threads' remaining programs, the shared world and the schedule steps left, which every step of either thread with any pick of the world's keeps, gives, for every schedule, that the run ends and how each thread stood satisfies what the invariant gives with no step left.
+
+```lean
+theorem two_ends {α β : Type} (Inv : Nat → Prog α → Prog β → World → Prop)
+    (first : ∀ n a b w pick, Inv (n + 1) a b w → Advance 1 pick a w (fun a' w' => Inv n a' b w'))
+    (second : ∀ n a b w pick, Inv (n + 1) a b w → Advance 2 pick b w (fun b' w' => Inv n a b' w'))
+    (Post : Ended α → Ended β → World → Prop)
+    (last : ∀ a b w, Inv 0 a b w →
+      ∃ ea eb w', (two [] a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w')
+    (schedule : List Step) (a : Prog α) (b : Prog β) (w : World)
+    (h : Inv schedule.length a b w) :
+    ∃ ea eb w', (two schedule a b).exec w = .ok ((ea, eb), w') ∧ Post ea eb w'
+```
+
+**`Blaze.Tests.ThreadsPark.no_unpark_is_lost`** (`Blaze.Tests.ThreadsParkProof`, `lean`): Of a park and an unpark on one word ordered as crates/blaze-core/src/wait/parking.rs orders their atomics, written by hand as programs over Blaze.Threads (a futex wait and wake, a compare-and-swap, a swap): for every schedule of the two threads and every pick of the world's (spurious returns, timeouts), no run ends with the unpark returned and the park asleep with no wake coming; where both returned the token was taken once and the word is empty, or the park left at its timeout before the token came and it is still there; and a park with no time limit returns only with a token.
+
+```lean
+theorem no_unpark_is_lost (timed : Bool) (schedule : List Step) :
+    ∃ fuel parked unparked last,
+      (run park fuel timed schedule).value = .ok (parked, unparked, last) ∧
+      -- the unpark returned: the park is not asleep with no wake coming
+      (unparked = .Done () → parked ≠ .Asleep) ∧
+      -- both returned: the token was taken once, or the park left at its timeout before it came and it is still there
+      (∀ took, parked = .Done took → unparked = .Done () →
+          (took = true ∧ last.val = EMPTY.val) ∨ (took = false ∧ timed = true ∧ last.val = NOTIFIED.val)) ∧
+      -- a park with no time limit returns only with a token
+      (∀ took, parked = .Done took → timed = false → took = true)
+```
+
+**`blaze_core.wait.parking.no_unpark_is_lost.spec.proof`** (`BlazeCore.Wait.Parking`, `lean`): The statement blaze generates from blaze-core's theorem function no_unpark_is_lost holds of its model, the real park and unpark of wait/parking.rs as programs over shared cells: for every schedule of the two as two threads one atomic operation at a time, every choice of the kernel's (a wait returned for nothing, or told its time ran out where the park has a deadline), every reading of a clock that stands still and every deadline or none, no run ends with the unpark returned and the park asleep with no wake coming; where both returned the park took the token and the word is empty, or it left without it (at its deadline, or because its clock stood still) before the token came and the token is still there; a park says its deadline passed only where it has one; and nothing panics.
+
+```lean
+theorem blaze_core.wait.parking.no_unpark_is_lost.spec.proof :
+    blaze_core.wait.parking.no_unpark_is_lost.spec.statement
+```
+
+**`atomics.two_adds_make_two.spec.proof`** (`BlazeModel.atomics.proved`, `lean`): The statement blaze generates from the fixture's theorem function two_adds_make_two holds of its model, a program over shared cells: two SeqCst fetch_add(1) on a new AtomicU32 and then a load give 2 (the first theorem whose model is a Threads.Prog, by evaluation).
+
+```lean
+theorem atomics.two_adds_make_two.spec.proof : atomics.two_adds_make_two.spec.statement
 ```

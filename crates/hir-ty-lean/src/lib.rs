@@ -83,6 +83,9 @@ pub const LIBRARY: &[(&str, &str)] = &[
     ("Blaze.Auto", include_str!("../../../lean/Blaze/Auto.lean")),
     // The `@[spec]`s of `Blaze.Vec`'s operations, which `Blaze.Auto` must come before.
     ("Blaze.VecAuto", include_str!("../../../lean/Blaze/VecAuto.lean")),
+    // What a proof about two threads is written with: the induction over a schedule and the
+    // world's step on each operation.
+    ("Blaze.ThreadsAuto", include_str!("../../../lean/Blaze/ThreadsAuto.lean")),
 ];
 
 /// A construct v0 does not translate: the function, the construct and where it is. The plan's
@@ -318,6 +321,17 @@ fn emit_in<'db>(
     let theorem = AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM);
     let stated = match (theorem, spec.as_ref()) {
         (false, None) => None,
+        (false, Some(_)) if model.shape.shared => {
+            return Err(NotTranslated {
+                function: body.display.clone(),
+                what: "`requires` or `ensures` clauses on a shared function (its model is a \
+                       `Threads.Prog`, a program of operations on the memory threads share, \
+                       whose result depends on the other threads; state it as a \
+                       `#[blaze::theorem]` over a schedule)"
+                    .to_owned(),
+                at: format!("fn {}", body.display),
+            });
+        }
         (false, Some(spec)) => Some(Stated::Clauses(spec)),
         (true, None) => {
             theorem_shape(body, &model)?;
@@ -396,6 +410,7 @@ pub(crate) fn rust_ty(ty: &body::Ty) -> String {
         Ty::Ordering => "core::cmp::Ordering".to_owned(),
         Ty::Str => "str".to_owned(),
         Ty::Opaque(opaque) => opaque.rust().to_owned(),
+        Ty::Shared(shared) => shared.rust(),
     }
 }
 
@@ -410,9 +425,12 @@ fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
     }
     args.extend(model.params.iter().map(|it| name(it.name.clone())));
     let call = app(function, args);
-    let holds = match model.shape.monadic {
-        true => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
-        false => infix(Infix::Eq, call, atom("true")),
+    // A shared function's model is a program of operations on the memory threads share: it is
+    // run alone, from an empty memory (`Threads.Prog.value`), and gives `true`.
+    let holds = match (model.shape.shared, model.shape.monadic) {
+        (true, _) => infix(Infix::Eq, Term::Proj(Box::new(call), "value".to_owned()), app("Result.ok", vec![atom("true")])),
+        (false, true) => infix(Infix::Eq, call, app("Result.ok", vec![atom("true")])),
+        (false, false) => infix(Infix::Eq, call, atom("true")),
     };
     let holds = match model.shape.fuel {
         true => Term::Exists(
@@ -449,7 +467,7 @@ pub fn type_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -488,7 +506,7 @@ pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+        shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
         imports: Vec::new(),
     }
 }
@@ -550,7 +568,7 @@ pub fn opaque_module(opaque: &body::OpaqueFn) -> Emitted {
         text,
         statement: None,
         clauses: Vec::new(),
-        shape: Shape { fuel: false, monadic: true, mut_params, returns_unit },
+        shape: Shape { fuel: false, monadic: true, shared: false, mut_params, returns_unit },
         imports: Vec::new(),
     }
 }

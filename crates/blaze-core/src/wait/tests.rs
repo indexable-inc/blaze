@@ -19,46 +19,59 @@
 //! promptly; one with a token waiting takes it at once; `Deadline` only with no unpark) and
 //! every park ends by its deadline. The plant ([`ParkPlant::CheckThenStore`]) looks for a token
 //! and then stores `PARKED` over it, the lost wakeup [`the_oracle_catches_a_lost_wakeup`] must
-//! find.
+//! find. That no unpark is lost is also proved, of every interleaving of the two threads' atomics
+//! (`parking::no_unpark_is_lost`, `crates/blaze-core/lean/BlazeCore/Wait/Parking.lean`), which
+//! this test's whole unparks never tried; this test stays for the clock: that a park ends by
+//! its deadline and promptly after its wake, which that theorem does not state.
 //!
-//! The reap ([`reaping`], `IORING_OP_WAITID` then `wait4(WNOHANG)` on Linux): simulated children
-//! exit at drawn times, before or after their reap begins and its deadline, under the same
-//! faults; the oracle is that every child reaped is reported with its status, never before it
-//! exited and promptly after, a reap that ends at its deadline leaves its child unreaped, and no
-//! child is left a zombie. The plant ([`ReapPlant::ReapInWait`]) waits without `WNOWAIT`, so the
-//! wait reaps the child and its exit is never reported, which
-//! [`the_oracle_catches_a_reaped_child_never_reported`] must find.
+//! The reap ([`reaping`]) has no simulation test of its own: that every child reaped is
+//! reported once with its status, that a reap that ends at its deadline leaves the child for
+//! the next, and that a child's reap never fails are proved of the real `reap` against the
+//! children's world (`reaping::a_reaped_child_is_reported`,
+//! `crates/blaze-core/lean/BlazeCore/Wait/Reaping.lean`), for every moment the exit may come,
+//! with the planted wait that reaps ([`ReapPlant::ReapInWait`]) as that theorem's control. Its
+//! waiting is the retry loop's, proved with it. What stays here is the direct driver's reap
+//! against simulated children (below, on Linux): children exit at drawn times, before or
+//! after their reap begins and its deadline, under the kernel's faults, and the oracle is
+//! that every child reaped is reported with its status, never before it exited and promptly
+//! after, that a reap that ends at its deadline leaves its child unreaped, and that no child
+//! is left a zombie.
 //!
 //! The direct driver (`wait/direct.rs`, the waits of a process where io_uring is refused) runs
-//! the park's and the reap's plans too ([`Through::Direct`], on Linux): the same simulated
-//! kernels answer its calls ([`FutexCalls`], [`ChildCalls`]), their `CLOCK_MONOTONIC` on another
+//! the park's plans too ([`Through::Direct`]) and the reap's, on Linux: simulated kernels
+//! answer its calls ([`FutexCalls`], [`ChildCalls`]), their `CLOCK_MONOTONIC` on another
 //! origin than the wait's clock ([`KERNEL_AHEAD`]) so each call's absolute time is made from
 //! the kernel's, and each fault comes back as the error the kernel returns (`EINTR`,
 //! `ETIMEDOUT`). The same oracles hold, and the same plants are caught through it.
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     convert::Infallible,
     fmt::Write as _,
     io,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::Ordering,
     time::Duration,
 };
 
 use blaze_sim::{Broke, Config, Tape};
 
 #[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+
+#[cfg(target_os = "linux")]
 use super::direct::{ChildCalls, Direct, FutexCalls};
+#[cfg(target_os = "linux")]
+use super::reaping::{self, ReapPlant};
 use super::{
     Clock, Deadline, Once, WaitError, Waited,
     parking::{self, Futex, ParkPlant},
-    reaping::{self, Children, ReapPlant},
     retry::FUEL,
     until,
 };
 use crate::{
     Completion, Done, Driver, Effect, FileName, Tag,
+    atomic::AtomicU32,
     sim::{Faults, Sim},
 };
 
@@ -543,6 +556,7 @@ fn the_oracle_catches_a_lost_wakeup() {
 
 // --- The reap: a child's exit waited for, then reaped ------------------------------------
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Life {
     Running,
@@ -550,6 +564,7 @@ enum Life {
     Reaped,
 }
 
+#[cfg(target_os = "linux")]
 struct SimChild {
     exits: Duration,
     status: i32,
@@ -558,6 +573,7 @@ struct SimChild {
 
 /// One child: when it exits after its reap begins (zero: it had exited), its status, and the
 /// reap's deadline.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Kid {
     exits: Duration,
@@ -567,12 +583,14 @@ struct Kid {
 
 /// The kernel's choices (which call a fault hits, where, each latency) are drawn from the
 /// case's tape as the run goes.
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 struct ReapPlan {
     faults: FutexFaults,
     kids: Vec<Kid>,
 }
 
+#[cfg(target_os = "linux")]
 fn reap_plan(tape: &Tape) -> ReapPlan {
     let faults = futex_faults(tape);
     let n = tape.int_in(1..=MOST_WAITS, "children");
@@ -593,6 +611,7 @@ fn reap_plan(tape: &Tape) -> ReapPlan {
 }
 
 /// The kernel's children on the virtual clock.
+#[cfg(target_os = "linux")]
 struct ChildSim<'a> {
     now: &'a Cell<Duration>,
     tape: &'a Tape,
@@ -600,6 +619,7 @@ struct ChildSim<'a> {
     kids: RefCell<BTreeMap<i32, SimChild>>,
 }
 
+#[cfg(target_os = "linux")]
 impl ChildSim<'_> {
     fn latency(&self) -> Duration {
         Duration::from_nanos(1 + self.tape.below(self.faults.max_latency.as_nanos() as u64 + 1, "latency ns"))
@@ -667,10 +687,10 @@ impl ChildSim<'_> {
     }
 }
 
-impl Children for ChildSim<'_> {
-    type Reaped = i32;
-
-    fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
+#[cfg(target_os = "linux")]
+impl ChildSim<'_> {
+    /// `wait4(WNOHANG)` of `pid`: its status if it had exited, which reaps it.
+    fn reaped(&self, pid: i32) -> io::Result<Option<i32>> {
         self.now.set(self.now.get() + self.latency());
         self.settle();
         let mut kids = self.kids.borrow_mut();
@@ -684,17 +704,6 @@ impl Children for ChildSim<'_> {
             Life::Reaped => Err(ChildSim::no_child(pid)),
         }
     }
-
-    fn exited<C: Clock>(
-        &self,
-        what: &'static str,
-        pid: i32,
-        keep: bool,
-        deadline: Option<Deadline>,
-        clock: &C,
-    ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| self.call(pid, keep, left))
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -704,7 +713,7 @@ impl ChildCalls for ChildSim<'_> {
     type Pidfd = i32;
 
     fn reap_now(&self, pid: i32) -> io::Result<Option<i32>> {
-        Children::reap_now(self, pid)
+        self.reaped(pid)
     }
 
     fn exited_now(&self, pid: i32, keep: bool) -> io::Result<bool> {
@@ -738,17 +747,19 @@ impl ChildCalls for ChildSim<'_> {
     }
 }
 
-/// A drawn [`ReapPlan`] run with `plant`, the reap reaching the simulated children as `through`
-/// says: the first broken rule, the oracle's.
-fn drawn_reaps(tape: &Tape, plant: ReapPlant, through: Through) -> Result<(), Broke> {
+/// A drawn [`ReapPlan`] run with `plant`, the reap reaching the simulated children through
+/// the direct driver: the first broken rule, the oracle's.
+#[cfg(target_os = "linux")]
+fn drawn_reaps(tape: &Tape, plant: ReapPlant) -> Result<(), Broke> {
     let plan = reap_plan(tape);
     tape.note(format_args!("plan {plan:?}"));
-    run_reaps_through(tape, &plan, plant, through).map_err(Broke::Oracle)
+    run_reaps(tape, &plan, plant).map_err(Broke::Oracle)
 }
 
 /// `plan`'s children reaped one after another on one clock, with `plant`, the kernel drawing
-/// from `tape`, the reap reaching it as `through` says: the first broken rule.
-fn run_reaps_through(tape: &Tape, plan: &ReapPlan, plant: ReapPlant, through: Through) -> Result<(), String> {
+/// from `tape`, the reap reaching it through the direct driver: the first broken rule.
+#[cfg(target_os = "linux")]
+fn run_reaps(tape: &Tape, plan: &ReapPlan, plant: ReapPlant) -> Result<(), String> {
     let now = Cell::new(Duration::ZERO);
     let clock = Virtual(&now);
     let sim = ChildSim {
@@ -767,11 +778,7 @@ fn run_reaps_through(tape: &Tape, plan: &ReapPlan, plant: ReapPlant, through: Th
             .borrow_mut()
             .insert(pid, SimChild { exits, status: kid.status, life: Life::Running });
         let deadline = kid.deadline.map(|it| Deadline::after(start, it));
-        let reap = |deadline| match through {
-            Through::Core => reaping::reap(what, &sim, pid, deadline, &clock, plant),
-            #[cfg(target_os = "linux")]
-            Through::Direct => reaping::reap(what, &Direct(&sim), pid, deadline, &clock, plant),
-        };
+        let reap = |deadline| reaping::reap(what, &mut Direct(&sim), pid, deadline, &clock, plant);
         let reaped = reap(deadline);
         let end = now.get();
         let life = sim.life(pid);
@@ -837,28 +844,9 @@ fn run_reaps_through(tape: &Tape, plan: &ReapPlan, plant: ReapPlant, through: Th
     Ok(())
 }
 
-/// The invariant: whatever interrupts the wait and whenever the child exits, every child is
-/// reaped once and its exit reported, by the reap's deadline or after it.
-#[test]
-fn every_reaped_child_is_reported_under_interruption() {
-    blaze_sim::check(Config::cases(300), |tape| drawn_reaps(tape, ReapPlant::None, Through::Core));
-}
-
 /// What the reap's oracle says of a child the wait reaped, whose exit then goes to no one.
+#[cfg(target_os = "linux")]
 const NEVER_REPORTED: &str = "never reported";
-
-/// The unreported child the oracle must catch in one of [`CONTROL_SEEDS`] cases: a wait that
-/// reaps, leaving the reap after it nothing to report.
-#[test]
-fn the_oracle_catches_a_reaped_child_never_reported() {
-    blaze_sim::control(
-        Config::cases(CONTROL_SEEDS),
-        ReapPlant::None,
-        ReapPlant::ReapInWait,
-        NEVER_REPORTED,
-        |tape, plant| drawn_reaps(tape, plant, Through::Core),
-    );
-}
 
 // --- The direct driver on the same kernels -------------------------------------------------
 
@@ -891,7 +879,7 @@ fn the_oracle_catches_a_lost_wakeup_through_the_direct_driver() {
 #[cfg(target_os = "linux")]
 #[test]
 fn every_reaped_child_is_reported_through_the_direct_driver() {
-    blaze_sim::check(Config::cases(300), |tape| drawn_reaps(tape, ReapPlant::None, Through::Direct));
+    blaze_sim::check(Config::cases(300), |tape| drawn_reaps(tape, ReapPlant::None));
 }
 
 /// The unreported child, planted in the reap the direct driver waits for (its `waitid` without
@@ -904,7 +892,7 @@ fn the_oracle_catches_a_reaped_child_never_reported_through_the_direct_driver() 
         ReapPlant::None,
         ReapPlant::ReapInWait,
         NEVER_REPORTED,
-        |tape, plant| drawn_reaps(tape, plant, Through::Direct),
+        drawn_reaps,
     );
 }
 

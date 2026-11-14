@@ -32,7 +32,7 @@ use crate::{
     NotTranslated,
     body::{
         AdtKind, BinOp, Body, Callee, Cond, Elem, IntTy, Local, OpTy, Operand, Place,
-        Rvalue, Stmt, Ty, Variant,
+        Rvalue, Shared, Stmt, Ty, Variant,
     },
     lean::{Binder, Decl, DoElem, Infix, Pat, Term, app, atom, infix, name},
     structured::{End, Node},
@@ -47,8 +47,12 @@ type Refused<T> = Result<T, NotTranslated>;
 pub struct Shape {
     /// It takes `fuel : Nat` first: it has a loop, or calls a function that does.
     pub fuel: bool,
-    /// It gives a `Result`.
+    /// It gives a `Result`, or a `Threads.Prog` when it is `shared`.
     pub monadic: bool,
+    /// It touches the memory threads share (it calls an atomic's operation, a function of
+    /// `blaze_core::world::threads`, or a shared function): it gives a `Threads.Prog`, a program
+    /// of operations on that memory. A shared function is monadic.
+    pub shared: bool,
     /// Its `&mut` parameters, by position: their final values follow its result.
     pub mut_params: Vec<usize>,
     /// It returns `()`, which the model leaves out when it gives `&mut` values back.
@@ -86,7 +90,49 @@ pub fn lean_ty(ty: &Ty) -> Term {
         Ty::Ordering => name("core.cmp.Ordering"),
         Ty::Str => name("Str"),
         Ty::Opaque(opaque) => name(opaque.lean()),
+        Ty::Shared(shared) => match shared {
+            Shared::Atomic(int) => app("core.sync.atomic.Atomic", vec![atom(format!(".{}", int.lean()))]),
+            Shared::AtomicBool => name("core.sync.atomic.AtomicBool"),
+            Shared::Ordering => name("core.sync.atomic.Ordering"),
+            Shared::Step => name("Threads.Step"),
+            Shared::Woke => name("Threads.Woke"),
+            Shared::Ended(inner) => app("Threads.Ended", vec![lean_ty(inner)]),
+        },
     }
+}
+
+/// What a computation may do besides give its value, in order: nothing, fail (a `Result`), or
+/// also operate on the memory threads share (a `Threads.Prog`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Eff {
+    Pure,
+    Result,
+    Prog,
+}
+
+/// `Threads.Prog.done r`: the program that does nothing and ends with the `Result` `r`. The one
+/// spelling of a `Result` made a `Threads.Prog`, so no model relies on a coercion.
+fn done(result: Term) -> Term {
+    app("Threads.Prog.done", vec![result])
+}
+
+/// Whether `nodes` call a function that touches the memory threads share: an atomic's
+/// operation, `blaze_core::world::threads`'s, or a function whose shape in `shapes` is shared
+/// (its callees are emitted before it, so their shapes are known).
+fn shares(nodes: &Nodes, shapes: &BTreeMap<String, Shape>) -> bool {
+    nodes.iter().any(|node| match node {
+        Node::Do(Stmt::Call { callee, .. }) => match callee {
+            Callee::Shared { .. } | Callee::Two { .. } => true,
+            Callee::Function { name } => shapes.get(name).is_some_and(|it| it.shared),
+            Callee::Model { .. } => false,
+        },
+        Node::Do(_) => false,
+        Node::Branch { arms, otherwise, .. } => {
+            arms.iter().any(|(_, arm)| shares(arm, shapes)) || shares(otherwise, shapes)
+        }
+        Node::Block(body) | Node::Loop(body) => shares(body, shapes),
+        Node::Break(_) | Node::Continue(_) | Node::Return | Node::End(_) => false,
+    })
 }
 
 /// `A × B × C`; `Unit` of none.
@@ -132,9 +178,12 @@ enum M {
     Fail(&'static str),
     /// A term that is the computation's `Result`.
     Tail(Term),
+    /// A term that is the computation's `Threads.Prog`.
+    ProgTail(Term),
     Let { pat: Pat, value: Rhs, body: Box<M> },
     If { cond: Term, then: Box<M>, otherwise: Box<M> },
-    Match { on: Term, arms: Vec<(Pat, M)> },
+    /// `of`: the constructors of the type of `on`, each as a pattern's head names it.
+    Match { on: Term, arms: Vec<(Pat, M)>, of: Vec<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -142,17 +191,19 @@ enum Rhs {
     Pure(Term),
     /// A term in `Result`.
     Act(Term),
+    /// A term in `Threads.Prog`.
+    Prog(Term),
     Sub(Box<M>),
 }
 
 fn is_pure(m: &M) -> bool {
     match m {
         M::Ret(_) => true,
-        M::Fail(_) | M::Tail(_) => false,
+        M::Fail(_) | M::Tail(_) | M::ProgTail(_) => false,
         M::Let { value, body, .. } => {
             let value = match value {
                 Rhs::Pure(_) => true,
-                Rhs::Act(_) => false,
+                Rhs::Act(_) | Rhs::Prog(_) => false,
                 Rhs::Sub(sub) => is_pure(sub),
             };
             value && is_pure(body)
@@ -232,17 +283,17 @@ fn substitute(term: &mut Term, x: &str, with: &Term) {
 /// How often `x` is read in `m`, up to where it is bound again.
 fn reads(m: &M, x: &str) -> usize {
     match m {
-        M::Ret(term) | M::Tail(term) => occurs(term, x),
+        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => occurs(term, x),
         M::Fail(_) => 0,
         M::Let { pat, value, body } => {
             let value = match value {
-                Rhs::Pure(term) | Rhs::Act(term) => occurs(term, x),
+                Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term) => occurs(term, x),
                 Rhs::Sub(sub) => reads(sub, x),
             };
             value + if binds(pat, x) { 0 } else { reads(body, x) }
         }
         M::If { cond, then, otherwise } => occurs(cond, x) + reads(then, x) + reads(otherwise, x),
-        M::Match { on, arms } => {
+        M::Match { on, arms, .. } => {
             occurs(on, x)
                 + arms
                     .iter()
@@ -255,8 +306,8 @@ fn reads(m: &M, x: &str) -> usize {
 /// The term `m` evaluates first, if it is one.
 fn head(m: &mut M) -> Option<&mut Term> {
     match m {
-        M::Ret(term) | M::Tail(term) => Some(term),
-        M::Let { value: Rhs::Pure(term) | Rhs::Act(term), .. } => Some(term),
+        M::Ret(term) | M::Tail(term) | M::ProgTail(term) => Some(term),
+        M::Let { value: Rhs::Pure(term) | Rhs::Act(term) | Rhs::Prog(term), .. } => Some(term),
         M::If { cond, .. } => Some(cond),
         M::Match { on, .. } => Some(on),
         M::Fail(_) | M::Let { value: Rhs::Sub(_), .. } => None,
@@ -313,6 +364,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                 Rhs::Sub(sub) => match simplify(*sub, temps) {
                     M::Ret(term) => Rhs::Pure(term),
                     M::Tail(term) => Rhs::Act(term),
+                    M::ProgTail(term) => Rhs::Prog(term),
                     sub => Rhs::Sub(Box::new(sub)),
                 },
                 other => other,
@@ -320,7 +372,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
             let nothing = match &value {
                 Rhs::Pure(_) => true,
                 Rhs::Sub(sub) => is_pure(sub),
-                Rhs::Act(_) => false,
+                Rhs::Act(_) | Rhs::Prog(_) => false,
             };
             if nothing && matches!(pat, Pat::Wild) {
                 return body;
@@ -355,6 +407,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
             {
                 match value {
                     Rhs::Act(term) => return M::Tail(term),
+                    Rhs::Prog(term) => return M::ProgTail(term),
                     Rhs::Sub(sub) => return *sub,
                     Rhs::Pure(term) => return M::Ret(term),
                 }
@@ -366,7 +419,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
             then: Box::new(simplify(*then, temps)),
             otherwise: Box::new(simplify(*otherwise, temps)),
         },
-        M::Match { on, arms } => {
+        M::Match { on, arms, of } => {
             let mut arms: Vec<(Pat, M)> =
                 arms.into_iter().map(|(pat, arm)| (pat, simplify(arm, temps))).collect();
             // `match x with | A => a | _ => match x with | B => b | A => c` is
@@ -390,7 +443,7 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                 (
                     Some(heads),
                     Some((Pat::Wild, M::Let { value: Rhs::Sub(sub), .. })),
-                ) if matches!(&**sub, M::Match { on: inner, arms }
+                ) if matches!(&**sub, M::Match { on: inner, arms, .. }
                         if *inner == on && arms.iter().any(|(pat, _)| !live(&heads, pat))) =>
                 {
                     let Some((_, M::Let { pat: bound, value: Rhs::Sub(sub), body })) = arms.pop() else {
@@ -404,7 +457,14 @@ fn simplify(m: M, temps: &BTreeSet<String>) -> M {
                 }
                 _ => {}
             }
-            M::Match { on, arms }
+            // Joined, the arms may take every constructor of the type (the inner match's own
+            // `_` arm was for the variants the outer arms took): a `_` arm after them is never
+            // reached, and Lean refuses it as redundant.
+            let taken: BTreeSet<String> = arms.iter().filter_map(|(pat, _)| pat_head(pat)).collect();
+            if !of.is_empty() && of.iter().all(|it| taken.contains(it)) {
+                arms.retain(|(pat, _)| !matches!(pat, Pat::Wild));
+            }
+            M::Match { on, arms, of }
         }
         other => other,
     }
@@ -419,33 +479,41 @@ fn pat_head(pat: &Pat) -> Option<String> {
     }
 }
 
-/// `m` as a Lean term: in `Result` when `monadic`.
-fn emit(m: &M, monadic: bool) -> Term {
+/// `m` as a Lean term at `level`: a plain value, in `Result`, or in `Threads.Prog`. In a
+/// `Threads.Prog`, a `Result` bound by `←` is lifted by `MonadLift Result Prog`; one that ends
+/// the computation, and every end, is made a program by [`done`].
+fn emit(m: &M, level: Eff) -> Term {
+    let inner = if level == Eff::Prog { Eff::Prog } else { Eff::Result };
     let mut elems = Vec::new();
     let mut at = m;
     while let M::Let { pat, value, body } = at {
         elems.push(match value {
             Rhs::Pure(term) => DoElem::Let(pat.clone(), term.clone()),
-            Rhs::Act(term) => DoElem::Bind(pat.clone(), term.clone()),
-            Rhs::Sub(sub) if is_pure(sub) => DoElem::Let(pat.clone(), emit(sub, false)),
-            Rhs::Sub(sub) => DoElem::Bind(pat.clone(), emit(sub, true)),
+            Rhs::Act(term) | Rhs::Prog(term) => DoElem::Bind(pat.clone(), term.clone()),
+            Rhs::Sub(sub) if is_pure(sub) => DoElem::Let(pat.clone(), emit(sub, Eff::Pure)),
+            Rhs::Sub(sub) => DoElem::Bind(pat.clone(), emit(sub, inner)),
         });
         at = body;
     }
-    let last = match at {
-        M::Ret(term) if monadic => app("Result.ok", vec![term.clone()]),
-        M::Ret(term) | M::Tail(term) => term.clone(),
-        M::Fail(error) => app("Result.fail", vec![name(format!("Error.{error}"))]),
-        M::If { cond, then, otherwise } => Term::If(
+    let fail = |error: &str| app("Result.fail", vec![name(format!("Error.{error}"))]);
+    let last = match (at, level) {
+        (M::Ret(term), Eff::Pure) => term.clone(),
+        (M::Ret(term), Eff::Result) => app("Result.ok", vec![term.clone()]),
+        (M::Ret(term), Eff::Prog) => done(app("Result.ok", vec![term.clone()])),
+        (M::Tail(term), Eff::Prog) => done(term.clone()),
+        (M::Tail(term) | M::ProgTail(term), _) => term.clone(),
+        (M::Fail(error), Eff::Prog) => done(fail(error)),
+        (M::Fail(error), _) => fail(error),
+        (M::If { cond, then, otherwise }, _) => Term::If(
             Box::new(cond.clone()),
-            Box::new(emit(then, monadic)),
-            Box::new(emit(otherwise, monadic)),
+            Box::new(emit(then, level)),
+            Box::new(emit(otherwise, level)),
         ),
-        M::Match { on, arms } => Term::Match(
+        (M::Match { on, arms, .. }, _) => Term::Match(
             Box::new(on.clone()),
-            arms.iter().map(|(pat, arm)| (pat.clone(), emit(arm, monadic))).collect(),
+            arms.iter().map(|(pat, arm)| (pat.clone(), emit(arm, level))).collect(),
         ),
-        M::Let { .. } => unreachable!("the loop above ends at what is not a `let`"),
+        (M::Let { .. }, _) => unreachable!("the loop above ends at what is not a `let`"),
     };
     if elems.iter().any(|it| matches!(it, DoElem::Bind(..))) {
         elems.push(DoElem::Term(last));
@@ -535,6 +603,8 @@ struct Translate<'a> {
     uses_fuel: bool,
     /// What `return` gives: the result unless it is `()`, then each `&mut` parameter.
     returned: Vec<Local>,
+    /// The loops whose functions are shared ([`shares`]): each gives a `Threads.Prog`.
+    prog_loops: BTreeSet<String>,
 }
 
 impl<'a> Translate<'a> {
@@ -842,6 +912,13 @@ impl<'a> Translate<'a> {
                 let (variant, _) = crate::body::ORDERING[*variant as usize];
                 name(format!("core.cmp.Ordering.{variant}"))
             }
+            Operand::Variant { ty, variant } => {
+                let Some(found) = self.body.variants(ty).and_then(|all| all.get(*variant as usize).cloned())
+                else {
+                    return Err(self.refuse("a constant of a variant its enum does not have", at));
+                };
+                name(self.constructor(ty, &found))
+            }
         })
     }
 
@@ -851,6 +928,9 @@ impl<'a> Translate<'a> {
             Ty::Adt(adt) => format!("{adt}.{}", variant.name),
             Ty::Option(_) => format!("Option.{}", variant.name),
             Ty::Ordering => format!("core.cmp.Ordering.{}", variant.name),
+            Ty::Shared(Shared::Ordering) => format!("core.sync.atomic.Ordering.{}", variant.name),
+            Ty::Shared(Shared::Woke) => format!("Threads.Woke.{}", variant.name),
+            Ty::Shared(Shared::Ended(_)) => format!("Threads.Ended.{}", variant.name),
             _ => format!("core.result.Result.{}", variant.name),
         }
     }
@@ -1004,7 +1084,8 @@ impl<'a> Translate<'a> {
                 if *lends_first {
                     // A method that returns `()` gives back only what it was lent.
                     let unit = matches!(self.ty_of(dest, dest.elems.len()), Ty::Unit);
-                    return self.call(call, *monadic, unit, &[0], dest, args, lets, at);
+                    let eff = if *monadic { Eff::Result } else { Eff::Pure };
+                    return self.call(call, eff, unit, &[0], dest, args, lets, at);
                 }
                 self.write(dest, if *monadic { Rhs::Act(call) } else { Rhs::Pure(call) }, lets, at)
             }
@@ -1021,9 +1102,14 @@ impl<'a> Translate<'a> {
                 for arg in args {
                     terms.push(self.operand(arg, lets, at)?);
                 }
+                let eff = match (shape.shared, shape.monadic) {
+                    (true, _) => Eff::Prog,
+                    (false, true) => Eff::Result,
+                    (false, false) => Eff::Pure,
+                };
                 self.call(
                     app(callee, terms),
-                    shape.monadic,
+                    eff,
                     shape.returns_unit,
                     &shape.mut_params,
                     dest,
@@ -1032,17 +1118,63 @@ impl<'a> Translate<'a> {
                     at,
                 )
             }
+            Stmt::Call { dest, callee: Callee::Shared { name: callee }, args, at } => {
+                let mut terms = Vec::with_capacity(args.len());
+                for arg in args {
+                    terms.push(self.operand(arg, lets, at)?);
+                }
+                self.write(dest, Rhs::Prog(app(callee, terms)), lets, at)
+            }
+            Stmt::Call { dest, callee: Callee::Two { first, second }, args, at } => {
+                let [schedule, first_env, second_env] = args.as_slice() else {
+                    return Err(self.refuse("a call of `two` not given a schedule and two closures", at));
+                };
+                let schedule = self.operand(schedule, lets, at)?;
+                let shapes: &'a BTreeMap<String, Shape> = self.shapes;
+                let mut threads = vec![schedule];
+                for (callee, env) in [(first, first_env), (second, second_env)] {
+                    let Some(shape) = shapes.get(callee) else {
+                        return Err(self.refuse(format!("a call of `{callee}`, whose model is not known"), at));
+                    };
+                    if !shape.mut_params.is_empty() {
+                        return Err(self.refuse(
+                            format!(
+                                "a closure given to `blaze_core::world::threads::two` whose call \
+                                 writes its captures back (`{callee}` takes its closure by `&mut`; a \
+                                 thread shares nothing with its caller but the memory; rule \
+                                 SharedLend)"
+                            ),
+                            at,
+                        ));
+                    }
+                    let mut terms = Vec::with_capacity(2);
+                    if shape.fuel {
+                        self.uses_fuel = true;
+                        terms.push(name("fuel"));
+                    }
+                    terms.push(self.operand(env, lets, at)?);
+                    let call = app(callee, terms);
+                    // Each thread is a program: a closure that is not shared is one that does no
+                    // operation and ends as its call does.
+                    threads.push(match (shape.shared, shape.monadic) {
+                        (true, _) => call,
+                        (false, true) => done(call),
+                        (false, false) => done(app("Result.ok", vec![call])),
+                    });
+                }
+                self.write(dest, Rhs::Prog(app("Threads.two_of", threads)), lets, at)
+            }
         }
     }
 
-    /// Binds what `call` gives back, `Result`-wrapped when `monadic`: its result (none when it
+    /// Binds what `call` gives back, in what `eff` says it is in: its result (none when it
     /// `returns_unit`), then the new value of each `&mut` argument in `mut_params`, written to
     /// `dest` and the places lent.
     #[expect(clippy::too_many_arguments, reason = "one call's whole shape")]
     fn call(
         &mut self,
         call: Term,
-        monadic: bool,
+        eff: Eff,
         returns_unit: bool,
         mut_params: &[usize],
         dest: &Place,
@@ -1077,7 +1209,11 @@ impl<'a> Translate<'a> {
                 writes.push((lent, x));
             }
         }
-        let value = if monadic { Rhs::Act(call) } else { Rhs::Pure(call) };
+        let value = match eff {
+            Eff::Pure => Rhs::Pure(call),
+            Eff::Result => Rhs::Act(call),
+            Eff::Prog => Rhs::Prog(call),
+        };
         lets.push((tuple_pat(pats), value));
         for (place, x) in writes {
             self.write(place, Rhs::Pure(name(x)), lets, at)?;
@@ -1098,7 +1234,10 @@ impl<'a> Translate<'a> {
         self.uses_fuel = true;
         let mut args = vec![name("fuel")];
         args.extend(params.iter().map(|it| self.var(*it)));
-        M::Tail(app(loop_name, args))
+        match self.prog_loops.contains(loop_name) {
+            true => M::ProgTail(app(loop_name, args)),
+            false => M::Tail(app(loop_name, args)),
+        }
     }
 
     /// What `then` is, the code before it having ended.
@@ -1332,7 +1471,8 @@ impl<'a> Translate<'a> {
                     self.narrowed = outer_narrowed;
                     out.push((pat, rest?));
                 }
-                Ok(Self::with(lets, M::Match { on, arms: out }))
+                let of = variants.iter().map(|it| self.constructor(ty, it)).collect();
+                Ok(Self::with(lets, M::Match { on, arms: out, of }))
             }
             _ => unreachable!("asked of a branch or a block"),
         }
@@ -1354,6 +1494,16 @@ impl<'a> Translate<'a> {
         let params: Vec<Local> = head.iter().copied().collect();
         let loop_name = format!("{}.loop_{}", self.body.name, self.loop_count);
         self.loop_count += 1;
+        // Shared when its body touches the memory threads share; known before the body is
+        // translated, whose `continue`s call the loop.
+        let shared = shares(body, self.shapes);
+        if shared {
+            self.prog_loops.insert(loop_name.clone());
+        }
+        let (level, monad, out_of_fuel) = match shared {
+            true => (Eff::Prog, "Threads.Prog", done(name("Result.div"))),
+            false => (Eff::Result, "Result", name("Result.div")),
+        };
         let depth = self.labels.len();
         let outer_boundary = std::mem::replace(&mut self.boundary, depth);
         let outer_bound = std::mem::take(&mut self.bound);
@@ -1379,12 +1529,12 @@ impl<'a> Translate<'a> {
         self.loops.push(Decl::Def {
             name: loop_name.clone(),
             params: binders,
-            ty: app("Result", vec![self.result.clone()]),
+            ty: app(monad, vec![self.result.clone()]),
             body: Term::Match(
                 Box::new(name("fuel")),
                 vec![
-                    (Pat::Atom("0".to_owned()), name("Result.div")),
-                    (Pat::Atom("fuel + 1".to_owned()), emit(&m, true)),
+                    (Pat::Atom("0".to_owned()), out_of_fuel),
+                    (Pat::Atom("fuel + 1".to_owned()), emit(&m, level)),
                 ],
             ),
         });
@@ -1411,7 +1561,7 @@ pub(crate) fn type_decl(adt: &crate::body::AdtDecl) -> Decl {
 /// library's namespaces and types. A variable of one of these names would shadow it, so
 /// `Slice.len v` would read a field of the variable `Slice`.
 const GLOBAL_ROOTS: &[&str] = &[
-    "Blaze", "Scalar", "ScalarTy", "Slice", "Array", "Vec", "Option", "Result", "Error", "core", "Str",
+    "Blaze", "Scalar", "ScalarTy", "Slice", "Array", "Vec", "Option", "Result", "Error", "core", "Str", "Threads",
     "Bool", "Nat", "Int", "List", "Prop", "Unit", "U8", "U16", "U32", "U64", "U128", "Usize",
     "I8", "I16", "I32", "I64", "I128", "Isize",
 ];
@@ -1484,12 +1634,20 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
         narrowed: Vec::new(),
         uses_fuel: false,
         returned,
+        prog_loops: BTreeSet::new(),
     };
     translate.result = translate.types(&translate.returned);
     let live: Set = translate.returned.iter().copied().collect();
     let m = translate.seq(&body.nodes, &Then::Return, &live)?;
     let m = simplify(m, &translate.temps);
-    let monadic = !is_pure(&m);
+    // A shared function gives a `Threads.Prog`: it is monadic whatever is left of its body.
+    let shared = shares(&body.nodes, shapes);
+    let monadic = shared || !is_pure(&m);
+    let level = match (shared, monadic) {
+        (true, _) => Eff::Prog,
+        (false, true) => Eff::Result,
+        (false, false) => Eff::Pure,
+    };
     let params: Vec<Binder> = body
         .params
         .iter()
@@ -1504,18 +1662,91 @@ pub fn translate(body: &Body, shapes: &BTreeMap<String, Shape>) -> Result<Model,
     }
     binders.extend(params.iter().cloned());
     let result = translate.result.clone();
-    let ty = if monadic { app("Result", vec![result.clone()]) } else { result.clone() };
+    let ty = match level {
+        Eff::Prog => app("Threads.Prog", vec![result.clone()]),
+        Eff::Result => app("Result", vec![result.clone()]),
+        Eff::Pure => result.clone(),
+    };
     // The types are not declared here: each has a module of its own, which this one imports.
-    let mut decls = std::mem::take(&mut translate.loops);
-    decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, monadic) });
+    let mut decls = mutual_loops(std::mem::take(&mut translate.loops));
+    decls.push(Decl::Def { name: body.name.clone(), params: binders, ty, body: emit(&m, level) });
     let mut params = params;
     renumber(&mut decls, &mut params, &generated_names(body, &translate.names, &translate.temps));
     Ok(Model {
         decls,
-        shape: Shape { fuel: translate.uses_fuel, monadic, mut_params, returns_unit },
+        shape: Shape { fuel: translate.uses_fuel, monadic, shared, mut_params, returns_unit },
         params,
         result,
     })
+}
+
+/// The loops' functions, in the order they were declared (each after the loops inside it), with
+/// those that call each other put in one `mutual` block. A loop calls one around it when its
+/// exit goes on with the outer loop (`while i < n { ..; while j < i { .. } i += 1; }`, where
+/// the inner loop's exit is the outer loop's next turn): the two are mutually recursive. Each
+/// recurses on its own `fuel`, matched as `fuel + 1`, and every call it makes, of itself or of
+/// another loop of the block, passes that smaller `fuel`, so Lean accepts the block by
+/// structural recursion on `Nat` as it does one loop. A block stands where its last loop was
+/// declared (the outermost, which the loops inside it all come before); a loop that calls no
+/// loop calling it back stays as it was.
+fn mutual_loops(loops: Vec<Decl>) -> Vec<Decl> {
+    let names: Vec<String> = loops
+        .iter()
+        .map(|it| match it {
+            Decl::Def { name, .. } => name.clone(),
+            _ => unreachable!("a loop is a definition"),
+        })
+        .collect();
+    // `calls[a][b]`: loop `a`'s body names loop `b`; closed transitively below.
+    let mut calls: Vec<Vec<bool>> = loops
+        .iter()
+        .map(|it| {
+            let Decl::Def { body, .. } = it else { unreachable!("a loop is a definition") };
+            names.iter().map(|callee| names_in(body, callee)).collect()
+        })
+        .collect();
+    let count = names.len();
+    for via in 0..count {
+        for from in 0..count {
+            if calls[from][via] {
+                for to in 0..count {
+                    if calls[via][to] {
+                        calls[from][to] = true;
+                    }
+                }
+            }
+        }
+    }
+    // Each loop's block: the loops it calls that call it back, itself among them.
+    let block_of = |at: usize| -> Vec<usize> {
+        (0..count).filter(|other| *other == at || (calls[at][*other] && calls[*other][at])).collect()
+    };
+    let mut slots: Vec<Option<Decl>> = loops.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(count);
+    for at in 0..count {
+        let block = block_of(at);
+        if block.len() == 1 {
+            if let Some(decl) = slots[at].take() {
+                out.push(decl);
+            }
+            continue;
+        }
+        if block.last() != Some(&at) {
+            continue;
+        }
+        let members: Vec<Decl> = block.iter().filter_map(|it| slots[*it].take()).collect();
+        out.push(Decl::Mutual(members));
+    }
+    out
+}
+
+/// Whether `term` names `name` anywhere (in a `do` block or a `match` arm too, which
+/// [`occurs`] counts as many without looking).
+fn names_in(term: &Term, name: &str) -> bool {
+    let mut found = false;
+    let mut probe = term.clone();
+    visit_term(&mut probe, &mut |it: &mut String| found |= it == name);
+    found
 }
 
 /// What a generated variable's new name is made of: its kind's prefix and a number.
@@ -1620,6 +1851,7 @@ fn visit_decl(decl: &mut Decl, f: &mut impl FnMut(&mut String)) {
             visit_term(ty, f);
             visit_term(body, f);
         }
+        Decl::Mutual(decls) => decls.iter_mut().for_each(|it| visit_decl(it, f)),
         Decl::Structure { .. }
         | Decl::Inductive { .. }
         | Decl::Theorem { .. }

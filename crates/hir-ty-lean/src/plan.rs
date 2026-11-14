@@ -799,7 +799,7 @@ mod tests {
             name,
             text,
             clauses: Vec::new(),
-            shape: Shape { fuel: false, monadic: false, mut_params: Vec::new(), returns_unit: false },
+            shape: Shape { fuel: false, monadic: false, shared: false, mut_params: Vec::new(), returns_unit: false },
             imports,
         }
     }

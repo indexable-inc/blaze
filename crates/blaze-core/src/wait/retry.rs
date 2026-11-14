@@ -84,7 +84,8 @@ pub enum Once<T> {
     TimedOut,
 }
 
-/// A wait that could not go on: the system call failed, or the clock stopped moving.
+/// A wait that could not go on: the system call failed, the clock stopped moving, or the
+/// kernel said a child exited and then had it running.
 #[derive(Debug)]
 pub struct WaitError {
     what: &'static str,
@@ -99,12 +100,22 @@ enum Why {
         calls: u32,
         at: Duration,
     },
+    /// The wait for process `pid`'s exit said it exited, and the reap after it found the
+    /// child running (`wait/reaping.rs`).
+    Ran {
+        pid: i32,
+    },
 }
 
 impl WaitError {
     /// The wait's system call failed with `error`.
     pub fn io(what: &'static str, error: io::Error) -> WaitError {
         WaitError { what, why: Why::Io(error) }
+    }
+
+    /// The wait for child `pid`'s exit said it exited, and the reap after it found it running.
+    pub fn ran(what: &'static str, pid: i32) -> WaitError {
+        WaitError { what, why: Why::Ran { pid } }
     }
 
     /// What the wait was for.
@@ -116,7 +127,7 @@ impl WaitError {
     pub fn io_error(&self) -> Option<&io::Error> {
         match &self.why {
             Why::Io(error) => Some(error),
-            Why::Stuck { .. } => None,
+            Why::Stuck { .. } | Why::Ran { .. } => None,
         }
     }
 }
@@ -133,6 +144,12 @@ impl fmt::Display for WaitError {
                 self.what,
                 at.as_nanos()
             ),
+            Why::Ran { pid } => write!(
+                f,
+                "waiting for {}: process {pid}: the wait said it exited, and the reap after \
+                 found it running",
+                self.what
+            ),
         }
     }
 }
@@ -141,18 +158,19 @@ impl std::error::Error for WaitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.why {
             Why::Io(error) => Some(error),
-            Why::Stuck { .. } => None,
+            Why::Stuck { .. } | Why::Ran { .. } => None,
         }
     }
 }
 
 /// The system call's own error where it failed, so its kind and OS code stay what they were;
-/// a stuck clock as an error of its own kind with the wait's message.
+/// a stuck clock, or a child the kernel said exited and then had running, as an error of its
+/// own kind with the wait's message.
 impl From<WaitError> for io::Error {
     fn from(error: WaitError) -> io::Error {
         match error.why {
             Why::Io(error) => error,
-            Why::Stuck { .. } => io::Error::other(error),
+            Why::Stuck { .. } | Why::Ran { .. } => io::Error::other(error),
         }
     }
 }
