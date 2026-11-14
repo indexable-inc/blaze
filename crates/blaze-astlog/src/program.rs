@@ -1,6 +1,7 @@
 //! blaze's atoms and actions on top of the engine's language (`astlog-engine`): code patterns
 //! (`expr`, `type`, `pat`, `stmt`, `item`, `path`), `syntax`, the semantic relations, and the
-//! `rename`, `retarget` and `add-use` actions. Templates splice `$var`.
+//! `rename`, `retarget`, `add-use`, `add-param`, `remove-param` and `reorder-params` actions.
+//! Templates splice `$var`.
 
 use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
 use syntax::SyntaxKind;
@@ -68,7 +69,26 @@ pub enum Action {
     Retarget,
     /// `(add-use n "krate::path")`: a `use` of the item in the file (or inline module) of `n`.
     AddUse,
+    /// `(add-param d "name: Type" "default")`, or with an index last: the fn `d` takes a new
+    /// parameter at the end or before the parameter of that index (`self` not counted), and
+    /// every call passes `default` for it.
+    AddParam,
+    /// `(remove-param d "name")`: the parameter, and its argument at every call.
+    RemoveParam,
+    /// `(reorder-params d "b" "a")`: every parameter of `d`, in the new order, and every
+    /// call's arguments with them.
+    ReorderParams,
 }
+
+/// The actions and the arities each takes.
+const ACTIONS: &[(&str, Action, usize, usize)] = &[
+    ("rename", Action::Rename, 2, 2),
+    ("retarget", Action::Retarget, 2, 2),
+    ("add-use", Action::AddUse, 2, 2),
+    ("add-param", Action::AddParam, 3, 4),
+    ("remove-param", Action::RemoveParam, 2, 2),
+    ("reorder-params", Action::ReorderParams, 2, usize::MAX),
+];
 
 const PATTERN_FORMS: &str = "(expr n \"...\"), (type n \"...\"), (pat n \"...\"), (stmt n \"...\"), \
                              (item n \"...\") or (path n \"...\")";
@@ -126,7 +146,7 @@ impl astlog_engine::Language for Blaze {
             || form_of(name).is_some()
             || shape(name).is_some()
             || LITERAL_ATOMS.contains(&name)
-            || matches!(name, "rename" | "retarget" | "add-use")
+            || ACTIONS.iter().any(|(action, ..)| *action == name)
     }
 
     fn parse_atom(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Atom>>, Error> {
@@ -193,14 +213,19 @@ impl astlog_engine::Language for Blaze {
     }
 
     fn parse_action(head: &str, args: &[Sexpr], line: usize) -> Result<Option<Parsed<Action>>, Error> {
-        let value = match head {
-            "rename" => Action::Rename,
-            "retarget" => Action::Retarget,
-            "add-use" => Action::AddUse,
-            _ => return Ok(None),
+        let Some(&(_, value, least, most)) = ACTIONS.iter().find(|(name, ..)| *name == head) else {
+            return Ok(None);
         };
-        if args.len() != 2 {
-            return BuiltinAritySnafu { line, name: head, expected: 2usize, got: args.len() }.fail();
+        if least == most && args.len() != least {
+            return BuiltinAritySnafu { line, name: head, expected: least, got: args.len() }.fail();
+        }
+        if args.len() < least || args.len() > most {
+            let most = if most == usize::MAX { "more".to_owned() } else { most.to_string() };
+            return DslSnafu {
+                line,
+                message: format!("`{head}` takes {least} or {most} arguments, got {}", args.len()),
+            }
+            .fail();
         }
         Ok(Some(Parsed { value, args: astlog_engine::terms(args)?, needs: Needs::Nothing }))
     }

@@ -334,3 +334,57 @@ fn retarget_writes_the_new_item_as_the_paths_module_names_it() {
     let text = &after(&files, &applied.edited.ops)[0].1;
     assert!(text.contains("{ new(1) }") && text.contains("{ crate::new(2) }"), "{text}");
 }
+
+const PARAMS: &str = r#"
+//- /lib.rs crate:lib edition:2021
+pub fn mix(a: u32, b: u32, unused: u32) -> u32 { a - b }
+pub fn call(x: u32) -> u32 { mix(1, x, 3) + mix(x, 2, x) }
+"#;
+
+#[test]
+fn remove_param_and_reorder_params_change_the_fn_and_every_call() {
+    let (db, files) = view(PARAMS, 0, &["lib.rs"]);
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite drop (mix d) (remove-param d "unused"))
+        (rewrite swap (mix d) (reorder-params d "b" "a" "unused"))
+    "#;
+    // Both rewrites make one `Edit::Params` each for one fn: blaze-intent refuses the pair.
+    let both = refused(edit(&db, &files, rules, &[]));
+    assert!(both.contains("two changes of `mix`'s parameters"), "{both}");
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite drop (mix d) (remove-param d "unused"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn mix(a: u32, b: u32) -> u32"), "{text}");
+    assert!(text.contains("{ mix(1, x) + mix(x, 2) }"), "{text}");
+    let rules = r#"
+        (rule (mix d) (def-path d "lib::mix"))
+        (rewrite swap (mix d) (reorder-params d "unused" "b" "a"))
+    "#;
+    let applied = edit(&db, &files, rules, &[]).unwrap();
+    let text = &after(&files, &applied.edited.ops)[0].1;
+    assert!(text.contains("pub fn mix(unused: u32, b: u32, a: u32) -> u32"), "{text}");
+    assert!(text.contains("{ mix(3, x, 1) + mix(x, 2, x) }"), "{text}");
+}
+
+#[test]
+fn a_param_action_that_names_no_parameter_or_not_every_one_is_refused_naming_the_fn() {
+    let (db, files) = view(PARAMS, 0, &["lib.rs"]);
+    let run = |action: &str| {
+        let rules = format!("(rule (mix d) (def-path d \"lib::mix\"))\n(rewrite r (mix d) {action})");
+        refused(edit(&db, &files, &rules, &[]))
+    };
+    let missing = run(r#"(remove-param d "c")"#);
+    assert!(missing.contains("`lib::mix` has no parameter `c` (it has `a`, `b`, `unused`)"), "{missing}");
+    let partial = run(r#"(reorder-params d "b" "a")"#);
+    assert!(partial.contains("names every parameter of `lib::mix` once"), "{partial}");
+    let past = run(r#"(add-param d "c: u32" "0" 4)"#);
+    assert!(past.contains("index 4 is past `lib::mix`'s 3 parameters"), "{past}");
+    let reads = run(r#"(remove-param d "a")"#);
+    assert!(reads.contains("removes parameter `a`, which the body still reads"), "{reads}");
+    let arity = refused(edit(&db, &files, "(rule (mix d) (def-path d \"lib::mix\"))\n(rewrite r (mix d) (add-param d \"c: u32\"))", &[]));
+    assert!(arity.contains("`add-param` takes 3 or 4 arguments, got 2"), "{arity}");
+}

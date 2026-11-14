@@ -76,7 +76,9 @@ And one over the type behind any references, by the names the std prelude gives:
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
-  item, imported when needed) and `(add-use n "krate::path")` (n any node of the file). Templates
+  item, imported when needed), `(add-use n "krate::path")` (n any node of the file), and
+  `add-param`, `remove-param` and `reorder-params` (d a fn; every call changes with it; see
+  "Changing a fn's parameters"). Templates
   splice `$var`; `$$` is a literal `$`. A template is parsed with each metavariable as a hole,
   as the form of what it edits (an expression it replaces, or statements it replaces or sits
   beside in a body), and a bound expression is parenthesized only where its hole's precedence
@@ -95,7 +97,7 @@ And one over the type behind any references, by the names the std prelude gives:
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error), and a file that had a syntax error before the rewrite (the file, the line, the
   error); the whole request fails, nothing is written.
-- **Surfaces.** The API first, schema 62: `Edit::Rules { rules }` rides the existing
+- **Surfaces.** The API first, schema 62 (63 adds `Edit::Params`): `Edit::Rules { rules }` rides the existing
   `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
   `blaze_intent::apply` sends them); one per request, after the request's other edits.
   `Request::Edit`'s `head` is optional: with none, the edits are made and answered and nothing is
@@ -174,6 +176,41 @@ single name matches an ADT of that name by text, with its arguments. A form the 
 not read is a load error that says what to write instead: `impl Trait` and `dyn Trait` point
 at `(implements t ...)`, a raw or fn pointer at `$t`, a path from `crate::` at the crate's
 name.
+
+## Changing a fn's parameters
+
+```lisp
+;; `lib::connect` takes a timeout; every call passes the old one
+(rule (connect d) (def-path d "lib::connect"))
+(rewrite connect-timeout (connect d)
+  (add-param d "timeout_secs: u64" "30"))
+```
+
+`(add-param d "name: Type" "default")` appends a parameter to the fn `d`, or puts it before
+the parameter of an index given last (`self` not counted), and passes `default` at every call.
+`(remove-param d "name")` drops a parameter and its argument. `(reorder-params d "b" "a")`
+names every parameter once, in the new order. Each is one `Edit::Params { item, params }`
+(schema 63): the new list, each entry a kept parameter by its pattern text
+(`Param::Kept { name }`) or a new one (`Param::Added { param, default }`). blaze-intent makes
+it with the renames, before any other kind of edit, so it resolves in the view as it is.
+
+Every name spelled like the fn, or like a `use ... as` alias of it, is resolved. A path call,
+a method call, a UFCS call (`Trait::f(x)`, `<T as Trait>::f(x)`), a call through an alias or a
+re-export, and a call in a macro's input whose expansion resolves to the fn get the change. A
+trait's method changes in the trait, in every impl and at every call; asked of an impl's fn,
+the change is refused, pointing at the trait. An added argument is inserted where it goes and
+needs no parentheses: an argument is a whole expression, and the default must parse as exactly
+one. A removal or reorder rewrites the argument list. A dropped or moved argument must be plain
+(a literal, a path, or a reference to one), so no side effect is lost or reordered; in a
+macro's input only additions are written.
+
+Refused, each naming the file and line: the fn used as a value (`let g = f;`, `map(f)`), whose
+callers it cannot see; a call a macro made, which has no input to write an argument in; a call
+with an argument count other than the fn's (a macro that drops or adds arguments); a field
+shorthand that is the fn's name; an `extern` ABI, `#[no_mangle]` or `#[export_name]` fn and a
+C-variadic one, whose callers are outside Rust; a removed parameter the body still reads, or a
+removed pattern parameter (`(a, b): (u8, u8)`); an index past the list, a name the fn has not,
+and a reorder that does not name every parameter once.
 
 ## The evaluator
 

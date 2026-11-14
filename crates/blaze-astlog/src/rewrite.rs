@@ -16,7 +16,7 @@ use std::ops::Range;
 
 use astlog_engine::{Facts as _, PlannedAction, Segment, Severity, TextKind, Value, row_binding};
 use base_db::Db;
-use blaze_api::Edit;
+use blaze_api::{Edit, Param};
 use blaze_api::query::{self as api, Cell, Finding, Relation, Rows};
 use blaze_hash::HashMap;
 use blaze_intent::{Applied, Files, TextEdit};
@@ -468,14 +468,18 @@ fn source_edit<'p, F: Files>(
     text: &mut Vec<Made<'p>>,
     edits: &mut Vec<Edit>,
 ) -> Res<()> {
-    let [target, Value::Text(to)] = args else {
-        return Err(unplaceable(by, "(rules)".to_owned(), "takes a value and a string"));
-    };
-    let Value::Node(target) = target else {
-        return Err(unplaceable(by, "(rules)".to_owned(), "takes a def or a node first"));
+    // `(action n "text")`: the node or def, and the text.
+    let pair = || match args {
+        [Value::Node(target), Value::Text(to)] => Ok((target, to)),
+        [_, Value::Text(_)] => Err(unplaceable(by, "(rules)".to_owned(), "takes a def or a node first")),
+        _ => Err(unplaceable(by, "(rules)".to_owned(), "takes a value and a string")),
     };
     match action {
+        Action::AddParam | Action::RemoveParam | Action::ReorderParams => {
+            return params_edit(facts, by, action, args, edits);
+        }
         Action::Rename => {
+            let (target, to) = pair()?;
             let def = match facts.def_at(*target) {
                 Some(def) => Some(def),
                 None => facts.view_of(*target).and_then(|it| facts.defines(it).or_else(|| facts.resolve(it))),
@@ -502,6 +506,7 @@ fn source_edit<'p, F: Files>(
             }
         }
         Action::Retarget => {
+            let (target, to) = pair()?;
             let Some(view) = facts.view_of(*target) else {
                 return Err(unplaceable(by, "(rules)".to_owned(), "retargets a value that is not code"));
             };
@@ -541,6 +546,7 @@ fn source_edit<'p, F: Files>(
             });
         }
         Action::AddUse => {
+            let (target, to) = pair()?;
             let Some(view) = facts.view_of(*target) else {
                 return Err(unplaceable(by, "(rules)".to_owned(), "adds a use beside a value that is not code"));
             };
@@ -552,6 +558,97 @@ fn source_edit<'p, F: Files>(
                 .map(blaze_intent::path::of);
             edits.push(Edit::AddUse { file, into, path: to.to_string() });
         }
+    }
+    Ok(())
+}
+
+/// `(add-param d ...)`, `(remove-param d ...)` or `(reorder-params d ...)` as the fn's new
+/// parameter list, each kept parameter by its pattern as written: one [`Edit::Params`], made
+/// once however many rows ask for it.
+fn params_edit<F: Files>(
+    facts: &Sema<'_, F>,
+    by: Origin<'_>,
+    action: Action,
+    args: &[Value<Node>],
+    edits: &mut Vec<Edit>,
+) -> Res<()> {
+    let rules = || "(rules)".to_owned();
+    let Some((Value::Node(target), rest)) = args.split_first() else {
+        return Err(unplaceable(by, rules(), "takes a fn's def first"));
+    };
+    let def = facts
+        .def_at(*target)
+        .or_else(|| facts.view_of(*target).and_then(|it| facts.defines(it)));
+    let Some(def @ crate::sema::Def::Item(ModuleDef::Function(_))) = def else {
+        return Err(unplaceable(by, rules(), "changes the parameters of a value that is no fn"));
+    };
+    let name = facts.def_path(def).unwrap_or_else(|| "(a fn with no path)".to_owned());
+    let Some(source) = facts.source_of(def) else {
+        return Err(unplaceable(by, name, "changes a fn with no source in the view"));
+    };
+    let (file, range) = locate(facts, source)
+        .map_err(|call| unplaceable(by, call, "changes the parameters of a fn a macro declares"))?;
+    let fail = |message: String| unplaceable(by, place(facts.files, &file, range.start()), message);
+    let names: Vec<String> = source
+        .children()
+        .filter(|it| it.kind() == SyntaxKind::PARAM_LIST)
+        .flat_map(|list| list.children().filter(|it| it.kind() == SyntaxKind::PARAM))
+        .map(|param| param.first_child().map_or("", |it| it.text()).to_owned())
+        .collect();
+    let text = |value: Option<&Value<Node>>| match value {
+        Some(Value::Text(text)) => Some(text.to_string()),
+        _ => None,
+    };
+    let mut params: Vec<Param> = names.iter().map(|it| Param::Kept { name: it.clone() }).collect();
+    match action {
+        Action::AddParam => {
+            let (Some(param), Some(default)) = (text(rest.first()), text(rest.get(1))) else {
+                return Err(fail("add-param takes the parameter and its default as text".to_owned()));
+            };
+            let at = match rest.get(2) {
+                None => params.len(),
+                Some(Value::Int(at)) => usize::try_from(*at)
+                    .ok()
+                    .filter(|at| *at <= params.len())
+                    .ok_or_else(|| fail(format!("index {at} is past `{name}`'s {} parameters", params.len())))?,
+                Some(_) => return Err(fail("add-param takes an integer index last".to_owned())),
+            };
+            params.insert(at, Param::Added { param, default });
+        }
+        Action::RemoveParam => {
+            let Some(removed) = text(rest.first()) else {
+                return Err(fail("remove-param takes the parameter's name as text".to_owned()));
+            };
+            if !names.contains(&removed) {
+                return Err(fail(format!("`{name}` has no parameter `{removed}` (it has `{}`)", names.join("`, `"))));
+            }
+            params.retain(|it| !matches!(it, Param::Kept { name } if *name == removed));
+        }
+        Action::ReorderParams => {
+            let order: Option<Vec<String>> = rest.iter().map(|it| text(Some(it))).collect();
+            let mut sorted = order.clone().unwrap_or_default();
+            sorted.sort();
+            let mut want = names.clone();
+            want.sort();
+            let Some(order) = order.filter(|_| sorted == want) else {
+                return Err(fail(format!(
+                    "reorder-params names every parameter of `{name}` once, as text (`{}`); \
+                     remove one with remove-param",
+                    names.join("`, `")
+                )));
+            };
+            params = order.into_iter().map(|name| Param::Kept { name }).collect();
+        }
+        Action::Rename | Action::Retarget | Action::AddUse => {
+            return Err(fail(format!("{action:?} is no change of parameters")));
+        }
+    }
+    let edit = Edit::Params {
+        item: blaze_api::Target { file: file.clone(), item: blaze_intent::path::of(source) },
+        params,
+    };
+    if !edits.contains(&edit) {
+        edits.push(edit);
     }
     Ok(())
 }

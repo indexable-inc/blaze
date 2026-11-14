@@ -32,7 +32,7 @@ use crate::{
 
 /// What a rename renames.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Def {
+pub(crate) enum Def {
     Item(ModuleDef),
     Field(Field),
 }
@@ -213,13 +213,13 @@ fn implements(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
 }
 
 /// Whether `found`, a reference resolved, is `item` or implements it.
-fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
+pub(crate) fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
     found == item || implements(db, found, item)
 }
 
 /// The files of the crates that can name `def`: its own, and those depending on it when it is
 /// public.
-fn files_of(db: &Db, def: Def) -> Vec<FileId> {
+pub(crate) fn files_of(db: &Db, def: Def) -> Vec<FileId> {
     let (krate, public) = match def {
         Def::Item(item) => {
             let module = match item {
@@ -285,7 +285,7 @@ fn classify<'db>(
     Ok(found)
 }
 
-fn unresolved() -> String {
+pub(crate) fn unresolved() -> String {
     "the front end can't resolve this occurrence (cfg'd out under this view's configuration, or \
      unresolved), so can't tell whether it names the renamed item"
         .to_owned()

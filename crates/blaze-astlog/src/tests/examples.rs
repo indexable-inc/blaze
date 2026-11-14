@@ -42,6 +42,30 @@ fn the_docs_unwrap_to_try_rewrites_an_unwrap_on_a_result_in_a_result_fn_only() {
 }
 
 #[test]
+fn the_docs_connect_timeout_adds_a_parameter_and_its_default_at_every_call() {
+    let rules = example(2);
+    assert!(rules.contains("(add-param d"), "{rules}");
+    let lib = "pub fn connect(addr: &str) -> usize { addr.len() }\n\
+        pub use self::connect as dial;\n\
+        macro_rules! id { ($($t:tt)*) => { $($t)* }; }\n\
+        pub fn direct() -> usize { connect(\"a\") + self::connect(\"b\") }\n\
+        pub fn aliased() -> usize { dial(\"c\") + id!(crate::connect(\"d\")) }\n";
+    let fixture = format!("//- /lib.rs crate:lib edition:2021\n{lib}");
+    let text = rewritten(&fixture, 0, rules);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "pub fn connect(addr: &str, timeout_secs: u64) -> usize { addr.len() }",
+            "pub use self::connect as dial;",
+            "macro_rules! id { ($($t:tt)*) => { $($t)* }; }",
+            "pub fn direct() -> usize { connect(\"a\", 30) + self::connect(\"b\", 30) }",
+            "pub fn aliased() -> usize { dial(\"c\", 30) + id!(crate::connect(\"d\", 30)) }",
+        ],
+    );
+}
+
+#[test]
 fn the_docs_is_empty_rewrites_vec_and_string_lengths_through_references_and_not_a_user_type() {
     let rules = example(1);
     assert!(rules.contains("(rewrite is-empty"), "{rules}");
