@@ -70,6 +70,8 @@ The engine checks modes at load: an argument a builtin or source atom needs boun
 - `astlog suppressions rules.astlog [paths...] [--json]` lists every finding an `astlog-ignore` comment hid, with that comment. `--json` adds `commentLine` and `commentText`.
 - `astlog fix rules.astlog src/ [--write]` applies rewrites.
 
+blaze's front end has no binary of its own; the daemon runs it. `blaze check --query rules.astlog` prints what the rules derive and find over the checkout as saved (`--message-format json` for one line of `Response::Rows`), `blaze check --rules rules.astlog` applies their rewrites through the front end, and `--dry-run` prints that diff instead of writing it. A blaze rules file uses `(expr n "...")` and the other Rust pattern forms, not `match`; `(not (in-macro-expansion n))` keeps a rewrite off code a macro made.
+
 ## Suppression
 
 A comment containing `astlog-ignore` suppresses findings on its own line or the line below. `astlog-ignore: name1, name2` limits it to those rules. A comment is any node whose kind contains "comment". Suppression filters at scan output only, so the rows still exist for joins and `query`.

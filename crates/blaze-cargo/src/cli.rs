@@ -708,8 +708,13 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     if let Err(what) = found {
         return refused(&what, color);
     }
-    if asked.command() == Command::Check && !asked.flags.replace.is_empty() {
-        return replaced(&place, &asked.flags.replace, color);
+    if asked.command() == Command::Check && let Some(file) = &asked.flags.query {
+        return queried(&place, file, format.json(), color);
+    }
+    if asked.command() == Command::Check
+        && (!asked.flags.replace.is_empty() || asked.flags.rules.is_some())
+    {
+        return replaced(&place, &asked.flags, color);
     }
     let pinned = match asked.command() == Command::Check && asked.flags.fix {
         true => match fix::pin(&mut request) {
@@ -891,11 +896,54 @@ fn cargo(asked: &Invocation, began: Option<blaze_thin::handover::Began>) -> i32 
     }
 }
 
-/// `check --replace`'s edits made in the checkout: its exit code.
-fn replaced(place: &Place, pairs: &[String], color: bool) -> i32 {
-    let done = replace::edits(pairs).and_then(|edits| replace::replace(&place.root, edits));
+/// `check --query FILE`: what the rules derive and find, on stdout (one JSON line of
+/// [`blaze_api::Response::Rows`] with `--message-format json`); its exit code, failed when a
+/// lint of severity `error` found anything.
+fn queried(place: &Place, file: &str, json: bool, color: bool) -> i32 {
+    let done = replace::rules(&place.cwd, file).and_then(|rules| replace::query(&place.root, rules));
+    let rows = match done {
+        Ok(rows) => rows,
+        Err(what) => {
+            blaze_report::err!("{}", say::error(&what, color));
+            return Exit::Failed.code();
+        }
+    };
+    let failed = rows.findings.iter().any(|it| it.severity == blaze_api::query::Severity::Error);
+    let response = blaze_api::Response::Rows(rows);
+    let shown = match json {
+        true => serde_json::to_string(&response).map(|mut it| {
+            it.push('\n');
+            it
+        }),
+        false => Ok(blaze_ui::api::lines(&response, color && io::stdout().is_terminal())),
+    };
+    let written = shown
+        .map_err(io::Error::other)
+        .and_then(|it| io::stdout().lock().write_all(it.as_bytes()));
+    match (written, failed) {
+        (Ok(()), false) => 0,
+        // stdout closed under it, or an error-severity finding.
+        (Ok(()), true) | (Err(_), _) => Exit::Failed.code(),
+    }
+}
+
+/// `check --replace` and `--rules`' edits made in the checkout, or with `--dry-run` their
+/// diff on stdout: its exit code.
+fn replaced(place: &Place, flags: &args::Flags, color: bool) -> i32 {
+    let done = replace::edits(&flags.replace).and_then(|mut edits| {
+        if let Some(file) = &flags.rules {
+            edits.push(blaze_api::Edit::Rules { rules: replace::rules(&place.cwd, file)? });
+        }
+        replace::replace(&place.root, edits, flags.dry_run)
+    });
     match done {
-        Ok(edited) => {
+        Ok(replace::Made { diff: Some(diff), edited }) => {
+            let written = io::stdout().lock().write_all(diff.as_bytes());
+            let rest = format!("{} item(s), nothing written", edited.items.len());
+            blaze_report::err!("{}", say::status("Would edit", &rest, color));
+            if written.is_ok() { 0 } else { Exit::Failed.code() }
+        }
+        Ok(replace::Made { edited, diff: None }) => {
             let mut files: Vec<&str> = edited.items.iter().map(|it| it.file.as_str()).collect(); // alloc: CLI edge, the files named once
             files.sort_unstable();
             files.dedup();

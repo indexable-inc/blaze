@@ -642,6 +642,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "similar",
  "span",
  "stdx",
  "syntax",

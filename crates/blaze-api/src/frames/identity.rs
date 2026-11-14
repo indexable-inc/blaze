@@ -283,7 +283,11 @@ impl Gen {
             16 => Request::Trace { view: self.view(0), targets: self.targets() },
             17 => Request::Tables { view: self.view(0) },
             18 => {
-                Request::Edit { base: self.id(), head: self.text(), edits: self.many(0, Gen::edit) }
+                Request::Edit {
+                    base: self.id(),
+                    head: self.maybe(Gen::text),
+                    edits: self.many(0, Gen::edit),
+                }
             }
             19 => Request::WillTest {
                 view: self.view(0),

@@ -36,3 +36,6 @@ Changed on the way in, so a sync is the diff of ix between two commits applied o
   and `attached-sibling` became tree-sitter source atoms, and an absent optional capture is
   now the `CaptureAbsent` error instead of an unbound column. An ix sync into these files is
   a port, not a patch.
+- engine, later on 2026-11-13: `(not (atom ...))` over a source atom (`BodyAtom::NegatedSource`),
+  every variable bound to its left and no stratum, so blaze's rules can exclude macro-made
+  matches. crates/blaze-astlog, blaze's front end over the engine, has no ix counterpart.

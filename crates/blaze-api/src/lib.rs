@@ -371,11 +371,13 @@ pub enum Request {
     Stop,
     /// Edits by meaning, applied in the front end to `base` and committed to `head` as
     /// [`Request::Commit`] commits: answered with [`Response::Edited`], then
-    /// [`Response::Committed`] once durable. The view's proc macros and build scripts' runs,
-    /// which its front end applies before it resolves a name as rustc would, are built first.
+    /// [`Response::Committed`] once durable. With no `head`, a dry run: answered with
+    /// [`Response::Edited`] and `Done`, nothing committed. The view's proc macros and build
+    /// scripts' runs, which its front end applies before it resolves a name as rustc would, are
+    /// built first.
     Edit {
         base: ContentId,
-        head: String,
+        head: Option<String>,
         edits: Vec<Edit>,
     },
     /// Declared intent: the tests `filter` selects in the view will be run soon. What they

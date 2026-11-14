@@ -38,29 +38,38 @@ A refactor written once, run by a person or an agent:
 - **Paths match by resolution.** A multi-segment path in a pattern is a def path from a crate
   name (`core::mem::take`, `::std::sync::Mutex`) and matches a path in the code only when that
   path resolves to the same item: through an alias, a glob or a re-export, and never another
-  crate's item of the same name. A single-segment name that resolves through the std or core
-  prelude matches the same way; any other bare name matches by text (it is a local, a field or a
-  method name, whose meaning `resolves` and `callee` give). A pattern path that names nothing is a
-  load error.
+  crate's item of the same name. An associated item's path (`std::sync::Mutex::new`) resolves
+  through its type's impls or its trait's items. A single-segment name matches by text, prelude
+  names included (it is a local, a field or a method name, whose meaning `resolves` and `callee`
+  give); write the def path to match by resolution. A pattern path that names nothing is a load
+  error.
 - **Rewrites.** `(replace n "tmpl")`, `(delete n)`, `(insert-before n "tmpl")`,
   `(insert-after n "tmpl")`, `(rename n "new_name")` (n a def; every reference moves, through
   blaze-intent), `(retarget n "krate::path")` (n a path node; written as the file sees the new
   item, imported when needed) and `(add-use n "krate::path")` (n any node of the file). Templates
   splice `$var`; `$$` is a literal `$`. An absolute path in a template (`::core::mem::take`) is a
-  def path, written as the destination module sees it (`Module::find_path`), with a `use` added
-  when the spelling needs one. A rewrite may hold several actions.
-- **Refusals, each naming what it names.** Two edits that overlap (both rules and the file and
-  range). A match whose range lies in a macro expansion and maps back to no single input range
-  (where, which rule), unless the rule excluded it with `(not (in-macro-expansion n))`. A
-  rewritten file that no longer parses (the file, the first syntax error); the whole request
-  fails, nothing is written.
-- **Surfaces.** The API first: `Edit::Rules { rules }` rides the existing `Request::Edit`, so the
-  answer is the usual `Edited` (VFS ops and seeds, the way `blaze_intent::apply` sends them).
-  `Request::Query { base, rules }` is read-only and answers `Response::Rows` with each relation's
-  rows and each lint finding as data (file, range, rule, severity, message, bound values). Schema
-  57. The CLI beside `--replace`: `--rules FILE` applies a rules file, `--query FILE` prints the
-  rows (JSON with `--message-format json`, per `structured-output.md`), and `--dry-run` with
-  `--rules` prints the diff and writes nothing.
+  def path, respelled as the edited node's module names that item (`Module::find_path`:
+  `crate::new`, `new`, `std::mem::take`); no `use` is added. A template path that names nothing
+  is an error naming the rule. A rewrite may hold several actions; the same edit from two rules
+  is one edit.
+- **Refusals, each naming what it names.** Two edits that overlap (both rules, their rules lines,
+  the file and line). A match a macro made, whose node maps back to no range of the macro's input
+  (the macro call's `path:line`, the rule), unless the rule excluded it with
+  `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
+  syntax error); the whole request fails, nothing is written.
+- **Surfaces.** The API first, schema 57: `Edit::Rules { rules }` rides the existing
+  `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
+  `blaze_intent::apply` sends them); one per request, after the request's other edits.
+  `Request::Edit`'s `head` is optional: with none, the edits are made and answered and nothing is
+  committed, which is a dry run. `Request::Query { view, rules }` is read-only and answers
+  `Response::Rows` (`blaze_api::query`): each relation's name, columns and rows by place, each
+  cell code (file, line, range, text), a node a macro made (the call's place, its text), a def
+  path, a type, text or an integer; then each lint finding (relation, severity, message, its
+  first code cell). The CLI beside `--replace` on `blaze check`: `--rules FILE` applies a rules
+  file (with any `--replace`, after them), `--dry-run` with `--rules` or `--replace` prints the
+  unified diff and writes nothing, `--query FILE` prints the rows (one JSON line of
+  `Response::Rows` with `--message-format json`) and exits failed when an `error` lint found
+  anything.
 
 ## The relations
 
@@ -86,12 +95,14 @@ argument.
 | `(attribute d "name")` | `d` | holds when the item carries that attribute |
 | `(defines n d)` | `n` or `d` | the def an item's syntax declares; or that item's syntax |
 | `(references d n)` | `d` | every name, path and method call in the target files that resolves to `d` |
-| `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters |
+| `(in-macro-input n)`, `(in-macro-expansion n)`, `(in-unsafe n)`, `(in-test n)`, `(cfg-off n)` | `n` | filters: `in-macro-input` holds for a node of an expansion that came from the macro's input, `in-macro-expansion` for one the macro made |
 
 Kept from astlog: `ancestor`, `parent`, `precedes`, `text`, `kind`, `text-match`, `same-text`,
 `same-file`, `file-path`, `misgrouped-digits`. New in the engine for every source: `(count c (rel
 args...))` binds `c` to the number of distinct rows of a lower-stratum relation that agree with the
 bound arguments, and `(lt a b)`, `(le a b)` compare integers; integer literals are bare numbers.
+`(not (atom ...))` negates a source atom as well as a relation: every variable bound to its left,
+it needs no stratum, and it is how a rule excludes macro-made matches.
 
 ## The evaluator
 
@@ -124,3 +135,8 @@ cycle. The old naive evaluator stays as the reference model for a property test 
   takes are matched only as text.
 - Edits inside a macro expansion that do not map to one input range are refused, not split.
 - Rules across checkouts: the target is the daemon's view of one workspace.
+- Prelude resolution of single-segment pattern names; they match by text.
+- A `use` added for a template path `find_path` can only spell through an import; it is written
+  as `find_path` spells it.
+- A query's cost report. `Response::Rows` carries no per-relation timing; `blaze trace` does
+  not see the rules' evaluation.

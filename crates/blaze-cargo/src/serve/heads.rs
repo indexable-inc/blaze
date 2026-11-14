@@ -735,7 +735,7 @@ mod tests {
         assert!(runs_user_code(&ahead));
         let edit = Request::Edit {
             base: ContentId::of("heads test", b"root"),
-            head: "/w".to_owned(),
+            head: Some("/w".to_owned()),
             edits: Vec::new(),
         };
         assert!(
@@ -772,10 +772,13 @@ mod tests {
         assert_eq!(named(&save), ["/w"]);
         let edit = Request::Edit {
             base: ContentId::of("heads test", b"root"),
-            head: "/w".to_owned(),
+            head: Some("/w".to_owned()),
             edits: Vec::new(),
         };
         assert!(named(&edit).is_empty());
+        let query = Request::Query { view: ViewRef::Head("/w".to_owned()), rules: String::new() };
+        assert_eq!(named(&query), ["/w"], "a rules query reads its view's head");
+        assert!(runs_user_code(&query), "it builds its view's proc macros first");
     }
 
     /// A request on a checkout waits on a flush of its watch, and nothing is written into the

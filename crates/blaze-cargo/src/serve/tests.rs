@@ -2383,7 +2383,7 @@ fn an_edit_builds_its_views_proc_macros_and_build_scripts_before_it_reads_it() {
         panic!("the open said no root: {got:#?}")
     };
     let id = client
-        .send(&mut daemon, Request::Edit { base: root, head: "/w".into(), edits: Vec::new() });
+        .send(&mut daemon, Request::Edit { base: root, head: Some("/w".into()), edits: Vec::new() });
     let got = client.wait(&mut daemon, id);
     assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
     assert!(got.iter().any(|it| matches!(it, Response::Edited(_))), "{got:#?}");
