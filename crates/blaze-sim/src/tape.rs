@@ -29,6 +29,10 @@ pub struct Choice {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Span {
     pub label: &'static str,
+    #[expect(
+        blaze::untyped_index,
+        reason = "a span's ends are counts of choices drawn, which the shrinker deletes by and other crates' tests read as numbers: a public field's type stays"
+    )]
     pub start: u32,
     pub end: u32,
 }
