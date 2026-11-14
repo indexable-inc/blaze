@@ -488,10 +488,14 @@ fn source_edit<'p, F: Files>(
             };
             let (file, _) = locate(facts, source)
                 .map_err(|call| unplaceable(by, call, "renames a def a macro declares"))?;
-            edits.push(Edit::Rename {
+            let rename = Edit::Rename {
                 to: to.to_string(),
                 item: blaze_api::Target { file, item: blaze_intent::path::of(source) },
-            });
+            };
+            // Every row that reaches one def asks for its rename: the same rename is one edit.
+            if !edits.contains(&rename) {
+                edits.push(rename);
+            }
         }
         Action::Retarget => {
             let Some(view) = facts.view_of(*target) else {

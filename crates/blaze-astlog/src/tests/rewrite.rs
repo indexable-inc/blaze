@@ -170,6 +170,23 @@ fn rename_goes_through_the_front_ends_references() {
     assert!(text.contains("id!(older(3))"), "{text}");
 }
 
+#[test]
+fn a_rename_reached_through_several_references_is_one_rename() {
+    let (db, files) = view(LIB, 0, &["lib.rs"]);
+    // `old` has three references, so three rows ask for the same rename.
+    let through = r#"
+        (rule (uses n) (def-path d "lib::old") (references d n))
+        (rewrite renamed (uses n) (rename n "older"))
+    "#;
+    let direct = r#"
+        (rule (target d) (def-path d "lib::old"))
+        (rewrite renamed (target d) (rename d "older"))
+    "#;
+    let through = edit(&db, &files, through, &[]).unwrap();
+    let direct = edit(&db, &files, direct, &[]).unwrap();
+    assert_eq!(through.edited.ops, direct.edited.ops);
+}
+
 const PREC: &str = r#"
 //- /lib.rs crate:lib edition:2021
 pub fn mul(a: u32, b: u32) -> u32 { a * b }
