@@ -716,8 +716,7 @@ fn synced_append(
 /// bytes a crash can take, whatever else it has in flight to that file. Its control is
 /// `the_oracle_catches_an_append_lost_before_its_sync_was_told`.
 ///
-/// Run on drawn disks, effects and cuts today; its proof is being written against the models
-/// under `lean/BlazeModel/blaze_core/world/asks`.
+/// Run on drawn disks, effects and cuts today; not yet proved.
 // when its proof (crates/blaze-core/lean/BlazeCore/World/Asks.lean) lands: `#[blaze::theorem]`
 // here, and "(proved: that file)" in the first line above. Until then it is no theorem of
 // `blaze prove`'s, which exits 1 on one that is stated and not proved.
