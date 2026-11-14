@@ -5,10 +5,25 @@ use blaze_ids::rng::SplitMix64;
 use super::{
     Executed, Failure, Finished, Outcome, Reported, Trace, fork_server, report,
     wire::{
-        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View,
-        closed_ranges, encode_ended, encode_hello, header, read_region,
+        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, TABLE_ID, Table, UNRECORDED,
+        VERSION, View, closed_ranges, encode_ended, encode_hello, header, read_region,
     },
 };
+
+/// A table of `slots` slots, of one lineage and generation.
+fn table(slots: u32) -> Table {
+    Table { lineage: [5; 16], generation: 2, slots }
+}
+
+/// What the runtime's 24 bytes and slot count name is what was written.
+#[test]
+fn a_table_reads_back_from_the_runtimes_bytes() {
+    let mut id = [0u8; TABLE_ID];
+    id[..16].copy_from_slice(&[9; 16]);
+    id[16..].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+    let table = Table::of_id(id, 86595);
+    assert_eq!(table, Table { lineage: [9; 16], generation: 0x0102_0304_0506_0708, slots: 86595 });
+}
 
 fn frames() -> Vec<Frame> {
     vec![
@@ -22,13 +37,16 @@ fn frames() -> Vec<Frame> {
             id: 7,
             end: End::Exited(0),
             output: b"ok\n".to_vec(),
-            executed: Executed::Hits { slots: 10, hits: vec![0, 3, 9] },
+            executed: Executed::Hits { table: table(10), hits: vec![0, 3, 9] },
         },
         Frame::Ended {
             id: u64::MAX,
             end: End::Exited(-1),
             output: Vec::new(),
-            executed: Executed::Hits { slots: 0, hits: Vec::new() },
+            executed: Executed::Hits {
+                table: Table { lineage: [0xff; 16], generation: u64::MAX, slots: 0 },
+                hits: Vec::new(),
+            },
         },
         Frame::Ended {
             id: 8,
@@ -78,7 +96,10 @@ fn seeded(rng: &mut SplitMix64) -> Frame {
                 0 => {
                     let slots = rng.below(200) as u32;
                     let hits = (0..slots).filter(|_| rng.one_in(4)).collect();
-                    Executed::Hits { slots, hits }
+                    let mut lineage = [0u8; 16];
+                    lineage[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+                    lineage[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+                    Executed::Hits { table: Table { lineage, generation: edge(rng), slots }, hits }
                 }
                 _ => Executed::Not(text(rng)),
             };
@@ -103,8 +124,8 @@ fn ended_parts(frame: &Frame) -> Option<(u64, &End, &[u8], &Executed, Vec<u8>)> 
 
 fn view_of<'a>(executed: &'a Executed, bytes: &'a [u8]) -> ExecView<'a> {
     match executed {
-        Executed::Hits { slots, .. } => {
-            ExecView::Hits { slots: *slots, hits: Hits::of_bytes(bytes).unwrap() }
+        Executed::Hits { table, .. } => {
+            ExecView::Hits { table: *table, hits: Hits::of_bytes(bytes).unwrap() }
         }
         Executed::Not(why) => ExecView::Not(why),
     }
@@ -309,7 +330,7 @@ fn an_execution_record_out_of_order_or_past_its_slots_is_refused() {
         id: 1,
         end: End::Exited(0),
         output: Vec::new(),
-        executed: Executed::Hits { slots, hits },
+        executed: Executed::Hits { table: table(slots), hits },
     };
     for (slots, hits) in [
         (10, vec![3, 3]),
@@ -331,9 +352,10 @@ fn an_execution_record_out_of_order_or_past_its_slots_is_refused() {
     let at = huge.len() - 4;
     huge[at..].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(Frame::decode(&huge).is_err());
-    // An unknown kind of record.
+    // An unknown kind of record: its kind byte is before the table (24 bytes and the slot
+    // count) and the hit count.
     let mut kind = ended(10, Vec::new()).to_bytes()[4..].to_vec();
-    let at = kind.len() - 9;
+    let at = kind.len() - (1 + TABLE_ID + 4 + 4);
     kind[at] = 2;
     assert!(Frame::decode(&kind).unwrap_err().contains("no execution record is of kind 2"));
 }
@@ -423,9 +445,10 @@ fn a_region_reads_as_its_bytes_one_by_one() {
         assert_eq!(got.to_vec(), expected, "{slots} slots");
         assert_eq!(got.len(), expected.len());
         let mut out = Vec::new();
-        encode_ended(&mut out, 1, End::Exited(0).view(), &[], ExecView::Hits { slots, hits: got });
+        let of = table(slots);
+        encode_ended(&mut out, 1, End::Exited(0).view(), &[], ExecView::Hits { table: of, hits: got });
         let Ok(Frame::Ended { executed, .. }) = Frame::decode(&out[4..]) else { panic!("{slots}") };
-        assert_eq!(executed, Executed::Hits { slots, hits: expected });
+        assert_eq!(executed, Executed::Hits { table: of, hits: expected });
     }
     // Every slot of every count past two groups of four words, alone and with the one after
     // the last set: the groups, the words after the last group and the masked last word.
@@ -527,7 +550,7 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         let opened = text.trim_start().trim_start_matches("#[allow(dead_code)]").trim_start();
         assert!(opened.starts_with("pub mod fork_server {"));
         assert!(text.contains("pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";"));
-        assert!(text.contains("pub const VERSION: u32 = 3;"));
+        assert!(text.contains("pub const VERSION: u32 = 4;"));
         // The server measures its fork for blaze, and makes replicas only when asked.
         assert!(text.contains("let fork = fork_cost()?;"));
         assert!(text.contains("View::Replicate { count } =>"));
@@ -544,12 +567,12 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         // exports, and those only with slots.
         let code: Vec<&str> =
             text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
-        let named = |it: &str| it.replace("__blaze_exec_slots", "").replace("__blaze_exec_arm", "");
+        let named = |it: &str| it.replace("__blaze_exec_table", "").replace("__blaze_exec_arm", "");
         assert!(
             code.iter().all(|it| !it.contains("crate::") && !named(it).contains("blaze_")),
             "{code:#?}"
         );
-        assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_slots() -> u32;")), record);
+        assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_table(out: *mut u8) -> u32;")), record);
         assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_arm(")), record);
         assert_eq!(code.iter().any(|it| it.contains("MAP_SHARED | MAP_ANONYMOUS")), record);
         // Nothing an older edition reads otherwise.
@@ -645,7 +668,7 @@ fn the_wire_allocates_nothing_once_its_buffers_have_grown() {
             1,
             End::Exited(0).view(),
             b"ok",
-            ExecView::Hits { slots: 300, hits: Hits::of_bytes(&hits).unwrap() },
+            ExecView::Hits { table: table(300), hits: Hits::of_bytes(&hits).unwrap() },
         );
     };
     round();

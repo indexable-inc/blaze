@@ -396,7 +396,6 @@ impl Query for Plan {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
-                sandboxed_tests: built.sandboxed_tests,
                 native: built.native,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),

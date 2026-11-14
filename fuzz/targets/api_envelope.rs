@@ -422,9 +422,14 @@ fn seeds() -> Vec<Vec<u8>> {
             }),
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::a".to_owned(),
             binary: "a".to_owned(),
             cached: None,
+            not_kept: Some(blaze_api::NotKept {
+                no: "clock".to_owned(),
+                why: "it read the wall clock".to_owned(),
+            }),
             millis: 12,
             output: b"ok\n".to_vec(),
             outcome: TestOutcome::Passed,
@@ -432,6 +437,7 @@ fn seeds() -> Vec<Vec<u8>> {
             executable: 0,
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::b".to_owned(),
             binary: "a".to_owned(),
             cached: Some(Cached {
@@ -439,13 +445,15 @@ fn seeds() -> Vec<Vec<u8>> {
                 millis: 3,
                 outcome: TestOutcome::Failed,
             }),
+            not_kept: None,
             millis: 0,
             output: Vec::new(),
-            outcome: TestOutcome::Unreached,
+            outcome: TestOutcome::Passed,
             outside: false,
             executable: 0,
         }),
         Response::TestResult(TestResult {
+            ran: None,
             name: "tests::c".to_owned(),
             binary: "b".to_owned(),
             cached: Some(Cached {
@@ -453,9 +461,10 @@ fn seeds() -> Vec<Vec<u8>> {
                 millis: 5,
                 outcome: TestOutcome::Ignored,
             }),
+            not_kept: None,
             millis: 0,
             output: Vec::new(),
-            outcome: TestOutcome::Unreached,
+            outcome: TestOutcome::Passed,
             outside: false,
             executable: 1,
         }),

@@ -54,6 +54,8 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wired_tests;
 
 /// The test of an effect about the suite (its index, the read table, the program).
 pub const NO_TEST: u32 = u32::MAX;
@@ -68,8 +70,7 @@ const PUT_HEAD: Ticket = Ticket(u64::MAX - 5);
 /// One test asked.
 #[derive(Clone, Copy, Debug)]
 pub struct Test<'a> {
-    /// Its base key: the core's `TestRun` key over its identity (blaze-program's
-    /// `reach::test_key`).
+    /// Its base key: the core's `TestRun` key over its identity ([`crate::host::base`]).
     pub base: Key<TestRun>,
     /// Its libtest name: what an error and a verdict's line name it by.
     pub name: &'a str,
@@ -140,6 +141,15 @@ pub struct Ran<'a> {
     /// What it read that cannot be traced.
     pub untraceable: &'a [Untraceable],
     pub sandboxed: bool,
+    /// The sandbox said what it read: false for a sandboxed run whose trace is missing, whose
+    /// reads are then not known.
+    pub traced: bool,
+    /// Codegen marks the test as reaching code the tracer cannot see (a process start, the
+    /// network, assembly: `TestOf::outside`).
+    pub foreign: bool,
+    /// Something it read can have changed after it began and before `reads` were hashed (the
+    /// runner hashes them once the run ends): `reads` need not be what it read.
+    pub moved: bool,
 }
 
 /// What a run executed, each function with its bound code when it ran.
@@ -206,19 +216,79 @@ pub enum NotKept {
     Raced { at: u32 },
     /// Its key has every one of `MAX_SHAPES` shapes filed with another.
     TooManyShapes,
+    /// It ran sandboxed and the sandbox did not say what it read.
+    Untraced,
+    /// It reaches code the tracer cannot see, as codegen marks it.
+    Foreign,
+    /// Something it read can have changed between its read and the hash of it ([`Ran::moved`]).
+    Moved,
 }
 
 impl NotKept {
+    /// The reason in a sentence: what `(not kept: ..)` says.
     pub fn name(self) -> &'static str {
         match self {
             NotKept::Failed => "failed",
             NotKept::Unsandboxed => "not sandboxed",
+            NotKept::Untraced => "the sandbox did not say what it read",
+            NotKept::Foreign => "it reaches code the tracer cannot see (a process start, the network or assembly)",
             NotKept::Untraceable(Untraceable::Clock) => "it read the wall clock",
             NotKept::Untraceable(Untraceable::Random) => "it read randomness the sandbox did not answer",
             NotKept::Untraceable(Untraceable::Network) => "it used the network",
             NotKept::Untraceable(Untraceable::Descriptor) => "it read through a descriptor the sandbox did not see opened",
             NotKept::Raced { .. } => "what it read changed while it ran",
+            NotKept::Moved => "a file it read changed after it began, so its hash need not be what it read",
             NotKept::TooManyShapes => "it has too many shapes",
+        }
+    }
+
+    /// The reason as one word: what JSON's `"kept": {"no": ..}` says.
+    pub fn code(self) -> &'static str {
+        match self {
+            NotKept::Failed => "failed",
+            NotKept::Unsandboxed => "unsandboxed",
+            NotKept::Untraced => "untraced",
+            NotKept::Foreign => "foreign",
+            NotKept::Untraceable(Untraceable::Clock) => "clock",
+            NotKept::Untraceable(Untraceable::Random) => "random",
+            NotKept::Untraceable(Untraceable::Network) => "network",
+            NotKept::Untraceable(Untraceable::Descriptor) => "descriptor",
+            NotKept::Raced { .. } => "raced",
+            NotKept::Moved => "moved",
+            NotKept::TooManyShapes => "too-many-shapes",
+        }
+    }
+}
+
+/// Why a test ran rather than being reported cached: why no kept pass of it was found. Every
+/// run's verdict carries one ([`Verdict::Ran`], [`Verdict::NotKept`]), so a run is never
+/// unexplained: a test that runs although a pass of it was kept says which ask moved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Missed {
+    /// The request runs every test asked (`--run-all`).
+    RunAll,
+    /// The suite has no index head: none was filed yet, or the host has none to give.
+    NoHead,
+    /// The head has no row for the test: no pass of it was kept, or its last run was not.
+    NoRow,
+    /// A function its row executed is not the code it was at the head (another bound code, or
+    /// gone; [`UNLOGGED`] for the code no slot calls), and its lookup by its answers now found
+    /// no kept pass. Its code then and now are the host's images'.
+    Function(FnId),
+    /// A read of its row answers otherwise now than at the head, and its lookup found no kept
+    /// pass: its place among the reads that changed ([`Selection::read_missed`] names it).
+    Read(u32),
+}
+
+impl Missed {
+    /// The reason as one word: what JSON's `"ran": {"why": ..}` says.
+    pub fn code(self) -> &'static str {
+        match self {
+            Missed::RunAll => "run-all",
+            Missed::NoHead => "no-head",
+            Missed::NoRow => "no-row",
+            Missed::Function(_) => "function-changed",
+            Missed::Read(_) => "read-changed",
         }
     }
 }
@@ -229,10 +299,20 @@ pub enum Verdict {
     /// A kept pass holds now: reported as a pass, marked cached. `micros`: its last run's time,
     /// when the index has it.
     Cached { by: By, basis: Basis, micros: Option<u64> },
-    /// It ran, passed and is kept.
-    Ran { micros: u64, basis: Basis },
-    /// It ran and is not kept.
-    NotKept { passed: bool, micros: u64, why: NotKept },
+    /// It ran (`missed`: why no kept pass held), passed and is kept.
+    Ran { micros: u64, basis: Basis, missed: Missed },
+    /// It ran (`missed`: why) and is not kept (`why`).
+    NotKept { passed: bool, micros: u64, why: NotKept, missed: Missed },
+}
+
+/// A read of the head's read table that answers otherwise now ([`Missed::Read`]): its place
+/// in the table, its kind, and where its name lies in the head's payload.
+#[derive(Clone, Copy, Debug)]
+struct ChangedRead {
+    id: ContentId,
+    at: u32,
+    kind: ReadKind,
+    name: (u32, u32),
 }
 
 /// What a request cost, against the floor (the module docs).
@@ -259,6 +339,9 @@ pub struct Report<A: Allocator> {
     pub verdicts: Vec<Verdict, A>,
     /// The suite's head now: the root the host keeps for the next request.
     pub head: Key<TestIndex>,
+    /// The postings the head names, when it names any: kept with the head, as the next request
+    /// reads both.
+    pub postings: Option<ContentId>,
     pub checks: Checks,
     pub cost: Cost,
 }
@@ -399,6 +482,9 @@ struct TestState<'s, A: Allocator> {
     micros: Option<u64>,
     verdict: Option<Verdict>,
     keep: Keep,
+    /// Why it was not settled cached from the head ([`Selection::begin_tests`]): what its run's
+    /// verdict says, if it runs.
+    missed: Missed,
 }
 
 struct IndexPut {
@@ -410,7 +496,8 @@ struct IndexPut {
 
 /// One request's selection (the module docs).
 pub struct Selection<'s, A: AllocatorClone> {
-    snap: Snapshot<'s>,
+    /// `None` once [`Selection::detach`]ed: no record is checked against it after.
+    snap: Option<Snapshot<'s>>,
     alloc: A,
     start: Start<'s>,
     stage: Stage,
@@ -423,8 +510,12 @@ pub struct Selection<'s, A: AllocatorClone> {
     postings: Option<(Vec<u8, A>, PostingsLayout)>,
     /// The ids of the asks changed since the head, sorted.
     changed: Vec<ContentId, A>,
-    /// Per old head row: an ask of it changed.
-    candidate: Vec<bool, A>,
+    /// The functions among them, by ask id, sorted: what a [`Missed::Function`] names.
+    changed_fns: Vec<(ContentId, FnId), A>,
+    /// The reads among them, sorted by ask id: what a [`Missed::Read`] is a place in.
+    changed_reads: Vec<ChangedRead, A>,
+    /// Per old head row: the first changed ask of it found, when one of its asks changed.
+    candidate: Vec<Option<ContentId>, A>,
     tests: Vec<TestState<'s, A>, A>,
     names: Vec<u8, A>,
     /// Tests whose next effect is to be asked.
@@ -445,6 +536,8 @@ pub struct Selection<'s, A: AllocatorClone> {
     put_at: usize,
     put_issued: bool,
     new_head: Option<Key<TestIndex>>,
+    /// The postings the new head names.
+    new_postings: Option<ContentId>,
     failed: Option<SelectError>,
     report: Option<Report<A>>,
 }
@@ -484,10 +577,11 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
                 micros: None,
                 verdict: None,
                 keep: Keep::No,
+                missed: Missed::NoHead,
             });
         }
         let mut selection = Selection {
-            snap,
+            snap: Some(snap),
             start,
             stage: Stage::Head,
             head_out: Out::Skip,
@@ -497,6 +591,8 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             head: None,
             postings: None,
             changed: Vec::new_in(alloc.clone()),
+            changed_fns: Vec::new_in(alloc.clone()),
+            changed_reads: Vec::new_in(alloc.clone()),
             candidate: Vec::new_in(alloc.clone()),
             tests: states,
             names,
@@ -513,6 +609,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             put_at: 0,
             put_issued: false,
             new_head: None,
+            new_postings: None,
             failed: None,
             report: None,
             alloc,
@@ -523,6 +620,120 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             selection.begin_tests();
         }
         Ok(selection)
+    }
+
+    /// The selection out of its snapshot, to wait for its runs across the host's turns (a
+    /// snapshot is one scope's, [`proof::scope`]). Only once every test has its verdict or is
+    /// to run (the host answered every lookup; with `workers` at least the tests asked, every
+    /// run is out at the first [`Step::Wait`]): nothing after reads a record under the
+    /// snapshot. A test that missed is filed from its first shape slot again
+    /// ([`Filer::new`]), at most `MAX_SHAPES` slot reads more than filing it from its lookup.
+    pub fn detach(self) -> Result<Selection<'static, A>, SelectError> {
+        if matches!(self.stage, Stage::Head | Stage::Prelude) {
+            return Err(SelectError::Misused("a selection detached before its index head was read"));
+        }
+        if self.tests.iter().any(|test| test.phase == Phase::Look) {
+            return Err(SelectError::Misused("a selection detached while a test is being looked up"));
+        }
+        let mut tests = Vec::with_capacity_in(self.tests.len(), self.alloc.clone());
+        for test in self.tests {
+            tests.push(TestState {
+                base: test.base,
+                name: test.name,
+                phase: test.phase,
+                issued: test.issued,
+                row: test.row,
+                lookup: None,
+                filer: test.filer,
+                shape: test.shape,
+                then: test.then,
+                put: test.put,
+                address: test.address,
+                micros: test.micros,
+                verdict: test.verdict,
+                keep: test.keep,
+                missed: test.missed,
+            });
+        }
+        let start = self.start;
+        Ok(Selection {
+            snap: None,
+            alloc: self.alloc,
+            start: Start {
+                tool: start.tool,
+                suite: start.suite,
+                program: start.program,
+                head: start.head,
+                certified: None,
+                run_all: start.run_all,
+                workers: start.workers,
+                compact_at: start.compact_at,
+            },
+            stage: self.stage,
+            head_out: self.head_out,
+            postings_out: self.postings_out,
+            changes_out: self.changes_out,
+            table_out: self.table_out,
+            head: self.head,
+            postings: self.postings,
+            changed: self.changed,
+            changed_fns: self.changed_fns,
+            changed_reads: self.changed_reads,
+            candidate: self.candidate,
+            tests,
+            names: self.names,
+            ready: self.ready,
+            runs: self.runs,
+            runs_at: self.runs_at,
+            running: self.running,
+            open: self.open,
+            seen: self.seen,
+            moved: self.moved,
+            checks: self.checks,
+            cost: self.cost,
+            index_puts: self.index_puts,
+            put_at: self.put_at,
+            put_issued: self.put_issued,
+            new_head: self.new_head,
+            new_postings: self.new_postings,
+            failed: self.failed,
+            report: self.report,
+        })
+    }
+
+    /// How many tests were asked.
+    pub fn tests(&self) -> usize {
+        self.tests.len()
+    }
+
+    /// Test `at`'s verdict, once it has one: a runner reports each test as it is settled
+    /// rather than at the request's end. The report's verdicts are these.
+    pub fn verdict(&self, at: u32) -> Option<Verdict> {
+        self.tests.get(at as usize).and_then(|test| test.verdict)
+    }
+
+    /// The read a [`Missed::Read`] of this selection names: its kind, its name, its answer at
+    /// the head and its answer now. `None` for a place no read that changed has.
+    pub fn read_missed(&self, place: u32) -> Option<(ReadKind, &[u8], ContentId, ContentId)> {
+        let changed = self.changed_reads.get(place as usize)?;
+        let (bytes, layout) = self.head.as_ref()?;
+        let name = bytes.get(changed.name.0 as usize..(changed.name.0 + changed.name.1) as usize)?;
+        let before = layout.view(bytes).read_digest(changed.at);
+        let now = self.seen.get(&changed.id).copied()?;
+        Some((changed.kind, name, before, now))
+    }
+
+    /// How long test `at`'s last kept run took, from its row in the head the selection read:
+    /// what a runner orders the runs it is asked for by, the longest first. `None` for a test
+    /// with no row (new, or last not kept, as a failure never is).
+    pub fn last_micros(&self, at: u32) -> Option<u64> {
+        let row = self.tests.get(at as usize)?.row?;
+        self.head_view().map(|head| head.row(row).micros)
+    }
+
+    /// The snapshot records are checked under, while the selection has one.
+    fn snap(&self) -> Result<Snapshot<'s>, SelectError> {
+        self.snap.ok_or(SelectError::Misused("a record read after the selection was detached from its snapshot"))
     }
 
     /// The request's outcome, once [`Step::Exit`].
@@ -696,7 +907,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         let Some(bytes) = record else {
             return Err(SelectError::MissingIndex { key: key.id() });
         };
-        let hit = proof::hit(self.snap, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
+        let hit = proof::hit(self.snap()?, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let payload = hit.payload().map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let layout = HeadLayout::decode(payload).map_err(|why| SelectError::IndexLayout { key: key.id(), why })?;
         let mut owned = Vec::with_capacity_in(payload.len(), self.alloc.clone());
@@ -706,7 +917,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         self.head = Some((owned, layout));
         self.cost.rows = rows;
         let mut candidate = Vec::with_capacity_in(rows as usize, self.alloc.clone());
-        candidate.resize(rows as usize, false);
+        candidate.resize(rows as usize, None);
         self.candidate = candidate;
         // The postings are read under a certificate too: a compaction inverts them.
         self.postings_out = if postings.is_some() { Out::Want } else { Out::Skip };
@@ -735,7 +946,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             return Err(SelectError::MissingIndex { key });
         };
         let key = Key::<TestPostings>::from_id(key);
-        let hit = proof::hit(self.snap, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
+        let hit = proof::hit(self.snap()?, key, bytes).map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let payload = hit.payload().map_err(|why| SelectError::IndexRecord { key: key.id(), why })?;
         let layout = PostingsLayout::decode(payload).map_err(|why| SelectError::IndexLayout { key: key.id(), why })?;
         let mut owned = Vec::with_capacity_in(payload.len(), self.alloc.clone());
@@ -749,7 +960,12 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         if planted(Plant::ShortcutSkipsChanged) {
             return;
         }
-        self.changed.extend(functions.iter().map(|function| Ask::Function(*function).id()));
+        self.changed_fns.reserve(functions.len());
+        for function in functions {
+            let id = Ask::Function(*function).id();
+            self.changed.push(id);
+            self.changed_fns.push((id, *function));
+        }
     }
 
     fn got_table(&mut self, now: &[ContentId]) -> Result<(), SelectError> {
@@ -769,12 +985,19 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             });
         }
         self.checks.read_lists += 1;
+        let start = bytes.as_ptr().addr();
         for (at, (ask, answer)) in view.reads().zip(now).enumerate() {
             self.checks.facts_compared += 1;
             let id = ask.id();
             saw(&mut self.seen, &mut self.moved, id, *answer);
             if view.read_digest(at as u32) != *answer {
                 self.changed.push(id);
+                // Its name, by where it lies in the head's payload (a read table's names are
+                // slices of it), so a miss names it without a walk of the table.
+                if let Ask::Read(kind, name) = ask {
+                    let from = (name.as_ptr().addr() - start) as u32;
+                    self.changed_reads.push(ChangedRead { id, at: at as u32, kind, name: (from, name.len() as u32) });
+                }
             }
         }
         Ok(())
@@ -784,14 +1007,32 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
     fn select(&mut self) {
         self.changed.sort_unstable();
         self.changed.dedup();
+        self.changed_fns.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        self.changed_fns.dedup_by(|later, earlier| later.0 == earlier.0);
+        self.changed_reads.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         self.cost.changed = self.changed.len() as u32;
         if let Some((bytes, layout)) = &self.head {
             let head = layout.view(bytes);
             let postings = self.postings.as_ref().map(|(bytes, layout)| layout.view(bytes));
-            mark(&head, postings.as_ref(), &self.changed, &mut self.candidate);
-            self.cost.candidates = self.candidate.iter().filter(|candidate| **candidate).count() as u32;
+            let candidate = &mut self.candidate;
+            mark(&head, postings.as_ref(), &self.changed, |row, ask| {
+                candidate[row as usize].get_or_insert(ask);
+            });
+            self.cost.candidates = self.candidate.iter().filter(|candidate| candidate.is_some()).count() as u32;
         }
         self.begin_tests();
+    }
+
+    /// Why a test whose head row was marked by the changed ask `ask` runs: the function or the
+    /// read it is.
+    fn missed_by(&self, ask: ContentId) -> Result<Missed, SelectError> {
+        if let Ok(at) = self.changed_fns.binary_search_by(|it| it.0.cmp(&ask)) {
+            return Ok(Missed::Function(self.changed_fns[at].1));
+        }
+        match self.changed_reads.binary_search_by(|it| it.id.cmp(&ask)) {
+            Ok(at) => Ok(Missed::Read(at as u32)),
+            Err(_) => Err(SelectError::Misused("a head row marked by an ask that is neither a changed function nor a changed read")),
+        }
     }
 
     fn begin_tests(&mut self) {
@@ -801,8 +1042,23 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             let base = self.tests[at].base;
             let row = self.head_view().and_then(|head| head.find(&base.id()).map(|row| (row, head.row(row))));
             self.tests[at].row = row.map(|(row, _)| row);
+            let marked = row.and_then(|(row, _)| self.candidate.get(row as usize).copied().flatten());
+            self.tests[at].missed = match (self.start.run_all, self.head.is_some(), row, marked) {
+                (true, ..) => Missed::RunAll,
+                (false, false, ..) => Missed::NoHead,
+                (false, true, None, _) => Missed::NoRow,
+                (false, true, Some(_), Some(ask)) => match self.missed_by(ask) {
+                    Ok(missed) => missed,
+                    Err(error) => {
+                        self.failed = Some(error);
+                        return;
+                    }
+                },
+                // Not marked: cached by its row below, so never run and never said.
+                (false, true, Some(_), None) => Missed::NoRow,
+            };
             match row {
-                Some((row, old)) if !self.start.run_all && !self.candidate[row as usize] => {
+                Some((row, old)) if !self.start.run_all && self.candidate[row as usize].is_none() => {
                     let by = if self.start.certified.is_some() { By::Certificate } else { By::Unchanged };
                     self.tests[at].address = old.address;
                     self.conclude(at, Verdict::Cached { by, basis: old.basis, micros: Some(old.micros) }, Keep::Carry(row));
@@ -812,7 +1068,11 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
                     self.runs.push(at as u32);
                 }
                 _ => {
-                    self.tests[at].lookup = Some(Box::new_in(Lookup::new(self.snap, base), self.alloc.clone()));
+                    let Some(snap) = self.snap else {
+                        self.failed = Some(SelectError::Misused("a test looked up after the selection was detached"));
+                        return;
+                    };
+                    self.tests[at].lookup = Some(Box::new_in(Lookup::new(snap, base), self.alloc.clone()));
                     self.tests[at].phase = Phase::Look;
                     self.ready.push(at as u32);
                     self.cost.lookups += 1;
@@ -840,8 +1100,8 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
     }
 
     fn not_kept(&mut self, at: usize, passed: bool, why: NotKept) {
-        let micros = self.tests[at].micros.unwrap_or(0);
-        self.conclude(at, Verdict::NotKept { passed, micros, why }, Keep::No);
+        let (micros, missed) = (self.tests[at].micros.unwrap_or(0), self.tests[at].missed);
+        self.conclude(at, Verdict::NotKept { passed, micros, why, missed }, Keep::No);
     }
 
     /// What test `at` asks next, readied (a record to file is written here); `None` when it
@@ -925,8 +1185,8 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
 
     fn filed(&mut self, at: usize) {
         let basis = Shape::checked(&self.tests[at].shape).basis();
-        let micros = self.tests[at].micros.unwrap_or(0);
-        self.conclude(at, Verdict::Ran { micros, basis }, Keep::New);
+        let (micros, missed) = (self.tests[at].micros.unwrap_or(0), self.tests[at].missed);
+        self.conclude(at, Verdict::Ran { micros, basis, missed }, Keep::New);
     }
 
     fn got_record(&mut self, at: usize, record: Option<&[u8]>) -> Result<(), SelectError> {
@@ -1046,8 +1306,20 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             self.not_kept(at, true, NotKept::Unsandboxed);
             return Ok(());
         }
+        if ran.foreign {
+            self.not_kept(at, true, NotKept::Foreign);
+            return Ok(());
+        }
+        if !ran.traced {
+            self.not_kept(at, true, NotKept::Untraced);
+            return Ok(());
+        }
         if let Some(untraceable) = ran.untraceable.iter().min() {
             self.not_kept(at, true, NotKept::Untraceable(*untraceable));
+            return Ok(());
+        }
+        if ran.moved {
+            self.not_kept(at, true, NotKept::Moved);
             return Ok(());
         }
         let (basis, functions) = match ran.executed {
@@ -1155,7 +1427,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             for row in 0..old_rows {
                 let carried = match asked[row] {
                     Some(at) => self.tests[at].keep == Keep::Carry(row as u32),
-                    None => !self.candidate[row],
+                    None => self.candidate[row].is_none(),
                 };
                 if carried {
                     sources.push((head.row(row as u32).base, Source::Old(row as u32)));
@@ -1175,7 +1447,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             let mut drop_old = Vec::with_capacity_in(old_rows, alloc.clone());
             drop_old.resize(old_rows, false);
             if let Some(head) = &head {
-                mark(head, postings.as_ref(), &moved, &mut drop_old);
+                mark(head, postings.as_ref(), &moved, |row, _| drop_old[row as usize] = true);
             }
             let tests = &self.tests;
             sources.retain(|(_, source)| match *source {
@@ -1326,6 +1598,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
         }
         self.index_puts = puts;
         self.new_head = Some(key);
+        self.new_postings = postings_key;
         self.stage = Stage::Index;
         Ok(())
     }
@@ -1343,7 +1616,7 @@ impl<'s, A: AllocatorClone> Selection<'s, A> {
             self.failed = Some(SelectError::Misused("a request ended with no head"));
             return;
         };
-        self.report = Some(Report { verdicts, head, checks: self.checks, cost: self.cost });
+        self.report = Some(Report { verdicts, head, postings: self.new_postings, checks: self.checks, cost: self.cost });
         self.stage = Stage::Done;
     }
 }
@@ -1355,9 +1628,10 @@ enum Source {
     Test(usize),
 }
 
-/// Marks in `out` every row of `head` that asks one of `asks` (sorted): posted rows through the
-/// postings, O(log entries + hits) per ask; inline rows by their own asks, O(inline log asks).
-fn mark(head: &HeadView<'_>, postings: Option<&PostingsView<'_>>, asks: &[ContentId], out: &mut [bool]) {
+/// Tells `marked` of every row of `head` that asks one of `asks` (sorted), with an ask of
+/// `asks` it has: posted rows through the postings, O(log entries + hits) per ask; inline
+/// rows by their own asks, O(inline log asks). A row can be told more than once.
+fn mark(head: &HeadView<'_>, postings: Option<&PostingsView<'_>>, asks: &[ContentId], mut marked: impl FnMut(u32, ContentId)) {
     if asks.is_empty() {
         return;
     }
@@ -1366,7 +1640,7 @@ fn mark(head: &HeadView<'_>, postings: Option<&PostingsView<'_>>, asks: &[Conten
             let Some(entry) = postings.find(ask) else { continue };
             for id in postings.ids(entry) {
                 match head.find(&postings.base(id)) {
-                    Some(row) if head.row(row).posted() => out[row as usize] = true,
+                    Some(row) if head.row(row).posted() => marked(row, *ask),
                     _ => {}
                 }
             }
@@ -1374,8 +1648,10 @@ fn mark(head: &HeadView<'_>, postings: Option<&PostingsView<'_>>, asks: &[Conten
     }
     for at in 0..head.rows() {
         let row = head.row(at);
-        if !row.posted() && head.inline(&row).any(|ask| asks.binary_search(&ask).is_ok()) {
-            out[at as usize] = true;
+        if !row.posted()
+            && let Some(ask) = head.inline(&row).find(|ask| asks.binary_search(ask).is_ok())
+        {
+            marked(at, ask);
         }
     }
 }

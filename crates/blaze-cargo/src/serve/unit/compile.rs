@@ -192,8 +192,11 @@ struct RecordRef<'a> {
 /// a narrow key that holds its dependencies' interfaces in place of their code
 /// ([`blaze_lower::Narrowed::built`]), and its record lists of its codegen's inputs its own
 /// roots alone ([`owned_inputs`]): a record of layout 13 lists a dependency's functions with
-/// the code they had, so under such a key it would be found after one of them changed.
-const RECORD: &str = "blaze v2 cargo unit record 14";
+/// the code they had, so under such a key it would be found after one of them changed. 15: a
+/// test binary's execution table names the jump table it is of ([`blaze_codegen::JumpTable`]:
+/// the image's lineage and generation, its capacity and the slots given out), which a record
+/// of layout 14 lacks; its bytes would not read as this layout.
+const RECORD: &str = "blaze v2 cargo unit record 15";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The store's key of an output file's `bytes`: what a record names it by, and what a dev

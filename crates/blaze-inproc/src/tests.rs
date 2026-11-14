@@ -885,6 +885,20 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     memory.reserve(arena, 16).unwrap();
 }
 
+/// The invariant: a start hook in a PID namespace of its own (a sandboxed run on Linux) is
+/// known by the last ID of its `NSpid`, the one its `getpid` answers; the control is a status
+/// with no such line, which names nobody. `host` is the daemon's side, behind its feature, as
+/// the `host` tests of `linux` below are.
+#[cfg(feature = "host")]
+#[test]
+fn a_hook_in_a_pid_namespace_is_known_by_its_innermost_id() {
+    let nested = "Name:\tt\nTgid:\t4711\nPid:\t4711\nNSpid:\t4711\t2\nNSpgid:\t4711\t1\n";
+    assert_eq!(crate::host::innermost(nested), Some(2));
+    assert_eq!(crate::host::innermost("Name:\tt\nNSpid:\t4711\n"), Some(4711));
+    assert_eq!(crate::host::innermost("Name:\tt\nPid:\t4711\n"), None);
+    assert_eq!(crate::host::innermost("NSpid:\t4711\tx\n"), None);
+}
+
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod linux {
     use std::path::PathBuf;
@@ -1526,7 +1540,13 @@ mod linux {
             } else {
                 assert!(services.is_empty());
             }
-            assert_eq!(write.len(), 1);
+            // The host's socket is connected to by its path, given readable: a launch adds
+            // nothing writable to the run's sandbox.
+            assert!(write.is_empty(), "{write:?}");
+            if cfg!(unix) {
+                let socket = dir.join(format!("inproc-{}.sock", std::process::id()));
+                assert!(read.contains(&socket), "{read:?}");
+            }
             assert!(!network);
 
             let slide = 0x5555_0000_0000;

@@ -564,6 +564,7 @@
      "blaze-item-hash",
      "blaze-items",
      "blaze-kernel",
+     "blaze-keyed",
      "blaze-launch",
      "blaze-launch-host",
      "blaze-lazy",
@@ -2352,14 +2353,12 @@
    {
     "dependencies": [
      "blaze-alloc-count",
-     "blaze-api",
-     "blaze-cas",
      "blaze-core",
      "blaze-format",
-     "blaze-hash",
      "blaze-ids",
      "blaze-keyed",
      "blaze-protocol",
+     "blaze-rng",
      "blaze-sim",
      "blaze-usercode"
     ],
@@ -2485,7 +2484,8 @@
      "memchr",
      "postcard",
      "serde",
-     "serde_json"
+     "serde_json",
+     "tracing"
     ],
     "name": "blaze-usercode",
     "version": "0.0.0"
@@ -22711,6 +22711,10 @@
        "unit": "blaze-kernel@0.0.0 lib blaze_kernel build"
       },
       {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
+      },
+      {
        "name": "blaze_launch_host",
        "unit": "blaze-launch-host@0.0.0 lib blaze_launch_host build"
       },
@@ -27983,20 +27987,12 @@
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_api",
-       "unit": "blaze-api@0.0.0 lib blaze_api build"
-      },
-      {
-       "name": "blaze_cas",
-       "unit": "blaze-cas@0.0.0 lib blaze_cas build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_ids",
@@ -28455,6 +28451,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -47696,6 +47696,10 @@
        "unit": "blaze-kernel@0.0.0 lib blaze_kernel build"
       },
       {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
+      },
+      {
        "name": "blaze_launch_host",
        "unit": "blaze-launch-host@0.0.0 lib blaze_launch_host build"
       },
@@ -52992,20 +52996,12 @@
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_api",
-       "unit": "blaze-api@0.0.0 lib blaze_api build"
-      },
-      {
-       "name": "blaze_cas",
-       "unit": "blaze-cas@0.0.0 lib blaze_cas build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_ids",
@@ -53464,6 +53460,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -72395,6 +72395,10 @@
        "unit": "blaze-kernel@0.0.0 lib blaze_kernel build"
       },
       {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
+      },
+      {
        "name": "blaze_launch_host",
        "unit": "blaze-launch-host@0.0.0 lib blaze_launch_host build"
       },
@@ -77663,20 +77667,12 @@
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_api",
-       "unit": "blaze-api@0.0.0 lib blaze_api build"
-      },
-      {
-       "name": "blaze_cas",
-       "unit": "blaze-cas@0.0.0 lib blaze_cas build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_ids",
@@ -78135,6 +78131,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",
@@ -97362,6 +97362,10 @@
        "unit": "blaze-kernel@0.0.0 lib blaze_kernel build"
       },
       {
+       "name": "blaze_keyed",
+       "unit": "blaze-keyed@0.0.0 lib blaze_keyed build"
+      },
+      {
        "name": "blaze_launch_host",
        "unit": "blaze-launch-host@0.0.0 lib blaze_launch_host build"
       },
@@ -102658,20 +102662,12 @@
      "crate_type": "lib",
      "deps": [
       {
-       "name": "blaze_api",
-       "unit": "blaze-api@0.0.0 lib blaze_api build"
-      },
-      {
-       "name": "blaze_cas",
-       "unit": "blaze-cas@0.0.0 lib blaze_cas build"
-      },
-      {
        "name": "blaze_core",
        "unit": "blaze-core@0.0.0 lib blaze_core build"
       },
       {
-       "name": "blaze_hash",
-       "unit": "blaze-hash@0.0.0 lib blaze_hash build"
+       "name": "blaze_format",
+       "unit": "blaze-format@0.0.0 lib blaze_format build"
       },
       {
        "name": "blaze_ids",
@@ -103130,6 +103126,10 @@
       {
        "name": "serde_json",
        "unit": "serde_json@1.0.154 lib serde_json build"
+      },
+      {
+       "name": "tracing",
+       "unit": "tracing@0.1.44 lib tracing build"
       }
      ],
      "edition": "2024",

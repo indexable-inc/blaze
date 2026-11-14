@@ -32,6 +32,9 @@ pub(crate) const LIBRARY: &str = "library";
 /// The prefix of a launched program's start image mark ([`LaunchMark`]); the program's path
 /// (the one its link was asked for) follows.
 pub(crate) const LAUNCH: &str = "launch\0";
+/// The prefix of a test suite's index head mark ([`TestHeadMark`]); the suite's settings
+/// (`Suite::given`) in hex follow.
+pub(crate) const TESTS: &str = "tests\0";
 
 /// The tool's executable as last looked at, and its hash: 1 + 36 + 8 + 32 bytes, the layout
 /// of `<state>/tool` ([`tool_hash`]).
@@ -73,6 +76,23 @@ pub(crate) struct LaunchMark {
     pub record: ContentId,
     pub start: blaze_cas::Key,
     pub runs_as: String,
+}
+
+/// A test suite's index head (blaze-testsel's `TestIndex` key), the postings it names, and the
+/// program state (the image digest, `Image::state`) its rows hold at, its puts durable when
+/// marked: 1 + 32 (the suite's settings, which its name says too) + 32 + 32 + 1 + 32 bytes,
+/// the postings' 32 zero when the flag byte is 0. A run uses the head only for a binary of
+/// that state: another binary's is a miss by key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TestHeadMark {
+    /// The suite's settings (`Suite::given`).
+    pub given: ContentId,
+    /// The head's `TestIndex` key.
+    pub head: ContentId,
+    /// The `TestPostings` key the head names, when it names one.
+    pub postings: Option<ContentId>,
+    /// The program state its rows hold at.
+    pub state: ContentId,
 }
 
 /// blaze's own copy of the standard library as last mounted: its `DIGEST` file's stamp when
@@ -134,6 +154,7 @@ const BODIES_BYTES: usize = 1 + 32;
 /// A launch mark's length before the path it runs from's bytes: the layout, two keys and the
 /// path's length.
 const LAUNCH_HEAD: usize = 1 + 32 + 32 + 4;
+pub(crate) const TESTS_BYTES: usize = 1 + 32 + 32 + 32 + 1 + 32;
 
 /// The value's bytes past its layout byte, if it is `len` long and of [`LAYOUT`].
 fn body<'a>(name: &str, bytes: &'a [u8], len: usize) -> Result<&'a [u8], Undecoded> {
@@ -229,6 +250,45 @@ impl BodiesMark {
     pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<BodiesMark, Undecoded> {
         let body = body(name, bytes, BODIES_BYTES)?;
         Ok(BodiesMark { session: blaze_cas::Key(ContentId(id(body))) })
+    }
+}
+
+impl TestHeadMark {
+    /// The mark's name for the suite whose settings are `given`.
+    #[expect(blaze::implicit_allocator, reason = "the VFS names a mark by a `String`, once a head marked or let go")]
+    pub(crate) fn name(given: ContentId) -> String {
+        format!("{TESTS}{given:x}")
+    }
+
+    /// The mark's bytes, in a fixed buffer: the VFS copies what it keeps.
+    pub(crate) fn encode(&self) -> [u8; TESTS_BYTES] {
+        let mut out = [0; TESTS_BYTES];
+        out[0] = LAYOUT;
+        out[1..33].copy_from_slice(&self.given.0);
+        out[33..65].copy_from_slice(&self.head.0);
+        out[65..97].copy_from_slice(&self.state.0);
+        if let Some(postings) = self.postings {
+            out[97] = 1;
+            out[98..].copy_from_slice(&postings.0);
+        }
+        out
+    }
+
+    /// A flag byte other than 0 or 1 is refused as another layout's, and a mark whose settings
+    /// are not the ones its name says is refused as another length's: both by the mark's name.
+    #[expect(blaze::implicit_allocator, reason = "an error path, the mark's name")]
+    pub(crate) fn decode(name: &str, bytes: &[u8]) -> Result<TestHeadMark, Undecoded> {
+        let body = body(name, bytes, TESTS_BYTES)?;
+        let postings = match body[96] {
+            0 => None,
+            1 => Some(ContentId(id(&body[97..]))),
+            found => return Err(Undecoded::Layout { name: name.to_owned(), found }),
+        };
+        let given = ContentId(id(body));
+        if TestHeadMark::name(given) != name {
+            return Err(Undecoded::Length { name: name.to_owned(), len: bytes.len() });
+        }
+        Ok(TestHeadMark { given, head: ContentId(id(&body[32..])), postings, state: ContentId(id(&body[64..])) })
     }
 }
 
@@ -673,6 +733,46 @@ mod tests {
             assert_eq!(refused, Undecoded::Layout { name: name.clone(), found });
             assert!(refused.to_string().contains("/w/target/debug/deps/app-0123"), "{refused}");
         }
+    }
+
+    /// The invariant: a test suite's head mark decodes from its bytes to itself and encodes
+    /// again to the same bytes, with postings and without. The mark has no layout before this
+    /// one: a value of another layout byte, another flag byte or another length is refused by
+    /// the mark's name (the restore lets it go, and the suite starts with no head). Control:
+    /// the cut value is refused.
+    #[test]
+    fn a_test_head_mark_round_trips_and_another_layout_is_refused_by_name() {
+        blaze_sim::check(Config::DEFAULT, a_test_head_mark_round_trips);
+    }
+
+    fn a_test_head_mark_round_trips(tape: &Tape) {
+        let given = ContentId(draw_id(tape));
+        let name = TestHeadMark::name(given);
+        assert!(name.starts_with(TESTS), "{name:?}");
+        let postings = tape.bool("postings").then(|| ContentId(draw_id(tape)));
+        let mark = TestHeadMark { given, head: ContentId(draw_id(tape)), postings, state: ContentId(draw_id(tape)) };
+        let bytes = mark.encode();
+        assert_eq!(bytes.len(), 1 + 32 + 32 + 32 + 1 + 32);
+        assert_eq!(TestHeadMark::decode(&name, &bytes), Ok(mark));
+        assert_eq!(TestHeadMark::decode(&name, &bytes).unwrap().encode(), bytes);
+        let cut = tape.int_in(0..=bytes.len() - 1, "cut");
+        assert_eq!(
+            TestHeadMark::decode(&name, &bytes[..cut]),
+            Err(Undecoded::Length { name: name.clone(), len: cut }),
+            "the control: cut at {cut}"
+        );
+        for found in [0u8, LAYOUT + 1] {
+            let mut other = bytes;
+            other[0] = found;
+            assert_eq!(TestHeadMark::decode(&name, &other), Err(Undecoded::Layout { name: name.clone(), found }));
+        }
+        let mut flag = bytes;
+        flag[1 + 96] = 2;
+        assert_eq!(TestHeadMark::decode(&name, &flag), Err(Undecoded::Layout { name: name.clone(), found: 2 }));
+        // Another suite's mark under this suite's name is not this suite's.
+        let mut other = bytes;
+        other[1] ^= 1;
+        assert_eq!(TestHeadMark::decode(&name, &other), Err(Undecoded::Length { name: name.clone(), len: bytes.len() }));
     }
 
     /// Every case of the window: a stamp changed at `CHANGED` (a whole second: the coarse

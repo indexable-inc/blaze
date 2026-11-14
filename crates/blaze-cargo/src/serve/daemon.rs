@@ -1925,6 +1925,9 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             // The launched programs' start images the journal marks: each is restored when
             // first asked for, with no build ([`launch`]).
             steps.launch_marked(store.reader(), driver.waker(), launch::marked(&mut vfs));
+            // Each test suite's index head the journal marks: its next run takes it
+            // ([`super::job::Jobs::test_heads`]).
+            steps.test_heads_marked(super::job::test_heads_marked(&mut vfs));
         }
         // The system's memory pressure, watched for the daemon's life: it fails at once where
         // there is no source ([`Daemon::pressure`]).

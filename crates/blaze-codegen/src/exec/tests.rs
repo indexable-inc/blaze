@@ -14,6 +14,11 @@ fn key(n: u8) -> InstanceKey {
     InstanceKey(ContentId([n; 32]))
 }
 
+/// A jump table whose link gave out `given` slots, of a capacity past them.
+fn given(given: u32) -> JumpTable {
+    JumpTable { lineage: [1; 16], generation: 2, capacity: given + 16, given }
+}
+
 fn id(n: u8) -> ContentId {
     ContentId([n + 100; 32])
 }
@@ -299,9 +304,11 @@ fn a_binary_records_what_it_ran_where_it_has_slots() {
 #[test]
 fn a_table_has_every_function_each_slot_s_and_each_test_s() {
     let beside = ContentId([7; 32]);
-    let table = ExecTable::new(&built(), &[], 4, slots, beside, tests()).unwrap();
+    let table = ExecTable::new(&built(), &[], given(4), slots, beside, tests()).unwrap();
     assert_eq!(table.fns, [(id(0), plain(ran(0))), (id(1), plain(ran(1))), (id(2), plain(ran(2)))]);
+    // A word per slot given out, not per slot of the table's capacity, which it keeps.
     assert_eq!(table.slot_fn, [1, ExecTable::EMPTY, 0, ExecTable::EMPTY]);
+    assert_eq!(table.jump, given(4));
     assert_eq!(table.beside, beside);
     let names: Vec<&str> = table.tests.iter().map(|it| it.0.as_str()).collect();
     assert_eq!(names, ["calls", "alone"]);
@@ -364,7 +371,8 @@ fn no_tests() -> Vec<(String, usize)> {
 fn placed_of(span_table_1: u8, static_0: u8) -> Vec<ContentId> {
     let (built, spans) = placing(span_table_1, static_0);
     let table =
-        ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
+        ExecTable::new(&built, &spans, given(0), |_| None, ContentId::default(), no_tests())
+            .unwrap();
     table.fns.iter().map(|it| it.1).collect()
 }
 
@@ -393,7 +401,8 @@ fn the_order_a_function_names_its_tables_in_is_not_in_its_bound() {
     built.functions[1] = Arc::new(compiled(key(1), &[position(2, 4)], &[position(1, 3)], &[]));
     built.versions[1].1 = Ok(ran(0));
     let table =
-        ExecTable::new(&built, &spans, 0, |_| None, ContentId::default(), no_tests()).unwrap();
+        ExecTable::new(&built, &spans, given(0), |_| None, ContentId::default(), no_tests())
+            .unwrap();
     assert_eq!(table.fns[0].1, table.fns[1].1);
 }
 
@@ -432,7 +441,8 @@ fn a_table_is_in_identity_order_and_says_each_place_in_it() {
     };
     let slot_of = |key: &InstanceKey| (key.0 == numbered(0, 0)).then_some(1);
     let tests = [("few".to_owned(), 0), ("every".to_owned(), 1)];
-    let table = ExecTable::new(&built, &[], 2, slot_of, ContentId::default(), tests).unwrap();
+    let table =
+        ExecTable::new(&built, &[], given(2), slot_of, ContentId::default(), tests).unwrap();
     let ids: Vec<ContentId> = table.fns.iter().map(|it| it.0).collect();
     assert_eq!(ids, (0..1000).map(|n| numbered(n, 4)).collect::<Vec<_>>());
     assert_eq!(table.fns[999].1, plain(numbered(0, 8)), "function 0 is last");
@@ -463,49 +473,56 @@ fn a_table_is_refused_when_it_would_not_say_what_ran() {
     let mut unbound = built();
     unbound.versions[1].1 = Err("no body".to_owned());
     assert_eq!(
-        ExecTable::new(&unbound, &[], 4, slots, zero, tests()),
+        ExecTable::new(&unbound, &[], given(4), slots, zero, tests()),
         Err(ExecError::Unbound { function: key(1), why: "no body".to_owned() })
     );
 
     let mut twice = built();
     twice.versions[2].0 = id(0);
     assert_eq!(
-        ExecTable::new(&twice, &[], 4, slots, zero, tests()),
+        ExecTable::new(&twice, &[], given(4), slots, zero, tests()),
         Err(ExecError::Twice { function: key(2), other: key(0) })
     );
 
     assert_eq!(
-        ExecTable::new(&built(), &[], 2, slots, zero, tests()),
+        ExecTable::new(&built(), &[], given(2), slots, zero, tests()),
         Err(ExecError::PastTable { function: key(0), slot: 2, slots: 2 })
     );
 
+    let over = JumpTable { capacity: 3, ..given(4) };
     assert_eq!(
-        ExecTable::new(&built(), &[], 4, |key| (key.0.0[0] < 2).then_some(1), zero, tests()),
+        ExecTable::new(&built(), &[], over, slots, zero, tests()),
+        Err(ExecError::PastCapacity { given: 4, capacity: 3 })
+    );
+
+    assert_eq!(
+        ExecTable::new(&built(), &[], given(4), |key| (key.0.0[0] < 2).then_some(1), zero, tests()),
         Err(ExecError::TwoInSlot { slot: 1, function: key(1), other: key(0) })
     );
 
     assert_eq!(
-        ExecTable::new(&built(), &[], 4, slots, zero, [("gone".to_owned(), 2)]),
+        ExecTable::new(&built(), &[], given(4), slots, zero, [("gone".to_owned(), 2)]),
         Err(ExecError::NoRoot { test: "gone".to_owned(), root: 2 })
     );
 
     let mut later = built();
     later.functions.remove(2);
     assert_eq!(
-        ExecTable::new(&later, &[], 4, slots, zero, tests()),
+        ExecTable::new(&later, &[], given(4), slots, zero, tests()),
         Err(ExecError::NotCompiled { function: key(2) })
     );
 
     let (unplaced, mut spans) = placing(0, 0);
     spans.remove(1);
     assert_eq!(
-        ExecTable::new(&unplaced, &spans, 0, |_| None, zero, no_tests()),
+        ExecTable::new(&unplaced, &spans, given(0), |_| None, zero, no_tests()),
         Err(ExecError::NoSpans { function: key(4), anchor: ContentId([2; 32]) })
     );
 
     let (mut lacking, spans) = placing(0, 0);
     lacking.statics.remove(0);
-    let error = ExecTable::new(&lacking, &spans, 0, |_| None, zero, no_tests()).unwrap_err();
+    let error =
+        ExecTable::new(&lacking, &spans, given(0), |_| None, zero, no_tests()).unwrap_err();
     assert!(
         matches!(&error, ExecError::Unbound { function, .. } if *function == key(4)),
         "{error}"

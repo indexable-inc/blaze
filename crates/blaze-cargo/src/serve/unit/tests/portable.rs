@@ -115,7 +115,6 @@ fn checkout(at: Where, a: &str, b: &str) -> Checkout {
         build_dir: target_dir,
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {

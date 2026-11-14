@@ -20,15 +20,15 @@ is made and no snapshot restored. The steps, each timed and each bounded (a step
           `git clean` of what is untracked and not ignored. The daemon's watcher sees only the
           files that differ: that is the view.
   check   `blaze check --workspace --message-format short`.
-  test    `blaze test --reached --no-fail-fast --message-format json`, of `packages` (each a
+  test    `blaze test --no-fail-fast --message-format json`, of `packages` (each a
           `-p`), or of harness/unittests.py's CRATES when `packages` is empty. Every test of
           those packages comes back as a `blaze-test-result` line, run or kept from a pass
           whose inputs did not move (docs/cargo.md, "Which tests run").
 
 It fails, never passes quietly, when: `checkout` is no clone and `init` is false (`init` true
 clones it, cold, and says so); a step exits nonzero or outlasts its bound; a `blaze-test-result`
-line is not JSON; any test failed; or fewer than `min_tests` results came back. Under
-`--reached` a test not run is still reported, so no result at all means the selection gave
+line is not JSON; any test failed; or fewer than `min_tests` results came back. A test not
+run is still reported (cached), so no result at all means the selection gave
 nothing, which is a failure of the selection and not a pass (min_tests of 0 is refused).
 
 `token_var`, when not empty, names an environment variable holding a token the fetch reads the
@@ -169,7 +169,7 @@ def packages(cfg: Config) -> list[str]:
 def tests(cfg: Config, env: dict[str, str]) -> dict[str, object]:
     """The reached tests run: their counts and the failed ones' names. Raises `Failed`."""
     names = packages(cfg)
-    command = ["blaze", "test", "--reached", "--no-fail-fast", "--message-format", "json", *(f"-p{it}" for it in names)]
+    command = ["blaze", "test", "--no-fail-fast", "--message-format", "json", *(f"-p{it}" for it in names)]
     # As harness/unittests.py: blaze-diagnostics' largest test overflows a test thread's 2 MiB.
     env = {"RUST_MIN_STACK": str(16 << 20), **env}
     failed_run: Failed | None = None
@@ -195,7 +195,7 @@ def tests(cfg: Config, env: dict[str, str]) -> dict[str, object]:
             failed.append(f"{result.get('binary')}::{result.get('name')}")
         if outcome == "ignored":
             ignored += 1
-        elif result.get("cached") is not None or outcome == "unreached":
+        elif result.get("cached") is not None:
             kept += 1
         else:
             ran += 1
@@ -209,8 +209,8 @@ def tests(cfg: Config, env: dict[str, str]) -> dict[str, object]:
         raise FailedTests(str(failed_run), counts)
     if total < cfg.min_tests:
         raise FailedTests(
-            f"test: `blaze test --reached` came back with {total} result(s), fewer than min_tests ({cfg.min_tests}): "
-            "every test of the packages is reported under --reached, run or kept, so the selection gave nothing",
+            f"test: `blaze test` came back with {total} result(s), fewer than min_tests ({cfg.min_tests}): "
+            "every test of the packages is reported, run or kept, so the selection gave nothing",
             counts,
         )
     return counts

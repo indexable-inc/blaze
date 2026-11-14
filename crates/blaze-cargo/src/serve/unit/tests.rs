@@ -188,7 +188,6 @@ fn build(dir: &std::path::Path) -> Units {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }
@@ -1323,7 +1322,6 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -1640,7 +1638,6 @@ fn script_front_for(
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2003,7 +2000,6 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
@@ -2138,7 +2134,6 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     };
     let config = BuildConfig {
