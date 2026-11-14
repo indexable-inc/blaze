@@ -1,13 +1,16 @@
-//! `blaze check --replace FROM=TO`: every reference that resolves to the item `FROM` names,
-//! retargeted to the item `TO` names ([`Edit::Replace`], which blaze-intent makes through the
-//! front end's name resolution), in the checkout as saved. The daemon opens the checkout's
-//! head, makes the edits in its front end and commits them to the head; they are written to
-//! the checkout's files here, which the daemon's watcher then sees as the head already has
-//! them.
+//! `blaze check --replace FROM=TO` and `--rules FILE`: every reference that resolves to the item
+//! `FROM` names, retargeted to the item `TO` names ([`Edit::Replace`], which blaze-intent makes
+//! through the front end's name resolution), and every rewrite of an astlog rules file
+//! ([`Edit::Rules`], docs/v2/plan/design/astlog-sema.md), in the checkout as saved. The daemon
+//! opens the checkout's head, makes the edits in its front end and commits them to the head;
+//! they are written to the checkout's files here, which the daemon's watcher then sees as the
+//! head already has them. With `--dry-run` the daemon commits nothing and nothing is written:
+//! the edits come back as a unified diff. `--query FILE` runs a rules file and writes nothing
+//! ([`Request::Query`]).
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
-use blaze_api::{Edit, Edited, Request, ResponseRef, ViewRef};
+use blaze_api::{Edit, Edited, Request, ResponseRef, ViewRef, query::Rows};
 use blaze_vfs::Op;
 
 use super::{daemon::Start, observe, place};
@@ -30,24 +33,27 @@ pub(crate) fn edits(pairs: &[String]) -> Result<Vec<Edit>, String> {
     Ok(edits)
 }
 
-/// `edits` made in the checkout at `root`, committed to its head and written to its files.
-pub fn replace(root: &Path, edits: Vec<Edit>) -> Result<Edited, String> {
+/// The rules file `--rules` or `--query` names, read whole; a path relative to the directory
+/// blaze was started in.
+pub(crate) fn rules(cwd: &Path, file: &str) -> Result<String, String> {
+    let path = cwd.join(file);
+    std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// What [`replace`] made: the edits, and with `dry` the diff they would write.
+pub struct Made {
+    pub edited: Edited,
+    pub diff: Option<String>,
+}
+
+/// `edits` made in the checkout at `root`, committed to its head and written to its files; with
+/// `dry`, made in the daemon's front end only and returned as a diff of the checkout's files.
+pub fn replace(root: &Path, edits: Vec<Edit>, dry: bool) -> Result<Made, String> {
     let head = place::utf8(root)?;
-    let mut base = None;
-    // clone: the head's name, in each of the two requests
-    observe::ask(
-        Request::Open { view: ViewRef::Head(head.clone()) },
-        Start::IfMissing,
-        |response| {
-            if let ResponseRef::Opened { root } = response {
-                base = Some(root);
-            }
-            Ok(())
-        },
-    )?;
-    let base = base.ok_or("the daemon answered the checkout's open with no root")?;
+    let base = opened(&head)?;
     let (mut edited, mut committed) = (None, false);
-    observe::ask(Request::Edit { base, head, edits }, Start::Never, |response| {
+    let target = if dry { None } else { Some(head) };
+    observe::ask(Request::Edit { base, head: target, edits }, Start::Never, |response| {
         match response {
             ResponseRef::Edited(it) => edited = Some(it),
             ResponseRef::Committed { .. } => committed = true,
@@ -56,20 +62,74 @@ pub fn replace(root: &Path, edits: Vec<Edit>) -> Result<Edited, String> {
         Ok(())
     })?;
     let edited = edited.ok_or("the daemon answered the edit with no edits")?;
+    if dry {
+        let planned = plan(root, &edited.ops)?;
+        return Ok(Made { diff: Some(planned.diff()), edited });
+    }
     if !committed {
         return Err(
             "the daemon made the edits and did not commit them to the checkout's head".to_owned()
         );
     }
     write(root, &edited.ops)?;
-    Ok(edited)
+    Ok(Made { edited, diff: None })
 }
 
-/// `ops`, as the VFS applies them in order, made in the files under `root`: each file read
-/// once, its edits made in memory, then written whole through a file beside it renamed over
-/// it, keeping its permissions; then each rename. A path that leaves `root`, or an edit past a
-/// file's end (it changed after the daemon read it), is an error before anything is written.
-pub(crate) fn write(root: &Path, ops: &[Op]) -> Result<(), String> {
+/// `rules` run over the checkout at `root` as saved: the relations they derive and the lints'
+/// findings. Nothing is committed or written.
+pub fn query(root: &Path, rules: String) -> Result<Rows, String> {
+    let head = place::utf8(root)?;
+    let mut rows = None;
+    let asked = Request::Query { view: ViewRef::Head(head), rules };
+    observe::ask(asked, Start::IfMissing, |response| {
+        if let ResponseRef::Rows(it) = response {
+            rows = Some(it);
+        }
+        Ok(())
+    })?;
+    rows.ok_or_else(|| "the daemon answered the query with no rows".to_owned())
+}
+
+/// The root the daemon opens the checkout's head at, started if it is not running.
+fn opened(head: &str) -> Result<blaze_ids::ContentId, String> {
+    let mut base = None;
+    observe::ask(Request::Open { view: ViewRef::Head(head.to_owned()) }, Start::IfMissing, |response| {
+        if let ResponseRef::Opened { root } = response {
+            base = Some(root);
+        }
+        Ok(())
+    })?;
+    base.ok_or_else(|| "the daemon answered the checkout's open with no root".to_owned())
+}
+
+/// What `ops` leave the checkout's files as, in memory: each file edited, its text before and
+/// after, and each rename.
+struct Planned<'o> {
+    files: Vec<(&'o str, Vec<u8>, Vec<u8>)>,
+    renames: Vec<(PathBuf, PathBuf)>,
+}
+
+impl Planned<'_> {
+    /// Each edited file's change as a unified diff (`a/PATH`, `b/PATH`), then each rename.
+    fn diff(&self) -> String {
+        let mut out = String::new();
+        for (path, before, after) in &self.files {
+            let (before, after) = (String::from_utf8_lossy(before), String::from_utf8_lossy(after));
+            let diff = similar::TextDiff::from_lines(&*before, &*after);
+            let shown = diff.unified_diff().header(&format!("a/{path}"), &format!("b/{path}")).to_string();
+            out.push_str(&shown);
+        }
+        for (from, to) in &self.renames {
+            out.push_str(&format!("rename {} -> {}\n", from.display(), to.display()));
+        }
+        out
+    }
+}
+
+/// `ops`, as the VFS applies them in order, made in memory over the files under `root`: each
+/// file read once. A path that leaves `root`, or an edit past a file's end (it changed after
+/// the daemon read it), is an error.
+fn plan<'o>(root: &Path, ops: &'o [Op]) -> Result<Planned<'o>, String> {
     let inside = |path: &str| {
         let ok = !path.is_empty()
             && Path::new(path).components().all(|it| matches!(it, Component::Normal(_)));
@@ -79,21 +139,23 @@ pub(crate) fn write(root: &Path, ops: &[Op]) -> Result<(), String> {
             Err(format!("`{path}` is no path inside the checkout"))
         }
     };
-    let mut files: Vec<(&str, Vec<u8>)> = Vec::new(); // alloc: CLI edge, the files one fix edits
+    // alloc: CLI edge, the files one fix edits
+    let mut files: Vec<(&str, Vec<u8>, Vec<u8>)> = Vec::new();
     let mut renames = Vec::new(); // alloc: CLI edge, a renamed module's files
     for op in ops {
         match op {
             Op::Edit { at, len, path, bytes } => {
-                let at_file = match files.iter().position(|(it, _)| *it == path.as_str()) {
+                let at_file = match files.iter().position(|(it, ..)| *it == path.as_str()) {
                     Some(at_file) => at_file,
                     None => {
                         let read = std::fs::read(inside(path)?)
                             .map_err(|error| format!("{path}: {error}"))?;
-                        files.push((path.as_str(), read));
+                        // clone: the text before, for a dry run's diff; CLI edge, once a file
+                        files.push((path.as_str(), read.clone(), read));
                         files.len() - 1
                     }
                 };
-                let text = &mut files[at_file].1;
+                let text = &mut files[at_file].2;
                 let start = usize::try_from(*at).ok();
                 let end =
                     start.zip(usize::try_from(*len).ok()).and_then(|(at, len)| at.checked_add(len));
@@ -111,12 +173,20 @@ pub(crate) fn write(root: &Path, ops: &[Op]) -> Result<(), String> {
             Op::Rename { to, from } => renames.push((inside(from)?, inside(to)?)),
             Op::Write { path, .. } | Op::Delete { path } => {
                 return Err(format!(
-                    "the daemon's edit writes or deletes {path} whole, which `--replace` and `--fix` do not do"
+                    "the daemon's edit writes or deletes {path} whole, which `--replace`, `--rules` and `--fix` do not do"
                 ));
             }
         }
     }
-    for (path, bytes) in &files {
+    Ok(Planned { files, renames })
+}
+
+/// `ops` made in the files under `root` ([`plan`]): each file written whole through a file
+/// beside it renamed over it, keeping its permissions; then each rename. Nothing is written
+/// when the plan fails.
+pub(crate) fn write(root: &Path, ops: &[Op]) -> Result<(), String> {
+    let Planned { files, renames } = plan(root, ops)?;
+    for (path, _, bytes) in &files {
         let file = root.join(path);
         let beside = file.with_file_name(format!(
             ".{}.blaze-edit",
@@ -147,7 +217,7 @@ mod tests {
     use blaze_api::Edit;
     use blaze_vfs::Op;
 
-    use super::{edits, write};
+    use super::{edits, plan, write};
 
     fn pairs(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|it| (*it).to_owned()).collect()
@@ -196,6 +266,29 @@ mod tests {
             text,
             "a refused fix writes nothing"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_is_the_diff_the_edits_would_write_and_writes_nothing() {
+        let made = blaze_core::temp::TempDir::for_test("blaze-dry-run-");
+        let root = made.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let before = "use std::sync::Mutex;\nfn f(_: Mutex) {}\n";
+        std::fs::write(root.join("src/lib.rs"), before).unwrap();
+        let ops = [Op::Edit {
+            at: 4,
+            len: 16,
+            path: "src/lib.rs".to_owned(),
+            bytes: b"parking_lot::Mutex".to_vec(),
+        }];
+        let diff = plan(&root, &ops).unwrap().diff();
+        assert_eq!(
+            diff,
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-use std::sync::Mutex;\n\
+             +use parking_lot::Mutex;\n fn f(_: Mutex) {}\n"
+        );
+        assert_eq!(std::fs::read_to_string(root.join("src/lib.rs")).unwrap(), before);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

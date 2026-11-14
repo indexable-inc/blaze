@@ -32,7 +32,7 @@ pub struct Touch {
 }
 
 /// The file an edit works in, as the request names it; `None` for a replace, which works in
-/// every file that names its item.
+/// every file that names its item, and for rules, which work wherever they match.
 pub fn file_of(edit: &Edit) -> Option<&str> {
     match edit {
         Edit::ReplaceBody { item, .. }
@@ -42,7 +42,7 @@ pub fn file_of(edit: &Edit) -> Option<&str> {
         | Edit::Rename { item, .. } => Some(&item.file),
         Edit::AddField { strukt, .. } | Edit::RemoveField { strukt, .. } => Some(&strukt.file),
         Edit::AddItem { file, .. } | Edit::AddUse { file, .. } => Some(file),
-        Edit::Replace { .. } => None,
+        Edit::Replace { .. } | Edit::Rules { .. } => None,
     }
 }
 
@@ -197,6 +197,7 @@ fn splice_of(
         }
         Edit::Rename { .. } => unreachable!("a rename is made by `crate::rename`"),
         Edit::Replace { .. } => unreachable!("a replace is made by `crate::replace`"),
+        Edit::Rules { .. } => unreachable!("rules are refused by `crate::apply_with_text`"),
     }
 }
 

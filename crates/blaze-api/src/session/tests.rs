@@ -1354,7 +1354,7 @@ fn body_edited() -> Edited {
 }
 
 fn edit_request(base: ContentId) -> Request {
-    Request::Edit { base, head: "main".to_owned(), edits: body_edit() }
+    Request::Edit { base, head: Some("main".to_owned()), edits: body_edit() }
 }
 
 #[test]
@@ -1379,6 +1379,27 @@ fn an_edit_reports_what_it_changed_then_commits_its_ops_once_durable() {
     );
     let replies = world.request(1, 2, Request::Cancel { id: 1 });
     assert_eq!(error_at(&replies), Some("request 1".to_owned()), "it is over");
+}
+
+#[test]
+fn a_dry_run_edit_reports_what_it_would_change_and_commits_nothing() {
+    let mut world = World::new();
+    let base = world.commit(&[("src/lib.rs", "fn a() {}\n")]);
+    let dry = Request::Edit { base, head: None, edits: body_edit() };
+    assert_eq!(world.request(1, 1, dry), []);
+    let job = world.last_job();
+    let edited = Response::Edited(body_edited());
+    assert_eq!(world.report(job, edited.clone()), [reply(1, 1, edited)]);
+    assert_eq!(world.finish(job, true, None), [done(1, 1, true)], "over with no commit");
+    assert_eq!(world.vfs.head("main"), Some(base), "the head did not move");
+    assert!(world.session.tickets.is_empty());
+    assert_eq!(world.session.views(), 0);
+    // The control: the same edit with its head commits.
+    world.request(1, 2, edit_request(base));
+    let job = world.last_job();
+    world.report(job, Response::Edited(body_edited()));
+    world.finish(job, true, None);
+    assert_ne!(world.vfs.head("main"), Some(base));
 }
 
 #[test]

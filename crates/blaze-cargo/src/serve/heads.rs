@@ -162,6 +162,7 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Lock { view, .. }
         | Request::Diagnostics { view, .. }
         | Request::Prove { view, .. }
+        | Request::Query { view, .. }
         | Request::WillTest { view, .. } => view_heads(view, &mut heads),
         Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
@@ -177,8 +178,8 @@ pub fn named(request: &Request) -> Vec<&str> {
 }
 
 /// Whether `request` runs user code (build scripts, proc macros, tests, a binary), whose checks
-/// of their inputs outside views read the watches' round. A reach, an edit and a build ahead
-/// build their views' proc macros and run their build scripts before they read them.
+/// of their inputs outside views read the watches' round. A reach, an edit, a rules query and a
+/// build ahead build their views' proc macros and run their build scripts before they read them.
 pub fn runs_user_code(request: &Request) -> bool {
     matches!(
         request,
@@ -193,6 +194,7 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::Reach { .. }
             | Request::Prove { .. }
             | Request::Edit { .. }
+            | Request::Query { .. }
             | Request::WillTest { .. }
             | Request::WillSave { .. }
     )
@@ -735,7 +737,7 @@ mod tests {
         assert!(runs_user_code(&ahead));
         let edit = Request::Edit {
             base: ContentId::of("heads test", b"root"),
-            head: "/w".to_owned(),
+            head: Some("/w".to_owned()),
             edits: Vec::new(),
         };
         assert!(
@@ -772,10 +774,13 @@ mod tests {
         assert_eq!(named(&save), ["/w"]);
         let edit = Request::Edit {
             base: ContentId::of("heads test", b"root"),
-            head: "/w".to_owned(),
+            head: Some("/w".to_owned()),
             edits: Vec::new(),
         };
         assert!(named(&edit).is_empty());
+        let query = Request::Query { view: ViewRef::Head("/w".to_owned()), rules: String::new() };
+        assert_eq!(named(&query), ["/w"], "a rules query reads its view's head");
+        assert!(runs_user_code(&query), "it builds its view's proc macros first");
     }
 
     /// A request on a checkout waits on a flush of its watch, and nothing is written into the

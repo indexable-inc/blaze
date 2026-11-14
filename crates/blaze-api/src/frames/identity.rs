@@ -22,8 +22,8 @@ use crate::{
     UnitTarget, Verb, ViewRef, Worked,
 };
 
-const REQUESTS: usize = 38;
-const RESPONSES: usize = 47;
+const REQUESTS: usize = 39;
+const RESPONSES: usize = 48;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -282,7 +282,11 @@ impl Gen {
             16 => Request::Trace { view: self.view(0), targets: self.targets() },
             17 => Request::Tables { view: self.view(0) },
             18 => {
-                Request::Edit { base: self.id(), head: self.text(), edits: self.many(0, Gen::edit) }
+                Request::Edit {
+                    base: self.id(),
+                    head: self.maybe(Gen::text),
+                    edits: self.many(0, Gen::edit),
+                }
             }
             19 => Request::WillTest {
                 view: self.view(0),
@@ -361,6 +365,7 @@ impl Gen {
                 subset: self.yes(),
                 targets: self.targets(),
             },
+            38 => Request::Query { view: self.view(0), rules: self.text() },
             _ => Request::Stop,
         }
     }
@@ -370,7 +375,7 @@ impl Gen {
     }
 
     fn edit(&mut self) -> Edit {
-        match self.below(10) {
+        match self.below(11) {
             0 => Edit::ReplaceBody { body: self.text(), item: self.target() },
             1 => Edit::ReplaceSignature { item: self.target(), signature: self.text() },
             2 => Edit::ReplaceItem { item: self.target(), text: self.text() },
@@ -382,6 +387,7 @@ impl Gen {
             6 => Edit::RemoveItem { item: self.target() },
             7 => Edit::AddUse { file: self.text(), into: self.maybe(Gen::text), path: self.text() },
             8 => Edit::Rename { to: self.text(), item: self.target() },
+            9 => Edit::Rules { rules: self.text() },
             _ => Edit::Replace { to: self.text(), from: self.text() },
         }
     }
@@ -933,6 +939,22 @@ impl Gen {
                 executable: self.u32(),
                 filtered_out: self.u32(),
             }),
+            46 => Response::Rows(crate::query::Rows {
+                findings: self.many(depth, |g| crate::query::Finding {
+                    at: g.maybe(Gen::cell),
+                    message: g.text(),
+                    relation: g.text(),
+                    severity: match g.yes() {
+                        true => crate::query::Severity::Error,
+                        false => crate::query::Severity::Warning,
+                    },
+                }),
+                relations: self.many(depth, |g| crate::query::Relation {
+                    name: g.text(),
+                    rows: g.many(depth + 1, |g| g.many(depth + 1, Gen::cell)),
+                    columns: g.texts(depth + 1),
+                }),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() } // alloc: test and fuzz reference only
             }
@@ -983,6 +1005,24 @@ impl Gen {
             9 => crate::ReportSpan::Command(g.text()),
             _ => crate::ReportSpan::Strong(g.text()),
         }))
+    }
+
+    fn cell(&mut self) -> crate::query::Cell {
+        use crate::query::Cell;
+        match self.below(6) {
+            0 => Cell::Code {
+                end: self.u32(),
+                line: self.maybe(Gen::u32),
+                path: self.text(),
+                text: self.text(),
+                start: self.u32(),
+            },
+            1 => Cell::Expanded { call: self.text(), text: self.text() },
+            2 => Cell::Def { path: self.text() },
+            3 => Cell::Type { text: self.text() },
+            4 => Cell::Text(self.text()),
+            _ => Cell::Int(self.next() as i64),
+        }
     }
 
     fn maybe_id(&mut self) -> Option<ContentId> {
@@ -1151,6 +1191,7 @@ fn request_index(request: &Request) -> usize {
         Request::Store { .. } => 35,
         Request::Diagnostics { .. } => 36,
         Request::Prove { .. } => 37,
+        Request::Query { .. } => 38,
     }
 }
 
@@ -1203,7 +1244,8 @@ fn response_index(response: &Response) -> usize {
         Response::Diagnostics(_) => 43,
         Response::Proven(_) => 44,
         Response::TestsOf(_) => 45,
-        Response::Of { .. } => 46,
+        Response::Rows(_) => 46,
+        Response::Of { .. } => 47,
     }
 }
 

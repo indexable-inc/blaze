@@ -9,7 +9,7 @@
 use std::cell::OnceCell;
 
 use base_db::FileId;
-use blaze_api::{ApiError, Edit, Edited};
+use blaze_api::{ApiError, Edit, Edited, query::Rows};
 use blaze_hash::HashMap;
 use blaze_intent::ahead;
 use blaze_vfs::Bytes;
@@ -20,18 +20,30 @@ use crate::serve::work::Failed;
 
 /// `edits` made in the job's view ([`blaze_intent::apply`]): what they change, for the session
 /// to commit. Bytes of the view that fail their check end it with an error naming the file.
+/// A request's [`Edit::Rules`] runs every rewrite of its rules file after the request's other
+/// edits ([`blaze_astlog::edit`]); one such edit a request.
 pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edited, Failed> {
-    // An edit resolves names in any crate of the view: every one's proc macros were built and
-    // applied before it was posted (`Jobs::next`); checked again here.
-    for at in 0..job.graph.len() {
-        let Some(krate) = job.crates.krate(at) else { continue };
-        if job.cancelled() {
-            return Err(Failed::Again);
-        }
-        answer_macros_built(reader.db(), krate, &job.unit(at)?.target.name, "edit")?;
+    macros_built(job, reader, "edit")?;
+    let mut rules = edits.iter().filter_map(|it| match it {
+        Edit::Rules { rules } => Some(rules.as_str()),
+        _ => None,
+    });
+    let (first, second) = (rules.next(), rules.next());
+    if second.is_some() {
+        let what = "an edit request carries two astlog rules edits: put every rule in one file";
+        return Err(ApiError::new(what, None).into());
     }
     let files = ViewFiles::new(&job.mounted, reader.paths());
-    let applied = blaze_intent::apply(reader.db(), &files, edits);
+    let applied = match first {
+        Some(rules) => {
+            // alloc: the request's other edits, once a request
+            let others: Vec<Edit> =
+                edits.iter().filter(|it| !matches!(it, Edit::Rules { .. })).cloned().collect();
+            blaze_astlog::edit(reader.db(), &files, rules, &others)
+                .map_err(|error| blaze_astlog::api_error(&error))
+        }
+        None => blaze_intent::apply(reader.db(), &files, edits),
+    };
     if let Some((path, why)) = files.corrupt.into_inner() {
         return Err(ApiError::new(why, Some(path)).into());
     }
@@ -39,6 +51,32 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
     // alloc: once per edit, one seed per file it reparsed
     *job.seeds.lock() = applied.seeds().collect();
     Ok(applied.edited)
+}
+
+/// `rules` run over the job's view ([`blaze_astlog::query`]): every relation they derive and
+/// every lint's finding. Writes nothing and builds nothing past the view's proc macros.
+pub(crate) fn query(job: &Job, reader: &UnitReader, rules: &str) -> Result<Rows, Failed> {
+    macros_built(job, reader, "query")?;
+    let files = ViewFiles::new(&job.mounted, reader.paths());
+    let rows = blaze_astlog::query(reader.db(), &files, rules)
+        .map_err(|error| blaze_astlog::api_error(&error));
+    if let Some((path, why)) = files.corrupt.into_inner() {
+        return Err(ApiError::new(why, Some(path)).into());
+    }
+    Ok(rows?)
+}
+
+/// Every crate of the view has its proc macros built and applied: an edit or a query resolves
+/// names in any of them. `Jobs::next` posted the job only after they were; checked again here.
+fn macros_built(job: &Job, reader: &UnitReader, what: &str) -> Result<(), Failed> {
+    for at in 0..job.graph.len() {
+        let Some(krate) = job.crates.krate(at) else { continue };
+        if job.cancelled() {
+            return Err(Failed::Again);
+        }
+        answer_macros_built(reader.db(), krate, &job.unit(at)?.target.name, what)?;
+    }
+    Ok(())
 }
 
 /// The job's test units (by their place in its graph) that hold a test `filter` selects, as

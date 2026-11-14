@@ -197,12 +197,12 @@ enum Kind {
         asked: Option<Box<Asked>>,
     },
     /// A [`Request::Edit`]'s job, on its base, and the ops it reported; it becomes the
-    /// `Commit` of them when it ends.
+    /// `Commit` of them when it ends; with no `head` (a dry run), it ends there.
     Edit {
         job: JobId,
         cancelled: bool,
         opened: Opened,
-        head: String,
+        head: Option<String>,
         ops: Option<Vec<blaze_vfs::Op>>,
     },
     BestOf(BestOf),
@@ -605,9 +605,13 @@ impl Session {
             )),
             (None, Some(ops)) => Ok(Some(ops)),
         };
-        let head = std::mem::take(head);
-        let over = match made {
-            Ok(Some(ops)) => match cx.vfs.commit_owned(&head, base, ops) {
+        let over = match (made, head.take()) {
+            // A dry run: the client has the ops in `Response::Edited`; nothing is committed.
+            (Ok(Some(_)), None) => {
+                sink.send(out, Response::Done { ok: true });
+                true
+            }
+            (Ok(Some(ops)), Some(head)) => match cx.vfs.commit_owned(&head, base, ops) {
                 Ok(commit) => {
                     self.intents.moved(cx.builder, &head, commit.root);
                     self.tickets.insert(commit.ticket, serial);
@@ -625,11 +629,11 @@ impl Session {
                     true
                 }
             },
-            Ok(None) => {
+            (Ok(None), _) => {
                 sink.send(out, Response::Done { ok: false });
                 true
             }
-            Err(error) => {
+            (Err(error), _) => {
                 sink.send(out, Response::Error(error));
                 sink.send(out, Response::Done { ok: false });
                 true
@@ -699,6 +703,7 @@ impl Session {
                 self.build(cx, req, &view, Work::Prove { targets, emit, subset, lean })?
             }
             Request::Tables { view } => self.build(cx, req, &view, Work::Tables)?,
+            Request::Query { view, rules } => self.build(cx, req, &view, Work::Query(rules))?,
             Request::Doc { view, targets, no_deps, private } => {
                 self.build(cx, req, &view, Work::Doc { targets, no_deps, private })?
             }
@@ -743,7 +748,14 @@ impl Session {
             Request::Stop => out.push(Reply { to: req, response: Response::Done { ok: true } }),
             Request::Edit { base, head, edits } => {
                 if !cx.vfs.has(base) {
-                    return Err(commit_error(&head, base, &CommitError::UnknownBase(base)));
+                    return Err(match &head {
+                        Some(head) => commit_error(head, base, &CommitError::UnknownBase(base)),
+                        None => ApiError::new(
+                            // alloc: error path, a dry run on an unknown base.
+                            format!("the base {base:x} of a dry-run edit is no root this daemon has"),
+                            None,
+                        ),
+                    });
                 }
                 let opened = open(cx, base)?;
                 let serial = self.serial();
@@ -1260,6 +1272,7 @@ fn incremental(work: &Work) -> bool {
         | Work::Snapshot
         | Work::Tables
         | Work::Edit(_)
+        | Work::Query(_)
         | Work::Ahead { .. }
         | Work::Prove { .. }
         | Work::Lock(_) => false,

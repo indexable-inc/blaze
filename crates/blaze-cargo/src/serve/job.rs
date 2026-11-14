@@ -548,6 +548,10 @@ pub(super) enum Does<S: Steps> {
         front: Arc<S::Front>,
         edits: Vec<Edit>,
     },
+    Query {
+        front: Arc<S::Front>,
+        rules: String,
+    },
     Ahead {
         front: Arc<S::Front>,
         filter: Vec<String>,
@@ -682,6 +686,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Trace { .. } => tracing::info_span!("trace"),
             Does::Verify { .. } => tracing::info_span!("verify"),
             Does::Edit { .. } => tracing::info_span!("edit"),
+            Does::Query { .. } => tracing::info_span!("query"),
             Does::Ahead { .. } => tracing::info_span!("ahead"),
             Does::Prove { emit, .. } => tracing::info_span!(target: "blaze", "prove", emit = *emit),
             Does::Doc { .. } => tracing::info_span!("doc"),
@@ -921,6 +926,9 @@ impl<S: Steps> plane::Work for Step<S> {
             }
             Does::Edit { front, edits } => self.settle(front.edit(this(readers), edits), |it| {
                 Value::Answer(it.map(Response::Edited))
+            }),
+            Does::Query { front, rules } => self.settle(front.query(this(readers), rules), |it| {
+                Value::Answer(it.map(Response::Rows))
             }),
             Does::Ahead { front, filter } => {
                 self.settle(front.ahead(this(readers), filter), Value::Ahead)
@@ -1270,6 +1278,7 @@ fn command_of(work: &Work) -> Command {
         | Work::Snapshot
         | Work::Edit(_)
         | Work::Prove { .. }
+        | Work::Query(_)
         | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
     }
@@ -1291,6 +1300,7 @@ fn kind_of(work: &Work) -> JobKind {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
+        | Work::Query(_)
         | Work::Doc { .. }
         | Work::Prove { .. }
         | Work::Lock(_) => JobKind::Check,
@@ -1309,7 +1319,7 @@ fn kind_of(work: &Work) -> JobKind {
 /// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
 fn reads_front_unbuilt(work: &Work) -> bool {
     match work {
-        Work::Reach { .. } | Work::Edit(_) | Work::Ahead { .. } | Work::Prove { .. } => true,
+        Work::Reach { .. } | Work::Edit(_) | Work::Query(_) | Work::Ahead { .. } | Work::Prove { .. } => true,
         Work::Check(_)
         | Work::Build(_)
         | Work::Test { .. }
@@ -1339,6 +1349,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Tables => "tables",
         Work::Doc { .. } => "doc",
         Work::Edit(_) => "edit",
+        Work::Query(_) => "query",
         Work::Ahead { .. } => "ahead",
         Work::Lock(_) => "lock",
         Work::Prove { .. } => "prove",
@@ -1380,7 +1391,7 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Doc { targets, .. }
         | Work::Prove { targets, .. }
         | Work::Lock(targets) => Some(targets),
-        Work::Tables | Work::Snapshot | Work::Edit(_) => None,
+        Work::Tables | Work::Snapshot | Work::Edit(_) | Work::Query(_) => None,
     }
 }
 
@@ -11070,6 +11081,8 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         }
         // clone: the task owns the edits, once per job
         Work::Edit(edits) => Does::Edit { front: lowered()?, edits: edits.clone() },
+        // clone: the task owns the rules, once per job
+        Work::Query(rules) => Does::Query { front: lowered()?, rules: rules.clone() },
         // clone: the task owns the filter, once per job
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
         Work::Doc { no_deps, private, .. } => {

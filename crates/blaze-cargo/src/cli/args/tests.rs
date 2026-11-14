@@ -95,6 +95,24 @@ fn check_reads_its_fix_replace_and_baseline_flags_and_keeps_them_from_the_load()
         unhonored(&["check", "--replace", "a::B=c::D", "--fix"]).is_some(),
         "a replace checks nothing"
     );
+    let rules = cargo(&["check", "--rules", "move.astlog", "--dry-run", "--replace=a::B=c::D"]);
+    assert_eq!(rules.flags.rules.as_deref(), Some("move.astlog"));
+    assert!(rules.flags.dry_run);
+    assert!(rules.args.is_empty(), "`--rules` and `--dry-run` stay with the client");
+    assert_eq!(unhonored(&["check", "--rules", "r", "--replace", "a::B=c::D"]), None);
+    let query = cargo(&["check", "--query=find.astlog"]);
+    assert_eq!(query.flags.query.as_deref(), Some("find.astlog"));
+    assert!(query.args.is_empty(), "`--query` stays with the client");
+    for (words, why) in [
+        (&["check", "--query", "q", "--rules", "r"][..], "a query writes nothing"),
+        (&["check", "--query", "q", "--dry-run"][..], "a query writes nothing already"),
+        (&["check", "--dry-run"][..], "a dry run of no edits"),
+        (&["check", "--rules", "r", "--fix"][..], "rules check nothing"),
+        (&["check", "--query", "q", "--deny", "unused_imports"][..], "a query checks nothing"),
+    ] {
+        assert!(unhonored(words).is_some(), "{why}: {words:?}");
+    }
+    assert!(refused(&["build", "--rules", "r"]).contains("--rules"), "`check`'s alone");
     assert!(unhonored(&["check", "--bless-baselines"]).is_some(), "no directory to bless");
     let whole = |words: &[&str]| unhonored(&[&["check", "--workspace", t], words].concat());
     assert_eq!(

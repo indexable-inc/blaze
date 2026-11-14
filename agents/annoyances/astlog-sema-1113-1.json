@@ -1,0 +1,14 @@
+{
+ "id": "astlog-sema-1113-1",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent in Claude Code, lane astlog-sema-1113",
+ "where": "crates/blaze-cargo/src/serve/job.rs Jobs::applied (writer.apply() on the loop), serve/unit.rs serve_written, serve/unit/deps.rs PagedRecord::of (frame::current, added by f25aa5be3c)",
+ "what": "An edit, a query or a reach whose view needs units applied first fails with `the proc macros and build scripts its front end applies did not apply: serving from the store the dependencies of ...` when a served record is read, not mapped (under MAP_FROM or still in a writer segment): the daemon panics at deps.rs:1712 with `frame::current outside any frame::task` on thread main. Backtrace: Jobs::happened, did, wrote, after, units_applied, applied, UnitWriter::apply, serve_written, deps::serve, deps::images, hir_ty::method_resolution::frozen::serve, Images::pages, PagedRecord::of. Seen on macOS with a debug blaze of 192808b17a: 5 of 5 requests on one home whose store an earlier daemon left; 0 of 9 on a fresh home; 0 of 4 with release builds of main 4630d47 and of the branch on blaze-vm.",
+ "cost": "an hour to find; `blaze check --query`, `--rules` and `--replace` fail on such a home until one `blaze check` has run",
+ "cause": "Jobs::applied applies the view writer on the loop without the loop Lender (`w.reads.lend`), which the two other loop-side store reads use for their driver and their Tag::Plane frame; the read that needs a frame came with f25aa5be3c (records read in place)",
+ "class": "a store read made on the loop outside the Lender",
+ "prevention": "one entry point for a loop-side apply that lends the driver and the frame, and a serve test whose fake writer checks it runs in a frame when applied on the loop",
+ "workaround": "run `blaze check` once on that home first",
+ "fix": "not yet: follow-up branch astlog-daemon-1113",
+ "state": "open"
+}

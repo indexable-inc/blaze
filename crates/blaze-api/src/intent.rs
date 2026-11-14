@@ -80,6 +80,14 @@ pub enum Edit {
         to: String,
         from: String,
     },
+    /// An astlog rules file over the view's front end (`blaze_astlog`,
+    /// docs/v2/plan/design/astlog-sema.md): every `(rewrite ...)`'s actions, after the
+    /// request's other edits. Its text edits are placed at the code they match, a macro's
+    /// expansion at its input; overlapping ones of two rules, a match a macro made, and a file
+    /// left unparsable fail the request, naming the rules and the place. One per request.
+    Rules {
+        rules: String,
+    },
 }
 
 /// What an edit request did: the ops it commits, and each item they touched.
