@@ -1515,9 +1515,13 @@ build directory, never in the checkout. Each theorem is one line:
   axiom but Lean's three.
 - `open F: PROOF_FILE`, then Lean's whole message indented: there is no proof file, or Lean
   refused it. The remaining goals are in the message; edit the proof file and run it again.
+- `model broken F: ..`, then Lean's first error with its file and line: the Lean model blaze
+  generated for the function does not build. That is a bug in blaze's translator, which no
+  proof file can fix. A theorem's model is compiled whether or not it has a proof file, so
+  `open` always means a model that builds and a proof still to write.
 - `refused F: WHAT at `WHERE``: the translator does not take a construct in it.
 
-The last line counts them: `N proved, N open, N refused`. Lean is the executable
+The last line counts them: `N proved, N open, N model broken, N refused`. Lean is the executable
 `BLAZE_LEAN_PROVER` names, an absolute path, of the release `lean/lean-toolchain` pins: unset,
 or another version, the command fails, naming the variable and the version, and checks
 nothing.
@@ -1532,6 +1536,26 @@ open, naming the module. A module Lean accepted is not run again while its text 
 imports stay the same: a second `blaze prove` of an unchanged tree runs Lean not at all, and
 after an edit it runs the modules the edit reaches.
 
+What a theorem's function may be, with a worked one of each kind in blaze-core:
+
+- A property of a pure function or of one step of a state machine, for every state:
+  `crates/blaze-core/src/busy.rs`, `wait/retry.rs` (`a_retry_waits_what_is_left`).
+- A crash: the function takes the crash's witness as an argument and returns `true` where the
+  disk's world does not allow it (`world/disk.rs`, three theorems; with effects in flight,
+  `world/asks.rs`).
+- A whole loop against everything a kernel may answer: the loop takes its kernel as one value,
+  and the theorem's function runs the real loop on a kernel that answers from a list
+  (`wait/retry.rs`, `a_wait_ends_by_its_deadline`; `agents/howto/H-prove-a-loop-against-a-world.json`).
+- Two threads that share atomics, on every interleaving: the function takes a schedule and
+  runs the two with `blaze_core::world::threads::two` (`wait/parking.rs`, `no_unpark_is_lost`;
+  `agents/howto/H-prove-two-threads.json`). A function that reaches an atomic operation is
+  translated as a program over shared cells, and the statement is that the program's value is
+  `true`. Orderings weaker than `SeqCst` are modelled on one cell; over more, the run belongs
+  to the weak world (`lean/Blaze/ThreadsWeak.lean`), which blaze-core's `two` does not run yet.
+
+Each has a test that runs the function on drawn arguments where it is stated, and a control: a
+planted bug the function must be `false` of.
+
 - `--emit` translates and writes the models and stops: one `emitted F: STATEMENT (MODEL)` line
   each, and no Lean is needed.
 - `--subset` also counts every function in a `#![blaze::sans_io]` module of those crates, in
@@ -1541,8 +1565,8 @@ after an edit it runs the modules the edit reaches.
   for WHAT`, most first; a function is counted under the first refusal the translator meets.
 - `--functions` (with `--subset` only; alone it is refused) adds one line a function of the
   subset, by path: `translated PATH`, `generic PATH` or `refused PATH: WHAT`.
-- `--json` prints one object: `records`, each with `outcome` (`Proved`, `Open`, `Emitted`,
-  `Refused`) and the record's fields; `subset` (`functions`, `translated`, `generic`,
+- `--json` prints one object: `records`, each with `outcome` (`Proved`, `Open`, `ModelBroken`,
+  `Emitted`, `Refused`) and the record's fields; `subset` (`functions`, `translated`, `generic`,
   `refused` as `{what, count}`, and `outcomes`, every function by path with its `outcome`,
   `Translated`, `Generic` or `Refused` with its `what`), with or without `--functions`; and
   `failed` (why no proof was checked, when none could be).
