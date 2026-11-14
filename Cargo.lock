@@ -1911,6 +1911,7 @@ name = "blaze-pg"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "blaze-cast",
  "blaze-sha256",
  "blaze-sim",
  "blaze-sql",
@@ -2280,6 +2281,7 @@ dependencies = [
 name = "blaze-sqlite"
 version = "0.0.0"
 dependencies = [
+ "blaze-cast",
  "blaze-sim",
  "blaze-sql",
  "libsqlite3-sys",

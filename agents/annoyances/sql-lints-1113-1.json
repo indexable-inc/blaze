@@ -1,0 +1,13 @@
+{
+ "id": "sql-lints-1113-1",
+ "date": "2026-11-13",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent of the blaze-sql work",
+ "where": "scripts/src/bin/smoke.rs, the cold step under a fresh BLAZE_HOME",
+ "what": "The smoke quote land.py requires cannot pass for a dev-built blaze whose standard library digest is not on the release server: `hello cold` exits 101 with `getting it from https://blaze-releases.ix.dev/v0.0.0-dev failed: library-bdd582918dcd...tar.xz: the download gave up after 4 tries: not there` (branch sql-lints-1113 at b67093c4cb, blaze-vm, 2026-11-13 19:30 PST). The smoke builds each step`s environment from nothing and does not set BLAZE_LIBRARY, and the fixture is outside the checkout, so the tree`s own library/ is never found.",
+ "cost": "The lint fixes for the SQL crates could not be landed; about 40 minutes over five VM runs.",
+ "cause": "Not confirmed: which step publishes a dev library tarball, and whether it ran for this digest, was not found in the tree.",
+ "class": "a required proof depends on an artifact published out of band, so a merge can be blocked by a publish that did not happen",
+ "prevention": "the smoke passes the tree`s library/ (BLAZE_LIBRARY) to its steps, since the quote already names that tree; not built",
+ "workaround": "none found that keeps the guard",
+ "state": "open"
+}
