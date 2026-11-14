@@ -11,18 +11,37 @@
 //! interleaving, and run on a drawn schedule here, it is a simulation test of the same text.
 //!
 //! What is one operation: a call of a method of a [`scheduled`] atomic (blaze-core's
-//! [`crate::atomic`] in its own tests), and a [`wait`] or a [`wake`]. Everything a thread does
-//! between two operations is its own and runs as part of the step before (the code before its
-//! first operation runs as the thread starts, before the schedule's first step). The world
-//! keeps what the Lean `World` keeps beyond the cells, which here are the real atomics: who
-//! sleeps in a wait of which word, who was woken and has not yet returned, which words the
-//! run's threads touched, and whether any of their operations was weaker than `SeqCst`.
+//! [`crate::atomic`] in its own tests), a [`wait`], a [`wait_until`] or a [`wake`], and a
+//! [`now`] or a [`time`] on a run's thread. Everything a thread does between two operations is
+//! its own and runs as part of the step before (the code before its first operation runs as
+//! the thread starts, before the schedule's first step). The world keeps what the Lean `World`
+//! keeps beyond the cells, which here are the real atomics: who sleeps in a wait of which word
+//! (one list for [`wait`] and [`wait_until`]), who was woken and has not yet returned, which
+//! words the run's threads touched, whether any of their operations was weaker than `SeqCst`,
+//! and the clock.
+//!
+//! The clock: whole nanoseconds (a `u128`, which holds every `Duration`'s `as_nanos()`
+//! exactly, as the Lean world's unbounded integer does), 0 when a run starts, and a script of the readings
+//! still to come, installed by [`clock`] on the thread that then calls [`two`] (a run with no
+//! [`clock`] before it has an empty script; one run consumes the script). [`now`] is one
+//! operation: the clock becomes the later of itself and the script's next reading, which it
+//! takes (with the script empty the clock stays), and that is the answer. [`time`] on a run's
+//! thread is one operation that answers the clock and changes nothing; on the thread that
+//! called [`two`], after it, it is the clock as that run left it, and no operation. Time moves
+//! only where someone looks (or where the kernel says a deadline passed, below): a run's
+//! observations are its readings, and any nondecreasing sequence of them is a script. Neither
+//! [`now`] nor [`time`] touches a word, so neither counts for the single-word rule below.
 //!
 //! The world's picks: 1 fails a `compare_exchange_weak` without writing (a strong one ignores
 //! the pick, and a weak one given any other pick is a strong one, so no run depends on the
-//! hardware's own spurious failures) and returns a sleeping [`wait`] for nothing; 2 tells a
-//! sleeping timed [`wait`] its time ran out; a [`wake`] takes the sleeper of number `pick` in
-//! its list, the first where there is none of that number.
+//! hardware's own spurious failures) and returns a sleeping [`wait`] or [`wait_until`] for
+//! nothing; 2 tells a sleeping timed [`wait`] its time ran out, and a sleeping [`wait_until`]
+//! with a deadline that it ran out, moving the clock to the deadline (the kernel said so at or
+//! after it); a [`wake`] takes the sleeper of number `pick` in its list, the first where there
+//! is none of that number. A [`wait_until`] whose deadline the clock has reached does not
+//! sleep: asked asleep, it returns timed out whatever the pick, and asked awake, it returns
+//! timed out where it would have gone to sleep. A [`wait_until`] with no deadline is a [`wait`]
+//! that is not timed: pick 2 leaves it asleep.
 //!
 //! The memory is sequentially consistent: the threads take turns, and each operation is the
 //! real one, with its real ordering, made while the other thread waits. That is the run's
@@ -46,13 +65,13 @@
 //! the Rust body of [`two`] is how a theorem's function runs where it is stated, and what a
 //! proof reads of it is its model, `Blaze.Threads.two`, which a translated core's function
 //! calls in place of this body. Outside blaze-core's own test build, [`crate::atomic`]'s types
-//! are std's, which no schedule can order, so there [`two`], [`wait`] and [`wake`] refuse to
-//! run at all.
+//! are std's, which no schedule can order, so there [`two`], [`wait`], [`wait_until`],
+//! [`wake`], [`clock`], [`now`] and [`time`] refuse to run at all.
 
 use std::{
     alloc::Global,
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{Arc, atomic::Ordering},
     thread::{Builder, Scope, ScopedJoinHandle},
@@ -79,7 +98,8 @@ pub enum Ended<T> {
     /// It had more to do and could go on.
     Running,
     /// Its next operation is a wait that would not return unless the kernel woke it for
-    /// nothing: it sleeps and no wake came, or it would go to sleep.
+    /// nothing: it sleeps and no wake came, or it would go to sleep, and (a [`wait_until`])
+    /// it has no deadline or the clock is before it.
     Asleep,
 }
 
@@ -92,8 +112,27 @@ pub enum Woke {
     Changed,
     /// The kernel woke it for nothing (pick 1).
     Spurious,
-    /// The kernel said its time ran out (pick 2, a timed wait only).
+    /// Its time ran out: the kernel said so (pick 2, a timed [`wait`] or a [`wait_until`] with
+    /// a deadline), or the clock had reached a [`wait_until`]'s deadline.
     TimedOut,
+}
+
+/// What ends a wait besides a wake, a changed word and a return for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Limit {
+    /// Nothing: an untimed [`wait`], or a [`wait_until`] with no deadline.
+    Never,
+    /// The kernel's word (pick 2), with no clock: a timed [`wait`].
+    Kernel,
+    /// A deadline on the world's clock, in nanoseconds: a [`wait_until`].
+    At(u128),
+}
+
+/// The `Duration` of `ns` nanoseconds of the world's clock. Exact: the clock is always 0, one
+/// of the script's readings or a deadline, each a `Duration`'s `as_nanos()`, so its seconds
+/// fit a `u64` and the division loses nothing.
+fn duration(ns: u128) -> Duration {
+    Duration::new((ns / 1_000_000_000) as u64, (ns % 1_000_000_000) as u32)
 }
 
 /// How long the scheduler waits for a thread given a step (or starting) to reach its next
@@ -106,7 +145,8 @@ const SCHEDULER_BOUND: Duration = Duration::from_secs(10);
 /// up.
 const THREAD_BOUND: Duration = Duration::from_secs(30);
 
-/// Why [`two`], [`wait`] and [`wake`] refuse in a build that is not blaze-core's tests.
+/// Why [`two`], [`wait`], [`wait_until`], [`wake`], [`clock`], [`now`] and [`time`] refuse in
+/// a build that is not blaze-core's tests.
 const NOT_SCHEDULED: &str = "a schedule is only run where the atomics are the scheduled ones \
      (blaze-core's own tests, where `blaze_core::atomic` is `world::threads::scheduled`); in this \
      build they are std's and no schedule can order them. A proof reads this function (its model \
@@ -133,7 +173,8 @@ fn named(who: Who) -> &'static str {
 enum Pending {
     /// An operation that is not a wait.
     Op,
-    /// A [`wait`]: when the schedule ends the scheduler asks it whether it is asleep.
+    /// A [`wait`] or a [`wait_until`]: when the schedule ends the scheduler asks it whether it
+    /// is asleep.
     Wait,
 }
 
@@ -188,6 +229,12 @@ struct Baton {
     /// Whether an operation of the run's threads had an ordering that is not `SeqCst`.
     weak: bool,
     refused: Option<Refused>,
+    /// The world's clock, in nanoseconds: 0 at the run's start, moved by [`now`] and by the
+    /// kernel's word that a [`wait_until`]'s deadline passed, never back.
+    clock: u128,
+    /// The readings [`now`] has still to take, in nanoseconds, the next one last (taken by
+    /// `pop`).
+    script: Vec<u128, Global>,
 }
 
 impl Baton {
@@ -230,6 +277,14 @@ struct Member {
 thread_local! {
     /// The run this thread is one of the threads of, while its closure runs.
     static ROLE: RefCell<Option<Member>> = const { RefCell::new(None) };
+
+    /// The script [`clock`] installed for this thread's next run of [`two`], the next reading
+    /// last; `None`: none was, and that run's script is empty. The run takes it.
+    static SCRIPT: RefCell<Option<Vec<u128, Global>>> = const { RefCell::new(None) };
+
+    /// The clock, in nanoseconds, as this thread's last run of [`two`] left it; 0 before any.
+    /// What [`time`] answers off a run's threads.
+    static LEFT: Cell<u128> = const { Cell::new(0) };
 }
 
 /// This thread as one of a run's, where it is one and is not unwinding. A thread that unwinds
@@ -243,7 +298,8 @@ fn here() -> Option<Member> {
 }
 
 impl Run {
-    fn new() -> Run {
+    /// A run whose clock starts at 0 with `script` (the next reading last).
+    fn new(script: Vec<u128, Global>) -> Run {
         Run {
             baton: Lock::new(
                 "threads.two.baton",
@@ -258,6 +314,8 @@ impl Run {
                     used: Vec::with_capacity_in(2, Global),
                     weak: false,
                     refused: None,
+                    clock: 0,
+                    script,
                 },
             ),
             signal: Signal::new("threads.two.baton"),
@@ -322,18 +380,21 @@ impl Member {
         out
     }
 
-    /// A wait of `word` while it holds `expected` (`World.step`'s `.wait`): each pass is one
-    /// step; a pass that leaves the thread asleep ends its step at the same wait. Bounded by
-    /// the schedule: every pass takes a step or ends the run.
-    fn wait(&self, word: &std::sync::atomic::AtomicU32, expected: u32, timed: bool) -> Woke {
+    /// A wait of `word` while it holds `expected` (`World.step`'s `.wait`), ended also as
+    /// `limit` says: each pass is one step; a pass that leaves the thread asleep ends its step
+    /// at the same wait. Bounded by the schedule: every pass takes a step or ends the run.
+    fn wait(&self, word: &std::sync::atomic::AtomicU32, expected: u32, limit: Limit) -> Woke {
         let (who, cell) = (self.who, word.as_ptr().addr());
         let me = (who, cell);
         loop {
             let mut baton = self.run.arrive(who, Pending::Wait);
+            // Whether the clock has reached the deadline: such a wait never sleeps.
+            let due = matches!(limit, Limit::At(deadline) if baton.clock >= deadline);
             let pick = match baton.ask {
                 Ask::Look => {
                     let asleep = !baton.woken.contains(&me)
-                        && (baton.asleep.contains(&me) || word.load(Ordering::SeqCst) == expected);
+                        && (baton.asleep.contains(&me) || word.load(Ordering::SeqCst) == expected)
+                        && !due;
                     baton.looked[slot(who)] = Some(asleep);
                     continue;
                 }
@@ -347,13 +408,30 @@ impl Member {
                 return Woke::Woken;
             }
             if let Some(at) = baton.asleep.iter().position(|it| *it == me) {
+                // A thread does not sleep past its deadline, whatever the pick.
+                if due {
+                    baton.asleep.remove(at);
+                    return Woke::TimedOut;
+                }
                 if pick == 1 {
                     baton.asleep.remove(at);
                     return Woke::Spurious;
                 }
-                if pick == 2 && timed {
-                    baton.asleep.remove(at);
-                    return Woke::TimedOut;
+                if pick == 2 {
+                    match limit {
+                        Limit::Never => {}
+                        Limit::Kernel => {
+                            baton.asleep.remove(at);
+                            return Woke::TimedOut;
+                        }
+                        // The kernel said so at or after the deadline, which the clock is
+                        // before (`due` is false): the clock becomes the deadline.
+                        Limit::At(deadline) => {
+                            baton.asleep.remove(at);
+                            baton.clock = deadline;
+                            return Woke::TimedOut;
+                        }
+                    }
                 }
                 // Asleep still: the step is used up.
                 continue;
@@ -361,7 +439,11 @@ impl Member {
             if word.load(Ordering::SeqCst) != expected {
                 return Woke::Changed;
             }
-            // Goes to sleep in the step it compared in; the step is used up.
+            if due {
+                return Woke::TimedOut;
+            }
+            // Goes to sleep in the step it compared in, at the front of the list; the step is
+            // used up.
             baton.asleep.insert(0, me);
         }
     }
@@ -370,7 +452,7 @@ impl Member {
     /// `pick` among the word's sleepers, the first where there is none of that number.
     fn wake(&self, word: &std::sync::atomic::AtomicU32) -> bool {
         let cell = word.as_ptr().addr();
-        self.op_with_world(cell, |baton, pick| {
+        self.op_with_world(Some(cell), |baton, pick| {
             let mut sleepers =
                 baton.asleep.iter().enumerate().filter(|(_, it)| it.1 == cell).map(|(at, _)| at);
             let first = sleepers.clone().next();
@@ -383,18 +465,21 @@ impl Member {
         })
     }
 
-    /// An operation on the world's own record (a wake), with no ordering.
-    fn op_with_world<R>(&self, cell: usize, act: impl FnOnce(&mut Baton, u8) -> R) -> R {
+    /// An operation on the world's own record, with no ordering: a wake, which touches its
+    /// `cell`, or a reading of the clock, which touches none (`None`).
+    fn op_with_world<R>(&self, cell: Option<usize>, act: impl FnOnce(&mut Baton, u8) -> R) -> R {
         let mut baton = self.run.arrive(self.who, Pending::Op);
         let Ask::Go(pick) = baton.ask else {
             drop(baton);
             panic!(
                 "blaze_core::world::threads::two: {} was asked to look at a wait while it stands \
-                 at a wake",
+                 at a wake or a reading of the clock",
                 named(self.who)
             );
         };
-        if !baton.touch(cell, &[]) {
+        if let Some(cell) = cell
+            && !baton.touch(cell, &[])
+        {
             self.run.refuse(baton, self.who, cell);
         }
         let out = act(&mut baton, pick);
@@ -569,7 +654,9 @@ fn ended<T>(exit: Exit<T>, stood: Stood, who: Who) -> Ended<T> {
 /// (`lean/Blaze/Threads.lean`); see the module's doc for what a step is.
 ///
 /// A step whose thread has returned does nothing; a step whose thread sleeps in a [`wait`]
-/// asks that wait again. When the schedule ends, every thread that has not returned is
+/// or a [`wait_until`] asks that wait again. The run's clock starts at 0 with the script the
+/// last [`clock`] on this thread installed (an empty one where none did), and the clock it
+/// ends at is what [`time`] then answers on this thread. When the schedule ends, every thread that has not returned is
 /// stopped: it unwinds from where it waits, its closure's destructors run (an atomic operation
 /// in one is std's, not a step), and it is [`Ended::Running`] or [`Ended::Asleep`].
 ///
@@ -597,7 +684,9 @@ pub fn two<A: Send, B: Send>(
              inside a run is not modelled (`Blaze.Threads.turn` refuses it)"
         );
     }
-    let run = Arc::new_in(Run::new(), Global);
+    // The script `clock` installed for this run, consumed by it; none: an empty one.
+    let script = SCRIPT.take().unwrap_or_else(|| Vec::new_in(Global));
+    let run = Arc::new_in(Run::new(script), Global);
     let (standing, one, other) = std::thread::scope(|scope| {
         // Made first and dropped last, also as the scheduler unwinds: every thread is stopped
         // before the scope waits for it.
@@ -610,6 +699,10 @@ pub fn two<A: Send, B: Send>(
         let other = other.join().unwrap_or_else(|payload| resume_unwind(payload));
         (standing, one, other)
     });
+    // The clock as the run left it, for `time` on this thread, kept before a refusal or a
+    // thread's panic is resumed here.
+    let left = run.baton.lock().clock;
+    LEFT.set(left);
     let stood = match standing {
         Standing::Stood(stood) => stood,
         Standing::Refused(Refused { who, cell, cells }) => panic!(
@@ -644,7 +737,106 @@ pub fn wait(word: &crate::atomic::AtomicU32, expected: u32, timed: bool) -> Woke
              `blaze_core::wait`)"
         );
     };
-    member.wait(Word::std(word), expected, timed)
+    member.wait(Word::std(word), expected, if timed { Limit::Kernel } else { Limit::Never })
+}
+
+/// A futex wait with a deadline on the world's clock: sleeps while `word` holds `expected`,
+/// until a [`wake`] of it, a return for nothing (pick 1), or its deadline: where there is one,
+/// the kernel may say it passed (pick 2), which moves the clock to it, and once the clock has
+/// reached it the wait does not sleep (it returns [`Woke::TimedOut`] whatever the pick, and a
+/// wait that begins then never sleeps). With no deadline it is an untimed [`wait`]. It counts
+/// as touching `word`. Asked in this order: woken, then asleep, then the word's value. The
+/// deadline is held exactly, as its `as_nanos()`.
+///
+/// Only a thread of a run of [`two`] waits here, and only in blaze-core's tests: anywhere
+/// else it panics. A real thread's deadline wait is `blaze_core::wait`.
+pub fn wait_until(word: &crate::atomic::AtomicU32, expected: u32, deadline: Option<Duration>) -> Woke {
+    if cfg!(not(test)) {
+        panic!("blaze_core::world::threads::wait_until: {NOT_SCHEDULED}");
+    }
+    let Some(member) = here() else {
+        panic!(
+            "blaze_core::world::threads::wait_until: called on a thread that is not one of a \
+             run's: a wait and a wake of the threads world are only run by `two` (a real \
+             thread's park is `blaze_core::wait`)"
+        );
+    };
+    let limit = match deadline {
+        Some(deadline) => Limit::At(deadline.as_nanos()),
+        None => Limit::Never,
+    };
+    member.wait(Word::std(word), expected, limit)
+}
+
+/// Installs the script of the clock's readings for the next run of [`two`] on this thread:
+/// that run starts with clock 0 and these readings (each held exactly, as its `as_nanos()`),
+/// which its [`now`]s take in order, and consumes them. Called again before that
+/// run, it replaces the script.
+///
+/// Panics on a thread of a run (the script is the caller's of [`two`], not a step), and in
+/// any build but blaze-core's tests.
+pub fn clock(readings: &[Duration]) {
+    if cfg!(not(test)) {
+        panic!("blaze_core::world::threads::clock: {NOT_SCHEDULED}");
+    }
+    if ROLE.with_borrow(Option::is_some) {
+        panic!(
+            "blaze_core::world::threads::clock: called on a thread of a run of `two`: the script \
+             of the clock's readings is installed by the thread that then calls `two`, before \
+             the run"
+        );
+    }
+    // The next reading last, so `now` takes it with `pop`.
+    let mut script = Vec::with_capacity_in(readings.len(), Global);
+    script.extend(readings.iter().rev().map(Duration::as_nanos));
+    SCRIPT.set(Some(script));
+}
+
+/// One operation of a run's thread: the clock becomes the later of itself and the script's
+/// next reading, which it takes (an empty script: the clock stays), and that is the answer.
+/// It touches no word.
+///
+/// Only a thread of a run of [`two`] reads the clock here, and only in blaze-core's tests:
+/// anywhere else it panics.
+pub fn now() -> Duration {
+    if cfg!(not(test)) {
+        panic!("blaze_core::world::threads::now: {NOT_SCHEDULED}");
+    }
+    let Some(member) = here() else {
+        panic!(
+            "blaze_core::world::threads::now: called on a thread that is not one of a run's (or \
+             one that unwinds): the world's clock moves only at a step of a run of `two`; after a \
+             run, `time` reads where it was left"
+        );
+    };
+    let clock = member.op_with_world(None, |baton, _| {
+        if let Some(reading) = baton.script.pop() {
+            baton.clock = baton.clock.max(reading);
+        }
+        baton.clock
+    });
+    duration(clock)
+}
+
+/// The clock as it stands, taking nothing from the script. On a run's thread, one operation
+/// that changes nothing and touches no word; on any other thread, no operation: the clock as
+/// this thread's last run of [`two`] left it, `Duration::ZERO` before any.
+///
+/// Panics on a run's thread that unwinds (the model has no steps after a thread ends), and in
+/// any build but blaze-core's tests.
+pub fn time() -> Duration {
+    if cfg!(not(test)) {
+        panic!("blaze_core::world::threads::time: {NOT_SCHEDULED}");
+    }
+    let clock = match here() {
+        Some(member) => member.op_with_world(None, |baton, _| baton.clock),
+        None if ROLE.with_borrow(Option::is_some) => panic!(
+            "blaze_core::world::threads::time: called on a thread of a run of `two` while it \
+             unwinds: the model has no steps after a thread ends"
+        ),
+        None => LEFT.get(),
+    };
+    duration(clock)
 }
 
 /// A futex wake of one thread asleep in a [`wait`] of `word` (by address): the sleeper of
@@ -988,11 +1180,14 @@ pub mod scheduled {
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        time::Duration,
+    };
 
     use blaze_sim::{Broke, Config, Tape, check};
 
-    use super::{Ended, Step, Woke, two, wait, wake};
+    use super::{Ended, Step, Woke, clock, now, time, two, wait, wait_until, wake};
     use crate::atomic::{AtomicU32, Ordering};
 
     /// Thread 1 goes, with the world's pick.
@@ -1319,5 +1514,162 @@ mod tests {
     fn a_wait_off_a_run_is_refused() {
         let word = AtomicU32::new(0);
         wait(&word, 1, false);
+    }
+
+    // --- The clock ------------------------------------------------------------------------
+
+    const fn ns(n: u64) -> Duration {
+        Duration::from_nanos(n)
+    }
+
+    /// A script of 5, 3, 9 ns: the clock is the latest reading so far, and with the script
+    /// spent it stays.
+    #[test]
+    fn now_reads_the_latest_of_the_script() {
+        clock(&[ns(5), ns(3), ns(9)]);
+        let (x, y) = two(&[A, A, A, A], || [now(), now(), now(), now()], || ());
+        assert_eq!((x, y), (Ended::Done([ns(5), ns(5), ns(9), ns(9)]), Ended::Done(())));
+        // After the run, `time` is where it left the clock, and takes nothing.
+        assert_eq!(time(), ns(9));
+        assert_eq!(time(), ns(9));
+        // On a run's thread, `time` is a step that takes nothing from the script: the second
+        // `now` takes 3, not 9.
+        clock(&[ns(5), ns(3), ns(9)]);
+        let (x, _) = two(&[A, A, A, A, A], || [time(), now(), time(), now(), now()], || ());
+        assert_eq!(x, Ended::Done([ns(0), ns(5), ns(5), ns(5), ns(9)]));
+        assert_eq!(time(), ns(9));
+    }
+
+    /// A sleeper with a deadline of 10 ns on a word holding 0 that nobody wakes, and a thread
+    /// that reads the clock twice from a script of 7 then 12 ns.
+    fn deadline(schedule: &[Step]) -> (Ended<Woke>, Ended<(Duration, Duration)>) {
+        let word = AtomicU32::new(0);
+        clock(&[ns(7), ns(12)]);
+        two(schedule, || wait_until(&word, 0, Some(ns(10))), || (now(), now()))
+    }
+
+    #[test]
+    fn a_sleeper_does_not_sleep_past_its_deadline() {
+        // The clock read to 7, before the deadline: the sleeper is asleep at the end.
+        assert_eq!(deadline(&[A, B]), (Ended::Asleep, Ended::Running));
+        // The clock read to 12: the sleeper's next step times out, though its pick is 0.
+        assert_eq!(deadline(&[A, B, B, a_(0)]), (Ended::Done(Woke::TimedOut), Ended::Done((ns(7), ns(12)))));
+        // The schedule ends before that step: it would not stay asleep, so it is running.
+        assert_eq!(deadline(&[A, B, B]), (Ended::Running, Ended::Done((ns(7), ns(12)))));
+    }
+
+    /// The kernel says the time ran out (pick 2) with the clock at 4 and a deadline of 10:
+    /// timed out, and the clock moves to the deadline.
+    #[test]
+    fn the_kernels_timeout_moves_the_clock_to_the_deadline() {
+        let word = AtomicU32::new(0);
+        clock(&[ns(4)]);
+        let (x, y) = two(&[B, A, a_(2)], || wait_until(&word, 0, Some(ns(10))), now);
+        assert_eq!((x, y), (Ended::Done(Woke::TimedOut), Ended::Done(ns(4))));
+        assert_eq!(time(), ns(10));
+    }
+
+    /// A wait whose deadline (10) has passed when it begins (the clock at 12): timed out at
+    /// once where the word holds what is expected, changed where it does not.
+    #[test]
+    fn a_wait_begun_after_its_deadline_never_sleeps() {
+        let begun_late = |expected: u32| {
+            let word = AtomicU32::new(0);
+            clock(&[ns(12)]);
+            two(
+                &[A, A],
+                || {
+                    now();
+                    wait_until(&word, expected, Some(ns(10)))
+                },
+                || (),
+            )
+            .0
+        };
+        assert_eq!(begun_late(0), Ended::Done(Woke::TimedOut));
+        assert_eq!(begun_late(1), Ended::Done(Woke::Changed));
+    }
+
+    /// A wake before the deadline: woken, and the clock is where the reading left it.
+    #[test]
+    fn a_wake_before_the_deadline_leaves_the_clock() {
+        let word = AtomicU32::new(0);
+        clock(&[ns(4)]);
+        let (x, y) = two(&[A, B, B, A], || wait_until(&word, 0, Some(ns(10))), || {
+            now();
+            wake(&word)
+        });
+        assert_eq!((x, y), (Ended::Done(Woke::Woken), Ended::Done(true)));
+        assert_eq!(time(), ns(4));
+    }
+
+    /// With no deadline, pick 2 does nothing: still asleep, as an untimed `wait`.
+    #[test]
+    fn without_a_deadline_the_kernel_cannot_time_out() {
+        let sleeper = |schedule: &[Step]| {
+            let word = AtomicU32::new(0);
+            two(schedule, || wait_until(&word, 0, None), || ()).0
+        };
+        assert_eq!(sleeper(&[A, a_(2)]), Ended::Asleep);
+        // Still asleep after the pick 2: a pick 1 then returns it for nothing.
+        assert_eq!(sleeper(&[A, a_(2), a_(1)]), Ended::Done(Woke::Spurious));
+        let word = AtomicU32::new(0);
+        assert_eq!(two(&[A, a_(2)], || wait(&word, 0, false), || ()).0, Ended::Asleep);
+    }
+
+    /// `clock` on a run's thread is refused, naming it.
+    #[test]
+    #[should_panic(expected = "blaze_core::world::threads::clock: called on a thread of a run")]
+    fn clock_on_a_runs_thread_is_refused() {
+        two(&[A], || clock(&[ns(1)]), || ());
+    }
+
+    /// One run consumes the script: the next starts at 0 with an empty one, unless `clock`
+    /// was called again.
+    #[test]
+    fn each_run_starts_its_own_clock() {
+        clock(&[ns(5), ns(6)]);
+        assert_eq!(two(&[A], now, || ()).0, Ended::Done(ns(5)));
+        assert_eq!(time(), ns(5));
+        assert_eq!(two(&[A, A], || (now(), now()), || ()).0, Ended::Done((ns(0), ns(0))));
+        assert_eq!(time(), ns(0));
+        clock(&[ns(3)]);
+        assert_eq!(two(&[A], now, || ()).0, Ended::Done(ns(3)));
+        assert_eq!(time(), ns(3));
+    }
+
+    /// The same schedule and script give the same run, every time.
+    #[test]
+    fn a_timed_run_is_the_same_every_time() {
+        let timed_out = deadline(&[A, B, B, a_(0)]);
+        let asleep = deadline(&[A, B]);
+        for _ in 0..50 {
+            assert_eq!(deadline(&[A, B, B, a_(0)]), timed_out);
+            assert_eq!(deadline(&[A, B]), asleep);
+            assert_eq!(deadline(&[A, B, B]), (Ended::Running, Ended::Done((ns(7), ns(12)))));
+        }
+    }
+
+    /// Times above `u64::MAX` nanoseconds are held exactly: a reading and a deadline one
+    /// nanosecond apart there are read back as they were and compared rightly (saturated,
+    /// they would be equal).
+    #[test]
+    fn times_beyond_u64_nanoseconds_are_exact() {
+        let early = Duration::new(u64::MAX, 5);
+        let late = Duration::new(u64::MAX, 6);
+        let sleeper = |reading: Duration, until: Duration, schedule: &[Step]| {
+            let word = AtomicU32::new(0);
+            clock(&[reading]);
+            two(schedule, || wait_until(&word, 0, Some(until)), now)
+        };
+        // The clock read to `early`, a nanosecond before the deadline: still asleep.
+        assert_eq!(sleeper(early, late, &[A, B]), (Ended::Asleep, Ended::Done(early)));
+        assert_eq!(time(), early);
+        // The clock read to `late`, a nanosecond past the deadline: timed out at pick 0.
+        assert_eq!(sleeper(late, early, &[A, B, A]), (Ended::Done(Woke::TimedOut), Ended::Done(late)));
+        assert_eq!(time(), late);
+        // The kernel's word moves the clock from `early` to the deadline `late` exactly.
+        assert_eq!(sleeper(early, late, &[A, B, a_(2)]), (Ended::Done(Woke::TimedOut), Ended::Done(early)));
+        assert_eq!(time(), late);
     }
 }
