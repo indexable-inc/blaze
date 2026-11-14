@@ -54,6 +54,7 @@ pub use body::embed::Embedded as EmbeddedMir;
 pub use spec::Spec;
 
 use lean::{Binder, Decl, Infix, Module, Pat, Term, app, atom, infix, name};
+use body::Instance;
 use translate::{Model, Shape};
 
 /// The translator's version: part of every proof key. Raised with any change to what is
@@ -137,12 +138,12 @@ impl Emitted {
 /// It is computed from memoized queries (`mir_body`, `borrowck`, inference) and is not yet a
 /// memoized query of its own.
 pub fn structured(db: &Db, func: FunctionId) -> Result<body::Body, NotTranslated> {
-    blaze_query::db::attach(db, || lowered(db, func)).map(|it| it.body)
+    blaze_query::db::attach(db, || lowered(db, Instance::of(db, func))).map(|it| it.body)
 }
 
-fn lowered(db: &Db, func: FunctionId) -> Result<body::Lowered, NotTranslated> {
-    accepted(db, func)?;
-    body::from_mir(db, func)
+fn lowered<'db>(db: &'db Db, instance: Instance<'db>) -> Result<body::Lowered<'db>, NotTranslated> {
+    accepted(db, instance.func)?;
+    body::from_mir(db, instance)
 }
 
 /// Refused unless `func` type-checks and borrow-checks: every reading of its MIR rests on
@@ -207,22 +208,40 @@ pub fn embed_mir_body_as<'db>(
     })
 }
 
-/// `func`'s Lean module, and those of the functions it calls: pipeline steps 1 to 3.
+/// `func`'s Lean module, and those of the functions it calls: pipeline steps 1 to 3. A
+/// function with type or const parameters is translated at each instance a function calls it
+/// at, never alone: asked for alone, it is a [`NotTranslated`] that says so
+/// ([`body::GENERIC_UNASKED`]), and a generic theorem function is refused.
 pub fn emit(db: &Db, func: FunctionId) -> Result<Emitted, NotTranslated> {
-    blaze_query::db::attach(db, || emit_in(db, func, &mut Vec::new()))
+    blaze_query::db::attach(db, || emit_in(db, Instance::of(db, func), &mut Vec::new()))
 }
 
-fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emitted, NotTranslated> {
-    let lowered = lowered(db, func)?;
+fn emit_in<'db>(
+    db: &'db Db,
+    instance: Instance<'db>,
+    stack: &mut Vec<Instance<'db>>,
+) -> Result<Emitted, NotTranslated> {
+    let lowered = lowered(db, instance)?;
     let body = &lowered.body;
-    if stack.contains(&func) {
-        return Err(NotTranslated {
-            function: body.display.clone(),
-            what: "recursion".to_owned(),
-            at: format!("fn {}", body.display),
-        });
+    let refuse = |what: String| NotTranslated {
+        function: body.display.clone(),
+        what,
+        at: format!("fn {}", body.display),
+    };
+    if stack.contains(&instance) {
+        return Err(refuse("recursion".to_owned()));
     }
-    stack.push(func);
+    // A chain of instances is bounded: deeper is a function that calls itself at an ever larger
+    // type, which no finite set of modules translates.
+    let depth = stack.iter().chain([&instance]).filter(|it| it.args.is_some()).count();
+    if depth > body::INSTANCE_DEPTH {
+        return Err(refuse(format!(
+            "a chain of instances deeper than {} (a generic function that calls itself, directly \
+             or not, at an ever larger type)",
+            body::INSTANCE_DEPTH
+        )));
+    }
+    stack.push(instance);
     // The types it names first, each after those its fields name (`Body::adts`' order), then
     // the `DecidableEq` of each whose derived `==` it calls, in the same order.
     let mut imports: Vec<Emitted> = body.adts.iter().map(type_module).collect();
@@ -234,27 +253,45 @@ fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emi
         // What the callee imports comes first; a module two callees share is listed once.
         for import in callee.imports.iter().chain([&callee]) {
             match imports.iter().find(|it| it.module == import.module) {
-                None => imports.push(import.clone()),
+                None => {
+                    // Two modules whose files differ only by letter case are one file where
+                    // the file system folds case (macOS's, by default).
+                    if let Some(it) = imports
+                        .iter()
+                        .find(|it| it.module.eq_ignore_ascii_case(&import.module))
+                    {
+                        return Err(refuse(format!(
+                            "two modules whose files differ only by letter case, `{}` and `{}`",
+                            it.module, import.module
+                        )));
+                    }
+                    imports.push(import.clone())
+                }
                 // One module, two texts: two items with one Lean name (methods of two traits
-                // of one name from two modules, on one type). Neither may stand for the other.
+                // of one name from two modules, on one type; two instances whose arguments are
+                // written alike). Neither may stand for the other.
                 Some(it) if it.text != import.text => {
-                    return Err(NotTranslated {
-                        function: body.display.clone(),
-                        what: format!(
-                            "two functions with one Lean name, `{}` (`{}` and `{}`)",
-                            import.name, it.function, import.function
-                        ),
-                        at: format!("fn {}", body.display),
-                    });
+                    return Err(refuse(format!(
+                        "two functions with one Lean name, `{}` (`{}` and `{}`)",
+                        import.name, it.function, import.function
+                    )));
                 }
                 Some(_) => {}
             }
         }
     }
     stack.pop();
+    let func = instance.func;
     let model = translate::translate(body, &shapes)?;
     let params: Vec<String> = model.params.iter().map(|it| it.name.clone()).collect();
     let spec = spec::lower(db, func, &params)?;
+    if instance.args.is_some() && spec.is_some() {
+        return Err(refuse(
+            "a generic function with `requires` or `ensures` clauses (its statement would be one \
+             per instance, which is not made yet)"
+                .to_owned(),
+        ));
+    }
     let theorem = AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM);
     let stated = match (theorem, spec.as_ref()) {
         (false, None) => None,
@@ -373,7 +410,7 @@ fn theorem_statement(function: &str, model: &Model, statement: &str) -> Decl {
 /// function's module has that name.
 pub fn type_module(adt: &body::AdtDecl) -> Emitted {
     let module = type_module_name(&adt.name);
-    let display = adt.name.replace('.', "::");
+    let display = adt.display.clone();
     let about = vec![
         format!("Generated by blaze ({TRANSLATOR}) from `{display}`: the type."),
         "Do not edit: the functions that use it import this module.".to_owned(),
@@ -407,7 +444,7 @@ fn type_module_name(adt: &str) -> String {
 /// function's module has that name.
 pub fn eq_module(adt: &body::AdtDecl) -> Emitted {
     let module = format!("BlazeModel.{}.impl", adt.name);
-    let display = adt.name.replace('.', "::");
+    let display = adt.display.clone();
     let about = vec![
         format!("Generated by blaze ({TRANSLATOR}) from `{display}`: its derived `PartialEq`."),
         "Do not edit: the functions that compare it import this module.".to_owned(),

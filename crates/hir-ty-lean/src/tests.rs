@@ -626,21 +626,24 @@ pub fn twice(limit: u32) -> u32 {
     assert_eq!(bump.shape.mut_params, [0]);
 }
 
+/// A method of an impl of a generic trait and one of a generic type are translated at the
+/// instance the call reaches, named by its arguments.
 #[test]
-fn a_method_of_a_trait_impl_or_a_generic_type_is_refused_by_name() {
+fn a_method_of_a_generic_trait_or_type_is_named_by_its_instance() {
     let cases = [
         (
             "pub trait T<X> { fn g(&self) -> u32; }\npub struct S;\nimpl T<u32> for S { fn g(&self) -> u32 { 0 } }\npub fn f(s: S) -> u32 { S::h(&s) }\nimpl S { pub fn h(&self) -> u32 { <S as T<u32>>::g(self) } }\n",
-            "generic trait `T`",
+            "BlazeModel.main.S.T.u32.g",
         ),
         (
             "pub struct W<T> { pub x: T }\nimpl<T> W<T> { pub fn get(&self) -> u32 { 0 } }\npub fn f(w: W<u32>) -> u32 { w.get() }\n",
-            "generic",
+            "BlazeModel.main.W.u32.get",
         ),
     ];
-    for (source, what) in cases {
-        let err = refused(FLAGS, "f", source);
-        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    for (source, module) in cases {
+        let out = emitted(FLAGS, "main", "f", source);
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        assert!(imported.contains(&module), "`{source}` imports {module}: {imported:?}");
     }
 }
 
@@ -652,9 +655,9 @@ fn what_v0_does_not_translate_is_refused_by_name() {
         ("pub fn f() -> u32 { let g = |x: u32| x; g(1) }\n", "closure"),
         ("pub fn f(x: f32) -> f32 { x }\n", "floating-point"),
         ("pub fn f(c: char) -> u32 { 0 }\n", "the type `char`"),
-        ("pub fn f<T>(x: T) -> T { x }\n", "generic function"),
+        ("pub fn f<T>(x: T) -> T { x }\n", crate::body::GENERIC_UNASKED),
         ("pub fn f(n: u32) -> u32 { if n == 0 { 0 } else { f(n - 1) } }\n", "recursion"),
-        ("pub struct P<'a> { pub x: &'a mut u32 }\npub fn f(p: P<'_>) -> u32 { 0 }\n", "generic struct"),
+        ("pub struct P<'a> { pub x: &'a mut u32 }\npub fn f(p: P<'_>) -> u32 { 0 }\n", "NestedBorrow"),
         ("pub fn f(x: &mut (u32, u32)) -> &mut u32 { &mut x.0 }\n", "returns a `&mut`"),
         ("pub union U { a: u32, b: u32 }\npub fn f(u: U) -> u32 { 0 }\n", "union"),
     ];
@@ -2120,10 +2123,10 @@ fn a_method_of_a_trait_impl_is_a_function_named_by_its_type_and_trait() {
     assert_eq!(square_size.map(|it| it.function.as_str()), Some("traits::Square::Shape::size"));
 }
 
-/// What a trait impl's method needs beyond a non-generic impl of a non-generic trait for a
-/// non-generic type is refused by name: a call through a generic bound, through a trait
-/// object, of a trait's default method, a method of an impl of a generic trait, of a generic
-/// impl, of an impl for a generic type, and two traits of one name on one type.
+/// What a trait impl's method needs beyond the subset is refused by name: a generic function
+/// asked for alone, a call through a trait object, of a trait's default method, an impl for a
+/// type that is not a struct, an enum, an integer or `bool`, and two traits of one name on one
+/// type. An impl for an instance of a generic type is that instance's.
 #[test]
 fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
     let shape = "pub trait Shape { fn size(&self) -> u64; }\npub struct S { pub x: u64 }\n\
@@ -2139,17 +2142,11 @@ fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
             "a call of `Shape::twice`, the trait's default method, whose body is generic over `Self`",
         ),
         (
-            "pub trait Conv<X> { fn conv(&self) -> u32; }\npub struct S;\n\
-             impl Conv<u64> for S { fn conv(&self) -> u32 { 1 } }\npub fn f(s: &S) -> u32 { s.conv() }\n"
-                .to_owned(),
-            "a method of an impl of the generic trait `Conv` with an argument other than `Self`",
-        ),
-        (
             "pub trait Shape { fn size(&self) -> u64; }\n\
              impl<const N: usize> Shape for [u32; N] { fn size(&self) -> u64 { 0 } }\n\
              pub fn f(a: &[u32; 2]) -> u64 { a.size() }\n"
                 .to_owned(),
-            "a method of a trait impl of `Shape` with type or const parameters",
+            "a method of a trait impl of `Shape` for a type that is not a struct, an enum, an integer or `bool`",
         ),
         (
             "mod a { pub trait Shape { fn size(&self) -> u64; } }\n\
@@ -2166,8 +2163,8 @@ fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
         assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
         assert_eq!(err.function, "main::f");
     }
-    // An impl for a generic type is reached by no call the subset has (a value of the type is
-    // refused first), but `blaze prove` asks for every function: the method itself, alone.
+    // An impl of a trait for one instance of a generic type is that instance's: asked for
+    // alone, as `blaze prove` asks for every function, it is named by the instance.
     let source = "pub trait Shape { fn size(&self) -> u64; }\npub struct W<T> { pub x: T }\n\
                   impl Shape for W<u32> { fn size(&self) -> u64 { 0 } }\n";
     let db = db(&fixture_of(TRAIT_FLAGS, "main", source));
@@ -2189,11 +2186,9 @@ fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
             _ => None,
         })
         .expect("the impl's `size`");
-    let err = emit(&db, size).expect_err("a method of an impl for a generic type is refused");
-    assert!(
-        err.what.contains("a method of a trait impl of `Shape` for a generic type"),
-        "{err}"
-    );
+    let out = emit(&db, size).expect("a method of an impl for an instance of a generic type");
+    assert_eq!(out.name, "main.W.u32.Shape.size");
+    assert_eq!(out.function, "main::W<u32>::Shape::size");
 }
 
 // ---- The standard library's `Duration`, `Ordering`, derived `Clone` and `PartialEq`, and
@@ -2534,4 +2529,214 @@ fn what_str_has_beyond_its_bytes_is_refused_by_name() {
         let err = refused(flags, "f", source);
         assert!(err.what.contains(what) && err.what.contains("NoModel"), "`{source}` is refused for {what}: {err}");
     }
+}
+
+// ---- Generics, by instance (docs/v2/plan/design/proofs-for-sans-io.md, section 3). ----
+
+/// What the `generics` fixture enables: `Ord` with `Ordering`'s methods, derives, `From`,
+/// `Vec` and `Option`.
+const GENERIC_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, vec, mem_take, drop, index, slice, \
+                             range, option, derive, clone, ord_ops, from";
+
+/// A generic function called at two integer types, a generic function whose bound's method is
+/// an integer's `cmp`, `>` or the crate's own `Ord`, a generic struct with inherent methods, a
+/// generic impl of a trait, an impl of `From` between two of the crate's types, the generic
+/// struct inside `Option` and `Vec`, and theorem functions over them, whose statements
+/// `lean/BlazeModel/generics/proved.lean` proves.
+const GENERICS: &str = "use core::cmp::Ordering;
+pub fn pick<T: Copy>(a: T, b: T, first: bool) -> T { if first { a } else { b } }
+pub fn largest<T: Ord + Copy>(a: T, b: T) -> T { if a.cmp(&b).is_gt() { a } else { b } }
+pub fn larger<T: PartialOrd + Copy>(a: T, b: T) -> T { if a > b { a } else { b } }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ver { pub major: u32 }
+impl PartialOrd for Ver {
+    fn partial_cmp(&self, other: &Ver) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for Ver {
+    fn cmp(&self, other: &Ver) -> Ordering { self.major.cmp(&other.major) }
+}
+pub struct Pair<T> { pub a: T, pub b: T }
+impl<T> Pair<T> {
+    pub fn new(a: T, b: T) -> Pair<T> { Pair { a, b } }
+    pub fn swap(self) -> Pair<T> { Pair { a: self.b, b: self.a } }
+}
+impl<T: Copy> Pair<T> {
+    pub fn first(&self) -> T { self.a }
+}
+pub trait Shape {
+    fn ordered(&self) -> bool;
+}
+impl<T: Copy + Ord> Shape for Pair<T> {
+    fn ordered(&self) -> bool { self.a.cmp(&self.b).is_le() }
+}
+pub struct Small { pub v: u8 }
+pub struct Big { pub v: u32 }
+impl From<Small> for Big {
+    fn from(s: Small) -> Big { Big { v: s.v as u32 } }
+}
+pub fn widen(s: Small) -> Big { Big::from(s) }
+pub fn first_or(p: Option<Pair<u32>>, d: u32) -> u32 {
+    match p { Some(p) => p.first(), None => d }
+}
+pub fn count(ps: &Vec<Pair<u32>>) -> usize { ps.len() }
+pub fn picks(a: u32, b: u64) -> (u32, u64) { (pick(a, 0, true), pick(b, 0, false)) }
+#[blaze::theorem]
+pub fn largest_is_at_least_both(a: u32, b: u32) -> bool {
+    let m = largest(a, b);
+    m >= a && m >= b
+}
+#[blaze::theorem]
+pub fn swap_twice_is_identity(a: u32, b: u32) -> bool {
+    let p = Pair::new(a, b).swap().swap();
+    p.a == a && p.b == b
+}
+#[blaze::theorem]
+pub fn instances_agree(a: u32, b: u64, s: u8) -> bool {
+    pick(a, 0, true) == a
+        && pick(b, 0, false) == 0
+        && larger(a, a) == a
+        && largest(Ver { major: a }, Ver { major: 0 }).major == a
+        && Pair::new(a, a).ordered()
+        && widen(Small { v: s }).v == s as u32
+        && first_or(Some(Pair::new(a, b as u32)), 0) == a
+        && first_or(None, a) == a
+}
+";
+
+/// Each generic function, method and impl is translated at the instance a call reaches: an
+/// instance is its own module, named by its type arguments, and its body is the generic body
+/// with them substituted, so a bound's method is the instance's own (an integer's `cmp`, the
+/// crate's `Ord` of `Ver`).
+#[test]
+fn a_generic_function_is_translated_at_each_instance() {
+    let cases: [(&str, &[&str], &[&str]); 6] = [
+        (
+            "picks",
+            &["generics.pick.u32 a", "generics.pick.u64 b"],
+            &["BlazeModel.generics.pick.u32", "BlazeModel.generics.pick.u64"],
+        ),
+        ("first_or", &["generics.Pair.u32.first"], &["BlazeModel.generics.Pair.u32.type", "BlazeModel.generics.Pair.u32.first"]),
+        ("count", &[], &["BlazeModel.generics.Pair.u32.type"]),
+        ("widen", &["generics.Big.From.Small.«from» s"], &["BlazeModel.generics.Big.From.Small.from"]),
+        ("largest_is_at_least_both", &["generics.largest.u32 a b"], &["BlazeModel.generics.largest.u32"]),
+        (
+            "swap_twice_is_identity",
+            &["generics.Pair.u32.new a b", "generics.Pair.u32.swap"],
+            &["BlazeModel.generics.Pair.u32.new", "BlazeModel.generics.Pair.u32.swap"],
+        ),
+    ];
+    for (name, calls, modules) in cases {
+        let out = golden(GENERIC_FLAGS, "generics", name, GENERICS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+        for module in modules {
+            assert!(imported.contains(module), "`{name}` imports `{module}`: {imported:?}");
+        }
+    }
+    // Two instances of one function are two modules with two names, each about its instance.
+    let out = golden(GENERIC_FLAGS, "generics", "picks", GENERICS);
+    let at = |module: &str| out.imports.iter().find(|it| it.module == module).expect("imported");
+    let (u32s, u64s) = (at("BlazeModel.generics.pick.u32"), at("BlazeModel.generics.pick.u64"));
+    assert_ne!(u32s.name, u64s.name);
+    assert_eq!((u32s.name.as_str(), u64s.name.as_str()), ("generics.pick.u32", "generics.pick.u64"));
+    assert_eq!((u32s.function.as_str(), u64s.function.as_str()), ("generics::pick::<u32>", "generics::pick::<u64>"));
+    assert_ne!(u32s.path(), u64s.path());
+    for name in ["largest_is_at_least_both", "swap_twice_is_identity", "instances_agree"] {
+        let out = golden(GENERIC_FLAGS, "generics", name, GENERICS);
+        assert_eq!(out.statement.as_deref(), Some(format!("generics.{name}.spec.statement").as_str()));
+    }
+    // The theorem reaches `largest` at the crate's `Ver`, whose `cmp` is the crate's `Ord`, and
+    // the generic impl of `Shape` at `Pair<u32>`.
+    let out = golden(GENERIC_FLAGS, "generics", "instances_agree", GENERICS);
+    let imported: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+    for module in [
+        "BlazeModel.generics.largest.Ver",
+        "BlazeModel.generics.Ver.Ord.cmp",
+        "BlazeModel.generics.Pair.u32.Shape.ordered",
+        "BlazeModel.generics.larger.u32",
+    ] {
+        assert!(imported.contains(&module), "imports `{module}`: {imported:?}");
+    }
+}
+
+/// What instances do not reach is refused by name: a generic theorem function, a generic
+/// function asked for alone, a call through a trait object, a chain of instances deeper than
+/// the bound, a closure as a type argument, `Into::into` through the standard library's
+/// blanket impl, two types of one Lean name, and an associated type the solver cannot
+/// normalize.
+#[test]
+fn what_instances_do_not_reach_is_refused_by_name() {
+    let shape = "pub trait Shape { fn size(&self) -> u64; }\npub struct S { pub x: u64 }\n\
+                 impl Shape for S { fn size(&self) -> u64 { self.x } }\n";
+    let cases = [
+        ("#[blaze::theorem]\npub fn f<T: Copy>(x: T) -> bool { true }\n".to_owned(), crate::body::GENERIC_THEOREM),
+        ("pub fn f<T>(x: T) -> T { x }\n".to_owned(), crate::body::GENERIC_UNASKED),
+        (
+            format!("{shape}pub fn g<T: ?Sized>() -> u64 {{ 0 }}\n\
+                     pub fn f() -> u64 {{ g::<dyn Shape>() }}\n"),
+            "a call of `g`, a trait object (rule DynTrait)",
+        ),
+        (
+            "pub fn grow<T>(x: T, n: u32) -> u32 { if n == 0 { 0 } else { grow(Some(x), n - 1) } }\n\
+             pub fn f() -> u32 { grow(1u32, 3) }\n"
+                .to_owned(),
+            "a chain of instances deeper than 32",
+        ),
+        (
+            "pub fn g<F: Fn(u32) -> u32>(h: F) -> u32 { 0 }\npub fn f() -> u32 { g(|x: u32| x) }\n".to_owned(),
+            "a closure",
+        ),
+        (
+            "pub struct Small { pub v: u8 }\npub struct Big { pub v: u32 }\n\
+             impl From<Small> for Big { fn from(s: Small) -> Big { Big { v: s.v as u32 } } }\n\
+             pub fn f(s: Small) -> Big { s.into() }\n"
+                .to_owned(),
+            "a call of `Into::into` into `main::Big`, the standard library's blanket impl over `From`",
+        ),
+        (
+            "mod a { pub struct Unit { pub v: u32 } }\nmod b { pub struct Unit { pub v: u32 } }\n\
+             pub fn g<T>(x: T) -> u32 { 0 }\n\
+             pub fn f(x: a::Unit, y: b::Unit) -> u32 { g(x) + g(y) }\n"
+                .to_owned(),
+            "two functions with one Lean name, `main.g.Unit`",
+        ),
+        (
+            "#[allow(non_camel_case_types)]\npub struct Unit { pub v: u32 }\n#[allow(non_camel_case_types)]\npub struct UNIT { pub v: u32 }\n\
+             pub fn g<T>(x: T) -> u32 { 0 }\n\
+             pub fn f(x: Unit, y: UNIT) -> u32 { g(x) + g(y) }\n"
+                .to_owned(),
+            "two modules whose files differ only by letter case",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(GENERIC_FLAGS, "f", &source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+        assert!(!err.function.is_empty());
+    }
+}
+
+/// An associated type of a type argument is what the trait solver normalizes it to at the
+/// instance: a field `T::A` of `H<u8>` is `u32`. An opaque type (`impl Copy`) is not
+/// revealed, and is refused by name.
+#[test]
+fn an_associated_type_is_normalized_at_the_instance_and_an_opaque_one_refused() {
+    let out = emitted(
+        GENERIC_FLAGS,
+        "assoc",
+        "f",
+        "pub trait Tr { type A; }\nimpl Tr for u8 { type A = u32; }\npub struct H<T: Tr> { pub x: T::A }\n\
+         pub fn f(h: H<u8>) -> u32 { h.x }\n",
+    );
+    let ty = out.imports.iter().find(|it| it.module == "BlazeModel.assoc.H.u8.type").expect("`H<u8>` is declared");
+    assert!(ty.text.contains("structure assoc.H.u8 where\n  x : U32\n"), "{}", ty.text);
+    let db = db(&fixture_of(
+        GENERIC_FLAGS,
+        "main",
+        "pub fn mk() -> impl Copy { 1u32 }\npub fn g<T: Copy>(x: T) -> T { x }\npub fn f() -> u32 { g(mk()); 0 }\n",
+    ));
+    // An opaque `impl Trait` is not revealed: refused where its value is first held.
+    let err = emit(&db, function(&db, "main", "f")).expect_err("an opaque type is refused");
+    assert_eq!(err.what, "an associated or opaque type");
 }
