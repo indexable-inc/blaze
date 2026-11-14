@@ -517,6 +517,9 @@ fn request(
                         reads: &out.reads,
                         untraceable: &out.untraceable,
                         sandboxed: true,
+                        traced: true,
+                        foreign: false,
+                        moved: false,
                     };
                     selection.give(Input::Ran { ticket, ran: given });
                     ran[at] = Some(out);

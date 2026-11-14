@@ -268,7 +268,9 @@ impl Registry {
 
     /// [`Registry::summaries`] on this thread.
     pub fn summaries_blocking(&self, name: &str) -> anyhow::Result<Arc<Summaries>> {
-        blaze_resolve::block_on(self.summaries(name))
+        // No bound of its own: the read ends by the HTTP client's deadlines, as `what` says.
+        let what = "a crate's index file (bounded by the HTTP client's timeouts)";
+        blaze_core::wait::block_on(what, None, self.summaries(name))?
     }
 
     fn forget(&self, name: &str, read: &Arc<Read>) {

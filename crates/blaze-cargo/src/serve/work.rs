@@ -773,6 +773,15 @@ pub trait Steps: Sized + Send + Sync + 'static {
     type Linked: Kept;
     /// User code of a job run through the loop's driver ([`Runs`]).
     type Runs: Runs<Self>;
+    /// What a `blaze prove`'s worker found ([`Front::prove`]): its theorems translated and the
+    /// plan of their check, which [`Steps::check_proofs`] makes a run of the loop.
+    type Proving: Send + 'static;
+
+    /// On the loop, once [`Front::prove`] has answered: its check as a run of the loop, the
+    /// Lean at `lean` over what the worker found, in the sandbox as all user code is, with the
+    /// tags `tags..tags + 2^32`. It ends with a [`Response::Proven`] whatever it found: what
+    /// is proved, what is open, and where no proof could be checked, why.
+    fn check_proofs(proving: Self::Proving, lean: Option<&str>, tags: u64) -> Self::Runs;
 
     /// On an IO thread: the source `fetch` names, fetched and checked (a `.crate`'s sha256 and
     /// its paths kept inside it, a git tree at its commit, an index file as served).
@@ -890,6 +899,12 @@ pub trait Steps: Sized + Send + Sync + 'static {
         marked: Vec<LaunchMarked>,
     ) {
         let _ = (store, waker, marked);
+    }
+    /// On the loop, once, as the daemon starts: each test suite's index head its journal mark
+    /// names (`Jobs::test_heads`), which the suite's next run takes. Steps that run no tests
+    /// keep nothing.
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        let _ = marked;
     }
     /// On the loop, each turn: the start images to put and, once durable, mark.
     fn launch_kept(&self) -> Vec<LaunchKept> {
@@ -1425,6 +1440,14 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     /// run that has not been asked for; the view's proc macros and build scripts' runs were
     /// built and applied before it is posted (`Jobs::next`).
     fn ahead(&self, reader: S::Reader, filter: &[String]) -> Result<Vec<u32>, Failed>;
+    /// On a worker, for `blaze prove` ([`blaze_api::Request::Prove`]): every theorem function
+    /// of the view's primary library crates translated to Lean and, unless `emit`, the plan
+    /// of their proofs' check made from the crates' proof files; with `subset`, the
+    /// translator's count over the sans-IO cores. It writes nothing and runs no Lean: the
+    /// loop does, with what this gives ([`Steps::check_proofs`]). Building nothing more: the
+    /// view's proc macros and build scripts' runs were built and applied before it is posted
+    /// (`Jobs::next`).
+    fn prove(&self, reader: S::Reader, emit: bool, subset: bool) -> Result<S::Proving, Failed>;
     /// On a worker: each codegen unit's inputs and output of the view's last build, as
     /// [`Response::CodegenInputs`] lists them.
     fn codegen_inputs(&self, reader: S::Reader) -> Result<Vec<(ContentId, ContentId)>, Failed>;
@@ -1453,11 +1476,20 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
 /// build script's is given what asks its job's [`Writer`] to apply its run ([`Asks`]); tests
 /// and runs, none.
 pub trait Runs<S: Steps>: Send + 'static {
-    /// Asks for what it runs first; it may end at once (a result the store kept).
+    /// Asks for what it runs first; it may end at once (a result the store kept). `store` is
+    /// mutable as `complete`'s: a test run reads kept results through it and puts what it learns.
+    ///
+    /// `placed` reads the job's record of a path its build placed an output at: the content
+    /// key of the output whose file is there as placed, or `None` (`Jobs::placed_key`). Asked
+    /// once its job's placements have all ended. A program started from such a path (a test
+    /// binary, a dev run) is started with that key, and refused where it is not the program's
+    /// own (`blaze_inproc::host::StartError::NotPlaced`): the placement is the path's one
+    /// writer, and nothing that starts a program writes its file.
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: the writer or the loop's record of asks while a task holds it, one call a run's step
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: the jobs' record read in place, once a run's start
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;
@@ -1495,6 +1527,20 @@ pub struct RunPuts {
     /// The tests a run finished, for the history's `test_runs` table: handed to its job with
     /// its puts, which gives them its build id as it ends.
     pub test_runs: Vec<blaze_profile::facts::TestRunRow>,
+    /// Each test suite's index head a run filed, or let go: marked in the journal once the
+    /// run's puts are durable ([`crate::serve::job::Jobs::test_heads`]).
+    pub heads: Vec<HeadFiled>,
+}
+
+/// A test suite's index head as its run left it ([`RunPuts::heads`]): the suite's settings
+/// (`Suite::given`), and the head's mark, or `None` for a suite whose head the store did not
+/// hold, whose mark is let go so its next run starts with no head.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeadFiled {
+    /// The suite's settings: what its mark is named by.
+    pub given: ContentId,
+    /// The mark to write, or `None` to let the suite's mark go.
+    pub mark: Option<super::local::TestHeadMark>,
 }
 
 impl RunPuts {
@@ -1519,5 +1565,6 @@ impl RunPuts {
         self.retracted |= other.retracted;
         self.misses.extend(other.misses);
         self.test_runs.extend(other.test_runs);
+        self.heads.extend(other.heads);
     }
 }

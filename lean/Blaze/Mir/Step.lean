@@ -28,7 +28,7 @@ def asTy (ty : ScalarTy) {ty' : ScalarTy} (b : Scalar ty') : Option (Scalar ty) 
 
 theorem asTy_self (ty : ScalarTy) (b : Scalar ty) : asTy ty b = some b := by
   unfold asTy
-  exact dif_pos rfl
+  exact dite_eq_left rfl
 
 def sameOr {ty : ScalarTy} : Option (Scalar ty) → (Scalar ty → Outcome Value) → Outcome Value
   | some b, f => f b

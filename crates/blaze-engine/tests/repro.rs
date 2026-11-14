@@ -1202,3 +1202,70 @@ fn a_package_not_on_the_latest_blaze_edition_is_told_once() {
     let out = case.ok_in("", &["check"]);
     assert_eq!(out.stderr.matches(TOLD).count(), 0, "{}", out.stderr);
 }
+
+/// `blaze prove --emit` translates each `#[blaze::theorem]` of the crate and checks nothing, so
+/// needs no Lean: a theorem returning `bool` is emitted with its statement, one returning `u32`
+/// is refused naming its return type, the command exits 1 (not every theorem was emitted), and
+/// a second run prints the same bytes. With `--subset`, each function of the crate's sans-IO
+/// module is named by path with its outcome (translated, generic, refused for what), and the
+/// counts add up.
+#[test]
+fn a_theorem_function_is_emitted_and_one_not_returning_bool_refused() {
+    let case = Case::new("a_theorem_function_is_emitted_and_one_not_returning_bool_refused");
+    let first = case.blaze_in("", &["prove", "--emit", "--subset", "--json"]);
+    assert!(!first.ok, "a refused theorem exits 1:\n{}\n{}", first.stdout, first.stderr);
+    let answer: serde_json::Value = serde_json::from_str(first.stdout.trim())
+        .unwrap_or_else(|error| panic!("no JSON answer ({error}):\n{}\n{}", first.stdout, first.stderr));
+    let records = answer["records"].as_array().unwrap_or_else(|| panic!("{answer}"));
+    assert_eq!(records.len(), 2, "{answer}");
+    let emitted: Vec<_> = records.iter().filter(|it| it["outcome"] == "Emitted").collect();
+    assert_eq!(emitted.len(), 1, "{answer}");
+    assert_eq!(emitted[0]["function"], "theorems::add_commutes", "{answer}");
+    assert_eq!(emitted[0]["statement"], "theorems.add_commutes.spec.statement", "{answer}");
+    let model = emitted[0]["path"].as_str().unwrap();
+    assert!(Path::new(model).is_file(), "the model {model} was not written");
+    assert!(!model.starts_with(case.dir.to_str().unwrap()), "the model {model} is in the checkout");
+    let refused: Vec<_> = records.iter().filter(|it| it["outcome"] == "Refused").collect();
+    assert_eq!(refused.len(), 1, "{answer}");
+    assert_eq!(refused[0]["function"], "theorems::not_bool", "{answer}");
+    let said = format!("{} {}", refused[0]["what"], refused[0]["at"]);
+    assert!(said.contains("u32"), "the refusal does not name the return type: {said}");
+
+    // The subset: the module's three functions, by path, each with its outcome; the theorems
+    // at the crate's root are in no sans-IO module and are not counted.
+    let subset = &answer["subset"];
+    let outcomes = subset["outcomes"].as_array().unwrap_or_else(|| panic!("{answer}"));
+    let named: Vec<(&str, &str)> = outcomes
+        .iter()
+        .map(|it| (it["path"].as_str().unwrap(), it["outcome"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        named,
+        [("theorems::cores::addr", "Refused"), ("theorems::cores::double", "Translated"), ("theorems::cores::first", "Generic")],
+        "{answer}"
+    );
+    let raw = outcomes[0]["what"].as_str().unwrap();
+    assert!(raw.contains("raw pointer"), "the refusal does not name the raw pointer: {raw}");
+    assert_eq!((subset["functions"].as_u64(), subset["translated"].as_u64(), subset["generic"].as_u64()), (Some(3), Some(1), Some(1)), "{answer}");
+    let refusals = subset["refused"].as_array().unwrap();
+    let refused: u64 = refusals.iter().map(|it| it["count"].as_u64().unwrap()).sum();
+    assert_eq!(refusals.len(), 1, "the generic function is not among the refusals: {answer}");
+    assert_eq!(refusals[0]["what"], raw, "{answer}");
+    assert_eq!(1 + 1 + refused, 3, "translated + generic + refused is not functions: {answer}");
+
+    let second = case.blaze_in("", &["prove", "--emit", "--subset", "--json"]);
+    assert_eq!(second.stdout, first.stdout, "a second run printed other bytes");
+    assert!(!second.ok);
+
+    // The text: the counts and the refusals, and with `--functions` a line a function.
+    let text = case.blaze_in("", &["prove", "--emit", "--subset", "--functions"]);
+    let counts = "subset: 3 functions in sans-IO modules, 1 translated, 1 generic (translated by instance), 1 refused";
+    assert!(text.stdout.contains(counts), "{}\n{}", text.stdout, text.stderr);
+    for line in [
+        format!("refused theorems::cores::addr: {raw}"),
+        "translated theorems::cores::double".to_owned(),
+        "generic theorems::cores::first".to_owned(),
+    ] {
+        assert!(text.stdout.lines().any(|it| it == line), "no line `{line}`:\n{}", text.stdout);
+    }
+}

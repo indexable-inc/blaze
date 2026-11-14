@@ -1,9 +1,15 @@
 //! The core: quinn-proto's endpoint and connections, and on each connection HTTP/3's control
 //! streams, the extended CONNECT of WebTransport sessions, their streams and their datagrams.
 //! A synchronous state machine: datagrams, asks and the time go in; datagrams, events and the
-//! next deadline come out (the driver contract is in [`super`]).
+//! next deadline come out (the driver contract is in [`super`]). Plain HTTP/3 requests on the
+//! same connections are [`requests`]'.
 
 #![blaze::sans_io]
+
+mod requests;
+
+#[cfg(test)]
+pub(crate) use requests::Plant;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -19,9 +25,11 @@ use quinn_proto::{
 };
 
 use super::{
-    ClientConfig, Error, ServerConfig, Step, config,
+    ClientConfig, Error, ServerConfig, Step, Ticket, config,
     frame::{self, Settings, code},
-    qpack, varint,
+    qpack,
+    request::{RequestEnd, RequestId, ResponseHead, Served},
+    varint,
 };
 
 /// How long after the handshake the peer's SETTINGS may take.
@@ -147,16 +155,38 @@ pub enum Event {
     StreamReset { stream: StreamRef, code: Option<u32> },
     /// The peer stopped this side's sending, with its WebTransport code; `None` as above.
     StreamStopped { stream: StreamRef, code: Option<u32> },
-    /// Everything given to [`Endpoint::send`] on the stream went into QUIC's send buffer.
+    /// Everything given to [`Endpoint::send`] on the stream went into QUIC's send buffer:
+    /// buffered here, not delivered. A session closed on this may still reset the stream at
+    /// the peer before it has read it; wait for [`Event::StreamAcked`] for that.
     StreamSent { stream: StreamRef },
+    /// The peer's QUIC acknowledged every byte sent on this side of the stream and its FIN
+    /// ([`Endpoint::finish`]): the peer's endpoint has the whole of it, so a close after this
+    /// cannot take any of it away (quinn-proto's `StreamEvent::Finished`). It comes once a
+    /// finished stream, after its [`Event::StreamSent`]; never for a stream not finished, nor
+    /// one reset ([`Endpoint::reset`]); and in its place [`Event::StreamStopped`] when the peer
+    /// stops the stream first, or nothing when the session ends first (its
+    /// [`Event::SessionClosed`] is the stream's last word). Whether the peer's application
+    /// read the bytes is not said: only that its QUIC holds them.
+    StreamAcked { stream: StreamRef },
     /// The peer allows more streams: an [`Endpoint::open`] that was refused may now work.
     StreamsAvailable { session: SessionId },
     /// A datagram of an open session.
     Datagram { session: SessionId, bytes: Vec<u8> },
     /// A request the core answered itself (not a WebTransport CONNECT, or a refused handshake).
     Refused { peer: SocketAddr, error: Error },
-    /// A connection is gone, and with it its sessions; `error` when it failed.
+    /// A connection is gone, and with it its sessions and requests; `error` when it failed.
     ConnectionClosed { conn: ConnId, peer: SocketAddr, error: Option<Error> },
+    /// A server's asker is handed a request: answer it with [`Endpoint::respond`].
+    Request { request: RequestId, served: Served },
+    /// The head of a request's answer.
+    ResponseHead { request: RequestId, head: ResponseHead },
+    /// Bytes of a request's body: say them taken with [`Endpoint::consumed_response`].
+    ResponseData { request: RequestId, bytes: Vec<u8> },
+    /// A request ended: its last event, exactly one per request.
+    RequestEnded { request: RequestId, end: RequestEnd },
+    /// A server sent a session ticket: the driver keeps it (bytes) for a later process's
+    /// [`Endpoint::add_ticket`].
+    Ticket { ticket: Ticket },
 }
 
 /// The core.
@@ -164,7 +194,9 @@ pub struct Endpoint {
     quic: quinn_proto::Endpoint,
     /// The server's transport limits, kept for a new identity.
     serving: Option<config::Transport>,
-    client: Option<quinn_proto::ClientConfig>,
+    /// Whether a server hands plain requests to its asker ([`ServerConfig::requests`]).
+    serves_requests: bool,
+    client: Option<config::Client>,
     epoch: Instant,
     now: Duration,
     next_conn: u64,
@@ -199,9 +231,14 @@ struct Conn {
     linger: Option<Duration>,
     /// The CONNECT stream whose FIN, once acknowledged, closes the connection.
     closing: Option<StreamId>,
+    /// The WebTransport streams this side finished whose acknowledgement the asker is owed
+    /// ([`Event::StreamAcked`]), each with its session's CONNECT stream.
+    acking: BTreeMap<StreamId, StreamId>,
     /// The error that closed it, this side's.
     failed: Option<Error>,
     lost: Option<Error>,
+    /// Its plain requests.
+    reqs: requests::Requests,
 }
 
 struct Connect {
@@ -246,6 +283,10 @@ enum Kind {
     Request,
     /// A WebTransport stream; `open` once its session is open and the asker told.
     Wt { session: StreamId, open: bool },
+    /// A client's plain request, by its number.
+    Get(u64),
+    /// A plain request this server was handed, by its number.
+    Serve(u64),
 }
 
 struct Stream {
@@ -318,6 +359,7 @@ impl Endpoint {
         client: Option<ClientConfig>,
     ) -> Result<Endpoint, Error> {
         let serving = server.as_ref().map(|it| it.transport);
+        let serves_requests = server.as_ref().is_some_and(|it| it.requests);
         let server = server.map(|it| config::server(&it)).transpose()?;
         let client = client.map(|it| config::client(&it)).transpose()?;
         // alloc: one per endpoint.
@@ -326,6 +368,7 @@ impl Endpoint {
         Ok(Endpoint {
             quic,
             serving,
+            serves_requests,
             client,
             epoch,
             now: Duration::ZERO,
@@ -364,6 +407,7 @@ impl Endpoint {
                 conn.linger = None;
                 conn.quic.close(at, h3_code(code::H3_NO_ERROR), Bytes::new());
             }
+            conn.request_deadlines(&mut cx);
             self.drive(id);
         }
     }
@@ -374,7 +418,8 @@ impl Endpoint {
         let mut next: Option<Duration> = None;
         for conn in self.conns.values_mut() {
             let quic = conn.quic.poll_timeout().map(|it| it.saturating_duration_since(epoch));
-            for due in [quic, conn.settings_due, conn.linger].into_iter().flatten() {
+            let request = conn.reqs.next_deadline();
+            for due in [quic, conn.settings_due, conn.linger, request].into_iter().flatten() {
                 next = Some(next.map_or(due, |it| it.min(due)));
             }
         }
@@ -456,6 +501,7 @@ impl Endpoint {
     ) -> ConnId {
         let id = ConnId(self.next_conn);
         self.next_conn += 1;
+        let serves = side == Side::Server && self.serves_requests;
         let conn = Conn {
             quic,
             handle,
@@ -470,8 +516,10 @@ impl Endpoint {
             connect,
             linger: None,
             closing: None,
+            acking: BTreeMap::new(),
             failed: None,
             lost: None,
+            reqs: requests::Requests::new(serves),
         };
         self.conns.insert(id, conn);
         self.handles.insert(handle.0, id);
@@ -510,10 +558,21 @@ impl Endpoint {
         if conn.quic.is_drained() {
             let peer = conn.peer;
             let error = conn.failed.take().or(conn.lost.take());
+            // Its loss ended its requests already; any left (none, unless a path above
+            // missed one) end here, so none is left without an outcome.
+            let gone = error.clone().unwrap_or_else(|| {
+                conn.error(Step::Request, "the connection closed with no error".to_owned())
+            });
+            conn.end_requests(&gone, &mut cx);
             let handle = conn.handle.0;
             self.conns.remove(&id);
             self.handles.remove(&handle);
             self.events.push_back(Event::ConnectionClosed { conn: id, peer, error });
+        }
+        if let Some(client) = &self.client {
+            while let Some(ticket) = client.tickets.take_fresh() {
+                self.events.push_back(Event::Ticket { ticket });
+            }
         }
     }
 
@@ -557,7 +616,7 @@ impl Endpoint {
     ) -> Result<SessionId, Error> {
         // alloc: an error's message, made only when it fails.
         let fail = |why: String| Error { peer: Some(to), step: Step::Connect, why };
-        let Some(client) = self.client.clone() else {
+        let Some(client) = self.client.as_ref().map(|it| it.quic.clone()) else {
             // alloc: an error's message, made only when it fails.
             return Err(fail("this endpoint was made without a ClientConfig".to_owned()));
         };
@@ -747,6 +806,8 @@ impl Endpoint {
             entry.out.clear();
             entry.out_at = 0;
             entry.finished = true;
+            // A reset stream is never acknowledged whole: nothing is owed.
+            conn.acking.remove(&id);
             // A stream already reset or stopped has nothing left to reset.
             _ = conn.quic.send_stream(id).reset(h3_code(frame::wt_to_h3(code)));
             conn.forget_if_done(id);
@@ -869,7 +930,8 @@ impl Endpoint {
                 why: "this endpoint does not serve".to_owned(),
             });
         };
-        let server = config::server(&ServerConfig { identity, transport })?;
+        let server =
+            config::server(&ServerConfig { identity, transport, requests: self.serves_requests })?;
         self.quic.set_server_config(Some(server));
         Ok(())
     }
@@ -969,6 +1031,7 @@ impl Conn {
         reason = &reason[..reason.len().min(256)];
         self.quic.close(cx.at, h3_code(h3), Bytes::copy_from_slice(reason));
         self.end_sessions(&Closed::Failed(error.clone()), cx);
+        self.end_requests(&error, cx);
         self.failed = Some(error);
     }
 
@@ -1009,6 +1072,8 @@ impl Conn {
             .filter(|(_, it)| matches!(it.kind, Kind::Wt { session, .. } if session == sid))
             .map(|(id, _)| *id)
             .collect();
+        // The session's end is its streams' last word: no acknowledgement is told after it.
+        self.acking.retain(|_, session| *session != sid);
         let gone = h3_code(code::WEBTRANSPORT_SESSION_GONE);
         for id in ids {
             let Some(stream) = self.streams.remove(&id) else { continue };
@@ -1106,15 +1171,32 @@ impl Conn {
         if stream.fin && !stream.finished {
             stream.finished = true;
             match self.quic.send_stream(id).finish() {
-                Ok(()) | Err(FinishError::Stopped(_) | FinishError::ClosedStream) => {}
+                Ok(()) => {
+                    // A stream the asker knows: its acknowledgement is owed to it.
+                    if let Kind::Wt { session, open: true } = stream.kind {
+                        #[cfg(test)]
+                        if self.reqs.plant == requests::Plant::AckedAtSent {
+                            let at = StreamRef { conn: cx.id, stream: u64::from(id) };
+                            cx.events.push_back(Event::StreamAcked { stream: at });
+                            self.forget_if_done(id);
+                            return;
+                        }
+                        self.acking.insert(id, session);
+                    }
+                }
+                // Stopped or gone: no acknowledgement comes, and the stop is its own event.
+                Err(FinishError::Stopped(_) | FinishError::ClosedStream) => {}
             }
         }
         self.forget_if_done(id);
     }
 
-    /// Forgets a WebTransport stream both of whose sides are over.
+    /// Forgets a WebTransport or served stream both of whose sides are over.
     fn forget_if_done(&mut self, id: StreamId) {
         let Some(stream) = self.streams.get(&id) else { return };
+        if let Kind::Serve(n) = stream.kind {
+            return self.forget_served(id, n);
+        }
         if !matches!(stream.kind, Kind::Wt { .. }) {
             return;
         }
@@ -1139,20 +1221,31 @@ impl Conn {
                     // The peer closed the connection with no error and no capsule first: its
                     // sessions end as a close with code 0 would end them.
                     self.end_sessions(&Closed::ByPeer { code: 0, reason: String::new() }, cx);
+                    let error = self.error(
+                        Step::Request,
+                        format!("the connection was closed with no error ({reason})"),
+                    );
+                    self.end_requests(&error, cx);
                     return;
                 }
-                let step = if self.connected { Step::Session } else { Step::Handshake };
                 let error = match (&self.failed, &reason) {
                     (Some(error), ConnectionError::LocallyClosed) => error.clone(),
+                    _ if !self.connected => {
+                        self.error(Step::Handshake, requests::handshake_failure(&reason))
+                    }
                     // alloc: an error's message, made only when it fails.
-                    _ => self.error(step, reason.to_string()),
+                    _ => self.error(Step::Session, reason.to_string()),
                 };
                 self.end_sessions(&Closed::Failed(error.clone()), cx);
+                self.end_requests(&error, cx);
                 self.lost = Some(error);
             }
             quinn_proto::Event::Stream(StreamEvent::Opened { dir }) => loop {
                 let Some(id) = self.quic.streams().accept(dir) else { break };
                 let kind = if dir == Dir::Uni { Kind::PeerUni } else { Kind::PeerBidi };
+                if dir == Dir::Bi && self.side == Side::Server {
+                    self.seen_bidi(id);
+                }
                 self.streams.insert(id, Stream::new(kind));
                 self.read(id, cx);
             },
@@ -1163,11 +1256,15 @@ impl Conn {
                     self.closing = None;
                     self.linger = Some(cx.now);
                 }
+                if self.acking.remove(&id).is_some() {
+                    cx.events.push_back(Event::StreamAcked { stream: StreamRef { conn: cx.id, stream: u64::from(id) } });
+                }
             }
             quinn_proto::Event::Stream(StreamEvent::Stopped { id, error_code }) => {
                 self.stopped(id, error_code, cx)
             }
             quinn_proto::Event::Stream(StreamEvent::Available { .. }) => {
+                self.send_waiting(cx);
                 for (sid, session) in &self.sessions {
                     if matches!(session.state, State::Open) {
                         let session = SessionId { conn: cx.id, stream: u64::from(*sid) };
@@ -1203,6 +1300,9 @@ impl Conn {
     /// The handshake is done: this side's control stream and SETTINGS go out.
     fn connected(&mut self, cx: &mut Cx<'_>) {
         self.connected = true;
+        // First, so the streams quinn-proto discarded with refused early data are forgotten
+        // before any stream (the control stream's included) takes their IDs again.
+        self.requests_connected();
         let Some(id) = self.quic.streams().open(Dir::Uni) else {
             // alloc: an error's message, made only when it fails.
             let why =
@@ -1219,10 +1319,24 @@ impl Conn {
         if self.peer_settings.is_none() {
             self.settings_due = Some(cx.now + SETTINGS_WAIT);
         }
+        // Requests need no SETTINGS first (RFC 9114, 6.2.1): the defaults allow them.
+        self.send_waiting(cx);
     }
 
     fn stopped(&mut self, id: StreamId, code: VarInt, cx: &mut Cx<'_>) {
-        let Some(stream) = self.streams.get_mut(&id) else { return };
+        // A finished stream the peer stopped before acknowledging it: the stop is what the
+        // asker hears in place of [`Event::StreamAcked`], even when the stream was forgotten
+        // (both its sides over).
+        let acking = self.acking.remove(&id);
+        let Some(stream) = self.streams.get_mut(&id) else {
+            if let Some(session) = acking
+                && self.sessions.contains_key(&session)
+            {
+                let at = StreamRef { conn: cx.id, stream: u64::from(id) };
+                cx.events.push_back(Event::StreamStopped { stream: at, code: frame::h3_to_wt(code.into_inner()) });
+            }
+            return;
+        };
         stream.out.clear();
         stream.out_at = 0;
         stream.finished = true;
@@ -1254,6 +1368,10 @@ impl Conn {
                 });
                 self.forget_if_done(id);
             }
+            // The client cancelled: its answer is not sent (what was queued is dropped above).
+            Kind::Serve(_) => self.forget_if_done(id),
+            // A request is sent whole with its FIN, so a server that stops it wants nothing
+            // more of it; a refusal comes as the reset of its answer, which ends it.
             _ => {}
         }
     }
@@ -1266,7 +1384,9 @@ impl Conn {
                 return;
             }
             let room = match stream.kind {
-                Kind::Wt { open: true, .. } => WINDOW.saturating_sub(stream.unconsumed),
+                Kind::Wt { open: true, .. } | Kind::Get(_) => {
+                    WINDOW.saturating_sub(stream.unconsumed)
+                }
                 // Held for a session not yet open: read no further than its header.
                 Kind::Wt { open: false, .. } => 0,
                 _ => WINDOW,
@@ -1359,6 +1479,8 @@ impl Conn {
             Kind::PeerUni | Kind::PeerBidi => {
                 self.streams.remove(&id);
             }
+            Kind::Get(n) => self.get_ended(n, end, cx),
+            Kind::Serve(_) => self.forget_if_done(id),
             Kind::Wt { open: false, .. } | Kind::Control | Kind::Wt { open: true, .. } => {}
         }
     }
@@ -1465,6 +1587,12 @@ impl Conn {
                 }
                 Kind::PeerControl => return self.control_frames(id, cx),
                 Kind::Request => return self.request_frames(id, cx),
+                Kind::Get(n) => return self.get_frames(id, n, cx),
+                // A served request's body, if its client sent one, is not read.
+                Kind::Serve(_) => {
+                    stream.inbuf.clear();
+                    return;
+                }
                 Kind::Drain => {
                     stream.inbuf.clear();
                     return;
@@ -1532,16 +1660,29 @@ impl Conn {
     fn control_frames(&mut self, id: StreamId, cx: &mut Cx<'_>) {
         loop {
             let Some(stream) = self.streams.get_mut(&id) else { return };
-            let (ty, len, settings) = match frame::next(&stream.inbuf) {
+            let (ty, len, settings, goaway) = match frame::next(&stream.inbuf) {
                 Ok(None) => return,
                 Ok(Some(found)) => {
                     let settings =
                         (found.ty == frame::SETTINGS).then(|| frame::parse_settings(found.payload));
-                    (found.ty, found.len, settings)
+                    let goaway = (found.ty == frame::GOAWAY)
+                        .then(|| varint::get(found.payload).map(|(it, _)| it));
+                    (found.ty, found.len, settings, goaway)
                 }
                 Err(error) => return self.fail(error.code, Step::Settings, error.why, cx),
             };
             stream.inbuf.drain(..len);
+            match goaway {
+                Some(Some(last)) if self.peer_settings.is_some() => {
+                    self.goaway_came(last, cx);
+                    continue;
+                }
+                Some(None) if self.peer_settings.is_some() => {
+                    let why = "a GOAWAY frame with no stream ID".to_owned();
+                    return self.fail(code::H3_FRAME_ERROR, Step::Settings, why, cx);
+                }
+                _ => {}
+            }
             match (self.peer_settings.is_some(), ty, settings) {
                 (false, _, Some(Ok(settings))) => {
                     self.peer_settings = Some(settings);
@@ -1641,6 +1782,11 @@ impl Conn {
             if !stream.recv_open && stream.inbuf.is_empty() {
                 return;
             }
+            if stream.kind != Kind::Request {
+                // Its HEADERS made it a served request: the rest is not read.
+                stream.inbuf.clear();
+                return;
+            }
             let (ty, len, payload) = match frame::next(&stream.inbuf) {
                 Ok(None) => return,
                 // alloc: one frame's payload, at most MOST_FRAME.
@@ -1680,6 +1826,9 @@ impl Conn {
             Ok(it) => it,
             Err(why) => return self.fail(code::QPACK_DECOMPRESSION_FAILED, Step::Connect, why, cx),
         };
+        if fields.iter().all(|(n, v)| n != ":method" || v != "CONNECT") && self.serve_came(id, &fields, cx) {
+            return;
+        }
         let field = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str());
         let refused = match (
             field(":method"),

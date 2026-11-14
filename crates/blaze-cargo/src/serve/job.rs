@@ -57,8 +57,9 @@ mod tests;
 
 #[cfg(test)]
 thread_local! {
-    /// The planted bug of `serve::tests`' durability control: [`Jobs::body_sessions`] marks a
-    /// session as if its puts were durable, whatever their tickets say.
+    /// The planted bug of `serve::tests`' durability controls: [`Jobs::body_sessions`] marks a
+    /// session, and [`Jobs::test_heads`] a test suite's head, as if its puts were durable,
+    /// whatever their tickets say.
     pub(super) static MARK_EARLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The planted bug of `serve::tests`' certificate control: a build's certificate is written
     /// as it ends ([`Jobs::heard`]), before what it left to settle after its answer is durable.
@@ -97,6 +98,34 @@ thread_local! {
     /// The planted bug: an output is placed at once whatever is in flight at its path
     /// ([`Jobs::place_output`]), as before outputs outlived their job's answer.
     pub(super) static PLANT_NO_QUEUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Each path a job wrote or cloned a file onto ([`Jobs::place`], [`Jobs::place_made_as`]):
+    /// what a test sees of a placement besides the file's bytes, which a placement of the same
+    /// value leaves as they were.
+    pub(super) static PLACED_PATHS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
+    /// The planted bug: an output is placed again whatever the path holds, its file not looked
+    /// at first ([`Jobs::place_now`]).
+    pub(super) static PLANT_PLACE_UNLOOKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a run is given no record of any path ([`Paths::placed_key`]), as
+    /// before launches read the job's record: what starts a program from its path must then
+    /// write the file itself.
+    pub(super) static PLANT_LAUNCH_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a path with any record is taken to hold the job's value and nothing is
+    /// placed or looked at ([`Jobs::place_now`]), as a shortcut that vouches for a path without
+    /// the record's key would: another command's value at a shared path stays there.
+    pub(super) static PLANT_VOUCH_ANY_KEY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a request certificate's check takes an output for the answer's with
+    /// no word from the jobs' record ([`certify::placed_elsewhere`] not asked), so the disk
+    /// alone vouches, as it did until 2026-11-14.
+    pub(super) static PLANT_HIT_UNRECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug: a certificate names each output as the jobs' record holds it when it is
+    /// written, after the build settled, not as its own build left it, as it did until
+    /// 2026-11-14: a file another request placed there meanwhile is named as this answer's.
+    pub(super) static PLANT_CERTIFY_SHARED_RECORD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the request certificate said of each request that became a job (why it was not
+    /// checked, or why its check missed: `job: ..`) and of each build whose certificate was
+    /// not written (`not written: ..`), in order, each in its own words: what a test whose
+    /// premise is a certificate's answer says when none answered.
+    pub(super) static CERTIFY_WORDS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
     /// Each `errors` row a job's words gave ([`Jobs::note_errors`]): its build, its kind and
     /// its message. What a test reads of a table only the history's thread writes.
     pub(super) static ERROR_ROWS: std::cell::RefCell<Vec<(u64, String, String)>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, a test's record
@@ -213,6 +242,8 @@ pub enum Value<S: Steps> {
     Answer(Result<Response, ApiError>),
     /// Answered with these, in order: a [`Work::Doc`]'s pages, warnings and documentation.
     Answers(Result<Vec<Response>, ApiError>),
+    /// [`Work::Prove`]: what its worker found ([`Front::prove`]), for the loop's run of Lean.
+    Proving(Result<S::Proving, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
     Selected(Result<Vec<String>, ApiError>),
     Evaluated(Result<TestResult, ApiError>),
@@ -525,6 +556,14 @@ pub(super) enum Does<S: Steps> {
         front: Arc<S::Front>,
         filter: Vec<String>,
     },
+    /// `blaze prove` ([`Work::Prove`]): the theorem functions of the job's library crates
+    /// translated to Lean and the check of their proofs planned ([`Front::prove`]); the
+    /// check itself is a run of the loop ([`Jobs::check_proofs`]).
+    Prove {
+        front: Arc<S::Front>,
+        emit: bool,
+        subset: bool,
+    },
     /// Posted with the job's writer, once its check is built and nothing reads its front end:
     /// the documentation sets `cfg(doc)` on the crates it documents.
     Doc {
@@ -649,6 +688,7 @@ impl<S: Steps> plane::Work for Step<S> {
             Does::Edit { .. } => tracing::info_span!("edit"),
             Does::Query { .. } => tracing::info_span!("query"),
             Does::Ahead { .. } => tracing::info_span!("ahead"),
+            Does::Prove { emit, .. } => tracing::info_span!(target: "blaze", "prove", emit = *emit),
             Does::Doc { .. } => tracing::info_span!("doc"),
             Does::StoreKept { checkout, .. } => tracing::info_span!(target: "blaze", "store kept front end", checkout = %checkout),
             Does::Write { asked, .. } => tracing::info_span!(
@@ -892,6 +932,9 @@ impl<S: Steps> plane::Work for Step<S> {
             }),
             Does::Ahead { front, filter } => {
                 self.settle(front.ahead(this(readers), filter), Value::Ahead)
+            }
+            Does::Prove { front, emit, subset } => {
+                self.settle(front.prove(this(readers), *emit, *subset), Value::Proving)
             }
             Does::Doc { front, no_deps, private } => {
                 let writer = readers
@@ -1234,6 +1277,7 @@ fn command_of(work: &Work) -> Command {
         | Work::Tables
         | Work::Snapshot
         | Work::Edit(_)
+        | Work::Prove { .. }
         | Work::Query(_)
         | Work::Lock(_) => Command::Check,
         Work::Doc { .. } => Command::Doc,
@@ -1248,6 +1292,7 @@ fn kind_of(work: &Work) -> JobKind {
         Work::Run { .. } => JobKind::Run,
         // A reach builds only the units its views' front ends apply, each as a check builds
         // it, and so shares a check's records ([`reads_front_unbuilt`]).
+        // A proof reads the front end as a reach does, and shares a check's records too.
         Work::Reach { .. }
         | Work::Check(_)
         | Work::Verify(_)
@@ -1257,13 +1302,14 @@ fn kind_of(work: &Work) -> JobKind {
         | Work::Edit(_)
         | Work::Query(_)
         | Work::Doc { .. }
+        | Work::Prove { .. }
         | Work::Lock(_) => JobKind::Check,
     }
 }
 
 /// Whether `work` answers from its views' front ends without building their units first: a
 /// reach (item hashes), an edit (name resolution) and a build ahead's choice (the tests each
-/// test unit holds) read def maps, which a crate whose proc macros are not built, or whose
+/// test unit holds) read def maps, and a proof (`blaze prove`) reads bodies' MIR, which a crate whose proc macros are not built, or whose
 /// build scripts' cfgs, env and `OUT_DIR` are not applied, gives only half expanded. Each view
 /// of such a job, once lowered, first builds the units its front end applies
 /// ([`applied_units`]) in the job's own plane request, and only then is read ([`Jobs::next`]):
@@ -1273,7 +1319,7 @@ fn kind_of(work: &Work) -> JobKind {
 /// and a verify walk the plan, the tables count, the codegen inputs read the units' records).
 fn reads_front_unbuilt(work: &Work) -> bool {
     match work {
-        Work::Reach { .. } | Work::Edit(_) | Work::Query(_) | Work::Ahead { .. } => true,
+        Work::Reach { .. } | Work::Edit(_) | Work::Query(_) | Work::Ahead { .. } | Work::Prove { .. } => true,
         Work::Check(_)
         | Work::Build(_)
         | Work::Test { .. }
@@ -1306,6 +1352,7 @@ fn work_word(work: &Work) -> &'static str {
         Work::Query(_) => "query",
         Work::Ahead { .. } => "ahead",
         Work::Lock(_) => "lock",
+        Work::Prove { .. } => "prove",
     }
 }
 
@@ -1342,6 +1389,7 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Reach { targets, .. }
         | Work::Ahead { targets, .. }
         | Work::Doc { targets, .. }
+        | Work::Prove { targets, .. }
         | Work::Lock(targets) => Some(targets),
         Work::Tables | Work::Snapshot | Work::Edit(_) | Work::Query(_) => None,
     }
@@ -2077,6 +2125,21 @@ impl<S: Steps> Paths<S> {
         id
     }
 
+    /// The content key the record of `path` holds: the output placed there whose file was as
+    /// placed at the last look; `None` for a path nothing is placed at, one whose placement is
+    /// in flight, or one whose file a look found changed ([`Jobs::placed_key`]). What a run
+    /// started from the file there is given for it ([`Runs::start`]'s `placed`): the host
+    /// starts a program only from a file its key says is its own, and writes none.
+    fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
+        let id = *self.ids.get(path)?;
+        let placed = self.placed[id as usize].as_ref()?;
+        #[cfg(test)]
+        if PLANT_LAUNCH_UNRECORDED.get() {
+            return None;
+        }
+        placed.meta.map(|_| placed.key.0.0)
+    }
+
     /// The id of `path`, an output of the unit whose outputs are `ids`: a compare of the few
     /// it has, interned only when it is none of them.
     fn find(&mut self, ids: &[u32], path: &str) -> u32 {
@@ -2302,6 +2365,36 @@ fn body_marks(vfs: &Vfs, checkout: &str) -> BTreeMap<String, blaze_cas::Key> {
         }
     }
     marks
+}
+
+/// The test suites' head marks the journal holds ([`Jobs::test_heads`]), as a start hands them
+/// to the steps (`Steps::test_heads_marked`): each head and its postings queued for the pin
+/// [`super::collect::TEST_HEADS`] again, so a crash between a mark and its pin's write leaves
+/// the head kept from the next build's end on. A mark that does not decode (another layout,
+/// another length, another suite's under this one's name) is said, naming it, and let go: its
+/// suite's next run starts with no head.
+pub(super) fn test_heads_marked(vfs: &mut Vfs) -> Vec<super::local::TestHeadMark, Global> {
+    let mut marked = Vec::new_in(Global);
+    let mut undecoded = Vec::new_in(Global);
+    for (name, bytes) in vfs.marks(super::local::TESTS) {
+        match super::local::TestHeadMark::decode(name, bytes) {
+            Ok(mark) => marked.push(mark),
+            Err(why) => undecoded.push(why),
+        }
+    }
+    for why in undecoded {
+        let (super::local::Undecoded::Layout { name, .. } | super::local::Undecoded::Length { name, .. }) = &why;
+        tracing::error!(target: "blaze", "a test suite's head mark is let go, and its next run starts with no head: {why}");
+        _ = vfs.unmark(name);
+    }
+    for mark in &marked {
+        super::collect::keep_in_place_of(
+            super::collect::TEST_HEADS,
+            super::unit::test_heads_pinned(mark.head, mark.postings),
+            Vec::new_in(Global),
+        );
+    }
+    marked
 }
 
 fn carry_view(vfs: &mut Vfs, root: ContentId) -> Result<ViewId, String> {
@@ -2551,6 +2644,71 @@ impl<S: Steps> Jobs<S> {
             }
         }
         self.body_sessions(vfs, store);
+        self.test_heads(vfs, store);
+    }
+
+    /// Marks each test suite's index head whose puts are durable in `store`, in the VFS's
+    /// journal under [`super::local::TESTS`] and the suite's settings
+    /// ([`super::local::TestHeadMark`]): what a start restores
+    /// (`unit::test::image::Selectors::restore`). A suite's heads are marked in the order its
+    /// runs filed them, each once it is durable, so a mark never goes back and never names a
+    /// head a crash can lose; a head let go unmarks its suite. Each mark moves the pin
+    /// [`super::collect::TEST_HEADS`] from the head the mark named to the one it names now.
+    /// A mark the journal refuses is said, named; the suite's next run after a restart then
+    /// starts from the mark before it.
+    pub fn test_heads(&mut self, vfs: &mut Vfs, store: &blaze_cas::Store) {
+        if self.heads.is_empty() {
+            return;
+        }
+        let _span = tracing::info_span!(
+            target: "blaze",
+            "test heads: mark those whose puts are durable",
+            waiting = self.heads.len() as u64,
+        )
+        .entered();
+        // The suites with an earlier head not durable yet: their later ones wait behind it.
+        let mut blocked: Vec<ContentId, Global> = Vec::new_in(Global);
+        let mut left = Vec::new_in(Global);
+        for (filed, tickets) in std::mem::replace(&mut self.heads, Vec::new_in(Global)) {
+            let durable = tickets.pending(|ticket| store.durable(ticket)).is_none();
+            #[cfg(test)]
+            let durable = durable || MARK_EARLY.get();
+            if !durable || blocked.contains(&filed.given) {
+                blocked.push(filed.given);
+                left.push((filed, tickets));
+                continue;
+            }
+            let name = super::local::TestHeadMark::name(filed.given);
+            let before = vfs.marked(&name).and_then(|bytes| super::local::TestHeadMark::decode(&name, bytes).ok());
+            let let_go = || {
+                let mut keys = Vec::new_in(Global);
+                if let Some(it) = before {
+                    keys.extend(super::unit::test_heads_pinned(it.head, it.postings));
+                }
+                keys
+            };
+            match filed.mark {
+                Some(mark) if before == Some(mark) => {}
+                Some(mark) => match vfs.mark(&name, &mark.encode()) {
+                    Ok(_) => super::collect::keep_in_place_of(
+                        super::collect::TEST_HEADS,
+                        super::unit::test_heads_pinned(mark.head, mark.postings),
+                        let_go(),
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "blaze",
+                        mark = %name.escape_debug(),
+                        "the journal refused a test suite's head mark, so its next run after a restart starts from the mark before: {error:?}"
+                    ),
+                },
+                None => {
+                    if vfs.unmark(&name).is_some() {
+                        super::collect::keep_in_place_of(super::collect::TEST_HEADS, std::iter::empty(), let_go());
+                    }
+                }
+            }
+        }
+        self.heads = left;
     }
 
     /// Marks each body entries' session a unit saved whose puts are durable in `store`, in the
@@ -3027,6 +3185,9 @@ struct Applying {
     left: u32,
     /// One of them did not end well: failed, skipped or cancelled.
     failed: bool,
+    /// The first of them that did not end well: its unit, and why where its end said, for the
+    /// job's error to name ([`Jobs::applied`]).
+    first: Option<(usize, Option<String>)>,
 }
 
 /// The units of a build that depend on a write to its front end that failed or panicked
@@ -4596,6 +4757,10 @@ pub struct Jobs<S: Steps> {
     /// root it was saved under, and the tickets of the unit's puts (its rows among them), in
     /// the order the units ended ([`Jobs::body_sessions`]).
     bodies: Vec<(String, blaze_cas::Key, blaze_cas::Tickets)>,
+    /// Each test suite's index head a run filed or let go that the journal has not marked yet,
+    /// in the order the runs handed them over, with the tickets of every put of the suite's
+    /// runs since its last mark ([`Jobs::test_heads`]).
+    heads: Vec<(super::work::HeadFiled, blaze_cas::Tickets)>,
     /// Each build that ended whose certificate waits for what its job left to settle after its
     /// answer ([`Settling`]): its records, kept front end and outputs durable and placed. Handed
     /// to the certificate's writer once its job settled ([`Jobs::certify_settled`]), and dropped,
@@ -4750,6 +4915,7 @@ impl<S: Steps> Jobs<S> {
             runs,
             put: blaze_cas::Tickets::default(),
             bodies: Vec::new(), // alloc: none until a unit saves a body entries' session
+            heads: Vec::new_in(Global),
             certify_held: Vec::new(), // alloc: none until a build ends with something to settle
             settling: Vec::new(), // alloc: none until a job leaves something to settle
             lost: Vec::new(),     // alloc: none until settling loses something
@@ -4820,9 +4986,7 @@ impl<S: Steps> Jobs<S> {
     /// is in flight, or one whose file a look found changed. What a launch of the file there
     /// may take the file for (`serve::unit::run::inproc::DevRuns::launch`).
     pub fn placed_key(&self, path: &str) -> Option<[u8; 32]> {
-        let id = *self.paths.ids.get(path)?;
-        let placed = self.paths.placed[id as usize].as_ref()?;
-        placed.meta.map(|_| placed.key.0.0)
+        self.paths.placed_key(path)
     }
 
     /// How many outputs answered jobs left being placed ([`Settling::placing`]): the loop is
@@ -5006,6 +5170,11 @@ impl<S: Steps> Jobs<S> {
         walks: Option<(String, ContentId)>,
     ) {
         let refused = self.refused.take();
+        #[cfg(test)]
+        CERTIFY_WORDS.with_borrow_mut(|it| {
+            let why = refused.as_deref().or(walks.as_ref().map(|it| it.0.as_str()));
+            it.push(format!("job: {}", why.unwrap_or("no word of the certificate"))); // alloc: a test's record
+        });
         let views = match (&work, view) {
             (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
             (_, Some(view)) => vec![view],                           // alloc: once per job
@@ -6508,10 +6677,13 @@ impl<S: Steps> Jobs<S> {
         // the job is over (something of it failed with the request still open), so that end is
         // never left waiting for a finish the request can't give.
         if let Stage::Units(build) = &mut job.stage
-            && build.unit(node).is_some()
+            && let Some(unit) = build.unit(node)
             && let Some(applying) = build.applying.as_mut()
         {
             applying.left = applying.left.saturating_sub(1);
+            if !ok && applying.first.is_none() {
+                applying.first = Some((unit, why.clone())); // clone: once a job, for its error
+            }
             applying.failed |= !ok;
             if applying.left == 0 {
                 let ok = !applying.failed && job.over.is_none();
@@ -6735,6 +6907,8 @@ impl<S: Steps> Jobs<S> {
                     self.end(w, id, true, None);
                 }
                 Some(Value::Answers(Err(error))) => self.end(w, id, false, Some(error)),
+                Some(Value::Proving(Ok(proving))) => self.check_proofs(w, id, proving),
+                Some(Value::Proving(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
             Stage::Ahead(at) if at == node => match job.take_value(node) {
@@ -8186,7 +8360,7 @@ impl<S: Steps> Jobs<S> {
             fresh: fresh_units,
             verdicts,
             whole: picked.is_none() && !applying,
-            applying: applying.then_some(Applying { left: count, failed: false }),
+            applying: applying.then_some(Applying { left: count, failed: false, first: None }),
             made_wait: (count > 0).then(|| {
                 tracing::info_span!(
                     target: "blaze",
@@ -8431,7 +8605,9 @@ impl<S: Steps> Jobs<S> {
         };
         let mut out = std::mem::take(&mut self.out);
         // The writer, or what keeps the run's ask while a write's task holds it.
-        let ended = runs.start(w.store, Some(&mut build.writer), w.effects, &mut out);
+        let paths = &self.paths;
+        let placed = |path: &str| paths.placed_key(path);
+        let ended = runs.start(w.store, Some(&mut build.writer), &placed, w.effects, &mut out);
         let puts = runs.take_puts();
         self.run_put(w, id, puts);
         for response in out.drain(..) {
@@ -8720,10 +8896,18 @@ impl<S: Steps> Jobs<S> {
             self.place_made(w, id, path, key, executable, made);
             return;
         }
+        #[cfg(test)]
+        let planted = PLANT_PLACE_UNLOOKED.get();
+        #[cfg(not(test))]
+        let planted = false;
         let placed = self.paths.placed[path as usize]
             .as_ref()
             .is_some_and(|it| it.key == key && it.executable == executable && it.meta.is_some());
-        if !placed {
+        #[cfg(test)]
+        if PLANT_VOUCH_ANY_KEY.get() && self.paths.placed[path as usize].as_ref().is_some_and(|it| it.meta.is_some()) {
+            return;
+        }
+        if !placed || planted {
             self.place(w, id, path, key, executable);
             return;
         }
@@ -8797,9 +8981,11 @@ impl<S: Steps> Jobs<S> {
         key: blaze_cas::Key,
         executable: bool,
     ) {
-        // The whole file the store kept to clone the path's last value from goes as this is
-        // answered, once no other path names it (`blaze_cas::Store::place`): a build dir
-        // rebuilt again and again keeps no store file of each version.
+        // The path's last value stays in the store, its record and the file that is its home
+        // (D45: a unit record that names it is replayed by the next request that shares the
+        // path); only a whole file kept to clone from that is no value's home goes as this is
+        // answered, once no other path names it (`blaze_cas::Store::place`). What lets a value
+        // go is the collector, by budget.
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {
@@ -8819,6 +9005,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        #[cfg(test)]
+        PLACED_PATHS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
         // An executable is started from its path: a clone placed there is prewarmed.
         w.store.starts(&file, executable);
         match w.store.place(&key, file, w.effects) {
@@ -8896,7 +9084,8 @@ impl<S: Steps> Jobs<S> {
         made: &Arc<Made>,
         over: bool,
     ) {
-        // The store lets go of the whole file of the path's last value as this is answered.
+        // The path's last value stays in the store (D45); a whole file kept only to clone it
+        // from, no value's home, is let go of as this is answered ([`Jobs::place`]).
         self.paths.placed[path as usize] = None;
         // What an answered job left goes on ([`Settling::placing`]); a dropped job's does not.
         match self.jobs.get_mut(key_of(id)) {
@@ -8916,6 +9105,8 @@ impl<S: Steps> Jobs<S> {
             self.placing_failed(id, path, error);
             return;
         };
+        #[cfg(test)]
+        PLACED_PATHS.with_borrow_mut(|it| it.push(self.paths.names[path as usize].to_string()));
         // An executable is started from its path: its staged file gets its mode before its
         // look and rename, and a clone is prewarmed (`blaze_cas::Store::starts`).
         w.store.starts(&file, executable);
@@ -9205,6 +9396,21 @@ impl<S: Steps> Jobs<S> {
             job.durable.extend(&puts.tickets);
             job.misses.append(&mut puts.misses);
             job.test_runs.append(&mut puts.test_runs);
+        }
+        for filed in puts.heads.drain(..) {
+            // A head is marked only once every put of its suite's runs since its last mark is
+            // durable: a run that found its head filed already put nothing for it, and its
+            // put's ticket is an earlier run's. A head let go waits for nothing.
+            let mut tickets = blaze_cas::Tickets::default();
+            if filed.mark.is_some() {
+                tickets.extend(&puts.tickets);
+                for (earlier, waits) in &self.heads {
+                    if earlier.given == filed.given {
+                        tickets.extend(waits);
+                    }
+                }
+            }
+            self.heads.push((filed, tickets));
         }
         if puts.retracted {
             // A retraction is flushed at once: every other checkout must stop being given
@@ -9659,6 +9865,33 @@ impl<S: Steps> Jobs<S> {
         self.release_runs(w);
     }
 
+    /// A `blaze prove`'s worker has answered: its check, Lean over what the worker found, is
+    /// a run of the loop as a build's tests are, in the sandbox, and the job's answer is the
+    /// run's ([`Steps::check_proofs`]).
+    fn check_proofs(&mut self, w: &mut World<'_, S>, id: JobId, proving: S::Proving) {
+        let (run, tags) = match self.run_tags(id, None) {
+            Ok(it) => it,
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else {
+            self.run_over(run);
+            return;
+        };
+        let runs = match &job.work {
+            Work::Prove { lean, .. } => S::check_proofs(proving, lean.as_deref(), tags),
+            _ => S::check_proofs(proving, None, tags),
+        };
+        job.stage = Stage::Runs(run);
+        if let Some(it) = self.runs.get_mut(run) {
+            it.runs = Some(Box::new_in(runs, Global));
+            it.held = true;
+        }
+        self.release_runs(w);
+    }
+
     /// Each job's tests or run [`Jobs::plane_finished`] held, asked again: one whose job has no
     /// placement in flight starts, everything the build placed all there; the rest wait on. One
     /// whose job ended meanwhile (a placement failed, or it was cancelled) ends unstarted, not
@@ -9701,7 +9934,12 @@ impl<S: Steps> Jobs<S> {
         #[cfg(test)]
         RUNS_STARTED_PLACING.with_borrow_mut(|it| it.push(job.placing));
         let mut out = std::mem::take(&mut self.out);
-        let ended = runs.start(w.store, None, w.effects, &mut out);
+        // Each program it starts is started from the file its path's record holds, with that
+        // record's key: its job's placements have all ended (`release_runs`), so the record is
+        // what the build placed and found as placed, and no one else writes the file.
+        let paths = &self.paths;
+        let placed = |path: &str| paths.placed_key(path);
+        let ended = runs.start(w.store, None, &placed, w.effects, &mut out);
         let puts = runs.take_puts();
         self.run_put(w, id, puts);
         for response in out.drain(..) {
@@ -9735,7 +9973,8 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, writer, root, units, .. } = *build;
+        let Build { input, front, writer, root, units, applying, .. } = *build;
+        let unbuilt = applying.and_then(|it| it.first);
         let Some(mut writer) = writer.into_here() else {
             let error = ApiError::new(
                 "the build's front end was lost to a write that failed, so its end reads none",
@@ -9755,16 +9994,24 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        self.applied(w, id, ok, Ready { input, root, front: Some(front), writer: Some(writer) });
+        self.applied(w, id, ok, unbuilt, Ready { input, root, front: Some(front), writer: Some(writer) });
     }
 
     /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
     /// all of them did: the wait's span closed, every write they asked for applied, and the view
     /// ready again, the job going on, in the same plane request, to its next view or its answer.
     /// A unit that did not build, or a write of one that did not apply, fails the job naming the
-    /// view: its answer would read what a macro that never ran left out, or a crate without its
-    /// build script's output.
-    fn applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool, mut ready: Ready<S>) {
+    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said):
+    /// its answer would read what a macro that never ran left out, or a crate without its build
+    /// script's output.
+    fn applied(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        ok: bool,
+        unbuilt: Option<(usize, Option<String>)>,
+        mut ready: Ready<S>,
+    ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.applying = None;
         let work = work_word(&job.work);
@@ -9778,7 +10025,26 @@ impl<S: Steps> Jobs<S> {
             ApiError::new(what, Some(root.clone())) // clone: an error, once
         };
         let error = match ready.writer.as_mut() {
-            _ if !ok => Some(refused("did not all build".to_owned())), // alloc: an error, once
+            _ if !ok => Some(refused(match &unbuilt {
+                // The job that asked is not a build, so the unit's own diagnostics were printed
+                // to no one: the error names the unit, and says how to see them.
+                Some((unit, why)) => {
+                    let named = match ready.input.units.graph.units.get(*unit) {
+                        Some(unit) => format!("{} of {}", unit.target.name, unit.pkg_id),
+                        None => format!("unit {unit}"),
+                    };
+                    // A `blaze check` of the unit's package prints what its end only counts.
+                    match why {
+                        Some(why) => format!(
+                            "did not all build: {named} did not build: {why}; `blaze check` of its package prints its errors"
+                        ),
+                        None => format!(
+                            "did not all build: {named} did not build; `blaze check` of its package prints its errors"
+                        ),
+                    }
+                }
+                None => "did not all build".to_owned(),
+            })), // alloc: an error, once
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
                 Err(error) => Some(refused(format!("did not apply: {}", error.what))),
@@ -10821,6 +11087,9 @@ fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<St
         Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
         Work::Doc { no_deps, private, .. } => {
             Does::Doc { front: lowered()?, no_deps: *no_deps, private: *private }
+        }
+        Work::Prove { emit, subset, .. } => {
+            Does::Prove { front: lowered()?, emit: *emit, subset: *subset }
         }
         Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
             return Err(ApiError::new(

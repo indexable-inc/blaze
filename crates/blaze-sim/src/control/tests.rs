@@ -3,7 +3,9 @@
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use super::*;
+use super::{Broke, control};
+use crate::search::Config;
+use crate::tape::Tape;
 
 /// The code under a control: a counter that a planted bug lets go past its bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,17 +47,23 @@ fn a_plant_caught_saying_the_words_passes() {
 
 #[test]
 fn an_oracle_that_misses_the_plant_panics_saying_so() {
-    let said = panic_of(|| control(Config::cases(64), Bug::None, Bug::None, "past its bound", counter));
+    let said =
+        panic_of(|| control(Config::cases(64), Bug::None, Bug::None, "past its bound", counter));
     let said = said.expect("a control whose plant is the clean code panics");
     assert_eq!(said, "the oracle missed None in 64 cases");
 }
 
 #[test]
 fn a_plant_caught_with_other_words_panics_quoting_them() {
-    let said = panic_of(|| control(Config::cases(64), Bug::None, Bug::Unbounded, "lost a message", counter));
+    let said = panic_of(|| {
+        control(Config::cases(64), Bug::None, Bug::Unbounded, "lost a message", counter)
+    });
     let said = said.expect("a control caught with other words panics");
     assert!(said.starts_with("Unbounded was caught "), "{said}");
-    assert!(said.contains(" times in 64 cases, never saying `lost a message`; first: `the count "), "{said}");
+    assert!(
+        said.contains(" times in 64 cases, never saying `lost a message`; first: `the count "),
+        "{said}"
+    );
     assert!(said.ends_with(" is past its bound of 4`"), "{said}");
 }
 
@@ -87,15 +95,21 @@ fn a_plant_caught_by_another_check_first_passes_a_control_naming_the_later_one()
 #[test]
 fn a_control_whose_words_no_case_says_panics_with_the_count_and_the_first_other_text() {
     let calls = Cell::new(0);
-    let said = panic_of(|| control(Config::cases(64), Bug::None, Bug::Unbounded, "check C", two_checks(&calls)));
+    let said = panic_of(|| {
+        control(Config::cases(64), Bug::None, Bug::Unbounded, "check C", two_checks(&calls))
+    });
     let said = said.expect("a control whose words no case says panics");
     let count: u32 = said
         .strip_prefix("Unbounded was caught ")
         .and_then(|rest| rest.split(' ').next())
-        .and_then(|count| count.parse().ok())
-        .unwrap_or_else(|| panic!("no count in `{said}`"));
+        .unwrap_or_else(|| panic!("no count in `{said}`"))
+        .parse()
+        .unwrap_or_else(|error| panic!("the count in `{said}` is not a number: {error}"));
     assert!(count > 10 && count <= 64, "{said}");
-    assert!(said.ends_with(" times in 64 cases, never saying `check C`; first: `check A on call 1`"), "{said}");
+    assert!(
+        said.ends_with(" times in 64 cases, never saying `check C`; first: `check A on call 1`"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -110,14 +124,22 @@ fn a_plant_caught_by_a_panic_is_not_the_oracle_catching_it() {
         })
     });
     let said = said.expect("a plant caught by a panic, not the oracle, fails the control");
-    assert!(said.starts_with("Unbounded was caught, but saying `the count is past its bound`"), "{said}");
+    assert!(
+        said.starts_with("Unbounded was caught, but saying `the count is past its bound`"),
+        "{said}"
+    );
 }
 
 #[test]
 fn a_control_whose_clean_run_fails_panics_with_the_report() {
-    let said = panic_of(|| control(Config::cases(64), Bug::AlwaysReports, Bug::Unbounded, "past its bound", counter));
+    let said = panic_of(|| {
+        control(Config::cases(64), Bug::AlwaysReports, Bug::Unbounded, "past its bound", counter)
+    });
     let said = said.expect("a control whose clean run fails panics");
     assert!(said.starts_with("the control's clean run did not pass:\nblaze-sim: `"), "{said}");
-    assert!(said.contains("failed at seed 0 (case 1 of 64): the count 0 is past its bound of 4"), "{said}");
+    assert!(
+        said.contains("failed at seed 0 (case 1 of 64): the count 0 is past its bound of 4"),
+        "{said}"
+    );
     assert!(said.contains("replay: BLAZE_SIM_TAPE="), "{said}");
 }

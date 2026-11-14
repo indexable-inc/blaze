@@ -219,7 +219,6 @@ fn units() -> Units {
         build_dir: "/w/target".to_owned(),
         finished: String::new(),
         link_dirs: Vec::new(),
-        sandboxed_tests: false,
         native: Vec::new(),
     }
 }

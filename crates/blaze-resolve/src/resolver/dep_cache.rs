@@ -240,7 +240,7 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
     pub(super) fn wait(&mut self) -> CargoResult<bool> {
         let pending = self.poller.pending_count();
         // Have all outstanding registry requests been completed?
-        let mut all_ready = self.poller.wait();
+        let mut all_ready = self.poller.wait()?;
         debug!(target: "cargo::resolver::restarting", pending);
 
         // Remove cached summaries that we produced with incomplete information.

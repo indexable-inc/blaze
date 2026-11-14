@@ -1933,7 +1933,7 @@ fn sealed_facts(fixture: &str) -> (Db, Vec<FactRef>) {
     (db, facts)
 }
 
-/// The invariant (keys-cover-every-input): a row read behind a library's seal stands for that
+/// The invariant: a row read behind a library's seal (rule keys-cover-every-input) stands for that
 /// library's `Crate` fact and the build's facts of the inputs no group holds, so a step that
 /// read it keeps its trace, and the trace's value moves with the library and not with what
 /// the reader's own crate changed. The controls: a group no crate the body sees has is

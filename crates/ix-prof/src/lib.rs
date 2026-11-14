@@ -29,6 +29,9 @@
 // inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+// `Vec::new_in(Global)` and the like: every allocation names its allocator (rule
+// bump-allocate), the explorer's serving core first (`explore::serving`).
+#![feature(allocator_api, btreemap_alloc)]
 // `std::random`: the explorer's token (`explore::link::Token`).
 #![cfg_attr(feature = "explore", feature(random))]
 

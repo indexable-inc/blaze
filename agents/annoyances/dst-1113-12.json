@@ -10,5 +10,6 @@
  "class": "a rule only the gate enforces, in a week the gate is off",
  "prevention": "one command a lane's piece is run through before it joins the head: `blaze check -p <crate>` with the tree's blaze on the VM, as a row of harness/v2/integrate.py, with its error count per crate printed; and blaze check not refusing dependencies' lints when asked for one package. Not built. For blaze-sim itself: a follow-up change brings it to zero (`blaze check --fix` for the effect markers, then the allocator and literal findings by hand)",
  "workaround": "none; said in the pull request",
- "state": "open"
+ "state": "fixed in #2134 (main 4cd75320d2): `blaze check -p blaze-sim --all-targets` exits 0; the four warnings left in the crate are the lint engine's (dst-1113-15)",
+ "fix": "three lint rounds on crates/blaze-sim and a module graph with no cycle; an old-against-new differential test showed no draw, record or verdict changed"
 }

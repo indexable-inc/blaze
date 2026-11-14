@@ -1,0 +1,11 @@
+{
+ "id": "auto-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5, lane auto",
+ "where": "Lean 4.35.0 Std.Do / Std.WP (Std/Tactic/Do/Syntax.lean:440, Init/Tactics.lean:2435)",
+ "what": "mvcgen and Std.Do (PostShape, WPMonad m ps) are deprecated since 2026-08-21 for vcgen, which runs on a different class, Std.WP.WP / WPMonad m Pred EPred over complete lattices; vcgen warns at every call unless experimental.vcgen is set. A brief that names mvcgen and Std.Do points at the deprecated API.",
+ "cost": "about 20 minutes reading two parallel frameworks",
+ "cause": "the release carries both frameworks while the new one is experimental",
+ "workaround": "instance Std.WP.WPMonad Result Prop EStack<Error -> Prop, Unit -> Prop>; blaze_auto sets experimental.vcgen around its one vcgen call (lean/Blaze/Auto.lean)",
+ "state": "open"
+}

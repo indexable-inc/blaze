@@ -1,0 +1,14 @@
+{
+ "id": "flight-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane flight (V14) under proofs-1113",
+ "where": "crates/blaze-core/src/world/asks.rs World::crash; crates/blaze-core/src/sim.rs Sim::crash_cut",
+ "what": "The asks world lands the writes from memory in flight at a crash in the order they were asked; Sim lands them in the order its pending wheel drains them (deadline order), so two in-flight writes to one file land in the other order and, where they overlap, leave bytes the world cannot reach (seed 683 of the refinement: writes 14 at 0 and 16 at 512 of w/a, Sim lands 16 sector 1 then 14 sectors 1 and 2).",
+ "cost": "three VM rounds and a stop: the lane rule may not be changed",
+ "cause": "the world fixes an order on concurrent landings that the kernel does not",
+ "whys": "a crash witness was written as one mask per write in a fixed order; landings were modelled per write, not per sector; nothing checked the witness shape against Sim before the rule was frozen",
+ "class": "a world witness that fixes an order or grouping the kernel leaves free",
+ "prevention": "not done: take a crash landing as a list of (write in flight, sector) in landing order, each at most once",
+ "workaround": "none; reported to the main agent",
+ "state": "fixed-by-rule-change"
+}

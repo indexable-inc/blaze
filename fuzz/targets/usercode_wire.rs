@@ -24,7 +24,7 @@
 use std::time::Duration;
 
 use blaze_fuzzer::Target;
-use blaze_usercode::test::wire::{End, Executed, Frame, Frames, LONGEST};
+use blaze_usercode::test::wire::{End, Executed, Frame, Frames, LONGEST, Table};
 
 const TARGET: Target = Target {
     name: "usercode_wire",
@@ -256,13 +256,19 @@ fn seeds() -> Vec<Vec<u8>> {
             id: 7,
             end: End::Exited(0),
             output: b"ok\n".to_vec(),
-            executed: Executed::Hits { slots: 64, hits: vec![0, 1, 9, 63] },
+            executed: Executed::Hits {
+                table: Table { lineage: [7; 16], generation: 3, slots: 64 },
+                hits: vec![0, 1, 9, 63],
+            },
         },
         Frame::Ended {
             id: u64::MAX,
             end: End::Exited(-1),
             output: Vec::new(),
-            executed: Executed::Hits { slots: 0, hits: Vec::new() },
+            executed: Executed::Hits {
+                table: Table { lineage: [0; 16], generation: 0, slots: 0 },
+                hits: Vec::new(),
+            },
         },
         Frame::Ended {
             id: 8,

@@ -43,8 +43,6 @@ mod parking;
 mod reaping;
 mod retry;
 
-#[cfg(test)]
-pub(crate) use self::retry::Plant;
 pub use self::{
     choice::{MarkRefused, SANDBOXED, Waits, choose, choose_from_env},
     retry::{Clock, Deadline, Once, WaitError, Waited},
@@ -181,7 +179,7 @@ pub fn until<T>(
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), clock, once);
+    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
     drop(registered);
     waited
 }
@@ -236,7 +234,7 @@ pub fn wake_shared(word: &std::sync::atomic::AtomicU64) {
 /// Elsewhere std's park, until that system's address wait lands. Only one thread parks on a
 /// `Parker`; nothing signals it.
 pub struct Parker {
-    word: std::sync::atomic::AtomicU32,
+    word: crate::atomic::AtomicU32,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     thread: crate::lock::Lock<Option<std::thread::Thread>>,
 }
@@ -244,7 +242,7 @@ pub struct Parker {
 impl Parker {
     pub fn new() -> Parker {
         Parker {
-            word: std::sync::atomic::AtomicU32::new(parking::EMPTY),
+            word: crate::atomic::AtomicU32::new(parking::EMPTY),
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             thread: crate::lock::Lock::unrecorded("wait.parker.thread", None),
         }
@@ -300,6 +298,84 @@ impl Default for Parker {
     }
 }
 
+/// A future's waker that unparks the one thread parked on this [`Parker`]: what
+/// [`block_on`] polls with, and any other thread that polls futures parked on its own.
+impl std::task::Wake for Parker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.unpark();
+    }
+
+    fn wake_by_ref(self: &std::sync::Arc<Self>) {
+        self.unpark();
+    }
+}
+
+/// How [`block_on`] ended without the future's output.
+#[derive(Debug)]
+pub enum Unfinished {
+    /// `within` passed first: the future is dropped, which cancels what it asked.
+    TimedOut { what: &'static str, within: Duration },
+    /// The wait itself failed.
+    Wait(WaitError),
+}
+
+impl std::fmt::Display for Unfinished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfinished::TimedOut { what, within } => {
+                write!(f, "waiting for {what}: not done in {within:?} (rule bounded-progress)")
+            }
+            Unfinished::Wait(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for Unfinished {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Unfinished::TimedOut { .. } => None,
+            Unfinished::Wait(error) => Some(error),
+        }
+    }
+}
+
+/// `future` polled on this thread to its end, parked between polls on a [`Parker`] (this
+/// module's deadline wait) for `what` (rule every-wait-says-what): at most `within` when given,
+/// on a [`Monotonic`] clock begun at the call. `None` is for a future whose every wait is
+/// bounded by deadlines of its own (an HTTP request's, which its client ends by its timeout),
+/// and says so in `what`. The tree's one "poll a future on this thread": no runtime under it.
+pub fn block_on<F: std::future::Future>(
+    what: &'static str,
+    within: Option<Duration>,
+    future: F,
+) -> Result<F::Output, Unfinished> {
+    use std::{
+        alloc::Global,
+        sync::Arc,
+        task::{Context, Poll},
+    };
+    let clock = Monotonic::new();
+    let deadline = within.map(|it| Deadline::after(Clock::now(&clock), it));
+    let parker = Arc::new_in(Parker::new(), Global);
+    let waker = std::task::Waker::from(Arc::clone(&parker));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    // Bounded by `deadline` (or by the future's own, for `None`): each turn either ends the
+    // future, or parks until a wake or the deadline, and the deadline ends the loop.
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return Ok(output);
+        }
+        match parker.park(what, deadline, &clock) {
+            Ok(Waited::Ready(())) => {}
+            Ok(Waited::Deadline) => {
+                return Err(Unfinished::TimedOut { what, within: within.unwrap_or(Duration::MAX) });
+            }
+            Err(error) => return Err(Unfinished::Wait(error)),
+        }
+    }
+}
+
 /// The park of a system with no wait of this module on an address yet: std's thread park,
 /// the thread recorded before it says it is parked.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -307,14 +383,14 @@ struct ThreadPark<'a>(&'a crate::lock::Lock<Option<std::thread::Thread>>);
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl parking::Futex for ThreadPark<'_> {
-    fn prepare(&self, _: &std::sync::atomic::AtomicU32) {
+    fn prepare(&self, _: &crate::atomic::AtomicU32) {
         *self.0.lock() = Some(std::thread::current());
     }
 
     fn wait<C: Clock>(
         &self,
         what: &'static str,
-        word: &std::sync::atomic::AtomicU32,
+        word: &crate::atomic::AtomicU32,
         expected: u32,
         deadline: Option<Deadline>,
         clock: &C,
@@ -331,7 +407,7 @@ impl parking::Futex for ThreadPark<'_> {
         })
     }
 
-    fn wake(&self, _: &std::sync::atomic::AtomicU32) {
+    fn wake(&self, _: &crate::atomic::AtomicU32) {
         if let Some(thread) = self.0.lock().as_ref() {
             thread.unpark();
         }
@@ -367,9 +443,9 @@ pub(crate) fn reap(
 ) -> Result<Waited<(libc::c_int, libc::rusage)>, WaitError> {
     let plant = reaping::ReapPlant::None;
     match choice::chosen() {
-        Waits::Ring => reaping::reap(what, &ring::Kids, pid, deadline, clock, plant),
+        Waits::Ring => reaping::reap(what, &mut ring::Kids, pid, deadline, clock, plant),
         Waits::Direct => {
-            reaping::reap(what, &direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
+            reaping::reap(what, &mut direct::Direct(&direct::Kernel), pid, deadline, clock, plant)
         }
     }
 }

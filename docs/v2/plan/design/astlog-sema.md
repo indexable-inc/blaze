@@ -83,7 +83,7 @@ And one over the type behind any references, by the names the std prelude gives:
   (the macro call's `path:line`, the rule), unless the rule excluded it with
   `(not (in-macro-expansion n))`. A rewritten file that no longer parses (the file, the first
   syntax error); the whole request fails, nothing is written.
-- **Surfaces.** The API first, schema 57: `Edit::Rules { rules }` rides the existing
+- **Surfaces.** The API first, schema 62: `Edit::Rules { rules }` rides the existing
   `Request::Edit`, so the answer is the usual `Edited` (VFS ops and seeds, the way
   `blaze_intent::apply` sends them); one per request, after the request's other edits.
   `Request::Edit`'s `head` is optional: with none, the edits are made and answered and nothing is

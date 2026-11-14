@@ -416,8 +416,8 @@ def selftest() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root, home = Path(tmp) / "root", Path(tmp) / "home"
         (root / "lean").mkdir(parents=True)
-        (root / "lean/lean-toolchain").write_text("leanprover/lean4:v4.20.0\n")
-        pinned = home / ".elan/toolchains/leanprover--lean4---v4.20.0/bin"
+        (root / "lean/lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
+        pinned = home / ".elan/toolchains/leanprover--lean4---v4.35.0/bin"
         try:
             lake_of("", root, home)
             expect(False, "a missing toolchain is refused")

@@ -2,6 +2,11 @@
 //! draw's plain behaviour. Each invariant's check also runs on a planted wrong draw defined
 //! here, since the draws have no state to plant a bug in.
 
+#![expect(
+    blaze::error_debug,
+    reason = "a test's failure message shows the values it compared as they are"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -24,14 +29,20 @@ const CALM: &[Calm] = &[
     ("text from 0 is empty", |t: &Tape| t.text(0..=8, "text").is_empty()),
     ("text from 2 is two spaces", |t: &Tape| t.text(2..=8, "text") == "  "),
     ("text_from from 0 is empty", |t: &Tape| t.text_from("qrs", 0..=3, "text_from").is_empty()),
-    ("text_from from 3 is the first letter thrice", |t: &Tape| t.text_from("qrs", 3..=5, "text_from") == "qqq"),
+    ("text_from from 3 is the first letter thrice", |t: &Tape| {
+        t.text_from("qrs", 3..=5, "text_from") == "qqq"
+    }),
     ("f64 is 0.0", |t: &Tape| t.f64("f64").to_bits() == 0.0f64.to_bits()),
     ("f64_finite is 0.0", |t: &Tape| t.f64_finite("f64_finite").to_bits() == 0.0f64.to_bits()),
-    ("f64_in is its start", |t: &Tape| t.f64_in(-2.5..=7.0, "f64_in").to_bits() == (-2.5f64).to_bits()),
+    ("f64_in is its start", |t: &Tape| {
+        t.f64_in(-2.5..=7.0, "f64_in").to_bits() == (-2.5f64).to_bits()
+    }),
     ("f64_in of one value is it", |t: &Tape| t.f64_in(1.0..=1.0, "f64_in") == 1.0),
     ("f32 is 0.0", |t: &Tape| t.f32("f32").to_bits() == 0.0f32.to_bits()),
     ("f32_finite is 0.0", |t: &Tape| t.f32_finite("f32_finite").to_bits() == 0.0f32.to_bits()),
-    ("f32_in is its start", |t: &Tape| t.f32_in(-2.5..=7.0, "f32_in").to_bits() == (-2.5f32).to_bits()),
+    ("f32_in is its start", |t: &Tape| {
+        t.f32_in(-2.5..=7.0, "f32_in").to_bits() == (-2.5f32).to_bits()
+    }),
     ("u128 is 0", |t: &Tape| t.u128("u128") == 0),
     ("i128 is 0", |t: &Tape| t.i128("i128") == 0),
     ("weighted is the first with a weight", |t: &Tape| t.weighted(&[0, 0, 4, 1], "weighted") == 2),
@@ -40,7 +51,8 @@ const CALM: &[Calm] = &[
         t.btree_map(0..=5, "map", |t| t.int::<u8>("key"), |t| t.int::<u8>("value")).is_empty()
     }),
     ("btree_map from 1 is 0 to 0", |t: &Tape| {
-        t.btree_map(1..=5, "map", |t| t.int::<u8>("key"), |t| t.int::<u8>("value")) == BTreeMap::from([(0, 0)])
+        t.btree_map(1..=5, "map", |t| t.int::<u8>("key"), |t| t.int::<u8>("value"))
+            == BTreeMap::from([(0, 0)])
     }),
     ("any u64 is 0", |t: &Tape| t.any::<u64>("any") == 0),
 ];
@@ -75,6 +87,14 @@ fn the_oracle_catches_an_option_that_is_some_when_calm() {
 }
 
 /// A mix of every draw here, as numbers (floats by their bits), so two runs compare exactly.
+#[expect(
+    blaze::as_cast,
+    reason = "the casts are the operation: each 128-bit draw is written as its high and low 64 bits"
+)]
+#[expect(
+    blaze::truncating_cast,
+    reason = "the bits are what is mixed: a negative value's two's complement is its 64 or 128 bits"
+)]
 fn mix(t: &Tape) -> Vec<u64> {
     let mut out = Vec::new();
     out.push(u64::from(t.bool("bool")));
@@ -93,12 +113,15 @@ fn mix(t: &Tape) -> Vec<u64> {
     out.push(u64::from(t.f32_in(0.5..=2.0, "f32_in").to_bits()));
     let unsigned = t.u128("u128");
     out.extend([(unsigned >> 64) as u64, unsigned as u64]);
-    let signed = t.i128("i128") as u128;
+    let signed = t.i128("i128").cast_unsigned();
     out.extend([(signed >> 64) as u64, signed as u64]);
-    out.push(t.weighted(&[3, 0, 1, 7], "weighted") as u64);
+    out.push(
+        u64::try_from(t.weighted(&[3, 0, 1, 7], "weighted"))
+            .expect("an index of four weights fits u64"),
+    );
     let map = t.btree_map(0..=5, "map", |t| t.int::<u16>("key"), |t| t.int::<i8>("value"));
     for (key, value) in map {
-        out.extend([u64::from(key), value as u64]);
+        out.extend([u64::from(key), i64::from(value).cast_unsigned()]);
     }
     let any = t.any::<(u8, Option<Vec<i16>>, String, [bool; 2], f32)>("any");
     out.extend(format!("{any:?}").bytes().map(u64::from));
@@ -124,7 +147,10 @@ fn replays(seed: u64, mix: fn(&Tape) -> Vec<u64>) -> Result<(), String> {
         return Err(format!("seed {seed}: drew {first:?}, replayed {again:?}"));
     }
     if replayed.clamped != 0 || replayed.unused != 0 {
-        return Err(format!("seed {seed}: the replay clamped {} and left {} unused", replayed.clamped, replayed.unused));
+        return Err(format!(
+            "seed {seed}: the replay clamped {} and left {} unused",
+            replayed.clamped, replayed.unused
+        ));
     }
     if replayed.choices != recorded.choices {
         return Err(format!("seed {seed}: the replay recorded other choices"));
@@ -143,6 +169,10 @@ fn every_draw_replays() {
 }
 
 /// A count outside any tape, which the planted mix reads.
+#[expect(
+    blaze::global_state,
+    reason = "the plant for the replay check: a value no tape owns, shared across runs on purpose, is what the oracle must catch"
+)]
 static OUTSIDE: AtomicU64 = AtomicU64::new(0);
 
 /// `mix` plus a value read from outside the tape: the plant for the replay check.
@@ -164,7 +194,9 @@ fn finite_and_in(what: &str, x: f64, range: Option<(f64, f64)>) -> Result<(), St
         return Err(format!("{what} gave {x:?}, which is not finite"));
     }
     match range {
-        Some((lo, hi)) if !(lo <= x && x <= hi) => Err(format!("{what} gave {x:?}, outside {lo:?}..={hi:?}")),
+        Some((lo, hi)) if !(lo <= x && x <= hi) => {
+            Err(format!("{what} gave {x:?}, outside {lo:?}..={hi:?}"))
+        }
         _ => Ok(()),
     }
 }
@@ -181,7 +213,9 @@ fn reaches_both_ends(lo: f64, hi: f64, draw: impl Fn(&Tape) -> f64) -> Result<()
     }
     match (low, high) {
         (true, true) => Ok(()),
-        _ => Err(format!("in 2,000 draws over {lo:?}..={hi:?}: start reached {low}, end reached {high}")),
+        _ => Err(format!(
+            "in 2,000 draws over {lo:?}..={hi:?}: start reached {low}, end reached {high}"
+        )),
     }
 }
 
@@ -197,7 +231,11 @@ fn floats_stay_finite_and_in_range() {
         finite_and_in("f64_in", t.f64_in(lo..=hi, "in"), Some((lo, hi)))?;
         let (a, b) = (t.f32_finite("a"), t.f32_finite("b"));
         let (lo, hi) = (a.min(b), a.max(b));
-        finite_and_in("f32_in", f64::from(t.f32_in(lo..=hi, "in")), Some((f64::from(lo), f64::from(hi))))?;
+        finite_and_in(
+            "f32_in",
+            f64::from(t.f32_in(lo..=hi, "in")),
+            Some((f64::from(lo), f64::from(hi))),
+        )?;
         Ok(())
     });
     reaches_both_ends(-1.5, 3.25, |t| t.f64_in(-1.5..=3.25, "in")).unwrap();
@@ -240,7 +278,12 @@ struct Seen {
 
 impl Seen {
     fn all(&self) -> bool {
-        self.nan && self.infinity && self.neg_infinity && self.zero && self.neg_zero && self.subnormal
+        self.nan
+            && self.infinity
+            && self.neg_infinity
+            && self.zero
+            && self.neg_zero
+            && self.subnormal
     }
 }
 
@@ -277,19 +320,19 @@ fn f32_reaches_nan_the_infinities_both_zeros_and_a_subnormal() {
 }
 
 #[test]
-#[should_panic(expected = "`range`: f64_in over 1.0..=0.0: the range is empty")]
+#[should_panic(expected = "`range`: f64_in over 1..=0: the range is empty")]
 fn f64_in_refuses_an_empty_range() {
     Tape::calm().f64_in(1.0..=0.0, "range");
 }
 
 #[test]
-#[should_panic(expected = "`range`: f64_in over 0.0..=inf: an end is NaN or infinite")]
+#[should_panic(expected = "`range`: f64_in over 0..=inf: an end is NaN or infinite")]
 fn f64_in_refuses_an_infinite_end() {
     Tape::calm().f64_in(0.0..=f64::INFINITY, "range");
 }
 
 #[test]
-#[should_panic(expected = "`range`: f32_in over NaN..=1.0: an end is NaN or infinite")]
+#[should_panic(expected = "`range`: f32_in over NaN..=1: an end is NaN or infinite")]
 fn f32_in_refuses_a_nan_end() {
     Tape::calm().f32_in(f32::NAN..=1.0, "range");
 }
@@ -427,30 +470,29 @@ fn bytes_draw_each_byte_in_a_span() {
 
 #[test]
 fn any_compiles_and_is_calm_for_each_type() {
-    let calm = Tape::calm;
-    assert!(!calm().any::<bool>("x"));
-    assert_eq!(calm().any::<char>("x"), ' ');
-    assert_eq!(calm().any::<u8>("x"), 0);
-    assert_eq!(calm().any::<u16>("x"), 0);
-    assert_eq!(calm().any::<u32>("x"), 0);
-    assert_eq!(calm().any::<u64>("x"), 0);
-    assert_eq!(calm().any::<usize>("x"), 0);
-    assert_eq!(calm().any::<u128>("x"), 0);
-    assert_eq!(calm().any::<i8>("x"), 0);
-    assert_eq!(calm().any::<i16>("x"), 0);
-    assert_eq!(calm().any::<i32>("x"), 0);
-    assert_eq!(calm().any::<i64>("x"), 0);
-    assert_eq!(calm().any::<isize>("x"), 0);
-    assert_eq!(calm().any::<i128>("x"), 0);
-    assert_eq!(calm().any::<f32>("x").to_bits(), 0);
-    assert_eq!(calm().any::<f64>("x").to_bits(), 0);
-    calm().any::<()>("x");
-    assert_eq!(calm().any::<(u8,)>("x"), (0,));
-    assert_eq!(calm().any::<(u8, bool, char, i64)>("x"), (0, false, ' ', 0));
-    assert_eq!(calm().any::<(u8, u16, u32, u64, i8, bool)>("x"), (0, 0, 0, 0, 0, false));
-    assert_eq!(calm().any::<[u16; 3]>("x"), [0; 3]);
-    assert_eq!(calm().any::<Option<Vec<u8>>>("x"), None);
-    assert_eq!(calm().any::<Vec<i32>>("x"), Vec::<i32>::new());
-    assert_eq!(calm().any::<String>("x"), "");
-    assert_eq!(calm().any::<Box<u8>>("x"), Box::new(0));
+    assert!(!Tape::calm().any::<bool>("x"));
+    assert_eq!(Tape::calm().any::<char>("x"), ' ');
+    assert_eq!(Tape::calm().any::<u8>("x"), 0);
+    assert_eq!(Tape::calm().any::<u16>("x"), 0);
+    assert_eq!(Tape::calm().any::<u32>("x"), 0);
+    assert_eq!(Tape::calm().any::<u64>("x"), 0);
+    assert_eq!(Tape::calm().any::<usize>("x"), 0);
+    assert_eq!(Tape::calm().any::<u128>("x"), 0);
+    assert_eq!(Tape::calm().any::<i8>("x"), 0);
+    assert_eq!(Tape::calm().any::<i16>("x"), 0);
+    assert_eq!(Tape::calm().any::<i32>("x"), 0);
+    assert_eq!(Tape::calm().any::<i64>("x"), 0);
+    assert_eq!(Tape::calm().any::<isize>("x"), 0);
+    assert_eq!(Tape::calm().any::<i128>("x"), 0);
+    assert_eq!(Tape::calm().any::<f32>("x").to_bits(), 0);
+    assert_eq!(Tape::calm().any::<f64>("x").to_bits(), 0);
+    Tape::calm().any::<()>("x");
+    assert_eq!(Tape::calm().any::<(u8,)>("x"), (0,));
+    assert_eq!(Tape::calm().any::<(u8, bool, char, i64)>("x"), (0, false, ' ', 0));
+    assert_eq!(Tape::calm().any::<(u8, u16, u32, u64, i8, bool)>("x"), (0, 0, 0, 0, 0, false));
+    assert_eq!(Tape::calm().any::<[u16; 3]>("x"), [0; 3]);
+    assert_eq!(Tape::calm().any::<Option<Vec<u8>>>("x"), None);
+    assert_eq!(Tape::calm().any::<Vec<i32>>("x"), Vec::<i32>::new());
+    assert_eq!(Tape::calm().any::<String>("x"), "");
+    assert_eq!(Tape::calm().any::<Box<u8>>("x"), Box::new(0));
 }

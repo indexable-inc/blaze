@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's QUIC and WebTransport stack becomes sans-IO cores with thin drivers, on rustls. quinn-proto stays as the QUIC core; a new HTTP/3 + WebTransport core in blaze-http (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams) drives it; one tokio driver owns the UDP socket and the timers behind the same driver contract as HTTP/1. quinn, quinn-udp, wtransport and wtransport-proto leave the graph. Covers what blaze uses QUIC for, the contracts, the browser's requirements, the losing designs, migration and tests.
+summary: blaze's QUIC and WebTransport stack becomes sans-IO cores with thin drivers, on rustls. quinn-proto stays as the QUIC core; a new HTTP/3 + WebTransport core in blaze-http (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams) drives it; one driver on blaze-core's effects (io_uring, kqueue or the simulation; no tokio) owns the UDP socket and the timer behind the same driver contract as HTTP/1. quinn, quinn-udp, wtransport and wtransport-proto leave the graph. Covers what blaze uses QUIC for, the contracts, the browser's requirements, the losing designs, migration and tests.
 date: 2026-11-04
 ---
 # HTTP/3 and WebTransport, sans-IO
@@ -55,10 +55,11 @@ days). No other part of blaze speaks QUIC, and none should until it needs to.
     unknown capsules skipped.
   - Error codes mapped between WebTransport's 32-bit space and HTTP/3's
     (`0x52e4a40fa8db + n + n / 0x1e`), as the draft says.
-- **One tokio driver** (`blaze_http::h3::tokio_driver`, feature `tokio`) owns the UDP socket
-  and the one timer, and drives the core. On top of it sits a small async surface (sessions,
-  streams, datagrams) that the explorer and the probe use, as `Driver::ask -> Answer` is for
-  HTTP/1.
+- **One driver on blaze-core's effects** (`blaze_http::h3::driver`; the tokio driver it
+  replaced was deleted 2026-11-13) owns the UDP socket (batched `Effect::SendTo` and
+  `Effect::RecvFrom`) and the one timer, and drives the core; it runs on io_uring, kqueue or
+  the simulation. On top of it sits a small async surface (sessions, streams, datagrams) that
+  the explorer and the probe use, as `Handle::ask -> Answer` is for HTTP/1.
 - **quinn, quinn-udp, wtransport and wtransport-proto leave the graph.** Their vendor copies,
   patch series and `[patch]` entries are deleted. `vendor/quinn-proto` is the one copy left,
   and `tools/vendor/sync.py` keeps working for it (and for `ra-ap-rustc_pattern_analysis`).
@@ -117,15 +118,17 @@ Errors (`h3::Error`) name the peer, the step (`Handshake`, `Settings`, `Connect`
 the dynamic table, ..."`. How a session ended is `h3::Closed`: `Refused { status }`,
 `ByPeer { code, reason }`, `Local { code, reason }` or `Failed(Error)`.
 
-### The tokio driver
+### The driver
 
-One task owns the core, the `tokio::net::UdpSocket` and one sleep. It loops: advance the clock,
+It was first a tokio task and is now `blaze_http::h3::driver`, on blaze-core's effects (the
+tokio one was deleted 2026-11-13); the loop is the same. One owner holds the core, the UDP
+socket and one timer. It loops: advance the clock,
 send every transmit, hand every event to its asker, then wait on the socket, the inbox of asks
 and the next deadline, whichever is first. Askers hold handles (`Request`, `Session`,
 `SendStream`, `RecvStream`) that post asks to the inbox and receive their events on channels of
 their own. Dropping a `RecvStream` stops it, dropping a `SendStream` finishes it, and dropping
-a `Request` unanswered refuses it with 500. An io_uring driver implements the same loop against
-the same core with no change to it.
+a `Request` unanswered refuses it with 500. The io_uring, kqueue and simulated hosts run the
+same loop against the same core.
 
 The driver's waits open no span yet: blaze-trace is not in the graph
 (docs/v2/plan/design/no-tracing.md). Each is bounded by a core deadline or by the asker's own
@@ -192,7 +195,7 @@ One change, whole port (rule 23):
 
 1. `crates/blaze-http/src/h3/`: the core (`endpoint.rs`), `qpack.rs`, `huffman.rs`,
    `frame.rs`, `varint.rs`, `config.rs` (rustls and quinn-proto configs, the certificate pin
-   verifier, a minimal DER reader for its checks) and `tokio_driver.rs`.
+   verifier, a minimal DER reader for its checks) and `driver.rs` (on blaze-core's effects).
 2. blaze-explore's `server.rs`, `cert.rs` and the probe move onto `blaze_http::h3`. Their public
    surface stays (`start`, `Config`, `Explorer`, `StartError`, the constants, `Cert`); the one
    type that changes is `StartError::Config`, which carries `blaze_http::h3::Error` instead of
@@ -223,3 +226,72 @@ One change, whole port (rule 23):
 - **The browser**, by hand: the probe page in Chrome and Firefox (bidirectional echo,
   unidirectional echo, datagrams), then `blaze explore` with the real page on ix.dev. This is
   the one check no test here can make.
+
+## 8. Requests and the remote cache
+
+The owner (2026-11-13): "remote cache should be quic (sans io with state machine, think we
+already have crates for this)". The same core makes plain requests, and blaze-remote reads
+public objects with them.
+
+**The core** (`h3/request.rs`, `h3/endpoint/requests.rs`). On a connection opened with
+`Endpoint::connect_requests`, `request(conn, Request)` sends one GET or HEAD:
+`:method`, `:scheme`, `:authority`, `:path`, `range` and `user-agent: blaze`, encoded with
+static-table QPACK, and FIN. The answer comes back as `Event::ResponseHead` (status,
+content-length, content-range, etag), `Event::ResponseData` (read only as far as the asker's
+`consumed_response` opens the window), and one `Event::RequestEnded`. The body is held to
+the asked `Length`: past it, or short of a stated content-length, the request ends `Failed`,
+naming the object. A cancel is STOP_SENDING and RESET_STREAM with H3_REQUEST_CANCELLED. Each
+request carries a deadline, and the core ends it `TimedOut` there. A GOAWAY, a close or a lost
+connection gives each open request exactly one outcome, saying whether the server started it:
+`NotStarted` for one at or above the GOAWAY's ID, or one never sent, and `Lost` otherwise. A
+server made with `ServerConfig::requests` gets `Event::Request` and answers with `respond`; that
+is enough for the simulation.
+
+**Tickets and 0-RTT.** Tickets go into the core as bytes, with their server name, issue time
+and lifetime (`add_ticket`), and come out as `Event::Ticket`. That needs the vendored rustls
+(`vendor/rustls`): it adds a serializer for TLS 1.3 client sessions, which upstream rustls
+lacks. Only an `Early` may go as early data, and only `Early::get` and `Early::head` make
+one. Asked before the handshake on a connection that resumes, its HEADERS leave in 0-RTT
+packets. If the server refuses early data, each such request is sent again exactly once, at
+handshake completion. That is QUIC's rule (RFC 9001, 4.6.2: 0-RTT data the server rejected was
+not processed), not a retry.
+
+**Floor and cost** (rule 67; computed from the code, not measured):
+
+| Operation | Floor | This design |
+|---|---|---|
+| Round trips to the first byte, with a ticket | 1 | 1 (0-RTT) |
+| Without a ticket | 2 (keys need one round trip) | 2 |
+| Server refused the early data | 2 | 2, plus the HEADERS sent twice |
+| Request framing | The path, range and authority bytes | Those plus about 20 bytes (frame and QPACK prefixes, static indices, `user-agent`) |
+| Response framing, per 16 KiB `DATA_FRAME` | 0 | 3 or 4 bytes (under 0.03%) |
+
+HTTP/1.1 over TLS 1.3 needs 3 round trips to the first byte cold, and 2 with TLS resumption,
+because TCP's handshake comes first.
+
+**The bucket** (`crates/blaze-remote/src/http3.rs`). `H3Bucket` is a `Bucket` that runs an
+`Endpoint` itself, on `blaze_http::h3::Wire` (`epoch`, `now`, `send`, and `wait(until)`). That is
+the one thing a driver gives it. It sends anonymous reads only: a GET or HEAD of a `public/`
+object, every read as `Early`. It keeps one connection to the origin, opened again only after
+it closes. Each ask's deadline becomes the request's. A connect that fails is `Reply::Failed`
+naming the object, the host, the way the handshake failed (timed out, version negotiation,
+ALPN refused) and `bucket.transport`. There is no fallback to HTTP/1.1. `Routed` sends
+anonymous reads to it and everything signed to the HTTP/1.1 bucket. The setting is
+`bucket.transport` (`BLAZE_CACHE_TRANSPORT`), `"h1"` by default. `"h3"` is refused until
+blaze-core's HTTP/3 driver implements `Wire`. Tickets live in
+`<settings dir>/remote-tickets.bin`, mode 0600, at most 4 of them and none past 7 days
+(`http::load_tickets`, `save_tickets`; the format is `http3::encode_tickets`).
+
+Nothing assumes that R2's public custom domain or its S3 endpoint serves HTTP/3. Whether it
+does is not known. With `"h3"` against a host that doesn't, every read fails, naming the
+setting.
+
+**Proof.** `h3/tests/requests.rs` runs the client core against the server core over a seeded
+network that drops, duplicates, reorders and delays datagrams. Its workload is ranged GETs,
+HEADs, missing objects, cancels, and a second process resuming with the first's tickets. The
+oracle checks three things: a completed read has exactly the asked bytes; each request has
+exactly one outcome by its deadline; only GET and HEAD come early. Three planted bugs are
+caught: a body past its length, no outcome on close, and a POST sent early. Two more tests
+check that a resumed GET's bytes are in a 0-RTT packet before any server datagram arrives,
+and that refused early requests are sent again exactly once. `blaze-remote`'s
+`http3_tests.rs` runs the bucket against an in-process server on a simulated `Wire`.

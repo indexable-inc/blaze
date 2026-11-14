@@ -1,0 +1,9 @@
+{
+ "id": "question-1",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (lane question)",
+ "where": "crates/hir-ty-lean/src/body.rs (binding names); the lane check that no line of `lake build` contains warning or error",
+ "state": "open",
+ "what": "Two surprises on `?`: the lowering names its own bindings (the value and the residual of `?`) `<ra@gennew>N`, and the translator printed them as user variables (`«<ra@gennew>0»`, numbered by the lowering) until body.rs made generated names temporaries (Name::is_generated); and the check `no line of lake build containing warning or error` matches module names (`core.io.error.Error.From.from`, a theorem named `..._the_error`), so a clean build reads as a failure.",
+ "fix": "Done for the names. For the check: look for lake's diagnostics (`warning:` and `error:` at a line's start) or skip the `Built` lines, as leanvm.sh's own output does."
+}

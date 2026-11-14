@@ -1,0 +1,20 @@
+{
+ "id": "proofs-1113-12",
+ "date": "2026-11-14",
+ "who": "claude-fable-5-2 (Claude Fable 5.2), main agent, lane proofs-1113",
+ "where": "hir-ty-pure, the query `summary_in` (crates/hir-ty-pure/src/sealed.rs), on the workspace proc-macro crate blaze-query-macros",
+ "what": "`blaze check -p blaze-query-macros` on blaze-vm, with a release blaze of main 375c903d73 plus the blaze-report fix (tree 61efdb13ec), ends after 340 s: `error: blaze panicked: `summary_in` of (StoredParamEnvAndCrate { param_env: [], krate: Crate(..) }, Spent, Instance { def: Body(Fn(FunctionId(a7f3c))), args: [`{region error}, Meta] }) held 413598968 reads in one run, past the 268435456 a run may hold on its query stack (rule 18): it keeps reading; ... what it held most: `Crate.data` 40372 times, `crate_impl_traits` 40372 times, `ImplSignature::served`(ImplId(f10e)) 40372 times, `ImplSignature::lowered` 40372 times, `TraitSignature::lowered` 40372 times ..`. So the proc macro is not built, and `blaze prove -p blaze-cas -p blaze-profile -p blaze-graph -p blaze-remote -p blaze-http --subset` is refused naming it (`blaze_query_macros .. did not build: panicked: ..`).",
+ "cost": "the subset count and every proof for five crates wait on it; found only after two other causes in front of it were removed the same day (proofs-1113-6)",
+ "cause": "not found. What the message shows: one run of the summary of a function generic over a lifetime and a type, at the type `Meta` (the crate uses syn with `full`; my guess, not checked, is a syn parse function at `syn::Meta`), reads the same eight facts of one impl 40,372 times each: the summary of what it reaches is recomputed inside the run instead of being found",
+ "whys": [
+  "the read bound of a query run stopped it: the run held 400 million reads",
+  "the same impl`s signature and items were read 40,372 times in that one run",
+  "nothing in the run remembers a sub-summary it already made, or the sub-summaries are not queries of their own",
+  "the panic names ids, not the function, so which function it is has to be found by search"
+ ],
+ "class": "an analysis whose cost grows with the paths through what a function reaches, not with what it reaches; and a bound`s message that names an id where a path would let someone act",
+ "prevention": "the summary of each reached instance is its own query (found, not recomputed), so one run reads each fact once; the bound`s panic prints the function`s path for a key that holds a function id. Not built: it is the effects analysis`s, outside this lane.",
+ "workaround": "none for the five crates; blaze-core and blaze-keyed do not reach it",
+ "fix": "",
+ "state": "open"
+}

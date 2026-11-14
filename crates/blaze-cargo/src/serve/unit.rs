@@ -45,6 +45,7 @@ mod intent;
 mod layout;
 mod memo;
 mod perf;
+mod prove;
 // Lane packs-1112: `Places` is also the export's guard against a record that holds a
 // directory of this machine (`serve::packs::home_places`).
 pub(crate) mod portable;
@@ -55,6 +56,7 @@ mod say;
 mod script;
 pub(crate) use compile::{Filed, PendingRecord, file_records, span_unit};
 pub(crate) use script::compile_of;
+pub(super) use test::image::pinned as test_heads_pinned;
 mod test;
 
 #[cfg(test)]
@@ -208,6 +210,11 @@ impl Steps for Real {
     type KeptFront = KeptLowered;
     type Linked = codegen::Linked;
     type Runs = UnitRuns;
+    type Proving = prove::Proving;
+
+    fn check_proofs(proving: prove::Proving, lean: Option<&str>, tags: u64) -> UnitRuns {
+        UnitRuns::Proofs(prove::Checking::new(proving, lean, tags))
+    }
 
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         let source = self.fetcher.fetch(fetch)?;
@@ -390,6 +397,10 @@ impl Steps for Real {
 
     fn launch_kept(&self) -> Vec<super::work::LaunchKept> {
         self.shared.launches.kept()
+    }
+
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
+        self.shared.selectors.restore(marked.into_iter());
     }
 
     fn launch_wants(&self) -> Vec<String> {
@@ -861,7 +872,6 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         build_dir,
         finished,
         link_dirs,
-        sandboxed_tests,
         native,
     } = kept;
     if graph != &now.graph {
@@ -884,8 +894,6 @@ fn units_differ(kept: &Units, now: &Units) -> &'static str {
         "the profile"
     } else if link_dirs != &now.link_dirs {
         "the build-script link directories"
-    } else if sandboxed_tests != &now.sandboxed_tests {
-        "whether tests run sandboxed"
     } else if native != &now.native {
         "the pinned native inputs"
     } else {
@@ -2322,8 +2330,12 @@ impl Job {
     }
 }
 
+/// `BLAZE_SANDBOX` turns sandboxes off in `env` (`off` or `0`), by the one rule
+/// ([`crate::sandbox::on_with`]) the build scripts, proc-macro servers and tests all decide by.
 pub(crate) fn sandbox_off(env: &[(String, String)]) -> bool {
-    env.iter().any(|(name, value)| name == "BLAZE_SANDBOX" && value == "off")
+    !crate::sandbox::on_with(|name| {
+        env.iter().find(|it| it.0 == name).map(|it| it.1.clone()) // clone: one variable's value, once per ask
+    })
 }
 
 pub(crate) fn package_of<'a>(
@@ -2671,6 +2683,13 @@ impl Front<Real> for JobFront {
         cancellable(|| intent::ahead(&self.0, &reader, filter))?
     }
 
+    fn prove(&self, reader: UnitReader, emit: bool, subset: bool) -> Result<prove::Proving, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| prove::prove(&self.0, reader.db(), emit, subset))?
+    }
+
     fn codegen_inputs(&self, reader: UnitReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         // Read from the units' records in the store: the front end is not asked.
         drop(reader);
@@ -2728,26 +2747,29 @@ impl Kept for codegen::Linked {
     }
 }
 
-/// User code of a job, run on the loop: a build script's run, the build's tests, or its
-/// program.
+/// User code of a job, run on the loop: a build script's run, the build's tests, its
+/// program, or Lean over its proofs.
 pub enum UnitRuns {
     Script(script::ScriptRun),
     Tests(test::TestRun),
     Program(run::Program),
+    Proofs(prove::Checking),
 }
 
 impl Runs<Real> for UnitRuns {
     fn start(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         writer: Option<&mut dyn Asks>, // dyn: as `Runs`'s
+        placed: &dyn Fn(&str) -> Option<[u8; 32]>, // dyn: as `Runs`'s
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         match self {
-            UnitRuns::Script(it) => it.start(store, writer, effects, out),
-            UnitRuns::Tests(it) => it.start(store, writer, effects, out),
-            UnitRuns::Program(it) => it.start(store, writer, effects, out),
+            UnitRuns::Script(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Tests(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Program(it) => it.start(store, writer, placed, effects, out),
+            UnitRuns::Proofs(it) => it.start(store, writer, placed, effects, out),
         }
     }
 
@@ -2756,6 +2778,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.owns(tag),
             UnitRuns::Tests(it) => it.owns(tag),
             UnitRuns::Program(it) => it.owns(tag),
+            UnitRuns::Proofs(it) => it.owns(tag),
         }
     }
 
@@ -2771,6 +2794,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Tests(it) => it.complete(completion, store, writer, effects, out),
             UnitRuns::Program(it) => it.complete(completion, store, writer, effects, out),
+            UnitRuns::Proofs(it) => it.complete(completion, store, writer, effects, out),
         }
     }
 
@@ -2779,6 +2803,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.cancel(effects),
             UnitRuns::Tests(it) => it.cancel(effects),
             UnitRuns::Program(it) => it.cancel(effects),
+            UnitRuns::Proofs(it) => it.cancel(effects),
         }
     }
 
@@ -2787,6 +2812,7 @@ impl Runs<Real> for UnitRuns {
             UnitRuns::Script(it) => it.take_puts(),
             UnitRuns::Tests(it) => it.take_puts(),
             UnitRuns::Program(it) => it.take_puts(),
+            UnitRuns::Proofs(it) => it.take_puts(),
         }
     }
 }
