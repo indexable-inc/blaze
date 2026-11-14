@@ -32,6 +32,13 @@ A futex wait compares the cell and goes to sleep in one step, and a wake finds e
 that sleeps: what the kernel promises of `FUTEX_WAIT` and `FUTEX_WAKE`, and of
 `os_sync_wait_on_address`. A sleeper returns when woken, and may return for nothing or, with a
 time limit, because the kernel says its time ran out, at any step the world picks.
+
+The world has a clock, in nanoseconds, and a script of readings still to come (`Op.clock`
+installs it before a run). Time moves only where someone looks: `Op.now` moves the clock to the
+later of itself and the script's next reading. `Op.wait_until` is the wait with a deadline on
+that clock: a sleeper whose deadline the clock has reached returns timed out at its next look,
+whatever the pick, and is not asleep when a schedule ends; the kernel may say the time ran out
+only where there is a deadline, and saying so moves the clock to it.
 -/
 
 namespace Blaze
@@ -84,6 +91,20 @@ inductive Op where
   when the schedule ends. Flagged where that wait would not return unless the kernel wakes it
   for nothing: the thread sleeps and no wake came, or it would go to sleep. -/
   | asleep (cell : Nat) (expected : Int)
+  /-- Installs the clock's script: the readings still to come, in nanoseconds. Answers 0,
+  flagged; the clock does not move. -/
+  | clock (readings : List Int)
+  /-- Reads the clock, in nanoseconds, flagged. `move`: the clock first becomes the later of
+  itself and the script's next reading, which is taken off the script (with the script empty it
+  stays). Not `move`: nothing changes. -/
+  | now (move : Bool)
+  /-- A futex wait with a deadline on the world's clock (`none`: none). As `wait`, but where
+  the clock has reached the deadline it returns timed out whatever the pick, and where the
+  kernel says the time ran out (pick 2, with a deadline) the clock moves to the deadline. -/
+  | wait_until (cell : Nat) (expected : Int) (deadline : Option Int)
+  /-- Not an operation of a program: `ended` asks it of a thread whose next operation is a
+  `wait_until`. Flagged where that wait would not return if asked now with pick 0. -/
+  | asleep_until (cell : Nat) (expected : Int) (deadline : Option Int)
 
 /-- The model of a function that touches what threads share. -/
 inductive Prog (α : Type) : Type where
@@ -145,12 +166,21 @@ structure World where
   used : List Nat
   /-- Whether a thread of a run did an operation with an ordering that is not `SeqCst`. -/
   weak : Bool
+  /-- The clock's last reading, in nanoseconds. -/
+  clock : Int := 0
+  /-- The clock's script: the readings still to come (`Op.clock`, `Op.now`). -/
+  readings : List Int := []
   deriving Repr, DecidableEq
+
+/-- Whether a clock reading `clock` has reached `deadline` (`none`: no deadline, never). -/
+def passed (clock : Int) : Option Int → Bool
+  | none => false
+  | some d => decide (d ≤ clock)
 
 namespace World
 
 /-- Nothing shared yet. -/
-def new : World := ⟨[], [], [], [], false⟩
+def new : World := ⟨[], [], [], [], false, 0, []⟩
 
 /-- Why a wait returned, as `Got.value`: 0 woken, 1 the cell did not hold what was expected,
 2 for nothing, 3 its time ran out. -/
@@ -237,6 +267,46 @@ def step (who pick : Nat) (o : Op) (w : World) : Option (Got × World) :=
     | some value =>
       some (⟨0, !w.woken.contains (who, cell)
         && (w.asleep.contains (who, cell) || value == expected)⟩, w)
+  | .clock readings => some (⟨0, true⟩, { w with readings := readings })
+  | .now move =>
+    if move then
+      match w.readings with
+      | [] => some (⟨w.clock, true⟩, w)
+      | r :: rest =>
+        let c := if w.clock < r then r else w.clock
+        some (⟨c, true⟩, { w with clock := c, readings := rest })
+    else some (⟨w.clock, true⟩, w)
+  | .wait_until cell expected deadline =>
+    match w.cells[cell]? with
+    | none => none
+    | some value =>
+      let w := w.touched who cell []
+      if !w.fits then none
+      else if w.woken.contains (who, cell) then
+        some (⟨woken_code, true⟩, { w with woken := w.woken.erase (who, cell) })
+      else if w.asleep.contains (who, cell) then
+        if passed w.clock deadline then
+          some (⟨timed_out_code, true⟩, { w with asleep := w.asleep.erase (who, cell) })
+        else if pick == 1 then
+          some (⟨spurious_code, true⟩, { w with asleep := w.asleep.erase (who, cell) })
+        else
+          match deadline with
+          | some d =>
+            if pick == 2 then
+              some (⟨timed_out_code, true⟩,
+                { w with asleep := w.asleep.erase (who, cell), clock := d })
+            else some (⟨0, false⟩, w)
+          | none => some (⟨0, false⟩, w)
+      else if value != expected then some (⟨changed_code, true⟩, w)
+      else if passed w.clock deadline then some (⟨timed_out_code, true⟩, w)
+      else some (⟨0, false⟩, { w with asleep := (who, cell) :: w.asleep })
+  | .asleep_until cell expected deadline =>
+    match w.cells[cell]? with
+    | none => none
+    | some value =>
+      some (⟨0, !w.woken.contains (who, cell)
+        && (w.asleep.contains (who, cell) || value == expected)
+        && !passed w.clock deadline⟩, w)
 
 end World
 
@@ -244,6 +314,7 @@ end World
 def Op.sleeps (o : Op) (got : Got) : Bool :=
   match o with
   | .wait _ _ _ => !got.flag
+  | .wait_until _ _ _ => !got.flag
   | _ => false
 
 namespace Prog
@@ -296,6 +367,9 @@ def ended {α : Type} (who : Nat) : Prog α → Prog (Ended α)
   | .done .div => .done .div
   | .op _ _ (.wait cell expected _) _ =>
     .op who 0 (.asleep cell expected)
+      (fun got => .done (.ok (if got.flag then .Asleep else .Running)))
+  | .op _ _ (.wait_until cell expected deadline) _ =>
+    .op who 0 (.asleep_until cell expected deadline)
       (fun got => .done (.ok (if got.flag then .Asleep else .Running)))
   | .op _ _ _ _ => .done (.ok .Running)
 

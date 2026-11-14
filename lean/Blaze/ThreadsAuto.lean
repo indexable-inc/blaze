@@ -10,8 +10,9 @@ How a proof that something holds on every schedule of `two schedule a b` is writ
    `Prog` the thread still has to run there (its first point is the function's model).
 2. Prove each point's shape: one `op` node whose continuation is, for each answer, the program at
    a named point (`Prog.op 0 0 o (fun got => ...)`). `Prog.op_ext` and `rfl` (or cases on the
-   answer) prove it; `Atomic.load_eq`, `swap_eq`, `compare_exchange_eq`, `wait_eq`, `wake_eq`
-   say what one atomic is as an `op`.
+   answer) prove it; `Atomic.load_eq`, `swap_eq`, `compare_exchange_eq`, `wait_eq`, `wake_eq`,
+   `wait_until_eq`, `clock_eq`, `now_eq`, `time_eq` say what one atomic or clock operation is
+   as an `op`.
 3. State the invariant `Inv n a b w`: `n` the schedule steps left, `a`, `b` the threads' points,
    `w` the world; typically an inductive listing the reachable combinations of the two points
    and the world's cells, sleepers and woken threads, and `w.OneCell c` (or every op `SeqCst`).
@@ -110,6 +111,13 @@ variable {w : World} {who pick cell : Nat}
   unfold touched; split <;> rfl
 
 @[simp] theorem touched_woken (os : List Order) : (w.touched who cell os).woken = w.woken := by
+  unfold touched; split <;> rfl
+
+@[simp] theorem touched_clock (os : List Order) : (w.touched who cell os).clock = w.clock := by
+  unfold touched; split <;> rfl
+
+@[simp] theorem touched_readings (os : List Order) :
+    (w.touched who cell os).readings = w.readings := by
   unfold touched; split <;> rfl
 
 /-- The threads of the run have touched no cell but `cell`: whatever their orderings, the run
@@ -221,6 +229,101 @@ theorem step_wait_sleeps {v e : Int} {tm : Bool} (hv : w.cells[cell]? = some v)
       some (⟨0, false⟩, { w.touched who cell [] with asleep := (who, cell) :: w.asleep }) := by
   unfold step; simp [hv, hf, hw, ha, heq]
 
+/-! The clock. -/
+
+theorem step_clock {readings : List Int} :
+    w.step who pick (.clock readings) = some (⟨0, true⟩, { w with readings := readings }) := rfl
+
+/-- `now` with the script empty: the clock stays. -/
+theorem step_now_nil (hr : w.readings = []) :
+    w.step who pick (.now true) = some (⟨w.clock, true⟩, w) := by
+  unfold step; simp [hr]
+
+/-- `now` takes the script's next reading: the clock becomes the later of itself and it. -/
+theorem step_now_cons {r : Int} {rest : List Int} (hr : w.readings = r :: rest) :
+    w.step who pick (.now true) =
+      some (⟨if w.clock < r then r else w.clock, true⟩,
+        { w with clock := if w.clock < r then r else w.clock, readings := rest }) := by
+  unfold step; simp [hr]
+
+/-- `time`: the clock, and nothing changes. -/
+theorem step_now_stay : w.step who pick (.now false) = some (⟨w.clock, true⟩, w) := rfl
+
+/-! A wait with a deadline. -/
+
+theorem step_wait_until_woken {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∈ w.woken) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨woken_code, true⟩,
+        { w.touched who cell [] with woken := w.woken.erase (who, cell) }) := by
+  unfold step; simp [hv, hf, hw]
+
+/-- A sleeper whose deadline the clock has reached returns timed out, whatever the pick. -/
+theorem step_wait_until_passed {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∈ w.asleep) (hd : passed w.clock dl = true) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨timed_out_code, true⟩,
+        { w.touched who cell [] with asleep := w.asleep.erase (who, cell) }) := by
+  unfold step; simp [hv, hf, hw, ha, hd]
+
+theorem step_wait_until_spurious {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∈ w.asleep) (hd : passed w.clock dl = false) (hp : pick = 1) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨spurious_code, true⟩,
+        { w.touched who cell [] with asleep := w.asleep.erase (who, cell) }) := by
+  unfold step; simp [hv, hf, hw, ha, hd, hp]
+
+/-- The kernel says the time ran out (pick 2) before the clock reached the deadline: timed
+out, and the clock moves to the deadline. -/
+theorem step_wait_until_told {v e d : Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∈ w.asleep) (hd : w.clock < d) (hp : pick = 2) :
+    w.step who pick (.wait_until cell e (some d)) =
+      some (⟨timed_out_code, true⟩,
+        { w.touched who cell [] with asleep := w.asleep.erase (who, cell), clock := d }) := by
+  have hd' : passed w.clock (some d) = false := by simp [passed]; omega
+  unfold step; simp [hv, hf, hw, ha, hd', hp]
+
+/-- A sleeper whose deadline the clock has not reached, and whom the world neither wakes for
+nothing nor tells its time ran out, sleeps on. -/
+theorem step_wait_until_stays {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∈ w.asleep) (hd : passed w.clock dl = false) (hp1 : pick ≠ 1)
+    (hp2 : pick = 2 → dl = none) :
+    w.step who pick (.wait_until cell e dl) = some (⟨0, false⟩, w.touched who cell []) := by
+  unfold step
+  cases dl with
+  | none => simp [hv, hf, hw, ha, hd, hp1]
+  | some d =>
+    have h2 : pick ≠ 2 := fun h => absurd (hp2 h) (by simp)
+    simp [hv, hf, hw, ha, hd, hp1, h2]
+
+theorem step_wait_until_changed {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∉ w.asleep) (hne : v ≠ e) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨changed_code, true⟩, w.touched who cell []) := by
+  unfold step; simp [hv, hf, hw, ha, hne]
+
+/-- A wait that begins with its deadline passed and the cell holding `expected` returns timed
+out at once: it never sleeps. -/
+theorem step_wait_until_timed_out_at_once {v e : Int} {dl : Option Int}
+    (hv : w.cells[cell]? = some v) (hf : (w.touched who cell []).fits = true)
+    (hw : (who, cell) ∉ w.woken) (ha : (who, cell) ∉ w.asleep) (heq : v = e)
+    (hd : passed w.clock dl = true) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨timed_out_code, true⟩, w.touched who cell []) := by
+  unfold step; simp [hv, hf, hw, ha, heq, hd]
+
+theorem step_wait_until_sleeps {v e : Int} {dl : Option Int} (hv : w.cells[cell]? = some v)
+    (hf : (w.touched who cell []).fits = true) (hw : (who, cell) ∉ w.woken)
+    (ha : (who, cell) ∉ w.asleep) (heq : v = e) (hd : passed w.clock dl = false) :
+    w.step who pick (.wait_until cell e dl) =
+      some (⟨0, false⟩, { w.touched who cell [] with asleep := (who, cell) :: w.asleep }) := by
+  unfold step; simp [hv, hf, hw, ha, heq, hd]
+
 /-- A wake with nobody asleep on the cell. -/
 theorem step_wake_none {all : Bool} (hc : cell < w.cells.length)
     (hf : (w.touched who cell []).fits = true)
@@ -296,6 +399,25 @@ theorem wait_eq (word : Atomic .U32) (e : U32) (tm : Bool) :
 
 theorem wake_eq (word : Atomic .U32) :
     wake word = .op 0 0 (.wake word.cell false) (fun got => .done (.ok got.flag)) := rfl
+
+theorem wait_until_eq (word : Atomic .U32) (e : U32) (dl : Option core.time.Duration) :
+    wait_until word e dl =
+      .op 0 0 (.wait_until word.cell e.val (dl.map core.time.Duration.toNanos))
+        (fun got => .done (.ok (Woke.ofGot got))) :=
+  rfl
+
+theorem clock_eq (readings : Slice core.time.Duration) :
+    clock readings =
+      .op 0 0 (.clock (readings.val.map core.time.Duration.toNanos)) (fun _ => .done (.ok ())) :=
+  rfl
+
+theorem now_eq :
+    now = .op 0 0 (.now true) (fun got => .done (.ok (core.time.Duration.ofNanosSat got.value))) :=
+  rfl
+
+theorem time_eq :
+    time = .op 0 0 (.now false) (fun got => .done (.ok (core.time.Duration.ofNanosSat got.value))) :=
+  rfl
 
 end shapes
 
@@ -390,9 +512,11 @@ theorem two_nil_ok {α β : Type} {a : Prog α} {b : Prog β} {w w1 w2 : World} 
 
 /-- A thread at an operation that is not a wait can go on. -/
 theorem ended_exec_running {α : Type} {who t k : Nat} {o : Op} {next : Got → Prog α} (w : World)
-    (ho : ∀ c e tm, o ≠ .wait c e tm) : (ended who (.op t k o next)).exec w = .ok (.Running, w) := by
+    (ho : ∀ c e tm, o ≠ .wait c e tm) (hu : ∀ c e dl, o ≠ .wait_until c e dl) :
+    (ended who (.op t k o next)).exec w = .ok (.Running, w) := by
   cases o with
   | wait c e tm => exact absurd rfl (ho c e tm)
+  | wait_until c e dl => exact absurd rfl (hu c e dl)
   | _ => rfl
 
 /-- A thread at a wait: asleep with no wake coming where it was not woken and it sleeps, or
@@ -404,5 +528,15 @@ theorem ended_exec_wait {α : Type} {who t k cell : Nat} {e v : Int} {tm : Bool}
         else .Running), w) := by
   simp only [ended]
   simp [Prog.exec, World.step, hv, Op.sleeps]
+
+/-- A thread at a wait with a deadline: asleep with no wake coming where it was not woken, it
+sleeps or would go to sleep, and the clock has not reached its deadline. -/
+theorem ended_exec_wait_until {α : Type} {who t k cell : Nat} {e v : Int} {dl : Option Int}
+    {next : Got → Prog α} {w : World} (hv : w.cells[cell]? = some v) :
+    (ended who (.op t k (.wait_until cell e dl) next)).exec w =
+      .ok ((if (who, cell) ∉ w.woken ∧ ((who, cell) ∈ w.asleep ∨ v = e) ∧ passed w.clock dl = false
+        then .Asleep else .Running), w) := by
+  simp only [ended]
+  simp [Prog.exec, World.step, hv, Op.sleeps, and_assoc]
 
 end Blaze.Threads

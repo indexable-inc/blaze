@@ -179,7 +179,7 @@ def Inv (t : Bool) (n : Nat) (a : Prog Bool) (b : Prog Unit) (w : World) : Prop 
     Good t n pt up w.cells w.asleep w.woken
 
 /-- The world after the word is made: `EMPTY`. -/
-def start : World := ⟨[0], [], [], [], false⟩
+def start : World := ⟨[0], [], [], [], false, 0, []⟩
 
 set_option hygiene false in
 local macro "close" : tactic => `(tactic| (

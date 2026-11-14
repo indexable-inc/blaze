@@ -636,6 +636,25 @@ theorem cmp_eq_Greater (a b : Duration) : cmp a b = .Greater ↔ b.toNanos < a.t
   rw [← Bool.not_eq_true, ge_iff]
   exact Int.not_le
 
+/-! A count of nanoseconds as a duration. -/
+
+/-- The duration of `n` nanoseconds: `ZERO` below 0 and `MAX` above `maxNanos`. -/
+def ofNanosSat (n : Int) : Duration :=
+  if h0 : n < 0 then ZERO
+  else if h1 : maxNanos < n then MAX
+  else
+    ofParts (n / 1000000000) (n % 1000000000)
+      (by unfold maxNanos at h1; omega) (by omega)
+
+theorem ofNanosSat_toNanos (n : Int) (h : 0 ≤ n ∧ n ≤ maxNanos) : (ofNanosSat n).toNanos = n := by
+  have h0 : ¬ n < 0 := by omega
+  have h1 : ¬ maxNanos < n := by omega
+  simp only [ofNanosSat, h0, h1, ↓reduceDIte, ofParts_toNanos]
+  omega
+
+theorem ofNanosSat_toNanos_self (d : Duration) : ofNanosSat d.toNanos = d :=
+  ext_toNanos (ofNanosSat_toNanos _ (toNanos_bounds d))
+
 end Duration
 
 end Blaze.core.time

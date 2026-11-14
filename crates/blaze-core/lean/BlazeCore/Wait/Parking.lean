@@ -80,7 +80,7 @@ def Inv (d : Option Deadline) (now : core.time.Duration) (n : Nat) (a : Prog Res
     Good d n pt up w.cells w.asleep w.woken
 
 /-- The world the threads start in: the word, `EMPTY`. -/
-def start : World := ⟨[0], [], [], [], false⟩
+def start : World := ⟨[0], [], [], [], false, 0, []⟩
 
 set_option hygiene false in
 /-- After a step: the point the thread is at and the combination after it. -/
