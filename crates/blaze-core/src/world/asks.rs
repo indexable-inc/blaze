@@ -650,6 +650,11 @@ fn synced_append(
     if !world.ask(0, Ask::Append { file, bytes }) || !world.tell(0, &Told::Done) {
         return None;
     }
+    // The append's bytes are any: with them the disk must still be within the bounds, or
+    // reading the file has no answer (a `Vec` of more than `usize::MAX` bytes).
+    if !world.disk.small() {
+        return None;
+    }
     let Some(at) = world.disk.find(file) else { return None };
     if !world.disk.files[at].only_appended() || world.disk.files[at].undo.is_some() {
         return None;
