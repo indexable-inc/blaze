@@ -1,0 +1,26 @@
+[package]
+name = "blaze-sql"
+description = "blaze's typed SQL, the checker (docs/v2/plan/design/sql.md): one statement of a SQL subset is lexed, parsed, typed against a schema and rendered for an engine, with named parameters only; sans-IO and pure, so the compiler runs it at compile time"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# `check_planted` and `infer::Plant`: planted bugs for the controls of tests in other crates.
+plant = []
