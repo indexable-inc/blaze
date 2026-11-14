@@ -150,6 +150,9 @@ pub enum Decl {
     Theorem { name: String, statement: String, proof: String },
     /// `#print axioms name`.
     PrintAxioms(String),
+    /// `deriving instance DecidableEq for name`: Lean's `=` of the type decided, the model of
+    /// its derived `==`.
+    DeriveDecidableEq(String),
 }
 
 /// A Lean file.
@@ -471,6 +474,9 @@ impl Printer {
                 &format!("theorem {} : {} := {}", ident(name), ident(statement), ident(proof)),
             ),
             Decl::PrintAxioms(name) => self.line(0, &format!("#print axioms {}", ident(name))),
+            Decl::DeriveDecidableEq(name) => {
+                self.line(0, &format!("deriving instance DecidableEq for {}", ident(name)))
+            }
         }
     }
 }

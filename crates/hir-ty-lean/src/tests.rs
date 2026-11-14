@@ -651,7 +651,7 @@ fn what_v0_does_not_translate_is_refused_by_name() {
         ("pub unsafe fn f() -> u32 { 0 }\n", "`unsafe fn`"),
         ("pub fn f() -> u32 { let g = |x: u32| x; g(1) }\n", "closure"),
         ("pub fn f(x: f32) -> f32 { x }\n", "floating-point"),
-        ("pub fn f(s: &str) -> u32 { 0 }\n", "string"),
+        ("pub fn f(c: char) -> u32 { 0 }\n", "the type `char`"),
         ("pub fn f<T>(x: T) -> T { x }\n", "generic function"),
         ("pub fn f(n: u32) -> u32 { if n == 0 { 0 } else { f(n - 1) } }\n", "recursion"),
         ("pub struct P<'a> { pub x: &'a mut u32 }\npub fn f(p: P<'_>) -> u32 { 0 }\n", "generic struct"),
@@ -742,6 +742,7 @@ impl Interp {
             Operand::Int(ty, bits) => Value::Int(*ty, mask(*ty, *bits)),
             Operand::Bool(value) => Value::Bool(*value),
             Operand::Unit => Value::Unit,
+            other => panic!("the test interpreter does not read the constant {other:?}"),
         })
     }
 
@@ -1105,7 +1106,7 @@ fn what_the_semantics_does_not_have_is_refused_by_name() {
         ("pub unsafe fn f() -> u32 { 0 }\n", "`unsafe fn`"),
         ("pub fn f() -> u32 { let g = |x: u32| x; g(1) }\n", "closure"),
         ("pub fn f(x: f32) -> f32 { x }\n", "floating-point"),
-        ("pub fn f(s: &str) -> u32 { 0 }\n", "string"),
+        ("pub fn f(s: &str) -> u32 { 0 }\n", "the type `str`"),
         ("pub fn f<T>(x: T) -> T { x }\n", "generic function"),
         ("pub union U { a: u32, b: u32 }\npub fn f(u: U) -> u32 { 0 }\n", "union"),
         ("pub fn g<T>(x: T) -> T { x }\npub fn f() -> u32 { g(1) }\n", "generic function `g`"),
@@ -2193,4 +2194,344 @@ fn what_a_trait_impl_needs_beyond_the_subset_is_refused_by_name() {
         err.what.contains("a method of a trait impl of `Shape` for a generic type"),
         "{err}"
     );
+}
+
+// ---- The standard library's `Duration`, `Ordering`, derived `Clone` and `PartialEq`, and
+// `str` (`lean/Blaze/Duration.lean`, `Ordering.lean`, `Str.lean`). ----
+
+/// What the `durations` fixture enables: `core::time::Duration`, `Ord`'s `max` and `min`, and
+/// `Option::is_none`.
+const DURATION_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, time, ord_methods";
+
+/// Every `Duration` operation the model has, each in a function of its own, and two theorem
+/// functions, whose statements `lean/BlazeModel/durations/proved.lean` proves.
+const DURATIONS: &str = "use core::time::Duration;
+pub fn timeout() -> Duration { Duration::from_millis(1500) }
+pub fn units(s: u64) -> (Duration, Duration, Duration) {
+    (Duration::from_secs(s), Duration::from_micros(s), Duration::from_nanos(s))
+}
+pub fn build(secs: u64, nanos: u32) -> Duration { Duration::new(secs, nanos) }
+pub fn parts(d: &Duration) -> (u64, u32, u32, u32) {
+    (d.as_secs(), d.subsec_millis(), d.subsec_micros(), d.subsec_nanos())
+}
+pub fn totals(d: &Duration) -> (u128, u128, u128) { (d.as_millis(), d.as_micros(), d.as_nanos()) }
+pub fn idle(d: Duration) -> bool { d.is_zero() }
+pub fn limits() -> (Duration, Duration) { (Duration::ZERO, Duration::MAX) }
+pub fn checked(a: Duration, b: Duration) -> (Option<Duration>, Option<Duration>) {
+    (a.checked_add(b), a.checked_sub(b))
+}
+pub fn deadline(now: Duration, wait: Duration) -> Duration { now.saturating_add(wait) }
+pub fn elapsed(now: Duration, start: Duration) -> Duration { now.saturating_sub(start) }
+pub fn sum(a: Duration, b: Duration) -> Duration { a + b }
+pub fn shrink(a: Duration, b: Duration) -> Duration {
+    let mut c = a;
+    c -= b;
+    c += b;
+    c - b
+}
+pub fn bounds(a: Duration, b: Duration) -> (Duration, Duration) { (a.max(b), a.min(b)) }
+pub fn order(a: Duration, b: Duration) -> (bool, bool, bool, bool, bool, bool) {
+    (a < b, a <= b, a > b, a >= b, a == b, a != b)
+}
+#[blaze::theorem]
+pub fn sub_then_add(a: Duration, b: Duration) -> bool {
+    if a <= b { b.saturating_sub(a) + a == b } else { true }
+}
+#[blaze::theorem]
+pub fn checked_add_overflows(a: Duration, b: Duration) -> bool {
+    a.checked_add(b).is_none() == (a.as_nanos() + b.as_nanos() > Duration::MAX.as_nanos())
+}
+";
+
+/// Each `Duration` function becomes its model in `core.time.Duration`; a constant is
+/// `ofLit` of its seconds and nanoseconds, read from its bytes by the type's layout.
+#[test]
+fn durations_become_their_models() {
+    let cases: [(&str, &[&str]); 15] = [
+        ("timeout", &["core.time.Duration.from_millis (1500 : U64)"]),
+        ("units", &[
+            "core.time.Duration.from_secs s", "core.time.Duration.from_micros s",
+            "core.time.Duration.from_nanos s",
+        ]),
+        ("build", &["core.time.Duration.new secs nanos"]),
+        ("parts", &[
+            "core.time.Duration.as_secs d", "core.time.Duration.subsec_millis d",
+            "core.time.Duration.subsec_micros d", "core.time.Duration.subsec_nanos d",
+        ]),
+        ("totals", &[
+            "core.time.Duration.as_millis d", "core.time.Duration.as_micros d",
+            "core.time.Duration.as_nanos d",
+        ]),
+        ("idle", &["core.time.Duration.is_zero d"]),
+        ("limits", &["core.time.Duration.ofLit 0 0", "core.time.Duration.ofLit 18446744073709551615 999999999"]),
+        ("checked", &["core.time.Duration.checked_add a b", "core.time.Duration.checked_sub a b"]),
+        ("deadline", &["core.time.Duration.saturating_add now wait"]),
+        ("elapsed", &["core.time.Duration.saturating_sub now start"]),
+        ("sum", &["core.time.Duration.add a b"]),
+        ("shrink", &["core.time.Duration.sub_assign", "core.time.Duration.add_assign", "core.time.Duration.sub"]),
+        ("bounds", &["core.time.Duration.max a b", "core.time.Duration.min a b"]),
+        ("order", &[
+            "core.time.Duration.lt", "core.time.Duration.le", "core.time.Duration.gt",
+            "core.time.Duration.ge", "core.cmp.PartialEq.eq", "core.cmp.PartialEq.ne",
+        ]),
+        ("sub_then_add", &["core.time.Duration.saturating_sub", "core.time.Duration.add"]),
+    ];
+    for (name, calls) in cases {
+        let out = golden(DURATION_FLAGS, "durations", name, DURATIONS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+    }
+    let out = golden(DURATION_FLAGS, "durations", "checked_add_overflows", DURATIONS);
+    assert_eq!(out.statement.as_deref(), Some("durations.checked_add_overflows.spec.statement"));
+}
+
+/// What `Duration` has beyond the model is refused by its name: a method the model has not
+/// (`checked_mul`, `abs_diff`), and `clamp`.
+#[test]
+fn what_duration_has_beyond_the_model_is_refused_by_name() {
+    let cases = [
+        ("use core::time::Duration;\npub fn f(d: Duration) -> Option<Duration> { d.checked_mul(2) }\n", "`Duration::checked_mul`"),
+        ("use core::time::Duration;\npub fn f(a: Duration, b: Duration) -> Duration { a.abs_diff(b) }\n", "`Duration::abs_diff`"),
+        (
+            "use core::time::Duration;\npub fn f(a: Duration, b: Duration) -> Duration { a.clamp(b, b) }\n",
+            "`clamp` on a `Duration`",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(DURATION_FLAGS, "f", source);
+        assert!(err.what.contains(what) && err.what.contains("NoModel"), "`{source}` is refused for {what}: {err}");
+    }
+}
+
+/// What the `orderings` fixture enables: `Ordering`'s methods and derives, and `Duration`.
+const ORDERING_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, time, ord_ops";
+
+/// `Ord::cmp` and `PartialOrd::partial_cmp` of integers and `Duration`s, `Ordering`'s
+/// methods, `==` of `Ordering`s and a `match` on one, and a theorem function.
+const ORDERINGS: &str = "use core::cmp::Ordering;
+use core::time::Duration;
+pub fn compare(a: u32, b: u32) -> Ordering { a.cmp(&b) }
+pub fn partial(a: u64, b: u64) -> Option<Ordering> { a.partial_cmp(&b) }
+pub fn by_duration(a: Duration, b: Duration) -> (Ordering, Option<Ordering>) {
+    (a.cmp(&b), a.partial_cmp(&b))
+}
+pub fn flip(o: Ordering) -> Ordering { o.reverse() }
+pub fn chain(a: u32, b: u32, c: u32, d: u32) -> Ordering { a.cmp(&b).then(c.cmp(&d)) }
+pub fn tests(o: Ordering) -> (bool, bool, bool, bool, bool, bool) {
+    (o.is_lt(), o.is_le(), o.is_gt(), o.is_ge(), o.is_eq(), o.is_ne())
+}
+pub fn sign(o: Ordering) -> i32 {
+    match o {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+pub fn less() -> Ordering { Ordering::Less }
+pub fn same(a: Ordering, b: Ordering) -> bool { a == b }
+#[blaze::theorem]
+pub fn cmp_agrees(a: u32, b: u32) -> bool {
+    compare(a, b).reverse() == compare(b, a)
+        && compare(a, b).is_lt() == (a < b)
+        && sign(compare(a, a)) == 0
+}
+";
+
+/// `cmp` and `partial_cmp` become `Scalar.cmp` and `core.time.Duration.cmp`, `Ordering`'s
+/// methods become `core.cmp.Ordering`'s, and a `match` on an `Ordering` is a Lean `match`.
+#[test]
+fn orderings_become_their_models() {
+    let cases: [(&str, &[&str]); 9] = [
+        ("compare", &["Scalar.cmp a b"]),
+        ("partial", &["Scalar.partial_cmp a b"]),
+        ("by_duration", &["core.time.Duration.cmp a b", "core.time.Duration.partial_cmp a b"]),
+        ("flip", &["core.cmp.Ordering.reverse o"]),
+        ("chain", &["core.cmp.Ordering.«then»"]),
+        ("tests", &[
+            "core.cmp.Ordering.is_lt o", "core.cmp.Ordering.is_le o", "core.cmp.Ordering.is_gt o",
+            "core.cmp.Ordering.is_ge o", "core.cmp.Ordering.is_eq o", "core.cmp.Ordering.is_ne o",
+        ]),
+        ("sign", &["core.cmp.Ordering.Less", "core.cmp.Ordering.Greater"]),
+        ("less", &["core.cmp.Ordering.Less"]),
+        ("same", &["core.cmp.PartialEq.eq a b"]),
+    ];
+    for (name, calls) in cases {
+        let out = golden(ORDERING_FLAGS, "orderings", name, ORDERINGS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+    }
+    let out = golden(ORDERING_FLAGS, "orderings", "cmp_agrees", ORDERINGS);
+    assert_eq!(out.statement.as_deref(), Some("orderings.cmp_agrees.spec.statement"));
+}
+
+/// An order the model has not is refused by name: `Ord::cmp` of two `Ordering`s (derived),
+/// and `Ordering`'s methods it has not.
+#[test]
+fn what_ordering_has_beyond_the_model_is_refused_by_name() {
+    let cases = [
+        ("use core::cmp::Ordering;\npub fn f(a: Ordering, b: Ordering) -> Ordering { a.cmp(&b) }\n", "`Ord::cmp` on `core::cmp::Ordering`"),
+        ("use core::cmp::Ordering;\npub fn f(a: Ordering, b: Ordering) -> bool { a < b }\n", "`PartialOrd::lt` on `core::cmp::Ordering`"),
+    ];
+    for (source, what) in cases {
+        let err = refused(ORDERING_FLAGS, "f", source);
+        assert!(err.what.contains(what) && err.what.contains("NoModel"), "`{source}` is refused for {what}: {err}");
+    }
+}
+
+/// What the `derives` fixture enables: derived `Clone` and `PartialEq`, and `Vec`'s and
+/// `Option`'s.
+const DERIVE_FLAGS: &str =
+    "sized, copy, add, ord, eq, fn, builtin_impls, derive, clone, vec, vec_eq, option_clone, ord_ops";
+
+/// A struct, an enum and a struct of a `Vec` and an `Option` of them, each deriving `Clone`
+/// and `PartialEq`, a struct with its own impls, and a theorem function.
+const DERIVES: &str = "#[derive(Clone, Copy, PartialEq)]
+pub struct Point { pub x: u32, pub y: u32 }
+#[derive(Clone, PartialEq)]
+pub enum Shape { Dot(Point), Line(Point, Point), Empty }
+#[derive(Clone, PartialEq)]
+pub struct Path { pub points: Vec<Point>, pub label: Option<Shape> }
+pub struct Own { pub v: u32 }
+impl PartialEq for Own { fn eq(&self, other: &Own) -> bool { self.v / 2 == other.v / 2 } }
+impl Clone for Own { fn clone(&self) -> Own { Own { v: self.v } } }
+pub fn copy_point(p: &Point) -> Point { p.clone() }
+pub fn same_point(a: &Point, b: &Point) -> bool { a == b }
+pub fn differ(a: &Shape, b: &Shape) -> bool { a != b }
+pub fn copy_path(p: &Path) -> Path { p.clone() }
+pub fn same_path(a: &Path, b: &Path) -> bool { *a == *b }
+pub fn same_points(a: &Vec<Point>, b: &Vec<Point>) -> bool { a == b }
+pub fn copy_label(a: &Option<Shape>) -> Option<Shape> { a.clone() }
+pub fn same_own(a: &Own, b: &Own) -> bool { a == b }
+pub fn copy_own(a: &Own) -> Own { a.clone() }
+#[blaze::theorem]
+pub fn clone_is_equal(p: Path, s: Shape) -> bool {
+    p.clone() == p && s.clone() == s && !(s.clone() != s)
+}
+";
+
+/// A derived `clone` is the value and a derived `==` is Lean's `=`, decided by the instance
+/// each type's `impl` module derives; a hand-written impl is its own function.
+#[test]
+fn derived_clone_and_eq_are_the_value_and_its_equality() {
+    let cases: [(&str, &[&str]); 9] = [
+        ("copy_point", &["p"]),
+        ("same_point", &["core.cmp.PartialEq.eq a b"]),
+        ("differ", &["core.cmp.PartialEq.ne a b"]),
+        ("copy_path", &["p"]),
+        ("same_path", &["core.cmp.PartialEq.eq"]),
+        ("same_points", &["core.cmp.PartialEq.eq a b"]),
+        ("copy_label", &["a"]),
+        ("same_own", &["derives.Own.PartialEq.eq a b"]),
+        ("copy_own", &["derives.Own.Clone.clone a"]),
+    ];
+    for (name, calls) in cases {
+        let out = golden(DERIVE_FLAGS, "derives", name, DERIVES);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+        let derives = out.imports.iter().any(|it| it.module.ends_with(".impl"));
+        let compares = name.starts_with("same") || name == "differ";
+        assert_eq!(derives, compares && name != "same_own", "`{name}` imports an `impl` module only when it compares a derive");
+    }
+    let out = golden(DERIVE_FLAGS, "derives", "clone_is_equal", DERIVES);
+    assert_eq!(out.statement.as_deref(), Some("derives.clone_is_equal.spec.statement"));
+    let modules: Vec<&str> = out.imports.iter().map(|it| it.module.as_str()).collect();
+    for module in ["BlazeModel.derives.Point.impl", "BlazeModel.derives.Shape.impl", "BlazeModel.derives.Path.impl"] {
+        assert!(modules.contains(&module), "imports {module}: {modules:?}");
+    }
+}
+
+/// A `clone` or `==` that is not the value's own is refused by name: a derive over a field
+/// with a hand-written impl, a `Vec` of such a type, and a derived order. (A float is refused
+/// as a type before its `==` is reached.)
+#[test]
+fn a_clone_or_eq_that_is_not_the_values_is_refused_by_name() {
+    let own = "pub struct Own { pub v: u32 }\nimpl PartialEq for Own { fn eq(&self, o: &Own) -> bool { true } }\n\
+               impl Clone for Own { fn clone(&self) -> Own { Own { v: 0 } } }\n";
+    let cases = [
+        (
+            format!("{own}#[derive(PartialEq)]\npub struct W {{ pub o: Own }}\npub fn f(a: &W, b: &W) -> bool {{ a == b }}\n"),
+            "`==` of `main::Own`, whose `PartialEq` is not derived",
+        ),
+        (
+            format!("{own}pub fn f(a: &Vec<Own>) -> Vec<Own> {{ a.clone() }}\n"),
+            "`Clone::clone` of `main::Own`, whose `Clone` is not derived",
+        ),
+        (
+            "#[derive(PartialEq, PartialOrd)]\npub struct P { pub x: u32 }\npub fn f(a: &P, b: &P) -> bool { a < b }\n".to_owned(),
+            "`PartialOrd::lt` on `main::P`, whose order is derived",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(DERIVE_FLAGS, "f", &source);
+        assert!(err.what.contains(what), "`{source}` is refused for {what}: {err}");
+    }
+}
+
+/// What the `strs` fixture enables: `str`'s `len` and `is_empty`, and `==` of strings.
+const STR_FLAGS: &str = "sized, copy, add, ord, eq, fn, builtin_impls, str_methods, slice";
+
+/// String literals, a `&'static str` passed along, `len`, `is_empty`, `as_bytes`, `==`, `!=`,
+/// and a theorem function.
+const STRS: &str = "pub fn greeting() -> &'static str { \"hello\" }
+pub fn empty() -> &'static str { \"\" }
+pub fn pass(s: &'static str) -> &'static str { s }
+pub fn pick(first: bool) -> &'static str { if first { pass(\"one\") } else { \"two\" } }
+pub fn size(s: &str) -> usize { s.len() }
+pub fn blank(s: &str) -> bool { s.is_empty() }
+pub fn bytes(s: &str) -> &[u8] { s.as_bytes() }
+pub fn is_hello(s: &str) -> bool { s == \"hello\" }
+pub fn not_hello(s: &str) -> bool { s != \"hello\" }
+#[blaze::theorem]
+pub fn greeting_is_hello(first: bool) -> bool {
+    size(greeting()) == 5 && is_hello(greeting()) && !blank(pick(first)) && blank(empty())
+}
+";
+
+/// A string literal is `Str.ofBytes` of its bytes, and `str`'s methods become `Str`'s.
+#[test]
+fn strings_are_their_bytes() {
+    let cases: [(&str, &[&str]); 9] = [
+        ("greeting", &["Str.ofBytes [104, 101, 108, 108, 111]"]),
+        ("empty", &["Str.ofBytes []"]),
+        ("pass", &["s"]),
+        ("pick", &["Str.ofBytes [111, 110, 101]", "strs.pass"]),
+        ("size", &["Str.len s"]),
+        ("blank", &["Str.is_empty s"]),
+        ("bytes", &["Str.as_bytes s"]),
+        ("is_hello", &["core.cmp.PartialEq.eq s"]),
+        ("not_hello", &["core.cmp.PartialEq.ne s"]),
+    ];
+    for (name, calls) in cases {
+        let out = golden(STR_FLAGS, "strs", name, STRS);
+        for call in calls {
+            assert!(out.text.contains(call), "`{name}` calls `{call}`:\n{}", out.text);
+        }
+    }
+    let out = golden(STR_FLAGS, "strs", "greeting_is_hello", STRS);
+    assert_eq!(out.statement.as_deref(), Some("strs.greeting_is_hello.spec.statement"));
+}
+
+/// Every method of `str` but `len`, `is_empty` and `as_bytes` is refused by name, as is a
+/// function of `core::str`.
+#[test]
+fn what_str_has_beyond_its_bytes_is_refused_by_name() {
+    let flags = "sized, copy, add, ord, eq, fn, builtin_impls, str_methods, slice";
+    let cases = [
+        (
+            "pub struct N;\nimpl core::str::FromStr for N { type Err = (); fn from_str(s: &str) -> Result<N, ()> { Err(()) } }\n\
+             pub fn f(s: &str) -> Result<N, ()> { s.parse::<N>() }\n",
+            "the `str` method `parse`",
+        ),
+        (
+            "pub fn f(b: &[u8]) -> usize { unsafe { core::str::from_utf8_unchecked(b) }.len() }\n",
+            "`from_utf8_unchecked`",
+        ),
+    ];
+    for (source, what) in cases {
+        let err = refused(flags, "f", source);
+        assert!(err.what.contains(what) && err.what.contains("NoModel"), "`{source}` is refused for {what}: {err}");
+    }
 }

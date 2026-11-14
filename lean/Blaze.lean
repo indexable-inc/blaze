@@ -4,4 +4,7 @@ import Blaze.Slice
 import Blaze.Std
 import Blaze.Vec
 import Blaze.ScalarOps
+import Blaze.Ordering
+import Blaze.Duration
+import Blaze.Str
 import Blaze.Machine

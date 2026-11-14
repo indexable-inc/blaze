@@ -75,6 +75,8 @@
 //!     option_methods: option, result, default
 //!     ord: eq, option
 //!     ord_methods: ord
+//!     ord_ops: ord, clone, copy, derive
+//!     option_clone: option, clone
 //!     panic: fmt
 //!     panic_location: panic
 //!     pat: panic
@@ -93,7 +95,10 @@
 //!     sized:
 //!     slice:
 //!     str: sized, result
+//!     str_methods: str, eq
+//!     sub:
 //!     sync: sized
+//!     time: add, sub, ord_ops, option, int_bounds
 //!     transmute:
 //!     try: infallible
 //!     tuple:
@@ -101,6 +106,7 @@
 //!     unpin: sized
 //!     unsize: sized
 //!     vec: allocator_api, index, reach, deref_mut, option, default, fn, clone
+//!     vec_eq: vec, eq
 //!     write: fmt
 //!     todo: panic
 //!     unimplemented: panic
@@ -1311,6 +1317,35 @@ pub mod ops {
     // endregion:builtin_impls
     // endregion:add
 
+    // region:sub
+    #[lang = "sub"]
+    pub const trait Sub<Rhs = Self> {
+        type Output;
+        fn sub(self, rhs: Rhs) -> Self::Output;
+    }
+
+    #[lang = "sub_assign"]
+    pub const trait SubAssign<Rhs = Self> {
+        fn sub_assign(&mut self, rhs: Rhs);
+    }
+
+    // region:builtin_impls
+    macro_rules! sub_impl {
+        ($($t:ty)*) => ($(
+            impl const Sub for $t {
+                type Output = $t;
+                fn sub(self, other: $t) -> $t { self - other }
+            }
+            impl SubAssign for $t {
+                fn sub_assign(&mut self, other: $t) { *self -= other; }
+            }
+        )*)
+    }
+
+    sub_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f16 f32 f64 f128 }
+    // endregion:builtin_impls
+    // endregion:sub
+
     // region:mul
     #[lang = "mul"]
     pub const trait Mul<Rhs = Self> {
@@ -1482,6 +1517,32 @@ pub mod cmp {
     #[lang = "partial_ord"]
     pub trait PartialOrd<Rhs: PointeeSized = Self>: PartialEq<Rhs> + PointeeSized {
         fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+        // region:ord_ops
+        fn lt(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Less) => true,
+                _ => false,
+            }
+        }
+        fn le(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Less | Ordering::Equal) => true,
+                _ => false,
+            }
+        }
+        fn gt(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Greater) => true,
+                _ => false,
+            }
+        }
+        fn ge(&self, other: &Rhs) -> bool {
+            match self.partial_cmp(other) {
+                Some(Ordering::Greater | Ordering::Equal) => true,
+                _ => false,
+            }
+        }
+        // endregion:ord_ops
     }
 
     pub trait Ord: Eq + PartialOrd<Self> + PointeeSized {
@@ -1517,11 +1578,50 @@ pub mod cmp {
     }
     // endregion:ord_methods
 
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)] // :ord_ops
+    #[lang = "Ordering"] // :ord_ops
+    #[repr(i8)] // :ord_ops
     pub enum Ordering {
         Less = -1,
         Equal = 0,
         Greater = 1,
     }
+
+    // region:ord_ops
+    impl Ordering {
+        pub const fn is_eq(self) -> bool {
+            self as i8 == 0
+        }
+        pub const fn is_ne(self) -> bool {
+            self as i8 != 0
+        }
+        pub const fn is_lt(self) -> bool {
+            (self as i8) < 0
+        }
+        pub const fn is_gt(self) -> bool {
+            (self as i8) > 0
+        }
+        pub const fn is_le(self) -> bool {
+            (self as i8) <= 0
+        }
+        pub const fn is_ge(self) -> bool {
+            (self as i8) >= 0
+        }
+        pub const fn reverse(self) -> Ordering {
+            match self {
+                Ordering::Less => Ordering::Greater,
+                Ordering::Equal => Ordering::Equal,
+                Ordering::Greater => Ordering::Less,
+            }
+        }
+        pub const fn then(self, other: Ordering) -> Ordering {
+            match self {
+                Ordering::Equal => other,
+                _ => self,
+            }
+        }
+    }
+    // endregion:ord_ops
 
     // region:derive
     #[rustc_builtin_macro]
@@ -1864,6 +1964,20 @@ pub mod option {
     // region:copy
     impl<T: Copy> Copy for Option<T> {}
     // endregion:copy
+
+    // region:option_clone
+    impl<T> crate::clone::Clone for Option<T>
+    where
+        T: crate::clone::Clone,
+    {
+        fn clone(&self) -> Self {
+            match self {
+                Some(x) => Some(x.clone()),
+                None => None,
+            }
+        }
+    }
+    // endregion:option_clone
 
     // region:mem_take
     impl<T> crate::default::Default for Option<T> {
@@ -2604,6 +2718,14 @@ pub mod str {
         fn from_str(s: &str) -> Result<Self, Self::Err>;
     }
     impl str {
+        // region:str_methods
+        pub const fn len(&self) -> usize {
+            self.as_bytes().len()
+        }
+        pub const fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+        // endregion:str_methods
         pub const fn as_bytes(&self) -> &[u8] {
             unsafe { &*(self as *const str as *const [u8]) }
         }
@@ -2611,8 +2733,126 @@ pub mod str {
             FromStr::from_str(self)
         }
     }
+
+    // region:str_methods
+    impl crate::cmp::PartialEq for str {
+        fn eq(&self, other: &str) -> bool {
+            loop {}
+        }
+    }
+    // endregion:str_methods
 }
 // endregion:str
+
+// region:time
+pub mod time {
+    use crate::ops::{Add, AddAssign, Sub, SubAssign};
+
+    const NANOS_PER_SEC: u32 = 1_000_000_000;
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct Duration {
+        secs: u64,
+        nanos: u32, // Always 0 <= nanos < NANOS_PER_SEC
+    }
+
+    impl Duration {
+        pub const ZERO: Duration = Duration::from_nanos(0);
+        pub const MAX: Duration = Duration::new(u64::MAX, NANOS_PER_SEC - 1);
+
+        pub const fn new(secs: u64, nanos: u32) -> Duration {
+            if nanos < NANOS_PER_SEC {
+                Duration { secs, nanos }
+            } else {
+                loop {}
+            }
+        }
+        pub const fn from_secs(secs: u64) -> Duration {
+            Duration { secs, nanos: 0 }
+        }
+        pub const fn from_millis(millis: u64) -> Duration {
+            loop {}
+        }
+        pub const fn from_micros(micros: u64) -> Duration {
+            loop {}
+        }
+        pub const fn from_nanos(nanos: u64) -> Duration {
+            const NANOS_PER_SEC: u64 = self::NANOS_PER_SEC as u64;
+            let secs = nanos / NANOS_PER_SEC;
+            let subsec_nanos = (nanos % NANOS_PER_SEC) as u32;
+            Duration { secs, nanos: subsec_nanos }
+        }
+        pub const fn is_zero(&self) -> bool {
+            self.secs == 0 && self.nanos == 0
+        }
+        pub const fn as_secs(&self) -> u64 {
+            self.secs
+        }
+        pub const fn subsec_millis(&self) -> u32 {
+            loop {}
+        }
+        pub const fn subsec_micros(&self) -> u32 {
+            loop {}
+        }
+        pub const fn subsec_nanos(&self) -> u32 {
+            self.nanos
+        }
+        pub const fn as_millis(&self) -> u128 {
+            loop {}
+        }
+        pub const fn as_micros(&self) -> u128 {
+            loop {}
+        }
+        pub const fn as_nanos(&self) -> u128 {
+            loop {}
+        }
+        pub const fn abs_diff(self, other: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_add(self, rhs: Duration) -> Option<Duration> {
+            loop {}
+        }
+        pub const fn saturating_add(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_sub(self, rhs: Duration) -> Option<Duration> {
+            loop {}
+        }
+        pub const fn saturating_sub(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+        pub const fn checked_mul(self, rhs: u32) -> Option<Duration> {
+            loop {}
+        }
+    }
+
+    impl Add for Duration {
+        type Output = Duration;
+        fn add(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+    }
+
+    impl AddAssign for Duration {
+        fn add_assign(&mut self, rhs: Duration) {
+            loop {}
+        }
+    }
+
+    impl Sub for Duration {
+        type Output = Duration;
+        fn sub(self, rhs: Duration) -> Duration {
+            loop {}
+        }
+    }
+
+    impl SubAssign for Duration {
+        fn sub_assign(&mut self, rhs: Duration) {
+            loop {}
+        }
+    }
+}
+// endregion:time
 
 // region:panic
 pub mod panic {
@@ -3643,6 +3883,13 @@ pub mod alloc {
     // region:vec
     #[lang = "global_alloc_ty"]
     pub struct Global;
+    // region:vec_eq
+    impl crate::clone::Clone for Global {
+        fn clone(&self) -> Self {
+            Global
+        }
+    }
+    // endregion:vec_eq
     unsafe impl Allocator for Global {
         fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocError> {
             loop {}
@@ -3767,6 +4014,23 @@ pub mod vec {
             loop {}
         }
     }
+
+    // region:vec_eq
+    impl<T: crate::clone::Clone, A: Allocator + crate::clone::Clone> crate::clone::Clone for Vec<T, A> {
+        fn clone(&self) -> Self {
+            loop {}
+        }
+    }
+
+    impl<T, U, A1: Allocator, A2: Allocator> crate::cmp::PartialEq<Vec<U, A2>> for Vec<T, A1>
+    where
+        T: crate::cmp::PartialEq<U>,
+    {
+        fn eq(&self, other: &Vec<U, A2>) -> bool {
+            loop {}
+        }
+    }
+    // endregion:vec_eq
 
     // region:drop
     impl<T, A: Allocator> Drop for Vec<T, A> {
