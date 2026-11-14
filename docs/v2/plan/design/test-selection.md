@@ -178,9 +178,12 @@ on, and each directory above it) changed since a moment before the run began
 (`blaze_usercode::inputs::Began::moved`, git's racy window), else it is not kept,
 `NotKept::Moved`, whose line the host words from the `Moved` it found, naming the read and
 the name whose stamp moved (the machine keeps its `Copy` verdict); what changes after the assembly the settle's second answers find.
-The test's own executable, which a macOS trace holds, does not move under it: its path has one
-writer, the job's placement, and a dev test binary is started from that file with the key the
-job's record holds there (`Runs::start`'s `placed`, `blaze_inproc::host::StartError`), never
-rewritten by the code memory's host. Doc tests
+The test's own executable has one writer, the job's placement, and a dev test binary is started
+from that file with the key the job's record holds there (`Runs::start`'s `placed`,
+`blaze_inproc::host::StartError`), never rewritten by the code memory's host. The server's start
+of it (the exec, and on macOS the loader's reads of the image, which the sandbox there records)
+is no test's read: the program's code is what each test's execution record is of, so the queue
+leaves those lines of no test's scope out (`test::queue`'s `own_start`); a test that opens its
+own executable reads it in its own scope, and that line is kept. Doc tests
 are neither selected nor kept: the CLI runs them after the daemon's results, every time, and
 says so.
