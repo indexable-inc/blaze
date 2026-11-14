@@ -5737,10 +5737,16 @@ fn the_oracle_catches_a_path_vouched_for_without_its_records_key() {
 fn a_certificate_answers_only_where_each_outputs_record_holds_its_key() {
     for seed in 330..336 {
         let steps = shared_path_certified(seed, false, false);
-        for (at, (command, certified, contents, recorded, placed, _, _)) in steps.iter().enumerate() {
+        for (at, (command, certified, contents, recorded, placed, _, said)) in steps.iter().enumerate() {
             let own = image_of(command);
             let key = ContentId::of("blaze serve tests output", own).0;
-            assert_eq!(&contents[..], own, "seed {seed}: step {at} ({command}) answered with another's file at {APP_AT}");
+            assert_eq!(
+                &contents[..],
+                own,
+                "seed {seed}: step {at} ({command}) answered with another's file at {APP_AT}; the certificate's: \
+                 {certified}, placed {placed} times, the record {recorded:02x?}, and it said {said:?}; every step: {:?}",
+                steps.iter().map(|it| (it.0, it.1, it.4, &it.6)).collect::<Vec<_>>()
+            );
             assert_eq!(*recorded, Some(key), "seed {seed}: step {at} ({command}): the record of {APP_AT} is not its key");
             if at == 0 {
                 continue;
