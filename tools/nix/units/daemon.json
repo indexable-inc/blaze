@@ -608,6 +608,7 @@
      "hir-ty",
      "hir-ty-borrowck",
      "hir-ty-codegen",
+     "hir-ty-lean",
      "hir-ty-pure",
      "hir-ty-ub",
      "intern",
@@ -22869,6 +22870,10 @@
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
       },
       {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
+      },
+      {
        "name": "hir_ty_pure",
        "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
       },
@@ -33018,6 +33023,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -47789,6 +47855,10 @@
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
       },
       {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
+      },
+      {
        "name": "hir_ty_pure",
        "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
       },
@@ -57876,6 +57946,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -72423,6 +72554,10 @@
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
       },
       {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
+      },
+      {
        "name": "hir_ty_pure",
        "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
       },
@@ -82558,6 +82693,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
@@ -97325,6 +97521,10 @@
        "unit": "hir-ty-codegen@0.0.0 lib hir_ty_codegen build"
       },
       {
+       "name": "hir_ty_lean",
+       "unit": "hir-ty-lean@0.0.0 lib hir_ty_lean build"
+      },
+      {
        "name": "hir_ty_pure",
        "unit": "hir-ty-pure@0.0.0 lib hir_ty_pure build"
       },
@@ -107406,6 +107606,67 @@
      },
      "src": "src/lib.rs",
      "target": "hir_ty_identity"
+    },
+    "hir-ty-lean@0.0.0 lib hir_ty_lean build": {
+     "crate_type": "lib",
+     "deps": [
+      {
+       "name": "base_db",
+       "unit": "base-db@0.0.0 lib base_db build"
+      },
+      {
+       "name": "blaze_ids",
+       "unit": "blaze-ids@0.0.0 lib blaze_ids build"
+      },
+      {
+       "name": "blaze_query",
+       "unit": "blaze-query@0.0.0 lib blaze_query build"
+      },
+      {
+       "name": "cfg",
+       "unit": "cfg@0.0.0 lib cfg build"
+      },
+      {
+       "name": "hir_def",
+       "unit": "hir-def@0.0.0 lib hir_def build"
+      },
+      {
+       "name": "hir_ty_borrowck",
+       "unit": "hir-ty-borrowck@0.0.0 lib hir_ty_borrowck build"
+      },
+      {
+       "name": "hir_ty",
+       "unit": "hir-ty@0.0.0 lib hir_ty build"
+      },
+      {
+       "name": "intern",
+       "unit": "intern@0.0.0 lib intern build"
+      },
+      {
+       "name": "rustc_type_ir",
+       "unit": "rustc_type_ir@0.0.0 lib rustc_type_ir build"
+      },
+      {
+       "name": "syntax",
+       "unit": "syntax@0.0.0 lib syntax build"
+      }
+     ],
+     "edition": "2024",
+     "features": [],
+     "kind": "lib",
+     "mode": "build",
+     "pkg": "hir-ty-lean@0.0.0",
+     "profile": {
+      "codegen_units": null,
+      "debug_assertions": false,
+      "debuginfo": 0,
+      "name": "release",
+      "opt_level": "3",
+      "overflow_checks": false,
+      "panic": "unwind"
+     },
+     "src": "src/lib.rs",
+     "target": "hir_ty_lean"
     },
     "hir-ty-linear@0.0.0 lib hir_ty_linear build": {
      "crate_type": "lib",
