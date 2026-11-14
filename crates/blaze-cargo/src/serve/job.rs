@@ -3131,6 +3131,9 @@ struct Applying {
     left: u32,
     /// One of them did not end well: failed, skipped or cancelled.
     failed: bool,
+    /// The first of them that did not end well: its unit, and why where its end said, for the
+    /// job's error to name ([`Jobs::applied`]).
+    first: Option<(usize, Option<String>)>,
 }
 
 /// The units of a build that depend on a write to its front end that failed or panicked
@@ -6617,10 +6620,13 @@ impl<S: Steps> Jobs<S> {
         // the job is over (something of it failed with the request still open), so that end is
         // never left waiting for a finish the request can't give.
         if let Stage::Units(build) = &mut job.stage
-            && build.unit(node).is_some()
+            && let Some(unit) = build.unit(node)
             && let Some(applying) = build.applying.as_mut()
         {
             applying.left = applying.left.saturating_sub(1);
+            if !ok && applying.first.is_none() {
+                applying.first = Some((unit, why.clone())); // clone: once a job, for its error
+            }
             applying.failed |= !ok;
             if applying.left == 0 {
                 let ok = !applying.failed && job.over.is_none();
@@ -8297,7 +8303,7 @@ impl<S: Steps> Jobs<S> {
             fresh: fresh_units,
             verdicts,
             whole: picked.is_none() && !applying,
-            applying: applying.then_some(Applying { left: count, failed: false }),
+            applying: applying.then_some(Applying { left: count, failed: false, first: None }),
             made_wait: (count > 0).then(|| {
                 tracing::info_span!(
                     target: "blaze",
@@ -9888,7 +9894,8 @@ impl<S: Steps> Jobs<S> {
             return;
         }
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
-        let Build { input, front, writer, root, units, .. } = *build;
+        let Build { input, front, writer, root, units, applying, .. } = *build;
+        let unbuilt = applying.and_then(|it| it.first);
         let Some(mut writer) = writer.into_here() else {
             let error = ApiError::new(
                 "the build's front end was lost to a write that failed, so its end reads none",
@@ -9908,16 +9915,24 @@ impl<S: Steps> Jobs<S> {
                 return;
             }
         }
-        self.applied(w, id, ok, Ready { input, root, front: Some(front), writer: Some(writer) });
+        self.applied(w, id, ok, unbuilt, Ready { input, root, front: Some(front), writer: Some(writer) });
     }
 
     /// A view `ready` with the units its front end applies built ([`Jobs::next`]), `ok` whether
     /// all of them did: the wait's span closed, every write they asked for applied, and the view
     /// ready again, the job going on, in the same plane request, to its next view or its answer.
     /// A unit that did not build, or a write of one that did not apply, fails the job naming the
-    /// view: its answer would read what a macro that never ran left out, or a crate without its
-    /// build script's output.
-    fn applied(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool, mut ready: Ready<S>) {
+    /// view and the unit (`unbuilt`: the first that did not build, and why where its end said):
+    /// its answer would read what a macro that never ran left out, or a crate without its build
+    /// script's output.
+    fn applied(
+        &mut self,
+        w: &mut World<'_, S>,
+        id: JobId,
+        ok: bool,
+        unbuilt: Option<(usize, Option<String>)>,
+        mut ready: Ready<S>,
+    ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.applying = None;
         let work = work_word(&job.work);
@@ -9931,7 +9946,24 @@ impl<S: Steps> Jobs<S> {
             ApiError::new(what, Some(root.clone())) // clone: an error, once
         };
         let error = match ready.writer.as_mut() {
-            _ if !ok => Some(refused("did not all build".to_owned())), // alloc: an error, once
+            _ if !ok => Some(refused(match &unbuilt {
+                // The job that asked is not a build, so the unit's own diagnostics were printed
+                // to no one: the error names the unit, and says how to see them.
+                Some((unit, why)) => {
+                    let named = match ready.input.units.graph.units.get(*unit) {
+                        Some(unit) => format!("`{}` of {}", unit.target.name, unit.pkg_id),
+                        None => format!("unit {unit}"),
+                    };
+                    match why {
+                        Some(why) => format!("did not all build: {named} did not build: {why}"),
+                        None => format!(
+                            "did not all build: {named} did not build (`blaze check -p {}` prints its errors)",
+                            ready.input.units.graph.units.get(*unit).map_or("<its package>", |it| it.target.name.as_str()),
+                        ),
+                    }
+                }
+                None => "did not all build".to_owned(),
+            })), // alloc: an error, once
             None => Some(refused("were built with no writer of it".to_owned())), // alloc: an error, once
             Some(writer) => match writer.apply() {
                 Err(error) => Some(refused(format!("did not apply: {}", error.what))),
