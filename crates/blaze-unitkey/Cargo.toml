@@ -1,0 +1,35 @@
+[package]
+name = "blaze-unitkey"
+description = "Task::Key of the keyed driver (D39, docs/v2/plan/design/read-addressed.md): a file's FileImage record from its bytes, and every key of a unit (manifest, surface, each body) from its own text alone, reading nothing of any other unit; sans-IO, reads no file"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The kinds and their keys (`kind::{FileImage, Surface, Body, UnitManifest}`), the record head,
+# the `Sections` root and `StableId`.
+blaze-keyed.workspace = true
+# Plain records: `record!`, `Writer`, `Slice`, `record_at`.
+blaze-format.workspace = true
+# `ContentId`, `Hasher`: every hash here.
+blaze-ids.workspace = true
+# The parser and the tree a file image holds; `builtin_attrs`, the views.
+syntax.workspace = true
+# `#[cfg]` predicates read from the tree (`CfgExpr::parse_from_view`) and a unit's options.
+cfg.workspace = true
+# `Symbol`, the atoms `CfgOptions` holds.
+intern.workspace = true
+
+[dev-dependencies]
+hegeltest.workspace = true
+
+[lints]
+workspace = true
