@@ -16,7 +16,7 @@ pub enum Namespace {
     Macros,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct Item<Def, Import = ImportId> {
     pub def: Def,
     pub vis: Visibility,
@@ -36,7 +36,7 @@ pub type ValuesItem = Item<ModuleDefId, ImportOrGlob>;
 // May be Externcrate for `[macro_use]`'d macros
 pub type MacrosItem = Item<MacroId, ImportOrExternCrate>;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, blaze_memo::Home)]
 pub struct PerNs {
     pub types: Option<TypesItem>,
     pub values: Option<ValuesItem>,
@@ -45,7 +45,7 @@ pub struct PerNs {
 
 // Ids are 8 bytes (index and generation), a `Visibility` a tag and a module id, a def a tag
 // and an id; each `Option` lives in a niche of the def's tag, so a `PerNs` is three items and
-// no more. `item_scope` stores none of these: it packs an entry into 40 bytes.
+// no more. `item_scope` stores none of these: it packs an entry into 36 bytes.
 const _: () = {
     assert!(size_of::<TypesItem>() <= 44);
     assert!(size_of::<ValuesItem>() <= 44);

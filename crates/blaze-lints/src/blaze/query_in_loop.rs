@@ -3,13 +3,13 @@
 //! memo; one call of the batch query records one edge, and is one memo to keep valid.
 //!
 //! A query is [`lock_across_query::query_of`]'s: a function an attribute macro of
-//! `blaze_query_macros` made, or a method of a trait implemented for `base_db::Db`. Per element
+//! `blaze_memo_macros` made, or a method of a trait implemented for `base_db::Db`. Per element
 //! is [`per_item`]'s (the body of a `for` loop, or a closure given to an iterator's method), and
 //! one of the call's arguments reads a local holding the element, so a call whose key is the
 //! same every time (a loop-invariant query) is not this lint's.
 //!
 //! Flagged only when a batch can be named, so every finding has a fix to make: a query of the
-//! same kind (made by one of `blaze_query_macros`' macros in the same module, or a method of the
+//! same kind (made by one of `blaze_memo_macros`' macros in the same module, or a method of the
 //! same database trait) whose return type holds the per-item query's return type as its
 //! element: a slice or an array of it, a collection that is `IntoIterator` (`Vec`, a map, a
 //! `SmallVec`, not `Option` or `Result`) whose type arguments name it, alone or in a tuple

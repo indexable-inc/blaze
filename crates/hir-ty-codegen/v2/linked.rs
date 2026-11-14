@@ -72,8 +72,8 @@ pub struct InputsWork {
     pub scanned: usize,
     /// Functions and statics whose relocations and lines were read for the anchors they name.
     pub functions: usize,
-    /// Bodies and declarations whose kept tables were encoded again because the engine named
-    /// their positions as changed since the last link: the edit's, never the program's.
+    /// Bodies and declarations whose kept tables were encoded again: none while the arenas
+    /// they were made under live (a control's sweep takes every one).
     pub verified: usize,
     /// Tables encoded, and their bytes.
     pub made: usize,
@@ -207,7 +207,7 @@ fn error(what: String) -> CodegenError {
 /// blocks, which an edit of a function's body changes for no crate. Asked as a plain
 /// function it walked them all again every link (2.8 ms of a one-function edit of hello
 /// world, `link natives`); as a memo, a crate nothing was written in is one check.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
     // alloc: an error's name of the crate
     let named = || format!("crate `{}`", krate.named(db));
@@ -347,18 +347,18 @@ static SERIAL: AtomicU64 = AtomicU64::new(1);
 
 const NOTHING_KEPT: &str = "no link inputs are kept for this build or its base: the first link \
                             of the program since the daemon started, or a link failed since";
-const LIBRARY_WRITTEN: &str = "a library input was written since the last link";
+const ARENA_DROPPED: &str = "an arena of the session memo the kept tables' owners are of was \
+                             dropped since the last link (an edit of its crate)";
 const RENAMED: &str = "the build names a file otherwise than the last link did, or no longer";
-const UNNAMED: &str = "the query engine cannot name what changed since the last link";
 
 /// A bug planted in [`Kept::advance`], for the tests' controls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(super) enum Plant {
     #[default]
     None,
-    /// The engine is not asked what changed: a body an edit moved keeps its old table
-    /// (`the_oracle_catches_a_moved_body_not_encoded_again`).
-    Unasked,
+    /// What is kept is taken though an arena it was made under was dropped: a body an edit
+    /// moved keeps its old table (`the_oracle_catches_a_moved_body_not_encoded_again`).
+    CarriesDropped,
     /// Every watched owner is taken as changed and its tables encoded again, as the link
     /// did before it asked the engine's changed set: right tables, at a cost of the program
     /// (`the_oracle_catches_a_link_that_asks_of_every_body`).
@@ -405,17 +405,18 @@ struct Watch {
 ///
 /// The invariant: `named` counts, for each anchor, the functions and statics of the build
 /// `built` that name it (`named_by`); `tables` holds exactly the anchors `named` holds, each
-/// with the id of its table as encoded in the view `view`; `watched` holds every owner of a
-/// table kept that is not of library inputs alone, with those tables.
+/// with the id of its table as encoded while the session memo's arenas were `arenas`;
+/// `watched` holds every owner of a table kept, with those tables.
 struct Kept {
     database: base_db::Nonce,
     /// The tests' hashes ([`HashSource`]'s `ById`), whose anchors are others.
     by_id: bool,
     built: BuiltId,
     serial: u64,
-    /// The database's view the tables are of, and the view its last library write opened.
-    view: u64,
-    durable_view: u64,
+    /// The session memo's arenas the tables were encoded under, ascending. The owners are
+    /// ids ([`blaze_memo::Gid`]), which name the same thing only while their arena lives, and
+    /// an edit drops its crate's arena: while these are the memo's, no position moved.
+    arenas: Vec<blaze_memo::ArenaId, Global>,
     /// The items resolved, and of those that resolve to nothing how many and the least.
     items: HashSet<ItemKey, Global>,
     unresolved: Option<(usize, ItemKey)>,
@@ -425,9 +426,6 @@ struct Kept {
     named: HashMap<ContentId, u32, Global>,
     tables: HashMap<ContentId, ContentId, Global>,
     watched: HashMap<Owner, Watch, Global>,
-    /// The owners seen durable ([`is_durable`]) in `durable_view`: no edit moves them while
-    /// it is the view.
-    durable: HashSet<Owner, Global>,
     /// What the build calls each file a table names: the encodings hold the names, so a
     /// link that names one otherwise makes every table again.
     files: HashMap<base_db::FileId, String, Global>,
@@ -474,13 +472,11 @@ fn by_id(hashes: &HashSource) -> bool {
     }
 }
 
-/// Whether `owner`'s positions, fetched in this view, are of library inputs alone: no write
-/// below a library's changes them.
-fn is_durable(db: &Db, owner: Owner) -> bool {
-    match owner {
-        Owner::Body(it) => span_places::durable(db, it) && span_bases::durable(db, it),
-        Owner::Declared(it) => crate::declaration_location::durable(db, it),
-    }
+/// The session memo's arenas now, ascending.
+fn arenas_of(db: &Db) -> Vec<blaze_memo::ArenaId, Global> {
+    let mut arenas = Vec::new_in(Global);
+    arenas.extend(blaze_memo::Database::memo(db).arenas());
+    arenas
 }
 
 /// The table of `source`, encoded.
@@ -497,7 +493,7 @@ fn encoded(
             encode(db, hashes, files, &cells, &bases)
         }
         Source::Declared(func) => {
-            let at = (*crate::declaration_location(db, func))
+            let at = crate::declaration_location(db, func)
                 // alloc: an error
                 .ok_or_else(|| format!("{func:?} is declared nowhere a position can name"))?;
             // Its one span is its base: a line added above it changes the base alone.
@@ -508,15 +504,12 @@ fn encoded(
 
 impl Kept {
     fn empty(db: &Db, hashes: &HashSource, built: BuiltId) -> Kept {
-        let (database, view) = db.nonce_and_revision();
-        let durable_view = blaze_query::db::Database::storage(db).durable_view().as_u64();
         Kept {
-            database,
+            database: db.nonce(),
             by_id: by_id(hashes),
             built,
             serial: 0,
-            view: view.as_u64(),
-            durable_view,
+            arenas: arenas_of(db),
             // alloc: per program kept, its link inputs' index, which lives as long as it
             items: HashSet::new_in(Global),
             unresolved: None,
@@ -525,7 +518,6 @@ impl Kept {
             named: HashMap::new_in(Global), // alloc: as `items`
             tables: HashMap::new_in(Global), // alloc: as `items`
             watched: HashMap::new_in(Global), // alloc: as `items`
-            durable: HashSet::new_in(Global), // alloc: as `items`
             files: HashMap::new_in(Global), // alloc: as `items`
         }
     }
@@ -647,8 +639,7 @@ impl Kept {
     }
 
     /// Encodes the table of each of `wanted` (sorted, each once) and keeps its id, watching
-    /// its owner where its positions are not of library inputs alone. An anchor of no table
-    /// found is an error naming it and what names it.
+    /// its owner. An anchor of no table found is an error naming it and what names it.
     #[blaze::renders_positions]
     fn make(
         &mut self,
@@ -676,15 +667,10 @@ impl Kept {
                 if !watch.tables.iter().any(|it| it.0 == anchor) {
                     watch.tables.push((anchor, source));
                 }
-            } else if !self.durable.contains(&owner) {
-                // Its positions were fetched for the encoding, so the row is current.
-                if is_durable(db, owner) {
-                    self.durable.insert(owner);
-                } else {
-                    // alloc: per owner watched, its tables the code names, a few
-                    let tables = vec![(anchor, source)];
-                    self.watched.insert(owner, Watch { tables });
-                }
+            } else {
+                // alloc: per owner watched, its tables the code names, a few
+                let tables = vec![(anchor, source)];
+                self.watched.insert(owner, Watch { tables });
             }
             tables.push(Table { anchor, id, bytes });
         }
@@ -736,8 +722,8 @@ impl Kept {
         )
     }
 
-    /// Brings what is kept, of the build `self.built` in the view `self.view`, to `built` in
-    /// the database's view now: the tables new or changed, and the anchors gone. `Ok(Err)`
+    /// Brings what is kept, of the build `self.built` under the arenas `self.arenas`, to
+    /// `built` in the database now: the tables new or changed, and the anchors gone. `Ok(Err)`
     /// says why what is kept can't be brought there, and every table is to be made; what is
     /// kept is then of no use. `plant` is a control's bug ([`Plant`]).
     #[blaze::renders_positions]
@@ -749,10 +735,14 @@ impl Kept {
         work: &mut InputsWork,
         plant: Plant,
     ) -> Result<Result<(Vec<Table>, Vec<ContentId>), &'static str>, String> {
-        let (_, view) = db.nonce_and_revision();
-        let durable_view = blaze_query::db::Database::storage(db).durable_view().as_u64();
-        if durable_view != self.durable_view {
-            return Ok(Err(LIBRARY_WRITTEN));
+        // No changed set names the bodies an edit moved (front-end-on-memo.md, rule 1), and
+        // an edit drops its crate's arena, so the owners kept of it are ids of nothing: what
+        // is kept is of use only while every arena it was made under lives. Coarser than the
+        // floor: an edit makes every table again (until per-item records, the spec's cost of
+        // decision 4).
+        let carried = blaze_memo::Database::memo(db).arenas().eq(self.arenas.iter().copied());
+        if !carried && plant != Plant::CarriesDropped {
+            return Ok(Err(ARENA_DROPPED));
         }
         // alloc: per link, the anchors an edit names anew or stops naming, a few
         let (mut wanted, mut dropped) = (Vec::new(), Vec::new());
@@ -810,14 +800,11 @@ impl Kept {
         removed.sort_unstable();
         removed.dedup();
         // The tables kept, as the database has their positions now.
-        let mut tables = match view.as_u64() == self.view {
-            true => Vec::new(), // alloc: none, empty
-            false => match self.verify(db, hashes, work, plant)? {
-                Ok(changed) => changed,
-                Err(why) => return Ok(Err(why)),
-            },
+        let mut tables = match self.verify(db, hashes, work, plant)? {
+            Ok(changed) => changed,
+            Err(why) => return Ok(Err(why)),
         };
-        self.view = view.as_u64();
+        self.arenas = arenas_of(db);
         // The tables named anew.
         wanted.retain(|it| self.named.contains_key(it) && !self.tables.contains_key(it));
         wanted.sort_unstable();
@@ -832,15 +819,12 @@ impl Kept {
         Ok(Ok((tables, removed)))
     }
 
-    /// Encodes again the kept tables of each watched owner whose positions changed since the
-    /// view the tables are of, and gives those whose encoding is another. Which owners those
-    /// are is the engine's answer ([`positions`]' and `declaration_location`'s
-    /// `changed_since`, the changed set walked from what was written): a link asks of the
-    /// bodies an edit moved, never of every body it watches. The engine may name more than
-    /// changed (a file whose rows are a wide level of its walk is named whole): such a body's
-    /// tables are encoded again and found the same, a cost of that file. Until 2026-11-11 it asked a
-    /// stamp memo of each watched owner each link, 4,590 memos verified for a one-line edit
-    /// of hello world. An owner none of whose tables is kept is no longer watched.
+    /// Checks that the build names each file a kept table names as it did, and gives the kept
+    /// tables whose encoding is another. Called only while every arena the tables were made
+    /// under lives ([`Self::advance`]), so no owner's positions moved and none is encoded
+    /// again; `Plant::Sweeps` encodes every watched owner again, a control. Until 2026-11-13
+    /// the query engine's changed set named the bodies an edit moved, and they alone were
+    /// encoded again; the session memo has none.
     #[blaze::renders_positions]
     fn verify(
         &mut self,
@@ -849,7 +833,6 @@ impl Kept {
         work: &mut InputsWork,
         plant: Plant,
     ) -> Result<Result<Vec<Table>, &'static str>, String> {
-        use blaze_query::db::{Changed, FromIdIn as _, View};
         // A file gone from the build has no name: its tables are of no use either.
         for (file, name) in &self.files {
             if hashes.file_name(db, *file).ok().as_ref() != Some(name) {
@@ -859,37 +842,8 @@ impl Kept {
         // alloc: per link, the owners an edit moved, a few
         let mut moved: Vec<Owner> = Vec::new();
         match plant {
-            Plant::Unasked => {}
+            Plant::None | Plant::CarriesDropped => {}
             Plant::Sweeps => moved.extend(self.watched.keys().copied()),
-            Plant::None => {
-                let since = View::from_u64(self.view);
-                let storage = blaze_query::db::Database::storage(db);
-                // A body's own edit changes its places; a line added above it, its bases
-                // alone: either is a body whose tables are encoded again.
-                let (Changed::Keys(placed), Changed::Keys(based), Changed::Keys(declared)) = (
-                    span_places::changed_since(db, since),
-                    span_bases::changed_since(db, since),
-                    crate::declaration_location::changed_since(db, since),
-                ) else {
-                    return Ok(Err(UNNAMED));
-                };
-                // A key the engine names that is no owner's (an id of something an edit
-                // removed) is of no table kept: the delta took its namers.
-                let bodies = placed
-                    .into_iter()
-                    .chain(based)
-                    .filter_map(|id| DefWithBodyId::from_id_in(storage, id).map(Owner::Body));
-                let declared = declared
-                    .into_iter()
-                    .filter_map(|id| FunctionId::from_id_in(storage, id).map(Owner::Declared));
-                // alloc: per link, the owners an edit moved, each once
-                let mut seen: HashSet<Owner, Global> = HashSet::new_in(Global);
-                for owner in bodies.chain(declared) {
-                    if self.watched.contains_key(&owner) && seen.insert(owner) {
-                        moved.push(owner);
-                    }
-                }
-            }
         }
         work.verified += moved.len();
         // alloc: per link, the tables an edit changed, a few
@@ -922,7 +876,7 @@ fn inputs(
     plant: Plant,
     links: &Links,
 ) -> Result<LinkInputs, String> {
-    let (database, _) = db.nonce_and_revision();
+    let database = db.nonce();
     let tests = by_id(hashes);
     let taken = {
         let mut kept = links.kept.lock();
@@ -1023,7 +977,7 @@ pub(super) struct Bases {
 /// Each span's place, item-relative ([`Places`]). Memoized, and kept across an edit above the
 /// body: a link after a line added above a body finds no place of it again, it adds the
 /// body's [`span_bases`] ([`table_rows`]). A body's own edit finds them all again.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[blaze::renders_positions]
 pub(super) fn span_places(db: &Db, owner: DefWithBodyId) -> Places {
     let store = BodyStore::of(db, owner);
@@ -1052,9 +1006,9 @@ pub(super) fn span_places(db: &Db, owner: DefWithBodyId) -> Places {
 }
 
 /// Where `owner`'s places are counted from ([`Bases`]). Memoized: a line added above the body
-/// changes this and nothing else of its positions, so the link is told the body moved
-/// (`span_bases::changed_since`) and finds its rows by adding, not by placing.
-#[blaze_query::tracked]
+/// changes this and nothing else of its positions, so the link finds its rows by adding,
+/// not by placing.
+#[blaze_memo::tracked]
 #[blaze::renders_positions]
 pub(super) fn span_bases(db: &Db, owner: DefWithBodyId) -> Bases {
     Bases { anchor: *crate::places::anchor_location(db, owner), owner: owner_location(db, owner) }
@@ -1092,7 +1046,7 @@ impl Cell {
 fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
     use hir_ty_mir::mir::location::{location_of, written_range};
     let source = match owner {
-        DefWithBodyId::FunctionId(func) => return *crate::declaration_location(db, func),
+        DefWithBodyId::FunctionId(func) => return crate::declaration_location(db, func),
         DefWithBodyId::StaticId(it) => crate::written_node(db, it.lookup(db)),
         DefWithBodyId::ConstId(it) => crate::written_node(db, it.lookup(db)),
         DefWithBodyId::VariantId(it) => crate::written_node(db, it.lookup(db)),
@@ -1229,7 +1183,7 @@ fn encode(
 pub(super) fn debug_name(db: &Db, kind: &Kind) -> String {
     match kind {
         Kind::Code(instance, _) => {
-            blaze_query::db::attach(db, || crate::backtrace_name(db, instance))
+            blaze_memo::attach(db, || crate::backtrace_name(db, instance))
         }
         Kind::Start(main) => match crate::target_of_crate(db, main.krate(db)) {
             // alloc: per instance described, its debug name

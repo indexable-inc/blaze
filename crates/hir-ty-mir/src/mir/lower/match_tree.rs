@@ -587,10 +587,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     VariantId::UnionId(_) => return None,
                 };
                 let mut inside = Vec::new_in(frame);
+                let table = self.resolver.ctx_table();
                 for field in args.iter() {
                     let mut within = variant_place(variant, &place, frame);
                     let hygiene = self.store.record_field_hygiene(field.pat);
-                    let id = fields.field_written(self.db, variant, &field.name, hygiene)?;
+                    let id = fields.field_written(self.db, table, variant, &field.name, hygiene)?;
                     within.push(Step::Field(u32::from(id.into_raw())));
                     self.pairs_of(field.pat, within, &mut inside)?;
                 }

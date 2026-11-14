@@ -22,7 +22,10 @@ smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
 la-arena.workspace = true
+# Only the edit-work stage names (`blaze_query::edit_work`); the front end's engine is blaze-memo.
 blaze-query.workspace = true
+blaze-memo.workspace = true
+blaze-graph.workspace = true
 
 rustc_type_ir.workspace = true
 

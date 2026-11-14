@@ -22,6 +22,7 @@ use base_db::{Crate, Db};
 use base_db::{FileId, VfsPath};
 use blaze_format::cursor::{Put, Reader};
 use blaze_hash::{HashMap, HashSet};
+use blaze_ids::ContentId;
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
@@ -104,36 +105,36 @@ pub struct Frozen {
     pub mode: Mode,
 }
 
-/// The crates whose `DefMap` is frozen, set by whoever has the bytes: read outside queries
-/// alone. A query reads its crate's own ([`DefMapSlot`], `crate::deps::given`).
-#[blaze_query::input(singleton, debug)]
-pub struct FrozenDefMaps {
-    #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
+/// The fact a crate's frozen slot of `kind` (`"def map"`, `"lang items"`) is read by: the
+/// slot's id, of the crate's own stable id and the kind, and the digest of the bytes and the
+/// mode.
+pub fn frozen_fact(krate_id: ContentId, kind: &str, frozen: &Frozen) -> blaze_memo::Fact {
+    let id = blaze_ids::Hasher::new("hir-def frozen slot")
+        .id(&krate_id)
+        .part(kind.as_bytes())
+        .finish();
+    let digest = blaze_ids::Hasher::new("hir-def frozen bytes")
+        .part(&frozen.bytes)
+        .part(&[frozen.mode as u8])
+        .finish();
+    blaze_memo::Fact { id, digest }
 }
 
-/// Has name resolution use `maps`.
-pub fn set(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // clone: the handle of the map set before, to tell which crates' bytes move
-    let was = FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db).clone());
-    crate::deps::given::give_changed::<DefMapSlot, Frozen>(db, was.as_deref(), &maps);
-    // alloc: Check/Verify only, which record differences; never when serving
-    let maps = Arc::new(maps);
-    match FrozenDefMaps::try_get(db) {
-        Some(it) => {
-            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
-        }
-        None => {
-            _ = FrozenDefMaps::new(db, Durability::HIGH, maps);
-        }
-    }
+/// Has name resolution use each crate's frozen `DefMap` of `entries` from the commit of `edit`
+/// on, given in the crate's own slot ([`DefMapSlot`]) with the fact it is read by
+/// ([`frozen_fact`]). Called by the driver in an edit of the world; how many crates' slots
+/// moved.
+pub fn give(
+    edit: &mut base_db::Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Frozen)>,
+) -> usize {
+    crate::deps::given::give_each::<DefMapSlot, Frozen>(edit, entries)
 }
 
-/// The kind of a crate's slot holding its entry of [`FrozenDefMaps`].
+/// The kind of a crate's slot holding its frozen `DefMap`.
 pub struct DefMapSlot;
 
-/// The kind of a crate's slot holding its entry of [`FrozenLangItems`].
+/// The kind of a crate's slot holding its frozen lang items.
 pub struct LangItemsSlot;
 
 /// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
@@ -227,18 +228,15 @@ pub fn check_frozen(
     }
 }
 
-/// The frozen `DefMap` of `krate`, by value: a [`set`] that leaves it as it was is backdated
-/// here, so it runs none of the queries of `krate` again.
-#[blaze_query::tracked(returns(as_ref))]
-fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
-    // clone: a count of the image the bytes are in, or of their own buffer
-    krate.given::<DefMapSlot, Frozen>(db).cloned()
+/// The frozen `DefMap` of `krate`, a read of its own slot (the getter notes the slot's fact).
+fn frozen_def_map(db: &Db, krate: Crate) -> Option<&Frozen> {
+    krate.given::<DefMapSlot, Frozen>(db)
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it: the
-/// crate's def map read from its pages ([`pages::set`]), a name at a time; nothing decodes a
+/// crate's def map read from its pages ([`pages::give`]), a name at a time; nothing decodes a
 /// crate's def map whole. Under [`Mode::Verify`] what was read is written again as pages and
-/// compared with the record ([`FrozenDefMaps`] holds it whole, for that alone); under
+/// compared with the record (its [`DefMapSlot`] holds it whole, for that alone); under
 /// [`Mode::Check`] the crate is given no pages and is resolved, and [`check`] compares. Pages
 /// that do not read stop the query with [`Unreadable`], failing the job that asked: never a
 /// panic of the daemon, and never a crate resolved instead.
@@ -246,8 +244,7 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     if !pages::is_paged(db, krate) {
         return None;
     }
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
+    // The value is the record's: the read of the crate's pages slot notes its fact.
     let (def_map, local) = pages::served(db, krate);
     if let Some(frozen) = frozen_def_map(db, krate)
         && frozen.mode == Mode::Verify
@@ -255,15 +252,13 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
         match pages::encode_of(db, krate, &def_map, &local) {
             Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
             Ok(written) => differs(db, krate, "what was read of it", &written, &frozen.bytes),
-            // alloc: error path
             Err(why) => differs(db, krate, &format!("what was read of it ({why})"), &[], &[]),
         }
     }
     Some((def_map, local))
 }
 
-/// Whether [`served`] gives `krate`'s `DefMap` from its pages: the name resolution maintainer
-/// never maintains such a crate.
+/// Whether [`served`] gives `krate`'s `DefMap` from its pages.
 pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
     pages::is_paged(db, krate)
 }
@@ -271,28 +266,34 @@ pub(super) fn is_served(db: &Db, krate: Crate) -> bool {
 /// A test's serve of `records` (each crate's def map pages, as [`pages::encode`] writes them)
 /// in `mode`, held whole in memory, as `crate::deps::serve` gives a crate's records: its pages
 /// under [`Mode::Serve`] and [`Mode::Verify`], the record whole under [`Mode::Check`] and
-/// [`Mode::Verify`].
+/// [`Mode::Verify`]. Given in the next commit of `db`.
 #[cfg(test)]
 pub(crate) fn serve_pages(db: &mut Db, records: &[(Crate, Vec<u8>)], mode: Mode) {
+    let slot_id = |bytes: &[u8]| ContentId::of("blaze test crate", bytes);
+    let mut edit = db.edit();
     if mode != Mode::Serve {
-        let maps = (records.iter())
-            .map(|(krate, bytes)| (*krate, Frozen { bytes: bytes.as_slice().into(), mode }))
-            .collect();
-        set(db, maps);
+        give(
+            &mut edit,
+            records.iter().map(|(krate, bytes)| {
+                let frozen = Frozen { bytes: bytes.as_slice().into(), mode };
+                (*krate, frozen_fact(slot_id(bytes), "def map", &frozen), frozen)
+            }),
+        );
     }
     if mode != Mode::Check {
-        let maps = (records.iter())
-            .map(|(krate, bytes)| {
-                let held: crate::deps::ImageBuf =
-                    Arc::new(blaze_format::Aligned::copy_from(bytes));
-                let key = blaze_ids::ContentId::of("blaze test def map pages", bytes);
+        pages::give(
+            &mut edit,
+            records.iter().map(|(krate, bytes)| {
+                let held: crate::deps::ImageBuf = Arc::new(blaze_format::Aligned::copy_from(bytes));
+                let key = ContentId::of("blaze test def map pages", bytes);
                 // dyn: a test's holder of one record, one a crate
                 let source: Arc<dyn pages::PageSource> = Arc::new(pages::Whole(held));
-                (*krate, pages::Paged { key, source })
-            })
-            .collect();
-        pages::set(db, maps);
+                let paged = pages::Paged { key, source };
+                (*krate, pages::pages_fact(slot_id(bytes), &paged), paged)
+            }),
+        );
     }
+    _ = edit.commit();
 }
 
 /// Records a difference between the `DefMap` resolving found, written as pages, and the
@@ -320,45 +321,27 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
     dec.files().err()
 }
 
-/// The crates whose lang items are frozen, set by whoever has the bytes: read outside
-/// queries alone. A query reads its crate's own ([`LangItemsSlot`]).
-#[blaze_query::input(singleton, debug)]
-pub struct FrozenLangItems {
-    #[returns(ref)]
-    pub maps: Arc<HashMap<Crate, Frozen, Global>>,
+/// Has finding the lang items of each crate of `entries` use its frozen ones from the commit
+/// of `edit` on, given in the crate's own slot ([`LangItemsSlot`]) with the fact it is read by
+/// ([`frozen_fact`] of `"lang items"`). Called by the driver in an edit of the world; how
+/// many crates' slots moved.
+pub fn give_lang_items(
+    edit: &mut base_db::Edit<'_>,
+    entries: impl IntoIterator<Item = (Crate, blaze_memo::Fact, Frozen)>,
+) -> usize {
+    crate::deps::given::give_each::<LangItemsSlot, Frozen>(edit, entries)
 }
 
-/// Has finding the lang items of a crate use `maps`.
-pub fn set_lang_items(db: &mut Db, maps: HashMap<Crate, Frozen, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // clone: the handle of the map set before, to tell which crates' bytes move
-    let was = FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db).clone());
-    crate::deps::given::give_changed::<LangItemsSlot, Frozen>(db, was.as_deref(), &maps);
-    // alloc: once per load of the frozen bytes
-    let maps = Arc::new(maps);
-    match FrozenLangItems::try_get(db) {
-        Some(it) => {
-            it.set_maps(db).with_durability(Durability::HIGH).to(maps);
-        }
-        None => {
-            _ = FrozenLangItems::new(db, Durability::HIGH, maps);
-        }
-    }
-}
-
-/// The frozen lang items of `krate`, by value, as [`frozen_def_map`] is.
-#[blaze_query::tracked(returns(as_ref))]
-fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
-    // clone: a count of the image the bytes are in, or of their own buffer
-    krate.given::<LangItemsSlot, Frozen>(db).cloned()
+/// The frozen lang items of `krate`, a read of its own slot.
+fn frozen_lang_items(db: &Db, krate: Crate) -> Option<&Frozen> {
+    krate.given::<LangItemsSlot, Frozen>(db)
 }
 
 /// What [`crate_lang_items`](crate::lang_item::crate_lang_items) reads for `krate` instead of
 /// finding them, when they are frozen.
 pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<LangItems>>> {
     let frozen = frozen_lang_items(db, krate).filter(|it| it.mode != Mode::Check)?;
-    // The value is the record's, found by content: told to the engine (`row::STORED`).
-    blaze_query::db::report_stored_read(db);
+    // The value is the record's: the read of the crate's lang items slot notes its fact.
     let read = || {
         let mut dec = Dec::new_checked(db, krate, &frozen.bytes)?;
         let items = dec.option(|dec| {
@@ -393,7 +376,7 @@ pub(crate) fn served_lang_items(db: &Db, krate: Crate) -> Option<Option<Box<Lang
 /// input, and the write that moves one withdraws the image in the same write (`deps`'
 /// implied write), so this is a bug in the key or in that withdrawal. Nothing is resolved in
 /// its place. It unwinds out of the query that asked, with this as its payload, as
-/// [`super::Unmaintained`] does, and the driver that catches it fails that one job with it as
+/// [`super::FixpointLimit`] does, and the driver that catches it fails that one job with it as
 /// the error (rule 20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
@@ -413,7 +396,7 @@ impl Unreadable {
         Unreadable { krate, name, kind, why }
     }
 
-    /// Unwinds with `self` as the payload, logged first, as [`super::Unmaintained::throw`] is.
+    /// Unwinds with `self` as the payload, logged first, as [`super::FixpointLimit::throw`] is.
     pub fn throw(self) -> ! {
         tracing::error!(target: "blaze", "{self}");
         std::panic::panic_any(self)
@@ -628,9 +611,13 @@ pub struct Enc<'a> {
     /// The files named, in the order of their index.
     file_order: Vec<FileId>,
     calls: HashMap<MacroCallId, u32, Global>,
-    contexts: HashMap<SyntaxContext, u32, Global>,
+    /// Each context written whole, by the table it is of: a context's word is crate-local.
+    contexts: HashMap<(blaze_memo::ArenaId, SyntaxContext), u32, Global>,
     call_hashes: HashMap<MacroCallId, u128, Global>,
-    context_hashes: HashMap<SyntaxContext, u128, Global>,
+    context_hashes: HashMap<(blaze_memo::ArenaId, SyntaxContext), u128, Global>,
+    /// The table the contexts being written are of: the crate's own, or while a macro call's
+    /// loc is written, the calling crate's (`MacroCallId::arena`).
+    ctx_arena: blaze_memo::ArenaId,
     modules: HashMap<ModuleId, (u32, u32), Global>,
     indexed: HashSet<Crate, Global>,
     /// The body each block that was looked for is in.
@@ -695,6 +682,7 @@ impl<'a> Enc<'a> {
             contexts: HashMap::new_in(Global),
             call_hashes: HashMap::new_in(Global),
             context_hashes: HashMap::new_in(Global),
+            ctx_arena: blaze_memo::Id::gid(krate).arena(),
             modules: HashMap::new_in(Global),
             indexed: HashSet::new_in(Global),
             block_owners: HashMap::new_in(Global),
@@ -906,7 +894,8 @@ impl Enc<'_> {
             // A file outside the VFS ([`INCLUDED`]): of the first crate of the closure that
             // read it, by its ported path.
             let read_by = |&krate: &Crate| {
-                db.files().included_by(db, krate).iter().any(|it| it.0.as_path() == outside)
+                let key = krate.key(db);
+                db.files().included_by(db, key).iter().any(|it| it.0.as_path() == outside)
             };
             let owner = self.closure.iter().position(read_by).ok_or_else(|| {
                 // alloc: error path
@@ -1067,8 +1056,11 @@ impl Enc<'_> {
         let MacroCallLoc { def, krate, kind, ctxt, macro_depth } = loc;
         self.def_id(def)?;
         self.krate(krate)?;
-        self.call_kind(kind)?;
-        self.context(ctxt)?;
+        // The loc's contexts (its spans' and its own) are of the calling crate's table.
+        let outer = std::mem::replace(&mut self.ctx_arena, blaze_memo::Id::gid(call).arena());
+        let written = self.call_kind(kind).and_then(|()| self.context(ctxt));
+        self.ctx_arena = outer;
+        written?;
         self.u32(macro_depth);
         // What `include!` expands to is the file it reads, which the header must name: one a
         // build script writes may not be there yet, or may have other text, where it is read.
@@ -1194,19 +1186,23 @@ impl Enc<'_> {
         Ok(())
     }
 
+    /// Writes `ctx`, a context of the table [`Enc::ctx_arena`] names, by its structure (root
+    /// and edition, or its expansion, transparency, edition, parent and opaque forms), never
+    /// its word, which is crate-local and follows interning order (port decision 3).
     pub(crate) fn context(&mut self, ctx: SyntaxContext) -> R {
         if ctx.is_root() {
             self.u8(0);
-            self.edition(ctx.edition(self.db));
+            self.edition(ctx.edition());
             return Ok(());
         }
+        let key = (self.ctx_arena, ctx);
         if self.fingerprinting {
             self.u8(1);
             let print = self.context_hash(ctx)?;
             self.out.put_u128(print);
             return Ok(());
         }
-        if let Some(&index) = self.contexts.get(&ctx) {
+        if let Some(&index) = self.contexts.get(&key) {
             self.u8(2);
             self.u32(index);
             return Ok(());
@@ -1214,31 +1210,33 @@ impl Enc<'_> {
         self.u8(1);
         self.context_data(ctx)?;
         let index = self.contexts.len() as u32;
-        self.contexts.insert(ctx, index);
+        self.contexts.insert(key, index);
         Ok(())
     }
 
     fn context_hash(&mut self, ctx: SyntaxContext) -> R<u128> {
-        if let Some(&it) = self.context_hashes.get(&ctx) {
+        let key = (self.ctx_arena, ctx);
+        if let Some(&it) = self.context_hashes.get(&key) {
             return Ok(it);
         }
         let print = hash128(&self.fingerprint(|enc| enc.context_data(ctx))?);
-        self.context_hashes.insert(ctx, print);
+        self.context_hashes.insert(key, print);
         Ok(print)
     }
 
     fn context_data(&mut self, ctx: SyntaxContext) -> R {
-        let db = self.db;
-        let outer = ctx.outer_expn(db).ok_or("a syntax context with no expansion")?;
+        let (db, arena) = (self.db, self.ctx_arena);
+        let outer = ctx.outer_expn(db, arena).ok_or("a syntax context with no expansion")?;
         self.call(MacroCallId::from(outer))?;
-        self.u8(match ctx.outer_transparency(db) {
+        self.u8(match ctx.outer_transparency(db, arena) {
             Transparency::Transparent => 0,
             Transparency::SemiOpaque => 1,
             Transparency::Opaque => 2,
         });
-        self.edition(ctx.edition(db));
-        self.context(ctx.parent(db))?;
-        for other in [ctx.opaque(db), ctx.opaque_and_semiopaque(db)] {
+        self.edition(ctx.edition());
+        // Its parent and opaque forms are of the same table.
+        self.context(ctx.parent(db, arena))?;
+        for other in [ctx.opaque(db, arena), ctx.opaque_and_semiopaque(db, arena)] {
             if other == ctx {
                 self.u8(0);
             } else {
@@ -2438,7 +2436,11 @@ pub struct Dec<'a> {
     /// As `closure`: read from the header, or the pages' files as their head read them.
     files: std::borrow::Cow<'a, [FileId]>,
     calls: Vec<MacroCallId>,
-    contexts: Vec<SyntaxContext>,
+    /// Each context read whole, with the table it was interned in.
+    contexts: Vec<(blaze_memo::ArenaId, SyntaxContext)>,
+    /// While a macro call's loc is read, the calling crate's table, which its contexts are
+    /// interned in; `None`: the crate being read's own ([`Dec::ctx_arena`]).
+    ctx_arena: Option<blaze_memo::ArenaId>,
     /// The modules of the crate being read, in its `DefMap`'s order. As `closure`.
     own: std::borrow::Cow<'a, [ModuleId]>,
     /// Reading the crate's own `DefMap`, whose modules are `own`.
@@ -2460,6 +2462,7 @@ impl<'a> Dec<'a> {
             calls: Vec::new(),
             // alloc: the decoded map's own storage, once per crate served
             contexts: Vec::new(),
+            ctx_arena: None,
             // alloc: the decoded map's own storage, once per crate served
             own: std::borrow::Cow::Owned(Vec::new()),
             in_def_map: false,
@@ -2728,7 +2731,16 @@ impl Dec<'_> {
             NEW => {
                 let loc = self.call_loc()?;
                 let include = includes(&loc);
+                let table = blaze_memo::Id::gid(loc.krate).arena();
                 let call = MacroCallId::new(self.db, loc);
+                if blaze_memo::Id::gid(call).arena() != table {
+                    // alloc: error path
+                    return Err(format!(
+                        "{call:?} is interned in {:?}, not its calling crate's {table:?}, whose \
+                         table its contexts were read into",
+                        blaze_memo::Id::gid(call).arena()
+                    ));
+                }
                 if include {
                     let written = self.file()?;
                     if call.loc(self.db).include_file_id(self.db, call) != Some(written) {
@@ -2747,10 +2759,19 @@ impl Dec<'_> {
     fn call_loc(&mut self) -> R<MacroCallLoc> {
         let def = self.def_id()?;
         let krate = self.krate()?;
-        let kind = self.call_kind()?;
-        let ctxt = self.context()?;
+        // The loc's contexts are interned in the calling crate's table, as [`Enc::call_loc`]
+        // wrote them of it; [`Dec::call`] checks the call is interned there too.
+        let outer = self.ctx_arena.replace(blaze_memo::Id::gid(krate).arena());
+        let read = self.call_kind().and_then(|kind| Ok((kind, self.context()?)));
+        self.ctx_arena = outer;
+        let (kind, ctxt) = read?;
         let macro_depth = self.u32()?;
         Ok(MacroCallLoc { def, krate, kind, ctxt, macro_depth })
+    }
+
+    /// The table the contexts being read are interned in ([`Dec::ctx_arena`]'s field).
+    fn ctx_arena(&self) -> blaze_memo::ArenaId {
+        self.ctx_arena.unwrap_or_else(|| blaze_memo::Id::gid(self.krate).arena())
     }
 
     fn call_kind(&mut self) -> R<MacroCallKind> {
@@ -2851,8 +2872,10 @@ impl Dec<'_> {
                         *it = Some(self.context()?);
                     }
                 }
+                let arena = self.ctx_arena();
                 let ctx = SyntaxContext::new(
                     self.db,
+                    arena,
                     outer.into(),
                     transparency,
                     edition,
@@ -2860,13 +2883,22 @@ impl Dec<'_> {
                     other[0],
                     other[1],
                 );
-                self.contexts.push(ctx);
+                self.contexts.push((arena, ctx));
                 Ok(ctx)
             }
             2 => {
                 let index = self.len()?;
-                // alloc: error path
-                self.contexts.get(index).copied().ok_or_else(|| "a context not read".to_owned())
+                let arena = self.ctx_arena();
+                match self.contexts.get(index) {
+                    Some(&(table, ctx)) if table == arena => Ok(ctx),
+                    // alloc: error path
+                    Some(&(table, _)) => Err(format!(
+                        "context {index} was read into {table:?}'s table and named again in \
+                         {arena:?}'s"
+                    )),
+                    // alloc: error path
+                    None => Err("a context not read".to_owned()),
+                }
             }
             // alloc: error path
             it => Err(format!("context tag {it}")),

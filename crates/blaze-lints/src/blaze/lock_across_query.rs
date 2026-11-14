@@ -7,7 +7,7 @@
 //! `parking_lot`'s (`lock_api`'s `MutexGuard`, `RwLock` read, write and upgradable guards, the
 //! mapped, `Arc` and reentrant ones) or std's (`MutexGuard`, `RwLock`'s guards, the mapped
 //! ones, `ReentrantLockGuard`), itself or held in a tuple, an array or a field. A query is
-//! a function an attribute macro of `blaze_query_macros` made (`#[blaze_query::tracked]`,
+//! a function an attribute macro of `blaze_memo_macros` made (`#[blaze_memo::tracked]`,
 //! `input`, `interned`: the macro the attribute resolves to, read off the function's own
 //! definition), or a method of a trait implemented for `base_db::Db` (`HirDatabase`'s).
 //!
@@ -38,7 +38,7 @@ use super::{
 };
 use crate::check::Cx;
 
-/// The attribute macros of `blaze_query_macros` whose functions are queries.
+/// The attribute macros of `blaze_memo_macros` whose functions are queries.
 const QUERY_MACROS: &[&str] = &["tracked", "input", "interned"];
 
 /// The guards of `lock_api` (whose types `parking_lot`'s are) and of std, by crate.
@@ -90,7 +90,7 @@ pub(super) fn check(cx: &mut Cx<'_, '_>) {
 /// What makes a callee a query, as a finding says it.
 #[derive(Clone)]
 pub(super) enum Query {
-    /// Made by this attribute macro of `blaze_query_macros`.
+    /// Made by this attribute macro of `blaze_memo_macros`.
     Macro(&'static str),
     /// A method of this trait, implemented for `base_db::Db`.
     Database(String),
@@ -99,7 +99,7 @@ pub(super) enum Query {
 impl Query {
     pub(super) fn say(&self) -> String {
         match self {
-            Query::Macro(name) => format!("made by `#[blaze_query::{name}]`"),
+            Query::Macro(name) => format!("made by `#[blaze_memo::{name}]`"),
             Query::Database(name) => format!("a method of `{name}` on the database"),
         }
     }
@@ -252,7 +252,7 @@ pub(super) fn query_of<'db>(
     on_db.then(|| Query::Database(trait_.name(db).as_str().to_owned()))
 }
 
-/// The attribute macro of `blaze_query_macros` that made `f`, if one of [`QUERY_MACROS`] did:
+/// The attribute macro of `blaze_memo_macros` that made `f`, if one of [`QUERY_MACROS`] did:
 /// the macro of the call whose expansion `f` is defined in.
 pub(super) fn query_macro(db: &Db, f: FunctionId) -> Option<&'static str> {
     let HirFileId::MacroFile(call) = DefWithBodyId::from(f).erased_ast_id(db).file_id else {
@@ -260,7 +260,7 @@ pub(super) fn query_macro(db: &Db, f: FunctionId) -> Option<&'static str> {
     };
     let loc = call.loc(db);
     let &MacroDefKind::ProcMacro(id, _, ProcMacroKind::Attr) = &loc.def.kind else { return None };
-    if !facts::crate_is(db, hir::Crate::from(loc.def.krate), "blaze_query_macros") {
+    if !facts::crate_is(db, hir::Crate::from(loc.def.krate), "blaze_memo_macros") {
         return None;
     }
     let HirFileId::FileId(file) = id.file_id else { return None };

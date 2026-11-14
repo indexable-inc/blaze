@@ -69,7 +69,7 @@ use super::{
     sans_io_core::{fn_name, root_path},
     test_code,
 };
-use crate::check::Cx;
+use crate::{check::Cx, kept};
 
 /// How many tests a finding names before it says how many more.
 const SHOWN: usize = 3;
@@ -112,7 +112,7 @@ const INVERSES: &[(&str, &str)] = &[
 
 /// What the body of the workspace function `f` does with its parameters, followed `depth`
 /// levels into the workspace functions it calls.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn summary(db: &Db, f: FunctionId, depth: u32) -> flow::Summary {
     let def = DefWithBodyId::FunctionId(f);
     let Ok(mir) = db.mir_body(InferBodyId::DefWithBodyId(def)) else {
@@ -123,10 +123,20 @@ pub(crate) fn summary(db: &Db, f: FunctionId, depth: u32) -> flow::Summary {
     flow::Summary::of(&flow::run(&body), &lower.mut_params(mir))
 }
 
+/// What a body calls and names ([`lower::Callees`]), kept in the body's arena.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Calls<'db> {
+    /// The functions it calls or names, resolved to their impls where the types say which.
+    pub(crate) fns: &'db [FunctionId],
+    /// The MIR of it or of one of its closures could not be built: what it calls is not known.
+    pub(crate) unread: bool,
+}
+
 /// What a body calls and names, for the walk of what the tests reach.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn callees(db: &Db, def: DefWithBodyId) -> lower::Callees {
-    lower::callees_of(db, def)
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn callees<'db>(db: &'db Db, def: DefWithBodyId) -> Calls<'db> {
+    let found = lower::callees_of(db, def);
+    Calls { fns: kept::slice(db, found.fns), unread: found.unread }
 }
 
 /// One call of the code under test in a test, and what the test observes of it.
@@ -172,7 +182,7 @@ pub(crate) struct Reads {
 }
 
 /// [`Reads`] of the body `def` of test code, once per body and edit.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn test_reads(db: &Db, def: DefWithBodyId) -> Reads {
     let mut out = Reads::default();
     let Ok(mir) = db.mir_body(InferBodyId::DefWithBodyId(def)) else {
@@ -293,7 +303,7 @@ pub(crate) fn test_reads(db: &Db, def: DefWithBodyId) -> Reads {
 
 /// Whether the workspace function `g` calls `f`, itself or through one workspace function.
 fn runs(db: &Db, g: FunctionId, f: FunctionId) -> bool {
-    let first = &callees(db, DefWithBodyId::FunctionId(g)).fns;
+    let first = callees(db, DefWithBodyId::FunctionId(g)).fns;
     first.contains(&f)
         || first.iter().any(|&h| {
             in_workspace(db, h) && callees(db, DefWithBodyId::FunctionId(h)).fns.contains(&f)
@@ -413,9 +423,11 @@ impl Walk {
 }
 
 /// What every test that can see `krate` observes, merged by function, and what they reach;
-/// once per crate and edit.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn strength_index(db: &Db, krate: base_db::Crate) -> Index {
+/// once per crate and edit. Keyed by `top` ([`crate::query::top_crate`]) as well: its scope
+/// is the test targets that depend on `krate`, above it, so the entry lives in `top`'s arena.
+#[blaze_memo::tracked(returns(ref), owns)]
+pub(crate) fn strength_index(db: &Db, krate: base_db::Crate, top: base_db::Crate) -> Index {
+    debug_assert!(krate <= top, "{krate:?} is past the top crate {top:?}");
     let mut index = Index::default();
     
     let mut walk = Walk { queue: Vec::new(), queued: HashSet::new_in(Global) };
@@ -449,7 +461,7 @@ pub(crate) fn strength_index(db: &Db, krate: base_db::Crate) -> Index {
         {
             index.unread.push(fn_name(db, f));
         }
-        for &g in &found.fns {
+        for &g in found.fns {
             let body = DefWithBodyId::FunctionId(g);
             if in_workspace(db, g) && !test_code::is_test_def(db, body) {
                 walk.push(body);
@@ -470,20 +482,29 @@ pub(crate) fn strength_index(db: &Db, krate: base_db::Crate) -> Index {
 }
 
 /// One function of one crate: the key of [`strength`].
-#[blaze_query::interned(debug, unsafe(no_lifetime))]
+/// Two ids, so a key as it is: nothing to intern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct StrengthKey {
-    #[returns(copy)]
-    pub(crate) krate: base_db::Crate,
-    #[returns(copy)]
-    pub(crate) f: FunctionId,
+    krate: base_db::Crate,
+    f: FunctionId,
+    /// The session's greatest crate ([`crate::query::top_crate`]): the index reads the test
+    /// targets that depend on `krate`, above it, so the key names a crate at or above them.
+    top: base_db::Crate,
+}
+
+impl StrengthKey {
+    pub(crate) fn new(db: &Db, krate: base_db::Crate, f: FunctionId) -> StrengthKey {
+        StrengthKey { krate, f, top: crate::query::top_crate(db) }
+    }
 }
 
 /// The [`Answer`] of one function: what its lints read, so an edit elsewhere that leaves it as
 /// it was leaves them as they were.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn strength(db: &Db, key: StrengthKey) -> Answer {
-    let index = strength_index(db, key.krate(db));
-    let mut answer = index.by_key.get(&root_path(db, key.f(db))).cloned().unwrap_or_default(); // clone: one function's answer
+    let StrengthKey { krate, f, top } = key;
+    let index = strength_index(db, krate, top);
+    let mut answer = index.by_key.get(&root_path(db, f)).cloned().unwrap_or_default(); // clone: one function's answer
     answer.any_tests = index.tests > 0;
     answer.unread = index.unread.clone(); // clone: a few names
     answer

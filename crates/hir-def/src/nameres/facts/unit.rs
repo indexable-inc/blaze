@@ -5,8 +5,8 @@
 //! ([`scc_state`]): its view is a `DefMap` in `ModulesSlot::Unit` holding the members' rows,
 //! every other module of the crate read through its round's row, whose scope is a fact
 //! (`ScopeSlot::Fact`). The unit replays its members' ops (`nameres-core.md` §3), runs the old
-//! worklist to its fixed point, and hands each member's scope to the database as a
-//! `ModuleScope`. Every read of a module it does not hold is checked against the partition
+//! worklist to its fixed point, and hands each member's scope to the database in its
+//! `SccState::made`, named by a `ScopeHandle`. Every read of a module it does not hold is checked against the partition
 //! before it is made: a read the partition does not put upstream would be a query cycle, and
 //! stops naming the import. A block's unit ([`Unit::block`]) holds every module of the block's
 //! map and is the sink the block's collection writes through.
@@ -40,7 +40,7 @@ use crate::{
     item_tree::{ImportAlias, ImportKind},
     nameres::{
         BuildingScope, BuiltinShadowMode, DefMap, DiagnosticsByModule, LocalDefMap, ModuleData,
-        ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot, def_site,
+        ModuleOrigin, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot, def_site,
         def_site::Hygienic,
         diagnostics::DefDiagnostic,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
@@ -62,7 +62,7 @@ use super::{
     ops::{DeclOp, ImportOp, MacroOp, OpLog},
     queries::{
         self, CrateEnvKey, FactKey, RoundActive, RoundKey, RoundKind, Rows, RowsKey, SccKey,
-        SccState,
+        SccState, ScopeHandle,
     },
     set_in,
 };
@@ -243,10 +243,8 @@ pub(crate) struct Unit<'db, 'f, A: Allocator + Clone = Global> {
 /// The rows of a unit's view.
 fn own_rows(modules: &mut ModulesSlot) -> &mut ModulesMap {
     match modules {
-        ModulesSlot::Building(own)
-        | ModulesSlot::Unit { own, .. }
-        | ModulesSlot::Maintained { own, .. } => own,
-        ModulesSlot::Collected(_) | ModulesSlot::Published(_) => {
+        ModulesSlot::Building(own) | ModulesSlot::Unit { own, .. } => own,
+        ModulesSlot::Collected(_) => {
             panic!("nameres facts: a unit's view is a collected `DefMap`")
         }
     }
@@ -342,33 +340,6 @@ impl<'db, 'f> Unit<'db, 'f, &'f Frame> {
     pub(crate) fn take_diagnostics(&mut self) -> FrameVec<'f, DefDiagnostic> {
         mem::replace(&mut self.diagnostics, Vec::new_in(self.frame))
     }
-
-    /// A run of the name resolution maintainer (`nameres::delta`): `def_map` is its
-    /// `ModulesSlot::Maintained` view, every module it holds a member, no partition check; paths
-    /// read the crate env `env`. Its state is in the frame.
-    pub(crate) fn region(
-        cx: &CollectCx<'db, 'f>,
-        def_map: DefMap,
-        env: &super::env::CrateEnv,
-    ) -> Unit<'db, 'f, &'f Frame> {
-        let mut def_map = def_map;
-        env.install(&mut def_map);
-        let state = UnitState::new_in(cx.frame);
-        Unit::new(cx.db, cx.frame, def_map, Local::Owned(env.local_def_map()), state, None)
-    }
-
-    /// The crate env changed under a run (the crate root's expansion made an `extern crate`,
-    /// a `#[macro_use]` or the std prelude): paths read the new one, and every import is
-    /// tried again.
-    pub(crate) fn set_env(&mut self, env: &super::env::CrateEnv) {
-        let prelude = self.def_map.prelude;
-        env.install(&mut self.def_map);
-        if self.state.prelude.is_some() {
-            self.def_map.prelude = prelude;
-        }
-        self.local = Local::Owned(env.local_def_map());
-        self.queues.wake_all(&self.state.imports);
-    }
 }
 
 impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
@@ -422,7 +393,7 @@ impl<'db, 'f> Unit<'db, 'f> {
             krate,
             block: None,
             root: queries::crate_root(db, krate),
-            modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
+            modules: ModulesSlot::Unit { own, rows },
             prelude: None,
             macro_use_prelude: HashMap::new_in(Global),
             derive_helpers_in_scope: HashMap::new_in(Global),
@@ -700,8 +671,6 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// Retries unresolved import `at`; whether it recorded anything.
     fn retry_unresolved(&mut self, at: u32) -> bool {
         let i = at as usize;
-        let _reading =
-            crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -732,8 +701,6 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     fn retry_indeterminate(&mut self, seq: u32) -> bool {
         let (at, settled) = self.state.imports.indeterminate[seq as usize];
         let i = at as usize;
-        let _reading =
-            crate::nameres::delta::reads::reading(self.state.imports.directives[i].op.module);
         self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
@@ -817,8 +784,10 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
             Hygienic::At(at, key) => (def_map.map_for(db, at), at, def_site::keyed_path(path, key)),
             Hygienic::Unknown => return PartialResolvedImport::Unresolved,
         };
+        // The path's contexts are of this def map's table wherever its lookup goes on.
         let ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, prefix_info } =
-            map.resolve_path_fp_recording(
+            map.resolve_path_written_in(
+                def_map.ctx_table(),
                 def_map.local_for(db, from, local.get()),
                 db,
                 ResolveMode::Import,
@@ -907,7 +876,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     }
                     Hygienic::Unknown => return Err(VisibilityError::Unresolved),
                 };
-                let result = map.resolve_path_fp_recording(
+                let result = map.resolve_path_written_in(
+                    def_map.ctx_table(),
                     def_map.local_for(db, from, local.get()),
                     db,
                     ResolveMode::Other,
@@ -1039,6 +1009,10 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                             // Each name as the glob binds it (`def_site::glob_imported_name`).
                             let expn = source_map.module_expansion(db, m);
                             let glob_ctxt = def_site::glob_context(db, glob);
+                            // The names are keyed in the source crate's table, the glob's
+                            // context is of this crate's.
+                            let (name_table, glob_table) =
+                                (source_map.ctx_table(), self.def_map.ctx_table());
 
                             // Module scoped macros is included
                             let start = self.held.len();
@@ -1049,7 +1023,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                                     .filter_map(|(n, res)| {
                                         let n = match n {
                                             Some(n) => Some(def_site::glob_imported_name(
-                                                db, n, expn, glob_ctxt,
+                                                db, name_table, n, expn, glob_table, glob_ctxt,
                                             )?),
                                             None => None,
                                         };
@@ -1115,23 +1089,22 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     }
                     Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
                         cov_mark::hit!(glob_enum);
-                        // A variant is no binding of the enum's module: a write touching the enum
-                        // wakes this read (`enum_glob_wakes`).
-                        crate::nameres::delta::reads::note(
-                            crate::Lookup::lookup(&e, self.db).container,
-                            Some(crate::nameres::delta::reads::enum_glob()),
-                        );
                         // glob import from enum => just import all the variants, each as the
                         // glob binds it (`def_site::glob_imported_name`, adjusted from the scope
                         // the enum's expansion made), as a module's names.
                         let db = self.db;
                         let expn = def_site::enum_expansion(db, e);
                         let glob_ctxt = def_site::glob_context(db, glob);
+                        // The variants are keyed in the table of the enum's file, the glob's
+                        // context is of this crate's.
+                        let name_table = e.lookup(db).id.file_id.context_arena();
+                        let glob_table = self.def_map.ctx_table();
                         let start = self.held.len();
                         self.held.extend(e.enum_variants(db).variants.iter().filter_map(
                             |(name, &(variant, shape))| {
-                                let name =
-                                    def_site::glob_imported_name(db, *name, expn, glob_ctxt)?;
+                                let name = def_site::glob_imported_name(
+                                    db, name_table, *name, expn, glob_table, glob_ctxt,
+                                )?;
                                 // We don't need to reduce the visibility, since enum variants and their fields do not have visibility on their own.
                                 let res = if shape.has_value_ns_ctor() {
                                     PerNs::both(variant.into(), variant.into(), vis, None)
@@ -1151,12 +1124,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                     Some(ModuleDefId::TraitId(it)) => {
                         // glob import from trait => its associated items, as rustc's traits are
                         // modules to `use`. None where it cannot list them, which the end of
-                        // collection reports. An item is no binding of the trait's module: a
-                        // write touching the trait wakes this read (`enum_glob_wakes`).
-                        crate::nameres::delta::reads::note(
-                            crate::Lookup::lookup(&it, self.db).container,
-                            Some(crate::nameres::delta::reads::trait_import()),
-                        );
+                        // collection reports.
                         let start = self.held.len();
                         let held = &mut self.held;
                         let listed = self.def_map.for_each_trait_item_for_import(
@@ -1199,6 +1167,8 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         // Each name as the glob binds it (`def_site::glob_imported_name`).
         let expn = source_map.module_expansion(db, source);
         let glob_ctxt = def_site::glob_context(db, glob);
+        // One crate: the names' table and the glob's are this map's.
+        let table = self.def_map.ctx_table();
 
         // Module scoped macros is included
         let start = self.held.len();
@@ -1208,7 +1178,9 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 // only keep visible names...
                 .filter_map(|(n, res)| {
                     let n = match n {
-                        Some(n) => Some(def_site::glob_imported_name(db, n, expn, glob_ctxt)?),
+                        Some(n) => Some(def_site::glob_imported_name(
+                            db, table, n, expn, table, glob_ctxt,
+                        )?),
                         None => None,
                     };
                     Some((
@@ -1406,7 +1378,14 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
                 // The name as this importer's glob binds it (`def_site::glob_imported_name`).
                 let name = match name {
                     Some(name) => {
-                        match def_site::glob_imported_name(self.db, name, expn, glob_ctxt) {
+                        match def_site::glob_imported_name(
+                            self.db,
+                            self.def_map.ctx_table(),
+                            name,
+                            expn,
+                            self.def_map.ctx_table(),
+                            glob_ctxt,
+                        ) {
                             Some(it) => Some(it),
                             None => continue,
                         }
@@ -1746,7 +1725,7 @@ pub(crate) fn local_scope(
 
 /// The round's `#[prelude_import]`: the index of the module that holds it. The graph puts that
 /// module's component upstream of every other.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
     let shape = queries::import_shape(db, round);
     let at =
@@ -1757,7 +1736,7 @@ fn prelude_holder(db: &Db, round: RoundKey) -> Option<u32> {
 /// The std prelude the round's `#[prelude_import]` resolved to, if one did: what every other
 /// component installs, from the holder's state at the last round its component ran.
 /// Backdates while it stays.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(super) fn round_prelude(db: &Db, round: RoundKey) -> Option<(ModuleId, Option<UseId>)> {
     let holder = prelude_holder(db, round)?;
     let krate = round.krate(db);
@@ -1924,6 +1903,8 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
             members: prev.members.clone(),
             // clone: as above.
             handles: prev.handles.clone(),
+            // Its handles name the scopes of the states that made them.
+            made: Box::default(),
             prelude: prev.prelude,
             // clone: as above.
             upstream: prev.upstream.clone(),
@@ -1990,6 +1971,8 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
 
     // Each member's handle: the one it had the round before when its scope is the same.
     let mut handles = Vec::with_capacity_in(members.len(), frame);
+    // The scopes this run hands to the database, which the value holds.
+    let mut made = Vec::new_in(Global);
     let mut all_carried = prev.is_some();
     for (at, &module) in members.iter().enumerate() {
         let before = match prev {
@@ -2004,19 +1987,24 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
         let ScopeSlot::Building(building) = &data.scope else {
             unreachable!("a unit's rows are building")
         };
-        let same = |id: blaze_query::db::Id| {
-            let scope = <ModuleScope<'_> as blaze_query::db::FromId>::from_id(id);
-            *scope.scope(db) == building.scope && *scope.children(db) == building.children
+        let same = |handle: ScopeHandle| {
+            let held = queries::handle_scope(db, handle);
+            held.scope == building.scope && held.children == building.children
         };
         let handle = match before {
-            Some(id) if prev.is_some() && !unit.touched.contains(&module) => id,
-            Some(id) if same(id) => id,
+            Some(handle) if prev.is_some() && !unit.touched.contains(&module) => handle,
+            Some(handle) if same(handle) => handle,
             _ => {
                 all_carried = false;
-                let (scope, children) = (&building.scope, &building.children);
-                // clone: the state carries the scope on; the database holds this copy, once per change.
-                let scope = ModuleScope::new(db, module, scope.clone(), children.clone());
-                blaze_query::db::AsId::as_id(&scope)
+                let at = u32::try_from(made.len()).expect("a component's members fit in u32");
+                // clone: the state carries the scope on; the value holds this copy, once per change.
+                let mut handed = crate::nameres::BuildingScope::clone(building);
+                // Settled as it is handed over (the old `DefMap::shrink_to_fit`'s
+                // `ItemScope::settle`): columns at their length and, for a scope of more than
+                // `LINEAR` names, its by-name and by-def tables, so no read of it allocates.
+                handed.scope.settle();
+                made.push(handed);
+                ScopeHandle::Made { by: key, at }
             }
         };
         handles.push(handle);
@@ -2041,6 +2029,7 @@ pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
         members: Box::from(&members[..]),
         // alloc: as `members`
         handles: Box::from(&handles[..]),
+        made: made.into_boxed_slice(),
         prelude,
         // alloc: as `members`
         upstream: Box::from(&upstream[..]),
@@ -2110,8 +2099,8 @@ fn member_state(db: &Db, key: FactKey) -> (&SccState, usize) {
     (state, position)
 }
 
-/// The module's `ModuleScope` after the round's import fixed point.
-pub(crate) fn fact_handle(db: &Db, key: FactKey) -> blaze_query::db::Id {
+/// The handle of the module's scope after the round's import fixed point.
+pub(crate) fn fact_handle(db: &Db, key: FactKey) -> ScopeHandle {
     let (state, at) = member_state(db, key);
     state.handles[at]
 }

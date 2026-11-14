@@ -105,10 +105,12 @@ fn hash_columns_answer_as_a_map_of_their_rows() {
     let mut rows: Vec<(ItemKey, ItemHashes)> =
         hashed.iter().enumerate().map(|(n, &key)| (key, row_hashes(n as u8))).collect();
     let model: HashMap<ItemKey, ItemHashes> = rows.iter().copied().collect();
-    let item = items(&single("struct S;").0)[0];
+    let (db, _) = single("struct S;");
+    let item = items(&db)[0];
     let mut missing: Vec<(ItemKey, Unhashable)> =
-        unhashable.iter().map(|&key| (key, Unhashable::of(item, "a test's"))).collect();
-    let columns = HashColumns::new(&mut rows, &mut missing);
+        unhashable.iter().map(|&key| (key, Unhashable::of(&db, item, "a test's"))).collect();
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Other).expect("a test's frame");
+    let columns = HashColumns::new(crate::table::Keep::Frame(&frame), &mut rows, &mut missing);
     assert_eq!(columns.len(), model.len());
     assert!(columns.keys().windows(2).all(|it| it[0] < it[1]));
     for (&key, &it) in &model {

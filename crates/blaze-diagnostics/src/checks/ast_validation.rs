@@ -156,7 +156,7 @@ impl<'db> V<'_, '_, 'db> {
             None => SyntaxContext::root(file.edition(self.cx.db)),
             Some(call) => call.expansion_span_map(self.cx.db).span_at(offset).ctx,
         };
-        ctxt.edition(self.cx.db)
+        ctxt.edition()
     }
 
     /// rustc's `Features::enabled`: whether the crate's `#![feature(..)]`s enable `name`.

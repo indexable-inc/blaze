@@ -17,7 +17,7 @@ use std::alloc::Global;
 use crate::{
     consteval::{
         ConstEvalError,
-        deps::{Drained, drain, set},
+        deps::{Drained, drain, kept_fact, set},
     },
     db::{GeneralConstId, HirDatabase},
     mir::MirEvalError,
@@ -136,10 +136,26 @@ fn const_named(db: &TestDB, krate: Crate, name: &str) -> ConstId {
 /// A database of [`FIXTURE`] keeping `lib`'s constants in `store` under `base`.
 fn database(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (TestDB, Crate) {
     let mut db = fixture::db(FIXTURE).into_db();
-    let lib = crate_named(&db, "lib");
+    let lib = crate_named(&db, "lib").key(&db);
     let crates = HashMap::from_iter_in([(lib, base)], Global);
+    let fact = kept_fact(mode, [(ContentId::of("blaze test crate", b"lib"), base)]);
     // dyn: hir-ty's `set` takes the driver's store, a boundary (`consteval::deps::Shared::store`)
-    set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
+    let store: Arc<dyn ImageStore + Send + Sync> = Arc::clone(store) as _;
+    // Given as a driver gives it: a maker of the session arena, which the commit makes again,
+    // so the crate's id is taken after it.
+    let mut edit = db.edit();
+    edit.set_given(
+        None,
+        fact,
+        Box::new_in(
+            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
+                set(builder, fact, Arc::clone(&store), crates.clone(), mode);
+            },
+            Global,
+        ),
+    );
+    _ = edit.commit();
+    let lib = db.krate(lib);
     (db, lib)
 }
 

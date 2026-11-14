@@ -276,7 +276,9 @@ fn eager_macro_recur_view<'db>(
 
         let def = match call.path().and_then(|path| {
             let ctxt = span_map.span_at(path.syntax().text_range().start()).ctx;
-            ModPath::from_src_view(db, path, &mut |range| span_map.span_at(range.start()).ctx)
+            ModPath::from_src_view(db, curr.file_id.context_arena(), path, &mut |range| {
+                span_map.span_at(range.start()).ctx
+            })
                 .map(|it| (it, ctxt))
         }) {
             Some((path, ctxt)) => match macro_resolver(&path, ctxt) {

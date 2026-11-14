@@ -3,7 +3,7 @@
 
 use base_db::Db;
 use blaze_hash::HashSet;
-use blaze_query::db::FromId;
+use blaze_memo::{Database as _, Id as _};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::{
     InferBodyId,
@@ -34,12 +34,12 @@ pub(crate) struct Hop {
 }
 
 /// What one instance is to the check.
-#[derive(Debug, PartialEq, Eq, Default)]
-pub(crate) struct Summary {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct Summary<'db> {
     /// How it may park its fiber; `None` when it never does.
     pub(crate) suspends: Option<Hop>,
     /// Every instance it calls, puts in a vtable or makes a pointer of: the walk's edges, each once.
-    pub(crate) callees: Box<[Instance]>,
+    pub(crate) callees: &'db [Instance],
     pub(crate) unseen: Option<Unseen>,
     /// It calls a root itself: it is the fiber driver's own code.
     pub(crate) driver: bool,
@@ -47,8 +47,12 @@ pub(crate) struct Summary {
 
 /// What `instance` is to the check, in `env`. A cycle of instances starts from "never
 /// suspends" and rises to its fixpoint: may-suspend only grows, and a path only shortens.
-#[blaze_query::tracked(returns(ref), cycle_initial = |_, _, _, _| Summary::default())]
-pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Summary {
+#[blaze_memo::tracked(returns(ref), cycle_initial = |_, _, _| Summary::default())]
+pub(crate) fn summary<'db>(
+    db: &'db Db,
+    env: StoredParamEnvAndCrate,
+    instance: Instance,
+) -> Summary<'db> {
     let cx = Cx::new(db, env);
     let body = match body_once(db, &cx.stored, &instance) {
         Ok(body) => body,
@@ -61,8 +65,8 @@ pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
     let mut best: Option<Hop> = None;
     let mut driver = false;
     let mut seen = HashSet::new_in(Global);
-    let mut callees = Vec::new(); // alloc: the summary's edges, once per instance
-    let mut edge = |instance: &Instance, callees: &mut Vec<Instance>| {
+    let mut callees = Vec::new_in(Global);
+    let mut edge = |instance: &Instance, callees: &mut Vec<Instance, Global>| {
         if seen.insert(*instance) {
             callees.push(*instance);
         }
@@ -100,7 +104,12 @@ pub(crate) fn summary(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) 
             edge(callee, &mut callees);
         }
     }
-    Summary { suspends: best, callees: callees.into_boxed_slice(), unseen: sites.unseen, driver }
+    Summary {
+        suspends: best,
+        callees: blaze_memo::keep_slice(db.memo(), &callees),
+        unseen: sites.unseen,
+        driver,
+    }
 }
 
 /// The monomorphized body of `instance` in `env`, made for the caller and dropped by it
@@ -198,13 +207,13 @@ pub(crate) fn instance_name(db: &Db, def: Body) -> String {
         Body::Fn(func) => fn_name(db, func),
         // alloc: an error's path
         Body::Closure(id) => {
-            format!("a closure in {}", parent(InternedClosureId::from_id(id).loc(db).owner))
+            format!("a closure in {}", parent(InternedClosureId::from_gid(id).loc(db).owner))
         }
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
             // alloc: an error's path
             format!(
                 "an `async` block in {}",
-                parent(InternedCoroutineId::from_id(id).loc(db).owner)
+                parent(InternedCoroutineId::from_gid(id).loc(db).owner)
             )
         }
     }
@@ -222,9 +231,9 @@ pub(crate) fn owner_of(db: &Db, def: Body) -> Option<DefWithBodyId> {
     };
     match def {
         Body::Fn(func) => Some(func.into()),
-        Body::Closure(id) => of(InternedClosureId::from_id(id).loc(db).owner),
+        Body::Closure(id) => of(InternedClosureId::from_gid(id).loc(db).owner),
         Body::Coroutine(id) | Body::CoroutineByMove(id) => {
-            of(InternedCoroutineId::from_id(id).loc(db).owner)
+            of(InternedCoroutineId::from_gid(id).loc(db).owner)
         }
     }
 }

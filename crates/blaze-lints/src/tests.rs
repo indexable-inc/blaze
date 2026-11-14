@@ -121,7 +121,7 @@ pub(crate) fn try_lint_once(
     let mut built = fixture::db(fixture);
     given(&mut built);
     let db = built.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut linted = None;
         let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
         let mut texts = Vec::new();
@@ -168,6 +168,11 @@ pub(crate) fn main_crate(db: &Db) -> hir::Crate {
         .expect("the fixture has a crate `main`")
 }
 
+/// The key of the crate `main`: what names it across a commit (a fix's), where its id dies.
+pub(crate) fn main_crate_key(db: &Db) -> base_db::CrateKey {
+    blaze_memo::attach(db, || main_crate(db).base().key(db))
+}
+
 /// The `Setup` of a lint test's flags.
 fn setup_of(flags: &str) -> Setup {
     let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
@@ -185,12 +190,12 @@ pub(crate) fn suggested_in(
     let fx = fixture::db(fixture);
     let file = *fx.files().last().expect("src/lib.rs");
     let db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let krate = blaze_memo::attach(&db, || main_crate(&db));
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let setup = setup_of(flags);
     let text = db.file_text(file).text(&db).to_string();
-    let found = blaze_query::db::attach(&db, || {
+    let found = blaze_memo::attach(&db, || {
         check(&db, krate, &setup, &name_of).expect("the file is named")
     });
     let messages = found.iter().map(|it| it.diagnostic.message.clone()).collect();
@@ -231,23 +236,24 @@ pub(crate) fn fixed_in(fixture: &str, flags: &str) -> String {
     let fx = fixture::db(fixture);
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let key = main_crate_key(&db);
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let setup = setup_of(flags);
     let before = db.file_text(file).text(&db).to_string();
     let made =
-        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+        crate::fix::fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let after = db.file_text(file).text(&db).to_string();
     assert_ne!(after, before, "the fix of `{flags}` changed the file");
     assert!(made.applied > 0, "the fix of `{flags}` made a suggestion");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let found = check(&db, krate, &setup, &name_of).expect("the file is named");
         let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
         assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");
     });
     let again =
-        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+        crate::fix::fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     let twice = db.file_text(file).text(&db).to_string();
     assert_eq!(again.applied, 0, "the fixed file has nothing left to fix:\n{twice}");
     assert_eq!(twice, after, "fixing the fixed file changes nothing");

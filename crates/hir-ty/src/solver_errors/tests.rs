@@ -43,7 +43,7 @@ impl const Const for u8 {}
 "#,
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let named = |trait_name| {

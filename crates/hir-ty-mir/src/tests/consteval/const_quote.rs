@@ -68,7 +68,7 @@ fn a_quoted_derive_is_the_built_one() {
     );
     let fixture = with_const_ast(QUOTED_FIELDS, &main);
     let (db, _, _) = load(&fixture, "Fields");
-    let built = blaze_query::db::attach(&db, || expansions(&db));
+    let built = blaze_memo::attach(&db, || expansions(&db));
     let expected = expected_fields(EVERY_VIEW);
     assert_eq!(expected.len(), 3, "Record, Tuple and Unit");
     let mut built: Vec<String> =
@@ -112,11 +112,14 @@ pub struct Point { x: u8 }
 ",
     );
     let (db, _, _) = load(&fixture, "Bad");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = *base_db::all_crates(&db).last().expect("the main crate");
         let derives = derives(&db, main);
         assert!(
-            derives.contains("built `PATH_TYPE` at output element 2 where its tokens parse to `NAME`"),
+            derives.contains(
+                "built `PATH_TYPE` (depth 2) at output element 2 where its tokens parse to \
+                 `NAME` (depth 2)"
+            ),
             "{derives}"
         );
     });

@@ -54,6 +54,8 @@ blaze-ids.workspace = true
 blaze-mem.workspace = true
 inventory.workspace = true
 blaze-phf.workspace = true
+blaze-memo.workspace = true
+# `blaze_query::carry` (the scheduler's carry, re-exported) alone: `hir::persist::carry_scopes`.
 blaze-query.workspace = true
 blaze-record.workspace = true
 

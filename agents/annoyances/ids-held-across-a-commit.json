@@ -1,0 +1,14 @@
+{
+ "id": "ids-held-across-a-commit",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port lane for crates/hir-def onto blaze-memo, port-memo-1113",
+ "where": "crates/hir-def/src/deps/serve.rs Served and Stored; crates/hir-def/src/deps/tests.rs; nameres/tests/*.rs; expr_store/tests/invalidation.rs; item_tree/items/tests.rs",
+ "what": "Under blaze-memo an id (Crate, ModuleId, FunctionId, the interned EditionedFileId) dies with its arena, and a commit that moves a file, a crate or the session drops it. hir-def's tests, and Served/Stored that the driver keeps across its give commit, held these ids across commits as blaze-query's revisioned ids had allowed; each such site compiled as a type but would read a dead id at runtime.",
+ "cost": "about 60 test sites rewritten to keep a CrateKey, a FileId or a span::EditionedFileId and take the id again after each commit; Served is rebuilt by key in the test wrapper",
+ "cause": "a value whose lifetime is a snapshot typed as 'static Copy, so nothing in the type stops holding it past the commit that ends it",
+ "class": "a snapshot-scoped handle with no lifetime tying it to the snapshot it came from",
+ "prevention": "make outlives-a-commit types (Served, Stored, test fixtures) hold keys (CrateKey, FileId) and give ids a 'db lifetime from the snapshot (the IdLt forms already exist, e.g. BlockIdLt); until then blaze-memo's generation compare refuses a dead id loudly (nameres/tests/stale_ids.rs)",
+ "workaround": "TestDBExt::set_text_of, set_crate_data and commit_with, then db.krate(key) after each commit",
+ "fix": "test_db.rs helpers; tests ported to keys; Served/Stored by CrateKey is still to do (also blaze-lower serve_deps/store_deps)",
+ "state": "written, not yet built"
+}

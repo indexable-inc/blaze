@@ -575,6 +575,31 @@ unsafe impl<'db, V: WorldExposer> GenericTypeVisitable<V> for ValTree<'db> {
     }
 }
 
+table::holds_by_visit!(ValTreeKind<'static>);
+
+/// The newest arena the kind names: a leaf (a scalar) names none, a branch its constants' list
+/// (the list's own home). By hand, as the kind is coded only as a row (`persist`'s
+/// `Node for ValTree`), with no `Code` of its own.
+impl<'db> table::Homed for ValTreeKind<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        match self {
+            ValTreeKind::Leaf(_) => None,
+            ValTreeKind::Branch(consts) => table::Homed::home(consts),
+        }
+    }
+}
+
+impl<'db> table::Homed for ValTree<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        VALTREES.home(self.index)
+    }
+}
+
+crate::next_solver::interner::memo_home!(ValTree<'db>);
+
 impl<'db> TypeVisitable<DbInterner<'db>> for ValTree<'db> {
     fn visit_with<V: rustc_type_ir::TypeVisitor<DbInterner<'db>>>(
         &self,

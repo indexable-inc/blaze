@@ -107,8 +107,8 @@ fn build_hasher(cx: &Cx<'_, '_>) -> Option<TraitId> {
 /// The type parameters of `adt` that are its hasher, as bits by their index among its type
 /// parameters (lifetimes and consts left out, as `GenericArgs::types` counts them): a parameter
 /// whose default implements `build_hasher`, or that `adt` bounds by it. Once per ADT.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn hasher_params(db: &Db, adt: AdtId, build_hasher: TraitId) -> u32 {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn hasher_params<'db>(db: &'db Db, adt: AdtId, build_hasher: TraitId) -> u32 {
     let build_hasher = hir::Trait::from(build_hasher);
     let mut bits = 0;
     let params = hir::GenericDef::Adt(hir::Adt::from(adt)).type_or_const_params(db);

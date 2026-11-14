@@ -217,7 +217,7 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 
 /// What a layout reads of a struct's signature: its flags. A rename, or a change to its
 /// generics or their bounds, leaves this equal.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
 }
@@ -226,7 +226,7 @@ pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
 /// stays last for all of them, so that unsizing the struct does not move it. The answer reads
 /// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
 /// it is asked once per struct and crate rather than once per instantiation.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
     variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
         let interner = DbInterner::new_with(db, krate);
@@ -238,21 +238,17 @@ pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
 
 /// The fields of a variant, in order: what a layout reads of them besides their types. A
 /// field's rename or visibility leaves this equal.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub fn variant_field_ids(db: &Db, variant: VariantId) -> Box<[LocalFieldId]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn variant_field_ids<'db>(db: &'db Db, variant: VariantId) -> &'db [LocalFieldId] {
     let fields = variant.fields(db).fields();
-    let mut ids = Vec::with_capacity(fields.len());
-    ids.extend(fields.iter().map(|(id, _)| id));
-    ids.into_boxed_slice()
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), fields.iter().map(|(id, _)| id))
 }
 
 /// The variants of an enum, in order: what a layout reads of them besides their fields.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub fn enum_variant_ids(db: &Db, id: EnumId) -> Box<[EnumVariantId]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn enum_variant_ids<'db>(db: &'db Db, id: EnumId) -> &'db [EnumVariantId] {
     let variants = &id.enum_variants(db).variants;
-    let mut ids = Vec::with_capacity(variants.len());
-    ids.extend(variants.values().map(|&(variant, _)| variant));
-    ids.into_boxed_slice()
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), variants.values().map(|&(variant, _)| variant))
 }
 
 struct LayoutCx<'a> {
@@ -455,7 +451,7 @@ fn univariant_of(
     )?)
 }
 
-#[blaze_query::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_memo::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone), owns, mem_tag = Infer)]
 pub fn layout_of_ty_query(
     db: &Db,
     ty: StoredTy,
@@ -900,7 +896,6 @@ fn layout_of_ty_in(
 
 fn layout_of_ty_cycle_result(
     _: &Db,
-    _: blaze_query::db::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
@@ -1103,7 +1098,7 @@ mod tests {
     use std::ops::ControlFlow;
 
     use blaze_ids::rng::SplitMix64;
-    use blaze_query::db::FromId;
+    use blaze_memo::Id;
     use hir_def::{ConstId, TypeAliasId};
     use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
 
@@ -1251,8 +1246,8 @@ mod tests {
         }
     }
 
-    fn id<T: FromId>(index: u32) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(index))
+    fn id<T: Id>(index: u32) -> T {
+        T::from_gid(blaze_memo::Gid::for_test(index))
     }
 
     fn ty<'db>(kind: TyKind<'db>) -> Ty<'db> {
@@ -1344,7 +1339,7 @@ mod tests {
     /// anything else; only a struct's last field is normalized.
     #[test]
     fn a_tail_goes_through_tuples_and_pattern_types() {
-        let db = Db::for_tests();
+        let db = Db::for_tests(|_| {});
         let interner = DbInterner::new_no_crate(&db);
         let u8 = ty(TyKind::Uint(UintTy::U8));
         let slice = ty(TyKind::Slice(u8));

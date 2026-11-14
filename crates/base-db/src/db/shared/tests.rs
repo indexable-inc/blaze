@@ -1,143 +1,94 @@
-use std::{
-    panic::AssertUnwindSafe,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
-use blaze_query::db::{Cancelled, Database as _};
 use span::FileId;
 
 use super::Shared;
-use crate::{Db, FileText};
+use crate::{
+    Db, FileText,
+    tests::{EditDb, ran, test_db},
+};
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn text_len(db: &Db, text: FileText) -> u32 {
     text.text(db).len() as u32
 }
 
+/// A shared database whose file 0 (in no source root) is `text`.
 fn shared_with(text: &str) -> (Shared, FileId) {
-    let mut db = Db::for_tests();
+    let mut db = test_db();
     let file = FileId::from_raw(0);
-    db.set_file_text(file, text);
+    db.commit_with(|edit| {
+        edit.set_file_text(file, text);
+    });
     (Shared::new(db), file)
 }
 
+/// The invariant: a reader answers from the snapshot it was made at, whatever the owner
+/// commits while it holds it, and the owner's write never waits for it; the owner reads its
+/// own commit at once.
 #[test]
-fn a_write_stops_a_held_reader_and_waits_for_it_to_let_go() {
+fn a_write_leaves_a_held_reader_its_snapshot_and_waits_for_nothing() {
     let (mut shared, file) = shared_with("fn main() {}\n");
-    let text = shared.file_text(file);
     let reader = shared.reader();
-    let (started, has_started) = crossbeam_channel::unbounded();
+    let (read, has_read) = crossbeam_channel::bounded(1);
+    let (committed, has_committed) = crossbeam_channel::bounded::<()>(1);
     let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let ran = Cancelled::catch(AssertUnwindSafe(|| {
-            started.send(()).unwrap();
-            while Instant::now() < deadline {
-                blaze_query::db::unwind_if_cancelled(&*reader);
-                assert_eq!(text_len(&reader, text), 13);
-                std::thread::yield_now();
-            }
-        }));
-        drop(reader);
-        ran
+        let text = reader.file_text(file);
+        let before = text_len(&reader, text);
+        read.send(()).expect("the owner waits for the first read");
+        has_committed
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the owner said it committed");
+        // The same snapshot after the owner's commit: the same handle, the same answer.
+        let after = (text_len(&reader, text), text_len(&reader, reader.file_text(file)));
+        (before, after)
     });
-    has_started.recv_timeout(Duration::from_secs(60)).expect("the reader thread said it started");
-    shared.write().set_file_text(file, "fn other() {}\n");
-    assert!(matches!(thread.join().unwrap(), Err(Cancelled::PendingWrite)));
-    assert!(!shared.storage().readers_stopped(), "the write clears the stop");
-    assert_eq!(text_len(&shared, shared.file_text(file)), 14);
+    has_read.recv_timeout(Duration::from_secs(60)).expect("the reader said it read");
+    shared.write().commit_with(|edit| {
+        edit.set_file_text(file, "fn other() {}\n");
+    });
+    assert_eq!(text_len(&shared, shared.file_text(file)), 14, "the owner reads its commit");
+    committed.send(()).expect("the reader waits for the commit");
+    assert_eq!(thread.join().unwrap(), (13, (13, 13)), "the reader keeps its snapshot");
 }
 
+/// A reader's copy is another hold on the same snapshot: what it ran there is a hit.
 #[test]
-fn a_write_with_no_reader_left_neither_waits_nor_stops() {
-    let (mut shared, file) = shared_with("fn main() {}\n");
-    drop(shared.reader());
-    shared.write().set_file_text(file, "fn other() {}\n");
-    assert!(!shared.storage().readers_stopped());
-    assert_eq!(text_len(&shared, shared.file_text(file)), 14);
-}
-
-#[test]
-fn idle_is_the_database_only_while_no_reader_holds_it_and_stops_none() {
-    let (mut shared, file) = shared_with("fn main() {}\n");
-    let text = shared.file_text(file);
+fn a_copy_of_a_reader_holds_its_snapshot() {
+    let (mut shared, file) = shared_with("ab");
     let reader = shared.reader();
-    assert!(shared.idle().is_none());
-    assert!(!shared.storage().readers_stopped(), "a reader goes on");
-    assert_eq!(text_len(&reader, text), 13);
-    drop(reader);
-    shared.idle().expect("no reader is left").set_file_text(file, "fn other() {}\n");
-    assert_eq!(text_len(&shared, shared.file_text(file)), 14);
-}
-
-#[test]
-fn a_stop_holds_until_the_next_write() {
-    let (mut shared, file) = shared_with("fn main() {}\n");
-    let text = shared.file_text(file);
-    shared.stop_readers();
-    assert!(shared.storage().readers_stopped());
-    let stopped = Cancelled::catch(AssertUnwindSafe(|| text_len(&shared, text)));
-    assert!(matches!(stopped, Err(Cancelled::PendingWrite)));
-    let reader = shared.reader();
-    let stopped = Cancelled::catch(AssertUnwindSafe(|| text_len(&reader, text)));
-    assert!(matches!(stopped, Err(Cancelled::PendingWrite)), "a reader made after the stop");
-    drop(reader);
+    shared.write().commit_with(|edit| {
+        edit.set_file_text(file, "abc");
+    });
+    let copy = reader.clone();
+    assert_eq!(text_len(&reader, reader.file_text(file)), 2);
+    assert_eq!(text_len(&copy, copy.file_text(file)), 2);
+    drop((reader, copy));
     let db = shared.into_inner();
-    assert!(!db.storage().readers_stopped());
-    assert_eq!(text_len(&db, text), 13);
+    assert_eq!(text_len(&db, db.file_text(file)), 3, "the database is at its last commit");
 }
 
-mod stopped_mid_query {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+/// An ask twice in one snapshot runs once, through a reader as through the owner, and the
+/// owner's log (the snapshot's) has the reader's runs.
+#[test]
+fn a_reader_hits_what_it_ran() {
+    let (shared, file) = shared_with("fn main() {}\n");
+    let reader = shared.reader();
+    let text = reader.file_text(file);
+    ran(&shared, "text_len");
+    assert_eq!(text_len(&reader, text), 13);
+    assert_eq!(text_len(&reader, text), 13);
+    assert_eq!(text_len(&shared, shared.file_text(file)), 13, "the owner's hit of one snapshot");
+    assert_eq!(ran(&shared, "text_len"), 1);
+}
 
-    use blaze_query::db::Database as _;
-
-    use super::*;
-
-    static INNER_RUNS: AtomicU32 = AtomicU32::new(0);
-    static OUTER_RUNS: AtomicU32 = AtomicU32::new(0);
-    static OUTER_READ: AtomicBool = AtomicBool::new(false);
-
-    #[blaze_query::tracked(returns(copy))]
-    fn counted_len(db: &Db, text: FileText) -> u32 {
-        INNER_RUNS.fetch_add(1, Ordering::Relaxed);
-        text.text(db).len() as u32
-    }
-
-    /// Reads [`counted_len`], and on its first run waits to be stopped before it returns.
-    #[blaze_query::tracked(returns(copy))]
-    fn len_once_stopped(db: &Db, text: FileText) -> u32 {
-        let first = OUTER_RUNS.fetch_add(1, Ordering::Relaxed) == 0;
-        let len = counted_len(db, text);
-        if first {
-            OUTER_READ.store(true, Ordering::Release);
-            while !db.storage().readers_stopped() {
-                std::thread::yield_now();
-            }
-            blaze_query::db::unwind_if_cancelled(db);
-            unreachable!("a stopped reader unwinds at its next check");
-        }
-        len
-    }
-
-    /// A stop unwinds a reader to its task, where it is caught once. The query the reader was in
-    /// stores nothing and runs again when next asked, and the query it had finished is kept.
-    #[test]
-    fn a_reader_stopped_mid_query_keeps_what_it_finished_and_stores_nothing_else() {
-        let (mut shared, file) = shared_with("fn main() {}\n");
-        let text = shared.file_text(file);
-        let reader = shared.reader();
-        let thread = std::thread::spawn(move || {
-            let ran = Cancelled::catch(AssertUnwindSafe(|| len_once_stopped(&reader, text)));
-            drop(reader);
-            ran
-        });
-        while !OUTER_READ.load(Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        let db = shared.write();
-        assert!(matches!(thread.join().unwrap(), Err(Cancelled::PendingWrite)));
-        assert_eq!(len_once_stopped(&*db, text), 13);
-        assert_eq!(OUTER_RUNS.load(Ordering::Relaxed), 2, "the stopped run stored no memo");
-        assert_eq!(INNER_RUNS.load(Ordering::Relaxed), 1, "the finished read is kept");
-    }
+#[test]
+#[should_panic(expected = "holds no world")]
+fn a_reader_cannot_edit() {
+    let (shared, file) = shared_with("ab");
+    // A reader is read through `Deref` alone; a copy of its database has no world to edit.
+    let mut db: Db = shared.reader().reader_copy();
+    db.commit_with(|edit| {
+        edit.set_file_text(file, "abc");
+    });
 }

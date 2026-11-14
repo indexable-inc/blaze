@@ -123,7 +123,7 @@ fn by_closure(f: &Format) -> usize {
 #[test]
 fn a_method_path_predicate_resolves_the_adaptors_methods() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);
@@ -198,7 +198,7 @@ fn through(job: &dyn Fn(usize)) { let _o: &dyn Fn(usize) = returns_it(job); }
 #[test]
 fn a_fn_item_with_a_reference_to_dyn_fn_parameter_meets_fn_of_every_lifetime() {
     let db = fixture::db(DYN_FN_PARAM).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut failed = String::new();
         let mut checked = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
@@ -276,7 +276,7 @@ fn as_pointer<I: Interner>() { let _p: for<'a> fn(&'a I, I::Ty) -> &'a I = retur
 #[test]
 fn a_fn_item_with_an_associated_type_parameter_meets_fn_of_every_lifetime() {
     let db = fixture::db(ASSOC_TY_PARAM).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut funcs = Vec::new();
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             let scope = module.scope(&db);

@@ -756,7 +756,7 @@ pub(crate) mod bodies {
         },
     };
 
-    use base_db::{Crate, Db, FileId};
+    use base_db::{Crate, CrateKey, Db, FileId};
     use blaze_core::lock::Lock;
     use blaze_format::SchemaHash;
     use blaze_front_items::{
@@ -770,7 +770,7 @@ pub(crate) mod bodies {
         Seen, Session, World, WorldError,
     };
     use blaze_lower::Lowered;
-    use blaze_query::db::View;
+    use blaze_memo::Epoch;
     use blaze_store_check::Setting;
     use hir_def::{DefWithBodyId, HasModule as _, nameres::crate_def_map};
     use hir_ty::{
@@ -906,13 +906,13 @@ pub(crate) mod bodies {
         pub(crate) unmapped: usize,
     }
 
-    /// The pin of `files` at the database's revision `revision` ([`World::pin`]).
-    fn pin_of(files: &BTreeMap<String, Mapped>, revision: View) -> Pin {
+    /// The pin of `files` at the snapshot `epoch` ([`World::pin`]).
+    fn pin_of(files: &BTreeMap<String, Mapped>, epoch: Epoch) -> Pin {
         let mut hasher = Hasher::new(PIN_DOMAIN);
         for (path, file) in files {
             hasher.part(path.as_bytes()).part(&file.content.0);
         }
-        hasher.part(&revision.as_u64().to_le_bytes());
+        hasher.part(&epoch.get().to_le_bytes());
         Pin(hasher.finish())
     }
 
@@ -1111,7 +1111,7 @@ pub(crate) mod bodies {
         }
 
         fn pin(&self) -> Pin {
-            pin_of(&self.files, self.front.db().nonce_and_revision().1)
+            pin_of(&self.files, blaze_memo::Database::memo(self.front.db()).snapshot_epoch())
         }
     }
 
@@ -1301,8 +1301,8 @@ pub(crate) mod bodies {
     /// What one crate keeps between serves, beside its front end's database: the kernel
     /// session, the file map (each file's content and body parts) and each body's rows as
     /// posted (its id in the database, each served step's entry, and whether every step of it
-    /// was served), by its file and item. `since`: the revision from which every row of the
-    /// crate posted is in `posted` (the stamp's, [`entries::stamp`]).
+    /// was served), by its file and item. `since`: the snapshot from which every row of the
+    /// crate posted is in `posted`.
     ///
     /// `pending`: every put of the overlay the session was last advanced over (its entries'
     /// values and its save), which the loop puts only when the unit that made them hands them
@@ -1314,7 +1314,7 @@ pub(crate) mod bodies {
         session: Session,
         files: BTreeMap<String, Mapped>,
         posted: BTreeMap<(String, ItemId), (DefWithBodyId, Vec<Row>, bool)>,
-        since: View,
+        since: Epoch,
         pending: Vec<StorePut>,
     }
 
@@ -1352,8 +1352,10 @@ pub(crate) mod bodies {
 
     /// Each crate's [`Kept`], lent to one task at a time ([`Sessions::take`]). The lock is for
     /// the map alone, never across a kernel call (rule 27). A task that finds a crate's out
-    /// uses a new session and puts nothing back.
-    pub(crate) struct Sessions(Lock<BTreeMap<Crate, Slot>>);
+    /// uses a new session and puts nothing back. By the crate's key, the same in every
+    /// snapshot: a [`Crate`] is one snapshot's, and another snapshot may give its id to
+    /// another crate.
+    pub(crate) struct Sessions(Lock<BTreeMap<CrateKey, Slot>>);
 
     impl Default for Sessions {
         fn default() -> Sessions {
@@ -1366,7 +1368,7 @@ pub(crate) mod bodies {
     /// keeps none (the task failed, and its rows may be half posted).
     pub(crate) struct Lent<'a> {
         sessions: &'a Sessions,
-        krate: Crate,
+        krate: CrateKey,
         kept: Option<Kept>,
         /// This task holds the crate's slot.
         holds: bool,
@@ -1374,7 +1376,7 @@ pub(crate) mod bodies {
 
     impl Sessions {
         /// Lends `krate`'s [`Kept`] to the caller.
-        pub(crate) fn take(&self, krate: Crate) -> Lent<'_> {
+        pub(crate) fn take(&self, krate: CrateKey) -> Lent<'_> {
             let mut map = self.0.lock();
             let (kept, holds) = match map.remove(&krate) {
                 Some(Slot::Here(kept)) => (Some(kept), true),
@@ -1432,7 +1434,7 @@ pub(crate) mod bodies {
         pub(crate) bodies: usize,
         /// Steps served from their entries (a serve), each looked up.
         pub(crate) served: usize,
-        /// Steps left posted from an earlier revision under the crate's stamp (a serve): their
+        /// Steps left posted from an earlier snapshot (a serve): their
         /// entries are the session's live ones still, so nothing was looked up or copied.
         pub(crate) carried: usize,
         /// Steps not served (a serve): each step whose entry was not found or did not verify,
@@ -1599,8 +1601,8 @@ pub(crate) mod bodies {
     /// The crate's [`Kept`] makes a revision cost what changed: the files whose text moved
     /// are mapped again, the kept session (or, with none kept, the one `marks` names under the
     /// crate's stable name, else a new one) is carried to this pin, and a body whose every
-    /// row's entry is still the session's live one is left posted, answering under the
-    /// crate's stamp ([`entries::stamp`]) with nothing looked up; any other body is unposted
+    /// row's entry is still the session's live one is left posted, answering while what its
+    /// entries read hashes as it did, with nothing looked up; any other body is unposted
     /// and served from its entries. Gives what it did and the crate's stable name with the
     /// root its session was saved under (none where nothing was served).
     pub(crate) fn serve<G: Get + ?Sized>(
@@ -1618,8 +1620,8 @@ pub(crate) mod bodies {
             None => return Ok((Did { no_store: true, ..Did::default() }, None)),
         }
         let db = front.db();
-        let (_, now) = db.nonce_and_revision();
-        let mut lent = sessions.take(krate);
+        let now = blaze_memo::Database::memo(db).snapshot_epoch();
+        let mut lent = sessions.take(krate.key(db));
         let (last, held) = match lent.kept.take() {
             Some(Kept { session, files, posted, since, pending }) => {
                 repend(store, pending)?;
@@ -1652,7 +1654,7 @@ pub(crate) mod bodies {
             Opened::New | Opened::Unreadable => false,
         };
         if carries {
-            match blaze_query::db::attach(db, || carry(kernel, &mut session, store, &world)) {
+            match blaze_memo::attach(db, || carry(kernel, &mut session, store, &world)) {
                 Ok(carried) => did.carry = carried,
                 Err(error) if did.session == Opened::Opened => {
                     tracing::warn!(target: "blaze", krate = %name, "the body entries' saved session does not carry, so the crate's bodies are served by a new one: {error}");
@@ -1675,7 +1677,7 @@ pub(crate) mod bodies {
         // alloc: once a serve, the bodies posted now, by key (rule 25)
         let mut now_posted = BTreeMap::new();
         let looked: &Overlay<'_, G> = store;
-        blaze_query::db::attach(db, || -> Result<(), FrontError> {
+        blaze_memo::attach(db, || -> Result<(), FrontError> {
             for key in world.keys() {
                 let def = world.body(&key).map_err(FrontError::Tree)?;
                 // clone: a body's path, a map key
@@ -1698,8 +1700,8 @@ pub(crate) mod bodies {
             entries::unpost(db, def);
         }
         // Every row of the crate posted since `since` is now in `now_posted`, and each whose
-        // entry moved was unposted above: what is left answers at this revision.
-        entries::stamp(db, krate, since);
+        // entry moved was unposted above. No stamp: a posted row answers while what its entry
+        // read hashes as it did (`entries::serve`), checked in the query, in any snapshot.
         let root = session.save(store)?;
         lent.put(Kept { session, files: world.into_files(), posted: now_posted, since, pending: pending_of(store) });
         Ok((did, Some((name, root))))
@@ -1781,8 +1783,8 @@ pub(crate) mod bodies {
         saved: &mut Vec<(String, blaze_cas::Key)>,
     ) -> Result<(), FrontError> {
         let db = front.db();
-        let (_, now) = db.nonce_and_revision();
-        let mut lent = sessions.take(krate);
+        let now = blaze_memo::Database::memo(db).snapshot_epoch();
+        let mut lent = sessions.take(krate.key(db));
         let (last, held) = match lent.kept.take() {
             // Served at this revision: its files are the world's, and its session is of this pin.
             Some(Kept { session, files, posted, since, pending }) if session.pin() == pin_of(&files, now) => {
@@ -1804,7 +1806,7 @@ pub(crate) mod bodies {
         };
         world.map_got(kernel, &mut session, store)?;
         did.bodies += world.by_def.len();
-        blaze_query::db::attach(db, || -> Result<(), FrontError> {
+        blaze_memo::attach(db, || -> Result<(), FrontError> {
             // alloc: once a crate a keep, what it keeps in key order (rule 25)
             let mut todo: Vec<(&BodyKey, Of)> = Vec::new();
             for &(def, step, schema) in steps {

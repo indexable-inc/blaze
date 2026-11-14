@@ -444,7 +444,7 @@ pub(crate) fn place(db: &Db, crates: Vec<Documented>, test_only: TestOnly) -> Pl
     // A worker waiting on a query runs other jobs of the pool, which may be another database's:
     // each item puts back the database attached below it.
     let placed: Vec<Vec<Placed>> = base_db::par_map(crates.len(), |at| {
-        blaze_query::db::attach(db, || Walker::new(db, &crates[at]).walk())
+        blaze_memo::attach(db, || Walker::new(db, &crates[at]).walk())
     });
     let mut canonical: HashMap<ModuleDef, ((u8, usize), (usize, usize)), Global> =
         HashMap::new_in(Global);
@@ -873,7 +873,7 @@ impl Places {
                     it.dependencies(db)
                         .into_iter()
                         .map(|dep| dep.krate)
-                        .filter(|dep| !self.test_only.contains(&(it, *dep))),
+                        .filter(|dep| !crate::only_tests_use(db, &self.test_only, it, *dep)),
                 );
             }
         }
@@ -903,7 +903,7 @@ impl Places {
                 .filter_map(|it| it.resolved_crate(db))
                 .collect();
             for dep in it.dependencies(db) {
-                if self.test_only.contains(&(it, dep.krate)) {
+                if crate::only_tests_use(db, &self.test_only, it, dep.krate) {
                     continue;
                 }
                 let linked = match lang_crate_name(db, dep.krate) {

@@ -86,6 +86,8 @@ tracing.workspace = true
 base-db.workspace = true
 blaze-diagnostics.workspace = true
 blaze-lower.workspace = true
+# The probe's database keeps no read lists (`blaze_memo::Reads::Off`).
+blaze-memo.workspace = true
 blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true

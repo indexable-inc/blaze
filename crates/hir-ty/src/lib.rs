@@ -53,6 +53,7 @@ pub mod error_union;
 pub mod evict;
 pub mod facts;
 pub mod fn_cache;
+pub mod kinds;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
@@ -184,6 +185,14 @@ pub fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
 
 pub fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
     hashbrown::HashSet::with_hasher_in(FixedState, frame)
+}
+
+/// The table the syntax contexts of what `krate`'s bodies and signatures write are of (see
+/// [`span::SyntaxContext`]): the crate's arena, where every expansion of its bodies is called
+/// (hir-def's `Resolver::ctx_table`, for code that holds an expression store and no resolver).
+#[inline]
+pub fn ctx_table(krate: base_db::Crate) -> blaze_memo::ArenaId {
+    blaze_memo::Id::gid(krate).arena()
 }
 
 /// A constant can have reference to other things. Memory map job is holding
@@ -817,7 +826,7 @@ mod memory_map_tests {
         with_static.statics.push(StaticMemory {
             start: 8,
             size: 4,
-            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)),
+            id: blaze_memo::Id::from_gid(blaze_memo::Gid::for_test(1)),
         });
         let empty = MemoryMap::Complex(Box::default());
         let with_static = MemoryMap::Complex(Box::new(with_static));
@@ -872,10 +881,11 @@ pub fn lifetime_param_idx(db: &Db, id: LifetimeParamId) -> u32 {
     generics::generics(db, id.parent).lifetime_param_idx(id, false).0
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, blaze_memo::Home)]
 pub enum ImplTraitId {
-    ReturnTypeImplTrait(hir_def::FunctionId, next_solver::ImplTraitIdx),
-    TypeAliasImplTrait(hir_def::TypeAliasId, next_solver::ImplTraitIdx),
+    // The index is a place in its owner's list, no id: the owner is the home.
+    ReturnTypeImplTrait(hir_def::FunctionId, #[home(skip)] next_solver::ImplTraitIdx),
+    TypeAliasImplTrait(hir_def::TypeAliasId, #[home(skip)] next_solver::ImplTraitIdx),
 }
 
 /// 'Canonicalizes' the `t` by replacing any errors with new variables. Also
@@ -1204,8 +1214,7 @@ impl Span {
     Hash,
     PartialOrd,
     Ord,
-    blaze_query::Supertype,
-    blaze_query::Value,
+    blaze_memo::Home,
 )]
 pub enum InferBodyId<'db> {
     DefWithBodyId(DefWithBodyId),

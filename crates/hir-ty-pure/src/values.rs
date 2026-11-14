@@ -14,7 +14,9 @@
 //!   two places) or that is shared while not `Freeze` is `Unknown`.
 //! - A call's value is its [`Flow`]: a walked callee's returned value substituted with the
 //!   call's, a model's transfer (whose `update` sets the local its argument borrows), or an
-//!   environment read.
+//!   environment read. A walked callee's returned value is its summary's, given to
+//!   [`Values::solve`] by the call's site (`rets`): the body's flows name the site, never the
+//!   callee's value, so they are of the body alone (`crate::walk::OwnPart`).
 
 use base_db::Db;
 use blaze_hash::HashMap;
@@ -86,8 +88,10 @@ pub(crate) enum Flow {
     Unknown,
     /// A constructor: its operands, joined.
     Join,
-    /// A walked callee's returned value, substituted with the parameters `spread` gives it.
-    Ret { ret: Abs, spread: Spread },
+    /// The returned value of the callee walked at site `site` of the body (its summary's
+    /// `ret`, which [`Values::solve`] is given by site), substituted with the parameters
+    /// `spread` gives it.
+    Ret { site: u32, spread: Spread },
     /// A leaf of the models: an environment read gives the variable, any other leaf nothing
     /// known.
     Leaf { leaf: Leaf, spread: Spread },
@@ -195,13 +199,15 @@ fn updated(flow: Flow) -> Option<usize> {
 
 impl<'a, 'db> Values<'a, 'db> {
     /// Solves `body`, whose call ending block `b` flows as `flows[b]` (anything for a block
-    /// that does not end in a call).
+    /// that does not end in a call); `rets[s]` is the returned value of the callee walked at
+    /// site `s` (anything for a site that is no walked callee's).
     pub(crate) fn solve(
         db: &'db Db,
         env: ParamEnvAndCrate<'db>,
         infcx: &'a InferCtxt<'db>,
         body: &'a MirBody<'db>,
         flows: &[Flow],
+        rets: &[Abs],
     ) -> Values<'a, 'db> {
         let locals = body.locals.len();
         let mut values = Values {
@@ -235,7 +241,7 @@ impl<'a, 'db> Values<'a, 'db> {
                 match &terminator.kind {
                     TerminatorKind::Call { args, destination, .. } => {
                         let flow = flows[id.into_raw().into_u32() as usize];
-                        let value = values.call(&roots, flow, args, &mut changed);
+                        let value = values.call(&roots, rets, flow, args, &mut changed);
                         changed |= values.write(&roots, destination, value);
                     }
                     TerminatorKind::TailCall { .. } => {
@@ -254,12 +260,21 @@ impl<'a, 'db> Values<'a, 'db> {
 
     /// The value a call gives its destination; a transfer's update is joined into the local
     /// its argument borrows.
-    fn call(&mut self, roots: &[Root], flow: Flow, args: &[Operand], changed: &mut bool) -> Abs {
+    fn call(
+        &mut self,
+        roots: &[Root],
+        rets: &[Abs],
+        flow: Flow,
+        args: &[Operand],
+        changed: &mut bool,
+    ) -> Abs {
         let operands: SmallVec<[Abs; SPREAD]> = args.iter().map(|arg| self.operand(arg)).collect(); // alloc: inline up to eight
         match flow {
             Flow::Unknown => Abs::Unknown,
             Flow::Join => operands.iter().fold(Abs::Unset, |all, &it| all.join(it)),
-            Flow::Ret { ret, spread } => ret.substitute(&spread.params(&operands)),
+            // A site the body's own walk made (`Walk::walk`): its index is in `rets` by
+            // construction, one entry per site.
+            Flow::Ret { site, spread } => rets[site as usize].substitute(&spread.params(&operands)),
             Flow::Leaf { leaf: leaf @ Leaf::EnvVar, spread } => {
                 match apply_leaf(leaf, &spread.params(&operands)) {
                     Applied::Done { ret, .. } => ret,

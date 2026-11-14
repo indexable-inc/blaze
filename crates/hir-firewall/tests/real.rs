@@ -1,6 +1,7 @@
 //! The harness over real crates: the harness projects (`harness/apps/*`, and the repositories
 //! `harness/apps/apps.json` names, checked out), each lowered as a build lowers it, every
-//! function of the named packages edited in turn.
+//! function of the named packages edited in turn, and nothing of the workspace crates that
+//! depend on a package recomputed.
 //!
 //! `BLAZE_FIREWALL` is one JSON value, inline or a path to a file holding it:
 //!
@@ -96,7 +97,8 @@ fn an_edit_of_each_function_of_the_harness_projects_reaches_only_it() {
     }
     assert!(
         dirty.is_empty(),
-        "edits reached past their function in {dirty:?}: the reports are above"
+        "edits recomputed a dependent crate's queries or compiled code past their function in \
+         {dirty:?}: the reports are above"
     );
 }
 
@@ -345,7 +347,8 @@ fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
     let sealed = blaze_lower::unsealed(&units);
     let lower =
         Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None, sealed: &sealed };
-    let mut lowered = blaze_lower::lower_into(Db::logged(), lower)
+    // As the fixture tests' databases: a run log, no fact boundaries, no read lists.
+    let mut lowered = blaze_lower::lower_into(Db::logged(|_| {}, blaze_memo::Reads::Off), lower)
         .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {

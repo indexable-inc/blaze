@@ -83,7 +83,7 @@ fn checked(name: &str) -> [BorrowckResult; 2] {
 fn checked_in(fixture_text: &str, name: &str) -> [BorrowckResult; 2] {
     let fx = fixture::db(fixture_text);
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, name);
         [Mode::Nll, Mode::Polonius].map(|mode| borrowck_in_mode(&db, function.into(), mode))
     })

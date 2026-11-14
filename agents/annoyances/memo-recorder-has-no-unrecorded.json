@@ -1,0 +1,14 @@
+{
+ "id": "memo-recorder-has-no-unrecorded",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L4 piece C (hir-ty next_solver goal tables), port-memo-1113",
+ "where": "crates/blaze-memo/src/record.rs; crates/hir-ty/src/next_solver/goal_store.rs lookup/offer_goal/find",
+ "what": "blaze-memo's recorder always appends a recorded list to the enclosing run (`record` replays into the outer frame) and has no way to run work whose reads belong to no run, which the goal store needs for its own bookkeeping (a miss's fact hashing, an offer's filing) so that which body solved a goal first changes no body's read list. blaze-query had `unrecorded` and `recorded_if`; the spec's rule 5 lists the capture sites but not these two.",
+ "cost": "the goal store was written against an assumed `blaze_memo::unrecorded(memo, work) -> T`; it does not compile until L1 adds it",
+ "cause": "the recorder was designed for queries and imaged records, whose every read is the asker's; a cache's own bookkeeping, whose reads are nobody's, was not among its users when it was specified",
+ "class": "an engine port spec that lists the call sites of the old API by name and misses the ones that use a sibling of the listed calls",
+ "prevention": "a port spec counts every public function of the module being replaced (`rg 'pub fn' db.rs`) and says for each what replaces it, not only the ones its rules name",
+ "workaround": "assumed `pub fn unrecorded<T>(memo: &Memo, work: impl FnOnce() -> T) -> T` (reads made in `work` are listed by no run; `keep*` inside it keeps in the enclosing run's arena); `recorded_if` became `unrecorded(|| recorded(..))` then `replay` when kept",
+ "fix": "not yet",
+ "state": "open"
+}

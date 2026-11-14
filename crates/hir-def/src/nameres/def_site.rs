@@ -87,6 +87,7 @@
 //! Not hygienic: positional fields, as in rustc ("FIXME(jseyfried): positional field hygiene").
 
 use base_db::{Crate, Db};
+use blaze_memo::ArenaId;
 use hir_expand::{
     AstId, HirFileId, MacroCallId, MacroDefKind,
     mod_path::{ModPath, PathKind},
@@ -107,7 +108,7 @@ use crate::{
     nameres::{
         BlockInfo, DefMap, LocalDefMap, MacroSubNs, ModuleOrigin, crate_def_map,
         crate_local_def_map,
-        path_resolution::{PathRead, adjust_to_nearest_non_block_module},
+        path_resolution::{PathRead, ResolveMode, adjust_to_nearest_non_block_module},
     },
     per_ns::{Namespace, PerNs},
     src::use_trees_view,
@@ -142,9 +143,18 @@ enum Step {
 }
 
 impl DefMap {
+    /// The table the syntax contexts of the paths written in this def map are of (see
+    /// [`span::SyntaxContext`]): its crate's arena, where every expansion its collection or
+    /// its bodies make is called. A real file's spans carry root contexts, which need no table.
+    /// A walk that moves to a def site in another crate keeps this table for the context it
+    /// carries: the context is still the one the path was written with.
+    pub(crate) fn ctx_table(&self) -> ArenaId {
+        blaze_memo::Id::gid(self.krate).arena()
+    }
+
     /// Where the first segment of `path`, written in `module` of this def map with syntax
-    /// context `ctxt`, is looked up: see the module docs. `ns` is the namespace the first
-    /// segment is looked up in (`None`: any).
+    /// context `ctxt` (of this def map's [`DefMap::ctx_table`]), is looked up: see the module
+    /// docs. `ns` is the namespace the first segment is looked up in (`None`: any).
     pub(crate) fn hygienic_origin(
         &self,
         db: &Db,
@@ -158,7 +168,7 @@ impl DefMap {
 
     /// [`DefMap::hygienic_origin`], calling `reads` with each scope slot the walk read for a
     /// name the expansion wrote ([`PathRead::Slot`], [`PathRead::LegacyMacro`] of the keyed
-    /// name), as [`DefMap::resolve_path_fp_recording`] reports a lookup's reads: an import of a
+    /// name), as [`DefMap::resolve_path_written_in`] reports a lookup's reads: an import of a
     /// def map being collected is retried when one of them is written.
     pub(crate) fn hygienic_origin_reading(
         &self,
@@ -178,6 +188,7 @@ impl DefMap {
             PathKind::Abs | PathKind::DollarCrate(_) => return Hygienic::Here,
             PathKind::Plain => {}
         }
+        let table = self.ctx_table();
         let mut module = module;
         let mut ctxt = ctxt;
         let mut moved = false;
@@ -185,12 +196,12 @@ impl DefMap {
         // outside it (`parent`), so it ends after as many turns as `ctxt` has opaque marks.
         loop {
             let map = self.map_for(db, module);
-            match map.hygienic_step(db, module, path, ns, ctxt, reads) {
+            match map.hygienic_step(db, table, module, path, ns, ctxt, reads) {
                 Step::Here if moved => {
-                    return Hygienic::At(module, ctxt.normalize_to_macros_2_0(db));
+                    return Hygienic::At(module, ctxt.normalize_to_macros_2_0(db, table));
                 }
                 Step::Here => return Hygienic::Here,
-                Step::At(it) => return Hygienic::At(it, ctxt.normalize_to_macros_2_0(db)),
+                Step::At(it) => return Hygienic::At(it, ctxt.normalize_to_macros_2_0(db, table)),
                 Step::Unknown => return Hygienic::Unknown,
                 Step::DefSite { module: def_site, ctxt: outside } => {
                     module = def_site;
@@ -217,14 +228,22 @@ impl DefMap {
             Hygienic::Here => {
                 self.resolve_path(local_def_map, db, module, path, shadow, expected_macro_subns)
             }
-            Hygienic::At(at, key) => self.map_for(db, at).resolve_path(
-                self.local_for(db, at, local_def_map),
-                db,
-                at,
-                &keyed_path(path, key),
-                shadow,
-                expected_macro_subns,
-            ),
+            Hygienic::At(at, key) => {
+                // The path's later segments keep the contexts written here: of this def map's
+                // table, wherever the lookup goes on.
+                let res = self.map_for(db, at).resolve_path_written_in(
+                    self.ctx_table(),
+                    self.local_for(db, at, local_def_map),
+                    db,
+                    ResolveMode::Other,
+                    at,
+                    &keyed_path(path, key),
+                    shadow,
+                    expected_macro_subns,
+                    &mut |_| {},
+                );
+                (res.resolved_def, res.segment_index)
+            }
             Hygienic::Unknown => (PerNs::none(), None),
         }
     }
@@ -252,18 +271,21 @@ impl DefMap {
     }
 
     /// One step of the lexical walk of a plain path's first segment (rustc's
-    /// `early_resolve_ident_in_lexical_scope` over `hygienic_lexical_parent`).
+    /// `early_resolve_ident_in_lexical_scope` over `hygienic_lexical_parent`). `table` is the
+    /// table `ctxt` is of: the def map's the path is written in, which need not be this one
+    /// once the walk has moved to a def site.
     fn hygienic_step(
         &self,
         db: &Db,
+        table: ArenaId,
         module: ModuleId,
         path: &ModPath,
         ns: Option<Namespace>,
         ctxt: SyntaxContext,
         reads: &mut impl FnMut(PathRead),
     ) -> Step {
-        let ctxt = ctxt.normalize_to_macros_2_0(db);
-        let Some(expn) = ctxt.outer_expn(db) else { return Step::Here };
+        let ctxt = ctxt.normalize_to_macros_2_0(db, table);
+        let Some(expn) = ctxt.outer_expn(db, table) else { return Step::Here };
         let expn = MacroCallId::from(expn);
         if matches!(expn.loc(db).def.kind, MacroDefKind::UnimplementedBuiltIn(_)) {
             return Step::Here;
@@ -291,7 +313,7 @@ impl DefMap {
             return Step::At(at);
         }
         match self.macro_def_module(db, module, expn) {
-            Some(def_site) => Step::DefSite { module: def_site, ctxt: ctxt.parent(db) },
+            Some(def_site) => Step::DefSite { module: def_site, ctxt: ctxt.parent(db, table) },
             None => Step::Unknown,
         }
     }
@@ -302,7 +324,7 @@ impl DefMap {
     /// moved, each later one starts again from the keyword's). [`Hygienic::Here`] where that is
     /// the module the path names as written, as in every module no `macro` wrote.
     fn super_origin(&self, db: &Db, module: ModuleId, levels: u8, ctxt: SyntaxContext) -> Hygienic {
-        let written = ctxt.normalize_to_macros_2_0(db);
+        let written = ctxt.normalize_to_macros_2_0(db, self.ctx_table());
         let mut ctxt = written;
         let Some(mut at) = self.resolve_self(db, &mut ctxt, module, module) else {
             return Hygienic::Unknown;
@@ -360,7 +382,9 @@ impl DefMap {
             let next = match map.module(db, at).parent {
                 Some(parent) => parent,
                 None => {
-                    let (Some(expn), _) = ctxt.remove_mark(db) else { return None };
+                    let (Some(expn), _) = ctxt.remove_mark(db, self.ctx_table()) else {
+                        return None;
+                    };
                     search = self.map_for(db, search).macro_def_module(
                         db,
                         search,
@@ -378,8 +402,9 @@ impl DefMap {
     /// (the last [`adjust`] to the root removes), or this crate's when it has none
     /// ([`Hygienic::Here`]).
     pub(crate) fn crate_origin(&self, db: &Db, ctxt: SyntaxContext) -> Hygienic {
-        let mut ctxt = ctxt.normalize_to_macros_2_0(db);
-        let Some(expn) = adjust(db, &mut ctxt, None) else { return Hygienic::Here };
+        let table = self.ctx_table();
+        let mut ctxt = ctxt.normalize_to_macros_2_0(db, table);
+        let Some(expn) = adjust(db, table, &mut ctxt, None) else { return Hygienic::Here };
         let krate = expn.loc(db).def.krate;
         match krate == self.krate {
             true => Hygienic::Here,
@@ -503,10 +528,7 @@ impl DefMap {
         // The crate's def map is collected unless it is this one, still being collected.
         let collecting = self.block.is_none()
             && def.krate == self.krate
-            && !matches!(
-                self.modules,
-                super::ModulesSlot::Published(_) | super::ModulesSlot::Collected(_)
-            );
+            && !matches!(self.modules, super::ModulesSlot::Collected(_));
         match collecting {
             true => None,
             false => macro_def_module(db, def.krate, ast_id),
@@ -531,7 +553,7 @@ fn declared_in(db: &Db, map: &DefMap, at: ModuleId, ast_id: AstId<ast::Macro>) -
 
 /// [`DefMap::macro_def_module`] in the def map of `krate`, the macro's crate, once collected: a
 /// scan of its modules, kept per macro.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn macro_def_module(db: &Db, krate: Crate, ast_id: AstId<ast::Macro>) -> Option<ModuleId> {
     let map = crate_def_map(db, krate);
     map.modules(db).find_map(|(id, _)| declared_in(db, map, id, ast_id))
@@ -586,15 +608,27 @@ pub fn expansion_of(file: HirFileId) -> Option<MacroCallId> {
     file.macro_file()
 }
 
+// Every function below that reads a context's hygiene data takes `table`, the arena whose
+// table of contexts the context it is handed is of ([`span::SyntaxContext`]): the arena of the
+// crate whose file or expansion the context came with (`HirFileId::context_arena`,
+// `Resolver::ctx_table`, [`DefMap::ctx_table`]). A function that reads the contexts itself
+// (from an item's file) takes no table: it knows which it read. A context of one table is
+// carried into another with `SyntaxContext::translate`, never by its word.
+
 /// rustc's `SyntaxContext::adjust`: removes the outer marks of `ctxt` until `expn` descends
 /// from its outer expansion, so that `ctxt` is what a name has as seen from a scope `expn`
 /// made. Gives the last mark removed, the expansion whose def site privacy is checked from.
-pub fn adjust(db: &Db, ctxt: &mut SyntaxContext, expn: Option<MacroCallId>) -> Option<MacroCallId> {
+pub fn adjust(
+    db: &Db,
+    table: ArenaId,
+    ctxt: &mut SyntaxContext,
+    expn: Option<MacroCallId>,
+) -> Option<MacroCallId> {
     let mut scope = None;
     // Each turn removes one mark; a root context has none and its outer expansion is the root,
     // which every expansion descends from.
-    while !is_descendant_of(db, expn, ctxt.outer_expn(db).map(MacroCallId::from)) {
-        scope = ctxt.remove_mark(db).0.map(MacroCallId::from);
+    while !is_descendant_of(db, expn, ctxt.outer_expn(db, table).map(MacroCallId::from)) {
+        scope = ctxt.remove_mark(db, table).0.map(MacroCallId::from);
     }
     scope
 }
@@ -603,22 +637,28 @@ pub fn adjust(db: &Db, ctxt: &mut SyntaxContext, expn: Option<MacroCallId>) -> O
 /// a `macro` wrote, an ADT's fields, an impl's items): its context normalized to macros 2.0
 /// and adjusted to `expn` (rustc's `normalize_to_macros_2_0_and_adjust`). `None` where that is
 /// a root context, as for every scope of a real file.
-pub fn key_in(db: &Db, ctxt: SyntaxContext, expn: Option<MacroCallId>) -> Option<SyntaxContext> {
-    let mut ctxt = ctxt.normalize_to_macros_2_0(db);
-    adjust(db, &mut ctxt, expn);
+pub fn key_in(
+    db: &Db,
+    table: ArenaId,
+    ctxt: SyntaxContext,
+    expn: Option<MacroCallId>,
+) -> Option<SyntaxContext> {
+    let mut ctxt = ctxt.normalize_to_macros_2_0(db, table);
+    adjust(db, table, &mut ctxt, expn);
     (!ctxt.is_root()).then_some(ctxt)
 }
 
 /// rustc's `hygienic_eq`: whether a name written with `use_ctxt` names a definition of the same
 /// text whose key is `def_key` ([`key_of_context`] of its name), the definition's scope being
-/// made by `expn` ([`expansion_of`] the file it is written in).
+/// made by `expn` ([`expansion_of`] the file it is written in). Both contexts are of `table`.
 pub fn hygienic_eq(
     db: &Db,
+    table: ArenaId,
     use_ctxt: SyntaxContext,
     def_key: Option<SyntaxContext>,
     expn: Option<MacroCallId>,
 ) -> bool {
-    key_in(db, use_ctxt, expn) == def_key
+    key_in(db, table, use_ctxt, expn) == def_key
 }
 
 /// The name a field or an associated item written `name` with `ctxt` is looked up by among the
@@ -629,11 +669,17 @@ pub fn hygienic_eq(
 /// (`check_field`, `check_expr_struct_fields`, `find_by_ident_and_namespace`). A name a real
 /// file or a `macro_rules!` writes, and a name looked up in a scope no `macro` made, keeps no
 /// key.
-pub fn name_in(db: &Db, name: Name, ctxt: SyntaxContext, expn: Option<MacroCallId>) -> Name {
+pub fn name_in(
+    db: &Db,
+    table: ArenaId,
+    name: Name,
+    ctxt: SyntaxContext,
+    expn: Option<MacroCallId>,
+) -> Name {
     if ctxt.is_root() {
         return name;
     }
-    match key_in(db, ctxt, expn) {
+    match key_in(db, table, ctxt, expn) {
         Some(key) => name.keyed(key),
         None => name,
     }
@@ -655,6 +701,7 @@ pub fn name_in(db: &Db, name: Name, ctxt: SyntaxContext, expn: Option<MacroCallI
 /// checks from `here` in its place (no fallback).
 pub fn privacy_scope(
     db: &Db,
+    table: ArenaId,
     ctxt: SyntaxContext,
     expn: Option<MacroCallId>,
     here: ModuleId,
@@ -662,8 +709,8 @@ pub fn privacy_scope(
     if ctxt.is_root() {
         return None;
     }
-    let mut ctxt = ctxt.normalize_to_macros_2_0(db);
-    let scope = adjust(db, &mut ctxt, expn)?;
+    let mut ctxt = ctxt.normalize_to_macros_2_0(db, table);
+    let scope = adjust(db, table, &mut ctxt, expn)?;
     let def = scope.loc(db).def;
     if matches!(def.kind, MacroDefKind::UnimplementedBuiltIn(_)) {
         return None;
@@ -758,11 +805,28 @@ pub fn assoc_item_key(db: &Db, item: crate::AssocItemId) -> Option<SyntaxContext
 
 /// [`name_in`] for a method name written with `hygiene` (as an expression store keeps it,
 /// [`crate::expr_store::ExpressionStore::member_hygiene`]) among the items of the impl `id`.
-pub fn impl_item_name(db: &Db, id: crate::ImplId, name: Name, hygiene: HygieneId) -> Name {
+pub fn impl_item_name(
+    db: &Db,
+    table: ArenaId,
+    id: crate::ImplId,
+    name: Name,
+    hygiene: HygieneId,
+) -> Name {
     if hygiene.is_root() {
         return name;
     }
-    name_in(db, name, hygiene.syntax_context(), impl_expansion(db, id))
+    name_in(db, table, name, hygiene.syntax_context(), impl_expansion(db, id))
+}
+
+/// The table the key of the associated item `item` ([`assoc_item_key`]) is of: that of the
+/// file it is declared in, whose span map the key is read from.
+fn assoc_item_table(db: &Db, item: crate::AssocItemId) -> ArenaId {
+    let file = match item {
+        crate::AssocItemId::FunctionId(it) => it.lookup(db).id.file_id,
+        crate::AssocItemId::ConstId(it) => it.lookup(db).id.file_id,
+        crate::AssocItemId::TypeAliasId(it) => it.lookup(db).id.file_id,
+    };
+    file.context_arena()
 }
 
 /// Whether the associated item `item`, listed by its impl or trait as `item_name` (the text it
@@ -783,11 +847,17 @@ pub fn trait_expansion(db: &Db, id: crate::TraitId) -> Option<MacroCallId> {
 /// [`name_in`] for an associated item name written with `hygiene` (a method call's
 /// `member_hygiene`, a path's segment) among the items of the trait `id`, as
 /// [`impl_item_name`] among an impl's. What [`assoc_item_is`] compares a trait's items with.
-pub fn trait_item_name(db: &Db, id: crate::TraitId, name: Name, hygiene: HygieneId) -> Name {
+pub fn trait_item_name(
+    db: &Db,
+    table: ArenaId,
+    id: crate::TraitId,
+    name: Name,
+    hygiene: HygieneId,
+) -> Name {
     if hygiene.is_root() {
         return name;
     }
-    name_in(db, name, hygiene.syntax_context(), trait_expansion(db, id))
+    name_in(db, table, name, hygiene.syntax_context(), trait_expansion(db, id))
 }
 
 /// `name`, the name of the associated item `item`, [keyed](Name::keyed) by the item's own key
@@ -805,21 +875,21 @@ pub fn assoc_item_binding_name(db: &Db, item: crate::AssocItemId, name: Name) ->
 /// looked up in is not known yet (the key of a query that searches bounds and supertraits,
 /// `T::Assoc`): `name` [keyed](Name::keyed) by [`key_of_context`], rustc's `assoc_ident` before
 /// any trait adjusts it. [`trait_item_written`] adjusts it to each trait it is looked up in.
-pub fn written_name(db: &Db, name: Name, hygiene: HygieneId) -> Name {
+pub fn written_name(db: &Db, table: ArenaId, name: Name, hygiene: HygieneId) -> Name {
     if hygiene.is_root() {
         return name;
     }
-    match key_of_context(db, hygiene.syntax_context()) {
+    match key_of_context(db, table, hygiene.syntax_context()) {
         Some(key) => name.unkeyed().keyed(key),
         None => name,
     }
 }
 
-/// [`trait_item_name`] of a [`written_name`]: the name it looks an item of the trait `id` up
-/// by. A name with no key is itself.
-pub fn trait_item_written(db: &Db, id: crate::TraitId, written: Name) -> Name {
+/// [`trait_item_name`] of a [`written_name`] (keyed in `table`): the name it looks an item of
+/// the trait `id` up by. A name with no key is itself.
+pub fn trait_item_written(db: &Db, table: ArenaId, id: crate::TraitId, written: Name) -> Name {
     match written.key() {
-        Some(key) => name_in(db, written.unkeyed(), key, trait_expansion(db, id)),
+        Some(key) => name_in(db, table, written.unkeyed(), key, trait_expansion(db, id)),
         None => written,
     }
 }
@@ -830,6 +900,7 @@ pub fn trait_item_written(db: &Db, id: crate::TraitId, written: Name) -> Name {
 /// `trait_defines_associated_item_named`. An item of no trait is looked up by no shorthand.
 pub fn trait_item_is_written(
     db: &Db,
+    table: ArenaId,
     item_name: Name,
     item: crate::AssocItemId,
     written: Name,
@@ -843,14 +914,14 @@ pub fn trait_item_is_written(
         crate::AssocItemId::TypeAliasId(it) => it.lookup(db).container,
     };
     let crate::ItemContainerId::TraitId(trait_) = container else { return false };
-    assoc_item_is(db, item_name, item, trait_item_written(db, trait_, written))
+    assoc_item_is(db, item_name, item, trait_item_written(db, table, trait_, written))
 }
 
 /// The key of a name written with `hygiene`, as a [`written_name`] has it: its context
 /// normalized to macros 2.0, `None` where that is a root context (every name a real file or a
 /// `macro_rules!` writes), for which the traits in scope are the plain walk's.
-pub fn written_key(db: &Db, hygiene: HygieneId) -> Option<SyntaxContext> {
-    key_of_context(db, hygiene.syntax_context())
+pub fn written_key(db: &Db, table: ArenaId, hygiene: HygieneId) -> Option<SyntaxContext> {
+    key_of_context(db, table, hygiene.syntax_context())
 }
 
 /// Whether the item `impl_item` of an impl of the trait `trait_`, declared `impl_name`,
@@ -885,7 +956,10 @@ pub fn implemented_name(
     impl_name: Name,
 ) -> Option<Name> {
     Some(match assoc_item_key(db, impl_item) {
-        Some(key) => name_in(db, impl_name.unkeyed(), key, trait_expansion(db, trait_()?)),
+        Some(key) => {
+            let table = assoc_item_table(db, impl_item);
+            name_in(db, table, impl_name.unkeyed(), key, trait_expansion(db, trait_()?))
+        }
         None => impl_name.unkeyed(),
     })
 }
@@ -900,11 +974,12 @@ pub fn implemented_name(
 /// rustc's `traits_in_module` takes them. Calls `f` with each, innermost first, with repeats.
 pub fn for_each_hygienic_trait_in_scope(
     db: &Db,
+    table: ArenaId,
     module: ModuleId,
     ctxt: SyntaxContext,
     mut f: impl FnMut(crate::TraitId),
 ) {
-    let mut ctxt = ctxt.normalize_to_macros_2_0(db);
+    let mut ctxt = ctxt.normalize_to_macros_2_0(db, table);
     let mut at = module;
     // Each turn either removes one mark of `ctxt` or leaves a block for the module around it,
     // which is outside it: it ends after at most as many turns as `ctxt` has marks times the
@@ -912,9 +987,9 @@ pub fn for_each_hygienic_trait_in_scope(
     loop {
         let map = at.def_map(db);
         map.module(db, at).traits_in_scope(db).for_each(&mut f);
-        let outer = ctxt.outer_expn(db).map(MacroCallId::from);
+        let outer = ctxt.outer_expn(db, table).map(MacroCallId::from);
         if !is_descendant_of(db, map.module_expansion(db, at), outer) {
-            let (Some(mark), _) = ctxt.remove_mark(db) else { break };
+            let (Some(mark), _) = ctxt.remove_mark(db, table) else { break };
             match map.macro_def_module(db, at, MacroCallId::from(mark)) {
                 Some(def_site) => at = def_site,
                 None => break,
@@ -932,19 +1007,19 @@ pub fn for_each_hygienic_trait_in_scope(
 }
 
 /// The root context under `ctxt`'s marks: the edition of the file its tokens were written in.
-fn root_of(db: &Db, ctxt: SyntaxContext) -> SyntaxContext {
+fn root_of(db: &Db, table: ArenaId, ctxt: SyntaxContext) -> SyntaxContext {
     let mut at = ctxt;
     // Each turn removes one mark.
     while !at.is_root() {
-        at = at.parent(db);
+        at = at.parent(db, table);
     }
     at
 }
 
 /// The key a definition whose name is written with `ctxt` binds: its context normalized to
 /// macros 2.0, `None` for a root context (every name a real file or a `macro_rules!` writes).
-pub fn key_of_context(db: &Db, ctxt: SyntaxContext) -> Option<SyntaxContext> {
-    normalized_key(db, ctxt)
+pub fn key_of_context(db: &Db, table: ArenaId, ctxt: SyntaxContext) -> Option<SyntaxContext> {
+    normalized_key(db, table, ctxt)
 }
 
 /// The name a generic parameter (type, const or lifetime, of an item or of a `for<..>` binder)
@@ -959,11 +1034,11 @@ pub fn key_of_context(db: &Db, ctxt: SyntaxContext) -> Option<SyntaxContext> {
 /// `Self` is never keyed: rustc resolves it with the root context ("FIXME(jseyfried) improve
 /// `Self` hygiene"). A name with no key (every one a real file or a `macro_rules!` writes)
 /// stays as it is, so ordinary code compares plain names.
-pub fn param_name(db: &Db, name: Name, ctxt: SyntaxContext) -> Name {
+pub fn param_name(db: &Db, table: ArenaId, name: Name, ctxt: SyntaxContext) -> Name {
     if name == sym::Self_ {
         return name;
     }
-    match key_of_context(db, ctxt) {
+    match key_of_context(db, table, ctxt) {
         Some(key) => name.keyed(key),
         None => name,
     }
@@ -974,40 +1049,50 @@ pub fn param_name(db: &Db, name: Name, ctxt: SyntaxContext) -> Name {
 /// [`param_name`] of that context, whose macros 2.0 normalization is the one `name` was written
 /// with. Taken once, before the scope walk, as rustc's `resolve_ident_in_lexical_scope` takes
 /// its `normalized_ident`.
-pub fn path_param_name(db: &Db, name: Name, hygiene: HygieneId) -> Name {
-    param_name(db, name, hygiene.syntax_context())
+pub fn path_param_name(db: &Db, table: ArenaId, name: Name, hygiene: HygieneId) -> Name {
+    param_name(db, table, name, hygiene.syntax_context())
 }
 
 /// rustc's `SyntaxContext::reverse_glob_adjust`: the key a name keyed `key` in a scope that
 /// `expn` made takes when a glob written with `glob_ctxt` imports it, so that the names the
 /// glob's own expansion writes find it. `None` when the name cannot be named through the glob
 /// (adjusting it to `expn` would remove a mark: it is hidden from the scope's own view).
+///
+/// `key` is of `key_table` (the table of the crate whose scope binds the name), `glob_ctxt`
+/// of `glob_table` (the importing crate's, which has `key_table` in its closure); the key is
+/// carried into `glob_table` ([`SyntaxContext::translate`]) and the answer is of `glob_table`.
 pub fn reverse_glob_adjust(
     db: &Db,
+    key_table: ArenaId,
     key: Option<SyntaxContext>,
     expn: Option<MacroCallId>,
+    glob_table: ArenaId,
     glob_ctxt: SyntaxContext,
 ) -> Option<Option<SyntaxContext>> {
-    let mut glob = glob_ctxt.normalize_to_macros_2_0(db);
+    let table = glob_table;
+    let mut glob = glob_ctxt.normalize_to_macros_2_0(db, table);
     // A name with no key gets the glob's marks on the root its tokens have, so that the
     // context made is the one the expansion's own tokens of that name have.
-    let mut ctxt = key.unwrap_or_else(|| root_of(db, glob));
-    if adjust(db, &mut ctxt, expn).is_some() {
+    let mut ctxt = match key {
+        Some(key) => key.translate(db, key_table, table),
+        None => root_of(db, table, glob),
+    };
+    if adjust(db, table, &mut ctxt, expn).is_some() {
         return None;
     }
     // alloc: none for up to 4 marks, the depth of nested `macro`s a glob is written in
     let mut marks: smallvec::SmallVec<[(MacroCallId, hir_expand::hygiene::Transparency); 4]> =
         smallvec::SmallVec::new();
     // Each turn removes one of the glob context's marks, ending at the root at the latest.
-    while !is_descendant_of(db, expn, glob.outer_expn(db).map(MacroCallId::from)) {
-        let (Some(mark), transparency) = glob.remove_mark(db) else { break };
+    while !is_descendant_of(db, expn, glob.outer_expn(db, table).map(MacroCallId::from)) {
+        let (Some(mark), transparency) = glob.remove_mark(db, table) else { break };
         marks.push((MacroCallId::from(mark), transparency));
     }
     while let Some((mark, transparency)) = marks.pop() {
         let edition = mark.loc(db).def.edition;
-        ctxt = hir_expand::hygiene::apply_mark(db, ctxt, mark.into(), transparency, edition);
+        ctxt = hir_expand::hygiene::apply_mark(db, table, ctxt, mark.into(), transparency, edition);
     }
-    Some(normalized_key(db, ctxt))
+    Some(normalized_key(db, table, ctxt))
 }
 
 /// `path` with its first segment keyed by `key` ([`Name::keyed`]), for the lookup in the scope
@@ -1092,7 +1177,7 @@ pub fn binding_key_at(db: &Db, file: HirFileId, range: TextRange) -> Option<Synt
     if file.macro_file().is_none() {
         return None;
     }
-    normalized_key(db, file.span_map(db).span_for_range(range).ctx)
+    normalized_key(db, file.context_arena(), file.span_map(db).span_for_range(range).ctx)
 }
 
 /// The context, normalized to macros 2.0, that the name the import `import` binds is keyed by,
@@ -1131,11 +1216,11 @@ pub(crate) fn macro_binding_key(db: &Db, mac: MacroId) -> Option<SyntaxContext> 
     }
 }
 
-fn normalized_key(db: &Db, ctxt: SyntaxContext) -> Option<SyntaxContext> {
+fn normalized_key(db: &Db, table: ArenaId, ctxt: SyntaxContext) -> Option<SyntaxContext> {
     if ctxt.is_root() {
         return None;
     }
-    let key = ctxt.normalize_to_macros_2_0(db);
+    let key = ctxt.normalize_to_macros_2_0(db, table);
     (!key.is_root()).then_some(key)
 }
 
@@ -1149,25 +1234,27 @@ fn item_key<N: AstIdNode>(db: &Db, ast: AstId<N>) -> Option<SyntaxContext> {
 /// The key of the name of the item `ast` of `call`'s expansion. A query of its own so that the
 /// def map, which keys each binding by it, reads this answer and not the expansion's syntax: an
 /// edit inside a macro's input that keeps the item's name context keeps the def map.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn expanded_item_key(db: &Db, call: MacroCallId, ast: ErasedFileAstId) -> Option<SyntaxContext> {
     let file = HirFileId::from(call);
     let node = view::to_node(file.ast_id_map(db).get_erased(ast), file.root(db));
     normalized_key(
         db,
+        file.context_arena(),
         name_range(node).map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx),
     )
 }
 
 /// The key of the name the `idx`th use tree of `use_`, an item of `call`'s expansion, binds:
 /// as [`expanded_item_key`], a query of its own.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn use_tree_key(db: &Db, call: MacroCallId, use_: UseId, idx: u32) -> Option<SyntaxContext> {
     let file = HirFileId::from(call);
     let trees = use_trees_view(db, use_.lookup(db).id);
     let tree = trees[Idx::from_raw(la_arena::RawIdx::from_u32(idx))];
     normalized_key(
         db,
+        file.context_arena(),
         name_range(view::AstNode::syntax(&tree))
             .map_or(ROOT, |range| file.span_map(db).span_for_range(range).ctx),
     )
@@ -1190,7 +1277,7 @@ pub(crate) fn use_path_context(db: &Db, import: ImportId) -> SyntaxContext {
 /// [`use_path_context`] of a use tree of `call`'s expansion: a query of its own, as
 /// [`expanded_item_key`]. The path of a nested tree starts in the outermost tree around it that
 /// has a path or a leading `::`.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn expanded_use_path_context(db: &Db, call: MacroCallId, use_: UseId, idx: u32) -> SyntaxContext {
     let file = HirFileId::from(call);
     let trees = use_trees_view(db, use_.lookup(db).id);
@@ -1203,7 +1290,7 @@ fn expanded_use_path_context(db: &Db, call: MacroCallId, use_: UseId, idx: u32) 
             start = view::AstNode::syntax(&tree).text_range();
         }
     }
-    file.span_map(db).span_for_range(start).ctx.normalize_to_macros_2_0(db)
+    file.span_map(db).span_for_range(start).ctx.normalize_to_macros_2_0(db, file.context_arena())
 }
 
 /// [`DefMap::module_key`] of a module declared at `origin`.
@@ -1215,7 +1302,7 @@ pub(crate) fn origin_key(db: &Db, origin: &ModuleOrigin) -> Option<SyntaxContext
 
 /// [`DefMap::module_key`] of the `mod` item `ast` of `call`'s expansion: the context of its
 /// `mod` keyword. A query of its own, as [`expanded_item_key`].
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn module_item_key(db: &Db, call: MacroCallId, ast: ErasedFileAstId) -> Option<SyntaxContext> {
     let file = HirFileId::from(call);
     let node = view::to_node(file.ast_id_map(db).get_erased(ast), file.root(db));
@@ -1223,7 +1310,7 @@ fn module_item_key(db: &Db, call: MacroCallId, ast: ErasedFileAstId) -> Option<S
         Some(keyword) => keyword.text_range(),
         None => node.text_range(),
     };
-    normalized_key(db, file.span_map(db).span_for_range(range).ctx)
+    normalized_key(db, file.context_arena(), file.span_map(db).span_for_range(range).ctx)
 }
 
 /// The context a glob is written with, normalized to macros 2.0: its `*`'s (rustc's
@@ -1239,7 +1326,7 @@ pub fn glob_context(db: &Db, glob: crate::item_scope::GlobId) -> SyntaxContext {
 
 /// [`glob_context`] of a glob of `call`'s expansion: a query of its own, as
 /// [`expanded_item_key`].
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn expanded_glob_context(db: &Db, call: MacroCallId, use_: UseId, idx: u32) -> SyntaxContext {
     let file = HirFileId::from(call);
     let trees = use_trees_view(db, use_.lookup(db).id);
@@ -1248,16 +1335,20 @@ fn expanded_glob_context(db: &Db, call: MacroCallId, use_: UseId, idx: u32) -> S
         Some(star) => star.text_range(),
         None => view::AstNode::syntax(&tree).text_range(),
     };
-    file.span_map(db).span_for_range(range).ctx.normalize_to_macros_2_0(db)
+    file.span_map(db).span_for_range(range).ctx.normalize_to_macros_2_0(db, file.context_arena())
 }
 
 /// The name `name` of a scope that `expn` made takes when a glob written with `glob_ctxt`
 /// ([`glob_context`]) imports it: [`reverse_glob_adjust`] of its key, `None` when the glob
-/// cannot name it. A name with no key through a glob a real file writes is itself.
+/// cannot name it. A name with no key through a glob a real file writes is itself. `name` is
+/// keyed in `name_table` (the crate whose scope binds it), `glob_ctxt` is of `glob_table`
+/// (the importing crate's), and the name given is keyed in `glob_table`.
 pub fn glob_imported_name(
     db: &Db,
+    name_table: ArenaId,
     name: Name,
     expn: Option<MacroCallId>,
+    glob_table: ArenaId,
     glob_ctxt: SyntaxContext,
 ) -> Option<Name> {
     let key = name.key();
@@ -1265,7 +1356,7 @@ pub fn glob_imported_name(
         return Some(name);
     }
     let plain = name.unkeyed();
-    Some(match reverse_glob_adjust(db, key, expn, glob_ctxt)? {
+    Some(match reverse_glob_adjust(db, name_table, key, expn, glob_table, glob_ctxt)? {
         Some(key) => plain.keyed(key),
         None => plain,
     })

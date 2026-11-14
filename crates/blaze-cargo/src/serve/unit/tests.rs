@@ -1356,7 +1356,7 @@ fn lowered_proc_macro() -> blaze_lower::Lowered {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
-    })
+    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
     .unwrap()
 }
 
@@ -1674,7 +1674,12 @@ fn script_front_for(
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
     };
-    let mut lowered = blaze_lower::lower(lower).unwrap();
+    let mut lowered = blaze_lower::lower(
+        lower,
+        blaze_item_hash::reads::mark_boundaries,
+        blaze_memo::Reads::Kept,
+    )
+    .unwrap();
     let identity = lowered.identity(1).unwrap();
     let krate = lowered.krate(1).unwrap();
     // What its compile does to the front end: every body resolved, `option_env!` expanded.
@@ -2032,7 +2037,7 @@ fn script_lib_front(lib: &[u8]) -> blaze_lower::Lowered {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
-    })
+    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
     .unwrap()
 }
 
@@ -2167,7 +2172,7 @@ fn front_of(pkgs: &[MemPkg<'_>]) -> MemFront {
         root: view,
         host_cpu: None,
         sealed: &blaze_lower::unsealed(&units),
-    })
+    }, blaze_item_hash::reads::mark_boundaries, blaze_memo::Reads::Kept)
     .unwrap();
     MemFront { lowered, units }
 }
@@ -2181,7 +2186,7 @@ fn sealed_diags(
     let db = lowered.db();
     let krate = lowered.krate(unit).unwrap();
     let files = blaze_diagnostics::Files::new(lowered.paths(), "/");
-    let in_graph = blaze_query::db::attach(db, || hir_ty::sealed_in_graph(db, krate));
+    let in_graph = blaze_memo::attach(db, || hir_ty::sealed_in_graph(db, krate));
     let diags =
         compile::reached_only_diags(db, krate, files, || Ok(blaze_diagnostics::Options::default()))
             .unwrap();
@@ -2665,6 +2670,8 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         .unwrap()
         .expect("`d` is keyed");
     assert_eq!(served.hits, Vec::new(), "a cold store");
+    // Each write commits and takes the crate's id: `d` is taken again after each.
+    let d = first.krate(2).unwrap();
     assert_eq!(root_values(&first, d), ["slow"]);
     keep(&first, &mut session, served);
     drop((session, first));
@@ -2673,11 +2680,14 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     let mut kept = script_cfg_front();
     kept.ran(1, &d_ran(&[])).unwrap();
     let d = kept.krate(2).unwrap();
+    // By key: the serve's commit takes `d`'s id, and what it served names crates by key.
+    let d_key = d.key(kept.db());
     let mut session = super::deps::session(&kept, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
-    assert_eq!(served.hits, [d], "`d` is read from its image");
+    assert_eq!(served.hits, [d_key], "`d` is read from its image");
+    let d = kept.krate(2).unwrap();
     assert_eq!(root_values(&kept, d), ["slow"]);
     assert!(
         super::deps::images(&mut kept, &[d], build, &mut session, mode).unwrap().is_none(),
@@ -2686,6 +2696,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
 
     // Its front end is kept for a build whose `CC` moved: the script's run gives `fast` now.
     kept.ran(1, &d_ran(&["fast"])).unwrap();
+    let d = kept.krate(2).unwrap();
     let fast = cfg::CfgAtom::Flag(intern::Symbol::intern("fast"));
     assert!(d.cfg_options(kept.db()).check_atom(&fast), "the run's cfg is applied to `d`");
     assert_eq!(
@@ -2697,6 +2708,7 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         .unwrap()
         .expect("`d`'s key moved");
     assert_eq!(served.hits, Vec::new(), "no image of `d` with `fast`");
+    let d = kept.krate(2).unwrap();
     assert!(hir_def::deps::image_of(kept.db(), d).is_none(), "`d` lost the image of the old cfg");
     assert_eq!(root_values(&kept, d), ["fast"], "`d` resolves with the cfg its run gives now");
     keep(&kept, &mut session, served);
@@ -2707,10 +2719,12 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
     // state and pay a cold run at the next edit): no hit, and never stale.
     for (cfgs, values) in [(&[][..], ["slow"]), (&["fast"][..], ["fast"])] {
         kept.ran(1, &d_ran(cfgs)).unwrap();
+        let d = kept.krate(2).unwrap();
         let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
             .unwrap()
             .expect("`d`'s key moved");
         assert_eq!(served.hits, Vec::new(), "{cfgs:?}: asked before and maintained");
+        let d = kept.krate(2).unwrap();
         assert_eq!(root_values(&kept, d), values, "{cfgs:?}");
     }
     drop((session, kept));
@@ -2721,11 +2735,13 @@ fn a_served_dependency_whose_scripts_cfg_moves_is_served_again_not_stale() {
         let mut fresh = script_cfg_front();
         fresh.ran(1, &d_ran(cfgs)).unwrap();
         let d = fresh.krate(2).unwrap();
+        let d_key = d.key(fresh.db());
         let mut session = super::deps::session(&fresh, &reader, &stores_of(&reader), &macros, &[]).unwrap();
         let served = super::deps::images(&mut fresh, &[d], build, &mut session, mode)
             .unwrap()
             .expect("`d` is keyed");
-        assert_eq!(served.hits, [d], "{cfgs:?}");
+        assert_eq!(served.hits, [d_key], "{cfgs:?}");
+        let d = fresh.krate(2).unwrap();
         assert_eq!(root_values(&fresh, d), values, "{cfgs:?}");
         drop((session, fresh));
     }
@@ -2830,6 +2846,8 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let served = super::deps::images(&mut first, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
+    // The serve's commit took `d`'s id: taken again.
+    let d = first.krate(2).unwrap();
     assert_eq!(root_values(&first, d), ["one"]);
     let kept = super::deps::Kept { served, mode };
     // `d` is unsealed: written as a front end let go writes it (`Which::All`).
@@ -2843,20 +2861,24 @@ fn a_served_dependency_whose_out_dir_file_alone_moves_is_served_again_not_stale(
     let mut kept = script_lib_front(D_INCLUDES);
     kept.ran(1, &d_generated("pub fn one() {}\n")).unwrap();
     let d = kept.krate(2).unwrap();
+    let d_key = d.key(kept.db());
     let mut session = super::deps::session(&kept, &reader, &stores_of(&reader), &macros, &[]).unwrap();
     let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d` is keyed");
-    assert_eq!(served.hits, [d], "`d` is read from its image");
+    assert_eq!(served.hits, [d_key], "`d` is read from its image");
+    let d = kept.krate(2).unwrap();
     assert_eq!(root_values(&kept, d), ["one"]);
     super::deps::stamp(&kept, build, &mut session);
 
     // Its script runs again with the same cfg and variables, and writes another `gen.rs`.
     kept.ran(1, &d_generated("pub fn two() {}\n")).unwrap();
+    let d = kept.krate(2).unwrap();
     let served = super::deps::images(&mut kept, &[d], build, &mut session, mode)
         .unwrap()
         .expect("`d`'s key moved with its `OUT_DIR` file");
     assert_eq!(served.hits, Vec::new(), "no image of `d` with this `gen.rs`");
+    let d = kept.krate(2).unwrap();
     assert!(
         hir_def::deps::image_of(kept.db(), d).is_none(),
         "`d` lost the image of the old `gen.rs`"
@@ -2894,7 +2916,7 @@ fn a_file_a_proc_macro_read_outside_the_tree_makes_the_record_miss_once_it_chang
         values: now(krate.env(db), &shape).unwrap(),
     };
     let served = base_db::ReadBy::Served(ContentId::of("blaze v2 cargo test image", b"script"));
-    db.files().expansions_are_read(krate, served, vec![read]);
+    db.files().expansions_are_read(krate.key(db), served, vec![read]);
     let read = super::reads::Reads::of(db, krate).unwrap();
     let env = super::reads::tests::env(&run);
     let mut store = super::reads::tests::Store::default();
@@ -3311,9 +3333,11 @@ fn no_marks() -> std::collections::BTreeMap<String, blaze_cas::Key> {
 /// The front end of `pkgs` ([`front_of`]), told which front end computes its bodies'
 /// identities as a build's is (`Steps::lower`).
 fn bodies_front(pkgs: &[MemPkg<'_>]) -> blaze_lower::Lowered {
+    // Its fact boundaries were marked as the database was made ([`front_of`]).
     let mut lowered = front_of(pkgs).lowered;
-    blaze_item_hash::impls::install(lowered.served_db());
-    blaze_item_hash::identity::set_build(lowered.served_db(), super::deps::front_end().unwrap());
+    let mut edit = lowered.served_db().edit();
+    blaze_item_hash::identity::give_build(&mut edit, super::deps::front_end().unwrap());
+    _ = edit.commit();
     lowered
 }
 
@@ -3344,7 +3368,7 @@ fn ask_bodies_steps(lowered: &blaze_lower::Lowered) -> usize {
     use hir_ty::db::HirDatabase as _;
     let db = lowered.db();
     let krate = lowered.krate(0).unwrap();
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let bodies = hir_def::nameres::demand::crate_body_owners(db, krate);
         for &def in &bodies {
             let _ = hir_ty::InferenceResult::of(db, def);
@@ -3617,7 +3641,7 @@ const LEAK_READERS: [&str; 3] = ["reads_make", "reads_n", "reads_work"];
 fn function_named(lowered: &blaze_lower::Lowered, name: &str) -> hir_def::DefWithBodyId {
     let db = lowered.db();
     let krate = lowered.krate(0).unwrap();
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         hir_def::nameres::demand::crate_body_owners(db, krate)
             .into_iter()
             .find(|def| match def {
@@ -3636,7 +3660,7 @@ fn steps_of(lowered: &blaze_lower::Lowered, name: &str) -> [Option<ContentId>; 2
     use hir_ty::body_store::{Step, step_value};
     let def = function_named(lowered, name);
     let db = lowered.db();
-    blaze_query::db::attach(db, || [step_value(db, def, Step::Infer), step_value(db, def, Step::Mir)])
+    blaze_memo::attach(db, || [step_value(db, def, Step::Infer), step_value(db, def, Step::Mir)])
 }
 
 /// The oracle of [`a_body_that_reads_an_edited_leak_is_never_served_stale`]: [`LEAKS`] built
@@ -3732,12 +3756,15 @@ fn carried_serve(seed: u64) -> Result<bodies::Did, String> {
     {
         let lowered = std::sync::Arc::get_mut(&mut next).ok_or("the front end is held past its serve")?;
         let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
-        // One change, in one batch: a build's database takes every write so
-        // (`Db::require_batches`, which blaze-lower sets once its crate graph is written).
-        lowered
-            .served_db()
-            .batch(base_db::Trigger::named("the test's edit of `uses`"), |db| db.set_file_text(root, &edited));
+        // One change, in one edit and one commit, under the batch's span as a build's writes.
+        lowered.batch(blaze_lower::Trigger::named("the test's edit of `uses`"), |lowered| {
+            let mut edit = lowered.served_db().edit();
+            edit.set_file_text(root, &edited);
+            _ = edit.commit();
+        });
     }
+    // The commit took the crate's id of the first snapshot: taken again in the new one.
+    let krate = next.krate(0).unwrap();
     let (_, second) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
         .map_err(|error| format!("the second serve: {}", error.what))?;
     ask_bodies_steps(&next);
@@ -3788,11 +3815,14 @@ fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
     let marks = no_marks();
     let mut next = std::sync::Arc::new(core_front(OWNERS));
     let served = super::deps::session(&next, &reader, &stores_of(&reader), &macros, &[]).unwrap();
-    let krate = next.krate(0).unwrap();
     let edit = |next: &mut std::sync::Arc<blaze_lower::Lowered>, text: &str, why: &'static str| -> Result<(), String> {
         let lowered = std::sync::Arc::get_mut(next).ok_or("the front end is held past its serve")?;
         let root = lowered.krate(0).unwrap().data(lowered.db()).root_file_id;
-        lowered.served_db().batch(base_db::Trigger::named(why), |db| db.set_file_text(root, text));
+        lowered.batch(blaze_lower::Trigger::named(why), |lowered| {
+            let mut edit = lowered.served_db().edit();
+            edit.set_file_text(root, text);
+            _ = edit.commit();
+        });
         Ok(())
     };
     // alloc: a test's texts
@@ -3806,7 +3836,9 @@ fn served_past_lost_puts(seed: u64) -> Result<bodies::Did, String> {
         if let Some((text, why)) = text {
             edit(&mut next, text, why)?;
         }
-        // Its puts are dropped: the loop never puts them.
+        // Its puts are dropped: the loop never puts them. The crate taken in this snapshot: an
+        // edit's commit took the last one's id.
+        let krate = next.krate(0).unwrap();
         let (_lost, did) = super::deps::serve_bodies_of(&next, krate, &all_in_view, &sessions, &marks, &reader)
             .map_err(|error| format!("serve {at}: {}", error.what))?;
         if at > 0 && did.session != Opened::Kept {

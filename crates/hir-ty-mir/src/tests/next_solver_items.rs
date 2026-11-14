@@ -112,24 +112,24 @@ fn param_region_def_id_is_the_declaring_item() {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
         let interner = DbInterner::new_with(&db, module_id.krate(&db));
-
+    
         let ModuleDefId::FunctionId(f) = declared(&db, scope, "f") else {
             panic!("`f` should be a function");
         };
         let impl_ = impl_with(&db, scope, "g");
         let g = impl_fn(&db, impl_, "g");
-
+    
         let f_a = EarlyParamRegion { id: only_lifetime(&db, f.into()), index: 0 };
         assert_eq!(
             interner.generics_of(f.into()).param_region_def_id(interner, f_a),
             SolverDefId::FunctionId(f),
         );
-
+    
         let impl_a = EarlyParamRegion { id: only_lifetime(&db, impl_.into()), index: 0 };
         assert_eq!(
             interner.generics_of(impl_.into()).param_region_def_id(interner, impl_a),
@@ -155,12 +155,12 @@ fn param_region_def_id_at_a_type_parameter_panics() {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
         let interner = DbInterner::new_with(&db, module_id.krate(&db));
-
+    
         let ModuleDefId::FunctionId(f) = declared(&db, scope, "f") else {
             panic!("`f` should be a function");
         };
@@ -191,12 +191,12 @@ fn h(_: N<{ 1 + 1 }>) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
         let interner = DbInterner::new_with(&db, module_id.krate(&db));
-
+    
         let ModuleDefId::AdtId(s) = declared(&db, scope, "S") else {
             panic!("`S` should be a struct");
         };
@@ -213,7 +213,7 @@ fn h(_: N<{ 1 + 1 }>) {}
             panic!("`E` should be an enum");
         };
         let variant = e.enum_variants(&db).variants.values().next().expect("a variant").0;
-
+    
         let named: [(SolverDefId<'_>, &str); 5] = [
             (s.into(), "S"),
             (f.into(), "f"),
@@ -226,7 +226,7 @@ fn h(_: N<{ 1 + 1 }>) {}
             assert_eq!(item_name.0.as_str(), name, "the name of {def:?}");
             assert_eq!(BoundRegionKind::Named(def).get_name(interner), Some(item_name));
         }
-
+    
         let body = Body::of(&db, f.into());
         let (binding, _) = body
             .bindings()
@@ -242,7 +242,7 @@ fn h(_: N<{ 1 + 1 }>) {}
         let anon_const = AnonConstId::all_from_signature(&db, h.into())
             .next()
             .expect("the anonymous const `{ 1 + 1 }` in `h`'s signature");
-
+    
         let anonymous: [SolverDefId<'_>; 3] =
             [impl_with(&db, scope, "m").into(), closure.into(), anon_const.into()];
         for def in anonymous {
@@ -280,12 +280,12 @@ trait Tr<T> {
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
         let interner = DbInterner::new_with(&db, module_id.krate(&db));
-
+    
         let ModuleDefId::AdtId(s) = declared(&db, scope, "S") else {
             panic!("`S` should be a struct");
         };
@@ -302,11 +302,11 @@ trait Tr<T> {
             })
             .expect("a type `Proj` in `Tr`");
         let assoc = impl_type(&db, impl_with(&db, scope, "Assoc"), "Assoc");
-
+    
         let s: GenericArg<'_> = Ty::new_adt(interner, s, GenericArgs::empty()).into();
         let u8: GenericArg<'_> = interner.default_types().types.u8.into();
         let statik: GenericArg<'_> = interner.default_types().regions.statik.into();
-
+    
         // `S::Assoc<u8>` in "Self form": the self type, then the item's own parameters.
         let inherent = AliasTermKind::InherentTy { def_id: InherentAssocTyId(assoc) };
         assert!(compatible(interner, inherent, &[s, u8]));
@@ -314,7 +314,7 @@ trait Tr<T> {
         assert!(!compatible(interner, inherent, &[s]));
         assert!(!compatible(interner, inherent, &[s, u8, u8]));
         assert!(!compatible(interner, inherent, &[s, statik]));
-
+    
         // `<S as Tr<u8>>::Proj<'static>`: the trait's `Self` and `T`, then the item's `'x`.
         let projection = AliasTermKind::ProjectionTy { def_id: TraitAssocTyId::from(proj) };
         assert!(compatible(interner, projection, &[s, u8, statik]));
@@ -342,14 +342,14 @@ fn h(_: N<{ 1 + 1 }>) {}
     let file_id = fx.only_file();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
         let scope = &def_map.module(&db, module_id).scope(&db);
         let krate = module_id.krate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let display_target = DisplayTarget::from_crate(&db, krate);
-
+    
         let ModuleDefId::FunctionId(h) = declared(&db, scope, "h") else {
             panic!("`h` should be a function");
         };
@@ -362,7 +362,7 @@ fn h(_: N<{ 1 + 1 }>) {}
         let ModuleDefId::StaticId(st) = declared(&db, scope, "ST") else {
             panic!("`ST` should be a static");
         };
-
+    
         let cases: [(SolverDefId<'_>, &str); 4] = [
             (impl_with(&db, scope, "new").into(), "W<T>"),
             (c.into(), "u32"),
@@ -400,7 +400,7 @@ impl Tr<Foreign> for S {}
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
 
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let dep_module = db.module_for_file(file_ids[0].file_id(&db));
         let main = db.module_for_file(file_ids[1].file_id(&db)).krate(&db);
         let def_map = dep_module.def_map(&db);
@@ -418,7 +418,7 @@ impl Tr<Foreign> for S {}
             })
             .expect("`Tr::m`");
         let impl_ = scope.impls().next().expect("`impl Tr<Foreign> for S`");
-
+    
         // `dep` knows every impl of `ForeignTrait`, so `Foreign: ForeignTrait` fails there.
         assert!(crate::traits::is_impossible_associated_item(
             &db,

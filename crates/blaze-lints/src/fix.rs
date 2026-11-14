@@ -4,9 +4,12 @@
 //! fixes changed. It ends when no finding has a fix left, or fails naming what it could not do;
 //! fixes that leave the crate with an error it did not have are refused, and the texts restored.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    alloc::Global,
+    collections::{BTreeMap, BTreeSet},
+};
 
-use base_db::{Db, EditionedFileId, FileId, FileText};
+use base_db::{CrateKey, Db, EditionedFileId, FileId, FileText};
 use blaze_diagnostics::model::{Applicability, Code, Diag, Level, Span};
 use blaze_intent::file::Working;
 use syntax::{TextRange, TextSize};
@@ -101,13 +104,16 @@ struct Planned<'f> {
     parts: Vec<(TextRange, &'f str)>,
 }
 
-/// Makes the fixes of `krate`'s findings in its files, setting the new texts in `db`.
+/// Makes the fixes of the findings of the crate `key` in its files, setting the new texts in
+/// `db`, one commit per pass. The crate is named by its key, as every id of a snapshot dies
+/// at a commit: each pass takes the crate's id again in the snapshot it reads.
 pub fn fix(
     db: &mut Db,
-    krate: hir::Crate,
+    key: CrateKey,
     setup: &Setup,
     name_of: NameOf<'_>,
 ) -> Result<Fixed, FixError> {
+    let krate = hir::Crate::from(db.krate(key));
     let files = files_of(db, krate, name_of);
     let before = errors(db, krate, &files);
     let originals: Vec<(FileId, String)> =
@@ -116,8 +122,13 @@ pub fn fix(
     let mut changed: BTreeMap<FileId, String> = BTreeMap::new();
     let mut applied = 0;
     let mut conflict = None;
+    // The last pass's spliced files: their trees are the seeds of the files' parses
+    // (`EditionedFileId::seed_parse`), kept weakly by the database, so they are held here until
+    // the next check has parsed them.
+    let mut held = Vec::new_in(Global);
     for pass in 1..=PASSES {
         conflict = None;
+        let krate = hir::Crate::from(db.krate(key));
         let found = check::check(db, krate, setup, name_of)?;
         let mut planned: BTreeMap<FileId, Vec<Planned<'_>>> = BTreeMap::new();
         for found in &found {
@@ -133,7 +144,7 @@ pub fn fix(
         if planned.is_empty() {
             return settled(
                 db,
-                krate,
+                key,
                 &files,
                 &before,
                 &originals,
@@ -183,31 +194,32 @@ pub fn fix(
             applied += taken.len();
             made.push((file, appended, working));
         }
-        db.batch(base_db::Trigger::named("lint fixes applied"), |db| {
-            for (file, _, working) in &made {
-                db.set_file_text(*file, working.bytes());
-            }
-            for (file, appended, working) in &made {
-                if working.parse.errors().is_empty() {
-                    let content = FileText::content_of(working.bytes(), *appended);
-                    let id = EditionedFileId::new_with_extensions(db, *file, edition, extensions);
-                    id.seed_parse(db, content, &working.parse);
-                }
-            }
-        });
-        for (file, _, working) in made {
-            changed.insert(file, working.bytes().to_owned());
+        // The pass's texts, all in one commit.
+        let mut edit = db.edit();
+        for (file, _, working) in &made {
+            edit.set_file_text(*file, working.bytes());
         }
+        _ = edit.commit();
+        for (file, appended, working) in &made {
+            if working.parse.errors().is_empty() {
+                let content = FileText::content_of(working.bytes(), *appended);
+                let id = EditionedFileId::new_with_extensions(db, *file, edition, extensions);
+                id.seed_parse(db, content, &working.parse);
+            }
+            changed.insert(*file, working.bytes().to_owned());
+        }
+        held = made;
     }
+    let krate = hir::Crate::from(db.krate(key));
     let found = check::check(db, krate, setup, name_of)?;
     if let Some((at, first, second)) = conflict {
         return Err(FixError::Conflict { at: at_of(db, &files, Some(&at)), first, second });
     }
     let left = found.iter().map(|it| &it.diagnostic).find(|it| machine_fix(it).is_some());
-    match left {
+    let outcome = match left {
         None => settled(
             db,
-            krate,
+            key,
             &files,
             &before,
             &originals,
@@ -219,7 +231,10 @@ pub fn fix(
             lint: diagnostic.lint_name().unwrap_or("").to_owned(),
             message: diagnostic.message.clone(),
         }),
-    }
+    };
+    // The seeds were parsed by the checks above.
+    drop(held);
+    outcome
 }
 
 /// The first machine-applicable substitution of `diagnostic`, its parts in the order of the text.
@@ -254,7 +269,7 @@ fn overlaps(a: &[(TextRange, &str)], b: &[(TextRange, &str)]) -> bool {
 /// are restored and the error named.
 fn settled(
     db: &mut Db,
-    krate: hir::Crate,
+    krate: CrateKey,
     files: &BTreeMap<String, (FileId, String)>,
     before: &[(String, Diag)],
     originals: &[(FileId, String)],
@@ -268,7 +283,7 @@ fn settled(
     for (key, _) in before {
         *had.entry(key.as_str()).or_default() += 1;
     }
-    let after = errors(db, krate, files);
+    let after = errors(db, hir::Crate::from(db.krate(krate)), files);
     let new = after.iter().find(|(key, _)| match had.get_mut(key.as_str()) {
         Some(count) if *count > 0 => {
             *count -= 1;
@@ -282,13 +297,13 @@ fn settled(
         error: error.message.clone(),
         by: by.into_iter().collect(),
     };
-    db.batch(base_db::Trigger::named("lint fixes undone"), |db| {
-        for (file, text) in originals {
-            if fixed.files.iter().any(|(it, _)| it == file) {
-                db.set_file_text(*file, text);
-            }
+    let mut edit = db.edit();
+    for (file, text) in originals {
+        if fixed.files.iter().any(|(it, _)| it == file) {
+            edit.set_file_text(*file, text);
         }
-    });
+    }
+    _ = edit.commit();
     Err(broke)
 }
 

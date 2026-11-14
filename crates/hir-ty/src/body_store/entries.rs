@@ -33,6 +33,14 @@
 //! trust; the world's map from a [`BodyKey`] to the database's body ([`BodyWorld::body`]) is
 //! the one the syntax gives: each body part of a file's `items` by where it starts ([`keyed`]),
 //! joined with where each body of the database is written ([`written`], [`join`]).
+//!
+//! Those three are the item store's only identification of a body by a position, and only
+//! this kernel world's [`BodyWorld::body`] (the driver's, blaze-cargo `serve/front_carry.rs`)
+//! reaches them. The entry points a body task calls, [`run_infer`], [`places`], [`run_mir`]
+//! and [`borrowck_schema`] (with `super::Installed::trace`), take the body's
+//! `DefWithBodyId`, which the task has from its stable id through the opened surface's index,
+//! and compute no offset: a MIR owner's [`Place`] is its expressions' indices in the body's
+//! own store, which no edit outside the body moves.
 
 use std::{alloc::Global, fmt, marker::PhantomData, sync::Arc};
 
@@ -50,12 +58,12 @@ use blaze_kernel::{
     Ask, Changed, CodeId, Compute, Fact, Got, Kernel, KernelError, Read, ReadKind, Reads, Seen,
     Session, Step as KernelStep, StepError, StepId, Subject, WorldError, steps as ids,
 };
-use blaze_query::{QueryKind, db::View};
-use hir_def::{DefWithBodyId, HasModule as _, Lookup};
+use blaze_query::QueryKind;
+use hir_def::{DefWithBodyId, Lookup};
 use syntax::view::AstNode as _;
 
 pub use super::mir::Place;
-use super::{Refusal, Step, with_store};
+use super::{Step, Traced, with_store};
 use crate::next_solver::goal_store::{FactObject, FactRef};
 
 /// The kinds of read a body entry makes of its world.
@@ -72,14 +80,6 @@ pub mod reads {
     pub fn fact(kind: ReadKind) -> bool {
         FACTS.contains(&kind.0)
     }
-}
-
-/// What the item store kept of the last run of a body's step ([`super::Store::traced`]).
-pub(super) enum Ran {
-    /// The facts the run read, sorted, each once, and the answer's bytes: the entry's value.
-    Kept { facts: Box<[FactRef]>, answer: Box<[u8]> },
-    /// The store would not keep the run, and why.
-    Refused(Refusal),
 }
 
 /// A body as its entries are keyed: its file, its item there and its crate (the crate a fact
@@ -421,10 +421,12 @@ pub fn run_mir(db: &Db, def: DefWithBodyId, place: Place) -> Result<SchemaHash, 
     Ok(mir_schema(db, def, place))
 }
 
-/// The schema [`BodyWorld::run`] gives for a passing borrow check of `def` by the checker
-/// named `checker` (what `hir_ty_borrowck::gate::checked` offers it under).
+/// The schema [`BodyWorld::run`] gives for the borrow check of `def` by the checker named
+/// `checker` (what `hir_ty_borrowck::borrowck` offers its verdict under,
+/// [`super::offer_verdict`]): empty answer bytes for a pass, the encoded refusal otherwise
+/// (`hir_ty_borrowck::gate::encode_verdict`, traced only in `Mode::Trace`).
 pub fn borrowck_schema(db: &Db, def: DefWithBodyId, checker: &'static str) -> SchemaHash {
-    super::with_crate_attrs(db, def, super::passed_schema(checker))
+    super::with_crate_attrs(db, def, super::verdict_schema(checker))
 }
 
 fn refused(why: String) -> StepError {
@@ -482,8 +484,8 @@ fn compute<W: BodyWorld + ?Sized + 'static>(
         )));
     };
     let (facts, answer): (&[FactRef], &[u8]) = match &*ran {
-        Ran::Kept { facts, answer } => (&facts[..], &answer[..]),
-        Ran::Refused(refusal) => {
+        Traced::Kept { facts, answer } => (&facts[..], &answer[..]),
+        Traced::Refused(refusal) => {
             return Err(refused(format!(
                 "{input:?} ({def:?}): the item store refused its {}: {refusal:?}",
                 super::what(step)
@@ -605,50 +607,43 @@ pub fn register<W: BodyWorld + ?Sized + 'static>(
 }
 
 /// A served step's answer as the kernel verified it ([`serve`]): what the step's query in the
-/// database answers from (`super::Store::served_answer`), at `revision`, and at a later one
-/// only where its crate is stamped there ([`stamp`]). With it, what the entry read, so the
-/// query reads each again and its row depends on them: the body's identity, and each fact
-/// with what it saw, of the step itself and of every earlier step of the body it read (theirs
-/// taken from their own rows, so a fact only an earlier step read is here too), sorted, each
-/// pair once.
+/// database answers from (`super::Store::served_answer`) while what the entry read hashes as
+/// it did: a kept answer's validity is its read list (front-end-on-memo B, `Revision`), so
+/// no revision or stamp says when it holds. With it, what the entry read, so the query reads
+/// each again and its read list holds them: the body's identity, and each fact with what it
+/// saw, of the step itself and of every earlier step of the body it read (theirs taken from
+/// their own rows, so a fact only an earlier step read is here too), sorted, each pair once.
 pub struct Served {
-    pub(super) revision: View,
-    /// The crate of the body: whose stamp the row answers under.
-    pub(super) krate: base_db::Crate,
     pub(super) identity: ContentId,
     pub(super) facts: Box<[(FactRef, Seen)]>,
     pub(super) answer: Arc<[u8]>,
 }
 
-/// The served answers of one database (`super::Store::served`), by body: each answers at the
-/// revision it was posted at, or at one its crate was stamped at ([`stamp`]), never at any
-/// other. A body's rows go when the driver unposts it ([`unpost`]).
+/// The served answers of one database (`super::Store::served`), by body: each answers while
+/// the identity and every fact it read hash as they did (`super::Store::served_answer`). A
+/// body's rows go when the driver unposts it ([`unpost`]).
 ///
 /// With them, what the driver claimed of the database (`claim_serve`, `claim_keeps`), so a
-/// body is served once a revision and kept once a run, however many units reach it.
+/// body is served once a snapshot and kept once a run, however many units reach it.
 #[derive(Default)]
 pub(super) struct Posted {
     /// Each body's rows, one a step and schema.
     rows: blaze_hash::HashMap<DefWithBodyId, Vec<(Step, SchemaHash, Arc<Served>)>, Global>,
-    /// Each crate's last stamp: the revision it is of, and the revision from which every row
-    /// of the crate posted is one the stamping driver knows of (a row posted before that,
-    /// by a driver whose rows it never saw, does not answer under the stamp).
-    stamped: blaze_hash::HashMap<base_db::Crate, (View, View), Global>,
-    /// The revision each crate's serve was last claimed at.
-    claimed: blaze_hash::HashMap<base_db::Crate, View, Global>,
+    /// The snapshot (`blaze_memo::Epoch`) each crate's serve was last claimed in.
+    claimed: blaze_hash::HashMap<base_db::Crate, blaze_memo::Epoch, Global>,
     /// Each trace a keep claimed, by its body, step and schema: the trace itself (a counted
     /// reference), so a run that replaced it is claimed again and nothing else is. Not cleared
-    /// at a revision: a trace is the run's, whatever revision it is read at.
-    kept: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Ran>, Global>,
+    /// at a snapshot: a trace is the run's, whatever snapshot it is read in.
+    kept: blaze_hash::HashMap<(DefWithBodyId, Step, SchemaHash), Arc<Traced>, Global>,
 }
 
 #[cfg(test)]
 thread_local! {
-    /// The planted bug of the revision oracle's control: a served answer is given at any
-    /// revision, not only the one it was posted at.
-    pub(super) static ANY_REVISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The planted bug of the stamp's oracle's control: [`unpost`] drops nothing, so a body
-    /// whose entry moved keeps its old rows, and the crate's stamp makes them answer.
+    /// The planted bug of the read-list oracle's control: a served answer is given without
+    /// its identity and facts read again, whatever they hash to now.
+    pub(super) static UNCHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The planted bug of the unpost's oracle's control: [`unpost`] drops nothing, so a body
+    /// whose entry moved keeps its old rows.
     pub(super) static KEEP_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -705,34 +700,23 @@ fn any_kind() -> bool {
     false
 }
 
+/// Whether a test planted [`UNCHECKED`]: never, outside a test.
 #[cfg(test)]
-fn any_revision() -> bool {
-    ANY_REVISION.with(std::cell::Cell::get)
+pub(super) fn unchecked() -> bool {
+    UNCHECKED.with(std::cell::Cell::get)
 }
 
 #[cfg(not(test))]
-fn any_revision() -> bool {
+pub(super) fn unchecked() -> bool {
     false
 }
 
 impl Posted {
-    /// The answer of `step` of `def` under `schema` that answers at `now`: posted at `now`,
-    /// or posted since its crate's stamp at `now` began ([`stamp`]); none otherwise.
-    pub(super) fn get(
-        &self,
-        now: View,
-        def: DefWithBodyId,
-        step: Step,
-        schema: SchemaHash,
-    ) -> Option<Arc<Served>> {
+    /// The posted answer of `step` of `def` under `schema`, if any: whether it holds now is
+    /// the asker's check of what it read (`super::Store::served_answer`).
+    pub(super) fn get(&self, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<Arc<Served>> {
         let rows = self.rows.get(&def)?;
         let (_, _, served) = rows.iter().find(|(at, of, _)| (*at, *of) == (step, schema))?;
-        let stamped = || {
-            self.stamped.get(&served.krate).is_some_and(|&(at, since)| at == now && served.revision >= since)
-        };
-        if served.revision != now && !stamped() && !any_revision() {
-            return None;
-        }
         // clone: a counted reference
         Some(served.clone())
     }
@@ -750,13 +734,17 @@ impl Posted {
 }
 
 /// The identity the row of `step` of `def` under `schema` was verified with, if a row answers
-/// in `db` at its revision now (posted now, or under its crate's stamp): what a test's oracle
-/// compares with the body's identity now, with no query asked, so what answers is checked
-/// whether or not the engine still holds a memo of the step.
+/// in `db` now (its identity and facts hash as they did, as `super::Store::served_answer`
+/// checks, [`UNCHECKED`] included): what a test's oracle compares with the body's identity
+/// now, with no step asked (the identity and facts are), so what answers is checked whether
+/// or not the memo still holds an entry of the step.
 #[cfg(test)]
 pub(super) fn answering(db: &Db, def: DefWithBodyId, step: Step, schema: SchemaHash) -> Option<ContentId> {
-    let (_, now) = db.nonce_and_revision();
-    with_store(db, |store| store.served.lock().get(now, def, step, schema).map(|it| it.identity)).flatten()
+    with_store(db, |store| {
+        let identity = store.facts.identity(db, def)?;
+        store.served_answer(db, def, step, schema, identity).map(|it| it.identity)
+    })
+    .flatten()
 }
 
 /// Drops every row of `def` in `db`'s item store: the driver's word that the entries they
@@ -769,22 +757,10 @@ pub fn unpost(db: &Db, def: DefWithBodyId) {
     });
 }
 
-/// Stamps `krate` in `db` at its revision now: every row of the crate still posted since
-/// `since` answers at this revision as if posted at it. The driver's word, said only once each
-/// body whose entry moved since its rows were posted is unposted ([`unpost`]), and only for
-/// rows it posted itself since `since` (a row posted before, by a driver whose rows it never
-/// saw, answers under no stamp of it).
-pub fn stamp(db: &Db, krate: base_db::Crate, since: View) {
-    let (_, now) = db.nonce_and_revision();
-    with_store(db, |store| {
-        store.served.lock().stamped.insert(krate, (now, since));
-    });
-}
-
 /// Posts what the kernel gave for the step `of` of the body `key` (`got`, from a get or after
-/// a carry) to the item store of `world`'s database, at its revision now: the step's query
-/// there answers from it until the database's next revision, checking again in the query what
-/// the entry read (`super::Store::served_answer`). The row holds the facts the entry read and
+/// a carry) to the item store of `world`'s database: the step's query there answers from it
+/// while what the entry read hashes as it did, checking again in the query what the entry
+/// read (`super::Store::served_answer`). The row holds the facts the entry read and
 /// those of each earlier step's row it read (an earlier step is a read of that step's entry,
 /// whose own facts the kernel keeps in that entry, not in this one), so the query's row
 /// depends on every fact the answer does. The driver serves every entry it gets, an earlier
@@ -792,7 +768,7 @@ pub fn stamp(db: &Db, krate: base_db::Crate, since: View) {
 ///
 /// Refused, naming the body: an entry with no read of its identity (no entry of a body step
 /// is made without one, so it is another step's or a corrupt one), a read of a step that is no
-/// earlier body step, an earlier step not served at this revision, and a database with no item
+/// earlier body step, an earlier step with no posted row, and a database with no item
 /// store installed.
 pub fn serve<W: BodyWorld + ?Sized + 'static>(
     world: &W,
@@ -801,10 +777,16 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
     got: &Got<'_>,
 ) -> Result<(), String> {
     let step = of.step();
+    if super::tracing(world.db()) {
+        // alloc: error path
+        return Err(format!(
+            "{key:?}: its {} posted to an item store in `Mode::Trace`, which serves no answer but its run's",
+            super::what(step)
+        ));
+    }
     let def = world.body(key)?;
     let schema = world.schema(def, of)?;
     let db = world.db();
-    let (_, revision) = db.nonce_and_revision();
     let mut identity = None;
     // alloc: the entry's facts and its earlier steps', kept with its answer
     let mut facts = Vec::new();
@@ -836,7 +818,7 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
                 return Ok(());
             }
             let earlier_schema = world.schema(def, earlier)?;
-            let posted = with_store(db, |store| store.served.lock().get(revision, def, earlier.step(), earlier_schema));
+            let posted = with_store(db, |store| store.served.lock().get(def, earlier.step(), earlier_schema));
             match posted {
                 Some(Some(row)) => facts.extend_from_slice(&row.facts),
                 Some(None) => {
@@ -863,8 +845,7 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
     };
     facts.sort_unstable();
     facts.dedup();
-    let krate = def.krate(db);
-    let served = Served { revision, krate, identity, facts: facts.into(), answer: got.value().into() };
+    let served = Served { identity, facts: facts.into(), answer: got.value().into() };
     match with_store(db, |store| store.served.lock().post(def, step, schema, served)) {
         Some(()) => Ok(()),
         // alloc: error path
@@ -872,13 +853,13 @@ pub fn serve<W: BodyWorld + ?Sized + 'static>(
     }
 }
 
-/// Claims the serve of `krate`'s bodies in `db` at its revision now: true for the first claim
-/// there, which serves them; false for every later one, which serves nothing (the bodies are
-/// posted already, or being posted by the claim's holder). The lock is held for the claim
-/// alone, never across a kernel call or a wait (rule 27). None where `db` has no item store
-/// installed (`BLAZE_ITEM_STORE=off`): nothing is served or kept there.
+/// Claims the serve of `krate`'s bodies in `db` in its snapshot now (its `blaze_memo::Epoch`):
+/// true for the first claim there, which serves them; false for every later one, which serves
+/// nothing (the bodies are posted already, or being posted by the claim's holder). The lock is
+/// held for the claim alone, never across a kernel call or a wait (rule 27). None where `db`
+/// has no item store installed (`BLAZE_ITEM_STORE=off`): nothing is served or kept there.
 pub fn claim_serve(db: &Db, krate: base_db::Crate) -> Option<bool> {
-    let (_, now) = db.nonce_and_revision();
+    let now = db.snapshot_epoch();
     with_store(db, |store| store.served.lock().claimed.insert(krate, now) != Some(now))
 }
 
@@ -910,7 +891,7 @@ pub struct Claim<'db> {
     pub refused: Vec<Refused>,
     db: &'db Db,
     /// Each mark this claim made, with the trace it marked.
-    marks: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)>,
+    marks: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>)>,
 }
 
 impl Claim<'_> {
@@ -953,7 +934,7 @@ impl Drop for Claim<'_> {
 pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
     let claimed = with_store(db, |store| {
         // alloc: one claim's snapshot of the database's traces, a counted reference each
-        let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Ran>)> = store
+        let traced: Vec<((DefWithBodyId, Step, SchemaHash), Arc<Traced>)> = store
             .traces
             .lock()
             .iter()
@@ -969,8 +950,8 @@ pub fn claim_keeps(db: &Db) -> Option<Claim<'_>> {
             let (def, step, _) = key;
             match &*ran {
                 // alloc: the refusal's text, named to the driver
-                Ran::Refused(refusal) => refused.push(Refused { def, step, why: format!("{refusal:?}") }),
-                Ran::Kept { .. } => steps.push(key),
+                Traced::Refused(refusal) => refused.push(Refused { def, step, why: format!("{refusal:?}") }),
+                Traced::Kept { .. } => steps.push(key),
             }
             // clone: a counted reference, the mark and the claim's record of it
             posted.kept.insert(key, Arc::clone(&ran));

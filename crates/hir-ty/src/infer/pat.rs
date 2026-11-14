@@ -1385,7 +1385,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // `check_struct_pat_fields`).
         for (field_idx, field) in fields.iter().enumerate() {
             let hygiene = self.store.record_field_hygiene(field.pat);
-            let name = VariantFields::name_written(self.db, variant, field.name, hygiene);
+            let name = VariantFields::name_written(
+                self.db,
+                self.resolver.ctx_table(),
+                variant,
+                field.name,
+                hygiene,
+            );
             match used_fields.entry(name) {
                 Occupied(_occupied) => {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {

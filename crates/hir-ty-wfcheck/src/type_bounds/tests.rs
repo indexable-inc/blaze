@@ -28,7 +28,7 @@ fn errors_with(minicore: &str, source: &str) -> Vec<(&'static str, String, Strin
     ));
     let db = fx.into_db();
     let mut out = Vec::new();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for &krate in all_crates(&db).iter() {
             let def_map = crate_def_map(&db, krate);
             for (_, module) in def_map.modules(&db) {

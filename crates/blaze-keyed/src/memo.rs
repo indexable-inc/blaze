@@ -8,10 +8,11 @@
 //!   time. This is the reference form the simulation holds the driver to; blaze-memo builds the
 //!   production one (entries pointing into mapped segments, an arena a bump region freed at
 //!   once) against the same trait and the same refinement test.
+//! - [`Audit`]: as `RecordsOnly`, and the driver redoes every hit and compares bytes.
 //!
 //! Dispatch is static: [`with_policy`] matches the policy once per process and runs the work
 //! monomorphized for it. The cost: the driver and everything generic over `M` is in the binary
-//! twice; per ask there is no dynamic call and no flag (for `RecordsOnly`, `get` is a constant
+//! once per policy; per ask there is no dynamic call and no flag (for `RecordsOnly`, `get` is a constant
 //! `None` the optimizer folds away, and `keep` is empty).
 //!
 //! The soundness invariant: nothing holds a record's value by any route other than the memo,
@@ -29,7 +30,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     Plant,
-    kind::{Keep, Key, Kind, Tag, UnitManifest},
+    kind::{Keep, Key, Kind, Mark, Tag},
     planted,
     proof::Holds,
 };
@@ -44,6 +45,9 @@ pub type Arena = u32;
 /// and edits (tests.rs, `resident_refines_records_only`).
 pub trait Memo {
     const NAME: &'static str;
+    /// Whether the driver redoes every hit and compares bytes ([`Audit`]): a found mark, a
+    /// record found by address, the certificate. Folded away for every other memo.
+    const AUDIT: bool = false;
 
     /// The record of kind `K` under `key`, 16-aligned, if this memo holds it.
     fn get<K: Kind>(&self, arena: Arena, key: &Key<K>) -> Option<&[u8]>;
@@ -92,7 +96,7 @@ struct Table {
     /// Sorted by (tag, key).
     entries: Vec<(Tag, ContentId, Aligned), Global>,
     bytes: u64,
-    /// The planted bug's route: the last manifest kept, by arena rather than by key.
+    /// The planted bug's route: the last mark kept, by arena rather than by key.
     last_manifest: Option<usize>,
 }
 
@@ -125,7 +129,7 @@ impl Memo for Resident {
         let wanted = (K::TAG, key.id());
         match table.entries.binary_search_by(|(tag, id, _)| (*tag, *id).cmp(&wanted)) {
             Ok(at) => Some(&*table.entries[at].2),
-            Err(_) if planted(Plant::StaleResident) && K::TAG == UnitManifest::TAG => {
+            Err(_) if planted(Plant::StaleResident) && K::TAG == Mark::TAG => {
                 table.last_manifest.map(|at| &*table.entries[at].2)
             }
             Err(_) => None,
@@ -155,7 +159,7 @@ impl Memo for Resident {
         if let Some(last) = table.last_manifest.as_mut().filter(|last| **last >= at) {
             *last += 1;
         }
-        if K::TAG == UnitManifest::TAG {
+        if K::TAG == Mark::TAG {
             table.last_manifest = Some(at);
         }
         table.bytes += len;
@@ -178,12 +182,44 @@ impl Memo for Resident {
     }
 }
 
+/// Every ask goes to the store, and the driver redoes every hit it finds and compares the bytes
+/// it makes with the bytes it found: a difference is [`crate::driver::Failure::Audit`], naming
+/// the record and its first differing fact. What `blaze check --audit` runs, and what the
+/// simulation holds to "never faults without a plant": the oracle of reuse, run on real code.
+/// Costs a from-scratch build plus every lookup.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Audit;
+
+impl Memo for Audit {
+    const NAME: &'static str = "audit";
+    const AUDIT: bool = true;
+
+    #[inline(always)]
+    fn get<K: Kind>(&self, _arena: Arena, _key: &Key<K>) -> Option<&[u8]> {
+        None
+    }
+
+    #[inline(always)]
+    fn keep<K: Kind>(&mut self, _arena: Arena, _holds: &Holds<'_, K>, _record: &[u8]) {}
+
+    #[inline(always)]
+    fn drop_arena(&mut self, _arena: Arena) {}
+
+    #[inline(always)]
+    fn end_request(&mut self) {}
+
+    fn resident_bytes(&self) -> u64 {
+        0
+    }
+}
+
 /// Which memo a process runs with, from the command: one-shot commands are `RecordsOnly`,
-/// `watch` and live runs `Resident`.
+/// `watch` and live runs `Resident`, an audit `Audit`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     RecordsOnly,
     Resident { cap_bytes: u64 },
+    Audit,
 }
 
 /// Work generic over the memo, run once per process with the memo its policy names.
@@ -197,5 +233,6 @@ pub fn with_policy<W: WithMemo>(policy: Policy, work: W) -> W::Out {
     match policy {
         Policy::RecordsOnly => work.run(RecordsOnly),
         Policy::Resident { cap_bytes } => work.run(Resident::new(cap_bytes)),
+        Policy::Audit => work.run(Audit),
     }
 }

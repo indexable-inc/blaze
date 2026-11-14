@@ -40,7 +40,7 @@ use crate::{
 };
 
 /// One piece of a crate's syntax a by-piece pass is run on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) enum Piece {
     /// The file's outline: its tree with each cut body left out.
     Outline(EditionedFileId),
@@ -87,12 +87,14 @@ impl Group {
 
 /// What a piece's memo is asked under beyond the database: its key beside the piece, so a memo
 /// is never read for other passes or flags than it ran with (keys-cover-every-input).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub(crate) struct PieceGate {
+    #[home(skip)]
     pub(crate) group: Group,
     /// The crate checked: a file of two crates is a piece of each.
     pub(crate) krate: base_db::Crate,
     /// The lints that may fire anywhere in the crate ([`Cx::lint_may_fire`]).
+    #[home(skip)]
     pub(crate) may_fire: LintSet,
     /// Whether rustc makes code of the crate (`CommandLine::codegen`).
     pub(crate) codegen: bool,
@@ -225,10 +227,10 @@ pub(crate) fn piece_root(db: &Db, piece: Piece) -> Option<(HirFileId, ast::Node<
 /// whose first read beyond the key unwinds ([`Unwound`], `hir::view::Asked`) and is caught
 /// here, every other panic going on. One small value, kept by the database, so the next
 /// check verifies it where this one ran it.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn piece_clean(db: &Db, piece: Piece, gate: PieceGate) -> Verdict {
     #[cfg(test)]
-    tests::PROBED.lock().push((db.nonce_and_revision().0, piece, gate.group));
+    tests::PROBED.lock().push((db.nonce(), piece, gate.group));
     #[cfg(test)]
     tests::plant_reads(db, piece);
     if !gate.group.converted() {

@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 
 use base_db::{
-    BuiltDependency, ConstEvalBudget, Crate, CrateName, CrateOrigin, CrateType, CrateTypes,
-    CrateWorkspaceData, LangCrateOrigin, TargetKind, TrustedCrate, Version,
+    ConstEvalBudget, CrateKey, CrateName, CrateOrigin, CrateType, CrateTypes,
+    CrateWorkspaceData, LangCrateOrigin, TargetKind, TrustedCrate, Version, WorldDependency,
     target::{Arch, TargetData},
 };
 use blaze_units::{
@@ -401,15 +401,15 @@ pub(crate) fn dependency(
     unit: &Unit,
     on: &Unit,
     dep: &UnitDep,
-    krate: Crate,
+    krate: CrateKey,
     what: &str,
-) -> Result<BuiltDependency, LowerError> {
+) -> Result<WorldDependency, LowerError> {
     let name = CrateName::new(&dep.extern_crate_name).map_err(|_| {
         LowerError::at(format!("`{}` is not a crate's name", dep.extern_crate_name), what)
     })?;
     let prelude = !dep.noprelude.unwrap_or(false)
         || (unit.target.is_proc_macro() && dep.extern_crate_name == "proc_macro");
-    Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
+    Ok(WorldDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std))
 }
 
 /// The Rust edition `unit`'s crate is parsed and resolved in: its target's, or for a target

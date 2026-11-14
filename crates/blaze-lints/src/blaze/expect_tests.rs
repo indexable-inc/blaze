@@ -18,7 +18,7 @@ use crate::{
     conf::Conf,
     fix::fix,
     level::CommandLine,
-    tests::{lint, main_crate},
+    tests::{lint, main_crate_key},
 };
 
 /// The flags the tests lint with.
@@ -42,7 +42,7 @@ fn fixed(meta: &str, main: &str) -> String {
     let fx = fixture::db(&fixture_of(meta, main));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let key = main_crate_key(&db);
     let file = file.file_id(&db);
     let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
     let flags: Vec<String> = FLAGS.split_whitespace().map(str::to_owned).collect();
@@ -50,7 +50,7 @@ fn fixed(meta: &str, main: &str) -> String {
         command_line: CommandLine::parse(&flags).expect("the flags read"),
         conf: Conf::default(),
     };
-    fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    fix(&mut db, key, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
     db.file_text(file).text(&db).to_string()
 }
 

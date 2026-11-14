@@ -4,7 +4,7 @@ use base_db::{Crate, Db, target::TargetLoadError};
 use hir_def::layout::TargetDataLayout;
 use rustc_abi::{AddressSpace, AlignFromBytesError, TargetDataLayoutError};
 
-#[blaze_query::tracked(returns(as_ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(as_ref), owns, mem_tag = Infer)]
 pub fn target_data_layout_query(
     db: &Db,
     krate: Crate,

@@ -32,6 +32,10 @@
 //!   lowering looks `Type::Name` up in, each by name, alias key and impl key: a list made by
 //!   iterating every module of the ADT's crate, which no lookup fact stands for.
 //!
+//! A body also makes a value no other body's step reads as a fact of this crate: [`escaped`],
+//! the digest of what its declared items show outside it (the keyed record's
+//! `FactKind::Escaped`, made by the body's task).
+//!
 //! A name looked up in a module, found or not, in any namespace or in textual macro scope, is
 //! lane items' `Resolves { scope, name }` ("nothing" is a value), and a macro's definition is
 //! its `Signature`: neither has a kind here.
@@ -49,8 +53,10 @@ use base_db::{Crate, Db};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, ItemKey, Resolved, goals::Goals, key};
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, ModuleId, VariantId,
+    AdtId, AssocItemId, AttrDefId, DefWithBodyId, HasModule as _, ModuleDefId, ModuleId,
+    VariantId,
     attrs::AttrFlags,
+    expr_store::Body,
     lang_item::{LangItemEnum, lang_items},
     nameres::{CrateName, crate_def_map, crate_recursion_limit},
     unstable_features::UnstableFeatures,
@@ -111,6 +117,11 @@ const CRATE_NAMES_DOMAIN: &str = "blaze v2 item-hash crate names 1";
 const FIELD_ORDER_DOMAIN: &str = "blaze v2 item-hash field order 1";
 const SETTING_DOMAIN: &str = "blaze v2 item-hash setting 1";
 const INHERENT_ASSOC_TYPES_DOMAIN: &str = "blaze v2 item-hash inherent assoc types 1";
+const ESCAPED_DOMAIN: &str = "blaze v2 item-hash escaped 1";
+const ESCAPED_ITEM_DOMAIN: &str = "blaze v2 item-hash escaped item 1";
+
+/// Why a body has no [`escaped`] digest: an item it declares has no signature hash.
+pub const ESCAPED_UNHASHED: &str = "a body's escaped items (`blaze_item_hash::values::escaped`): an item declared in the body has no signature hash (`blaze_items::signature_hash` refused it)";
 
 /// The subject of the [`kinds::SETTING`] fact of `FrontSettings::borrowck_debug`: a tag, which
 /// no key is. The settings are one for the build, so the fact names nothing else.
@@ -292,7 +303,7 @@ pub fn crate_names(db: &Db, krate: Crate) -> FactRef {
 
 /// What `krate`'s def map holds outside its modules' scopes (`hir_def::nameres::crate_names`),
 /// each module and macro by key.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn crate_names_of(db: &Db, krate: Crate) -> ContentId {
     let mut h = Hasher::new(CRATE_NAMES_DOMAIN);
     hir_def::nameres::crate_names(db, krate, &mut |row| {
@@ -353,7 +364,7 @@ pub fn inherent_assoc_types(db: &Db, adt: AdtId) -> FactRef {
 /// read of its own, recorded by its own rule. Not read through: the query iterates every
 /// module of the ADT's crate (`Modules::table`, each scope's inherent impls), reads no single
 /// fact names.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn inherent_assoc_types_of(db: &Db, adt: AdtId) -> ContentId {
     let rows = hir_ty::body_store::inherent_assoc_types_of(db, adt);
     let mut h = Hasher::new(INHERENT_ASSOC_TYPES_DOMAIN);
@@ -368,7 +379,7 @@ fn inherent_assoc_types_of(db: &Db, adt: AdtId) -> ContentId {
 }
 
 /// The traits in scope in `module`, by key, sorted.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn traits_in_scope_of(db: &Db, module: ModuleId) -> ContentId {
     let traits = module_trait_set(db, module).traits();
     // alloc: none for up to 32 traits in scope; a module past that spills once per change of
@@ -387,7 +398,7 @@ fn traits_in_scope_of(db: &Db, module: ModuleId) -> ContentId {
 /// Every name of `module`'s scope (its items and imports in each namespace, its textual
 /// macros) with its `Resolves` value, sorted by the name's hash; `None` when one of them
 /// cannot be hashed.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn whole_scope_of(db: &Db, module: ModuleId) -> Option<ContentId> {
     let scope = module.def_map(db).module(db, module).scope(db);
     let subject = key::module_key(db, module).0;
@@ -532,7 +543,7 @@ fn attr_owner(resolved: Resolved) -> Option<AttrDefId> {
 /// The names of `item`'s members, in order, over its signature hash, which infers no body, so
 /// a body's inference may ask it of its own owner; `None` for an item with no members of this
 /// kind or no signature hash.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn fields_of(db: &Db, item: ItemId) -> Option<ContentId> {
     let signature = blaze_items::signature_hash(db, item).ok()?;
     let mut h = Hasher::new(FIELDS_DOMAIN);
@@ -589,7 +600,7 @@ fn member_names(db: &Db, h: &mut Hasher, items: &[(Name, AssocItemId)]) {
 
 /// Everything a read of `owner`'s attributes in a step can give: the flags, the `#[unstable]`
 /// feature, and a function's target features, sorted.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn attrs_of(db: &Db, owner: AttrDefId) -> ContentId {
     let flags = AttrFlags::query(db, owner);
     let mut h = Hasher::new(ATTRS_DOMAIN);
@@ -642,7 +653,7 @@ fn feed_debug(h: &mut Hasher, value: &impl std::fmt::Debug) {
 
 /// A crate's lang items by item key, the crates it loads and depends on by crate key (itself
 /// as a mark: its key is of all its files), its features, sorted, and its recursion limit.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn crate_root_of(db: &Db, krate: Crate) -> ContentId {
     let mut h = Hasher::new(CRATE_ROOT_DOMAIN);
     let lang = lang_items(db, krate);
@@ -672,4 +683,185 @@ fn crate_root_of(db: &Db, krate: Crate) -> ContentId {
     }
     h.part(b"recursion limit").update(&crate_recursion_limit(db, krate).to_le_bytes());
     h.finish()
+}
+
+/// The digest of what `def`'s body lets escape: every item declared inside it (after
+/// expansion, in any of its blocks and in any module written in one), by what a reader outside
+/// the body can observe of it, never by what is inside a body of it. `Ok(None)` when the body
+/// declares nothing that escapes.
+///
+/// The set, from Rust's semantics:
+///
+/// - Every impl, written or a built-in derive's: a trait impl joins coherence for the whole
+///   crate graph, and an inherent impl's methods are found on its type from anywhere the type
+///   is. Its row is its header and its items' signatures (`blaze_items::signature_hash` of the
+///   impl and of each item), its items' names (`Fields`) and each item's attributes, of which a
+///   method's `#[no_mangle]` and `#[export_name]` export a symbol. A built-in derive's impl is
+///   its key (its type, trait and derive) over its type's signature, which is all it is made of.
+/// - Every `#[macro_export]` `macro_rules!`: it is placed at the crate's root, and its
+///   definition is its signature. A macro not exported is visible only inside the body, whose
+///   uses of it are the body's own text, so it does not escape.
+/// - Every function, static, const, ADT, trait and type alias: one with `#[no_mangle]`,
+///   `#[export_name]`, `#[used]`, `#[link_section]`, `#[linkage]`, `#[panic_handler]` or a
+///   lang item is seen by the linker and the runtime under its symbol; any of them can be
+///   named outside through what does escape (an escaped impl's signature, an `impl Trait` of
+///   the return type whose hidden type is a local type or a local function's item type, a
+///   local trait an escaped impl implements), which names it by key and reads its signature.
+///   Its row is its signature hash, its members' names, its attribute flags and the values of
+///   its symbol attributes (export name, link section, linkage, link name, lang item); a
+///   trait's also its items' signatures and attributes, as an impl's. Its body is not in it:
+///   that body makes its own facts.
+/// - Every `extern` block's `#[link]` libraries and `#[wasm_import_module]`: they join the
+///   link of everything that links the crate. Its items are rows of their own, above.
+///
+/// Not in it: the body's `impl Trait` hidden types, and the closures and coroutines they name,
+/// which are the body's `HiddenType` fact (`blaze_items::facts::hidden_types`, one concept with
+/// one home), whose making needs the body's inference, which this does not; `use` and
+/// `extern crate` items, which bind names inside the body alone; unnamed `const _` items,
+/// which bind no name, and whose own bodies' items are their own bodies' `escaped`.
+///
+/// Rows are by item key, sorted, so the digest has no `Gid` and no position: an item's key is
+/// its path through the body's blocks (`blaze_items::key`), which a statement edited, added or
+/// removed around it does not move.
+///
+/// Cost: one pass over the scopes of the body's block def maps (which its lowering and
+/// inference build in any case), and per declared item its signature hash, member names and
+/// attributes, each a memoized query its own `Signature`, `Fields` and `Attrs` facts already
+/// ask; a body with no item is the pass over its blocks alone (none for a body with no block
+/// that declares an item). Floor: reading each declared item's observable form once and one
+/// hash per item; this is at the floor.
+pub fn escaped(db: &Db, def: DefWithBodyId) -> Result<Option<ContentId>, &'static str> {
+    let body = Body::of(db, def);
+    let mut rows: Vec<(ContentId, ContentId), _> = Vec::new_in(std::alloc::Global);
+    for (_, block) in body.blocks(db) {
+        for (_, module) in block.modules(db) {
+            let scope = module.scope(db);
+            for declared in scope.declarations() {
+                let item = match declared {
+                    ModuleDefId::FunctionId(it) => ItemId::Function(it),
+                    ModuleDefId::AdtId(it) => ItemId::Adt(it),
+                    ModuleDefId::ConstId(it) => ItemId::Const(it),
+                    ModuleDefId::StaticId(it) => ItemId::Static(it),
+                    ModuleDefId::TraitId(it) => ItemId::Trait(it),
+                    ModuleDefId::TypeAliasId(it) => ItemId::Alias(it),
+                    ModuleDefId::MacroId(it) if exported(db, it) => ItemId::Macro(it),
+                    ModuleDefId::MacroId(_) => continue,
+                    ModuleDefId::ModuleId(_)
+                    | ModuleDefId::EnumVariantId(_)
+                    | ModuleDefId::BuiltinType(_) => continue,
+                };
+                rows.push((key::item_key(db, item).0, escaped_item(db, item)?));
+            }
+            for (_, macros) in scope.legacy_macros() {
+                for &it in macros {
+                    if exported(db, it) {
+                        let item = ItemId::Macro(it);
+                        rows.push((key::item_key(db, item).0, escaped_item(db, item)?));
+                    }
+                }
+            }
+            for it in scope.impls() {
+                let item = ItemId::Impl(it);
+                rows.push((key::item_key(db, item).0, escaped_item(db, item)?));
+            }
+            for it in scope.builtin_derive_impls() {
+                let adt = it.loc(db).adt;
+                let signature =
+                    blaze_items::signature_hash(db, ItemId::Adt(adt)).map_err(|_| ESCAPED_UNHASHED)?;
+                let mut h = Hasher::new(ESCAPED_ITEM_DOMAIN);
+                h.update(b"derive").id(&signature.0);
+                rows.push((key::builtin_derive_key(db, it).0, h.finish()));
+            }
+            for it in scope.extern_blocks() {
+                let libs = AttrFlags::native_libs(db, it);
+                let wasm = AttrFlags::wasm_import_module(db, it);
+                if libs.is_empty() && wasm.is_none() {
+                    continue;
+                }
+                let mut h = Hasher::new(ESCAPED_ITEM_DOMAIN);
+                h.update(b"link").update(&(libs.len() as u64).to_le_bytes());
+                for lib in libs.iter() {
+                    feed_debug(&mut h, lib);
+                }
+                h.opt_part(wasm.as_ref().map(|it| it.as_str()));
+                // An extern block has no key of its own: its row is under its module's, the
+                // block's module's key, with the block's content after it, so two blocks of one
+                // module are two rows.
+                rows.push((key::module_key(db, it.module(db)).0, h.finish()));
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    let mut h = Hasher::new(ESCAPED_DOMAIN);
+    h.update(&(rows.len() as u64).to_le_bytes());
+    for (key, row) in &rows {
+        h.id(key).id(row);
+    }
+    Ok(Some(h.finish()))
+}
+
+/// Whether `it` is a `#[macro_export]` macro: one placed at its crate's root.
+fn exported(db: &Db, it: hir_def::MacroId) -> bool {
+    AttrFlags::query(db, AttrDefId::MacroId(it)).contains(AttrFlags::IS_MACRO_EXPORT)
+}
+
+/// What a reader outside a body observes of `item` declared in it (see [`escaped`]): its
+/// signature hash, its members' names, its attributes and its symbol attributes' values; an
+/// impl's or trait's items' the same.
+fn escaped_item(db: &Db, item: ItemId) -> Result<ContentId, &'static str> {
+    let mut h = Hasher::new(ESCAPED_ITEM_DOMAIN);
+    item_form(db, &mut h, item)?;
+    h.opt_part(fields_of(db, item).as_ref().map(|it| &it.0));
+    let members: Option<&[(Name, AssocItemId)]> = match item {
+        ItemId::Impl(it) => Some(&it.impl_items(db).items),
+        ItemId::Trait(it) => Some(&it.trait_items(db).items),
+        ItemId::Function(_)
+        | ItemId::Adt(_)
+        | ItemId::Const(_)
+        | ItemId::Static(_)
+        | ItemId::Alias(_)
+        | ItemId::Macro(_) => None,
+    };
+    if let Some(members) = members {
+        h.update(&(members.len() as u64).to_le_bytes());
+        for &(_, member) in members.iter() {
+            let member = match member {
+                AssocItemId::FunctionId(it) => ItemId::Function(it),
+                AssocItemId::ConstId(it) => ItemId::Const(it),
+                AssocItemId::TypeAliasId(it) => ItemId::Alias(it),
+            };
+            item_form(db, &mut h, member)?;
+        }
+    }
+    Ok(h.finish())
+}
+
+/// `item`'s signature hash, attributes and symbol attributes' values, into `h`.
+fn item_form(db: &Db, h: &mut Hasher, item: ItemId) -> Result<(), &'static str> {
+    let signature = blaze_items::signature_hash(db, item).map_err(|_| ESCAPED_UNHASHED)?;
+    let owner = match item {
+        ItemId::Function(it) => AttrDefId::FunctionId(it),
+        ItemId::Adt(it) => AttrDefId::AdtId(it),
+        ItemId::Trait(it) => AttrDefId::TraitId(it),
+        ItemId::Impl(it) => AttrDefId::ImplId(it),
+        ItemId::Const(it) => AttrDefId::ConstId(it),
+        ItemId::Static(it) => AttrDefId::StaticId(it),
+        ItemId::Alias(it) => AttrDefId::TypeAliasId(it),
+        ItemId::Macro(it) => AttrDefId::MacroId(it),
+    };
+    h.id(&signature.0).id(&attrs_of(db, owner));
+    for value in [
+        AttrFlags::export_name(db, owner),
+        AttrFlags::link_section(db, owner),
+        AttrFlags::linkage(db, owner),
+        AttrFlags::link_name(db, owner),
+        AttrFlags::lang_item(db, owner),
+    ] {
+        h.opt_part(value.as_ref().map(|it| it.as_str()));
+    }
+    Ok(())
 }

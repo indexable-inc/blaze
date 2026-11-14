@@ -167,7 +167,7 @@ pub(super) fn env_may_shadow<'db>(interner: DbInterner<'db>, param_env: ParamEnv
 
 /// The levels of the walk that proves `Adt<identity args>: trait_` with `krate`'s impls, the
 /// goal's own included, or 0 when the walk does not prove it.
-#[blaze_query::tracked(returns(copy), cycle_result = auto_trait_depth_cycle)]
+#[blaze_memo::tracked(returns(copy), cycle_result = auto_trait_depth_cycle)]
 pub(crate) fn auto_trait_depth(db: &Db, adt: AdtId, trait_: TraitId, krate: Crate) -> u8 {
     let interner = DbInterner::new_with(db, krate);
     let trait_ = TraitIdWrapper::from(trait_);
@@ -179,13 +179,13 @@ pub(crate) fn auto_trait_depth(db: &Db, adt: AdtId, trait_: TraitId, krate: Crat
 
 /// A verdict that reaches itself through a query the walk reads (none does today) gives no
 /// answer, so the solver decides.
-fn auto_trait_depth_cycle(_: &Db, _: blaze_query::db::Id, _: AdtId, _: TraitId, _: Crate) -> u8 {
+fn auto_trait_depth_cycle(_: &Db, _: AdtId, _: TraitId, _: Crate) -> u8 {
     0
 }
 
 /// Whether the ADT, which has no generic parameters, has exactly one positive, non-default,
 /// non-generic impl of `trait_` with no where clause, among `krate`'s.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 pub(crate) fn copy_clone_impl(db: &Db, adt: AdtId, trait_: TraitId, krate: Crate) -> bool {
     let interner = DbInterner::new_with(db, krate);
     let ty = Ty::new_adt(interner, adt, GenericArgs::empty());

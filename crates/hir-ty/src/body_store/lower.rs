@@ -20,6 +20,8 @@
 //! The invariant: equal keys are equal bytes. The key is the base key and the facts the
 //! lowering read; a second answer under one key is refused by the flush.
 
+use std::alloc::Global;
+
 use base_db::Db;
 use blaze_format::{Part, SchemaHash, schema_of};
 use blaze_ids::ContentId;
@@ -51,15 +53,16 @@ pub struct Closure {
     pub own: bool,
 }
 
-/// What a body's lowering gives that its later steps need before they run.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Lowered {
+/// What a body's lowering gives that its later steps need before they run. Owns nothing: its
+/// closures are kept in the arena of the query that made it ([`lowering`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Lowered<'db> {
     pub exprs: u32,
     pub pats: u32,
     pub bindings: u32,
     /// Each closure, `async` block and coroutine of the body's store, in the order of their
     /// expressions.
-    pub closures: Box<[Closure]>,
+    pub closures: &'db [Closure],
     /// Whether lowering found an error (`Body::has_lowering_errors`).
     pub errors: bool,
     /// Whether the body calls a location macro (`mir::calls_location_macro`).
@@ -70,7 +73,7 @@ pub struct Lowered {
     pub value: Option<ContentId>,
 }
 
-impl Lowered {
+impl Lowered<'_> {
     /// The places of the MIR owners an entry keys (`mir::owners`), from the closures alone:
     /// [`super::mir::Place::BODY`], then each own closure of a keyed kind, in the order of
     /// their expressions.
@@ -89,12 +92,13 @@ impl Lowered {
 
 /// `def`'s lowering as the item store keeps it: found by the item's content and the facts its
 /// shape lists, with no lowering, or made by lowering and offered.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub fn lowering(db: &Db, def: DefWithBodyId) -> Lowered {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn lowering<'db>(db: &'db Db, def: DefWithBodyId) -> Lowered<'db> {
     if REGISTRY.is_empty() {
         return made(db, def);
     }
-    match super::lookup_keyed(db, def, Step::Lower, SCHEMA, |_, bytes, key| decode(bytes, key)) {
+    let keep = |closures: &[Closure]| blaze_memo::keep_slice(blaze_memo::Database::memo(db), closures);
+    match super::lookup_keyed(db, def, Step::Lower, SCHEMA, |_, bytes, key| decode(bytes, key, keep)) {
         Lookup::Off => made(db, def),
         Lookup::Miss => {
             let (mut lowered, reads) = super::capture(db, || made(db, def));
@@ -116,8 +120,9 @@ pub fn lowering(db: &Db, def: DefWithBodyId) -> Lowered {
     }
 }
 
-/// `def`'s lowering, made by lowering it: no value.
-fn made(db: &Db, def: DefWithBodyId) -> Lowered {
+/// `def`'s lowering, made by lowering it: no value. Its closures are kept in the arena of the
+/// running query ([`lowering`]).
+fn made(db: &Db, def: DefWithBodyId) -> Lowered<'_> {
     let body = Body::of(db, def);
     let count = |n: usize| u32::try_from(n).expect("a body of more than u32::MAX parts");
     let mut own = Own { store: &body.store, own: Vec::new() }; // alloc: the walk's list, once per lowering
@@ -127,9 +132,9 @@ fn made(db: &Db, def: DefWithBodyId) -> Lowered {
     }
     own.on_expr(body.root_expr());
     let Own { own: reached, .. } = own;
-    let closures = body
-        .exprs()
-        .filter_map(|(expr, written)| match written {
+    let closures = blaze_memo::keep_iter(
+        blaze_memo::Database::memo(db),
+        body.exprs().filter_map(|(expr, written)| match written {
             Expr::Closure { closure_kind, .. } => Some(Closure {
                 expr,
                 kind: u8::try_from(kind_code(closure_kind)).expect("a closure kind's code is small"),
@@ -137,8 +142,8 @@ fn made(db: &Db, def: DefWithBodyId) -> Lowered {
                 own: reached.binary_search(&expr.into_raw().into_u32()).is_ok(),
             }),
             _ => None,
-        })
-        .collect(); // alloc: the memo's list, once per body
+        }),
+    );
     Lowered {
         exprs: count(body.exprs().count()),
         pats: count(body.pats().count()),
@@ -207,7 +212,7 @@ impl StoreVisitor for Own<'_> {
     blaze::narrowed_len,
     reason = "the lowered record writes its closure count as a u32; a body with 2^32 closures needs a typed refusal from lowering"
 )]
-fn encode(lowered: &Lowered, out: &mut Vec<u8>) {
+fn encode(lowered: &Lowered<'_>, out: &mut Vec<u8>) {
     let Lowered { exprs, pats, bindings, closures, errors, located, value: _ } = lowered;
     for word in [*exprs, *pats, *bindings] {
         out.extend_from_slice(&word.to_le_bytes()); // alloc: the store's answer buffer, reused
@@ -221,8 +226,13 @@ fn encode(lowered: &Lowered, out: &mut Vec<u8>) {
     }
 }
 
-/// The [`Lowered`] [`encode`] wrote as `bytes`, filed under `key`.
-fn decode(bytes: &[u8], key: ContentId) -> Result<Lowered, String> {
+/// The [`Lowered`] [`encode`] wrote as `bytes`, filed under `key`, its closures given to
+/// `keep` (the running query's arena, [`lowering`]).
+fn decode<'db>(
+    bytes: &[u8],
+    key: ContentId,
+    keep: impl FnOnce(&[Closure]) -> &'db [Closure],
+) -> Result<Lowered<'db>, String> {
     // alloc: the reason an answer does not read
     let short = || String::from("a lowering's answer ends early");
     let word = |at: usize| -> Result<u32, String> {
@@ -240,9 +250,9 @@ fn decode(bytes: &[u8], key: ContentId) -> Result<Lowered, String> {
         // alloc: as above
         return Err(format!("a lowering's answer of {n} closures has {} bytes for them", rest.len()));
     }
-    let closures = rest
-        .chunks_exact(7)
-        .map(|it| {
+    let mut closures = Vec::with_capacity_in(n, Global);
+    for it in rest.chunks_exact(7) {
+        closures.push({
             let raw = u32::from_le_bytes(it[..4].try_into().expect("4 bytes"));
             let own = match it[6] {
                 0 => false,
@@ -250,19 +260,19 @@ fn decode(bytes: &[u8], key: ContentId) -> Result<Lowered, String> {
                 // alloc: as above
                 other => return Err(format!("a lowering's closure is own {other}")),
             };
-            Ok(Closure {
+            Closure {
                 expr: ExprId::from_raw(la_arena::RawIdx::from_u32(raw)),
                 kind: it[4],
                 tag: it[5],
                 own,
-            })
-        })
-        .collect::<Result<Box<[Closure]>, String>>()?; // alloc: the memo's list
+            }
+        });
+    }
     Ok(Lowered {
         exprs: word(0)?,
         pats: word(4)?,
         bindings: word(8)?,
-        closures,
+        closures: keep(&closures),
         errors: flags & 1 != 0,
         located: flags & 2 != 0,
         value: Some(key),
@@ -277,14 +287,15 @@ mod tests {
     /// is filed under; the control: a byte cut off is refused, never read as another lowering.
     #[test]
     fn a_lowering_reads_back_as_written() {
+        let closures = [
+            Closure { expr: ExprId::from_raw(la_arena::RawIdx::from_u32(5)), kind: 0, tag: 1, own: true },
+            Closure { expr: ExprId::from_raw(la_arena::RawIdx::from_u32(9)), kind: 4, tag: 2, own: false },
+        ];
         let lowered = Lowered {
             exprs: 40,
             pats: 7,
             bindings: 3,
-            closures: Box::new([
-                Closure { expr: ExprId::from_raw(la_arena::RawIdx::from_u32(5)), kind: 0, tag: 1, own: true },
-                Closure { expr: ExprId::from_raw(la_arena::RawIdx::from_u32(9)), kind: 4, tag: 2, own: false },
-            ]),
+            closures: &closures,
             errors: false,
             located: true,
             value: None,
@@ -292,7 +303,9 @@ mod tests {
         let mut bytes = Vec::new();
         encode(&lowered, &mut bytes);
         let key = ContentId([3; 32]);
-        assert_eq!(decode(&bytes, key), Ok(Lowered { value: Some(key), ..lowered }));
-        assert!(decode(&bytes[..bytes.len() - 1], key).is_err(), "a cut answer read");
+        // Outside a query there is no arena: the test keeps the read closures for its life.
+        let keep = |it: &[Closure]| -> &'static [Closure] { Vec::leak(it.to_vec_in(Global)) };
+        assert_eq!(decode(&bytes, key, keep), Ok(Lowered { value: Some(key), ..lowered }));
+        assert!(decode(&bytes[..bytes.len() - 1], key, keep).is_err(), "a cut answer read");
     }
 }

@@ -296,7 +296,7 @@ struct Settled {
 /// they were made of: the database's revision (a root's links are read again in each), the
 /// package and `OUT_DIR` and the passed `CARGO_HOME` and `HOME`. Made again when any differs.
 struct KeptRoots {
-    at: (Nonce, blaze_query::db::View),
+    at: blaze_memo::Epoch,
     made_of: [Option<String>; 2],
     map: RootMap,
 }
@@ -424,7 +424,7 @@ impl Library {
     /// The session of `calling` in the database's revision now, started again when it was of
     /// another.
     fn session(&self, db: &Db, calling: Crate) -> Arc<SessionOf> {
-        let now = db.nonce_and_revision();
+        let now = blaze_memo::Database::memo(db).snapshot_epoch();
         // clone: the session's handle, held for one call
         let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, SessionOf::new));
         {
@@ -461,7 +461,7 @@ impl Library {
     /// per calling crate and revision ([`KeptRoots`]), not once per expansion, as making them
     /// reads each root's links.
     fn kept_roots(&self, db: &Db, calling: Crate, roots: Roots<'_>) -> Arc<KeptRoots> {
-        let at = db.nonce_and_revision();
+        let at = blaze_memo::Database::memo(db).snapshot_epoch();
         // The sources directory is the daemon's, the same for every call: not in `made_of`.
         let made_of = [roots.get(Role::Package), roots.get(Role::OutDir)];
         let same = |kept: &KeptRoots| {
@@ -532,8 +532,8 @@ impl SessionOf {
 /// an unwind, unless the session was started again for another revision meanwhile.
 struct SessionTurn<'s> {
     session: &'s SessionOf,
-    /// The revision the session was of when the turn was taken.
-    at: Option<(Nonce, blaze_query::db::View)>,
+    /// The snapshot the session was of when the turn was taken.
+    at: Option<blaze_memo::Epoch>,
     calls: Vec<Kept>,
     // Dropped after `drop` has put the calls back: the next holder finds them there.
     _turn: Turn<'s>,
@@ -560,7 +560,7 @@ impl Drop for SessionTurn<'_> {
 /// One calling crate's calls of a library's macros in one revision.
 #[derive(Default)]
 struct Session {
-    at: Option<(Nonce, blaze_query::db::View)>,
+    at: Option<blaze_memo::Epoch>,
     /// The statics the calls so far left that hold no address.
     statics: Vec<(StaticId, Vec<u8>)>,
     /// Whether a static they left holds an address: then [`Session::calls`] are run again.
@@ -982,12 +982,10 @@ impl Evaluated {
             if ran.asked.is_some() {
                 // What it asked the database of a span was read outside this query, which so
                 // depends on nothing it read: run again in the next revision.
-                blaze_query::db::report_untracked_read(
-                    db,
-                    blaze_query::db::Untracked {
-                        what: "what a proc macro run ahead of its turn asked the database of a span, \
-                               outside the expansion's query",
-                    },
+                blaze_memo::read_untracked(
+                    blaze_memo::Database::memo(db),
+                    "what a proc macro run ahead of its turn asked the database of a span, \
+                     outside the expansion's query",
                 );
             }
             ran
@@ -1114,6 +1112,8 @@ impl Evaluated {
                 attr: it.attr,
                 inputs,
                 sites: it.sites,
+                // Every call of a session is `calling`'s, homed in its arena.
+                contexts: hir_ty::ctx_table(calling),
                 edition: it.edition,
                 forced_keywords: it.forced_keywords,
             })
@@ -1181,7 +1181,7 @@ impl Evaluated {
             self.run_on(db, calling, call, &preset, &[], &this)
         }));
         let ran = match ran {
-            Err(payload) if payload.is::<blaze_query::db::Cancelled>() => {
+            Err(payload) if payload.is::<blaze_memo::Cancelled>() => {
                 std::panic::resume_unwind(payload)
             }
             ran => ran,
@@ -1277,7 +1277,8 @@ impl Evaluated {
     ) -> Result<Result<(), &'static str>, ProcMacroExpansionError> {
         const DIFFERS: &str = "its macro's crate settles, yet it gives otherwise from the fresh state than from the settled one, or its first calls leave other states: what it gives depends on whether it ran first";
         let library = &*self.library;
-        let (at, _) = db.nonce_and_revision();
+        // Which database: a `StaticId` belongs to its database's arenas.
+        let at = db.nonce();
         // The settled state, and the statics to run the other state from: none for the fresh.
         let other: Vec<(StaticId, Vec<u8>)> = match (from.replayed, from.start) {
             (true, _) => return Ok(Err(concat!("its macro's crate settles, and it was not shown to give the same from the fresh state as from the settled one", ": it ran after its session's calls before it again"))),

@@ -203,7 +203,12 @@ fn main() {}
     let with = |args: &[&str]| {
         let (mut db, krate) = db_of(fixture);
         let args: Vec<String> = args.iter().map(|&it| it.to_owned()).collect();
-        krate.set_lint_options(&mut db, LintOptions::parse(&args).unwrap());
+        // The commit ends the crate's id; the key names it across, and the id is taken again.
+        let key = krate.key(&db);
+        let mut edit = db.edit();
+        edit.set_crate_lint_options(key, LintOptions::parse(&args).unwrap());
+        _ = edit.commit();
+        let krate = db.krate(key);
         (lint_level(&db, body(&db, krate, "C"), LINT), lint_level(&db, body(&db, krate, "D"), LINT))
     };
     assert_eq!(with(&[]), (Level::Warn, Level::Allow));

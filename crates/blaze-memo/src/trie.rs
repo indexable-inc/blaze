@@ -21,7 +21,7 @@ use std::{
 
 use blaze_mem::ArenaLocal;
 
-use crate::{Fact, Kind};
+use crate::{Kind, Read};
 
 const FANOUT: usize = 16;
 const BITS: u32 = 4;
@@ -36,14 +36,14 @@ pub(crate) struct Head {
     /// The next entry of the same full hash.
     chain: AtomicPtr<Head>,
     /// The entry's read list ([`crate::Reads::Kept`]), in the same arena; empty otherwise.
-    reads: *const Fact,
+    reads: *const Read,
     reads_len: u32,
     /// An interned value's or input's index in its arena's column; 0 for a query's entry.
     pub(crate) local: u32,
 }
 
 impl Head {
-    pub(crate) fn new(hash: u64, kind: &'static Kind, reads: &[Fact], local: u32) -> Head {
+    pub(crate) fn new(hash: u64, kind: &'static Kind, reads: &[Read], local: u32) -> Head {
         Head {
             hash,
             kind,
@@ -55,7 +55,7 @@ impl Head {
     }
 
     /// The entry's read list.
-    pub(crate) fn reads(&self) -> &[Fact] {
+    pub(crate) fn reads(&self) -> &[Read] {
         if self.reads_len == 0 {
             return &[];
         }
@@ -163,6 +163,40 @@ impl Trie {
                 // SAFETY: a chained head is published by release.
                 at = unsafe { &*next };
             }
+        }
+    }
+
+    /// Calls `f` on every published entry. A walk of the whole table (for tests and counts,
+    /// never a query): bounded by the entries, each node visited once.
+    pub(crate) fn each(&self, f: &mut dyn FnMut(&Head)) {
+        fn walk(slots: &[AtomicPtr<()>; FANOUT], f: &mut dyn FnMut(&Head)) {
+            for slot in slots {
+                let it = slot.load(Ordering::Acquire);
+                if it.is_null() {
+                    continue;
+                }
+                if is_node(it) {
+                    // SAFETY: tagged as a node, published by release.
+                    walk(unsafe { &node(it).slots }, f);
+                    continue;
+                }
+                // SAFETY: an untagged non-null slot is a published entry's head.
+                let mut at = unsafe { &*it.cast::<Head>() };
+                loop {
+                    f(at);
+                    let next = at.chain.load(Ordering::Acquire);
+                    if next.is_null() {
+                        break;
+                    }
+                    // SAFETY: a chained head is published by release.
+                    at = unsafe { &*next };
+                }
+            }
+        }
+        let root = self.root.load(Ordering::Acquire);
+        if !root.is_null() {
+            // SAFETY: as in `get`.
+            walk(unsafe { &(*root).slots }, f);
         }
     }
 

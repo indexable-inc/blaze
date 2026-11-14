@@ -1,12 +1,25 @@
 //! A body reads only what it names: an edit re-infers the bodies whose text or whose named
 //! items it changes, and no other. Each test checks every body once, makes one kind of edit and
 //! checks them all again, counting what ran.
+//!
+//! False by design since the port to blaze-memo (port decision 3: the memo is not the
+//! incremental mechanism), and left failing until restated over the body entries: every test
+//! here but [`a_warm_check_of_every_body_allocates_nothing`] claimed that an edit of a file of
+//! a crate re-infers only some of the bodies of that crate. Now the commit drops the arena of
+//! the crate whose file changed wholesale, and the arenas that borrow from it (its dependents),
+//! so every body of the edited crate, and of a crate that depends on it, is inferred and
+//! checked again in the new snapshot ([`an_edit_of_another_crate_reinfers_no_body`]: `main`
+//! depends on the edited `dep`). Which bodies an edit really costs is the item store's and the
+//! kernel's to keep small (`hir_ty::body_store::entries`), not the memo's.
 
-use hir_expand::EditionedFileId;
+use std::alloc::Global;
+
+use blaze_memo::testing::Ran;
 use hir_expand::fixture;
 use hir_ty::{InferBodyId, InferenceResult};
+use span::FileId;
 
-use super::{TestDB, count, function};
+use super::{CHECK, INFER, TestDB, count, function, runs_of, set_file_text};
 
 const FIXTURE: &str = r#"
 //- minicore: sized, copy, clone, derive, default
@@ -43,18 +56,25 @@ pub fn sibling() -> u32 {
 /// The module-level functions of [`FIXTURE`]: every body it has but `Shared::get`'s.
 const BODIES: [&str; 4] = ["main", "reader", "edited", "sibling"];
 
-fn fixture() -> (TestDB, Vec<EditionedFileId>) {
+/// The database of [`FIXTURE`], every body checked once, and its files by their ids, which a
+/// commit keeps (a fixture's `EditionedFileId`s are of the snapshot they were taken in).
+fn fixture() -> (TestDB, Vec<FileId>) {
     let fx = fixture::db(FIXTURE);
-    let files = fx.files().to_vec();
+    let files = file_ids(&fx);
     let db = fx.into_db();
     check_all(&db);
     (db, files)
 }
 
-/// Infers and borrow-checks every body of [`BODIES`], and what ran doing it.
-fn check_all(db: &TestDB) -> Vec<String> {
-    blaze_query::db::attach(db, || {
-        db.log_executed(|| {
+fn file_ids(fx: &fixture::Fixture) -> Vec<FileId> {
+    fx.files().iter().map(|it| it.file_id(fx.db())).collect()
+}
+
+/// Infers and borrow-checks every body of [`BODIES`], and what ran doing it. Each body's id is
+/// taken in the database's snapshot.
+fn check_all(db: &TestDB) -> Vec<Ran, Global> {
+    blaze_memo::attach(db, || {
+        runs_of(db, || {
             for name in BODIES {
                 let f = function(db, name);
                 InferenceResult::of(db, InferBodyId::DefWithBodyId(f));
@@ -64,30 +84,28 @@ fn check_all(db: &TestDB) -> Vec<String> {
     })
 }
 
-/// Replaces `from` with `to` in the one file of `files` whose text has `from`.
-fn edit(db: &mut TestDB, files: &[EditionedFileId], from: &str, to: &str) {
-    let mut found = files.iter().map(|it| it.file_id(db)).filter(|&it| {
-        let text = db.file_text(it).text(db);
-        text.contains(from)
-    });
+/// Replaces `from` with `to` in the one file of `files` whose text has `from`, in a new
+/// snapshot.
+fn edit(db: &mut TestDB, files: &[FileId], from: &str, to: &str) {
+    let mut found = files.iter().copied().filter(|&it| db.file_text(it).text(db).contains(from));
     let file = found.next().unwrap_or_else(|| panic!("no file has `{from}`"));
     assert!(found.next().is_none(), "more than one file has `{from}`");
     let text = db.file_text(file).text(db).replacen(from, to, 1);
-    db.set_file_text(file, &text);
+    set_file_text(db, file, &text);
 }
 
 /// After `from` becomes `to`, the number of bodies inferred and borrow-checked again.
-fn rerun_after(from: &str, to: &str) -> (usize, usize, Vec<String>) {
+fn rerun_after(from: &str, to: &str) -> (usize, usize, Vec<Ran, Global>) {
     let (mut db, files) = fixture();
     edit(&mut db, &files, from, to);
     let executed = check_all(&db);
-    (count(&executed, "infer_body_query"), count(&executed, "borrowck"), executed)
+    (count(&executed, INFER), count(&executed, CHECK), executed)
 }
 
 #[test]
 fn a_warm_check_of_every_body_allocates_nothing() {
     let (db, _) = fixture();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let bodies = BODIES.map(|name| function(&db, name));
         blaze_alloc_count::assert_at_most(0, "a warm check of every body", || {
             for f in bodies {
@@ -173,16 +191,16 @@ fn a_trait_use_reinfers_no_body_of_another_module() {
         "pub fn edited()",
         "pub trait Local {\n    fn local(&self) {}\n}\nuse core::clone::Clone as _;\npub fn edited()",
     );
-    let outside_b = blaze_query::db::attach(&db, || {
-        db.log_executed(|| {
+    let outside_b = blaze_memo::attach(&db, || {
+        runs_of(&db, || {
             for name in ["main", "reader"] {
                 InferenceResult::of(&db, InferBodyId::DefWithBodyId(function(&db, name)));
             }
         })
     });
-    assert_eq!(count(&outside_b, "infer_body_query"), 0, "{outside_b:#?}");
+    assert_eq!(count(&outside_b, INFER), 0, "{outside_b:#?}");
     let inside_b = check_all(&db);
-    assert!(count(&inside_b, "infer_body_query") <= 2, "at most `b`'s two bodies: {inside_b:#?}");
+    assert!(count(&inside_b, INFER) <= 2, "at most `b`'s two bodies: {inside_b:#?}");
 }
 
 #[test]
@@ -195,13 +213,13 @@ fn a_changed_signature_reinfers_its_callers() {
         "pub fn get(&self) -> u64 {\n        self.0 as u64",
     );
     let executed = check_all(&db);
-    assert_eq!(
-        count(&executed, "infer_body_query"),
-        1,
-        "`reader`, which calls `get`: {executed:#?}"
-    );
-    blaze_query::db::attach(&db, || {
+    assert_eq!(count(&executed, INFER), 1, "`reader`, which calls `get`: {executed:#?}");
+    blaze_memo::attach(&db, || {
         let reader = function(&db, "reader");
+        assert!(
+            executed.iter().any(|it| it.is::<hir_ty::kinds::infer_body_query>(&(reader,))),
+            "the one inferred again is `reader`'s: {executed:#?}"
+        );
         let result = InferenceResult::of(&db, InferBodyId::DefWithBodyId(reader));
         assert!(result.has_type_mismatches(), "`reader` returns the `u64` of `get` as `u32`");
     });
@@ -232,12 +250,10 @@ fn main() {
 }
 "#,
     );
-    let files = fx.files().to_vec();
+    let files = file_ids(&fx);
     let mut db = fx.into_db();
-    let main = blaze_query::db::attach(&db, || {
-        let main = function(&db, "main");
-        InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));
-        main
+    blaze_memo::attach(&db, || {
+        InferenceResult::of(&db, InferBodyId::DefWithBodyId(function(&db, "main")));
     });
     edit(
         &mut db,
@@ -245,10 +261,12 @@ fn main() {
         "pub fn unused() -> u32 {\n    2",
         "pub fn unused() -> u32 {\n    let z = 2;\n    z",
     );
-    let executed = blaze_query::db::attach(&db, || {
-        db.log_executed(|| {
+    let executed = blaze_memo::attach(&db, || {
+        // `main`'s id taken in the snapshot the edit's commit made.
+        let main = function(&db, "main");
+        runs_of(&db, || {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));
         })
     });
-    assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
+    assert_eq!(count(&executed, INFER), 0, "{executed:#?}");
 }

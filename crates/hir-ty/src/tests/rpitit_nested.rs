@@ -12,7 +12,7 @@ use crate::{InferBodyId, InferenceDiagnostic, InferenceResult};
 /// The inference diagnostics of every function of `fixture`, trait methods included, by name.
 fn diagnostics(fixture: &str) -> Vec<(String, InferenceDiagnostic)> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut functions = Vec::new(); // alloc: test
         for (_, module) in crate_def_map(&db, fixture::test_crate(&db)).modules(&db) {
             for def in module.scope(&db).declarations() {

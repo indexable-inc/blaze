@@ -180,7 +180,7 @@ fn ctxt_at(cx: &Cx<'_, '_>, file: HirFileId, offset: TextSize) -> SyntaxContext 
 
 /// rustc's `Span::edition` of the token at `offset` of `file`.
 fn edition_at(cx: &Cx<'_, '_>, file: HirFileId, offset: TextSize) -> Edition {
-    ctxt_at(cx, file, offset).edition(cx.db)
+    ctxt_at(cx, file, offset).edition()
 }
 
 fn span(cx: &Cx<'_, '_>, tree: &Tree<'_>, range: TextRange) -> Span {

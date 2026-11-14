@@ -127,7 +127,7 @@ impl Emitted {
 /// It is computed from memoized queries (`mir_body`, `borrowck`, inference) and is not yet a
 /// memoized query of its own.
 pub fn structured(db: &Db, func: FunctionId) -> Result<body::Body, NotTranslated> {
-    blaze_query::db::attach(db, || lowered(db, func)).map(|it| it.body)
+    blaze_memo::attach(db, || lowered(db, func)).map(|it| it.body)
 }
 
 fn lowered(db: &Db, func: FunctionId) -> Result<body::Lowered, NotTranslated> {
@@ -161,7 +161,7 @@ fn accepted(db: &Db, func: FunctionId) -> Result<(), NotTranslated> {
 /// (index 0) and the functions it calls, which `lean/Blaze/Mir` gives a meaning. The semantics'
 /// side of every check that a model, a pass or the evaluator agrees with what blaze compiles.
 pub fn embed_mir(db: &Db, func: FunctionId) -> Result<EmbeddedMir, NotTranslated> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         accepted(db, func)?;
         let term = body::embed::program(db, func, None)?;
         Ok(body::embed::module(db, func, term))
@@ -175,7 +175,7 @@ pub fn embed_mir_body<'db>(
     func: FunctionId,
     mir: &hir_ty::mir::MirBody<'db>,
 ) -> Result<String, NotTranslated> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         accepted(db, func)?;
         body::embed::program(db, func, Some(mir))
     })
@@ -183,7 +183,7 @@ pub fn embed_mir_body<'db>(
 
 /// `func`'s Lean module, and those of the functions it calls: pipeline steps 1 to 3.
 pub fn emit(db: &Db, func: FunctionId) -> Result<Emitted, NotTranslated> {
-    blaze_query::db::attach(db, || emit_in(db, func, &mut Vec::new()))
+    blaze_memo::attach(db, || emit_in(db, func, &mut Vec::new()))
 }
 
 fn emit_in(db: &Db, func: FunctionId, stack: &mut Vec<FunctionId>) -> Result<Emitted, NotTranslated> {

@@ -200,8 +200,6 @@ impl<S: Steps> Jobs<S> {
             steps: Arc::clone(w.steps), // clone: a refcount, once a store
             kept: Lock::new("serve.job.store_members.kept", Some(front)),
             checkout: checkout.clone(), // clone: the task's span's name, once a store
-            build: 0,
-            logs: false,
             wanted: Arc::clone(&wanted), // clone: a refcount, once a store
             filing: None,
         };

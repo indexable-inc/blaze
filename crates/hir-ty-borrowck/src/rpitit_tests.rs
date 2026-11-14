@@ -36,7 +36,7 @@ fn function(db: &Db, name: &str) -> DefWithBodyId {
 #[test]
 fn the_value_of_a_trait_methods_impl_trait_borrows_self_while_held() {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let codes = |name: &str| -> Vec<&'static str> {
             let result = crate::borrowck(&db, function(&db, name));
             assert_eq!(result.skipped, None, "`{name}`");
@@ -99,7 +99,7 @@ pub fn ok_bounded(c: &u8) { take_static(0u8.mkst(c)) }
 #[test]
 fn a_trait_methods_impl_trait_called_on_an_impl_type_borrows_what_is_passed() {
     let db = fixture::db(CONCRETE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let expect = |name: &str, want: &[&str]| {
             for mode in [crate::Mode::Nll, crate::Mode::Polonius] {
                 let result = crate::borrowck_in_mode(&db, function(&db, name), mode);
@@ -140,7 +140,7 @@ fn uncaptured<T: Tr>(mut t: T) { let it = t.f(); touch(&mut t); let _keep = it; 
 #[test]
 fn a_lifetime_a_trait_methods_impl_trait_does_not_capture_need_not_be_live() {
     let db = fixture::db(USE_FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let result = crate::borrowck(&db, function(&db, "uncaptured"));
         assert_eq!(result.skipped, None);
         assert_eq!(result.not_checked, None);
@@ -167,7 +167,7 @@ trait D {
 #[test]
 fn a_trait_methods_default_body_is_borrow_checked_as_returning_its_impl_trait() {
     let db = fixture::db(DEFAULT_FIXTURE).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let codes = |name: &str| -> Vec<&'static str> {
             let result = crate::borrowck(&db, trait_method(&db, name));
             assert_eq!(result.skipped, None, "`{name}`");

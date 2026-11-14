@@ -9,10 +9,10 @@ use super::{check_number, check_number_in};
 /// records them leaves the derived methods without bodies to evaluate.
 #[track_caller]
 fn check_number_derived(#[rust_analyzer::rust_fixture] ra_fixture: &str, answer: i128) {
-    let fx = fixture::db(ra_fixture);
+    let mut fx = fixture::db(ra_fixture);
+    crate::test_db::expand_builtin_derives(&mut fx);
     let file_ids = fx.files().to_vec();
-    let mut db = fx.into_db();
-    hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+    let db = fx.into_db();
     check_number_in(&db, *file_ids.last().unwrap(), answer);
 }
 

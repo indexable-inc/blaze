@@ -313,8 +313,9 @@ fn ask(db: &SimDb<'_>, world: &World, model: &Model<'_>, ask: Ask) -> Result<(),
         Ask::Ring(c, at) => (common::ring(db, world.krate(c), at), model.ring(at)),
         Ask::Reach(c, n) => (common::reach(db, world.krate(c), n), model.reach(c, n)),
         Ask::Record(c, d) => {
-            let (got, reads) = record(db.memo, || common::total(db, world.krate(c), d))
+            let (got, rows) = record(db.memo, || common::total(db, world.krate(c), d))
                 .map_err(|it| it.to_string())?;
+            let reads = common::facts_of(&rows);
             let want = model.total_facts(c, d);
             if reads.as_slice() != want.as_slice() {
                 return Err(format!(

@@ -193,7 +193,7 @@ fn codes(early: bool, name: &str) -> Vec<Vec<&'static str>> {
     let fx = fixture::db(&source);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, name);
         [Mode::Nll, Mode::Polonius]
             .into_iter()

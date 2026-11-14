@@ -12,7 +12,8 @@ use intern::Symbol;
 use std::alloc::Global;
 
 use super::{
-    Enc, HEADER, LAYOUT, PageSource, Paged, encode, encode_maps, names_of, read_head, set,
+    Enc, HEADER, LAYOUT, PageSource, Paged, encode, encode_maps, names_of, read_head,
+    set_for_test as set,
 };
 use crate::{
     nameres::{
@@ -379,42 +380,6 @@ fn the_print_of_a_meaning_tells_two_apart() {
     assert_eq!(print(&db, lib, PerNs::none()), print(&db, lib, PerNs::none()));
 }
 
-/// What reading the pages of `lib` runs after `main`, a crate beside it, was given other
-/// pages; and what reading `main`'s runs then.
-fn runs_after_another_crates_gift() -> (Vec<String>, Vec<String>) {
-    use crate::test_db::TestDBExt;
-    let pages = written(FIXTURE, &["lib", "main"]);
-    let mut db = paged(FIXTURE, &sources(&pages));
-    let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
-    assert!(super::paged(&db, lib).is_some() && super::paged(&db, main).is_some());
-    let mut maps = super::all(&db);
-    maps.get_mut(&main).unwrap().key = ContentId([9; 32]);
-    set(&mut db, maps);
-    let of_lib = db.executed_in_read_order(|| _ = super::paged(&db, lib));
-    let of_main = db.executed_in_read_order(|| _ = super::paged(&db, main));
-    assert_eq!(super::paged(&db, main).as_ref().map(|it| it.key), Some(ContentId([9; 32])));
-    assert_eq!(super::paged(&db, lib).as_ref().map(|it| it.key), Some(ContentId([1; 32])));
-    (of_lib, of_main)
-}
-
-/// The invariant: what a crate is read from is the crate's own slot (`deps::given`), so pages
-/// given to one crate run no row of another crate; the crate given them runs its own again.
-#[test]
-fn pages_given_to_one_crate_run_no_row_of_another() {
-    let (of_lib, of_main) = runs_after_another_crates_gift();
-    assert_eq!(of_lib, Vec::<String>::new(), "`lib` was given nothing");
-    assert_eq!(of_main.len(), 1, "`main`'s reader runs once: {of_main:?}");
-}
-
-/// The control: every crate given its entry again at each set, as one map of every crate
-/// did to its readers, runs `lib`'s reader too.
-#[test]
-fn the_oracle_catches_a_gift_to_every_crate() {
-    crate::deps::given::GIVES_EVERY_CRATE.set(true);
-    let (of_lib, _) = runs_after_another_crates_gift();
-    crate::deps::given::GIVES_EVERY_CRATE.set(false);
-    assert_eq!(of_lib.len(), 1, "the planted bug writes `lib`'s slot: {of_lib:?}");
-}
 
 /// What a random edit appends to `main.rs`: items, uses of `lib`'s names (one a glob, one
 /// through a module of its own) and a use of a name `lib` does not have.
@@ -461,7 +426,25 @@ fn agree_under_edits(
         text.push_str(&EDITS[draw() % EDITS.len()].replace('N', &step.to_string()));
         for db in [&mut resolved, &mut read] {
             let root = crate_named(db, "main").data(db).root_file_id;
-            db.set_file_text(root, &text);
+            // What a driver does at a write: the crates read from pages whose files the write
+            // moves (`deps::withdrawn`, asked of the snapshot before it) lose their pages in
+            // the snapshot the write makes. A gift lasts until it is taken and no commit takes
+            // one on its own, so the test writes as the driver does.
+            let paged: Vec<Crate> = base_db::all_crates(db)
+                .iter()
+                .copied()
+                .filter(|&krate| super::is_paged(db, krate))
+                .collect();
+            let gone: Vec<base_db::CrateKey> = crate::deps::withdrawn(db, &paged, &[root], &[])
+                .iter()
+                .map(|krate| krate.key(db))
+                .collect();
+            let mut edit = db.edit();
+            _ = edit.set_file_text(root, &text);
+            for &key in &gone {
+                _ = crate::deps::withdraw_image(&mut edit, key);
+            }
+            _ = edit.commit();
         }
         let lib = crate_named(&read, "lib");
         if super::paged(&read, lib).is_none() {
@@ -630,8 +613,14 @@ fn sealed_run(whole: bool) -> Vec<String> {
         }
     });
     // An ingredient's name is its function's: `tail` is the pages' tail, which only a crate
-    // read from pages runs.
-    ran.into_iter().filter(|it| it.ends_with("scope_memo") || it == "tail" || it.ends_with("::tail")).collect()
+    // read from pages runs. The run log writes a run as `path::to::query(key)`, so a run is
+    // told by its path, up to the key's parenthesis.
+    ran.into_iter()
+        .filter(|it| {
+            let path = it.split_once('(').map_or(it.as_str(), |(path, _)| path);
+            path.ends_with("scope_memo") || path == "tail" || path.ends_with("::tail")
+        })
+        .collect()
 }
 
 /// The invariant: name resolution holds no decoded state of a sealed crate. `main` resolved

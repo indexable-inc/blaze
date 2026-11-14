@@ -810,7 +810,7 @@ impl<'db> Cx<'db> {
                 return Err(self.refuse("`async` or a coroutine (rule Async)", at));
             }
             _ => {
-                let what = blaze_query::db::attach(self.db, || format!("the type `{ty:?}`"));
+                let what = blaze_memo::attach(self.db, || format!("the type `{ty:?}`"));
                 return Err(self.refuse(what, at));
             }
         })

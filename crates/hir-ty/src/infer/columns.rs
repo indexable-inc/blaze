@@ -1252,7 +1252,7 @@ impl<K: DenseKey + fmt::Debug> fmt::Debug for ModeColumn<K> {
 }
 
 /// A side table of the few keys that have a value, sorted by key.
-#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SortedMap<K, V> {
     entries: Box<[(K, V)]>,
 }
@@ -1615,10 +1615,10 @@ mod tests {
 
     #[test]
     fn field_column_takes_back_its_parts_and_refuses_others() {
-        use blaze_query::db::FromId;
-        let id = |index: u32| blaze_query::db::Id::from_u32(index + (2 << 20));
+        use blaze_memo::Id as _;
+        let id = |index: u32| blaze_memo::Gid::for_test(index + (2 << 20));
         let field = |local: u32| FieldId {
-            parent: hir_def::StructId::from_id(id(3)).into(),
+            parent: hir_def::StructId::from_gid(id(3)).into(),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),
         };
         let tuple_field =

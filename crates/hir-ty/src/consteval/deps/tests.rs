@@ -267,11 +267,33 @@ fn const_named(db: &Db, krate: Crate, name: &str) -> ConstId {
 /// `lib::SEVEN`.
 fn kept(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (Db, Crate, ConstId) {
     let mut db = fixture::db(FIXTURE).into_db();
-    let lib = crate_named(&db, "lib");
-    let seven = const_named(&db, lib, "SEVEN");
+    let lib = crate_named(&db, "lib").key(&db);
     let crates = HashMap::from_iter_in([(lib, base)], Global);
-    set(&mut db, Arc::clone(store) as Arc<dyn ImageStore + Send + Sync>, crates, mode);
+    let fact = kept_fact(mode, [(lib_id(), base)]);
+    // dyn: the driver's store, as `set` takes it
+    let store: Arc<dyn ImageStore + Send + Sync> = Arc::clone(store) as _;
+    // Given as a driver gives it: a maker of the session arena, which the commit makes again,
+    // so every crate's id is taken after it.
+    let mut edit = db.edit();
+    edit.set_given(
+        None,
+        fact,
+        Box::new_in(
+            move |builder: &blaze_memo::Builder, _: &blaze_memo::Inputs<'_>| {
+                set(builder, fact, Arc::clone(&store), crates.clone(), mode);
+            },
+            Global,
+        ),
+    );
+    _ = edit.commit();
+    let lib = db.krate(lib);
+    let seven = const_named(&db, lib, "SEVEN");
     (db, lib, seven)
+}
+
+/// The stable id the tests give `lib`.
+fn lib_id() -> ContentId {
+    ContentId::of("blaze test crate", b"lib")
 }
 
 fn u32_value(n: u32) -> Allocation<'static> {
@@ -287,7 +309,7 @@ fn of_constants(differences: Vec<String>) -> Vec<String> {
 fn a_hit_allocates_only_its_result() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Serve);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let item = hir_def::deps::const_key(&db, seven).unwrap();
         store.keep(key(BASE, item), u32_value(8));
         let empty = GenericArgs::empty();
@@ -302,7 +324,7 @@ fn a_hit_allocates_only_its_result() {
 fn what_is_not_kept_is_not_asked() {
     let store = Arc::new(Memory::default());
     let (db, lib, seven) = kept(&store, Some(BASE), Mode::Serve);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mine = const_named(&db, crate_named(&db, "main"), "MINE");
         assert!(site(&db, mine, GenericArgs::empty()).is_none(), "a workspace member's");
         let args = GenericArgs::new_from_slice(&[default_types().types.u8.into()]);
@@ -316,7 +338,7 @@ fn what_is_not_kept_is_not_asked() {
 fn an_unreadable_kept_value_is_an_error_naming_it() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Serve);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let key = key(BASE, hir_def::deps::const_key(&db, seven).unwrap());
         let body = codec::encode(u32_value(7)).unwrap();
         store.put(key, codec::file(ContentId([1; 32]), &body)).unwrap();
@@ -333,7 +355,7 @@ fn an_unreadable_kept_value_is_an_error_naming_it() {
 fn a_recorded_value_is_drained_under_its_key() {
     let store = Arc::new(Memory::default());
     let (db, lib, seven) = kept(&store, None, Mode::Serve);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let empty = GenericArgs::empty();
         assert_eq!(cached(&db, seven, empty), Ok(None), "a crate checked now has no base yet");
         for _ in 0..3 {
@@ -346,10 +368,10 @@ fn a_recorded_value_is_drained_under_its_key() {
         let item = hir_def::deps::const_key(&db, seven).unwrap();
         assert_eq!(store.read(key(BASE, item)), Some(u32_value(7)));
         assert_eq!(drain(&db, &bases), Ok(Drained::default()), "drained once");
-
+    
         record(&db, seven, empty, &Ok(u32_value(7).store()));
         assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained { written: 0, unkeyed: 1 }));
-
+    
         record(&db, seven, empty, &Ok(u32_value(7).store()));
         record(&db, seven, empty, &Ok(u32_value(9).store()));
         let two = drain(&db, &bases).unwrap_err();
@@ -361,7 +383,7 @@ fn a_recorded_value_is_drained_under_its_key() {
 fn check_mode_records_a_difference_and_verify_serves() {
     let store = Arc::new(Memory::default());
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Check);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         _ = frozen::differences();
         let key = key(BASE, hir_def::deps::const_key(&db, seven).unwrap());
         store.keep(key, u32_value(8));
@@ -375,22 +397,21 @@ fn check_mode_records_a_difference_and_verify_serves() {
         assert_eq!(drain(&db, &HashMap::new_in(Global)), Ok(Drained::default()), "nothing to keep");
     });
     let (db, _, seven) = kept(&store, Some(BASE), Mode::Verify);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert_eq!(cached(&db, seven, GenericArgs::empty()), Ok(Some(u32_value(8))));
         assert_eq!(of_constants(frozen::differences()), Vec::<String>::new(), "it writes back");
     });
 }
 
+/// The fact names what decides the values served, and only that: the same mode and crates give
+/// the same fact, so a constant's record read under one is read again under the next; another
+/// base, another mode or another crate gives another.
 #[test]
-fn setting_the_same_store_changes_nothing() {
-    let store = Arc::new(Memory::default());
-    let (mut db, lib, _) = kept(&store, Some(BASE), Mode::Serve);
-    // clone: a test reading the input before and after
-    let before = KeptConsts::get(&db).kept(&db).clone();
-    let same = Arc::clone(&store) as Arc<dyn ImageStore + Send + Sync>;
-    set(&mut db, same, HashMap::from_iter_in([(lib, Some(BASE))], Global), Mode::Serve);
-    assert_eq!(*KeptConsts::get(&db).kept(&db), before, "the input is not set again");
-    let other = Arc::clone(&store) as Arc<dyn ImageStore + Send + Sync>;
-    set(&mut db, other, HashMap::from_iter_in([(lib, Some(KEY))], Global), Mode::Serve);
-    assert_ne!(*KeptConsts::get(&db).kept(&db), before, "another base is another input");
+fn the_kept_fact_is_what_decides_the_values() {
+    let other = ContentId::of("blaze test crate", b"other");
+    let fact = kept_fact(Mode::Serve, [(lib_id(), Some(BASE)), (other, None)]);
+    assert_eq!(kept_fact(Mode::Serve, [(other, None), (lib_id(), Some(BASE))]), fact, "order");
+    assert_ne!(kept_fact(Mode::Serve, [(lib_id(), Some(KEY)), (other, None)]), fact, "base");
+    assert_ne!(kept_fact(Mode::Check, [(lib_id(), Some(BASE)), (other, None)]), fact, "mode");
+    assert_ne!(kept_fact(Mode::Serve, [(lib_id(), Some(BASE))]), fact, "crates");
 }

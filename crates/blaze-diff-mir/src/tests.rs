@@ -172,7 +172,7 @@ pub fn not_differentiable(x: f64) -> f64 {
 #[track_caller]
 fn with_db<T>(check: impl FnOnce(&Db) -> T) -> T {
     let db = fixture::db(FIXTURE).into_db();
-    blaze_query::db::attach(&db, || check(&db))
+    blaze_memo::attach(&db, || check(&db))
 }
 
 #[track_caller]

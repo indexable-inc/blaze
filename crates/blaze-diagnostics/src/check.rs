@@ -69,7 +69,7 @@ fn breaks_items(found: &Found) -> bool {
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
 /// closing ones ("aborting due to ...", "For more information about this error, ...").
 pub fn check_crate(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options) -> Vec<Diag> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let plan = Plan::of_every_body(db, &[krate], false);
         frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, &plan, frame).diags)
     })
@@ -85,7 +85,7 @@ pub fn check_planned(
     files: Files<'_>,
     options: &Options,
 ) -> CrateCheck {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         frame::task(Tag::Diagnostics, |frame| run(db, krate, files, options, plan, frame))
     })
 }
@@ -106,7 +106,7 @@ pub fn check_reached_only(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let expanded = hir::check::check_expansions(db, krate);
         let sealed = hir::check::check_sealed(db, krate);
         if expanded.is_empty() && sealed.diagnostics.is_empty() && sealed.foreign_impls.is_empty() {
@@ -159,7 +159,7 @@ pub fn check_reached_only(
 /// kin). Errors only, its lints left out as a dependency's are, in rustc's order, each with a
 /// note naming the body; empty when the front end finds none, which leaves the failure blaze's.
 pub fn check_one_body(db: &Db, def: hir_def::DefWithBodyId, files: Files<'_>) -> Vec<Diag> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let krate = hir::Crate::from(hir_def::HasModule::krate(&def, db));
         let found = hir::check::check_body(db, def, false);
         frame::task(Tag::Diagnostics, |frame| {
@@ -533,10 +533,10 @@ mod tests {
             checked.messages()
         );
         let db = &checked.db;
-        let krate = blaze_query::db::attach(db, || hir::check::workspace_crates(db))
+        let krate = blaze_memo::attach(db, || hir::check::workspace_crates(db))
             .into_iter()
             .find(|it| {
-                blaze_query::db::attach(db, || {
+                blaze_memo::attach(db, || {
                     it.display_name(db).is_some_and(|name| name.to_string() == "main")
                 })
             })

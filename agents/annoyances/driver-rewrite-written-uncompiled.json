@@ -1,0 +1,14 @@
+{
+ "id": "driver-rewrite-written-uncompiled",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port-memo-1113 lane K1 (blaze-keyed read-addressed, blaze-host)",
+ "where": "crates/blaze-keyed/src/{driver.rs,tests.rs}, crates/blaze-host/src/{host.rs,workers.rs,tests.rs}",
+ "what": "A rewrite of the keyed driver (about 2,700 lines of state machine), its simulation and its host was written by a write-only lane with no compile and no test run; the exact counts the scenario tests assert (tasks run, marks hit, records found) were derived by reading the driver, not seen.",
+ "cost": "the main agent's first compile meets every borrow and type error at once, and a wrong expected count is indistinguishable from a driver bug until the profile is read",
+ "cause": "the fan-out rule keeps lanes from running anything, and a sans-IO core this size has no smaller piece that compiles alone",
+ "class": "a large stateful core changed in one piece with the compiler out of the loop",
+ "prevention": "let a lane run `cargo check -p <its crate>` (no tests, no VM) in its own target directory, or split a driver rewrite into a compiling skeleton first and the paths after",
+ "workaround": "the report lists what to check first: closure annotations in tests.rs, borrows in driver.rs write/got_address/after_deps, and each scenario's expected counts",
+ "fix": "",
+ "state": "open"
+}

@@ -706,8 +706,8 @@ impl BasicAdtInfo {
 }
 
 // FIXME: This whole thing needs a refactor. Each derive requires its special values, and the result is a mess.
-fn parse_adt(db: &Db, tt: &tt::TopSubtree, call_site: Span) -> Result<BasicAdtInfo, ExpandError> {
-    let (parsed, tm) = parse_item(db, tt);
+fn parse_adt(_db: &Db, tt: &tt::TopSubtree, call_site: Span) -> Result<BasicAdtInfo, ExpandError> {
+    let (parsed, tm) = parse_item(tt);
     parse_adt_from_syntax(adt_of(&parsed, call_site)?, &tm, call_site)
 }
 
@@ -905,9 +905,9 @@ fn parse_adt_from_syntax(
 }
 
 /// The derive's item parsed from its token tree, and the span of each of its tokens.
-fn parse_item(db: &Db, tt: &tt::TopSubtree) -> (Parse<ast::Untyped>, span::SpanMap) {
+fn parse_item(tt: &tt::TopSubtree) -> (Parse<ast::Untyped>, span::SpanMap) {
     let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+        crate::token_tree_to_syntax_node(frame, tt.view(), crate::ExpandTo::Items)
     });
     (parsed, tm)
 }
@@ -1132,12 +1132,12 @@ fn const_param_ty_derive<'f>(
 /// (`deriving/from.rs`): the impl keeps the struct's generics and bounds, and adds no bound of
 /// its own.
 fn from_expand<'f>(
-    db: &Db,
+    _db: &Db,
     frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let (parsed, span_map) = parse_item(db, tt);
+    let (parsed, span_map) = parse_item(tt);
     let adt = match adt_of(&parsed, span) {
         Ok(it) => it,
         Err(err) => return ExpandResult::new(empty(frame, span), err),
@@ -1234,12 +1234,12 @@ fn reborrow_derive<'f>(
 }
 
 fn coerce_shared_expand<'f>(
-    db: &Db,
+    _db: &Db,
     frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let (parsed, span_map) = parse_item(db, tt);
+    let (parsed, span_map) = parse_item(tt);
     let adt = match adt_of(&parsed, span) {
         Ok(it) => it,
         Err(err) => {
@@ -1252,7 +1252,7 @@ fn coerce_shared_expand<'f>(
             ExpandError::builtin_derive(span, "`CoerceShared` can only be derived on `struct`s"),
         );
     };
-    let Some(target) = coerce_shared_target(db, span, strukt) else {
+    let Some(target) = coerce_shared_target(span, strukt) else {
         return ExpandResult::new(
             empty(frame, span),
             ExpandError::builtin_derive(
@@ -1315,10 +1315,10 @@ impl SpanMapper for AtSpan {
     }
 }
 
-fn coerce_shared_target(db: &Db, span: Span, strukt: ast::Struct<'_>) -> Option<tt::TopSubtree> {
+fn coerce_shared_target(span: Span, strukt: ast::Struct<'_>) -> Option<tt::TopSubtree> {
     let target = coerce_shared_target_tokens(span, strukt)?;
     let (parse, _, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        crate::token_tree_to_syntax_node(db, frame, target.view(), crate::ExpandTo::Type)
+        crate::token_tree_to_syntax_node(frame, target.view(), crate::ExpandTo::Type)
     });
     if !parse.errors().is_empty() {
         return None;
@@ -2047,12 +2047,12 @@ fn is_maybe_sized_bound(bound: ast::TypeBound<'_>) -> bool {
 }
 
 fn coerce_pointee_expand<'f>(
-    db: &Db,
+    _db: &Db,
     frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
-    let (parsed, span_map) = parse_item(db, tt);
+    let (parsed, span_map) = parse_item(tt);
     let adt = match adt_of(&parsed, span) {
         Ok(it) => it,
         Err(err) => {

@@ -332,7 +332,8 @@ fn main_blocks(
         for (name, _) in map.module(&db, map.root_module_id()).scope(&db).entries() {
             let Some(key) = name.key() else { continue };
             let expn = hir_expand::MacroCallId::from(
-                key.outer_expn(&db).expect("a keyed name's context has a mark"),
+                key.outer_expn(&db, blaze_memo::Id::gid(krate).arena())
+                    .expect("a keyed name's context has a mark"),
             );
             let at =
                 calls.iter().position(|&it| it == expn).expect("a call of `main`'s body wrote it");

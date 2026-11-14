@@ -33,7 +33,6 @@ mod tests;
 
 use std::{
     cell::Cell,
-    ops::ControlFlow,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -50,6 +49,7 @@ use hir_def::deps::ImageStore;
 use super::{
     DbInterner, SolverDefId,
     global_goals::{Answer, GoalKey},
+    interner::{Reads, recorded, replay},
 };
 use crate::store_registry::{Linked, Registry};
 use pending::{Pending, Tallies};
@@ -69,17 +69,17 @@ pub trait GoalFacts: Send + Sync + 'static {
     /// items), one fixed key. A memoized query, as it is asked on every miss.
     fn crate_key(&self, db: &Db, krate: Option<Crate>) -> ContentId;
 
-    /// The fact a read of the query or input `read` (named `name`, its ingredient's debug name)
-    /// made by a goal of `krate`'s interner stands for, if one does: one whose value, as `krate`
-    /// sees it, changes whenever what that read returned does. `None` keeps the goal out of the
-    /// store.
+    /// The fact of lane items a read row `read` (one row of a goal's read list, made by a goal
+    /// of `krate`'s interner: an input's fact, or a fact boundary query by its key) stands for:
+    /// one whose value, as `krate` sees it, changes whenever what `read` names does. `Err`
+    /// names what `read` is of (its kind's name), which stands for no fact here and keeps the
+    /// goal out of the store, counted by that name in [`Flushed::inexpressible`].
     fn fact_of(
         &self,
         db: &Db,
         krate: Option<Crate>,
-        read: blaze_query::db::DatabaseKeyIndex,
-        name: &'static str,
-    ) -> Option<FactRef>;
+        read: blaze_memo::Read,
+    ) -> Result<FactRef, &'static str>;
 
     /// The value of `fact` in `db` now as `krate` sees it (`blaze_items::facts::value`): a fact
     /// about impls covers only the crates `krate` loads, the ones its goals search, and never
@@ -98,6 +98,13 @@ pub struct FactRef {
     pub object: FactObject,
 }
 
+/// A fact by stable ids and hashes only, so it names no arena: a key holding it is homed by
+/// its other parts (`blaze_items::goals::FactRefKey`).
+impl blaze_memo::Home for FactRef {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum FactObject {
     None,
@@ -110,7 +117,7 @@ pub enum FactObject {
 /// captured shareably: the answer is then good for the asking query alone).
 pub(crate) struct Found {
     pub(crate) answer: Answer,
-    pub(crate) reads: Option<blaze_query::db::Reads>,
+    pub(crate) reads: Option<Reads>,
 }
 
 /// On a global-table miss, before solving: the stored answer of `key` for `interner`'s crate
@@ -129,16 +136,11 @@ pub(crate) fn lookup<'db>(interner: DbInterner<'db>, key: GoalKey) -> Option<Fou
 /// The offer is bookkeeping of the goal store, never part of the asking query's value: what it
 /// reads to file the goal (each read's fact, the facts' values, the crate's key, the goal's
 /// words with each definition's item key) is kept out of the running query and of every capture
-/// open on it ([`blaze_query::db::unrecorded`]). So a body whose solve offered a goal holds the
+/// open on it ([`blaze_memo::unrecorded`]). So a body whose solve offered a goal holds the
 /// goal's own reads and nothing more, exactly what a body that took the goal from the goal
 /// table replays: which body solved it first changes no body's trace.
 #[inline]
-pub(crate) fn offer<'db>(
-    interner: DbInterner<'db>,
-    key: GoalKey,
-    answer: Answer,
-    reads: blaze_query::db::Reads,
-) {
+pub(crate) fn offer<'db>(interner: DbInterner<'db>, key: GoalKey, answer: Answer, reads: Reads) {
     if REGISTRY.is_empty() {
         return;
     }
@@ -152,12 +154,7 @@ fn lookup_goal<'db>(interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found>
 
 #[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
 #[inline(never)]
-fn offer_goal<'db>(
-    interner: DbInterner<'db>,
-    goal: Goal<'db>,
-    answer: Answer,
-    reads: blaze_query::db::Reads,
-) {
+fn offer_goal<'db>(interner: DbInterner<'db>, goal: Goal<'db>, answer: Answer, reads: Reads) {
     let file = || {
         with_store(interner.db, |store| store.offer(interner, goal, answer, reads));
     };
@@ -166,7 +163,7 @@ fn offer_goal<'db>(
         file();
         return;
     }
-    blaze_query::db::unrecorded(interner.db, file);
+    blaze_memo::unrecorded(blaze_memo::Database::memo(interner.db), file);
 }
 
 /// The planted bug of the order oracle's control
@@ -243,41 +240,50 @@ enum Refusal {
 
 impl Store {
     /// A hit's reads (the crate's key and the values of the facts its record names) are the
-    /// key of its answer, the query's own as `report_stored_read` says, and the capture the
-    /// goal table keeps for the next asker to replay. A miss's are nothing of the query's: the
-    /// goal is solved next, under a capture of its own, so they are dropped
-    /// ([`blaze_query::db::recorded_if`]), and the body that missed holds what one that took
-    /// the solved goal from the table replays.
+    /// key of its answer, listed for the asking query with the stored answer's own fact, and
+    /// the list the goal table keeps for the next asker to replay. A miss's are nothing of the
+    /// query's: the goal is solved next, under a recorder of its own, so they are recorded
+    /// under [`blaze_memo::unrecorded`] and not replayed, and the body that missed holds what
+    /// one that took the solved goal from the table replays.
     #[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
     fn lookup<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found> {
         #[cfg(test)]
-        let recorded = planted::RECORDED.get();
+        let planted = planted::RECORDED.get();
         #[cfg(not(test))]
-        let recorded = false;
-        let (answer, reads) = blaze_query::db::recorded_if(
-            interner.db,
-            || blaze_query::db::capture_reads(interner.db, || self.find(interner, goal)),
-            |(answer, _)| recorded || answer.is_some(),
-        );
-        let answer = answer?;
+        let planted = false;
+        let memo = blaze_memo::Database::memo(interner.db);
+        let (hit, reads) =
+            blaze_memo::unrecorded(memo, || recorded(interner.db, || self.find(interner, goal)));
+        if (planted || hit.is_some())
+            && let Some(reads) = &reads
+        {
+            replay(interner.db, reads);
+        }
+        let (answer, stored) = hit?;
         // A goal's answer taken from the store, in the query that asked it: that query's own
         // reads are then the answer's key (the facts checked above), not the reads of solving
-        // the goal. Told to the engine after the capture, so it marks the query's own run and
-        // not the capture's (`report_stored_read`; the item store's hit site is
+        // the goal. Listed after the recorder, so it is the query's own read and not the
+        // list's: the goal's key and the answer's key (the item store's hit site is
         // `body_store::Store::lookup`).
-        blaze_query::db::report_stored_read(interner.db);
+        blaze_memo::read(memo, stored);
         Some(Found { answer, reads })
     }
 
+    /// The stored answer of `goal`, with the fact of having read it: the goal's key and the
+    /// key the answer was filed under.
     #[expect(clippy::disallowed_methods, reason = "a cache's own bookkeeping: its reads are not the asking query's")]
-    fn find<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Answer> {
+    fn find<'db>(
+        &self,
+        interner: DbInterner<'db>,
+        goal: Goal<'db>,
+    ) -> Option<(Answer, blaze_memo::Fact)> {
         let db = interner.db;
         let crate_key = self.facts.crate_key(db, interner.krate());
         // The goal's words name each definition by its item key: an identity, which the facts
         // the record names are keyed by and whose values are read below, so what the key reads
         // is no part of the answer and is not recorded (as at the offer). The crate's key is:
         // the answer holds for the crate's lang items and loaded crates it hashes.
-        let goal_key = blaze_query::db::unrecorded(db, || {
+        let goal_key = blaze_memo::unrecorded(blaze_memo::Database::memo(db), || {
             stable::goal_key(interner, &*self.facts, &self.version, &crate_key, goal)
         })?;
         // What `blaze_record::lookup` cannot say through a read's digest: a name in a shape
@@ -303,7 +309,7 @@ impl Store {
         match found {
             Ok(blaze_record::Found::Hit { answer, key, at }) => {
                 match record::open_answer(answer.bytes(), &key) {
-                    Ok(answer) => Some(answer),
+                    Ok(answer) => Some((answer, blaze_memo::Fact { id: goal_key, digest: key })),
                     Err(why) => {
                         // alloc: error text
                         self.fail(format!(
@@ -346,7 +352,7 @@ impl Store {
         interner: DbInterner<'db>,
         goal: Goal<'db>,
         answer: Answer,
-        reads: blaze_query::db::Reads,
+        reads: Reads,
     ) {
         let mut scratch = SCRATCH.take();
         scratch.facts.clear();
@@ -364,32 +370,15 @@ impl Store {
         interner: DbInterner<'db>,
         goal: Goal<'db>,
         answer: Answer,
-        reads: blaze_query::db::Reads,
+        reads: Reads,
         scratch: &mut Scratch,
     ) -> Result<(), Refusal> {
         let db = interner.db;
         let krate = interner.krate();
-        let mut refused = None;
-        let facts = &mut scratch.facts;
-        let storage = blaze_query::db::Database::storage(db);
-        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {
-            if kind == blaze_query::db::ReadKind::Interned {
-                return ControlFlow::Continue(());
-            }
-            let name = storage.read_name(read, kind);
-            match self.facts.fact_of(db, krate, read, name) {
-                Some(fact) => {
-                    facts.push(fact);
-                    ControlFlow::Continue(())
-                }
-                None => {
-                    refused = Some(name);
-                    ControlFlow::Break(())
-                }
-            }
-        });
-        if let Some(name) = refused {
-            return Err(Refusal::Read(name));
+        // A read list holds input facts and fact boundary rows alone: an interned value is an
+        // identity, never listed.
+        for &read in reads.rows() {
+            scratch.facts.push(self.facts.fact_of(db, krate, read).map_err(Refusal::Read)?);
         }
         scratch.facts.sort_unstable();
         scratch.facts.dedup();
@@ -516,7 +505,7 @@ fn with_store<R>(db: &Db, f: impl FnOnce(&Store) -> R) -> Option<R> {
     if REGISTRY.is_empty() {
         return None;
     }
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     REGISTRY.with(|it| it.nonce == nonce, f)
 }
 
@@ -539,7 +528,7 @@ pub fn install(
     facts: Arc<dyn GoalFacts>,
     build: ContentId,
 ) -> Result<Installed, String> {
-    let (nonce, _) = db.nonce_and_revision();
+    let nonce = db.nonce();
     if REGISTRY.with(|it| it.nonce == nonce, |_| ()).is_some() {
         // alloc: error text
         return Err(String::from("this database has a goal store installed already"));

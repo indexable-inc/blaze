@@ -389,6 +389,8 @@ fn a_fixture_proc_macro_crate_has_the_macros_it_is_given() {
     let identity = super::default_test_proc_macros().into_iter().next().expect("identity").1;
     fixture.set_proc_macros(macros, vec![ProcMacro { name: Symbol::intern("Given"), ..identity }]);
     let db = fixture.db();
+    // The gift dropped the crate's arena, so its id from before is dead: found again.
+    let macros = named(db, "macros");
     let loaded = ProcMacros::get_for_crate(db, macros).expect("the crate was given macros");
     let names: Vec<&str> =
         loaded.macros().expect("loaded").iter().map(|it| it.name.as_str()).collect();
@@ -428,7 +430,9 @@ fn f$0() {}
 fn an_edit_after_setup_is_set_file_text() {
     let mut fixture = db("//- /main.rs\nfn a() {}\n//- /b.rs\nfn b() {}\n");
     let file = file_id(&fixture, 1);
-    fixture.db_mut().set_file_text(file, "fn c() {}\n");
+    _ = fixture.edit(|edit| {
+        edit.set_file_text(file, "fn c() {}\n");
+    });
     let db = fixture.into_db();
     assert_eq!(text(&db, file), "fn c() {}\n");
     assert_eq!(path(&db, file), "/b.rs");

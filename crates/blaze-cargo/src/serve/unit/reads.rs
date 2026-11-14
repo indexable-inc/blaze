@@ -215,7 +215,7 @@ impl Reads {
         // alloc: once per unit stored, a file read each
         let mut files: Vec<(String, Option<ContentId>)> = Vec::new();
         for &by in krate.transitive_deps(db) {
-            for (path, content) in db.files().included_by(db, by) {
+            for (path, content) in db.files().included_by(db, by.key(db)) {
                 files.push((path.as_str().to_owned(), Some(content))); // alloc: as above
             }
         }
@@ -228,14 +228,20 @@ impl Reads {
                 .to_owned());
         }
         // alloc: once per unit stored, a crate of its closure each
-        let closure: blaze_hash::HashSet<Crate, std::alloc::Global> =
-            krate.transitive_deps(db).iter().copied().collect();
+        // By key, as the log names the crates that read: a key of a crate no longer in this
+        // snapshot is no crate of the closure.
+        let closure: blaze_hash::HashSet<base_db::CrateKey, std::alloc::Global> =
+            krate.transitive_deps(db).iter().map(|it| it.key(db)).collect();
         // alloc: once per unit stored, a variable read each
         let mut names = Vec::new();
         // alloc: once per unit stored, a crate that read `CARGO_PRIMARY_PACKAGE` each
         let mut primary = Vec::new();
         for (by, name) in db.files().env_read() {
-            if !closure.contains(&by) || by.data(db).origin.is_lang() {
+            if !closure.contains(&by) {
+                continue;
+            }
+            let by = db.krate(by);
+            if by.data(db).origin.is_lang() {
                 continue;
             }
             if name == base_db::PRIMARY_PACKAGE {

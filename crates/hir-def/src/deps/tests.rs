@@ -19,7 +19,12 @@ use blaze_core::lock::Lock;
 use std::alloc::Global;
 
 use super::*;
-use crate::{nameres::frozen, test_db::TestDB};
+use blaze_memo::Id as _;
+
+use crate::{
+    nameres::frozen,
+    test_db::{TestDB, TestDBExt},
+};
 
 const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib new_source_root:local
@@ -55,16 +60,17 @@ pub(super) static TURN: Lock<()> = Lock::new("test.def.deps.turn", ());
 
 /// Each run of a crate's image key ([`key::crate_image_key`]), by the database it ran in:
 /// what a test counts to say which keys a walk made, a memo's verification counting for none.
-pub(super) static KEYED: Lock<Vec<(base_db::Nonce, Crate)>> =
+/// Each crate by its key, which outlives the commits its id does not.
+pub(super) static KEYED: Lock<Vec<(base_db::Nonce, base_db::CrateKey)>> =
     Lock::new("test.def.deps.keyed", Vec::new());
 
 /// The crates whose key was made in `db` since the last take, by name, sorted.
 fn take_keyed(db: &TestDB) -> Vec<String> {
-    let nonce = db.nonce_and_revision().0;
+    let nonce = db.nonce();
     let mut own = Vec::new();
     KEYED.lock().retain(|&(of, krate)| {
         if of == nonce {
-            own.push(krate);
+            own.push(db.krate(krate));
         }
         of != nonce
     });
@@ -94,24 +100,31 @@ fn keyed_across_edits(libraries: usize) -> [Vec<String>; 3] {
     let main = fixture.file_at("/main.rs").file_id(fixture.db());
     let inner = fixture.file_at(&format!("/lib{}.rs", libraries - 1)).file_id(fixture.db());
     let mut db = fixture.into_db();
-    let crates = all(&db);
-    let walk = |db: &TestDB| sorted(&keys(db, &crates, BUILD));
+    // Each walk is of the crates of its own snapshot, its keys by crate key, sorted: the
+    // crates' ids do not outlive the commit that drops their arenas, their keys do.
+    let walk = |db: &TestDB| -> Vec<(base_db::CrateKey, ContentId)> {
+        let mut keyed: Vec<_> =
+            keys(db, &all(db), BUILD).iter().map(|(&krate, &key)| (krate.key(db), key)).collect();
+        keyed.sort_unstable();
+        keyed
+    };
     let first = walk(&db);
     assert_eq!(first.len(), libraries + 1, "every crate is keyed, the member too");
     let cold = take_keyed(&db);
 
-    let member = crate_named(&db, "main");
-    let libraries_of = |keys: &[(Crate, ContentId)]| -> Vec<(Crate, ContentId)> {
-        keys.iter().copied().filter(|it| it.0 != member).collect()
-    };
-    db.set_file_text(main, "fn main() { let _ = 1; }\n");
+    let member = crate_named(&db, "main").key(&db);
+    let libraries_of =
+        |keys: &[(base_db::CrateKey, ContentId)]| -> Vec<(base_db::CrateKey, ContentId)> {
+            keys.iter().copied().filter(|it| it.0 != member).collect()
+        };
+    _ = db.set_file_text(main, "fn main() { let _ = 1; }\n");
     let after = walk(&db);
     assert_eq!(libraries_of(&after), libraries_of(&first), "an edit of a member moves no library's key");
     assert_ne!(after, first, "the member's own key covers its file");
     let after_member = take_keyed(&db);
 
     let edited = format!("pub fn f{}() {{}}\npub struct More;\n", libraries - 1);
-    db.set_file_text(inner, &edited);
+    _ = db.set_file_text(inner, &edited);
     let moved = walk(&db);
     let after_library = take_keyed(&db);
     // The refinement: the memo's keys are those of a walk from scratch over the same text,
@@ -218,6 +231,95 @@ pub(super) fn all(db: &TestDB) -> Vec<Crate> {
     base_db::all_crates(db).iter().copied().collect()
 }
 
+/// The stable id a test's driver gives `krate`'s slots under: of its name, which a fixture
+/// gives each crate once.
+pub(super) fn stable_id(db: &TestDB, krate: Crate) -> ContentId {
+    ContentId::of("hir-def test crate", krate.named(db).to_string().as_bytes())
+}
+
+/// The driver's serve, as a test makes it: [`super::serve`] over this snapshot, then the next
+/// snapshot built with what the driver gives ([`give_next`]).
+pub(crate) fn serve(
+    db: &mut TestDB,
+    crates: &[Crate],
+    build: ContentId,
+    // dyn: the test's store
+    images: &dyn ImageStore,
+    mode: Mode,
+) -> Result<Served, String> {
+    let (served, found) = super::serve(db, crates, build, images, mode)?;
+    // The serve names its crates by key ([`Served`]), so it is kept across the give's commit
+    // as it is; the withdrawn are taken in this snapshot, which the give reads.
+    let withdrawn: Vec<Crate> = served.withdrawn.iter().map(|&key| db.krate(key)).collect();
+    give_next(db, found, &withdrawn);
+    Ok(served)
+}
+
+/// Crates by their key or their id, as a test names them ([`names`]).
+pub(super) trait Named: Copy {
+    fn in_db(self, db: &TestDB) -> Crate;
+}
+
+impl Named for Crate {
+    fn in_db(self, _: &TestDB) -> Crate {
+        self
+    }
+}
+
+impl Named for base_db::CrateKey {
+    fn in_db(self, db: &TestDB) -> Crate {
+        db.krate(self)
+    }
+}
+
+/// Commits the next snapshot of `db` with each crate's image as a driver gives it: those of
+/// `found`, and every image given now that `found` does not replace and that is not
+/// `withdrawn` ([`give_image`], each to its crate). `found` and `withdrawn` are of the
+/// snapshot `db` holds now, which every read here is of: the commit drops their arenas.
+pub(crate) fn give_next(db: &mut TestDB, found: Vec<(Crate, Image), Global>, withdrawn: &[Crate]) {
+    let mut edit = db.edit();
+    let given = {
+        let db = edit.db();
+        // alloc: a test's images, once a snapshot
+        let mut given: HashMap<Crate, Image, Global> = HashMap::new_in(Global);
+        for krate in all(db) {
+            if let Some(image) = image_of(db, krate)
+                && !withdrawn.contains(&krate)
+            {
+                given.insert(krate, image.clone()); // clone: an image's handle, once a crate
+            }
+        }
+        given.extend(found);
+        // alloc: as above, each with its stable id
+        let mut each: Vec<(Crate, ContentId, Image), Global> = Vec::new_in(Global);
+        each.extend(given.into_iter().map(|(krate, image)| (krate, stable_id(db, krate), image)));
+        // By key: the order the world is given them in, the same in every snapshot.
+        each.sort_unstable_by_key(|it| it.0.key(db));
+        each
+    };
+    for (krate, krate_id, image) in given {
+        give_image(&mut edit, krate, krate_id, image);
+    }
+    // A gift lasts until it is taken: a withdrawn crate's image is taken, as a driver does.
+    for &krate in withdrawn {
+        let key = krate.key(edit.db());
+        super::withdraw_image(&mut edit, key);
+    }
+    _ = edit.commit();
+}
+
+/// What a driver does at a write that moves `files` (set or added): it withdraws the images
+/// [`withdrawn`] names, asked of the snapshot before the write (`withdrawn` reads the snapshot
+/// the driver makes the write from), in the snapshot the write makes.
+pub(super) fn write_files(db: &mut TestDB, files: &[FileId], write: impl FnOnce(&mut TestDB)) {
+    let served: Vec<Crate> = all(db).into_iter().filter(|&krate| is_served(db, krate)).collect();
+    let gone: Vec<base_db::CrateKey> =
+        withdrawn(db, &served, files, &[]).iter().map(|krate| krate.key(db)).collect();
+    write(db);
+    let gone: Vec<Crate> = gone.into_iter().map(|key| db.krate(key)).collect();
+    give_next(db, Vec::new_in(Global), &gone);
+}
+
 /// A store with the images of a fresh database of `fixture`.
 fn stored(fixture: &str) -> (Memory, Stored) {
     let mut db = fixture::db(fixture).into_db();
@@ -229,8 +331,8 @@ fn stored(fixture: &str) -> (Memory, Stored) {
     (memory, stored)
 }
 
-fn names(db: &TestDB, crates: &[Crate]) -> Vec<String> {
-    let mut names: Vec<String> = crates.iter().map(|&it| it.named(db).to_string()).collect();
+fn names(db: &TestDB, crates: &[impl Named]) -> Vec<String> {
+    let mut names: Vec<String> = crates.iter().map(|&it| it.in_db(db).named(db).to_string()).collect();
     names.sort();
     names
 }
@@ -314,22 +416,30 @@ fn a_kept_walk_keys_each_crate_once_and_as_one_walk_does() {
     }
 }
 
-/// The planted bug: a walk kept across a write of an input (a dependency's text), not
-/// cleared: it goes on giving nothing for the crates it keyed before, whose keys moved.
+/// The invariant: a [`KeyWalk`] kept across a write of an input (a dependency's text) keys
+/// the written database as one walk of it does: at the new view it forgets what it walked
+/// and walks again, with no call of [`KeyWalk::clear`]. The planted bug: the view check off
+/// (`plant_keep_across_views`), a walk kept across the write goes on giving nothing for the
+/// crates it keyed before, whose keys moved, and the oracle says so.
 #[test]
 fn the_oracle_catches_a_walk_kept_across_a_write() {
-    let db = fixture::db(FIXTURE).into_db();
-    let (mut walk, mut union) = (KeyWalk::new(), HashMap::new_in(Global));
-    assert_eq!(kept_walk_differs(&db, &all(&db), &mut walk, &mut union), None);
     let edited = FIXTURE.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
-    let written = fixture::db(&edited).into_db();
-    let why = kept_walk_differs(&written, &all(&written), &mut walk, &mut union)
-        .expect("the oracle missed a walk kept across a write");
-    assert!(why.contains("one walk keys"), "{why}");
-    // Cleared, as its caller does when the view moves, it keys the written database rightly.
-    walk.clear();
-    union.clear();
-    assert_eq!(kept_walk_differs(&written, &all(&written), &mut walk, &mut union), None);
+    assert_ne!(edited, FIXTURE, "premise: the write changes a dependency's text");
+    for plant in [false, true] {
+        let db = fixture::db(FIXTURE).into_db();
+        let (mut walk, mut union) = (KeyWalk::new(), HashMap::new_in(Global));
+        walk.plant_keep_across_views = plant;
+        assert_eq!(kept_walk_differs(&db, &all(&db), &mut walk, &mut union), None);
+        let written = fixture::db(&edited).into_db();
+        union.clear();
+        let why = kept_walk_differs(&written, &all(&written), &mut walk, &mut union);
+        if plant {
+            let why = why.expect("the oracle missed a walk kept across a write");
+            assert!(why.contains("one walk keys"), "{why}");
+        } else {
+            assert_eq!(why, None, "a walk at a new view walks again");
+        }
+    }
 }
 
 /// Whether a crate is sealed by the old rule: an origin outside the workspace and a root in a
@@ -359,17 +469,19 @@ fn a_crate_is_sealed_by_its_pin_and_nothing_else() {
          pub use lib::L;\n",
     )
     .into_db();
+    // The fixture pins every library crate in a library root, as a registry package's planner
+    // does; `path` stands for a path dependency, which no planner pins.
+    let path = crate_named(&db, "path");
+    let mut data = path.data(&db).clone(); // clone: a test's crate data, once
+    data.sealed = None;
+    _ = db.set_crate_data(path, &data);
+    // Each crate's id in the snapshot the write made: the ids before are of dropped arenas.
     let (lib, path, above, doc) = (
         crate_named(&db, "lib"),
         crate_named(&db, "path"),
         crate_named(&db, "above"),
         crate_named(&db, "doc"),
     );
-    // The fixture pins every library crate in a library root, as a registry package's planner
-    // does; `path` stands for a path dependency, which no planner pins.
-    let mut data = path.data(&db).clone(); // clone: a test's crate data, once
-    data.sealed = None;
-    path.set_data(&mut db, data);
     assert!(lib.data(&db).sealed.is_some() && sealed(&db, lib), "a pinned crate is sealed");
     assert!(!sealed(&db, path), "a path dependency is not, whatever its origin and root");
     assert!(!sealed(&db, above), "nor is a pinned crate above it");
@@ -432,19 +544,38 @@ fn a_key_covers_every_input() {
 #[test]
 fn an_image_reads_back_its_parts() {
     let key = ContentId([1; 32]);
-    let parts: [&[u8]; 2] = [b"", &[9; 33]];
-    let bytes = Aligned::copy_from(&write_image(key, parts));
+    let owned = hand_parts();
+    let parts: [&[u8]; Part::ALL.len()] = owned.each_ref().map(Vec::as_slice);
+    let bytes = Aligned::copy_from(&image_with(key, parts));
     let image = ImageRef::open(&bytes, key).unwrap();
     for (part, bytes) in Part::ALL.into_iter().zip(parts) {
         assert_eq!(image.part(part), bytes, "{part:?}");
         assert!(bytes.is_empty() || (image.part(part).as_ptr() as usize).is_multiple_of(16));
     }
-    assert_eq!(write_image(key, parts), write_image(key, parts));
+    assert_eq!(image_with(key, parts), image_with(key, parts));
+}
+
+/// [`write_image`] of parts a test made by hand, taken as they are.
+fn image_with(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
+    let parts = parts.map(|it| Portable::written(it.to_vec_in(Global)));
+    write_image(key, parts.each_ref())
+}
+
+/// One part a test makes by hand for each of [`Part::ALL`], however many there are: the
+/// first empty, part `n` after it `9 + n` repeated `33 + n` times, so no two are alike and
+/// none is a multiple of 16 long.
+fn hand_parts() -> [Vec<u8>; Part::ALL.len()] {
+    std::array::from_fn(|at| match at {
+        0 => Vec::new(),
+        at => vec![9 + at as u8; 33 + at],
+    })
 }
 
 #[test]
 fn an_image_under_another_key_does_not_read() {
-    let bytes = Aligned::copy_from(&write_image(ContentId([1; 32]), [b"a", b"b"]));
+    let owned = hand_parts();
+    let parts = owned.each_ref().map(Vec::as_slice);
+    let bytes = Aligned::copy_from(&image_with(ContentId([1; 32]), parts));
     assert_eq!(
         ImageRef::open(&bytes, ContentId([2; 32])).err(),
         Some(ImageError::Key { found: ContentId([1; 32]), wanted: ContentId([2; 32]) })
@@ -456,7 +587,8 @@ fn an_image_under_another_key_does_not_read() {
 #[test]
 fn damaged_images_read_within_bounds_or_not_at_all() {
     let key = ContentId([1; 32]);
-    let written = write_image(key, [b"lang", b"signatures"]);
+    let owned = hand_parts();
+    let written = image_with(key, owned.each_ref().map(Vec::as_slice));
     let mut read = 0;
     for at in 0..written.len() {
         let mut bytes = written.clone();
@@ -586,12 +718,15 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
         let stored = store(&db, &served, &memory, Which::Sealed).unwrap();
         assert_eq!(stored.filed.len(), stored.written.len());
         let filed: HashMap<String, ContentId, Global> =
-            stored.filed.iter().map(|(&krate, &key)| (krate.named(&db).to_string(), key)).collect();
+            stored.filed.iter().map(|(&krate, &key)| (db.krate(krate).named(&db).to_string(), key)).collect();
         let mut db = open();
         let crates = all(&db);
         serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        // The give committed: the crates again, as this snapshot has them.
+        let crates = all(&db);
         let raw: &Db = &db;
-        for (krate, image) in DepImages::try_get(raw).unwrap().images(raw).iter() {
+        for image in crates.iter().filter_map(|&krate| Some((krate, image_of(raw, krate)?))) {
+            let (krate, image) = image;
             assert_eq!(Some(&image.key()), filed.get(&krate.named(raw).to_string()));
         }
         assert!(filed.contains_key("lib"), "{filed:?}");
@@ -640,6 +775,12 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
 ///
 /// Its control is the tree before `DefMap::empty` took `crate_root`: the decoded map's root
 /// was a tracked struct of the decoding query, and this failed on the root's id.
+///
+/// PORT (round 20): false by design on blaze-memo, left failing. It compares ids taken before
+/// the serve's commit with ids taken after it; an id is of its snapshot (port decision 3.1:
+/// nothing may rely on an arena surviving a change), and the give's commit makes the crates'
+/// arenas again (round 20: before `1.0:15, 1.0:20, ..`, after `1.0:11, 1.0:12, ..`), so no row
+/// made before the serve is read after it, and the ids it would key by are not comparable.
 #[test]
 fn a_crate_served_after_it_was_resolved_keeps_its_module_ids() {
     let _turn = TURN.lock();
@@ -703,7 +844,7 @@ fn an_image_written_under_another_key_is_an_error() {
     memory
         .images
         .lock()
-        .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b""]))));
+        .insert(key, Arc::new(Aligned::copy_from(&image_with(other, [b"", b""]))));
     let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
@@ -809,7 +950,7 @@ fn reading_db_of(fixture: &str) -> TestDB {
     // so it is pinned here with its origin, or nothing above it is sealed and a build's end
     // (`Which::Sealed`) stores none of them.
     data.sealed = Some(ContentId::of("blaze v2 test pin of proc_macros 1", &[]));
-    macros.set_data(&mut db, data);
+    _ = db.set_crate_data(macros, &data);
     db
 }
 
@@ -840,10 +981,10 @@ fn a_crate_with_traced_expansions_resolves_from_its_image_as_a_fresh_one() {
         let crates = all(&db);
         let served = serve(&mut db, &crates, BUILD, &memory, mode).unwrap();
         let lib = crate_named(&db, "lib");
-        assert!(served.hits.contains(&lib), "{mode:?}");
+        assert!(served.hits.contains(&lib.key(&db)), "{mode:?}");
         let raw: &Db = &db;
-        let filed = DepImages::try_get(raw).unwrap().images(raw)[&lib].key();
-        assert_ne!(filed, served.keys[&lib], "an image with reads is filed by them, not the key");
+        let filed = image_of(raw, lib).unwrap().key();
+        assert_ne!(filed, served.keys[&lib.key(&db)], "an image with reads is filed by them, not the key");
         let def_map = crate::nameres::crate_def_map(&db, lib);
         let fresh_map = crate::nameres::crate_def_map(&fresh, live);
         assert_eq!(def_map.diagnostics(&db).len(), fresh_map.diagnostics(&fresh).len(), "{mode:?}");
@@ -869,7 +1010,7 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
     let mut db = reading_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    let lib = crate_named(&db, "lib");
+    let lib = crate_named(&db, "lib").key(&db);
     assert!(!served.hits.contains(&lib));
     assert!(served.stale.contains(&lib));
     let stored = store(&db, &served, &memory, Which::Sealed).unwrap();
@@ -881,7 +1022,7 @@ fn a_changed_read_misses_the_image_and_the_next_one_is_found() {
     drop(images);
     let mut db = reading_db();
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert!(served.hits.contains(&crate_named(&db, "lib")));
+    assert!(served.hits.contains(&crate_named(&db, "lib").key(&db)));
     VALUE.store(0, SeqCst);
 }
 
@@ -906,7 +1047,7 @@ fn a_read_of_a_proc_macro_among_an_impls_items_files_the_image() {
         let mut db = reading_db_of(READING_IN_IMPL);
         let crates = all(&db);
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-        let lib = crate_named(&db, "lib");
+        let lib = crate_named(&db, "lib").key(&db);
         (db, served, lib)
     };
     let fresh = reading_db_of(READING_IN_IMPL);
@@ -944,7 +1085,7 @@ fn a_dependents_image_is_not_served_once_a_dependencys_expansion_reads_another_v
         let mut db = reading_db_of(READING_APP);
         let crates = all(&db);
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-        let (lib, app) = (crate_named(&db, "lib"), crate_named(&db, "app"));
+        let (lib, app) = (crate_named(&db, "lib").key(&db), crate_named(&db, "app").key(&db));
         (db, served, lib, app)
     };
     let (db, served, lib, app) = serve_app();
@@ -954,7 +1095,7 @@ fn a_dependents_image_is_not_served_once_a_dependencys_expansion_reads_another_v
     let (db, served, lib, app) = serve_app();
     assert!(served.hits.contains(&lib) && served.hits.contains(&app));
     let raw: &Db = &db;
-    let filed = DepImages::try_get(raw).unwrap().images(raw)[&app].key();
+    let filed = image_of(raw, db.krate(app)).unwrap().key();
     assert_ne!(filed, served.keys[&app], "a dependency's reads file the dependent's image");
     assert!(memory.images.lock().remove(&filed).is_some());
 
@@ -984,7 +1125,7 @@ fn the_expansion_log_has_a_crates_reads_whether_they_ran_or_were_served() {
     let _turn = TURN.lock();
     VALUE.store(0, SeqCst);
     let logged = |db: &TestDB| -> Vec<base_db::ExpansionRead> {
-        let lib = crate_named(db, "lib");
+        let lib = crate_named(db, "lib").key(db);
         db.files()
             .expansions_read()
             .into_iter()
@@ -1002,7 +1143,7 @@ fn the_expansion_log_has_a_crates_reads_whether_they_ran_or_were_served() {
     let mut db = reading_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert!(served.hits.contains(&crate_named(&db, "lib")));
+    assert!(served.hits.contains(&crate_named(&db, "lib").key(&db)));
     assert_eq!(logged(&db), read, "served from its image, filed by those reads");
 }
 
@@ -1072,12 +1213,16 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
     VALUE.store(0, SeqCst);
     TRACES.store(false, SeqCst);
     let (mut db, file) = flaky_db();
-    let (lib, main) = (crate_named(&db, "lib"), crate_named(&db, "main"));
+    // The crates by key, which outlives the commits; their ids are taken again in each
+    // snapshot, as an edit of `lib.rs` drops `lib`'s arena and `main`'s.
+    let lib_key = crate_named(&db, "lib").key(&db);
+    let crates = |db: &TestDB| (crate_named(db, "lib"), crate_named(db, "main"));
     let unknown = |db: &TestDB| {
         let log = db.files().expansions_read();
         log.iter()
-            .any(|(by, read)| *by == lib && matches!(read, base_db::ExpansionRead::Unknown(_)))
+            .any(|(by, read)| *by == lib_key && matches!(read, base_db::ExpansionRead::Unknown(_)))
     };
+    let (lib, main) = crates(&db);
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(unknown(&db), "the expansion ran and could not be traced");
     let refused = closure_expansion_reads(&db, main).unwrap_err();
@@ -1087,7 +1232,8 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
     );
 
     TRACES.store(true, SeqCst);
-    db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made {}\n");
+    _ = db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made {}\n");
+    let (lib, main) = crates(&db);
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(!unknown(&db), "the call's latest expansion traced: its unknown read is replaced");
     let read = closure_expansion_reads(&db, main).unwrap();
@@ -1098,10 +1244,12 @@ fn an_unknown_expansion_that_traces_once_expanded_again_stops_refusing_its_depen
     );
 
     TRACES.store(false, SeqCst);
-    db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made;\n");
+    _ = db.set_file_text(file, "#[proc_macros::flaky]\npub struct Made;\n");
+    let (lib, main) = crates(&db);
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(closure_expansion_reads(&db, main).is_err(), "unknown again");
-    db.set_file_text(file, "pub struct Made;\n");
+    _ = db.set_file_text(file, "pub struct Made;\n");
+    let (lib, main) = crates(&db);
     let _ = crate::nameres::crate_def_map(&db, lib);
     assert!(unknown(&db), "the call is gone, and what it last read stays in the log");
     assert!(
@@ -1133,12 +1281,16 @@ fn a_key_covers_the_library_of_its_macros() {
 fn process_variables_read_file_the_image_by_their_values() {
     let mut db = fixture::db(FIXTURE).into_db();
     let reads = Reads::for_tests(&["BLAZE_DEPS_TEST"], &[]);
-    let of = crate_named(&db, "lib");
-    let unset = reads.values_then(&db, of);
-    base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "1".into())]));
-    let one = reads.values_then(&db, of);
-    base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "2".into())]));
-    let two = reads.values_then(&db, of);
+    let unset = reads.values_then(&db, crate_named(&db, "lib"));
+    // `lib` is taken again after each write: a session write drops every arena it reads.
+    let set = |db: &mut TestDB, value: &str| {
+        let vars = Env::from_iter([("BLAZE_DEPS_TEST".into(), value.into())]);
+        _ = db.commit_with(|edit| _ = edit.set_process_env(vars));
+    };
+    set(&mut db, "1");
+    let one = reads.values_then(&db, crate_named(&db, "lib"));
+    set(&mut db, "2");
+    let two = reads.values_then(&db, crate_named(&db, "lib"));
     assert!(unset != one && one != two && unset != two);
     let mut list = Vec::new();
     reads::write_list(&mut list, ContentId([4; 32]), &reads.encode());
@@ -1446,7 +1598,8 @@ fn a_crate_with_no_outside_input_is_not_refused() {
     let db = fixture::db(FIXTURE).into_db();
     for name in ["core", "lib"] {
         assert_eq!(serve::refusal(&db, crate_named(&db, name)), None, "{name}");
-        assert_eq!(serve::include_refusal(&db, crate_named(&db, name), &[]), None, "{name}");
+        let walked = late::walk(&db, crate_named(&db, name), &[], late::Nested::Walk);
+        assert!(walked.as_ref().is_ok_and(|it| it.unasked.is_none()), "{name}");
     }
 }
 
@@ -1493,13 +1646,17 @@ fn tasks_on_threads_store_and_serve_as_in_order() {
     let _turn = TURN.lock();
     let (memory, _) = stored(FIXTURE);
     let threads = Threads::default();
-    let mut db = fixture::db(FIXTURE).into_db();
+    // A build's database: the store's threads ask its queries at once, which a test
+    // database's single flight (one thread's) cannot tell from a cycle.
+    let mut db = fixture::db_on_threads(FIXTURE).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
     let stored = store(&db, &served, &threads, Which::Sealed).unwrap();
     assert_eq!(names(&db, &stored.written), ["core", "lib"]);
     assert_eq!(contents(&threads.0), contents(&memory));
-    let mut db = fixture::db(FIXTURE).into_db();
+    let mut db = fixture::db_on_threads(FIXTURE).into_db();
+    // This database's crates: ids are another database's in the first.
+    let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
 }
@@ -1559,7 +1716,7 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
     .into_db();
     let set = |db: &mut TestDB, value: &str| {
         let vars = Env::from_iter([("BLAZE_DEPS_BODY".into(), value.into())]);
-        base_db::set_process_env(db, vars);
+        _ = db.commit_with(|edit| _ = edit.set_process_env(vars));
     };
     set(&mut db, "1");
     let lib = crate_named(&db, "lib");
@@ -1575,10 +1732,11 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
     // it is a hit while the value those reads name is kept.
     let counted = |hits| blaze_record::Counts { lookups: 1, hits, lists: 1, reads: 1 };
     assert_eq!(searched_in(&db, lib, key, &memory), (Some(filed), counted(1)));
+    // `lib` again after each write: a session write drops every arena it reads.
     set(&mut db, "2");
-    assert_eq!(searched_in(&db, lib, key, &memory), (None, counted(0)));
+    assert_eq!(searched_in(&db, crate_named(&db, "lib"), key, &memory), (None, counted(0)));
     set(&mut db, "1");
-    assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
+    assert_eq!(found_in(&db, crate_named(&db, "lib"), key, &memory), Some(filed));
 }
 
 /// A value found by its reads stands in for the `env!`s that read them, which never run: the
@@ -1593,7 +1751,7 @@ fn a_value_found_by_its_reads_notes_their_variables_as_read() {
     let made = |value: &str| {
         let mut db = fixture::db(source).into_db();
         let vars = Env::from_iter([("BLAZE_DEPS_NOTED".into(), value.into())]);
-        base_db::set_process_env(&mut db, vars);
+        _ = db.commit_with(|edit| _ = edit.set_process_env(vars));
         db
     };
     let db = made("1");
@@ -1607,7 +1765,7 @@ fn a_value_found_by_its_reads_notes_their_variables_as_read() {
     let lib = crate_named(&fresh, "lib");
     assert_eq!(fresh.files().env_read(), Vec::new());
     assert_eq!(found_in(&fresh, lib, key, &memory), Some(filed));
-    assert_eq!(fresh.files().env_read(), vec![(lib, "BLAZE_DEPS_NOTED".to_owned())]);
+    assert_eq!(fresh.files().env_read(), vec![(lib.key(&fresh), "BLAZE_DEPS_NOTED".to_owned())]);
     let changed = made("2");
     let lib = crate_named(&changed, "lib");
     assert_eq!(found_in(&changed, lib, key, &memory), None);
@@ -1625,7 +1783,7 @@ fn outside_reads_follow_the_values_read() {
     let outside = |value: &str| {
         let mut db = fixture::db(source).into_db();
         let vars = Env::from_iter([("BLAZE_DEPS_OUTSIDE".into(), value.into())]);
-        base_db::set_process_env(&mut db, vars);
+        _ = db.commit_with(|edit| _ = edit.set_process_env(vars));
         let lib = crate_named(&db, "lib");
         outside_reads(&db, lib).unwrap()
     };
@@ -1682,7 +1840,7 @@ fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let lib = crate_named(&db, "lib");
-    assert!(served.hits.contains(&lib));
+    assert!(served.hits.contains(&lib.key(&db)));
     assert!(checked_reads(&db, lib).unwrap().is_empty());
 }
 
@@ -1691,18 +1849,17 @@ fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
 /// loses its image.
 #[test]
 fn a_serve_that_finds_nothing_writes_nothing() {
-    let mut db = fixture::db(FIXTURE).into_db();
+    let db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
-    let passes = db.maintain_passes();
-    let served = serve(&mut db, &crates, BUILD, &Memory::default(), Mode::Serve).unwrap();
+    // `serve` reads the snapshot it is given; what it would change is what it returns.
+    let (served, found) = super::serve(&db, &crates, BUILD, &Memory::default(), Mode::Serve).unwrap();
     assert_eq!(served.hits, Vec::new());
-    assert_eq!(
-        db.maintain_passes(),
-        passes,
-        "a cold store's misses change nothing a maintainer reads"
+    assert!(
+        found.is_empty() && served.withdrawn.is_empty(),
+        "a cold store's misses give nothing to the next snapshot"
     );
     let raw: &Db = &db;
-    assert!(DepImages::try_get(raw).is_none(), "nothing served, nothing given");
+    assert!(crates.iter().all(|&krate| image_of(raw, krate).is_none()), "nothing served, nothing given");
 }
 
 #[test]
@@ -1711,27 +1868,26 @@ fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     let mut db = fixture::db(FIXTURE).into_db();
     let (lib, core) = (crate_named(&db, "lib"), crate_named(&db, "core"));
     let first = serve(&mut db, &[core], BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(first.hits, [core]);
+    assert_eq!(names(&db, &first.hits), ["core"]);
     let gets = *memory.gets.lock();
     let second = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(names(&db, &second.hits), ["core", "lib"]);
     assert_eq!(*memory.gets.lock(), gets + 1, "core is kept, not fetched again");
     let raw: &Db = &db;
-    let images = DepImages::try_get(raw).unwrap().images(raw);
-    assert!(images.contains_key(&lib) && images.contains_key(&core));
-    let maps = frozen::pages::all(raw);
-    assert!(maps.contains_key(&lib) && maps.contains_key(&core));
-    assert!(frozen::FrozenDefMaps::try_get(raw).unwrap().maps(raw).is_empty(), "a served crate's record held whole");
     assert!(image_of(raw, core).is_some() && image_of(raw, lib).is_some());
+    assert!(is_paged(raw, lib) && is_paged(raw, core));
+    assert!(
+        [lib, core].iter().all(|&krate| image_of(raw, krate).unwrap().def_map.is_none()),
+        "a served crate's record held whole"
+    );
     let again = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(*memory.gets.lock(), gets + 1, "nothing is fetched again");
     assert_eq!(again.hits, second.hits);
     let other = serve(&mut db, &[lib], ContentId([8; 32]), &memory, Mode::Serve).unwrap();
     assert!(other.hits.is_empty(), "another build has other keys, which have no image");
     let raw: &Db = &db;
-    assert!(DepImages::try_get(raw).unwrap().images(raw).is_empty());
-    assert!(frozen::pages::all(raw).is_empty());
-    assert!(image_of(raw, core).is_none());
+    assert!(image_of(raw, lib).is_none() && image_of(raw, core).is_none());
+    assert!(!is_paged(raw, lib) && !is_paged(raw, core));
 }
 
 /// A key's inputs are those of the walk that made it: the crate, every crate its key covers
@@ -1983,7 +2139,7 @@ fn an_edit_of_a_file_that_is_not_utf8_gives_a_new_key() {
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let stored = store(&db, &served, &memory, Which::Sealed).unwrap();
     assert_eq!(stored.refused, Vec::new(), "a file of its own source root is no outside read");
-    assert_eq!(stored.written, vec![lib]);
+    assert_eq!(names(&db, &stored.written), ["lib"]);
 }
 
 /// Making a crate's key reads its files and writes nothing (rule 25): what the caches that hash
@@ -2011,7 +2167,7 @@ fn a_key_made_before_or_after_the_expansions_leaves_the_same_reads() {
         (
             key,
             signature,
-            files.included_by(&db, lib),
+            files.included_by(&db, lib.key(&db)),
             files.included_files(),
             files.sources_included_by(),
         )
@@ -2067,12 +2223,15 @@ pub trait Sized {}
 fn aliased(glue: &str) -> TestDB {
     let mut db = fixture::db(ALIASED).into_db();
     let lib = crate_named(&db, "lib");
-    let mut data = lib.data(&db).clone();
-    let alias = db.alias(data.root_file_id).unwrap();
-    db.set_alias_appended(alias, Some(("__glue", glue))).unwrap();
-    data.root_file_id = alias;
-    lib.set_data(&mut db, data);
-    db.note_crates_changed();
+    let key = lib.key(&db);
+    let mut data = lib.data(&db).keyed(&db);
+    // One write: the alias, what it appends, and `lib` rooted at it.
+    _ = db.commit_with(|edit| {
+        let alias = edit.alias(data.root_file_id).unwrap();
+        edit.set_alias_appended(alias, Some(("__glue", glue))).unwrap();
+        data.root_file_id = alias;
+        edit.set_crate_data(key, data);
+    });
     db
 }
 
@@ -2140,11 +2299,14 @@ fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_tha
     // `deep.rs`, a module of `lib` that is not its root: `lib` loses its image, and `core`,
     // which depends on nothing that moved, keeps its own.
     let (mut db, deep) = served_db(2);
-    let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
+    // Each crate is taken again in each snapshot: a write drops the arenas of what it moved.
+    let crates = |db: &TestDB| (crate_named(db, "core"), crate_named(db, "lib"));
+    let (core, lib) = crates(&db);
     assert_eq!((mode(&db, core), mode(&db, lib)), (Some(Mode::Serve), Some(Mode::Serve)));
     let text =
         db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
-    db.set_file_text(deep, &text);
+    write_files(&mut db, &[deep], |db| _ = db.set_file_text(deep, &text));
+    let (core, lib) = crates(&db);
     assert_eq!(mode(&db, lib), None, "`lib`'s image is withdrawn by the write of its file");
     assert!(image(&db, lib).is_none());
     assert_eq!(mode(&db, core), Some(Mode::Serve), "`core` keeps its image");
@@ -2152,11 +2314,11 @@ fn a_write_to_a_served_crates_file_withdraws_its_image_and_its_dependents_in_tha
 
     // `core.rs`: `core` loses its image, and so does `lib`, which depends on it.
     let (mut db, core_rs) = served_db(3);
-    let (core, lib) = (crate_named(&db, "core"), crate_named(&db, "lib"));
     let more =
         |text: &str| text.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
     let text = more(&db.file_text(core_rs).text(&db));
-    db.set_file_text(core_rs, &text);
+    write_files(&mut db, &[core_rs], |db| _ = db.set_file_text(core_rs, &text));
+    let (core, lib) = crates(&db);
     assert_eq!(
         (mode(&db, core), mode(&db, lib)),
         (None, None),
@@ -2181,12 +2343,14 @@ fn a_frozen_def_map_read_against_a_moved_file_stops_the_query_with_an_error_nami
     let deep = fixture.file(2);
     let mut db = fixture.into_db();
     let deep = deep.file_id(&db);
-    let lib = crate_named(&db, "lib");
-    let bytes = frozen::pages::encode(&db, lib).unwrap();
+    let bytes = frozen::pages::encode(&db, crate_named(&db, "lib")).unwrap();
     let text =
         db.file_text(deep).text(&db).replace("pub fn f() {}", "pub fn f() {} pub fn more() {}");
-    db.set_file_text(deep, &text);
-    frozen::serve_pages(&mut db, &[(lib, bytes)], Mode::Serve);
+    _ = db.set_file_text(deep, &text);
+    // `lib` of each snapshot: the edit and the serve each commit, which drops its arena.
+    let before = crate_named(&db, "lib");
+    frozen::serve_pages(&mut db, &[(before, bytes)], Mode::Serve);
+    let lib = crate_named(&db, "lib");
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         _ = crate::nameres::crate_def_map(&db, lib);
     }));
@@ -2210,7 +2374,7 @@ fn a_frozen_def_map_read_against_a_moved_file_stops_the_query_with_an_error_nami
 }
 
 /// The invariant: a dependency enters the key of a crate above it by its surface where the
-/// lowering gave it one ([`super::given::set_surface`]), so an edit of the dependency that
+/// lowering gave it one ([`super::given::give_surface`]), so an edit of the dependency that
 /// leaves its surface as it was moves the dependency's own key and not the key above, and a
 /// surface that moved moves the key above. The control, first (the cause removed): with no
 /// surface given the same kind of edit moves both, the dependency then entering by its key.
@@ -2220,24 +2384,41 @@ fn a_dependency_enters_the_key_above_it_by_its_surface_where_it_was_given_one() 
     let fixture = fixture::db(&text);
     let inner = fixture.file_at("/lib1.rs").file_id(fixture.db());
     let mut db = fixture.into_db();
-    let (above, below) = (crate_named(&db, "lib0"), crate_named(&db, "lib1"));
-    let key = |db: &TestDB, krate: Crate| keys(db, &[krate], BUILD)[&krate];
+    // Each crate by name in the snapshot asked: every write here commits, which drops the
+    // arenas of the crates it moved.
+    let key = |db: &TestDB, name: &str| {
+        let krate = crate_named(db, name);
+        keys(db, &[krate], BUILD)[&krate]
+    };
+    let (above, below) = ("lib0", "lib1");
 
     let (was_above, was_below) = (key(&db, above), key(&db, below));
-    db.set_file_text(inner, "pub fn f1() { let _ = 1; }\n");
+    _ = db.set_file_text(inner, "pub fn f1() { let _ = 1; }\n");
     assert_ne!(key(&db, below), was_below, "a crate's own key covers its bytes");
     assert_ne!(key(&db, above), was_above, "with no surface given, the key above covers them too");
 
     let surface = ContentId([3; 32]);
-    super::given::set_surface(&mut db, below, surface, blaze_query::db::Durability::LOW);
-    assert_eq!(super::given::surface(&db, below), Some(surface));
+    let given_to = crate_named(&db, below);
+    give_surface_next(&mut db, given_to, surface);
+    assert_eq!(super::given::surface(&db, crate_named(&db, below)), Some(surface));
     let (with_above, with_below) = (key(&db, above), key(&db, below));
-    db.set_file_text(inner, "pub fn f1() { let _ = 2; }\n");
+    _ = db.set_file_text(inner, "pub fn f1() { let _ = 2; }\n");
     assert_ne!(key(&db, below), with_below, "its own key still covers its bytes");
     assert_eq!(key(&db, above), with_above, "the key above holds the surface, which stands");
 
-    super::given::set_surface(&mut db, below, ContentId([4; 32]), blaze_query::db::Durability::LOW);
+    let given_to = crate_named(&db, below);
+    give_surface_next(&mut db, given_to, ContentId([4; 32]));
     assert_ne!(key(&db, above), with_above, "a surface that moved moves the key above");
+}
+
+/// What a driver does once the lowering has worked out `krate`'s surface: gives it in the
+/// crate in the next snapshot ([`super::given::give_surface`]), `krate` of the snapshot `db`
+/// holds now.
+fn give_surface_next(db: &mut TestDB, krate: Crate, surface: ContentId) {
+    let krate_id = stable_id(db, krate);
+    _ = db.commit_with(|edit| {
+        super::given::give_surface(edit, krate, krate_id, surface);
+    });
 }
 
 /// A dependency of a source root of its own, of three modules over two files, and a crate
@@ -2281,7 +2462,7 @@ fn runs(ran: &[String], query: &str) -> usize {
 /// The invariant: a crate served from its records is read in place: resolving a crate that
 /// names it, by a path and by a glob import, parses no file of it and collects none of its
 /// modules (`module_decls` runs for the dependent's one module alone), and holds no decoded
-/// def map of it (nothing of it is held whole in [`frozen::FrozenDefMaps`]); and what the
+/// def map of it (its image holds no def map whole, [`Image`]); and what the
 /// dependent resolves to is what it resolves to over the crate resolved from source
 /// ([`Mode::Check`]). The cause removed, under `Mode::Check`, the same resolution collects
 /// every module of the dependency, which is what the count is of. The control: pages whose
@@ -2311,9 +2492,9 @@ fn a_served_crate_parses_no_file_and_decodes_no_def_map() {
     assert_eq!(names(&db, &served.hits), ["lib"]);
     let lib = crate_named(&db, "lib");
     let raw: &Db = &db;
-    assert!(frozen::pages::all(raw).contains_key(&lib), "`lib` is read from its pages");
+    assert!(is_paged(raw, lib), "`lib` is read from its pages");
     assert!(
-        frozen::FrozenDefMaps::try_get(raw).is_none_or(|it| it.maps(raw).is_empty()),
+        image_of(raw, lib).unwrap().def_map.is_none(),
         "a served crate's def map record is held whole"
     );
     let mut read = None;
@@ -2346,7 +2527,7 @@ fn a_layout_7_image_is_a_named_miss() {
     let (memory, stored) = stored(FIXTURE);
     let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
-    let filed = stored.filed[&lib];
+    let filed = stored.filed[&lib.key(&db)];
     let old = super::image::write_layout_7_image(filed, [b"def map", b"lang", b"signatures"]);
     assert!(ImageRef::is_layout_7(&Aligned::copy_from(&old)), "premise: the image is of layout 7");
     assert!(ImageRef::open(&Aligned::copy_from(&old), filed).is_err(), "premise: not this layout");
@@ -2471,52 +2652,6 @@ fn an_edit_of_a_member_withdraws_it_and_those_above_and_no_other() {
     assert_eq!(served_after_an_edit_of_mid(true), ["lib", "other"]);
 }
 
-/// The invariant (R3, rule (a)): within one database a crate it asked for before and holds
-/// state for (resolved, not paged) is never served again, though its pages are in the store
-/// under its key now; its key is kept, so a store still writes it. `main` is served, edited
-/// (its key moves, so it is resolved), its new pages written, and a serve then leaves it
-/// resolved. The cause is the database's own history: a fresh database of the edited text is
-/// served `main` from the same pages.
-#[test]
-fn a_maintained_crate_is_not_served_again() {
-    let _turn = TURN.lock();
-    let (memory, _) = {
-        let mut first = fixture::db(FIXTURE).into_db();
-        let memory = Memory::default();
-        let crates = all(&first);
-        let served = serve(&mut first, &crates, BUILD, &memory, Mode::Serve).unwrap();
-        let stored = store(&first, &served, &memory, Which::All).unwrap();
-        (memory, stored)
-    };
-    const EDITED: &str = "use lib::{Shown, shown, deep::deeper::f};\nfn main() { shown!(); f(); let _ = 1; }\n";
-    let fixture = fixture::db(FIXTURE);
-    let main_file = fixture.file_at("/main.rs").file_id(fixture.db());
-    let mut db = fixture.into_db();
-    let crates = all(&db);
-    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(names(&db, &served.hits), ["core", "lib", "main"]);
-    db.set_file_text(main_file, EDITED);
-    let main = crate_named(&db, "main");
-    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert!(!served.hits.contains(&main), "its key moved: resolved");
-    _ = crate::nameres::crate_def_map(&db, main);
-    let stored = store(&db, &served, &memory, Which::All).unwrap();
-    assert!(stored.written.contains(&main), "the edited member's pages, under its new key: {:?}", names(&db, &stored.written));
-    assert!(crate::nameres::delta::maintained(&mut db, main), "the database holds main's state");
-    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert!(!served.hits.contains(&main), "asked before and maintained: not served again");
-    assert_eq!(mode(&db, main), None);
-    assert!(served.keys.contains_key(&main), "its key is kept, so the store writes it");
-    // The control: a database that never asked is served it.
-    let fixture = fixture::db(FIXTURE);
-    let main_file = fixture.file_at("/main.rs").file_id(fixture.db());
-    let mut fresh = fixture.into_db();
-    fresh.set_file_text(main_file, EDITED);
-    let crates = all(&fresh);
-    let served = serve(&mut fresh, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(names(&fresh, &served.hits), ["core", "lib", "main"]);
-}
-
 /// The members a store of `which` writes of a fresh database of [`FIXTURE`], and then what a
 /// second store, with [`Which::All`], writes after it.
 fn written_by(which: Which) -> [Vec<String>; 2] {
@@ -2544,4 +2679,409 @@ fn a_build_end_store_writes_no_member() {
 fn the_oracle_catches_a_build_end_store_that_writes_a_member() {
     let _turn = TURN.lock();
     assert_ne!(written_by(Which::All)[0], ["core", "lib"]);
+}
+
+/// A section of a record held where a test keeps it, read as a page source with its reads
+/// counted: what a `Surface` record's pages section is to [`Image::in_place`].
+struct Section {
+    holder: ImageBuf,
+    range: std::ops::Range<usize>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PageSource for Section {
+    fn size(&self) -> u64 {
+        self.range.len() as u64
+    }
+
+    // dyn: as `PageSource::read`
+    fn read(&self, at: u64, len: u64, with: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        self.reads.fetch_add(1, SeqCst);
+        let bytes = &self.holder.bytes()[self.range.clone()];
+        let range = usize::try_from(at).ok().zip(usize::try_from(len).ok());
+        let part = range.and_then(|(at, len)| bytes.get(at..at.checked_add(len)?));
+        with(part.ok_or_else(|| format!("bytes {at}+{len} of a section of {}", bytes.len()))?);
+        Ok(())
+    }
+}
+
+/// The byte a test record is filled with around its sections.
+const FILL: u8 = 0xa5;
+
+/// A record laid out as a `Surface` record's payload is: `lead` bytes of [`FILL`], the image of
+/// `parts` written under `key` at the next multiple of 16, then `pages` at the next, then 16
+/// bytes of fill. The record, held as a store holds it, and the image's and the pages' ranges.
+fn record_of(
+    lead: usize,
+    key: ContentId,
+    parts: &[Portable; Part::ALL.len()],
+    pages: &[u8],
+) -> (ImageBuf, std::ops::Range<usize>, std::ops::Range<usize>) {
+    let image = write_image(key, parts.each_ref());
+    let mut bytes = vec![FILL; lead];
+    let mut place = |section: &[u8]| {
+        let start = bytes.len().next_multiple_of(blaze_format::ALIGN);
+        bytes.resize(start, FILL);
+        bytes.extend_from_slice(section);
+        start..start + section.len()
+    };
+    let image_at = place(&image);
+    let pages_at = place(pages);
+    bytes.resize(bytes.len() + 16, FILL);
+    let holder: ImageBuf = Arc::new(Aligned::copy_from(&bytes));
+    (holder, image_at, pages_at)
+}
+
+/// The invariant: a crate given an image opened in place from a section of a larger record
+/// ([`Image::in_place`] over [`image_parts`], as a `Surface` record holds it, at a non-zero
+/// offset) is served from it and resolves as the crate built from source: its def map with
+/// its diagnostics and its lang items, as the frozen encoding writes them, and its dependent's.
+/// And opening and giving it read no page and run no query: only a query that asks reads.
+///
+/// The control of the second: the counter counts, since the first query that asks reads the
+/// pages. The control of the first is that each crate is served (`Mode::Serve`) and read from
+/// the record's pages, not resolved.
+#[test]
+fn a_crate_opened_in_place_from_a_record_resolves_as_a_fresh_one() {
+    let _turn = TURN.lock();
+    let source = fixture::db(FIXTURE).into_db();
+    let mut db = fixture::db(FIXTURE).into_db();
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut opened = Vec::new();
+    for name in ["core", "lib"] {
+        let krate = crate_named(&source, name);
+        let parts = image_parts(&source, krate).unwrap().parts;
+        let pages = frozen::pages::encode(&source, krate).unwrap();
+        let key = ContentId::of("hir-def test surface", name.as_bytes());
+        let (holder, image_at, pages_at) = record_of(48, key, &parts, &pages);
+        assert_ne!(image_at.start, 0, "the image is inside the record, not at its start");
+        let section = Section { holder: holder.clone(), range: pages_at, reads: reads.clone() };
+        let paged = Paged {
+            key: ContentId::of("hir-def test surface pages", name.as_bytes()),
+            source: Arc::new(section),
+        };
+        let image = Image::in_place(key, key, holder, image_at, Mode::Serve, Some(paged)).unwrap();
+        let krate = crate_named(&db, name);
+        opened.push((krate, stable_id(&db, krate), image));
+    }
+    assert_eq!(reads.load(SeqCst), 0, "opening reads no page");
+    _ = db.runs().expect("a test database logs its runs").take();
+    let mut edit = db.edit();
+    for (krate, krate_id, image) in opened {
+        give_image(&mut edit, krate, krate_id, image);
+    }
+    _ = edit.commit();
+    assert_eq!(reads.load(SeqCst), 0, "giving reads no page");
+    let ran = db.runs().expect("a test database logs its runs").take();
+    assert!(ran.is_empty(), "giving runs no query: {ran:?}");
+
+    let fresh = fixture::db(FIXTURE).into_db();
+    for name in ["core", "lib"] {
+        assert_eq!(mode(&db, crate_named(&db, name)), Some(Mode::Serve), "{name} is served");
+    }
+    for name in ["core", "lib", "main"] {
+        let (krate, live) = (crate_named(&db, name), crate_named(&fresh, name));
+        let def_map = crate::nameres::crate_def_map(&db, krate);
+        let fresh_map = crate::nameres::crate_def_map(&fresh, live);
+        assert_eq!(def_map.diagnostics(&db).len(), fresh_map.diagnostics(&fresh).len(), "{name}");
+        assert_eq!(frozen::encode(&db, krate), frozen::encode(&fresh, live), "{name}");
+        assert_eq!(
+            frozen::encode_lang_items(&db, krate),
+            frozen::encode_lang_items(&fresh, live),
+            "{name}"
+        );
+    }
+    assert!(reads.load(SeqCst) > 0, "a query that asks reads the record's pages");
+    assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+/// Parts a test makes by hand ([`hand_parts`]), as an image holds them.
+fn portable_hand_parts() -> [Portable; Part::ALL.len()] {
+    hand_parts().map(Portable::written)
+}
+
+/// What an image answers: each part's bytes, then the lang items as name resolution reads
+/// them (the bytes of the slot [`give_image`] fills).
+fn answers(image: &Image) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Part::ALL.iter().map(|&part| image.view().part(part).to_vec()).collect();
+    out.push(image.lang_items.bytes.to_vec());
+    out
+}
+
+/// The refinement: an image opened in place at a non-zero offset of its record answers as the
+/// same image opened at offset zero, and both as the parts written. The control: the same
+/// image with each part's range left at its offset in the image (the shift by `range.start`
+/// planted away) answers otherwise, and the oracle catches it.
+#[test]
+fn an_image_opened_in_place_answers_the_same_at_any_offset() {
+    let key = ContentId([3; 32]);
+    let parts = portable_hand_parts();
+    let open = |lead: usize| {
+        let (holder, image_at, _) = record_of(lead, key, &parts, b"pages");
+        let paged = Paged { key, source: Arc::new(frozen::pages::Whole(holder.clone())) };
+        let image = Image::in_place(key, key, holder, image_at.clone(), Mode::Serve, Some(paged));
+        (image.unwrap(), image_at)
+    };
+    let (at_zero, zero) = open(0);
+    let (inside, range) = open(48);
+    assert_eq!((zero.start, range.start), (0, 48));
+    let mut written: Vec<Vec<u8>> = parts.iter().map(|it| it.as_bytes().to_vec()).collect();
+    written.push(parts[Part::LangItems as usize].as_bytes().to_vec());
+    assert_eq!(answers(&at_zero), written);
+    assert_eq!(answers(&inside), answers(&at_zero));
+
+    let mut planted = inside.clone();
+    planted.parts = planted.parts.map(|it| it.start - range.start..it.end - range.start);
+    planted.lang_items.bytes = PartBytes::of(&planted.bytes, &planted.parts, Part::LangItems);
+    assert_ne!(answers(&planted), answers(&at_zero), "the oracle catches parts read at their offsets in the image");
+}
+
+/// An image opened in place at a range not aligned to 16 or outside its record, of bytes
+/// written under another key, in a mode that compares with a whole def map, or with no pages,
+/// is an error naming which. The control: the same bytes at their range, under their key, in
+/// `Mode::Serve` with pages, open.
+#[test]
+fn an_image_in_place_at_a_wrong_range_or_key_is_an_error_naming_which() {
+    let key = ContentId([4; 32]);
+    let (holder, at, _) = record_of(48, key, &portable_hand_parts(), b"pages");
+    let len = holder.bytes().len();
+    let paged = || Some(Paged { key, source: Arc::new(frozen::pages::Whole(holder.clone())) });
+    let open = |range: std::ops::Range<usize>, wanted: ContentId, mode: Mode| {
+        Image::in_place(wanted, wanted, holder.clone(), range, mode, paged()).err()
+    };
+    assert_eq!(open(at.clone(), key, Mode::Serve), None, "the control opens");
+    assert_eq!(open(at.start + 8..at.end, key, Mode::Serve), Some(ImageError::Unaligned { start: at.start + 8 }));
+    assert_eq!(
+        open(at.start..len + 16, key, Mode::Serve),
+        Some(ImageError::OutOfRecord { range: at.start..len + 16, len })
+    );
+    let other = ContentId([5; 32]);
+    assert_eq!(open(at.clone(), other, Mode::Serve), Some(ImageError::Key { found: key, wanted: other }));
+    for mode in [Mode::Check, Mode::Verify] {
+        assert!(matches!(open(at.clone(), key, mode), Some(ImageError::Mode { mode: it, .. }) if it == mode), "{mode:?}");
+    }
+    let no_pages = Image::in_place(key, key, holder.clone(), at, Mode::Serve, None).err();
+    assert!(matches!(no_pages, Some(ImageError::Mode { mode: Mode::Serve, .. })), "{no_pages:?}");
+}
+
+/// A crate whose expansion of a procedural macro traced reading something has no surface
+/// image: a surface's shape has no fact that names what it read, so [`image_parts`] refuses it
+/// by the call. The control: a crate with no such expansion ([`FIXTURE`]'s `lib`) is not
+/// refused.
+#[test]
+fn image_parts_refuses_a_traced_expansion_by_its_call() {
+    let _turn = TURN.lock();
+    let db = reading_db();
+    let refused = image_parts(&db, crate_named(&db, "lib")).err();
+    assert!(
+        matches!(&refused, Some(Refused::Unasked { what }) if what.contains("proc_macros")),
+        "{refused:?}"
+    );
+    let fixture = fixture::db(FIXTURE).into_db();
+    assert!(image_parts(&fixture, crate_named(&fixture, "lib")).is_ok());
+}
+
+/// A library with a late read of each kind at item level: `env!("X")` in a signature,
+/// `option_env!` of a variable no one sets, and `include!(concat!(env!("Y"), ".rs"))` in its
+/// module, whose `env!("Y")` is two eager arguments deep.
+const LATE_READS: &str = r#"
+//- /registry/lib/src/lib.rs crate:lib new_source_root:library env:X=ex,Y=made
+#[rustc_builtin_macro]
+macro_rules! include { () => {} }
+#[rustc_builtin_macro]
+macro_rules! concat { () => {} }
+#[rustc_builtin_macro]
+macro_rules! env { () => {} }
+#[rustc_builtin_macro]
+macro_rules! option_env { () => {} }
+pub struct A(pub [u8; env!("X").len()]);
+pub struct B(pub [u8; option_env!("BLAZE_DEPS_LATE_UNSET").is_some() as usize]);
+include!(concat!(env!("Y"), ".rs"));
+//- /registry/lib/src/made.rs
+pub fn made() {}
+"#;
+
+/// `fixture`'s `lib`: its late reads as [`image_parts`] gives them with `nested`, and the
+/// content ID of its `made.rs`.
+fn late_of(fixture: &str, nested: late::Nested) -> (Vec<LateSeen, Global>, ContentId) {
+    let fixture = fixture::db(fixture);
+    let made = fixture.file_at("/registry/lib/src/made.rs").file_id(fixture.db());
+    let db = fixture.into_db();
+    let parts = serve::image_parts_walking(&db, crate_named(&db, "lib"), nested);
+    let late = match parts {
+        Ok(parts) => parts.late,
+        Err(refused) => panic!("`lib` refused: {refused}"),
+    };
+    (late, db.file_content(made))
+}
+
+fn seen(which: u8, name: &str, value: LateValue) -> LateSeen {
+    LateSeen { which, name: name.as_bytes().into(), value }
+}
+
+/// The invariant: an image's late reads are every `env!`, `option_env!` and `include!` its
+/// parts depend on, each once with the value its expansion saw, sorted by `(which, name)`;
+/// a call nested in another's eager argument among them, and an include named by its path
+/// relative to the crate root's directory. The control: with the nested calls dropped (the
+/// planted bug), the nested `env!("Y")` is missing, and the list is otherwise the same.
+#[test]
+fn image_parts_lists_every_late_read_nested_ones_included() {
+    let _turn = TURN.lock();
+    let (late, made) = late_of(LATE_READS, late::Nested::Walk);
+    let want = vec![
+        seen(LATE_ENV, "X", LateValue::Var(Some("ex".into()))),
+        seen(LATE_ENV, "Y", LateValue::Var(Some("made".into()))),
+        seen(LATE_OPTION_ENV, "BLAZE_DEPS_LATE_UNSET", LateValue::Var(None)),
+        seen(LATE_INCLUDE, "made.rs", LateValue::File(made)),
+    ];
+    assert_eq!(late.iter().collect::<Vec<_>>(), want.iter().collect::<Vec<_>>());
+
+    let (planted, _) = late_of(LATE_READS, late::Nested::Skip);
+    assert!(
+        !planted.iter().any(|it| it.which == LATE_ENV && &*it.name == b"Y"),
+        "the planted walk reached the nested `env!(\"Y\")`, so it is no control: {planted:?}"
+    );
+    let rest: Vec<_> = want.iter().filter(|it| &*it.name != b"Y").collect();
+    assert_eq!(planted.iter().collect::<Vec<_>>(), rest, "the plant drops the nested call alone");
+}
+
+/// The invariant: the late reads are a function of the sources and the environment: two
+/// databases of the same give equal lists, and another value of `X` changes that read's
+/// value and nothing else, its name the same. The control is the second half: a list that
+/// ignored the values would be equal there too.
+#[test]
+fn late_reads_are_the_same_in_every_database_and_follow_the_values() {
+    let _turn = TURN.lock();
+    let (one, _) = late_of(LATE_READS, late::Nested::Walk);
+    let (two, _) = late_of(LATE_READS, late::Nested::Walk);
+    assert_eq!(one.iter().collect::<Vec<_>>(), two.iter().collect::<Vec<_>>());
+
+    let other = LATE_READS.replace("env:X=ex,", "env:X=other,");
+    assert_ne!(other, LATE_READS, "premise: the fixture sets `X`");
+    let (moved, _) = late_of(&other, late::Nested::Walk);
+    assert_eq!(moved.len(), one.len());
+    for (was, now) in one.iter().zip(&moved) {
+        assert_eq!((was.which, &was.name), (now.which, &now.name));
+        if was.which == LATE_ENV && &*was.name == b"X" {
+            assert_eq!(now.value, LateValue::Var(Some("other".into())));
+        } else {
+            assert_eq!(was.value, now.value, "{was:?}");
+        }
+    }
+}
+
+/// `filed` as a list in key order, to compare.
+fn filed_list(filed: &HashMap<base_db::CrateKey, ContentId, Global>) -> Vec<(base_db::CrateKey, ContentId)> {
+    let mut list: Vec<_> = filed.iter().map(|(&krate, &key)| (krate, key)).collect();
+    list.sort_unstable();
+    list
+}
+
+/// The invariant: a [`Served`] names its crates by key, so a driver keeps it across a commit
+/// that does not touch its crates (an edit of the member `main`'s file, after the commit
+/// that gave the images) and stores from it as from a serve of that snapshot: each key names
+/// the same crate, and the same crates are written, filed under the same keys as a serve and
+/// store with no commit between.
+#[test]
+fn a_served_kept_across_an_unrelated_commit_is_used_again() {
+    let _turn = TURN.lock();
+    let fixture = fixture::db(FIXTURE);
+    let main_rs = fixture.file_at("/main.rs").file_id(fixture.db());
+    let mut db = fixture.into_db();
+    let crates = all(&db);
+    let memory = Memory::default();
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let keyed = |db: &TestDB| names(db, &served.keys.keys().copied().collect::<Vec<_>>());
+    let before = keyed(&db);
+    assert_eq!(before, ["core", "lib", "main"], "premise: the serve keyed every crate");
+    _ = db.set_file_text(main_rs, "use lib::{Shown, shown, deep::deeper::f};\nfn main() { shown!(); f(); f(); }\n");
+    assert_eq!(keyed(&db), before, "each key names its crate after the commit");
+
+    let stored_after = store(&db, &served, &memory, Which::Sealed).unwrap();
+    assert_eq!(stored_after.refused, Vec::new());
+    assert_eq!(names(&db, &stored_after.written), ["core", "lib"]);
+    let (_, without_commit) = stored(FIXTURE);
+    assert_eq!(filed_list(&stored_after.filed), filed_list(&without_commit.filed));
+}
+
+/// The control of [`a_served_kept_across_an_unrelated_commit_is_used_again`], on the type.
+/// The old form (the three keyed by [`Crate`] ids) is not kept behind a test switch: it is a
+/// second type of every field and of each user, and what it does wrong is not a wrong
+/// answer a test can compare but a dead id, whose use after the commit that drops its arena
+/// panics or, once the arena is made again, may name another crate; no cheap plant shows
+/// that. So the control is that no field of [`Served`], [`Stored`] or [`KeyWalk`] can hold a
+/// [`Crate`]: each one that names a crate is a [`base_db::CrateKey`], by its type, and the
+/// patterns are exhaustive, so a field added fails to compile here until it is held to this.
+#[test]
+fn no_field_of_served_stored_or_key_walk_is_a_crate_id() {
+    type Key = base_db::CrateKey;
+    fn served(it: &Served) -> usize {
+        let Served { nonce, keys, hits, stale, build: _, old_layout, lookups: _, stored, withdrawn } = it;
+        let _: &base_db::Nonce = nonce;
+        let keys: &HashMap<Key, ContentId, Global> = keys;
+        let lists: [&Vec<Key>; 3] = [hits, stale, old_layout];
+        let withdrawn: &Vec<Key, Global> = withdrawn;
+        let StoredOf(stored) = stored;
+        let stored: &Lock<blaze_hash::HashSet<Key, Global>> = stored;
+        keys.len() + lists.iter().map(|it| it.len()).sum::<usize>() + withdrawn.len() + stored.lock().len()
+    }
+    fn stored_of(it: &Stored) -> usize {
+        let Stored { written, refused, filed, families: _ } = it;
+        let written: &Vec<Key> = written;
+        let refused: &Vec<(Key, Refused)> = refused;
+        let filed: &HashMap<Key, ContentId, Global> = filed;
+        written.len() + refused.len() + filed.len()
+    }
+    fn walk(it: &KeyWalk) -> usize {
+        let KeyWalk { at, memo, plant_keep_across_views: _ } = it;
+        let _: &Option<(base_db::Nonce, blaze_memo::Epoch, ContentId)> = at;
+        let memo: &HashMap<Key, Option<ContentId>, Global> = memo;
+        memo.len()
+    }
+    let _turn = TURN.lock();
+    let mut db = fixture::db(FIXTURE).into_db();
+    let crates = all(&db);
+    let memory = Memory::default();
+    let mut key_walk = KeyWalk::new();
+    assert_eq!(key_walk.more(&db, &crates, BUILD).len(), 3);
+    let served_now = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let stored_now = store(&db, &served_now, &memory, Which::Sealed).unwrap();
+    assert!(served(&served_now) > 0 && stored_of(&stored_now) > 0 && walk(&key_walk) == 3);
+}
+
+/// The invariant: a [`Served`] whose crates a later write removed is stale, and [`store`]
+/// says so by the typed error [`StoreError::Gone`] naming the least such key and the rule,
+/// before it writes anything: never a panic, never the crate skipped. The control: the same
+/// serve stored before the write writes images.
+///
+/// PORT (round 20): its premise is false by design on the port's base-db, left failing (it
+/// fails at "premise: the write removed the crate"). A crate, once made, keeps its key and its
+/// slot for the database's life: a graph that lacks it takes it off the list
+/// (`Crates::set_graph`, "leave the list") and `Db::crate_at` still finds it, so no write makes
+/// a served key name no crate, and `StoreError::Gone` is reached by no write a test can make.
+/// Owed: decide whether a served crate taken off the list is stale (`store` refusing it, by
+/// listing) or `Gone` goes.
+#[test]
+fn a_key_that_names_no_crate_is_the_typed_error() {
+    let _turn = TURN.lock();
+    let mut db = fixture::db(FIXTURE).into_db();
+    let crates = all(&db);
+    let memory = Memory::default();
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let control = store(&db, &served, &memory, Which::Sealed).unwrap();
+    assert!(!control.written.is_empty(), "the control writes nothing: the test tests nothing");
+
+    // Every crate removed: an empty graph.
+    _ = db.commit_with(|edit| _ = edit.set_crate_graph(base_db::CrateGraphBuilder::default()));
+    let least = served.keys.keys().copied().min().expect("premise: the serve keyed crates");
+    assert_eq!(db.crate_at(least), None, "premise: the write removed the crate");
+    let images = memory.images.lock().len();
+    let error = store(&db, &served, &memory, Which::All).err();
+    assert_eq!(error, Some(StoreError::Gone { key: least }));
+    assert_eq!(memory.images.lock().len(), images, "nothing written");
+    let shown = error.map(|it| it.to_string()).unwrap_or_default();
+    assert!(
+        shown.contains(&format!("crate key {}", least.index())) && shown.contains("keys-cover-every-input"),
+        "{shown}"
+    );
 }

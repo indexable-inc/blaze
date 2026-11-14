@@ -2,6 +2,7 @@
 //! (docs/v2/plan/design/frontend.md, "Tests").
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, HashMap},
     fmt::Write as _,
     sync::Barrier,
@@ -288,11 +289,11 @@ fn goals<'db>(db: &'db Db, krate: Crate, interner: DbInterner<'db>) -> Vec<(Trai
 
 /// Each goal's evaluation, twice in a row (the second a table hit when the tables are on), in
 /// the two typing modes the table keys most.
-#[blaze_query::tracked(returns(deref))]
-fn answers(db: &Db, krate: Crate) -> Box<[u8]> {
+#[blaze_memo::tracked(returns(copy))]
+fn answers<'db>(db: &'db Db, krate: Crate) -> &'db [u8] {
     let interner = DbInterner::new_with(db, krate);
     let goals = goals(db, krate, interner);
-    let mut answers = Vec::new();
+    let mut answers = Vec::new_in(Global);
     for mode in [TypingMode::non_body_analysis(), TypingMode::PostAnalysis] {
         let infcx = interner.infer_ctxt().build(mode);
         for &(trait_, ty) in &goals {
@@ -301,28 +302,26 @@ fn answers(db: &Db, krate: Crate) -> Box<[u8]> {
             }
         }
     }
-    answers.into()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &answers)
 }
 
 /// The shape table's verdict on each goal, in the first typing mode of [`answers`].
-#[blaze_query::tracked(returns(deref))]
-fn shape_verdicts(db: &Db, krate: Crate) -> Box<[bool]> {
+#[blaze_memo::tracked(returns(copy))]
+fn shape_verdicts<'db>(db: &'db Db, krate: Crate) -> &'db [bool] {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     let cx = <&SolverContext<'_>>::from(&infcx);
     let names = names(db, krate);
     let (copy, clone) = (names.traits["Copy"], names.traits["Clone"]);
     let limit = interner.recursion_limit();
-    goals(db, krate, interner)
-        .into_iter()
-        .map(|(trait_, ty)| {
-            if trait_ == copy || trait_ == clone {
-                shape::copy_clone_holds(cx, trait_.into(), ty)
-            } else {
-                shape::auto_trait_holds(cx, trait_.into(), ty, ParamEnv::empty(), limit).is_some()
-            }
-        })
-        .collect()
+    let verdicts = goals(db, krate, interner).into_iter().map(|(trait_, ty)| {
+        if trait_ == copy || trait_ == clone {
+            shape::copy_clone_holds(cx, trait_.into(), ty)
+        } else {
+            shape::auto_trait_holds(cx, trait_.into(), ty, ParamEnv::empty(), limit).is_some()
+        }
+    });
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), verdicts)
 }
 
 #[test]
@@ -440,18 +439,18 @@ fn limit_goals<'db>(
 }
 
 /// Each goal's evaluation and the overflow warnings it gave, twice in a row.
-#[blaze_query::tracked(returns(deref))]
-fn limit_answers(db: &Db, krate: Crate) -> Box<[u8]> {
+#[blaze_memo::tracked(returns(copy))]
+fn limit_answers<'db>(db: &'db Db, krate: Crate) -> &'db [u8] {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-    let mut answers = Vec::new();
+    let mut answers = Vec::new_in(Global);
     for (trait_, ty) in limit_goals(db, krate, interner) {
         for _ in 0..2 {
             answers.push(infcx.type_implements_trait(trait_, [ty], ParamEnv::empty()) as u8);
             answers.push(infcx.take_next_solver_overflows().len() as u8);
         }
     }
-    answers.into()
+    blaze_memo::keep_slice(blaze_memo::Database::memo(db), &answers)
 }
 
 #[test]

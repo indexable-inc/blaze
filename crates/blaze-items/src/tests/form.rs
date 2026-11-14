@@ -609,8 +609,9 @@ fn shared_type_forms_are_the_forms_each_cx_spelled() {
             for (_, local) in body.locals.iter() {
                 let ty = local.ty.as_ref();
                 let old = Cx::reference(&db).reference_ty(ty);
-                assert_eq!(*ty_form(&db, FormTy::new(&db, local.ty)), old, "the form of {ty:?}");
-                assert_eq!(*Cx::new(&db).ty(ty), old.sub, "the form of {ty:?}");
+                let kept = ty_form(&db, FormTy::new(&db, local.ty));
+                assert_eq!((kept.sub, kept.spans), (old.sub.view(), old.spans), "the form of {ty:?}");
+                assert_eq!(Cx::new(&db).ty(ty), old.sub.view(), "the form of {ty:?}");
                 forms += 1;
             }
         }

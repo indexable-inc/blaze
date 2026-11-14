@@ -109,6 +109,7 @@ fn use_row(cx: &Cx<'_, '_>, id: UseId, module: ModuleId, node: ast::Use<'_>) -> 
     let db = cx.db;
     let sources = use_tree_sources_view(db, id);
     let span_map = sources.file_id.span_map(db);
+    let arena = crate::cx::context_arena(sources.file_id);
     let public = node.visibility().is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
     let mut trees = Vec::new(); // alloc: a test's rows
     let mut open: Vec<(TextRange, u32)> = Vec::new(); // alloc: a test's stack
@@ -138,7 +139,7 @@ fn use_row(cx: &Cx<'_, '_>, id: UseId, module: ModuleId, node: ast::Use<'_>) -> 
         };
         let underscore = tree.rename().is_some_and(|it| it.underscore_token().is_some());
         let own = match tree.path() {
-            Some(path) => ModPath::from_src_view(db, path, &mut |range| {
+            Some(path) => ModPath::from_src_view(db, arena, path, &mut |range| {
                 span_map.span_for_range(range).ctx
             }),
             None => Some(ModPath::from_kind(if tree.coloncolon_token().is_some() {
@@ -191,7 +192,7 @@ enum Plant {
 fn rows(source: &str, edition: &str, plant: Plant) -> [(Vec<UseRow>, Vec<CrateRow>); 2] {
     let fixture = format!("//- /main.rs crate:main edition:{edition}\n{source}");
     let (db, names, _) = crate::tests::fixture_db(&fixture, "");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = hir::check::workspace_crates(&db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(&db, krate, Files::new(&names, ""), &frame);

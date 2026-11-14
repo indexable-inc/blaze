@@ -27,7 +27,7 @@ blaze-inproc.workspace = true
 blaze-items.workspace = true
 # A job's frame.
 blaze-mem.workspace = true
-blaze-query.workspace = true
+blaze-memo.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true

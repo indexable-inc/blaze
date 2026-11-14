@@ -90,6 +90,12 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 #[test]
 fn the_walks_over_the_crates_that_name_find_what_the_walks_over_every_crate_find() {
     let db = fixture::db(FIXTURE).into_db();
+    // Attached: a failed assertion prints the ids it names (a `SolverDefId` refuses to print
+    // with no database attached).
+    blaze_memo::attach(&db, || the_walks_agree(&db));
+}
+
+fn the_walks_agree(db: &base_db::Db) {
     let (mut compared, mut found_any) = (0, false);
     for (trait_, self_tys) in traits_and_self_tys(&db) {
         for &krate in all_crates(&db).iter() {

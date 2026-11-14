@@ -37,7 +37,8 @@ pub struct Progress {
     /// spans close on and on while a build stands still, as they did through the poolborrow
     /// stall's ten minutes (2026-11-02).
     pub jobs: u64,
-    /// Query work ended (`blaze_query::db::completed`): queries brought up to date under their
+    /// Query work ended (`blaze_memo::completed`; until the port to the session memo,
+    /// `blaze_query::db::completed`, which this describes): queries brought up to date under their
     /// flight, run or verified; rows the claim-free verification marked current; and items of
     /// a loop over the pool (`run_all`, `par_for_each`) that ran to their end. The last two
     /// are what a daemon does after a restart, every worker inside one loop's items proving
@@ -519,7 +520,7 @@ mod tests {
         items: u64,
     }
 
-    /// `blaze_query::db::completed` of `did`, as it counts.
+    /// The daemon's completed count (`blaze_memo::completed`) of `did`, as it counts.
     fn completed(did: Did) -> u64 {
         did.flown + did.marked + did.items
     }

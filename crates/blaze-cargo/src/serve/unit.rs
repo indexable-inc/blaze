@@ -75,7 +75,8 @@ use std::{
 )]
 use std::sync::OnceLock;
 
-use base_db::{FileId, Trigger};
+use base_db::FileId;
+use blaze_lower::Trigger;
 use blaze_api::{
     ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf,
     UnitTarget,
@@ -302,13 +303,11 @@ impl Steps for Real {
                 // The outcomes of the sealed crates now; a member's waits for its image,
                 // which the second store writes.
                 let db = kept.lowered.db();
-                // alloc: setup: once per front end stored, one entry a crate walked
-                let mut sealed = blaze_hash::HashMap::new_in(std::alloc::Global);
                 // alloc: once per front end stored, the outcomes it checked split in two
                 let (now, members): (Vec<deps::Later>, Vec<deps::Later>) =
                     std::mem::take(&mut kept.later)
                         .into_iter()
-                        .partition(|it| hir_def::deps::sealed_in(db, it.krate, &mut sealed));
+                        .partition(|it| hir_def::deps::sealed(db, db.krate(it.krate)));
                 kept.later = members;
                 (hir_def::deps::Which::Sealed, now, None)
             }
@@ -346,22 +345,13 @@ impl Steps for Real {
             hir_def::deps::Which::Sealed => Stored::Sealed,
             hir_def::deps::Which::All => Stored::All,
         };
-        // What storing ran (each dependency's signatures) is folded into the reverse edges
-        // here, after the answer and with the front end exclusive, never at the next build's
-        // first write (`Storage::pack_reverse`).
-        blaze_query::db::Database::storage_mut(kept.lowered.served_db()).pack_reverse();
-        // And settled: what those runs said changed leaves the next walk's start
-        // (`Storage::settle_changed_set`).
-        blaze_query::db::Database::storage_mut(kept.lowered.served_db()).settle_changed_set();
+        // Nothing to fold or settle after: the memo keeps no reverse edges and no changed set
+        // past a snapshot; the next edit's `Memo::next` drops what it names.
         Ok(puts)
     }
 
     fn kept_refusal(&self, kept: &mut KeptLowered) -> Option<String> {
         kept.flushed.as_mut().and_then(deps::Flushes::take_refusal)
-    }
-
-    fn kept_run_log(&self, kept: &KeptLowered) -> blaze_query::db::Taken {
-        hir_def::span_names::take_run_log(kept.lowered.db())
     }
 
     fn serve_needs(&self, kept: &mut KeptLowered, wanted: &std::sync::atomic::AtomicBool) -> Vec<KeptPut> {
@@ -486,6 +476,14 @@ impl Steps for Real {
                     sealed: &sealed,
                 };
                 let failed = |error| Failed::Error(lower_error(error));
+                // A database made anew: its session marks blaze-item-hash's fact boundaries,
+                // and its queries keep read lists where the item store files body records by
+                // them ([`deps::reads_in`]).
+                let reads = deps::reads_in(&input.config.invocation.env)?;
+                let lower_anew = || {
+                    blaze_lower::lower(lower(), blaze_item_hash::reads::mark_boundaries, reads)
+                        .map_err(failed)
+                };
                 // A front end kept and moved to the view keeps what it was served, until a serve of
                 // this job finds a crate's key moved: moving reads again only the view's files, and
                 // the runs and proc macros applied again are served after as in a fresh job.
@@ -547,11 +545,11 @@ impl Steps for Real {
                                     // The walks first: they name the database's ids.
                                     drop((walks, session, lowered, seeds));
                                 }
-                                (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new(), None)
+                                (lower_anew()?, None, Vec::new(), None)
                             }
                         }
                     }
-                    None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new(), None),
+                    None => (lower_anew()?, None, Vec::new(), None),
                 };
                 // What codegen's walks over this database keep for its next build: the kept
                 // front end's, while its database is the one refreshed into; a new database
@@ -592,7 +590,6 @@ impl Steps for Real {
                 })?; // alloc: an error, once
                 let fresh = session.is_none();
                 if fresh {
-                    blaze_item_hash::impls::install(lowered.served_db());
                     // Which front end computes a body's identity, told before any is asked:
                     // the one the goal store and the item store are given below. Until
                     // 2026-11-10 nothing told it, so every identity was `Err("no front-end
@@ -600,15 +597,18 @@ impl Steps for Real {
                     // the item store refused every body (`Refusal::NoIdentity`), and
                     // `identity_of` ran again for every body it was asked of in every
                     // revision (about 10,000 runs a build, all `ran_untracked`). A database
-                    // lowered into again was told when it was made.
-                    blaze_item_hash::identity::set_build(lowered.served_db(), deps::front_end()?);
+                    // lowered into again was told when it was made. (blaze-item-hash's fact
+                    // boundaries were marked when the database was made: `lower_anew`.)
+                    let mut edit = lowered.served_db().edit();
+                    blaze_item_hash::identity::give_build(&mut edit, deps::front_end()?);
+                    _ = edit.commit();
                 }
                 // The guard: a build whose database was not told stops here, naming it, where
                 // it used to go on with no identity and an untracked read a body.
                 if blaze_item_hash::identity::FrontEnd::try_get(lowered.db()).is_none() {
                     // alloc: an error, once
                     return Err(Failed::Error(ApiError::new(
-                        "the front end's database was not told which front end computes its bodies' identities (`blaze_item_hash::identity::set_build`), so each would be asked again in every revision and none filed",
+                        "the front end's database was not told which front end computes its bodies' identities (`blaze_item_hash::identity::give_build`), so each would be asked again in every revision and none filed",
                         None,
                     )));
                 }
@@ -1225,19 +1225,19 @@ const EDIT_CRATES: usize = 4;
 /// (`unit::release`, deleted with the memory gate). A value let go keeps its memo, so a read
 /// of it by the next build makes it again and backdates it: nothing read can differ.
 ///
-/// - A check keeps its inference, which the next check of the head reads again; its MIR goes.
-/// - An edit's build (it found a unit kept and made at most [`EDIT_CRATES`] crates) keeps its
-///   inference and MIR, which the next edit's check reads again (the lints of bodies), and
-///   lets go of the trait solver's caches, which are of this revision alone.
-/// - Any other build lets go of every MIR and of the inference of the dependencies it
-///   finished (no workspace member's, `CrateOrigin::Local`: those an edit makes again).
+/// What a query computed (inference, MIR) is the memo's, held in its crate's arena until a
+/// commit drops that arena; nothing here lets go of it. What is let go is what lives beside
+/// the memo:
 ///
-/// Then, at every end, the storage's upkeep: [`blaze_query::db::Storage::end_epoch`] lets go
-/// of what neither this build nor the one before read, the reverse edges are packed and the
-/// changed set settled.
+/// - An edit's build (it found a unit kept and made at most [`EDIT_CRATES`] crates) lets go of
+///   every crate's trait solver caches, which are of this snapshot alone.
+/// - Any other build that compiles lets go of the solver caches of the dependencies it
+///   finished (no workspace member's, `CrateOrigin::Local`: those an edit reads again).
+/// - Every build frees the interners' tables grown out past their grace.
 struct BuildEnd {
-    /// Each unit's crate; none for a build script's run.
-    of: Vec<Option<base_db::Crate>>,
+    /// Each unit's crate, by key: the build's commits kill the crates' ids of the snapshot it
+    /// began in. None for a build script's run.
+    of: Vec<Option<base_db::CrateKey>>,
     /// Each unit found kept as it began ([`Writer::found_kept`]).
     kept: Vec<bool>,
     /// Each unit whose compile ended ([`Writer::compiled`]).
@@ -1249,7 +1249,7 @@ struct BuildEnd {
 impl BuildEnd {
     fn new(crates: &Crates, units: usize, compiles: bool) -> BuildEnd {
         BuildEnd {
-            of: (0..units).map(|unit| crates.krate(unit)).collect(), // alloc: a crate a unit, once per build
+            of: (0..units).map(|unit| crates.key(unit)).collect(), // alloc: a crate a unit, once per build
             kept: vec![false; units],     // alloc: a flag a unit, once per build
             compiled: vec![false; units], // alloc: a flag a unit, once per build
             compiles,
@@ -1271,10 +1271,10 @@ impl BuildEnd {
     }
 
     /// The crates every unit of which compiled, in the order of their first unit.
-    fn finished(&self) -> Vec<base_db::Crate> {
+    fn finished(&self) -> Vec<base_db::CrateKey> {
         // Each crate's place in `crates` and whether every unit of it compiled so far.
         let mut seen = blaze_hash::HashMap::new_in(std::alloc::Global);
-        let mut crates: Vec<(base_db::Crate, bool)> = Vec::new(); // alloc: a crate a build, once per build
+        let mut crates: Vec<(base_db::CrateKey, bool)> = Vec::new(); // alloc: a crate a build, once per build
         for unit in 0..self.of.len() {
             let Some(krate) = self.of[unit] else { continue };
             let at = *seen.entry(krate).or_insert_with(|| {
@@ -1288,54 +1288,44 @@ impl BuildEnd {
 
     /// Lets go of what the build's end lets go (the type's doc), under a span naming it.
     fn release(self, lowered: &mut Lowered) {
-        use blaze_query::db::Database as _;
-
-        let db = lowered.served_db();
+        // Nothing here writes: the release reads the last commit's snapshot.
+        let db = lowered.db();
         let found_kept = self.kept.iter().any(|&it| it);
         let edit = self.compiles && found_kept && self.made() <= EDIT_CRATES;
-        let crates: Vec<base_db::Crate> = match (self.compiles, edit) {
-            (false, _) | (true, true) => Vec::new(), // alloc: none, empty
+        let crates: Vec<base_db::Crate, std::alloc::Global> = match (self.compiles, edit) {
+            (false, _) | (true, true) => Vec::new_in(std::alloc::Global),
             (true, false) => {
-                let db: &base_db::Db = &*db;
-                let mut finished = self.finished();
-                finished.retain(|krate| !krate.data(db).origin.is_local());
+                // Taken in the snapshot the build ended in, by key.
+                let keys = self.finished();
+                let mut finished = Vec::with_capacity_in(keys.len(), std::alloc::Global);
+                finished.extend(
+                    keys.into_iter()
+                        .map(|key| db.krate(key))
+                        .filter(|krate| !krate.data(db).origin.is_local()),
+                );
                 finished
             }
         };
-        let mir = !edit;
         let span = tracing::info_span!(
             target: "blaze",
             "front end release at the build's end",
             edit,
             crates = crates.len(),
-            mir,
-            inference = tracing::field::Empty,
-            mir_dropped = tracing::field::Empty,
             solver_caches = tracing::field::Empty,
-            unread = tracing::field::Empty,
+            intern_tables = tracing::field::Empty,
             query_storage = tracing::field::Empty,
         );
         let _release = span.enter();
-        let mut dropped = hir::evict::drop_crates_after_store(db, &crates, mir);
+        // The given crates' caches alone: an edit's build lets go of every crate's below.
+        let mut dropped = hir::evict::drop_crates_after_store(db, &crates, false);
         if edit {
             dropped.solver_caches += hir::evict::drop_every_solver_cache(db);
         }
-        let unread = db.storage_mut().end_epoch();
-        db.storage_mut().pack_reverse();
-        // What its pulls left for the next changed-set walk is settled: each row the build
-        // made again said it changed, and the next edit's walk would start from all of them.
-        db.storage_mut().settle_changed_set();
-        if std::env::var_os("BLAZE_DURABILITY_CENSUS").is_some() {
-            crate::serve::said::logged!(INFO,
-                "blaze serve: durability census: {}",
-                db.storage().durability_census()
-            );
-        }
-        span.record("inference", dropped.inference);
-        span.record("mir_dropped", dropped.mir);
+        // No epoch to end, reverse edges to pack or changed set to settle: the memo keeps none
+        // past a snapshot, and the next edit's commit drops the arenas it moves.
         span.record("solver_caches", dropped.solver_caches);
-        span.record("unread", unread.values);
-        span.record("query_storage", db.storage().held_bytes());
+        span.record("intern_tables", dropped.intern_tables);
+        span.record("query_storage", blaze_memo::Database::memo(db).held() as u64);
     }
 }
 
@@ -1409,7 +1399,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     /// The writes asked for since the last apply, as three changes, each one maintenance pass
-    /// of the database ([`base_db::Trigger`] names each on its `maintain` span), not one per
+    /// of the database ([`blaze_lower::Trigger`] names each on its `maintain` span), not one per
     /// input set: every proc macro's load and build script's run in one batch; then, reading
     /// the database as those left it, the harness and glue of every unit they reached or made
     /// ready in one ([`harness::write`]), before those units are identified; then the images of
@@ -1571,10 +1561,6 @@ impl Writer<Real> for UnitWriter {
 
     fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
         deps::served(self.front.db(), &self.job, &self.session)
-    }
-
-    fn run_log(&self) -> blaze_query::db::Taken {
-        hir_def::span_names::take_run_log(self.front.db())
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
@@ -2089,7 +2075,7 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     match caught {
         Ok(it) => Ok(it),
         Err(payload) => {
-            if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>()
+            if payload.is::<blaze_memo::Cancelled>() || payload.is::<blaze_graph::Cancelled>()
             {
                 Err(Failed::Again)
             } else if let Some(it) = hir_def::nameres::stopped(&*payload) {
@@ -2256,7 +2242,7 @@ impl Job {
     /// ([`blaze_diagnostics::cache::encode`]), for the build's report ([`deps::served`]).
     pub(crate) fn check_later(
         &self,
-        krate: base_db::Crate,
+        krate: base_db::CrateKey,
         flags: Vec<String>,
         diags: Vec<blaze_diagnostics::Diag>,
         items_broken: bool,

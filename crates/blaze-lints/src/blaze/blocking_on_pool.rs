@@ -11,32 +11,30 @@
 //! sockets, and `Read` and `Write` on a file or a stream).
 
 use base_db::Db;
-use blaze_hash::HashSet;
 use hir::AsAssocItem as _;
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule as _, hir::Expr, signatures::FunctionSignature,
 };
 use hir_ty::next_solver::GenericArgs;
 use rustc_type_ir::inherent::GenericArgs as _;
-use std::alloc::Global;
 
 use super::{Finding, Lint, alloc::written_callee, facts};
-use crate::check::Cx;
+use crate::{check::Cx, kept};
 
 /// The functions of a crate's walk that run on a fiber or a pool thread, as a set.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct OnFiber(HashSet<FunctionId, Global>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OnFiber<'db>(kept::Set<'db, FunctionId>);
 
-impl OnFiber {
+impl OnFiber<'_> {
     pub(crate) fn contains(&self, f: FunctionId) -> bool {
         self.0.contains(&f)
     }
 }
 
 /// [`hir_ty_suspend::on_fiber`] of `krate`, once per crate, to ask of each body.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn on_fiber_set(db: &Db, krate: base_db::Crate) -> OnFiber {
-    OnFiber(hir_ty_suspend::on_fiber(db, krate).iter().copied().collect())
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn on_fiber_set<'db>(db: &'db Db, krate: base_db::Crate) -> OnFiber<'db> {
+    OnFiber(kept::Set::keep_set(db, hir_ty_suspend::on_fiber(db, krate).iter().copied()))
 }
 
 /// What a finding says to wait with instead.

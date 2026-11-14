@@ -129,7 +129,7 @@ fn named(db: &Db, name: &str) -> Crate {
 
 /// Runs `f` as a query's caller does: the database attached, in a task's frame.
 fn within<T>(db: &Db, f: impl FnOnce() -> T) -> T {
-    blaze_query::db::attach(db, || blaze_mem::frame::task(Tag::Infer, |_| f()))
+    blaze_memo::attach(db, || blaze_mem::frame::task(Tag::Infer, |_| f()))
 }
 
 /// The pages of the impl tables of `name`, written by a fresh database of `text`.
@@ -144,7 +144,7 @@ fn paged(text: &str, name: &str, source: Arc<Counting>) -> Db {
     let krate = named(&db, name);
     let mut tables = Tables::whole(&[], Mode::Serve);
     tables.pages.source = source;
-    frozen::set(&mut db, [(krate, tables)].into_iter().collect());
+    frozen::give_for_test(&mut db, [(krate, tables)].into_iter().collect());
     db
 }
 
@@ -226,10 +226,14 @@ fn plain(text: &str) -> Name {
 fn answers(db: &Db, krate: Crate, narrow: bool) -> Vec<Vec<u8>> {
     within(db, || {
         let mut out = Vec::new();
-        let table = &**TraitImpls::for_crate(db, krate);
+        let table = TraitImpls::for_crate(db, krate);
         for (trait_, t) in table.trait_indices() {
             let blanket: Vec<ImplId> = match narrow {
-                true => TraitImpls::served_blanket(db, krate, trait_).blanket_impls(trait_).to_vec(),
+                true => {
+                    let mut blanket = Vec::new();
+                    frozen::blanket(db, krate, trait_, |it| blanket.push(it));
+                    blanket
+                }
                 false => table.blanket_impls(trait_).to_vec(),
             };
             let key = |enc: &mut Enc<'_>| enc.def(ModuleDefId::TraitId(trait_));
@@ -644,7 +648,9 @@ fn an_impl_lookup_reads_a_bounded_number_of_pages() {
             bounded("a name's items");
             assert!(in_crate_trait_value_items(&db, lib, plain("no_such")).is_empty());
             bounded("a name no trait binds");
-            assert!(TraitImpls::served_blanket(&db, lib, trait_).blanket_impls(trait_).is_empty());
+            let mut blanket = 0;
+            frozen::blanket(&db, lib, trait_, |_| blanket += 1);
+            assert_eq!(blanket, 0);
             bounded("a trait's blanket impls");
             // A type's trait impls: its window and entry, then its one row (two pages more
             // where the row crosses one).

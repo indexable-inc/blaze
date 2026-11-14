@@ -320,8 +320,13 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
-        let scope_items =
-            self.traits_in_scope.named(self.infcx.interner.db, item_name, item_hygiene, self.frame);
+        let scope_items = self.traits_in_scope.named(
+            self.infcx.interner.db,
+            self.resolver.ctx_table(),
+            item_name,
+            item_hygiene,
+            self.frame,
+        );
         let choice = ProbeForNameChoice {
             private_candidate: None,
             item_name,
@@ -869,10 +874,13 @@ impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
         let db = this.db();
         let name = this.choice.item_name;
         let hygiene = this.choice.item_hygiene;
+        let table = this.ctx.resolver.ctx_table();
         let item = match items {
-            ItemsOf::Impl(id) => inherent_value_item(db, id, impl_item_name(db, id, name, hygiene)),
+            ItemsOf::Impl(id) => {
+                inherent_value_item(db, id, impl_item_name(db, table, id, name, hygiene))
+            }
             ItemsOf::Trait(id) => {
-                this.choice.trait_items.get(db, id, trait_item_name(db, id, name, hygiene))
+                this.choice.trait_items.get(db, id, trait_item_name(db, table, id, name, hygiene))
             }
         }
         .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));

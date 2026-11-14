@@ -206,11 +206,11 @@ impl Hashes for HashSource {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Body {
     Item(DefWithBodyId),
-    Closure(blaze_query::db::Id),
+    Closure(blaze_memo::Gid),
     /// The `Future::poll` of an `async` block.
-    Coroutine(blaze_query::db::Id),
+    Coroutine(blaze_memo::Gid),
     /// The future an `async` closure gives when called by value though it could be again.
-    CoroutineByMove(blaze_query::db::Id),
+    CoroutineByMove(blaze_memo::Gid),
 }
 
 /// A function instance as the front end holds it.
@@ -247,8 +247,8 @@ pub(crate) enum Kind {
     Allocator(allocator::Forward),
 }
 
-/// A static as the front end holds it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// A static as the front end holds it: homed where its item is (its crate's arena).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, blaze_memo::Home)]
 pub struct HirStatic(pub StaticId);
 
 /// A function whose IR is built, waiting for its backend.
@@ -395,7 +395,7 @@ pub(crate) fn failed_in_front(
 ) -> CodegenError {
     // alloc: the error's message, its parts kept apart for the reader
     let (named, why) =
-        blaze_query::db::attach(db, || (Named(db, instance).to_string(), why.to_string()));
+        blaze_memo::attach(db, || (Named(db, instance).to_string(), why.to_string()));
     let front = frontend::item_of(db, &instance.0).ok().map(|id| {
         // clone: the error's parts, kept beside its message
         Box::new(blaze_codegen::FrontItem { id, named: named.clone(), why: why.clone() })
@@ -457,7 +457,7 @@ pub(crate) fn undescribed(
     CodegenError {
         unit: InstanceKey(ContentId::default()),
         item: item.unwrap_or(ItemKey(ContentId::default())),
-        what: blaze_query::db::attach(db, || format!("{instance:?}: {what}")), // alloc: the error's message
+        what: blaze_memo::attach(db, || format!("{instance:?}: {what}")), // alloc: the error's message
         front: None,
     }
 }

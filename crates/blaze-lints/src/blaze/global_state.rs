@@ -72,18 +72,17 @@ pub(crate) enum Global {
 /// Every use of a `static` or `const` by a body of a crate, in the order of
 /// [`frozen_collection::crate_bodies`] and, in a body, of its expressions: the item, the body,
 /// and whether the use changes it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Uses(Vec<(Global, DefWithBodyId, bool)>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Uses<'db>(&'db [(Global, DefWithBodyId, bool)]);
 
 /// The uses of `krate`'s bodies, as [`Uses`] says, once per crate.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn global_uses(db: &Db, krate: base_db::Crate) -> Uses {
-    // alloc: every use of a static or const by the crate, once per crate and edit
-    let mut uses = Vec::new();
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn global_uses<'db>(db: &'db Db, krate: base_db::Crate) -> Uses<'db> {
+    let mut uses = Vec::new_in(std::alloc::Global);
     for def in frozen_collection::crate_bodies(db, krate) {
         uses_in(db, def, &mut uses);
     }
-    Uses(uses)
+    Uses(crate::kept::slice(db, uses))
 }
 
 /// Adds the uses of `static`s and `const`s by the body of `def` to `out`.
@@ -254,7 +253,7 @@ pub(super) fn keys_in<'t>(
 fn uses_said(db: &Db, krate: base_db::Crate, global: Global, writes: bool) -> String {
     // alloc: the bodies that use one item, a finding's message part
     let mut bodies: Vec<(DefWithBodyId, bool)> = Vec::new();
-    for &(it, def, changes) in &global_uses(db, krate).0 {
+    for &(it, def, changes) in global_uses(db, krate).0 {
         if it != global {
             continue;
         }

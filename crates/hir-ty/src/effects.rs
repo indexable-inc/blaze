@@ -244,7 +244,7 @@ pub fn const_param_env<'db>(db: &'db Db, def: GenericDefId) -> ParamEnvAndCrate<
     ParamEnvAndCrate { param_env: ParamEnv { clauses }, krate }
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 fn const_param_env_query(db: &Db, def: GenericDefId) -> StoredClauses {
     let interner = DbInterner::new_with(db, def.module(db).krate(db));
     let env = crate::lower::trait_environment(db, def);

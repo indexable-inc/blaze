@@ -1,0 +1,14 @@
+{
+ "id": "unitkey-whitespace-vs-joint-tokens",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane K2 (crates/blaze-unitkey), port-memo-1113",
+ "where": "crates/blaze-unitkey/src/image.rs Walk::lex (JOINT); docs/v2/plan/design/host.md \"blaze-unitkey\"",
+ "what": "The K2 brief asks both that whitespace be in no digest and that `x - -y` and `x --y` key apart. Outside a token tree the parser gives both the same tokens (MINUS MINUS), so the only difference is whitespace between two punctuation tokens. The old image set JOINT only inside token trees, so the two keyed alike. The brief also cites host.md's \"second-round item 1\" for serving a body's syntax from the image, and host.md on this branch has no such section.",
+ "cost": "half an hour deciding which claim gives, and searching host.md for a section that is not there",
+ "cause": "the design text says 'whitespace is in no key' without saying what a token stream is: proc macros and macro matchers see Spacing, so whitespace between two punctuation tokens is part of the token stream",
+ "class": "a rule stated over source text where the thing keyed is a token stream, whose boundary with whitespace is left unsaid",
+ "prevention": "say in host.md (or target.md's key rules) that a digest is over the token stream with proc_macro Spacing: JOINT on a punctuation token the next punctuation token follows with nothing between, and nothing else of whitespace",
+ "workaround": "JOINT is set on every punctuation token the next punctuation token follows with nothing between; tokens_are_hashed_as_tokens holds both `x - -y`/`x --y` (moves) and `a + b`/`a+b` (does not)",
+ "fix": "the host.md wording above; the main agent's call",
+ "state": "open"
+}

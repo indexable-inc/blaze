@@ -53,15 +53,15 @@ pub fn record_defaults_owner(db: &Db, function: FunctionId) -> FunctionId {
 
 /// Every default of the record parameters of `function`'s own declaration, in the order
 /// written. A call reads one of them through [`record_param_default`].
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub fn record_param_defaults(db: &Db, function: FunctionId) -> Box<[RecordParamDefault]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn record_param_defaults<'db>(db: &'db Db, function: FunctionId) -> &'db [RecordParamDefault] {
     let data = FunctionSignature::of(db, function);
     let has_defaults = |param: &TypeRefId| match data.store.type_ref(*param) {
         TypeRef::Record { defaults, .. } => defaults.any(),
         _ => false,
     };
     if !data.params.iter().any(has_defaults) {
-        return Box::default();
+        return &[];
     }
     blaze_mem::frame::current(|frame| {
         let resolver = function.resolver(db);
@@ -97,7 +97,7 @@ pub fn record_param_defaults(db: &Db, function: FunctionId) -> Box<[RecordParamD
                 });
             }
         }
-        found.into_boxed_slice()
+        blaze_memo::keep_iter(blaze_memo::Database::memo(db), found)
     })
 }
 
@@ -109,7 +109,7 @@ pub fn record_param_defaults(db: &Db, function: FunctionId) -> Box<[RecordParamD
 /// the value is that one constant: a caller reads it only for a field it leaves out, so a
 /// changed default recomputes the callers that leave that field out and no other. A default
 /// is no part of the record's type or of the function's signature type.
-#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
 pub fn record_param_default(
     db: &Db,
     function: FunctionId,

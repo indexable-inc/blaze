@@ -405,7 +405,7 @@ impl<'db> Mark<'_, '_, '_, 'db> {
     /// What the walk of the store of `owner` recorded, done in the crate's numbering.
     fn replay(&mut self, owner: ExpressionStoreOwnerId) {
         let k = self.k;
-        for &mark in store_marks(k.cx.db, owner, ()) {
+        for &mark in store_marks(k.cx.db, owner) {
             match mark {
                 StoreMark::Named { named, in_pat, ignored } => {
                     self.handle_res_as(res(k.defs, named), in_pat, ignored)

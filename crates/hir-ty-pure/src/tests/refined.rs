@@ -67,7 +67,7 @@ fn struct_named(db: &base_db::Db, name: &str) -> AdtId {
 #[test]
 fn an_invariant_discharges_the_overflow_checks_it_implies() {
     let db = fixture::db(&source()).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         assert!(fits(&db, "doubled"), "`t.x * 2` of a `Twice` fits");
         assert!(!fits(&db, "doubled_raw"), "`x * 2` of an `i32` is not shown to fit");
         assert!(fits(&db, "room"), "`cap - len` under `len <= cap` fits");
@@ -79,7 +79,7 @@ fn an_invariant_discharges_the_overflow_checks_it_implies() {
 #[test]
 fn invariants_are_read_and_the_implied_part_set_aside() {
     let db = fixture::db(&source()).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let twice = refined::invariant_of(&db, struct_named(&db, "Twice")).expect("stated");
         assert!(twice.refused.is_none(), "{twice:?}");
         assert_eq!(twice.clauses.len(), 1);

@@ -22,7 +22,7 @@ use frame_map::{FrameHashMap, FrameHashSet, FrameMap};
 use std::cell::Cell;
 
 use blaze_hash::{HashMap, HashSet};
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id as _;
 use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, AtomicRmwOp, InstBuilder, MemFlagsData, Signature,
@@ -730,13 +730,13 @@ struct Instance {
 enum InstanceDef {
     Fn(FunctionId),
     /// An `InternedClosureId`, stored without its database lifetime.
-    Closure(blaze_query::db::Id),
+    Closure(blaze_memo::Gid),
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block. Polled with a null
     /// context, it drops whatever the block holds instead.
-    Coroutine(blaze_query::db::Id),
+    Coroutine(blaze_memo::Gid),
     /// The same of the future an `async` closure gives when it is called by value though it
     /// could be called again: that future owns what the closure captured.
-    CoroutineByMove(blaze_query::db::Id),
+    CoroutineByMove(blaze_memo::Gid),
     /// `drop_in_place` for the type that is the instance's only generic argument.
     DropGlue,
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
@@ -758,13 +758,15 @@ enum InstanceDef {
     },
 }
 
-impl blaze_query::db::NamesIds for InstanceDef {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
+impl blaze_memo::Home for InstanceDef {
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
         match *self {
-            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => out.push(func.as_id()),
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => {
+                blaze_memo::Home::home(&func, homes)
+            }
             InstanceDef::Closure(id)
             | InstanceDef::Coroutine(id)
-            | InstanceDef::CoroutineByMove(id) => out.push(id),
+            | InstanceDef::CoroutineByMove(id) => blaze_memo::Home::home(&id, homes),
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
             | InstanceDef::FnPointerShim
@@ -773,11 +775,10 @@ impl blaze_query::db::NamesIds for InstanceDef {
     }
 }
 
-impl blaze_query::db::NamesIds for Instance {
-    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
-        use blaze_query::db::NamesIds;
-        self.def.names_ids(out);
-        self.args.names_ids(out);
+impl blaze_memo::Home for Instance {
+    fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
+        blaze_memo::Home::home(&self.def, homes);
+        blaze_memo::Home::home(&self.args, homes);
     }
 }
 
@@ -841,10 +842,10 @@ impl Instance {
         let code = match self.def {
             InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.krate(db)),
             InstanceDef::Closure(id) => {
-                Some(InternedClosureId::from_id(id).loc(db).owner.krate(db))
+                Some(InternedClosureId::from_gid(id).loc(db).owner.krate(db))
             }
             InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-                Some(InternedCoroutineId::from_id(id).loc(db).owner.krate(db))
+                Some(InternedCoroutineId::from_gid(id).loc(db).owner.krate(db))
             }
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
@@ -860,12 +861,12 @@ impl InstanceDef {
     fn mir_owner<'db>(self) -> Option<MirOwner<'db>> {
         match self {
             InstanceDef::Fn(func) => Some(MirOwner::Body(func.into())),
-            InstanceDef::Closure(id) => Some(MirOwner::Closure(InternedClosureId::from_id(id))),
+            InstanceDef::Closure(id) => Some(MirOwner::Closure(InternedClosureId::from_gid(id))),
             InstanceDef::Coroutine(id) => {
-                Some(MirOwner::Coroutine(InternedCoroutineId::from_id(id)))
+                Some(MirOwner::Coroutine(InternedCoroutineId::from_gid(id)))
             }
             InstanceDef::CoroutineByMove(id) => {
-                Some(MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)))
+                Some(MirOwner::CoroutineByMove(InternedCoroutineId::from_gid(id)))
             }
             InstanceDef::DropGlue
             | InstanceDef::CallOnceShim
@@ -1015,19 +1016,19 @@ const PRINT_DOMAIN: &str = "blaze v2 compiled code print 1";
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn root_serial(db: &Db, func: FunctionId) -> u128 {
     compiled_root(db, func).as_ref().map_or(0, print_of)
 }
 
 // Nothing in its arguments is ever collected (the query database frees no interned value),
 // so they stay interned and are never verified.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn instance_serial(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn static_serial(db: &Db, id: StaticId) -> u128 {
     compiled_static(db, id).as_ref().map_or(0, print_of)
 }
@@ -1036,34 +1037,33 @@ fn static_serial(db: &Db, id: StaticId) -> u128 {
 type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(copy))]
 #[blaze::renders_positions]
-fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
-    compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
+fn root_rows<'db>(db: &'db Db, func: FunctionId) -> &'db [Row] {
+    compiled_root(db, func).as_ref().map_or(&[], |it| rows_of(db, it))
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(copy))]
 #[blaze::renders_positions]
-fn instance_rows(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> Vec<Row> {
-    compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
+fn instance_rows<'db>(db: &'db Db, instance: Instance, env: StoredParamEnvAndCrate) -> &'db [Row] {
+    compiled_instance(db, instance, env).as_ref().map_or(&[], |it| rows_of(db, it))
 }
 
+/// The rows of `compiled`, kept in the arena of the run asking (`root_rows`, `instance_rows`).
 #[blaze::renders_positions]
-fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
-    // alloc: empty, allocates nothing
-    let Some(source) = &compiled.source else { return Vec::new() };
+fn rows_of<'db>(db: &'db Db, compiled: &CompiledFunction) -> &'db [Row] {
+    let Some(source) = &compiled.source else { return &[] };
     let rows = compiled.code.lines.iter().filter_map(|row| {
         let at = source.written(row.span, compiled.closure)?;
         let (file, line, column) = row_location(db, at.owner, at.closure, at.span)?;
         Some((row.offset, file, line, column))
     });
-    // alloc: the rows the memo of `root_rows`/`instance_rows` keeps, once per compile
-    rows.collect()
+    blaze_memo::keep_iter(blaze_memo::Database::memo(db), rows)
 }
 
 /// The code of a non-generic function.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn compiled_root(db: &Db, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     root_code(db, func, false, &mut tier::for_build()).map(Produced::code)
@@ -1097,11 +1097,11 @@ fn backtrace_name(db: &Db, instance: &Instance) -> String {
     let name = match instance.def {
         InstanceDef::Fn(func) => hir_ty_print::rustc_function_name(db, func, args.as_slice()),
         InstanceDef::Closure(id) => {
-            let at = InternedClosureId::from_id(id).loc(db);
+            let at = InternedClosureId::from_gid(id).loc(db);
             of_closure(at.owner, at.expr)
         }
         InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-            let at = InternedCoroutineId::from_id(id).loc(db);
+            let at = InternedCoroutineId::from_gid(id).loc(db);
             of_closure(at.owner, at.expr)
         }
         InstanceDef::DropGlue => ty()
@@ -1377,7 +1377,7 @@ fn panic_strategy(db: &Db, krate: Crate) -> std::result::Result<PanicStrategy, S
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
 // Nothing in its arguments is ever collected (the query database frees no interned value),
 // so they stay interned and are never verified.
-#[blaze_query::tracked(returns(ref), lru = 0)]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn compiled_instance<'db>(
     db: &'db Db,
     instance: Instance,
@@ -1481,9 +1481,9 @@ fn instance_code(
     };
     let args = instance.args;
     let closure = match instance.def {
-        InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db).expr),
+        InstanceDef::Closure(id) => Some(InternedClosureId::from_gid(id).loc(db).expr),
         InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
-            Some(InternedCoroutineId::from_id(id).loc(db).expr)
+            Some(InternedCoroutineId::from_gid(id).loc(db).expr)
         }
         _ => None,
     };
@@ -1906,7 +1906,7 @@ struct BodyTypes {
     poll: Option<StoredTy>,
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn body_types<'db>(
     db: &'db Db,
     instance: Instance,
@@ -2049,7 +2049,7 @@ type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 
 /// The value of a static with an initializer: any but one of an `extern` block, whose value is
 /// another object's (readers ask `v2::statics::source`, which tells the two apart).
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 fn compiled_static(db: &Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
     let target = target_of_crate(db, id.krate(db))?;
@@ -2201,7 +2201,8 @@ fn row_location_in_file(
     let within = match source_map.expr_syntax(code) {
         Ok(body) => {
             let start = TextRange::empty(body.value.syntax_node_ptr().text_range().start());
-            body.file_id.span_map(db).span_for_range(start).ctx
+            let ctx = body.file_id.span_map(db).span_for_range(start).ctx;
+            (body.file_id.context_arena(), ctx)
         }
         Err(_) => return source_location_in_file(db, owner, span),
     };
@@ -2210,21 +2211,25 @@ fn row_location_in_file(
 
 /// File, line and column of where `range` of `file_id` is for a debugger: where the macro
 /// has it while the macro is the crate's own, and where the first macro that is not is
-/// called from, up to the expansion `within` or to the source.
+/// called from, up to the expansion `within` or to the source. A syntax context is a word of
+/// one arena's table, so `within` names its table and the walk carries the table of `at`:
+/// the file's whose span map gave it ([`HirFileId::context_arena`]).
 fn written_place(
     db: &Db,
     file_id: HirFileId,
     range: TextRange,
-    within: Option<span::SyntaxContext>,
+    within: Option<(blaze_memo::ArenaId, span::SyntaxContext)>,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let mut at = file_id.span_map(db).span_for_range(TextRange::empty(range.start()));
+    let mut table = file_id.context_arena();
     let mut kept = at;
-    while !at.ctx.is_root() && Some(at.ctx) != within {
-        let Some(call) = at.ctx.outer_expn(db) else { break };
+    while !at.ctx.is_root() && Some((table, at.ctx)) != within {
+        let Some(call) = at.ctx.outer_expn(db, table) else { break };
         let call = hir_expand::MacroCallId::from(call).loc(db);
         let written = call.to_node_view(db);
         let range = TextRange::empty(written_range(written.value).start());
         at = written.file_id.span_map(db).span_for_range(range);
+        table = written.file_id.context_arena();
         let own = call.def.krate == call.krate && call.def.kind.is_declarative();
         if !own {
             kept = at;
@@ -2235,7 +2240,7 @@ fn written_place(
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
-#[blaze_query::tracked]
+#[blaze_memo::tracked(returns(copy))]
 #[blaze::renders_positions]
 fn declaration_location(db: &Db, func: FunctionId) -> Option<(base_db::FileId, u32, u32)> {
     let source = written_node(db, func.lookup(db));
@@ -2295,7 +2300,7 @@ pub(crate) fn unexpanded_derive(
     let derive = impl_.loc(db).trait_.name();
     let (derive, method) = (derive.as_str(), method.name());
     // A type's `Debug` reads its interned parts from the attached database.
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         // alloc: the error's message
         format!(
             "`{derive}::{}` of `{self_ty:?}`, which `#[derive({derive})]` implements: the database \
@@ -2335,7 +2340,7 @@ pub(crate) fn no_impl_method(
     };
     let (why, args) = (why.describe(), args.as_slice());
     // A type's `Debug` reads its interned parts from the attached database.
-    blaze_query::db::attach(db, || match trait_ {
+    blaze_memo::attach(db, || match trait_ {
         // alloc: the error's message
         Some(trait_) => {
             format!("trait {} method {method} for {args:?}: {why}", trait_.name.as_str())
@@ -2509,7 +2514,7 @@ pub fn stand_in_section(format: object::BinaryFormat) -> (&'static str, &'static
 /// attribute's expansion exports for `__rust_alloc` (the attribute itself is gone from the
 /// static once expanded). The expansion names the function as it exports it, so each module
 /// is asked for the name rather than for the attributes of all its functions.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn declares_global_allocator(db: &Db, krate: Crate) -> bool {
     global_allocator_export(db, krate, "__blaze_global_alloc").is_some()
 }
@@ -2837,7 +2842,7 @@ fn built_in_of(cg: &mut Recorder<'_>, body: Option<&MirBody<'_>>) -> Vec<Instanc
     for callee in body.into_iter().flat_map(|it| &it.inlined.callees) {
         let def = match callee.body {
             hir_ty_mir::mir::InlinedBody::Fn(func) => InstanceDef::Fn(func),
-            hir_ty_mir::mir::InlinedBody::Closure(closure) => InstanceDef::Closure(closure.as_id()),
+            hir_ty_mir::mir::InlinedBody::Closure(closure) => InstanceDef::Closure(closure.gid()),
         };
         let inlined = Instance { def, args: callee.args, checked: cg.checked };
         if !built_in.contains(&inlined) {
@@ -3009,7 +3014,7 @@ fn build<'db>(
 }
 
 /// The body of a small function, built to be put where the function is called.
-#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle)]
+#[blaze_memo::tracked(returns(ref), owns, cycle_result = inlinable_cycle)]
 fn inlinable(
     db: &Db,
     instance: Instance,
@@ -3035,7 +3040,7 @@ fn inlinable(
 /// is called, as LLVM's always-inliner puts it at every level rustc compiles at. `unit` is the
 /// v2 unit's settings it is built under (debug assertions, panic strategy, MIR options), part
 /// of the key; `None` in v1.
-#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle)]
+#[blaze_memo::tracked(returns(ref), owns, cycle_result = always_inlinable_cycle)]
 fn always_inlinable(
     db: &Db,
     instance: Instance,
@@ -3098,7 +3103,6 @@ fn built_in_body(
 
 fn inlinable_cycle(
     _: &Db,
-    _: blaze_query::db::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
@@ -3107,7 +3111,6 @@ fn inlinable_cycle(
 
 fn always_inlinable_cycle(
     _: &Db,
-    _: blaze_query::db::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
     _: Option<v2::build::Build>,
@@ -4113,7 +4116,7 @@ impl ConstOf<'_> {
             ConstOf::Item(GeneralConstId::AnonConstId(_)) => {
                 "an anonymous constant".to_owned() // alloc: an error's text
             }
-            ConstOf::Promoted(promoted) => blaze_query::db::attach(db, || {
+            ConstOf::Promoted(promoted) => blaze_memo::attach(db, || {
                 // alloc: an error's text
                 format!(
                     "the promoted constant {:?} of {}",
@@ -4137,7 +4140,7 @@ pub(crate) fn no_promoted_mir(
     error: impl std::fmt::Debug,
 ) -> CodegenError {
     // alloc: the error's message
-    CodegenError::Refused(blaze_query::db::attach(db, || {
+    CodegenError::Refused(blaze_memo::attach(db, || {
         format!("{} has no MIR: {error:?}", ConstOf::Promoted(promoted).describe(db))
     }))
 }
@@ -10496,7 +10499,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     _ => unreachable!(),
                 };
                 let parent_args = GenericArgs::new_from_slice(parent_args);
-                let body = self.body_types(InstanceDef::Closure(id.as_id()), parent_args)?;
+                let body = self.body_types(InstanceDef::Closure(id.gid()), parent_args)?;
                 if body.params.len() != values.len() + 1 {
                     unsupported!("closure called with a tuple of arguments");
                 }
@@ -10511,7 +10514,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     (addr, ty)
                 };
                 values.insert(0, self_arg);
-                let def = InstanceDef::Closure(id.as_id());
+                let def = InstanceDef::Closure(id.gid());
                 let call = |this: &mut Self| {
                     this.emit_call(Callee::Instance(def, parent_args), &values, dst, dst_ty)
                 };
@@ -11034,13 +11037,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             return self.reified(ty, true);
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let body = self.body_types(InstanceDef::Closure(id.0.gid()), parent_args)?;
         let sig = self.body_signature(body)?;
         let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
         };
         let receiver_ty = receiver.as_ref();
-        let closure = InstanceDef::Closure(id.0.as_id());
+        let closure = InstanceDef::Closure(id.0.gid());
         if receiver_ty.as_reference().is_none() {
             // The body takes the closure by value. Only when that means "through a pointer to
             // memory the body owns" is it what the `call_once` slot is called with.
@@ -11329,14 +11332,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("fn pointer to {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let body = self.body_types(InstanceDef::Closure(id.0.gid()), parent_args)?;
         let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
         };
         if receiver.as_ref().as_reference().is_none() {
             // Taken by value, a closure without captures is not passed at all.
             let sig = self.body_signature(body)?;
-            return self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig);
+            return self.cg.callee(InstanceDef::Closure(id.0.gid()), parent_args, self.env, &sig);
         }
         let abi = self.closure_pointer_abi(body)?;
         let sig = self.signature(&abi.args, abi.ret);
@@ -11358,7 +11361,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("fn pointer shim for {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let body = self.body_types(InstanceDef::Closure(id.0.gid()), parent_args)?;
         let sig = self.body_signature(body)?;
         let abi = self.closure_pointer_abi(body)?;
         let shim = self.signature(&abi.args, abi.ret);
@@ -11411,7 +11414,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             values
         };
         let callee =
-            self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, &sig)?;
+            self.cg.callee(InstanceDef::Closure(id.0.gid()), parent_args, self.env, &sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         let results = self.invoke(callee, &values);
         self.builder.ins().return_(&results);
@@ -11589,7 +11592,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             unsupported!("call_once shim for {ty:?}");
         };
         let parent_args = GenericArgs::new_from_slice(generic_args.as_closure().parent_args());
-        let body = self.body_types(InstanceDef::Closure(id.0.as_id()), parent_args)?;
+        let body = self.body_types(InstanceDef::Closure(id.0.gid()), parent_args)?;
         let sig = self.body_signature(body)?;
         let Some(receiver) = body.params.first() else {
             unsupported!("closure without a receiver");
@@ -11617,7 +11620,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let sig = callee_sig.as_ref().unwrap_or(&self.builder.func.signature);
         let callee =
-            self.cg.callee(InstanceDef::Closure(id.0.as_id()), parent_args, self.env, sig)?;
+            self.cg.callee(InstanceDef::Closure(id.0.gid()), parent_args, self.env, sig)?;
         let callee = self.cg.declare_func_in_func(callee, self.builder.func);
         if by_value {
             // The body owns the closure and takes it in registers.

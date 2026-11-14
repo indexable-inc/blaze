@@ -171,7 +171,7 @@ fn named_calls(body: &MirBody<'_>) -> usize {
 fn bodies(name: &str, check: impl FnOnce(&Db, FunctionId, &MirBody<'_>, &MirBody<'_>)) {
     let db = db_with(CALLS);
     let func = fn_named(&db, crate_named(&db, "kernel"), name);
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let before = db
             .optimized_mir_body(func.into(), MirOptions::at(MirOptLevel::Debug))
             .unwrap_or_else(|error| panic!("`{name}` at Debug: {error:?}"));
@@ -248,7 +248,7 @@ fn a_repeated_call_of_a_pure_function_takes_the_firsts_result() {
 fn returns(db: &Db, name: &str, level: MirOptLevel) -> bool {
     let krate = crate_named(db, "kernel");
     let func = fn_named(db, krate, name);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let env = ParamEnvAndCrate { param_env: db.trait_environment(func.into()), krate }.store();
         let args = GenericArgs::new_from_slice(&[]).store();
         let body = match level {
@@ -363,7 +363,7 @@ fn adt_named(db: &Db, krate: Crate, name: &str) -> AdtId {
 fn program_lifetime_is_accepted_of_plain_and_static_shapes() {
     let db = db_with(TYPES);
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["Node", "Token", "HoldsPlain", "Opaque"] {
             let adt = adt_named(&db, krate, name);
             let refused = program_lifetime::shape(&db, adt);
@@ -384,7 +384,7 @@ fn program_lifetime_is_accepted_of_plain_and_static_shapes() {
 fn program_lifetime_is_refused_naming_the_reason() {
     let db = db_with(TYPES);
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for (name, why, path, says) in [
             ("Generic", Why::Generic, "", "has a generic parameter"),
             ("Dropped", Why::Drops, "", "has a `Drop` impl"),
@@ -452,7 +452,7 @@ pub fn written<'a>(
 fn a_late_bound_lifetime_in_a_parameters_projection_is_scanned() {
     let db = db_with(LATE_BOUND);
     let krate = crate_named(&db, "kernel");
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for name in ["summary", "written"] {
             let func = fn_named(&db, krate, name);
             if let crate::FnPurity::Impure(refusal) = crate::fn_purity_generic(&db, func) {

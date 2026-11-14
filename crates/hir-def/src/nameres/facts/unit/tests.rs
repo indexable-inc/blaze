@@ -4,10 +4,9 @@ use hir_expand::name::Name;
 use super::{ReadCheck, Unit, UnitState};
 use crate::{
     nameres::{
-        ScopeSlot,
         facts::{
             graph::{ImportGraph, components},
-            queries::{self, FactKey, RoundKey, RoundKind, SccKey},
+            queries::{self, FactKey, RoundKey, RoundKind, SccKey, Scope},
             tests::{Exempt, compare_db, facts_crate_local_def_map, fixture_db},
         },
     },
@@ -52,8 +51,8 @@ fn assert_one_member_unit_resolves(fixture: &str, krate: &str, names: &[&str]) {
     assert!(diff.is_empty(), "{diff}");
 
     let new = facts_crate_local_def_map(&db, krate).def_map(&db);
-    let handle = queries::fact_handle(&db, FactKey::new(&db, root, krate, r));
-    assert_eq!(new.module(&db, root).scope, ScopeSlot::Collected(handle));
+    let fact = queries::fact_slot(&db, Scope::Fact(FactKey::new(&db, root, krate, r)));
+    assert_eq!(new.module(&db, root).scope, fact);
     let scope = new.module(&db, root).scope(&db);
     for name in names {
         assert_ne!(scope.get(&Name::new_root(name)), PerNs::none(), "`{name}` in the root");

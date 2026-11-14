@@ -4,7 +4,7 @@
 
 use base_db::{Crate, Db};
 use blaze_ids::ContentId;
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 
 use super::{
     key::{self, Item},
@@ -25,7 +25,7 @@ pub const BODY_KEY_DOMAIN: &str = key::KEY_DOMAIN;
 pub struct IdKind(Kind);
 
 /// An item id a [`PortableIds`] table holds.
-pub trait PortableId: Copy + AsId + FromId {
+pub trait PortableId: Id {
     const KIND: IdKind;
 }
 
@@ -62,12 +62,12 @@ impl PortableIds {
 
     /// The index of `id`, added when it is new.
     pub fn index<T: PortableId>(&mut self, id: T) -> u32 {
-        self.0.index(T::KIND.0, u64::from(id.as_id().as_u32()))
+        self.0.index(T::KIND.0, crate::hir::persist::session_word(id.gid()))
     }
 
     /// The item at `index`, `None` when there is none or it is another type.
     pub fn get<T: PortableId>(&self, index: u32) -> Option<T> {
-        self.0.get(T::KIND.0, index).map(|bits| T::from_id(entry_id(bits)))
+        self.0.get(T::KIND.0, index).map(|bits| T::from_gid(entry_id(bits)))
     }
 
     pub fn len(&self) -> usize {

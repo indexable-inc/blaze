@@ -17,7 +17,7 @@ use crate::{
     conf::Conf,
     fix::fix,
     level::CommandLine,
-    tests::{lint, main_crate},
+    tests::{lint, main_crate_key},
 };
 
 /// core as the pinned nightly has it for the fixes, and a blaze-cast of the functions used.
@@ -206,7 +206,7 @@ fn fixed(main: &str) -> (String, String) {
     let fx = fixture::db(&fixture_of(main));
     let file = *fx.files().last().expect("src/lib.rs");
     let mut db = fx.into_db();
-    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let key = main_crate_key(&db);
     let file = file.file_id(&db);
     let mut names: HashMap<FileId, String, Global> = HashMap::new_in(Global);
     names.insert(file, "src/lib.rs".to_owned());
@@ -217,11 +217,12 @@ fn fixed(main: &str) -> (String, String) {
         conf: Conf::default(),
     };
     let fixing = setup("-A clippy::all --warn=blaze::as_cast");
-    let made = fix(&mut db, krate, &fixing, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let made = fix(&mut db, key, &fixing, &name_of).unwrap_or_else(|error| panic!("{error}"));
     assert!(made.applied > 0, "the fix made a suggestion");
     let after = db.file_text(file).text(&db).to_string();
     let listing = setup("-A clippy::all --warn=blaze::as_cast --warn=blaze::truncating_cast");
-    let left = blaze_query::db::attach(&db, || {
+    let left = blaze_memo::attach(&db, || {
+        let krate = hir::Crate::from(db.krate(key));
         let found = check(&db, krate, &listing, &name_of).expect("the file is named");
         found.iter().map(|it| format!("{}\n", it.diagnostic.message)).collect::<String>()
     });

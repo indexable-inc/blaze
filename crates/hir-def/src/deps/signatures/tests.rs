@@ -7,7 +7,7 @@ use std::alloc::Global;
 
 use super::*;
 use crate::{
-    deps::{DepImages, ImageRef, ImageStore, Which, keys, serve, store, write_image},
+    deps::{ImageRef, ImageStore, Which, keys, store, tests::serve, write_image},
     test_db::{TestDB, TestDBExt},
 };
 
@@ -175,10 +175,14 @@ fn stored(fixture: &str) -> Memory {
 
 /// A fresh database of `fixture` reading every dependency from `memory`, in `mode`.
 fn served_db(fixture: &str, memory: &Memory, mode: Mode) -> TestDB {
-    let mut db = fixture::db(fixture).into_db();
+    serving(fixture::db(fixture).into_db(), memory, mode)
+}
+
+/// `db`, fresh, reading every dependency from `memory`, in `mode`.
+fn serving(mut db: TestDB, memory: &Memory, mode: Mode) -> TestDB {
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, memory, mode).unwrap();
-    assert!(served.hits.contains(&crate_named(&db, "lib")));
+    assert!(served.hits.contains(&crate_named(&db, "lib").key(&db)));
     db
 }
 
@@ -189,15 +193,17 @@ fn turn() -> LockGuard<'static, ()> {
 }
 
 /// Asserts that `item`'s signature as `db` reads it from its image is the one `db` lowers from
-/// syntax: the same record and, with `values`, the same value, read by the `served_*` function
-/// itself. A block is a tracked struct of the query that makes it, another id in each, so a
-/// signature with one compares by its record, read through its query.
+/// syntax: the same record and, with `values`, the same value, read by the `served` query (the
+/// `served_*` function run inside it, which keeps the value in the query's arena: called bare,
+/// outside any run, nothing would own it). A block is a tracked struct of the query that makes
+/// it, another id in each, so a signature with one compares by its record, read through its
+/// query.
 fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
     let what = item.what();
     macro_rules! same {
-        ($code:ident, $sig:ident, $served:ident, $id:expr) => {{
+        ($code:ident, $sig:ident, $id:expr) => {{
             let direct =
-                values.then(|| $served(db, $id).expect("an item of a crate with an image"));
+                values.then(|| $sig::served(db, $id).expect("an item of a crate with an image"));
             let served: &$sig = match &direct {
                 Some(it) => it,
                 None => $sig::of(db, $id),
@@ -215,16 +221,16 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
         }};
     }
     match item {
-        Item::Struct(id) => same!(Struct, StructSignature, served_struct, id),
-        Item::Union(id) => same!(Union, UnionSignature, served_union, id),
-        Item::Enum(id) => same!(Enum, EnumSignature, served_enum, id),
-        Item::Const(id) => same!(Const, ConstSignature, served_const, id),
-        Item::Static(id) => same!(Static, StaticSignature, served_static, id),
-        Item::Impl(id) => same!(Impl, ImplSignature, served_impl, id),
-        Item::Trait(id) => same!(Trait, TraitSignature, served_trait, id),
-        Item::Function(id) => same!(Function, FunctionSignature, served_function, id),
-        Item::TypeAlias(id) => same!(TypeAlias, TypeAliasSignature, served_type_alias, id),
-        Item::Fields(id) => same!(Fields, VariantFields, served_variant_fields, id),
+        Item::Struct(id) => same!(Struct, StructSignature, id),
+        Item::Union(id) => same!(Union, UnionSignature, id),
+        Item::Enum(id) => same!(Enum, EnumSignature, id),
+        Item::Const(id) => same!(Const, ConstSignature, id),
+        Item::Static(id) => same!(Static, StaticSignature, id),
+        Item::Impl(id) => same!(Impl, ImplSignature, id),
+        Item::Trait(id) => same!(Trait, TraitSignature, id),
+        Item::Function(id) => same!(Function, FunctionSignature, id),
+        Item::TypeAlias(id) => same!(TypeAlias, TypeAliasSignature, id),
+        Item::Fields(id) => same!(Fields, VariantFields, id),
         Item::Variants(id) => {
             // Outside the query, which runs in a frame of its `mem_tag`, the lowering needs one.
             let in_frame = |f: &dyn Fn() -> (EnumVariants, ThinVec<InactiveEnumVariantCode>)| {
@@ -336,20 +342,24 @@ fn declared(db: &TestDB, krate: Crate) -> Vec<Item> {
     found
 }
 
-/// Reads `item`'s signature from its image, through the `served_*` function.
+/// Reads `item`'s signature from its image, through its `served` query (which runs the
+/// `served_*` function and owns what it keeps); the variants, kept by no one, through
+/// `served_enum_variants` in a frame of the query's tag.
 fn serve_one(db: &TestDB, item: Item) -> bool {
     match item {
-        Item::Struct(id) => served_struct(db, id).is_some(),
-        Item::Union(id) => served_union(db, id).is_some(),
-        Item::Enum(id) => served_enum(db, id).is_some(),
-        Item::Const(id) => served_const(db, id).is_some(),
-        Item::Static(id) => served_static(db, id).is_some(),
-        Item::Impl(id) => served_impl(db, id).is_some(),
-        Item::Trait(id) => served_trait(db, id).is_some(),
-        Item::Function(id) => served_function(db, id).is_some(),
-        Item::TypeAlias(id) => served_type_alias(db, id).is_some(),
-        Item::Fields(id) => served_variant_fields(db, id).is_some(),
-        Item::Variants(id) => served_enum_variants(db, id).is_some(),
+        Item::Struct(id) => StructSignature::served(db, id).is_some(),
+        Item::Union(id) => UnionSignature::served(db, id).is_some(),
+        Item::Enum(id) => EnumSignature::served(db, id).is_some(),
+        Item::Const(id) => ConstSignature::served(db, id).is_some(),
+        Item::Static(id) => StaticSignature::served(db, id).is_some(),
+        Item::Impl(id) => ImplSignature::served(db, id).is_some(),
+        Item::Trait(id) => TraitSignature::served(db, id).is_some(),
+        Item::Function(id) => FunctionSignature::served(db, id).is_some(),
+        Item::TypeAlias(id) => TypeAliasSignature::served(db, id).is_some(),
+        Item::Fields(id) => VariantFields::served(db, id).is_some(),
+        Item::Variants(id) => blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| {
+            served_enum_variants(db, id).is_some()
+        }),
     }
 }
 
@@ -380,25 +390,49 @@ fn serving_a_signature_parses_nothing() {
     assert_eq!(parsed, Vec::<&String>::new(), "{executed:?}");
 }
 
-/// What a witnessed run of `read` read below `Durability::HIGH`, each read with its cause
-/// (`Witness::cause_text`), and whether the witness could name every read.
-fn below_high(db: &TestDB, read: impl FnOnce()) -> (Vec<String>, bool) {
-    let mut reads = Vec::new(); // alloc: a test's keys
-    let ((), witness) = blaze_query::db::witnessed(db, &mut reads, read);
-    let named = reads.iter().map(|&key| blaze_query::db::Witness::cause_text(db, key)).collect();
-    (named, witness.complete)
+/// The rows of the read list of `read` (`blaze_memo::record`) that are a source file's read:
+/// a file of the VFS's text ([`base_db::VfsText`]) or bytes ([`base_db::RawFile`]), or a file
+/// outside the VFS (`include!`'s, [`base_db::FileText::Included`], listed with its own kind
+/// [`base_db::INCLUDED_READ`]), each as its `Debug` text. A test database marks no fact
+/// boundary, so every query `read` asks, hit or run, has its own list flattened into this one.
+fn file_rows(db: &TestDB, read: impl FnOnce()) -> Vec<String, Global> {
+    let source = [
+        blaze_memo::KindId::of(base_db::VfsText::INPUT_KIND),
+        blaze_memo::KindId::of(base_db::RawFile::INPUT_KIND),
+        base_db::INCLUDED_READ,
+    ];
+    let recorded = blaze_memo::record(blaze_memo::Database::memo(db), read);
+    let ((), reads) = recorded.unwrap_or_else(|off| panic!("a served signature's reads: {off}"));
+    let mut rows = Vec::new_in(Global);
+    rows.extend(reads.iter().filter_map(|row| match row {
+        blaze_memo::Read::Input { kind, .. } if source.contains(kind) => Some(format!("{row:?}")),
+        _ => None,
+    }));
+    rows
+}
+
+/// The planted bug: `TraitSignature::of` served from the image, and the trait's file read
+/// beside it, as a served accessor that also read its source would.
+fn served_and_reading_the_file(db: &TestDB, trait_id: TraitId) {
+    use crate::Lookup as _;
+    _ = TraitSignature::of(db, trait_id);
+    let file = trait_id.lookup(db).id.file_id.file_id().expect("`lib`'s trait is in a file");
+    _ = db.file_text(file.file_id(db)).text(db);
 }
 
 /// The invariant: a sealed crate's trait signature, served from its image (`served_trait`,
-/// through `TraitSignature::served`), reads nothing below `Durability::HIGH`, in a crate with a
-/// `#[path]` module and an `include!`d file: so a sealed crate's summary that reads it is shared
-/// (`hir_ty_pure`'s sealed table), not a row. The control: the signature of the workspace
-/// crate's `main`, whose file is at `LOW`, is a read below `HIGH` the witness names.
+/// through `TraitSignature::served`), lists no source file's input in its read list, in a crate
+/// with a `#[path]` module and an `include!`d file: so an edit of a file never reaches a reader
+/// of the served signature, and a sealed crate's summary that reads it is shared
+/// (`hir_ty_pure`'s sealed table), not a row. The controls: a planted served accessor that also
+/// reads the trait's file lists that file, and the signature of the workspace crate's `main`,
+/// lowered from its file, lists the file.
 #[test]
-fn a_sealed_trait_s_served_signature_reads_nothing_below_high() {
+fn a_sealed_trait_s_served_signature_reads_no_source_file() {
     let _turn = turn();
     let memory = stored(FIXTURE);
-    let db = served_db(FIXTURE, &memory, Mode::Serve);
+    // A database that keeps read lists, so `file_rows` can record them.
+    let db = serving(fixture::db_with_reads(FIXTURE).into_db(), &memory, Mode::Serve);
     let lib = crate_named(&db, "lib");
     let traits: Vec<TraitId> = (declared(&db, lib).into_iter())
         .filter_map(|it| match it {
@@ -407,10 +441,15 @@ fn a_sealed_trait_s_served_signature_reads_nothing_below_high() {
         })
         .collect();
     assert!(!traits.is_empty(), "the fixture declares `Shape`");
-    for trait_id in traits {
-        assert!(served_trait(&db, trait_id).is_some(), "`lib`'s trait is served from its image");
-        let (reads, complete) = below_high(&db, || _ = TraitSignature::of(&db, trait_id));
-        assert_eq!((reads, complete), (Vec::new(), true), "below `HIGH` in `{trait_id:?}`'s signature");
+    for &trait_id in &traits {
+        assert!(
+            TraitSignature::served(&db, trait_id).is_some(),
+            "`lib`'s trait is served from its image"
+        );
+        let rows = file_rows(&db, || _ = TraitSignature::of(&db, trait_id));
+        assert_eq!(rows, Vec::<String>::new(), "a source file in `{trait_id:?}`'s served signature");
+        let planted = file_rows(&db, || served_and_reading_the_file(&db, trait_id));
+        assert!(!planted.is_empty(), "the planted bug: a served accessor read its file unseen");
     }
 
     let main = (declared(&db, crate_named(&db, "main")).into_iter())
@@ -419,8 +458,8 @@ fn a_sealed_trait_s_served_signature_reads_nothing_below_high() {
             _ => None,
         })
         .expect("the fixture's `main`");
-    let (reads, _) = below_high(&db, || _ = FunctionSignature::of(&db, main));
-    assert!(!reads.is_empty(), "the control: a workspace signature reads its `LOW` file");
+    let rows = file_rows(&db, || _ = FunctionSignature::of(&db, main));
+    assert!(!rows.is_empty(), "the control: a workspace signature lists its file");
 }
 
 #[test]
@@ -429,8 +468,7 @@ fn finding_a_record_allocates_nothing() {
     let memory = stored(FIXTURE);
     let db = served_db(FIXTURE, &memory, Mode::Serve);
     let krate = crate_named(&db, "lib");
-    let images = DepImages::try_get(&db).unwrap().images(&db);
-    let part = images[&krate].view().part(Part::Signatures);
+    let part = crate::deps::image_of(&db, krate).unwrap().view().part(Part::Signatures);
     let items = declared(&db, krate);
     // The keys' module indexes, made once per crate from its def map.
     find(&db, part, items[0]).unwrap();
@@ -465,7 +503,7 @@ where
     S::Of: PartialEq + std::fmt::Debug,
 {
     let record = record::<S>(db, krate, item.what(), of).unwrap();
-    let bytes = std::sync::Arc::new(Aligned::copy_from(&record));
+    let bytes = std::sync::Arc::new(Aligned::copy_from(record.as_bytes()));
     let held: crate::deps::ImageBuf = bytes.clone();
     let value = read::<S>(db, krate, item.what(), &held, &bytes).unwrap();
     assert_eq!(S::of(&value), of, "{item:?}");
@@ -565,7 +603,7 @@ fn a_store_s_macro_calls_read_back_as_this_database_s() {
     let db = served_db(CALLS, &memory, Mode::Serve);
     let krate = crate_named(&db, "lib");
     let f = function_f(&db);
-    let served = served_function(&db, f).expect("an item of a crate with an image");
+    let served = FunctionSignature::served(&db, f).expect("an item of a crate with an image");
     let lowered = &FunctionSignature::with_source_map(&db, f).0;
     assert!(!lowered.store.macro_calls().is_empty(), "the fixture's calls are in the store");
     assert_eq!(served.store.macro_calls(), lowered.store.macro_calls());
@@ -600,14 +638,16 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     let key = keys(&db, &[lib], BUILD)[&lib];
     let image = memory.images.lock()[&key].clone();
     let image = ImageRef::open(&image, key).unwrap();
-    let bytes = write_image(key, [image.part(Part::LangItems), part]);
+    // A test's part, made by hand: bytes the image takes as they are.
+    let lang = Portable::written(image.part(Part::LangItems).to_vec_in(Global));
+    let bytes = write_image(key, [&lang, &Portable::written(part.to_vec_in(Global))]);
     memory.images.lock().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 
 /// The signatures part of `lib` in a fresh database of `fixture`, the record filed under the
 /// key of its `f` the record of its `g`: what an encoding that wrote one item's signature for
 /// another would store, made from the database's own source text.
-fn part_with_g_as_f(fixture: &str) -> Vec<u8> {
+fn part_with_g_as_f(fixture: &str) -> Portable {
     let db = fixture::db(fixture).into_db();
     let krate = crate_named(&db, "lib");
     let (f, g) = (function_named(&db, "f"), function_named(&db, "g"));
@@ -629,12 +669,12 @@ fn checking_finds_a_difference_and_serves_the_image() {
     let fixture = FIXTURE
         .replace("pub fn f() -> u8 { 0 }", "pub fn f() -> u16 { 0 }\npub fn g() -> u8 { 0 }");
     let memory = stored(&fixture);
-    with_signatures(&fixture, &memory, &part_with_g_as_f(&fixture));
+    with_signatures(&fixture, &memory, part_with_g_as_f(&fixture).as_bytes());
     _ = frozen::differences();
     for mode in [Mode::Serve, Mode::Check] {
         let db = served_db(&fixture, &memory, mode);
         let f = function_f(&db);
-        let served = served_function(&db, f).unwrap();
+        let served = FunctionSignature::served(&db, f).unwrap();
         let lowered = &FunctionSignature::with_source_map(&db, f).0;
         assert_ne!(
             *served, **lowered,
@@ -679,7 +719,7 @@ fn a_record_of_another_query_is_refused() {
     let f = function_f(&db);
     let what = Item::Function(f).what();
     let written = record::<codes::Function>(&db, krate, what, FunctionSignature::of(&db, f));
-    let bytes = std::sync::Arc::new(Aligned::copy_from(&written.unwrap()));
+    let bytes = std::sync::Arc::new(Aligned::copy_from(written.unwrap().as_bytes()));
     let image: crate::deps::ImageBuf = bytes.clone();
     assert!(read::<codes::Function>(&db, krate, what, &image, &bytes).is_ok());
     let a_struct = items(&db, krate).into_iter().find(|it| matches!(it, Item::Struct(_)));

@@ -332,7 +332,9 @@ impl Crate {
     }
 
     pub fn transitive_reverse_dependencies(self, db: &Db) -> impl Iterator<Item = Crate> {
-        self.id.transitive_rev_deps(db).iter().map(|&id| Crate { id })
+        let mut dependents = Vec::new_in(Global);
+        self.id.transitive_rev_deps(db, &mut dependents);
+        dependents.into_iter().map(|id| Crate { id })
     }
 
     pub fn notable_traits_in_deps(self, db: &Db) -> impl Iterator<Item = &TraitId> {
@@ -4774,10 +4776,10 @@ impl<'db> PartialEq for Type<'db> {
         if self.ty != other.ty {
             return false;
         }
-        blaze_query::db::with_attached_db(|db: Option<&Db>| {
+        blaze_memo::with_attached_db(|db: Option<&Db>| {
             let db = db.expect(
                 "two `hir::Type`s of one type and different owners are compared through the database \
-                 `blaze_query::db::attach` lends, and none is attached",
+                 `blaze_memo::attach` lends, and none is attached",
             );
             self.owner.can_rebase_into(db, other.owner, self.ty)
                 || other.owner.can_rebase_into(db, self.owner, other.ty)

@@ -14,15 +14,15 @@
 //! region constraint, variable or universe was added. Such an answer replayed has the effect
 //! the evaluation had. The query reads of the evaluation are kept with it and replayed on a
 //! hit, as `tls_cache`'s shared cache does, so the asking query depends on what the answer
-//! read; an evaluation whose reads `blaze_query::db::capture_reads` could not capture (a cycle
-//! head, an untracked read) is not kept.
+//! read; an evaluation recorded with no read list (`interner::recorded` gives none when the
+//! snapshot keeps no read lists) is not kept.
 
 pub(crate) mod shape;
 mod table;
 #[cfg(test)]
 mod tests;
 
-use std::num::NonZeroU32;
+use std::{alloc::Global, num::NonZeroU32};
 
 use rustc_next_trait_solver::solve::{
     GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt,
@@ -34,14 +34,65 @@ use rustc_type_ir::{
 
 use super::{
     Clauses, DbInterner, Goal, ParamEnv, Predicate, SolverContext, SolverDefIds, TypingMode,
-    goal_store, infer::InferCtxt,
+    goal_store,
+    infer::InferCtxt,
+    interner::{Reads, recorded, replay},
 };
 use crate::Span;
 
-/// The table of one (crate, regions flag, revision): each global goal's answer and its reads.
-pub(crate) type Goals = table::Table<(Answer, blaze_query::db::Reads)>;
+/// The table of one (crate, regions flag, snapshot): each global goal's answer and its reads.
+///
+/// The table's values are `Copy`, and a read list ([`Reads`]) is reference counted, so a slot
+/// holds the address of a list boxed in `kept`, which owns every list the table names and is
+/// dropped with it: a hit copies the address and replays the list in place, with no count
+/// written. Cost against the old 64-byte slot of a `Copy` list handle: the same slot (an
+/// answer and an address, 16 bytes, in a 64-byte line), plus on each insert (a miss) one box
+/// of 8 bytes and a push under `kept`'s lock; nothing on a hit.
+pub(crate) struct Goals {
+    table: table::Table<(Answer, KeptReads)>,
+    kept: blaze_core::lock::Lock<Vec<Box<Reads, Global>, Global>>,
+}
 
-const _: () = assert!(table::slot_size::<(Answer, blaze_query::db::Reads)>() == 64);
+const _: () = assert!(table::slot_size::<(Answer, KeptReads)>() == 64);
+
+/// A read list that [`Goals::kept`] holds, by its address.
+#[derive(Clone, Copy)]
+struct KeptReads(*const Reads);
+
+// SAFETY: the list it points to is `Send + Sync` (an `Arc` of facts) and lives in its table's
+// `kept` until the table is dropped, which outlives every copy read out of the table (a copy is
+// used only inside the `with_global_goals` closure that borrowed the table).
+unsafe impl Send for KeptReads {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for KeptReads {}
+
+impl Default for Goals {
+    fn default() -> Goals {
+        Goals {
+            table: table::Table::default(),
+            kept: blaze_core::lock::Lock::new("ty.global_goals.kept", Vec::new_in(Global)),
+        }
+    }
+}
+
+impl Goals {
+    /// The answer of `key`, its read list replayed into the current run.
+    #[inline]
+    fn get(&self, db: &base_db::Db, key: GoalKey) -> Option<Answer> {
+        let (answer, reads) = self.table.get(key)?;
+        // SAFETY: `reads` points into a box `kept` holds while `self` lives (`KeptReads`).
+        replay(db, unsafe { &*reads.0 });
+        Some(answer)
+    }
+
+    /// Keeps `answer` and `reads` for `key` unless the table has the key or is full.
+    fn insert(&self, key: GoalKey, answer: Answer, reads: &Reads) {
+        let boxed = Box::new_in(reads.clone(), Global);
+        let at = KeptReads(std::ptr::from_ref::<Reads>(&boxed));
+        self.kept.lock().push(boxed);
+        self.table.insert(key, (answer, at));
+    }
+}
 
 /// A goal with these flags reads the inference context, or is not one goal for every body.
 const NOT_GLOBAL: TypeFlags = TypeFlags::HAS_INFER
@@ -220,13 +271,15 @@ pub(crate) fn holds_at_registration<'db>(
     }
     let Some((key, _)) = root_key(infcx, goal) else { return false };
     let interner = infcx.interner;
-    match interner.with_global_goals(|table| table.get(key)) {
+    // Only a goal that holds is dropped, so only its reads are replayed.
+    interner.with_global_goals(|table| match table.table.get(key) {
         Some((Answer::Holds, reads)) => {
-            blaze_query::db::replay_reads(interner.db, reads);
+            // SAFETY: `reads` points into a box `kept` holds while `table` lives (`KeptReads`).
+            replay(interner.db, unsafe { &*reads.0 });
             true
         }
         Some((Answer::Fails, _)) | None => false,
-    }
+    })
 }
 
 /// [`SolverDelegateEvalExt::evaluate_root_goal`], answered from the table, then the store, when the
@@ -246,27 +299,25 @@ pub(crate) fn evaluate_root_goal<'db>(
         return delegate.evaluate_root_goal(goal, span, stalled_on);
     };
     let interner = infcx.interner;
-    if let Some((answer, reads)) = interner.with_global_goals(|table| table.get(key)) {
-        blaze_query::db::replay_reads(interner.db, reads);
+    if let Some(answer) = interner.with_global_goals(|table| table.get(interner.db, key)) {
         return answer.evaluation(resolved);
     }
     if let Some(found) = goal_store::lookup(interner, key) {
-        if let Some(reads) = found.reads {
-            interner.with_global_goals(|table| table.insert(key, (found.answer, reads)));
+        if let Some(reads) = &found.reads {
+            interner.with_global_goals(|table| table.insert(key, found.answer, reads));
         }
         return found.answer.evaluation(resolved);
     }
     let Some(before) = Mark::of(infcx) else {
         return delegate.evaluate_root_goal(goal, span, None);
     };
-    let (result, reads) = blaze_query::db::capture_reads(interner.db, || {
-        delegate.evaluate_root_goal(goal, span, None)
-    });
+    let (result, reads) =
+        recorded(interner.db, || delegate.evaluate_root_goal(goal, span, None));
     if let Some(reads) = reads
         && let Some(answer) = Answer::of(resolved, &result)
         && Mark::of(infcx) == Some(before)
     {
-        interner.with_global_goals(|table| table.insert(key, (answer, reads)));
+        interner.with_global_goals(|table| table.insert(key, answer, &reads));
         goal_store::offer(interner, key, answer, reads);
     }
     result

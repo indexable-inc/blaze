@@ -10,20 +10,18 @@
 
 use std::{ops::Range, sync::Arc};
 
-use base_db::{Crate, Db, Env};
+use base_db::{Crate, CrateKey, Db, Env, Nonce};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
-use hir_expand::{
-    InFile, MacroCallId, MacroCallKind, MacroDefKind, builtin::include_input_to_file_id,
-};
+use hir_expand::{InFile, MacroCallId};
 use std::alloc::Global;
 use syntax::ast::HasName;
 
 use crate::{
     Lookup,
     deps::{
-        DepImages, Image, filed,
-        image::{ImageBuf, ImageRef, Part, PartBytes, write_image},
+        Image, filed,
+        image::{ImageBuf, ImageRef, Part, PartBytes, Portable, write_image},
         key::{Base, keys},
         reads::Reads,
         signatures,
@@ -32,7 +30,7 @@ use crate::{
         crate_def_map,
         diagnostics::DefDiagnosticKind,
         frozen::{
-            self, Frozen, FrozenDefMaps, FrozenLangItems, Mode,
+            self, Frozen, Mode,
             pages::{self, PageSource, Paged},
         },
     },
@@ -174,25 +172,39 @@ impl ImageStore for ReadThrough<'_> {
 }
 
 /// What [`serve`] did.
-#[derive(Debug, Default)]
+///
+/// The invariant: nothing in it is tied to a snapshot. Every crate in it is named by its
+/// [`CrateKey`], which the world gives once and never reuses in a session, never by a
+/// [`Crate`] id (an id dies at a commit that drops its arena, and a serve ends in one), so it
+/// is valid across any number of commits: a driver keeps it across its serves' and builds'
+/// commits and passes it to [`store`] later. `nonce` says which database it is of.
+///
+/// What makes it stale: a crate whose key no longer names a crate of the database's world
+/// (the crate was removed by a later write), or a database other than `nonce`'s. [`store`]
+/// is then the typed error [`StoreError::Gone`] naming the key, or
+/// [`StoreError::OtherDatabase`]: never a panic, never the crate skipped. Its fields are
+/// data; reading them asks nothing of a database.
+#[derive(Debug)]
 pub struct Served {
+    /// The database the serve read ([`Db::nonce`]): the one whose world its keys name.
+    pub nonce: Nonce,
     /// The key of each crate read from an image or that can be: the [`eligible`] crates of
     /// those asked, and their dependencies.
     ///
     /// [`eligible`]: super::eligible
-    pub keys: HashMap<Crate, ContentId, Global>,
+    pub keys: HashMap<CrateKey, ContentId, Global>,
     /// The crates read from an image, in the order of their keys.
-    pub hits: Vec<Crate>,
+    pub hits: Vec<CrateKey>,
     /// The crates with reads kept under their key but no image for the values those reads
     /// have now: something they read changed, so they are resolved and imaged again.
-    pub stale: Vec<Crate>,
+    pub stale: Vec<CrateKey>,
     /// The blaze the keys were made by: [`store`] makes each key again with it, to check the
     /// database did not move a crate's key between the serve and the store.
     pub build: ContentId,
     /// The crates whose image under their key is of the layout keys of domain 7 filed, its
     /// def map a part of it (`ImageRef::is_layout_7`): each the named miss `records of
     /// <crate>, def map, layout 7: made again from source`, resolved and imaged again.
-    pub old_layout: Vec<Crate>,
+    pub old_layout: Vec<CrateKey>,
     /// What this serve's searches of the crates' read-filing slots came to, as `blaze_record`
     /// counted them (`filed::search`): one lookup a crate fetched that has no image under
     /// its key alone, a hit where a slot's reads have now the values an image is filed by,
@@ -203,12 +215,15 @@ pub struct Served {
     /// front end makes before it is let go, after its build's end made the [`Which::Sealed`]
     /// one) writes none of them again, each written under the key this serve gave it.
     pub stored: StoredOf,
+    /// The crates that held an image in this snapshot and found none under their key now:
+    /// the driver gives them none in the next ([`serve`]).
+    pub withdrawn: Vec<CrateKey, Global>,
 }
 
 /// The crates the stores of one [`Served`] wrote, behind a lock: [`store`] has the serve by
-/// `&`, as a front end kept for later holds it.
+/// `&`, as a front end kept for later holds it. By [`CrateKey`], as [`Served`] is.
 #[derive(Debug)]
-pub struct StoredOf(blaze_core::lock::Lock<HashSet<Crate, Global>>);
+pub struct StoredOf(pub(super) blaze_core::lock::Lock<HashSet<CrateKey, Global>>);
 
 impl Default for StoredOf {
     fn default() -> StoredOf {
@@ -233,7 +248,7 @@ pub enum Refused {
     /// A module, an `include!`, `include_str!` or `include_bytes!` of it reads a file outside
     /// the crate's source root (a `#[path]` or a path into another package, a file no source
     /// root has): the key, made before the crate is resolved, covers only the source root's
-    /// files ([`refusal`], [`include_refusal`]). A build script's `OUT_DIR` files are in it.
+    /// files ([`refusal`], `super::late::walk`). A build script's `OUT_DIR` files are in it.
     /// `what` names the module or the macro, where it is, and the file.
     OutsideSourceRoot { what: String },
     /// A `mod foo;` of it names a file that is not there (rustc's E0583): the key covers the
@@ -251,6 +266,15 @@ pub enum Refused {
     Reads { why: &'static str },
     /// An encoding refused a part of it.
     Encode { part: Part, why: String },
+    /// Its image depends on an input that a `Surface` record's key (its unit's own text) does
+    /// not cover and that no fact of a surface's shape can ask ([`image_parts`]): what a
+    /// procedural macro's expansion traced reading, or a file outside the VFS. `what` names
+    /// the call or the file and the crate.
+    Unasked { what: String },
+    /// One late read (an `env!`'s variable, an `include!`'s file) seen with two values in one
+    /// walk of the crate's calls (`super::late::walk`): an input moved while the crate was
+    /// resolved. `what` names the crate, the read and both values.
+    LateTwice { what: String },
 }
 
 impl Refused {
@@ -265,6 +289,8 @@ impl Refused {
             Refused::MachinePath { .. } => "machine path",
             Refused::Reads { .. } => "reads",
             Refused::Encode { .. } => "encode",
+            Refused::Unasked { .. } => "unasked",
+            Refused::LateTwice { .. } => "late read twice",
         }
     }
 }
@@ -298,6 +324,16 @@ impl std::fmt::Display for Refused {
             }
             Refused::Reads { why } => write!(f, "its reads can't be kept: {why}"),
             Refused::Encode { part, why } => write!(f, "its {} do not encode: {why}", part.name()),
+            Refused::Unasked { what } => write!(
+                f,
+                "{what}: an input of its image that a surface's key (its unit's own text) does \
+                 not cover and no fact of its shape can ask (rule keys-cover-every-input)"
+            ),
+            Refused::LateTwice { what } => write!(
+                f,
+                "{what}: one late read with two values while the crate was resolved, an input \
+                 that moved (rule keys-cover-every-input)"
+            ),
         }
     }
 }
@@ -316,44 +352,90 @@ pub enum Which {
     All,
 }
 
-/// The crates the serves of one database asked of the store, its write-side state
-/// ([`Db::with_state`]). A crate asked before that the maintainers hold state for now is not
-/// fetched again ([`serve`]): an edit took its image away and it is maintained by deltas from
-/// then on, where serving it again would drop that state and pay a cold run at the next edit.
-/// The first serve after a lowering asks every crate for the first time, so the crates the
-/// lowering's pass resolved are served then.
-#[derive(Default)]
-struct Asked(HashSet<Crate, Global>);
-
 /// The most crates of each kind a [`serve`]'s event names.
 const NAMED: usize = 12;
 
 /// What [`store`] did.
+///
+/// The invariant: as [`Served`], nothing in it is tied to a snapshot: each crate is named by
+/// its [`CrateKey`], so it is valid across any number of commits. What makes it stale is the
+/// same: a key that names no crate of the world any more, which a caller turning one into a
+/// [`Crate`] meets as `None` from `Db::crate_at`, to answer with its own typed error. Its
+/// fields are data; it has no method that asks a database.
 #[derive(Debug, Default)]
 pub struct Stored {
     /// The crates whose image was written.
-    pub written: Vec<Crate>,
+    pub written: Vec<CrateKey>,
     /// The crates whose image was not, and why.
-    pub refused: Vec<(Crate, Refused)>,
+    pub refused: Vec<(CrateKey, Refused)>,
     /// The key each crate of `written` has its image filed under ([`Image::key`]): what a
     /// value made from the crate as this database resolved it is filed by
     /// (`blaze_diagnostics::cache`).
-    pub filed: HashMap<Crate, ContentId, Global>,
+    pub filed: HashMap<CrateKey, ContentId, Global>,
     /// The record families ([`super::found::family`]) written of each crate of `written`:
     /// its image and its def map pages. What a found record
     /// of the crate says it has; the impl tables are another store's to add.
     pub families: u32,
 }
 
+/// Why [`store`] wrote nothing: an error of the store's caller or of the store, never of one
+/// crate's image (that is [`Refused`], in [`Stored::refused`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    /// A crate the [`Served`] names by `key` is no crate of the database's world: a write
+    /// after the serve removed it. The serve is stale for it (rule keys-cover-every-input:
+    /// its key named a crate that is gone), so nothing is written for any.
+    Gone { key: CrateKey },
+    /// The [`Served`] is of another database (`served`) than the one asked to store
+    /// (`asked`): its crates' keys name another world's crates.
+    OtherDatabase { served: Nonce, asked: Nonce },
+    /// The image store failed, or an image did not encode as a store keeps it: what and
+    /// which crate.
+    Store(String),
+}
+
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Gone { key } => write!(
+                f,
+                "crate key {} of a dependency serve names no crate of the database now: the \
+                 crate was removed after the serve, so the serve is stale for it (rule \
+                 keys-cover-every-input); serve again before storing",
+                key.index()
+            ),
+            StoreError::OtherDatabase { served, asked } => write!(
+                f,
+                "a dependency serve of database {served:?} was stored through database \
+                 {asked:?}: its crate keys name the other database's crates \
+                 (rule keys-cover-every-input)"
+            ),
+            StoreError::Store(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// The message, for a caller whose errors are text (`blaze_lower::LowerError::new`).
+impl From<StoreError> for String {
+    fn from(error: StoreError) -> String {
+        error.to_string()
+    }
+}
+
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
 /// keep for it, by `build`, the blaze reading: `mode` says what is done with each image.
 ///
-/// Adds to what earlier calls served, so a driver serves crates as their inputs become final.
-/// A crate served before under the same key and mode keeps its image as it is and is not
-/// fetched again. One whose key or mode is another is fetched again, and loses its image when
-/// none is found. The frozen def maps and lang items `db` was given for other crates are kept.
-/// A write that moves a served crate's files has already taken its image away, in that write
-/// (`withdraw_moved`): it is fetched again here like a crate never served.
+/// Reads this snapshot and writes nothing: what it found is given in the next one. Each
+/// `(crate, image)` returned is given to the crate's own arena by the driver while it builds
+/// that snapshot ([`super::give_image`], which gives the image, its lang items, its def map
+/// pages and, under `Mode::Check` and `Mode::Verify`, its def map whole); each crate of
+/// [`Served::withdrawn`] is given none there. A crate served before under the same key and mode
+/// is neither: the driver gives it the same image again. One whose key or mode is another is
+/// fetched again, and is withdrawn when none is found. A write that moves a served crate's
+/// files withdraws its image in that write ([`withdrawn`]): it is fetched again here like a
+/// crate never served.
 ///
 /// An image that does not read under the key it is filed by, or reads that do not decode, are
 /// an error naming the crate and why, never a crate resolved instead: the key covers what the
@@ -362,47 +444,25 @@ pub struct Stored {
 ///
 /// [`eligible`]: super::eligible
 pub fn serve(
-    db: &mut Db,
+    db: &Db,
     crates: &[Crate],
     build: ContentId,
     // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
     mode: Mode,
-) -> Result<Served, String> {
-    let keys = keys(&*db, crates, build);
-    // clone: the handle of the images served before, once per serve
-    let before = DepImages::try_get(&*db).map(|it| it.images(&*db).clone()).unwrap_or_default();
+) -> Result<(Served, Vec<(Crate, Image), Global>), String> {
+    let keys = keys(db, crates, build);
+    // What this snapshot gives each crate is its own slot ([`super::image_of`]): a crate kept
+    // under the same key and mode is given the same image again by the driver.
     let kept = |krate: &Crate, key: &ContentId| {
-        before.get(krate).is_some_and(|it| it.base == *key && it.mode == mode)
+        super::image_of(db, *krate).is_some_and(|it| it.base == *key && it.mode == mode)
     };
-    // The crates asked before that the maintainers hold state for: in `keys`, so [`store`]
-    // writes them, but neither fetched, nor a hit, nor stale ([`Asked`]). One that holds an
-    // image from before (`Mode::Check` resolves a crate it serves) loses it below as a crate
-    // whose key moved and no image was found for does.
-    // alloc: none until a crate asked before is maintained
-    let mut left: Vec<Crate> = Vec::new();
-    db.with_state::<Asked, _>(|db, asked| {
-        for (&krate, key) in &keys {
-            if !kept(&krate, key)
-                && asked.0.contains(&krate)
-                && crate::nameres::delta::maintained(db, krate)
-            {
-                left.push(krate);
-            }
-        }
-        // alloc: one entry a crate, once per crate ever asked
-        asked.0.extend(keys.keys().copied());
-    });
-    left.sort_unstable();
-    let is_left = |krate: &Crate| left.binary_search(krate).is_ok();
     let mut order: Vec<(Crate, ContentId)> = (keys.iter())
-        .filter(|(krate, key)| !kept(krate, key) && !is_left(krate))
+        .filter(|(krate, key)| !kept(krate, key))
         .map(|(&krate, &key)| (krate, key))
         // alloc: setup: once per serve
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
-    // alloc: none: the crates left out that held an image, `Mode::Check` alone
-    let left_held: Vec<Crate> = left.iter().copied().filter(|krate| before.contains_key(krate)).collect();
     // alloc: setup: one slot per crate, once per serve
     #[expect(
         clippy::disallowed_types,
@@ -413,136 +473,109 @@ pub fn serve(
     // What the fetches' searches of the slots come to: counted from every thread of the
     // store's, taken once they have all ended.
     let lookups = blaze_record::Tally::new();
-    {
-        let db = &*db;
-        images.for_each(order.len(), &|at| {
-            let (krate, key) = order[at];
-            _ = found[at].set(fetch(db, krate, key, images, &lookups, mode));
-        });
-    }
+    images.for_each(order.len(), &|at| {
+        let (krate, key) = order[at];
+        _ = found[at].set(fetch(db, krate, key, images, &lookups, mode));
+    });
     let lookups = lookups.take();
     let mut hits: Vec<Crate> =
         // alloc: setup: once per serve
         keys.iter().filter(|(krate, key)| kept(krate, key)).map(|(&krate, _)| krate).collect();
-    if order.is_empty() && left_held.is_empty() {
-        hits.sort_unstable_by_key(|krate| keys[krate]);
-        // alloc: none: an empty `Vec` holds no buffer
-        return Ok(Served {
-            keys,
-            hits,
-            stale: Vec::new(),
-            old_layout: Vec::new(),
-            build,
-            lookups,
-            stored: StoredOf::default(),
-        });
-    }
-    // clone: what was served before, once per serve that fetches a crate, to add to
-    let mut served = (*before).clone();
-    let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
-    let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
-    // The crates read from pages: every crate found in `Mode::Serve` and `Mode::Verify`;
-    // `Mode::Check` resolves each and compares what it resolves to with its pages.
-    let mut paged = pages::all(&*db);
-    // alloc: setup, as above
+    // alloc: none until a crate is found: the images to give in the next snapshot
+    let mut given: Vec<(Crate, Image), Global> = Vec::new_in(Global);
+    // alloc: none until a crate that held an image finds none
+    let mut withdrawn: Vec<Crate, Global> = Vec::new_in(Global);
+    // alloc: none until a crate's reads are stale
     let mut stale = Vec::new();
     // alloc: none until a crate's image is of layout 7
     let mut old_layout = Vec::new();
-    // Whether what the database was given changes: an image served, or one served before
-    // taken away. A serve that found nothing new (a cold store) writes nothing, so it costs
-    // no maintenance pass.
-    let mut changed = false;
-    for krate in &left_held {
-        changed |= served.remove(krate).is_some();
-        changed |= maps.remove(krate).is_some();
-        changed |= lang_items.remove(krate).is_some();
-        changed |= paged.remove(krate).is_some();
-    }
     for (&(krate, base), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
         });
-        changed |= served.remove(&krate).is_some();
-        changed |= maps.remove(&krate).is_some();
-        changed |= lang_items.remove(&krate).is_some();
-        changed |= paged.remove(&krate).is_some();
+        let held = super::is_served(db, krate);
+        let missed = |withdrawn: &mut Vec<Crate, Global>| {
+            if held {
+                withdrawn.push(krate);
+            }
+        };
         let Hit { bytes, parts, filed, pages: def_pages, whole } = match found? {
             Found::Hit(hit) => hit,
             Found::Miss { stale: true } => {
                 stale.push(krate);
+                missed(&mut withdrawn);
                 continue;
             }
-            Found::Miss { stale: false } => continue,
+            Found::Miss { stale: false } => {
+                missed(&mut withdrawn);
+                continue;
+            }
             Found::OldLayout => {
                 old_layout.push(krate);
+                missed(&mut withdrawn);
                 continue;
             }
         };
-        lang_items.insert(krate, Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode });
+        let lang_items = Frozen { bytes: PartBytes::of(&bytes, &parts, Part::LangItems), mode };
         // Under `Mode::Check` and `Mode::Verify` the def map's record whole, which what the
         // crate resolves to (`Check`) or what was read of its pages (`Verify`) is compared
         // with; never when serving, which holds no byte of it past a read.
-        if let Some(whole) = whole {
+        let def_map = whole.map(|whole| {
             let range = 0..whole.bytes().len();
-            maps.insert(krate, Frozen { bytes: PartBytes::In { buffer: whole, range }, mode });
-        }
-        if mode != Mode::Check {
-            paged.insert(krate, def_pages);
-        }
-        served.insert(krate, Image { base, key: filed, bytes, parts, mode });
+            Frozen { bytes: PartBytes::In { buffer: whole, range }, mode }
+        });
+        // Read from pages in `Mode::Serve` and `Mode::Verify`; `Mode::Check` resolves the
+        // crate and compares what it resolves to with its pages.
+        let pages = (mode != Mode::Check).then_some(def_pages);
+        let image = Image { base, key: filed, bytes, parts, mode, lang_items, def_map, pages };
+        given.push((krate, image));
         hits.push(krate);
-        changed = true;
     }
     hits.sort_unstable_by_key(|krate| keys[krate]);
-    if !changed {
-        let stored = StoredOf::default();
-        return Ok(Served { keys, hits, stale, old_layout, build, lookups, stored });
-    }
-    // What this serve changes of how each crate is read, named: a crate that gains an image
-    // is read from it from here on, and one that loses its image is resolved again. Either
-    // way every reader of the crate's def map runs again, so the write says which crates
-    // (rule 19). Bounded: the first [`NAMED`] of each, the rest counted.
-    {
-        let db = &*db;
+    if !given.is_empty() || !withdrawn.is_empty() {
+        // What this serve changes of how each crate is read, named: a crate that gains an
+        // image is read from it from the next snapshot on, and one that loses its image is
+        // resolved again (rule 19). Bounded: the first [`NAMED`] of each, the rest counted.
         let name = |krate: &Crate| krate.named(db).to_string(); // alloc: an event's names, at most `NAMED` a list
         let list = |crates: &[Crate]| crates.iter().take(NAMED).map(name).collect::<Vec<_>>().join(", "); // alloc: as above
-        let gained: Vec<Crate> = (order.iter().map(|it| it.0))
-            .filter(|krate| served.contains_key(krate) && !before.contains_key(krate))
-            .collect(); // alloc: once per serve that changed what is served
-        let lost: Vec<Crate> = (order.iter().map(|it| it.0))
-            .chain(left_held.iter().copied())
-            .filter(|krate| !served.contains_key(krate) && before.contains_key(krate))
-            .collect(); // alloc: as above
-        let again = (order.len() + left_held.len()) - gained.len() - lost.len();
+        // alloc: once per serve that changed what is given
+        let mut gained: Vec<Crate, Global> = Vec::new_in(Global);
+        gained.extend(given.iter().map(|it| it.0).filter(|krate| !super::is_served(db, *krate)));
+        let again = given.len() - gained.len();
         tracing::info!(
             target: "blaze",
             asked = order.len() as u64,
-            maintained = left.len() as u64,
             gained = gained.len() as u64,
-            lost = lost.len() as u64,
+            lost = withdrawn.len() as u64,
             again = again as u64,
-            served = served.len() as u64,
+            given = given.len() as u64,
             gained_first = %list(&gained),
-            lost_first = %list(&lost),
+            lost_first = %list(&withdrawn),
             "dependency images served: crates that gained an image are read from it, crates that lost theirs are resolved again"
         );
     }
-    frozen::set(db, maps);
-    frozen::set_lang_items(db, lang_items);
-    if !paged.is_empty() || !pages::all(&*db).is_empty() {
-        pages::set(db, paged);
-    }
-    set_images(db, served);
-    // A served crate's modules are the decoded map's, not the ones its dependents were
-    // maintained against: the maintainers run again over the crates now served.
-    db.note_crates_changed();
-    Ok(Served { keys, hits, stale, old_layout, build, lookups, stored: StoredOf::default() })
-}
-
-/// The frozen bytes a database was given, to add to.
-fn copied(maps: Option<&Arc<HashMap<Crate, Frozen, Global>>>) -> HashMap<Crate, Frozen, Global> {
-    // clone: what was served before, once per serve that fetches a crate, to add to
-    maps.map(|it| (**it).clone()).unwrap_or_default()
+    // Each crate by its key in the world, so what is served outlives the commit that gives
+    // the images ([`Served`]); `given` is this snapshot's, used before that commit.
+    let world = |krate: &Crate| krate.key(db);
+    // alloc: setup: once per serve, as `keys`
+    let keys = HashMap::from_iter_in(keys.iter().map(|(krate, &key)| (world(krate), key)), Global);
+    let mut gone: Vec<CrateKey, Global> = Vec::with_capacity_in(withdrawn.len(), Global);
+    gone.extend(withdrawn.iter().map(world));
+    let served = Served {
+        nonce: db.nonce(),
+        keys,
+        // alloc: setup: once per serve, as above
+        hits: hits.iter().map(world).collect(),
+        // alloc: none for a serve with no stale crate
+        stale: stale.iter().map(world).collect(),
+        // alloc: none for a serve with no image of layout 7
+        old_layout: old_layout.iter().map(world).collect(),
+        build,
+        lookups,
+        stored: StoredOf::default(),
+        withdrawn: gone,
+    };
+    Ok((served, given))
 }
 
 /// What one task of [`serve`] found of a crate.
@@ -671,86 +704,58 @@ fn open(
     }))
 }
 
-inventory::submit! {
-    base_db::Implied { name: "dependency images withdrawn", write: withdraw_moved }
-}
-
-/// The write implied by a change to the files of crates read from images. A crate whose own
-/// files moved loses its image, frozen def map and lang items in the same write. Its own files
-/// moved when a file of its source root was set, added or removed: an edit, a build script's
-/// run that left other `OUT_DIR` files, a view moved. So does every crate read from an image
-/// that depends on a crate whose files moved, whether that crate is served or not. The
-/// maintainers then go over the crate graph again, as after a [`serve`] that takes an image
-/// away.
+/// The crates of `served` (those the driver gives an image in this snapshot) that a write
+/// takes the image from, whose files `files` were set or added and whose source roots `roots`
+/// had their file sets changed (which covers a file removed): the driver gives each of them none in the snapshot the
+/// write makes, nor its frozen def map, lang items or pages ([`super::give_image`] gives the
+/// four together). A crate's own files moved when a file of its source root was set, added or
+/// removed: an edit, a build script's run that left other `OUT_DIR` files, a view moved. So
+/// does every crate read from an image that depends on a crate whose files moved, whether that
+/// crate is served or not.
 ///
 /// The key covers every file of the crate's source root and every crate it depends on, so the
 /// image no longer names the crate. Kept, it would be read against files it was not made from,
 /// which the content check refuses ([`frozen::Unreadable`]). The next [`serve`] fetches it
-/// under its new key. A serve in the same batch as a write of its crates' files is withdrawn
-/// by it: drivers serve in a batch of its own, after the writes.
+/// under its new key. Reads this snapshot only: the driver asks it while it makes the write.
 ///
 /// A crate whose cfg or env alone moved keeps its image until that serve. The image still
 /// reads, and holds what the crate was before the write.
-fn withdraw_moved(db: &mut Db, written: &base_db::Written<'_>) {
-    let gone = moved_served(db, written);
-    if gone.is_empty() {
-        return;
+pub fn withdrawn(
+    db: &Db,
+    served: &[Crate],
+    files: &[base_db::FileId],
+    roots: &[base_db::SourceRootId],
+) -> Vec<Crate, Global> {
+    if served.is_empty() || (files.is_empty() && roots.is_empty()) {
+        return Vec::new_in(Global);
     }
-    tracing::info!(target: "blaze", crates = gone.len(), "dependency images withdrawn: their files moved");
-    withdraw(db, &gone);
-}
-
-/// The crates given an image or frozen bytes that `written` moved the files of, or of a crate
-/// they depend on: what [`withdraw_moved`] takes away.
-fn moved_served(db: &Db, written: &base_db::Written<'_>) -> Vec<Crate> {
-    if written.set.is_empty()
-        && written.added.is_empty()
-        && written.removed.is_empty()
-        && written.roots.is_empty()
-    {
-        // alloc: none, an empty list
-        return Vec::new();
-    }
-    let served = served_crates(db);
-    if served.is_empty() {
-        return served;
-    }
-    let moved = moved_crates(db, written);
+    let moved = moved_crates(db, files, roots);
     if moved.is_empty() {
-        // alloc: none, an empty list
-        return Vec::new();
+        return Vec::new_in(Global);
     }
     // alloc: one entry per crate walked, once per write that moved a served crate's files
     let mut reaches = HashMap::new_in(Global);
     // alloc: as above
-    served.into_iter().filter(|&krate| reaches_moved(db, krate, &moved, &mut reaches)).collect()
+    let mut gone = Vec::new_in(Global);
+    gone.extend(served.iter().copied().filter(|&krate| reaches_moved(db, krate, &moved, &mut reaches)));
+    gone.sort_unstable();
+    gone.dedup();
+    if !gone.is_empty() {
+        tracing::info!(target: "blaze", crates = gone.len(), "dependency images withdrawn: their files moved");
+    }
+    gone
 }
 
-/// Every crate given an image, a frozen def map or frozen lang items, sorted.
-fn served_crates(db: &Db) -> Vec<Crate> {
+/// The crates whose root is in a source root a write moved: a file of it set or added
+/// (`files`), or its file set changed (`roots`, which covers a file removed).
+fn moved_crates(
+    db: &Db,
+    files: &[base_db::FileId],
+    roots: &[base_db::SourceRootId],
+) -> HashSet<Crate, Global> {
     // alloc: once per write that moved a file while any crate is served
-    let mut crates = Vec::new();
-    if let Some(it) = DepImages::try_get(db) {
-        crates.extend(it.images(db).keys().copied());
-    }
-    if let Some(it) = FrozenDefMaps::try_get(db) {
-        crates.extend(it.maps(db).keys().copied());
-    }
-    if let Some(it) = FrozenLangItems::try_get(db) {
-        crates.extend(it.maps(db).keys().copied());
-    }
-    crates.extend(pages::all(db).keys().copied());
-    crates.sort_unstable();
-    crates.dedup();
-    crates
-}
-
-/// The crates whose root is in a source root `written` moved: a file of it set or added, or
-/// its file set changed (which covers a file removed).
-fn moved_crates(db: &Db, written: &base_db::Written<'_>) -> HashSet<Crate, Global> {
-    // alloc: once per write that moved a file while any crate is served
-    let mut roots: Vec<base_db::SourceRootId> = written.roots.to_vec();
-    for &file in written.set.iter().chain(written.added) {
+    let mut roots: Vec<base_db::SourceRootId, Global> = roots.to_vec_in(Global);
+    for &file in files {
         roots.push(db.file_source_root(file).source_root_id(db));
     }
     roots.sort_unstable();
@@ -779,54 +784,19 @@ fn reaches_moved(
     it
 }
 
-/// Takes the image, frozen def map and frozen lang items of each of `gone` away, and has the
-/// maintainers go over the crate graph again: from here on each resolves as a fresh crate.
-fn withdraw(db: &mut Db, gone: &[Crate]) {
-    // clone: what was served, once per write that withdraws an image
-    let mut images =
-        DepImages::try_get(&*db).map(|it| (**it.images(&*db)).clone()).unwrap_or_default();
-    let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
-    let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
-    let mut paged = pages::all(&*db);
-    let mut paged_gone = false;
-    for krate in gone {
-        images.remove(krate);
-        maps.remove(krate);
-        lang_items.remove(krate);
-        paged_gone |= paged.remove(krate).is_some();
-    }
-    frozen::set(db, maps);
-    frozen::set_lang_items(db, lang_items);
-    if paged_gone {
-        pages::set(db, paged);
-    }
-    set_images(db, images);
-    db.note_crates_changed();
-}
-
-fn set_images(db: &mut Db, images: HashMap<Crate, Image, Global>) {
-    use blaze_query::db::{Durability, Setter};
-    // alloc: setup: the one input value, once per session
-    // clone: the handle of the map set before, to tell which crates' images move
-    let was = DepImages::try_get(&*db).map(|it| it.images(&*db).clone());
-    super::given::give_changed::<super::ImageSlot, Image>(db, was.as_deref(), &images);
-    let images = Arc::new(images);
-    match DepImages::try_get(&*db) {
-        Some(it) => {
-            it.set_images(db).with_durability(Durability::HIGH).to(images);
-        }
-        None => {
-            _ = DepImages::new(db, Durability::HIGH, images);
-        }
-    }
-}
-
 /// Writes to `images` the image of each crate [`serve`] found none of that `which` names,
 /// resolving it in `db`, one task a crate ([`ImageStore::for_each`]). A crate whose image
 /// would not cover every input is refused, with why. An image the store will not keep is an
 /// error naming the crate. A crate written before under the same key writes the same bytes,
 /// which the store keeps once, so a store with [`Which::All`] after one with
 /// [`Which::Sealed`] writes the members and what was refused before, and keeps the rest.
+///
+/// `served` may be of any earlier snapshot of `db`'s database ([`Served`]'s invariant): each
+/// crate it names is found in `db` by its key. One that `db` no longer has is
+/// [`StoreError::Gone`] naming its key, and a serve of another database is
+/// [`StoreError::OtherDatabase`]; both before anything is written. Floor: one lookup of each
+/// key the serve holds (an index into the world's table), against the resolution and
+/// encoding of each crate written.
 // dyn: the driver's store, one call per crate per session
 pub fn store(
     db: &Db,
@@ -834,24 +804,36 @@ pub fn store(
     // dyn: as above
     images: &dyn ImageStore,
     which: Which,
-) -> Result<Stored, String> {
+) -> Result<Stored, StoreError> {
+    if served.nonce != db.nonce() {
+        return Err(StoreError::OtherDatabase { served: served.nonce, asked: db.nonce() });
+    }
     // The crates read from an image and those an earlier store of this serve wrote: neither
     // is written again.
     // alloc: setup: once per session
-    let mut hits: HashSet<Crate, Global> = served.hits.iter().copied().collect();
+    let mut hits: HashSet<CrateKey, Global> = served.hits.iter().copied().collect();
     hits.extend(served.stored.0.lock().iter().copied());
-    // alloc: setup: one entry a crate walked, once per store with `Which::Sealed`
-    let mut sealed = HashMap::new_in(Global);
-    let named = |krate: &Crate, sealed: &mut HashMap<Crate, bool, Global>| match which {
+    let named = |krate: Crate| match which {
         Which::All => true,
-        Which::Sealed => super::key::sealed_in(db, *krate, sealed),
+        Which::Sealed => super::key::sealed(db, krate),
     };
     // alloc: setup: once per session
-    let mut order: Vec<(Crate, ContentId)> = (served.keys.iter())
-        .filter(|(krate, _)| !hits.contains(*krate) && named(krate, &mut sealed))
-        .map(|(&krate, &key)| (krate, key))
-        // alloc: setup: once per session
-        .collect();
+    let mut order: Vec<(Crate, ContentId)> = Vec::with_capacity(served.keys.len());
+    // Every key is looked up, a hit's too: a serve that names a crate gone is stale whole.
+    // The least such key is the one named, so the error is the same in every run.
+    let mut gone: Option<CrateKey> = None;
+    for (&world, &key) in &served.keys {
+        let Some(krate) = db.crate_at(world) else {
+            gone = Some(gone.map_or(world, |it| it.min(world)));
+            continue;
+        };
+        if !hits.contains(&world) && named(krate) {
+            order.push((krate, key));
+        }
+    }
+    if let Some(key) = gone {
+        return Err(StoreError::Gone { key });
+    }
     order.sort_unstable_by_key(|&(_, key)| key);
     // The keys as the database has them now, in one walk: a crate whose key moved since the
     // serve is not written under the old one.
@@ -879,11 +861,12 @@ pub fn store(
         let made = made.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", krate.named(db))
         });
-        match made? {
+        let world = krate.key(db);
+        match made.map_err(StoreError::Store)? {
             Ok(filed) => {
-                stored.written.push(krate);
-                stored.filed.insert(krate, filed);
-                served.stored.0.lock().insert(krate);
+                stored.written.push(world);
+                stored.filed.insert(world, filed);
+                served.stored.0.lock().insert(world);
             }
             Err(why) => {
                 // Said, a crate each: a crate with no image is resolved again by every daemon
@@ -896,7 +879,7 @@ pub fn store(
                     why = %why,
                     "a crate's image is not written: every daemon that starts resolves the crate again"
                 );
-                stored.refused.push((krate, why));
+                stored.refused.push((world, why));
             }
         }
     }
@@ -912,29 +895,25 @@ fn make(
     // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
 ) -> Result<Result<ContentId, Refused>, String> {
-    if let Some(why) = refusal(db, krate) {
-        return Ok(Err(why));
-    }
     // alloc: setup: the macro calls the crate's signatures name, once per crate imaged
-    let mut calls = Vec::new();
-    let parts = match encode(db, krate, &mut calls) {
-        Ok(parts) => parts,
+    let mut calls = Vec::new_in(Global);
+    // The late reads and what no surface can ask are a surface's ([`image_parts`]): a store
+    // files the crate by its [`Reads`].
+    let parts = match checked_parts(db, krate, &mut calls, super::late::Nested::Walk) {
+        Ok((parts, _)) => parts,
         Err(why) => return Ok(Err(why)),
     };
-    if let Some(why) = include_refusal(db, krate, &calls) {
-        return Ok(Err(why));
-    }
     // The crate's def map pages, made before anything is kept: a def map that does not write
     // as pages refuses the crate whole, so no image is kept whose pages never will be.
     let paged = match pages::encode(db, krate) {
         Ok(paged) => paged,
         Err(why) => return Ok(Err(Refused::Encode { part: Part::DefMap, why })),
     };
-    let held = [
-        (Part::LangItems, parts[0].as_slice()),
-        (Part::Signatures, parts[1].as_slice()),
-        (Part::DefMap, paged.as_slice()),
-    ];
+    // Every part of the image, then the pages beside it.
+    let held: [(Part, &[u8]); Part::ALL.len() + 1] = std::array::from_fn(|at| match Part::ALL.get(at) {
+        Some(&part) => (part, parts[at].as_bytes()),
+        None => (Part::DefMap, paged.as_slice()),
+    });
     if let Some(why) = Base::of(db, krate).held_by(&held) {
         return Ok(Err(why));
     }
@@ -946,7 +925,7 @@ fn make(
         Ok(filed) => filed,
         Err(why) => return Ok(Err(why)),
     };
-    let image = write_image(filed, [&parts[0], &parts[1]]);
+    let image = write_image(filed, parts.each_ref());
     drop(parts);
     images.put(filed, image).map_err(|why| {
         // alloc: error text
@@ -966,16 +945,93 @@ fn make(
     Ok(Ok(filed))
 }
 
+/// The parts of the image of `krate`, in the order of [`Part::ALL`], as a `Surface` record
+/// holds them (crates/blaze-front/src/surface.rs): each to be passed as it is to
+/// [`write_image`], under the record's address. The image a [`store`] would write, less what
+/// filing it in the store asks (its reads' slots, its key).
+///
+/// A surface's key covers its unit's own text only (`blaze_keyed::kind::SurfaceInputs`:
+/// tool, settings, unit, pieces), and its shape what it asked of other surfaces and of the
+/// request's late reads. So every input the image has is one of those or a refusal here:
+///
+/// - Refused, as [`store`] refuses them, since no key made from text covers them: a def map
+///   that uses the session's macros, a module whose file is outside the crate's source root
+///   or is not there ([`refusal`]), an `include!` of a file of the VFS in another source root
+///   or of no source root (`Refused::OutsideSourceRoot`, [`super::late::walk`]), a part that
+///   holds a path of the checkout (`Refused::MachinePath`), and an expansion of a procedural
+///   macro whose reads are not known (`Refused::ProcMacro`).
+/// - Refused here alone ([`Refused::Unasked`]): an expansion of a procedural macro that
+///   traced reading something, and an `include!` of a file outside the VFS. A store files
+///   them by their values ([`Reads`]); a surface's shape has no fact that names them.
+/// - Refused when it cannot happen ([`Refused::LateTwice`]): one late read with two values.
+/// - Given to the caller to ask in its shape ([`super::ImageParts::late`]): every `env!`,
+///   `option_env!`, `include!`, `include_str!` and `include_bytes!` of a file of its source
+///   root that the image or the def map pages depend on, with the value its expansion saw,
+///   nested ones included ([`super::late`]). What a body's expansions read is the body's.
+/// - Left to the caller's shape as it is: what the crate read of its dependencies, which is
+///   their surfaces' (each a fact of the shape), their expansions' reads included.
+///
+/// Floor: the crate's lang items and signatures encoded once, and the macro calls its image
+/// is made from walked once, for its refusals and its late reads alike. Here: that, the def
+/// map's modules walked for [`refusal`], and the parts scanned once for a path of the
+/// checkout. A crate with no late read allocates nothing for [`super::ImageParts::late`].
+pub fn image_parts(db: &Db, krate: Crate) -> Result<super::ImageParts, Refused> {
+    image_parts_walking(db, krate, super::late::Nested::Walk)
+}
+
+/// [`image_parts`], its walk reading nested calls or not ([`super::late::Nested`]): `Skip` is
+/// a test's planted control alone.
+pub(super) fn image_parts_walking(
+    db: &Db,
+    krate: Crate,
+    nested: super::late::Nested,
+) -> Result<super::ImageParts, Refused> {
+    // alloc: the macro calls the crate's signatures name, once per surface written
+    let mut calls = Vec::new_in(Global);
+    let (parts, walked) = checked_parts(db, krate, &mut calls, nested)?;
+    let held: [(Part, &[u8]); Part::ALL.len()] =
+        std::array::from_fn(|at| (Part::ALL[at], parts[at].as_bytes()));
+    if let Some(why) = Base::of(db, krate).held_by(&held) {
+        return Err(why);
+    }
+    if let Some(why) = walked.unasked {
+        return Err(why);
+    }
+    Ok(super::ImageParts { parts, late: walked.late })
+}
+
+/// The parts of the image of `krate` ([`encode`]), with in `calls` the macro calls its
+/// signatures name, and the one walk of the calls the image is made from
+/// ([`super::late::walk`]: its late reads and what no surface can ask); or the refusal of the
+/// crate that its def map ([`refusal`]) or that walk makes. What [`store`] and
+/// [`image_parts`] both check; a store ignores the late reads and the unaskable.
+fn checked_parts(
+    db: &Db,
+    krate: Crate,
+    calls: &mut Vec<MacroCallId>,
+    nested: super::late::Nested,
+) -> Result<([Portable; Part::ALL.len()], super::late::Walked), Refused> {
+    if let Some(why) = refusal(db, krate) {
+        return Err(why);
+    }
+    let parts = encode(db, krate, calls)?;
+    let walked = super::late::walk(db, krate, calls, nested)?;
+    Ok((parts, walked))
+}
+
 /// The parts of the image of `krate`, in the order of [`Part::ALL`], and in `calls` the macro
 /// calls its signatures name.
 fn encode(
     db: &Db,
     krate: Crate,
     calls: &mut Vec<MacroCallId>,
-) -> Result<[Vec<u8>; Part::ALL.len()], Refused> {
+) -> Result<[Portable; Part::ALL.len()], Refused> {
     let refused = |part| move |why| Refused::Encode { part, why };
     Ok([
-        frozen::encode_lang_items(db, krate).map_err(refused(Part::LangItems))?,
+        // `nameres::frozen` writes no id, only keys ([`frozen::Enc`]).
+        Portable::written(
+            frozen::encode_lang_items(db, krate).map_err(refused(Part::LangItems))?,
+        ),
         signatures::encode(db, krate, calls).map_err(refused(Part::Signatures))?,
     ])
 }
@@ -992,7 +1048,7 @@ fn encode(
 /// image filed by it (as by [`Reads`]) would be kept as it is by a [`serve`] whose key did not
 /// move after that file was edited: such a crate is refused. The `include!`s the image depends
 /// on are asked once it is encoded, when its signatures' calls are known
-/// ([`include_refusal`]).
+/// (`super::late::walk`).
 pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
     let def_map = crate_def_map(db, krate);
     if def_map.session_macros {
@@ -1043,62 +1099,8 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
     None
 }
 
-/// Why the image of `krate` would leave out a file an `include!`, `include_str!` or
-/// `include_bytes!` it depends on reads, if it would: one of `calls` (those its signatures
-/// name) or of its modules' scopes, or one any of them is expanded in, whose file is a file of
-/// the VFS in another package's source root, or not known ([`refusal`]). The calls walked are
-/// those its reads are worked out from ([`super::reads::image_calls`]).
-///
-/// A file outside the VFS is no refusal: the crate is noted as having read it
-/// (`base_db::Files::included_by`) and its image is filed by the file's content
-/// ([`Reads`]' files), so an edit of the file misses the image. A file of the VFS in another
-/// source root still is one: nothing reads such a file's content by its path before the
-/// crate is resolved, which a search by reads would need.
-pub(super) fn include_refusal(db: &Db, krate: Crate, calls: &[MacroCallId]) -> Option<Refused> {
-    let root = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
-    let todo = super::reads::image_calls(db, krate, calls);
-    let refused = super::reads::each_call(db, krate, todo, |call, loc| {
-        let MacroDefKind::BuiltInEager(_, expander) = &loc.def.kind else { return Ok(()) };
-        if !expander.is_include_like() {
-            return Ok(());
-        }
-        // The argument of an eager macro, expanded as a call of its own (`eager: None`): the
-        // parent of the calls in it (`concat!`, `env!`). The include it is the argument of is a
-        // call of the scope or store too, and is asked there.
-        let MacroCallKind::FnLike { eager: Some(eager), .. } = &loc.kind else { return Ok(()) };
-        let read = match include_input_to_file_id(db, call, &eager.arg) {
-            Ok(file) => {
-                let file = file.file_id(db);
-                if db.file_source_root(file).source_root_id(db) == root {
-                    return Ok(());
-                }
-                if db.files().included_source_path(file).is_some() {
-                    return Ok(());
-                }
-                // alloc: why a crate is refused, once per refused crate
-                format!("reads {}", shown_path(db, file))
-            }
-            // alloc: as above
-            Err(why) => format!(
-                "names a file no source root has ({})",
-                why.kind().render_to_string(db).message
-            ),
-        };
-        let name = match expander {
-            hir_expand::builtin::EagerExpander::Include => "include!",
-            hir_expand::builtin::EagerExpander::IncludeStr => "include_str!",
-            _ => "include_bytes!",
-        };
-        // alloc: as above
-        let what =
-            format!("`{name}` of crate {} at {} {read}", krate.named(db), call_site(db, loc));
-        Err(Refused::OutsideSourceRoot { what })
-    });
-    refused.err()
-}
-
 /// The path the source root has `file` at, as an error shows it.
-fn shown_path(db: &Db, file: base_db::FileId) -> String {
+pub(super) fn shown_path(db: &Db, file: base_db::FileId) -> String {
     match db.path_for_file(file) {
         Some(path) => path.to_string(),                 // alloc: error text
         None => format!("{file:?}, which has no path"), // alloc: error text
@@ -1106,7 +1108,7 @@ fn shown_path(db: &Db, file: base_db::FileId) -> String {
 }
 
 /// Where the call `loc` is in a file of its crate: the file's path and the line, from 1.
-fn call_site(db: &Db, loc: &hir_expand::MacroCallLoc) -> String {
+pub(super) fn call_site(db: &Db, loc: &hir_expand::MacroCallLoc) -> String {
     site(db, loc.kind.original_call_range_with_input(db))
 }
 

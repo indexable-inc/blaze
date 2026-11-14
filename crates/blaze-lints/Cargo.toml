@@ -26,6 +26,8 @@ blaze-intent.workspace = true
 # The PGO names of blaze's own profiles and the item keys they hash, for the profile lints.
 blaze-items.workspace = true
 blaze-mem.workspace = true
+# The front end's engine: the lint queries are its tracked functions.
+blaze-memo.workspace = true
 blaze-phf.workspace = true
 # The rule of which spans the flight recorder keeps, for `blaze::unrecorded_span`.
 blaze-profile.workspace = true
@@ -53,7 +55,6 @@ memchr.workspace = true
 rustc_type_ir.workspace = true
 # The symbols of a profile of a program rustc built, for the profile lints.
 rustc-demangle.workspace = true
-blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 span.workspace = true

@@ -34,7 +34,9 @@ use blaze_ids::{ContentId, Hasher};
 use hir::AsAssocItem as _;
 use hir_def::{DefWithBodyId, FunctionId, ModuleDefId};
 
-use crate::query;
+use intern::Symbol;
+
+use crate::{kept, query};
 
 /// The domain of a profile's [`Profile::id`].
 pub const ID_DOMAIN: &str = "blaze v2 lint profile 1";
@@ -322,9 +324,10 @@ pub fn read(bytes: &[u8]) -> Result<Profile, String> {
 }
 
 /// The profile's functions as one crate's functions are matched to them: [`query::profile_hits`].
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Hits {
-    by_fn: HashMap<FunctionId, Hit, Global>,
+/// Kept in the query's arena ([`crate::kept`]): it owns nothing to drop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hits<'db> {
+    by_fn: kept::Map<'db, FunctionId, Hit>,
     /// The crate's functions with a body.
     pub functions: u32,
     /// Those the profile has a name for.
@@ -333,13 +336,13 @@ pub struct Hits {
     pub ambiguous: u32,
     /// The profile's hot names in the crate's path that no function of it matched, hottest
     /// first (by key after), at most [`UNMATCHED_SHOWN`].
-    pub unmatched_hot: Box<[(Box<str>, Hit)]>,
+    pub unmatched_hot: &'db [(Symbol, Hit)],
 }
 
 /// How many of [`Hits::unmatched_hot`] are kept.
 pub const UNMATCHED_SHOWN: usize = 8;
 
-impl Hits {
+impl Hits<'_> {
     pub fn of(&self, f: FunctionId) -> Option<Hit> {
         self.by_fn.get(&f).copied()
     }
@@ -368,7 +371,7 @@ fn without_arguments(db: &Db, f: hir::Function) -> bool {
 
 /// [`query::profile_hits`]: every function with a body of `krate` ([`query::lint_plan`]),
 /// matched by its blaze name and by its key.
-pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
+pub(crate) fn hits_of<'db>(db: &'db Db, krate: base_db::Crate, loaded: &Loaded) -> Hits<'db> {
     let profile = &loaded.profile;
     let plan = query::lint_plan(db, krate);
     // alloc: the query's worklist, once per crate and profile
@@ -391,6 +394,7 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
     }
     let mut hits =
         Hits { functions: u32::try_from(keyed.len()).unwrap_or(u32::MAX), ..Hits::default() };
+    let mut by_fn: Vec<(FunctionId, Hit), Global> = Vec::new_in(Global);
     let mut matched_keys: blaze_hash::HashSet<&str, Global> = blaze_hash::HashSet::new_in(Global);
     for (id, key, blaze) in &keyed {
         let unique = key.as_deref().filter(|it| seen.get(*it).copied() == Some(1));
@@ -412,8 +416,9 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
             },
         };
         hits.matched += 1;
-        hits.by_fn.insert(*id, loaded.hit(agg));
+        by_fn.push((*id, loaded.hit(agg)));
     }
+    hits.by_fn = kept::Map::keep(db, by_fn);
     // The hot names that look like the crate's and matched nothing: what the coverage note
     // shows, so a mapping that misses is seen.
     if let Some(name) = hir::Crate::from(krate).display_name(db) {
@@ -432,7 +437,8 @@ pub(crate) fn hits_of(db: &Db, krate: base_db::Crate, loaded: &Loaded) -> Hits {
             .collect();
         unmatched.sort_unstable_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
         unmatched.truncate(UNMATCHED_SHOWN);
-        hits.unmatched_hot = unmatched.into_boxed_slice();
+        hits.unmatched_hot =
+            kept::slice(db, unmatched.iter().map(|(key, hit)| (Symbol::intern(key), *hit)));
     }
     hits
 }
@@ -443,7 +449,7 @@ pub fn coverage<'db>(
     db: &'db Db,
     krate: hir::Crate,
     conf: &crate::conf::Conf,
-) -> Option<&'db Hits> {
+) -> Option<&'db Hits<'db>> {
     let loaded = conf.profile.as_ref()?;
     // clone: the profile's settings and a refcount, once per crate
     Some(query::profile_hits(db, krate.base(), query::ProfileKey::new(db, loaded.clone())))

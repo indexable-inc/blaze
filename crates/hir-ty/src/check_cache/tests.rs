@@ -7,7 +7,6 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::{Aligned, HEADER_LEN, Persist};
 use blaze_hash::HashMap;
-use blaze_query::db::AsId;
 use hir_def::{
     DefWithBodyId, FunctionId, LoweringMode, deps::ImageBuf, expr_store::Body,
     nameres::demand::crate_body_owners, signatures::FunctionSignature,
@@ -130,7 +129,7 @@ fn a_part_reads_back_in_another_database() {
     let first = db_of(FIXTURE);
     let first_dep = crate_named(&first, "dep");
     let (mut db, dep) = second();
-    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_u32();
+    let bits = |db: &Db, krate| crate::check_cache::ids::word_of(function(db, krate, "area"));
     assert_ne!(bits(&first, first_dep), bits(&db, dep), "the two databases' ids differ");
 
     open(&bytes).unwrap();
@@ -138,6 +137,8 @@ fn a_part_reads_back_in_another_database() {
     let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
+    // Taken after the commit `set_served` made: an id from before it is dead.
+    let dep = crate_named(&db, "dep");
 
     let owners = crate_body_owners(&db, dep);
     assert!(owners.len() >= 15, "the fixture's bodies: {owners:?}");
@@ -164,7 +165,7 @@ fn outside_a_scope_a_record_is_todays_bytes() {
     let read =
         InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner, nodes);
     assert!(read.unwrap() == *result, "a record outside a scope reads back in its own database");
-    let sum_bits = u64::from(sum.as_id().as_u32()).to_le_bytes();
+    let sum_bits = u64::from(crate::check_cache::ids::word_of(sum)).to_le_bytes();
     let names = |bytes: &[u8]| bytes.windows(8).any(|it| it == sum_bits);
     assert!(names(&outside), "a method's id, as today's records write it");
 
@@ -296,6 +297,8 @@ fn a_body_neither_recorded_nor_left_out_is_an_error() {
     let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
+    // Taken after the commit `set_served` made: an id from before it is dead.
+    let dep = crate_named(&db, "dep");
     let unwritten = DefWithBodyId::FunctionId(function(&db, dep, "unwritten"));
     let key = hir_def::deps::body_key(&db, unwritten).expect("a module's function has a key");
     assert!(part.find(&key).is_none() && part.left_out(&key).is_none());
@@ -339,6 +342,9 @@ fn a_left_out_body_is_listed_with_why_and_not_served() {
     let mut parts = HashMap::new_in(Global);
     parts.insert(dep, buf(&bytes));
     set_served(&mut db, parts);
+    // Taken after the commit `set_served` made: an id from before it is dead.
+    let dep = crate_named(&db, "dep");
+    let area = DefWithBodyId::FunctionId(function(&db, dep, "area"));
     assert!(served_inference(&db, area).is_none() && !served_passed(&db, area));
     let sum = DefWithBodyId::FunctionId(function(&db, dep, "sum"));
     assert!(served_inference(&db, sum).is_some(), "the others are served");
@@ -405,7 +411,7 @@ fn ported(db: &Db) -> (Vec<u8>, u32, u32) {
 fn ported_values_are_the_same_bytes_in_two_databases_and_read_back() {
     let first = db_of(FIXTURE);
     let (second, dep) = second();
-    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_u32();
+    let bits = |db: &Db, krate| crate::check_cache::ids::word_of(function(db, krate, "area"));
     assert_ne!(bits(&first, crate_named(&first, "dep")), bits(&second, dep), "the ids differ");
 
     let (bytes, args, area) = ported(&first);

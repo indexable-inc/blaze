@@ -43,8 +43,11 @@ use hir_ty::{
 };
 use std::alloc::Global;
 
+use base_db::CrateKey;
+
 use crate::{
-    CodeHash, DeepHash, InterfaceHash, ItemHashes, ItemId, LayoutHash, SignatureHash, form, key,
+    CodeHash, DeepHash, InterfaceHash, ItemHashes, ItemId, ItemKey, LayoutHash, SignatureHash,
+    form, key,
 };
 
 pub const INTERFACE_DOMAIN: &str = "blaze v2 interface hash 1";
@@ -58,6 +61,11 @@ pub const COROUTINE_CODE_DOMAIN: &str = "blaze v2 coroutine code hash 1";
 /// Why an item has no hash: a part of it is not of a program rustc accepts (an error type,
 /// MIR that failed to lower, a macro without rules), or it was read before the proc macros its
 /// crate can expand were built. A build stops at it, naming the item.
+///
+/// It holds stable keys, never ids: a refusal is kept (in a query's value, a hash column, a
+/// pending build's error) across commits, and an id is dead after the commit that drops its
+/// arena. Whoever says it takes the ids again from the snapshot it is said in
+/// ([`Unhashable::describe`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Unhashable {
     pub of: Unhashed,
@@ -65,44 +73,86 @@ pub struct Unhashable {
     /// For a read before proc macros were built ([`form::Missed::MacroPending`]): the
     /// proc-macro crate found unbuilt when it was refused, kept so that the error names it
     /// whenever it is said, after that build too.
-    pub pending: Option<base_db::Crate>,
+    pub pending: Option<CrateKey>,
 }
 
-/// What has no hash.
+/// What has no hash, by its stable key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Unhashed {
     /// An item.
-    Item(ItemId),
+    Item(ItemKey),
     /// What a crate reads of the crates it loads: the impls and traits its `Implements`,
     /// `Method` and `Vtable` facts cover, or its code, at the start of a job of it.
-    Crate(base_db::Crate),
+    Crate(CrateKey),
+}
+
+impl Unhashed {
+    /// `item`, by its key.
+    pub fn item(db: &Db, item: ItemId) -> Unhashed {
+        Unhashed::Item(key::item_key(db, item))
+    }
+
+    /// `krate`, by its key.
+    pub fn krate(db: &Db, krate: base_db::Crate) -> Unhashed {
+        Unhashed::Crate(krate.key(db))
+    }
+}
+
+/// The item `key` names in `db`'s snapshot, if it has one.
+fn item_in(db: &Db, key: ItemKey) -> Option<ItemId> {
+    match key::resolve(db, key)? {
+        key::Resolved::Item(item) => Some(item),
+        _ => None,
+    }
+}
+
+/// Writes `krate` by name in `db`'s snapshot, or by its key where the snapshot no longer has
+/// it, to `out`.
+fn write_crate(db: &Db, krate: CrateKey, out: &mut String) {
+    _ = match db.crate_at(krate) {
+        Some(it) => write!(out, "{}", it.named(db)),
+        None => write!(out, "#{} (not in this snapshot)", krate.index()),
+    };
 }
 
 impl Unhashable {
     /// `item` has no hash, for `what`.
-    pub(crate) fn of(item: ItemId, what: &'static str) -> Unhashable {
-        Unhashable { of: Unhashed::Item(item), what, pending: None }
+    pub(crate) fn of(db: &Db, item: ItemId, what: &'static str) -> Unhashable {
+        Unhashable { of: Unhashed::item(db, item), what, pending: None }
     }
 
     /// The error a build stops with: the item by kind and path (or the crate), what could not
-    /// be hashed, and for MIR that failed to lower, the error lowering it gave.
+    /// be hashed, and for MIR that failed to lower, the error lowering it gave. The item and
+    /// crates are taken from their keys in `db`'s snapshot, whichever it is; one the snapshot
+    /// no longer has is named by its key, and the message says so.
     #[blaze::renders_positions]
     pub fn describe(&self, db: &Db) -> String {
         // alloc: the message a build stops with, written once at the edge.
-        let mut said = match self.of {
-            Unhashed::Item(item) => format!(
-                "blaze-items: {:?} `{}` has no hash: {}",
-                item.kind(),
-                key::path(db, item),
-                self.what
-            ),
-            Unhashed::Crate(krate) => format!(
-                "blaze-items: what crate `{}` reads of the crates it loads has no hash: {}",
-                krate.named(db),
-                self.what
-            ),
-        };
-        if let Unhashed::Item(item) = self.of {
+        let mut said = String::new();
+        match self.of {
+            Unhashed::Item(named) => match item_in(db, named) {
+                Some(item) => _ = write!(
+                    said,
+                    "blaze-items: {:?} `{}` has no hash: {}",
+                    item.kind(),
+                    key::path(db, item),
+                    self.what
+                ),
+                None => _ = write!(
+                    said,
+                    "blaze-items: the item of key {:x} (not in this snapshot) has no hash: {}",
+                    named.0, self.what
+                ),
+            },
+            Unhashed::Crate(krate) => {
+                said.push_str("blaze-items: what crate `");
+                write_crate(db, krate, &mut said);
+                _ = write!(said, "` reads of the crates it loads has no hash: {}", self.what);
+            }
+        }
+        if let Unhashed::Item(named) = self.of
+            && let Some(item) = item_in(db, named)
+        {
             if self.what == form::Missed::NoMir.what()
                 && let Some(error) = form::Cx::new(db).mir_error(item)
             {
@@ -115,16 +165,19 @@ impl Unhashable {
             }
         }
         if let Some(pending) = self.pending {
-            let reader = match self.of {
-                Unhashed::Item(item) => item.krate(db),
-                Unhashed::Crate(krate) => krate,
-            };
-            _ = write!(
-                said,
-                " (`{}` was read before the proc macros of `{}` were built, whose calls expand to \
-                 nothing until they are; a read of it must wait on that build)",
-                reader.named(db),
-                pending.named(db)
+            said.push_str(" (`");
+            match self.of {
+                Unhashed::Item(named) => match key::crate_of_key(db, &named.0) {
+                    Some(it) => _ = write!(said, "{}", it.named(db)),
+                    None => _ = write!(said, "the crate of key {:x}", named.0),
+                },
+                Unhashed::Crate(krate) => write_crate(db, krate, &mut said),
+            }
+            said.push_str("` was read before the proc macros of `");
+            write_crate(db, pending, &mut said);
+            said.push_str(
+                "` were built, whose calls expand to nothing until they are; a read of it must \
+                 wait on that build)",
             );
         }
         said
@@ -147,10 +200,11 @@ impl Unhashable {
         &self,
         db: &'db Db,
     ) -> Option<(ItemId, Option<form::Nested<'db>>, hir_ty::mir::MirLowerError<'db>)> {
-        let Unhashed::Item(item) = self.of else { return None };
+        let Unhashed::Item(named) = self.of else { return None };
         if !self.missed_mir() {
             return None;
         }
+        let item = item_in(db, named)?;
         let (within, error) = form::Cx::new(db).mir_lowering_error(item)?;
         Some((item, within, error))
     }
@@ -160,17 +214,20 @@ impl Unhashable {
 /// ([`form::pending_proc_macro`]); otherwise [`form::Missed::MacroPending`] for `of`, naming
 /// the first such proc-macro crate. The one check every read of a crate's half-expanded items
 /// goes through: a form's hash, a fact's value, and a job of the crate as it starts
-/// ([`macros_built`]).
+/// ([`macros_built`]). `of` is asked only for the refusal: a key is not made where nothing is
+/// refused.
 pub(crate) fn macros_built_for(
     db: &Db,
     krate: base_db::Crate,
-    of: Unhashed,
+    of: impl FnOnce() -> Unhashed,
 ) -> Result<(), Unhashable> {
     match form::pending_proc_macro(db, krate) {
         None => Ok(()),
-        Some(pending) => {
-            Err(Unhashable { of, what: form::Missed::MacroPending.what(), pending: Some(pending) })
-        }
+        Some(pending) => Err(Unhashable {
+            of: of(),
+            what: form::Missed::MacroPending.what(),
+            pending: Some(pending.key(db)),
+        }),
     }
 }
 
@@ -180,17 +237,17 @@ pub(crate) fn macros_built_for(
 /// macro's build, never a state to go on from (rule 3: nothing of `krate` is inferred,
 /// checked or kept on a half-expanded program).
 pub fn macros_built(db: &Db, krate: base_db::Crate) -> Result<(), Unhashable> {
-    macros_built_for(db, krate, Unhashed::Crate(krate))
+    macros_built_for(db, krate, || Unhashed::krate(db, krate))
 }
 
 impl fmt::Display for Unhashable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.of {
-            Unhashed::Item(item) => {
-                write!(f, "{:?} {:?} has no hash: {}", item.kind(), item, self.what)
+            Unhashed::Item(named) => {
+                write!(f, "the item of key {:x} has no hash: {}", named.0, self.what)
             }
             Unhashed::Crate(krate) => {
-                write!(f, "what crate {krate:?} reads has no hash: {}", self.what)
+                write!(f, "what crate #{} reads has no hash: {}", krate.index(), self.what)
             }
         }
     }
@@ -198,19 +255,19 @@ impl fmt::Display for Unhashable {
 
 impl std::error::Error for Unhashable {}
 
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn interface_form(db: &Db, id: ItemId) -> form::Sub {
-    form::Cx::new(db).interface(id)
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn interface_form<'db>(db: &'db Db, id: ItemId) -> form::SubRef<'db> {
+    form::Cx::new(db).interface(id).kept(db)
 }
 
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn signature_form(db: &Db, id: ItemId) -> form::Sub {
-    form::Cx::leak_free(db).signature(id)
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn signature_form<'db>(db: &'db Db, id: ItemId) -> form::SubRef<'db> {
+    form::Cx::leak_free(db).signature(id).kept(db)
 }
 
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn body_form(db: &Db, id: ItemId) -> Option<form::Sub> {
-    form::Cx::new(db).body(id).map(|code| code.sub)
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn body_form<'db>(db: &'db Db, id: ItemId) -> Option<form::SubRef<'db>> {
+    form::Cx::new(db).body(id).map(|code| code.sub.kept(db))
 }
 
 /// Which graph a hash is over, and so what its refs are filled with.
@@ -239,7 +296,7 @@ impl Graph {
     }
 
     /// The form every ref of `id` in this graph is a slot of, but a body's.
-    fn form(self, db: &Db, id: ItemId) -> &form::Sub {
+    fn form(self, db: &Db, id: ItemId) -> form::SubRef<'_> {
         match self {
             Graph::Interface | Graph::Layout | Graph::Deep => interface_form(db, id),
             Graph::Signature => signature_form(db, id),
@@ -248,11 +305,11 @@ impl Graph {
 
     /// Appends the refs of `id` in this graph to `out`, in slot order.
     fn refs_into<A: Allocator>(self, db: &Db, id: ItemId, out: &mut Vec<ItemId, A>) {
-        out.extend_from_slice(&self.form(db, id).refs);
+        out.extend_from_slice(self.form(db, id).refs);
         if self == Graph::Deep
             && let Some(body) = body_form(db, id)
         {
-            out.extend_from_slice(&body.refs);
+            out.extend_from_slice(body.refs);
         }
     }
 
@@ -272,7 +329,7 @@ impl Graph {
                 let target = match &id.krate(db).workspace_data(db).target {
                     Ok(target) => target,
                     Err(_) => {
-                        return Err(Unhashable::of(id, "its crate has no target"));
+                        return Err(Unhashable::of(db, id, "its crate has no target"));
                     }
                 };
                 let mut h = Hasher::new(LAYOUT_DOMAIN);
@@ -327,40 +384,40 @@ fn arch_name(arch: base_db::target::Arch) -> &'static str {
 
 /// Why `item`'s form `sub` has no hash, if it has none. A form of an item whose crate's proc
 /// macros are pending names the proc-macro crate as it is refused (`Unhashable::pending`).
-fn missed(db: &Db, sub: &form::Sub, item: ItemId) -> Result<(), Unhashable> {
+fn missed(db: &Db, sub: form::SubRef<'_>, item: ItemId) -> Result<(), Unhashable> {
     match sub.missed {
         Some(form::Missed::MacroPending) => {
-            macros_built_for(db, item.krate(db), Unhashed::Item(item))?;
+            macros_built_for(db, item.krate(db), || Unhashed::item(db, item))?;
             // Written pending in this revision, and its crate's macros built in it: the form is
             // read with the check that wrote it, so this is not reached.
-            Err(Unhashable::of(item, form::Missed::MacroPending.what()))
+            Err(Unhashable::of(db, item, form::Missed::MacroPending.what()))
         }
-        Some(why) => Err(Unhashable::of(item, why.what())),
+        Some(why) => Err(Unhashable::of(db, item, why.what())),
         None => Ok(()),
     }
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn interface_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Interface, id)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn layout_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Layout, id)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn deep_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Deep, id)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn signature_of(db: &Db, id: ItemId) -> Result<ContentId, Unhashable> {
     component_hash(db, Graph::Signature, id)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn code_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let Some(body) = body_form(db, id) else { return Ok(None) };
     let interface = interface_of(db, id)?;
@@ -374,7 +431,7 @@ fn code_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
 pub(crate) fn filled(
     db: &Db,
     domain: &'static str,
-    sub: &form::Sub,
+    sub: form::SubRef<'_>,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
     filled_into(db, &mut Hasher::new(domain), sub, owner)
@@ -383,13 +440,13 @@ pub(crate) fn filled(
 fn filled_into(
     db: &Db,
     h: &mut Hasher,
-    sub: &form::Sub,
+    sub: form::SubRef<'_>,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
     missed(db, sub, owner)?;
     // A form other than the item's own (a field's, a closure's captures, an opaque's auto
     // traits) is written without the check `form::Cx::item_form` makes, so it is made here.
-    macros_built_for(db, owner.krate(db), Unhashed::Item(owner))?;
+    macros_built_for(db, owner.krate(db), || Unhashed::item(db, owner))?;
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {
         h.id(&interface_of(db, to)?);
@@ -402,11 +459,11 @@ fn filled_into(
 pub(crate) fn signature_filled(
     db: &Db,
     domain: &'static str,
-    sub: &form::Sub,
+    sub: form::SubRef<'_>,
     owner: ItemId,
 ) -> Result<ContentId, Unhashable> {
     missed(db, sub, owner)?;
-    macros_built_for(db, owner.krate(db), Unhashed::Item(owner))?;
+    macros_built_for(db, owner.krate(db), || Unhashed::item(db, owner))?;
     let mut h = Hasher::new(domain);
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
     for &to in sub.refs.iter() {
@@ -497,41 +554,42 @@ fn component_hash(db: &Db, graph: Graph, root: ItemId) -> Result<ContentId, Unha
 
 /// A component hashed as one unit: its members sorted by id, the hash of the whole, and each
 /// member's position in the content order the whole is spelled in.
-#[derive(PartialEq, Eq, Debug)]
-pub(crate) struct Unit {
-    members: Box<[ItemId]>,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Unit<'db> {
+    members: &'db [ItemId],
     whole: ContentId,
-    ranks: Box<[u32]>,
+    ranks: &'db [u32],
 }
 
 /// The unit of the component whose first member (by id) is `first`: asked once per component,
 /// not once per member.
-#[blaze_query::tracked(returns(ref))]
-fn interface_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
+#[blaze_memo::tracked(returns(ref))]
+pub(crate) fn interface_unit<'db>(db: &'db Db, first: ItemId) -> Result<Unit<'db>, Unhashable> {
     unit(db, Graph::Interface, first)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn layout_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
+#[blaze_memo::tracked(returns(ref))]
+fn layout_unit<'db>(db: &'db Db, first: ItemId) -> Result<Unit<'db>, Unhashable> {
     unit(db, Graph::Layout, first)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn deep_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
+#[blaze_memo::tracked(returns(ref))]
+fn deep_unit<'db>(db: &'db Db, first: ItemId) -> Result<Unit<'db>, Unhashable> {
     unit(db, Graph::Deep, first)
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn signature_unit(db: &Db, first: ItemId) -> Result<Unit, Unhashable> {
+#[blaze_memo::tracked(returns(ref))]
+fn signature_unit<'db>(db: &'db Db, first: ItemId) -> Result<Unit<'db>, Unhashable> {
     unit(db, Graph::Signature, first)
 }
 
-fn unit(db: &Db, graph: Graph, first: ItemId) -> Result<Unit, Unhashable> {
-    // alloc: a unit's members, kept in its memo.
-    let members: Box<[ItemId]> = match members(db, graph, first) {
-        Members::Alone => Box::new([first]), // alloc: as above, an item with a ref to itself.
-        Members::Table(members) => Box::from(members),
-        Members::Searched(members) => members.into_boxed_slice(),
+fn unit<'db>(db: &'db Db, graph: Graph, first: ItemId) -> Result<Unit<'db>, Unhashable> {
+    let memo = blaze_memo::Database::memo(db);
+    // The unit's members, kept in its run's arena.
+    let members: &'db [ItemId] = match members(db, graph, first) {
+        Members::Alone => blaze_memo::keep_slice(memo, &[first]),
+        Members::Table(members) => blaze_memo::keep_slice(memo, members),
+        Members::Searched(members) => blaze_memo::keep_slice(memo, &members),
     };
     let n = members.len();
     let domain = graph.domain();
@@ -606,8 +664,8 @@ fn unit(db: &Db, graph: Graph, first: ItemId) -> Result<Unit, Unhashable> {
         let mut order: Vec<usize, &Frame> = Vec::with_capacity_in(n, frame);
         order.extend(0..n);
         order.sort_by(|&a, &b| color[a].0.cmp(&color[b].0).then(keys[a].cmp(&keys[b])));
-        // alloc: each member's position, kept in the unit's memo.
-        let mut rank = vec![0u32; n].into_boxed_slice();
+        let mut rank: Vec<u32, &Frame> = Vec::with_capacity_in(n, frame);
+        rank.resize(n, 0);
         for (at, &member) in order.iter().enumerate() {
             rank[member] = u32::try_from(at).expect("blaze-items: a component past u32::MAX items");
         }
@@ -619,7 +677,8 @@ fn unit(db: &Db, graph: Graph, first: ItemId) -> Result<Unit, Unhashable> {
                 rank[inside(to).expect("a ref without a fill is to a member")] as usize
             });
         }
-        (b.hash_one(domain), rank)
+        // Each member's position, kept in the unit's run's arena.
+        (b.hash_one(domain), blaze_memo::keep_slice(memo, &rank))
     });
     Ok(Unit { members, whole, ranks })
 }
@@ -628,9 +687,9 @@ fn unit(db: &Db, graph: Graph, first: ItemId) -> Result<Unit, Unhashable> {
 /// from its forms as [`component_hash`] would spell it; `None` for one that is.
 fn alone(db: &Db, graph: Graph, only: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let own = graph.own(db, only)?;
-    let interface: &[ItemId] = &graph.form(db, only).refs;
+    let interface: &[ItemId] = graph.form(db, only).refs;
     let body: &[ItemId] = match graph {
-        Graph::Deep => body_form(db, only).as_ref().map_or(&[][..], |it| &it.refs[..]),
+        Graph::Deep => body_form(db, only).map_or(&[][..], |it| it.refs),
         Graph::Interface | Graph::Layout | Graph::Signature => &[],
     };
     let refs = || interface.iter().chain(body).copied();
@@ -713,7 +772,7 @@ pub(crate) fn searched(
     db: &Db,
     graph: Graph,
     krate: base_db::Crate,
-    known: Option<&Components>,
+    known: Option<Components<'_>>,
     root: ItemId,
 ) -> Vec<ItemId> {
     frame::task(Tag::Other, |frame| {
@@ -732,22 +791,23 @@ pub(crate) fn searched(
 /// in it, with the members of each component of two or more. Numbered by first member, each
 /// sorted, so two searches that find the same components give equal tables whatever order
 /// they met the items in, and a table an edit leaves as it was stops what reads it.
-#[derive(PartialEq, Eq, Debug, Default)]
-pub(crate) struct Components {
-    /// Each item searched and its component, [`ALONE`] for an item by itself.
-    of: HashMap<ItemId, u32, Global>,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Components<'a> {
+    /// Each item searched and its component, [`ALONE`] for an item by itself, sorted by item.
+    of: &'a [(ItemId, u32)],
     /// Component `c`'s members are `members[starts[c]..starts[c + 1]]`.
-    members: Box<[ItemId]>,
-    starts: Box<[u32]>,
+    members: &'a [ItemId],
+    starts: &'a [u32],
 }
 
 const ALONE: u32 = u32::MAX;
 
-impl Components {
+impl<'a> Components<'a> {
     /// The members of `id`'s component, empty for an item by itself; `None` for an item not
     /// searched.
-    pub(crate) fn get(&self, id: ItemId) -> Option<&[ItemId]> {
-        match *self.of.get(&id)? {
+    pub(crate) fn get(self, id: ItemId) -> Option<&'a [ItemId]> {
+        let at = self.of.binary_search_by_key(&id, |&(it, _)| it).ok()?;
+        match self.of[at].1 {
             ALONE => Some(&[]),
             c => Some(
                 &self.members
@@ -756,12 +816,22 @@ impl Components {
         }
     }
 
-    pub(crate) fn contains(&self, id: ItemId) -> bool {
-        self.of.contains_key(&id)
+    pub(crate) fn contains(self, id: ItemId) -> bool {
+        self.of.binary_search_by_key(&id, |&(it, _)| it).is_ok()
+    }
+
+    /// The table with its columns kept in the current run's arena.
+    fn kept<'db>(self, db: &'db Db) -> Components<'db> {
+        let memo = blaze_memo::Database::memo(db);
+        Components {
+            of: blaze_memo::keep_slice(memo, self.of),
+            members: blaze_memo::keep_slice(memo, self.members),
+            starts: blaze_memo::keep_slice(memo, self.starts),
+        }
     }
 }
 
-fn components(db: &Db, graph: Graph, krate: base_db::Crate) -> &Components {
+fn components(db: &Db, graph: Graph, krate: base_db::Crate) -> Components<'_> {
     match graph {
         Graph::Deep => deep_components(db, krate),
         Graph::Interface | Graph::Layout | Graph::Signature => {
@@ -770,21 +840,22 @@ fn components(db: &Db, graph: Graph, krate: base_db::Crate) -> &Components {
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
-fn deep_components(db: &Db, krate: base_db::Crate) -> Components {
-    find_components(db, Graph::Deep, krate)
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn deep_components<'db>(db: &'db Db, krate: base_db::Crate) -> Components<'db> {
+    find_components(db, Graph::Deep, krate, |found| found.kept(db))
 }
 
 /// The refs of an item in the deep graph that stay in its crate: a body edit that calls
 /// nothing new gives the same list, and leaves [`deep_components`] as it was.
-#[blaze_query::tracked(returns(deref))]
-fn deep_refs(db: &Db, id: ItemId) -> Box<[ItemId]> {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn deep_refs<'db>(db: &'db Db, id: ItemId) -> &'db [ItemId] {
     let krate = id.krate(db);
-    // alloc: a memo's list, at its final length.
-    let mut refs = Vec::new();
-    Graph::Deep.refs_into(db, id, &mut refs);
-    refs.retain(|&to| Graph::Deep.inside(db, krate, to));
-    refs.into_boxed_slice()
+    frame::task(Tag::Other, |frame| {
+        let mut refs: Vec<ItemId, &Frame> = Vec::new_in(frame);
+        Graph::Deep.refs_into(db, id, &mut refs);
+        refs.retain(|&to| Graph::Deep.inside(db, krate, to));
+        blaze_memo::keep_slice(blaze_memo::Database::memo(db), &refs)
+    })
 }
 
 /// Tarjan's algorithm from every item of `krate` not yet reached: linear in the items and refs
@@ -793,7 +864,12 @@ fn deep_refs(db: &Db, id: ItemId) -> Box<[ItemId]> {
     blaze::narrowed_len,
     reason = "a component's start is a u32 index into the crate's cycle members, at most the crate's items, and a crate's items are u32-numbered, so the count fits"
 )]
-pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> Components {
+pub(crate) fn find_components<R>(
+    db: &Db,
+    graph: Graph,
+    krate: base_db::Crate,
+    then: impl FnOnce(Components<'_>) -> R,
+) -> R {
     frame::task(Tag::Other, |frame| {
         let mut tarjan = Tarjan::new(db, graph, krate, None, frame);
         // Every component of two or more, as a range of `found`.
@@ -813,27 +889,26 @@ pub(crate) fn find_components(db: &Db, graph: Graph, krate: base_db::Crate) -> C
             }
         }
         cycles.sort_unstable_by_key(|&(start, _)| found[start]);
-        let mut of = HashMap::new_in(Global);
-        // alloc: the memo's map, one entry per item searched.
-        of.reserve(tarjan.index.len());
-        for &id in tarjan.index.keys() {
-            of.insert(id, ALONE);
-        }
-        // alloc: the memo's lists, at their final lengths.
-        let mut members = Vec::with_capacity(found.len());
-        let mut starts = Vec::with_capacity(cycles.len() + 1);
+        let mut of: Vec<(ItemId, u32), &Frame> = Vec::with_capacity_in(tarjan.index.len(), frame);
+        of.extend(tarjan.index.keys().map(|&id| (id, ALONE)));
+        of.sort_unstable_by_key(|&(id, _)| id);
+        let mut members: Vec<ItemId, &Frame> = Vec::with_capacity_in(found.len(), frame);
+        let mut starts: Vec<u32, &Frame> = Vec::with_capacity_in(cycles.len() + 1, frame);
         starts.push(0);
         for (c, &(start, end)) in cycles.iter().enumerate() {
             let c = u32::try_from(c).expect("blaze-items: more than u32::MAX components");
             for &id in &found[start..end] {
-                of.insert(id, c);
+                let at = of
+                    .binary_search_by_key(&id, |&(it, _)| it)
+                    .expect("a member of a component was searched");
+                of[at].1 = c;
             }
             members.extend_from_slice(&found[start..end]);
             starts.push(
                 u32::try_from(members.len()).expect("blaze-items: a crate past u32::MAX items"),
             );
         }
-        Components { of, members: members.into_boxed_slice(), starts: starts.into_boxed_slice() }
+        then(Components { of: &of, members: &members, starts: &starts })
     })
 }
 
@@ -854,7 +929,7 @@ struct Tarjan<'a, 'f> {
     db: &'a Db,
     graph: Graph,
     krate: base_db::Crate,
-    known: Option<&'a Components>,
+    known: Option<Components<'a>>,
     // alloc: std's map takes no allocator; one per search.
     index: HashMap<ItemId, usize, Global>,
     low: Vec<usize, &'f Frame>,
@@ -869,7 +944,7 @@ impl<'a, 'f> Tarjan<'a, 'f> {
         db: &'a Db,
         graph: Graph,
         krate: base_db::Crate,
-        known: Option<&'a Components>,
+        known: Option<Components<'a>>,
         frame: &'f Frame,
     ) -> Self {
         Tarjan {
@@ -896,7 +971,7 @@ impl<'a, 'f> Tarjan<'a, 'f> {
         match self.graph {
             Graph::Deep => self.edges.extend_from_slice(deep_refs(self.db, node)),
             Graph::Interface | Graph::Layout | Graph::Signature => {
-                self.edges.extend_from_slice(&self.graph.form(self.db, node).refs);
+                self.edges.extend_from_slice(self.graph.form(self.db, node).refs);
                 let mut kept = start;
                 for read in start..self.edges.len() {
                     if self.graph.inside(self.db, self.krate, self.edges[read]) {
@@ -1013,13 +1088,13 @@ pub fn closure_code<'db>(
     closure_code_of(db, closure).map(CodeHash)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn closure_code_of<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Result<ContentId, Unhashable> {
     let sub = form::Cx::new(db).closure_code(closure).sub;
-    filled(db, CLOSURE_CODE_DOMAIN, &sub, owner_of(db, closure.loc(db)))
+    filled(db, CLOSURE_CODE_DOMAIN, sub.view(), owner_of(db, closure.loc(db)))
 }
 
 /// The code hash of one coroutine (an `async` block or fn body, a `gen` block), with its
@@ -1031,11 +1106,11 @@ pub fn coroutine_code<'db>(
     coroutine_code_of(db, coroutine).map(CodeHash)
 }
 
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn coroutine_code_of<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<ContentId, Unhashable> {
     let sub = form::Cx::new(db).coroutine_code(coroutine).sub;
-    filled(db, COROUTINE_CODE_DOMAIN, &sub, owner_of(db, coroutine.loc(db)))
+    filled(db, COROUTINE_CODE_DOMAIN, sub.view(), owner_of(db, coroutine.loc(db)))
 }

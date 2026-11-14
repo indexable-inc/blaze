@@ -143,7 +143,7 @@ fn allocates_its_result_alone(fixture: &str, first: &[&str], errors: bool) {
     let fx = fixture::db(fixture);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let mut defs = functions(&db);
         assert!(defs.len() >= 3, "{}", defs.len());
         defs.sort_by_key(|(name, _)| first.iter().position(|it| it == name).unwrap_or(first.len()));
@@ -194,7 +194,7 @@ fn asking_again_allocates_nothing() {
         let fx = fixture::db(fixture);
         let _ = fx.only_file();
         let db = fx.into_db();
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             for (name, def) in functions(&db) {
                 let first: *const BorrowckResult = borrowck(&db, def);
                 let (again, used) = measure(|| borrowck(&db, def) as *const BorrowckResult);
@@ -205,24 +205,30 @@ fn asking_again_allocates_nothing() {
     }
 }
 
+/// The other file is another crate's, which `main` does not depend on: a commit drops the
+/// arena of the crate whose file changed and the arenas that borrow from it, and carries
+/// `main`'s, so its bodies' ids stay alive and their answers are hits. (An edit of a file of
+/// `main` itself drops `main`'s arena wholesale, and with it every id and answer in it.)
+/// `other` is in a source root of its own, as another package's files are: a file is homed
+/// in the arena of the first crate of its source root (base-db's `Layout::owner`), so in one
+/// root shared with `main` its edit would drop `main`'s arena too.
 #[test]
-fn an_edit_to_another_file_allocates_nothing_to_answer_again() {
+fn an_edit_to_another_crates_file_allocates_nothing_to_answer_again() {
     let fx = fixture::db(
         r#"
-//- /main.rs
-mod other;
+//- /main.rs crate:main
 struct Text;
 fn take(_: Text) {}
 fn moved_twice() { let text = Text; take(text); take(text); }
 fn fine(n: &mut u32) { *n += 1; }
-//- /other.rs
+//- /other.rs crate:other new_source_root:local
 pub fn elsewhere() -> u32 { 1 }
 "#,
     );
-    let files = fx.files().to_vec();
+    // The file's stable key, taken before the commit: the interned id dies with its arena.
+    let other = fx.file_at("/other.rs").file_id(fx.db());
     let mut db = fx.into_db();
-    let other = files[1].file_id(&db);
-    let defs = blaze_query::db::attach(&db, || {
+    let defs = blaze_memo::attach(&db, || {
         let defs: Vec<_> =
             // alloc: the test's setup, before anything is measured.
             functions(&db).into_iter().filter(|(name, _)| name != "elsewhere").collect();
@@ -231,8 +237,10 @@ pub fn elsewhere() -> u32 { 1 }
         }
         defs
     });
-    db.set_file_text(other, "pub fn elsewhere() -> u32 { 2 }\n");
-    blaze_query::db::attach(&db, || {
+    let mut edit = db.edit();
+    edit.set_file_text(other, "pub fn elsewhere() -> u32 { 2 }\n");
+    let _: base_db::Committed = edit.commit();
+    blaze_memo::attach(&db, || {
         for (name, def) in &defs {
             let (_, used) = measure(|| borrowck(&db, *def));
             assert_eq!(used.allocations, 0, "{name}");
@@ -245,7 +253,7 @@ fn a_passing_gate_allocates_nothing() {
     let fx = fixture::db(TYPICAL);
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         for (name, def) in functions(&db) {
             assert!(crate::gate::checked(&db, def).is_ok(), "{name}: the typical fixture passes");
             let (passed, used) = measure(|| crate::gate::checked(&db, def).is_ok());

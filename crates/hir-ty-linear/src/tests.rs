@@ -89,7 +89,7 @@ fn diagnostics(src: &str) -> Vec<(LinearDiagnostic, String)> {
     let fx = fixture::db(&fixture_text);
     let file = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db).to_owned();
         let mut found = Vec::new();
         for def in functions(&db) {

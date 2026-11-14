@@ -103,7 +103,7 @@ pub(crate) fn exact_thin<T>(
 
 pub(crate) struct PathDiagnosticCallbackData(pub(crate) TypeRefId);
 
-#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct WithDefinedOpaques<T> {
     value: T,
     impl_traits: ThinVec<SelfAndAssocBounds>,
@@ -113,7 +113,7 @@ pub enum ImplTrait {}
 
 pub type ImplTraitIdx = la_arena::Idx<ImplTrait>;
 
-#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct SelfAndAssocBounds {
     /// The self bounds, then the associated type bounds from `assoc_ty_bounds_start`, then from
     /// `const_bounds_start` each written `[const] Trait` bound again as `HostEffect(Maybe)`.
@@ -2514,7 +2514,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let first = segments.first()?;
         // A binder's parameter, as each generic parameter, by its macros 2.0 key.
         let hygiene = self.store.type_path_hygiene(source);
-        let name = hir_def::nameres::path_param_name(self.db, *first.name, hygiene);
+        let table = self.resolver.ctx_table();
+        let name = hir_def::nameres::path_param_name(self.db, table, *first.name, hygiene);
         let (debruijn, var, reflected) = self.find_reflected_var(&name)?;
         let refuse = |ctx: &mut Self| {
             ctx.push_diagnostic(TyLoweringDiagnostic::ComptimeBinderNotYetSupported { source });
@@ -2575,7 +2576,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
 /// A lowered signature and what lowering it found: its diagnostics and the anonymous constants it
 /// defined. Both lists are empty for most items, and an empty `ThinVec` allocates nothing.
-#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TyLoweringResult<'db, T> {
     pub value: T,
     diagnostics: ThinVec<TyLoweringDiagnostic>,
@@ -2806,12 +2807,8 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
     impl_trait_of_impl(db, impl_id).as_ref().map(TyLoweringResult::as_lowered)
 }
 
-#[blaze_query::tracked(
-    returns(ref),
-    cycle_result = impl_trait_with_diagnostics_cycle_result,
-    mem_tag = Infer
-)]
-fn impl_trait_of_impl<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
+pub fn impl_trait_of_impl<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
@@ -2855,7 +2852,6 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
 /// when the impl names no trait, which is no cycle of its trait but the true answer.
 pub(crate) fn impl_trait_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
     let impl_data = ImplSignature::of(db, impl_id);
@@ -2934,7 +2930,7 @@ pub enum TyDefId {
 }
 impl_from!(BuiltinType, AdtId(StructId, EnumId, UnionId), TypeAliasId for TyDefId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum ValueTyDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -3000,8 +2996,8 @@ pub(crate) fn type_for_const<'db>(db: &'db Db, def: ConstId) -> EarlyBinder<'db,
 }
 
 /// Build the declared type of a const.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn type_for_const_with_diagnostics<'db>(
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn type_for_const_with_diagnostics<'db>(
     db: &'db Db,
     def: ConstId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
@@ -3033,8 +3029,8 @@ pub(crate) fn type_for_static<'db>(db: &'db Db, def: StaticId) -> EarlyBinder<'d
 }
 
 /// Build the declared type of a static.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn type_for_static_with_diagnostics<'db>(
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn type_for_static_with_diagnostics<'db>(
     db: &'db Db,
     def: StaticId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
@@ -3119,12 +3115,13 @@ pub(crate) fn value_ty<'db>(db: &'db Db, def: ValueTyDefId) -> Option<EarlyBinde
     }
 }
 
-#[blaze_query::tracked(
+#[blaze_memo::tracked(
     returns(ref),
     cycle_result = type_for_type_alias_with_diagnostics_cycle_result,
-    mem_tag = Infer
+    owns,
+    mem_tag = Infer,
 )]
-pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
+pub fn type_for_type_alias_with_diagnostics<'db>(
     db: &'db Db,
     t: TypeAliasId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
@@ -3176,7 +3173,6 @@ pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
 
 pub(crate) fn type_for_type_alias_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     _adt: TypeAliasId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
     TyLoweringResult::empty(WithDefinedOpaques {
@@ -3205,12 +3201,8 @@ pub(crate) fn impl_self_ty_with_diagnostics<'db>(
     impl_self_ty_of_impl(db, impl_id).as_lowered()
 }
 
-#[blaze_query::tracked(
-    returns(ref),
-    cycle_result = impl_self_ty_with_diagnostics_cycle_result,
-    mem_tag = Infer
-)]
-fn impl_self_ty_of_impl<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
+pub fn impl_self_ty_of_impl<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
@@ -3247,7 +3239,6 @@ pub(crate) fn lower_impl_self_ty<'db, 'f>(
 /// guarantees.
 pub(crate) fn impl_self_ty_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     TyLoweringResult::new(
@@ -3265,7 +3256,7 @@ pub(crate) fn const_param_ty<'db>(db: &'db Db, def: ConstParamId) -> Ty<'db> {
 
 /// The types of an item's const parameters, by the parameter's `LocalTypeOrConstParamId`: one
 /// column, `None` at the type parameters' places.
-#[derive(Debug, Default, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Default, PartialEq, Eq, Hash)]
 pub struct ConstParamTypes {
     tys: ThinVec<Option<StoredTy>>,
 }
@@ -3284,12 +3275,13 @@ pub(crate) fn const_param_types(db: &Db, def: GenericDefId) -> &ConstParamTypes 
     &const_param_types_with_diagnostics(db, def).value
 }
 
-#[blaze_query::tracked(
+#[blaze_memo::tracked(
     returns(ref),
     cycle_result = const_param_types_with_diagnostics_cycle_result,
-    mem_tag = Infer
+    owns,
+    mem_tag = Infer,
 )]
-pub(crate) fn const_param_types_with_diagnostics<'db>(
+pub fn const_param_types_with_diagnostics<'db>(
     db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
@@ -3332,7 +3324,6 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
 
 fn const_param_types_with_diagnostics_cycle_result<'db>(
     _db: &'db Db,
-    _: blaze_query::db::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
     TyLoweringResult::empty(ConstParamTypes::default())
@@ -3417,7 +3408,7 @@ pub(crate) fn field_types_query(db: &Db, variant_id: VariantId) -> &FieldTypes {
     field_types_with_diagnostics(db, variant_id).value
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FieldType {
     pub(crate) ty: StoredEarlyBinder<StoredTy>,
     pub(crate) default: Option<StoredEarlyBinder<StoredConst>>,
@@ -3457,8 +3448,14 @@ pub(crate) fn field_types_with_diagnostics<'db>(
     )
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn field_types_of_variant<'db>(
+/// The kind names of the field-type queries, for a test database that marks them fact
+/// boundaries (`blaze_memo::Builder::mark_boundary`): named here, where they are in scope.
+#[cfg(test)]
+pub(crate) const FIELD_TYPES_KINDS: &[&str] =
+    &[field_types_of_variant::KIND_NAME, batch::crate_field_types::KIND_NAME];
+
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn field_types_of_variant<'db>(
     db: &'db Db,
     variant_id: VariantId,
 ) -> TyLoweringResult<'db, ThinVec<FieldType>> {
@@ -3510,7 +3507,7 @@ pub(crate) fn lower_field_types<'db, 'f>(
 }
 
 #[derive(Debug, PartialEq, Eq, Default, Hash)]
-pub(crate) struct SupertraitsInfo {
+pub struct SupertraitsInfo {
     /// Every supertrait, the trait itself first and the rest depth first in the order their
     /// bounds are written, then the direct supertraits in the order they are written: one
     /// column, the direct ones from `direct_start`. The order is the source's, never an id's or
@@ -3576,96 +3573,91 @@ impl SupertraitsInfo {
 
     #[inline]
     pub(crate) fn query(db: &Db, trait_: TraitId) -> &Self {
-        return supertraits_info(db, trait_);
-
-        #[blaze_query::tracked(returns(ref), cycle_result = supertraits_info_cycle, mem_tag = Infer)]
-        fn supertraits_info(db: &Db, trait_: TraitId) -> SupertraitsInfo {
-            blaze_mem::frame::current(|frame| {
-                let mut all_supertraits = Vec::new_in(frame);
-                all_supertraits.push(trait_);
-                let mut direct_supertraits = Vec::new_in(frame);
-                let mut defined_assoc_types = Vec::new_in(frame);
-                defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
-                    |(name, id)| match *id {
-                        // clone: a 4-byte interned `Name`
-                        AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
-                        _ => None,
-                    },
-                ));
-
-                let resolver = trait_.resolver(db);
-                let signature = TraitSignature::of(db, trait_);
-                for pred in signature.generic_params.where_predicates() {
-                    // A binder predicate's target names its own parameters (`for<F: ..> F::Type: ..`).
-                    let WherePredicate::TypeBound {
-                        lifetimes: _,
-                        binder: BinderParams { len: 0, .. },
-                        target,
-                        bound,
-                    } = pred
-                    else {
-                        continue;
-                    };
-                    let (TypeBound::Path(
-                        bounded_trait,
-                        TraitBoundModifier::None
-                        | TraitBoundModifier::Const
-                        | TraitBoundModifier::MaybeConst,
-                    )
-                    | TypeBound::ForLifetime(_, bounded_trait)) = *bound
-                    else {
-                        continue;
-                    };
-                    let target = signature.store.type_ref(*target);
-                    match target {
-                        TypeRef::TypeParam(param)
-                            if param.local_id() == GenericParams::SELF_PARAM_ID_IN_SELF => {}
-                        TypeRef::Path(path) if path.is_self_type() => {}
-                        _ => continue,
-                    }
-                    let Some(TypeNs::TraitId(bounded_trait)) = resolver
-                        .resolve_path_in_type_ns_fully(db, signature.store.path(bounded_trait))
-                    else {
-                        continue;
-                    };
-                    let bounded = SupertraitsInfo::query(db, bounded_trait);
-                    for &it in bounded.all_supertraits() {
-                        push_new(&mut all_supertraits, it);
-                    }
-                    push_new(&mut direct_supertraits, bounded_trait);
-                    for it in &bounded.defined_assoc_types {
-                        push_new(&mut defined_assoc_types, it.clone()); // clone: a `Name` and an id
-                    }
-                }
-
-                SupertraitsInfo::new(&all_supertraits, &direct_supertraits, &defined_assoc_types)
-            })
-        }
-
-        /// `trait A: B {}` with `trait B: A {}`: rustc's E0391 "cycle detected when computing
-        /// the super clauses of `A`", which [`supertraits_cycle`] reports for each trait in the
-        /// cycle. The trait alone, with its own associated types, so name lookup in it still
-        /// finds them.
-        fn supertraits_info_cycle(
-            db: &Db,
-            _: blaze_query::db::Id,
-            trait_: TraitId,
-        ) -> SupertraitsInfo {
-            blaze_mem::frame::current(|frame| {
-                let mut defined_assoc_types = Vec::new_in(frame);
-                defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
-                    |(name, id)| match *id {
-                        // clone: a 4-byte interned `Name`
-                        AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
-                        _ => None,
-                    },
-                ));
-                let mut info = SupertraitsInfo::new(&[trait_], &[], &defined_assoc_types);
-                info.cycle = true;
-                info
-            })
-        }
+        supertraits_info(db, trait_)
     }
+}
+
+/// [`SupertraitsInfo`] of `trait_`. At module level, `pub`, so its kind is named outside the
+/// crate ([`crate::kinds`]); read it through [`SupertraitsInfo::query`].
+#[blaze_memo::tracked(returns(ref), cycle_result = supertraits_info_cycle, owns, mem_tag = Infer)]
+pub fn supertraits_info(db: &Db, trait_: TraitId) -> SupertraitsInfo {
+    blaze_mem::frame::current(|frame| {
+        let mut all_supertraits = Vec::new_in(frame);
+        all_supertraits.push(trait_);
+        let mut direct_supertraits = Vec::new_in(frame);
+        let mut defined_assoc_types = Vec::new_in(frame);
+        defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
+            |(name, id)| match *id {
+                // clone: a 4-byte interned `Name`
+                AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
+                _ => None,
+            },
+        ));
+
+        let resolver = trait_.resolver(db);
+        let signature = TraitSignature::of(db, trait_);
+        for pred in signature.generic_params.where_predicates() {
+            // A binder predicate's target names its own parameters (`for<F: ..> F::Type: ..`).
+            let WherePredicate::TypeBound {
+                lifetimes: _,
+                binder: BinderParams { len: 0, .. },
+                target,
+                bound,
+            } = pred
+            else {
+                continue;
+            };
+            let (TypeBound::Path(
+                bounded_trait,
+                TraitBoundModifier::None | TraitBoundModifier::Const | TraitBoundModifier::MaybeConst,
+            )
+            | TypeBound::ForLifetime(_, bounded_trait)) = *bound
+            else {
+                continue;
+            };
+            let target = signature.store.type_ref(*target);
+            match target {
+                TypeRef::TypeParam(param)
+                    if param.local_id() == GenericParams::SELF_PARAM_ID_IN_SELF => {}
+                TypeRef::Path(path) if path.is_self_type() => {}
+                _ => continue,
+            }
+            let Some(TypeNs::TraitId(bounded_trait)) =
+                resolver.resolve_path_in_type_ns_fully(db, signature.store.path(bounded_trait))
+            else {
+                continue;
+            };
+            let bounded = SupertraitsInfo::query(db, bounded_trait);
+            for &it in bounded.all_supertraits() {
+                push_new(&mut all_supertraits, it);
+            }
+            push_new(&mut direct_supertraits, bounded_trait);
+            for it in &bounded.defined_assoc_types {
+                push_new(&mut defined_assoc_types, it.clone()); // clone: a `Name` and an id
+            }
+        }
+
+        SupertraitsInfo::new(&all_supertraits, &direct_supertraits, &defined_assoc_types)
+    })
+}
+
+/// `trait A: B {}` with `trait B: A {}`: rustc's E0391 "cycle detected when computing the super
+/// clauses of `A`", which [`supertraits_cycle`] reports for each trait in the cycle. The trait
+/// alone, with its own associated types, so name lookup in it still finds them.
+fn supertraits_info_cycle(db: &Db, trait_: TraitId) -> SupertraitsInfo {
+    blaze_mem::frame::current(|frame| {
+        let mut defined_assoc_types = Vec::new_in(frame);
+        defined_assoc_types.extend(trait_.trait_items(db).items.iter().filter_map(
+            |(name, id)| match *id {
+                // clone: a 4-byte interned `Name`
+                AssocItemId::TypeAliasId(id) => Some((name.clone(), id)),
+                _ => None,
+            },
+        ));
+        let mut info = SupertraitsInfo::new(&[trait_], &[], &defined_assoc_types);
+        info.cycle = true;
+        info
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -3696,21 +3688,38 @@ enum AssocTypeShorthandResolution {
 /// This is a query mostly to handle cycles somewhat gracefully; e.g. the
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.
+///
+/// `table` is the table `assoc_name`'s key is a context of (the writer's crate's,
+/// [`crate::ctx_table`]): a key is a context word of one crate's table, so it is part of the
+/// query's key. Asked through [`assoc_type_shorthand`], which keys a name with no key by
+/// `def`'s own crate's table, whoever asks.
 #[tracing::instrument(target = "blaze", skip(db), ret)]
-#[blaze_query::tracked(
-    returns(ref),
-    cycle_result = resolve_type_param_assoc_type_shorthand_cycle_result,
-    mem_tag = Infer
-)]
+#[blaze_memo::tracked(returns(ref), cycle_result = resolve_type_param_assoc_type_shorthand_cycle_result, mem_tag = Infer)]
 fn resolve_type_param_assoc_type_shorthand(
     db: &Db,
     def: GenericDefId,
     param: TypeParamId,
     assoc_name: Name,
+    table: blaze_memo::ArenaId,
 ) -> AssocTypeShorthandResolution {
     blaze_mem::frame::current(|frame| {
-        resolve_type_param_assoc_type_shorthand_in(db, def, param, assoc_name, frame)
+        resolve_type_param_assoc_type_shorthand_in(db, def, param, assoc_name, table, frame)
     })
+}
+
+/// [`resolve_type_param_assoc_type_shorthand`] of `assoc_name`, written with a context of
+/// `table`. A name with no key reads no table, so every asker shares one entry for it.
+pub(crate) fn assoc_type_shorthand<'db>(
+    db: &'db Db,
+    def: GenericDefId,
+    param: TypeParamId,
+    assoc_name: Name,
+    table: blaze_memo::ArenaId,
+) -> &'db AssocTypeShorthandResolution {
+    // A name with no key reads no table, so every asker shares one entry: keyed by `def`'s own
+    // crate's table, a live arena `def` names already, never a constant.
+    let table = if assoc_name.key().is_some() { table } else { crate::ctx_table(def.krate(db)) };
+    resolve_type_param_assoc_type_shorthand(db, def, param, assoc_name, table)
 }
 
 fn resolve_type_param_assoc_type_shorthand_in(
@@ -3718,6 +3727,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
     def: GenericDefId,
     param: TypeParamId,
     assoc_name: Name,
+    table: blaze_memo::ArenaId,
     frame: &Frame,
 ) -> AssocTypeShorthandResolution {
     let generics = generics(db, def);
@@ -3744,7 +3754,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
     {
         // Add the trait's own associated types, the one `assoc_name` names in this trait
         // (rustc's `trait_defines_associated_item_named`, `hygienic_eq`).
-        let own = trait_item_written(db, containing_trait, assoc_name);
+        let own = trait_item_written(db, table, containing_trait, assoc_name);
         if let Some(assoc_type) = containing_trait.trait_items(db).associated_type_named(db, own) {
             let args = GenericArgs::identity_for_item(interner, containing_trait.into());
             this_trait_resolution =
@@ -3789,7 +3799,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
             if !SupertraitsInfo::query(db, bounded_trait)
                 .defined_assoc_types
                 .iter()
-                .any(|&(name, id)| trait_item_is_written(db, name, id.into(), assoc_name))
+                .any(|&(name, id)| trait_item_is_written(db, table, name, id.into(), assoc_name))
             {
                 continue;
             }
@@ -3798,11 +3808,14 @@ fn resolve_type_param_assoc_type_shorthand_in(
                 ctx.lower_trait_ref_from_resolved_path(bounded_trait, param_ty, false, Span::Dummy);
             // Now, search from the start on the *bounded* trait like if we wrote `Self::Assoc`. Eventually, we'll get
             // the correct trait ref (or a cycle).
-            let lookup_on_bounded_trait = resolve_type_param_assoc_type_shorthand(
+            // The name keeps the table it was written in, whichever crate the trait is of; a
+            // name with no key is keyed by the bounded trait's own table, as any asker's.
+            let lookup_on_bounded_trait = assoc_type_shorthand(
                 db,
                 bounded_trait.into(),
                 TypeParamId::trait_self(bounded_trait),
                 assoc_name,
+                table,
             );
             let assoc_type_and_args = match &lookup_on_bounded_trait {
                 AssocTypeShorthandResolution::Resolved(trait_ref) => trait_ref,
@@ -3870,10 +3883,10 @@ fn resolve_type_param_assoc_type_shorthand_in(
 
 fn resolve_type_param_assoc_type_shorthand_cycle_result(
     _db: &Db,
-    _: blaze_query::db::Id,
     _def: GenericDefId,
     _param: TypeParamId,
     _assoc_name: Name,
+    _table: blaze_memo::ArenaId,
 ) -> AssocTypeShorthandResolution {
     AssocTypeShorthandResolution::Cycle
 }
@@ -3933,8 +3946,8 @@ fn maybe_const_bound<'db>(
     )
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn type_alias_bounds_with_diagnostics<'db>(
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn type_alias_bounds_with_diagnostics<'db>(
     db: &'db Db,
     type_alias: TypeAliasId,
 ) -> TyLoweringResult<'db, SelfAndAssocBounds> {
@@ -4262,7 +4275,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for MapAndCompressBoundVars<'db, '_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GenericPredicates {
     // The order is the following:
     //
@@ -4304,8 +4317,8 @@ impl GenericPredicates {
     }
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, mem_tag = Infer)]
-fn generic_predicates_of<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, owns, mem_tag = Infer)]
+pub fn generic_predicates_of<'db>(
     db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
@@ -4324,7 +4337,6 @@ fn generic_predicates_of<'db>(
 /// it without cascading errors.
 fn generic_predicates_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     cycle_predicates(db, def, CycleQuery::Predicates)
@@ -4370,8 +4382,8 @@ pub(crate) fn explicit_implied_clauses(db: &Db, trait_: TraitId) -> &GenericPred
     &explicit_implied_clauses_of(db, trait_).value
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = explicit_super_clauses_cycle_result, mem_tag = Infer)]
-fn explicit_super_clauses_of<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = explicit_super_clauses_cycle_result, owns, mem_tag = Infer)]
+pub fn explicit_super_clauses_of<'db>(
     db: &'db Db,
     trait_: TraitId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
@@ -4387,14 +4399,13 @@ fn explicit_super_clauses_of<'db>(
 /// being lowered. rustc's E0391 "cycle detected when computing the super clauses of `Tr`".
 fn explicit_super_clauses_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     trait_: TraitId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     cycle_predicates(db, trait_.into(), CycleQuery::SuperClauses)
 }
 
-#[blaze_query::tracked(returns(ref), cycle_result = explicit_implied_clauses_cycle_result, mem_tag = Infer)]
-fn explicit_implied_clauses_of<'db>(
+#[blaze_memo::tracked(returns(ref), cycle_result = explicit_implied_clauses_cycle_result, owns, mem_tag = Infer)]
+pub fn explicit_implied_clauses_of<'db>(
     db: &'db Db,
     trait_: TraitId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
@@ -4415,7 +4426,6 @@ fn explicit_implied_clauses_of<'db>(
 /// rustc's E0391 "cycle detected when computing the implied clauses of `Tr`".
 fn explicit_implied_clauses_cycle_result<'db>(
     db: &'db Db,
-    _: blaze_query::db::Id,
     trait_: TraitId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     cycle_predicates(db, trait_.into(), CycleQuery::ImpliedClauses)
@@ -4725,31 +4735,34 @@ fn infer_and_non_rigid_aliases_to_errors<'db>(
 }
 
 pub(crate) fn trait_environment<'db>(db: &'db Db, def: GenericDefId) -> ParamEnv<'db> {
-    return ParamEnv { clauses: trait_environment_query(db, def).as_ref() };
+    ParamEnv { clauses: trait_environment_query(db, def).as_ref() }
+}
 
-    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-    pub(crate) fn trait_environment_query(db: &Db, def: GenericDefId) -> StoredClauses {
-        let module = def.module(db);
-        let interner = DbInterner::new_with(db, module.krate(db));
-        let predicates = GenericPredicates::query(db, def);
-        let GenericDefId::FunctionId(function) = def else {
-            return param_env_from_predicates(interner, predicates).clauses.store();
-        };
-        // A trait method's default body sees its `impl Trait` as its own opaque types.
-        blaze_mem::frame::current(|frame| {
-            let default_body = crate::rpitit::default_body_clauses(interner, function, frame);
-            param_env_from_clauses(
-                interner,
-                predicates
-                    .all_predicates()
-                    .iter_identity()
-                    .map(Unnormalized::skip_norm_wip)
-                    .chain(default_body.iter().copied()),
-            )
-            .clauses
-            .store()
-        })
-    }
+/// [`trait_environment`], stored. At module level, `pub`, so its kind is named outside the
+/// crate ([`crate::kinds`]); read it through [`trait_environment`]. Its kind name is the one it
+/// had nested there (`hir_ty::lower::trait_environment_query`).
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn trait_environment_query(db: &Db, def: GenericDefId) -> StoredClauses {
+    let module = def.module(db);
+    let interner = DbInterner::new_with(db, module.krate(db));
+    let predicates = GenericPredicates::query(db, def);
+    let GenericDefId::FunctionId(function) = def else {
+        return param_env_from_predicates(interner, predicates).clauses.store();
+    };
+    // A trait method's default body sees its `impl Trait` as its own opaque types.
+    blaze_mem::frame::current(|frame| {
+        let default_body = crate::rpitit::default_body_clauses(interner, function, frame);
+        param_env_from_clauses(
+            interner,
+            predicates
+                .all_predicates()
+                .iter_identity()
+                .map(Unnormalized::skip_norm_wip)
+                .chain(default_body.iter().copied()),
+        )
+        .clauses
+        .store()
+    })
 }
 
 /// What a use of `def` in a const context has to prove const: its `[const]` bounds, its parent's,
@@ -4759,69 +4772,65 @@ pub(crate) fn const_conditions<'db>(
     db: &'db Db,
     def: GenericDefId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
-    return const_conditions_query(db, def).get().map_bound(|it| it.as_slice());
+    const_conditions_query(db, def).get().map_bound(|it| it.as_slice())
+}
 
-    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-    fn const_conditions_query(db: &Db, def: GenericDefId) -> StoredEarlyBinder<StoredClauses> {
-        blaze_mem::frame::current(|frame| {
-            let interner = DbInterner::new_no_crate(db);
-            let mut conditions = Vec::new_in(frame);
-            if crate::effects::is_conditionally_const(db, def) {
-                let generics = generics(db, def);
-                if let Some(parent) = generics.parent() {
-                    conditions
-                        .extend(const_conditions(db, parent.def()).skip_binder().iter().copied());
-                }
-                if let GenericDefId::TraitId(trait_) = def {
-                    conditions
-                        .push(maybe_const(interner, TraitRef::identity(interner, trait_.into())));
-                }
-                let store = generics.store();
-                let generics = &generics;
-                let resolver = def.resolver(db);
-                let mut ctx = TyLoweringContext::new(
-                    db,
-                    &resolver,
-                    store,
-                    ExpressionStoreOwnerId::Signature(def),
-                    def,
-                    generics,
-                    LifetimeElisionKind::AnonymousReportError,
-                    LifetimeLoweringMode::Bound,
-                    frame,
-                );
-                for pred in generics.owner().where_predicates() {
-                    let WherePredicate::TypeBound {
-                        lifetimes: None,
-                        binder: BinderParams { len: 0, .. },
-                        target,
-                        bound: TypeBound::Path(path, TraitBoundModifier::MaybeConst),
-                    } = pred
-                    else {
-                        continue;
-                    };
-                    let self_ty = ctx.lower_ty(*target);
-                    let mut ctx = ctx.at_path(*path);
-                    let Some(TypeNs::TraitId(bounded)) = ctx.resolve_path_in_type_ns_fully() else {
-                        continue;
-                    };
-                    let trait_ref = ctx.lower_trait_ref_from_resolved_path(
-                        bounded,
-                        self_ty,
-                        false,
-                        Span::Dummy,
-                    );
-                    conditions.push(maybe_const(interner, trait_ref));
-                }
+/// [`const_conditions`], stored. At module level, `pub`, so its kind is named outside the crate
+/// ([`crate::kinds`]); read it through [`const_conditions`].
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn const_conditions_query(db: &Db, def: GenericDefId) -> StoredEarlyBinder<StoredClauses> {
+    blaze_mem::frame::current(|frame| {
+        let interner = DbInterner::new_no_crate(db);
+        let mut conditions = Vec::new_in(frame);
+        if crate::effects::is_conditionally_const(db, def) {
+            let generics = generics(db, def);
+            if let Some(parent) = generics.parent() {
+                conditions.extend(const_conditions(db, parent.def()).skip_binder().iter().copied());
             }
-            StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&conditions).store())
-        })
-    }
+            if let GenericDefId::TraitId(trait_) = def {
+                conditions.push(maybe_const(interner, TraitRef::identity(interner, trait_.into())));
+            }
+            let store = generics.store();
+            let generics = &generics;
+            let resolver = def.resolver(db);
+            let mut ctx = TyLoweringContext::new(
+                db,
+                &resolver,
+                store,
+                ExpressionStoreOwnerId::Signature(def),
+                def,
+                generics,
+                LifetimeElisionKind::AnonymousReportError,
+                LifetimeLoweringMode::Bound,
+                frame,
+            );
+            for pred in generics.owner().where_predicates() {
+                let WherePredicate::TypeBound {
+                    lifetimes: None,
+                    binder: BinderParams { len: 0, .. },
+                    target,
+                    bound: TypeBound::Path(path, TraitBoundModifier::MaybeConst),
+                } = pred
+                else {
+                    continue;
+                };
+                let self_ty = ctx.lower_ty(*target);
+                let mut ctx = ctx.at_path(*path);
+                let Some(TypeNs::TraitId(bounded)) = ctx.resolve_path_in_type_ns_fully() else {
+                    continue;
+                };
+                let trait_ref =
+                    ctx.lower_trait_ref_from_resolved_path(bounded, self_ty, false, Span::Dummy);
+                conditions.push(maybe_const(interner, trait_ref));
+            }
+        }
+        StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&conditions).store())
+    })
+}
 
-    fn maybe_const<'db>(interner: DbInterner<'db>, trait_ref: TraitRef<'db>) -> Clause<'db> {
-        Binder::dummy(trait_ref)
-            .to_host_effect_clause(interner, rustc_type_ir::BoundConstness::Maybe)
-    }
+/// `trait_ref` as a `[const]` condition: a `HostEffect(Maybe)` clause.
+fn maybe_const<'db>(interner: DbInterner<'db>, trait_ref: TraitRef<'db>) -> Clause<'db> {
+    Binder::dummy(trait_ref).to_host_effect_clause(interner, rustc_type_ir::BoundConstness::Maybe)
 }
 
 /// Resolve the where clause(s) of an item with generics,
@@ -5163,7 +5172,7 @@ fn push_const_arg_has_type_predicates<'db>(
     });
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GenericDefaults(ThinVec<Option<StoredEarlyBinder<StoredGenericArg>>>);
 
 impl GenericDefaults {
@@ -5190,12 +5199,13 @@ pub(crate) fn generic_defaults(db: &Db, def: GenericDefId) -> GenericDefaultsRef
 /// Resolve the default type params from generics.
 ///
 /// Diagnostics are only returned for this `GenericDefId` (returned defaults include parents).
-#[blaze_query::tracked(
+#[blaze_memo::tracked(
     returns(ref),
     cycle_result = generic_defaults_with_diagnostics_cycle_result,
-    mem_tag = Infer
+    owns,
+    mem_tag = Infer,
 )]
-pub(crate) fn generic_defaults_with_diagnostics<'db>(
+pub fn generic_defaults_with_diagnostics<'db>(
     db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericDefaults> {
@@ -5267,7 +5277,6 @@ pub(crate) fn generic_defaults_with_diagnostics<'db>(
 
 fn generic_defaults_with_diagnostics_cycle_result<'db>(
     _db: &'db Db,
-    _: blaze_query::db::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericDefaults> {
     TyLoweringResult::empty(GenericDefaults(ThinVec::new()))
@@ -5299,7 +5308,7 @@ pub fn solver_fn_sig<'db>(db: &'db Db, def: CallableDefId) -> EarlyBinder<'db, P
     }
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 fn fn_sig_with_elided_bound(db: &Db, def: FunctionId) -> StoredEarlyBinder<StoredPolyFnSig> {
     let interner = DbInterner::new_no_crate(db);
     let sig = callable_item_signature(db, def.into()).skip_binder();
@@ -5307,8 +5316,8 @@ fn fn_sig_with_elided_bound(db: &Db, def: FunctionId) -> StoredEarlyBinder<Store
     StoredEarlyBinder::bind(interner, StoredPolyFnSig::new(sig))
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-pub(crate) fn fn_sig_for_fn<'db>(
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
+pub fn fn_sig_for_fn<'db>(
     db: &'db Db,
     def: FunctionId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredPolyFnSig>>> {
@@ -5388,7 +5397,7 @@ fn fn_sig_for_fn_in<'db>(
 /// where rustc makes each a late-bound lifetime of its own. An `impl Trait` the function returns
 /// has a lifetime parameter for each after the function's own, as rustc's has one for each
 /// lifetime it captures, and an error for its argument as the parameters have.
-#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct ElidedLifetimes {
     /// How many each parameter leaves out, `None` where this does not work it out: then none of
     /// them is the `impl Trait`'s.
@@ -5398,7 +5407,7 @@ pub struct ElidedLifetimes {
     pub output: Option<ElidedOutput>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum ElidedOutput {
     /// The one the parameters leave out at this index.
     Elided(u32),
@@ -5545,7 +5554,7 @@ pub fn with_elided_regions<'db>(
     ty.fold_with(&mut folder)
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn elided_lifetimes(db: &Db, function: FunctionId) -> ElidedLifetimes {
     blaze_mem::frame::current(|frame| elided_lifetimes_in(db, function, frame))
 }
@@ -5612,7 +5621,7 @@ fn elided_lifetimes_in(db: &Db, function: FunctionId, frame: &Frame) -> ElidedLi
 /// each error region of its type in [`callable_item_signature`] is, numbered by the order they
 /// are first met: `&dyn Trait` has the reference's twice, the object's default being the
 /// reference's lifetime. `None` for a type that does not line up with its lowering.
-#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
+#[derive(PartialEq, Eq, Debug, Hash)]
 pub struct ElidedGroups {
     pub params: Box<[Option<Box<[u32]>>]>,
     pub output: Option<Box<[u32]>>,
@@ -5645,7 +5654,7 @@ impl ElidedGroups {
     }
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn elided_groups(db: &Db, function: FunctionId) -> ElidedGroups {
     blaze_mem::frame::current(|frame| elided_groups_in(db, function, frame))
 }
@@ -5906,13 +5915,16 @@ fn ctor_signature(db: &Db, variant: VariantId, adt: AdtId) -> StoredEarlyBinder<
     })))
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn fn_sig_for_struct_constructor(db: &Db, def: StructId) -> StoredEarlyBinder<StoredPolyFnSig> {
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn fn_sig_for_struct_constructor(
+    db: &Db,
+    def: StructId,
+) -> StoredEarlyBinder<StoredPolyFnSig> {
     ctor_signature(db, def.into(), def.into())
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
-fn fn_sig_for_enum_variant_constructor(
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
+pub fn fn_sig_for_enum_variant_constructor(
     db: &Db,
     def: EnumVariantId,
 ) -> StoredEarlyBinder<StoredPolyFnSig> {
@@ -5923,14 +5935,16 @@ pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db
     db: &'db Db,
     trait_ref: TraitRef<'db>,
     name: Name,
+    table: blaze_memo::ArenaId,
 ) -> Option<(TypeAliasId, GenericArgs<'db>)> {
     let (AssocTypeShorthandResolution::Resolved(assoc_type)
     | AssocTypeShorthandResolution::Ambiguous { sub_trait_resolution: Some(assoc_type) }) =
-        resolve_type_param_assoc_type_shorthand(
+        assoc_type_shorthand(
             db,
             trait_ref.def_id.0.into(),
             TypeParamId::trait_self(trait_ref.def_id.0),
             name,
+            table,
         )
     else {
         return None;
@@ -5949,14 +5963,14 @@ pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db
 
 #[cfg(test)]
 mod tests {
-    use blaze_query::db::FromId;
+    use blaze_memo::Id as _;
     use hir_def::type_ref::TypeRefId;
 
     use super::*;
     use crate::lower::diagnostics::{GenericArgsProhibitedReason, PathLoweringDiagnostic};
 
     fn trait_id(index: u32) -> TraitId {
-        TraitId::from_id(blaze_query::db::Id::from_u32(index))
+        TraitId::from_gid(blaze_memo::Gid::for_test(index))
     }
 
     #[test]

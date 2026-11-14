@@ -17,6 +17,7 @@
 //! only one the rest of the path reads.
 
 use base_db::Db;
+use blaze_memo::ArenaId;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
@@ -64,7 +65,7 @@ pub struct ResolvePathResultPrefixInfo {
 }
 
 /// One thing a path lookup read, reported in order to the `reads` of
-/// [`DefMap::resolve_path_fp_recording`]: a caller that retries the lookup when one of them is
+/// [`DefMap::resolve_path_written_in`]: a caller that retries the lookup when one of them is
 /// written gets the answer a fresh lookup would. Reads of finished def maps (another crate, an
 /// enclosing block) are reported too; the caller drops what it knows cannot change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,19 +122,26 @@ impl ResolvePathResult {
 /// The segments of a path a lookup reads, with the context each is written with
 /// ([`ModPath::contexts`]): a segment after those the path's kind and first segment resolve is
 /// looked up in the module the path reached so far by its name keyed as def-site hygiene says
-/// ([`super::def_site::key_in`] that module's expansion).
+/// ([`super::def_site::key_in`] that module's expansion). The contexts are of their table, the
+/// table of the crate the path is written in, which the segments keep when the lookup goes on
+/// in another crate's def map. A path with no contexts has no table: there is nothing to look
+/// up in one.
 #[derive(Clone, Copy)]
 pub(super) struct Segments<'a> {
     pub(super) names: &'a [Name],
-    contexts: Option<&'a [SyntaxContext]>,
+    /// The context of each segment and the table they are of; `None` for a path no expansion
+    /// wrote.
+    contexts: Option<(&'a [SyntaxContext], ArenaId)>,
 }
 
 impl<'a> Segments<'a> {
-    pub(super) fn of(path: &'a ModPath) -> Self {
-        Segments { names: path.segments(), contexts: path.contexts() }
+    /// The segments of `path`, whose contexts are of `table` ([`DefMap::ctx_table`] of the def
+    /// map it is written in).
+    pub(super) fn of(path: &'a ModPath, table: ArenaId) -> Self {
+        Segments { names: path.segments(), contexts: path.contexts().map(|it| (it, table)) }
     }
 
-    /// Segments written with no context: a path no expansion wrote.
+    /// Segments written with no context: a path no expansion wrote, so of no table.
     pub(super) fn plain(names: &'a [Name]) -> Self {
         Segments { names, contexts: None }
     }
@@ -148,12 +156,18 @@ impl<'a> Segments<'a> {
 
     /// The segments from `i` on.
     pub(super) fn from(self, i: usize) -> Self {
-        Segments { names: &self.names[i..], contexts: self.contexts.map(|it| &it[i..]) }
+        Segments {
+            names: &self.names[i..],
+            contexts: self.contexts.map(|(it, table)| (&it[i..], table)),
+        }
     }
 
     /// The first `len` segments.
     pub(super) fn prefix(self, len: usize) -> Self {
-        Segments { names: &self.names[..len], contexts: self.contexts.map(|it| &it[..len]) }
+        Segments {
+            names: &self.names[..len],
+            contexts: self.contexts.map(|(it, table)| (&it[..len], table)),
+        }
     }
 
     /// The `i`th segment's name as the scope of `module` binds it: keyed by its context
@@ -173,8 +187,10 @@ impl<'a> Segments<'a> {
         i: usize,
     ) -> Name {
         let name = self.names[i];
-        let Some(ctxt) = self.contexts.map(|it| it[i]) else { return name };
-        match super::def_site::key_in(db, ctxt, expn()) {
+        let Some((ctxt, table)) = self.contexts.map(|(it, table)| (it[i], table)) else {
+            return name;
+        };
+        match super::def_site::key_in(db, table, ctxt, expn()) {
             Some(key) => name.keyed(key),
             None => name,
         }
@@ -243,7 +259,11 @@ fn bang_path_fallback(path: &ModPath, expected: Option<MacroSubNs>) -> Option<Se
 /// `::core::blaze::contract_test` (docs/v2/plan/design/contracts.md, part 2) in every crate,
 /// whatever else `blaze` names there, as `blaze::pure` and the other inert `blaze::` attributes
 /// are (`DefMap::is_builtin_or_registered_attr`). Every other path is itself.
-fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, Segments<'_>) {
+fn attr_path_alias(
+    path: &ModPath,
+    table: ArenaId,
+    expected: Option<MacroSubNs>,
+) -> (PathKind, Segments<'_>) {
     match (expected, path.kind, path.segments()) {
         (Some(MacroSubNs::Attr), PathKind::Plain, [first, second])
             if first.symbol().as_str() == "blaze"
@@ -251,7 +271,7 @@ fn attr_path_alias(path: &ModPath, expected: Option<MacroSubNs>) -> (PathKind, S
         {
             (PathKind::Abs, Segments::plain(&CONTRACT_TEST[..]))
         }
-        (_, kind, _) => (kind, Segments::of(path)),
+        (_, kind, _) => (kind, Segments::of(path, table)),
     }
 }
 
@@ -343,22 +363,27 @@ impl DefMap {
         // resolving them to. Pass `None` otherwise, e.g. when we're resolving import paths.
         expected_macro_subns: Option<MacroSubNs>,
     ) -> ResolvePathResult {
-        let q =
-            PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        let (kind, segments) = attr_path_alias(path, expected_macro_subns);
-        let result = self.resolve_fp(q, original_module, kind, segments, &mut |_| {});
-        match bang_path_fallback(path, expected_macro_subns) {
-            Some(fallback) if result.resolved_def.macros.is_none() => {
-                self.resolve_fp(q, original_module, PathKind::Abs, fallback, &mut |_| {})
-            }
-            _ => result,
-        }
+        self.resolve_path_written_in(
+            self.ctx_table(),
+            local_def_map,
+            db,
+            mode,
+            original_module,
+            path,
+            shadow,
+            expected_macro_subns,
+            &mut |_| {},
+        )
     }
 
-    /// [`Self::resolve_path_fp_with_macro`], calling `reads` with everything the lookup read,
-    /// in order.
-    pub(super) fn resolve_path_fp_recording(
+    /// [`Self::resolve_path_fp_with_macro`] of a path whose contexts are of `table` (the
+    /// [`DefMap::ctx_table`] of the def map it is written in: this one's, or the one def-site
+    /// hygiene moved its lookup out of to a module of this one, [`super::Hygienic::At`], whose
+    /// later segments are still keyed by the contexts they were written with), calling `reads`
+    /// with everything the lookup read, in order.
+    pub(super) fn resolve_path_written_in(
         &self,
+        table: ArenaId,
         local_def_map: &LocalDefMap,
         db: &Db,
         mode: ResolveMode,
@@ -370,7 +395,7 @@ impl DefMap {
     ) -> ResolvePathResult {
         let q =
             PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        let (kind, segments) = attr_path_alias(path, expected_macro_subns);
+        let (kind, segments) = attr_path_alias(path, table, expected_macro_subns);
         let result = self.resolve_fp(q, original_module, kind, segments, reads);
         match bang_path_fallback(path, expected_macro_subns) {
             Some(fallback) if result.resolved_def.macros.is_none() => {
@@ -380,8 +405,10 @@ impl DefMap {
         }
     }
 
+    /// `table`: the table `path`'s contexts are of ([`Self::resolve_path_written_in`]).
     pub(super) fn resolve_path_fp_with_macro_single(
         &self,
+        table: ArenaId,
         local_def_map: &LocalDefMap,
         db: &Db,
         mode: ResolveMode,
@@ -392,7 +419,8 @@ impl DefMap {
     ) -> ResolvePathResult {
         let q =
             PathQuery { local_def_map, db, mode, shadow, expected_macro_subns, collected: false };
-        self.resolve_single(q, original_module, path.kind, Segments::of(path), &mut |_| {})
+        let segments = Segments::of(path, table);
+        self.resolve_single(q, original_module, path.kind, segments, &mut |_| {})
     }
 
     /// `segments` of a path of `kind`, as [`Self::resolve_path_fp_with_macro`] resolves them
@@ -782,12 +810,6 @@ impl DefMap {
                     let vis = self
                         .declared_enum_visibility(db, e, curr, named, reads)
                         .unwrap_or(curr.vis);
-                    // A variant is no binding of the enum's module: a write touching the enum
-                    // wakes this read (`enum_glob_wakes`), as it wakes a glob of the enum.
-                    crate::nameres::delta::reads::note(
-                        crate::Lookup::lookup(&e, db).container,
-                        Some(crate::nameres::delta::reads::enum_glob()),
-                    );
                     // The variant's name as the enum's scope binds it, adjusted to the enum's
                     // expansion (rustc's `resolve_ident_in_module` of the enum's module).
                     let segment =
@@ -829,12 +851,7 @@ impl DefMap {
                     // `use Trait::item`: an import reads a trait as rustc's module of its
                     // associated items. Whether the crate may (E0658) is the importer's to
                     // report. Items the trait's def map cannot list yet bind nothing, and the
-                    // importer reports `ItemsFromMacros`. An item is no binding of the trait's
-                    // module: a write touching the trait wakes this read (`enum_glob_wakes`).
-                    crate::nameres::delta::reads::note(
-                        crate::Lookup::lookup(&trait_, db).container,
-                        Some(crate::nameres::delta::reads::trait_import()),
-                    );
+                    // importer reports `ItemsFromMacros`.
                     let mut res = PerNs::none();
                     let listed = self.for_each_trait_item_for_import(
                         db,

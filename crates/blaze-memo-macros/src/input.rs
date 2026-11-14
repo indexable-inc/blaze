@@ -1,5 +1,6 @@
-//! `#[blaze_memo::input(singleton, debug)]`: a struct of fields the driver makes while it builds
-//! a snapshot, each input one fact of its records; a getter's read lists that fact.
+//! `#[blaze_memo::input(singleton, debug, parts)]`: a struct of fields the driver makes while it
+//! builds a snapshot, each input one fact of its records; a getter's read lists that fact (none
+//! with `parts`: an image read item by item, whose accessors list each item's fact).
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
@@ -39,6 +40,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
     // alloc: expansion time, once per annotated item; no query runs this
     let idents: Vec<&syn::Ident> = fields.iter().map(|it| &it.ident).collect();
     let singleton = options.singleton.is_some();
+    let parts = options.parts.is_some();
 
     let mut methods = TokenStream::new();
     for (index, field) in fields.iter().enumerate() {
@@ -57,6 +59,17 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                 #out
             }
         });
+        if !singleton {
+            let getter_mut = quote::format_ident!("{}_mut", getter);
+            methods.extend(quote! {
+                /// The field to write in place, in a snapshot built and not yet run
+                /// (`Memo::input_mut`, which refuses any other).
+                #[track_caller]
+                #vis fn #getter_mut(self, memo: &mut #plumbing::Memo) -> &mut #ty {
+                    &mut memo.input_mut::<#config>(self.0).#tuple_index
+                }
+            });
+        }
     }
 
     let makers = if singleton {
@@ -114,7 +127,8 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
                         ::core::option::Option::Some(fields) => f
                             .debug_struct(::core::stringify!(#ident))
                             .field("[id]", &this.0)
-                            #(.field(#names, &fields.#indices))*
+                            // One level, each field cut at `FIELD_CAP` (see interned's).
+                            #(.field(#names, &#plumbing::Bounded::field(&fields.#indices)))*
                             .finish(),
                         ::core::option::Option::None => f
                             .debug_struct(::core::stringify!(#ident))
@@ -143,13 +157,35 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             impl #plumbing::Input for #config {
                 type Fields = (#(#tys,)*);
                 const KIND: &'static #plumbing::Kind = &#kind_static;
+                const PARTS: bool = #parts;
             }
 
             #id_impls
 
+            /// An input is known across snapshots by the fact the driver made it with.
+            impl #plumbing::Stable for #ident {
+                fn stable(&self, memo: &#plumbing::Memo, out: &mut #plumbing::StableKey) {
+                    out.id(&#plumbing::input_fact::<#config>(memo, self.0).id);
+                }
+            }
+
             impl #ident {
                 #makers
                 #methods
+            }
+
+            // The input's kind and fact by its own name: the `Input` impl is of a type hidden
+            // here (its `Fields` would put the struct's private field types in a public
+            // interface), so a caller that classifies a read row asks the struct.
+            impl #ident {
+                /// This input's kind: what a `Read::Input` row of one carries.
+                pub const INPUT_KIND: &'static #plumbing::Kind = &#kind_static;
+
+                /// The fact the driver made this input with. Lists no read and notes no borrow
+                /// (`input_fact`).
+                pub fn input_fact(self, memo: &#plumbing::Memo) -> #plumbing::Fact {
+                    #plumbing::input_fact::<#config>(memo, self.0)
+                }
             }
 
             #debug

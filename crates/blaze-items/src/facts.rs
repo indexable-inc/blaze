@@ -171,7 +171,7 @@ pub(crate) fn value_as(
     seen_by: Option<Crate>,
     fact: &Fact,
 ) -> Result<ContentId, Unhashable> {
-    blaze_query::db::attach(db, || value_in(db, seen_by, fact))
+    blaze_memo::attach(db, || value_in(db, seen_by, fact))
 }
 
 fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, Unhashable> {
@@ -180,7 +180,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
     // missing from it.
     let seen_by = match (seen_by, asked_by_crate(fact.kind())) {
         (Some(krate), true) => {
-            hash::macros_built_for(db, krate, hash::Unhashed::Crate(krate))?;
+            hash::macros_built_for(db, krate, || hash::Unhashed::krate(db, krate))?;
             Some(krate)
         }
         (None, true) => unreachable!(
@@ -225,7 +225,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             };
             let adt = variant.adt_id(db);
             let sub = crate::form::Cx::new(db).field(variant, local);
-            h.id(&hash::filled(db, domain, &sub, ItemId::Adt(adt))?);
+            h.id(&hash::filled(db, domain, sub.view(), ItemId::Adt(adt))?);
             field_offset(db, &mut h, adt, variant, local)?;
         }
         Fact::Method { self_ty, name } => write_method(db, &mut h, seen(), self_ty, name)?,
@@ -256,7 +256,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                     Ok(value) => {
                         h.part(b"value").update(&value.to_le_bytes());
                     }
-                    Err(err) => write_eval_error(&mut h, &err),
+                    Err(err) => write_eval_error(db, &mut h, &err),
                 }
             }
             Some(other) => {
@@ -283,7 +283,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                 }
             };
             let sub = crate::form::Cx::new(db).captures(closure);
-            h.id(&hash::filled(db, domain, &sub, infer_owner_item(db, closure.loc(db).owner))?);
+            h.id(&hash::filled(db, domain, sub.view(), infer_owner_item(db, closure.loc(db).owner))?);
         }
         Fact::AutoTraits(subject) => {
             let (owner, index) = match key::resolve(db, subject) {
@@ -293,7 +293,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             };
             // The solver asks it inside a body's inference: refs by signature hash.
             let sub = crate::form::Cx::leak_free(db).auto_traits(owner, index);
-            h.id(&hash::signature_filled(db, domain, &sub, owner)?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), owner)?);
         }
         Fact::HiddenTypes(subject) => {
             let owner = match item(db, subject, fact) {
@@ -302,7 +302,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
                 Some(other) => unreachable!("{fact:?} names {other:?}, which has no opaque types"),
             };
             let sub = crate::form::Cx::leak_free(db).hidden_types(owner);
-            h.id(&hash::signature_filled(db, domain, &sub, owner)?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), owner)?);
         }
         Fact::RpititTys(subject) => {
             let func = match item(db, subject, fact) {
@@ -314,7 +314,7 @@ fn value_in(db: &Db, seen_by: Option<Crate>, fact: &Fact) -> Result<ContentId, U
             // `impl_rpitit_tys`: refs by signature hash, and the method's own signature holds
             // none of it (`Fact::RpititTys`), so this never reads back into what asked it.
             let sub = crate::form::Cx::leak_free(db).rpitit_tys(func);
-            h.id(&hash::signature_filled(db, domain, &sub, ItemId::Function(func))?);
+            h.id(&hash::signature_filled(db, domain, sub.view(), ItemId::Function(func))?);
         }
         Fact::Coherence(key) => {
             let Some(imp) = impl_of(db, key, fact) else { return absent() };
@@ -519,7 +519,7 @@ pub(crate) mod planted {
 /// const-eval budget, and its dependencies' content), the content of the source root of its
 /// root file (every file's path and text), and its proc macros with their libraries, as a
 /// dependency image's key (`hir_def::deps::key`) has them.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn crate_inputs(db: &Db, krate: base_db::Crate) -> ContentId {
     let mut h = Hasher::new(CRATE);
     let all = krate.transitive_deps(db);
@@ -576,7 +576,9 @@ fn write_noted_reads(db: &Db, h: &mut Hasher, krate: base_db::Crate) {
     // alloc: base-db hands the notes out as one list; made once per value of a crate fact
     let env_read = files.env_read();
     h.part(b"noted");
-    for &it in krate.transitive_deps(db) {
+    for &dep in krate.transitive_deps(db) {
+        // The notes are by the crate's stable key, never its id (`base_db::CrateKey`).
+        let it = dep.key(db);
         // alloc: as above, empty (no allocation) for a crate that included no such file
         let included = files.included_by(db, it);
         h.update(&(included.len() as u64).to_le_bytes());
@@ -661,7 +663,8 @@ pub fn scope_traits_named(db: &Db, module: ModuleId, name: &Name) -> Fact {
 /// The impls declared in `block`, by the key of its def map's root module: what
 /// `TraitImpls::for_block` and `InherentImpls::for_block` give.
 pub fn block_impls(db: &Db, block: BlockIdLt<'_>) -> Fact {
-    Fact::BlockImpls(key::module_key(db, hir_def::nameres::block_def_map(db, block).root))
+    let def_map = hir_def::nameres::block_def_map(db, block.to_static());
+    Fact::BlockImpls(key::module_key(db, def_map.root))
 }
 
 pub fn code(db: &Db, id: ItemId) -> Fact {
@@ -899,7 +902,7 @@ fn write_evaluated<'db>(
     let value = match value {
         Ok(value) => value,
         Err(err) => {
-            write_eval_error(h, &err);
+            write_eval_error(db, h, &err);
             return Ok(());
         }
     };
@@ -966,16 +969,17 @@ fn ty_hash<'db>(db: &'db Db, owner: ItemId, ty: Ty<'db>) -> Result<ContentId, Un
     hash::filled(db, CONST_TYPE, sub, owner)
 }
 
-fn write_eval_error(h: &mut Hasher, err: &ConstEvalError<'_>) {
+fn write_eval_error(db: &Db, h: &mut Hasher, err: &ConstEvalError<'_>) {
     scratch::with_string(|kind| {
-        eval_error_kind(err, kind);
+        eval_error_kind(db, err, kind);
         h.part(b"error").part(kind.as_bytes());
     });
 }
 
 /// Which error stopped an evaluation, written to `out`: its stage and kind, never its text,
-/// which names spans.
-fn eval_error_kind(err: &ConstEvalError<'_>, out: &mut String) {
+/// which names spans. The kind is the start of the error's `Debug`, written with `db`
+/// attached: the rest names definitions (a `SolverDefId`), which print only through it.
+fn eval_error_kind(db: &Db, err: &ConstEvalError<'_>, out: &mut String) {
     let stage = match err {
         ConstEvalError::MirLowerError(_) => "lower",
         ConstEvalError::MirEvalError(_) => "eval",
@@ -983,10 +987,10 @@ fn eval_error_kind(err: &ConstEvalError<'_>, out: &mut String) {
     out.push_str(stage);
     out.push(' ');
     let start = out.len();
-    let written = match err {
+    let written = blaze_memo::attach(db, || match err {
         ConstEvalError::MirLowerError(it) => write!(out, "{it:?}"),
         ConstEvalError::MirEvalError(it) => write!(out, "{it:?}"),
-    };
+    });
     written.expect("writing to a string cannot fail");
     let kind = out[start..]
         .find(|c: char| !(c.is_alphanumeric() || c == '_'))

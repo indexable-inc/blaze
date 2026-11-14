@@ -68,7 +68,7 @@ use super::{
     facts::{self, Parents},
     frozen_collection, packable,
 };
-use crate::{check::Cx, diag, profile, query};
+use crate::{check::Cx, diag, kept, profile, query};
 
 const LINT: Lint = Lint::SoaCandidate;
 
@@ -115,27 +115,102 @@ impl Walk {
     }
 }
 
-/// One walk over a collection of a struct, and what it touches of each element.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One walk over a collection of a struct, and what it touches of each element: a row of
+/// [`Passes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Pass {
     pub(crate) def: DefWithBodyId,
     /// Where it is: the `for` expression, the collection an iterator chain starts from, or the
     /// loop or closure that indexes.
     pub(crate) at: ExprId,
     pub(crate) walk: Walk,
-    /// The fields it reads or writes, by index, sorted.
-    pub(crate) fields: Vec<u32>,
+    /// The fields it reads or writes, by index, sorted: its `(start, len)` of
+    /// [`Passes::fields`].
+    fields: (u32, u32),
     /// It uses an element whole: all of it.
     pub(crate) whole: bool,
 }
 
-/// The passes over collections of the crate's structs, once per crate.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Passes {
-    by_struct: HashMap<StructId, Vec<Pass>, Global>,
+/// The passes over collections of the crate's structs, once per crate, kept in the crate's
+/// arena: each struct's passes and unread bodies are a `(start, len)` of the slices.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Passes<'db> {
+    passes: &'db [Pass],
+    fields: &'db [u32],
+    unread_defs: &'db [DefWithBodyId],
+    by_struct: kept::Map<'db, StructId, (u32, u32)>,
     /// The bodies whose MIR (or a closure's in them) can't be built, by the structs their
     /// expressions name: their passes are not counted, and a finding says so.
-    unread: HashMap<StructId, Vec<DefWithBodyId>, Global>,
+    unread: kept::Map<'db, StructId, (u32, u32)>,
+}
+
+fn part<T>(rows: &[T], (start, len): (u32, u32)) -> &[T] {
+    &rows[start as usize..(start + len) as usize]
+}
+
+impl<'db> Passes<'db> {
+    /// The passes over collections of `strukt`, in the order of the crate's bodies.
+    fn of(&self, strukt: StructId) -> Option<&'db [Pass]> {
+        self.by_struct.get(&strukt).map(|&at| part(self.passes, at))
+    }
+
+    /// The fields `pass` touches, by index, sorted.
+    fn fields(&self, pass: &Pass) -> &'db [u32] {
+        part(self.fields, pass.fields)
+    }
+
+    /// The bodies naming `strukt` whose MIR can't be built.
+    fn unread(&self, strukt: StructId) -> Option<&'db [DefWithBodyId]> {
+        self.unread.get(&strukt).map(|&at| part(self.unread_defs, at))
+    }
+}
+
+/// A pass as [`soa_passes`] reads it, before it is kept.
+struct Found {
+    def: DefWithBodyId,
+    at: ExprId,
+    walk: Walk,
+    fields: Vec<u32, Global>,
+    whole: bool,
+}
+
+/// What [`soa_passes`] reads, before it is kept.
+struct Gathered {
+    by_struct: HashMap<StructId, Vec<Found, Global>, Global>,
+    unread: HashMap<StructId, Vec<DefWithBodyId, Global>, Global>,
+}
+
+impl Gathered {
+    /// Kept in the current run's arena, each struct's rows in the order they were read.
+    fn keep(self, db: &Db) -> Passes<'_> {
+        let len = |n: usize| u32::try_from(n).expect("a crate's passes fit in u32");
+        let mut passes = Vec::new_in(Global);
+        let mut fields = Vec::new_in(Global);
+        let mut by_struct = Vec::new_in(Global);
+        for (strukt, found) in self.by_struct {
+            let start = len(passes.len());
+            for it in found {
+                let at = (len(fields.len()), len(it.fields.len()));
+                fields.extend_from_slice(&it.fields);
+                passes.push(Pass { def: it.def, at: it.at, walk: it.walk, fields: at, whole: it.whole });
+            }
+            by_struct.push((strukt, (start, len(passes.len()) - start)));
+        }
+        let mut unread_defs = Vec::new_in(Global);
+        let mut unread = Vec::new_in(Global);
+        for (strukt, defs) in self.unread {
+            let start = len(unread_defs.len());
+            unread_defs.extend_from_slice(&defs);
+            unread.push((strukt, (start, len(defs.len()))));
+        }
+        Passes {
+            passes: kept::slice(db, passes),
+            fields: kept::slice(db, fields),
+            unread_defs: kept::slice(db, unread_defs),
+            by_struct: kept::Map::keep(db, by_struct),
+            unread: kept::Map::keep(db, unread),
+        }
+    }
 }
 
 /// The traits a pass is recognized by.
@@ -146,9 +221,10 @@ struct Traits {
 }
 
 /// Every pass over a collection of a struct of `krate`, in the order of the crate's bodies.
-#[blaze_query::tracked(returns(ref))]
-pub(crate) fn soa_passes(db: &Db, krate: base_db::Crate) -> Passes {
-    let mut out = Passes::default();
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn soa_passes<'db>(db: &'db Db, krate: base_db::Crate) -> Passes<'db> {
+    let mut out =
+        Gathered { by_struct: HashMap::new_in(Global), unread: HashMap::new_in(Global) };
     let lang = lang_items(db, krate);
     let traits = Traits { iterator: lang.Iterator, index: lang.Index, index_mut: lang.IndexMut };
     for def in frozen_collection::crate_bodies(db, krate) {
@@ -157,7 +233,7 @@ pub(crate) fn soa_passes(db: &Db, krate: base_db::Crate) -> Passes {
         }
         read_body(db, krate, &traits, def, &mut out);
     }
-    out
+    out.keep(db)
 }
 
 fn is_test(db: &Db, def: DefWithBodyId) -> bool {
@@ -206,7 +282,7 @@ fn read_body(
     krate: base_db::Crate,
     traits: &Traits,
     def: DefWithBodyId,
-    out: &mut Passes,
+    out: &mut Gathered,
 ) {
     let analysis = hir::BodyAnalysis::new(db, hir::DefWithBody::from(def));
     let body = analysis.body();
@@ -329,11 +405,12 @@ fn read_body(
         if pass.fields.is_empty() && !pass.whole {
             continue;
         }
-        let mut fields = pass.fields;
+        let mut fields = Vec::new_in(Global);
+        fields.extend_from_slice(&pass.fields);
         fields.sort_unstable();
         fields.dedup();
-        let found = Pass { def, at: pass.at, walk: pass.walk, fields, whole: pass.whole };
-        out.by_struct.entry(pass.strukt).or_default().push(found); // alloc: one struct's passes
+        let found = Found { def, at: pass.at, walk: pass.walk, fields, whole: pass.whole };
+        out.by_struct.entry(pass.strukt).or_insert_with(|| Vec::new_in(Global)).push(found);
     }
 }
 
@@ -344,7 +421,7 @@ fn unread(
     krate: base_db::Crate,
     analysis: &hir::BodyAnalysis<'_>,
     def: DefWithBodyId,
-    out: &mut Passes,
+    out: &mut Gathered,
 ) {
     let infer = analysis.infer();
     for (id, _) in analysis.body().exprs() {
@@ -352,7 +429,8 @@ fn unread(
             if let Some(hir::Adt::Struct(it)) = inner.as_adt()
                 && it.module(db).krate(db).base() == krate
             {
-                let defs = out.unread.entry(StructId::from(it)).or_default(); // alloc: one struct's unread bodies
+                let defs =
+                    out.unread.entry(StructId::from(it)).or_insert_with(|| Vec::new_in(Global));
                 if !defs.contains(&def) {
                     defs.push(def);
                 }
@@ -766,7 +844,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     }
     let krate = cx.krate();
     let found = soa_passes(db, krate.base());
-    let Some(passes) = found.by_struct.get(&StructId::from(def)) else { return };
+    let Some(passes) = found.of(StructId::from(def)) else { return };
     let loaded = cx.conf().profile.as_ref();
     // clone: the profile's settings and a refcount, once per struct linted with a profile
     let hits = loaded
@@ -791,7 +869,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
     };
     // alloc: the fields the counted passes touch, a few
     let mut touched: Vec<u32> =
-        counted.iter().flat_map(|(it, _)| it.fields.iter().copied()).collect();
+        counted.iter().flat_map(|(it, _)| found.fields(it).iter().copied()).collect();
     touched.sort_unstable();
     touched.dedup();
     let mut needed = 0;
@@ -828,8 +906,9 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             },
             None => String::new(), // alloc: a message's part
         };
-        let pass_names: Vec<String> = pass.fields.iter().map(|&it| name_of(it)).collect(); // alloc: a message's part
-        let pass_bytes: u64 = pass.fields.iter().filter_map(|&it| size_of(it)).sum();
+        let pass_fields = found.fields(pass);
+        let pass_names: Vec<String> = pass_fields.iter().map(|&it| name_of(it)).collect(); // alloc: a message's part
+        let pass_bytes: u64 = pass_fields.iter().filter_map(|&it| size_of(it)).sum();
         let hot = match (hit, loaded) {
             (Some(hit), Some(loaded)) => {
                 format!(", {} of profile `{}`'s counts", hit.percent(), loaded.file_name())
@@ -857,7 +936,7 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, item: ast::Struct<'t>) {
             ),
         ));
     }
-    if let Some(defs) = found.unread.get(&StructId::from(def)) {
+    if let Some(defs) = found.unread(StructId::from(def)) {
         let named: Vec<String> = defs.iter().map(|&it| body_name(db, it)).collect(); // alloc: a message's part
         notes.push((
             None,

@@ -11,8 +11,8 @@
 use arrayvec::ArrayVec;
 use base_db::Db;
 use hir_def::{
-    ConstParamId, GenericDefId, GenericParamId, ItemContainerId, LifetimeParamId, Lookup,
-    TypeOrConstParamId, TypeParamId,
+    ConstParamId, GenericDefId, GenericParamId, HasModule, ItemContainerId, LifetimeParamId,
+    Lookup, TypeOrConstParamId, TypeParamId,
     expr_store::ExpressionStore,
     hir::generics::{
         GenericParamDataRef, GenericParams, LifetimeParamData, TypeOrConstParamData,
@@ -215,7 +215,9 @@ impl<'db> Generics<'db> {
                         && path.mod_path().and_then(|it| it.as_ident()).is_some_and(|name| {
                             // As the path's lookup names it: by its macros 2.0 key.
                             let hygiene = owner.store.type_path_hygiene(target);
-                            let name = hir_def::nameres::path_param_name(db, *name, hygiene);
+                            let table = crate::ctx_table(owner.def.krate(db));
+                            let name =
+                                hir_def::nameres::path_param_name(db, table, *name, hygiene);
                             owner.params.find_type_by_name(&name, owner.def) == Some(param)
                         })
                 }

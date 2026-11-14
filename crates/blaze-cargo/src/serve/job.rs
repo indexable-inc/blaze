@@ -139,7 +139,7 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_history::History;
 use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use blaze_profile::{
-    facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow, ProvenanceRow, TestRunRow},
+    facts::{CrateDepRow, DepKind, LinkOutcome, LinkRow, TestRunRow},
     history::{self as profile_history, BuildRow},
 };
 use blaze_protocol::events::NodeKind;
@@ -219,14 +219,12 @@ pub enum Value<S: Steps> {
     /// [`Work::Ahead`]: the units to build ahead ([`Front::ahead`]).
     Ahead(Result<Vec<u32>, ApiError>),
     /// What a kept front end left for the store ([`Steps::store_kept`]), and the front end
-    /// given back: none when its store panicked, as it may be half written. With its build's
-    /// run log as the history's rows ([`Steps::kept_run_log`]), named by the task.
-    /// And the units' records filed first ([`crate::serve::unit::Filed`]), whatever the
-    /// store came to: a failed store drops the front end, never the records.
+    /// given back: none when its store panicked, as it may be half written. And the units'
+    /// records filed first ([`crate::serve::unit::Filed`]), whatever the store came to: a
+    /// failed store drops the front end, never the records.
     StoredKept(
         Option<S::KeptFront>,
         Result<Vec<super::work::KeptPut>, ApiError>,
-        Vec<ProvenanceRow>,
         crate::serve::unit::Filed,
     ),
     /// A front-end carry's pass ran ([`Does::FrontCarry`]): what it gave is in its
@@ -528,16 +526,13 @@ pub(super) enum Does<S: Steps> {
         private: bool,
     },
     /// A job's front end as it is kept, what its build left for the store written from it
-    /// ([`Steps::store_kept`]); taken by the task and given back in its value. The task names
-    /// the run log of build `build` first when `logs` ([`Steps::kept_run_log`]), and lets go
-    /// last of what the build's end releases ([`Steps::release_kept`]), unless `wanted` is
+    /// ([`Steps::store_kept`]); taken by the task and given back in its value. The task lets
+    /// go last of what the build's end releases ([`Steps::release_kept`]), unless `wanted` is
     /// set by then: a request of the checkout waits for the front end.
     StoreKept {
         steps: Arc<S>,
         kept: Lock<Option<S::KeptFront>>,
         checkout: String,
-        build: u64,
-        logs: bool,
         wanted: Arc<AtomicBool>,
         /// A build's store files its units' records first; none for a store of a checkout's
         /// members, which no build's end posts ([`Jobs::store_members`]).
@@ -747,7 +742,7 @@ impl<S: Steps> plane::Work for Step<S> {
                 let compiled = match caught {
                     Ok(it) => it,
                     Err(payload)
-                        if payload.is::<blaze_query::db::Cancelled>()
+                        if payload.is::<blaze_memo::Cancelled>()
                             || payload.is::<blaze_graph::Cancelled>() =>
                     {
                         Err(Failed::Again)
@@ -890,7 +885,7 @@ impl<S: Steps> plane::Work for Step<S> {
                     .expect("the documentation's task is posted with its job's writer");
                 self.settle(front.doc(writer, *no_deps, *private), Value::Answers)
             }
-            Does::StoreKept { steps, kept, build, logs, wanted, filing, .. } => {
+            Does::StoreKept { steps, kept, wanted, filing, .. } => {
                 // The units' records first: they need no front end, and their puts reach the
                 // loop whatever the store below comes to.
                 let filed = match filing {
@@ -926,26 +921,11 @@ impl<S: Steps> plane::Work for Step<S> {
                         "the kept front end to store was taken before its task ran",
                         None,
                     );
-                    // alloc: none, an empty vec
                     return self.settle(Err(Failed::Error(error)), |it| {
-                        Value::StoredKept(None, it, Vec::new(), filed)
+                        Value::StoredKept(None, it, filed)
                     });
                 };
                 let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // The build's run log first, as it was taken before the front end was
-                    // kept: what the store's own reads run is not the build's.
-                    let ran = match *logs {
-                        true => {
-                            let _span = tracing::info_span!(
-                                target: "blaze",
-                                "kept front end: name the build's run log",
-                                build = *build,
-                            )
-                            .entered();
-                            super::observe::provenance_rows(*build, steps.kept_run_log(&front))
-                        }
-                        false => Vec::new(), // alloc: none
-                    };
                     let mut stored = {
                         let _span = tracing::info_span!(
                             target: "blaze",
@@ -975,10 +955,10 @@ impl<S: Steps> plane::Work for Step<S> {
                         .entered();
                         steps.release_kept(&mut front, wanted);
                     }
-                    (ran, stored)
+                    stored
                 }));
-                let (front, stored, ran) = match caught {
-                    Ok((ran, stored)) => (Some(front), stored, ran),
+                let (front, stored) = match caught {
+                    Ok(stored) => (Some(front), stored),
                     Err(payload) => {
                         let panic = plane::panicked(&*payload);
                         drop(front);
@@ -986,10 +966,10 @@ impl<S: Steps> plane::Work for Step<S> {
                         let what = format!(
                             "blaze {panic}, storing what the build left for the store; its front end is dropped, as it may be half written"
                         );
-                        (None, Err(ApiError::new(what, None)), Vec::new()) // alloc: none
+                        (None, Err(ApiError::new(what, None)))
                     }
                 };
-                self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it, ran, filed))
+                self.settle(stored.map_err(Failed::Error), |it| Value::StoredKept(front, it, filed))
             }
             Does::Write { slot, .. } => {
                 let taken = slot.lock().take();
@@ -4175,16 +4155,11 @@ impl<S: Steps> Job<S> {
 
     /// The history's rows of its plane request `request` ([`Job::row`]): its own, each image
     /// its units linked, and its units' crate graph.
-    ///
-    /// `logs`: its front end's run log is taken and named here, on the loop. Not for a build
-    /// whose front end is kept: the task that stores it names the log, after the answer
-    /// ([`Steps::kept_run_log`], [`Jobs::ran`]).
     fn ended(
         &mut self,
         request: RequestId,
         stats: Option<RequestStats>,
         outcome: profile_history::Outcome,
-        logs: bool,
     ) -> Ended {
         let build_id = u64::from(request.0);
         let links = self
@@ -4295,24 +4270,7 @@ impl<S: Steps> Job<S> {
         for it in &mut test_runs {
             it.build_id = build_id;
         }
-        // Its front end's run log, named with its database in hand, before the front end is
-        // kept or dropped: why each of its queries ran again.
-        let provenance = match (&self.stage, logs) {
-            (Stage::Units(build), true) => match build.writer.here() {
-                Some(writer) => super::observe::provenance_rows(build_id, writer.run_log()),
-                // A build whose write was lost has no database to name its run log with.
-                None => Vec::new(), // alloc: none
-            },
-            _ => Vec::new(), // alloc: none
-        };
-        Ended {
-            row: self.row(request, stats, outcome),
-            links,
-            crate_deps,
-            misses,
-            test_runs,
-            provenance,
-        }
+        Ended { row: self.row(request, stats, outcome), links, crate_deps, misses, test_runs }
     }
 
     /// The value its stage waited on, if node `node` gave it.
@@ -4594,9 +4552,6 @@ pub struct Jobs<S: Steps> {
     settling: Vec<Settling<S>>,
     /// The last of what settling lost ([`Jobs::lose`]), oldest first, [`LOST_SHOWN`] at most.
     lost: Vec<Lost>,
-    /// The run logs of builds whose front end was kept, as the history's rows, named by the
-    /// task that stored it ([`Steps::kept_run_log`]): for the daemon to hand to its history.
-    pub ran: Vec<ProvenanceRow>,
     /// Each error a build said, as the history's `errors` rows ([`Jobs::note_errors`]): for
     /// the daemon to hand to its history, before the build's answer is told to it, so the
     /// answer's flush writes them.
@@ -4741,7 +4696,6 @@ impl<S: Steps> Jobs<S> {
             certify_held: Vec::new(), // alloc: none until a build ends with something to settle
             settling: Vec::new(), // alloc: none until a job leaves something to settle
             lost: Vec::new(),     // alloc: none until settling loses something
-            ran: Vec::new(),      // alloc: none until a kept front end's run log is named
             errors: Vec::new(),   // alloc: none until a build says an error
             fronts: fronts::Fronts::new(),
             erring: HashMap::new_in(Global),
@@ -5930,41 +5884,23 @@ impl<S: Steps> Jobs<S> {
         }
     }
 
-    /// What each kept front end's query storage holds, by ingredient, a line a front end in
-    /// the daemon's log: the idle daemon's answer to "what holds the memory" (rule
-    /// ask-the-profile-first). A walk of every function's rows made, sound beside readers
-    /// (`blaze_query::db::Storage::memory_usage`), so only where nothing waits on it: as the
-    /// daemon gives its warm memory back ([`super::idle`]).
+    /// What each kept front end's snapshot holds, a line a front end in the daemon's log: the
+    /// idle daemon's answer to "what holds the memory" (rule ask-the-profile-first). Said as
+    /// the daemon gives its warm memory back ([`super::idle`]). The memo counts bytes by
+    /// arena, not by query ([`blaze_memo::Memo::held`]), so the line says the total and the
+    /// arenas it is in.
     pub fn say_what_the_kept_front_ends_hold(&self) {
-        use std::fmt::Write as _;
-        const SHOWN: usize = 48;
         let mib = |bytes: u64| bytes as f64 / f64::from(1u32 << 20);
         for (root, &id) in self.roots.ids.iter() {
             let Some(db) = self.roots.fronts[id as usize].as_ref().and_then(KeptDb::db) else {
                 continue;
             };
             let _span = tracing::info_span!(target: "blaze", "idle: what the kept front end holds").entered();
-            let mut usage = Vec::new(); // alloc: an idle daemon's report, an entry an ingredient
-            blaze_query::db::Database::storage(db).memory_usage(&mut usage);
-            usage.sort_by(|a, b| b.held().cmp(&a.held()).then(a.name.cmp(b.name)));
-            let total: u64 = usage.iter().map(blaze_query::db::MemoryUsage::held).sum();
-            let mut said = String::new(); // alloc: as above, one line
-            for it in usage.iter().take(SHOWN) {
-                let _ = write!(
-                    said,
-                    "; {} {:.1} (rows {:.1}, values {:.1}; {} rows made, {} used)",
-                    it.name,
-                    mib(it.held()),
-                    mib(it.row_bytes),
-                    mib(it.value_bytes),
-                    it.rows,
-                    it.used,
-                );
-            }
+            let memo = blaze_memo::Database::memo(db);
             crate::serve::said::logged!(INFO,
-                "blaze serve: idle: the kept front end of {root} holds {:.1} MiB of query storage in {} ingredients, in MiB{said}",
-                mib(total),
-                usage.len(),
+                "blaze serve: idle: the kept front end of {root} holds {:.1} MiB of memo in {} arenas",
+                mib(memo.held() as u64),
+                memo.arenas().count(),
             );
         }
     }
@@ -6419,8 +6355,7 @@ impl<S: Steps> Jobs<S> {
                     self.native_waiting.remove(&key);
                 }
             }
-            Value::StoredKept(front, stored, mut ran, filed) => {
-                self.ran.append(&mut ran);
+            Value::StoredKept(front, stored, filed) => {
                 // Its job's while the job lives, else of what the job left to settle.
                 let settling = self
                     .settling
@@ -7435,8 +7370,8 @@ impl<S: Steps> Jobs<S> {
     /// tasks are done with it. The request is idle: the job's answer does not wait for it
     /// ([`Jobs::wind_up`]), and only a lowering held for the front end makes it run as one
     /// asked ([`Jobs::lower_or_wait`]). The front end is the root's again once the puts are
-    /// made ([`Jobs::stored_kept`]). The task also names the run log of build `build` when `logs`,
-    /// and lets go of what the build's end releases, both after the answer.
+    /// made ([`Jobs::stored_kept`]). The task also lets go of what the build's end releases,
+    /// after the answer.
     fn store_kept(
         &mut self,
         w: &mut World<'_, S>,
@@ -7444,8 +7379,6 @@ impl<S: Steps> Jobs<S> {
         root: u32,
         checkout: String,
         kept: S::KeptFront,
-        build: u64,
-        logs: bool,
         input: &JobInput,
     ) {
         let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
@@ -7466,8 +7399,6 @@ impl<S: Steps> Jobs<S> {
             steps: Arc::clone(w.steps),
             kept: Lock::new("serve.job.store_kept.kept", Some(kept)),
             checkout: checkout.clone(),
-            build,
-            logs,
             wanted: Arc::clone(&wanted), // clone: a refcount, once per build
             filing: Some(Filing {
                 records: Lock::new("serve.job.store_kept.records", std::mem::take(&mut job.records)),
@@ -9339,20 +9270,13 @@ impl<S: Steps> Jobs<S> {
         {
             job.left = Some(build.left());
         }
-        // A build whose front end is kept has its run log named by the task that stores the
-        // front end, after the answer ([`Steps::kept_run_log`]); any other's is named here,
-        // before its front end goes. A documentation's front end is not kept.
-        let kept_logs = !job.cancelled.load(Ordering::Acquire)
-            && !matches!(job.work, Work::Doc { .. })
-            && matches!(&job.stage, Stage::Units(build) if build.root.is_some() && build.applying.is_none());
         #[cfg(test)]
         ENDED_ROWS.with_borrow_mut(|it| it.push(command_line(&job.work))); // alloc: a test's record
         let ended = tracing::info_span!(
             target: "blaze",
             "loop: the build's rows for the history",
-            run_log_named_here = !kept_logs,
         )
-        .in_scope(|| job.ended(request, Some(stats), outcome, !kept_logs));
+        .in_scope(|| job.ended(request, Some(stats), outcome));
         #[cfg(test)]
         ENDED_LOST.with_borrow_mut(|it| {
             // alloc: a test's record
@@ -9566,8 +9490,6 @@ impl<S: Steps> Jobs<S> {
                             root,
                             input.config.invocation.root.clone(),
                             kept,
-                            u64::from(request.0),
-                            kept_logs,
                             &input,
                         ),
                         Err(error) => {
@@ -10036,7 +9958,7 @@ impl<S: Steps> Jobs<S> {
             self.held_leases.push((id, Arc::clone(&job.cancelled), Arc::clone(&job.leases)));
             if let Some(request) = job.request {
                 let stats = w.plane.stats(request);
-                self.rows.push(job.ended(request, stats, profile_history::Outcome::Stalled, true));
+                self.rows.push(job.ended(request, stats, profile_history::Outcome::Stalled));
                 self.answered.push(u64::from(request.0));
                 job.cancelled.store(true, Ordering::Release);
                 if w.plane.is_open(request) {

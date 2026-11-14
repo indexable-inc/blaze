@@ -67,12 +67,12 @@ const DEV_RUNTIME: &str = "blaze_inproc_rt";
 /// crate` ([`is_panic_runtime`]): every one, for a crate of the standard library. In the order
 /// `krate` lists its dependencies. A proc-macro crate is among them when it is named, though a
 /// program does not link one.
-#[blaze_query::tracked(returns(ref))]
-pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
+#[blaze_memo::tracked(returns(copy))]
+pub fn named_dependencies<'db>(db: &'db Db, krate: Crate) -> &'db [Crate] {
+    let memo = blaze_memo::Database::memo(db);
     let dependencies = &krate.data(db).dependencies;
     if matches!(krate.data(db).origin, CrateOrigin::Lang(_)) {
-        // alloc: the memo's value, once per crate
-        return dependencies.iter().map(|it| it.crate_id).collect();
+        return blaze_memo::keep_iter(memo, dependencies.iter().map(|it| it.crate_id));
     }
     let lang = |krate: Crate| matches!(krate.data(db).origin, CrateOrigin::Lang(_));
     // A `#![no_std]` crate (not built as a test harness, which rustc gives `test` and so std)
@@ -121,7 +121,7 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
     // rustc injects `std`: its paths say `std`, which the walk above does not read as the
     // dependency's own name (docs/v2/plan/design/std.md, "The blaze edition: opting in").
     let edition_std = krate.blaze_edition(db).map(|_| span::BlazeEdition::STD);
-    dependencies
+    let named = dependencies
         .iter()
         .filter(|it| {
             walk.named.contains(it.name.as_str())
@@ -130,14 +130,13 @@ pub fn named_dependencies(db: &Db, krate: Crate) -> Box<[Crate]> {
                     && !by_name(it.crate_id, it.name.as_str())
                     && !is_panic_runtime(db, it.crate_id))
         })
-        .map(|it| it.crate_id)
-        // alloc: the memo's value, once per crate
-        .collect()
+        .map(|it| it.crate_id);
+    blaze_memo::keep_iter(memo, named)
 }
 
 /// Whether `krate` is a panic runtime: `#![panic_runtime]` on its root, as rustc's
 /// `is_panic_runtime` reads it.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub fn is_panic_runtime(db: &Db, krate: Crate) -> bool {
     let root = crate_def_map(db, krate).crate_root(db);
     AttrFlags::has_word(db, AttrDefId::ModuleId(root), "panic_runtime")
@@ -145,7 +144,7 @@ pub fn is_panic_runtime(db: &Db, krate: Crate) -> bool {
 
 /// Whether `krate` is the compiler's builtins: `#![compiler_builtins]` on its root, as rustc's
 /// `is_compiler_builtins` reads it.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub fn is_compiler_builtins(db: &Db, krate: Crate) -> bool {
     let root = crate_def_map(db, krate).crate_root(db);
     AttrFlags::has_word(db, AttrDefId::ModuleId(root), "compiler_builtins")

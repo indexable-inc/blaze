@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use base_db::{Db, EditionedFileId, FileId};
-use blaze_query::db::{Database, Id};
+use blaze_memo::ArenaId;
 use hir_expand::{FileRange, HirFileId};
 use proc_macro_api::bridge::questions::{ParentSpan, SpanJoin};
 use span::{
@@ -18,12 +18,15 @@ use span::{
 
 pub use proc_macro_api::bridge::questions::{SubRequest, SubResponse};
 
-/// `req` answered from `db`, the database of the expansion that asked it.
-pub fn answer(db: &Db, req: SubRequest) -> SubResponse {
-    answered(db, req).unwrap_or_else(|reason| SubResponse::Cancel { reason })
+/// `req` answered from `db`, the database of the expansion that asked it. `contexts` is the
+/// table the question's syntax contexts are words of, and the contexts of the answer are
+/// given as words of: the calling crate's arena, where the expansion's call is homed
+/// (`span::MacroCallId::arena`).
+pub fn answer(db: &Db, contexts: ArenaId, req: SubRequest) -> SubResponse {
+    answered(db, contexts, req).unwrap_or_else(|reason| SubResponse::Cancel { reason })
 }
 
-fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
+fn answered(db: &Db, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, String> {
     Ok(match req {
         SubRequest::LocalFilePath { file_id } => {
             SubResponse::LocalFilePathResult { name: path_of(db, file(db, file_id)?) }
@@ -65,13 +68,17 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
             SubResponse::ByteRangeResult { range: range.range.into() }
         }
         SubRequest::SpanSource { file_id, ast_id, start, end, ctx } => {
-            let mut current_span = span_of(db, file_id, ast_id, start, end, ctx)?;
+            let mut current_span = span_of(db, contexts, file_id, ast_id, start, end, ctx)?;
             let mut current_ctx = current_span.ctx;
-            while let Some(macro_call_id) = current_ctx.outer_expn(db) {
+            // The table `current_ctx` is a word of: a call's site is of its calling crate's
+            // table, the call's own arena.
+            let mut table = contexts;
+            while let Some(macro_call_id) = current_ctx.outer_expn(db, table) {
                 let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
                 let call_site_file = macro_call_loc.kind.file_id();
                 let resolved = hir_expand::resolve_span(db, current_span);
                 current_ctx = macro_call_loc.ctxt;
+                table = macro_call_id.arena();
                 current_span = Span {
                     range: resolved.range,
                     anchor: SpanAnchor {
@@ -90,12 +97,13 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
                 ast_id: ROOT_ERASED_FILE_AST_ID.into_raw(),
                 start: u32::from(resolved.range.start()),
                 end: u32::from(resolved.range.end()),
-                ctx: current_span.ctx.into_u32(),
+                // A word of the asker's table, where the context is carried from the call's.
+                ctx: current_span.ctx.translate(db, table, contexts).into_u32(),
             }
         }
         SubRequest::SpanParent { file_id, ast_id, start, end, ctx } => {
-            let span = span_of(db, file_id, ast_id, start, end, ctx)?;
-            let parent_span = span.ctx.outer_expn(db).and_then(|macro_call_id| {
+            let span = span_of(db, contexts, file_id, ast_id, start, end, ctx)?;
+            let parent_span = span.ctx.outer_expn(db, contexts).and_then(|macro_call_id| {
                 let macro_call_loc = hir_expand::MacroCallId::from(macro_call_id).loc(db);
                 let editioned_file_id = macro_call_loc.kind.file_id().file_id()?;
                 let range = HirFileId::from(editioned_file_id)
@@ -107,7 +115,8 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
                     ast_id: ROOT_ERASED_FILE_AST_ID.into_raw(),
                     start: u32::from(range.start()),
                     end: u32::from(range.end()),
-                    ctx: macro_call_loc.ctxt.into_u32(),
+                    // The call's site is of the call's table: carried into the asker's.
+                    ctx: macro_call_loc.ctxt.translate(db, macro_call_id.arena(), contexts).into_u32(),
                 })
             });
             SubResponse::SpanParentResult { parent_span }
@@ -127,8 +136,8 @@ fn answered(db: &Db, req: SubRequest) -> Result<SubResponse, String> {
             end_second,
             ctx_second,
         } => {
-            context(db, ctx_first)?;
-            context(db, ctx_second)?;
+            context(db, contexts, ctx_first)?;
+            context(db, contexts, ctx_second)?;
             let first = resolve(db, file_id, ast_id_first, range(start_first, end_first)?)?;
             let second = resolve(db, file_id, ast_id_second, range(start_second, end_second)?)?;
             let range = match ctx_first == ctx_second {
@@ -213,32 +222,21 @@ fn anchor(
     Ok((anchor, editioned, item.text_range().start()))
 }
 
-/// The syntax context `raw` numbers, if it is a root or one the database interned. A context
-/// is an interned value: its id must be on a page the contexts' ingredient owns.
-fn context(db: &Db, raw: u32) -> Result<SyntaxContext, String> {
-    if raw == u32::MAX {
+/// The syntax context `raw` numbers in `contexts`' table, checked (`SyntaxContext::checked`):
+/// a root, or a context of that table. A number that names none (past the table, of another
+/// edition than the context there, `u32::MAX`) is refused by name, never looked up: the
+/// number is user code's. A number of another table's context is a context of this one or
+/// none, so every lookup made with it reads this table.
+fn context(db: &Db, contexts: ArenaId, raw: u32) -> Result<SyntaxContext, String> {
+    SyntaxContext::checked(db, contexts, raw).ok_or_else(|| {
         // alloc: the message of a question refused.
-        return Err(format!("ctx {raw} names no syntax context"));
-    }
-    let ctx = SyntaxContext::from_u32(raw);
-    if ctx.is_root() {
-        return Ok(ctx);
-    }
-    let storage = db.storage();
-    let owned = raw
-        .checked_add(1)
-        .and_then(Id::new)
-        .and_then(|id| storage.owner(id))
-        .is_some_and(|owner| storage.ingredient_name(owner) == "SyntaxContextImpl");
-    match owned {
-        true => Ok(ctx),
-        // alloc: the message of a question refused.
-        false => Err(format!("ctx {raw} names no syntax context of the build")),
-    }
+        format!("ctx {raw} names no syntax context of the calling crate's table ({contexts:?})")
+    })
 }
 
 fn span_of(
     db: &Db,
+    contexts: ArenaId,
     file_id: u32,
     ast_id: u32,
     start: u32,
@@ -248,7 +246,7 @@ fn span_of(
     let range = range(start, end)?;
     let (anchor, _, at) = anchor(db, file_id, ast_id)?;
     within(range, at, file_id)?;
-    Ok(Span { range, anchor, ctx: context(db, ctx)? })
+    Ok(Span { range, anchor, ctx: context(db, contexts, ctx)? })
 }
 
 /// `range` past `at`, if it fits a file's offsets.

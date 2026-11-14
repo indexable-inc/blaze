@@ -28,7 +28,7 @@ pub enum ValTreeError {
 /// The value-tree error of `def`'s value, `None` when it has a value tree, when its
 /// evaluation fails (an error of its own), and when it depends on its owner's generic
 /// parameters, as the solver only evaluates such a constant at a use with concrete arguments.
-#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Infer)]
 pub fn anon_const_valtree_error<'db>(db: &'db Db, def: AnonConstId<'db>) -> Option<ValTreeError> {
     let loc = def.loc(db);
     let owner = loc.owner.generic_def(db);

@@ -29,7 +29,7 @@ use hir_expand::{
 };
 
 use super::{
-    BodyFacts, Lookup, REGISTRY, Step,
+    BodyFacts, Lookup, REGISTRY, Reads, Step,
     infer::{Keyed, items_of},
     with_crate_attrs,
 };
@@ -58,25 +58,26 @@ type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
 /// A `concat!` of no location is kept as a slot too, which reads back as the same constant. The
 /// source map changes with every edit above the body, and only a body that calls one of these
 /// macros reads it.
-#[blaze_query::tracked(returns(deref), mem_tag = Mir)]
-pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Mir)]
+pub fn location_literals<'db>(db: &'db Db, def: DefWithBodyId) -> &'db [ExprId] {
     let body = Body::of(db, def);
     if !calls_location_macro(db, body) {
-        return Box::default();
+        return &[];
     }
     let source_map = Body::unmoved_source_map(db, def);
-    body.exprs()
-        .filter(|(_, expr)| matches!(expr, Expr::Literal(_)))
-        .filter(|&(id, _)| {
-            source_map
-                .expr_syntax(id)
-                .ok()
-                .and_then(|source| source.file_id.macro_file())
-                .is_some_and(|call| located(call.loc(db).def.kind))
-        })
-        .map(|(id, _)| id)
-        // alloc: the query's value, of a body that called a location macro
-        .collect()
+    blaze_memo::keep_iter(
+        blaze_memo::Database::memo(db),
+        body.exprs()
+            .filter(|(_, expr)| matches!(expr, Expr::Literal(_)))
+            .filter(|&(id, _)| {
+                source_map
+                    .expr_syntax(id)
+                    .ok()
+                    .and_then(|source| source.file_id.macro_file())
+                    .is_some_and(|call| located(call.loc(db).def.kind))
+            })
+            .map(|(id, _)| id),
+    )
 }
 
 /// Whether a macro `kind` makes a literal of where it is called: `line!`, `column!`, `file!`,
@@ -506,7 +507,7 @@ fn offer_mir<'db>(
     owner: MirOwner<'db>,
     schema: SchemaHash,
     body: &MirBody<'db>,
-    reads: Option<blaze_query::db::Reads>,
+    reads: Option<Reads>,
 ) {
     let mut unreadable = None;
     super::offer(db, def, Step::Mir, schema, reads, |facts, out| {

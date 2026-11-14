@@ -42,7 +42,7 @@ fn check_refused(fixture: &str, check: impl FnOnce(&TestDB, &ComptimeError<'_>, 
     let fx = fixture::db(fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let error = match eval_goal(&db, *file_ids.last().unwrap()) {
             Ok(_) => panic!("`GOAL` evaluated; a `ComptimeError` was expected"),
             Err(error) => error,

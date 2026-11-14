@@ -37,8 +37,9 @@ pub struct ImportInfo {
     pub complete: Complete,
 }
 
-/// 12 bytes: the name's symbol (4), the module's id (4) and three bytes of flags.
-const _: () = assert!(size_of::<ImportInfo>() == 12);
+/// 16 bytes (was 12): the name's symbol (4), the module's memo id (8) and three bytes of
+/// flags, padded to the id's alignment of 4.
+const _: () = assert!(size_of::<ImportInfo>() == 16);
 
 /// A map from publicly exported items to its name.
 ///
@@ -78,9 +79,9 @@ enum IsTraitAssocItem {
     No,
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ImportMap {
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn of(db: &Db, krate: Crate) -> Self {
         Self::import_map_query_impl(db, krate)
     }

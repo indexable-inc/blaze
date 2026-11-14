@@ -114,7 +114,7 @@ fn two_allocators(db: &Db, a: Crate, b: Crate) -> String {
 
 /// The function of `krate` its `#[alloc_error_handler]`'s expansion exports as `__rg_oom`
 /// (`hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT`), when it declares one.
-#[blaze_query::tracked(returns(copy))]
+#[blaze_memo::tracked(returns(copy))]
 fn alloc_error_handler_export(db: &Db, krate: Crate) -> Option<hir_def::FunctionId> {
     global_allocator_export(db, krate, hir_expand::builtin::ALLOC_ERROR_HANDLER_EXPORT)
 }
@@ -146,7 +146,7 @@ fn two_alloc_error_handlers(db: &Db, a: Crate, b: Crate) -> String {
 /// With `db` attached, as a query's run is: the codegen driver calls this outside any query,
 /// and why the MIR does not build formats the types it names.
 pub fn allocations_unobserved(db: &Db, krate: Crate) -> Result<bool, String> {
-    blaze_query::db::attach(db, || allocations_unobserved_attached(db, krate))
+    blaze_memo::attach(db, || allocations_unobserved_attached(db, krate))
 }
 
 fn allocations_unobserved_attached(db: &Db, krate: Crate) -> Result<bool, String> {

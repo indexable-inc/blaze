@@ -217,7 +217,7 @@ impl Observation {
 /// What `krate`, as its configuration builds it, says of its definitions: the observation
 /// [`merge`] joins with the other configurations'. `label` and `unit` are the caller's.
 pub fn observe(db: &Db, krate: hir::Crate, files: Files<'_>, options: &Options, label: String, unit: u32) -> Observation {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         frame::task(Tag::Diagnostics, |frame| {
             let cx = Cx::new(db, krate, files, frame).with_lints(&options.lints);
             let mut observation = crate::lints::observe(&cx);

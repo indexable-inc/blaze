@@ -167,6 +167,70 @@ impl Query<'_> {
         let loaded = output.load_ref(&quote!(value));
         let output_db = &output.db;
         let homes = indices.iter().map(|index| quote!(#plumbing::Home::home(&self.#index, homes);));
+        // `#[tracked(image)]`: the key's stable form (each argument's, in order) and the image
+        // codec passed to the fetch; without it the fetch gets `None` and nothing is filed.
+        // `owns`: the value may own memory, dropped with its arena; else the no-drop check,
+        // here at item level (seen by `cargo check`: the key and value are never generic) as
+        // well as at monomorphization in `fetch`.
+        let owns = self.options.owns.is_some();
+        // `owns` with `cycle_initial` too: every round's value stays where it was placed and is
+        // dropped once with its arena (`blaze_memo::plumbing::Query::OWNS`).
+        let owns_items = if owns {
+            // Counted from the source by blaze-memo's `owns` ratchet (tests/owns.rs), by the
+            // attribute's last path segment, however it is imported.
+            quote!()
+        } else {
+            quote! {
+                const _: () = ::core::assert!(
+                    !::core::mem::needs_drop::<#stored_output>(),
+                    ::core::concat!(
+                        "the value of ",
+                        ::core::module_path!(),
+                        "::",
+                        #query_name,
+                        " owns memory to drop: an arena frees values without a destructor, so \
+                         hold `&'db [T]` from `blaze_memo::keep_slice` or ids, or mark the query \
+                         `owns` (counted debt)"
+                    )
+                );
+            }
+        };
+        // `mem_tag = Nameres`: the run's frame's tag, a variant of `blaze_mem::Tag` (as
+        // blaze-query took it); `Tag::Query` without it.
+        let tag = match &self.options.mem_tag {
+            Some(tag) => quote! {{
+                #[allow(unused_imports)]
+                use #plumbing::Tag::*;
+                #tag
+            }},
+            None => quote!(#plumbing::Tag::Query),
+        };
+        let imaged_static = self.hygiene.ident("IMAGED");
+        let (image_items, image_arg) = match &self.options.image {
+            Some(_) => {
+                let stables = indices
+                    .iter()
+                    .map(|index| quote!(#plumbing::Stable::stable(&self.#index, memo, out);));
+                (
+                    quote! {
+                        impl #plumbing::Stable for #key {
+                            fn stable(
+                                &self,
+                                memo: &#plumbing::Memo,
+                                out: &mut #plumbing::StableKey,
+                            ) {
+                                #(#stables)*
+                            }
+                        }
+
+                        const #imaged_static: #plumbing::Imaged<#key, #stored_output> =
+                            #plumbing::Imaged::new();
+                    },
+                    quote!(::core::option::Option::Some(&#imaged_static)),
+                )
+            }
+            None => (quote!(), quote!(::core::option::Option::None)),
+        };
 
         quote! {
             #[doc(hidden)]
@@ -215,15 +279,45 @@ impl Query<'_> {
                     #plumbing::CycleKind::#kind,
                 );
 
+                #image_items
+
+                #owns_items
+
                 struct #query;
 
                 impl #plumbing::Query for #query {
                     type Key = #key;
                     type Value = #stored_output;
                     const KIND: &'static #plumbing::Kind = &#kind_static;
+                    const OWNS: bool = #owns;
+                    const TAG: #plumbing::Tag = #tag;
                 }
 
                 impl #name {
+                    /// The arguments (stored form) of the entry a read row names, when the row
+                    /// is a `Read::Query` of this query in `memo` (a fact boundary's,
+                    /// `Builder::mark_boundary`); `None` for any other row.
+                    #[allow(dead_code)]
+                    #vis fn key_of(
+                        memo: &#plumbing::Memo,
+                        row: #plumbing::Read,
+                    ) -> ::core::option::Option<(#(#stored_tys,)*)> {
+                        match row {
+                            #plumbing::Read::Query { kind, key }
+                                if ::core::ptr::eq(kind.kind(), &#kind_static) =>
+                            {
+                                #plumbing::boundary_key::<#key>(memo, &#kind_static, key)
+                                    .map(|it| (#(it.#indices,)*))
+                            }
+                            _ => ::core::option::Option::None,
+                        }
+                    }
+
+                    /// This query's kind name, what `Builder::mark_boundary` takes.
+                    #[allow(dead_code)]
+                    #vis const KIND_NAME: &'static str =
+                        ::core::concat!(::core::module_path!(), "::", #query_name);
+
                     #[inline]
                     #[allow(clippy::needless_lifetimes, clippy::too_many_arguments)]
                     fn __blaze_memo_fetch<#db_lt>(
@@ -242,8 +336,24 @@ impl Query<'_> {
                             key,
                             &run,
                             &recovery,
+                            #image_arg,
                         );
                         #loaded
+                    }
+                }
+
+                impl #plumbing::Logged for #name {
+                    fn ran_with(ran: &#plumbing::Ran, args: &dyn ::core::any::Any) -> bool {
+                        let ::core::option::Option::Some(args) =
+                            args.downcast_ref::<(#(#stored_tys,)*)>()
+                        else {
+                            #plumbing::wrong_args(
+                                #kind_static.name(),
+                                ::core::any::type_name::<(#(#stored_tys,)*)>(),
+                            )
+                        };
+                        #plumbing::ran_key::<#key>(ran, &#kind_static)
+                            .is_some_and(|it| true #(&& it.#indices == args.#indices)*)
                     }
                 }
             };

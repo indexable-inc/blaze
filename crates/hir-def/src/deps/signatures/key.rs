@@ -86,7 +86,7 @@ impl Item {
 }
 
 /// The modules of `krate`'s `DefMap` by their index in it.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub(super) fn module_indexes(db: &Db, krate: Crate) -> HashMap<ModuleId, u32, Global> {
     let modules = crate_def_map(db, krate).modules(db);
     // alloc: once per crate, the map every key of the crate reads.

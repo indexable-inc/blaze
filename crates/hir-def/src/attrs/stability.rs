@@ -250,7 +250,7 @@ pub fn default_body_stability(db: &Db, def: AttrDefId) -> Option<&Stability> {
     }
     return default_body_of(db, def).as_ref();
 
-    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
     fn default_body_of(db: &Db, def: AttrDefId) -> Option<Stability> {
         let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, def, Tree::Live);
         collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |meta, _| {
@@ -290,7 +290,7 @@ fn deprecation_from(db: &Db, def: StabilityDef) -> Option<StabilityDef> {
         }
     };
 
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     fn deprecation_origin(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
         deprecation_or_parent(db, def.into(), || parent(db, def))
     }
@@ -324,7 +324,7 @@ fn stability_from(db: &Db, def: StabilityDef) -> Option<StabilityFrom> {
         }
     };
 
-    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     fn stability_origin(db: &Db, def: AttrDefId) -> Option<StabilityFrom> {
         let inherits = matches!(def, AttrDefId::EnumVariantId(_));
         stability_or_parent(db, def.into(), def.krate(db), || parent(db, def), inherits)
@@ -400,7 +400,7 @@ fn own(db: &Db, def: StabilityDef) -> Option<&Own> {
     (own != NONE).then_some(own)
 }
 
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn own_of_def(db: &Db, def: AttrDefId) -> Own {
     let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, def, Tree::Live);
     let context = Context::of(db, krate);
@@ -413,7 +413,7 @@ fn own_of_def(db: &Db, def: AttrDefId) -> Own {
 }
 
 /// The own attributes of each field of `variant` its cfg leaves in, by `LocalFieldId`.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn own_of_fields(db: &Db, variant: VariantId) -> Box<[Own]> {
     let krate = variant.krate(db);
     let context = Context::of(db, krate);
@@ -736,7 +736,7 @@ fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
 /// ancestors, through the macro calls it is expanded from, that is one. A block def map
 /// exists only for a block a definition's syntax holds, so there is always one; not finding
 /// it is a bug of the def maps, and stops.
-#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
     let no_owner =

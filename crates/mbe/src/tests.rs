@@ -21,7 +21,7 @@ fn check_(
     expect: &expect_test::Expect,
     parse: parser::TopEntryPoint,
 ) {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let decl_tt = &syntax_bridge::parse_to_token_tree(
         def_edition,
         SpanAnchor {
@@ -526,7 +526,7 @@ fn minus_belongs_to_literal() {
 /// window of the level, not the rest of it, into the thread's input words.
 #[test]
 fn a_fragment_allocates_the_same_however_much_follows_it() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -562,7 +562,7 @@ fn a_fragment_allocates_the_same_however_much_follows_it() {
 /// grow with it, so the counts are compared, not the bytes.
 #[test]
 fn a_warm_expansion_allocates_the_same_for_any_input() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -593,7 +593,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
 /// the global expansion gives.
 #[test]
 fn an_expansion_into_a_frame_allocates_nothing() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -628,7 +628,7 @@ fn an_expansion_into_a_frame_allocates_nothing() {
 /// `$s:stmt`'s statement at the metavariable.
 #[test]
 fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let def = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -678,7 +678,7 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
 /// `${concat(..)}` gives the spans of the identifiers it made, which no source has.
 #[test]
 fn concat_gives_the_spans_of_the_identifiers_it_made() {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -734,7 +734,7 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
 "#,
     );
     assert!(mac.err().is_none(), "{:?}", mac.err());
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let expand = |arg: &str| {
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, arg).unwrap();
         let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
@@ -779,7 +779,7 @@ fn expanded_across(
         ast_id: ROOT_ERASED_FILE_AST_ID,
     };
     let ctx = SyntaxContext::root(edition);
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let decl = syntax_bridge::parse_to_token_tree(edition, anchor(0, def), ctx, decl).unwrap();
     let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| edition);
     assert!(mac.err().is_none(), "{:?}", mac.err());
@@ -869,7 +869,7 @@ fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
 
 /// The error, if any, of expanding `arg` by the `macro_rules` rules `decl`.
 fn expansion_error(decl: &str, arg: &str) -> Option<String> {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let anchor = |file: u32| SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(file), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -942,7 +942,7 @@ fn expand_as(
     call: impl Fn(Option<&tt::TopSubtree>) -> crate::MacroCall<'_>,
     args: Option<&str>,
 ) -> String {
-    let db = base_db::Db::for_tests();
+    let db = base_db::Db::for_tests(|_| {});
     let def = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,

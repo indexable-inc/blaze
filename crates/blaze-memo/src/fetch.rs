@@ -8,6 +8,7 @@ use crate::{
     counts,
     flight::{FlightKey, Flown, Hold},
     home::{Home, home_of, mark_borrows},
+    image::Imaged,
     task::{self, Role, Run},
     trie::{Entry, Head},
 };
@@ -16,9 +17,42 @@ use crate::{
 pub trait Query: 'static {
     /// The arguments after `db`, as a tuple, in their stored (`'static`) form.
     type Key: Copy + Eq + Hash + Home + Debug + Send + Sync + 'static;
-    /// The value, in its stored form. Owns no memory to drop.
+    /// The value, in its stored form. Owns no memory to drop, unless [`Query::OWNS`].
     type Value: Send + Sync + 'static;
     const KIND: &'static Kind;
+    /// `#[tracked(owns)]`: the value may own memory; its destructor runs when its arena drops
+    /// (one registration per value, on the arena's drop list). A `cycle_result` fallback value
+    /// is dropped the same. Under `cycle_initial` every round's value is placed once in the
+    /// arena where it stays (a head's, and a member's inside the entry its head publishes if
+    /// that round is the last), listed for drop once and dropped once with the arena: no value
+    /// is copied between rounds and none is dropped before its arena, so a reference handed
+    /// out in any round stays readable. Rounds converge by the value's `PartialEq`, and the
+    /// final value is the last round's. The cost: the rounds' values are all kept, rounds ×
+    /// value size, bounded by [`MAX_ROUNDS`]; counted in [`crate::Counts::owned_rounds`].
+    const OWNS: bool = false;
+    /// `#[tracked(mem_tag = ..)]`: the tag of the task frame each run is ([`in_frame`]), so what
+    /// the run takes through `blaze_mem::frame::current` counts under its subsystem.
+    const TAG: blaze_mem::Tag = blaze_mem::Tag::Query;
+}
+
+/// Runs user code of `Q` (its body, each fixpoint round its own, and its `cycle_result`,
+/// `cycle_initial` and `cycle_fn`) as a `blaze_mem::frame::task` of `Q::TAG`: code it reaches
+/// that allocates through `frame::current` has a frame, counted under the query's tag, and
+/// freed when the run returns. What `f` returns cannot borrow the frame (it is owned, or in the
+/// arena through `keep*`); nothing of blaze-memo's holds the frame across `f`.
+///
+/// The cost, every run pays it (blaze-mem's `frame::task`, crates/blaze-mem/src/frame.rs): for
+/// a body that takes nothing from the frame, three thread-local reads and writes (`begin_task`,
+/// `enter_task`, `end_task`, each an out-of-line call), the outer frame's seal checked (two
+/// volatile loads), a frame header of about 150 bytes written on the stack, and at the end a
+/// tag count skipped (no peak, no copies) and an empty block list dropped: no allocation, no
+/// system call, and an atomic only once per 1024 tasks on a thread (its task ids); tens of
+/// instructions, more than a pointer save. A body that takes
+/// from the frame pays its blocks as any task does (from the thread's shelves once warm).
+#[inline]
+#[track_caller]
+pub(crate) fn in_frame<Q: Query, R>(f: impl FnOnce() -> R) -> R {
+    blaze_mem::frame::task(Q::TAG, |_frame| f())
 }
 
 /// What a query does when its key is asked inside its own run: its `cycle_*` options.
@@ -107,14 +141,22 @@ pub(crate) fn publish<'db, K: Eq + 'static, V: 'static>(
 ///
 /// Where the run panics (the panic goes on; a waiter asks again and runs it itself), where a
 /// cycle has no recovery, or where a fixpoint does not settle in [`MAX_ROUNDS`].
+///
+/// `image` is an imaged query's (`#[tracked(image)]`): on a miss inside [`Memo::serve`] its
+/// record is looked up before it runs, and a run files its record (`crate::image`).
 pub fn fetch<'db, Q: Query>(
     memo: &'db Memo,
     key: Q::Key,
     run: &dyn Fn() -> Q::Value,
     recovery: &Recovery<'_, Q::Value>,
+    image: Option<&Imaged<Q::Key, Q::Value>>,
 ) -> &'db Q::Value {
-    const { crate::plumbing::assert_no_drop::<Q::Value>() };
-    let slot = memo.slot(home_of(&key));
+    const {
+        if !Q::OWNS {
+            crate::plumbing::assert_no_drop::<Q::Value>()
+        }
+    };
+    let slot = memo.slot(home_of(memo, &key));
     task::note_read_of(memo, slot);
     let hash = hash_of(Q::KIND, &key);
     if let Some(head) = lookup::<Q::Key, Q::Value>(memo, slot, Q::KIND, hash, &key) {
@@ -125,7 +167,7 @@ pub fn fetch<'db, Q: Query>(
             }
             counts::hit_check();
         }
-        task::replay(memo, head);
+        task::replay(memo, slot.id, head);
         // SAFETY: an entry of `Q::KIND` is an `Entry<Q::Key, Q::Value>`.
         return &unsafe { Entry::<Q::Key, Q::Value>::of(head) }.value;
     }
@@ -139,7 +181,7 @@ pub fn fetch<'db, Q: Query>(
     if task::here(Q::KIND, hash, key_ptr) == task::Here::Kept {
         // A fixpoint member of an earlier round of a head on this task's stack, which holds
         // its flight still: its next round runs here, and no other task can be running it.
-        return execute::<Q>(memo, slot, hash, &key, run, recovery).0;
+        return execute::<Q>(memo, slot, hash, &key, run, recovery, image).0;
     }
     let flight = FlightKey::of(Q::KIND, slot.id, hash);
     let named = |out: &mut String| {
@@ -151,12 +193,19 @@ pub fn fetch<'db, Q: Query>(
         let mut member: Option<task::Member> = None;
         let mut body = || {
             if let Some(head) = lookup::<Q::Key, Q::Value>(memo, slot, Q::KIND, hash, &key) {
-                task::replay(memo, head);
+                task::replay(memo, slot.id, head);
                 // SAFETY: as above.
                 out = Some(&unsafe { Entry::<Q::Key, Q::Value>::of(head) }.value);
                 return Hold::End;
             }
-            let (value, of) = execute::<Q>(memo, slot, hash, &key, run, recovery);
+            if let Some(imaged) = image
+                && let Some(value) =
+                    crate::image::probe::<Q::Key, Q::Value>(memo, slot, Q::KIND, hash, &key, imaged)
+            {
+                out = Some(value);
+                return Hold::End;
+            }
+            let (value, of) = execute::<Q>(memo, slot, hash, &key, run, recovery, image);
             out = Some(value);
             match of {
                 Some(of) if memo.plant() != crate::Plant::MemberLetGo => {
@@ -177,7 +226,7 @@ pub fn fetch<'db, Q: Query>(
             Flown::Waited => {
                 counts::wait();
                 if let Some(head) = lookup::<Q::Key, Q::Value>(memo, slot, Q::KIND, hash, &key) {
-                    task::replay(memo, head);
+                    task::replay(memo, slot.id, head);
                     // SAFETY: as above.
                     return &unsafe { Entry::<Q::Key, Q::Value>::of(head) }.value;
                 }
@@ -185,11 +234,18 @@ pub fn fetch<'db, Q: Query>(
             Flown::Mine => {
                 let value = task::reenter(Q::KIND, hash, key_ptr, || {
                     let value = match recovery {
-                        Recovery::Result(fallback) => fallback(),
-                        Recovery::Fixpoint { initial, .. } => initial(),
+                        Recovery::Result(fallback) => in_frame::<Q, _>(|| fallback()),
+                        Recovery::Fixpoint { initial, .. } => in_frame::<Q, _>(|| initial()),
                         Recovery::Panic => unreachable!("`reenter` refuses a query with no recovery"),
                     };
-                    ptr::from_ref(keep_in(slot, value)).cast()
+                    let kept = keep_in(slot, value);
+                    // SAFETY: just kept in `slot`'s arena, never moved out (a `cycle_result`
+                    // fallback, or a fixpoint's initial value, which stays where it is).
+                    unsafe { slot.drop_owned(kept) };
+                    if Q::OWNS && matches!(recovery, Recovery::Fixpoint { .. }) {
+                        counts::owned_round();
+                    }
+                    ptr::from_ref(kept).cast()
                 });
                 // SAFETY: as for `provisional`.
                 return unsafe { &*value.cast::<Q::Value>() };
@@ -219,17 +275,29 @@ fn execute<'db, Q: Query>(
     key: &Q::Key,
     run: &dyn Fn() -> Q::Value,
     recovery: &Recovery<'_, Q::Value>,
+    image: Option<&Imaged<Q::Key, Q::Value>>,
 ) -> (&'db Q::Value, Option<task::Member>) {
     counts::run();
-    let frame = Run::new(memo, Q::KIND, slot, hash, key);
+    memo.note_run();
+    if let Some(log) = memo.log() {
+        log.push::<Q>(slot.id, key, memo.plant());
+    }
+    let frame = Run::new(memo, Q::KIND, slot, hash, key, image.is_some());
     let pushed = task::push(&frame);
     let mut round = 0;
+    // Whether the value is the run's own, in no cycle: only such a value is filed in the image.
+    let mut own = false;
     let value = loop {
-        let value = run();
+        // Each round its own frame: a round's scratch is freed before the next begins.
+        let value = in_frame::<Q, _>(run);
+        counts::ran_one();
         match (frame.role(), recovery) {
-            (Role::Plain, _) => break Settled::Final(value),
+            (Role::Plain, _) => {
+                own = true;
+                break Settled::Final(value);
+            }
             (Role::Head | Role::Member, Recovery::Result(fallback)) => {
-                break Settled::Final(fallback());
+                break Settled::Final(in_frame::<Q, _>(|| fallback()));
             }
             (Role::Head, Recovery::Fixpoint { recover, same, .. }) => {
                 // SAFETY: a head was reentered, so its provisional value is set, a `Q::Value`.
@@ -254,11 +322,19 @@ fn execute<'db, Q: Query>(
                             round: round - 1,
                             _memo: std::marker::PhantomData,
                         };
-                        recover(&cycle, last, value)
+                        in_frame::<Q, _>(|| recover(&cycle, last, value))
                     }
                     None => value,
                 };
-                frame.set_provisional(ptr::from_ref(keep_in(slot, next)).cast());
+                let kept = keep_in(slot, next);
+                if Q::OWNS {
+                    // SAFETY: just kept in `slot`'s arena, where it stays: the next round's
+                    // provisional value, never moved out or copied (the final value is a
+                    // later round's own).
+                    unsafe { slot.drop_owned(kept) };
+                    counts::owned_round();
+                }
+                frame.set_provisional(ptr::from_ref(kept).cast());
             }
             (Role::Member, Recovery::Fixpoint { same, .. }) => {
                 let moved = if frame.provisional().is_null() {
@@ -268,25 +344,43 @@ fn execute<'db, Q: Query>(
                     let last = unsafe { &*frame.provisional().cast::<Q::Value>() };
                     !same(last, &value)
                 };
-                let at = keep_in(slot, value);
-                let key_copy = keep_in(slot, *key);
                 let reads = frame.take_reads();
-                let kept = with_local(slot, |local| -> *const [crate::Fact] {
+                let kept = with_local(slot, |local| -> *const [crate::Read] {
                     local.alloc_slice_copy(&reads)
                 });
-                let settle = task::Settle {
-                    slot: ptr::from_ref(slot),
-                    reads: kept,
-                    publish: publish_member::<Q::Key, Q::Value>,
+                // The round's value and key in the arena, as raw pointers: under `owns` they are
+                // fields of one entry, and the pointers keep the whole entry's provenance, so
+                // `publish_member_placed` reaches the entry's head from the value's.
+                let (at, key_copy, publish): (*const Q::Value, *const Q::Key, task::Publish) = if Q::OWNS {
+                    // An owned value is placed once, in the entry its head publishes if this
+                    // round is the last: no copy of it is made, and it is listed for drop once,
+                    // now, whether or not the entry is published.
+                    let entry = with_local(slot, |local| -> *mut Entry<Q::Key, Q::Value> {
+                        // SAFETY: `kept` was just made in `slot`'s arena.
+                        let reads = unsafe { &*kept };
+                        local.alloc(Entry { head: Head::new(hash, Q::KIND, reads, 0), key: *key, value })
+                    });
+                    // SAFETY: `entry` was just made in `slot`'s arena; its value is never moved
+                    // out, and is listed for drop here alone. Fields are reached by raw
+                    // projection, never through a reference to the whole entry.
+                    unsafe { slot.drop_owned(&raw const (*entry).value) };
+                    counts::owned_round();
+                    // SAFETY: as above: projections of a live allocation.
+                    unsafe {
+                        (&raw const (*entry).value, &raw const (*entry).key, publish_member_placed::<Q::Key, Q::Value>)
+                    }
+                } else {
+                    (
+                        ptr::from_ref(keep_in(slot, value)),
+                        ptr::from_ref(keep_in(slot, *key)),
+                        publish_member::<Q::Key, Q::Value>,
+                    )
                 };
-                task::member_done(
-                    &frame,
-                    ptr::from_ref(key_copy).cast(),
-                    ptr::from_ref(at).cast(),
-                    moved,
-                    settle,
-                );
-                break Settled::Provisional(at, reads, frame.member(ptr::from_ref(key_copy).cast()));
+                let settle = task::Settle { slot: ptr::from_ref(slot), reads: kept, publish };
+                task::member_done(&frame, key_copy.cast(), at.cast(), moved, settle);
+                // SAFETY: in `slot`'s arena, which `memo` holds for `'db`; never written again.
+                let at: &'db Q::Value = unsafe { &*at };
+                break Settled::Provisional(at, reads, frame.member(key_copy.cast()));
             }
             (_, Recovery::Panic) => {
                 unreachable!("`reenter` refuses a cycle through a query with no recovery")
@@ -298,24 +392,50 @@ fn execute<'db, Q: Query>(
         Settled::Final(_) => frame.take_reads(),
     };
     drop(pushed);
-    // The asker depends on what this run read.
-    task::replay_list(&reads);
     match value {
-        Settled::Provisional(at, _, member) => (at, Some(member)),
+        Settled::Provisional(at, _, member) => {
+            // A fixpoint member is flattened into its asker whatever its kind: its entry is
+            // its head's to publish, and the cycle's members read each other.
+            task::replay_list(&reads);
+            (at, Some(member))
+        }
         Settled::Final(value) => {
-            mark_borrows(memo, slot, key);
+            mark_borrows(memo, slot, key, &|out: &mut String| {
+                // SAFETY: `key` is a `Q::Key`.
+                unsafe { task::describe::<Q::Key>(Q::KIND, ptr::from_ref(key).cast(), out) }
+            });
+            let boundary = boundary_local(memo, slot, Q::KIND);
             let entry = with_local(slot, |local| -> *const Entry<Q::Key, Q::Value> {
                 let reads = local.alloc_slice_copy(&reads);
                 local.alloc(Entry {
-                    head: Head::new(hash, Q::KIND, reads, 0),
+                    head: Head::new(hash, Q::KIND, reads, boundary.map_or(0, |(_, at)| at)),
                     key: *key,
                     value,
                 })
             });
-            // SAFETY: just made in `slot`'s arena, which `memo` holds.
-            let entry: &'db Entry<Q::Key, Q::Value> = unsafe { &*entry };
+            // SAFETY: just made in `slot`'s arena, which `memo` holds; an `owns` value is
+            // dropped with the arena, once (the run's own value or a head's last round's,
+            // moved here; earlier rounds' values are listed where they were kept).
+            let entry: &'db Entry<Q::Key, Q::Value> = unsafe {
+                if Q::OWNS {
+                    slot.drop_owned(&raw const (*entry).value);
+                }
+                &*entry
+            };
+            // The column first: a `Read::Query` row naming the entry may be read at once.
+            if let Some((column, at)) = boundary {
+                column.set_local(at, &entry.head);
+            }
             match publish::<Q::Key, Q::Value>(memo, slot, &entry.head) {
-                Ok(()) => (&entry.value, None),
+                Ok(()) => {
+                    // The asker depends on what this run read: its list, or for a boundary
+                    // one row naming this entry.
+                    task::pass_on(memo, slot.id, &entry.head);
+                    if own && let Some(imaged) = image {
+                        crate::image::file(memo, slot, Q::KIND, key, &entry.value, &reads, imaged);
+                    }
+                    (&entry.value, None)
+                }
                 Err(_) => {
                     let mut name = String::new();
                     // SAFETY: `key` is a `Q::Key`.
@@ -332,7 +452,69 @@ fn execute<'db, Q: Query>(
 enum Settled<'db, V> {
     Final(V),
     /// A fixpoint member's value this round, what it read, and who keeps its flight.
-    Provisional(&'db V, Vec<crate::Fact, std::alloc::Global>, task::Member),
+    Provisional(&'db V, Vec<crate::Read, std::alloc::Global>, task::Member),
+}
+
+/// Where a boundary entry of `kind` in `slot` is listed (its column and index, so a
+/// [`crate::Read::Query`] row can name it), or `None` for every other kind and when no lists
+/// are kept. The spill table's column after a successor took `slot`, as for an interned value.
+pub(crate) fn boundary_local<'db>(
+    memo: &'db Memo,
+    slot: &'db Slot,
+    kind: &'static Kind,
+) -> Option<(&'db Slot, u32)> {
+    if memo.reads() != crate::Reads::Kept || !memo.is_boundary(kind) {
+        return None;
+    }
+    let spill = !slot.writable_by(memo.epoch());
+    let column = if spill { memo.spill() } else { slot };
+    Some((column, column.reserve_local(spill)))
+}
+
+/// Publishes a fixpoint member's last-round entry of an `owns` query, once its head settled:
+/// the entry made in place in that round ([`execute`]), its value never moved or copied. Its
+/// head gets its boundary index, if any, and is published. `hash` and `reads` are the head's
+/// already.
+///
+/// # Safety
+///
+/// `value` points at the `value` field of an `Entry<K, V>` in `slot`'s arena, which `memo`
+/// holds, with the provenance of the whole entry; `key` at its `key`; nothing published it,
+/// and no reference to its head exists.
+unsafe fn publish_member_placed<K: Copy + Eq + Home + Debug + 'static, V: 'static>(
+    memo: &Memo,
+    slot: &Slot,
+    kind: &'static Kind,
+    _hash: u64,
+    key: *const (),
+    value: *const (),
+    _reads: &[crate::Read],
+) {
+    // SAFETY: the caller's: `value` is the entry's `value` field, so the entry starts this
+    // many bytes before it, within the same allocation.
+    let entry = unsafe { value.byte_sub(std::mem::offset_of!(Entry<K, V>, value)) }.cast::<Entry<K, V>>().cast_mut();
+    // SAFETY: the caller's: `key` is a `K`.
+    let key = unsafe { *key.cast::<K>() };
+    mark_borrows(memo, slot, &key, &|out: &mut String| task::write_key(out, kind, &key));
+    let boundary = boundary_local(memo, slot, kind);
+    if let Some((_, at)) = boundary {
+        // SAFETY: the caller's: the entry is unpublished and nothing refers to its head; the
+        // write is to the head's field alone, never to the value readers hold.
+        unsafe { (&raw mut (*entry).head.local).write(at) };
+    }
+    // SAFETY: as above; from here on the head is only read.
+    let head: &Head = unsafe { &*(&raw const (*entry).head) };
+    if let Some((column, at)) = boundary {
+        column.set_local(at, head);
+    }
+    // As for `publish_member`: the head held the member's flight, so no other task ran it.
+    if publish::<K, V>(memo, slot, head).is_err() {
+        panic!(
+            "{} ran twice in one snapshot: a fixpoint member was run by another task while its \
+             head held it",
+            kind.name()
+        );
+    }
 }
 
 /// Publishes a fixpoint member's last-round value as its entry, once its head settled.
@@ -340,26 +522,34 @@ enum Settled<'db, V> {
 /// # Safety
 ///
 /// `key` and `value` point at a `K` and a `V` in `slot`'s arena, which `memo` holds.
-unsafe fn publish_member<K: Copy + Eq + Home + 'static, V: 'static>(
+unsafe fn publish_member<K: Copy + Eq + Home + Debug + 'static, V: 'static>(
     memo: &Memo,
     slot: &Slot,
     kind: &'static Kind,
     hash: u64,
     key: *const (),
     value: *const (),
-    reads: &[crate::Fact],
+    reads: &[crate::Read],
 ) {
     // SAFETY: the caller's.
     let (key, value) = unsafe { (*key.cast::<K>(), ptr::read(value.cast::<V>())) };
     // A bitwise copy of a value that owns nothing to drop: the original in the arena is never
     // dropped, and both are immutable.
-    mark_borrows(memo, slot, &key);
+    mark_borrows(memo, slot, &key, &|out: &mut String| task::write_key(out, kind, &key));
+    let boundary = boundary_local(memo, slot, kind);
     let entry = with_local(slot, |local| -> *const Entry<K, V> {
         let reads = local.alloc_slice_copy(reads);
-        local.alloc(Entry { head: Head::new(hash, kind, reads, 0), key, value })
+        local.alloc(Entry {
+            head: Head::new(hash, kind, reads, boundary.map_or(0, |(_, at)| at)),
+            key,
+            value,
+        })
     });
     // SAFETY: just made in `slot`'s arena, which `memo` holds.
     let entry: &Entry<K, V> = unsafe { &*entry };
+    if let Some((column, at)) = boundary {
+        column.set_local(at, &entry.head);
+    }
     // The head has held the member's flight since the member's first run here, so no other
     // task ran it: an entry already there is two runs of one key in one snapshot.
     if publish::<K, V>(memo, slot, &entry.head).is_err() {

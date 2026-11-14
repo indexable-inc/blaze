@@ -226,7 +226,7 @@ pub struct Models {
 
 /// The models of `krate`, a toolchain crate, built once: its table resolved through its def
 /// map, and the foreign functions it declares that are the allocator's or the panic runtime's.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn crate_models(db: &Db, krate: Crate) -> Models {
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |_| {
         let Some(home) = toolchain(&krate.data(db).origin) else {

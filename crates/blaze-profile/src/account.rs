@@ -37,7 +37,7 @@ use crate::{batches, facts::QueryCountRow, schema};
 /// The engine counts a write per input kind (`query_counts.written`) and no write says who
 /// made it, so the kind is what the account has. A kind no row of [`Writer::of_input`] names is
 /// [`Writer::Unattributed`], which is counted, shown and held at zero by a test over the
-/// tree's `#[blaze_query::input]`s: a new input says who writes it.
+/// tree's `#[blaze_memo::input]`s: a new input says who writes it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Writer {
     /// A file's bytes (`FileText`, `IncludedFile`): a person's edit, a build script's output or
@@ -454,7 +454,7 @@ impl Account {
             row.ran_untracked += it.ran_untracked;
             row.ran_cycle += it.ran_cycle;
             row.ran_evicted += it.evicted_asked;
-            // The sum the engine promises (`blaze_query::db::Counts`): its causes add up to
+            // The sum the engine promises (`query_counts`, `blaze_query::Database::take_counts`): its causes add up to
             // its runs, a query function at a time.
             let by_cause =
                 it.ran_new + it.ran_changed + it.ran_untracked + it.ran_cycle + it.evicted_asked;
@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     /// The guard: every input of the query engine the tree defines has a writer named, so a
-    /// build's writes are attributed whole. A new `#[blaze_query::input]` fails here until
+    /// build's writes are attributed whole. A new `#[blaze_memo::input]` fails here until
     /// [`Writer::of_input`] names who writes it.
     #[test]
     fn every_input_of_the_tree_has_a_writer() {
@@ -1077,7 +1077,7 @@ mod tests {
                 let path = entry.unwrap().path();
                 let name = path.file_name().unwrap().to_string_lossy().into_owned();
                 if path.is_dir() {
-                    if !["target", "tests", "benches", "blaze-query", "blaze-query-macros"].contains(&name.as_str()) {
+                    if !["target", "tests", "benches", "blaze-memo", "blaze-memo-macros"].contains(&name.as_str()) {
                         walk(&path, into);
                     }
                 } else if name.ends_with(".rs") && name != "tests.rs" {
@@ -1094,7 +1094,7 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
             let lines: Vec<&str> = text.lines().collect();
             for (at, line) in lines.iter().enumerate() {
-                if !line.trim_start().starts_with("#[blaze_query::input") {
+                if !line.trim_start().starts_with("#[blaze_memo::input") {
                     continue;
                 }
                 let Some(name) = lines[at + 1..].iter().take(8).find_map(|it| {

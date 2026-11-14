@@ -24,7 +24,7 @@ pub(crate) fn edit(job: &Job, reader: &UnitReader, edits: &[Edit]) -> Result<Edi
     // An edit resolves names in any crate of the view: every one's proc macros were built and
     // applied before it was posted (`Jobs::next`); checked again here.
     for at in 0..job.graph.len() {
-        let Some(krate) = job.crates.krate(at) else { continue };
+        let Some(krate) = job.crates.krate(reader.db(), at) else { continue };
         if job.cancelled() {
             return Err(Failed::Again);
         }
@@ -56,7 +56,7 @@ pub(crate) fn ahead(job: &Job, reader: &UnitReader, filter: &[String]) -> Result
         let unit = job.unit(at)?;
         // Its tests are listed from its def map: its proc macros were built and applied before
         // this was posted (`Jobs::next`); checked again here.
-        if let Some(krate) = job.crates.krate(at) {
+        if let Some(krate) = job.crates.krate(reader.db(), at) {
             answer_macros_built(reader.db(), krate, &unit.target.name, "ahead")?;
         }
         let roots = super::codegen::test_roots(job, reader, at)

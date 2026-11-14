@@ -685,8 +685,10 @@ fn infer_builtin_macros_line() {
             let x = line!();
         }
         "#,
+        // `line!()` expands to the placeholder `0u32` (`hir_expand::builtin::PLACE_PLACEHOLDER`),
+        // which whoever reads the literal's value resolves to the line: the body reads no line.
         &expect![[r#"
-            !0..4 '5u32': u32
+            !0..4 '0u32': u32
             63..87 '{     ...!(); }': ()
             73..74 'x': u32
         "#]],
@@ -723,8 +725,9 @@ fn infer_builtin_macros_column() {
             let x = column!();
         }
         "#,
+        // `column!()` expands to the placeholder `0u32`, as `line!()` does (see above).
         &expect![[r#"
-            !0..5 '13u32': u32
+            !0..4 '0u32': u32
             65..91 '{     ...!(); }': ()
             75..76 'x': u32
         "#]],

@@ -9,7 +9,7 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_item_hash::identity::early_identity;
 use blaze_items::{ItemId, item_key};
-use blaze_query::db::FromId;
+use blaze_memo::Id as _;
 use hir_def::{
     DefWithBodyId, StaticId,
     signatures::{StaticFlags, StaticSignature},
@@ -76,10 +76,10 @@ pub(crate) fn content(
 }
 
 /// [`content`] in `env`, the instance's home.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 #[expect(
     clippy::needless_pass_by_value,
-    reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
+    reason = "a tracked query's arguments are its key, which `blaze_memo::tracked` hands the body by value"
 )]
 pub(crate) fn content_in(
     db: &Db,
@@ -92,12 +92,12 @@ pub(crate) fn content_in(
             h.update(&[1]).id(&body(db, func.into())?);
         }
         Def::Body(Body::Closure(id)) => {
-            let loc = InternedClosureId::from_id(id).loc(db);
+            let loc = InternedClosureId::from_gid(id).loc(db);
             h.update(&[2]);
             closure(db, &mut h, loc)?;
         }
         Def::Body(Body::Coroutine(id) | Body::CoroutineByMove(id)) => {
-            let loc = InternedCoroutineId::from_id(id).loc(db);
+            let loc = InternedCoroutineId::from_gid(id).loc(db);
             h.update(&[if matches!(instance.def, Def::Body(Body::Coroutine(_))) { 3 } else { 4 }]);
             closure(db, &mut h, loc)?;
         }

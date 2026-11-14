@@ -1,7 +1,7 @@
 //! Test databases from fixture text: a fixture ([`FixtureWithProjectMeta`]) read into a [`Db`]
-//! through the inputs a build sets. Each source root's files are one view
-//! ([`Db::set_view_root`]), the crate graph is set by [`CrateGraphBuilder::set_in_db`], and the
-//! test proc macros by [`ProcMacrosBuilder`]. [`db`] makes one; the [`Fixture`] it returns
+//! through the edits a build makes ([`Db::edit`]). Each source root's files are one view
+//! (`Edit::set_view_root`), the crate graph is one commit (`Edit::set_crate_graph`), and the
+//! test proc macros the next ([`ProcMacrosBuilder`]). [`db`] makes one; the [`Fixture`] it returns
 //! owns the database and answers the files, the `$0` position or range and the test crate.
 //!
 //! # Fixture syntax
@@ -48,7 +48,8 @@
 //! Each file is at its fixture path under `/`, the one directory the fixture's views are of;
 //! minicore is `/sysroot/core/lib.rs` and the proc macros' crate `/sysroot/proc_macros/lib.rs`.
 //! A fixture's files have the file IDs from 0 in its order, then minicore's, then the proc
-//! macros'. An edit after setup is [`Db::set_file_text`].
+//! macros'. An edit after setup is [`Fixture::edit`], which commits and makes the fixture's
+//! file ids again (an id of an arena the commit dropped is dead).
 
 use std::{any::TypeId, str::FromStr, sync};
 
@@ -60,7 +61,6 @@ use base_db::{
     target::{Arch, TargetData},
 };
 use blaze_hash::HashSet;
-use blaze_query::db::{Durability, Setter};
 use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
@@ -98,14 +98,18 @@ const FIXTURE_ENV: &str = "__ra_is_test_fixture";
 /// A database made from a fixture, with the files it has and where its `$0` is.
 pub struct Fixture {
     db: Db,
-    /// The fixture's own files, in its order.
+    /// The fixture's own files, in its order, as ids of the current snapshot: made again from
+    /// `keys` after each commit ([`Fixture::refresh`]).
     files: Vec<EditionedFileId>,
+    /// What each of `files` is: its file, edition and syntax extensions, stable across commits.
+    keys: Vec<(FileId, Edition, Extensions)>,
     paths: Vec<String>,
     /// The line of the fixture each file's text starts at.
     lines: Vec<usize>,
     /// Minicore's file and the proc macros', those it has.
     sysroot_files: Vec<FileId>,
-    marked: Option<(EditionedFileId, RangeOrOffset)>,
+    /// The index in `files` of the file `$0` marks, and what it marks.
+    marked: Option<(usize, RangeOrOffset)>,
 }
 
 /// The database of `fixture`, with every test proc macro its `//- proc_macros:` names.
@@ -122,7 +126,39 @@ pub fn db_with_proc_macros(
     #[rust_analyzer::rust_fixture] fixture: &str,
     extra: Vec<(String, ProcMacro)>,
 ) -> Fixture {
-    build(fixture, extra)
+    // No fact boundaries for this crate's own tests (hir-expand's queries are below every
+    // boundary; blaze-item-hash, above this crate, marks them).
+    build(fixture, extra, || for_tests(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] in a build's database ([`Db::logged`]: single flight across tasks,
+/// `blaze_memo::Scheduled`, and batches on the pool), with a run log and no read lists: for a
+/// test whose queries are asked from several threads at once (a store's own threads,
+/// `hir_def::deps::ImageStore::for_each`). A test database's single flight is one thread's
+/// (`blaze_memo::Alone`): a key another thread runs reads to it as a cycle of its own.
+#[track_caller]
+pub fn db_on_threads(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || Db::logged(|_| {}, blaze_memo::Reads::Off))
+}
+
+/// [`db`] whose queries keep read lists ([`Db::for_tests_with_reads`]), so
+/// `blaze_memo::record` answers on it: for a test that checks what a query read.
+#[track_caller]
+pub fn db_with_reads(#[rust_analyzer::rust_fixture] fixture: &str) -> Fixture {
+    build(fixture, Vec::new(), || for_tests(|_| {}, blaze_memo::Reads::Kept))
+}
+
+/// [`db`] whose first snapshot marks its fact boundaries with `boundaries` (a boundary can be
+/// marked only as a database's first snapshot is built, `blaze_memo::Builder::mark_boundary`)
+/// and keeps read lists or not as `reads` says: for the tests of a crate above this one that
+/// check which boundary rows a query's read list holds (`hir-ty`'s body store).
+#[track_caller]
+pub fn db_with_boundaries(
+    #[rust_analyzer::rust_fixture] fixture: &str,
+    boundaries: fn(&mut blaze_memo::Builder),
+    reads: blaze_memo::Reads,
+) -> Fixture {
+    build(fixture, Vec::new(), || for_tests(boundaries, reads))
 }
 
 /// Sets the file at `path` (absolute, as a fixture names its files) to `bytes`, as a checkout's
@@ -183,7 +219,8 @@ pub fn set_bytes(db: &mut Db, path: &str, bytes: &[u8]) -> FileId {
         })
         .collect();
     let partition = Default::default();
-    let change = db
+    let mut edit = db.edit();
+    let change = edit
         .set_view_root(ViewRoot {
             base: &dir,
             built: &[],
@@ -193,6 +230,7 @@ pub fn set_bytes(db: &mut Db, path: &str, bytes: &[u8]) -> FileId {
         })
         .unwrap_or_else(|error| panic!("`{path}`: {error}"));
     assert!(change.removed.is_empty(), "setting `{path}` removed {:?}", change.removed);
+    _ = edit.commit();
     let set = db.source_root(other).source_root(&*db);
     *set.file_for_path(&VfsPath::from(path.clone()))
         .unwrap_or_else(|| panic!("`{path}` is in no source root"))
@@ -317,12 +355,12 @@ impl Fixture {
 
     /// The file and position or range `$0` marks, if it marks one.
     pub fn marked(&self) -> Option<(EditionedFileId, RangeOrOffset)> {
-        self.marked
+        self.marked.map(|(at, marks)| (self.files[at], marks))
     }
 
     #[track_caller]
     pub fn range_or_offset(&self) -> (EditionedFileId, RangeOrOffset) {
-        self.marked
+        self.marked()
             .expect("Could not find file position in fixture. Did you forget to add an `$0`?")
     }
 
@@ -348,8 +386,31 @@ impl Fixture {
 
     /// Gives `krate` the proc macros `macros` in place of those it had, as loading its dylib
     /// would: a fixture's own `crate:proc-macro:name` has none until it is given some.
+    /// The fixture's ids are made again after the commit; a `Crate` held from before is looked
+    /// up again by its key ([`Crate::key`], [`Db::krate`]).
     pub fn set_proc_macros(&mut self, krate: Crate, macros: Vec<ProcMacro>) {
         ProcMacros::give(&mut self.db, [(krate, Ok(macros))]);
+        self.refresh();
+    }
+
+    /// Makes `change` to the database's world as one commit, then the fixture's file ids
+    /// again: an edit after setup (`edit.set_file_text(file.file_id(db), ..)`, read the file
+    /// id before the call). Ids of the snapshot before are dead where their arena dropped.
+    pub fn edit(&mut self, change: impl FnOnce(&mut base_db::Edit<'_>)) -> base_db::Committed {
+        let mut edit = self.db.edit();
+        change(&mut edit);
+        let committed = edit.commit();
+        self.refresh();
+        committed
+    }
+
+    /// The fixture's file ids made again in the current snapshot, from their keys.
+    fn refresh(&mut self) {
+        let db = &self.db;
+        self.files.clear();
+        self.files.extend(self.keys.iter().map(|&(file, edition, extensions)| {
+            EditionedFileId::new_with_extensions(db, file, edition, extensions)
+        }));
     }
 }
 
@@ -377,7 +438,21 @@ struct PlannedCrate {
 }
 
 #[track_caller]
-fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
+/// The test database of `boundaries` and `reads`: one that runs its batches on the calling
+/// thread and keeps a run log ([`Db::for_tests`]).
+fn for_tests(boundaries: fn(&mut blaze_memo::Builder), reads: blaze_memo::Reads) -> Db {
+    match reads {
+        blaze_memo::Reads::Off => Db::for_tests(boundaries),
+        blaze_memo::Reads::Kept => Db::for_tests_with_reads(boundaries),
+    }
+}
+
+/// The fixture `fixture` written into the empty database `make` makes.
+fn build(
+    fixture: &str,
+    mut extra: Vec<(String, ProcMacro)>,
+    make: impl FnOnce() -> Db,
+) -> Fixture {
     let FixtureWithProjectMeta {
         fixture,
         mini_core,
@@ -517,7 +592,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         });
     }
 
-    let mut db = Db::for_tests();
+    let mut db = make();
     let ids = set_files(&mut db, &base, &planned, &roots);
     let sysroot_files = ids[own_files..].to_vec();
     let core_file = has_core.then(|| ids[own_files]);
@@ -669,14 +744,14 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         graph.seal(krate, base_db::ContentId::of("blaze v2 fixture pin 1", &(at as u64).to_le_bytes()));
     }
 
-    // Setting the crate graph maintains every crate's def map, which reads the proc macros: one
-    // write sets both, so the maintainers run once and see the fixture's.
-    let crates_id_map =
-        db.batch(base_db::Trigger::named("the fixture's crate graph and proc macros"), |db| {
-            let crates_id_map = graph.set_in_db(db);
-            macros.build_in(db, &crates_id_map);
-            crates_id_map
-        });
+    // The crate graph, then the proc macros given to the crates it made (a gift names a crate's
+    // key, known once the graph is committed). Nothing reads the snapshot between the two.
+    let committed = {
+        let mut edit = db.edit();
+        edit.set_crate_graph(graph);
+        edit.commit()
+    };
+    _ = macros.build_in(&mut db, &committed.crates);
 
     let all = all_crates(&db);
     // The syntax extensions of the crate of the fixture's `at`th file (`Fixture::files`).
@@ -686,13 +761,15 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
         let krate = all.iter().find(|krate| krate.data(&db).root_file_id == ids[root]);
         krate.map_or(Extensions::NONE, |krate| krate.extensions(&db))
     };
-    let id = |at: usize, edition: Edition| {
-        EditionedFileId::new_with_extensions(&db, ids[at], edition, extensions(at))
-    };
-    let files = editions.iter().enumerate().map(|(at, &edition)| id(at, edition)).collect();
-    let marked = marked.map(|(at, edition, marks)| (id(at, edition), marks));
+    let keys: Vec<(FileId, Edition, Extensions)> =
+        editions.iter().enumerate().map(|(at, &edition)| (ids[at], edition, extensions(at))).collect();
+    // The marked file is the fixture's `at`th, read in its own edition.
+    let marked = marked.map(|(at, _, marks)| (at, marks));
     let paths = planned.into_iter().take(own_files).map(|it| it.path).collect();
-    Fixture { db, files, paths, lines, sysroot_files, marked }
+    let mut fixture =
+        Fixture { db, files: Vec::new_in(Global), keys, paths, lines, sysroot_files, marked };
+    fixture.refresh();
+    fixture
 }
 
 /// Makes the source roots, empty, then sets each one's files (those `Planned::root` puts in
@@ -708,6 +785,7 @@ fn set_files(
     by_id.sort_unstable_by_key(|(id, _)| id.0);
     let mut local = HashSet::new_in(Global);
     let mut library = HashSet::new_in(Global);
+    let mut edit = db.edit();
     for (id, kind) in by_id {
         let root = match kind {
             SourceRootKind::Local => {
@@ -719,13 +797,10 @@ fn set_files(
                 SourceRoot::new_library(FileSet::default())
             }
         };
-        // A library root's set is `HIGH`, a local one's `MEDIUM`, as base-db writes them
-        // (`base_db::FileChange`): a sealed crate's cover reads a library root's.
-        let durability = if root.is_library { Durability::HIGH } else { Durability::MEDIUM };
-        db.set_source_root_with_durability(id, Arc::new(root), durability);
+        edit.set_source_root(id, Arc::new(root));
     }
-    LocalRoots::get(&*db).set_roots(db).to(local);
-    LibraryRoots::get(&*db).set_roots(db).to(library);
+    edit.set_local_roots(local);
+    edit.set_library_roots(library);
 
     let bytes: Vec<blaze_vfs::Bytes> = planned
         .iter()
@@ -756,11 +831,14 @@ fn set_files(
             .collect();
         let view =
             ViewRoot { base, built: &built, partition: &partition, other: id, files: &files };
-        let change =
-            db.set_view_root(view).unwrap_or_else(|error| panic!("the fixture's files: {error}"));
+        let change = edit
+            .set_view_root(view)
+            .unwrap_or_else(|error| panic!("the fixture's files: {error}"));
         assert!(change.removed.is_empty(), "a fixture's view removed {:?}", change.removed);
         assert!(change.no_text.is_empty(), "a fixture's file has no text: {:?}", change.no_text);
     }
+    // The roots and their views, one commit.
+    _ = edit.commit();
 
     planned
         .iter()

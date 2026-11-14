@@ -14,7 +14,6 @@ use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Hasher};
 use blaze_kernel::Seen;
 use blaze_query::QueryKind;
-use blaze_query::db::{Database as _, Durability, SealNotWhole, Setter};
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId,
@@ -30,8 +29,9 @@ use blaze_record::{AnswerKey, Digest};
 use std::alloc::Global;
 
 use super::{
-    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install,
-    lookup_inference, lookup_passed, offer_passed,
+    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, Traced, Untraced, capture,
+    entries, infer, install, install_trace, lookup_inference, lookup_passed, offer_passed,
+    offer_verdict,
     record::{self, ShapeRef},
     step_value,
 };
@@ -70,12 +70,14 @@ pub(super) const BUILD: ContentId = ContentId([7; 32]);
 const IMPLS: FactRef =
     FactRef { kind: QueryKind(0x1800), subject: ContentId([4; 32]), object: FactObject::None };
 
+/// The database of `fixture`, its queries keeping read lists (what [`capture`] answers from)
+/// and the impl tables its fact boundaries ([`impl_table_boundaries`]), as lane item-hash's
+/// install marks its own: the boundaries are the session's, fixed in its first snapshot.
 pub(super) fn db_of(fixture: &str) -> Db {
-    let db = fixture::db(fixture).into_db();
-    db
+    fixture::db_with_boundaries(fixture, impl_table_boundaries, blaze_memo::Reads::Kept).into_db()
 }
 
-fn crate_named(db: &Db, name: &str) -> Crate {
+pub(super) fn crate_named(db: &Db, name: &str) -> Crate {
     *all_crates(db)
         .iter()
         .find(|it| it.extra_data(db).display_name.as_ref().is_some_and(|it| it.to_string() == name))
@@ -156,7 +158,7 @@ pub(super) fn kept_by_the_kernel(first: &Session, memory: &Memory) {
     })
     .expect("the first database's item store");
     for ((def, step, schema), ran) in traces {
-        let (DefWithBodyId::FunctionId(f), super::entries::Ran::Kept { facts, answer }) = (def, &*ran) else {
+        let (DefWithBodyId::FunctionId(f), super::Traced::Kept { facts, answer }) = (def, &*ran) else {
             continue;
         };
         if !step.served() {
@@ -178,11 +180,10 @@ pub(super) fn kept_by_the_kernel(first: &Session, memory: &Memory) {
     }
 }
 
-/// Posts to `s`'s database, at its revision now, each entry beside `memory` the kernel's
-/// lookup verifies there: its body's identity and each fact it read are what they were.
+/// Posts to `s`'s database each entry beside `memory` the kernel's lookup verifies there: its
+/// body's identity and each fact it read are what they were.
 fn served_by_the_kernel(s: &Session, memory: &Memory) {
     let db = &s.db;
-    let (_, revision) = db.nonce_and_revision();
     let main = crate_named(db, "main");
     for kept in memory.entries.lock().iter() {
         let Some(def) = crate_body_owners(db, main).into_iter().find(|def| {
@@ -196,8 +197,6 @@ fn served_by_the_kernel(s: &Session, memory: &Memory) {
             continue;
         }
         let served = super::entries::Served {
-            revision,
-            krate: hir_def::HasModule::krate(&def, db),
             identity: kept.identity,
             facts: kept.facts.clone(),
             answer: kept.answer.clone(),
@@ -274,6 +273,8 @@ pub(super) struct TestFacts {
 
 impl TestFacts {
     pub(super) fn new(db: &Db, defs: &Defs, refuse: Option<&'static str>) -> TestFacts {
+        // The test's fact boundaries, the impl tables, were marked as the database was made
+        // ([`db_of`]): a read of one is a row of its own and not its table's inputs.
         TestFacts {
             defs: defs.clone(),
             main: crate_named(db, "main"),
@@ -281,6 +282,31 @@ impl TestFacts {
             refuse,
             names: Lock::new("test.ty.body_store.names", Default::default()),
         }
+    }
+}
+
+/// Marks each impl table's query kind ([`crate::method_resolution::IMPL_TABLE_KINDS`]) a fact
+/// boundary (port decision 2): a call of one is a `Read::Query` row of its asker's list. A
+/// database's first snapshot is given it ([`db_of`]).
+pub(super) fn impl_table_boundaries(builder: &mut blaze_memo::Builder) {
+    for &name in crate::method_resolution::IMPL_TABLE_KINDS {
+        builder.mark_boundary(name);
+    }
+}
+
+/// The invariant: every kind [`impl_table_boundaries`] marks is one [`is_impl_table`] calls an
+/// impl table, so a boundary row of one is classified as the impl fact.
+#[test]
+fn every_impl_table_boundary_is_classified_as_one() {
+    for &name in crate::method_resolution::IMPL_TABLE_KINDS {
+        assert!(is_impl_table(name), "`{name}` is marked an impl table and not classified as one");
+    }
+}
+
+/// The name of the kind of `read`, a query's or an input's: what the test classifiers go by.
+pub(super) fn kind_name(read: blaze_memo::Read) -> &'static str {
+    match read {
+        blaze_memo::Read::Input { kind, .. } | blaze_memo::Read::Query { kind, .. } => kind.name(),
     }
 }
 
@@ -338,22 +364,15 @@ impl BodyFacts for TestFacts {
         identity
     }
 
-    fn classify(
-        &self,
-        _: &Db,
-        _: DefWithBodyId,
-        _: Step,
-        _: blaze_query::db::DatabaseKeyIndex,
-        _: blaze_query::db::ReadKind,
-        name: &'static str,
-    ) -> Classified {
+    fn fact_of(&self, _: &Db, _: DefWithBodyId, _: Step, read: blaze_memo::Read) -> Classified {
+        let name = kind_name(read);
         self.names.lock().push(name);
         if self.refuse == Some(name) {
-            return Classified::Refused;
+            return Classified::Refused(name);
         }
-        match is_impl_table(name) {
-            true => Classified::Fact(IMPLS),
-            false => Classified::Covered,
+        match read {
+            blaze_memo::Read::Query { .. } if is_impl_table(name) => Classified::Fact(IMPLS),
+            _ => Classified::Covered,
         }
     }
 
@@ -750,22 +769,72 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
 /// The checker the stand-in's verdicts are stored for.
 const CHECKER: &str = "polonius";
 
-/// A borrow check's stand-in: `def`'s check passes when `passes` says so.
-#[blaze_query::input]
+/// The function every [`Verdict`] is of.
+const CHECKED: &str = "seven";
+
+/// A borrow check's stand-in: [`CHECKED`]'s check passes when `passes` says so. Made with its
+/// snapshot ([`with_verdicts`]), before any id of it can be taken, so it names its body by the
+/// function's name.
+#[blaze_memo::input]
 struct Verdict {
-    #[returns(copy)]
-    def: DefWithBodyId,
     #[returns(copy)]
     passes: bool,
 }
 
+/// Both [`Verdict`]s of a database [`with_verdicts`] made, failing then passing.
+#[blaze_memo::input(singleton)]
+struct Verdicts {
+    #[returns(copy)]
+    verdicts: [Verdict; 2],
+}
+
+/// The fact the verdicts are made under ([`with_verdicts`]).
+fn verdicts_fact() -> blaze_memo::Fact {
+    blaze_memo::Fact {
+        id: ContentId::of("body store test: the verdicts", CHECKED.as_bytes()),
+        digest: ContentId::of("body store test: the verdicts' fields", CHECKED.as_bytes()),
+    }
+}
+
+/// `db` with both [`Verdict`]s made in its session arena, held by [`Verdicts`]: inputs are made
+/// only while a snapshot is built, so the verdicts are a maker of the session arena
+/// (`Edit::set_given`) and its commit makes them. Each verdict's fact is known by `passes`,
+/// which is its digest.
+fn with_verdicts(mut db: Db) -> Db {
+    let make = |_: &blaze_memo::Builder, inputs: &blaze_memo::Inputs<'_>| {
+        let verdict = |passes: bool| {
+            let fact = blaze_memo::Fact {
+                id: ContentId::of("body store test: a verdict", &[u8::from(passes)]),
+                digest: ContentId::of("body store test: a verdict's pass", &[u8::from(passes)]),
+            };
+            Verdict::new(inputs, fact, passes)
+        };
+        Verdicts::set(inputs, verdicts_fact(), [verdict(false), verdict(true)]);
+    };
+    let mut edit = db.edit();
+    edit.set_given(None, verdicts_fact(), Box::new_in(make, Global));
+    _ = edit.commit();
+    db
+}
+
+/// The [`Verdict`] of `db` ([`with_verdicts`]) that passes where `passes` says.
+fn new_verdict(db: &Db, passes: bool) -> Verdict {
+    Verdicts::get(db).verdicts(db)[usize::from(passes)]
+}
+
 /// What `hir_ty_borrowck::borrowck` does with the store: the check, captured, and its verdict
-/// offered when it passes.
-#[blaze_query::tracked(returns(copy))]
+/// offered when it passes. Keyed by the crate [`CHECKED`] is in as well
+/// ([`borrow_checked_in`]): the check reads that crate's arena, and a key of the session's
+/// [`Verdict`] alone is homed at the session arena, which may read no crate's.
 fn borrow_checked(db: &Db, verdict: Verdict) -> bool {
+    borrow_checked_in(db, verdict, crate_named(db, "main"))
+}
+
+#[blaze_memo::tracked(returns(copy))]
+fn borrow_checked_in(db: &Db, verdict: Verdict, _krate: Crate) -> bool {
     let (passes, reads) = capture(db, || verdict.passes(db));
     if passes {
-        offer_passed(db, verdict.def(db), CHECKER, reads);
+        offer_passed(db, function(db, CHECKED), CHECKER, reads);
     }
     passes
 }
@@ -774,9 +843,9 @@ fn borrow_checked(db: &Db, verdict: Verdict) -> bool {
 fn only_a_passing_borrow_check_is_stored() {
     let memory = Arc::new(Memory::default());
     let defs = Defs::default();
-    let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
-    let seven = function(&first.db, "seven");
-    let verdict = Verdict::new(&first.db, Durability::LOW, seven, false);
+    let first = session(with_verdicts(db_of(FIXTURE)), &memory, &defs, None, Mode::Serve);
+    let seven = function(&first.db, CHECKED);
+    let verdict = new_verdict(&first.db, false);
     assert!(!borrow_checked(&first.db, verdict));
     assert_eq!(
         first.installed.flush().unwrap(),
@@ -789,7 +858,9 @@ fn only_a_passing_borrow_check_is_stored() {
         only(Step::Borrowck, StepCounts { ran: 1, ..StepCounts::default() })
     );
 
-    verdict.set_passes(&mut first.db).to(true);
+    // The passing verdict: another input, made with the snapshot as both are
+    // ([`with_verdicts`]), so another key of the check.
+    let verdict = new_verdict(&first.db, true);
     assert!(borrow_checked(&first.db, verdict));
     kept_by_the_kernel(&first, &memory);
     assert_eq!(first.installed.flush().unwrap().written, 0, "the pass is the kernel's entry");
@@ -1098,60 +1169,181 @@ fn a_step_the_store_refuses_keeps_no_other_step_out() {
 }
 
 /// `main`'s bodies inferred in a fresh database over a store that holds them all, under
-/// `mode`, with the hits of `left_out` not told to the engine (the planted bug): what the
-/// engine then says of `main`'s seal group, whose rows the inferences are
-/// (`Storage::seal_group_whole`).
-fn mains_group_after_hits(mode: Mode, left_out: Option<Step>) -> Result<(), SealNotWhole> {
+/// `mode`, with the hits of `left_out` not noted (the planted bug): how many of the
+/// inferences' read lists (`blaze_memo::record`, around each ask) list the stored answer's
+/// own fact, under the step's base key (`Store::lookup`). The test snapshot keeps read lists.
+fn hits_listed(mode: Mode, left_out: Option<Step>) -> usize {
     let (memory, defs, _) = stored(Mode::Serve);
-    let mut fresh = session(second(FIXTURE), &memory, &defs, None, mode);
+    let fresh = session(second(FIXTURE), &memory, &defs, None, mode);
+    let db = &fresh.db;
     super::UNREPORTED.with(|it| it.set(left_out));
     reset_ran();
+    let mut listed = 0;
     for name in BODIES {
-        let def = function(&fresh.db, name);
-        let _ = InferenceResult::of(&fresh.db, def);
+        let def = function(db, name);
+        let base = super::with_store(db, |store| {
+            let identity = store.facts.identity(db, def)?;
+            Some(super::record::base_key(&identity, Step::Infer, &super::infer::SCHEMA, &store.version))
+        })
+        .flatten()
+        .expect("a body of the fixture has an identity");
+        let ((), reads) = blaze_memo::record(blaze_memo::Database::memo(db), || {
+            let _ = InferenceResult::of(db, def);
+        })
+        .expect("the test snapshot keeps read lists");
+        listed += usize::from(reads.iter().any(|read| {
+            matches!(read, blaze_memo::Read::Input { kind, fact } if *kind == super::STORED_ANSWER && fact.id == base)
+        }));
     }
     super::UNREPORTED.with(|it| it.set(None));
     let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
     assert_eq!(fresh.installed.steps(), hits, "every body's inference was found in the store");
-    let group = crate_named(&fresh.db, "main")
-        .seal_group_of(&fresh.db)
-        .expect("a crate is given its seal group as it is made");
-    fresh.db.storage_mut().seal_group_whole(group)
+    listed
 }
 
-/// The invariant: a row whose value the item store answered is told to the engine as such,
-/// each one, so a list of what its crate's rows read is never taken for every read their
-/// values rest on: after every body of `main` is found in the store, `main`'s group is not
-/// whole, by exactly as many rows as there were hits, none emptied and none untracked. What
-/// those rows did read is their record's key: the body's identity and each fact of its
-/// shape, worked out in the hit (`Store::answer_key_now`), which is what a unit's read parts
-/// take of them.
+/// The invariant: a query whose value the item store answered lists the stored answer as a
+/// fact it read, each one, so its read list is never taken for every read its value rests
+/// on alone: after every body of `main` is found in the store, exactly as many read lists
+/// list it as there were hits. What else those lists hold is their record's key: the body's
+/// identity and each fact of its shape, read in the hit.
 #[test]
 fn every_row_answered_from_the_store_is_told_to_the_engine() {
-    assert_eq!(
-        mains_group_after_hits(Mode::Serve, None),
-        Err(SealNotWhole { stored: BODIES.len() as u64, emptied: 0, untracked: 0 })
-    );
+    assert_eq!(hits_listed(Mode::Serve, None), BODIES.len());
     assert_eq!(ran(), 0, "none was inferred");
 }
 
 /// Under `Mode::Verify` a hit runs the step as well, in its own query and by its own reads:
-/// no row is told as answered from the store, and the group is whole.
+/// no read list lists the stored answer.
 #[test]
 fn a_verified_hit_ran_by_its_own_reads_and_is_not_told() {
-    assert_eq!(mains_group_after_hits(Mode::Verify, None), Ok(()));
+    assert_eq!(hits_listed(Mode::Verify, None), 0);
     assert_eq!(ran(), BODIES.len() as u32, "each was inferred as well");
 }
 
-/// The control (test-the-cause): with the hit site's report left out for the step, the
-/// same hits leave `main`'s group reading as whole, which is the wrong answer the count of
+/// The control (test-the-cause): with the hit site's note left out for the step, the same
+/// hits list no stored answer, which the count of
 /// `every_row_answered_from_the_store_is_told_to_the_engine` fails on; left out for another
 /// step, which made no hit here, nothing changes.
 #[test]
 fn the_count_catches_a_hit_site_that_does_not_tell_the_engine() {
-    assert_eq!(mains_group_after_hits(Mode::Serve, Some(Step::Infer)), Ok(()));
-    assert_eq!(
-        mains_group_after_hits(Mode::Serve, Some(Step::Mir)),
-        Err(SealNotWhole { stored: BODIES.len() as u64, emptied: 0, untracked: 0 })
+    assert_eq!(hits_listed(Mode::Serve, Some(Step::Infer)), 0);
+    assert_eq!(hits_listed(Mode::Serve, Some(Step::Mir)), BODIES.len());
+}
+
+/// A database with an item store in `Mode::Trace` ([`install_trace`]), and its facts: no store
+/// of records is given to it.
+fn trace_session(db: Db) -> Session {
+    let facts = Arc::new(TestFacts::new(&db, &Defs::default(), None));
+    let installed = install_trace(&db, facts.clone(), BUILD).unwrap();
+    Session { installed, facts, db }
+}
+
+/// What a body task takes of `name`'s inference and the built MIR of each of its owners in
+/// `s`, through the entry points it calls: each step with its schema and its trace.
+fn body_task(s: &Session, name: &str) -> Vec<(Step, blaze_format::SchemaHash, Arc<Traced>)> {
+    let db = &s.db;
+    let def = function(db, name);
+    let mut out = Vec::new();
+    let schema = entries::run_infer(db, def);
+    out.push((Step::Infer, schema, s.installed.trace(def, Step::Infer, schema).expect("the inference is traced")));
+    for place in entries::places(db, def) {
+        let schema = entries::run_mir(db, def, place).unwrap();
+        out.push((Step::Mir, schema, s.installed.trace(def, Step::Mir, schema).expect("the MIR is traced")));
+    }
+    out
+}
+
+/// In `Mode::Trace` two runs of the same body in two fresh databases, whose ids differ
+/// ([`second`]), give byte-equal traces: the same facts and the same answers, every step kept.
+/// And a trace store files nothing: its flush is an error, and a store not in `Mode::Trace`
+/// gives no trace.
+///
+/// To move: it asks built MIR ([`entries::run_mir`] → `providers::mir_at(.., Built)`), which
+/// this crate's test binary cannot build (it registers only the coroutine-witness `Mir`
+/// table, whose `no_build` is `unreachable!`). It belongs with hir-ty-mir's tests, which link
+/// the MIR builder, with [`TestFacts`], [`trace_session`], [`second`] and [`FIXTURE`] made
+/// reachable there. Fails here until it is moved; what it claims is still true.
+#[test]
+fn a_trace_is_the_same_in_two_fresh_databases() {
+    let first = trace_session(db_of(FIXTURE));
+    let other = trace_session(second(FIXTURE));
+    for name in BODIES {
+        let (a, b) = (body_task(&first, name), body_task(&other, name));
+        assert_eq!(a.len(), b.len(), "`{name}`'s owners");
+        for ((step, schema, one), (_, other_schema, two)) in a.iter().zip(&b) {
+            assert_eq!(schema, other_schema, "`{name}`'s {step:?} schema");
+            assert!(matches!(&**one, Traced::Kept { .. }), "`{name}`'s {step:?} is kept: {one:?}");
+            assert_eq!(**one, **two, "`{name}`'s {step:?} traces, facts and answers");
+        }
+    }
+    assert!(first.installed.flush().is_err(), "a trace store files nothing");
+    drop((first, other));
+
+    let serve = session(db_of(FIXTURE), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    let seven = function(&serve.db, "seven");
+    let schema = entries::run_infer(&serve.db, seven);
+    assert_eq!(serve.installed.trace(seven, Step::Infer, schema), Err(Untraced::NotTracing));
+}
+
+/// What `hir_ty_borrowck::borrowck` does with the store, for [`Verdict`]'s stand-in: a stored
+/// pass answers; else the check runs, captured, and its verdict is offered (traced whatever it
+/// is under `Mode::Trace`, `b"fails"` for a failure as the stand-in's encoding).
+/// Keyed by the crate [`CHECKED`] is in as well ([`verdict_of_in`]), as [`borrow_checked`] is.
+fn verdict_of(db: &Db, verdict: Verdict) -> bool {
+    verdict_of_in(db, verdict, crate_named(db, "main"))
+}
+
+#[blaze_memo::tracked(returns(copy))]
+fn verdict_of_in(db: &Db, verdict: Verdict, _krate: Crate) -> bool {
+    let def = function(db, CHECKED);
+    if lookup_passed(db, def, CHECKER, || panic!("no store here verifies")) {
+        return true;
+    }
+    let (passes, reads) = capture(db, || verdict.passes(db));
+    offer_verdict(db, def, CHECKER, reads, passes, |out| {
+        if !passes {
+            out.extend_from_slice(b"fails");
+        }
+    });
+    passes
+}
+
+/// Plants in `s`'s store a served answer of [`CHECKED`]'s borrow check that says it passes,
+/// valid while its identity is what it is now (it read no fact): an answer that differs from
+/// the run's, whose verdict fails. Gives the step's schema.
+fn plant_a_pass(s: &Session) -> blaze_format::SchemaHash {
+    let db = &s.db;
+    let def = function(db, CHECKED);
+    let schema = entries::borrowck_schema(db, def, CHECKER);
+    let identity = s.facts.identity(db, def).expect("the checked body has an identity");
+    let planted = super::entries::Served { identity, facts: Box::new([]), answer: Arc::from(&[][..]) };
+    super::with_store(db, |store| store.served.lock().post(def, Step::Borrowck, schema, planted))
+        .expect("the database's item store");
+    schema
+}
+
+/// The invariant of `Mode::Trace` and its control: no step's answer comes from anywhere but
+/// its own run in this process. With a stored answer planted that differs from the true one
+/// (a pass of a check that fails), `Mode::Serve` answers with the stored one; `Mode::Trace`
+/// with the run's, and its trace is the run's: the planted pass never reaches it.
+#[test]
+fn under_trace_no_answer_comes_from_anywhere_but_its_run() {
+    let serve = session(with_verdicts(db_of(FIXTURE)), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    plant_a_pass(&serve);
+    let failing = new_verdict(&serve.db, false);
+    assert!(verdict_of(&serve.db, failing), "under `Mode::Serve` the planted pass is the answer");
+    drop(serve);
+
+    let trace = trace_session(with_verdicts(db_of(FIXTURE)));
+    let schema = plant_a_pass(&trace);
+    let seven = function(&trace.db, CHECKED);
+    assert!(
+        !lookup_passed(&trace.db, seven, CHECKER, || panic!("nothing is looked up")),
+        "under `Mode::Trace` nothing is looked up"
     );
+    let failing = new_verdict(&trace.db, false);
+    assert!(!verdict_of(&trace.db, failing), "under `Mode::Trace` the run's verdict is the answer");
+    let traced = trace.installed.trace(seven, Step::Borrowck, schema).expect("the failing verdict is traced");
+    let Traced::Kept { answer, .. } = &*traced else { panic!("refused: {traced:?}") };
+    assert_eq!(&answer[..], b"fails", "the trace is the run's, not the planted pass");
 }

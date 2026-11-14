@@ -161,7 +161,7 @@ impl std::error::Error for Error {}
 /// The crate's local functions, and the ADTs and foreign functions they use, as ULLBC: what
 /// charon-driver hands Charon's passes. Every construct version 1 refuses is collected, sorted.
 pub fn translate_crate(db: &Db, krate: Crate) -> Result<TranslatedCrate, Vec<Unsupported>> {
-    blaze_query::db::attach(db, || items::translate(db, krate))
+    blaze_memo::attach(db, || items::translate(db, krate))
 }
 
 /// The options [`to_llbc`] runs Charon's passes with: the Aeneas preset, as `charon

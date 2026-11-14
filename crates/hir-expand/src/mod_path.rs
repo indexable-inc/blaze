@@ -12,6 +12,7 @@ use crate::{
     tt,
 };
 use base_db::{Crate, Db};
+use blaze_memo::ArenaId;
 use intern::{InternedSlice, sym};
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
@@ -20,7 +21,7 @@ use syntax::view::{self, AstNode as _};
 intern::impl_slice_internable!(PathContexts, (), SyntaxContext);
 intern::impl_slice_internable!(PathSegments, Option<InternedSlice<PathContexts>>, Name);
 
-/// A path's kind and its segments. 16 bytes, `Copy`: the segments are interned once per
+/// A path's kind and its segments. 24 bytes, `Copy`: the segments are interned once per
 /// distinct list (one hash of the names' pointers and a probe, no allocation when the list
 /// exists), so equality and hashing are two words and a clone is a copy. `None` is no segments.
 ///
@@ -35,8 +36,10 @@ pub struct ModPath {
     segments: Option<InternedSlice<PathSegments>>,
 }
 
-// The kind (8 bytes) and a pointer: 16 bytes on a 64-bit target.
-const _: () = assert!(size_of::<ModPath>() == 8 + size_of::<usize>());
+// The kind (16 bytes since `PathKind::DollarCrate` holds a `Crate` that is an 8-byte memo id)
+// and a pointer: 24 bytes on a 64-bit target. Owed: `DollarCrate` holding the 4-byte
+// `base_db::CrateKey` brings this back to 16 (port notes, "ModPath grew").
+const _: () = assert!(size_of::<ModPath>() == 16 + size_of::<usize>());
 
 /// Segments are gathered here before they are interned: paths longer than this spill to the heap.
 type SegmentBuf = SmallVec<[Name; 8]>;
@@ -146,27 +149,34 @@ impl PathKind {
 }
 
 impl ModPath {
+    /// The path at `path`. `arena` is the table the contexts `span_for_range` gives are of
+    /// (see [`span::SyntaxContext`]; [`crate::HirFileId::context_arena`] of the path's file),
+    /// and so of the path's contexts.
     pub fn from_src_view(
         db: &Db,
+        arena: ArenaId,
         path: view::Path<'_>,
         span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
-        convert_path_view(db, path, span_for_range, false)
+        convert_path_view(db, arena, path, span_for_range, false)
     }
 
     /// [`ModPath::from_src_view`] with each segment's context ([`ModPath::contexts`]), read
     /// with `span_for_range`: for a path of a macro expansion that is resolved (every segment
-    /// of a real file has a root context, so its reader need not ask).
+    /// of a real file has a root context, so its reader need not ask). The contexts are of
+    /// `arena`'s table.
     pub fn from_src_view_with_contexts(
         db: &Db,
+        arena: ArenaId,
         path: view::Path<'_>,
         span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
-        convert_path_view(db, path, span_for_range, true)
+        convert_path_view(db, arena, path, span_for_range, true)
     }
 
-    pub fn from_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
-        convert_path_tt(db, tt)
+    /// The path of `tt`, whose spans' contexts are of `arena`'s table.
+    pub fn from_tt(db: &Db, arena: ArenaId, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+        convert_path_tt(db, arena, tt)
     }
 
     pub fn from_segments(kind: PathKind, segments: impl IntoIterator<Item = Name>) -> ModPath {
@@ -384,6 +394,7 @@ fn display_fmt_path(
 
 fn convert_path_view(
     db: &Db,
+    arena: ArenaId,
     path: view::Path<'_>,
     span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     with_contexts: bool,
@@ -409,7 +420,7 @@ fn convert_path_view(
                     names.push(name.as_name());
                     contexts.push(match with_contexts {
                         true => {
-                            span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db)
+                            span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db, arena)
                         }
                         false => root,
                     });
@@ -427,14 +438,14 @@ fn convert_path_view(
     let mut kind = match segment.kind()? {
         view::PathSegmentKind::Name(name_ref) => {
             if name_ref.text() == "$crate" {
-                resolve_crate_root(db, span_for_range(name_ref.syntax().text_range()))
+                resolve_crate_root(db, arena, span_for_range(name_ref.syntax().text_range()))
                     .map(PathKind::DollarCrate)
                     .unwrap_or(PathKind::Crate)
             } else {
                 names.push(name_ref.as_name());
                 contexts.push(match with_contexts {
                     true => {
-                        span_for_range(name_ref.syntax().text_range()).normalize_to_macros_2_0(db)
+                        span_for_range(name_ref.syntax().text_range()).normalize_to_macros_2_0(db, arena)
                     }
                     false => root,
                 });
@@ -463,7 +474,7 @@ fn convert_path_view(
         let (name, ctxt) = match segment.kind()? {
             view::PathSegmentKind::Name(name) => {
                 let ctxt = match with_contexts {
-                    true => span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db),
+                    true => span_for_range(name.syntax().text_range()).normalize_to_macros_2_0(db, arena),
                     false => root,
                 };
                 (name.as_name(), ctxt)
@@ -487,10 +498,10 @@ fn convert_path_view(
         && let Some(_macro_call) = path.syntax().parent().and_then(view::MacroCall::cast)
     {
         let syn_ctx = span_for_range(segment.syntax().text_range());
-        if let Some(macro_call_id) = syn_ctx.outer_expn(db)
+        if let Some(macro_call_id) = syn_ctx.outer_expn(db, arena)
             && crate::MacroCallId::from(macro_call_id).loc(db).def.local_inner
         {
-            kind = match resolve_crate_root(db, syn_ctx) {
+            kind = match resolve_crate_root(db, arena, syn_ctx) {
                 Some(crate_root) => PathKind::DollarCrate(crate_root),
                 None => PathKind::Crate,
             }
@@ -500,7 +511,7 @@ fn convert_path_view(
     Some(ModPath { kind, segments: intern_segments_in(&names, &contexts) })
 }
 
-fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+fn convert_path_tt(db: &Db, arena: ArenaId, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
     let mut leaves = tt.iter().filter_map(|tt| match tt {
         tt::TtElement::Leaf(leaf) => Some(leaf),
         tt::TtElement::Subtree(..) => None,
@@ -513,7 +524,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
             _ => return None,
         },
         tt::Leaf::Ident(tt::Ident { sym: text, span, .. }) if text == sym::dollar_crate => {
-            resolve_crate_root(db, span.ctx).map(PathKind::DollarCrate).unwrap_or(PathKind::Crate)
+            resolve_crate_root(db, arena, span.ctx).map(PathKind::DollarCrate).unwrap_or(PathKind::Crate)
         }
         tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::self_ => PathKind::SELF,
         tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::super_ => {
@@ -523,7 +534,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
             {
                 if text != sym::super_ {
                     segments.push(Name::new_symbol(text, span.ctx));
-                    contexts.push(span.ctx.normalize_to_macros_2_0(db));
+                    contexts.push(span.ctx.normalize_to_macros_2_0(db, arena));
                     break;
                 }
                 deg += 1;
@@ -533,7 +544,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
         tt::Leaf::Ident(tt::Ident { sym: text, .. }) if text == sym::crate_ => PathKind::Crate,
         tt::Leaf::Ident(ident) => {
             segments.push(Name::new_symbol(ident.sym, ident.span.ctx));
-            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db));
+            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db, arena));
             PathKind::Plain
         }
         _ => return None,
@@ -541,21 +552,22 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
     for leaf in leaves {
         if let ::tt::Leaf::Ident(ident) = leaf {
             segments.push(Name::new_symbol(ident.sym, ident.span.ctx));
-            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db));
+            contexts.push(ident.span.ctx.normalize_to_macros_2_0(db, arena));
         }
     }
     Some(ModPath { kind, segments: intern_segments_in(&segments, &contexts) })
 }
 
-pub fn resolve_crate_root(db: &Db, mut ctxt: SyntaxContext) -> Option<Crate> {
+/// The crate `$crate` with context `ctxt` (of `arena`'s table) names.
+pub fn resolve_crate_root(db: &Db, arena: ArenaId, mut ctxt: SyntaxContext) -> Option<Crate> {
     // When resolving `$crate` from a `macro_rules!` invoked in a `macro`,
     // we don't want to pretend that the `macro_rules!` definition is in the `macro`
     // as described in `SyntaxContextId::apply_mark`, so we ignore prepended opaque marks.
     // FIXME: This is only a guess and it doesn't work correctly for `macro_rules!`
     // definitions actually produced by `macro` and `macro` definitions produced by
     // `macro_rules!`, but at least such configurations are not stable yet.
-    ctxt = ctxt.normalize_to_macro_rules(db);
-    let mut iter = ctxt.marks_rev(db).peekable();
+    ctxt = ctxt.normalize_to_macro_rules(db, arena);
+    let mut iter = ctxt.marks_rev(db, arena).peekable();
     let mut result_mark = None;
     // Find the last opaque mark from the end if it exists.
     while let Some(&(mark, Transparency::Opaque)) = iter.peek() {

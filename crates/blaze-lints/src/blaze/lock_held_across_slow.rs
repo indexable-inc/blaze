@@ -110,8 +110,8 @@ impl Kind {
 }
 
 /// What `f` is to the IO walk, by its crate, its module path and its name: once per function.
-#[blaze_query::tracked(returns(copy))]
-pub(crate) fn io(db: &Db, f: FunctionId) -> Io {
+#[blaze_memo::tracked(returns(copy))]
+pub(crate) fn io<'db>(db: &'db Db, f: FunctionId) -> Io {
     let module = hir::Function::from(f).module(db);
     let krate = module.krate(db);
     let is = |name: &str| facts::crate_is(db, krate, name);

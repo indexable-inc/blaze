@@ -86,9 +86,18 @@ fn executed_after(text: &str) -> Vec<String> {
     let krate = main_crate(fixture.db());
     let _ = used_imports_with_traits(fixture.db(), krate);
     let file = fixture.file_at("/lib.rs").file_id(fixture.db());
-    fixture.db_mut().set_file_text(file, text);
+    _ = fixture.edit(|edit| _ = edit.set_file_text(file, text));
     let db = fixture.db();
-    db.log_executed(|| _ = used_imports_with_traits(db, krate))
+    // The commit made the crate's arena again: its id is taken in the new snapshot.
+    let krate = main_crate(db);
+    let runs = db.runs().expect("a fixture's database logs its runs");
+    _ = runs.take();
+    _ = used_imports_with_traits(db, krate);
+    // Each run by its query's own name, the last part of its path.
+    runs.take()
+        .iter()
+        .map(|ran| ran.query.rsplit("::").next().unwrap_or(ran.query).to_owned())
+        .collect()
 }
 
 /// The folds over the crate's uses: what an edit whose uses are equal must not run.
@@ -99,6 +108,13 @@ const FOLDS: [&str; 2] = ["crate_uses", "used_imports_with_traits"];
 /// equal. The control: an edit that adds a type path through the import of `Unused`, which
 /// changes the body's uses, runs both folds; a record keyed by the body's text (the planted bug: the fold reading the
 /// body, as it did before the per-body records) would run them on the first edit too.
+///
+/// False by design since the port to blaze-memo (port decision 3: the memo is not the
+/// incremental mechanism): it claimed the edited crate's folds are not run again after an edit
+/// of one of its bodies. Now the commit drops the edited crate's arena wholesale, and every
+/// query of that crate, the folds too, runs again in the new snapshot; what an edit costs
+/// within its crate is the item store's and the kernel's to keep small, not the memo's. Left
+/// failing until it is restated over the body entries.
 #[test]
 fn a_body_edit_with_equal_uses_reruns_no_fold() {
     let equal = executed_after(&with_by_method("1u8.method();"));

@@ -6,7 +6,7 @@ use hir_expand::{HirFileId, InFile, fixture};
 use span::{ErasedFileAstId, FileAstId};
 use syntax::{AstPtr, SyntaxKind, ast};
 
-use super::{Counts, Memory, set};
+use super::{Counts, Memory, set_for_test as set};
 use crate::{nameres::frozen::tests::crate_named, test_db::TestDBExt};
 
 const MACROS: usize = 4;

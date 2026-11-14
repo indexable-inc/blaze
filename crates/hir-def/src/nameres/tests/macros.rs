@@ -2062,8 +2062,12 @@ include!({path:?});
     }
 
     std::fs::write(&code, "pub fn moved() {}\n").expect("code.rs");
-    assert!(db.reload_included_file(&at, &base_db::Looks::none()), "the file changed on disk");
-    let dump = crate_def_map(&db, krate).dump(&db);
+    let key = krate.key(&db);
+    let mut moved = false;
+    _ = db.commit_with(|edit| moved = edit.reload_included_file(&at, &base_db::Looks::none()));
+    assert!(moved, "the file changed on disk");
+    // The crate by its key in the snapshot the reload made.
+    let dump = crate_def_map(&db, db.krate(key)).dump(&db);
     drop(dir);
     expect![[r#"
         crate

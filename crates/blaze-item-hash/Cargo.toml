@@ -19,6 +19,8 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
+blaze-memo.workspace = true
+# `QueryKind` only: the fact kinds (`blaze_query::kinds::FACTS`), outside the deleted engine.
 blaze-query.workspace = true
 
 la-arena.workspace = true
@@ -33,7 +35,6 @@ hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 hir-ty-matchck.workspace = true
 span.workspace = true
-syntax.workspace = true
 
 [dev-dependencies]
 blaze-core.workspace = true

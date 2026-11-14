@@ -17,7 +17,7 @@ mod tests;
 
 use std::sync::Arc;
 
-use base_db::{Crate, Db};
+use base_db::{Crate, CrateKey, Db};
 use blaze_hash::HashMap;
 use blaze_ids::{ContentId, Domain, Hasher};
 use crossbeam_queue::SegQueue;
@@ -54,9 +54,9 @@ pub fn key(base: ContentId, item: ContentId) -> ContentId {
     hasher.finish()
 }
 
-/// Where the values of dependencies' constants are kept, and which crates' are: set by the
-/// driver ([`set`]).
-#[blaze_query::input(singleton, debug)]
+/// Where the values of dependencies' constants are kept, and which crates' are: given by the
+/// driver while it builds a snapshot ([`set`]).
+#[blaze_memo::input(singleton, debug)]
 pub struct KeptConsts {
     #[returns(ref)]
     pub kept: Kept,
@@ -73,8 +73,10 @@ struct Shared {
     mode: Mode,
     /// Each crate whose constants are kept, with the key its check results are filed under
     /// when that is known now: `None` for a crate checked in this session, whose key is known
-    /// only once its bodies are, at [`drain`].
-    crates: HashMap<Crate, Option<ContentId>, Global>,
+    /// only once its bodies are, at [`drain`]. By the world's key, the same in every snapshot:
+    /// the maker that gives this runs again in each snapshot that makes the session arena
+    /// again, where every crate has a new id.
+    crates: HashMap<CrateKey, Option<ContentId>, Global>,
     pending: SegQueue<Pending>,
 }
 
@@ -116,35 +118,46 @@ impl std::fmt::Debug for Kept {
 /// results are filed by frontend-fast-bodies-cache, each with the key they are filed under when
 /// it is known now.
 ///
+/// The fact [`set`] gives [`KeptConsts`] by: the mode and each kept crate, by its stable id
+/// (`krate_id`, the driver's) with the key its check results are filed under, sorted by the
+/// stable id so the digest names no order of the caller's.
+pub fn kept_fact(
+    mode: Mode,
+    crates: impl IntoIterator<Item = (ContentId, Option<ContentId>)>,
+) -> blaze_memo::Fact {
+    let mut sorted: Vec<(ContentId, Option<ContentId>), Global> = Vec::new_in(Global);
+    sorted.extend(crates);
+    sorted.sort_unstable();
+    let mut digest = Hasher::new("hir-ty kept constants");
+    digest.part(&[mode as u8, VERSION]);
+    for (krate_id, base) in &sorted {
+        digest.id(krate_id);
+        match base {
+            Some(base) => digest.part(&[1]).id(base),
+            None => digest.part(&[0]),
+        };
+    }
+    let id = Hasher::new("hir-ty kept constants slot").finish();
+    blaze_memo::Fact { id, digest: digest.finish() }
+}
+
 /// Values noted and not yet drained are dropped with the input they were noted in: drain before
-/// setting again. The same store, mode and crates as now changes nothing, so a constant served
-/// before is not asked again.
+/// giving the next snapshot its own. Given in the session arena of the snapshot `builder`
+/// builds, read by `fact`: the driver's digest of what decides the values served (`mode`, and
+/// each crate's stable id with its key), so that a snapshot given the same reads every
+/// constant's record as before. Whether anything changed is the driver's: an arena it carries
+/// keeps what it read.
 pub fn set(
-    db: &mut Db,
+    builder: &blaze_memo::Builder,
+    fact: blaze_memo::Fact,
     // dyn: the driver's store, as `Shared::store`
     store: Arc<dyn ImageStore + Send + Sync>,
-    crates: HashMap<Crate, Option<ContentId>, Global>,
+    crates: HashMap<CrateKey, Option<ContentId>, Global>,
     mode: Mode,
 ) {
-    use blaze_query::db::{Durability, Setter};
-    let current = KeptConsts::try_get(&*db);
-    if let Some(it) = current {
-        let now = &it.kept(&*db).0;
-        if Arc::ptr_eq(&now.store, &store) && now.mode == mode && now.crates == crates {
-            return;
-        }
-    }
     let pending = SegQueue::new();
-    // alloc: setup: the one input value, once per session
-    let kept = Kept(Arc::new(Shared { store, mode, crates, pending }));
-    match current {
-        Some(it) => {
-            it.set_kept(db).with_durability(Durability::HIGH).to(kept);
-        }
-        None => {
-            _ = KeptConsts::new(db, Durability::HIGH, kept);
-        }
-    }
+    let kept = Kept(Arc::new_in(Shared { store, mode, crates, pending }, Global));
+    KeptConsts::set(&builder.inputs(builder.session()), fact, kept);
 }
 
 /// A constant whose value is kept: its crate's entry and its item's key.
@@ -167,7 +180,7 @@ fn site<'a>(db: &'a Db, def: ConstId, subst: GenericArgs<'_>) -> Option<Site<'a>
         return None;
     }
     let shared = &*KeptConsts::try_get(db)?.kept(db).0;
-    let &base = shared.crates.get(&krate)?;
+    let &base = shared.crates.get(&krate.key(db))?;
     let item = hir_def::deps::const_key(db, def)?;
     Some(Site { shared, krate, item, base })
 }

@@ -35,6 +35,13 @@ use crate::{
 /// The most shapes one key may have. A run reads the same things every time, whatever is in
 /// them, so a key has one shape, or a few where a read decides what else is read; past this,
 /// lookup would be a search.
+///
+/// At the cap a filing ends in [`OutsideError::TooManyShapes`], and what that costs is the
+/// caller's: the request driver ([`crate::driver`]) has filed every record and mark by then, so
+/// it ends [`Built`](crate::driver::Outcome::Built) with
+/// [`Filed::Full`](crate::driver::Filed::Full): nothing certifies the request and the next one
+/// settles each unit by its mark, a rebuild of nothing (before read-addressing it failed the
+/// request after filing everything). Expansions and script runs (blaze-expansion) refuse.
 pub const MAX_SHAPES: u32 = 64;
 
 /// The key the `slot`th shape of `key` is filed under.

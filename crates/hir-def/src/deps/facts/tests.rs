@@ -305,7 +305,7 @@ fn ask(db: &Db) -> Vec<String> {
 fn keeping(text: &str, store: &Arc<Memory>) -> Db {
     let mut db = fixture::db(text).into_db();
     // clone: a test's handle of its store
-    entries::set(&mut db, store.clone());
+    entries::set_for_test(&mut db, store.clone());
     db
 }
 
@@ -316,11 +316,11 @@ fn imaged(text: &str, store: &Arc<Memory>) -> Images {
     let images = Images::default();
     let mut db = keeping(text, store);
     let crates = all(&db);
-    let served = deps::serve(&mut db, &crates, BUILD, &images, Mode::Serve).unwrap();
+    let served = deps::tests::serve(&mut db, &crates, BUILD, &images, Mode::Serve).unwrap();
     assert_eq!(served.hits, Vec::new());
     let stored = deps::store(&db, &served, &images, Which::All).unwrap();
     assert_eq!(stored.refused, Vec::new());
-    assert!(stored.written.contains(&crate_named(&db, "lib")), "lib's image written");
+    assert!(stored.written.contains(&crate_named(&db, "lib").key(&db)), "lib's image written");
     images
 }
 
@@ -329,8 +329,8 @@ fn imaged(text: &str, store: &Arc<Memory>) -> Images {
 fn serving(text: &str, store: &Arc<Memory>, images: &Images) -> Db {
     let mut db = keeping(text, store);
     let crates = all(&db);
-    let served = deps::serve(&mut db, &crates, BUILD, images, Mode::Serve).unwrap();
-    assert!(served.hits.contains(&crate_named(&db, "lib")), "lib read from its image");
+    let served = deps::tests::serve(&mut db, &crates, BUILD, images, Mode::Serve).unwrap();
+    assert!(served.hits.contains(&crate_named(&db, "lib").key(&db)), "lib read from its image");
     // What the databases before this one counted.
     _ = store.take();
     db

@@ -52,7 +52,7 @@ fn helper(name: &str, params: usize) -> Option<Helper> {
 
 /// Panics, naming it, for a helper of `file_id`'s module that asserts nothing.
 pub(crate) fn hold(db: &TestDB, file_id: EditionedFileId) {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let Some(module) = db.module_for_file_opt(file_id.file_id(db)) else { return };
         let def_map = module.def_map(db);
         let functions =

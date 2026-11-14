@@ -108,7 +108,7 @@ fn to_def_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let mut checked = 0u32;
@@ -131,7 +131,7 @@ fn ancestors_ranges_and_scopes_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         for (file, root) in roots(&vsema, file_id) {
@@ -163,7 +163,7 @@ fn types_and_resolutions_of_every_node() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let (mut exprs, mut paths) = (0u32, 0u32);
@@ -252,7 +252,7 @@ fn descending_every_token() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let mut out = String::new();
         let mut into_macros = 0u32;
@@ -281,7 +281,7 @@ fn source_view_of_every_def() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         use std::fmt::Write as _;
         let vsema = Semantics::new(&db);
         let krate = vsema.file_to_module_def(file_id.file_id(&db)).expect("a module").krate(&db);
@@ -378,7 +378,7 @@ pub fn inner() {
     );
     let m = *fx.files().last().expect("m.rs");
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         assert!(
             vsema.file_to_module_def(m.file_id(&db)).is_some(),
@@ -426,7 +426,7 @@ pub fn inner() {
     let main = fx.file_at("/a/src/main.rs");
     let m = fx.file_at("/b/tests/m.rs");
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let a = Semantics::new(&db)
             .file_to_module_def(main.file_id(&db))
             .expect("main.rs is `a`'s root")
@@ -536,10 +536,10 @@ fn each_of_two_identical_selects_maps_the_enum_its_proc_macro_declares_to_its_ow
 fn two_expansions_map_to_their_own_defs(fx: fixture::Fixture) {
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let roots = roots(&vsema, file_id);
-
+    
         let mut modules = Vec::new();
         for &(file, root) in &roots {
             for module in root.descendants().filter_map(view::Module::cast) {
@@ -554,7 +554,7 @@ fn two_expansions_map_to_their_own_defs(fx: fixture::Fixture) {
             modules[0].1, modules[1].1,
             "each expansion's module is the module of its own block: {modules:?}"
         );
-
+    
         let mut enums = 0u32;
         for &(file, root) in &roots {
             for node in root.descendants().filter_map(view::Enum::cast) {
@@ -593,7 +593,7 @@ fn planted_blocks_of_any_file_make_the_two_expansions_modules_one() {
     let fx = fixture::db(TWO_SELECTS);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let _planted = BlocksOfAnyFile::planted();
         let vsema = Semantics::new(&db);
         let mut modules = Vec::new();
@@ -633,7 +633,7 @@ fn main() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let _planted = BlocksOfAnyFile::planted();
         let vsema = Semantics::new(&db);
         for (_, root) in roots(&vsema, file_id) {
@@ -661,7 +661,7 @@ fn planted_blocks_of_any_file_stop_at_the_enum_a_proc_macro_declares() {
     let fx = fixture::db(TWO_SELECTS_OF_A_PROC_MACRO);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let files: Vec<HirFileId> = {
             let vsema = Semantics::new(&db);
             roots(&vsema, file_id).into_iter().map(|(file, _)| file).collect()
@@ -697,7 +697,7 @@ fn main() {
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let root = vsema.parse(file_id).syntax();
         let mut asked = 0u32;
@@ -735,7 +735,7 @@ impl Tr for A<{ fn in_impl() {} 1 }> {}
     );
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let root = vsema.parse(file_id).syntax();
         let mut fns = 0u32;
@@ -773,7 +773,7 @@ fn a_warm_lookup_walk_allocates_nothing() {
     let fx = fixture::db(FIXTURE);
     let file_id = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let vsema = Semantics::new(&db);
         let root = vsema.parse(file_id).syntax();
         let strukt = root.descendants().find_map(view::Struct::cast).expect("`struct Point`");

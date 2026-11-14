@@ -1,6 +1,6 @@
 //! What `hash_twice`, `syscall_in_loop`, `query_in_loop` and `string_key` run over in their
 //! tests: a `hashbrown` with a map and a set, an `std` with `fs::metadata` and `File::open`,
-//! `blaze_query_macros`' attributes (each the test proc macro `identity`), `base_db`'s `Db`, and
+//! `blaze_memo_macros`' attributes (each the test proc macro `identity`), `base_db`'s `Db`, and
 //! `intern`'s `Symbol` and `hir_expand`'s `Name`.
 
 use base_db::all_crates;
@@ -49,7 +49,7 @@ pub mod fs {
         pub fn open(path: &str) -> File { loop {} }
     }
 }
-//- /blaze_query_macros.rs crate:proc-macro:blaze_query_macros
+//- /blaze_memo_macros.rs crate:proc-macro:blaze_memo_macros
 #[proc_macro_attribute]
 pub fn tracked(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -62,8 +62,8 @@ pub fn input(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn interned(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
-//- /blaze_query.rs crate:blaze_query deps:blaze_query_macros
-pub use blaze_query_macros::{input, interned, tracked};
+//- /blaze_memo.rs crate:blaze_memo deps:blaze_memo_macros
+pub use blaze_memo_macros::{input, interned, tracked};
 //- /base_db.rs crate:base_db
 pub struct Db;
 //- /intern.rs crate:intern
@@ -83,7 +83,7 @@ pub mod name {
 /// The fixture of the crate `krate` written `main`, with [`CRATES`] beside it.
 fn fixture(krate: &str, main: &str) -> String {
     format!(
-        "{MINICORE}{CRATES}//- /src/lib.rs crate:{krate} deps:hashbrown,std,blaze_query,base_db,intern,hir_expand\n{}",
+        "{MINICORE}{CRATES}//- /src/lib.rs crate:{krate} deps:hashbrown,std,blaze_memo,base_db,intern,hir_expand\n{}",
         main.trim_start_matches('\n')
     )
 }
@@ -106,7 +106,7 @@ fn identity() -> ProcMacro {
     loaded.macros().expect("they loaded")[0].clone() // clone: a test's macro, once per fixture
 }
 
-/// Gives `blaze_query_macros` its three attribute macros, each `identity` under its name.
+/// Gives `blaze_memo_macros` its three attribute macros, each `identity` under its name.
 fn give_query_macros(built: &mut Fixture) {
     let identity = identity();
     let db = built.db();
@@ -116,9 +116,9 @@ fn give_query_macros(built: &mut Fixture) {
             it.extra_data(db)
                 .display_name
                 .as_ref()
-                .is_some_and(|it| it.crate_name().as_str() == "blaze_query_macros")
+                .is_some_and(|it| it.crate_name().as_str() == "blaze_memo_macros")
         })
-        .expect("the fixture has `blaze_query_macros`");
+        .expect("the fixture has `blaze_memo_macros`");
     let macros = ["tracked", "input", "interned"]
         .map(|name| ProcMacro { name: Symbol::intern(name), ..identity.clone() }) // clone: a test's macro
         .to_vec();
@@ -236,19 +236,19 @@ fn query_in_loop_names_the_batch_query() {
         r#"
 use base_db::Db;
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub fn width(db: &Db, x: u32) -> u32 {
     let _ = db;
     x
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub fn widths(db: &Db, xs: &'static [u32]) -> &'static [u32] {
     let _ = db;
     xs
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 pub fn depth(db: &Db, x: u64) -> u64 {
     let _ = db;
     x

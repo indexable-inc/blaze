@@ -511,7 +511,12 @@ fn main() {}
     let fixture =
         format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n{source}");
     let messages = checked(&fixture).messages();
-    assert_eq!(messages, ["`#[track_caller]` on async functions is a no-op"], "{messages:?}");
+    // `messages` writes each with its code, a lint's name for a lint.
+    assert_eq!(
+        messages,
+        ["ungated_async_fn_track_caller: `#[track_caller]` on async functions is a no-op"],
+        "{messages:?}"
+    );
     let gated = format!(
         "//- minicore: future\n//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}"
     );

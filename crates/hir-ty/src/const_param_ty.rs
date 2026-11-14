@@ -5,6 +5,7 @@
 //! environment, where an ambiguity is an error too.
 
 use base_db::Db;
+use blaze_memo::Database as _;
 use hir_def::{
     ConstParamId, GenericDefId, HasModule, TypeOrConstParamId,
     hir::generics::{GenericParams, TypeOrConstParamData},
@@ -54,8 +55,8 @@ pub struct ConstParamTyError {
 
 /// The refused const parameters of `def`, its own parameters only, in their order. A type
 /// with an error in it is passed over, as rustc passes over a type whose error is reported.
-#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
-pub fn const_param_ty_errors(db: &Db, def: GenericDefId) -> Box<[ConstParamTyError]> {
+#[blaze_memo::tracked(returns(copy), mem_tag = Infer)]
+pub fn const_param_ty_errors<'db>(db: &'db Db, def: GenericDefId) -> &'db [ConstParamTyError] {
     let params = GenericParams::of(db, def);
     let mut consts = params.iter_type_or_consts().filter_map(|(local_id, data)| match data {
         TypeOrConstParamData::ConstParamData(_) => {
@@ -64,7 +65,7 @@ pub fn const_param_ty_errors(db: &Db, def: GenericDefId) -> Box<[ConstParamTyErr
         TypeOrConstParamData::TypeParamData(_) => None,
     });
     let Some(first) = consts.next() else {
-        return Box::default();
+        return &[];
     };
     let krate = def.module(db).krate(db);
     let features = UnstableFeatures::query(db, krate);
@@ -87,7 +88,7 @@ pub fn const_param_ty_errors(db: &Db, def: GenericDefId) -> Box<[ConstParamTyErr
             errors.push(ConstParamTyError { param, ty: ty.store(), reason });
         }
     }
-    errors.into_boxed_slice()
+    blaze_memo::keep_iter(db.memo(), errors)
 }
 
 fn refused_without_the_feature(ty: Ty<'_>) -> Option<ConstParamTyReason> {

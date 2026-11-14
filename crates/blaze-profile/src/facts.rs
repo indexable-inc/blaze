@@ -79,7 +79,8 @@ pub struct CrateDepRow {
 }
 
 /// A row of the schema's `query_counts` table: what the query engine counted of one query
-/// function by the end of a build (`blaze_query::db::Counts`, field for field).
+/// function by the end of a build (the tracked engine's `Counts`, field for field, until its
+/// deletion; blaze-units' `blaze_query::Database::take_counts` still fills its own fields).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueryCountRow {
     pub build_id: u64,
@@ -104,7 +105,7 @@ pub struct QueryCountRow {
     pub validity: Validity,
 }
 
-/// The validity census columns of a `query_counts` row (`blaze_query::db::Validity`, field for
+/// The validity census columns of a `query_counts` row (the deleted tracked engine's `Validity`, field for
 /// field): how the query's rows of an earlier view were proved unchanged, each under the first
 /// proof to answer in the engine's order, and what proving by edges cost. Each field is the
 /// column of its name.
@@ -143,7 +144,7 @@ impl RunOutcome {
 }
 
 /// A row of the schema's `provenance` table: one entry of the query engine's run log
-/// (`blaze_query::db::LoggedRun`).
+/// (the deleted tracked engine's `LoggedRun`; the session memo keeps no run log).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvenanceRow {
     pub build_id: u64,

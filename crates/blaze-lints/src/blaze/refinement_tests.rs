@@ -60,8 +60,10 @@ fn linted(main: &str, flags: &str) -> String {
 }
 
 /// The findings of `blaze::refinement` alone.
+/// `blaze::unreachable` is left at its level, deny: it can't be waived (a flag below deny
+/// refuses the check), and these fixtures write no `blaze::unreachable!()` for it to find.
 fn refinement(main: &str) -> String {
-    linted(main, "-A clippy::all -A blaze::unreachable")
+    linted(main, "-A clippy::all")
 }
 
 fn count(out: &str) -> usize {

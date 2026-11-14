@@ -526,7 +526,11 @@ fn a_session_macro_reports_its_reads_only_once_shown_the_same_from_either_state(
         .find(|(_, it)| Path::new(it.as_str()) == path)
         .map(|(file, _)| *file)
         .unwrap_or_else(|| panic!("the front end has no file {}", path.display()));
-    second.lowered.served_db().set_file_text(file, &edited);
+    let mut edit = second.lowered.served_db().edit();
+    edit.set_file_text(file, &edited);
+    _ = edit.commit();
+    // The crates' ids of the snapshot before die at the commit: taken again by their units.
+    let (sessions, once, settles) = crates(&second);
     let db = second.lowered.db();
     let reads = reads_of(db, sessions, once);
     assert!(

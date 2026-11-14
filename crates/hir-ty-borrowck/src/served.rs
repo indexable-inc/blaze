@@ -58,6 +58,8 @@ fn served(passed: fn(DefWithBodyId) -> bool) -> (Db, Crate) {
     // alloc: test setup
     parts.insert(dep, Arc::new(Aligned::copy_from(&bytes)) as hir_def::deps::ImageBuf);
     check_cache::set_served(&mut db, parts);
+    // Taken after the commit `set_served` made: an id from before it is dead.
+    let dep = crate_named(&db, "dep");
     (db, dep)
 }
 

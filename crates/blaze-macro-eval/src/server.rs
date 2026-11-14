@@ -13,10 +13,11 @@ use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
 use blaze_hash::HashMap;
+use blaze_memo::ArenaId;
 use blaze_lower::{SubRequest, SubResponse};
 use intern::Symbol;
 use proc_macro_api::bridge::spans::{self, spanned};
-use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SyntaxContext, TextRange, TextSize};
+use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
 use std::alloc::Global;
 
 use crate::{
@@ -32,8 +33,6 @@ use crate::{
 /// learned, which is what its reads are not known for ([`Asked::why`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Asked {
-    /// The edition of a span's context, to print a keyword of some editions (`dyn`, `async`).
-    Edition,
     /// A span's `Debug` text, which is of the database's numbering.
     Debug,
     FilePath,
@@ -73,8 +72,7 @@ impl Asked {
     /// one of those the expansion's reads are not known.
     pub(crate) fn by_position(self) -> bool {
         match self {
-            Asked::Edition
-            | Asked::FilePath
+            Asked::FilePath
             | Asked::LineColumn
             | Asked::Source
             | Asked::Parent
@@ -86,9 +84,6 @@ impl Asked {
     /// Why the expansion's reads are not known, naming what it asked (rule 19).
     pub(crate) fn why(self) -> &'static str {
         match self {
-            Asked::Edition => {
-                "it asked the database the edition of a span (to print a keyword of some editions)"
-            }
             Asked::Debug => "it asked the database a span's `Debug` text",
             Asked::FilePath => "it asked the database a span's file",
             Asked::SourceText => "it asked the database a span's source text",
@@ -114,18 +109,15 @@ pub(crate) struct Emitted {
 /// What only the database can say of a span, asked mid-request: the database itself on the
 /// evaluator, and on a wasm expansion's own thread the job that holds it
 /// ([`crate::wasm`]'s `thread`), which can be gone.
+/// `contexts` is the table the question's syntax contexts are words of: the calling crate's
+/// arena, where the expansion's call is homed (`span::MacroCallId::arena`).
 pub(crate) trait Answer {
-    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop>;
-    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop>;
+    fn answer(&self, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, Stop>;
 }
 
 impl Answer for Db {
-    fn answer(&self, req: SubRequest) -> Result<SubResponse, Stop> {
-        Ok(blaze_lower::answer(self, req))
-    }
-
-    fn edition(&self, ctx: SyntaxContext) -> Result<Edition, Stop> {
-        Ok(ctx.edition(self))
+    fn answer(&self, contexts: ArenaId, req: SubRequest) -> Result<SubResponse, Stop> {
+        Ok(blaze_lower::answer(self, contexts, req))
     }
 }
 
@@ -139,6 +131,9 @@ pub(crate) struct Server {
     saved: Vec<Span>,
     /// The def, call and mixed sites.
     sites: [Span; 3],
+    /// The table the sites' contexts, and every context the macro sends back, are words of:
+    /// the calling crate's arena ([`Answer`]).
+    contexts: ArenaId,
     /// The calling crate's edition: what text the macro parses is lexed in.
     edition: Edition,
     /// Whether the calling crate enables `forced_keywords`, which gates each `k#` it lexes.
@@ -283,9 +278,15 @@ fn bound_word(bound: Bound<u64>) -> u64 {
 }
 
 impl Server {
-    /// The server of one expansion at `sites` (def, call, mixed), for a crate of `edition`
-    /// that enables `forced_keywords` or not.
-    pub(crate) fn new(sites: [Span; 3], edition: Edition, forced_keywords: bool) -> Server {
+    /// The server of one expansion at `sites` (def, call, mixed), whose contexts are words of
+    /// `contexts`' table (the calling crate's arena), for a crate of `edition` that enables
+    /// `forced_keywords` or not.
+    pub(crate) fn new(
+        sites: [Span; 3],
+        contexts: ArenaId,
+        edition: Edition,
+        forced_keywords: bool,
+    ) -> Server {
         let mut server = Server {
             // alloc: once per expansion, its tables, which grow with what it builds
             streams: Vec::new(),
@@ -293,6 +294,7 @@ impl Server {
             span_handles: HashMap::new_in(Global),
             saved: Vec::new(), // alloc: once per expansion, as above
             sites,
+            contexts,
             edition,
             forced_keywords,
             asked: None,
@@ -397,7 +399,7 @@ impl Server {
 
     fn ask(&mut self, db: &(impl Answer + ?Sized), req: SubRequest) -> SubResponse {
         self.note_asked(Asked::of(&req));
-        match db.answer(req) {
+        match db.answer(self.contexts, req) {
             Ok(it) => it,
             Err(stop) => {
                 let reason = stop.0.clone(); // alloc: error path
@@ -788,24 +790,9 @@ impl Server {
                 let handle = r.handle()?;
                 let mut text = std::mem::take(&mut self.text);
                 text.clear();
-                // A span's edition is its context's, which the key numbers but does not say.
-                let mut asked = false;
-                let mut lost = None;
-                // What is printed once an edition is lost is never sent: the request stops.
-                let calling = self.edition;
-                print::to_string(self.stream(handle)?.trees(), &mut text, |span| {
-                    asked = true;
-                    db.edition(span.ctx).unwrap_or_else(|stop| {
-                        lost.get_or_insert(stop);
-                        calling
-                    })
-                });
-                if asked {
-                    self.note_asked(Asked::Edition);
-                }
-                if let Some(stop) = lost {
-                    self.lost.get_or_insert(stop);
-                }
+                // A span's edition is in its context's word, which the key numbers with the
+                // edition: nothing is asked of the database.
+                print::to_string(self.stream(handle)?.trees(), &mut text, |span| span.ctx.edition());
                 w.ok(true);
                 w.str(&text);
                 self.text = text;
@@ -885,6 +872,10 @@ impl Server {
             }
             Method::SpanParent => {
                 let span = self.read_span(&mut r)?;
+                // In process: the request goes to this database (or the job holding it) and back
+                // within the expansion, never into a record, so it may carry the context's
+                // crate-local word. What is kept of an expansion names its call's contexts by
+                // ordinal (`proc_macro_api::kept::written`), never by word.
                 let req = SubRequest::SpanParent {
                     file_id: span.anchor.file_id.as_u32(),
                     ast_id: span.anchor.ast_id.into_raw(),
@@ -907,6 +898,7 @@ impl Server {
             }
             Method::SpanSource => {
                 let span = self.read_span(&mut r)?;
+                // In process, as `SpanParent`'s: the word never reaches a record.
                 let req = SubRequest::SpanSource {
                     file_id: span.anchor.file_id.as_u32(),
                     ast_id: span.anchor.ast_id.into_raw(),

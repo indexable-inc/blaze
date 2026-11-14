@@ -79,7 +79,8 @@ impl<'db> Expander<'db> {
     pub(super) fn hygiene_for_range(&self, db: &Db, range: TextRange) -> HygieneId {
         match self.span_map {
             SpanMap::ExpansionSpanMap(span_map) => {
-                HygieneId::new(span_map.span_at(range.start()).ctx.opaque_and_semiopaque(db))
+                let table = self.current_file_id.context_arena();
+                HygieneId::new(span_map.span_at(range.start()).ctx.opaque_and_semiopaque(db, table))
             }
             SpanMap::RealSpanMap(_) => HygieneId::ROOT,
         }
@@ -125,7 +126,8 @@ impl<'db> Expander<'db> {
             );
             let path = macro_call.value.path().and_then(|path| {
                 let range = path.syntax().text_range();
-                let mod_path = ModPath::from_src_view_with_contexts(db, path, &mut |range| {
+                let arena = macro_call.file_id.context_arena();
+                let mod_path = ModPath::from_src_view_with_contexts(db, arena, path, &mut |range| {
                     this.span_map.span_for_range(range).ctx
                 })?;
                 let call_site = this.span_map.span_for_range(range);

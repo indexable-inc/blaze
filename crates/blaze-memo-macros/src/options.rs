@@ -33,6 +33,18 @@ pub(crate) struct Options {
     pub(crate) debug: Option<Ident>,
     pub(crate) no_lifetime: Option<Ident>,
     pub(crate) singleton: Option<Ident>,
+    /// `#[input(parts)]`: the getters note no fact (the input is an image read item by item).
+    pub(crate) parts: Option<Ident>,
+    /// `#[tracked(image)]`: the query's entries are filed in its crate's image and served from
+    /// it after the arena is dropped (`blaze_memo::image`).
+    pub(crate) image: Option<Ident>,
+    /// `#[tracked(owns)]`, `#[interned(owns)]`: the value (the fields) may own memory to drop;
+    /// its destructor runs when its arena drops. Debt against flat records, counted by
+    /// blaze-memo's `owns` ratchet (`tests/owns.rs`, `owns.txt`).
+    pub(crate) owns: Option<Ident>,
+    /// `mem_tag = <Tag variant>`: the `blaze_mem::Tag` of the task frame each run of the query is
+    /// (`blaze_memo::plumbing::Query::TAG`); `Tag::Query` without it.
+    pub(crate) mem_tag: Option<syn::Path>,
     pub(crate) cycle_fn: Option<Expr>,
     pub(crate) cycle_initial: Option<Expr>,
     pub(crate) cycle_result: Option<Expr>,
@@ -59,10 +71,6 @@ const REMOVED: &[(&str, &str)] = &[
          a per-task result in the task, outside the memo)",
     ),
     ("settled", "a value is final when its run ends: nothing is told it settled"),
-    (
-        "mem_tag",
-        "an entry is counted to its arena's tag, set by the driver (`Builder::arena(index, tag)`)",
-    ),
 ];
 
 impl Options {
@@ -111,6 +119,18 @@ impl Options {
                     allowed(&[Site::Input])?;
                     set(&mut options.singleton, &name, name.clone())?; // clone: expansion time, an identifier
                 }
+                "parts" => {
+                    allowed(&[Site::Input])?;
+                    set(&mut options.parts, &name, name.clone())?; // clone: expansion time, an identifier
+                }
+                "image" => {
+                    allowed(&[Site::TrackedFn])?;
+                    set(&mut options.image, &name, name.clone())?; // clone: expansion time, an identifier
+                }
+                "owns" => {
+                    allowed(&[Site::TrackedFn, Site::Interned])?;
+                    set(&mut options.owns, &name, name.clone())?; // clone: expansion time, an identifier
+                }
                 "no_lifetime" => {
                     return Err(syn::Error::new(
                         name.span(),
@@ -129,6 +149,11 @@ impl Options {
                         ));
                     }
                     set(&mut options.no_lifetime, &inner, inner.clone())?; // clone: expansion time, an identifier
+                }
+                "mem_tag" => {
+                    allowed(&[Site::TrackedFn])?;
+                    input.parse::<Token![=]>()?;
+                    set(&mut options.mem_tag, &name, syn::Path::parse_mod_style(input)?)?;
                 }
                 "cycle_fn" => {
                     allowed(&[Site::TrackedFn])?;

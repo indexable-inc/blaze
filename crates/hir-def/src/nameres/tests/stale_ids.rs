@@ -1,6 +1,5 @@
-//! A `ModuleId` kept across revisions that delete its module and make others: the query
-//! database reads the fields the module last had, never UB (the contract of
-//! `ModuleIdLt::to_static`, a safe `fn` over `blaze_query::db::FromId`). `blaze test --ub` runs this under
+//! A `ModuleId` kept across revisions that delete its module and make others: a dead id is
+//! refused loudly (blaze-memo's generation compare), never UB. `blaze test --ub` runs this under
 //! the UB checker.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -30,13 +29,21 @@ pub struct T;
     let name_of = |name: Option<hir_expand::name::Name>| name.map(|it| it.as_str().to_owned());
     assert_eq!(name_of(foo.name(&db)), Some("foo".to_owned()));
 
-    db.set_file_text(main, "mod bar;\n");
-    assert!(crate_def_map(&db, krate).modules(&db).all(|(id, _)| id != foo), "`foo` is gone");
+    // The crate by its key, taken again after each write: a write drops the arena its id (and
+    // `foo`'s) was homed in. `foo` is kept on purpose; `krate`, the id `foo` was made with, is
+    // what a stale read of it is held to.
+    let key = krate.key(&db);
+    _ = db.set_file_text(main, "mod bar;\n");
+    let live_krate = db.krate(key);
+    assert!(crate_def_map(&db, live_krate).modules(&db).all(|(id, _)| id != foo), "`foo` is gone");
 
     // New modules, which must not be handed `foo`'s id.
-    db.set_file_text(main, "mod bar;\nmod baz {}\nmod qux {}\n");
-    let live: Vec<Option<String>> =
-        crate_def_map(&db, krate).modules(&db).map(|(id, _)| name_of(id.name(&db))).collect();
+    _ = db.set_file_text(main, "mod bar;\nmod baz {}\nmod qux {}\n");
+    let live_krate = db.krate(key);
+    let live: Vec<Option<String>> = crate_def_map(&db, live_krate)
+        .modules(&db)
+        .map(|(id, _)| name_of(id.name(&db)))
+        .collect();
     assert!(live.contains(&Some("qux".to_owned())));
 
     let read = catch_unwind(AssertUnwindSafe(|| (foo.krate(&db), name_of(foo.name(&db)))));
@@ -49,5 +56,5 @@ pub struct T;
     }
 
     // The database is still sound to use after the read, panicking or not.
-    assert_eq!(crate_def_map(&db, krate).modules(&db).count(), live.len());
+    assert_eq!(crate_def_map(&db, live_krate).modules(&db).count(), live.len());
 }

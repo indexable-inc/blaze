@@ -15,7 +15,7 @@ use std::{
     sync::Once,
 };
 
-use crate::{Fact, Kind, Memo, Plant, Reads, arena::Slot, trie::Head};
+use crate::{Gid, Kind, KindId, Memo, Plant, Read, Reads, arena::Slot, trie::Head};
 
 thread_local! {
     static INNERMOST: Cell<*const Run> = const { Cell::new(ptr::null()) };
@@ -55,13 +55,17 @@ struct Prov {
     settle: Settle,
 }
 
+/// What publishes a member's `Entry<K, V>` of (key, value) in its slot, the reads its list:
+/// one made from the value (`fetch::publish_member`), or, for an `owns` query, the entry the
+/// value was placed in (`fetch::publish_member_placed`).
+pub(crate) type Publish = unsafe fn(&Memo, &Slot, &'static Kind, u64, *const (), *const (), &[Read]);
+
 /// A member's entry, made final when its head settles.
 pub(crate) struct Settle {
     pub(crate) slot: *const Slot,
     /// The member's reads in its round, in its arena.
-    pub(crate) reads: *const [Fact],
-    /// Publishes `Entry<K, V>` of (key, value) in `slot`, the reads its list.
-    pub(crate) publish: unsafe fn(&Memo, &Slot, &'static Kind, u64, *const (), *const (), &[Fact]),
+    pub(crate) reads: *const [Read],
+    pub(crate) publish: Publish,
 }
 
 /// What a cycle's head keeps across its rounds: its members' values this round. Global heap,
@@ -198,7 +202,9 @@ pub(crate) struct Run {
     provisional: Cell<*const ()>,
     book: RefCell<Option<Book>>,
     keeping: bool,
-    reads: RefCell<Vec<Fact, Global>>,
+    reads: RefCell<Vec<Read, Global>>,
+    /// A run of an imaged query: it reads only its home and its home's declared closure.
+    imaged: bool,
 }
 
 /// # Safety
@@ -219,17 +225,27 @@ pub(crate) unsafe fn describe<K: std::fmt::Debug>(
 ) {
     // SAFETY: the caller's.
     let key = unsafe { &*key.cast::<K>() };
-    let _ = write!(out, "{}({key:?})", kind.name());
+    write_key(out, kind, key);
+}
+
+/// The one way a message names a query's key: `kind(key)`, the key cut at
+/// [`crate::KEY_CAP`] bytes ([`crate::Bounded::key`]) and each id in it printed one level
+/// deep (`attach`'s `shallow`). Called only once a refusal is certain: a message is never
+/// built ahead of its check.
+pub(crate) fn write_key<K: std::fmt::Debug + ?Sized>(out: &mut String, kind: &'static Kind, key: &K) {
+    let _ = write!(out, "{}({:?})", kind.name(), crate::Bounded::key(key));
 }
 
 impl Run {
-    /// A run of `kind` for `key` homed in `slot`, its outer run the task's innermost now.
+    /// A run of `kind` for `key` homed in `slot`, its outer run the task's innermost now;
+    /// `imaged` for an imaged query's.
     pub(crate) fn new<K: Eq + std::fmt::Debug>(
         memo: &Memo,
         kind: &'static Kind,
         slot: &Slot,
         hash: u64,
         key: &K,
+        imaged: bool,
     ) -> Run {
         let outer = INNERMOST.with(Cell::get);
         // SAFETY: the innermost run is on this task's stack below us.
@@ -251,11 +267,22 @@ impl Run {
             book: RefCell::new(None),
             keeping: memo.reads() == Reads::Kept,
             reads: RefCell::new(Vec::new_in(Global)),
+            imaged,
         }
     }
 
     /// The recorder's frame: it gathers reads and lends its outer run's arena.
     pub(crate) fn recorder(memo: &Memo) -> Run {
+        Run::frame(memo, true)
+    }
+
+    /// [`crate::unrecorded`]'s frame: it lends its outer run's arena (borrows are still
+    /// noted, as soundness needs) and keeps no read, so nothing below it reaches any list.
+    pub(crate) fn unrecorded(memo: &Memo) -> Run {
+        Run::frame(memo, false)
+    }
+
+    fn frame(memo: &Memo, keeping: bool) -> Run {
         let outer = INNERMOST.with(Cell::get);
         // SAFETY: as in `new`.
         let outer_ref = unsafe { outer.as_ref() };
@@ -274,8 +301,10 @@ impl Run {
             reentered: Cell::new(false),
             provisional: Cell::new(ptr::null()),
             book: RefCell::new(None),
-            keeping: true,
+            keeping,
             reads: RefCell::new(Vec::new_in(Global)),
+            // A recorder inside an imaged run reads for that run.
+            imaged: outer_ref.is_some_and(|it| it.imaged),
         }
     }
 
@@ -324,19 +353,22 @@ impl Run {
     ///
     /// Where one fact was read with two digests: inputs are fixed for a snapshot, so that is
     /// two snapshots' reads mixed.
-    pub(crate) fn take_reads(&self) -> Vec<Fact, Global> {
+    pub(crate) fn take_reads(&self) -> Vec<Read, Global> {
         let mut reads = std::mem::replace(&mut *self.reads.borrow_mut(), Vec::new_in(Global));
         reads.sort_unstable();
         reads.dedup();
         for pair in reads.windows(2) {
-            assert!(
-                pair[0].id != pair[1].id,
-                "{} read fact {:?} with two digests ({:?} and {:?}) in one snapshot",
-                self.name(),
-                pair[0].id,
-                pair[0].digest,
-                pair[1].digest
-            );
+            if let (Read::Input { kind: a, fact: x }, Read::Input { kind: b, fact: y }) = (pair[0], pair[1])
+            {
+                assert!(
+                    a != b || x.id != y.id || a.name() == crate::record::UNTRACKED.name(),
+                    "{} read fact {:?} with two digests ({:?} and {:?}) in one snapshot",
+                    self.name(),
+                    x.id,
+                    x.digest,
+                    y.digest
+                );
+            }
         }
         reads
     }
@@ -407,7 +439,7 @@ pub(crate) fn note_read_of(memo: &Memo, slot: &Slot) {
     if home.id == slot.id {
         return;
     }
-    if home.id.index() == 0 && slot.id.index() != 0 {
+    if home.id.is_session() && !slot.id.is_session() {
         panic!(
             "{} is homed at the session arena (its key names no arena) but reads {:?}: give it \
              a key that names the crate",
@@ -415,11 +447,21 @@ pub(crate) fn note_read_of(memo: &Memo, slot: &Slot) {
             slot.id
         );
     }
+    if run.imaged && !home.reaches(slot.id) {
+        panic!(
+            "{} is an imaged query homed at {:?} but reads {:?}, outside its home's declared \
+             borrows (`Inputs::borrows`): an entry served from the image sets no borrow, so an \
+             imaged query reads only what its home's declared closure keeps it sound to carry",
+            run.name(),
+            home.id,
+            slot.id
+        );
+    }
     home.borrow(slot.id, memo.epoch());
 }
 
 /// Lists `fact` as read by the innermost run.
-pub(crate) fn note_fact(memo: &Memo, fact: Fact) {
+pub(crate) fn note_fact(memo: &Memo, fact: Read) {
     if memo.reads() != Reads::Kept {
         return;
     }
@@ -430,17 +472,34 @@ pub(crate) fn note_fact(memo: &Memo, fact: Fact) {
     }
 }
 
-/// Replays an entry's read list into the innermost run: a hit depends on what the entry read.
+/// What an ask of the entry `head` (homed at `arena`) adds to the innermost run's list, hit or
+/// run alike: for a boundary kind one [`Read::Query`] row naming the entry (the firewall: its
+/// own list stays behind), for any other its list.
+/// This is a hit's; [`pass_on`] is a run's own end.
 #[inline]
-pub(crate) fn replay(memo: &Memo, head: &Head) {
-    if memo.reads() != Reads::Kept || memo.plant() == Plant::HitSkipsReplay {
+pub(crate) fn replay(memo: &Memo, arena: crate::ArenaId, head: &Head) {
+    if memo.plant() == Plant::HitSkipsReplay {
         return;
     }
-    replay_list(head.reads());
+    pass_on(memo, arena, head);
+}
+
+/// [`replay`] at the end of the entry's own run.
+#[inline]
+pub(crate) fn pass_on(memo: &Memo, arena: crate::ArenaId, head: &Head) {
+    if memo.reads() != Reads::Kept {
+        return;
+    }
+    if memo.is_boundary(head.kind) && memo.plant() != Plant::BoundaryLeaks {
+        let row = Read::Query { kind: KindId::of(head.kind), key: Gid::new(arena, head.local) };
+        replay_list(std::slice::from_ref(&row));
+    } else {
+        replay_list(head.reads());
+    }
 }
 
 /// Appends `reads` to the innermost run's list.
-pub(crate) fn replay_list(reads: &[Fact]) {
+pub(crate) fn replay_list(reads: &[Read]) {
     if reads.is_empty() {
         return;
     }

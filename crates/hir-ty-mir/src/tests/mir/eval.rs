@@ -44,7 +44,7 @@ pub(super) fn eval_main_at(
     file_id: EditionedFileId,
     level: MirOptLevel,
 ) -> Result<(String, String), MirEvalError<'_>> {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let module_id = db.module_for_file(file_id.file_id(db));
         let def_map = module_id.def_map(db);
         let scope = &def_map.module(db, module_id).scope(db);
@@ -117,15 +117,16 @@ fn check_pass_and_stdio_in(
     expand_derives: bool,
 ) {
     let _tracing = setup_tracing();
-    let fx = fixture::db(ra_fixture);
-    let file_ids = fx.files().to_vec();
-    let mut db = fx.into_db();
+    let mut fx = fixture::db(ra_fixture);
     if expand_derives {
-        hir_def::nameres::set_expand_builtin_derives(&mut db, true);
+        crate::test_db::expand_builtin_derives(&mut fx);
     }
     // As a build does, for `Location::caller` and `file!()`.
-    crate::mir::location::name_sources(&mut db, "fixture", |_, _, _| Some("main.rs".to_owned()));
-    blaze_query::db::attach(&db, || {
+    crate::test_db::name_sources(&mut fx, "fixture", "main.rs");
+    // Taken after the commits above, which make the arenas again.
+    let file_ids = fx.files().to_vec();
+    let db = fx.into_db();
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let x = eval_main(&db, file_id);
         match x {
@@ -173,7 +174,7 @@ fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: 
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         assert_eq!(
@@ -190,7 +191,7 @@ pub(super) fn check_error_with(
     let fx = fixture::db(ra_fixture);
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let file_id = *file_ids.last().unwrap();
         let e = eval_main(&db, file_id).unwrap_err();
         let shown = format!("{e:?}");
@@ -3300,7 +3301,7 @@ fn main() {}
     );
     let file_ids = fx.files().to_vec();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let module_id = db.module_for_file(file_ids[0].file_id(&db));
         let inc = module_id
             .def_map(&db)

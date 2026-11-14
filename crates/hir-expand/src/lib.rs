@@ -40,7 +40,7 @@ mod budget_tests;
 #[cfg(test)]
 mod view_tests;
 
-use blaze_query::db::{AsId, FromId};
+use blaze_memo::Id;
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
@@ -392,11 +392,15 @@ impl From<mbe::ExpandError> for ExpandError {
         ExpandError { inner: Arc::new((ExpandErrorKind::Mbe(mbe.inner.1.clone()), mbe.inner.0)) } // alloc: clone: one per error, on the error path
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Homed at the greatest of the calling crate (`krate`), the definition's crate and the ids
+/// its kind names: the calling crate's, every other being it or a dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct MacroCallLoc {
     pub def: MacroDefId,
     pub krate: Crate,
     pub kind: MacroCallKind,
+    /// Of the calling crate's table (crate-local, [`span::SyntaxContext`]): names no arena.
+    #[home(skip)]
     pub ctxt: SyntaxContext,
     /// The macro recursion depth of this expansion.
     ///
@@ -405,9 +409,10 @@ pub struct MacroCallLoc {
     pub macro_depth: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub struct MacroDefId {
     pub krate: Crate,
+    #[home(skip)]
     pub edition: Edition,
     pub kind: MacroDefKind,
     pub local_inner: bool,
@@ -417,15 +422,20 @@ pub struct MacroDefId {
     pub edition_panic: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Homed where its definition's file is; an expander names no arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum MacroDefKind {
-    Declarative(AstId<ast::Macro>, MacroCallStyles),
-    BuiltIn(AstId<ast::Macro>, BuiltinFnLikeExpander),
-    BuiltInAttr(AstId<ast::Macro>, BuiltinAttrExpander),
-    BuiltInDerive(AstId<ast::Macro>, BuiltinDeriveExpander),
-    BuiltInEager(AstId<ast::Macro>, EagerExpander),
+    Declarative(AstId<ast::Macro>, #[home(skip)] MacroCallStyles),
+    BuiltIn(AstId<ast::Macro>, #[home(skip)] BuiltinFnLikeExpander),
+    BuiltInAttr(AstId<ast::Macro>, #[home(skip)] BuiltinAttrExpander),
+    BuiltInDerive(AstId<ast::Macro>, #[home(skip)] BuiltinDeriveExpander),
+    BuiltInEager(AstId<ast::Macro>, #[home(skip)] EagerExpander),
     UnimplementedBuiltIn(AstId<ast::Macro>),
-    ProcMacro(AstId<ast::Fn>, CustomProcMacroExpander, ProcMacroKind),
+    ProcMacro(
+        AstId<ast::Fn>,
+        #[home(skip)] CustomProcMacroExpander,
+        #[home(skip)] ProcMacroKind,
+    ),
 }
 
 impl MacroDefKind {
@@ -475,16 +485,21 @@ pub struct EagerCallInfo {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Homed at its call's file and the ids it names. The eager input and the attribute's
+/// arguments are skipped: they are trees, and the eager input's `arg_id` is a call of the
+/// same calling crate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum MacroCallKind {
     FnLike {
         ast_id: AstId<ast::MacroCall>,
+        #[home(skip)]
         expand_to: ExpandTo,
         /// Some if this is a macro call for an eager macro. Note that this is `None`
         /// for the eager input macro file.
         // FIXME: This is being interned, subtrees can vary quickly differing just slightly causing
         // leakage problems here
         // Shared, as `attr_args` is: the query engine clones an interned key, and a token tree is never cloned.
+        #[home(skip)]
         eager: Option<Arc<EagerCallInfo>>,
     },
     Derive {
@@ -500,6 +515,7 @@ pub enum MacroCallKind {
     Attr {
         ast_id: AstId<ast::Item>,
         // FIXME: This shouldn't be here, we can derive this from `invoc_attr_index`.
+        #[home(skip)]
         attr_args: Option<Arc<tt::TopSubtree>>,
         /// This contains the list of all *active* attributes (derives and attr macros) preceding this
         /// attribute, including this attribute. You can retrieve the [`AttrId`] of the current attribute
@@ -508,6 +524,7 @@ pub enum MacroCallKind {
         /// The macro should not see the attributes here.
         ///
         /// [`invoc_attr()`]: AttrMacroAttrIds::invoc_attr
+        #[home(skip)]
         censored_attr_ids: AttrMacroAttrIds,
     },
 }
@@ -655,19 +672,12 @@ impl MacroCallId {
     }
 }
 
-/// What [`MacroCallId::parse_macro_expansion`]'s value holds on the heap: the expansion's tree
-/// with the text it owns, and its span map.
-fn expansion_bytes(expansion: &ExpandResult<(Parse<view::Untyped>, ExpansionSpanMap)>) -> usize {
-    let (parse, map) = &expansion.value;
-    parse.heap_bytes() + parse.source_bytes() + map.heap_bytes()
-}
-
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl MacroCallId {
     /// Implementation of [`HirFileId::parse_or_expand`] for the macro case.
     // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
     // instead of having it be untyped
-    #[blaze_query::tracked(returns(ref), lru, weigh = expansion_bytes, mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
     pub fn parse_macro_expansion(
         self,
         db: &Db,
@@ -686,7 +696,7 @@ impl MacroCallId {
                 self.macro_expand(db, frame, loc);
 
             let (parse, mut rev_token_map, semicolon) =
-                token_tree_to_syntax_node(db, frame, tt.view(), expand_to);
+                token_tree_to_syntax_node(frame, tt.view(), expand_to);
             rev_token_map.matched_arm = matched_arm;
             rev_token_map.dropped_semicolon = semicolon;
             // alloc: only for an expansion whose `${concat(..)}`s made identifiers
@@ -758,7 +768,7 @@ impl MacroCallId {
     /// Lowers syntactic macro call to a token tree representation. That's a firewall
     /// query, only typing in the macro call itself changes the returned
     /// subtree.
-    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
     #[deprecated = "calling this is incorrect, call `macro_arg_considering_derives` instead"]
     fn macro_arg(self, db: &Db) -> MacroArgResult {
         use syntax::view::AstNode as _;
@@ -1002,8 +1012,9 @@ impl MacroCallId {
     /// proc macros, since they are not deterministic in general, and
     /// non-determinism breaks the query engine in a very, very, very bad way.
     /// @edwin0cheng heroically debugged this once! See #4315 for details
-    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
-    fn proc_macro_expansion(
+    // `pub`: a query kind tests above this crate name (hir-ty-mir's const-macro tests).
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
+    pub fn proc_macro_expansion(
         self,
         db: &Db,
     ) -> (ExpandResult<tt::TopSubtree>, proc_macro::ExpansionReads, proc_macro::StateUse) {
@@ -1012,7 +1023,7 @@ impl MacroCallId {
         if let Some(refusal) = self.arg_refusal(db, &loc.kind) {
             let empty = tt::TopSubtree::empty(macro_arg.top_subtree().delimiter.delim_span());
             db.files().expansions_are_read(
-                loc.krate,
+                loc.krate.key(db),
                 base_db::ReadBy::Call(self.into()),
                 Vec::new(),
             );
@@ -1058,7 +1069,7 @@ impl MacroCallId {
         // same. A call that is fixed by its call and reads (a stateless crate's, or a shown call
         // of a crate that settles) reads nothing outside the database and is reused.
         if let proc_macro::StateUse::Session(why) = state {
-            blaze_query::db::report_untracked_read(db, blaze_query::db::Untracked { what: why });
+            blaze_memo::read_untracked(blaze_memo::Database::memo(db), why);
         }
         // What keys a value by the crate's reads (a unit's record) reads them from the log, which
         // has this call's latest expansion only: one that was unknown and traces now replaces it.
@@ -1071,7 +1082,7 @@ impl MacroCallId {
             // alloc: one entry, once per expansion of unknown reads
             &proc_macro::ExpansionReads::Unknown(why) => vec![base_db::ExpansionRead::Unknown(why)],
         };
-        db.files().expansions_are_read(loc.krate, base_db::ReadBy::Call(self.into()), logged);
+        db.files().expansions_are_read(loc.krate.key(db), base_db::ReadBy::Call(self.into()), logged);
 
         fixup::reverse_fixups(&mut tt, undo_info);
 
@@ -1167,7 +1178,7 @@ fn expand_unimplemented_builtin_macro(
 /// parse queries being LRU cached. If they weren't the invalidations would only happen if the
 /// user wrote in the file that defines the proc-macro.
 fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>) -> Span {
-    #[blaze_query::tracked(returns(copy), mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
     fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>, _: ()) -> Span {
         let span_map = ast.file_id.span_map(db);
         let node = ast.to_view(db);
@@ -1181,7 +1192,6 @@ fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>) -> Span {
 /// The syntax `tt` parses to as `expand_to`, and the span of the `;` an expression's expansion
 /// ends in, which is left out of the parse.
 pub(crate) fn token_tree_to_syntax_node(
-    db: &Db,
     frame: &Frame,
     tt: tt::SubtreeView<'_>,
     expand_to: ExpandTo,
@@ -1202,7 +1212,7 @@ pub(crate) fn token_tree_to_syntax_node(
         None => (tt, None),
     };
     let (parse, map) =
-        syntax_bridge::token_tree_to_syntax_node(tt, entry_point, &mut |ctx| ctx.edition(db));
+        syntax_bridge::token_tree_to_syntax_node(tt, entry_point, &mut |ctx| ctx.edition());
     (parse, map, semicolon)
 }
 
@@ -1909,7 +1919,12 @@ impl ExpandTo {
 ///
 /// We encode macro definitions into ids of macro calls, this what allows us
 /// to be incremental.
-#[blaze_query::interned(unsafe(no_lifetime), debug)]
+///
+/// Homed in the calling crate's arena: the key's greatest arena is `loc.krate`'s, the crate
+/// the call is written in (an expander is called with `loc.def.krate` as the defining crate
+/// and `loc.krate` as the calling one), and every other id it names is of that crate or a
+/// dependency. Owns: the location holds the eager call's and the attribute's `Arc`s.
+#[blaze_memo::interned(unsafe(no_lifetime), debug, owns)]
 #[doc(alias = "MacroFileId")]
 pub struct MacroCallId {
     #[returns(ref)]
@@ -1919,21 +1934,40 @@ pub struct MacroCallId {
 impl From<span::MacroCallId> for MacroCallId {
     #[inline]
     fn from(value: span::MacroCallId) -> Self {
-        MacroCallId::from_id(value.0)
+        MacroCallId::from_gid(value.0)
     }
 }
 
 impl From<MacroCallId> for span::MacroCallId {
     #[inline]
     fn from(value: MacroCallId) -> span::MacroCallId {
-        span::MacroCallId(value.as_id())
+        span::MacroCallId(value.gid())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
+/// A file of syntax: a real file, or a macro call's expansion. A plain enum of the two ids,
+/// homed where the id it holds is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum HirFileId {
     FileId(EditionedFileId),
     MacroFile(MacroCallId),
+}
+
+impl HirFileId {
+    /// The arena whose table this file's syntax contexts are of (see [`span::SyntaxContext`]):
+    /// an expansion's, its call's (the calling crate's). A real file's spans carry only root
+    /// contexts, which every lookup answers without reading a table (`SyntaxContext::id` is
+    /// `None` for a root), so its arena is never read: it is the arena the file's own id is
+    /// homed in (its text's, a crate's or its source root owner's), live wherever the id is,
+    /// and within the asking crate's declared closure. Never a constant arena: one would name a
+    /// generation of the session that a commit drops, and a key holding it would be homed there.
+    #[inline]
+    pub fn context_arena(self) -> blaze_memo::ArenaId {
+        match self {
+            HirFileId::MacroFile(call) => span::MacroCallId::from(call).arena(),
+            HirFileId::FileId(file) => blaze_memo::Id::gid(file).arena(),
+        }
+    }
 }
 
 impl From<EditionedFileId> for HirFileId {
@@ -2089,35 +2123,26 @@ impl HirFileId {
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl HirFileId {
-    #[blaze_query::tracked(lru, weigh = AstIdMap::heap_bytes, returns(ref), mem_tag = Expand)]
+    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
     pub fn ast_id_map(self, db: &Db) -> AstIdMap {
         AstIdMap::from_view(self.root(db))
     }
 
     /// The ranges of the file's syntax errors, sorted by where they start: what
     /// [`HirFileId::has_syntax_error_in`] searches, so the errors are found once per file.
-    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
-    fn syntax_error_ranges(self, db: &Db) -> Box<[TextRange]> {
-        let mut ranges: Vec<TextRange> = match self {
-            HirFileId::FileId(file_id) => {
-                file_id
-                    .parse_errors(db)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(SyntaxError::range)
-                    .collect() // alloc: the query's value, once per file
-            }
-            HirFileId::MacroFile(macro_file) => macro_file
-                .parse_macro_expansion(db)
-                .value
-                .0
-                .errors()
-                .iter()
-                .map(SyntaxError::range)
-                .collect(), // alloc: the query's value, once per file
-        };
+    /// Kept in the memo as a slice: the value owns nothing.
+    #[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
+    fn syntax_error_ranges<'db>(self, db: &'db Db) -> &'db [TextRange] {
+        let mut ranges = Vec::new_in(std::alloc::Global);
+        match self {
+            HirFileId::FileId(file_id) => ranges
+                .extend(file_id.parse_errors(db).unwrap_or_default().iter().map(SyntaxError::range)),
+            HirFileId::MacroFile(macro_file) => ranges.extend(
+                macro_file.parse_macro_expansion(db).value.0.errors().iter().map(SyntaxError::range),
+            ),
+        }
         RANGE_SORT.with_borrow_mut(|scratch| {
             radix::sort_copy_by_key_in(
                 &mut ranges,
@@ -2125,7 +2150,7 @@ impl HirFileId {
                 scratch.take(),
             )
         });
-        ranges.into_boxed_slice()
+        blaze_memo::keep_slice(blaze_memo::Database::memo(db), &ranges)
     }
 }
 

@@ -728,6 +728,15 @@ impl Writer {
         at
     }
 
+    /// Where `bytes` were written, at a multiple of [`ALIGN`]: a buffer of this format held
+    /// inside another (a record's payload) is then opened where it is, with no copy, since
+    /// [`open`] takes only a buffer aligned to [`ALIGN`].
+    pub fn push_buffer(&mut self, bytes: &[u8]) -> u64 {
+        let at = self.pad(ALIGN);
+        self.bytes.extend_from_slice(bytes);
+        at
+    }
+
     /// Where `text` was written, for a [`Str`] of `text.len()` bytes.
     pub fn push_str(&mut self, text: &str) -> u64 {
         self.push_slice(text.as_bytes())

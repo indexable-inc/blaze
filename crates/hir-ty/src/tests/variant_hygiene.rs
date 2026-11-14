@@ -197,7 +197,7 @@ globbed!();
 /// ([`variant_of`]).
 fn check_variants(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
     let db = fixture::db(ra_fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = fixture::test_crate(&db);
         let mut crates: Vec<_> = main
             .data(&db)

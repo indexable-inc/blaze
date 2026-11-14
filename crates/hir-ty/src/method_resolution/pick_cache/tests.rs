@@ -91,9 +91,11 @@ fn same_pick<'db>(a: &Pick<'db>, b: &Pick<'db>) -> bool {
         && a.unstable_candidates == b.unstable_candidates
 }
 
+/// The database of `fixture`, its queries keeping read lists: a probe's answer is stored only
+/// with the reads it made (`next_solver::interner::recorded`), which a database that keeps no
+/// lists cannot give, so it would store nothing and no probe would hit.
 fn db_of(fixture: &str) -> Db {
-    let db = fixture::db(fixture).into_db();
-    db
+    fixture::db_with_reads(fixture).into_db()
 }
 
 /// Every module of the fixture's own crates (not minicore's).

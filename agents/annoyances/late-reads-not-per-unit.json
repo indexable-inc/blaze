@@ -1,0 +1,14 @@
+{
+ "id": "late-reads-not-per-unit",
+ "date": "2026-11-14",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor, host round 2 piece front, third pass (late reads in a surface's shape)",
+ "where": "crates/blaze-keyed/src/record.rs `late_id(which, name)` (no unit); crates/blaze-host/src/host.rs:85 `Request::late` and :441 `Universe { outside: self.request.late }` (one table for every unit); crates/blaze-unitkey/src/unit.rs `LateAnswer { file, late, name }` (per file, by the literal the call wrote)",
+ "what": "A late read is unit-relative (`env!(\"CARGO_PKG_VERSION\")` is each crate's own) and an include's literal is file-relative (two files' `include_str!(\"a.txt\")` read different files), but its fact id names neither, and the host answers every unit from one table. A surface or body that asks a late read gets another unit's value, or a request with two such values cannot be answered.",
+ "cost": "an hour finding which side defines what a late read's name and answer are; blaze-front had to pick (a variable's name; an include's path in its source root; the host's var_answer and file_answer) and say so",
+ "cause": "the late-read id was designed from blaze-unitkey's per-file key rows, before any task asked one through Universe::answer",
+ "class": "an id that leaves out a coordinate its value depends on (rule keys-cover-every-input)",
+ "prevention": "the outside table a task's universe holds is its unit's (per asker), and an include is named by its resolved path, not its literal; a test asks one variable from two units with two values",
+ "workaround": "blaze-front checks every late answer against the value its expansions saw and fails LATE_MOVED where they differ, so a wrong table fails loudly, never files",
+ "fix": "blaze-host: a late table per unit in `Request`; blaze-unitkey: name an include by its resolved source-root path",
+ "state": "open"
+}

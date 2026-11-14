@@ -89,9 +89,9 @@ pub(crate) fn range_from_expansion(cx: &Cx<'_, '_>, range: InFile<TextRange>) ->
 /// `#[allow_internal_unsafe]`. A file's own text is of no expansion: no span map is read.
 pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> bool {
     file.macro_file().is_some()
-        && ctxt(cx, file, range).outer_expn(cx.db).is_some_and(|call| {
-            hir_expand::MacroCallId::from(call).loc(cx.db).def.allow_internal_unsafe
-        })
+        && ctxt(cx, file, range).outer_expn(cx.db, crate::cx::context_arena(file)).is_some_and(
+            |call| hir_expand::MacroCallId::from(call).loc(cx.db).def.allow_internal_unsafe,
+        )
 }
 
 /// The trees of the walk by the macro call (or the item or attribute of an attribute macro or

@@ -32,7 +32,7 @@ fn check(
     let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let def = pick(&db);
         let map = Body::source_map(&db, def);
         let at = |span: MirSpan| {
@@ -59,7 +59,7 @@ fn check_anon_consts(minicore: &str, src: &str, name: &str) -> Vec<(ConstCheckDi
     let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let func = function(&db, name);
         let mut found = Vec::new();
         for &konst in InferenceResult::of(&db, func).defined_anon_consts() {
@@ -649,7 +649,7 @@ fn main() {
     let fx = fixture::db(&format!("//- minicore: sized\n{src}"));
     let _ = fx.only_file();
     let db = fx.into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let main = function(&db, "main");
         let def = DefWithBodyId::from(main);
         let (body, map) = (Body::of(&db, def), Body::source_map(&db, def));

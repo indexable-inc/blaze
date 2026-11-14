@@ -25,7 +25,7 @@
 //! crate it names is the home's or one of its dependencies' ([`Closure`], checked, never
 //! assumed): the standard library's own, a dependency's, and their generics over each other's
 //! types. Code an edit reaches (a workspace crate's, a generic over its types) has none and is
-//! described by the walk's own task, as before (`frontend/witnesses.rs`).
+//! described by the walk's own task.
 //!
 //! **The record** ([`HirFrontend::to_record_in`]) is the [`Described`] with its origin as
 //! "the requester's" or the item's crate's own, each reference ported, and with each function
@@ -45,7 +45,7 @@ use blaze_format::{
     schema_of,
 };
 use blaze_hash::SharedMap;
-use blaze_query::db::AsId as _;
+use blaze_memo::Id as _;
 use hir_ty::check_cache::port;
 
 use super::*;
@@ -167,23 +167,30 @@ pub(super) struct Found {
     counted: SharedMap<HirInstance, Counted>,
 }
 
-/// What `db` read from records since the last write of an input a library's describe may
-/// read (its durable view, as [`Frontend::durable_view`] gives it), kept in `slot` with that
-/// view (its owner's, [`super::Walks`]; or none, for a front end whose builds keep nothing):
-/// after such a write nothing read before it is kept, as a kept walk is not patched across
-/// one. A count ([`Found::counted`]) is of a function by its id, and what an id names is the
-/// same only while no library's source was written. No process static holds any: until
+/// Where an owner keeps what its database read from records ([`found_in`]): the table, with
+/// the session memo's arenas it was made under.
+pub(super) type FoundSlot = Option<(Vec<blaze_memo::ArenaId, Global>, Arc<Found>)>;
+
+/// What `db` read from records while every arena of its session memo is the one it was made
+/// under, kept in `slot` with those arenas (its owner's, [`super::Walks`]; or none, for a
+/// front end whose builds keep nothing). The table names instances by their ids
+/// ([`blaze_memo::Gid`]), and an id names the same thing only while its arena lives; an edit
+/// drops its crate's arena (a new generation is another [`blaze_memo::ArenaId`]), so after
+/// one nothing read before it is kept. That is coarser than the floor: an edit of a
+/// workspace crate empties a table of library describes whose arenas it did not drop
+/// (front-end-on-memo.md, the cost of decision 4). No process static holds any: until
 /// 2026-11-13 one did, by the database's nonce, and nothing let it go.
-pub(super) fn found_in(slot: &mut Option<(u64, Arc<Found>)>, db: &Db) -> Arc<Found> {
-    let durable = blaze_query::db::Database::storage(db).durable_view().as_u64();
+pub(super) fn found_in(slot: &mut FoundSlot, db: &Db) -> Arc<Found> {
+    let memo = blaze_memo::Database::memo(db);
     if let Some((was, found)) = slot
-        && *was == durable
+        && was.iter().copied().eq(memo.arenas())
     {
         return found.clone(); // clone: a reference count, once a build
     }
-    // alloc: once per owner and write of a library's input, an empty table
+    let mut arenas = Vec::new_in(Global);
+    arenas.extend(memo.arenas());
     let made = Arc::new(Found::default());
-    *slot = Some((durable, made.clone())); // clone: a reference count
+    *slot = Some((arenas, made.clone())); // clone: a reference count
     made
 }
 
@@ -283,12 +290,12 @@ fn put_instance<'db>(
             }
             let (def, entry) = match code.def {
                 InstanceDef::Fn(func) => (0u8, writer.function(func)),
-                InstanceDef::Closure(id) => (1, writer.closure(InternedClosureId::from_id(id))),
+                InstanceDef::Closure(id) => (1, writer.closure(InternedClosureId::from_gid(id))),
                 InstanceDef::Coroutine(id) => {
-                    (2, writer.coroutine(InternedCoroutineId::from_id(id)))
+                    (2, writer.coroutine(InternedCoroutineId::from_gid(id)))
                 }
                 InstanceDef::CoroutineByMove(id) => {
-                    (3, writer.coroutine(InternedCoroutineId::from_id(id)))
+                    (3, writer.coroutine(InternedCoroutineId::from_gid(id)))
                 }
                 InstanceDef::DropGlue => (4, NO_ENTRY),
                 InstanceDef::CallOnceShim => (5, NO_ENTRY),
@@ -335,9 +342,9 @@ fn get_instance<'db>(
             let krate = ContentId(*bytes.array::<32>()?);
             let def = match def {
                 0 => InstanceDef::Fn(ported.function(entry)?),
-                1 => InstanceDef::Closure(ported.closure(entry)?.as_id()),
-                2 => InstanceDef::Coroutine(ported.coroutine(entry)?.as_id()),
-                3 => InstanceDef::CoroutineByMove(ported.coroutine(entry)?.as_id()),
+                1 => InstanceDef::Closure(ported.closure(entry)?.gid()),
+                2 => InstanceDef::Coroutine(ported.coroutine(entry)?.gid()),
+                3 => InstanceDef::CoroutineByMove(ported.coroutine(entry)?.gid()),
                 4 => InstanceDef::DropGlue,
                 5 => InstanceDef::CallOnceShim,
                 6 => InstanceDef::VtableShim(ported.function(entry)?),

@@ -847,7 +847,7 @@ impl TypeColumns<Frozen> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_query::db::FromId;
+    use blaze_memo::Id as _;
     use hir_expand::mod_path::{ModPath, PathKind};
     use intern::Symbol;
     use la_arena::RawIdx;
@@ -872,7 +872,7 @@ mod tests {
 
     fn type_param(local: u32) -> TypeParamId {
         TypeParamId::from_unchecked(TypeOrConstParamId {
-            parent: GenericDefId::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(
+            parent: GenericDefId::FunctionId(FunctionId::from_gid(blaze_memo::Gid::for_test(
                 5 + (1 << 20),
             ))),
             local_id: Idx::from_raw(RawIdx::from_u32(local)),

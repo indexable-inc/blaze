@@ -38,14 +38,14 @@ pub struct TraitItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl TraitItems {
     #[inline]
     pub(crate) fn query(db: &Db, tr: TraitId) -> &TraitItems {
         &Self::query_with_diagnostics(db, tr).0
     }
 
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
         // The trait's own entry where one is kept (rule 65), else collected and kept.
         crate::nameres::frozen::entries::items::trait_items(db, tr, || Self::collected(db, tr))
@@ -128,9 +128,9 @@ pub struct ImplItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ImplItems {
-    #[blaze_query::tracked(returns(ref))]
+    #[blaze_memo::tracked(returns(ref), owns)]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
         // The impl's own entry where one is kept (rule 65), else collected and kept.
@@ -217,7 +217,9 @@ impl<'db> AssocItemCollector<'db> {
 
     fn collect_item(&mut self, item: view::AssocItem<'db>) {
         let ast_id = self.ast_id_map.ast_id_of_view::<ast::AssocItem>(item);
-        let attrs = match AttrsOrCfg::lower(self.db, item, &|| self.cfg_options, self.span_map) {
+        let table = self.file_id.context_arena();
+        let attrs = match AttrsOrCfg::lower(self.db, table, item, &|| self.cfg_options, self.span_map)
+        {
             AttrsOrCfg::Enabled { attrs } => attrs,
             AttrsOrCfg::CfgDisabled(cfg) => {
                 self.diagnostics.push(DefDiagnostic::unconfigured_code(
@@ -318,7 +320,8 @@ impl<'db> AssocItemCollector<'db> {
                 let ast_id = InFile::new(self.file_id, ast_id);
                 let Some(path) = call.path() else { return };
                 let range = path.syntax().text_range();
-                let Some(path) = ModPath::from_src_view(self.db, path, &mut |range| {
+                let table = self.file_id.context_arena();
+                let Some(path) = ModPath::from_src_view(self.db, table, path, &mut |range| {
                     self.span_map.span_for_range(range).ctx
                 }) else {
                     return;

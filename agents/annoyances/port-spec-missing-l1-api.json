@@ -1,0 +1,14 @@
+{
+ "id": "port-spec-missing-l1-api",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane L9a (lints and diagnostics) of the front-end-on-memo port",
+ "where": "docs/v2/plan/design/front-end-on-memo.md (no \"L1 API, as written\" section); crates/base-db/src/db.rs nonce_and_revision, settings.rs FrontSettings; crates/span/src/hygiene.rs",
+ "what": "Lanes downstream of L1 port while L1 is still writing base-db and blaze-memo: the spec's \"L1 API, as written\" section did not exist, base-db still returned blaze-query types, and the value rule changed mid-lane (the `owns` decision), so one value (the body lints' diagnostics) was flattened to JSON in kept text and then put back.",
+ "cost": "a redone design in query.rs/check.rs/kept.rs, and a list of assumed signatures (nonce, set_all_crates, the FrontSettings setter) that the first compile will check",
+ "cause": "the lanes start in parallel on an interface that is written by one of them, with no frozen signature file to code against",
+ "class": "parallel lanes against an interface still being written",
+ "prevention": "freeze the upstream lane's public signatures (a stub file that compiles) before downstream lanes start, and settle value rules (`owns`) in the spec, not mid-lane",
+ "workaround": "assume the smallest signature and list it in the report",
+ "fix": "not yet",
+ "state": "open"
+}

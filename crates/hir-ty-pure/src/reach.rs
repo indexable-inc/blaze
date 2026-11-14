@@ -633,7 +633,7 @@ thread_local! {
 /// The integer operations of the body of `def` and of its closures that the prover can't
 /// show keep their value ([`Overflow`]), once per definition: what `blaze::implicit_overflow`
 /// reads.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn overflow_of_body(db: &Db, def: DefWithBodyId) -> Overflow {
     let Ok(root) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else {
         return Overflow {
@@ -824,7 +824,7 @@ pub fn worth(body: &MirBody<'_>) -> bool {
 
 /// The proof of the body of `def` as it is written (its generic runtime MIR), once per
 /// definition. A body that does not lower is refused.
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub fn of_body(db: &Db, def: DefWithBodyId) -> Reach {
     let Ok(body) = db.runtime_mir_body(InferBodyId::DefWithBodyId(def)) else {
         return Reach::refused("its body does not lower to MIR");

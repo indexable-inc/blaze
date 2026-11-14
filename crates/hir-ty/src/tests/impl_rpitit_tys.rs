@@ -15,7 +15,7 @@ use crate::{
 /// The values the impl method `name`'s items have, each displayed, or the error.
 fn values(fixture: &str, name: &str) -> Vec<Result<String, RpititError>> {
     let db = fixture::db(fixture).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let mut found: Option<FunctionId> = None;
         for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -283,7 +283,7 @@ fn the_impls_item_has_the_trait_methods_where_clauses() {
          impl Tr for S { fn f<T>(&self, t: T) -> T { t } }\n",
     )
     .into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let krate = fixture::test_crate(&db);
         let impl_fn = crate_def_map(&db, krate)
             .modules(&db)

@@ -1771,7 +1771,7 @@ impl Lint {
                 "sort what comes out, or keep it in a `BTreeMap` or an ordered `Vec`"
             }
             Lint::HeldAcrossWait => {
-                "end the value before the call, or carry it with the job (`blaze_query::carry`) and read the thread-local again after the wait"
+                "end the value before the call, or carry it with the job (`blaze_graph::sched::carry`) and read the thread-local again after the wait"
             }
             Lint::LockAcrossQuery => {
                 "copy out what the query needs and drop the guard before the call, or make the locked state a query input"

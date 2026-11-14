@@ -211,10 +211,12 @@ impl<'db> Predicate<'db> {
     pub(super) fn intern(kind: Binder<'db, PredicateKind<'db>>) -> Self {
         Self::at(PREDICATES.intern(kind, || {
             let computed = FlagComputation::for_predicate(kind);
+            let (tag, home) = persist::tag_and_home(&kind);
             table::RowInfo {
-                tag: persist::tag(&kind),
+                tag,
                 flags: computed.flags,
                 binder: computed.outer_exclusive_binder,
+                home,
             }
         }))
     }
@@ -281,6 +283,33 @@ impl ClausesStorage {
 
 impl_stored_interned_slice!(Clauses, StoredClauses);
 impl_foldable_for_stored_type!(StoredClauses);
+
+table::holds_by_visit!(PredicateRow<'static>, Clause<'static>);
+
+impl<'db> table::Homed for Predicate<'db> {
+    /// Its row's home, written when the row was added.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        PREDICATES.home(self.index)
+    }
+}
+
+impl<'db> table::Homed for Clause<'db> {
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        table::Homed::home(&self.0)
+    }
+}
+
+impl<'db> table::Homed for Clauses<'db> {
+    /// Its row's home: the newest of its clauses' homes.
+    #[inline]
+    fn home(&self) -> Option<blaze_memo::ArenaId> {
+        ClausesStorage::table().home(self.index)
+    }
+}
+
+crate::next_solver::interner::memo_home!(Clause<'db>, Clauses<'db>);
 
 impl_stored_interned!(Predicate, StoredPredicate);
 impl_foldable_for_stored_type!(StoredPredicate);
@@ -1029,14 +1058,13 @@ impl<'db> rustc_type_ir::inherent::Clause<DbInterner<'db>> for Clause<'db> {
 
 #[cfg(test)]
 mod tests {
-    use blaze_query::db::FromId;
     use rustc_type_ir::inherent::Clause as _;
 
     use super::*;
     use crate::next_solver::{AliasTermKind, GenericArgs, TraitAssocTyId};
 
-    fn id<T: FromId>(index: u32) -> T {
-        T::from_id(blaze_query::db::Id::from_u32(index))
+    fn id<T: blaze_memo::Id>(index: u32) -> T {
+        T::from_gid(blaze_memo::Gid::for_test(index))
     }
 
     fn clause<'db>(kind: ClauseKind<'db>) -> Clause<'db> {

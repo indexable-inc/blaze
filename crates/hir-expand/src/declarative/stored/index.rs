@@ -260,7 +260,7 @@ pub fn key(set: &ContentId) -> ContentId {
 /// read). Found by the file's content where this database keeps entries, with no parse; made
 /// from the file's parse and kept where it is not found. A database that keeps no entries
 /// makes it from the parse.
-#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
 pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
     let kept = super::of(db);
     let set = super::file_set(db, file);
@@ -289,7 +289,7 @@ pub fn of(db: &Db, file: EditionedFileId, krate: Crate) -> FileIndex {
 ///
 /// A row is a function of its item's text, as a file's is; the positions are of the
 /// expansion's text, which the key determines.
-#[blaze_query::tracked(returns(ref), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Expand)]
 pub fn of_expansion(db: &Db, call: MacroCallId, krate: Crate) -> Option<FileIndex> {
     let set = super::expansion::key(db, call)?;
     let key = key(&set);
@@ -658,7 +658,20 @@ fn node_source(
     header.kind(node.kind());
     let text = node.text();
     let start = node.text_range().start();
+    // The parser hangs a plain comment written right above an item on the item's node: it is
+    // no text of the item (the comment means nothing to any crate), so the header starts after
+    // it and the whitespace with it. A doc comment is the item's (`#[doc]`) and is kept.
     let mut at = 0;
+    for child in node.children_with_tokens() {
+        match child {
+            NodeOrToken::Token(token)
+                if matches!(token.kind(), SyntaxKind::COMMENT | SyntaxKind::WHITESPACE) =>
+            {
+                at = u32::from(token.text_range().end() - start) as usize;
+            }
+            _ => break,
+        }
+    }
     for cut in cuts {
         let range = cut.text_range();
         let (from, to) = (u32::from(range.start() - start) as usize, u32::from(range.end() - start) as usize);

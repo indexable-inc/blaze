@@ -4,9 +4,8 @@ use core::fmt;
 use std::any::Any;
 use std::{panic::RefUnwindSafe, sync};
 
-use base_db::{Crate, CrateBuilderId, CratesIdMap, Db, Env, Given, ProcMacroLoadingError};
+use base_db::{Crate, CrateBuilderId, CrateKey, CratesIdMap, Db, Env, Given, ProcMacroLoadingError};
 use blaze_hash::HashMap;
-use blaze_query::db::{Durability, Setter};
 use intern::Symbol;
 use span::Span;
 use std::alloc::Global;
@@ -220,12 +219,13 @@ impl ProcMacrosBuilder {
         );
     }
 
-    /// Gives each crate its proc macros ([`ProcMacros`]).
-    pub(crate) fn build_in(self, db: &mut Db, crates_id_map: &CratesIdMap) {
+    /// Gives each crate its proc macros ([`ProcMacros`]), in one commit.
+    pub(crate) fn build_in(self, db: &mut Db, crates_id_map: &CratesIdMap) -> base_db::Committed {
+        let mut edit = db.edit();
         for (krate, proc_macro) in self.0 {
-            crates_id_map[&krate].give::<ProcMacros>(db, Given::new(proc_macro), Durability::HIGH);
+            edit.give::<ProcMacros>(crates_id_map[&krate], Given::new(proc_macro));
         }
-        db.note_crates_changed();
+        edit.commit()
     }
 }
 
@@ -250,12 +250,12 @@ thread_local! {
 pub struct CrateProcMacros(StoredProcMacroLoadResult);
 
 /// The proc macros: each crate's are a slot of that crate's own
-/// (`base_db::Crate::give`, of kind `HIGH`), read with
-/// [`ProcMacros::get_for_crate`] and written with [`ProcMacros::give`].
+/// (`base_db::Edit::give`), read with [`ProcMacros::get_for_crate`] and written with
+/// [`ProcMacros::give`].
 ///
-/// The invariant: giving one crate its macros writes that crate's input and no other, so no
-/// row that read another crate's macros verifies again, and the crate's seal group is the one
-/// group the write opens. Until 2026-11-12 one map held every crate's (a `HIGH` singleton),
+/// The invariant: giving one crate its macros writes that crate's slot and no other, so the
+/// commit marks that crate's arena changed and no other crate's (its dependents drop through
+/// their borrows, as for any change of the crate). Until 2026-11-12 one map held every crate's (a `HIGH` singleton),
 /// and a new proc-macro crate, or a list loaded again, was a write every crate's expansion
 /// had read.
 pub struct ProcMacros;
@@ -267,10 +267,12 @@ impl ProcMacros {
     }
 
     /// Gives each crate of `given` its proc macros (or why it has none) in place of those it
-    /// had, as loading its dylib does, and notes it ([`Db::note_proc_macros`]): the one way to
-    /// change a crate's list once the crate graph is set. A crate's def map lists its proc
-    /// macros' expanders, so one resolved before its list was given must resolve again, and a
-    /// set that is not noted leaves it naming none.
+    /// had, as loading its dylib does, in one commit of `db`'s world: the one way to change a
+    /// crate's list once the crate graph is set. A crate's def map lists its proc macros'
+    /// expanders, so one resolved before its list was given resolves again: the gift marks
+    /// the crate's arena changed, which drops what was derived in it. `Crate` ids of `db`
+    /// from before the call are dead where their arena dropped: callers look a crate up again
+    /// by its key ([`Crate::key`], [`Db::krate`]).
     ///
     /// The invariant: a crate given the list it has (each macro's name, kind and expander
     /// equal: [`ProcMacroExpander::eq_dyn`], which for a built macro is the code it runs),
@@ -280,35 +282,53 @@ impl ProcMacros {
     /// expanders again (its unit's record replayed); until 2026-11-12 each load set the
     /// whole map at `HIGH` and noted its crate, so a build of reth with nothing changed
     /// wrote 53 inputs and verified every row of the database.
+    ///
+    /// [`ProcMacros::give_in`] in an edit of its own, committed: one that gave nothing moves
+    /// nothing, so its commit keeps the snapshot ([`base_db::Committed::moved`]).
     pub fn give(
         db: &mut Db,
         given: impl IntoIterator<Item = (Crate, ProcMacroLoadResult)>,
     ) -> bool {
-        db.batch(base_db::Trigger::named("ProcMacros::give"), |db| {
-            let mut any = false;
-            for (krate, macros) in given {
-                let macros = CrateProcMacros::new(macros);
-                let held = krate.given::<ProcMacros, Arc<CrateProcMacros>>(&*db);
-                if held.is_some_and(|it| !macros.replaces(it)) && !GIVES_EQUAL_LISTS.get() {
-                    continue;
-                }
-                // alloc: once per crate, when its proc macros are loaded
-                let macros = Given::new(Arc::new(macros));
-                krate.give::<ProcMacros>(db, macros, Durability::HIGH);
-                db.note_proc_macros(krate);
-                any = true;
+        // The keys first: the ids are of the snapshot the edit borrows `db` away from.
+        let mut loads = Vec::new_in(Global);
+        loads.extend(given.into_iter().map(|(krate, macros)| (krate.key(&*db), macros)));
+        let mut edit = db.edit();
+        let changed = ProcMacros::give_in(&mut edit, loads);
+        _ = edit.commit();
+        changed
+    }
+
+    /// [`ProcMacros::give`] inside the caller's edit, with no commit of its own: each crate of
+    /// `loads` (by key, so one `edit` made is named too) is given its list where it replaces
+    /// the list the crate holds in the world as `edit` has it, with its own writes
+    /// ([`base_db::Edit::written_given`]), so a list given earlier in the same edit counts as
+    /// held. The caller's commit is the one that marks the crates' arenas changed. Whether
+    /// any crate's list changed is returned.
+    pub fn give_in(
+        edit: &mut base_db::Edit<'_>,
+        loads: impl IntoIterator<Item = (CrateKey, ProcMacroLoadResult)>,
+    ) -> bool {
+        let mut changed = false;
+        for (key, macros) in loads {
+            let macros = CrateProcMacros::new(macros);
+            let held = edit.written_given::<ProcMacros, Arc<CrateProcMacros>>(key);
+            if held.is_some_and(|it| !macros.replaces(it)) && !GIVES_EQUAL_LISTS.get() {
+                continue;
             }
-            any
-        })
+            // alloc: once per crate, when its proc macros are loaded
+            edit.give::<ProcMacros>(key, Given::new(Arc::new(macros)));
+            changed = true;
+        }
+        changed
     }
 }
 
-#[blaze_query::tracked]
+#[blaze_memo::tracked]
 impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
-    #[blaze_query::tracked(returns(as_ref), mem_tag = Expand)]
-    pub fn get_for_crate(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
-        krate.given::<ProcMacros, Arc<CrateProcMacros>>(db).cloned()
+    #[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
+    pub fn get_for_crate<'db>(db: &'db Db, krate: Crate) -> Option<&'db Arc<CrateProcMacros>> {
+        krate.given::<ProcMacros, Arc<CrateProcMacros>>(db)
     }
 }
 
@@ -386,7 +406,7 @@ impl CrateProcMacros {
 
 /// Whether this crate can call a macro whose state belongs to a compilation session,
 /// including macros reexported by a dependency.
-#[blaze_query::tracked(returns(copy), mem_tag = Expand)]
+#[blaze_memo::tracked(returns(copy), mem_tag = Expand)]
 pub fn may_have_session_macros(db: &Db, krate: Crate) -> bool {
     ProcMacros::get_for_crate(db, krate)
         .and_then(|it| {
@@ -672,8 +692,12 @@ mod tests {
         }
     }
 
-    fn set(db: &mut Db, krate: Crate, macros: ProcMacroLoadResult) {
+    /// Gives `krate` `macros`; the crate as it is after the commit (an id from before is dead
+    /// where its arena dropped).
+    fn set(db: &mut Db, krate: Crate, macros: ProcMacroLoadResult) -> Crate {
+        let key = krate.key(db);
         ProcMacros::give(db, [(krate, macros)]);
+        db.krate(key)
     }
 
     #[test]
@@ -682,17 +706,47 @@ mod tests {
         let krate = test_crate(fixture.db());
         let none = why(fixture.db(), krate);
         assert!(none.contains("`pm`") && none.contains("no entry in the proc-macro map"), "{none}");
-        set(fixture.db_mut(), krate, Err(ProcMacroLoadingError::NotYetBuilt));
+        let krate = set(fixture.db_mut(), krate, Err(ProcMacroLoadingError::NotYetBuilt));
         let unbuilt = why(fixture.db(), krate);
         assert!(
             unbuilt.contains("`pm`") && unbuilt.contains("proc-macro not yet built"),
             "{unbuilt}"
         );
-        set(fixture.db_mut(), krate, Ok(Vec::new()));
+        let krate = set(fixture.db_mut(), krate, Ok(Vec::new()));
         let loaded = why(fixture.db(), krate);
         assert!(loaded.contains("exports no macro of this name"), "{loaded}");
         let error = ExpandErrorKind::MissingProcMacroExpander { krate, why: unbuilt.clone() };
         let rendered = error.render_to_string(fixture.db());
         assert_eq!((rendered.message.as_str(), rendered.error), (&*unbuilt, true));
+    }
+
+    /// The invariant: `give_in` writes into the caller's edit and commits nothing: the
+    /// snapshot the edit started from holds no list until the caller commits, a second load of
+    /// an equal list in the same edit is decided against the first one's write (no change),
+    /// and a list that replaces it is a change; the caller's one commit gives the last.
+    #[test]
+    fn give_in_writes_in_the_callers_edit_and_commits_nothing() {
+        let mut fixture = db("//- /lib.rs crate:pm\npub fn f() {}\n");
+        let krate = test_crate(fixture.db());
+        let key = krate.key(fixture.db());
+        let mut edit = fixture.db_mut().edit();
+        let unbuilt = || Err(ProcMacroLoadingError::NotYetBuilt);
+        assert!(ProcMacros::give_in(&mut edit, [(key, unbuilt())]), "a first list is a change");
+        assert!(
+            ProcMacros::given(edit.db(), edit.db().krate(key)).is_none(),
+            "give_in committed: the edit's snapshot holds a list"
+        );
+        assert!(
+            !ProcMacros::give_in(&mut edit, [(key, unbuilt())]),
+            "an equal list after the edit's own write is a change"
+        );
+        assert!(
+            ProcMacros::give_in(&mut edit, [(key, Ok(Vec::new()))]),
+            "a list that replaces the edit's write is no change"
+        );
+        _ = edit.commit();
+        let db = fixture.db();
+        let held = ProcMacros::given(db, db.krate(key)).expect("the commit gives the list");
+        assert_eq!(held.macros(), Some(&[][..]), "the last list given is held");
     }
 }

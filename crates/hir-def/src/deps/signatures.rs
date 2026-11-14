@@ -36,7 +36,6 @@ use blaze_ids::ContentId;
 use hir_expand::{AstId, MacroCallId, name::Name};
 use syntax::ast;
 use thin_vec::ThinVec;
-use triomphe::Arc;
 
 use self::{codes::Sig, key::Item, table::StoreBytes};
 use crate::{
@@ -44,7 +43,9 @@ use crate::{
     TraitId, TypeAliasId, UnionId, VariantId,
     deps::Part,
     expr_store::ExpressionStore,
-    hir::persist::{Column, Read, Relocation, Words, WordsRec, relocating},
+    hir::persist::{
+        Column, Portable, Read, Relocation, SessionBytes, Words, WordsRec, relocating,
+    },
     item_scope::ItemScope,
     item_tree::ItemTree,
     nameres::{
@@ -112,6 +113,9 @@ pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
 ]);
 
 
+/// The domain of the digest of a signature record's bytes: the fact a read of it lists.
+const RECORD_FACT_DOMAIN: &str = "blaze v2 dependency signature record fact";
+
 /// The schema of one record's buffer.
 const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Str("blaze v2 dependency signature record 3"),
@@ -121,7 +125,7 @@ const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 /// The signatures part of the image of `krate`: a record of every signature query of every item
 /// of its modules. An item that cannot be written portably fails the whole part, with why.
 /// Appends to `calls` each macro call a record names.
-pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
+pub(crate) fn encode(db: &Db, krate: Crate, calls: &mut Vec<MacroCallId>) -> R<Portable> {
     encode_with(db, krate, calls, |item, calls| record_of(db, krate, item, calls))
 }
 
@@ -131,8 +135,8 @@ fn encode_with(
     db: &Db,
     krate: Crate,
     calls: &mut Vec<MacroCallId>,
-    mut record_of: impl FnMut(Item, &mut Vec<MacroCallId>) -> R<Vec<u8>>,
-) -> R<Vec<u8>> {
+    mut record_of: impl FnMut(Item, &mut Vec<MacroCallId>) -> R<Portable>,
+) -> R<Portable> {
     let items = items(db, krate);
     let mut keyed = Vec::with_capacity(items.len());
     for item in items {
@@ -156,7 +160,7 @@ fn encode_with(
             .map_err(|why| format!("the signature of {item:?}: {why}"))?;
         let at = out.bytes.len().next_multiple_of(ALIGN);
         out.bytes.resize(at, 0);
-        out.bytes.extend_from_slice(&record);
+        out.bytes.extend_from_slice(record.as_bytes());
         places.push(Place { at: place(at)?, len: place(record.len())? });
     }
     // alloc: the key column, written once per crate.
@@ -170,7 +174,8 @@ fn encode_with(
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
-    Ok(out.finish(at))
+    // Keys, places and the records, each [`Portable`] already.
+    Ok(Portable::written(out.finish(at)))
 }
 
 /// Each signature query of the items of `krate`'s modules: what the front end asks of a
@@ -287,7 +292,7 @@ fn assoc(items: &mut Vec<Item>, assoc: &[(Name, AssocItemId)]) {
 }
 
 /// The record of `item` of `krate`, from its signature as this database has it.
-fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) -> R<Vec<u8>> {
+fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) -> R<Portable> {
     let what = item.what();
     match item {
         Item::Struct(id) => {
@@ -333,7 +338,7 @@ fn record_of(db: &Db, krate: Crate, item: Item, calls: &mut Vec<MacroCallId>) ->
 /// The record of `of`, the value of query `what` of an item of `krate`. The same value is the
 /// same bytes in every process: the table lists the ids in the order they are first written,
 /// the store first.
-fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
+fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Portable> {
     // alloc: none: an empty list, which nothing reads
     record_naming::<S>(db, krate, what, of, &mut Vec::new())
 }
@@ -346,13 +351,12 @@ fn record_naming<S: Sig>(
     what: u8,
     of: &S::Of,
     calls: &mut Vec<MacroCallId>,
-) -> R<Vec<u8>> {
+) -> R<Portable> {
     let mut table = Relocation::new();
-    let mut store =
-        S::store(of).map(|store| relocating(&mut table, || blaze_format::to_bytes(store)));
-    if let Some(store) = &mut store {
-        table::relocate_store(store, &mut table);
-    }
+    let store = S::store(of).map(|store| {
+        let written = relocating(&mut table, || SessionBytes::of(store));
+        table::relocate_store(written, &mut table)
+    });
     let mut words = Words::new();
     relocating(&mut table, || S::put(of, &mut words));
     table::calls(&table, calls);
@@ -365,7 +369,7 @@ fn record_naming<S: Sig>(
         // A store is a buffer of its own, read in place: at an aligned address.
         let at = out.bytes.len().next_multiple_of(ALIGN);
         out.bytes.resize(at, 0);
-        Column::push(&mut out, &store)
+        Column::push(&mut out, store.as_bytes())
     });
     let at = out.next::<RecordRoot>();
     let root = RecordRoot {
@@ -376,7 +380,9 @@ fn record_naming<S: Sig>(
     };
     let written = out.push(&root);
     debug_assert_eq!(written, at, "`Writer::next` is not where `push` writes");
-    Ok(out.finish(at))
+    // The words were relocated, the table is keyed and the store went through
+    // `relocate_store`: every id in the record is portable.
+    Ok(Portable::written(out.finish(at)))
 }
 
 /// Why bytes do not read, for the panic of a corrupt image.
@@ -473,27 +479,32 @@ fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
 /// An image with no record of the item, or one that does not read, is a corrupt image: a panic
 /// naming the crate, the item and why. Serving only gives a database images whose bytes the
 /// store checked against their key, so lowering the item instead would hide a bug.
-fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -> Option<S::Value> {
+fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Portable>) -> Option<S::Value> {
     let module = item.module(db);
     if module.block(db).is_some() {
         return None;
     }
     let krate = module.krate(db);
-    let image = super::image_of(db, krate).as_ref()?;
+    let image = super::image_of(db, krate)?;
     let what = item.what();
     let part = image.view().part(Part::Signatures);
     let stored = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
     let value = read::<S>(db, krate, what, image.bytes(), stored)
         .unwrap_or_else(|why| corrupt(db, krate, item, &why));
+    // The value is the record's: the read is of the item's fact (its stable key and the
+    // digest of its record), not of the image ([`super::ImageSlot`]'s fact says only the mode).
+    let note = || {
+        let (_, key) = key::of(db, item).expect("an item outside a block has a key");
+        super::note_item_read(db, RECORD_FACT_DOMAIN, key, stored);
+    };
     match image.mode() {
-        // The value is the record's, found by content: told to the engine (`row::STORED`).
-        Mode::Serve => blaze_query::db::report_stored_read(db),
+        Mode::Serve => note(),
         Mode::Check => {
             let written = live(krate);
             compare(db, krate, item, "the signature lowered from syntax", written, stored);
         }
         Mode::Verify => {
-            blaze_query::db::report_stored_read(db);
+            note();
             let written = record::<S>(db, krate, what, S::of(&value));
             compare(db, krate, item, "what was read of it", written, stored);
         }
@@ -503,13 +514,13 @@ fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -
 
 /// Records a difference between `written`, the record of `what` of `item`, and `record`, the
 /// image's.
-fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Vec<u8>>, record: &[u8]) {
+fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Portable>, record: &[u8]) {
     match written {
-        Ok(written) if written == record => {}
+        Ok(written) if written.as_bytes() == record => {}
         Ok(written) => {
             // alloc: a difference, which is a bug.
             let what = format!("{what}, of {item:?}");
-            frozen::record_difference(db, krate, "signatures", &what, &written, record);
+            frozen::record_difference(db, krate, "signatures", &what, written.as_bytes(), record);
         }
         Err(why) => {
             // alloc: a difference, which is a bug.
@@ -522,11 +533,16 @@ fn compare(db: &Db, krate: Crate, item: Item, what: &str, written: R<Vec<u8>>, r
 macro_rules! served {
     ($($(#[$doc:meta])* $name:ident($id:ty) -> $sig:ident as $code:ident;)*) => {$(
         $(#[$doc])*
-        pub(crate) fn $name(db: &Db, id: $id) -> Option<Arc<$sig>> {
+        ///
+        /// Called inside the `served` query of the signature: the value is kept in that
+        /// query's arena and dropped with it ([`blaze_memo::keep_owned`]: a decoded signature
+        /// owns its expression store).
+        pub(crate) fn $name(db: &Db, id: $id) -> Option<&$sig> {
             let item = Item::$code(id);
-            served::<codes::$code>(db, item, |krate| {
+            let value = served::<codes::$code>(db, item, |krate| {
                 record::<codes::$code>(db, krate, item.what(), &$sig::lower_alone(db, id))
-            })
+            })?;
+            Some(blaze_memo::keep_owned(blaze_memo::Database::memo(db), value))
         }
     )*};
 }

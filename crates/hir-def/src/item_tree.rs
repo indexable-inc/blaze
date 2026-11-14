@@ -225,7 +225,7 @@ pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
 /// lowers only the items it touches, and one that touches none returns the last tree itself;
 /// a macro file's is lowered whole, as each expansion is made anew. The tree is behind an
 /// `Arc` so the last one is kept beside the query database without a copy.
-#[blaze_query::tracked(returns(deref))]
+#[blaze_memo::tracked(returns(deref), owns)]
 fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTree> {
     let _p = crate::span_names::of_file(
         db,
@@ -381,7 +381,7 @@ pub fn extern_crate_item(db: &Db, id: crate::ExternCrateId) -> ExternCrateItem<'
     }
 }
 
-#[blaze_query::tracked(returns(ref))]
+#[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
@@ -729,7 +729,7 @@ pub(crate) enum SpanItem<'a> {
 pub(crate) type ItemTreeAstId<T: ItemTreeNode> = FileAstId<T::Source>;
 
 /// Identifies a particular [`ItemTree`].
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, blaze_memo::Home)]
 pub struct TreeId {
     file: HirFileId,
     block: Option<BlockId>,
@@ -763,6 +763,13 @@ blaze_format::record! {
     pub struct ModItemId: 1 {
         index: u32,
     }
+}
+
+/// An index into one tree's columns: it names no arena (the tree's id, beside it in a key,
+/// does).
+impl blaze_memo::Home for ModItemId {
+    #[inline]
+    fn home(&self, _: &mut blaze_memo::Homes<'_>) {}
 }
 
 impl ModItemId {

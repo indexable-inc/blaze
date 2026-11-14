@@ -5,12 +5,13 @@
 //! - [`Snapshot`]: one request's view of the tree and the store. Every proof carries its
 //!   lifetime `'s`, which [`scope`] makes generative (the closure is universal over `'s`), so a
 //!   proof never outlives its request and never mixes with another request's.
-//! - [`Holds<K>`]: a record of kind `K` under its key is valid in this snapshot. Made only by
-//!   [`hit`] (an equal key: the head checked against the key asked), by
-//!   [`Candidate::verify`] (a read list whose every digest is the current one), by a parent's
-//!   proof ([`Hit::named`]: a held unit manifest settles every record it names, with no lookup
-//!   each), or by an outside lookup's hit by address after its answers
-//!   ([`crate::outside::Lookup`]).
+//! - [`Holds<K>`]: a record of kind `K` filed at its key is valid in this snapshot. Made only by
+//!   [`hit`]: the head checked against the key it was asked by. A read-addressed record is asked
+//!   by its address, which names the answers its work saw, and those answers are this
+//!   snapshot's (the driver answered the shape before it asked), so the one check is the same
+//!   check; an outside value is asked by its address after its answers
+//!   ([`crate::outside::Lookup`]); a record a mark names is held by the mark's proof
+//!   ([`Holds::named_by`]): no lookup each.
 //! - [`Certified`]: the request's certificate held; nothing below it is checked. Made only from a
 //!   [`Holds`] of the certificate.
 //! - Bytes: the store's proof that a segment was checked once is its own type, bound by
@@ -24,13 +25,13 @@
 
 #![blaze::sans_io]
 
-use core::{fmt, marker::PhantomData, slice};
+use core::{fmt, marker::PhantomData};
 
 use blaze_ids::ContentId;
 
 use crate::{
-    kind::{Certificate, Key, Kind, Tag, UnitManifest},
-    record::{self, Entry, Fact, HasPayload, Headed, RecordError, StableId},
+    kind::{Certificate, Key, Kind, Mark, Tag},
+    record::{self, HasPayload, Headed, RecordError},
 };
 
 /// Invariant in `'s`: two snapshots' brands never unify.
@@ -58,21 +59,27 @@ pub fn scope<R>(f: impl for<'s> FnOnce(Snapshot<'s>) -> R) -> R {
 /// it; `rechecks` must be zero (the simulation's oracle holds the driver to it).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Checks {
-    /// Reads by key, of the memo or the store: a manifest, a record, an old record, a shape slot
-    /// or an address.
+    /// Reads by key or address, of the memo or the store: a mark, a manifest root, a chunk, a
+    /// shape node, a record's address, a certificate slot.
     pub key_lookups: u32,
-    /// Read lists compared against the facts now ([`Candidate::verify`], an outside shape's
-    /// answers).
+    /// Lists of asks answered now: a dictionary's rows, a candidate shape, an outside shape.
     pub read_lists: u32,
-    /// Facts compared in those lists, up to the first that differs.
+    /// Facts answered in those lists.
     pub facts_compared: u32,
     /// Tasks run to make a record.
     pub records_run: u32,
-    /// Checks of an item already proved in this snapshot: a bug, always zero.
+    /// Checks of an item already settled in this snapshot: a bug, always zero.
     pub rechecks: u32,
+    /// Shape nodes another run filed first ([`crate::store::Put::Other`] on a node): a hint
+    /// lost, never a failure.
+    pub shape_races: u32,
+    /// Shape walks that reached [`crate::driver::WALK_MOST`] nodes and ran the work instead.
+    pub walks_capped: u32,
+    /// Hits redone under [`crate::memo::Audit`], their bytes compared.
+    pub audits: u32,
 }
 
-/// A record of kind `K` under `key()` is valid in snapshot `'s`.
+/// A record of kind `K` filed at `key()` is valid in snapshot `'s`.
 pub struct Holds<'s, K> {
     key: Key<K>,
     brand: Brand<'s>,
@@ -113,6 +120,15 @@ impl<'s> Holds<'s, Certificate> {
     }
 }
 
+impl<'s, K: Kind> Holds<'s, K> {
+    /// The record at `key` a held mark names (its manifest root, its surface): the mark was
+    /// filed after every record it names, so they are in the store, and the mark's key covers
+    /// every input of them. No lookup each.
+    pub fn named_by(mark: &Holds<'s, Mark>, key: Key<K>) -> Holds<'s, K> {
+        Holds { key, brand: mark.brand }
+    }
+}
+
 /// A proof whose kind is a value: what a driver keeps per item of a unit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AnyHolds<'s> {
@@ -148,7 +164,7 @@ pub struct Certified<'s> {
     brand: Brand<'s>,
 }
 
-/// A record found under the key asked, its head checked: the proof with the bytes it is of.
+/// A record found at the key asked, its head checked: the proof with the bytes it is of.
 pub struct Hit<'s, 'b, K: Kind> {
     holds: Holds<'s, K>,
     root: &'b K::Root,
@@ -188,8 +204,8 @@ where
 
 /// The payload of `record`, the bytes the store holds under `holds`'s key, by the proof: the one
 /// reader of an [`Opaque`](crate::record::Opaque) or [`Traced`](crate::record::Traced) record's
-/// payload for code that holds a proof but not the [`Hit`] that made it (a manifest's named
-/// record, an outside value found by address, an action's input).
+/// payload for code that holds a proof but not the [`Hit`] that made it (a record a mark names,
+/// an outside value found by address, an action's input).
 ///
 /// No head is compared and nothing is verified: the proof was made by the record's one check,
 /// and a key's bytes never change in the store. What runs is the format's bounds on the buffer,
@@ -206,87 +222,4 @@ where
         holds.key().id()
     );
     root.payload().follow(record).map_err(RecordError::Format)
-}
-
-impl<'s, 'b> Hit<'s, 'b, UnitManifest> {
-    /// Every record the held manifest names, each with its proof: no lookup each (a manifest is
-    /// filed after every record it names, so they are in the store).
-    pub fn named(&self) -> Result<Named<'s, 'b>, RecordError> {
-        let entries = self.root.entries.follow(self.bytes).map_err(RecordError::Format)?;
-        Ok(Named { entries: entries.iter(), brand: self.holds.brand })
-    }
-}
-
-/// The records a held manifest names, in its order.
-pub struct Named<'s, 'b> {
-    entries: slice::Iter<'b, Entry>,
-    brand: Brand<'s>,
-}
-
-impl<'s> Iterator for Named<'s, '_> {
-    type Item = (StableId, AnyHolds<'s>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.entries.next()?;
-        Some((StableId(entry.item), AnyHolds { tag: Tag(entry.tag), key: entry.key, brand: self.brand }))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.entries.size_hint()
-    }
-}
-
-/// The record the last manifest names for an item whose key moved: valid under the new key if
-/// its read list still holds. Consumed by its one check.
-#[derive(Debug)]
-pub struct Candidate<'s> {
-    tag: Tag,
-    new: ContentId,
-    brand: Brand<'s>,
-}
-
-/// `bytes`, the record filed under `old`, as a candidate for `new`: its head checked against
-/// `old`.
-pub fn candidate<'s, K: Kind>(snap: Snapshot<'s>, new: Key<K>, old: Key<K>, bytes: &[u8]) -> Result<Candidate<'s>, RecordError> {
-    record::open::<K>(bytes, &old)?;
-    Ok(Candidate { tag: K::TAG, new: new.id(), brand: snap.brand })
-}
-
-/// What a candidate's one check gives.
-#[derive(Debug)]
-pub enum Verdict<'s> {
-    /// Every read is the current fact: the record holds under the new key (the caller files it
-    /// there re-headed, so the next request hits by key).
-    Holds(AnyHolds<'s>),
-    /// Read `at` differs or is gone: the work is redone.
-    Redo { at: u32 },
-}
-
-/// The host answered a check with another number of facts than it was asked.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Misanswered {
-    pub asked: u32,
-    pub answered: u32,
-}
-
-impl<'s> Candidate<'s> {
-    pub fn tag(&self) -> Tag {
-        self.tag
-    }
-
-    /// The one read-list check: `reads` is the candidate record's read list and `now[i]` the
-    /// current digest of `reads[i]`'s fact (`None`: gone). Compares up to the first difference.
-    pub fn verify(self, reads: &[Fact], now: &[Option<ContentId>], checks: &mut Checks) -> Result<Verdict<'s>, Misanswered> {
-        if reads.len() != now.len() {
-            return Err(Misanswered { asked: reads.len() as u32, answered: now.len() as u32 });
-        }
-        checks.read_lists += 1;
-        for (at, (read, now)) in reads.iter().zip(now).enumerate() {
-            checks.facts_compared += 1;
-            if *now != Some(read.digest) {
-                return Ok(Verdict::Redo { at: at as u32 });
-            }
-        }
-        Ok(Verdict::Holds(AnyHolds { tag: self.tag, key: self.new, brand: self.brand }))
-    }
 }

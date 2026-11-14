@@ -225,7 +225,7 @@ pub fn check(
         [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
     let _span = tracing::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
     let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops)
-        .map_err(|it| blaze_query::db::attach(db, || format!("{it:?}")))?; // alloc: error path
+        .map_err(|it| blaze_memo::attach(db, || format!("{it:?}")))?; // alloc: error path
     Ok(crate::borrowck_rewritten(db, def, &body, mode))
 }
 

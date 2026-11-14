@@ -3,7 +3,14 @@
 //! an answer is found while its facts hold and refused when one or the solver changed, a goal
 //! with a read that is no fact is never stored, and a lookup with no store allocates nothing.
 
-use std::{collections::BTreeSet, marker::PhantomData, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+};
 
 use base_db::{Crate, Db, Env, all_crates};
 use blaze_alloc_count::assert_at_most;
@@ -11,8 +18,8 @@ use blaze_core::lock::Lock;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
+use blaze_memo::{Gid, Id as _};
 use blaze_query::QueryKind;
-use blaze_query::db::{Durability, Setter};
 use hir_def::{
     FunctionId, GenericDefId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
@@ -37,6 +44,7 @@ use crate::{
         AdtDef, Binder, ClauseKind, Clauses, DbInterner, ParamEnv, Pattern, PatternKind, Predicate,
         PredicateKind, SolverDefId, Ty, TyKind, TypingMode,
         global_goals::GoalKey,
+        interner::{Reads, recorded, replay},
         persist::{self, Code, Node, Sink, Source},
     },
 };
@@ -105,21 +113,74 @@ const CRATE: ContentId = ContentId([5; 32]);
 const KNOB: FactRef =
     FactRef { kind: QueryKind(0x1000), subject: ContentId([3; 32]), object: FactObject::None };
 
-/// A stand-in for what a goal's evaluation reads: `value` is its fact; `holds`, the answer, is
-/// read outside the capture, as a read the facts would miss.
-#[blaze_query::input]
-struct Knob {
-    #[returns(copy)]
-    value: u32,
-    #[returns(copy)]
-    holds: bool,
-    #[returns(copy)]
+/// A stand-in for what a goal's evaluation reads: `value` is its fact, listed with
+/// `blaze_memo::read` (a read the memo does not see, as a record read from the store is) under
+/// the knob's own fact id; `holds`, the answer, lists nothing, as a read the facts would miss.
+/// Set between lookups as the driver would make the next snapshot with the fact's new digest:
+/// nothing memoized reads a knob, so no snapshot is needed to see the new value.
+#[derive(Clone)]
+struct Knob(Arc<KnobState>);
+
+struct KnobState {
+    fact: ContentId,
+    value: AtomicU32,
+    holds: AtomicBool,
     krate: Crate,
 }
 
+/// The number of the next knob, for its fact id: no two knobs of a process share one.
+static KNOB_IDS: AtomicU64 = AtomicU64::new(0);
+
+impl Knob {
+    fn new(value: u32, holds: bool, krate: Crate) -> Knob {
+        let n = KNOB_IDS.fetch_add(1, Ordering::Relaxed);
+        Knob(Arc::new_in(
+            KnobState {
+                fact: ContentId::of("blaze v2 goal test knob id", &n.to_le_bytes()),
+                value: AtomicU32::new(value),
+                holds: AtomicBool::new(holds),
+                krate,
+            },
+            Global,
+        ))
+    }
+
+    fn value(&self, db: &Db) -> u32 {
+        let value = self.0.value.load(Ordering::Relaxed);
+        let digest = ContentId::of("blaze v2 goal test knob", &value.to_le_bytes());
+        blaze_memo::read(
+            blaze_memo::Database::memo(db),
+            blaze_memo::Fact { id: self.0.fact, digest },
+        );
+        value
+    }
+
+    fn holds(&self) -> bool {
+        self.0.holds.load(Ordering::Relaxed)
+    }
+
+    fn krate(&self) -> Crate {
+        self.0.krate
+    }
+
+    fn set_value(&self, value: u32) {
+        self.0.value.store(value, Ordering::Relaxed);
+    }
+
+    fn set_holds(&self, holds: bool) {
+        self.0.holds.store(holds, Ordering::Relaxed);
+    }
+
+    /// The knob's fact id: what a read list names it by.
+    fn fact(&self) -> ContentId {
+        self.0.fact
+    }
+}
+
+/// A database of `fixture` whose queries keep read lists: every offer here is made with what
+/// [`recorded`] read, which answers only where reads are kept (`blaze_memo::Reads::Kept`).
 fn db_of(fixture: &str) -> Db {
-    let db = fixture::db(fixture).into_db();
-    db
+    fixture::db_with_reads(fixture).into_db()
 }
 
 fn local_crate(db: &Db) -> Crate {
@@ -181,7 +242,7 @@ impl ImageStore for Memory {
 /// so [`Back`] can read a stable form back; every read but an interned one is [`KNOB`] (or none,
 /// when not `expressible`).
 struct TestFacts {
-    defs: Lock<HashMap<ContentId, Vec<u32>, Global>>,
+    defs: Lock<HashMap<ContentId, DefWords, Global>>,
     knob: Knob,
     expressible: bool,
     names: Lock<Vec<&'static str>>,
@@ -200,11 +261,17 @@ impl TestFacts {
 
 impl GoalFacts for TestFacts {
     fn def_key<'db>(&self, _: &'db Db, def: SolverDefId<'db>) -> ContentId {
-        let mut words = RawWords(Vec::new());
+        let mut words = RawWords::default();
         persist::put_def(&mut words, def);
-        let bytes: Vec<u8> = words.0.iter().flat_map(|word| word.to_le_bytes()).collect();
+        // The key names the ids by their parts, in this process alone: a test's keys are
+        // never kept.
+        let id_words = words.ids.iter().flat_map(|gid| {
+            [gid.arena().index(), gid.arena().generation(), gid.local()]
+        });
+        let bytes: Vec<u8> =
+            words.words.iter().copied().chain(id_words).flat_map(u32::to_le_bytes).collect();
         let key = ContentId::of("blaze v2 goal test def", &bytes);
-        self.defs.lock().insert(key, words.0);
+        self.defs.lock().insert(key, (words.words, words.ids));
         key
     }
 
@@ -216,11 +283,11 @@ impl GoalFacts for TestFacts {
         &self,
         _: &Db,
         _: Option<Crate>,
-        _: blaze_query::db::DatabaseKeyIndex,
-        name: &'static str,
-    ) -> Option<FactRef> {
-        self.names.lock().push(name);
-        self.expressible.then_some(KNOB)
+        _: blaze_memo::Read,
+    ) -> Result<FactRef, &'static str> {
+        const NAME: &str = "Knob::value";
+        self.names.lock().push(NAME);
+        if self.expressible { Ok(KNOB) } else { Err(NAME) }
     }
 
     fn value(&self, db: &Db, _: Option<Crate>, fact: FactRef) -> Option<ContentId> {
@@ -230,11 +297,25 @@ impl GoalFacts for TestFacts {
 }
 
 /// `persist`'s words of a definition.
-struct RawWords(Vec<u32>);
+/// A definition's words and the ids they name, an id written as its place in `ids` (an id's
+/// bits mean nothing past its snapshot, so no word holds one).
+type DefWords = (Vec<u32>, Vec<Gid>);
+
+/// `persist`'s words of a definition, its ids by their places in `ids`.
+#[derive(Default)]
+struct RawWords {
+    words: Vec<u32>,
+    ids: Vec<Gid>,
+}
 
 impl<'db> Sink<'db> for RawWords {
     fn word(&mut self, word: u32) {
-        self.0.push(word);
+        self.words.push(word);
+    }
+
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        self.words.push(u32::try_from(self.ids.len()).expect("a definition names few ids"));
+        self.ids.push(id.gid());
     }
 
     fn node<N: Node<'db>>(&mut self, _: N) {
@@ -248,6 +329,7 @@ impl<'db> Sink<'db> for RawWords {
 
 struct RawSource<'a> {
     words: &'a [u32],
+    ids: &'a [Gid],
 }
 
 impl<'db> Source<'db> for RawSource<'_> {
@@ -257,6 +339,11 @@ impl<'db> Source<'db> for RawSource<'_> {
         let (&word, rest) = self.words.split_first().ok_or("a definition cut short")?;
         self.words = rest;
         Ok(word)
+    }
+
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, &'static str> {
+        let at = self.word()? as usize;
+        self.ids.get(at).map(|&gid| T::from_gid(gid)).ok_or("an id past the definition's ids")
     }
 
     fn node<N: Node<'db>>(&mut self) -> Result<N, &'static str> {
@@ -283,7 +370,7 @@ impl<'db> Source<'db> for RawSource<'_> {
 /// A stable form, read back: children inline, definitions by the keys [`TestFacts`] made.
 struct Back<'a, 'db> {
     words: &'a [u32],
-    defs: &'a HashMap<ContentId, Vec<u32>, Global>,
+    defs: &'a HashMap<ContentId, DefWords, Global>,
     db: PhantomData<&'db ()>,
 }
 
@@ -298,6 +385,10 @@ impl<'db> Source<'db> for Back<'_, 'db> {
 
     fn node<N: Node<'db>>(&mut self) -> Result<N, &'static str> {
         N::get_node(self)
+    }
+
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, &'static str> {
+        Err("an id in a stable form, which names definitions by their keys")
     }
 
     fn adt(&mut self) -> Result<AdtDef, &'static str> {
@@ -330,18 +421,18 @@ impl<'db> Source<'db> for Back<'_, 'db> {
         for at in 0..8 {
             key[4 * at..4 * at + 4].copy_from_slice(&self.word()?.to_le_bytes());
         }
-        let words = self.defs.get(&ContentId(key)).ok_or("a definition no key names")?;
+        let (words, ids) = self.defs.get(&ContentId(key)).ok_or("a definition no key names")?;
         if words.first() != Some(&variant) {
             return Err("a definition of another variant than its key's");
         }
-        persist::get_def(&mut RawSource { words })
+        persist::get_def(&mut RawSource { words, ids })
     }
 }
 
 /// The head words, predicate and clauses of the stable form `words`.
 fn decode<'db>(
     words: &[u32],
-    defs: &HashMap<ContentId, Vec<u32>, Global>,
+    defs: &HashMap<ContentId, DefWords, Global>,
 ) -> Result<([u32; 3], Predicate<'db>, Clauses<'db>), &'static str> {
     let mut back = Back { words, defs, db: PhantomData };
     let head = [back.word()?, back.word()?, back.word()?];
@@ -456,7 +547,7 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
     let interner = DbInterner::new_with(&db, krate);
-    let facts = TestFacts::new(Knob::new(&db, Durability::LOW, 1, true, krate), true);
+    let facts = TestFacts::new(Knob::new(1, true, krate), true);
     let functions = functions(&db, krate);
     let tys = fixture_types(&db, interner, &functions);
 
@@ -554,12 +645,11 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
 }
 
 /// Offers [`the_goal`] with the reads of reading the knob's value, answered by `holds`.
-#[blaze_query::tracked(returns(copy))]
-fn offered(db: &Db, knob: Knob) -> u32 {
-    let interner = DbInterner::new_with(db, knob.krate(db));
-    let answer = if knob.holds(db) { Answer::Holds } else { Answer::Fails };
-    let (value, reads) = blaze_query::db::capture_reads(db, || knob.value(db));
-    offer_goal(interner, the_goal(interner), answer, reads.expect("an input's read is shareable"));
+fn offered(db: &Db, knob: &Knob) -> u32 {
+    let interner = DbInterner::new_with(db, knob.krate());
+    let answer = if knob.holds() { Answer::Holds } else { Answer::Fails };
+    let (value, reads) = recorded(db, || knob.value(db));
+    offer_goal(interner, the_goal(interner), answer, reads.expect("the fixture keeps read lists"));
     value
 }
 
@@ -570,11 +660,11 @@ fn looked_up(db: &Db, krate: Crate) -> Option<Answer> {
 
 #[test]
 fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
-    let mut db = db_of(FIXTURE);
+    let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let knob = Knob::new(1, true, krate);
     let memory = Arc::new(Memory::default());
-    let facts = Arc::new(TestFacts::new(knob, true));
+    let facts = Arc::new(TestFacts::new(knob.clone(), true));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
     assert_eq!(looked_up(&db, krate), None, "nothing stored yet");
     // What the lookups since the last flush came to (`Flushed::lookups`): each `looked_up`
@@ -582,7 +672,7 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     let counted =
         |lookups, hits, lists, reads| blaze_record::Counts { lookups, hits, lists, reads };
 
-    assert_eq!(offered(&db, knob), 1);
+    assert_eq!(offered(&db, &knob), 1);
     assert_eq!(memory.len(), 0, "an offer writes nothing until the flush");
     let flushed = installed.flush().unwrap();
     // The miss above: no shape to read yet.
@@ -597,9 +687,9 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
         "a flush writes each offer once"
     );
 
-    knob.set_value(&mut db).to(2);
+    knob.set_value(2);
     assert_eq!(looked_up(&db, krate), None, "a fact it read hashes otherwise");
-    assert_eq!(offered(&db, knob), 2);
+    assert_eq!(offered(&db, &knob), 2);
     // That miss read the shape and valued its fact, and found no answer under the value.
     assert_eq!(
         installed.flush().unwrap(),
@@ -607,7 +697,7 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
     );
     assert_eq!(memory.len(), 3, "the same shape, a second answer");
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
-    knob.set_value(&mut db).to(1);
+    knob.set_value(1);
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds), "the first answer, by content");
 
     drop(installed);
@@ -625,16 +715,16 @@ fn an_answer_is_found_while_its_facts_hash_the_same_and_its_solver_matches() {
 /// is not the flush's error, which would lose every other goal the build offered.
 #[test]
 fn two_answers_under_the_same_facts_are_named_by_the_flush() {
-    let mut db = db_of(FIXTURE);
+    let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let knob = Knob::new(1, true, krate);
     let memory = Arc::new(Memory::default());
     let installed =
-        install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
-    offered(&db, knob);
+        install(&db, memory.clone(), Arc::new(TestFacts::new(knob.clone(), true)), BUILD).unwrap();
+    offered(&db, &knob);
     installed.flush().unwrap();
-    knob.set_holds(&mut db).to(false);
-    offered(&db, knob);
+    knob.set_holds(false);
+    offered(&db, &knob);
     let flushed = installed.flush().expect("a goal's refusal stops no flush");
     assert_eq!((flushed.written, flushed.failed), (0, 1), "{flushed:?}");
     let why = flushed.failure.expect("the answer depends on a read the facts miss");
@@ -645,11 +735,11 @@ fn two_answers_under_the_same_facts_are_named_by_the_flush() {
 fn a_goal_with_a_read_that_is_no_fact_is_never_stored() {
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let knob = Knob::new(1, true, krate);
     let memory = Arc::new(Memory::default());
-    let facts = Arc::new(TestFacts::new(knob, false));
+    let facts = Arc::new(TestFacts::new(knob.clone(), false));
     let installed = install(&db, memory.clone(), facts.clone(), BUILD).unwrap();
-    offered(&db, knob);
+    offered(&db, &knob);
     let flushed = installed.flush().unwrap();
     let names = facts.names.lock().clone();
     assert_eq!(names.len(), 1, "one read asked about: {names:?}");
@@ -663,27 +753,28 @@ fn a_database_finds_only_its_own_store() {
     let db = db_of(FIXTURE);
     let other = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let knob = Knob::new(1, true, krate);
     let memory = Arc::new(Memory::default());
     let installed =
-        install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).unwrap();
-    assert!(install(&db, memory.clone(), Arc::new(TestFacts::new(knob, true)), BUILD).is_err());
-    offered(&db, knob);
+        install(&db, memory.clone(), Arc::new(TestFacts::new(knob.clone(), true)), BUILD).unwrap();
+    assert!(
+        install(&db, memory.clone(), Arc::new(TestFacts::new(knob.clone(), true)), BUILD).is_err()
+    );
+    offered(&db, &knob);
     installed.flush().unwrap();
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
     assert_eq!(looked_up(&other, local_crate(&other)), None);
 }
 
 /// Offers [`the_goal`] under [`assert_at_most`]: with no store, nothing is allocated.
-#[blaze_query::tracked(returns(copy))]
-fn offered_with_no_store(db: &Db, knob: Knob) -> u32 {
-    let interner = DbInterner::new_with(db, knob.krate(db));
+fn offered_with_no_store(db: &Db, knob: &Knob) -> u32 {
+    let interner = DbInterner::new_with(db, knob.krate());
     let goal = the_goal(interner);
     let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis)
         .expect("a global goal");
-    let (value, reads) = blaze_query::db::capture_reads(db, || knob.value(db));
-    let reads = reads.expect("an input's read is shareable");
-    offer(interner, key, Answer::Holds, reads);
+    let (value, reads) = recorded(db, || knob.value(db));
+    let reads = reads.expect("the fixture keeps read lists");
+    offer(interner, key, Answer::Holds, reads.clone());
     assert_at_most(0, "a goal-store offer with no store installed", || {
         offer(interner, key, Answer::Holds, reads)
     });
@@ -706,7 +797,7 @@ fn a_lookup_or_offer_with_no_store_allocates_nothing() {
         assert_at_most(0, "a goal-store lookup with no store installed", || lookup(interner, key))
             .is_none()
     );
-    offered_with_no_store(&db, Knob::new(&db, Durability::LOW, 1, true, krate));
+    offered_with_no_store(&db, &Knob::new(1, true, krate));
 }
 
 /// Rule 21, the solver's code: an edit of the vendored solver's source is another front-end
@@ -725,11 +816,11 @@ fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
 
     let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let knob = Knob::new(&db, Durability::LOW, 1, true, krate);
+    let knob = Knob::new(1, true, krate);
     let memory = Arc::new(Memory::default());
-    let facts = Arc::new(TestFacts::new(knob, true));
+    let facts = Arc::new(TestFacts::new(knob.clone(), true));
     let kept = install(&db, memory.clone(), facts.clone(), before).unwrap();
-    offered(&db, knob);
+    offered(&db, &knob);
     assert_eq!(kept.flush().unwrap(), Flushed { written: 1, ..Flushed::default() });
     assert_eq!(looked_up(&db, krate), Some(Answer::Holds));
     drop(kept);
@@ -748,68 +839,65 @@ fn a_solver_source_edit_changes_the_identity_and_misses_the_goal_store() {
 thread_local! {
     /// The goal table of [`body`]'s crate: the goal's answer (the goal knob's value) and the
     /// reads of solving it, for the next body to replay.
-    static TABLE: std::cell::Cell<Option<(u32, blaze_query::db::Reads)>> =
-        const { std::cell::Cell::new(None) };
+    static TABLE: std::cell::RefCell<Option<(u32, Reads)>> =
+        const { std::cell::RefCell::new(None) };
     /// The knob the goal's evaluation reads, the facts' knob (what the store's bookkeeping
     /// reads: [`TestFacts::value`]) and each body's own, by name.
     static KNOBS: std::cell::RefCell<Vec<(Knob, &'static str)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// Each body's trace by its own knob's name: its capture's reads, by knob name and field.
+    /// Each body's trace by its own knob's name: its recorder's read list, by knob name,
+    /// sorted (a read list is in fact order, and a knob's fact id is a process counter's).
     static TRACES: std::cell::RefCell<Vec<(&'static str, Vec<String>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// `knob`'s name in [`KNOBS`].
-fn knob_name(knob: Knob) -> &'static str {
+/// The name in [`KNOBS`] of the knob whose fact id is `fact`.
+fn knob_named(fact: ContentId) -> Option<&'static str> {
     KNOBS.with_borrow(|knobs| {
-        knobs.iter().find(|(it, _)| *it == knob).map(|(_, name)| *name).expect("a test knob")
+        knobs.iter().find(|(it, _)| it.fact() == fact).map(|(_, name)| *name)
     })
 }
 
 /// A body's step as `global_goals::evaluate_root_goal` runs a goal in it, under the step's
-/// capture (`body_store::capture`): the goal from the table, replayed; else looked up in the
-/// store (a miss: its one shape's fact has another value) and solved under a capture of its
+/// recorder (`body_store::capture`): the goal from the table, replayed; else looked up in the
+/// store (a miss: its one shape's fact has another value) and solved under a recorder of its
 /// own (the goal knob's value), put in the table and offered. Then the body's own read.
-#[blaze_query::tracked(returns(copy))]
-fn body(db: &Db, own: Knob) -> u32 {
-    let interner = DbInterner::new_with(db, own.krate(db));
-    let goal = KNOBS.with_borrow(|knobs| knobs[0].0);
-    let (value, reads) = blaze_query::db::capture_reads(db, || {
-        let answer = match TABLE.get() {
+fn body(db: &Db, own: &Knob) -> u32 {
+    let interner = DbInterner::new_with(db, own.krate());
+    let goal = KNOBS.with_borrow(|knobs| knobs[0].0.clone());
+    let (value, reads) = recorded(db, || {
+        let answer = match TABLE.with_borrow(Clone::clone) {
             Some((answer, reads)) => {
-                blaze_query::db::replay_reads(db, reads);
+                replay(db, &reads);
                 answer
             }
             None => {
                 let found = lookup_goal(interner, the_goal(interner));
                 assert!(found.is_none(), "the store holds the goal under another fact value");
-                let (answer, reads) = blaze_query::db::capture_reads(db, || goal.value(db));
-                let reads = reads.expect("an input's read is shareable");
-                TABLE.set(Some((answer, reads)));
+                let (answer, reads) = recorded(db, || goal.value(db));
+                let reads = reads.expect("the fixture keeps read lists");
+                TABLE.set(Some((answer, reads.clone())));
                 offer_goal(interner, the_goal(interner), Answer::Holds, reads);
                 answer
             }
         };
         answer + own.value(db)
     });
-    let reads = reads.expect("plain reads are shareable");
-    let mut trace = Vec::new();
-    let storage = blaze_query::db::Database::storage(db);
-    let _: Option<()> = reads.for_each_read(storage, |read| {
-        let knob = KNOBS.with_borrow(|knobs| {
-            knobs
-                .iter()
-                .find(|(it, _)| blaze_query::db::AsId::as_id(it) == read.key.key_index())
-                .map(|(it, _)| *it)
-        });
-        // alloc: test
+    let reads = reads.expect("the fixture keeps read lists");
+    let mut trace = Vec::new_in(Global);
+    for read in reads.rows() {
+        let knob = match *read {
+            blaze_memo::Read::Input { fact, .. } => knob_named(fact.id),
+            blaze_memo::Read::Query { .. } => None,
+        };
         trace.push(match knob {
-            Some(knob) => format!("{}.{:?}", knob_name(knob), read.kind),
-            None => format!("{}({:?})", storage.read_name(read.key, read.kind), read.kind),
+            Some(name) => String::from(name),
+            None => format!("{read:?}"),
         });
-        std::ops::ControlFlow::Continue(())
-    });
-    TRACES.with_borrow_mut(|traces| traces.push((knob_name(own), trace)));
+    }
+    trace.sort();
+    let own = knob_named(own.fact()).expect("a test knob");
+    TRACES.with_borrow_mut(|traces| traces.push((own, trace)));
     value
 }
 
@@ -818,29 +906,29 @@ fn body(db: &Db, own: Knob) -> u32 {
 /// value of its fact: so each body that runs the goal first looks it up and misses, reading
 /// that fact's value, then solves and offers it.
 fn traces_in(order: &[usize]) -> Vec<(&'static str, Vec<String>)> {
-    let mut db = db_of(FIXTURE);
+    let db = db_of(FIXTURE);
     let krate = local_crate(&db);
-    let goal = Knob::new(&db, Durability::LOW, 1, true, krate);
-    let facts_knob = Knob::new(&db, Durability::LOW, 1, true, krate);
-    let own: Vec<Knob> =
-        (0..3u32).map(|n| Knob::new(&db, Durability::LOW, 10 * (n + 1), true, krate)).collect();
+    let goal = Knob::new(1, true, krate);
+    let facts_knob = Knob::new(1, true, krate);
+    let own = [Knob::new(10, true, krate), Knob::new(20, true, krate), Knob::new(30, true, krate)];
     KNOBS.set(vec![
         (goal, "goal"),
-        (facts_knob, "facts"),
-        (own[0], "one"),
-        (own[1], "two"),
-        (own[2], "three"),
+        (facts_knob.clone(), "facts"),
+        (own[0].clone(), "one"),
+        (own[1].clone(), "two"),
+        (own[2].clone(), "three"),
     ]);
     TABLE.set(None);
     TRACES.with_borrow_mut(Vec::clear);
     let memory = Arc::new(Memory::default());
     let installed =
-        install(&db, memory.clone(), Arc::new(TestFacts::new(facts_knob, true)), BUILD).unwrap();
-    assert_eq!(offered(&db, facts_knob), 1);
+        install(&db, memory.clone(), Arc::new(TestFacts::new(facts_knob.clone(), true)), BUILD)
+            .unwrap();
+    assert_eq!(offered(&db, &facts_knob), 1);
     installed.flush().unwrap();
-    facts_knob.set_value(&mut db).to(2);
+    facts_knob.set_value(2);
     for &at in order {
-        assert_eq!(body(&db, own[at]), 1 + 10 * (at as u32 + 1));
+        assert_eq!(body(&db, &own[at]), 1 + 10 * (at as u32 + 1));
     }
     installed.flush().unwrap();
     let mut traces = TRACES.with_borrow_mut(std::mem::take);
@@ -858,10 +946,7 @@ fn traces_in(order: &[usize]) -> Vec<(&'static str, Vec<String>)> {
 #[test]
 fn a_body_s_trace_is_the_same_whichever_body_solved_the_goal_first() {
     let orders: [&[usize]; 3] = [&[0, 1, 2], &[2, 1, 0], &[1, 2, 0]];
-    // alloc: test
-    let want = |own: &'static str| {
-        (own, vec![String::from("goal.InputField(0)"), format!("{own}.InputField(0)")])
-    };
+    let want = |own: &'static str| (own, vec![String::from("goal"), String::from(own)]);
     let first = traces_in(orders[0]);
     assert_eq!(first, vec![want("one"), want("three"), want("two")]);
     for order in &orders[1..] {

@@ -1053,7 +1053,7 @@ fn validation(db: &Db, krate: &str, name: &str, pass: Pass) -> String {
     let func = function(db, krate, name);
     let (_, pass_name, spec) =
         SPECIFIED.iter().find(|it| it.0 == pass).expect("a pass with a specification");
-    let (before, after) = blaze_query::db::attach(db, || {
+    let (before, after) = blaze_memo::attach(db, || {
         let def = DefWithBodyId::FunctionId(func);
         let before = match db.runtime_mir_body(def.into()) {
             Ok(body) => body.clone(),
@@ -1117,7 +1117,7 @@ fn the_passes_are_their_lean_specifications() {
 /// What blaze's MIR evaluator says of the nullary function `func`, in the fixed form of
 /// `lean/Blaze/Mir/Runner.lean`: `ok <value>`, `panic <kind>`, `undefined`, or `error ..`.
 fn evaluated(db: &Db, func: FunctionId, returns: &str) -> String {
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         // The body the evaluator runs: runtime MIR, as `tests/layout/field_order.rs` asks for it.
         let env = hir_ty::traits::ParamEnvAndCrate {
             param_env: db.trait_environment(func.into()),

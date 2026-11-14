@@ -82,8 +82,8 @@ pub trait Kept: Send + Sync + 'static {
 }
 
 /// Where this database's macro definitions are kept, set by `entries::set` with the entry
-/// store. One value a database.
-#[blaze_query::input(singleton, debug)]
+/// store, in the session arena while the driver builds a snapshot. One value a database.
+#[blaze_memo::input(singleton, debug)]
 pub struct KeptDefs {
     #[returns(ref)]
     pub held: Holder,
@@ -108,18 +108,11 @@ impl std::fmt::Debug for Holder {
     }
 }
 
-/// Has `db` keep and find its macro definitions in `kept`.
+/// Has the snapshot `inputs` builds (its session arena's) keep and find its macro definitions
+/// in `kept`, read by `fact` (the driver's name for the holder).
 // dyn: the one holder
-pub fn set(db: &mut Db, kept: Arc<dyn Kept>) {
-    use blaze_query::db::{Durability, Setter};
-    match KeptDefs::try_get(&*db) {
-        Some(it) => {
-            it.set_held(db).with_durability(Durability::HIGH).to(Holder(kept));
-        }
-        None => {
-            _ = KeptDefs::new(db, Durability::HIGH, Holder(kept));
-        }
-    }
+pub fn set(inputs: &blaze_memo::Inputs<'_>, fact: blaze_memo::Fact, kept: Arc<dyn Kept>) {
+    KeptDefs::set(inputs, fact, Holder(kept));
 }
 
 /// Where the macro definitions of `db` are kept, if anything said.
@@ -293,7 +286,13 @@ impl Def {
     /// The expander of the definition, for a defining crate of `def_edition`: what
     /// `decl_macro_expander` makes of the definition's syntax. Every context of a kept
     /// definition is its file's root, whose edition for the rules is the defining crate's.
-    pub(super) fn compile(self, def_edition: Edition) -> DeclarativeMacroExpander {
+    /// `table` is the definition file's ([`HirFileId::context_arena`]); its root contexts are
+    /// the same in every table.
+    pub(super) fn compile(
+        self,
+        def_edition: Edition,
+        table: blaze_memo::ArenaId,
+    ) -> DeclarativeMacroExpander {
         let ctx_edition = move |_: SyntaxContext| def_edition;
         let no_tree = || {
             mbe::DeclarativeMacro::from_err(mbe::ParseError::Expected(
@@ -307,7 +306,12 @@ impl Def {
                 mbe::DeclarativeMacro::parse_macro2(args.as_ref(), body, ctx_edition)
             }
         };
-        DeclarativeMacroExpander { mac, transparency: self.transparency, edition: def_edition }
+        DeclarativeMacroExpander {
+            mac,
+            transparency: self.transparency,
+            edition: def_edition,
+            table,
+        }
     }
 }
 

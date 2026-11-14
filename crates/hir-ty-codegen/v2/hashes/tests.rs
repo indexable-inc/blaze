@@ -12,7 +12,7 @@ use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
 
 use super::ItemHashes;
-use crate::v2::{Body, HashSource, Hashes, by_id::ById};
+use crate::v2::{Body, HashSource, Hashes, by_id::ById, tests::write_file};
 use db::TestDB;
 
 fn hashes() -> ItemHashes {
@@ -74,7 +74,7 @@ fn both(minicore: &str, text: &str, name: &str) -> (CodeHash, CodeHash) {
 #[track_caller]
 fn ty(db: &TestDB, name: &str) -> ContentId {
     let alias = alias(db, name);
-    blaze_query::db::attach(db, || {
+    blaze_memo::attach(db, || {
         let ty = db.ty(TyDefId::TypeAliasId(alias)).skip_binder();
         hashes().ty(db, ty).unwrap_or_else(|e| panic!("the type `{name}`: {e}"))
     })
@@ -128,11 +128,11 @@ fn a_callee_body_edit_keeps_its_callers_code_and_an_interface_edit_does_not() {
     let (mut db, file) = fixture("sized", CALLS);
     let (callee, caller) = (code(&db, "callee"), code(&db, "caller"));
 
-    db.set_file_text(file, &CALLS.replace("{ 1 }", "{ 2 }"));
+    write_file(&mut db, file,&CALLS.replace("{ 1 }", "{ 2 }"));
     assert_ne!(code(&db, "callee"), callee, "the callee's body is its code");
     assert_eq!(code(&db, "caller"), caller, "a caller takes its callee by its interface");
 
-    db.set_file_text(file, &CALLS.replace("pub fn callee", "pub(crate) fn callee"));
+    write_file(&mut db, file,&CALLS.replace("pub fn callee", "pub(crate) fn callee"));
     assert_ne!(code(&db, "caller"), caller, "a callee's interface is in its callers' code");
 }
 
@@ -148,7 +148,7 @@ fn renaming_a_local_keeps_its_functions_code_and_its_callers() {
     let (mut db, file) = fixture("sized", LOCALS);
     let (callee, caller) = (code(&db, "callee"), code(&db, "caller"));
 
-    db.set_file_text(file, &LOCALS.replace("one", "uno"));
+    write_file(&mut db, file,&LOCALS.replace("one", "uno"));
     assert_eq!(code(&db, "callee"), callee, "a local is its binding, not its name");
     assert_eq!(code(&db, "caller"), caller, "a caller takes its callee by its interface");
 }
@@ -171,10 +171,11 @@ fn a_drop_impl_of_a_fields_type_is_in_the_type() {
     let (mut db, file) = fixture("sized, drop", DROPS);
     let held = ty(&db, "Held");
 
-    db.set_file_text(file, &format!("{DROPS}pub fn unrelated() {{}}\n"));
+    write_file(&mut db, file,&format!("{DROPS}pub fn unrelated() {{}}\n"));
     assert_eq!(ty(&db, "Held"), held, "an item the type does not reach is not in it");
 
-    db.set_file_text(
+    write_file(
+        &mut db,
         file,
         &format!("{DROPS}impl Drop for Inner {{\n    fn drop(&mut self) {{}}\n}}\n"),
     );
@@ -197,13 +198,13 @@ fn renaming_or_moving_a_type_changes_its_identity() {
     let (mut db, file) = fixture("sized", NAMED);
     let held = ty(&db, "Held");
 
-    db.set_file_text(file, &format!("\n\n// moved down\n{NAMED}"));
+    write_file(&mut db, file,&format!("\n\n// moved down\n{NAMED}"));
     assert_eq!(ty(&db, "Held"), held, "a move within the file keeps what the program sees");
 
-    db.set_file_text(file, &NAMED.replace("struct A", "struct B").replace("m::A", "m::B"));
+    write_file(&mut db, file,&NAMED.replace("struct A", "struct B").replace("m::A", "m::B"));
     assert_ne!(ty(&db, "Held"), held, "`type_name` prints the new name");
 
-    db.set_file_text(file, &NAMED.replace("mod m", "mod n").replace("m::A", "n::A"));
+    write_file(&mut db, file,&NAMED.replace("mod m", "mod n").replace("m::A", "n::A"));
     assert_ne!(ty(&db, "Held"), held, "`type_name` prints the new module");
 }
 
@@ -219,10 +220,10 @@ fn a_body_reading_a_constant_is_keyed_by_its_value() {
     let (mut db, file) = fixture("sized", VALUED);
     let reads = code(&db, "reads");
 
-    db.set_file_text(file, &VALUED.replace("= 1", "= 2 - 1"));
+    write_file(&mut db, file,&VALUED.replace("= 1", "= 2 - 1"));
     assert_eq!(code(&db, "reads"), reads, "one value, however written");
 
-    db.set_file_text(file, &VALUED.replace("= 1", "= 2"));
+    write_file(&mut db, file,&VALUED.replace("= 1", "= 2"));
     assert_ne!(code(&db, "reads"), reads, "a body reading it reads its value");
 }
 
@@ -243,7 +244,7 @@ fn moving_a_function_that_reads_its_line_keeps_its_code() {
     let (mut db, file) = fixture("panic_location", LINED);
     let names = ["here", "tracked", "borrowed"];
     let before = names.map(|it| code(&db, it));
-    db.set_file_text(file, &format!("\n{LINED}"));
+    write_file(&mut db, file,&format!("\n{LINED}"));
     let after = names.map(|it| code(&db, it));
     assert_eq!(after[0], before[0], "the line is read where the code runs");
     assert_ne!(after[1], before[1], "a `#[track_caller]` function's line is its value");
@@ -289,7 +290,7 @@ fn a_constant_is_its_value() {
     let krate = fixture::test_crate(&db);
     let h = hashes();
     let konst = |value: u128| {
-        blaze_query::db::attach(&db, || {
+        blaze_memo::attach(&db, || {
             h.konst(&db, usize_const(&db, Some(value), krate)).unwrap_or_else(|e| panic!("{e}"))
         })
     };
@@ -318,7 +319,7 @@ fn a_span_is_its_place_in_its_owner_and_formatting_keeps_it() {
     let (_, spans) = tables.iter().find(|(anchor, _)| *anchor == start.anchor).expect("its table");
     assert_eq!(spans[start.index as usize], MirSpan::ExprId(root));
 
-    db.set_file_text(file, "\n// a comment\npub fn f(x: u32) -> u32 {\n    x  +  1\n}\n");
+    write_file(&mut db, file,"\n// a comment\npub fn f(x: u32) -> u32 {\n    x  +  1\n}\n");
     let (_, _, moved, moved_end) = at(&db);
     assert_eq!((moved, moved_end), (start, end));
 }

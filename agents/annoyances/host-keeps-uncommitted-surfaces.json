@@ -1,0 +1,14 @@
+{
+ "id": "host-keeps-uncommitted-surfaces",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port-memo-1113 lane K1 (blaze-keyed read-addressed, blaze-host)",
+ "where": "crates/blaze-host/src/host.rs Host::written, surface_bytes, get; crates/blaze-cas/src/plain/handle.rs Store::map (StoreError::Uncommitted)",
+ "what": "Store::map refuses a record put by this process and not yet committed (StoreError::Uncommitted), while Store::read serves it from the writer. A surface is a plain (mapped) record, and a dependent unit's tasks read the surface its dependency filed earlier in the same request, so the host keeps its own copy of every surface it put and answers from it.",
+ "cost": "a second copy of every surface written in a request, a sorted side table in the host, and a branch on every surface read",
+ "cause": "the store's contract says a put is readable at once, but mapping needs a segment and the writer's buffer is not one; the trait gives no way to borrow uncommitted bytes for the request's life",
+ "class": "a read interface whose answer depends on whether the bytes are committed, so every caller grows its own cache of what it wrote",
+ "prevention": "Store::put returns a borrow of the placed bytes valid for the store's life (the writer's buffer is append-only until commit), or map serves uncommitted records from it; then the host's `written` table goes",
+ "workaround": "Host::written in blaze-host",
+ "fix": "",
+ "state": "open"
+}

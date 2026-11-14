@@ -123,6 +123,7 @@ blaze-thin.workspace = true
 blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-query.workspace = true
+blaze-memo.workspace = true
 blaze-cas.workspace = true
 blaze-gc.workspace = true
 blaze-format.workspace = true

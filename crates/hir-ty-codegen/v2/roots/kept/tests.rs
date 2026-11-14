@@ -9,13 +9,14 @@ use std::sync::Arc;
 
 use base_db::{Crate, Env};
 use blaze_core::lock::Lock;
+use blaze_memo::testing::Ran;
 use blaze_format::Aligned;
 use blaze_hash::HashMap;
 use blaze_ids::ContentId;
 use hir_def::{
     AssocItemId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StaticId,
     deps::{ImageBuf, ImageStore},
-    expr_store::ExpressionStore,
+    expr_store::{ExpressionStore, body::Body_of},
     nameres::{DefMap, crate_def_map, demand::bodies_declaring_roots, frozen::Mode},
     signatures::{FunctionSignature, StaticFlags, StaticSignature},
 };
@@ -23,6 +24,7 @@ use hir_expand::fixture;
 use std::alloc::Global;
 
 use super::{frozen, keeps_function, keeps_static, kept, over_bodies};
+use crate::v2::tests::runs_of;
 use db::TestDB;
 
 /// A dependency that keeps a `#[no_mangle]` function at module level (`top`), one in an impl
@@ -172,20 +174,18 @@ fn reference(db: &TestDB, krate: Crate) -> Vec<String> {
     names(db, &functions, &statics)
 }
 
-/// How many bodies `ran` lowered, by the name the run log gives the lowering.
-fn lowered(ran: &[String]) -> usize {
-    ran.iter().filter(|it| it.contains("Body::of")).count()
+/// The runs of `ran` that lowered a body: its runs of `Body::of`, by the query's kind.
+fn lowered(ran: &[Ran]) -> impl Iterator<Item = &Ran> {
+    ran.iter().filter(|it| it.query == Body_of::KIND_NAME)
 }
 
-/// Whether `ran` lowered at most the `owners` bodies it may: a body another query lowered
-/// first is read, not lowered again, and the run log has no row of it. The impls maintainer
-/// does that when the fixture sets its crate graph: it reads the bodies of every module whose
-/// bodies may hold an impl (`method_resolution::delta`'s body parts), which are the bodies with
-/// items in their blocks, `f`'s and `g`'s here. So the bound is the check: a body none of them
-/// may declare (`h`'s, `i`'s, `S::plain`'s) is lowered by nobody before, and `kept` lowering it
-/// is a row more than `owners`.
-fn lowered_at_most(ran: &[String], owners: usize) -> bool {
-    lowered(ran) <= owners
+/// Whether `ran` lowered only bodies of `owners`, at most as many as there are: a body
+/// another query lowered first is read, not lowered again, and the run log has no row of it.
+/// So a body none of them may declare (`h`'s, `i`'s, `S::plain`'s) lowered by `kept` is a run
+/// whose key is not in `owners`.
+fn lowered_only(ran: &[Ran], owners: &[DefWithBodyId]) -> bool {
+    lowered(ran).count() <= owners.len()
+        && lowered(ran).all(|it| owners.iter().any(|&owner| it.is::<Body_of>(&(owner,))))
 }
 
 /// A database of [`FIXTURE`] that reads `lib` from its image, its def map pages and its
@@ -195,13 +195,15 @@ fn lowered_at_most(ran: &[String], owners: usize) -> bool {
 // dyn: a test's planted record, one a call
 fn served(record: Option<&dyn Fn(&TestDB, Crate) -> Vec<u8>>) -> (TestDB, Vec<u8>) {
     let memory = Memory::default();
-    let mut first = fixture::db(FIXTURE).into_db();
+    let first = fixture::db(FIXTURE).into_db();
     let crates: Vec<Crate> = base_db::all_crates(&first).iter().copied().collect();
-    let served = hir_def::deps::serve(&mut first, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let (served, found) =
+        hir_def::deps::serve(&first, &crates, BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(served.hits, Vec::new(), "premise: a cold store");
+    assert!(found.is_empty(), "premise: a cold store gives no image");
     let stored = hir_def::deps::store(&first, &served, &memory, hir_def::deps::Which::Sealed).unwrap();
     let lib = crate_named(&first, "lib");
-    let filed = stored.filed[&lib];
+    let filed = stored.filed[&lib.key(&first)];
     let refused = frozen::store(&first, &[(lib, filed)], &memory).unwrap();
     assert_eq!(refused, Vec::new(), "`lib`'s kept roots do not encode");
     let key = hir_def::deps::kept_key(filed);
@@ -213,10 +215,36 @@ fn served(record: Option<&dyn Fn(&TestDB, Crate) -> Vec<u8>>) -> (TestDB, Vec<u8
 
     let mut db = fixture::db(FIXTURE).into_db();
     let crates: Vec<Crate> = base_db::all_crates(&db).iter().copied().collect();
-    let served = hir_def::deps::serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(served.hits, [crate_named(&db, "lib")], "premise: `lib` is served");
-    let given = frozen::serve(&mut db, &served, &memory, Mode::Serve).unwrap();
-    assert_eq!(given, [crate_named(&db, "lib")], "premise: `lib`'s record is given");
+    let (served, images) =
+        hir_def::deps::serve(&db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let lib = crate_named(&db, "lib");
+    assert_eq!(served.hits, [lib.key(&db)], "premise: `lib` is served");
+    let given: Vec<Crate> = images.iter().map(|it| it.0).collect();
+    assert_eq!(given, [lib], "premise: `lib`'s image is found");
+    // The driver's order: the records of the images found, read before they are given, so
+    // the one next snapshot holds each image and its record in the crate's slots.
+    let found =
+        frozen::find(&db, images.iter().map(|(krate, image)| (*krate, image)), &memory, Mode::Serve)
+            .unwrap();
+    let given: Vec<Crate> = found.iter().map(|it| it.0).collect();
+    assert_eq!(given, [lib], "premise: `lib`'s record is found");
+    // Each crate's stable id, which its slots' facts are of: the key it is served under,
+    // one a crate.
+    let records: Vec<_> = found
+        .into_iter()
+        .map(|(krate, record)| {
+            (krate, frozen::kept_fact(served.keys[&krate.key(&db)], &record), record)
+        })
+        .collect();
+    let mut edit = db.edit();
+    for (krate, image) in images {
+        let krate_id = served.keys[&krate.key(edit.db())];
+        hir_def::deps::give_image(&mut edit, krate, krate_id, image);
+    }
+    frozen::give(&mut edit, records);
+    let committed = edit.commit();
+    assert!(committed.moved, "premise: the commit gives `lib` its image and record");
+    // `lib`'s arena is made again by the commit: every id of it is taken again from here.
     (db, bytes)
 }
 
@@ -229,11 +257,9 @@ fn served(record: Option<&dyn Fn(&TestDB, Crate) -> Vec<u8>>) -> (TestDB, Vec<u8
 fn kept_of_a_served_crate_equals_the_walk_and_lowers_only_its_owners() {
     let (db, bytes) = served(None);
     let lib = crate_named(&db, "lib");
-    let mut found = None;
-    let ran = db.log_executed(|| found = Some(kept(&db, lib)));
-    let found = found.unwrap();
+    let (found, ran) = runs_of(&db, || kept(&db, lib));
     assert_eq!(found.owners.len(), 2, "`f` and `g` declare a kept item: {:?}", found.owners);
-    assert!(lowered_at_most(&ran, found.owners.len()), "lowered beyond the record's owners: {ran:?}");
+    assert!(lowered_only(&ran, &found.owners), "lowered beyond the record's owners: {ran:?}");
     let fresh = fixture::db(FIXTURE).into_db();
     let expected = reference(&fresh, crate_named(&fresh, "lib"));
     assert_eq!(expected, ["NESTED", "in_block", "in_impl", "top"], "premise: the model");
@@ -267,11 +293,9 @@ fn the_oracle_catches_a_record_without_its_owners() {
 fn an_unserved_crate_lowers_only_bodies_that_can_say_a_root() {
     let db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
-    let mut found = None;
-    let ran = db.log_executed(|| found = Some(kept(&db, lib)));
-    let found = found.unwrap();
+    let (found, ran) = runs_of(&db, || kept(&db, lib));
     let saying = bodies_declaring_roots(&db, lib);
-    assert!(lowered_at_most(&ran, saying.len()), "lowered other bodies than those that say a root: {ran:?}");
+    assert!(lowered_only(&ran, &saying), "lowered other bodies than those that say a root: {ran:?}");
     assert_eq!(saying.len(), 2, "premise: `f` and `g` alone can say one: {saying:?}");
     let fresh = fixture::db(FIXTURE).into_db();
     let expected = reference(&fresh, crate_named(&fresh, "lib"));

@@ -1300,13 +1300,18 @@ pub(crate) fn engine(
     // first; a hook something else set first would leave the watchdog counting nothing.
     #[expect(
         clippy::disallowed_types,
-        reason = "blaze_query's run hook is set once per process; this keeps whether this process's set took"
+        reason = "blaze_memo's run hook is set once per process; this keeps whether this process's set took"
     )]
     static WATCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*WATCHED.get_or_init(|| blaze_query::on_each_run(blaze_profile::moved).is_ok()) {
+    // Both engines: base-db and hir-expand still run on blaze-query's tracked engine
+    // (front-end-on-memo.md "base-db: not ported"), the rest on blaze-memo.
+    if !*WATCHED.get_or_init(|| {
+        blaze_memo::on_each_run(blaze_profile::moved).is_ok()
+            && blaze_query::on_each_run(blaze_profile::moved).is_ok()
+    }) {
         anyhow::bail!(
-            "blaze_query::on_each_run already has a hook other than the daemon's, so the stall \
-             watchdog would not see query runs as progress"
+            "blaze_memo::on_each_run or blaze_query::on_each_run already has a hook other than \
+             the daemon's, so the stall watchdog would not see query runs as progress"
         );
     }
     let steps = {

@@ -226,7 +226,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 /// Borrowck of `name` in both modes, and its item well-formedness errors' codes.
 fn checked(fixture_text: &str, name: &str) -> ([BorrowckResult; 2], Vec<&'static str>) {
     let db = fixture::db(fixture_text).into_db();
-    blaze_query::db::attach(&db, || {
+    blaze_memo::attach(&db, || {
         let function = function(&db, name);
         let borrowck =
             [Mode::Nll, Mode::Polonius].map(|mode| borrowck_in_mode(&db, function.into(), mode));
