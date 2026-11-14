@@ -68,6 +68,20 @@ fn references_are_the_names_that_resolve_to_the_def_and_not_its_namesakes() {
 }
 
 #[test]
+fn references_to_a_tuple_field_are_its_numbered_accesses() {
+    let fixture = "//- /lib.rs crate:lib edition:2021\n\
+                   pub struct Pair(pub u32, pub u32);\n\
+                   pub fn first(p: &Pair) -> u32 { p.0 }\n\
+                   pub fn second(p: &Pair) -> u32 { p.1 + 10 }\n\
+                   pub fn again(p: &Pair) -> u32 { p.0 + 20 }\n";
+    let (db, files) = view(fixture, 0, &["lib.rs"]);
+    let rules = r#"(rule (refs n) (expr e "$p.0") (resolves e d) (references d n))"#;
+    let outcome = query(&db, &files, rules).unwrap();
+    // `p.1` is the other field, and the `0` of `10` and `20` is no name.
+    assert_eq!(lines(&outcome, "refs"), [2, 4], "{:?}", texts(&outcome, "refs"));
+}
+
+#[test]
 fn in_unsafe_holds_inside_an_unsafe_block_only() {
     let (db, files) = lib();
     let rules = r#"(rule (deref e) (syntax e "PREFIX_EXPR") (in-unsafe e))"#;

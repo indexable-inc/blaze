@@ -761,7 +761,8 @@ impl<'a, F: Files> Sema<'a, F> {
             for start in finder.find_iter(text) {
                 let at = syntax::TextSize::from(u32::try_from(start).expect("a file under 4 GiB"));
                 let Some(token) = root.token_at_offset(at).right_biased() else { continue };
-                if token.kind() != SyntaxKind::IDENT || token.text() != name {
+                // A tuple field's name is a number: `value.0` names field `0` by an INT_NUMBER.
+                if !matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::INT_NUMBER) || token.text() != name {
                     continue;
                 }
                 for mapped in self.sema.descend_into_macros_exact(token) {
