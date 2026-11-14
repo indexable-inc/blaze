@@ -20,7 +20,8 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 
 [dev-dependencies]
-blaze-sim.workspace = true
+blaze-rng.workspace = true
+hegeltest.workspace = true
 
 [lints]
 workspace = true

@@ -84,8 +84,8 @@ pub enum BodyError {
 
 /// What a walk reads of the front end, each a lookup of something already computed.
 pub trait Front {
-    /// The key of `item`'s body (decision 2a: its text with positions item-relative, plus
-    /// what the names it mentions resolve to), once the body passed its check.
+    /// What `item`'s instances are planned by, once its body passed its check: the body
+    /// record's result digest ([`BodyKey`]), not its key from text.
     fn body_key(&self, item: &ItemId) -> Result<BodyKey, BodyError>;
     /// Whether `item` is the workspace's own code (else a dependency's, always optimized).
     fn in_workspace(&self, item: &ItemId) -> bool;

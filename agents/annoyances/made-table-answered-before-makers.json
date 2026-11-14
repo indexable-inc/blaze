@@ -1,0 +1,14 @@
+{
+ "id": "made-table-answered-before-makers",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), port-memo-1113 lane K1 (blaze-keyed read-addressed)",
+ "where": "crates/blaze-keyed/src/driver.rs: got_last, waits_on_maker, try_start, probe",
+ "what": "A body's asks of a fact its own unit makes were answered from a made table that did not hold the maker's row yet: empty until the first body settled (L's rows were added only by refresh_made in settle/quiesce), and in a cold or audited unit nothing until the maker settled, which no wait covered (the wait needed L). The audit then redid a hit found at the 'absent' address with the maker settled and faulted on the read (audit_never_faults_without_a_plant, the audit control), and an incremental edit ran a reader twice (a_signature_edit_redoes_exactly_its_readers: 4 bodies for 3).",
+ "cost": "an extra run and an extra record filed per reader of a kept maker's fact; an audit fault with no bug in any record",
+ "cause": "the made table had two owners (L's rows and settled makers) and was only made whole at settle and quiesce, while the wait for makers looked at L alone",
+ "class": "a provisional table read before it is initialised, by a check that consults a different table than the asks it guards",
+ "prevention": "the made table is refreshed once L is read, and the one wait (waits_on_maker) reads the same table the asks are answered from, over the shape actually about to be asked",
+ "workaround": "",
+ "fix": "this lane: refresh_made in got_last; probe parks a slot whose shape has a made fact with an unsettled maker (or no row while another examined item is unsettled), resumed at its probe",
+ "state": "fixed, not yet run"
+}

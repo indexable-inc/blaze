@@ -1,0 +1,14 @@
+{
+ "id": "keyed-inputs-miss-reading-and-identity",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), executor H1 (crates/blaze-unitkey), port-memo-1113",
+ "where": "crates/blaze-keyed/src/kind.rs FileInputs, SurfaceInputs; crates/blaze-keyed/src/text.rs top comment and Graph::build",
+ "what": "Writing blaze-unitkey against blaze-keyed's inputs structs: FileInputs has `edition: u16` but no syntax extensions, though both decide the parse; SurfaceInputs has no crate identity; text.rs's top comment still counts generic and #[inline] bodies as interface where host.md does not; Graph::build takes only whole crates' nodes, so a dependency cannot be handed in as its closures.",
+ "cost": "an hour reading kind.rs, text.rs and host.md side by side to find which is current, and a synthetic universe crate to stand for dependencies",
+ "cause": "the inputs structs and text.rs were written before host.md fixed what a file's reading, a unit's identity and an interface body are, and no test ties a key's fields to the facts host.md says it covers",
+ "class": "a key's inputs struct and the design doc that says what the key covers drifting apart, with nothing checking one against the other",
+ "prevention": "a key_ignores_field-style check from the design side: each inputs struct lists the facts its doc says it covers (reading, identity), and a property test moves each one and watches the key move",
+ "workaround": "blaze-unitkey packs edition | extensions << 8 into FileInputs::edition, prepends the identity to SurfaceInputs::pieces, follows host.md for interface bodies (commented at image::interface), and builds crate 0 of the graph from the universe's UnitClosures found tables",
+ "fix": "proposed in the H1 report: rename FileInputs::edition to reading, add SurfaceInputs::identity, correct text.rs lines 5-6, add a sealed-crate input to Graph::build",
+ "state": "open"
+}
