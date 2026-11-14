@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-92 theorems: 79 in `lean`, 13 in `lean/analysis`.
+94 theorems: 81 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -911,4 +911,18 @@ theorem theorems.bump_keeps_wf.spec.proof : theorems.bump_keeps_wf.spec.statemen
 
 ```lean
 theorem theorems.counting_ends.spec.proof : theorems.counting_ends.spec.statement
+```
+
+**`blaze_core.busy.next_is_bounded.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_bounded holds of its model: for every number of tries and every time waited, busy::next does not panic and its wait is positive, at most the cap and at most what is left of the bound (so the waits of an exec that met ETXTBSY end, on the bound exactly).
+
+```lean
+theorem blaze_core.busy.next_is_bounded.spec.proof :
+    blaze_core.busy.next_is_bounded.spec.statement
+```
+
+**`blaze_core.busy.next_is_the_doubling_schedule.spec.proof`** (`BlazeCore.Busy`, `lean`): The statement blaze generates from blaze-core's theorem function next_is_the_doubling_schedule holds of its model: for every number of tries and every time waited, busy::next (one shift) gives the wait of busy::doubling (the loop that doubles and caps), which returns.
+
+```lean
+theorem blaze_core.busy.next_is_the_doubling_schedule.spec.proof :
+    blaze_core.busy.next_is_the_doubling_schedule.spec.statement
 ```

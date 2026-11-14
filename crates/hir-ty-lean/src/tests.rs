@@ -1651,3 +1651,38 @@ fn a_closure_taking_method_is_refused_by_name() {
         assert!(err.at.contains(call), "the refusal is at the `{call}` call: {err}");
     }
 }
+
+// ---- blaze's own crates: the models the proofs under `crates/*/lean` are about. ----
+
+/// The pure part of `crates/blaze-core/src/busy.rs` (its constants, the schedule and its
+/// theorem functions, up to the first function that sleeps), as the file has it, in a crate
+/// and a module of the same names: the checked-in models are named by them.
+fn busy_fixture() -> String {
+    let file = include_str!("../../blaze-core/src/busy.rs");
+    let from = file.find("/// The first wait").expect("busy.rs begins with its constants");
+    let to = file.find("/// Waits out one wait of the schedule").expect("`wait` follows the pure part");
+    format!("pub mod busy {{\n{}}}\n", &file[from..to])
+}
+
+/// The models `crates/blaze-core/lean/BlazeCore/Busy.lean` proves its theorems about are what
+/// the translator emits from blaze-core's own source today. An edit of `busy.rs` that changes
+/// a model changes these files (`UPDATE_EXPECT=1`), and `lake build` then checks the proofs
+/// against the new ones: a proof cannot go on standing for code that has moved. When `blaze
+/// prove` is the gate, the models are its outputs and this test goes.
+#[test]
+fn blaze_cores_busy_models_are_its_sources() {
+    let source = busy_fixture();
+    for name in ["next_is_bounded", "next_is_the_doubling_schedule"] {
+        let out = emitted(FLAGS, "blaze_core", name, &source);
+        let statement = format!("blaze_core.busy.{name}.spec.statement");
+        assert_eq!(out.statement.as_deref(), Some(statement.as_str()));
+        assert_eq!(out.function, format!("blaze_core::busy::{name}"));
+        for module in out.imports.iter().chain([&out]) {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean").join(module.path());
+            expect_file![path].assert_eq(&module.text);
+        }
+    }
+    // `next` has no loop and `doubling` has one: the refinement's statement is total.
+    let refines = emitted(FLAGS, "blaze_core", "next_is_the_doubling_schedule", &source);
+    assert!(refines.shape.fuel && refines.text.contains("∃ (fuel : Nat)"), "{}", refines.text);
+}
