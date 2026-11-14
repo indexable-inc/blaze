@@ -1,0 +1,14 @@
+{
+ "id": "A-stream-sent-not-delivered-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane T2 (tokio out of ix-prof and blaze-explore)",
+ "where": "crates/ix-prof/src/explore/serving.rs (the `bad_token` close) over crates/blaze-http/src/h3/endpoint.rs",
+ "what": "`StreamSent` means buffered, not delivered: closing a WebTransport session on it resets the stream the peer has not read. The explorer closed a `bad_token` session at its answer's `StreamSent`; the close capsule raced the answer, the page's endpoint reset the request stream on the capsule, and the page lost the answer that says why (the DST's request 7, seed 0, clean network).",
+ "cost": "one failed test round, a timed stand-in (CLOSE_AFTER) written and then replaced by an acknowledgement event in blaze-http",
+ "cause": "the h3 core reported only that QUIC took the bytes; nothing said the peer had them, so a close-after-answer had no signal to wait on",
+ "class": "acting on a local buffering signal as if it were the peer's receipt: any close, reset or teardown sequenced after `StreamSent` (or a socket write, or an fsync of only our side) can destroy what it was meant to follow",
+ "workaround": "none needed now",
+ "fix": "blaze-http's `Event::StreamAcked` (quinn-proto's `StreamEvent::Finished`: every byte and the FIN acknowledged); the serving machine closes on it; a test with a planted `AckedAtSent` control proves it comes only after the peer read the FIN",
+ "prevention": "`StreamSent`'s doc says it is not delivery and names `StreamAcked`; every exhaustive match over `h3::Event` must say what it does with `StreamAcked`, so a new close-after-answer meets the choice",
+ "state": "fixed"
+}

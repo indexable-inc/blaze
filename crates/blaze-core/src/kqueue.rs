@@ -372,6 +372,11 @@ pub struct Kqueue {
     /// kernel keys a knote by its filter and ident, and a second `EV_ADD` would take the first's.
     pressure: Option<(Tag, u64)>,
     in_flight: usize,
+    /// Whether a [`crate::Waker`] was handed out ([`Driver::waker`]): a poll with nothing in
+    /// flight then parks for its wake, to its deadline, rather than returning at once (which
+    /// turned a caller's loop into a spin). Read and written by the polling thread alone, so
+    /// relaxed; an atomic so the driver's auto traits do not change with it.
+    waker_given: std::sync::atomic::AtomicBool,
     /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
     #[cfg(test)]
     watch_overhead: u64,
@@ -477,6 +482,7 @@ impl Kqueue {
             locks: crate::locks::Locks::new(),
             pressure: None,
             in_flight: 0,
+            waker_given: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             watch_overhead: 0,
             descriptors,
@@ -647,6 +653,7 @@ impl Kqueue {
             | Effect::SendTo { .. }
             | Effect::RecvFrom { .. }
             | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
@@ -1395,7 +1402,12 @@ impl Driver for Kqueue {
             // A waker's ask ends the poll with what there is, which may be nothing: what it
             // woke the loop for is in a queue of the caller's own.
             let asked = self.notify.asked.swap(false, std::sync::atomic::Ordering::SeqCst);
-            if out.len() > before || self.in_flight == 0 || asked {
+            // Nothing in flight and no waker: nothing can come, so the poll only looks. With a
+            // waker handed out it parks for the wake, to its deadline (the rule on
+            // `Driver::waker`).
+            let nothing_can_come = self.in_flight == 0
+                && !self.waker_given.load(std::sync::atomic::Ordering::Relaxed);
+            if out.len() > before || nothing_can_come || asked {
                 // Changes asked for are made now, not once nothing else is ready.
                 if !self.changes.is_empty() {
                     self.wait(Some(Deadline::PASSED));
@@ -1438,6 +1450,8 @@ impl Driver for Kqueue {
     }
 
     fn waker(&self) -> Option<crate::Waker> {
+        // Only the polling thread reads it, and only after this call on that same thread.
+        self.waker_given.store(true, std::sync::atomic::Ordering::Relaxed);
         // clone: a handle to the kqueue's notify, once per waker asked for
         Some(crate::Waker::new(Arc::clone(&self.notify) as Arc<dyn crate::Wake>))
     }
@@ -1632,6 +1646,58 @@ mod tests {
         assert_eq!(driver.poll(&mut out, near), 0);
         assert!(began.elapsed() >= Duration::from_millis(55), "{:?}", began.elapsed());
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// The invariant ([`Driver::waker`]): a wake sent after the polling thread has parked in
+    /// `kevent` ends the poll, first with nothing in flight (the poll parks for the wake rather
+    /// than returning at once and spinning its caller), then with a timer far past the deadline
+    /// in flight; each through the trigger (`EVFILT_USER`, registered in [`Kqueue::new`]),
+    /// counted, not through the `asked` look before the wait. The Linux driver's test of the
+    /// same name holds io_uring to the same rule.
+    ///
+    /// Its control is the driver before the rule: with nothing in flight the first poll
+    /// returned at once, before the wake was sent, and the bound on `waited` fails.
+    #[test]
+    fn a_wake_ends_a_wait_parked_in_the_kernel() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const BOUND: Duration = Duration::from_secs(20);
+        /// How long the waking thread lets the polling thread get into `kevent`.
+        const SETTLE: Duration = Duration::from_millis(100);
+        let root = dir("wake-parked");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let waker = driver.waker().expect("the kqueue driver has a waker");
+        for timer_in_flight in [false, true] {
+            if timer_in_flight {
+                driver.submit(&mut vec![Effect::Timer { after: BOUND * 2, tag: Tag(1) }]);
+            }
+            assert_eq!(driver.in_flight(), usize::from(timer_in_flight));
+            let polling = Arc::new(AtomicBool::new(false));
+            // clone: the flag and the waker, for the waking thread.
+            let (seen, other) = (Arc::clone(&polling), waker.clone());
+            let waking = std::thread::spawn(move || {
+                blaze_spin::SpinWait::within("the poll to begin", BOUND, || seen.load(Ordering::SeqCst));
+                std::thread::sleep(SETTLE);
+                other.wake();
+            });
+            let triggers = driver.notify.triggers.load(Ordering::Relaxed);
+            let mut out = Vec::new();
+            let until = Deadline::after(driver.now(), BOUND);
+            polling.store(true, Ordering::SeqCst);
+            let began = Instant::now();
+            driver.poll(&mut out, until);
+            let waited = began.elapsed();
+            waking.join().unwrap();
+            assert!(out.is_empty(), "a wake completes nothing: {out:?}");
+            assert!(
+                waited >= SETTLE && waited < BOUND / 2,
+                "with a timer in flight: {timer_in_flight}, the poll waited {waited:?}"
+            );
+            assert_eq!(
+                driver.notify.triggers.load(Ordering::Relaxed),
+                triggers + 1,
+                "the wake ended the wait through one trigger"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! adds no place that starts either.
 
 use std::{
+    alloc::Global,
     fs::File,
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
@@ -20,9 +21,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::mpsc;
+use blaze_core::wait::{Clock as _, Deadline, Monotonic, Parker, Waited};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
-use blaze_registry::http::HyperHttp;
+use blaze_registry::http::{Bounds, HttpNotSuccessful, HyperHttp};
+
+#[blaze::sans_io]
+mod keep;
+
+use keep::Keep;
 
 /// The release, and the sha256 and size of each of its files blaze downloads, by host.
 const PINS: &str = include_str!("pins.txt");
@@ -30,12 +37,16 @@ const PINS: &str = include_str!("pins.txt");
 /// Where the Rust project publishes its releases, under the release's date.
 const DIST: &str = "https://static.rust-lang.org/dist";
 
-/// How many times a file is asked for before the download gives up. Each time after the first
-/// goes on from where the one before stopped.
-const TRIES: u32 = 4;
-
-/// How many pieces of a file are held between the download and its unpacking.
+/// How many pieces of a file are held between the download and its unpacking: the most the
+/// download is ahead of it, [`AHEAD`] times [`PIECE`] bytes (16 MiB), a bounded crossbeam
+/// channel ([`handoff`]).
 const AHEAD: usize = 256;
+
+/// The longest the download of a file waits for its unpacking to take a piece, and the
+/// unpacking for the download to give one: far past any pause of a working stage (a piece is
+/// 64 KiB of xz; a download with no byte for blaze-fetch's stall bound, 30 s, is stopped by the
+/// HTTP client, which ends the unpacking's wait), so only a stage that stopped reaches it.
+const STAGE_WAIT: Duration = Duration::from_secs(300);
 
 pub struct Release {
     /// The toolchain as rustup names it, `nightly-2026-10-25`: what blaze's directory of it and
@@ -397,104 +408,140 @@ impl Source {
         Ok(Source::Web { http: HyperHttp::shared()?, base: super::base(&address)? })
     }
 
-    /// `file` from `offset` on.
-    async fn read(&self, file: &str, offset: u64) -> anyhow::Result<Body> {
-        let missing = || anyhow::anyhow!("{file} is not there");
+    /// Where `file` is read from: its address, or its path.
+    fn place(&self, file: &str) -> String {
+        match self {
+            Source::Web { base, .. } => base.join(file).map_or_else(|_| format!("{base}{file}"), String::from),
+            Source::Dir(dir) => dir.join(file).display().to_string(),
+        }
+    }
+
+    /// `file` from byte `from` on, asked once (rule no-fallback: no retry), each piece handed
+    /// to `each` with its offset in the whole file, in order. A server that ignores the range
+    /// sends the whole from 0, which `each` is given as it comes ([`Keep::piece`] leaves out
+    /// what is had). An error of `each` stops the transfer and is the result, as it was.
+    fn read(
+        &self,
+        file: &str,
+        from: u64,
+        each: &mut (dyn FnMut(u64, &[u8]) -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<()> {
         match self {
             Source::Web { http, base } => {
-                let bytes =
-                    super::read_from(http, base, file, offset).await?.ok_or_else(missing)?;
-                Ok(Body::Web { bytes, at: 0 })
+                let url = base.join(file)?;
+                // The keeper's own error (the unpacking stopped or is stuck, a write failed,
+                // the file is longer than published), kept so that it is the result, not the
+                // client's message of a sink that refused a piece.
+                let mut kept_error = None;
+                let mut sink = |offset: u64, bytes: &[u8]| -> io::Result<()> {
+                    for (at, piece) in (0u64..).step_by(PIECE).zip(bytes.chunks(PIECE)) {
+                        if let Err(error) = each(offset + at, piece) {
+                            kept_error = Some(error);
+                            return Err(io::Error::other("the download's piece was not kept"));
+                        }
+                    }
+                    Ok(())
+                };
+                // In parallel ranges, said in blaze-fetch's downloads (the status line, `blaze
+                // status`, the build's stall bound) and stopped after its stall bound without
+                // a byte: a blocking call, parked on blaze-core's deadline wait by the client.
+                let answer =
+                    http.stream_watched(url.as_str(), &[], from, Bounds::NONE, &mut sink, file, &mut |_| {});
+                if let Some(error) = kept_error {
+                    return Err(error);
+                }
+                let answer = answer?;
+                match answer.status {
+                    200 | 206 => Ok(()),
+                    404 | 410 => anyhow::bail!("{url} answered {}: the server has no such file", answer.status),
+                    _ => Err(HttpNotSuccessful::new(url.as_str(), &answer).into()),
+                }
             }
             Source::Dir(dir) => {
                 let path = dir.join(file);
                 let mut opened = File::open(&path).map_err(|e| match e.kind() {
-                    io::ErrorKind::NotFound => missing(),
+                    io::ErrorKind::NotFound => anyhow::anyhow!("{} is not there", path.display()),
                     _ => anyhow::anyhow!("opening {}: {e}", path.display()),
                 })?;
-                opened.seek(io::SeekFrom::Start(offset))?;
-                Ok(Body::File(opened))
+                opened.seek(io::SeekFrom::Start(from))?;
+                let mut piece = Vec::with_capacity_in(PIECE, Global);
+                piece.resize(PIECE, 0);
+                // Bounded by the file's length, and by the pin's: `each` refuses a byte past it.
+                let mut at = from;
+                loop {
+                    let read = opened.read(&mut piece)?;
+                    if read == 0 {
+                        return Ok(());
+                    }
+                    each(at, &piece[..read])?;
+                    at += read as u64;
+                }
             }
         }
     }
 }
 
-/// What is read of a file, given on in pieces of [`PIECE`] bytes.
-enum Body {
-    /// The bytes the server sent, of which the first `at` are given.
-    Web {
-        bytes: Vec<u8>,
-        at: usize,
-    },
-    File(File),
-}
-
-/// The bytes of a piece of a file a download gives on.
+/// The bytes of a piece of a file a download gives on: what is read of a file at once, and the
+/// most a server's piece is handed on in.
 const PIECE: usize = 1 << 16;
 
-impl Body {
-    async fn next(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        match self {
-            Body::Web { bytes, at } => {
-                let end = bytes.len().min(*at + PIECE);
-                let piece = bytes[*at..end].to_vec();
-                *at = end;
-                Ok((!piece.is_empty()).then_some(piece))
-            }
-            Body::File(file) => {
-                let mut bytes = vec![0; PIECE];
-                let read = file.read(&mut bytes)?;
-                bytes.truncate(read);
-                Ok((read != 0).then_some(bytes))
-            }
-        }
-    }
-}
-
 /// Downloads every component into `downloads` and unpacks each into a directory of its own
-/// under `staging` as its bytes arrive, all at once. The result is the channel manifest.
+/// under `staging` as its bytes arrive, all at once: each component's download and its
+/// unpacking on threads of their own, the manifest on this one. The result is the channel
+/// manifest.
 fn download_all(
     release: &Release,
     source: &Source,
     downloads: &Path,
     staging: &Path,
 ) -> anyhow::Result<Vec<u8>> {
-    let runtime = super::runtime()?;
     let manifest_file = format!("channel-rust-{}.toml", release.channel);
+    let manifest_part = downloads.join(&manifest_file);
     let unpacked = |at: usize| staging.join(".unpacked").join(at.to_string());
-    let (manifest, fetched, unpacking) = std::thread::scope(|scope| {
-        let mut downloading = Vec::new();
-        let mut unpacking = Vec::new();
+    let (manifest, joined) = std::thread::scope(|scope| -> anyhow::Result<_> {
+        let mut started = Vec::with_capacity_in(release.components.len(), Global);
         for (at, component) in release.components.iter().enumerate() {
-            let (to, from) = mpsc::channel(AHEAD);
-            let into = unpacked(at);
-            unpacking.push(scope.spawn(move || unpack(Pieces::new(from), &into)));
             let file = component.file(release.channel);
+            let (feed, pieces) = handoff(&file, crossbeam_channel::bounded(AHEAD), STAGE_WAIT);
+            let into = unpacked(at);
+            let unpacking = std::thread::Builder::new()
+                .name(format!("toolchain: unpack {file}"))
+                .spawn_scoped(scope, move || unpack(pieces, &into))?;
             let part = downloads.join(format!("{file}.part"));
-            downloading.push(async move {
-                let sent = download(source, &file, &part, component.pin, Some(to)).await;
-                sent.map_err(|e| e.context(file))
-            });
+            let named = file.clone(); // clone: the file's name, for its download's thread
+            let downloading = std::thread::Builder::new()
+                .name(format!("toolchain: download {file}"))
+                .spawn_scoped(scope, move || {
+                    let sent = download(source, &named, &part, component.pin, Some(&feed));
+                    // Its end, said to the unpacking: the stream is whole, or stopped.
+                    drop(feed);
+                    sent.map_err(|e| e.context(super::DownloadFailed::of(&named, source.place(&named))))
+                })?;
+            started.push((file, downloading, unpacking));
         }
-        let manifest_part = downloads.join(&manifest_file);
-        let (manifest, fetched) = runtime.block_on(async {
-            let manifest = download(source, &manifest_file, &manifest_part, release.manifest, None);
-            futures_util::future::join(manifest, futures_util::future::join_all(downloading)).await
-        });
-        let unpacking: Vec<_> = unpacking.into_iter().map(|it| it.join()).collect();
-        (manifest.map(|()| manifest_part), fetched, unpacking)
-    });
-    drop(runtime);
-    for (got, unpacked) in fetched.into_iter().zip(unpacking) {
-        let unpacked = unpacked.map_err(|_| anyhow::anyhow!("unpacking panicked"))?;
+        let manifest = download(source, &manifest_file, &manifest_part, release.manifest, None)
+            .map_err(|e| e.context(super::DownloadFailed::of(&manifest_file, source.place(&manifest_file))));
+        let mut joined = Vec::with_capacity_in(started.len(), Global);
+        for (file, downloading, unpacking) in started {
+            joined.push((file, downloading.join(), unpacking.join()));
+        }
+        Ok((manifest, joined))
+    })?;
+    for (file, got, unpacked) in joined {
+        let got = got.map_err(|_| anyhow::anyhow!("the download of {file} panicked"))?;
+        let unpacked = unpacked.map_err(|_| anyhow::anyhow!("the unpacking of {file} panicked"))?;
+        let unpacked = || unpacked.map_err(|e| anyhow::Error::new(e).context(format!("unpacking {file}")));
         match got {
-            Err(e) if e.is::<Unpacking>() => unpacked.map_err(anyhow::Error::from)?,
+            Err(e) if e.is::<Unpacking>() => {
+                unpacked()?;
+                anyhow::bail!("the unpacking of {file} ended before its download did: the archive ended early")
+            }
             Err(e) => return Err(e.into_published(release)),
-            Ok(()) => unpacked?,
+            Ok(()) => unpacked()?,
         }
     }
-    let manifest = manifest.map_err(|e| e.into_published(release))?;
-    Ok(std::fs::read(manifest)?)
+    manifest.map_err(|e| e.into_published(release))?;
+    Ok(std::fs::read(manifest_part)?)
 }
 
 /// The unpacking of a file stopped before its download did; why is the unpacking's to say.
@@ -508,6 +555,158 @@ impl std::fmt::Display for Unpacking {
 }
 
 impl std::error::Error for Unpacking {}
+
+/// One stage of a file's download waited [`STAGE_WAIT`] for the other and it did nothing:
+/// that stage is stuck (rule bounded-progress).
+#[derive(Debug)]
+struct Stuck {
+    file: String,
+    /// The stage waited on: `the unpacking` or `the download`.
+    stage: &'static str,
+    /// What it was to do.
+    to: &'static str,
+    within: Duration,
+}
+
+impl std::fmt::Display for Stuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Stuck { file, stage, to, within } = self;
+        write!(
+            f,
+            "{stage} of {file} did not {to} in {within:?}, so it is stuck and blaze stopped the \
+             download (rule bounded-progress)"
+        )
+    }
+}
+
+impl std::error::Error for Stuck {}
+
+/// The pieces of one file between its download ([`Feed`]) and its unpacking ([`Pieces`]):
+/// `channel`, a bounded crossbeam channel (the download is at most its bound ahead), and a
+/// [`Parker`] on each side, so that each side's wait is blaze-core's deadline wait, named and
+/// bounded by `within`. Each side unparks the other after each piece it moves and when it goes.
+fn handoff(file: &str, channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>), within: Duration) -> (Feed, Pieces) {
+    let (to, from) = channel;
+    let (download, unpacking) = (Arc::new_in(Parker::new(), Global), Arc::new_in(Parker::new(), Global));
+    let feed = Feed {
+        to,
+        held: Arc::clone(&download),
+        reader: Wakes(Arc::clone(&unpacking)),
+        file: file.to_owned(),
+        within,
+    };
+    let pieces = Pieces {
+        from,
+        waiting: unpacking,
+        feed: Wakes(download),
+        file: file.to_owned(),
+        within,
+        piece: Vec::new_in(Global),
+        at: 0,
+    };
+    (feed, pieces)
+}
+
+/// Unparks the other side of a [`handoff`] when told, and when it goes: declared after the
+/// channel's end in its side, so that end is gone first and the other side sees it.
+struct Wakes(Arc<Parker, Global>);
+
+impl Wakes {
+    fn wake(&self) {
+        self.0.unpark();
+    }
+}
+
+impl Drop for Wakes {
+    fn drop(&mut self) {
+        self.0.unpark();
+    }
+}
+
+/// A download's side of a [`handoff`].
+struct Feed {
+    to: Sender<Vec<u8>>,
+    /// Parked on by the download while the channel is full.
+    held: Arc<Parker, Global>,
+    reader: Wakes,
+    file: String,
+    within: Duration,
+}
+
+impl Feed {
+    /// Hands `piece` to the unpacking, waiting while it is [`AHEAD`] pieces behind: at most
+    /// `within`, then [`Stuck`]. [`Unpacking`] once the unpacking is gone.
+    fn give(&self, mut piece: Vec<u8>) -> anyhow::Result<()> {
+        let clock = Monotonic::new();
+        let deadline = Deadline::after(clock.now(), self.within);
+        // Bounded by `deadline`: each turn hands the piece on, or parks until the unpacking
+        // takes one (or goes) or the deadline passes, which ends the loop.
+        loop {
+            match self.to.try_send(piece) {
+                Ok(()) => {
+                    self.reader.wake();
+                    return Ok(());
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(Unpacking.into()),
+                Err(TrySendError::Full(back)) => piece = back,
+            }
+            let what = "a toolchain file's unpacking to take the next piece of its download";
+            match self.held.park(what, Some(deadline), &clock)? {
+                Waited::Ready(()) => {}
+                Waited::Deadline => {
+                    let (file, within) = (self.file.clone(), self.within); // clone: an error's name
+                    let to = "take a piece of its download";
+                    return Err(Stuck { file, stage: "the unpacking", to, within }.into());
+                }
+            }
+        }
+    }
+}
+
+/// Downloads `file` into `part`, going on from what an earlier download left there, and gives
+/// each piece on to `to`, what was there first included: the driver of [`Keep`], which decides
+/// what is kept. The source is asked once (rule no-fallback); a download that ends short is an
+/// error saying how far it got. Its sha256 is checked once it is whole: a file that is not the
+/// one published is removed, and is [`NotPublished`].
+fn download(source: &Source, file: &str, part: &Path, pin: Pin, to: Option<&Feed>) -> anyhow::Result<()> {
+    let give = |piece: &[u8]| match to {
+        Some(to) if !piece.is_empty() => to.give(piece.to_vec_in(Global)),
+        _ => Ok(()),
+    };
+    let mut keep = Keep::new(pin.sha256, pin.bytes)?;
+    let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
+    let have = keep.resume(written.metadata()?.len());
+    written.set_len(have)?;
+    let mut kept = BufReader::new(File::open(part)?).take(have);
+    let mut piece = Vec::with_capacity_in(PIECE, Global);
+    piece.resize(PIECE, 0);
+    // Bounded by `have`, the part file's bytes gone on from.
+    loop {
+        let read = kept.read(&mut piece)?;
+        if read == 0 {
+            break;
+        }
+        keep.kept(&piece[..read])?;
+        give(&piece[..read])?;
+    }
+    if !keep.whole() {
+        let from = keep.have();
+        source.read(file, from, &mut |offset, bytes| {
+            let new = keep.piece(offset, bytes)?;
+            written.write_all(new)?;
+            give(new)
+        })?;
+    }
+    match keep.end() {
+        Ok(()) => Ok(()),
+        Err(keep::Refused::NotPublished) => {
+            drop(written);
+            _ = std::fs::remove_file(part);
+            Err(NotPublished { file: file.to_owned(), version: "" }.into())
+        }
+        Err(refused) => Err(refused.into()),
+    }
+}
 
 trait IntoPublished {
     fn into_published(self, release: &Release) -> anyhow::Error;
@@ -523,100 +722,54 @@ impl IntoPublished for anyhow::Error {
     }
 }
 
-/// Downloads `file` into `part`, going on from what an earlier download left there, and sends
-/// each piece on to `to`, what was there first included. Its sha256 is checked once it is
-/// whole: a file that is not the one published is removed, and is [`NotPublished`].
-async fn download(
-    source: &Source,
-    file: &str,
-    part: &Path,
-    pin: Pin,
-    to: Option<mpsc::Sender<Vec<u8>>>,
-) -> anyhow::Result<()> {
-    let send = async |piece: Vec<u8>| match &to {
-        Some(to) => to.send(piece).await.map_err(|_| anyhow::Error::new(Unpacking)),
-        None => Ok(()),
-    };
-    // alloc: once a file
-    let pinned = blaze_fetch::Digest::parse(&format!("sha256:{}", pin.sha256))
-        .map_err(anyhow::Error::new)?;
-    let mut written = std::fs::OpenOptions::new().create(true).append(true).open(part)?;
-    // The pin's algorithm and BLAKE3 in one pass, as blaze-fetch checks every download.
-    let mut hasher = blaze_fetch::Hashing::new(pinned.algo());
-    let mut have = written.metadata()?.len();
-    if have > pin.bytes {
-        written.set_len(0)?;
-        have = 0;
-    }
-    let mut kept = BufReader::new(File::open(part)?).take(have);
-    loop {
-        let mut piece = vec![0; 1 << 16];
-        let read = kept.read(&mut piece)?;
-        if read == 0 {
-            break;
-        }
-        piece.truncate(read);
-        hasher.update(&piece);
-        send(piece).await?;
-    }
-    let mut tries = 0;
-    while have < pin.bytes {
-        let got = async {
-            let mut body = source.read(file, have).await?;
-            while let Some(piece) = body.next().await? {
-                if have + piece.len() as u64 > pin.bytes {
-                    anyhow::bail!("it is longer than the {} bytes published", pin.bytes);
-                }
-                written.write_all(&piece)?;
-                have += piece.len() as u64;
-                hasher.update(&piece);
-                send(piece).await?;
-            }
-            anyhow::Ok(())
-        }
-        .await;
-        match got {
-            Err(e) if e.is::<Unpacking>() => return Err(e),
-            Ok(()) if have == pin.bytes => break,
-            Ok(()) if tries + 1 == TRIES => {
-                // alloc: error path, the last failure, as below.
-                let gave_up = super::GaveUp { file: file.to_owned(), tries: TRIES };
-                return Err(anyhow::anyhow!("it ended at {have} of its {} bytes", pin.bytes)
-                    .context(gave_up));
-            }
-            // alloc: error path, the last failure.
-            Err(e) if tries + 1 == TRIES => {
-                return Err(e.context(super::GaveUp { file: file.to_owned(), tries: TRIES }));
-            }
-            _ => tries += 1,
-        }
-        tokio::time::sleep(Duration::from_secs(tries.into())).await;
-    }
-    if hasher.finish().digest != pinned {
-        drop(written);
-        _ = std::fs::remove_file(part);
-        return Err(NotPublished { file: file.to_owned(), version: "" }.into());
-    }
-    Ok(())
-}
-
-/// What a download sends on, read as one stream.
+/// An unpacking's side of a [`handoff`]: what the download gives, read as one stream.
 struct Pieces {
-    from: mpsc::Receiver<Vec<u8>>,
+    from: Receiver<Vec<u8>>,
+    /// Parked on by the unpacking while the channel is empty.
+    waiting: Arc<Parker, Global>,
+    /// Declared after `from`, so the download sees the channel gone when it is woken.
+    feed: Wakes,
+    file: String,
+    within: Duration,
     piece: Vec<u8>,
     at: usize,
 }
 
 impl Pieces {
-    fn new(from: mpsc::Receiver<Vec<u8>>) -> Pieces {
-        Pieces { from, piece: Vec::new(), at: 0 }
+    /// The next piece the download gives, waiting while none is here: at most `within`, then
+    /// [`Stuck`]. `None` once the download is gone and every piece is read.
+    fn next(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let clock = Monotonic::new();
+        let deadline = Deadline::after(clock.now(), self.within);
+        // Bounded by `deadline`: each turn takes a piece, or parks until the download gives
+        // one (or goes) or the deadline passes, which ends the loop.
+        loop {
+            match self.from.try_recv() {
+                Ok(piece) => {
+                    self.feed.wake();
+                    return Ok(Some(piece));
+                }
+                Err(TryRecvError::Disconnected) => return Ok(None),
+                Err(TryRecvError::Empty) => {}
+            }
+            let what = "a toolchain file's download to give its next piece (bounded by the HTTP client's stall bound)";
+            match self.waiting.park(what, Some(deadline), &clock)? {
+                Waited::Ready(()) => {}
+                Waited::Deadline => {
+                    let (file, within) = (self.file.clone(), self.within); // clone: an error's name
+                    let to = "give its next piece";
+                    return Err(io::Error::other(Stuck { file, stage: "the download", to, within }));
+                }
+            }
+        }
     }
 }
 
 impl Read for Pieces {
     fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        // Bounded by the download's pieces: each turn takes one or ends.
         while self.at == self.piece.len() {
-            match self.from.blocking_recv() {
+            match self.next()? {
                 Some(piece) => (self.piece, self.at) = (piece, 0),
                 None => return Ok(0),
             }
@@ -1029,5 +1182,90 @@ mod tests {
         assert!(said.contains("the download failed"), "{said}");
         assert!(!work.path().join("toolchains/escaped").exists());
         assert!(!dir.exists());
+    }
+
+    /// The invariant: a download is held back by its unpacking. With the unpacking taking
+    /// nothing, the download of a file of 32 pieces into a channel of 4 has written at most
+    /// 4 + 1 pieces (4 held, 1 waiting to be handed on) and is still waiting. The control: the
+    /// same download into an unbounded channel runs to the file's end, which fails the bound.
+    #[test]
+    fn a_download_waits_for_its_unpacking_by_the_channels_bound() {
+        const BOUND: usize = 4;
+        const PIECES: usize = 32;
+        let work = tempfile::tempdir().unwrap();
+        let dist = work.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        let bytes: Vec<u8> = (0..PIECES * PIECE).map(|it| (it % 251) as u8).collect();
+        std::fs::write(dist.join("big.tar.xz"), &bytes).unwrap();
+        let pin = Pin { sha256: sha256(&bytes), bytes: bytes.len() as u64 };
+        let source = Source::Dir(dist);
+        // How far a download into `channel` gets while the unpacking takes nothing: the bytes
+        // it wrote once they stop growing, and whether it ended.
+        let ahead = |name: &str, channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>)| -> (u64, bool) {
+            let part = work.path().join(format!("{name}.part"));
+            let (feed, pieces) = handoff("big.tar.xz", channel, Duration::from_secs(60));
+            std::thread::scope(|scope| {
+                let downloading = std::thread::Builder::new()
+                    .name(format!("test: download into {name}"))
+                    .spawn_scoped(scope, || download(&source, "big.tar.xz", &part, pin, Some(&feed)))
+                    .unwrap();
+                let clock = Monotonic::new();
+                let (mut last, mut still) = (u64::MAX, 0);
+                // Bounded: at most 1000 looks 10 ms apart; it ends once the download ended or
+                // its part, once begun, has not grown for 20 looks.
+                for _ in 0..1000 {
+                    let len = std::fs::metadata(&part).map_or(0, |it| it.len());
+                    (still, last) = if len == last && len > 0 { (still + 1, len) } else { (0, len) };
+                    if downloading.is_finished() || still == 20 {
+                        break;
+                    }
+                    let next = Deadline::after(blaze_core::wait::Clock::now(&clock), Duration::from_millis(10));
+                    blaze_core::wait::sleep_until("the test's next look at the part", next, &clock).unwrap();
+                }
+                let ended = downloading.is_finished();
+                // The unpacking goes: a download still waiting ends, as stopped.
+                drop(pieces);
+                let got = downloading.join().unwrap();
+                if !ended {
+                    assert!(got.unwrap_err().is::<Unpacking>(), "a held download ends as the unpacking goes");
+                }
+                (last, ended)
+            })
+        };
+        let most = ((BOUND + 1) * PIECE) as u64;
+        let (held, ended) = ahead("bounded", crossbeam_channel::bounded(BOUND));
+        assert!(held <= most && !ended, "{held} bytes written of {most} at most, ended: {ended}");
+        let (ran, ended) = ahead("unbounded", crossbeam_channel::unbounded());
+        assert!(
+            ran > most && ended,
+            "the control: with no bound the download runs ahead, {ran} bytes, ended: {ended}"
+        );
+        assert_eq!(ran, bytes.len() as u64);
+    }
+
+    /// The invariant (rule no-fallback): a download that fails is asked once, file by file, and
+    /// the error names the file and its address. The server answers every request with a 500;
+    /// the control is what it saw: one request for each file of the release and none again.
+    #[test]
+    fn a_failed_download_asks_each_file_once_and_names_its_address() {
+        let work = tempfile::tempdir().unwrap();
+        let dist = work.path().join("dist");
+        let release = release(&dist, &rustc());
+        let (address, asked) = super::super::tests::failing_server(16);
+        let http = Arc::new_in(HyperHttp::new(Duration::from_secs(10)).unwrap(), Global);
+        let base = super::super::base(&address).unwrap();
+        let dir = work.path().join("toolchains/9.9.9-test-host");
+        let said = fetch_from(&release, &dir, || Ok(Source::Web { http, base })).unwrap_err();
+        let rustc = "rustc-9.9.9-test-host.tar.xz";
+        assert!(said.contains(&format!("downloading {rustc} from {address}{rustc}: ")), "{said}");
+        assert!(said.contains("got 500"), "{said}");
+        let mut asked = asked.lock().clone(); // clone: what the server saw, to sort
+        asked.sort();
+        assert_eq!(
+            asked,
+            ["/channel-rust-9.9.9.toml", "/rust-std-9.9.9-test-host.tar.xz", "/rustc-9.9.9-test-host.tar.xz"],
+            "each file asked once, and none again"
+        );
+        assert!(!dir.exists(), "nothing is put in place");
     }
 }

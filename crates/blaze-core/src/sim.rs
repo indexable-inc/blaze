@@ -2346,6 +2346,7 @@ impl Sim {
             | Effect::SendTo { .. }
             | Effect::RecvFrom { .. }
             | Effect::Unbind { .. }
+            | Effect::Resolve { .. }
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
@@ -2692,6 +2693,7 @@ impl Driver for Sim {
                 | Effect::SendTo { .. }
                 | Effect::RecvFrom { .. }
                 | Effect::Unbind { .. }
+                | Effect::Resolve { .. }
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }
                 | Effect::Now { .. }

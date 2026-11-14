@@ -1126,3 +1126,69 @@ fn the_oracle_catches_a_reaped_child_never_reported_through_the_direct_driver() 
         |tape, plant| drawn_reaps(tape, plant, Through::Direct),
     );
 }
+
+/// The invariant: [`super::block_on`] gives a future's output once a wake from another thread
+/// lets it end, and a future that never ends is [`super::Unfinished::TimedOut`] at its bound,
+/// naming what it waited for. The control: the same never-ready future given the wake ends.
+#[test]
+fn block_on_ends_a_woken_future_and_times_out_one_never_woken() {
+    use std::{
+        alloc::Global,
+        sync::{Arc, atomic::AtomicBool},
+        task::{Poll, Waker},
+    };
+
+    use super::{Monotonic, Parker, Unfinished, block_on};
+
+    type Left = Arc<crate::lock::Lock<Option<Waker>>, Global>;
+    // Ready once `set`; each poll leaves its waker under a lock and unparks `told`, the
+    // thread that sets it.
+    let set = Arc::new_in(AtomicBool::new(false), Global);
+    let left: Left = Arc::new_in(crate::lock::Lock::new("test.wait.block_on.waker", None), Global);
+    let told = Arc::new_in(Parker::new(), Global);
+    let future = |set: Arc<AtomicBool, Global>, left: Left, told: Arc<Parker, Global>| {
+        std::future::poll_fn(move |cx| {
+            *left.lock() = Some(cx.waker().clone()); // clone: the waker the setter wakes
+            told.unpark();
+            if set.load(Ordering::Acquire) { Poll::Ready(7) } else { Poll::Pending }
+        })
+    };
+
+    let never = block_on(
+        "a future no one wakes",
+        Some(Duration::from_millis(30)),
+        future(Arc::clone(&set), Arc::clone(&left), Arc::clone(&told)),
+    );
+    match never {
+        Err(Unfinished::TimedOut { what, within }) => {
+            assert_eq!((what, within), ("a future no one wakes", Duration::from_millis(30)));
+        }
+        other => panic!("{other:?}"),
+    }
+    // The first future's waker and its unpark are gone with it.
+    left.lock().take();
+
+    let (setter_set, setter_left, setter_told) = (Arc::clone(&set), Arc::clone(&left), Arc::clone(&told));
+    let setter = std::thread::Builder::new()
+        .name("test: wakes block_on's future".to_owned())
+        .spawn(move || {
+            let clock = Monotonic::new();
+            let deadline = Deadline::after(clock.now(), Duration::from_secs(10));
+            // Each turn parks until a poll or the deadline, which ends it.
+            loop {
+                if let Some(waker) = setter_left.lock().take() {
+                    setter_set.store(true, Ordering::Release);
+                    waker.wake();
+                    return true;
+                }
+                match setter_told.park("block_on's future to leave its waker", Some(deadline), &clock) {
+                    Ok(Waited::Ready(())) => {}
+                    Ok(Waited::Deadline) | Err(_) => return false,
+                }
+            }
+        })
+        .unwrap();
+    let woken = block_on("a future another thread wakes", Some(Duration::from_secs(10)), future(set, left, told));
+    assert_eq!(woken.unwrap(), 7);
+    assert!(setter.join().unwrap(), "the setter found the future's waker");
+}

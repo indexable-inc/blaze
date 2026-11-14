@@ -156,13 +156,22 @@ impl SparseIndex {
         if on_disk().is_some_and(|it| it.auth_required) {
             self.auth_required.store(true, Ordering::Relaxed);
         }
-        let fetched = match blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None)) {
+        // No bound of its own: the fetch ends by the HTTP client's deadlines, as `what` says.
+        let what = "a registry's config.json (bounded by the HTTP client's timeouts)";
+        let fetch = || {
+            blaze_core::wait::block_on(what, None, self.fetch(RegistryConfig::NAME, None))
+                .map_err(anyhow::Error::from)
+                .and_then(std::convert::identity)
+        };
+        let fetched = match fetch() {
+            // The protocol's one second ask, with credentials (cargo's `auth-required`): not a
+            // retry of a failure, the answer that says the registry needs them.
             Err(e)
                 if !self.auth_required.load(Ordering::Relaxed)
                     && e.downcast_ref::<HttpNotSuccessful>().is_some_and(|it| it.code == 401) =>
             {
                 self.auth_required.store(true, Ordering::Relaxed);
-                blaze_resolve::block_on(self.fetch(RegistryConfig::NAME, None))
+                fetch()
             }
             fetched => fetched,
         };

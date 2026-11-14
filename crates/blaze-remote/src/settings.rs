@@ -13,6 +13,11 @@
 //!   `BLAZE_CACHE_ACCESS_KEY_ID`, `BLAZE_CACHE_SECRET_ACCESS_KEY`, `BLAZE_CACHE_SIGNING_SEED`,
 //!   `BLAZE_CACHE_KEY_LIST`. A value set both in a file and in the environment is refused,
 //!   naming both.
+//! - `bucket.transport` (`BLAZE_CACHE_TRANSPORT`): what anonymous reads of the public address
+//!   go over, `"h1"` (HTTP/1.1 over TLS, the default) or `"h3"` (HTTP/3 over QUIC, with
+//!   resumption and 0-RTT; [`crate::http3`]). Signed requests always go over HTTP/1.1. There is
+//!   no fallback between them: a public address that does not speak HTTP/3 fails each read,
+//!   naming this setting.
 //!
 //! Secrets are held as [`Secret`], whose Debug and Display are `<redacted>`. Nothing here
 //! prints a secret, and an error about one names the setting, never its value.
@@ -86,6 +91,7 @@ struct BucketForm {
     name: Option<String>,
     public_url: Option<String>,
     cas: Option<bool>,
+    transport: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +119,41 @@ pub struct BucketSettings {
     /// Where public objects are read without a login.
     pub public_url: Option<String>,
     pub cas: bool,
+    /// What anonymous reads go over.
+    pub transport: Transport,
 }
+
+/// What anonymous reads of the public address go over (`bucket.transport`,
+/// `BLAZE_CACHE_TRANSPORT`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Transport {
+    /// HTTP/1.1 over TLS: the default until both are measured on the real bucket.
+    #[default]
+    H1,
+    /// HTTP/3 over QUIC.
+    H3,
+}
+
+impl Transport {
+    /// The setting's text: `h1` or `h3`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Transport::H1 => "h1",
+            Transport::H3 => "h3",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Transport, String> {
+        match text {
+            "h1" => Ok(Transport::H1),
+            "h3" => Ok(Transport::H3),
+            other => Err(format!("{TRANSPORT_SETTING} is {other:?}: it is \"h1\" or \"h3\"")),
+        }
+    }
+}
+
+/// The transport setting, by both of its names.
+pub const TRANSPORT_SETTING: &str = "bucket.transport (BLAZE_CACHE_TRANSPORT)";
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NamespaceSettings {
@@ -150,6 +190,9 @@ pub struct Settings {
     pub credentials: Option<Credentials>,
     pub signer: Option<Signer>,
     pub key_list: Option<PathBuf>,
+    /// The directory the settings were read from: what the cache keeps of its own (the
+    /// HTTP/3 tickets, [`crate::http3::TICKETS_FILE`]) goes there too.
+    pub dir: PathBuf,
     /// Where each setting came from, for `status`: (setting, "file" or "environment").
     pub from: Vec<(&'static str, &'static str)>,
 }
@@ -210,7 +253,9 @@ impl Settings {
         let endpoint = one("bucket.endpoint (BLAZE_CACHE_ENDPOINT)", bucket_form.endpoint, env_text(env, "BLAZE_CACHE_ENDPOINT")?, &mut from)?;
         let name = one("bucket.name (BLAZE_CACHE_BUCKET)", bucket_form.name, env_text(env, "BLAZE_CACHE_BUCKET")?, &mut from)?;
         let public_url = one("bucket.public_url (BLAZE_CACHE_PUBLIC_URL)", bucket_form.public_url, env_text(env, "BLAZE_CACHE_PUBLIC_URL")?, &mut from)?;
-        let bucket = (endpoint.is_some() || name.is_some() || public_url.is_some()).then(|| BucketSettings { endpoint, name, public_url, cas: bucket_form.cas.unwrap_or(true) });
+        let transport = one(TRANSPORT_SETTING, bucket_form.transport, env_text(env, "BLAZE_CACHE_TRANSPORT")?, &mut from)?;
+        let transport = transport.as_deref().map(Transport::parse).transpose()?.unwrap_or_default();
+        let bucket = (endpoint.is_some() || name.is_some() || public_url.is_some()).then(|| BucketSettings { endpoint, name, public_url, cas: bucket_form.cas.unwrap_or(true), transport });
         for url in bucket.iter().flat_map(|it| it.endpoint.iter().chain(it.public_url.iter())) {
             if !url.starts_with("https://") || url.contains('@') || url.trim_end_matches('/').matches('/').count() != 2 {
                 return Err(format!("the bucket address {url:?} is refused: it is `https://<host>` with no path and no credentials in it"));
@@ -256,6 +301,7 @@ impl Settings {
             credentials,
             signer,
             key_list,
+            dir: root.to_owned(),
             from,
         })
     }
