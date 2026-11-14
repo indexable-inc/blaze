@@ -42,6 +42,12 @@ pub enum Error<S: std::error::Error + 'static> {
     #[snafu(display("rules:{line}: builtin `{name}` needs a number, but `{arg}` is {what}"))]
     BuiltinNotNumber { line: usize, name: String, arg: String, what: &'static str },
 
+    #[snafu(display(
+        "rules:{line}: `case` reads an identifier's words, but `{text}` is not an identifier \
+         (letters, digits, `_` and `-` only)"
+    ))]
+    CaseNotIdentifier { line: usize, text: String },
+
     #[snafu(display("rules:{line}: relation `{name}` is not defined by any rule"))]
     UnknownRelation { name: String, line: usize },
 

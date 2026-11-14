@@ -108,6 +108,8 @@ pub(crate) const BUILTINS: &[(&str, usize, &[usize])] = &[
     ("text-match", 2, &[0, 1]),
     // Two or more: the text, the pattern, then one variable per capture group.
     ("text-capture", 2, &[0, 1]),
+    ("text-replace", 4, &[0, 1, 2]),
+    ("case", 3, &[0, 1]),
     ("misgrouped-digits", 2, &[0]),
     ("lt", 2, &[0, 1]),
     ("le", 2, &[0, 1]),
@@ -136,7 +138,10 @@ pub struct AppAtom {
 }
 
 /// The builtins whose second argument is a regex, which must be a string literal.
-pub(crate) const REGEX_BUILTINS: &[&str] = &["text-match", "text-capture"];
+pub(crate) const REGEX_BUILTINS: &[&str] = &["text-match", "text-capture", "text-replace"];
+
+/// The identifier styles `case` writes.
+pub(crate) const CASES: &[&str] = &["snake", "camel", "pascal", "upper-snake", "kebab"];
 
 /// The builtins whose arity is a least: `text-capture` binds one variable per capture group.
 const VARIADIC: &[&str] = &["text-capture"];
@@ -574,6 +579,16 @@ fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) ->
     } else {
         check_arity(app, arity, true)?;
     }
+    if app.name == "case" {
+        return match &app.args[1] {
+            Term::Text(style) if CASES.contains(&style.as_str()) => Ok(()),
+            other => dsl(format!(
+                "case style `{}` is none of {}: write one as a string literal",
+                term_display(other),
+                CASES.iter().map(|it| format!("\"{it}\"")).collect::<Vec<_>>().join(", ")
+            )),
+        };
+    }
     if !REGEX_BUILTINS.contains(&app.name.as_str()) {
         return Ok(());
     }
@@ -589,6 +604,65 @@ fn check_builtin<S: std::error::Error + 'static>(app: &AppAtom, arity: usize) ->
                  variables follow it: one per group"
             ));
         }
+    }
+    if app.name == "text-replace" {
+        let Some(Term::Text(replacement)) = app.args.get(2) else {
+            return dsl("text-replace replacement must be a string literal".to_owned());
+        };
+        if let Err(message) = check_replacement(regex, replacement) {
+            return dsl(format!("text-replace replacement `{replacement}`: {message}"));
+        }
+    }
+    Ok(())
+}
+
+/// Every `$` of a `text-replace` replacement names a group of `regex`, or is `$$`.
+///
+/// The `regex` crate reads `$name` as the longest run of letters, digits and `_`, and writes
+/// empty text for a name no group has: `$1_suffix` is group `1_suffix`, so the replacement
+/// would silently drop the group. Here it is refused, naming the group and the `${1}` spelling.
+fn check_replacement(regex: &regex::Regex, replacement: &str) -> Result<(), String> {
+    let named = |name: &str| match name.parse::<usize>() {
+        Ok(index) => index < regex.captures_len(),
+        Err(_) => regex.capture_names().flatten().any(|it| it == name),
+    };
+    let groups = regex.captures_len() - 1;
+    let mut rest = replacement;
+    while let Some(at) = rest.find('$') {
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('$') {
+            rest = after;
+            continue;
+        }
+        let (name, after, braced) = match rest.strip_prefix('{') {
+            Some(inner) => {
+                let Some(end) = inner.find('}') else {
+                    return Err("`${` has no closing `}`".to_owned());
+                };
+                (&inner[..end], &inner[end + 1..], true)
+            }
+            None => {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                (&rest[..end], &rest[end..], false)
+            }
+        };
+        if name.is_empty() {
+            return Err("a `$` names no group: write `$$` for a literal `$`".to_owned());
+        }
+        if !named(name) {
+            let hint = match name.find(|c: char| !c.is_ascii_digit()) {
+                Some(cut) if !braced && cut > 0 => {
+                    format!(": for group {} followed by `{}`, write `${{{}}}`", &name[..cut], &name[cut..], &name[..cut])
+                }
+                _ => String::new(),
+            };
+            return Err(format!(
+                "`${name}` names no group of the pattern, which has {groups} groups{hint}"
+            ));
+        }
+        rest = after;
     }
     Ok(())
 }

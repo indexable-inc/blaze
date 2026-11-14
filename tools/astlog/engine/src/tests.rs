@@ -459,6 +459,80 @@ fn text_capture_with_a_variable_count_other_than_its_groups_is_refused_at_load()
 }
 
 #[test]
+fn text_replace_writes_every_match_with_its_groups() -> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (r t u) (edge a b) (text a t) (text-replace t \"(\\\\d)(\\\\d)\" \"${2}${1}_$$\" u))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1234, 1), (5, 6)]))?;
+    // Both pairs of `1234` swap; `5` has no match and is its own text: the builtin always holds.
+    assert_eq!(rows(&sets, "r"), [["1234", "21_$43_$"], ["5", "5"]]);
+    Ok(())
+}
+
+#[test]
+fn a_text_replace_dollar_that_names_no_group_is_refused_at_load() {
+    let refused = |replacement: &str| {
+        let rules = format!(
+            "(rule (r a) (edge a b))\n(rule (s u) (edge a b) (text a t) \
+             (text-replace t \"legacy_(.*)\" \"{replacement}\" u))"
+        );
+        Program::<Graph>::parse(&rules).err().map(|it| it.to_string())
+    };
+    // The `regex` crate reads `$1_new` as a group named `1_new` and writes empty text for it.
+    let glued = refused("$1_new").expect("`$1_new` is no group");
+    assert!(
+        glued.starts_with("rules:2: ") && glued.contains("`$1_new`") && glued.contains("write `${1}`"),
+        "{glued}"
+    );
+    let missing = refused("$2").expect("one group only");
+    assert!(missing.contains("`$2` names no group") && missing.contains("1 groups"), "{missing}");
+    let stray = refused("cost $ 5").expect("a lone `$`");
+    assert!(stray.contains("write `$$`"), "{stray}");
+    let open = refused("${1").expect("unclosed brace");
+    assert!(open.contains("no closing"), "{open}");
+    for fine in ["${1}_new", "$1", "$$1", "${0}", "new"] {
+        assert_eq!(refused(fine), None, "{fine}");
+    }
+}
+
+#[test]
+fn case_splits_identifier_words_and_writes_each_style() {
+    let cases = [
+        ("legacy_parse_HTTP", "pascal", "LegacyParseHttp"),
+        ("HTTPServer", "snake", "http_server"),
+        ("utf8Error", "kebab", "utf8-error"),
+        ("parse_v2", "camel", "parseV2"),
+        ("fooBar", "upper-snake", "FOO_BAR"),
+        ("_unused_value", "camel", "_unusedValue"),
+        ("type_", "pascal", "Type_"),
+        ("__", "snake", "__"),
+        ("my-crate", "snake", "my_crate"),
+    ];
+    for (text, case, want) in cases {
+        assert_eq!(crate::eval::recase(text, case).as_deref(), Some(want), "{text} as {case}");
+    }
+    assert_eq!(crate::eval::recase("r#type", "snake"), None);
+    assert_eq!(crate::eval::recase("a b", "snake"), None);
+}
+
+#[test]
+fn case_is_a_builtin_with_a_literal_style_and_refuses_text_that_is_no_identifier()
+-> Result<(), Error<GraphError>> {
+    let program = Program::<Graph>::parse(
+        "(rule (r y) (edge a b) (case \"HTTPServer\" \"snake\" y))",
+    )?;
+    let sets = semi_naive(&program, &Edges(vec![(1, 2)]))?;
+    assert_eq!(rows(&sets, "r"), [["http_server"]]);
+    let style = Program::<Graph>::parse("(rule (r y) (edge a b) (case \"x\" \"Title\" y))")
+        .expect_err("no such style");
+    assert!(style.to_string().contains("`\"Title\"`") || style.to_string().contains("`Title`"), "{style}");
+    let spaced = Program::<Graph>::parse("(rule (r y) (edge a b) (case \"a b\" \"snake\" y))")?;
+    let error = semi_naive(&spaced, &Edges(vec![(1, 2)])).expect_err("`a b` has a space");
+    assert!(matches!(error, Error::CaseNotIdentifier { line: 1, ref text } if text == "a b"), "{error}");
+    Ok(())
+}
+
+#[test]
 fn a_run_past_its_row_cap_stops_naming_the_relation_and_the_rule() -> Result<(), Error<GraphError>> {
     let program = Program::<Graph>::parse(
         "(rule (path a b) (edge a b))

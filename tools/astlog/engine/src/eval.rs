@@ -22,10 +22,11 @@ use std::sync::Arc;
 use blaze_hash::{HashMap, HashSet};
 
 use crate::error::{
-    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, Error, InternalSnafu, TooManyBindingsSnafu,
+    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, CaseNotIdentifierSnafu, Error, InternalSnafu,
+    TooManyBindingsSnafu,
     TooManyRowsSnafu, TooManySourceRowsSnafu,
 };
-use crate::program::{AppAtom, BodyAtom, Language, Program, Term};
+use crate::program::{AppAtom, BodyAtom, CASES, Language, Program, Term};
 
 /// One value in a relation row.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -195,6 +196,8 @@ enum Builtin {
     FilePath,
     TextMatch,
     TextCapture,
+    TextReplace,
+    Case,
     MisgroupedDigits,
     Lt,
     Le,
@@ -213,6 +216,8 @@ impl Builtin {
             "file-path" => Self::FilePath,
             "text-match" => Self::TextMatch,
             "text-capture" => Self::TextCapture,
+            "text-replace" => Self::TextReplace,
+            "case" => Self::Case,
             "misgrouped-digits" => Self::MisgroupedDigits,
             "lt" => Self::Lt,
             "le" => Self::Le,
@@ -761,6 +766,30 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 });
                 row.into_iter().collect()
             }
+            Builtin::TextReplace => {
+                let subject = value(0)?;
+                let replacement = value(2)?;
+                let text = facts.value_text(&subject);
+                // The replacement's every `$` was checked against the pattern's groups at load.
+                let replaced = regex()?.replace_all(&text, facts.value_text(&replacement).as_ref());
+                let replaced = Value::Text(Arc::from(replaced.as_ref()));
+                vec![vec![subject, value(1)?, replacement, replaced]]
+            }
+            Builtin::Case => {
+                let subject = value(0)?;
+                let style = value(1)?;
+                let text = facts.value_text(&subject);
+                let Some(&case) = CASES.iter().find(|it| **it == facts.value_text(&style)) else {
+                    return InternalSnafu {
+                        what: format!("case at rules:{} ran with a style load did not check", app.line),
+                    }
+                    .fail();
+                };
+                let cased = recase(&text, case).ok_or_else(|| {
+                    CaseNotIdentifierSnafu { line: app.line, text: text.as_ref() }.build()
+                })?;
+                vec![vec![subject, style, Value::Text(Arc::from(cased.as_str()))]]
+            }
             Builtin::MisgroupedDigits => {
                 let subject = value(0)?;
                 let fixed = regroup_digits(&facts.value_text(&subject));
@@ -921,6 +950,68 @@ fn clear<N>(env: &mut Env<N>, set: &[usize]) {
     for &slot in set {
         env[slot] = None;
     }
+}
+
+/// `text`, an identifier, in `case` (one of [`CASES`]), or `None` when it is not one (a
+/// character other than an ASCII letter, digit, `_` or `-`, a raw `r#` included).
+///
+/// Words split at `_` and `-` and at case boundaries: before an upper-case letter after a
+/// lower-case letter or a digit (`fooBar`, `utf8Error`), and before the last upper-case letter
+/// of a run followed by a lower-case one (`HTTPServer` is `HTTP` `Server`). Digits stay with
+/// the word before them (`v2`). Leading and trailing `_` are kept, so `_unused` stays private
+/// and `type_` keeps its keyword escape.
+pub(crate) fn recase(text: &str, case: &str) -> Option<String> {
+    if !text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    let core = text.trim_matches('_');
+    let (lead, trail) = if core.is_empty() {
+        (text, "")
+    } else {
+        let start = text.len() - text.trim_start_matches('_').len();
+        let end = text.trim_end_matches('_').len();
+        (&text[..start], &text[end..])
+    };
+    let mut words: Vec<String> = Vec::new();
+    for chunk in core.split(['_', '-']).filter(|it| !it.is_empty()) {
+        let chars: Vec<char> = chunk.chars().collect();
+        let mut word = String::new();
+        for (at, &c) in chars.iter().enumerate() {
+            let before = at.checked_sub(1).map(|it| chars[it]);
+            let after = chars.get(at + 1);
+            let boundary = c.is_ascii_uppercase()
+                && before.is_some_and(|b| {
+                    b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || (b.is_ascii_uppercase() && after.is_some_and(char::is_ascii_lowercase))
+                });
+            if boundary && !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            word.push(c);
+        }
+        words.push(word);
+    }
+    let capital = |word: &str| {
+        let mut chars = word.chars();
+        chars.next().map_or_else(String::new, |first| {
+            first.to_ascii_uppercase().to_string() + &chars.as_str().to_ascii_lowercase()
+        })
+    };
+    let lower = |join: &str| words.iter().map(|it| it.to_ascii_lowercase()).collect::<Vec<_>>().join(join);
+    let joined = match case {
+        "snake" => lower("_"),
+        "kebab" => lower("-"),
+        "upper-snake" => words.iter().map(|it| it.to_ascii_uppercase()).collect::<Vec<_>>().join("_"),
+        "pascal" => words.iter().map(|it| capital(it)).collect(),
+        "camel" => words
+            .iter()
+            .enumerate()
+            .map(|(at, it)| if at == 0 { it.to_ascii_lowercase() } else { capital(it) })
+            .collect(),
+        _ => return None,
+    };
+    Some(format!("{lead}{joined}{trail}"))
 }
 
 /// Canonical underscore digit grouping for a numeric-literal text, following the Rust convention:

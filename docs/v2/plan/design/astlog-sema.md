@@ -151,6 +151,8 @@ compiled when the file is read; one that does not compile, or whose compiled pro
 |---|---|---|
 | `(text-match x "re")` | `x` | holds when the regex matches somewhere in `x`'s text |
 | `(text-capture x "re" g1 g2 ...)` | `x` | holds when the regex matches; binds each capture group of the first match, in order, as text (a group that took no part binds empty text). The variables must be one per group, checked at load |
+| `(text-replace x "re" "with" y)` | `x` | always holds; `y` is `x`'s text with every match replaced. `$1`, `${1}` and `${name}` write a group, `$$` a literal `$`. `$name` takes the longest run of letters, digits and `_`, so `$1_new` would read a group `1_new`: a `$` that names no group of the pattern, or names nothing, is a load error that gives the `${1}` spelling |
+| `(case x "style" y)` | `x` | `x`'s text as `snake`, `camel`, `pascal`, `upper-snake` or `kebab` (the style a literal). Words split at `_`, `-` and case changes (`HTTPServer` is `HTTP` `Server`, digits stay with the word before them); leading and trailing `_` are kept. Text with any other character, `r#` included, is an error naming it |
 
 ## Type patterns
 
