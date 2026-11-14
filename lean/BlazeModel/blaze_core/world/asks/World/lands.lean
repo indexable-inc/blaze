@@ -16,6 +16,8 @@ import BlazeModel.blaze_core.world.disk.sectors
 open Blaze
 set_option linter.unusedVariables false
 
+mutual
+
 def blaze_core.world.asks.World.lands.loop_1 (fuel : Nat) (self : blaze_core.world.asks.World) (landings : Slice blaze_core.world.asks.Landing) (i : Usize) (landing : blaze_core.world.asks.Landing) (j : Usize) : Result Bool :=
   match fuel with
   | 0 => Result.div
@@ -57,6 +59,8 @@ def blaze_core.world.asks.World.lands.loop_0 (fuel : Nat) (self : blaze_core.wor
             blaze_core.world.asks.World.lands.loop_1 fuel self landings i landing j
         | _ => Result.ok false
     else Result.ok true
+
+end
 
 def blaze_core.world.asks.World.lands (fuel : Nat) (self : blaze_core.world.asks.World) (landings : Slice blaze_core.world.asks.Landing) : Result Bool :=
   let i := (0 : Usize)

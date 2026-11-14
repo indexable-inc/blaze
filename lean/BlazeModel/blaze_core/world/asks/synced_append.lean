@@ -187,26 +187,29 @@ def blaze_core.world.asks.synced_append (fuel : Nat) (disk : blaze_core.world.di
         Result.ok (world, !t20)
     if t19 then Result.ok (Option.none : Option Bool)
     else do
-      let t21 ← blaze_core.world.disk.Disk.find fuel world.disk file
-      match t21 with
-      | Option.some v5 => do
-        let «at» := v5
-        let t22 ← Slice.index world.disk.files «at»
-        let t23 ← blaze_core.world.disk.File.only_appended fuel t22
-        let t24 := !t23
-        let t25 ←
-          if t24 then Result.ok t24
+      let t21 ← blaze_core.world.disk.Disk.small fuel world.disk
+      if !t21 then Result.ok (Option.none : Option Bool)
+      else do
+        let t22 ← blaze_core.world.disk.Disk.find fuel world.disk file
+        match t22 with
+        | Option.some v5 => do
+          let «at» := v5
+          let t23 ← Slice.index world.disk.files «at»
+          let t24 ← blaze_core.world.disk.File.only_appended fuel t23
+          let t25 := !t24
+          let t26 ←
+            if t25 then Result.ok t25
+            else do
+              let t27 ← Slice.index world.disk.files «at»
+              Result.ok (core.option.Option.is_some t27.undo)
+          if t26 then Result.ok (Option.none : Option Bool)
           else do
-            let t26 ← Slice.index world.disk.files «at»
-            Result.ok (core.option.Option.is_some t26.undo)
-        if t25 then Result.ok (Option.none : Option Bool)
-        else do
-          let t27 ← Slice.index world.disk.files «at»
-          let before ← blaze_core.world.disk.File.contents fuel t27
-          let (t28, world) ←
-            blaze_core.world.asks.World.ask fuel world (1 : U64) (blaze_core.world.asks.Ask.Sync file : blaze_core.world.asks.Ask)
-          if !t28 then Result.ok (Option.none : Option Bool)
-          else
-            let i := (0 : Usize)
-            blaze_core.world.asks.synced_append.loop_0 fuel file between covers landings cut world before i
-      | Option.none => Result.ok (Option.none : Option Bool)
+            let t28 ← Slice.index world.disk.files «at»
+            let before ← blaze_core.world.disk.File.contents fuel t28
+            let (t29, world) ←
+              blaze_core.world.asks.World.ask fuel world (1 : U64) (blaze_core.world.asks.Ask.Sync file : blaze_core.world.asks.Ask)
+            if !t29 then Result.ok (Option.none : Option Bool)
+            else
+              let i := (0 : Usize)
+              blaze_core.world.asks.synced_append.loop_0 fuel file between covers landings cut world before i
+        | Option.none => Result.ok (Option.none : Option Bool)

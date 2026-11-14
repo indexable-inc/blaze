@@ -116,5 +116,4 @@ def blaze_core.world.asks.World.allows (fuel : Nat) (self : blaze_core.world.ask
       | blaze_core.world.asks.Told.Failed => Result.ok true
       | _ => Result.ok false
     | blaze_core.world.asks.Ask.Remove v25 => Result.ok (blaze_core.world.asks.done_or_failed told)
-    | _ => Result.fail Error.unreachable
   | Option.none => Result.ok false
