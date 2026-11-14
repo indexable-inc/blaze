@@ -59,7 +59,7 @@ to them rather than repeating them:
 
 ### DST on everything, proofs on small stable cores
 
-Changed on 2026-11-13 (decision D38, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
+Changed on 2026-11-13 (decision D40, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
 sans-IO code the translator reads, a proof Lean has checked in the gate takes the place of
 the simulation test, which is deleted; that doc says what stands for what a proof does not
 cover (a conformance test per world model, and each translated function run as its Lean model

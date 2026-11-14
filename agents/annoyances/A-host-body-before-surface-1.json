@@ -1,0 +1,12 @@
+{
+ "id": "A-host-body-before-surface-1",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane H4 blaze-host",
+ "where": "crates/blaze-keyed/src/driver.rs, start_checking and got_ask",
+ "what": "The driver asks every slot of a unit at once, so a Body task or a body's Verify can be issued before the unit's own Surface is proved and filed, while a body's universe must hold that surface. The host has to park them by unit, watch for the surface's proof (after a give, at its put, and after memo hits settled with no effect), and give the driver an unreachable capacity so parked tasks hold no slot. A reading of driver.rs end to end was needed to find it.",
+ "cost": "about an hour of reading and a parking layer in blaze-host that the driver's order would make unnecessary",
+ "cause": "the driver orders units by dependency but not a unit's bodies after its own surface; Effect::Put carries no unit, and Input::Now has no failure",
+ "workaround": "blaze-host parks Run and Verify of a body until its unit's surface resolves (host.rs, Host::refresh)",
+ "fix": "driver.rs: push a unit's Body Run and body Verify only once its Surface slot is Done; add `unit` to Effect::Put and a `TaskFailed` arm to Input::Now",
+ "state": "open"
+}
