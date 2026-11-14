@@ -30,6 +30,7 @@ mod comptime;
 mod const_ast;
 mod const_macro;
 mod const_quote;
+mod const_str;
 mod const_traits;
 mod deps;
 mod intrinsics;
@@ -39,6 +40,7 @@ pub(crate) mod reach;
 mod records;
 mod simd;
 mod trivial;
+mod type_of;
 mod word;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {

@@ -1778,16 +1778,26 @@ fn rustc_mir_opt_level(lang: bool, optimized: bool) -> MirOptLevel {
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
 fn mir_options_of(db: &Db, krate: Crate) -> Result<MirOptions> {
     let level = mir_opt_level_of(db, krate)?;
+    let lang = krate.data(db).origin.is_lang();
+    // The library's bodies as shipped (rustc's pipeline, no pass on facts); another crate's
+    // optimizing where its level is 2, else tier 0. v1 keeps the library inlined at every
+    // level, as it was; v2's `Build::options` decides per unit.
+    let tier = match (level, lang) {
+        (_, true) => hir_ty::facts::Tier::Shipped,
+        (MirOptLevel::Release, false) => hir_ty::facts::Tier::Optimizing,
+        (_, false) => hir_ty::facts::Tier::Zero,
+    };
     Ok(MirOptions {
         level,
         ub_checks: debug_assertions(db, krate),
         lifetime_markers: true,
-        inline: rustc_inlines(level, krate.data(db).origin.is_lang(), backend::optimizing()),
+        inline: rustc_inlines(level, lang, backend::optimizing()),
         // v1 knows nothing of the program its crates are linked into, so not what allocator
         // it has: no allocation moves to the stack.
         heap_to_stack: false,
         // Nor what trait objects it makes.
         world: None,
+        tier,
     })
 }
 

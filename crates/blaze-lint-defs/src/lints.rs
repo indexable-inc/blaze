@@ -533,6 +533,17 @@ pub(super) const BLAZE: &[Lint] = &[
     // Duplicated behaviour, by a canonical form of runtime MIR.
     l("blaze::same_behaviour", Allow, "detects a function written differently from another but compiled to the same behaviour, by a canonical form of their runtime MIR")
         .externally_loaded(),
+    // Trust: what a dependency may do only when the workspace grants it.
+    l("blaze::dependency_capability", Deny, "detects a dependency that uses a capability (files, sockets, processes, the environment, the clock, threads, global state, randomness, foreign code, a build script, a proc macro) the workspace's `[workspace.metadata.blaze.trust]` does not grant it")
+        .externally_loaded(),
+    l("blaze::dependency_unsafe", Deny, "detects a dependency with `unsafe` code the workspace's `[workspace.metadata.blaze.trust]` does not grant it")
+        .externally_loaded(),
+    l("blaze::trust_grant_unused", Warn, "detects a grant in `[workspace.metadata.blaze.trust]` for no dependency, for a version the build does not have, or of a capability its dependency does not use")
+        .externally_loaded(),
+    l("blaze::dependency_capability_unreached", Warn, "detects a dependency's code that nothing the workspace builds reaches yet and that uses a capability the workspace does not grant it")
+        .externally_loaded(),
+    l("blaze::workspace_unsafe", Allow, "detects a workspace crate with `unsafe` code whose root does not say why with `#![blaze::trust(unsafe, reason = \"..\")]`")
+        .externally_loaded(),
     // Nightly-only speed advice, after the rest so the order stays `Lint::ALL`'s.
     l("blaze::loop_match_candidate", Allow, "detects a `loop` over a local state that sets the next state from a `match` on it, with transitions to constant states that nightly's `#[loop_match]` would make direct jumps")
         .externally_loaded(),

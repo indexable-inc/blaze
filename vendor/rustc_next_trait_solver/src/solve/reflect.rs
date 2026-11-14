@@ -13,8 +13,10 @@
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::lang_items::SolverTraitLangItem;
 use rustc_type_ir::reflect::{
-    ReflectContainer, ReflectedDomain, first_reflected_var, instantiate_reflected_var,
+    ReflectContainer, ReflectedDomain, TypeOfAnswer, first_reflected_var,
+    instantiate_reflected_var,
 };
+use rustc_type_ir::solve::NoSolutionOrRerunNonErased;
 use rustc_type_ir::{
     self as ty, Interner, TraitRef, TypeVisitableExt as _, Upcast as _, elaborate,
 };
@@ -111,6 +113,23 @@ where
             }
             ReflectAnswer::Fails => Err(NoSolution.into()),
         }
+    }
+
+    /// What `self_ty: TypeOf` and `<self_ty as TypeOf>::Type` answer
+    /// (docs/v2/plan/design/type-of.md): for `Described<'a, D, Args>`, `D` is normalized
+    /// first (an anonymous constant is evaluated here, within the evaluator's step limit), then
+    /// the interner reads its value tree. Any other self type is refused.
+    pub(super) fn type_of_answer(
+        &mut self,
+        param_env: I::ParamEnv,
+        self_ty: I::Ty,
+    ) -> Result<TypeOfAnswer<I>, NoSolutionOrRerunNonErased> {
+        let cx = self.cx();
+        let Some(desc) = cx.reflect_described_desc(self_ty) else {
+            return Ok(TypeOfAnswer::Refused);
+        };
+        let desc = self.structurally_normalize_const(param_env, desc)?;
+        Ok(cx.reflect_type_of(self_ty, desc))
     }
 
     /// Proves `kind`, a predicate whose binder has the reflected variable `index` (its first):

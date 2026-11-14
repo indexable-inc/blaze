@@ -20,6 +20,11 @@
 //!
 //! In a binary that links no analyses (a crate below `hir-ty-pure` testing itself) nothing
 //! is proved and the pass changes nothing ([`linked`]).
+//!
+//! The pass runs only at the optimizing tier (`MirOptions::tier`, `super::passes_at`): a tier
+//! 0 body and the library's as shipped ask no fact, so building them computes no effect
+//! summary. Each fact is asked with the proofs the tier spends (`hir_ty::facts::proofs_at`);
+//! the options key the body, so a body made on facts of one tier is never served for another.
 
 use hir_def::{DefWithBodyId, FunctionId, ItemContainerId, signatures::FunctionSignature};
 use rustc_abi::ExternAbi;
@@ -27,7 +32,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use crate::{
     InferBodyId,
-    facts::{Callee, Fact, FactItem, Facts, Spend, facts_of, linked},
+    facts::{Callee, Fact, FactItem, Facts, Proofs, Spend, facts_of, linked},
     mir::{
         BasicBlockId, InlinedBody, LocalId, MirBody, Operand, OperandKind, Rvalue, Statement,
         StatementKind, StoredPlace, Terminator, TerminatorKind,
@@ -81,11 +86,13 @@ fn callee<'db>(
     (Callee::Direct, Some(item))
 }
 
-/// The facts of the callee of the call that ends `block`, if it is one a fact is asked of.
+/// The facts of the callee of the call that ends `block`, if it is one a fact is asked of,
+/// proved with `proofs` (those of the body's [`crate::mir::MirOptions::tier`]).
 fn callee_facts<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     block: BasicBlockId,
+    proofs: Proofs,
 ) -> Option<&'db Facts> {
     let Some(Terminator { kind: TerminatorKind::Call { func, intrinsic, .. }, .. }) =
         &body.basic_blocks[block].terminator
@@ -96,11 +103,12 @@ fn callee_facts<'db>(
     if !how.asked() {
         return None;
     }
-    Some(facts_of(ctx.db, FactItem::Fn(item?)))
+    Some(facts_of(ctx.db, FactItem::Fn(item?), proofs))
 }
 
-/// [`Spend::UnwindEdge`] over `body`: says how many edges went.
-pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> u32 {
+/// [`Spend::UnwindEdge`] over `body`, its callees' facts proved with `proofs`: says how many
+/// edges went.
+pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, proofs: Proofs) -> u32 {
     if linked().is_none() || body.coroutine.is_some() {
         return 0;
     }
@@ -120,7 +128,7 @@ pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> 
         if !has_edge {
             continue;
         }
-        let Some(facts) = callee_facts(ctx, body, block) else { continue };
+        let Some(facts) = callee_facts(ctx, body, block, proofs) else { continue };
         let Some(relied) = facts.license(Spend::UnwindEdge) else { continue };
         if let Some(Terminator { kind: TerminatorKind::Call { cleanup, .. }, .. }) =
             &mut body.basic_blocks[block].terminator
@@ -135,7 +143,7 @@ pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> 
     // The body's own: the code generator marks a function `nounwind` where its body relied
     // on the function's own fact, so the mark is in the key that covers it.
     if let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(own)) = body.owner {
-        let facts = facts_of(ctx.db, FactItem::Fn(own));
+        let facts = facts_of(ctx.db, FactItem::Fn(own), proofs);
         if facts.spendable(Fact::NoUnwind) {
             body.inlined.rely(facts.relied(Fact::NoUnwind));
         }
@@ -146,17 +154,18 @@ pub(super) fn unwind_edges<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> 
     gone
 }
 
-/// Whether the body's code may be marked as never unwinding: its optimized body relied on
-/// its own [`Fact::NoUnwind`] ([`unwind_edges`]). The one question the code generator asks
-/// for `nounwind`; it reads the body, so whatever keys the body's code keys the mark.
-pub fn relied_on_own_no_unwind(db: &base_db::Db, body: &MirBody<'_>) -> bool {
+/// Whether the body's code may be marked as never unwinding: its optimized body, made with
+/// `proofs` (its options'), relied on its own [`Fact::NoUnwind`] ([`unwind_edges`]). The one
+/// question the code generator asks for `nounwind`; it reads the body, so whatever keys the
+/// body's code keys the mark.
+pub fn relied_on_own_no_unwind(db: &base_db::Db, body: &MirBody<'_>, proofs: Proofs) -> bool {
     let InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(own)) = body.owner else {
         return false;
     };
     if linked().is_none() || body.inlined.relied.is_empty() {
         return false;
     }
-    let digest = facts_of(db, FactItem::Fn(own)).relied(Fact::NoUnwind);
+    let digest = facts_of(db, FactItem::Fn(own), proofs).relied(Fact::NoUnwind);
     body.inlined.relied.contains(&digest)
 }
 
@@ -292,7 +301,7 @@ fn predecessors(body: &MirBody<'_>) -> Vec<(u32, BasicBlockId)> {
 }
 
 /// [`Spend::MergeRepeat`] over `body`: says how many calls went.
-pub(super) fn merge_repeats<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) -> u32 {
+pub(super) fn merge_repeats<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, proofs: Proofs) -> u32 {
     if linked().is_none() || body.coroutine.is_some() {
         return 0;
     }
@@ -304,7 +313,7 @@ pub(super) fn merge_repeats<'db>(ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>) ->
         // The first call's block still ends in the call: a merged call is a `Goto`, which
         // `repeated` does not match, so a third call in a row merges with the first's result
         // through the second's copy on the next run, never with a call that is gone.
-        let Some(facts) = callee_facts(ctx, body, first) else { continue };
+        let Some(facts) = callee_facts(ctx, body, first, proofs) else { continue };
         let Some(relied) = facts.license(Spend::MergeRepeat) else { continue };
         let block = &mut body.basic_blocks[second];
         let Some(terminator) = &mut block.terminator else { continue };

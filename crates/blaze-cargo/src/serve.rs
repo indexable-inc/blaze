@@ -25,6 +25,8 @@ mod daemon;
 pub mod dev_toolchain;
 pub(crate) mod direct;
 mod fetch;
+/// The daemon's fetcher, for `blaze audit pin`'s fresh fetch of a git tree it pins.
+pub(crate) use self::fetch::Fetcher;
 mod fetch_url;
 #[blaze::sans_io]
 pub(crate) mod front_carry;

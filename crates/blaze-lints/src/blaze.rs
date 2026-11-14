@@ -174,6 +174,7 @@ mod todo;
 mod thread_local_tests;
 mod tmp_path;
 mod truncating_cast;
+pub mod trust;
 mod unbounded_from_input;
 mod unbounded_test_wait;
 mod unbounded_wait;
@@ -494,6 +495,12 @@ pub enum Lint {
     RegistrySpread,
     // Duplicated behaviour (`dup::semantic`): two functions whose canonical runtime MIR is one.
     SameBehaviour,
+    // Trust (`trust`): what a dependency may do only when the workspace grants it.
+    DependencyCapability,
+    DependencyUnsafe,
+    TrustGrantUnused,
+    DependencyCapabilityUnreached,
+    WorkspaceUnsafe,
     // A hand-written state machine nightly's `#[loop_match]` could turn into direct jumps.
     LoopMatchCandidate,
 }
@@ -553,7 +560,15 @@ pub(crate) const DENY_BY_DEFAULT: &[Lint] = &[
     // Fire only on a function marked with its role (docs/v2/plan/design/effect-summary.md).
     Lint::LoopTurnEffects,
     Lint::SyncOnAnswerPath,
+    // A dependency doing what the workspace did not grant it: a compromised version stops the
+    // build that pulls it in. Fires only where the driver gave the grants (`Conf::trust`).
+    Lint::DependencyCapability,
+    Lint::DependencyUnsafe,
 ];
+
+/// The group `blaze::trust`: what a dependency may do only when the workspace grants it, and
+/// a workspace crate's own `unsafe` ([`trust`]).
+pub(crate) const TRUST: &[Lint] = &trust::LINTS;
 
 /// The lints no level waives (docs/v2/plan/design/proved-unreachable.md): `deny` whatever an
 /// attribute, a flag, a manifest table or `--cap-lints` says ([`crate::level::Levels::of`]).
@@ -904,6 +919,11 @@ impl Lint {
         Lint::RepeatedFieldList,
         Lint::RegistrySpread,
         Lint::SameBehaviour,
+        Lint::DependencyCapability,
+        Lint::DependencyUnsafe,
+        Lint::TrustGrantUnused,
+        Lint::DependencyCapabilityUnreached,
+        Lint::WorkspaceUnsafe,
         Lint::LoopMatchCandidate,
     ];
 
@@ -1214,6 +1234,14 @@ impl Lint {
             | Lint::CouldHaveInvariant => Kind::Suggest,
             // Allowed elsewhere, as the other duplicate lints: held by the ratchet baselines.
             Lint::SameBehaviour => Kind::Internal,
+            // A dependency's capabilities are every workspace's concern: the two denials are
+            // `deny` ([`DENY_BY_DEFAULT`], which wins over this), the other two warn. A
+            // workspace crate's own `unsafe` is a policy blaze holds itself to by its ratchet.
+            Lint::DependencyCapability
+            | Lint::DependencyUnsafe
+            | Lint::TrustGrantUnused
+            | Lint::DependencyCapabilityUnreached => Kind::General,
+            Lint::WorkspaceUnsafe => Kind::Internal,
         }
     }
 
@@ -1480,6 +1508,11 @@ impl Lint {
             Lint::RepeatedFieldList => "repeated_field_list",
             Lint::RegistrySpread => "registry_spread",
             Lint::SameBehaviour => "same_behaviour",
+            Lint::DependencyCapability => "dependency_capability",
+            Lint::DependencyUnsafe => "dependency_unsafe",
+            Lint::TrustGrantUnused => "trust_grant_unused",
+            Lint::DependencyCapabilityUnreached => "dependency_capability_unreached",
+            Lint::WorkspaceUnsafe => "workspace_unsafe",
             Lint::LoopMatchCandidate => "loop_match_candidate",
         }
     }
@@ -1739,6 +1772,13 @@ impl Lint {
             Lint::FiberBoundary => {
                 "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan.md"
             }
+            Lint::DependencyCapability => concat!(general_docs!(), "#dependency_capability"),
+            Lint::DependencyUnsafe => concat!(general_docs!(), "#dependency_unsafe"),
+            Lint::TrustGrantUnused => concat!(general_docs!(), "#trust_grant_unused"),
+            Lint::DependencyCapabilityUnreached => {
+                concat!(general_docs!(), "#dependency_capability_unreached")
+            }
+            Lint::WorkspaceUnsafe => concat!(docs!(), "#workspace_unsafe"),
         }
     }
 
@@ -2478,6 +2518,21 @@ impl Lint {
             Lint::FrozenCollection => {
                 "make the field a `Box<[T]>` (`Box<str>` for a string), built once with `into_boxed_slice()` / `into_boxed_str()`; or say why it stays growable with `#[expect(blaze::frozen_collection, reason = \"..\")]`"
             }
+            Lint::DependencyCapability => {
+                "read what the dependency does there; if it is trusted with it, add the capability to its entry under `[workspace.metadata.blaze.trust]` in the root Cargo.toml with a `reason` (`blaze audit grants` prints the table the workspace needs today); if not, pin or drop the dependency"
+            }
+            Lint::DependencyUnsafe => {
+                "read the dependency's `unsafe` code; if it is trusted with it, add `\"unsafe\"` to its `allow` under `[workspace.metadata.blaze.trust]` in the root Cargo.toml with a `reason`; if not, pin or drop the dependency"
+            }
+            Lint::TrustGrantUnused => {
+                "remove what the grant no longer needs from `[workspace.metadata.blaze.trust]`, so a version that starts to use it again is told"
+            }
+            Lint::DependencyCapabilityUnreached => {
+                "no build reaches it yet; grant it under `[workspace.metadata.blaze.trust]` before a call does, or keep the workspace from calling it"
+            }
+            Lint::WorkspaceUnsafe => {
+                "say why the crate runs `unsafe` code at its root: `#![blaze::trust(unsafe, reason = \"..\")]`, or make the code safe"
+            }
         }
     }
 }
@@ -2699,6 +2754,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         truncating_cast::check(cx);
         build_script_ambient::check(cx);
         not_latest_edition::check(cx);
+        trust::check(cx);
         std_use::check(cx);
         env_read::check(cx);
         untied_child::check(cx);

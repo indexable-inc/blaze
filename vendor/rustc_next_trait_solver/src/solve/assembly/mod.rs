@@ -759,7 +759,8 @@ where
                     | SolverTraitLangItem::ReflectField
                     | SolverTraitLangItem::ReflectVariant
                     | SolverTraitLangItem::ReflectFnItem
-                    | SolverTraitLangItem::ReflectMemoPoint),
+                    | SolverTraitLangItem::ReflectMemoPoint
+                    | SolverTraitLangItem::ReflectTypeOf),
                 ) => G::consider_builtin_reflect_candidate(self, goal, item),
                 Some(SolverTraitLangItem::ErrorUnionFrom) => {
                     G::consider_builtin_error_union_from_candidate(self, goal)
