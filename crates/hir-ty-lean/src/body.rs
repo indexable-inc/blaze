@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use base_db::Db;
 use hir_def::{
-    AdtId,
+    AdtId, AttrDefId, attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait, CallableDefId, DefWithBodyId, FunctionId, HasModule as _, ImplId, ItemContainerId,
     Lookup as _, ModuleId, TraitId, VariantId,
     expr_store::{ExpressionStore, pretty::print_expr_hir},
@@ -41,12 +41,14 @@ use hir_ty::{
     method_resolution::NoImplMethod,
     mir as m,
     next_solver::{
-        AliasConstKind, ConstKind, DbInterner, FreeConstAliasId, GenericArgs, InherentAssocConstId,
-        TraitRef, Ty as HTy, TyKind,
+        AliasConstKind, Const as HConst, ConstKind, DbInterner, FreeConstAliasId, GenericArg,
+        GenericArgs, InherentAssocConstId, ParamEnv, TraitRef, Ty as HTy, TyKind, TypingMode,
+        infer::{DbInternerInferExt as _, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
     },
 };
 use rustc_type_ir::{
-    IntTy as RIntTy, UintTy,
+    IntTy as RIntTy, TypeVisitableExt as _, UintTy,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _},
 };
 
@@ -228,7 +230,12 @@ pub enum AdtKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdtDecl {
+    /// Its Lean name ([`adt_path`]): `krate.module.Name`, and for an instance of a generic
+    /// type the [`segment`] of its arguments after it (`krate.Pair.u32`).
     pub name: String,
+    /// What it is in Rust, every type by its whole path (`krate::Pair<u32>`): two instances
+    /// with one Lean name have two of these, which makes them a refusal, never one.
+    pub display: String,
     pub kind: AdtKind,
 }
 
@@ -752,10 +759,10 @@ pub fn fold(nodes: Vec<Node<Stmt, Cond>>) -> Vec<Node<Stmt, Cond>> {
     out
 }
 
-/// What [`from_mir`] gives: the body, and the functions it calls by their Lean names.
-pub(crate) struct Lowered {
+/// What [`from_mir`] gives: the body, and the instances it calls by their Lean names.
+pub(crate) struct Lowered<'db> {
     pub(crate) body: Body,
-    pub(crate) callees: Vec<(String, FunctionId)>,
+    pub(crate) callees: Vec<(String, Instance<'db>)>,
     /// The structs and enums whose derived `==` the body calls, or that a field of one holds:
     /// each gets a Lean `DecidableEq` instance ([`crate::eq_module`]).
     pub(crate) derives: BTreeSet<String>,
@@ -1001,30 +1008,311 @@ fn module_path(db: &Db, module: ModuleId) -> Vec<String> {
     segments
 }
 
-/// `func`'s path, its segments: the crate, the modules, the type for a method or an associated
-/// function of an inherent impl, the name.
+/// What a generic function asked for alone is: neither translated nor refused, but translated
+/// at each instance a theorem reaches (docs/v2/plan/design/proofs-for-sans-io.md, section 3,
+/// "Generics are translated by instance"). Its leading words, `a generic function`, are what
+/// `blaze prove --subset` counts the line by.
+pub const GENERIC_UNASKED: &str =
+    "a generic function, translated at each instance a theorem reaches (none is asked for here)";
+
+/// A `#[blaze::theorem]` function with type or const parameters: a theorem's statement is
+/// closed, so it is refused, never stated per instance.
+pub const GENERIC_THEOREM: &str = "a generic `#[blaze::theorem]` function (a theorem's statement \
+    is closed: it states one function, so its type and const parameters are given in it)";
+
+/// How many instances of generic functions one chain of calls may hold: deeper is a function
+/// that calls itself, directly or not, at an ever larger type (`f::<T>` calling
+/// `f::<Option<T>>`), which no finite set of Lean modules translates, and is refused
+/// ([`crate::emit`]). rustc stops such a program at its recursion limit (128) while it
+/// instantiates; 32 is far above the chains the tests reach (one instance deep).
+pub const INSTANCE_DEPTH: usize = 32;
+
+/// A function at its generic arguments: what is translated (docs/v2/plan/design/
+/// proofs-for-sans-io.md, section 3). A theorem function is closed, so everything it reaches
+/// is reached at concrete arguments, as in codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Instance<'db> {
+    pub(crate) func: FunctionId,
+    /// `None` for a function with no type or const parameters, its own or its impl's: its body
+    /// is its MIR as built, in its own environment. Otherwise every argument (the impl's, then
+    /// its own), each concrete: its body is its MIR monomorphized at them
+    /// (`HirDatabase::monomorphized_mir_body`), every type substituted before it is modelled
+    /// and every callee's arguments with them.
+    pub(crate) args: Option<GenericArgs<'db>>,
+    /// The crate an instance's calls of a trait's methods are resolved in, with no where
+    /// clauses (as codegen resolves them): the crate of the function the chain of instances
+    /// began at, which sees every impl its arguments' types have.
+    pub(crate) krate: base_db::Crate,
+}
+
+impl<'db> Instance<'db> {
+    /// `func` itself, at no arguments.
+    pub(crate) fn of(db: &Db, func: FunctionId) -> Instance<'db> {
+        Instance { func, args: None, krate: func.krate(db) }
+    }
+}
+
+/// Whether `func` has type or const parameters, its own or its impl's. Lifetimes are dropped:
+/// a function generic only over lifetimes is one function.
+pub(crate) fn is_generic(db: &Db, func: FunctionId) -> bool {
+    if GenericParams::of(db, func.into()).len_type_or_consts() != 0 {
+        return true;
+    }
+    match func.lookup(db).container {
+        ItemContainerId::ImplId(imp) => GenericParams::of(db, imp.into()).len_type_or_consts() != 0,
+        _ => false,
+    }
+}
+
+/// The naming of instances: how generic arguments are written in a Lean name, as one name
+/// component that is also a file name.
+///
+/// - A function's instance is its path, then one component of its own arguments: `pick` at
+///   `u32` is `krate.pick.u32`, module `BlazeModel.krate.pick.u32`, file
+///   `BlazeModel/krate/pick/u32.lean`.
+/// - A generic struct or enum's instance is its path, then one component of its arguments
+///   (`krate.Pair.u32`, `krate.Pair.Vec_u8`), a Lean structure or inductive type of its own,
+///   in the module `<name>.type`; its inherent methods are in its namespace
+///   (`krate.Pair.u32.swap`), and a method of a trait impl in the namespace of the type and the
+///   trait (`krate.Pair.u32.Shape.area`), with one more component for a trait's arguments other
+///   than `Self` (`krate.Big.From.Small.from`).
+/// - The component: each type or const argument, joined by `_`; lifetimes are dropped, and a
+///   function with no type or const argument has none (so every name of a non-generic item is
+///   what it was). A type is written prefix, each head of a fixed arity: an integer, `bool`,
+///   `str` and `char` by their names, `()` as `unit`, `!` as `never`, a tuple of `n` as
+///   `tuple<n>_..`, `&T` as `ref_T`, `&mut T` as `mut_T`, `[T]` as `slice_T`, `[T; N]` as
+///   `array<N>_T`, a struct or enum (the standard library's too) by its own name then its
+///   arguments (`Option_u32`; `Vec`'s `Global` allocator is not written), and a const argument
+///   as `c` and its value's bits in decimal (`c4`). Only ASCII letters, digits and `_`, never
+///   first a digit: a legal file name on Linux and macOS and a Lean identifier.
+/// - Injective as far as the names say: a struct or enum is written by its own name, not its
+///   path, and a type's name may hold `_`. Two instances that would get one Lean name are a
+///   refusal where both are imported, never one replacing the other: each module's text names
+///   its instance in Rust with every type by its whole path ([`Named::display`]), so the two
+///   texts differ ([`crate::emit`]'s guard, which also refuses two module files that differ
+///   only by letter case).
+fn segment<'db>(
+    db: &'db Db,
+    args: impl IntoIterator<Item = GenericArg<'db>>,
+) -> Result<Option<String>, String> {
+    let mut parts = Vec::new();
+    for arg in args {
+        if let Some(ty) = arg.ty() {
+            parts.push(ty_segment(db, ty)?);
+        } else if let Some(konst) = arg.konst() {
+            parts.push(format!("c{}", const_value(konst)?));
+        }
+        // A lifetime is dropped.
+    }
+    Ok((!parts.is_empty()).then(|| parts.join("_")))
+}
+
+/// The value of a const argument, its bits.
+fn const_value(konst: HConst<'_>) -> Result<u128, String> {
+    let value = match konst.kind() {
+        ConstKind::Value(value) => value.try_to_leaf().map(|leaf| leaf.to_bits_unchecked()),
+        _ => None,
+    };
+    value.ok_or_else(|| "a const argument that is not a number".to_owned())
+}
+
+/// The arguments of the struct or enum `adt` that are written: all, but `Vec`'s allocator when
+/// it is `Global`.
+fn written_args<'db>(db: &'db Db, adt: AdtId, args: GenericArgs<'db>) -> Vec<GenericArg<'db>> {
+    let global = |arg: &GenericArg<'db>| {
+        arg.ty().is_some_and(|ty| {
+            matches!(ty.kind(), TyKind::Adt(def, _) if def.def_id().krate(db).data(db).origin.is_lang()
+                && matches!(def.def_id(), AdtId::StructId(it) if StructSignature::of(db, it).name.as_str() == "Global"))
+        })
+    };
+    let mut all: Vec<GenericArg<'db>> = args.iter().collect();
+    if is_vec(db, adt) && all.len() == 2 && global(&all[1]) {
+        all.truncate(1);
+    }
+    all
+}
+
+/// `ty` as one part of a [`segment`].
+fn ty_segment<'db>(db: &'db Db, ty: HTy<'db>) -> Result<String, String> {
+    if let Some(int) = int_ty(ty) {
+        return Ok(format!("{int:?}").to_lowercase());
+    }
+    let all = |tys: &mut dyn Iterator<Item = HTy<'db>>| -> Result<String, String> {
+        Ok(tys.map(|it| ty_segment(db, it)).collect::<Result<Vec<_>, _>>()?.join("_"))
+    };
+    Ok(match ty.kind() {
+        TyKind::Bool => "bool".to_owned(),
+        TyKind::Str => "str".to_owned(),
+        TyKind::Never => "never".to_owned(),
+        TyKind::Char => return Err("the type `char`".to_owned()),
+        TyKind::Float(_) => return Err("a floating-point number".to_owned()),
+        TyKind::Tuple(fields) if fields.is_empty() => "unit".to_owned(),
+        TyKind::Tuple(fields) => format!("tuple{}_{}", fields.len(), all(&mut fields.iter())?),
+        TyKind::Ref(_, inner, mutability) => {
+            format!("{}_{}", if mutability.is_mut() { "mut" } else { "ref" }, ty_segment(db, inner)?)
+        }
+        TyKind::Slice(elem) => format!("slice_{}", ty_segment(db, elem)?),
+        TyKind::Array(elem, len) => format!("array{}_{}", const_value(len)?, ty_segment(db, elem)?),
+        TyKind::Adt(def, args) => {
+            let adt = def.def_id();
+            let own = adt_own_name(db, adt)?;
+            match segment(db, written_args(db, adt, args))? {
+                Some(rest) => format!("{own}_{rest}"),
+                None => own,
+            }
+        }
+        TyKind::RawPtr(..) => return Err("a raw pointer (rule RawPointer)".to_owned()),
+        TyKind::Dynamic(..) => return Err("a trait object (rule DynTrait)".to_owned()),
+        TyKind::Param(_) => return Err("a type parameter".to_owned()),
+        TyKind::Alias(..) => return Err("an associated or opaque type".to_owned()),
+        TyKind::FnDef(..) | TyKind::FnPtr(..) => return Err("a function used as a value".to_owned()),
+        TyKind::Closure(..) | TyKind::CoroutineClosure(..) => return Err("a closure".to_owned()),
+        TyKind::Coroutine(..) | TyKind::CoroutineWitness(..) => {
+            return Err("`async` or a coroutine (rule Async)".to_owned());
+        }
+        _ => return Err(blaze_query::db::attach(db, || format!("the type `{ty:?}`"))),
+    })
+}
+
+/// The type and const arguments in `args`, as Rust writes them with every type by its whole
+/// path (`<u32, krate::Small>`); empty when there is none.
+fn rust_args<'db>(db: &'db Db, args: impl IntoIterator<Item = GenericArg<'db>>) -> String {
+    let mut parts = Vec::new();
+    for arg in args {
+        if let Some(ty) = arg.ty() {
+            parts.push(rust_of(db, ty));
+        } else if let Some(konst) = arg.konst() {
+            parts.push(match const_value(konst) {
+                Ok(value) => value.to_string(),
+                Err(_) => blaze_query::db::attach(db, || format!("{konst:?}")),
+            });
+        }
+    }
+    match parts.is_empty() {
+        true => String::new(),
+        false => format!("<{}>", parts.join(", ")),
+    }
+}
+
+/// `ty` as Rust writes it, a struct or enum by its whole path.
+fn rust_of<'db>(db: &'db Db, ty: HTy<'db>) -> String {
+    if let Some(int) = int_ty(ty) {
+        return format!("{int:?}").to_lowercase();
+    }
+    match ty.kind() {
+        TyKind::Bool => "bool".to_owned(),
+        TyKind::Str => "str".to_owned(),
+        TyKind::Never => "!".to_owned(),
+        TyKind::Tuple(fields) if fields.len() == 1 => format!("({},)", rust_of(db, fields.iter().next().expect("one field"))),
+        TyKind::Tuple(fields) => {
+            format!("({})", fields.iter().map(|it| rust_of(db, it)).collect::<Vec<_>>().join(", "))
+        }
+        TyKind::Ref(_, inner, mutability) => {
+            format!("&{}{}", if mutability.is_mut() { "mut " } else { "" }, rust_of(db, inner))
+        }
+        TyKind::Slice(elem) => format!("[{}]", rust_of(db, elem)),
+        TyKind::Array(elem, len) => match const_value(len) {
+            Ok(len) => format!("[{}; {len}]", rust_of(db, elem)),
+            Err(_) => blaze_query::db::attach(db, || format!("{ty:?}")),
+        },
+        TyKind::Adt(def, args) => {
+            let adt = def.def_id();
+            let mut path = module_path(db, adt.module(db));
+            path.push(adt_own_name(db, adt).unwrap_or_else(|it| it));
+            format!("{}{}", path.join("::"), rust_args(db, written_args(db, adt, args)))
+        }
+        _ => blaze_query::db::attach(db, || format!("{ty:?}")),
+    }
+}
+
+/// The struct or enum `adt`'s own name.
+fn adt_own_name(db: &Db, adt: AdtId) -> Result<String, String> {
+    match adt {
+        AdtId::StructId(it) => Ok(StructSignature::of(db, it).name.as_str().to_owned()),
+        AdtId::EnumId(it) => Ok(EnumSignature::of(db, it).name.as_str().to_owned()),
+        AdtId::UnionId(_) => Err("a union".to_owned()),
+    }
+}
+
+/// The struct or enum `adt` at `args`: its Lean name's components (its path, and the
+/// [`segment`] of its arguments when it has a type or const one) and what it is in Rust,
+/// component by component (`krate`, `Pair<u32>`).
+pub(crate) fn adt_path<'db>(
+    db: &'db Db,
+    adt: AdtId,
+    args: GenericArgs<'db>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let own = adt_own_name(db, adt)?;
+    let written = written_args(db, adt, args);
+    let mut lean = module_path(db, adt.module(db));
+    let mut display = lean.clone();
+    lean.push(own.clone());
+    if let Some(rest) = segment(db, written.iter().copied())? {
+        lean.push(rest);
+    }
+    display.push(format!("{own}{}", rust_args(db, written)));
+    Ok((lean, display))
+}
+
+/// A function's names: Lean's (`krate.Pair.u32.swap`) and Rust's, every type by its whole path
+/// (`krate::Pair<u32>::swap`).
+pub(crate) struct Named {
+    pub(crate) lean: String,
+    pub(crate) display: String,
+}
+
+/// The names of `func` at `args` (`None`: itself): its owner's path ([`owner`]: its module, or
+/// its type's and trait's), its name, and the [`segment`] of its own arguments (those its impl
+/// has are in its type's name). A method lives in its type's namespace (`krate.Counter.bump`),
+/// where Lean has already put the type's fields, constructors and what it derives from them; a
+/// method of one of those names is `<name>_fn`. `Err` names what is not translated.
+pub(crate) fn instance_name<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: Option<GenericArgs<'db>>,
+) -> Result<Named, String> {
+    let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+    let (mut lean, mut display, own) = match owner(db, func, args)? {
+        Some(Owner { lean, display, taken }) => {
+            let own = match taken.contains(&name) || LEAN_DERIVED.contains(&name.as_str()) {
+                true => format!("{name}_fn"),
+                false => name.clone(),
+            };
+            (lean, display, own)
+        }
+        None => {
+            let path = module_path(db, func.module(db));
+            (path.clone(), path, name.clone())
+        }
+    };
+    lean.push(own);
+    let own_args: Vec<GenericArg<'db>> = match args {
+        Some(args) => {
+            let parent = hir_ty::generics::generics(db, func.into()).len_parent();
+            args.iter().skip(parent).collect()
+        }
+        None => Vec::new(),
+    };
+    match segment(db, own_args.iter().copied())? {
+        Some(rest) => {
+            lean.push(rest);
+            display.push(format!("{name}::{}", rust_args(db, own_args)));
+        }
+        None => display.push(name),
+    }
+    Ok(Named { lean: lean.join("."), display: display.join("::") })
+}
+
+/// `func`'s path as Rust writes it, its segments: the crate, the modules, the type (and the
+/// trait) for a method or an associated function of an impl, the name. A function refused for
+/// its impl is named by its module: the refusal says the rest.
 pub(crate) fn function_path(db: &Db, func: FunctionId) -> Vec<String> {
-    let mut path = match owner(db, func) {
-        Ok(Some((path, _))) => path,
-        // A function refused for its impl is named by its module: the refusal says the rest.
+    let mut path = match owner(db, func, None) {
+        Ok(Some(owner)) => owner.display,
         Ok(None) | Err(_) => module_path(db, func.module(db)),
     };
     path.push(FunctionSignature::of(db, func).name.as_str().to_owned());
     path
-}
-
-/// `func`'s name in Lean: its path, dotted. A method lives in its type's namespace
-/// (`krate.Counter.bump`), where Lean has already put the type's fields, constructors and
-/// what it derives from them; a method of one of those names is `<name>_fn`.
-pub(crate) fn function_lean_name(db: &Db, func: FunctionId) -> String {
-    let mut path = function_path(db, func);
-    if let Ok(Some((_, taken))) = owner(db, func) {
-        let name = path.last_mut().expect("a path ends in the function's name");
-        if taken.contains(name) || LEAN_DERIVED.contains(&name.as_str()) {
-            name.push_str("_fn");
-        }
-    }
-    path.join(".")
 }
 
 /// The names Lean declares in the namespace of every structure and inductive type.
@@ -1034,17 +1322,28 @@ const LEAN_DERIVED: &[&str] = &[
     "ext_iff",
 ];
 
-/// The namespace a method's Lean name is in, and the names Lean's declarations have already
-/// put there, which a method of the same name must not take (a struct's fields, an enum's
-/// variants): for a method of an inherent impl the type's path (`krate.Counter`); for a method
-/// of a trait impl the type's path and the trait's name (`krate.Square.Shape`), so two traits
-/// with a method of one name on one type are two namespaces. A trait impl here has no type or
-/// const parameters and its trait's arguments other than `Self` are `Self`
-/// (`impl PartialEq for Point`), so the type and the trait's name say which impl it is: two
-/// traits of one name from two modules on one type are refused where both are imported
-/// ([`crate::emit`]). `None` for a function of a module; `Err` names the kind of function that
-/// is not translated.
-fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<String>)>, String> {
+/// The namespace a method's Lean name is in, what it is in Rust, and the names Lean's
+/// declarations have already put there, which a method of the same name must not take.
+struct Owner {
+    lean: Vec<String>,
+    display: Vec<String>,
+    taken: BTreeSet<String>,
+}
+
+/// The namespace a method's Lean name is in ([`Owner`]): for a method of an inherent impl the
+/// type's ([`adt_path`]: `krate.Counter`, `krate.Pair.u32`), whose fields or variants are
+/// taken; for a method of a trait impl the type's and the trait's name (`krate.Square.Shape`),
+/// so two traits with a method of one name on one type are two namespaces, and a component of
+/// the trait's arguments other than `Self` when it has any (`krate.Big.From.Small`). The impl
+/// is at `args`, the method's (the impl's first); with `None`, an impl with type or const
+/// parameters is a generic function not asked for at an instance. Two traits of one name from
+/// two modules on one type are refused where both are imported ([`crate::emit`]). `None` for a
+/// function of a module; `Err` names the kind of function that is not translated.
+fn owner<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    args: Option<GenericArgs<'db>>,
+) -> Result<Option<Owner>, String> {
     let imp = match func.lookup(db).container {
         ItemContainerId::ModuleId(_) => return Ok(None),
         ItemContainerId::ImplId(imp) => imp,
@@ -1060,19 +1359,25 @@ fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<Stri
         }
     };
     blaze_query::db::attach(db, || {
-        let self_ty = db.impl_self_ty(imp).skip_binder();
-        if let Some(of) = db.impl_trait(imp) {
-            return trait_impl_owner(db, imp, of.skip_binder(), self_ty).map(Some);
+        let interner = DbInterner::new_with(db, func.krate(db));
+        let generic_impl = GenericParams::of(db, imp.into()).len_type_or_consts() != 0;
+        let (self_ty, of) = match args {
+            Some(args) => (
+                db.impl_self_ty(imp).instantiate(interner, args).skip_norm_wip(),
+                db.impl_trait(imp).map(|it| it.instantiate(interner, args).skip_norm_wip()),
+            ),
+            None if generic_impl => return Err(GENERIC_UNASKED.to_owned()),
+            None => (db.impl_self_ty(imp).skip_binder(), db.impl_trait(imp).map(|it| it.skip_binder())),
+        };
+        if let Some(of) = of {
+            return trait_impl_owner(db, imp, of, self_ty).map(Some);
         }
-        let TyKind::Adt(def, args) = self_ty.kind() else {
+        let TyKind::Adt(def, adt_args) = self_ty.kind() else {
             return Err("a method of a type that is not a struct or an enum".to_owned());
         };
-        if !args.is_empty() {
-            return Err("a method of a generic type".to_owned());
-        }
         let adt = def.def_id();
         let mut taken = BTreeSet::new();
-        let own = match adt {
+        match adt {
             AdtId::StructId(it) => {
                 let data = VariantId::StructId(it).fields(db);
                 let positional = matches!(data.shape, FieldsShape::Tuple);
@@ -1082,67 +1387,51 @@ fn owner(db: &Db, func: FunctionId) -> Result<Option<(Vec<String>, BTreeSet<Stri
                         false => field.name.as_str().to_owned(),
                     });
                 }
-                StructSignature::of(db, it).name.as_str().to_owned()
             }
             AdtId::EnumId(it) => {
                 for (variant, _) in it.enum_variants(db).variants.iter() {
                     taken.insert(variant.as_str().to_owned());
                 }
-                EnumSignature::of(db, it).name.as_str().to_owned()
             }
             AdtId::UnionId(_) => return Err("a method of a union".to_owned()),
-        };
-        let mut path = module_path(db, adt.module(db));
-        path.push(own);
-        Ok(Some((path, taken)))
+        }
+        let (lean, display) = adt_path(db, adt, adt_args)?;
+        Ok(Some(Owner { lean, display, taken }))
     })
 }
 
-/// [`owner`] of a method of the impl `imp` of the trait `of` for `self_ty`: refused unless
-/// the impl is one function per method (no type or const parameters, lifetimes aside), its
-/// trait's arguments other than `Self` are `Self`, and `self_ty` is a struct or enum without
-/// arguments, an integer or `bool`.
+/// [`owner`] of a method of the impl `imp` of the trait `of` for `self_ty`, both at the
+/// instance: refused unless `self_ty` is a struct or enum, an integer or `bool`.
 fn trait_impl_owner<'db>(
     db: &'db Db,
     imp: ImplId,
     of: TraitRef<'db>,
     self_ty: HTy<'db>,
-) -> Result<(Vec<String>, BTreeSet<String>), String> {
+) -> Result<Owner, String> {
     let trait_id = of.def_id.0;
     let trait_name = TraitSignature::of(db, trait_id).name.as_str().to_owned();
-    if GenericParams::of(db, imp.into()).len_type_or_consts() != 0 {
-        return Err(format!(
-            "a method of a trait impl of `{trait_name}` with type or const parameters (a generic \
-             impl; translated by instance, not yet)"
-        ));
-    }
-    if of.args.iter().skip(1).any(|arg| arg.ty() != Some(self_ty)) {
-        return Err(format!(
-            "a method of an impl of the generic trait `{trait_name}` with an argument other than \
-             `Self` (an impl is named by its type and its trait's name, which do not tell two \
-             such impls apart)"
-        ));
-    }
-    let (mut path, own) = match self_ty.kind() {
+    // The trait's arguments other than `Self`, lifetimes dropped: none written when each is
+    // `Self` (`impl PartialEq for Point`), as an impl of a trait without arguments is named.
+    let rest: Vec<GenericArg<'db>> = of.args.iter().skip(1).filter(|it| it.region().is_none()).collect();
+    let selfish = rest.iter().all(|arg| arg.ty() == Some(self_ty));
+    let (mut lean, mut display) = match self_ty.kind() {
         TyKind::Adt(def, args) => {
             let adt = def.def_id();
-            if !args.is_empty() {
-                return Err(format!("a method of a trait impl of `{trait_name}` for a generic type"));
+            if matches!(adt, AdtId::UnionId(_)) {
+                return Err(format!("a method of a trait impl of `{trait_name}` for a union"));
             }
-            let own = match adt {
-                AdtId::StructId(it) => StructSignature::of(db, it).name.as_str().to_owned(),
-                AdtId::EnumId(it) => EnumSignature::of(db, it).name.as_str().to_owned(),
-                AdtId::UnionId(_) => {
-                    return Err(format!("a method of a trait impl of `{trait_name}` for a union"));
-                }
-            };
-            (module_path(db, adt.module(db)), own)
+            adt_path(db, adt, args)?
         }
         // A primitive has no module: its impls are named in the impl's.
-        TyKind::Bool => (module_path(db, imp.module(db)), "bool".to_owned()),
+        TyKind::Bool => {
+            let mut path = module_path(db, imp.module(db));
+            path.push("bool".to_owned());
+            (path.clone(), path)
+        }
         _ if int_ty(self_ty).is_some() => {
-            let own = format!("{:?}", int_ty(self_ty).expect("an integer")).to_lowercase();
-            (module_path(db, imp.module(db)), own)
+            let mut path = module_path(db, imp.module(db));
+            path.push(format!("{:?}", int_ty(self_ty).expect("an integer")).to_lowercase());
+            (path.clone(), path)
         }
         _ => {
             return Err(format!(
@@ -1151,10 +1440,18 @@ fn trait_impl_owner<'db>(
             ));
         }
     };
-    path.push(own);
-    path.push(trait_name);
+    lean.push(trait_name.clone());
+    match selfish {
+        true => display.push(trait_name),
+        false => {
+            if let Some(rest_segment) = segment(db, rest.iter().copied())? {
+                lean.push(rest_segment);
+            }
+            display.push(format!("{trait_name}{}", rust_args(db, rest)));
+        }
+    }
     // Nothing is declared in `<type>.<trait>` but the impl's methods.
-    Ok((path, BTreeSet::new()))
+    Ok(Owner { lean, display, taken: BTreeSet::new() })
 }
 
 fn index(local: m::LocalId) -> Local {
@@ -1189,8 +1486,10 @@ struct Std<'a, 'db> {
 
 struct Cx<'db> {
     db: &'db Db,
-    /// The function's crate: where its calls of a trait's methods are resolved.
-    krate: base_db::Crate,
+    /// Where its calls of a trait's methods are resolved: a function's own environment and
+    /// crate, or for an instance no where clauses and the crate its chain began at
+    /// ([`Instance::krate`]).
+    env: ParamEnvAndCrate<'db>,
     interner: DbInterner<'db>,
     display: String,
     mir: &'db m::MirBody<'db>,
@@ -1199,7 +1498,7 @@ struct Cx<'db> {
     /// A `&mut` temporary and the place it stands for.
     alias: BTreeMap<Local, Alias>,
     adts: Vec<AdtDecl>,
-    callees: Vec<(String, FunctionId)>,
+    callees: Vec<(String, Instance<'db>)>,
     checks_overflow: bool,
     /// The temporaries and bindings of a type outside the subset, and why: each is refused
     /// where a place names it (with the statement or call that does), not where it is declared,
@@ -1349,13 +1648,11 @@ impl<'db> Cx<'db> {
                         )),
                     };
                 }
-                if !args.is_empty() {
-                    return Err(self.refuse("a generic struct or enum", at));
-                }
                 if def.destructor(self.interner).is_some() {
                     return Err(self.refuse("a type with a destructor (`impl Drop`)", at));
                 }
-                Ty::Adt(self.adt(adt, at)?)
+                // A generic struct or enum at its arguments is a type of its own.
+                Ty::Adt(self.adt(adt, args, at)?)
             }
             TyKind::RawPtr(..) => return Err(self.refuse("a raw pointer (rule RawPointer)", at)),
             TyKind::Float(_) => return Err(self.refuse("a floating-point number", at)),
@@ -1380,25 +1677,29 @@ impl<'db> Cx<'db> {
         })
     }
 
-    /// The Lean name of the crate's struct or enum `adt`, declared on first use.
-    fn adt(&mut self, adt: AdtId, at: &str) -> Refused<String> {
-        let own = match adt {
-            AdtId::StructId(it) => StructSignature::of(self.db, it).name.as_str().to_owned(),
-            AdtId::EnumId(it) => EnumSignature::of(self.db, it).name.as_str().to_owned(),
-            AdtId::UnionId(_) => return Err(self.refuse("a union", at)),
+    /// The Lean name of the crate's struct or enum `adt` at `args` ([`adt_path`]), declared on
+    /// first use with each field's type at `args`. Two instances with one Lean name are
+    /// refused, never one declared for both.
+    fn adt(&mut self, adt: AdtId, args: GenericArgs<'db>, at: &str) -> Refused<String> {
+        let (name, display) = match adt_path(self.db, adt, args) {
+            Ok((lean, display)) => (lean.join("."), display.join("::")),
+            Err(why) => return Err(self.refuse(why, at)),
         };
-        let mut path = module_path(self.db, adt.module(self.db));
-        path.push(own);
-        let name = path.join(".");
-        if self.adts.iter().any(|it| it.name == name) {
+        if let Some(it) = self.adts.iter().find(|it| it.name == name) {
+            if it.display != display {
+                return Err(self.refuse(
+                    format!("two types with one Lean name, `{name}` (`{}` and `{display}`)", it.display),
+                    at,
+                ));
+            }
             return Ok(name);
         }
         let kind = match adt {
-            AdtId::StructId(it) => AdtKind::Struct(self.fields(VariantId::StructId(it), at)?),
+            AdtId::StructId(it) => AdtKind::Struct(self.fields(VariantId::StructId(it), args, at)?),
             AdtId::EnumId(it) => {
                 let mut variants = Vec::new();
                 for (variant_name, &(variant, _)) in it.enum_variants(self.db).variants.iter() {
-                    let fields = self.fields(VariantId::EnumVariantId(variant), at)?;
+                    let fields = self.fields(VariantId::EnumVariantId(variant), args, at)?;
                     let discriminant = match self.db.const_eval_discriminant(variant) {
                         Ok(value) => value as u128,
                         Err(_) => {
@@ -1423,18 +1724,43 @@ impl<'db> Cx<'db> {
         };
         // A type that holds itself was refused above: its field's declaration is not there yet
         // and would be asked for again, without end; the depth of a body's types bounds this.
-        self.adts.push(AdtDecl { name: name.clone(), kind });
+        self.adts.push(AdtDecl { name: name.clone(), display, kind });
         Ok(name)
     }
 
-    /// The fields of `variant`; a positional field `i` is named `f{i}`.
-    fn fields(&mut self, variant: VariantId, at: &str) -> Refused<Vec<Field>> {
+    /// The fields of `variant` of a struct or enum at `args`; a positional field `i` is named
+    /// `f{i}`.
+    fn fields(&mut self, variant: VariantId, args: GenericArgs<'db>, at: &str) -> Refused<Vec<Field>> {
         let db = self.db;
         let data = variant.fields(db);
         let positional = matches!(data.shape, FieldsShape::Tuple);
         let mut out = Vec::new();
         for (at_field, (local, field)) in db.field_types(variant).iter().enumerate() {
-            let ty = self.ty(field.ty().skip_binder(), false, at)?;
+            let field_ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
+            // A field typed by an associated type of a parameter (`T::Out`) is that alias at
+            // the instance: it is what the trait solver normalizes it to, as codegen's layout
+            // has it; one the solver cannot normalize is refused.
+            let field_ty = if field_ty.has_aliases() {
+                let infcx = self.interner.infer_ctxt().build(TypingMode::PostAnalysis);
+                let ocx = ObligationCtxt::new(&infcx);
+                match ocx.deeply_normalize(&ObligationCause::dummy(), self.env.param_env, field_ty) {
+                    Ok(normalized) if !normalized.has_aliases() && !normalized.has_infer() => normalized,
+                    _ => {
+                        let shown = blaze_query::db::attach(db, || format!("{field_ty:?}"));
+                        return Err(self.refuse(
+                            format!(
+                                "a field whose type is an associated type of a type argument \
+                                 (`{shown}`) that the trait solver does not normalize at the \
+                                 instance"
+                            ),
+                            at,
+                        ));
+                    }
+                }
+            } else {
+                field_ty
+            };
+            let ty = self.ty(field_ty, false, at)?;
             let name = if positional {
                 format!("f{at_field}")
             } else {
@@ -2015,31 +2341,38 @@ impl<'db> Cx<'db> {
             }
             return self.goto(target, at);
         } else {
-            // What the callee is (a method of a generic impl) says more than that it was given
-            // arguments: it is named first.
-            match container {
-                ItemContainerId::ExternBlockId(_) => {
-                    return Err(self.refuse(format!("a call of the extern function `{name}` (rule Ffi)"), at));
-                }
-                _ => {
-                    if let Err(why) = owner(db, callee) {
-                        return Err(self.refuse(format!("a call of `{name}`, {why}"), at));
-                    }
-                }
+            if let ItemContainerId::ExternBlockId(_) = container {
+                return Err(self.refuse(format!("a call of the extern function `{name}` (rule Ffi)"), at));
             }
-            if !generics.is_empty() {
-                return Err(self.refuse(format!("a call of the generic function `{name}`"), at));
-            }
-            let lean = function_lean_name(db, callee);
-            if !self.callees.iter().any(|(_, it)| *it == callee) {
-                self.callees.push((lean.clone(), callee));
-            }
-            Callee::Function { name: lean }
+            self.crate_callee(callee, generics, &name, at)?
         };
         let (dest, _) = self.place(destination, at)?;
         let args = self.operands(args, at)?;
         out.push(Stmt::Call { dest, callee, args, at: at.to_owned() });
         self.goto(target, at)
+    }
+
+    /// A call of the crate's function `callee` with `generics`: the instance it names (the
+    /// function itself when it has no type or const parameters), its model's name, and the
+    /// instance put among the callees, to be translated after this body.
+    fn crate_callee(
+        &mut self,
+        callee: FunctionId,
+        generics: GenericArgs<'db>,
+        name: &str,
+        at: &str,
+    ) -> Refused<Callee> {
+        let db = self.db;
+        let args = is_generic(db, callee).then_some(generics);
+        let named = match instance_name(db, callee, args) {
+            Ok(named) => named,
+            Err(why) => return Err(self.refuse(format!("a call of `{name}`, {why}"), at)),
+        };
+        let instance = Instance { func: callee, args, krate: self.env.krate };
+        if !self.callees.iter().any(|(_, it)| *it == instance) {
+            self.callees.push((named.lean.clone(), instance));
+        }
+        Ok(Callee::Function { name: named.lean })
     }
 
     /// What static dispatch runs for a call of `callee` with `generics`: for a method of a
@@ -2076,10 +2409,7 @@ impl<'db> Cx<'db> {
                 at,
             ));
         }
-        let env = ParamEnvAndCrate {
-            param_env: db.trait_environment(self.mir.owner.generic_def(db)),
-            krate: self.krate,
-        };
+        let env = self.env;
         let looked = db
             .lookup_impl_method_or_why(env, callee, generics)
             .map(|(found, args)| (found.left(), args));
@@ -2394,6 +2724,21 @@ impl<'db> Cx<'db> {
                         let (callee, to) = match (from.value(), self.place(destination, at)?.1) {
                             (Ty::Int(_), Ty::Int(to)) => ("Scalar.cast", to),
                             (Ty::Bool, Ty::Int(to)) => ("Scalar.ofBool", to),
+                            // `x.into()` into a type with the crate's own `From` runs the
+                            // standard library's blanket `impl<T, U: From<T>> Into<U> for T`,
+                            // whose body (`U::from(self)`) is the standard library's: not
+                            // translated (step c), and not stood in for by the `From` it calls.
+                            (_, to) if name == "into" => {
+                                return Err(self.refuse(
+                                    format!(
+                                        "a call of `Into::into` into `{}`, the standard library's \
+                                         blanket impl over `From` (its body is not translated; \
+                                         call `From::from`, which is; rule NoModel)",
+                                        crate::rust_ty(&to)
+                                    ),
+                                    at,
+                                ));
+                            }
                             _ => return Err(no_model(self)),
                         };
                         let callee =
@@ -2772,27 +3117,17 @@ impl<'db> Cx<'db> {
         if peeled == self_ty || def.def_id().krate(db).data(db).origin.is_lang() {
             return Ok(None);
         }
-        let env = ParamEnvAndCrate {
-            param_env: db.trait_environment(self.mir.owner.generic_def(db)),
-            krate: self.krate,
-        };
+        let env = self.env;
         let generics = GenericArgs::new_from_slice(&[peeled.into(), peeled.into()]);
-        let found = match db.lookup_impl_method_or_why(env, eq, generics) {
-            Ok((found, _)) => found.left(),
-            Err(_) => None,
+        let (found, args) = match db.lookup_impl_method_or_why(env, eq, generics) {
+            Ok((found, args)) => (found.left(), args),
+            Err(_) => (None, generics),
         };
         let Some(found) = found else { return Ok(None) };
         if found.krate(db).data(db).origin.is_lang() {
             return Ok(None);
         }
-        if let Err(why) = owner(db, found) {
-            return Err(self.refuse(format!("a call of `eq`, {why}"), at));
-        }
-        let lean = function_lean_name(db, found);
-        if !self.callees.iter().any(|(_, it)| *it == found) {
-            self.callees.push((lean.clone(), found));
-        }
-        Ok(Some(Callee::Function { name: lean }))
+        self.crate_callee(found, args, "eq", at).map(Some)
     }
 
     /// Refused unless `ty`'s `Clone` (`which` is [`Structural::Clone`]) is a copy of its value
@@ -2810,7 +3145,7 @@ impl<'db> Cx<'db> {
         method: FunctionId,
         ty: HTy<'db>,
         which: Structural,
-        seen: &mut BTreeSet<AdtId>,
+        seen: &mut BTreeSet<String>,
         at: &str,
     ) -> Refused<()> {
         let db = self.db;
@@ -2858,14 +3193,11 @@ impl<'db> Cx<'db> {
                 let Ty::Adt(lean) = lean else {
                     return Err(self.refuse(format!("{what} of `{lean:?}`"), at));
                 };
-                if !seen.insert(adt) {
+                if !seen.insert(lean.clone()) {
                     return Ok(());
                 }
                 let shown = lean.replace('.', "::");
-                let env = ParamEnvAndCrate {
-                    param_env: db.trait_environment(self.mir.owner.generic_def(db)),
-                    krate: self.krate,
-                };
+                let env = self.env;
                 let generics = match which {
                     Structural::Clone => GenericArgs::new_from_slice(&[ty.into()]),
                     Structural::PartialEq => GenericArgs::new_from_slice(&[ty.into(), ty.into()]),
@@ -2902,8 +3234,11 @@ impl<'db> Cx<'db> {
                     AdtId::UnionId(_) => return Err(self.refuse("a union", at)),
                 };
                 for variant in variants {
-                    let fields: Vec<HTy<'db>> =
-                        db.field_types(variant).iter().map(|(_, field)| field.ty().skip_binder()).collect();
+                    let fields: Vec<HTy<'db>> = db
+                        .field_types(variant)
+                        .iter()
+                        .map(|(_, field)| field.ty().instantiate(self.interner, args).skip_norm_wip())
+                        .collect();
                     for field in fields {
                         self.structural(method, field, which, seen, at)?;
                     }
@@ -3015,11 +3350,34 @@ fn normal_successors(kind: &m::TerminatorKind) -> Vec<m::BasicBlockId> {
     }
 }
 
-/// `func`'s structured MIR, from its built MIR. The caller has checked that the function
+/// The structured MIR of `instance`, from its function's built MIR (monomorphized at its
+/// arguments for an instance of a generic function). The caller has checked that the function
 /// type-checks and borrow-checks.
-pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslated> {
-    let path = function_path(db, func);
-    let display = path.join("::");
+pub(crate) fn from_mir<'db>(db: &'db Db, instance: Instance<'db>) -> Result<Lowered<'db>, NotTranslated> {
+    let func = instance.func;
+    let unnamed = function_path(db, func).join("::");
+    let refuse_unnamed = |what: &str| NotTranslated {
+        function: unnamed.clone(),
+        what: what.to_owned(),
+        at: format!("fn {unnamed}"),
+    };
+    // A function with type or const parameters is translated at an instance only, and a theorem
+    // at none: its statement is closed.
+    let args = match is_generic(db, func) {
+        false => None,
+        true if AttrFlags::query(db, AttrDefId::FunctionId(func)).contains(AttrFlags::THEOREM) => {
+            return Err(refuse_unnamed(GENERIC_THEOREM));
+        }
+        true => match instance.args {
+            Some(args) => Some(args),
+            None => return Err(refuse_unnamed(GENERIC_UNASKED)),
+        },
+    };
+    let named = match instance_name(db, func, args) {
+        Ok(named) => named,
+        Err(why) => return Err(refuse_unnamed(&why)),
+    };
+    let display = named.display;
     let fn_text = format!("fn {display}");
     let refuse = |what: String| NotTranslated {
         function: display.clone(),
@@ -3027,12 +3385,6 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         at: fn_text.clone(),
     };
     let sig = FunctionSignature::of(db, func);
-    if let Err(why) = owner(db, func) {
-        return Err(refuse(why.to_owned()));
-    }
-    if !sig.generic_params.is_empty() {
-        return Err(refuse("a generic function".to_owned()));
-    }
     if sig.is_async() {
         return Err(refuse("an `async` function (rule Async)".to_owned()));
     }
@@ -3043,7 +3395,15 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         return Err(refuse("a function without a body (rule Ffi)".to_owned()));
     }
     let def = DefWithBodyId::FunctionId(func);
-    let mir = match db.mir_body(def.into()) {
+    // An instance's calls of a trait's methods are resolved with no where clauses in the
+    // crate its chain began at, as codegen resolves them; a function's own, in its own
+    // environment.
+    let instance_env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: instance.krate };
+    let built = match args {
+        None => db.mir_body(def.into()),
+        Some(args) => db.monomorphized_mir_body(def.into(), args.store(), instance_env.store()),
+    };
+    let mir = match built {
         Ok(mir) => mir,
         Err(err) => return Err(refuse(format!("the body, which has no MIR ({err:?})"))),
     };
@@ -3051,13 +3411,17 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         return Err(refuse("an `async` block (rule Async)".to_owned()));
     }
     let krate = func.krate(db);
+    let env = match args {
+        None => ParamEnvAndCrate { param_env: db.trait_environment(mir.owner.generic_def(db)), krate },
+        Some(_) => instance_env,
+    };
     let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
     let checks_overflow = mir.inherits_overflow_checks
         || (!krate.data(db).origin.is_lang() && krate.cfg_options(db).check_atom(&flag));
     let store = ExpressionStore::of(db, mir.owner.expression_store_owner(db));
     let mut cx = Cx {
         db,
-        krate,
+        env,
         interner: DbInterner::new_with(db, krate),
         display: display.clone(),
         mir,
@@ -3199,7 +3563,7 @@ pub(crate) fn from_mir(db: &Db, func: FunctionId) -> Result<Lowered, NotTranslat
         Err(err) => return Err(refuse(err.to_string())),
     };
     let body = Body {
-        name: function_lean_name(db, func),
+        name: named.lean,
         display,
         locals: cx.locals,
         params: mir.param_locals.iter().map(|it| index(*it)).collect(),

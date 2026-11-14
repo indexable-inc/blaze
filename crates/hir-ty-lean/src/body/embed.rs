@@ -683,7 +683,7 @@ fn body<'db>(
     let store = ExpressionStore::of(db, built.owner.expression_store_owner(db));
     let cx = Cx {
         db,
-        krate,
+        env: ParamEnvAndCrate { param_env: db.trait_environment(built.owner.generic_def(db)), krate },
         interner: DbInterner::new_with(db, krate),
         display: display.clone(),
         // Spans are read through the built body's owner, which every phase shares.
