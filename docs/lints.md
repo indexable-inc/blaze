@@ -157,6 +157,7 @@ The lints with a threshold read it from `clippy.toml` (or `.clippy.toml`), as cl
 | `bounded-heap-field-vec-len` | `bounded_heap_field` | 8 (elements) |
 | `large-box-threshold` | `box_large_new` | 4096 (bytes) |
 | `unmarked-effects-private` | `unmarked_pure`, `unmarked_nopanic`, `unmarked_noalloc`, `unmarked_nonblocking` | `false` (a flag; `true` also finds functions with no visibility written) |
+| `one-at-a-time` | `one_at_a_time` | none (a list of `{ path, batched }`; with none the lint is off) |
 
 ```toml
 # clippy.toml
@@ -2289,10 +2290,10 @@ it.
   from the global heap". The workspace's own crates, whose allocations the lint finds where they
   are made, and `papaya` are not walked.
 
-A type written with an allocator parameter left to its default, `Vec<T>` or `Box<T>`, is not a
-finding where it is written: `Vec<T>` is `Vec<T, Global>`, so the allocation is found where the
-value is made, and a signature need not change. A call given `Global` (`Vec::new_in(Global)`) is
-not a finding. The allocator parameter is found by what it is (bounded by `Allocator` or
+A type written with an allocator parameter left to its default, `Vec<T>` or `Box<T>`, is not
+this lint's finding where it is written: the allocation is found where the value is made, and
+the type at an item's interface is [`unwritten_allocator`](#unwritten_allocator)'s. A call given
+`Global` (`Vec::new_in(Global)`) is not a finding. The allocator parameter is found by what it is (bounded by `Allocator` or
 defaulting to `Global`), not by its name. It is `deny` in blaze's workspace, with
 `blaze::hot_alloc`.
 
@@ -2318,7 +2319,13 @@ allocator where std's types do not.
 
 **The fix.** `blaze check --fix` writes the explicit global form, which keeps the meaning exactly:
 not allocating, or allocating in the task's frame, is the better change and is made by hand (the
-help says so). It is given where the crate root enables `#![feature(allocator_api)]` (a fix
+help says so). It is not given for a value of the type the function returns: that value's
+lifetime is the caller's, and `Global` written in the body would then be written into the
+signature (`-> Vec<T, Global>`), fixing the global heap for every caller. That finding's note
+says to make the function generic over `A: Allocator + Clone`, take `alloc: A` from its caller
+(the tree's `_in` convention) and build the value with `new_in(alloc)`; the caller names
+`Global` where it owns the lifetime. Before 2026-11-14 it offered `Vec::new_in(Global)` there,
+which is how `fn find(..) -> Vec<Finding>` became `-> Vec<Finding, Global>`. It is given where the crate root enables `#![feature(allocator_api)]` (a fix
 cannot add the gate from another file; 74 of 150 crates have it) and the type has the `_in`
 constructor:
 
@@ -2340,7 +2347,7 @@ that import; `--fix` applies one of them and the rest on its next pass (it runs 
 
 **What a type change costs.** `Vec<T>` and `Vec<T, Global>` are one type, and so are `Box<T>`,
 `VecDeque<T>`, `BTreeMap<K, V>` and the rest with an allocator parameter: the fix changes a
-constructor and nothing else, and no signature or caller moves. It is not one type for `String`,
+constructor in a body that owns the value and nothing else, and no signature or caller moves. It is not one type for `String`,
 `PathBuf`, `OsString` and std's `HashMap`/`HashSet`, which take no allocator: their explicit
 form is `blaze_mem::String<Global>`, `blaze_mem::PathBuf<Global>` or
 `blaze_hash::HashMap<K, V, Global>`, so the change reaches every signature the value passes
@@ -2360,6 +2367,126 @@ columns:
 
 A crate over a row fails, naming the new lines; a crate under one fails until the row is
 lowered (`{"command": "write"}`); a crate with no row, every new crate, is held to 0.
+
+## `unwritten_allocator`
+
+In `blaze::internal`, `warn` in blaze's ratchet until its findings are counted down; then it
+folds into [`implicit_allocator`](#implicit_allocator), whose home (`implicit_allocator.rs`)
+it shares.
+
+**The rule.** `bump-allocate`: allocate by lifetime and name the allocator. A function does not
+own the lifetime of what it takes or returns; its caller does. So a function that takes or
+returns a collection is generic over its allocator and is handed it, by the tree's `_in`
+convention: `fn find<A: Allocator + Clone>(cx: &Cx, alloc: A) -> Vec<Finding, A>`. `Global` is
+named in an expression where the lifetime is decided (`find(cx, Global)`), never in a
+signature.
+
+**What it catches.** A type with an allocator parameter (found by what it is, bounded by
+`Allocator` or defaulting to `Global`: `Vec`, `VecDeque`, `Box`, `BTreeMap`, `BTreeSet`,
+`BinaryHeap`, `Rc`, `Arc`, `LinkedList`, blaze_hash's maps, and an alias that hands the
+parameter on), resolved by name resolution, at an item's interface: a function's parameter or
+return type, a struct's, enum's or union's field, a type alias and an associated type. Every
+such type at any depth is its own finding: inside `Result` and `Option`, a tuple, a reference,
+a slice or array, the arguments of `impl Trait<..>` and `dyn Trait<..>`, and a function
+pointer's parameters and return. Two findings:
+
+- the allocator left to its default, anywhere at the interface:
+  `-> Result<Option<Arc<dyn PageSource>>, E>` is a finding at the `Arc`;
+- `Global` written as the allocator in a function's signature: `-> Vec<T, Global>`.
+
+A field, an alias or an associated type may name `Global` (or a parameter of its owner). A
+`let`'s type, a turbofish and a cast are the body's, which `implicit_allocator` judges at the
+call. `String`, `PathBuf` and `OsString` take no allocator parameter: `implicit_allocator`
+finds them where they are written, naming `blaze_mem::String<A>`, and, for a `Result`'s
+error, a typed error enum (`blaze_host::HostError`, `blaze_keyed::StoreError`).
+
+**Why it matters.** `Vec<T>` is `Vec<T, Global>`: a signature that writes it, or writes
+`Global`, fixes the global heap for every caller, and a caller with a task's frame cannot hand
+it in. The owner asked for this on 2026-11-14 after `blaze::one_at_a_time`'s first draft had
+`pub fn one_at_a_time(&self) -> Result<Vec<OneAtATime>, String>`, and its next had
+`fn find(cx) -> Vec<Finding, std::alloc::Global>`.
+
+**How to fix it.** In a signature: make the function generic over `A: Allocator + Clone`, add
+`alloc: A` (last, as the `_in` functions take it), write `A` in the type, and have each caller
+hand its allocator (`Global` where it owns the lifetime). No fix is offered there: the type
+parameter and the argument change every caller, a whole port. In a field, alias or associated
+type, the fix writes `Global` out (`, std::alloc::Global` before the `>`), where the allocator
+is the next argument; a parameter of the owner is the better change, made by hand.
+
+**Not found.** A method of any trait impl, whether the crate defines the trait or another crate
+does: its signature is the trait's. The finding is at the trait's declaration when the crate
+defines the trait, where the fix is made once, and nowhere when it does not; one finding per
+cause. An associated type in an impl is the impl's choice and is found there. A method of a
+trait that is used as `dyn` cannot be
+generic; such a trait's signatures stay findings until the trait takes its allocator another
+way (a type parameter of the trait, or an allocator the implementor holds).
+
+**Allowing it.** `#[expect(blaze::unwritten_allocator, reason = "..")]` on the item. No comment
+keeps a finding.
+
+## `default_refuses`
+
+In `blaze::internal`, `warn` in blaze's ratchet until its findings are counted down.
+
+**What it catches.** A trait method whose default body answers nothing: `Err(..)`, `None`, an
+empty string or slice (`""`, `[]`, `&[]`), `Ok` of one of these, or a call of `new`, `default`
+or `Default::default()` with no argument (or `new_in` with only its allocator), after any
+`let _ = ..;` statements that only mark the parameters used. Test code is left alone.
+
+**Why it matters.** Every implementor that forgot the method inherits the answer without a
+word. On 2026-11-14, `Writer::still`, `env_named` and `read_seen` answered "its front end does
+not say" by default; the serve simulation's writer inherited them, no simulated build left a
+request certificate, and the certificate simulations failed, or passed for the wrong reason,
+for two days.
+
+**How to fix it.** Make the method required (`fn m(&self) -> T;`), so each implementor says what
+it answers; the fix offered (`MaybeIncorrect`) replaces the body with `;`, and each implementor
+that relied on the default then fails to compile until it says.
+
+**Allowing it.** A default every implementor may inherit says why in a doc line that starts
+`/// The default:` on the method. A body that does real work (`Some(n)`, `0`, `{}`) is not found.
+
+## `one_at_a_time`
+
+In `blaze::internal`, `warn` in blaze's ratchet until its findings are counted down; off where
+`clippy.toml` has no `one-at-a-time` list.
+
+**What it catches.** A call of a function the `one-at-a-time` list names, once per item of a
+`for` loop or of a closure given to an iterator adaptor (`map`, `for_each`, `filter_map`,
+`flat_map`, `try_for_each`, `fold`, ...), resolved, never by name, whose receiver or an argument
+reads the item. A trait's method in the list names every implementation's call too. The finding
+names the batched form:
+
+```toml
+# clippy.toml
+one-at-a-time = [
+    { path = "blaze_cas::direct::Direct::read", batched = "read_many" },
+    { path = "blaze_cargo::serve::direct::read", batched = "read_many" },
+]
+```
+
+An entry that does not read (no `batched`, an unknown field) fails the load; an entry whose
+crate the linted crate reaches and whose path names no function there is an error at the
+crate's root; an entry of a crate it does not depend on is not its concern. A read whose key
+is the same every round (one to hoist), a `while` or `loop`, and test code are not found.
+
+**Why it matters.** A store's single-record read in a loop pays a lookup, a read and a wake per
+record; the batched form sorts the records into file order and reads neighbours in one read.
+`serve::direct::slots`' walk of a unit record's lookup read its slots one `serve::direct::read`
+at a time while `read_many` already read a batch in file order.
+
+**Its limit.** It sees the calls written in a body. A query the engine calls once per item (a
+tracked function that reads one record, asked for each of a thousand items by the engine's own
+walk) is a read one at a time that no body writes in a loop; the profile's spans of that query,
+counted per build, show it.
+
+**Only reads with a batched form are listed.** These have none yet, so a finding would have no
+fix: `blaze_cas::Store::get`, `get_in_place` and `has`; `Reader::get`, `get_in_place`,
+`get_from` and `has`; `Direct::map`; `serve::direct::map`, `value` and `owned`;
+`hir_def::deps::ImageStore::get` and `pages`; `Entries::get`; `hir_def::nameres::frozen::entries::entry`.
+
+**Allowing it.** `#[expect(blaze::one_at_a_time, reason = "..")]` on the function, saying why
+one at a time is right there (each read decides whether the next is made).
 
 ## `untied_child`
 

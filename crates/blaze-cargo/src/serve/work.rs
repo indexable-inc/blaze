@@ -808,17 +808,16 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// its directory ([`super::native::ensure`]). One that can't be is the error of each job
     /// asking it, naming it; there is no other place a build script is pointed at. A wait for
     /// another process laying it out stops once `cancelled` is set: once no job waits on it.
+    ///
+    /// No method of these steps from here to [`Steps::held_code`] has a default: each answers
+    /// what the daemon is expected to have (a layout, a refusal, a run log, the launch host's
+    /// state), and a default of "none" let the serve simulation's steps inherit an answer the
+    /// real ones never give (the class `blaze::default_refuses` keeps out, 2026-11-14).
     fn native(
         &self,
         input: &blaze_units::query::NativeInput,
         cancelled: &AtomicBool,
-    ) -> Result<std::path::PathBuf, ApiError> {
-        let _ = cancelled;
-        Err(ApiError::new(
-            format!("pinned native input `{}`: these steps lay out none", input.name),
-            Some(input.pin.clone()), // clone: an error's place, once
-        ))
-    }
+    ) -> Result<std::path::PathBuf, ApiError>;
     /// On a worker, before a job's lowering builds anything: the leases of `units`' build dirs
     /// (`target_dir`, `build_dir`) for `checkout`, `builds` the dir of every workspace's build
     /// dir, each dir made and marked on disk as docs/gc.md says (the daemon's is
@@ -854,19 +853,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// build's (the daemon's log, `blaze status`, the checkout's next `blaze why`), and it
     /// drops nothing: one record's refusal fails that record (panics-fail-one-job), never
     /// the front end, without which the checkout's next build would lower anew.
-    fn kept_refusal(&self, kept: &mut Self::KeptFront) -> Option<String> {
-        let _ = kept;
-        None
-    }
+    fn kept_refusal(&self, kept: &mut Self::KeptFront) -> Option<String>;
     /// On a worker, by the task that stores a kept front end and before it stores: what the
     /// front end's query engine logged of why its queries ran since the last take, each memo
     /// and input named with the database in hand ([`Writer::run_log`], taken here so naming a
     /// build's runs is never on the loop before the build's answer); none for a front end
     /// with no database, and while the run log is off.
-    fn kept_run_log(&self, kept: &Self::KeptFront) -> blaze_query::db::Taken {
-        let _ = kept;
-        blaze_query::db::Taken::default()
-    }
+    fn kept_run_log(&self, kept: &Self::KeptFront) -> blaze_query::db::Taken;
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// after the build's answer: what the build's end lets go of its front end (its MIR and
     /// inference no next build reads, by the build's kind), then the storage's end-of-build
@@ -874,20 +867,15 @@ pub trait Steps: Sized + Send + Sync + 'static {
     /// precondition of the checkout's next build: once `wanted` is set (a request of the
     /// checkout waits for the front end) it is skipped, and that build goes on with what was
     /// not let go.
-    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) {
-        let _ = (kept, wanted);
-    }
+    fn release_kept(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool);
     /// On a worker, by the task that stores a kept front end, after [`Steps::store_kept`] and
     /// before [`Steps::release_kept`]: the first calls of the checkout's launched runs that no
     /// bind record answers, made with the front end (`run::needs`), until `wanted` is set,
     /// every launcher has gone, or none attached in time. What it made for the store.
-    fn serve_needs(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) -> Vec<KeptPut> {
-        let _ = (kept, wanted);
-        Vec::new() // alloc: none, empty
-    }
+    fn serve_needs(&self, kept: &mut Self::KeptFront, wanted: &AtomicBool) -> Vec<KeptPut>;
     /// On the loop, just after a request set a stored front end's `wanted`: wakes the task
     /// serving launched runs' first calls ([`Steps::serve_needs`]), so it lets the front end go.
-    fn wake_needs(&self) {}
+    fn wake_needs(&self);
     /// On the loop, once, as the daemon starts: the home's store, what wakes the loop, and the
     /// journal's marks of launched programs' start images ([`LaunchMarked`]), each
     /// restored from its image when first asked for (a certificate's look, a launcher's
@@ -897,48 +885,32 @@ pub trait Steps: Sized + Send + Sync + 'static {
         store: blaze_cas::Reader,
         waker: Option<blaze_core::Waker>,
         marked: Vec<LaunchMarked>,
-    ) {
-        let _ = (store, waker, marked);
-    }
+    );
     /// On the loop, once, as the daemon starts: each test suite's index head its journal mark
     /// names (`Jobs::test_heads`), which the suite's next run takes. Steps that run no tests
     /// keep nothing.
-    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>) {
-        let _ = marked;
-    }
+    fn test_heads_marked(&self, marked: Vec<super::local::TestHeadMark, std::alloc::Global>);
     /// On the loop, each turn: the start images to put and, once durable, mark.
-    fn launch_kept(&self) -> Vec<LaunchKept> {
-        Vec::new() // alloc: none, empty
-    }
+    fn launch_kept(&self) -> Vec<LaunchKept>;
     /// On the loop, each turn: the programs a first call of which waits for a front end no
     /// task holds, each by the path it runs from ([`LaunchKept::runs_as`]), for each of which the loop sends itself the `blaze run` it last answered
     /// ([`Steps::launch_built`] says how it ended); and the needs waiting past their bound
     /// refused.
-    fn launch_wants(&self) -> Vec<String> {
-        Vec::new() // alloc: none, empty
-    }
+    fn launch_wants(&self) -> Vec<String>;
     /// On the loop: how many launchers are connected to the launch host now. A daemon a
     /// launcher is connected to does not exit idle ([`super::idle::exit_due`]).
-    fn launchers_connected(&self) -> usize {
-        0
-    }
+    fn launchers_connected(&self) -> usize;
     /// On the loop: the client of build `build` became process `pid`'s program at `exec_ns`
     /// (its rows' [`blaze_api::Timed::exec_of`]): the launch host joins it to the program's
     /// `Hello` and exit for the program's spans.
-    fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64) {
-        let _ = (pid, build, exec_ns);
-    }
+    fn launch_execd(&self, pid: u32, build: u64, exec_ns: i64);
     /// On the loop: the launched programs' spans made since the last take, each of the build
     /// that ran it, for the profile history.
-    fn launch_spans(&self) -> Vec<crate::serve::unit::run::launch::ProgramSpans> {
-        Vec::new() // alloc: none, empty
-    }
+    fn launch_spans(&self) -> Vec<crate::serve::unit::run::launch::ProgramSpans>;
     /// On the loop: the daemon's own request for `program` ended; `Err` says why none ran or
     /// it failed. Where it held no front end for the program, its waiting needs are refused
     /// with that reason.
-    fn launch_built(&self, program: &str, built: Result<(), String>) {
-        let _ = (program, built);
-    }
+    fn launch_built(&self, program: &str, built: Result<(), String>);
     /// On the loop: `blaze run`'s start of the built program at `program` as process `pid`
     /// ([`blaze_api::Request::Launch`]): the variables it runs on the daemon's code memory
     /// with, or `None` for a program that is no dev executable and runs its file. `placed`
@@ -950,19 +922,13 @@ pub trait Steps: Sized + Send + Sync + 'static {
         program: &str,
         pid: u32,
         placed: Option<[u8; 32]>,
-    ) -> Result<Option<Vec<(String, String)>>, ApiError> {
-        let _ = (program, pid, placed);
-        Ok(None)
-    }
+    ) -> Result<Option<Vec<(String, String)>>, ApiError>;
     /// On the loop: the code `holder` holds now for the program whose output is at
     /// `program`, by the identity of the build it is of; `None` where `holder` holds no
     /// program there. What a run of that program executes, which no placed file says: a
     /// request certificate records it as an output and a check compares it with this
-    /// (`job::certify::outputs_of`). Steps with no holder hold nothing.
-    fn held_code(&self, holder: CodeHolder, program: &str) -> Option<HeldCode> {
-        let _ = (holder, program);
-        None
-    }
+    /// (`job::certify::outputs_of`). Steps with no holder say they hold nothing.
+    fn held_code(&self, holder: CodeHolder, program: &str) -> Option<HeldCode>;
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {
         blaze_units::query::register(db);
@@ -1146,21 +1112,17 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// and never finds a reader.
     fn idle(&self) -> bool;
     /// What a write that waits waits with, for the loop's status and its stall to say
-    /// ([`WriteWait`]): read only, no query.
-    fn write_wait(&self) -> WriteWait {
-        WriteWait::default()
-    }
+    /// ([`WriteWait`]): read only, no query. No default: a stall that said "nothing waits"
+    /// of a write that waits would name nothing.
+    fn write_wait(&self) -> WriteWait;
     /// On the loop, as unit `unit` began and was found kept ([`Front::fresh`]): its compile
     /// replays its record, and makes nothing in the front end for the build's end to let go
-    /// ([`Steps::release_kept`]).
-    fn found_kept(&mut self, unit: usize) {
-        let _ = unit;
-    }
+    /// ([`Steps::release_kept`]). No default, nor for [`Writer::compiled`]: each writer says
+    /// whether it counts them.
+    fn found_kept(&mut self, unit: usize);
     /// On the loop, as unit `unit`'s compile ended (its last phase gave its outcome, ok or
     /// not): counted for what the build's end lets go ([`Steps::release_kept`]).
-    fn compiled(&mut self, unit: usize) {
-        let _ = unit;
-    }
+    fn compiled(&mut self, unit: usize);
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:
     /// `Ok(true)` once applied (or none waited), `Ok(false)` while a reader is, asking again
     /// costing one load. A write that fails (its error, or a panic, a maintainer's included,
@@ -1181,15 +1143,12 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// made that applied to nothing), as the build's error, or its warnings to say, with what
     /// `blaze check` lints over every configuration of a package at once (`blaze::dead`; an
     /// error of those fails the build). `ok`: whether the build succeeded; `built`: its nodes'
-    /// units, a unit once a node.
+    /// units, a unit once a node. No default: "nothing found" is each front end's to say.
     fn finished(
         &mut self,
         ok: bool,
         built: &[u32],
-    ) -> Result<Vec<blaze_api::Diagnostic>, ApiError> {
-        let _ = (ok, built);
-        Ok(Vec::new())
-    }
+    ) -> Result<Vec<blaze_api::Diagnostic>, ApiError>;
     /// On the loop, once every task of the job's build has ended and before it is kept: each
     /// library crate of the build that is not a workspace member, sorted by cargo package
     /// name, with whether its check outcome and its bodies were served from the store,
@@ -1198,10 +1157,9 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// On the loop, as the job's build ends and before it is kept: what its front end's query
     /// engine logged of why its queries ran since the last take, each memo and input named
     /// with the database in hand ([`blaze_query::db::take_log_in`]); none for a front end
-    /// with no database, and while the run log is off.
-    fn run_log(&self) -> blaze_query::db::Taken {
-        blaze_query::db::Taken::default()
-    }
+    /// with no database, and while the run log is off. No default: a front end with a
+    /// database that inherited "none" would hide why its queries ran.
+    fn run_log(&self) -> blaze_query::db::Taken;
     /// On the loop, once every task of a build that made nothing so far has ended and before
     /// it is kept: the Rust sources of the view that every key of the build held by code text
     /// alone, each by its path from the view's root with the edition its crates parse it in,
@@ -1209,10 +1167,15 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// leaves every key, and the no-op lane says the build's answer again over it
     /// (`serve::job::noop`, "An edit that changes no code"). Or why it vouches for none: a
     /// reason, never an empty list. It runs no query and reads no file: inputs, what the
-    /// build noted, and the store's index. A front end that does not say vouches for none.
-    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String> {
-        Err("its front end does not say which sources it held by code text".to_owned()) // alloc: a reason, once a build
-    }
+    /// build noted, and the store's index.
+    ///
+    /// No default, nor for [`Writer::env_named`], [`Writer::read_outside`] and
+    /// [`Writer::read_seen`]: each front end says what its steps read, a fake's included. When
+    /// these four answered "its front end does not say" by default, the serve simulation's
+    /// writer inherited three of them, no simulated build left a request certificate, and the
+    /// certificate simulations failed, or passed for the wrong reason, for two days
+    /// (2026-11-14; `blaze::default_refuses` keeps the class out).
+    fn still(&self) -> Result<Vec<(String, ::span::Edition)>, String>;
     /// On the loop, where [`Writer::still`] is asked: the variables of the request's
     /// environment that the build's steps asked for by name (a build script's or its
     /// programs' traced reads of a variable, a crate's `env!` and `option_env!`), each at
@@ -1221,21 +1184,16 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// on, so the no-op lane says it again whatever a variable nothing read holds
     /// (`serve::job::noop`, "The request's environment"). Or why they are not all known: a
     /// reason, and then every variable is compared. It runs no query and reads no file: what
-    /// the build noted. A front end that does not say names none it can vouch for.
-    fn env_named(&self) -> Result<Vec<String>, String> {
-        Err("its front end does not say which variables its steps read by name".to_owned()) // alloc: a reason, once a build
-    }
+    /// the build noted.
+    fn env_named(&self) -> Result<Vec<String>, String>;
     /// On the loop, where [`Writer::still`] is asked: the paths under the build's directories
     /// of outputs that its steps read beside their own units' outputs: each file a build
     /// script's kept run was checked against or a unit record was filed by, then each
     /// directory one of them listed or hashed whole (there, or above there). A superset is
     /// sound. What the no-op lane never sets a change aside at (`serve::job::noop`, "What
     /// was heard is told apart by path"). Or why they are not all known: a reason, and then
-    /// no change heard is set aside. It runs no query and reads no file. A front end that
-    /// does not say names none it can vouch for.
-    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String> {
-        Err("its front end does not say which paths its steps read".to_owned()) // alloc: a reason, once a build
-    }
+    /// no change heard is set aside. It runs no query and reads no file.
+    fn read_outside(&self) -> Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), String>;
     /// On the loop, once every task of the job's build has ended: every read of the machine's
     /// files that a traced step's record rests on ([`Seen`]), each with what was there when
     /// that record's own check held: for a run found kept, what its check saw as the build
@@ -1244,10 +1202,8 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// the build after its step read it differs from them at the next request. In any order,
     /// a read as often as steps read it. Or why they are not all known: the step that has no
     /// trace, named; no request certificate is written of that build. It runs no query and
-    /// reads no file. A front end that does not say names none it can vouch for.
-    fn read_seen(&self) -> Result<Vec<Seen>, String> {
-        Err("its front end does not say what its traced steps read".to_owned()) // alloc: a reason, once a build
-    }
+    /// reads no file.
+    fn read_seen(&self) -> Result<Vec<Seen>, String>;
     /// Under `-v`: the note of what storing the kept front end this build lowered into did with
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;
@@ -1377,11 +1333,8 @@ pub trait Front<S: Steps>: Send + Sync + 'static {
     fn refused(&self, unit: usize, what: String) -> Diagnostic;
     /// On a worker, as a phase task of unit `unit` starts: the unit's crate (its target's
     /// name) and the unit as its phase spans name it (`serde v1.0.219 (lib)`), for its `task`
-    /// span. `None` for a front that names no units.
-    fn subject(&self, unit: usize) -> Option<(String, String)> {
-        let _ = unit;
-        None
-    }
+    /// span. `None` for a front that names no units, said by that front: no default.
+    fn subject(&self, unit: usize) -> Option<(String, String)>;
     /// On the loop: the run of build script unit `unit` (mode `RunCustomBuild`). Its run
     /// reports [`Response::BuildScript`] (and cargo's warnings as diagnostics), and before it
     /// ends applies its directives as cargo does to the units they reach (`rustc-cfg`,
