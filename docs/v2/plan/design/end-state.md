@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: The end state of blaze's incremental design, as one idea at three levels (the request, the query engine, the front end): every result is kept with exactly what it read, at the grain of the smallest thing that changes alone; it is the answer until one of those reads differs; then only what read it is redone. Says what each level becomes, what is deleted, the order of building and the numbers that judge it.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # The end state: records with their reads
 

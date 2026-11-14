@@ -175,6 +175,11 @@ impl KeyHasher {
         KeyHasher(hasher)
     }
 
+    pub fn toolchain(&mut self, tool: &ToolId) -> &mut KeyHasher {
+        self.0.id(&tool.namespace.0).id(&tool.tool).id(&tool.target);
+        self
+    }
+
     pub fn id(&mut self, id: &ContentId) -> &mut KeyHasher {
         self.0.id(id);
         self
@@ -229,11 +234,48 @@ impl KeyHasher {
     }
 }
 
-/// The compiler's own code identity: every key starts from it, so a new blaze keys apart.
+/// Where a record may be shared: the public namespace (std, a registry package at a version),
+/// readable by all, or one organisation's, under its own credentials. Read lists and names never
+/// leave their namespace.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct ToolId(pub ContentId);
+pub struct Namespace(pub ContentId);
 
-/// The digest of a unit's typed settings: cfg, features, target, edition, profile, lint levels.
+impl Namespace {
+    pub const PUBLIC: Namespace = Namespace(ContentId([0; 32]));
+}
+
+/// Where a package's source came from: what decides its namespace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Origin {
+    /// A registry package at a version, by the registry's checksum of its archive: public.
+    Registry { checksum: ContentId },
+    /// The toolchain's own crates (std, blaze-std): public.
+    Toolchain,
+    /// A path, a workspace member, a git repository or a private registry: the organisation's.
+    Private,
+}
+
+/// The namespace of a package's records: public only for a registry archive known by its
+/// checksum or the toolchain's crates; everything else, private code included, under `org`. So
+/// private code never lands in the public namespace, whatever it is called.
+pub fn namespace_of(origin: Origin, org: Namespace) -> Namespace {
+    match origin {
+        Origin::Registry { .. } | Origin::Toolchain => Namespace::PUBLIC,
+        Origin::Private => org,
+    }
+}
+
+/// Everything of the toolchain every key starts from, and nothing of the machine: blaze's own
+/// code identity with its pinned nightly, the target (triple and target features), and the
+/// namespace. No path, host name, time or address is ever an input of a key.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct ToolId {
+    pub tool: ContentId,
+    pub target: ContentId,
+    pub namespace: Namespace,
+}
+
+/// The digest of a unit's typed settings: cfg, features, edition, profile, lint levels.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Settings(pub ContentId);
 
@@ -297,9 +339,12 @@ macro_rules! kind {
 }
 
 kind! {
-    /// A request's certificate: what the last answer read, checked before anything else.
+    /// A request's certificate: checked before anything else. An outside kind
+    /// ([`crate::outside`]): its shape is what the request read (files' stamps and digests,
+    /// variables), its value at the address of those answers is the unit manifests it built, so
+    /// an undone edit finds its old certificate still filed.
     Certificate {
-        tag: 1, version: 1, layout: Flat, grain: Request, trace: Key, keep: Disk, root: Opaque,
+        tag: 1, version: 2, layout: Flat, grain: Request, trace: Outside, keep: Disk, root: Traced,
         inputs: CertificateInputs,
     }
 }
@@ -314,7 +359,7 @@ pub struct CertificateInputs<'a> {
 
 impl CertificateInputs<'_> {
     fn key(&self) -> Key<Certificate> {
-        KeyHasher::of::<Certificate>().id(&self.tool.0).id(&self.base).finish()
+        KeyHasher::of::<Certificate>().toolchain(&self.tool).id(&self.base).finish()
     }
 }
 
@@ -335,7 +380,7 @@ pub struct FileInputs<'a> {
 impl FileInputs<'_> {
     fn key(&self) -> Key<FileImage> {
         KeyHasher::of::<FileImage>()
-            .id(&self.tool.0)
+            .toolchain(&self.tool)
             .u64(u64::from(self.edition))
             .bytes(self.bytes)
             .finish()
@@ -366,7 +411,7 @@ pub struct SurfaceInputs<'a> {
 impl SurfaceInputs<'_> {
     fn key(&self) -> Key<Surface> {
         KeyHasher::of::<Surface>()
-            .id(&self.tool.0)
+            .toolchain(&self.tool)
             .id(&self.settings.0)
             .ids(self.pieces)
             .keys(self.deps)
@@ -405,7 +450,7 @@ pub struct BodyInputs<'a> {
 impl BodyInputs<'_> {
     fn key(&self) -> Key<Body> {
         let mut hasher = KeyHasher::of::<Body>();
-        hasher.id(&self.tool.0).id(&self.settings.0).id(&self.sysroot).id(&self.text);
+        hasher.toolchain(&self.tool).id(&self.settings.0).id(&self.sysroot).id(&self.text);
         let names = match planted(Plant::KeyLeavesOutNames) && !self.names.is_empty() {
             true => &self.names[1..],
             false => self.names,
@@ -440,7 +485,7 @@ pub struct InstanceInputs<'a> {
 impl InstanceInputs<'_> {
     fn key(&self) -> Key<Instance> {
         KeyHasher::of::<Instance>()
-            .id(&self.tool.0)
+            .toolchain(&self.tool)
             .id(&self.settings.0)
             .id(&self.body)
             .ids(self.args)
@@ -452,53 +497,149 @@ impl InstanceInputs<'_> {
 kind! {
     /// One macro call's expansion.
     Expansion {
-        tag: 6, version: 1, layout: Flat, grain: Call, trace: Key, keep: DiskAndResident,
-        root: Opaque, inputs: ExpansionInputs,
+        tag: 6, version: 2, layout: Flat, grain: Call, trace: Outside, keep: DiskAndResident,
+        root: Traced, inputs: ExpansionInputs,
     }
 }
 
-/// An expansion's key. Sound with no read list because an expander runs in Wasmtime with no
-/// ambient reads: what it can see is its input, this context and nothing else.
+/// A proc macro's kind of entry point.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProcKind {
+    Bang = 0,
+    Attr = 1,
+    Derive = 2,
+}
+
+/// What expands a call: its code identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Expander {
+    /// A proc macro: its compiled module's digest ([`ExpanderModule`]'s content), the export it
+    /// runs by index, its kind, and the digest of the host interface it is linked against.
+    Proc { module: ContentId, export: u32, kind: ProcKind, host: ContentId },
+    /// A declarative macro: its definition's identity.
+    Declarative { definition: ContentId },
+}
+
+/// The state a call's expander starts from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StartState {
+    Fresh,
+    /// Its statics as a digest.
+    Statics(ContentId),
+    /// The state replayed from earlier calls, as a digest.
+    Replayed(ContentId),
+}
+
+/// What of the call site an expander can see. No crate name: hygiene is position-free, its
+/// contexts numbered by first appearance in the tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CallContext {
+    /// The version of the call's layout (how input, attribute and spans are laid out).
+    pub layout: u32,
+    /// The call's edition, as its year.
+    pub edition: u16,
+    /// Whether keywords of every edition are forced.
+    pub forced_keywords: bool,
+    pub state: StartState,
+}
+
+/// An expansion's key. What else an expander reads goes through the host (environment
+/// variables, tracked paths, a span's line and column), each an outside read of its shape.
 pub struct ExpansionInputs<'a> {
     pub tool: ToolId,
-    /// The expander's code identity (its wasm module's content).
-    pub expander: ContentId,
+    pub expander: Expander,
     pub input: ContentId,
     /// An attribute macro's own arguments.
     pub attr: Option<ContentId>,
-    /// What of the call site the expander can see: edition, crate name, the def-site hygiene
-    /// context.
-    pub context: ContentId,
+    pub context: CallContext,
     pub of: PhantomData<&'a ()>,
 }
 
 impl ExpansionInputs<'_> {
     fn key(&self) -> Key<Expansion> {
-        KeyHasher::of::<Expansion>()
-            .id(&self.tool.0)
-            .id(&self.expander)
-            .id(&self.input)
-            .opt_id(self.attr.as_ref())
-            .id(&self.context)
-            .finish()
+        let mut hasher = KeyHasher::of::<Expansion>();
+        hasher.toolchain(&self.tool);
+        match self.expander {
+            Expander::Proc { module, export, kind, host } => {
+                hasher.u64(0).id(&module).u64(u64::from(export)).u64(kind as u64).id(&host);
+            }
+            Expander::Declarative { definition } => {
+                hasher.u64(1).id(&definition);
+            }
+        }
+        hasher.id(&self.input).opt_id(self.attr.as_ref());
+        let context = &self.context;
+        hasher.u64(u64::from(context.layout)).u64(u64::from(context.edition)).u64(context.forced_keywords as u64);
+        match context.state {
+            StartState::Fresh => hasher.u64(0),
+            StartState::Statics(it) => hasher.u64(1).id(&it),
+            StartState::Replayed(it) => hasher.u64(2).id(&it),
+        };
+        hasher.finish()
+    }
+}
+
+kind! {
+    /// A macro crate's compiled `wasm32-wasip1` module: its bytes and its exports.
+    ExpanderModule {
+        tag: 11, version: 1, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
+        root: Opaque, inputs: ModuleInputs,
+    }
+}
+
+/// A module's key: the toolchain and the macro crate's code key, made from its source closure
+/// before anything compiles.
+pub struct ModuleInputs<'a> {
+    pub tool: ToolId,
+    pub unit: CodeKey,
+    pub of: PhantomData<&'a ()>,
+}
+
+impl ModuleInputs<'_> {
+    fn key(&self) -> Key<ExpanderModule> {
+        KeyHasher::of::<ExpanderModule>().toolchain(&self.tool).id(&self.unit.0).finish()
+    }
+}
+
+/// The code identity of a unit with everything it links, by text, before anything compiles: its
+/// manifest's key and each dependency's code key. Unlike a manifest key, which a dependency's
+/// private body edit leaves equal (it covers dependencies' surfaces only), this moves with any
+/// text below: what runs a unit's code (a script, a proc macro) is keyed by it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct CodeKey(pub ContentId);
+
+impl CodeKey {
+    pub fn of(tool: &ToolId, unit: Key<UnitManifest>, deps: &[CodeKey]) -> CodeKey {
+        let mut hasher = Hasher::new("blaze-keyed code key 1");
+        hasher.id(&tool.namespace.0).id(&tool.tool).id(&tool.target).id(&unit.id());
+        hasher.update(&(deps.len() as u64).to_le_bytes());
+        deps.iter().for_each(|dep| {
+            hasher.id(&dep.0);
+        });
+        CodeKey(hasher.finish())
     }
 }
 
 kind! {
     /// One build-script run: its outputs and the outside reads it made.
     ScriptRun {
-        tag: 7, version: 1, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
+        tag: 7, version: 2, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
         inputs: ScriptInputs,
     }
 }
 
 pub struct ScriptInputs<'a> {
     pub tool: ToolId,
-    /// The script's program.
-    pub script: Key<ProgramManifest>,
+    /// The script unit's code key, made before it compiles.
+    pub script: CodeKey,
+    /// The package's identity (name, version, source).
     pub package: ContentId,
-    /// The environment cargo defines for a script (declared, not traced).
+    /// What no file shows: the OS build, the architecture, the sandbox's version.
+    pub host: ContentId,
+    /// The variables blaze gives the script, sorted by name, each once (declared, not traced).
     pub env: ContentId,
+    /// The arguments, in order.
+    pub args: ContentId,
     pub settings: Settings,
     pub of: PhantomData<&'a ()>,
 }
@@ -506,10 +647,12 @@ pub struct ScriptInputs<'a> {
 impl ScriptInputs<'_> {
     fn key(&self) -> Key<ScriptRun> {
         KeyHasher::of::<ScriptRun>()
-            .id(&self.tool.0)
-            .id(&self.script.id())
+            .toolchain(&self.tool)
+            .id(&self.script.0)
             .id(&self.package)
+            .id(&self.host)
             .id(&self.env)
+            .id(&self.args)
             .id(&self.settings.0)
             .finish()
     }
@@ -535,7 +678,7 @@ pub struct TestInputs<'a> {
 impl TestInputs<'_> {
     fn key(&self) -> Key<TestRun> {
         KeyHasher::of::<TestRun>()
-            .id(&self.tool.0)
+            .toolchain(&self.tool)
             .id(&self.reach)
             .bytes(self.test)
             .id(&self.settings.0)
@@ -544,27 +687,31 @@ impl TestInputs<'_> {
 }
 
 kind! {
-    /// One unit's list: its surface's, bodies' and instances' keys, by item. Written after every
-    /// record it names.
+    /// One unit's list: its surface's and bodies' keys, by item. Written after every record it
+    /// names. (Instances are a program's: blaze-program files them under the program manifest.)
     UnitManifest {
-        tag: 9, version: 1, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
+        tag: 9, version: 2, layout: Flat, grain: Unit, trace: Key, keep: DiskAndResident,
         root: ManifestRoot, inputs: UnitInputs,
     }
 }
 
-/// A unit manifest's key: its files' keys, its late inputs and its dependencies' manifests' keys.
+/// A unit manifest's key: its files' keys, its late inputs and its dependencies' surfaces' keys.
+/// The firewall: a dependency whose surface is unchanged leaves this key equal, so its
+/// dependents are settled by one manifest hit and none of their records is looked at. Sound
+/// because a unit's records read a dependency only through its surface (the pieces a name
+/// closure crosses are in the surface's key).
 pub struct UnitInputs<'a> {
     pub tool: ToolId,
     pub settings: Settings,
     pub files: &'a [Key<FileImage>],
     pub late: &'a [LateRead<'a>],
-    pub deps: &'a [Key<UnitManifest>],
+    pub deps: &'a [Key<Surface>],
 }
 
 impl UnitInputs<'_> {
     fn key(&self) -> Key<UnitManifest> {
         let mut hasher = KeyHasher::of::<UnitManifest>();
-        hasher.id(&self.tool.0).id(&self.settings.0).keys(self.files);
+        hasher.toolchain(&self.tool).id(&self.settings.0).keys(self.files);
         if !planted(Plant::KeyLeavesOutLateInputs) {
             hasher.late(self.late);
         }
@@ -590,7 +737,7 @@ pub struct ProgramInputs<'a> {
 impl ProgramInputs<'_> {
     fn key(&self) -> Key<ProgramManifest> {
         KeyHasher::of::<ProgramManifest>()
-            .id(&self.tool.0)
+            .toolchain(&self.tool)
             .id(&self.link)
             .keys(self.instances)
             .finish()
@@ -598,7 +745,7 @@ impl ProgramInputs<'_> {
 }
 
 /// Every kind's tag, for a host that dispatches an untyped ask to `Store::read::<K>`.
-pub const TAGS: [(Tag, &str); 10] = [
+pub const TAGS: [(Tag, &str); 11] = [
     (Certificate::TAG, Certificate::NAME),
     (FileImage::TAG, FileImage::NAME),
     (Surface::TAG, Surface::NAME),
@@ -609,4 +756,5 @@ pub const TAGS: [(Tag, &str); 10] = [
     (TestRun::TAG, TestRun::NAME),
     (UnitManifest::TAG, UnitManifest::NAME),
     (ProgramManifest::TAG, ProgramManifest::NAME),
+    (ExpanderModule::TAG, ExpanderModule::NAME),
 ];

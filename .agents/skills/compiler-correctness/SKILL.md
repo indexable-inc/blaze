@@ -1,6 +1,6 @@
 ---
 name: compiler-correctness
-description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input and are computed from text before the work, positions item-relative in every key and record, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
+description: "What blaze must compile and how: never rustc, every program the pinned nightly builds behaves the same (except rustc soundness holes), usefulness over parity with rustc and cargo, semantics in the front end's query crates (blaze-query, derived from salsa), keys that cover every input and are computed from text before the work, checks done once with a proof type later code takes, positions item-relative in every key and record, deterministic output, proc macros on wasm and Cranelift's place, sandboxed build scripts and proc macros. A cache of a function's results keyed by code identity, and what the store holds, are the `memory-and-data` skill. Load before changing the front end, codegen, the linker, caching or store keys, diagnostics, proc-macro or build-script execution, or the sandbox."
 ---
 
 # Compiler correctness
@@ -53,13 +53,15 @@ builds through a rustc soundness bug.
 
 ## blaze-uses-its-extensions (rule 6)
 
-Only blaze builds blaze, so blaze's own source is blaze-only Rust: use its extensions
-(`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`, `#[blaze::linear]`, contracts, comptime,
-sealed traits) wherever they make blaze more correct or more incremental, and rely on them being
-checked. No `cfg_attr` guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension
-blaze can't check yet is an error to fix in blaze. The one limit is stage 0: an extension blaze's
-source uses must be one the stage-0 blaze (`.github/blaze-version`) already reads, so a new
-extension lands in a release before blaze's source depends on it.
+blaze's own source uses blaze's extensions (`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`,
+`#[blaze::linear]`, contracts, comptime, sealed traits) wherever they make blaze more correct or
+more incremental, and relies on them being checked when blaze builds blaze. While cargo also builds
+blaze (`blaze-builds-blaze`), an extension is used only in a form rustc ignores (an attribute, a
+tool attribute), and code only blaze accepts waits until blaze builds blaze again. No `cfg_attr`
+guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension blaze can't check yet
+is an error to fix in blaze. The one limit is stage 0: an extension blaze's source uses must be one
+the stage-0 blaze (`.github/blaze-version`) already reads, so a new extension lands in a release
+before blaze's source depends on it.
 
 See [docs/future/bootstrap.md](../../../docs/future/bootstrap.md).
 
@@ -97,14 +99,20 @@ key is a refusal with a typed error, never an overwrite, and the fix is the key,
 
 ## deterministic-output (rule 25)
 
-No output (an object, a diagnostic's order, a store key, a profile row's identity) depends on
-hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed seeds,
-except a table whose keys an attacker may pick (names, paths, literals), which is keyed by a
-`blaze_hash::SipKey`: random when nothing persists its layout and nothing output depends on where a
-key lands, or `blaze_ids::index_key` of its content when an image lays it out; a hot one may instead
-be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run no honest keys make,
-then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
-a test builds twice and compares bytes.
+Nothing of the machine is in what is kept or shared: no absolute path, host name, user, time,
+address or thread order in a key, a record or an output. Two builders of one key, on any machine,
+produce byte-identical values: that is what lets a record be fetched from the shared cache instead
+of made, so it is a protocol requirement, and the CI push refuses a key whose bytes differ from the
+bucket's. How: make a path relative to its root (the workspace, the toolchain, the registry archive)
+before it enters a key; fill a time or an absolute position in only when printed; order by
+construction, never by arrival. No output (an object, a diagnostic's order, a store key, a profile
+row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
+Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths, literals),
+which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and nothing output
+depends on where a key lands, or `blaze_ids::index_key` of its content when an image lays it out; a
+hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run
+no honest keys make, then a random `SipKey` for good. Anything iterated into output is sorted or
+ordered by construction; a test builds twice and compares bytes.
 
 ## semantics-in-front-end (rule 31)
 
@@ -113,8 +121,10 @@ hashes) go in the front end's crates in `crates/` (`hir-ty`, `hir-def` and the r
 rust-analyzer but no longer synced with it), whose queries run on blaze's own engine
 (`blaze_query::db`, crates/blaze-query: derived from salsa but not salsa; dense ids, in memory, one
 view at a time; what outlives a request is a record, `outputs-are-records`, never a row kept in the
-engine), in a crate of their own where possible. Codegen, the store, the driver (the daemon today),
-cargo integration and the runtime stay outside the front end.
+engine), in a crate of their own where possible. The target design (docs/v2/plan/design/target.md)
+replaces the engine's validity machinery with records keyed before the work; the language rules stay
+in these crates. Codegen, the store, the driver (the daemon today), cargo integration and the
+runtime stay outside the front end.
 
 See [docs/contributing.md#where-new-code-goes](../../../docs/contributing.md#where-new-code-goes).
 
@@ -210,5 +220,43 @@ it, or is an input of that one record's key; it is never left out of the key
 (`errors-name-the-thing`), worked out when it is printed. A type for each kind of position
 (`item-relative` and `absolute` as different types) keeps the two from mixing
 (`type-then-lint-then-rule`).
+
+## verify-once (rule 74)
+
+Every check has one place where it happens and a value that proves it happened; code that needs the
+checked thing takes the proof, so checking twice cannot be written and skipping the check cannot
+either. (1) A proof is a type only its checker can make (`Verified<Segment>`, `Certified`,
+`Holds<K>`), branded with what it is valid for (the snapshot, the boot, the generation) so it cannot
+outlive it. Checking consumes the unchecked value and returns the proof; there is no way to ask for
+a check of something already proved. (2) A proof at a coarse level is the proof for everything under
+it: a certified request checks nothing below it; an unchanged crate surface means no dependent is
+looked at; a unit manifest that holds settles every body it names without a lookup each; only under
+a parent that moved is the next level compared. (3) An equal key is followed by no other check
+(`keys-cover-every-input` is what makes that sound). A read list is verified at most once per item
+and snapshot, and its result is filed under the new key so the next request hits by key. (4) Bytes
+are verified once per boot or fetch, never on each read: a segment this process wrote is trusted; a
+segment from an earlier boot is checked in full once and the result recorded in the manifest; a
+fetched segment's signature and digest are checked once at fetch and recorded; a read of a record in
+a verified segment checks nothing. (5) A file is hashed again only when its stat stamp moved (the
+racy-stamp rule decides the edge case); with a watcher journal, only the paths the journal names are
+looked at. (6) A put of bytes the store already holds writes nothing, and nothing syncs on the edit
+path. The counters that show it are checks per kind per request; a second check of one thing in one
+snapshot is a bug the simulation's oracle catches. This is `type-then-lint-then-rule` applied to
+verification: the type makes the second check impossible to write.
+
+See [docs/v2/plan/design/target.md](../../../docs/v2/plan/design/target.md).
+
+## work-once (rule 77)
+
+Work is done once, or not at all. Never compute at request time what a key computed before the work
+can skip (`granular-caching`): an equal key is a hit, with no other check. Never verify twice
+(`verify-once`): a check returns a proof and later code takes it, and a proof or an unchanged parent
+covers everything under it. Never rebuild what a record already holds (`outputs-are-records`): a
+result is filed once and read in place. Never hold in memory what a fresh process could rebuild from
+records (`no-state-between-requests`), and never write what the store already holds: an identical
+put writes nothing. How: for each step on a hot path, ask what makes it necessary on this request;
+if the answer is "it might have changed", find the key, stamp or proof that says whether it did and
+skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
+in one snapshot is an invariant the simulation's oracle checks.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

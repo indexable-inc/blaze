@@ -31,6 +31,7 @@ use crate::{
     Plant,
     kind::{Keep, Key, Kind, Tag, UnitManifest},
     planted,
+    proof::Holds,
 };
 
 /// A crate's arena: the unit index of the request's plan.
@@ -47,8 +48,10 @@ pub trait Memo {
     /// The record of kind `K` under `key`, 16-aligned, if this memo holds it.
     fn get<K: Kind>(&self, arena: Arena, key: &Key<K>) -> Option<&[u8]>;
 
-    /// Offers `record`, read from or written to the store under `key`.
-    fn keep<K: Kind>(&mut self, arena: Arena, key: &Key<K>, record: &[u8]);
+    /// Offers `record`, proved in the asking request (`holds`: read under its key, verified, or
+    /// written), so nothing unproved is kept. What `get` answers in a later request is checked
+    /// once there, by its key ([`crate::proof::hit`]).
+    fn keep<K: Kind>(&mut self, arena: Arena, holds: &Holds<'_, K>, record: &[u8]);
 
     /// Drops everything of `arena`, wholesale: a crate whose files changed, or a dependent whose
     /// imported digests changed. Always safe.
@@ -72,7 +75,7 @@ impl Memo for RecordsOnly {
     }
 
     #[inline(always)]
-    fn keep<K: Kind>(&mut self, _arena: Arena, _key: &Key<K>, _record: &[u8]) {}
+    fn keep<K: Kind>(&mut self, _arena: Arena, _holds: &Holds<'_, K>, _record: &[u8]) {}
 
     #[inline(always)]
     fn drop_arena(&mut self, _arena: Arena) {}
@@ -129,7 +132,8 @@ impl Memo for Resident {
         }
     }
 
-    fn keep<K: Kind>(&mut self, arena: Arena, key: &Key<K>, record: &[u8]) {
+    fn keep<K: Kind>(&mut self, arena: Arena, holds: &Holds<'_, K>, record: &[u8]) {
+        let key = holds.key();
         if K::KEEP == Keep::Disk {
             return;
         }

@@ -19,11 +19,13 @@ Anything blaze persists (the store's records, the certificate, the profile histo
 image while it exists; what a persisted value is, is `outputs-are-records`) has a test that restores
 it and checks the result equals a fresh build byte for byte, and a budget for a fresh process to
 first answer. A file that another version of blaze can find (in the state directory, in a home, in
-`/tmp`) also has a test that a file of its previous layout is handled: refused by name with what to
-do, or read, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive
-a version", lists each with its test. A restore that silently starts empty is a failure blaze
-reports, naming why. A format that is written while blaze runs and read after a crash also gets a
-DST (`dst-not-review`) that crashes it at every point and checks the restore.
+`/tmp`) also has a test that a file of its previous layout is handled: an old home after an upgrade
+is detected, reported by name and rebuilt, and nothing is migrated (scope decision D35); a file
+outside a home is refused by name with what to do, or left alone under a name that carries its
+layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
+silently starts empty is a failure blaze reports, naming why. A format that is written while blaze
+runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and
+checks the restore.
 
 ## dst-not-review (rule 43)
 

@@ -302,6 +302,22 @@
    "why": "Andrew, 2026-11-12 17:52: \"it needs to be better, not just 3x, but better\": Relax holds nothing between runs, so a daemon that stays loses the held row whatever it holds.",
    "recommended": "Yes. The cost: the first edit after an idle exit pays a daemon start and a restore from disk.",
    "state": "written on int-1112, not compiled"
+  },
+  {
+   "id": "D34",
+   "date": "2026-11-13",
+   "decision": "The fresh core (docs/v2/plan/design/target.md, interface crate crates/blaze-keyed): one process per command answers from records keyed from text before the work, each carrying the read list its work made; on a key miss the read list is checked against the current surfaces and a verified result is filed under the new key byte for byte. No daemon, no query graph, no memory admission; the memo (`RecordsOnly` for one-shot commands, `Resident` for watch and live runs) and the executor (`Local`, or a remote service) are static type parameters of one driver. Records are the unit of sharing: deterministic bytes, namespaced keys (public only for registry archives by checksum and the toolchain), segments as the wire format, signed statements. It supersedes end-state.md and end-state/*.md.",
+   "why": "Decided by the main agent on the owner's instruction, 2026-11-13. The owner's priority order: \"incremental comp being short > memory usage > cold comp > disk gc being good/not locking > disk usage\"; \"dont measure just build\". Builds on the outside audit accepted 2026-11-13 (/Volumes/Projects/blaze-int-1112-notes/audit-1113.md) and target-decisions-1113.md beside it; both traces from the start because incremental time comes first and disk last.",
+   "recommended": "Yes. Wave 2 (front end over surface images, body records, blaze-memo, blaze-program, blaze-expansion, test records) builds on blaze-keyed's vocabulary.",
+   "state": "page and crate written on fix-hello-1113 by claude-opus-5-5, not compiled"
+  },
+  {
+   "id": "D35",
+   "date": "2026-11-13",
+   "decision": "Scope of the target design, as the owner answered it. In: cargo workspaces, accepted on reth, tempo and blaze; hosts macOS arm64 and Linux (arm64 first; x86-64 is CI's, no x86 VM for now); a build runs when asked and may leave a helper process with an expiry that holds only what records rebuild and never builds on its own; `run` and `build` check only what the program reaches, `check` checks everything asked; dependencies and everything from the bucket maximally optimized, workspace code fast first and tiered up in the background, the top tier optimizing across functions at function grain (keyed by its body and the keys of every body it took in); the shared cache read without a login, written only by CI and later the remote workers; fully local private builds always possible; an old home detected, reported and rebuilt, never migrated; new crates move to bstd once blaze builds blaze; long-term code sans-IO; every design aims within 10% of the floor from the start. Not now: `blaze watch` or building on save (edits come in transactions), live patching that keeps a running program's state, Windows, Buck or Bazel. Content-addressed code as in Unison, except that a body's key holds the interfaces of what it calls, not their bodies. AGENTS.md's Scope section, docs/v2/plan/design/target.md's Scope section, and rules 2, 6, 14, 20, 26, 28, 34, 60, 67 and 70 carry it. Verify once, by construction (the owner's decision 18, 16:13) is the new rule 74, verify-once, and a section of target.md. The day's general principles are rules for all code: 75 nothing-ambient, 76 correct-by-construction, 77 work-once, 78 strategy-is-a-type-parameter, 79 interfaces-first, 80 act-on-snapshots; 18 (bounded by construction) and 25 (nothing of the machine in what is kept or shared) are widened.",
+   "why": "Decided by the owner, 2026-11-13 15:59 (/Volumes/Projects/blaze-int-1112-notes/target-decisions-1113.md, \"Scope, as the owner answered it\"), with his words that day: \"10% of floor should AIM for the right thing from the start! it is ok if we don't get there but think properly; just work for something you are highly proud of even on first try likely and then iterate\" and \"always make sure what you build is something you are proud of ... on first iteration even\".",
+   "recommended": "Yes, as the owner's decision; recorded by claude-opus-5-5.",
+   "state": "rules and AGENTS.md regenerated on fix-hello-1113 by claude-opus-5-5, not committed"
   }
  ]
 }

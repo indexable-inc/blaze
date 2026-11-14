@@ -316,6 +316,31 @@ fn a_covered_run_refuses_a_read_below_high_by_name() {
     assert_eq!(*get::<DoubleA>(&db, low), 6);
 }
 
+query!(QuadA, u64, |db, key| *get::<DoubleA>(db, key) * 2);
+
+/// The invariant: the cause a witness's key is given ([`super::super::Witness::cause_text`])
+/// follows the row's reads below `Durability::HIGH` down to the input field read: a row over a
+/// row over `Cell.a` of a `LOW` cell names all three, outermost first. The control: a witness
+/// of a `HIGH` cell's rows gives no key, so nothing is named.
+#[test]
+fn a_cause_names_the_chain_of_reads_below_high_down_to_the_field() {
+    let db = TestDb::new();
+    let high = Cell::of(&db, 3, 4, Durability::HIGH);
+    let low = Cell::of(&db, 3, 4, Durability::LOW);
+    let mut reads = Vec::new(); // alloc: a test's keys
+    let (value, witness) = witnessed(&db, &mut reads, || *get::<QuadA>(&db, high));
+    assert_eq!((value, witness.complete, reads.len()), (12, true, 0), "the control: `HIGH` reads give no key");
+
+    let (value, witness) = witnessed(&db, &mut reads, || *get::<QuadA>(&db, low));
+    assert_eq!((value, witness.complete, reads.len()), (12, true, 1), "the witness's one read is `QuadA`'s row");
+    let cause = super::super::Witness::cause_text(&db, reads[0]);
+    let quad = cause.find("`QuadA`").expect(&cause);
+    let double = cause.find("`DoubleA`").expect(&cause);
+    let field = cause.find("`Cell.a`").expect(&cause);
+    assert!(quad < double && double < field, "outermost first: {cause}");
+    assert_eq!(cause.matches(" < ").count(), 2, "three reads, joined: {cause}");
+}
+
 thread_local! {
     /// What [`ClimbPair::settled`] was told, in order.
     static SETTLED: RefCell<Vec<(bool, u64)>> = const { RefCell::new(Vec::new()) };

@@ -330,6 +330,46 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::lock_unwrap", Allow, "detects std's `Mutex::lock`, `RwLock::read` or `write` unwrapped, which turns one panic into a panic of every thread that takes the lock after it")
         .externally_loaded(),
+    // The suspicious-code lints: what compiles and reads as right but leaves something implicit.
+    l("blaze::skipped_pair", Allow, "detects the first call of a pair (`push`/`pop`, `begin`/`end`, `#[blaze::pairs_with]`) whose second an early exit between them skips")
+        .externally_loaded(),
+    l("blaze::half_done", Allow, "detects a write through a `&mut` parameter, then a fallible exit, then more writes to it: the error leaves the value half changed")
+        .externally_loaded(),
+    l("blaze::hidden_exit", Allow, "detects a call of a workspace macro whose expansion returns, `?`s, breaks or continues out of the caller, unseen at the call")
+        .externally_loaded(),
+    l("blaze::question_mark_converts", Allow, "detects a `?` whose `From` conversion drops what the error was about: a subject-less std error, or one turned into a general error type")
+        .externally_loaded(),
+    l("blaze::option_question_mark_hides", Allow, "detects a `?` on an `Option` from a failed lookup or parse in a function returning `Option`, which makes missing and broken one `None`")
+        .externally_loaded(),
+    l("blaze::unseen_target", Allow, "detects `.into()`, `.parse()`, `.collect()`, `Default::default()`, `.sum()` and the like whose target type only distant inference fixes")
+        .externally_loaded(),
+    l("blaze::glob_import", Allow, "detects a private `use path::*`, which brings names into scope unseen")
+        .externally_loaded(),
+    l("blaze::shadow_changes_meaning", Allow, "detects a `let` that shadows a binding still in scope with a value not made from it")
+        .externally_loaded(),
+    l("blaze::versioned_name", Allow, "detects an item named another's with a version on it (`_v2`, `_new`, `_old`, `_legacy`, `_tmp`, `2`) while the other is still declared beside it")
+        .externally_loaded(),
+    l("blaze::unused_parameter", Allow, "detects a parameter of a function that its body never reads, an underscore name included")
+        .externally_loaded(),
+    l("blaze::fallback", Allow, "detects an error branch that computes the same kind of result another way without looking at the error")
+        .externally_loaded(),
+    l("blaze::placeholder_body", Allow, "detects a function whose whole body is a constant success while its inputs go unread or its doc promises an effect")
+        .externally_loaded(),
+    l("blaze::test_asserts_nothing", Allow, "detects a test with no path that can fail")
+        .externally_loaded(),
+    l("blaze::assertion_cannot_fail", Allow, "detects an assertion that cannot fail: a constant, a value compared with itself, or one after an unconditional exit")
+        .externally_loaded(),
+    l("blaze::test_misses_its_subject", Allow, "detects a test that calls none of its crate's non-test code")
+        .externally_loaded(),
+    l("blaze::ignored_without_reason", Allow, "detects `#[ignore]` with no reason")
+        .externally_loaded(),
+    l("blaze::doc_names_nothing", Allow, "detects a path in backticks in a doc comment that resolves to no item")
+        .externally_loaded(),
+    // The magic literals: a number or a name stated in place of its one home.
+    l("blaze::magic_number", Allow, "detects a number written in code that is neither derived from what it depends on nor a named `const`")
+        .externally_loaded(),
+    l("blaze::magic_string", Allow, "detects a string the program branches or looks up by, or writes in more than one place, that is neither a named `const` nor an enum")
+        .externally_loaded(),
     // Emitted by the release build, which reads it from the code LLVM made, never by `blaze check`.
     l("blaze::vecreport", Allow, "reports a bounds check, overflow check or panic path the optimizer kept inside a loop, and a loop it left unvectorized with its reason, read from the optimized code; only hot loops when the build has a profile"),
 ];

@@ -418,8 +418,8 @@ fn allowed<'t>(cx: &Cx<'_, 't>, entry: &Entry, node: ast::Node<'t>) -> bool {
 
 /// What `path` names, for [`Retarget`]: in a use tree of the file's items, each namespace's
 /// item, since the `use` imports them all (`serde::Serialize` is a trait and a derive); else the
-/// one item the path means.
-fn names(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Names {
+/// one item the path means. The one home of it: `blaze::glob_import`'s fix asks it too.
+pub(crate) fn names(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Names {
     let def = |it: Option<PathResolution<'_>>| match it {
         Some(PathResolution::Def(it)) => Some(it),
         _ => None,

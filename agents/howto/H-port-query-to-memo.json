@@ -1,0 +1,9 @@
+{
+ "id": "H-port-query-to-memo",
+ "date": "2026-11-13",
+ "who": "claude-opus-5-5 (Claude Opus 5.5), lane blaze-memo",
+ "task": "Port a front-end query, input or interned struct from blaze-query to blaze-memo",
+ "do": "Change the attribute path `blaze_query::` to `blaze_memo::`; the call shape (`#[blaze_memo::tracked(returns(..))] fn q(db: &dyn Db, ..) -> V`, tracked impls, `#[input]`, `#[interned]`) is the same. Then: (1) the value must own no memory to drop (a compile-time error after monomorphization names it): replace Vec/Box/Arc/String/ThinVec in it with `&'db [T]` from `blaze_memo::keep_slice`/`keep_iter`/`keep_str` (or `keep` for one value) made inside the run, or with ids; (2) every argument type must be Copy + Eq + Hash + `blaze_memo::Home` (add `#[derive(blaze_memo::Home)]`, `#[home(skip)]` on fields holding no id); interned fields too; (3) `cycle_result`/`cycle_initial`/`cycle_fn` lose the `Id` parameter: `(db, args..)` and `(db, &Cycle, last, new, args..)`; (4) drop `lru`, `weigh`, `no_eq`, `scope`, `settled`, `mem_tag`, `#[set]`, `#[default]` (each refusal says what replaces it); a tracked struct becomes `#[interned]`; `Value`/`Supertype` derives go (a `Home` derive replaces what they told the engine); (5) a query whose key names no crate (homed at the session arena) may not read a crate's arena: give it a key holding the crate's id; (6) inputs are made by the driver with `X::new(&inputs, fact, fields..)` (singletons `X::set`) while it builds a snapshot, never set later; an input that holds ids of another arena needs `inputs.borrows(that_arena)`. `Debug` of an id prints fields inside `blaze_memo::attach(db, || ..)`.",
+ "why": "blaze-memo replaces blaze-query under hir-def and hir-ty (audit 2026-11-13 verdict (a)); the porting lanes need the mechanical part and the six real changes in one place.",
+ "state": "current"
+}

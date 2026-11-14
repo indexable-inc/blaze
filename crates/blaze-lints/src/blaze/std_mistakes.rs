@@ -97,15 +97,16 @@ pub(super) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 }
 
 /// A fix of a finding: the parts it rewrites and how sure it is.
-struct Fix {
-    message: &'static str,
-    parts: Vec<(TextRange, String)>,
-    applicability: Applicability,
+pub(super) struct Fix {
+    pub(super) message: &'static str,
+    pub(super) parts: Vec<(TextRange, String)>,
+    pub(super) applicability: Applicability,
 }
 
 /// Reports `lint` at `range`, its level asked at `node`, with `note`, the lint's help and, when
-/// there is one, `fix`.
-fn report<'t>(
+/// there is one, `fix`. The one home of a finding with its fix, which `suspicious` reports
+/// through too.
+pub(super) fn report<'t>(
     cx: &mut Cx<'_, 't>,
     lint: Lint,
     node: ast::Node<'t>,

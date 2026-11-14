@@ -52,7 +52,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     let store = Store::default();
     let lint = lint("blaze::const_impure").expect("blaze's lint");
     assert_eq!(lint.default_level, Level::Warn);
-    assert_eq!(blaze_lints().len(), 151);
+    // 151 before the 17 suspicious-code lints (`blaze::skipped_pair` .. `blaze::doc_names_nothing`)
+    // and the 2 magic-literal lints (`blaze::magic_number`, `blaze::magic_string`).
+    assert_eq!(blaze_lints().len(), 170);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =

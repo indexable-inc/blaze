@@ -208,7 +208,26 @@ const fn tag(lint: Lint) -> Option<&'static str> {
         | Lint::RefcellBorrowAcrossCall
         | Lint::ProcessExit
         | Lint::PrintInLib
-        | Lint::LockUnwrap => None,
+        | Lint::LockUnwrap
+        | Lint::SkippedPair
+        | Lint::HalfDone
+        | Lint::HiddenExit
+        | Lint::QuestionMarkConverts
+        | Lint::OptionQuestionMarkHides
+        | Lint::UnseenTarget
+        | Lint::GlobImport
+        | Lint::ShadowChangesMeaning
+        | Lint::VersionedName
+        | Lint::UnusedParameter
+        | Lint::Fallback
+        | Lint::PlaceholderBody
+        | Lint::TestAssertsNothing
+        | Lint::AssertionCannotFail
+        | Lint::TestMissesItsSubject
+        | Lint::IgnoredWithoutReason
+        | Lint::DocNamesNothing
+        | Lint::MagicNumber
+        | Lint::MagicString => None,
     }
 }
 

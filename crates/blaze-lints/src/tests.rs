@@ -165,6 +165,92 @@ pub(crate) fn main_crate(db: &Db) -> hir::Crate {
         .expect("the fixture has a crate `main`")
 }
 
+/// The `Setup` of a lint test's flags.
+fn setup_of(flags: &str) -> Setup {
+    let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
+    Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf: Conf::default() }
+}
+
+/// The text of the fixture's last file (the crate `main`'s `src/lib.rs`), the findings `flags`
+/// turn on in it, and the first substitution of each finding's first suggestion, whatever its
+/// applicability, in order.
+pub(crate) fn suggested_in(
+    fixture: &str,
+    flags: &str,
+) -> (String, Vec<String>, Vec<(syntax::TextRange, String)>) {
+    use syntax::{TextRange, TextSize};
+    let fx = fixture::db(fixture);
+    let file = *fx.files().last().expect("src/lib.rs");
+    let db = fx.into_db();
+    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let file = file.file_id(&db);
+    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
+    let setup = setup_of(flags);
+    let text = db.file_text(file).text(&db).to_string();
+    let found = blaze_query::db::attach(&db, || {
+        check(&db, krate, &setup, &name_of).expect("the file is named")
+    });
+    let messages = found.iter().map(|it| it.diagnostic.message.clone()).collect();
+    let mut parts: Vec<(TextRange, String)> = found
+        .iter()
+        .filter_map(|it| it.diagnostic.suggestions.first()?.substitutions.first())
+        .flatten()
+        .map(|(span, text)| {
+            (TextRange::new(TextSize::new(span.lo), TextSize::new(span.hi)), text.clone())
+        })
+        .collect();
+    parts.sort_by_key(|(range, _)| (range.start(), range.end()));
+    (text, messages, parts)
+}
+
+/// The fixture's last file after every suggestion `flags` turn on is made, a `MaybeIncorrect`
+/// one too (which `blaze check --fix` leaves to the author), after checking that the
+/// suggestions changed it, that linting it again finds nothing, and that it offers nothing
+/// more, so making the suggestions again changes nothing. `header` is the fixture before the
+/// file's text, which the made file is linted again under.
+pub(crate) fn offered_in(header: &str, main: &str, flags: &str) -> String {
+    let (before, _, parts) = suggested_in(&format!("{header}{main}"), flags);
+    assert!(!parts.is_empty(), "the lints of `{flags}` offer a fix of:\n{before}");
+    let mut after = before.clone();
+    for (range, text) in parts.iter().rev() {
+        after.replace_range(std::ops::Range::<usize>::from(*range), text);
+    }
+    assert_ne!(after, before, "the suggestions of `{flags}` changed the file");
+    let (_, left, more) = suggested_in(&format!("{header}{after}"), flags);
+    assert!(left.is_empty(), "the file the suggestions made lints clean:\n{after}\n{left:#?}");
+    assert!(more.is_empty(), "the file the suggestions made has nothing left to offer");
+    after
+}
+
+/// The fixture's last file after `blaze check --fix` with `flags`, after checking that the fix
+/// changed it, that linting it again finds nothing, and that fixing it again changes nothing.
+pub(crate) fn fixed_in(fixture: &str, flags: &str) -> String {
+    let fx = fixture::db(fixture);
+    let file = *fx.files().last().expect("src/lib.rs");
+    let mut db = fx.into_db();
+    let krate = blaze_query::db::attach(&db, || main_crate(&db));
+    let file = file.file_id(&db);
+    let name_of = |it: FileId| (it == file).then(|| "src/lib.rs".to_owned());
+    let setup = setup_of(flags);
+    let before = db.file_text(file).text(&db).to_string();
+    let made =
+        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let after = db.file_text(file).text(&db).to_string();
+    assert_ne!(after, before, "the fix of `{flags}` changed the file");
+    assert!(made.applied > 0, "the fix of `{flags}` made a suggestion");
+    blaze_query::db::attach(&db, || {
+        let found = check(&db, krate, &setup, &name_of).expect("the file is named");
+        let left: Vec<&str> = found.iter().map(|it| it.diagnostic.message.as_str()).collect();
+        assert!(left.is_empty(), "the fixed file lints clean:\n{after}\n{left:#?}");
+    });
+    let again =
+        crate::fix::fix(&mut db, krate, &setup, &name_of).unwrap_or_else(|error| panic!("{error}"));
+    let twice = db.file_text(file).text(&db).to_string();
+    assert_eq!(again.applied, 0, "the fixed file has nothing left to fix:\n{twice}");
+    assert_eq!(twice, after, "fixing the fixed file changes nothing");
+    after
+}
+
 #[test]
 fn lints_what_an_attribute_macro_is_handed() {
     let fixture = format!(

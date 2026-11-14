@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for the query engine and the front end: records in the store are the engine and the in-memory graph is a cache of what this process verified; a crate is sealed, suspect or open; name resolution and impl tables as demanded records. Not yet reconciled with the shared page in end-state.md.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: the query engine and the compiler front end
 

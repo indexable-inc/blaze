@@ -2807,3 +2807,113 @@ outside a module a `clippy.toml` entry's `allow-in` names (a driver).
 
 **The right form.** A core reads time from its injected clock and waits for a deadline on it
 (AGENTS.md rule 14); the driver reads the wall clock and sleeps.
+
+## Suspicious code
+
+Code that compiles and reads as right but leaves something implicit, which the next reader (a
+person, or an LLM editing it) has to reconstruct and gets wrong: an early exit that skips the
+second half of a pair, a value left half changed by a `?`, a conversion whose target only
+inference knows, a fallback that hides the failure it answers, a test that checks nothing. Each
+lint is in `blaze::internal` (crates/blaze-lints/src/blaze/suspicious/, one module each): denied
+in blaze's workspace by the ratchet, with a crate held at `warn` only by the lint's baseline
+(`half_done` warns outright), and allowed in other workspaces until they turn it on. Each is
+found by name resolution, inferred types or the MIR's control flow, never by text.
+
+An `#[allow]` with no reason, and any `#[allow]` where `#[expect]` would say when it stops
+suppressing, are clippy's `allow_attributes` and `allow_attributes_without_reason`, which
+`blaze check` implements and the workspace turns on; there is no blaze lint for them. Clippy's
+`wildcard_imports` and `shadow_unrelated` are not implemented by `blaze check`; `glob_import`
+and `shadow_changes_meaning` below are their blaze forms.
+
+## `skipped_pair`
+
+**What it catches.** The first call of a pair whose second, on the same receiver, does not come
+after it on every path: `begin`/`end`, `start`/`stop`, `open`/`close`, `enter`/`exit`,
+`push`/`pop`, `acquire`/`release`, `lock`/`unlock`, or a function marked
+`#[blaze::pairs_with(second)]`. A `?`, `return` or `break` between the two leaves with the first
+done and the second not: `self.scopes.push(s); let t = self.resolve(e)?; self.scopes.pop();`
+leaves the scope pushed on every error. Read from the MIR: the receiver is the place the first
+argument borrows, through reborrows, and both callees are of one type, trait or module; a path
+that ends in a call that never returns is no skip. The message names the exit. Left alone: a
+first whose second the body never calls, a first that returns a value with drop glue (a guard),
+test code.
+
+**The right form.** A type: a guard whose `Drop` does the second, or a `#[blaze::linear]` value
+the second consumes, so the compiler checks every path. No fix.
+
+## `half_done`
+
+**What it catches.** A function returning `Result` or `Option` that writes through a `&mut`
+parameter (`&mut self` too), can then leave by `?` or `return`, and writes the same parameter
+again after: on that exit the caller has the error and a half-changed value (`self.len += 1;
+let slot = self.alloc()?; self.slots.push(slot);`). A write is an assignment through the
+parameter or a `&mut` borrow of a place behind it. The message names the first write, the exit
+and the later write. Left alone: a function taking its value by value (a builder consumed and
+handed back), closures and `async` blocks, test code.
+
+**The right form.** Compute everything that can fail into locals first and write after the
+last exit, or change a copy and swap it in; `fn f(self) -> Result<Self, E>` makes it a type.
+Warns in blaze's workspace (many findings are deliberate: a counter bumped before a fallible
+call); no fix.
+
+## `hidden_exit`
+
+**What it catches.** A call of a `macro_rules!` or `macro` of a workspace crate whose expansion
+leaves the caller: a `return`, a `?`, or a `break`/`continue` outside a loop of the expansion.
+Exits inside the expansion's closures, nested functions, `async` and `try` blocks do not count,
+nor exits in the arguments the caller wrote (`log!(f()?)`). Macros of std, core and dependencies
+are left alone, and test code.
+
+**The right form.** Have the macro make the value and write the `return` or `?` at the call
+(`return Err(error!(..))`). No fix.
+
+## `unused_parameter`
+
+**What it catches.** A parameter of a function of the workspace that its body never reads, a
+name starting with `_` included: the underscore only quiets rustc's `unused_variables`. Read
+from the HIR with macro expansions (a parameter named only in `format!` is read), closures
+included; a write is not a read, a compound assignment is. Left alone: `self`, a trait's method
+or an impl of one, a function with an ABI, a callback (named as a value in its own file), a
+function under `#[cfg(..)]` (a twin of another target's), a body whose value diverges, a
+signature a macro wrote.
+
+**The right form.** Read it again where the body lost its use, or remove it with its argument
+at every call in one change; a signature fixed for a reason says it with
+`#[expect(blaze::unused_parameter, reason = "..")]`. No fix.
+
+## `versioned_name`
+
+**What it catches.** An item named another's with a version on it (`parse_v2`, `load_new`,
+`read_old`, `encode_legacy`, `build_tmp`, `lower2`, `ParserV2`, `StoreOld`) while the item of the
+plain name is still declared beside it: in the same module, or among the same type's associated
+items in the crate. Two versions of one thing, and neither name says which is current. A name
+that only looks like a version (`sha2`, `level1`) is left alone while no item of the stem is
+beside it, as are test code and an item (or twin) marked `#[deprecated]`.
+
+**The right form.** One item under the plain name: move the callers with a `.clippy.toml` ban
+and `blaze check --replace OLD=NEW`, then delete the other; or, when both stay, name each for
+what it does differently (`parse_strict`, `parse_lenient`). No fix.
+
+## `glob_import`
+
+**What it catches.** A private `use path::*;`: every public name of `path` comes into scope
+unseen, a name in the file does not say where it is from, and an item added to `path` later can
+shadow one or change which method a call resolves to. Left alone: `pub use` (a re-export), a
+glob of a module named `prelude`, `use super::*;` in test code, and a glob of an enum's variants
+inside a function body (for a `match`).
+
+**The right form.** Import each name the scope uses. The fix (machine-applicable) writes that
+list, each name found by name resolution, each trait of the module kept as `Trait as _`; a name
+seen only inside a macro call's tokens is kept too and makes the fix maybe-incorrect.
+
+## `shadow_changes_meaning`
+
+**What it catches.** A `let` that reuses the name of a binding still in scope for a value not
+made from it: `let len = header.len(); .. let len = body.len();`. A line below reads the second
+where the first was meant, and with one type nothing catches it. The shadowed binding is the one
+the resolver names at the initializer's scope; a shadow whose initializer reads it (`let x =
+x.trim();`, `let path = path?;`) is the same thing narrowed, and left alone. Also left alone:
+names starting with `_`, bindings a macro made, `match` arm and closure bindings, test code.
+
+**The right form.** A name for each value (`header_len`, `body_len`), or a block that ends the
+first one's scope. No fix.

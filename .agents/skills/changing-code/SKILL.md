@@ -31,10 +31,12 @@ half-ported tree blocks every lane's run.
 
 ## best-long-term-design (rule 28)
 
-Pick the best long-term design, not the least work: own the layer or port rustc's rule properly, and
-spend the effort on proving it right: real crates' own test suites passing under blaze, Hegel
-property tests and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing
-of parsers of hostile bytes.
+Build only what you are proud of, on the first iteration too: the first version of a design is
+already the one you would defend, never a placeholder to improve later; then iterate. Pick the best
+long-term design, not the least work: own the layer or port rustc's rule properly, and spend the
+effort on proving it right: real crates' own test suites passing under blaze, Hegel property tests
+and deterministic simulation of blaze's own invariants (`testing` skill), and fuzzing of parsers of
+hostile bytes.
 
 See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
 
@@ -186,24 +188,26 @@ See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-
 
 ## within-ten-percent-of-the-floor (rule 67)
 
-The floor is what an oracle that already knows exactly which results changed would do: redo those
-and the direct readers of each changed value (a reader must rerun to learn whether its own value
-changed), plus unavoidable I/O (a process start, a socket round trip, the bytes of the result). The
-bar is bookkeeping of at most max(10% of that work, a few milliseconds); under a few milliseconds a
-percentage means nothing. Before building: (1) write the floor for each operation the design serves
-(no-op, comment edit, body edit, interface edit under many dependents, restart, idle memory, peak
-memory, bytes on disk) and the design's cost beside it as a formula in the things that grow
-(entries, reads, files, dependents), and reject a cost that grows with what is reachable where the
-floor grows with what changed; (2) count constants too: a check that costs microseconds where a mark
-costs nanoseconds is off by a hundred before any asymptotics; (3) where two measures trade (an index
-that buys time for memory or disk; small when idle against instant after idle), pick the point and
-say which measure pays; (4) say plainly what no design reaches (direct readers rerun; every
-instantiation of an edited generic is recompiled; a restart on Linux stats every file) so nobody
-designs around it. After building: every edit-loop measurement reports results changed, direct
-readers rerun, everything else touched, and the ratio of the last to the first two; a ratio over 1.1
-is a defect with an owner. The compiler's own throughput (type checking, LLVM) has no theoretical
-best and is compared with the best existing tools instead. An outside review of the cost table comes
-before the build (end-state-not-hill-climb).
+Aim at the floor from the start: the first design is drawn against it, never a design to be tuned
+toward it later. Missing it is allowed; aiming lower is not. Build something you are proud of on the
+first try, then iterate (`best-long-term-design`). The floor is what an oracle that already knows
+exactly which results changed would do: redo those and the direct readers of each changed value (a
+reader must rerun to learn whether its own value changed), plus unavoidable I/O (a process start, a
+socket round trip, the bytes of the result). The bar is bookkeeping of at most max(10% of that work,
+a few milliseconds); under a few milliseconds a percentage means nothing. Before building: (1) write
+the floor for each operation the design serves (no-op, comment edit, body edit, interface edit under
+many dependents, restart, idle memory, peak memory, bytes on disk) and the design's cost beside it
+as a formula in the things that grow (entries, reads, files, dependents), and reject a cost that
+grows with what is reachable where the floor grows with what changed; (2) count constants too: a
+check that costs microseconds where a mark costs nanoseconds is off by a hundred before any
+asymptotics; (3) where two measures trade (an index that buys time for memory or disk; small when
+idle against instant after idle), pick the point and say which measure pays; (4) say plainly what no
+design reaches (direct readers rerun; every instantiation of an edited generic is recompiled; a
+restart on Linux stats every file) so nobody designs around it. After building: every edit-loop
+measurement reports results changed, direct readers rerun, everything else touched, and the ratio of
+the last to the first two; a ratio over 1.1 is a defect with an owner. The compiler's own throughput
+(type checking, LLVM) has no theoretical best and is compared with the best existing tools instead.
+An outside review of the cost table comes before the build (end-state-not-hill-climb).
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
@@ -234,5 +238,44 @@ correct one: the safe form is the short one, and the risky form is longer and na
 Before adding a lint, list the lints that already cover the same mistake (`.clippy.toml`'s bans,
 `crates/blaze-lints`, `docs/lints.md`) and extend the one that covers it, or say in the change why
 none does.
+
+## correct-by-construction (rule 76)
+
+What `type-then-lint-then-rule` means by a type, for any code here: a value that carries an
+obligation, a proof or a meaning is a type that states it, so the wrong program does not compile. A
+value that must be handed over or consumed (a lease, a reservation, a write to commit or abort) is
+linear (`#[blaze::linear]`): dropping it is an error. What was checked is a proof type only its
+checker can make (`verify-once`). A key, a digest or an id is its own type (a digest per record
+kind, a dense id per table), never raw bytes, a `u64` or a `usize`, so two kinds cannot be mixed and
+a key cannot be built from part of its inputs. A length, an offset or a count is a newtype with
+checked arithmetic, and item-relative and absolute positions are two types
+(`item-relative-positions`). A state is an enum or a typestate, not a flag beside the data, and a
+unit (bytes, pages, nanoseconds) is in the type. How: before writing a function that takes a bare
+integer, bytes or a bool, ask what the value means and what must be true of it, and make that the
+type; where the language cannot state it, extend the language (`own-the-language`).
+
+## strategy-is-a-type-parameter (rule 78)
+
+Where blaze can do one thing several ways (keep results resident or not, run a task here or on a
+remote worker, an IO backend, how outputs are placed), the choice is a type parameter at one seam
+(`Driver<M: Memo, X: Executor>` is the first use), never a runtime flag, a `dyn` object or a `cfg`:
+it costs nothing per call, and every instantiation is compiled in the one binary and kept building.
+Each instantiation is tested observationally equal to the others: the same requests under the
+simulation give byte-identical records and answers (`Resident` refines `RecordsOnly`), with a
+planted divergence the test catches. The seam is one place, and the code on either side does not
+know which strategy runs. Which instantiation a command uses is chosen once, up front, from stated
+facts and reported (`no-fallback`), never switched mid-run. How: name the trait for the decision,
+not for an implementation, and put the equality test beside it.
+
+## interfaces-first (rule 79)
+
+A rewrite of a part, or a new subsystem, starts with its interface: one small crate of the types,
+traits and sans-IO state machines the rest is written against (`blaze-keyed` for the target design),
+compiling, with a simulation that drives it and an oracle. Other builders then write against it,
+each in new crates beside the old code (`agents-are-a-cost`, `fan-out-write-only`), never by editing
+the old code in place; the old code is switched off and deleted as soon as its replacement passes
+(`end-state-not-hill-climb`), in the same piece of work. The interface crate changes only by whole
+ports (`whole-ports`). How: before splitting work across lanes, land the interface crate on the
+green head; every brief names it and the crate the lane owns.
 
 <!-- End of the generated rules. Hand-written notes follow. -->

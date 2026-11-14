@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for proof and delivery: every check yields a verdict record; main is the only integration tree and moves through a merge queue (everything compiles, tests equal one shrinking expectations table, exact work counts, the oracle budget); times only in a paired table on a measurement machine. Not yet reconciled with the shared page.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: proof and delivery (the evidence ladder, the one oracle, the gate, the measured table, the release train, the installer, how the work is run)
 

@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for the daemon, the client protocol, observability and proof: the daemon is a cache of evidence and pages; the certificate check is run by the client; each request is a sans-IO state machine; work starts only with a typed cause.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: the daemon, the client protocol, observability, and proof
 

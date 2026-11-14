@@ -27,7 +27,8 @@ waits or sits behind the extension's own crate; where the two disagree on plain 
 refusal of a program blaze accepted is a blaze bug to file (2026-11-11: a method redeclaring its
 impl's lifetime). The rule returns to blaze-only when the owner says the loop is fast enough; the
 measure to watch is a warm rebuild of blaze by blaze after a one-function change in under a minute,
-and a cold one inside 64 GiB. Never sccache.
+and a cold one inside 64 GiB. While cargo builds blaze, a new crate is written on `core` and `alloc`
+and need not be on bstd; it moves to bstd once blaze builds blaze. Never sccache.
 
 See [docs/contributing.md](../../../docs/contributing.md).
 
@@ -68,10 +69,10 @@ lane's own state lives under `/root/wt/<lane>/` and long runs are systemd units 
 every lane shares the machine, a timing names the load average it was taken under and compares base
 and new alternately in one window; for a table a claim rests on, the main agent holds the other work
 and the row says so. The exceptions are facts the one VM cannot give, each named in the lane's brief
-with its reason: an x86_64 or other-architecture machine to RUN binaries on (never to build), and
-the Mac for macOS behaviour (one build at a time, since three at once made every number of a night
-unusable). Never AWS (`fleet-ops`, `dev-aws-N`). Where none of these can do it, stop and say what is
-missing.
+with its reason: the Mac for macOS behaviour (one build at a time, since three at once made every
+number of a night unusable). There is no x86-64 machine for now: x86-64 is CI's, and an x86 run (an
+EPYC VM, `ix new --cpu epyc-5`) is an exception the owner is asked for first. Never AWS
+(`fleet-ops`, `dev-aws-N`). Where none of these can do it, stop and say what is missing.
 
 See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel).
 
@@ -135,9 +136,9 @@ variant tree, a long-lived rewrite that cannot keep the tree building; the brief
 ## clean-up-lane (rule 39)
 
 When a lane is done, delete what it made: its directory under `/root/wt/<lane>/` and its homes on
-`blaze-vm`, any blaze process it left running there (a daemon or a `watch`, by pid), any worktree
-and merged branch, and any exception machine its brief allowed (`ix rm`). The build VM itself is
-never removed by a lane.
+`blaze-vm`, any blaze process it left running there (a daemon or a build's helper, by pid), any
+worktree and merged branch, and any exception machine its brief allowed (`ix rm`). The build VM
+itself is never removed by a lane.
 
 ## ledger-decides (rule 46)
 
@@ -198,6 +199,18 @@ flight recording the watchdog names (`bounded-progress`); the report quotes that
 a finding: a hang in blaze is a bug to report with that line and file (an annoyance row at least),
 and the fix is in blaze. Never wait a hang out, never rerun with a longer limit hoping it passes
 (`no-fallback`), and never let a script sleep and poll with no bound.
+
+## act-on-snapshots (rule 80)
+
+Nothing acts on a half-made change. An edit is often one of several that belong together (a
+transaction, as an agent makes them), and the states between are invalid, so work starts only when
+asked for, on a snapshot of the tree taken at that moment, and its result names that snapshot
+(`measure-the-exact-tree`). Nothing builds, checks, lints, commits or publishes on save or in the
+middle of a multi-file edit: blaze has no `watch` (`no-state-between-requests`), no hook runs a
+build on write, a lane's half-written files are not compiled until it says its piece is ready
+(`fan-out-write-only`), and no script publishes a result for a tree that changed under it. How: a
+command reads the tree once, at its start, and refuses by name a file that changed while it ran,
+never mixing two states.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

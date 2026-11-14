@@ -1,7 +1,8 @@
 ---
-status: plan
+status: superseded
 summary: End state for check, lints, diagnostics and tests: a finding is a per-item record with no level or drawn text; levels and drawing are a client-side view; whole-crate lints as per-item use rows with folds; a test result is a record with its reads and only tests whose reads moved run. Not yet reconciled with the shared page.
 date: 2026-11-12
+superseded_by: v2/plan/design/target.md
 ---
 # End state: `blaze check`, lints and diagnostics, and `blaze test`
 

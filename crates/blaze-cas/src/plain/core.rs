@@ -14,13 +14,14 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Mapping, Tag};
+use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag};
 use blaze_ids::{ContentId, crc32c};
 
 use super::format::{
-    self, ALIGN, ENTRY, Entry, FOOTER, HeadRead, Manifest, OFFSET_MOST, Retired, Root, SLOT_AT,
-    Segment, Slot, aligned, record_crc,
+    self, ALIGN, Described, ENTRY, Entry, FOOTER, HEAD_LEN, HEADER, HeadRead, Manifest, Namespace,
+    OFFSET_MOST, Retired, Root, SEGMENT_DIGEST, SLOT_AT, Segment, Slot, aligned, record_crc,
 };
+use super::verified::{Boot, Checks, Unverified, Verified};
 use crate::{Corrupt, Key, Kind, Mismatch, content_of};
 
 /// The tags a store asks with: `tags .. tags + TAGS`.
@@ -58,7 +59,6 @@ const LOCK_STEPS_MOST: u32 = 30_000;
 
 /// What a root's record key is derived under.
 const ROOT_DOMAIN: &str = "blaze plain store root 1";
-const SEGMENT_DOMAIN: &str = "blaze plain store segment 1";
 const LOG_DOMAIN: &str = "blaze plain store log 1";
 
 const HEAD: &str = "head";
@@ -91,6 +91,11 @@ pub struct PlainConfig {
     /// The machine's page size: the stride a segment's index is touched at once mapped, so a
     /// probe takes no fault. Nothing in the layout depends on it.
     pub page: u32,
+    /// The namespace its commits write: [`Namespace::LOCAL`] on a developer's machine; a
+    /// trusted builder (CI) writes [`Namespace::PUBLIC`] or an organisation's.
+    pub namespace: Namespace,
+    /// The namespaces [`Plain::get`] answers from, in no order; no other is searched.
+    pub reads: Vec<Namespace>,
 }
 
 /// A record read in place.
@@ -100,7 +105,8 @@ pub struct Got<'a> {
     pub bytes: &'a [u8],
 }
 
-/// Where a committed record lies, for a read into the caller's buffer ([`Plain::check`]).
+/// Where a committed record lies in a proved segment, for a read into the caller's buffer:
+/// the bytes read there are the record, with nothing to check.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Located {
     pub key: Key,
@@ -108,7 +114,6 @@ pub struct Located {
     pub file: FileName,
     pub at: u64,
     pub len: u32,
-    crc: u32,
 }
 
 /// Why a put or a commit was refused.
@@ -156,6 +161,11 @@ pub struct Report {
     pub lost: Vec<Lost>,
     /// Segments of another boot checked whole.
     pub checked: u32,
+    /// The generation whose manifest the open read whole: everything committed at or before
+    /// it reads back or is in `lost` by name. None when no generation survived. What was
+    /// committed after it, with no sync, a power cut may have taken with no trace to name
+    /// (durable mode syncs so nothing is).
+    pub whole: Option<u64>,
 }
 
 /// A completed commit.
@@ -202,6 +212,9 @@ pub(crate) enum Plant {
     StaleBase,
     /// A segment of another boot is read unchecked.
     TrustBoot,
+    /// A full check is made and not recorded in the manifest: the next open of the boot checks
+    /// the segment again.
+    ForgetCheck,
 }
 
 /// Puts one worker holds, laid out as they will lie in a segment: each payload at a multiple
@@ -221,6 +234,16 @@ impl Batch {
     /// Keeps `value` under `key`. Two puts of one key with other bytes are refused at the
     /// commit, naming the key.
     pub fn put(&mut self, key: Key, kind: Kind, value: &[u8]) -> Result<(), PutError> {
+        let crc = record_crc(&key, kind, value);
+        self.put_crc(key, kind, value, crc)
+    }
+
+    /// A record copied from a proved segment, with the CRC its entry recorded.
+    fn put_known(&mut self, entry: &Entry, value: &[u8]) -> Result<(), PutError> {
+        self.put_crc(entry.key, entry.kind, value, entry.crc)
+    }
+
+    fn put_crc(&mut self, key: Key, kind: Kind, value: &[u8], crc: u32) -> Result<(), PutError> {
         let at = self.bytes.len() as u64;
         let len = value.len() as u64;
         if len > u64::from(u32::MAX) || at + len > OFFSET_MOST {
@@ -229,7 +252,6 @@ impl Batch {
         // alloc: the batch's buffer, which the commit hands to the write whole
         self.bytes.extend_from_slice(value);
         self.bytes.resize(aligned(at + len) as usize, 0);
-        let crc = record_crc(&key, kind, value);
         self.entries.push(Entry { key, kind, at, len: len as u32, crc });
         Ok(())
     }
@@ -271,14 +293,7 @@ const HEAD_SYNC: u8 = 15;
 const UNLOCK: u8 = 16;
 const REMOVE: u8 = 17;
 const LATE_SYNC: u8 = 18;
-
-/// One segment this process mapped: kept mapped for the life of the process, never unmapped
-/// during a run (an unmap is a TLB shootdown on every core).
-struct Mapped {
-    seg: Segment,
-    file: FileName,
-    map: Mapping,
-}
+const HEAD_MAKE: u8 = 19;
 
 enum RootEdit {
     Set { name: String, key: Key },
@@ -313,6 +328,10 @@ enum Change {
     /// Only what an open found (segments checked or lost): [`Plain::pending_stamps`].
     Stamp,
     Compact { seg: Option<(Segment, FileName)>, candidates: Vec<u64>, orphans: Vec<(u64, bool)>, stats: Sliced },
+    /// Segments fetched from a source, written here: named here and published.
+    Adopt { segs: Vec<Segment> },
+    /// Segments pushed to a shared bucket.
+    Publish { ids: Vec<u64> },
 }
 
 /// The generation a flip builds on, read under the lock.
@@ -346,11 +365,21 @@ enum Phase {
     ReadHead(Ctx),
     /// A slot's manifest read: `slots[at]`, the other the fallback.
     ReadManifest { ctx: Ctx, slots: [Option<Slot>; 2], at: usize, fell_back: bool },
+    /// A manifest's read failed: the directory is listed to tell a log a power cut took (not
+    /// there: the same as torn) from a read that failed (there: the error, by name). A failed
+    /// read is never taken for a lost generation.
+    CheckLog { ctx: Ctx, slots: [Option<Slot>; 2], at: usize, why: String },
+    /// The head was short of its length (never made, or made and not synced before a power
+    /// cut): it is cut to [`HEAD_LEN`] and synced, then read again.
+    MakeHead,
     /// The open fell back: which files no generation names, and what their footers hold.
     Orphans { left: u32 },
     /// Compaction's look at the directory.
     Listing,
     Mapping { left: u32, then: Then },
+    /// The maps are in and some of an earlier boot failed: the directory is listed to tell a
+    /// file a power cut took from one that failed to map.
+    CheckMaps { then: Then },
     Ready,
     Writing(Box<Writing>, Box<Why>),
     /// The segment's sync, before the flip.
@@ -380,7 +409,16 @@ pub struct Plain {
     /// The newest generation this process saw, and its manifest.
     slot: Option<Slot>,
     manifest: Manifest,
-    maps: Vec<Mapped>,
+    /// Every segment this process mapped, each through its proof: kept mapped for the life of
+    /// the process, never unmapped during a run (an unmap is a TLB shootdown on every core).
+    maps: Vec<Verified>,
+    /// The boot every proof here holds for.
+    boot: Boot,
+    /// Full checks made by this process, and reads (the per-read count stays zero).
+    checks: std::cell::Cell<Checks>,
+    /// Each segment this process checked in full, in order: for the oracle, which fails on a
+    /// segment checked twice in one boot.
+    checked_ids: Vec<u64>,
     by_id: BTreeMap<u64, usize>,
     /// What [`Plain::get`] searches: this generation's mapped segments, newest first.
     view: Vec<usize>,
@@ -410,6 +448,19 @@ pub struct Plain {
     orphans_for_compact: Vec<(u64, bool)>,
     /// The planted [`Plant::FlipBeforeSync`]'s segment, synced after the flip.
     late_sync: Option<FileName>,
+    /// Segments of an earlier boot whose map failed, with why: lost only if the directory no
+    /// longer holds them (a power cut took the file); a failed map of one it holds is an error.
+    unopened: Vec<(Segment, FileName, String)>,
+    /// This open made the head at its length already (it is made once, never twice).
+    head_made: bool,
+    /// The flip lock is held (taken, and its unlock not yet asked): a step that fails under it
+    /// lets it go as it stops, so a broken store never holds every other process's commit.
+    holds_lock: bool,
+    /// The torn slot a short head showed before this open made it whole length.
+    head_torn: Option<usize>,
+    /// A torn slot was reported at this open: the next flip writes over it (that slot is the
+    /// one the newest does not hold), so it is reported once, not at every open.
+    torn_stamp: bool,
 }
 
 fn tag_of(tags: u64, op: u8, index: u32) -> Tag {
@@ -461,6 +512,9 @@ impl Plain {
         Plain {
             head: name(HEAD),
             flip: name(FLIP),
+            boot: Boot(cfg.boot),
+            checks: std::cell::Cell::new(Checks::default()),
+            checked_ids: Vec::new(),
             cfg,
             #[cfg(test)]
             plant: Plant::None,
@@ -487,6 +541,11 @@ impl Plain {
             flip_parked: None,
             orphans_for_compact: Vec::new(),
             late_sync: None,
+            unopened: Vec::new(),
+            head_made: false,
+            holds_lock: false,
+            head_torn: None,
+            torn_stamp: false,
         }
     }
 
@@ -581,38 +640,97 @@ impl Plain {
 
     // ---- reads: no lock, no write to anything shared ----
 
-    fn find_committed(&self, key: &Key) -> Result<Option<(usize, Entry)>, Corrupt> {
+    /// The newest entry of `key` in the mapped segments of `spaces`: one probe of each such
+    /// segment's index, newest first.
+    fn find_in(&self, spaces: &[Namespace], key: &Key) -> Result<Option<(usize, Entry)>, Corrupt> {
+        // Each segment here is proved ([`Verified`]): the probe decodes the entry it lands on
+        // and checks nothing (its kind and bounds were checked once, with every byte).
         for &at in &self.view {
             let mapped = &self.maps[at];
-            let run = mapped.seg.run(mapped.map.bytes());
+            if !spaces.contains(&mapped.seg().namespace) {
+                continue;
+            }
+            let run = mapped.run();
             if let Some(i) = format::find(run, key) {
-                let entry = Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY])
-                    .map_err(|what| Corrupt { key: *key, pack: mapped.file.clone(), what })?;
-                if entry.at + u64::from(entry.len) > mapped.seg.data_len {
-                    return Err(Corrupt {
-                        key: *key,
-                        pack: mapped.file.clone(),
-                        // alloc: a refusal
-                        what: format!("its entry places {} bytes at {}, past the segment's {} bytes of data", entry.len, entry.at, mapped.seg.data_len),
-                    });
-                }
+                // Decoding its kind's byte cannot fail in a proved segment (a check's layout pass
+                // or this boot's writer made it); if it does, it is said by name, never skipped.
+                let entry = Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]).map_err(|what| Corrupt { key: *key, pack: mapped.file().clone(), what })?;
                 return Ok(Some((at, entry)));
             }
         }
         Ok(None)
     }
 
-    fn checked_payload<'a>(&self, key: &Key, mapped: &'a Mapped, entry: &Entry) -> Result<&'a [u8], Corrupt> {
-        let payload = &mapped.map.bytes()[entry.at as usize..(entry.at + u64::from(entry.len)) as usize];
-        if record_crc(key, entry.kind, payload) != entry.crc {
-            return Err(Corrupt {
-                key: *key,
-                pack: mapped.file.clone(),
-                // alloc: a refusal
-                what: format!("its {} bytes at {} fail their CRC-32C {:08x}: the record is refused, never returned", entry.len, entry.at, entry.crc),
-            });
+    fn find_committed(&self, key: &Key) -> Result<Option<(usize, Entry)>, Corrupt> {
+        self.find_in(&self.cfg.reads, key)
+    }
+
+    /// The writer's own namespace: what a put is compared with.
+    fn find_own(&self, key: &Key) -> Result<Option<(usize, Entry)>, Corrupt> {
+        self.find_in(std::slice::from_ref(&self.cfg.namespace), key)
+    }
+
+    /// [`Plain::get`] in `spaces` alone (the caller's, never more).
+    pub fn get_in(&self, spaces: &[Namespace], key: &Key) -> Result<Option<Got<'_>>, Corrupt> {
+        if spaces.contains(&self.cfg.namespace)
+            && let Some(got) = self.held_get(key)
+        {
+            return Ok(Some(got));
         }
-        Ok(payload)
+        match self.find_in(spaces, key)? {
+            None => Ok(None),
+            Some((at, entry)) => {
+                let mut checks = self.checks.get();
+                checks.reads += 1;
+                self.checks.set(checks);
+                Ok(Some(Got { kind: entry.kind, bytes: self.maps[at].payload(&entry) }))
+            }
+        }
+    }
+
+    /// How many full checks this process made and records it read; reads check nothing.
+    pub fn checks(&self) -> Checks {
+        self.checks.get()
+    }
+
+    /// The ids of the segments this process checked in full: each at most once a boot.
+    pub fn fully_checked(&self) -> &[u64] {
+        &self.checked_ids
+    }
+
+    /// The caller's explicit ask (a `scrub` command), never a read's: every record of every
+    /// segment mapped here checked against its CRC-32C as its bytes lie now. A byte that changed
+    /// on the disk after its segment was proved is found here, or by the consumer that fails on
+    /// it; a read never looks.
+    pub fn scrub(&self) -> Vec<Corrupt> {
+        // alloc: a scrub's findings, usually none
+        self.maps.iter().flat_map(Verified::scrub).collect()
+    }
+
+    /// The segments of `spaces` this generation names that are not here: what a source is
+    /// asked to fetch from on a miss.
+    pub fn remote(&self, spaces: &[Namespace]) -> Vec<Segment> {
+        // alloc: a miss's list, short
+        self.manifest.segments.iter().filter(|it| !it.local && spaces.contains(&it.namespace)).copied().collect()
+    }
+
+    /// The namespaces reads answer from.
+    pub fn reads(&self) -> &[Namespace] {
+        &self.cfg.reads
+    }
+
+    /// The files of the segments this process has mapped (each once, for its life).
+    pub fn mapped_files(&self) -> impl Iterator<Item = &FileName> {
+        self.maps.iter().map(|it| it.file())
+    }
+
+    fn held_entry(&self, key: &Key) -> Option<Entry> {
+        for (batch, at) in [(&self.held, &self.held_at), (&self.sealed, &self.sealed_at)] {
+            if let Some(&i) = at.get(key) {
+                return Some(batch.entries[i]);
+            }
+        }
+        None
     }
 
     fn held_get(&self, key: &Key) -> Option<Got<'_>> {
@@ -625,46 +743,21 @@ impl Plain {
         None
     }
 
-    /// The record under `key`, read in place from its segment's mapping and checked against
-    /// its CRC-32C; a record that fails it is refused, naming the key and the segment.
+    /// The record under `key`, read in place from its proved segment's mapping: no check (the
+    /// segment's bytes were proved once, `Verified`).
     pub fn get(&self, key: &Key) -> Result<Option<Got<'_>>, Corrupt> {
-        if let Some(got) = self.held_get(key) {
-            return Ok(Some(got));
-        }
-        match self.find_committed(key)? {
-            None => Ok(None),
-            Some((at, entry)) => {
-                let bytes = self.checked_payload(key, &self.maps[at], &entry)?;
-                Ok(Some(Got { kind: entry.kind, bytes }))
-            }
-        }
+        self.get_in(&self.cfg.reads, key)
     }
 
     /// Where the committed record under `key` lies, for a read into the caller's buffer
-    /// (`pread`), which [`Plain::check`] then checks. Records put and not committed are
-    /// [`Plain::get`]'s.
+    /// (`pread`) of a proved segment. Records put and not committed are [`Plain::get`]'s.
     pub fn locate(&self, key: &Key) -> Result<Option<Located>, Corrupt> {
-        Ok(self.find_committed(key)?.map(|(at, entry)| Located {
-            key: *key,
-            kind: entry.kind,
-            file: self.maps[at].file.clone(),
-            at: entry.at,
-            len: entry.len,
-            crc: entry.crc,
+        Ok(self.find_committed(key)?.map(|(at, entry)| {
+            let mut checks = self.checks.get();
+            checks.reads += 1;
+            self.checks.set(checks);
+            Located { key: *key, kind: entry.kind, file: self.maps[at].file().clone(), at: entry.at, len: entry.len }
         }))
-    }
-
-    /// Checks bytes read from where [`Plain::locate`] said.
-    pub fn check(located: &Located, bytes: &[u8]) -> Result<(), Corrupt> {
-        if bytes.len() != located.len as usize || record_crc(&located.key, located.kind, bytes) != located.crc {
-            return Err(Corrupt {
-                key: located.key,
-                pack: located.file.clone(),
-                // alloc: a refusal
-                what: format!("the {} bytes read at {} are not the {} its entry's CRC-32C {:08x} covers", bytes.len(), located.at, located.len, located.crc),
-            });
-        }
-        Ok(())
     }
 
     pub fn has(&self, key: &Key) -> Result<bool, Corrupt> {
@@ -675,19 +768,27 @@ impl Plain {
 
     /// Keeps `value` under `key` in the store's own batch, written by the next commit. A key
     /// already held with the same record is a no-op; with other bytes, a refusal naming it.
+    ///
+    /// A put of what the store holds writes nothing, decided from the entry alone: the key covers
+    /// every input of its value, so an equal key names an equal value, and the entry's kind,
+    /// length and CRC-32C (computed once from the put's bytes, which the record needs anyway)
+    /// are compared with the put's, with no read of the payload kept. A difference there is two
+    /// values under one key, refused; only then are the kept bytes read, to name both.
     pub fn put(&mut self, key: Key, kind: Kind, value: &[u8]) -> Result<(), PutError> {
         let crc = record_crc(&key, kind, value);
-        if let Some(got) = self.held_get(&key) {
-            if got.kind == kind && got.bytes == value {
+        let same = |entry: &Entry| entry.kind == kind && entry.len as usize == value.len() && entry.crc == crc;
+        if let Some(entry) = self.held_entry(&key) {
+            if same(&entry) {
                 return Ok(());
             }
-            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(got.bytes), given: content_of(value) }));
+            let kept = self.held_get(&key).expect("held").bytes;
+            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
         }
-        if let Some((at, entry)) = self.find_committed(&key).map_err(PutError::Corrupt)? {
-            if entry.kind == kind && entry.len as usize == value.len() && entry.crc == crc {
+        if let Some((at, entry)) = self.find_own(&key).map_err(PutError::Corrupt)? {
+            if same(&entry) {
                 return Ok(());
             }
-            let kept = self.checked_payload(&key, &self.maps[at], &entry).map_err(PutError::Corrupt)?;
+            let kept = self.maps[at].payload(&entry);
             return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
         }
         self.held.put(key, kind, value)?;
@@ -747,15 +848,15 @@ impl Plain {
         let mut entries: Vec<Entry> = Vec::new();
         // alloc: as above
         let mut pieces: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut base = 0u64;
+        let mut base = HEADER as u64;
         for (n, batch) in sources.iter().enumerate() {
             for entry in &batch.entries {
-                if let Some((at, kept)) = self.find_committed(&entry.key).map_err(PutError::Corrupt)? {
+                if let Some((at, kept)) = self.find_own(&entry.key).map_err(PutError::Corrupt)? {
                     if kept.same_record(entry) {
                         // Its bytes stay in the segment unreferenced; compaction drops them.
                         continue;
                     }
-                    let kept = self.checked_payload(&entry.key, &self.maps[at], &kept).map_err(PutError::Corrupt)?;
+                    let kept = self.maps[at].payload(&kept);
                     return Err(PutError::Mismatch(Mismatch { key: entry.key, kept: content_of(kept), given: content_of(batch.payload(entry)) }));
                 }
                 let mut moved = *entry;
@@ -796,20 +897,21 @@ impl Plain {
         let run = format::sorted_run(entries).map_err(PutError::TwoValues)?;
         // The roots this commit's records were put with: one set after it started is the next's.
         let roots = std::mem::take(&mut self.roots_pending);
-        self.write_segment(pieces, base, run, Why::Commit { started_ns: now_ns, roots }, now_ns, effects);
+        let namespace = self.cfg.namespace;
+        self.write_segment(pieces, base, run, namespace, Why::Commit { started_ns: now_ns, roots }, effects);
         Ok(())
     }
 
     /// Whether an open found what the next flip must write.
     fn pending_stamps(&self) -> bool {
-        !self.checked.is_empty() || !self.dropped.is_empty() || !self.orphans.is_empty()
+        !self.checked.is_empty() || !self.dropped.is_empty() || !self.orphans.is_empty() || self.torn_stamp
     }
 
     fn what(&self) -> &'static str {
         match self.phase {
             Phase::New => "not opened",
-            Phase::ReadHead(_) | Phase::ReadManifest { .. } | Phase::Orphans { .. } => "opening",
-            Phase::Mapping { .. } | Phase::Removing { .. } => "mapping a new generation",
+            Phase::ReadHead(_) | Phase::MakeHead | Phase::ReadManifest { .. } | Phase::CheckLog { .. } | Phase::Orphans { .. } => "opening",
+            Phase::Mapping { .. } | Phase::CheckMaps { .. } | Phase::Removing { .. } => "mapping a new generation",
             Phase::Ready => "ready",
             Phase::Listing => "compacting",
             Phase::Writing(..) | Phase::SyncingSegment(..) => "writing a segment",
@@ -818,28 +920,79 @@ impl Plain {
         }
     }
 
-    /// Lays out a segment (payloads at `pieces`, `data_len` of them, then `run` and the
-    /// footer), and starts its write: the file made at its length, then each piece written
-    /// at its offset, in parallel.
-    fn write_segment(&mut self, mut pieces: Vec<(u64, Vec<u8>)>, data_len: u64, run: Vec<u8>, why: Why, now_ns: u64, effects: &mut Vec<Effect>) {
+    /// Lays out a segment (its header; the payloads of `pieces`, from [`HEADER`] to
+    /// `index_at`; `run`; the footer and the digest of all before it), names it by its digest,
+    /// and starts its write: the file made at its length, then each piece written at its
+    /// offset, in parallel. A segment of the same bytes already here is not written again (a
+    /// published file is never rewritten).
+    fn write_segment(&mut self, mut pieces: Vec<(u64, Vec<u8>)>, index_at: u64, run: Vec<u8>, namespace: Namespace, why: Why, effects: &mut Vec<Effect>) {
         let count = (run.len() / ENTRY) as u32;
-        let footer = format::footer(count, data_len);
-        let mut crc = 0u32;
-        let mut at = 0u64;
+        let header = format::header(namespace, &run, index_at);
+        let foot = format::footer_head(count, index_at);
+        let mut hasher = blaze_ids::Hasher::new(SEGMENT_DIGEST);
+        hasher.update(&header);
+        let mut at = HEADER as u64;
         for (piece_at, bytes) in &pieces {
             debug_assert_eq!(*piece_at, at, "pieces lie end to end");
-            crc = crc32c::extend(crc, bytes);
+            hasher.update(bytes);
             at += bytes.len() as u64;
         }
-        crc = crc32c::extend(crc32c::extend(crc, &run), &footer);
-        self.seq += 1;
-        let id = format::id_of(SEGMENT_DOMAIN, &[&self.cfg.nonce.to_le_bytes(), &self.seq.to_le_bytes(), &now_ns.to_le_bytes()]);
-        let seg = Segment { id, data_len, count, crc, generation: 0, boot: self.cfg.boot };
-        pieces.push((data_len, run));
-        pieces.push((data_len + u64::from(count) * ENTRY as u64, footer.to_vec()));
-        let file = self.segment_file(id);
-        effects.push(Effect::Truncate { file: file.clone(), len: seg.file_len(), tag: self.tag(SEG_TRUNCATE, 0) });
+        debug_assert_eq!(at, index_at, "the index follows the payloads");
+        hasher.update(&run);
+        hasher.update(&foot);
+        let digest = hasher.finish();
+        let len = index_at + run.len() as u64 + FOOTER as u64;
+        let mut seg = Segment::of(&Described { namespace, count, index_at, digest }, len);
+        seg.boot = self.cfg.boot;
+        let file = self.segment_file(seg.id);
+        if let Why::Compact { candidates, stats } = &why
+            && candidates.contains(&seg.id)
+        {
+            // The slice would write back what it read: nothing to do.
+            self.sliced = Some(Sliced { segments: 0, ..*stats });
+            self.phase = Phase::Ready;
+            return;
+        }
+        if self.by_id.contains_key(&seg.id) {
+            // These bytes are here already, under this name: flip without writing them.
+            self.segment_written(Writing { seg, file, pieces: Vec::new(), left: 0 }, why, effects);
+            return;
+        }
+        // alloc: once a segment
+        let mut footer = foot.to_vec();
+        footer.extend_from_slice(&digest.0);
+        pieces.insert(0, (0, header.to_vec()));
+        pieces.push((index_at, run));
+        pieces.push((index_at + u64::from(count) * ENTRY as u64, footer));
+        effects.push(Effect::Truncate { file: file.clone(), len, tag: self.tag(SEG_TRUNCATE, 0) });
         self.phase = Phase::Writing(Box::new(Writing { seg, file, pieces, left: 0 }), Box::new(why));
+    }
+
+    /// Names segments fetched from a source (their files already written here, unchanged,
+    /// each checked by [`super::format::check_segment`] and its statement verified by the
+    /// driver) in a new generation: here, published.
+    pub fn adopt(&mut self, fetched: Vec<Segment>, effects: &mut Vec<Effect>) -> Result<(), PutError> {
+        if !self.ready() {
+            return Err(PutError::Busy(self.what()));
+        }
+        self.start_flip(Change::Adopt { segs: fetched }, effects);
+        Ok(())
+    }
+
+    /// Marks segments as published (pushed to a shared bucket): compaction never rewrites them.
+    pub fn publish(&mut self, ids: Vec<u64>, effects: &mut Vec<Effect>) -> Result<(), PutError> {
+        if !self.ready() {
+            return Err(PutError::Busy(self.what()));
+        }
+        self.start_flip(Change::Publish { ids }, effects);
+        Ok(())
+    }
+
+    /// The segment `id` of this generation, and its bytes when it is mapped here: what a push
+    /// uploads unchanged.
+    pub fn segment(&self, id: u64) -> Option<(Segment, Option<&[u8]>)> {
+        let seg = *self.manifest.segments.iter().find(|it| it.id == id)?;
+        Some((seg, self.by_id.get(&id).map(|at| self.maps[*at].bytes())))
     }
 
     // ---- compaction ----
@@ -861,18 +1014,24 @@ impl Plain {
     fn plan(&self) -> (Vec<Segment>, bool) {
         let current = self.manifest.generation;
         let over = self.manifest.bytes() > self.cfg.cap_bytes;
-        let old_enough = |it: &&Segment| !over || it.generation + WINDOW <= current;
+        let local = self.manifest.segments.iter().filter(|it| it.local).count();
         let wanted = if over {
             1
-        } else if self.manifest.segments.len() > SEGMENTS_MOST {
+        } else if local > SEGMENTS_MOST {
             2
         } else {
+            return (Vec::new(), false);
+        };
+        // Pruning reads published segments too (it lets go of this machine's copy, rewriting
+        // nothing); merging never does. One namespace a slice: no segment mixes two.
+        let eligible = |it: &&Segment| it.local && (if over { it.generation + WINDOW <= current } else { !it.published });
+        let Some(namespace) = self.manifest.segments.iter().find(eligible).map(|it| it.namespace) else {
             return (Vec::new(), false);
         };
         // alloc: once a slice
         let mut out = Vec::new();
         let mut bytes = 0u64;
-        for seg in self.manifest.segments.iter().filter(old_enough) {
+        for seg in self.manifest.segments.iter().filter(eligible).filter(|it| it.namespace == namespace) {
             if !out.is_empty() && bytes + seg.file_len() > SLICE_BYTES {
                 break;
             }
@@ -898,7 +1057,7 @@ impl Plain {
                     what: format!("the root `{}` names a record no segment holds", root.name),
                 });
             };
-            let bytes = self.checked_payload(&root.key, &self.maps[at], &entry)?;
+            let bytes = self.maps[at].payload(&entry);
             for key in bytes.chunks_exact(32) {
                 out.insert(Key(ContentId(key.try_into().expect("32 bytes"))));
             }
@@ -936,18 +1095,30 @@ impl Plain {
             Err(corrupt) => return self.stop(corrupt.to_string()),
         };
         let current = self.manifest.generation;
+        // A published segment is let go of whole, or kept whole: it is never rewritten.
+        let holds_live = |seg: &Segment| -> bool {
+            let (Some(live), Some(&at)) = (live.as_ref(), self.by_id.get(&seg.id)) else { return true };
+            let run = self.maps[at].run();
+            (0..seg.count as usize).any(|i| live.contains(&format::key_at(run, i)))
+        };
+        let candidates: Vec<Segment> = candidates.into_iter().filter(|seg| !seg.published || !holds_live(seg)).collect();
+        let namespace = candidates.first().map_or(self.cfg.namespace, |it| it.namespace);
         let mut out = Batch::new();
         let mut seen = BTreeSet::new();
         for seg in &candidates {
             let mapped = &self.maps[self.by_id[&seg.id]];
             stats.bytes_in += seg.file_len();
+            if seg.published {
+                stats.dropped += u64::from(seg.count);
+                continue;
+            }
             let young = seg.generation + WINDOW > current;
-            let run = seg.run(mapped.map.bytes());
+            let run = mapped.run();
             for i in 0..seg.count as usize {
                 let entry = match Entry::decode(&run[i * ENTRY..(i + 1) * ENTRY]) {
                     Ok(entry) => entry,
                     // alloc: a refusal
-                    Err(what) => return self.stop(format!("{}: entry {i}: {what}", mapped.file)),
+                    Err(what) => return self.stop(format!("{}: entry {i}: {what}", mapped.file())),
                 };
                 let keep = live.as_ref().is_none_or(|live| young || live.contains(&entry.key));
                 if !keep {
@@ -957,11 +1128,9 @@ impl Plain {
                 if !seen.insert(entry.key) {
                     continue;
                 }
-                let payload = match self.checked_payload(&entry.key, mapped, &entry) {
-                    Ok(payload) => payload,
-                    Err(corrupt) => return self.stop(corrupt.to_string()),
-                };
-                if let Err(error) = out.put(entry.key, entry.kind, payload) {
+                // Copied from a proved segment with its CRC as recorded: nothing is checked
+                // or computed again.
+                if let Err(error) = out.put_known(&entry, mapped.payload(&entry)) {
                     return self.stop(error.to_string());
                 }
                 stats.kept += 1;
@@ -974,14 +1143,18 @@ impl Plain {
             self.start_flip(Change::Compact { seg: None, candidates: ids, orphans, stats }, effects);
             return;
         }
-        let run = match format::sorted_run(std::mem::take(&mut out.entries)) {
+        let mut entries = std::mem::take(&mut out.entries);
+        for entry in entries.iter_mut() {
+            entry.at += HEADER as u64;
+        }
+        let run = match format::sorted_run(entries) {
             Ok(run) => run,
             Err(why) => return self.stop(why),
         };
-        let data_len = out.bytes.len() as u64;
-        stats.bytes_out = data_len + run.len() as u64 + FOOTER as u64;
+        let index_at = HEADER as u64 + out.bytes.len() as u64;
+        stats.bytes_out = index_at + run.len() as u64 + FOOTER as u64;
         self.orphans_for_compact = orphans;
-        self.write_segment(vec![(0, out.bytes)], data_len, run, Why::Compact { candidates: ids, stats }, now_ns, effects);
+        self.write_segment(vec![(HEADER as u64, out.bytes)], index_at, run, namespace, Why::Compact { candidates: ids, stats }, effects);
     }
 
     // ---- the flip: the one lock, held for it alone ----
@@ -1016,7 +1189,7 @@ impl Plain {
             }
         };
         for seg in m.segments.iter_mut() {
-            if self.checked.contains(&seg.id) {
+            if self.checked.contains(&seg.id) && self.plant() != Plant::ForgetCheck {
                 seg.boot = self.cfg.boot;
             }
         }
@@ -1050,7 +1223,11 @@ impl Plain {
                     if let Some((seg, _)) = seg {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
                         seg.generation = generation;
-                        m.segments.push(*seg);
+                        match m.segments.iter_mut().find(|it| it.id == seg.id) {
+                            // The same bytes, named already: here again if they were not.
+                            Some(named) => named.local = true,
+                            None => m.segments.push(*seg),
+                        }
                     }
                     for edit in roots.iter() {
                         match edit {
@@ -1064,12 +1241,35 @@ impl Plain {
                 }
             }
             Change::Stamp => {}
+            Change::Adopt { segs } => {
+                for seg in segs.iter() {
+                    m.retired.retain(|it| !(it.id == seg.id && !it.log));
+                    let mut seg = *seg;
+                    seg.generation = generation;
+                    seg.boot = self.cfg.boot;
+                    seg.local = true;
+                    seg.published = true;
+                    match m.segments.iter_mut().find(|it| it.id == seg.id) {
+                        Some(named) => *named = Segment { generation: named.generation, ..seg },
+                        None => m.segments.push(seg),
+                    }
+                }
+            }
+            Change::Publish { ids } => {
+                for seg in m.segments.iter_mut().filter(|it| ids.contains(&it.id)) {
+                    seg.published = true;
+                }
+            }
             Change::Compact { seg, candidates, orphans, .. } => {
-                if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id)) {
+                if candidates.iter().any(|id| !m.segments.iter().any(|it| it.id == *id && it.local)) {
                     aborted = true;
                 } else {
                     let first = m.segments.iter().position(|it| candidates.first() == Some(&it.id));
-                    m.segments.retain(|it| !candidates.contains(&it.id));
+                    // A published candidate stays named, as not here: a source has it.
+                    for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
+                        it.local = false;
+                    }
+                    m.segments.retain(|it| it.published || !candidates.contains(&it.id));
                     if let Some((seg, _)) = seg {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
                         // The copy is as old as the oldest it replaced: pruning sees its
@@ -1089,7 +1289,7 @@ impl Plain {
             flip.refused = refused;
             flip.aborted = aborted;
             self.phase = Phase::Flipping(flip);
-            effects.push(Effect::Unlock { lock: self.tag(LOCK, 0), tag: self.tag(UNLOCK, 0) });
+            self.unlock(effects);
             return;
         }
         // Files retired past their grace go now: out of the list, and unlinked once unlocked.
@@ -1134,24 +1334,27 @@ impl Plain {
         let Phase::Flipping(flip) = &mut self.phase else { unreachable!("a slot is a flip's") };
         let slot = flip.next.as_ref().expect("built").0;
         let fresh = flip.fresh;
-        flip.left = if fresh { 2 } else { 1 };
+        flip.left = if fresh { 3 } else { 1 };
+        // Every flip, the first included, writes one 64-byte slot in place in the head the
+        // open made at its full length: inside one sector, never extending or rewriting the
+        // file, so a tear can destroy only the slot being written, never the one before it.
+        // The first flip has no slot before it: a tear of it leaves none whole, and the next
+        // open reads the directory's segments from their footers and reports them.
+        let at = SLOT_AT[(slot.generation % 2) as usize];
+        effects.push(Effect::WriteAt { file: self.head.clone(), at, bytes: slot.encode().to_vec(), tag: self.tag(SLOT_WRITE, 0) });
         if fresh {
-            let head = format::head_with(&slot);
             let tag_file = self.name(CACHEDIR_TAG);
-            if self.cfg.durable {
-                effects.push(Effect::Write { file: self.head.clone(), bytes: head, tag: self.tag(SLOT_WRITE, 0) });
-            } else {
-                effects.push(Effect::WriteUnsynced { file: self.head.clone(), bytes: head, tag: self.tag(SLOT_WRITE, 0) });
-            }
             effects.push(Effect::WriteUnsynced { file: tag_file, bytes: CACHEDIR_SIGNATURE.to_vec(), tag: self.tag(SLOT_WRITE, 1) });
-        } else {
-            let at = SLOT_AT[(slot.generation % 2) as usize];
-            effects.push(Effect::WriteAt { file: self.head.clone(), at, bytes: slot.encode().to_vec(), tag: self.tag(SLOT_WRITE, 0) });
+            // No slot was whole, so the other may hold a torn one: blanked in place (it holds
+            // nothing to lose), so the trace is reported once, at the open that found it.
+            let other = SLOT_AT[((slot.generation + 1) % 2) as usize];
+            effects.push(Effect::WriteAt { file: self.head.clone(), at: other, bytes: vec![0u8; format::SLOT], tag: self.tag(SLOT_WRITE, 2) });
         }
     }
 
     /// The flip's writes are done (or it was refused): let go of the lock.
     fn unlock(&mut self, effects: &mut Vec<Effect>) {
+        self.holds_lock = false;
         effects.push(Effect::Unlock { lock: self.tag(LOCK, 0), tag: self.tag(UNLOCK, 0) });
     }
 
@@ -1187,7 +1390,7 @@ impl Plain {
         let (slot, manifest) = flip.next.expect("built");
         let then = match flip.change {
             Change::Commit { seg, .. } => Then::Commit { segment: seg.map(|(it, _)| it.id) },
-            Change::Stamp => Then::Stamp,
+            Change::Stamp | Change::Adopt { .. } | Change::Publish { .. } => Then::Stamp,
             Change::Compact { mut stats, .. } => {
                 stats.removed = flip.removals.len() as u32;
                 Then::Compact(stats)
@@ -1195,6 +1398,7 @@ impl Plain {
         };
         self.checked.clear();
         self.dropped.clear();
+        self.torn_stamp = false;
         self.slot = Some(slot);
         self.manifest = manifest;
         if self.cfg.durable && self.plant() == Plant::FlipBeforeSync {
@@ -1232,7 +1436,7 @@ impl Plain {
     fn map_new(&mut self, then: Then, effects: &mut Vec<Effect>) {
         let mut left = 0;
         for (i, seg) in self.manifest.segments.iter().enumerate() {
-            if self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) {
+            if !seg.local || self.by_id.contains_key(&seg.id) || self.dropped.contains(&seg.id) {
                 continue;
             }
             left += 1;
@@ -1252,48 +1456,76 @@ impl Plain {
         let file = self.segment_file(seg.id);
         let generation = self.manifest.generation;
         let earlier_boot = seg.boot != self.cfg.boot;
-        let check_crc = earlier_boot && self.plant() != Plant::TrustBoot;
         let map = match done {
             Done::Mapped(map) => map,
             done => {
                 let why = failed(&done).unwrap_or_else(|| format!("{done:?}"));
                 if earlier_boot {
-                    // alloc: a report
-                    let why = format!("generation {generation} names it, written in an earlier boot, and it cannot be opened: {why}");
-                    self.lose(seg, file, why);
+                    // Decided once every map is in, by whether the directory still holds it.
+                    self.unopened.push((seg, file, why));
                     return Ok(());
                 }
                 // alloc: a refusal
                 return Err(format!("{file}: generation {generation} names it and it cannot be mapped: {why}; something outside blaze removed it"));
             }
         };
-        let len = map.bytes().len() as u64;
-        let whole = len == seg.file_len() && (!check_crc || crc32c::crc32c(map.bytes()) == seg.crc);
-        if !whole {
-            if earlier_boot {
+        // The proof: this boot's row needs no byte read; an earlier boot's segment is checked
+        // in full once, here, and the open's next flip records the boot so no process of this
+        // boot checks it again.
+        let unverified = Unverified::new(seg, file, map);
+        let proved = match Verified::recorded(unverified, self.boot) {
+            Ok(proved) => Ok(proved),
+            Err(unverified) if !earlier_boot => {
+                // alloc: a refusal
+                return Err(format!(
+                    "{}: it is {} bytes and generation {generation} of this boot names {}: changed outside blaze",
+                    unverified.file(),
+                    unverified.len(),
+                    unverified.seg().file_len()
+                ));
+            }
+            Err(unverified) if self.plant() == Plant::TrustBoot => Ok(self.trust_for_a_plant(unverified)),
+            Err(unverified) => {
+                let mut checks = self.checks.get();
+                let proved = Verified::check(unverified, self.boot, &mut checks);
+                self.checks.set(checks);
+                self.checked_ids.push(seg.id);
+                proved
+            }
+        };
+        let proved = match proved {
+            Ok(proved) => proved,
+            Err((seg, file, what)) => {
                 // alloc: a report
-                let why = format!("it was written in an earlier boot and did not survive its end whole ({len} bytes, {} named, or its CRC-32C fails): a power cut before the kernel wrote it back; its records are dropped", seg.file_len());
+                let why = format!("it was written in an earlier boot and did not survive its end whole ({what}): a power cut before the kernel wrote it back; its records are dropped");
                 self.lose(seg, file, why);
                 return Ok(());
             }
-            // alloc: a refusal
-            return Err(format!("{file}: it is {len} bytes and generation {generation} names {}: changed outside blaze", seg.file_len()));
-        }
-        let bytes = map.bytes();
-        if seg.boot != self.cfg.boot {
+        };
+        if earlier_boot {
             self.checked.insert(seg.id);
             self.report.checked += 1;
         }
         // Touch the index a page at a time, so no probe faults (the payloads are not touched).
-        let run = seg.run(bytes);
+        let run = proved.run();
         let mut touched = 0u8;
-        for at in (0..run.len()).step_by(self.cfg.page.max(4096) as usize) {
+        for at in (0..run.len()).step_by(self.cfg.page.max(1) as usize) {
             touched ^= run[at];
         }
         std::hint::black_box(touched);
         self.by_id.insert(seg.id, self.maps.len());
-        self.maps.push(Mapped { seg, file, map });
+        self.maps.push(proved);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn trust_for_a_plant(&self, it: Unverified) -> Verified {
+        Verified::unchecked_for_a_plant(it, self.boot)
+    }
+
+    #[cfg(not(test))]
+    fn trust_for_a_plant(&self, _: Unverified) -> Verified {
+        unreachable!("outside tests a store's plant is always none")
     }
 
     fn lose(&mut self, seg: Segment, file: FileName, why: String) {
@@ -1339,7 +1571,19 @@ impl Plain {
         if op == LATE_SYNC {
             return;
         }
+        if matches!(self.phase, Phase::Broken) {
+            // Stopped already, with the first failure named ([`Plain::broken`]): what was in
+            // flight as it stopped (a flip's other slot write, the unlock it asked as it
+            // stopped) completes here and changes nothing; the first reason is the one kept.
+            return;
+        }
         if let Err(why) = self.step(op, index, completion.done, now_ns, effects) {
+            if self.holds_lock {
+                // A failure under the flip lock lets the lock go as the store stops: a process
+                // that lives on with a broken store (a daemon) must not hold every other
+                // process's commit for good, and the kernel would let it go only at exit.
+                self.unlock(effects);
+            }
             self.stop(why);
         }
     }
@@ -1353,10 +1597,50 @@ impl Plain {
                 let Done::Read(bytes) = done else {
                     return Err(fail("reading the head", &self.head, &done).unwrap_or_else(|| unexpected("reading the head")));
                 };
-                match format::read_head(&bytes) {
-                    HeadRead::Refused(why) => Err(format!("{}: {why}", self.head)),
-                    HeadRead::Fresh => self.resolved(ctx, Base { slot: None, manifest: Manifest::default() }, true, false, now_ns, effects),
-                    HeadRead::Committed(newest, older) => {
+                let read = format::read_head(&bytes);
+                if let HeadRead::Refused(why) = &read {
+                    return Err(format!("{}: {why}", self.head));
+                }
+                if bytes.len() < HEAD_LEN {
+                    // A plain head (or nothing) short of its length: made at its full length
+                    // and synced before anything else is written, so no flip ever extends or
+                    // rewrites it. The cut extends with zeros and never touches a byte there.
+                    if ctx == Ctx::Flip || self.head_made {
+                        // alloc: a refusal
+                        return Err(format!("{}: it is {} bytes after this process made it {HEAD_LEN} and synced it: it was cut outside blaze", self.head, bytes.len()));
+                    }
+                    self.head_made = true;
+                    // The trace a cut head holds is kept: the zeros the cut adds are not one.
+                    self.head_torn = match read {
+                        HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn,
+                        HeadRead::Refused(_) => None,
+                    };
+                    effects.push(Effect::Truncate { file: self.head.clone(), len: HEAD_LEN as u64, tag: self.tag(HEAD_MAKE, 0) });
+                    self.phase = Phase::MakeHead;
+                    return Ok(());
+                }
+                let torn = match read {
+                    HeadRead::Fresh { torn } | HeadRead::Committed(_, _, torn) => torn.or(self.head_torn.take()),
+                    HeadRead::Refused(_) => None,
+                };
+                if let Some(at) = torn
+                    && ctx == Ctx::Open
+                {
+                    self.torn_stamp = true;
+                    self.report.lost.push(Lost {
+                        file: self.head.clone(),
+                        segment: None,
+                        records: None,
+                        // alloc: a report
+                        why: format!("its slot {at} is torn: a flip a power cut cut short; what no whole generation names is read from the segments' own footers and reported"),
+                    });
+                }
+                match read {
+                    HeadRead::Refused(_) => unreachable!("refused above"),
+                    // No whole slot: at an open, what the directory holds is read from the
+                    // files' own footers and reported (nothing, for a store never written).
+                    HeadRead::Fresh { .. } => self.resolved(ctx, Base { slot: None, manifest: Manifest::default() }, true, ctx == Ctx::Open, now_ns, effects),
+                    HeadRead::Committed(newest, older, _) => {
                         if ctx == Ctx::Flip && self.plant() == Plant::StaleBase && self.slot.is_some() {
                             let base = Base { slot: self.slot, manifest: self.manifest.clone() };
                             return self.resolved(ctx, base, false, false, now_ns, effects);
@@ -1366,7 +1650,9 @@ impl Plain {
                             let base = Base { slot: self.slot, manifest: self.manifest.clone() };
                             return self.resolved(ctx, base, false, false, now_ns, effects);
                         }
-                        self.read_manifest(ctx, [Some(newest), older], 0, false, effects);
+                        // A torn slot beside it: a newer flip was cut, and the segments it
+                        // named are found and reported by the directory's look.
+                        self.read_manifest(ctx, [Some(newest), older], 0, ctx == Ctx::Open && torn.is_some(), effects);
                         Ok(())
                     }
                 }
@@ -1377,38 +1663,55 @@ impl Plain {
                 let log = self.log_file(slot.log);
                 let bytes = match done {
                     Done::Read(bytes) => bytes,
-                    // A log that is gone after a power cut reads as nothing: the same as torn.
-                    done => fail("reading a manifest", &log, &done).map(|_| Vec::new()).ok_or_else(|| unexpected("reading a manifest"))?,
+                    done => {
+                        // Whether the log is there decides what the failure means: one the
+                        // directory still holds failed to read (an error); one a power cut took
+                        // is the same as torn.
+                        let why = fail("reading a manifest", &log, &done).unwrap_or_else(|| unexpected("reading a manifest"));
+                        effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+                        self.phase = Phase::CheckLog { ctx, slots, at, why };
+                        return Ok(());
+                    }
                 };
                 let manifest = (bytes.len() == slot.manifest_len as usize && crc32c::crc32c(&bytes) == slot.manifest_crc)
                     .then(|| Manifest::decode(&bytes))
                     .transpose();
                 match manifest {
                     Ok(Some(manifest)) if manifest.generation == slot.generation => {
+                        if ctx == Ctx::Open {
+                            self.report.whole = Some(manifest.generation);
+                        }
                         self.resolved(ctx, Base { slot: Some(slot), manifest }, false, fell_back, now_ns, effects)
                     }
                     Err(why) => Err(format!("{log}: generation {}'s manifest at {}: {why}", slot.generation, slot.manifest_at)),
-                    _ => {
-                        if ctx == Ctx::Open {
-                            self.report.lost.push(Lost {
-                                file: log,
-                                segment: None,
-                                records: None,
-                                // alloc: a report
-                                why: format!("generation {}'s manifest at {} is not whole: a power cut before the kernel wrote it back; the generation before is read", slot.generation, slot.manifest_at),
-                            });
-                        }
-                        if at == 0 && slots[1].is_some() {
-                            self.read_manifest(ctx, slots, 1, true, effects);
-                            return Ok(());
-                        }
-                        // Neither generation survived: everything is lost, said by name below,
-                        // and the next generation follows the newest number so its slot is right.
-                        let newest = slots[0].expect("read");
-                        let manifest = Manifest { generation: newest.generation, ..Manifest::default() };
-                        self.resolved(ctx, Base { slot: Some(newest), manifest }, false, true, now_ns, effects)
-                    }
+                    _ => self.manifest_torn(ctx, slots, at, now_ns, effects),
                 }
+            }
+            (HEAD_MAKE, Phase::MakeHead) => {
+                if let Some(why) = fail(if index == 0 { "making the head at its length" } else { "syncing the head made" }, &self.head, &done) {
+                    return Err(why);
+                }
+                if index == 0 {
+                    // Synced once in the store's life, before its first segment: so an empty or
+                    // short head never stands beside segments a power cut kept.
+                    effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_MAKE, 1) });
+                } else {
+                    self.phase = Phase::ReadHead(Ctx::Open);
+                    effects.push(Effect::ReadAll { file: self.head.clone(), tag: self.tag(HEAD_READ, 0) });
+                }
+                Ok(())
+            }
+            (LIST, Phase::CheckLog { .. }) => {
+                let Phase::CheckLog { ctx, slots, at, why } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!() };
+                let Done::Listed(listed) = done else {
+                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
+                };
+                let log = self.log_file(slots[at].expect("read").log);
+                let leaf = log.as_str().rsplit('/').next().unwrap_or(log.as_str());
+                if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
+                    return Err(why);
+                }
+                self.manifest_torn(ctx, slots, at, now_ns, effects)
             }
             (LIST, Phase::Orphans { .. }) => {
                 let Done::Listed(listed) = done else {
@@ -1463,8 +1766,32 @@ impl Plain {
                 let (left, then) = (*left, *then);
                 self.on_map(index, done)?;
                 if left == 0 {
-                    self.mapped(then, effects);
+                    if self.unopened.is_empty() {
+                        self.mapped(then, effects);
+                    } else {
+                        effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+                        self.phase = Phase::CheckMaps { then };
+                    }
                 }
+                Ok(())
+            }
+            (LIST, Phase::CheckMaps { then }) => {
+                let then = *then;
+                let Done::Listed(listed) = done else {
+                    return Err(fail("listing", &self.cfg.dir, &done).unwrap_or_else(|| unexpected("listing")));
+                };
+                let generation = self.manifest.generation;
+                for (seg, file, why) in std::mem::take(&mut self.unopened) {
+                    let leaf = file.as_str().rsplit('/').next().unwrap_or(file.as_str());
+                    if listed.iter().any(|(name, _)| name.as_str().rsplit('/').next() == Some(leaf)) {
+                        // alloc: a refusal
+                        return Err(format!("{file}: generation {generation} names it and it is here, and it cannot be mapped: {why}"));
+                    }
+                    // alloc: a report
+                    let why = format!("generation {generation} names it, written in an earlier boot, and it is gone: a power cut before the kernel wrote its directory entry back; its records are dropped");
+                    self.lose(seg, file, why);
+                }
+                self.mapped(then, effects);
                 Ok(())
             }
             (REMOVE, Phase::Removing { left, then }) => {
@@ -1534,6 +1861,7 @@ impl Plain {
             }
             (LOCK, Phase::Flipping(flip)) => match done {
                 Done::Locked => {
+                    self.holds_lock = true;
                     self.phase_ctx_read_head(effects);
                     Ok(())
                 }
@@ -1586,7 +1914,7 @@ impl Plain {
                 if flip.left > 0 {
                     return Ok(());
                 }
-                if self.cfg.durable && !flip.fresh {
+                if self.cfg.durable {
                     effects.push(Effect::Sync { file: self.head.clone(), tag: self.tag(HEAD_SYNC, 0) });
                 } else {
                     self.unlock(effects);
@@ -1623,6 +1951,30 @@ impl Plain {
         let slot = slots[at].expect("a slot to read");
         effects.push(Effect::Read { file: self.log_file(slot.log), at: slot.manifest_at, len: slot.manifest_len as usize, tag: self.tag(MANIFEST_READ, 0) });
         self.phase = Phase::ReadManifest { ctx, slots, at, fell_back };
+    }
+
+    /// `slots[at]`'s manifest is not whole (torn, cut short, or its log gone): said by name at
+    /// an open, then the older slot's generation is read, or, with none, nothing survived.
+    fn manifest_torn(&mut self, ctx: Ctx, slots: [Option<Slot>; 2], at: usize, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), String> {
+        let slot = slots[at].expect("read");
+        if ctx == Ctx::Open {
+            self.report.lost.push(Lost {
+                file: self.log_file(slot.log),
+                segment: None,
+                records: None,
+                // alloc: a report
+                why: format!("generation {}'s manifest at {} is not whole: a power cut before the kernel wrote it back; the generation before is read", slot.generation, slot.manifest_at),
+            });
+        }
+        if at == 0 && slots[1].is_some() {
+            self.read_manifest(ctx, slots, 1, true, effects);
+            return Ok(());
+        }
+        // Neither generation survived: everything is lost, said by name below, and the next
+        // generation follows the newest number so its slot is right.
+        let newest = slots[0].expect("read");
+        let manifest = Manifest { generation: newest.generation, ..Manifest::default() };
+        self.resolved(ctx, Base { slot: Some(newest), manifest }, false, true, now_ns, effects)
     }
 
     /// A generation to read (at the open) or to build on (under the lock).

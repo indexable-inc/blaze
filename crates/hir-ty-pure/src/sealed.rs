@@ -17,19 +17,27 @@
 //!   source root through `include_bytes!`, a `#[path]` module outside its package): it is not
 //!   sealed. The instance is summarized as a row ([`summary_in`]), as a workspace instance is,
 //!   so an edit of what it read verifies it again; this is said by a span `sealed summary reads
-//!   below HIGH` naming the crate, the instance and the first such read (by key order), and
-//!   counted per crate ([`below_high`]), so the profile answers how many. The instance is kept
-//!   in the crate's [`Sealed::below_high`] and goes straight to its row from then on: every read
-//!   before its first below `HIGH` is one the cover holds, so while the cover holds, a run
-//!   reaches that read again.
+//!   below HIGH` naming the crate, the instance, the first such read (by key order) and its
+//!   cause (`Witness::cause_text`: the chain of reads down to the input below `HIGH`), and
+//!   counted per crate ([`below_high`]), so the profile answers how many. The instance, and
+//!   every instance its run asked on the way ([`Attempt::asked`]), is kept in its crate's
+//!   [`Sealed::below_high`] and goes straight to its row from then on: every read before its
+//!   first below `HIGH` is one the cover holds, so while the cover holds, a run reaches that
+//!   read again.
 //!
 //! **Nothing is shared before the whole run is known.** A run's callees settle inside it, and
 //! a callee's own reads cannot be told from its caller's in the witness: so each value a run
-//! settles is held in its attempt's pending list ([`Attempt`]) and written to its crate's table
-//! only once the outer run is found to have read nothing below `HIGH`, which then holds of every
-//! callee too (each one's reads, a scope's hit's replayed, are in the outer witness). A run that
-//! read below `HIGH` leaves its pending values unshared; its callees are asked again from its
-//! row, each on its own witness, and the ones that read only `HIGH` are shared then.
+//! settles is held in its attempt's pending list ([`Attempt::settled`]) and written to its
+//! crate's table only once the outer run is found to have read nothing below `HIGH`, which then
+//! holds of every callee too (each one's reads, a scope's hit's replayed, are in the outer
+//! witness). A run that read below `HIGH` leaves its pending values unshared, and routes every
+//! instance it asked to its row: which callee made the run low the witness cannot say, and a
+//! callee asked again on a witness of its own would run its whole subgraph again, each depth
+//! of a chain once more than the one above it (quadratic in the depth, the cost of track 5b's
+//! first cut). A row is right for any instance (it is what a workspace instance is); the cost
+//! is that a callee of a low run reading only `HIGH` is a row, not shared. So each instance is
+//! summarized at most twice: once in the discarded run, once as its row. Once more is
+//! [`Reattempted`], a typed error naming the instance and the read.
 //!
 //! An instance whose home is a workspace crate stays a row ([`summary_in`]): an edit must verify
 //! it again, and the row graph is linear where forwarded reads would be quadratic.
@@ -44,7 +52,13 @@
 //! tables, freed whole when the row's value goes; a store record of them (key: cover and ported
 //! instance; value: a `Summary` codec) needs a front-end record hook in hir-ty's body store.
 
-use std::{alloc::Global, sync::Arc};
+use std::{
+    alloc::Global,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use base_db::{Crate, Db};
 use blaze_hash::{HashMap, SharedMap, SharedSet};
@@ -60,9 +74,23 @@ pub(crate) const COVER_DOMAIN: &str = "blaze v2 pure sealed cover 1";
 /// The summaries of one sealed crate's instances, by the environment and instance asked.
 pub(crate) type Table = SharedMap<(StoredParamEnvAndCrate, Instance), Arc<Summary>>;
 
-/// The values one witnessed run settled, by the environment and instance, each with the table
-/// of its home's crate: written to those tables only once the run read nothing below `HIGH`.
-pub(crate) type Attempt = SharedMap<(StoredParamEnvAndCrate, Instance), (Arc<Table>, Arc<Summary>)>;
+/// One witnessed run of a sealed crate's instance ([`sealed_or_row`]).
+#[derive(Default)]
+pub(crate) struct Attempt {
+    /// The values the run settled, by the environment and instance, each with the table of its
+    /// home's crate: written to those tables only once the run read nothing below `HIGH`.
+    settled: SharedMap<(StoredParamEnvAndCrate, Instance), (Arc<Table>, Arc<Summary>)>,
+    /// Every instance the run asked on the scoped path ([`from_table`]), the outer one among
+    /// them, with its home crate's [`Sealed`] (no attempt in it: no cycle of counts): routed
+    /// to their rows when the run read below `HIGH`.
+    asked: SharedMap<(StoredParamEnvAndCrate, Instance), Sealed>,
+}
+
+/// The epoch of the routes to rows: each run that read below `HIGH` takes the next once it has
+/// routed what it asked ([`route_to_rows`]). Process-wide and only rising: a run that started at
+/// or after the epoch an instance was routed at found the route, so it never asks the instance
+/// on the scoped path. Not an output: a run's value never reads it.
+static ROUTED: AtomicU64 = AtomicU64::new(0);
 
 /// The summaries of instances whose home is `krate`, shared by every task: a function of
 /// `cover` alone, so two of one cover are equal whatever their tables hold.
@@ -71,9 +99,14 @@ pub(crate) struct Sealed {
     cover: ContentId,
     krate: Crate,
     table: Arc<Table>,
-    /// The instances of `krate` whose run read below `HIGH`, by the environment asked: each is
-    /// a row ([`summary_in`]), and how many there are is the crate's count ([`below_high`]).
+    /// The instances of `krate` asked by a run that read below `HIGH`, by the environment
+    /// asked: each is a row ([`summary_in`]), and how many there are is the crate's count
+    /// ([`below_high`]).
     below_high: Arc<SharedSet<(StoredParamEnvAndCrate, Instance)>>,
+    /// Each instance of `below_high` by the epoch ([`ROUTED`]) of the first run that routed it:
+    /// a run that started at or after it and summarizes it on the scoped path is
+    /// [`Reattempted`].
+    routed: Arc<SharedMap<(StoredParamEnvAndCrate, Instance), u64>>,
     /// Each crate below `krate` (all sealed) by its own [`Sealed`]: where a run under the
     /// witness frame finds its callees' tables without a read.
     below: Arc<HashMap<Crate, Sealed, Global>>,
@@ -174,13 +207,15 @@ pub(crate) fn sealed(db: &Db, krate: Crate) -> Option<Sealed> {
         krate,
         table: Arc::new(Table::default()), // alloc: the crate's table, once per cover
         below_high: Arc::new(SharedSet::default()), // alloc: the crate's rows, once per cover
+        routed: Arc::new(SharedMap::default()),     // alloc: their epochs, once per cover
         below: Arc::new(below), // alloc: the crates below, once per cover
         attempt: None,
     })
 }
 
-/// How many instances of `krate` were found to read below `HIGH` under its present cover, and
-/// so are rows ([`summary_in`]) though the crate is sealed: 0 for a crate that is not.
+/// How many instances of `krate` were asked by a run that read below `HIGH` under its present
+/// cover (the run's own instance and every one it asked), and so are rows ([`summary_in`])
+/// though the crate is sealed: 0 for a crate that is not.
 pub(crate) fn below_high(db: &Db, krate: Crate) -> usize {
     sealed(db, krate).map_or(0, |it| it.below_high.len())
 }
@@ -242,6 +277,8 @@ fn sealed_or_row(
     let attempt = Arc::new(Attempt::default()); // alloc: one witnessed run's settled values
     // clone: reference counts
     let part = Sealed { attempt: Some(Arc::clone(&attempt)), ..sealed.clone() };
+    // Loaded before the run asks anything: every route of an epoch below it is found.
+    let started = ROUTED.load(Ordering::SeqCst);
     let mut reads = Vec::new(); // alloc: the keys of one witnessed run's reads below `HIGH`
     // clone: the scoped key, reference counts
     let (value, witness) = blaze_query::db::witnessed(db, &mut reads, || {
@@ -257,7 +294,7 @@ fn sealed_or_row(
         false => witness,
     };
     if witness.complete && reads.is_empty() {
-        for (key, (table, settled)) in attempt.pin().iter() {
+        for (key, (table, settled)) in attempt.settled.pin().iter() {
             // clone: the table's key and value, reference counts
             _ = table.pin().try_insert(key.clone(), Arc::clone(settled));
         }
@@ -266,15 +303,19 @@ fn sealed_or_row(
     let krate = crate_name(db, home.krate);
     let name = name_of(db, &instance);
     match reads.first() {
-        Some(&read) => {
-            sealed.below_high.pin().insert(key);
-            let read = Witness::read_text(db, read);
+        Some(&first) => {
+            let read = Witness::read_text(db, first);
+            let cause = Witness::cause_text(db, first);
+            let (discarded, epoch) = route_to_rows(db, &key, &attempt, started, &cause);
             let _span = tracing::info_span!(
                 target: "blaze",
                 "sealed summary reads below HIGH",
                 krate = %krate,
                 instance = %name,
                 read = %read,
+                cause = %cause,
+                discarded,
+                epoch,
                 count = sealed.below_high.len(),
             )
             .entered();
@@ -293,6 +334,98 @@ fn sealed_or_row(
             .entered();
             summary_in(db, home, instance)
         }
+    }
+}
+
+/// Routes every instance `attempt` asked on the scoped path (`root`, its outer instance, among
+/// them) to its row ([`Sealed::below_high`] of its home), then takes the next epoch
+/// ([`ROUTED`]) and records it as the epoch of each one not routed before. How many it
+/// discarded and the epoch, for the span.
+///
+/// # Panics
+///
+/// [`Reattempted`], when an instance the run asked was routed at an epoch at or below
+/// `started`, the epoch the run began at: it found the route, so it asked the instance on the
+/// scoped path only if the routing is broken, and work a discarded run did is done again.
+fn route_to_rows(
+    db: &Db,
+    root: &(StoredParamEnvAndCrate, Instance),
+    attempt: &Attempt,
+    started: u64,
+    cause: &str,
+) -> (usize, u64) {
+    let asked = attempt.asked.pin();
+    for (key, home) in asked.iter() {
+        // The planted bug: the outer instance alone is routed, as before the fix, so each
+        // callee is asked again on a witness of its own.
+        #[cfg(test)]
+        if plant::routes_the_root_only() && key != root {
+            continue;
+        }
+        _ = home.below_high.pin().insert(key.clone()); // clone: the routing's key, reference counts
+    }
+    #[cfg(not(test))]
+    let _ = root;
+    // After every route above: a run that loads this epoch or a later one finds each of them.
+    let epoch = ROUTED.fetch_add(1, Ordering::SeqCst) + 1;
+    for (key, home) in asked.iter() {
+        // clone: the routing's key, reference counts
+        if let Err(it) = home.routed.pin().try_insert(key.clone(), epoch)
+            && *it.current <= started
+        {
+            Reattempted {
+                krate: crate_name(db, key.0.krate),
+                instance: name_of(db, &key.1),
+                cause: cause.to_owned(), // alloc: an error's text, once
+                routed: *it.current,
+                started,
+            }
+            .throw();
+        }
+        // Routed before by a run still going when this one started: both discarded it once.
+    }
+    (asked.len(), epoch)
+}
+
+/// A sealed crate's instance summarized on the scoped path by a witnessed run that started at
+/// or after the epoch another run, which read below `HIGH`, routed it to its row: the work of
+/// a discarded run done again, which [`route_to_rows`] makes impossible, so a bug in the
+/// routing (rule bounded-progress: each instance is summarized at most twice, once in the
+/// discarded run and once as its row). It unwinds with this as its payload
+/// ([`Reattempted::throw`]), failing the job that asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Reattempted {
+    /// The instance's home crate, by name.
+    pub(crate) krate: String,
+    /// The instance, by name (`walk::name_of`).
+    pub(crate) instance: String,
+    /// The first read below `HIGH` of the run that discarded it again, with its chain of
+    /// reads down to the input (`Witness::cause_text`).
+    pub(crate) cause: String,
+    /// The epoch ([`ROUTED`]) it was first routed at, and the one the run started at.
+    pub(crate) routed: u64,
+    pub(crate) started: u64,
+}
+
+impl Reattempted {
+    /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
+    /// panic's text finds none in it, and the panic hook prints only where it was thrown.
+    pub(crate) fn throw(self) -> ! {
+        tracing::error!(target: "blaze", "{self}");
+        std::panic::panic_any(self)
+    }
+}
+
+impl std::fmt::Display for Reattempted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pure summary: {} of crate `{}` was summarized again on the scoped path by a \
+             witnessed run that started at epoch {}, after a run that read below `HIGH` routed \
+             it to its row at epoch {}; the run read {} (rule bounded-progress: a sealed \
+             crate's instance is summarized at most once in a discarded run and once as its row)",
+            self.instance, self.krate, self.started, self.routed, self.cause,
+        )
     }
 }
 
@@ -322,6 +455,16 @@ fn from_table(
     if sealed.below_high.pin().contains(&key) {
         return summary_in(db, home, instance);
     }
+    let attempt = sealed.attempt.as_ref().unwrap_or_else(|| {
+        panic!(
+            "the summary of {} in crate {:?} was asked on the scoped path outside a witnessed \
+             run: `from_table` is given a part of one (`sealed_or_row`, `Sealed::of`)",
+            name_of(db, &instance),
+            sealed.krate,
+        )
+    });
+    // clone: reference counts; the attempt is left out, so the record holds no count of it
+    _ = attempt.asked.pin().try_insert(key, Sealed { attempt: None, ..sealed.clone() });
     blaze_query::db::task_scope(db, || summary_sealed(db, sealed, home, instance))
 }
 
@@ -335,6 +478,8 @@ fn from_table(
     reason = "a tracked query's arguments are its key, which `blaze_query::tracked` hands the body by value"
 )]
 pub(crate) fn summary_in(db: &Db, env: StoredParamEnvAndCrate, instance: Instance) -> Arc<Summary> {
+    #[cfg(test)]
+    plant::ran(db, &instance);
     summarized(db, None, env, &instance)
 }
 
@@ -357,6 +502,8 @@ fn summary_sealed(
     env: StoredParamEnvAndCrate,
     instance: Instance,
 ) -> Arc<Summary> {
+    #[cfg(test)]
+    plant::ran(db, &instance);
     summarized(db, Some(&sealed), env, &instance)
 }
 
@@ -381,19 +528,65 @@ fn publish(_db: &Db, key: &(Sealed, StoredParamEnvAndCrate, Instance), value: &A
     };
     // clone: the attempt's key and value, reference counts
     let settled = (Arc::clone(&sealed.table), Arc::clone(value));
-    _ = attempt.pin().try_insert((env.clone(), instance.clone()), settled);
+    _ = attempt.settled.pin().try_insert((env.clone(), instance.clone()), settled);
 }
 
 #[cfg(test)]
 pub(crate) mod plant {
-    //! What a test plants in the routing.
-    use std::cell::Cell;
+    //! What a test plants in the routing, and the count of runs it reads.
+    use std::cell::{Cell, RefCell};
+
+    use base_db::Db;
+
+    use crate::walk::{Instance, name_of};
 
     thread_local! {
         static ALL_ROWS: Cell<bool> = const { Cell::new(false) };
         static NAMES_ONLY: Cell<bool> = const { Cell::new(false) };
         static A_ROUND: Cell<bool> = const { Cell::new(false) };
         static BELOW_HIGH: Cell<bool> = const { Cell::new(false) };
+        static ROOT_ONLY: Cell<bool> = const { Cell::new(false) };
+        /// While [`counting_runs`] runs: each instance's summary runs on this thread, by name.
+        static RUNS: RefCell<Option<Vec<(String, u32)>>> = const { RefCell::new(None) };
+    }
+
+    /// A summary of `instance` ran (a row's or a scoped run): counted while [`counting_runs`]
+    /// runs on this thread.
+    pub(super) fn ran(db: &Db, instance: &Instance) {
+        if RUNS.with(|it| it.borrow().is_none()) {
+            return;
+        }
+        // Named outside the borrow: a name reads the database.
+        let name = name_of(db, instance);
+        RUNS.with(|it| {
+            let mut runs = it.borrow_mut();
+            let runs = runs.as_mut().expect("counting, checked above");
+            match runs.iter_mut().find(|it| it.0 == name) {
+                Some(it) => it.1 += 1,
+                None => runs.push((name, 1)), // alloc: a test's count
+            }
+        });
+    }
+
+    /// `work`, and how many times each instance's summary ran on this thread while it did, by
+    /// name ([`name_of`]), sorted by name.
+    pub(crate) fn counting_runs<R>(work: impl FnOnce() -> R) -> (R, Vec<(String, u32)>) {
+        RUNS.with(|it| *it.borrow_mut() = Some(Vec::new())); // alloc: a test's count
+        let made = work();
+        let mut runs = RUNS.with(|it| it.borrow_mut().take()).expect("set above");
+        runs.sort();
+        (made, runs)
+    }
+
+    pub(super) fn routes_the_root_only() -> bool {
+        ROOT_ONLY.with(Cell::get)
+    }
+
+    /// `work` with each run on this thread that read below `HIGH` routing its outer instance
+    /// alone to its row, as before every instance it asked was: the planted bug of the chain
+    /// test, whose callees are each asked again on a witness of their own.
+    pub(crate) fn routing_the_root_only<R>(work: impl FnOnce() -> R) -> R {
+        with(&ROOT_ONLY, work)
     }
 
     /// `work` with `flag` set on this thread, cleared after.

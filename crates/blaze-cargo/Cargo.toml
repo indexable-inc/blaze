@@ -84,6 +84,8 @@ blaze-ui.workspace = true
 blaze-units.workspace = true
 blaze-registry.workspace = true
 blaze-report.workspace = true
+# `blaze cache push | pull | status | keys`: the shared cache in an object bucket.
+blaze-remote.workspace = true
 # `.crate` files and `blaze fetch-url`: bytes by their digest, kept in the store.
 blaze-fetch.workspace = true
 # The `SourceId` of a git dependency the daemon fetches (`serve/fetch/git.rs`).

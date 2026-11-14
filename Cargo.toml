@@ -211,6 +211,11 @@ implicit_overflow = "allow"
 # line, `blaze check --deny blaze::todo` (.github/workflows/blaze.yaml, `lint-baselines`): a
 # command line's level comes after this table's.
 todo = "warn"
+# A write through a `&mut` left half done by an early exit (docs/lints.md#half_done), in
+# `internal` above and named here: many findings are deliberate (a counter bumped before a
+# fallible call), so it warns, held at each crate's count by its baseline, until the real ones are
+# fixed and the rest say why.
+half_done = "warn"
 # `blaze::hot` is the lints of code where the time goes, each decided here. `allow` outside
 # hot code, as docs/lints.md#profile_hot says, for the three that find what is right in cold
 # code and `large_move` (moves of over 512 bytes, and lopsided enums, "in hot code" by its own
@@ -448,6 +453,7 @@ blaze-dbsp = { path = "crates/blaze-dbsp" }
 blaze-diff = { path = "crates/blaze-diff", version = "0.0.0" }
 blaze-diff-mir = { path = "crates/blaze-diff-mir", version = "0.0.0" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
+blaze-expansion = { path = "crates/blaze-expansion" }
 blaze-ext = { path = "crates/blaze-ext" }
 blaze-ext-host = { path = "crates/blaze-ext-host" }
 blaze-fetch = { path = "crates/blaze-fetch" }
@@ -456,10 +462,13 @@ blaze-hash = { path = "crates/blaze-hash" }
 # blaze's sans-IO HTTP/1.1 client and its tokio driver (blaze-registry's `HyperHttp`).
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
+# The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
+blaze-keyed = { path = "crates/blaze-keyed" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
+blaze-remote = { path = "crates/blaze-remote" }
 # The request certificate, its slot and the client's own check, with no compiler in it.
 blaze-certify = { path = "crates/blaze-certify" }
 blaze-rng = { path = "crates/blaze-rng" }
@@ -480,6 +489,8 @@ blaze-launch = { path = "crates/blaze-launch" }
 blaze-pack = { path = "crates/blaze-pack" }
 blaze-launch-host = { path = "crates/blaze-launch-host" }
 blaze-launch-rt = { path = "crates/blaze-launch-rt" }
+blaze-program = { path = "crates/blaze-program" }
+blaze-mutants = { path = "crates/blaze-mutants" }
 blaze-inproc-rt = { path = "crates/blaze-inproc-rt" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lints = { path = "crates/blaze-lints" }
@@ -488,6 +499,9 @@ blaze-stencil = { path = "crates/blaze-stencil", default-features = false }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-query-macros = { path = "crates/blaze-query-macros" }
+# The session memo that replaces blaze-query under the front end, and its attributes.
+blaze-memo = { path = "crates/blaze-memo" }
+blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-usercode = { path = "crates/blaze-usercode" }
@@ -858,13 +872,18 @@ print_stderr = "warn"
 
 ## restriction lints for code written by agents: more typing, and each choice made where it
 ## is written (`blaze check` implements each of these; crates/blaze-lints/src/lints/mod.rs)
-# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is
+# an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is. These two are
+# the "unexplained allow" check (any `#[allow]`, an `#[expect]` with no reason), so blaze has no
+# lint of its own for it (docs/lints.md#suspicious-code); `--fix` turns an outer `allow` into
+# `expect`.
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 # `let _ = f()` of a `#[must_use]` value throws away what it says
 let_underscore_must_use = "warn"
 # Listed in clippy's table but not implemented by `blaze check`, so turning them on does nothing
-# until they are: string_slice, missing_assert_message. wildcard_enum_match_arm and
+# until they are: string_slice, missing_assert_message, let_underscore_lock, unused_async,
+# unused_self. wildcard_imports and shadow_unrelated are `blaze::glob_import` and
+# `blaze::shadow_changes_meaning` instead (in `internal`, denied by the ratchet). wildcard_enum_match_arm and
 # match_wildcard_for_single_variants are `blaze::wildcard_arm` instead, which checks the
 # workspace's enums only (clippy's also fires on other crates' enums such as
 # `std::io::ErrorKind`).

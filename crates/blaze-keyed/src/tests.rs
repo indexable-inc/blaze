@@ -1,7 +1,7 @@
 //! The driver under deterministic simulation (rule 43, 64): a model of three crates whose items
 //! call each other by name, edited at random; every request runs the real driver, the real key
-//! functions, the real text graph and the real record formats, with the host's answers delivered
-//! in a seeded random order and the process killed at random points.
+//! functions, the real text graph, the real outside machine and the real record formats, with the
+//! host's answers delivered in a seeded random order and the process killed at random points.
 //!
 //! The oracle:
 //! - Keys: every key the model computes maps to one meaning for the whole run (two meanings
@@ -10,12 +10,20 @@
 //!   records the store holds.
 //! - Reuse: a record filed under a moved key (its read list verified) is the meaning of the new
 //!   key, which a fresh build computes from scratch.
+//! - Verify once (decision 18), per request: no item is looked up twice or verified twice; no
+//!   item is checked after its hit; nothing a held manifest names is looked up; no record of a
+//!   unit whose own text and dependencies' surfaces are unchanged is examined; the driver's
+//!   `rechecks` counter is zero.
 //! - Work: no task runs for a record the store holds; at most `max(workers, 1)` tasks run.
-//! - Ends: a built request filed the certificate and the fresh manifests; a request after it
-//!   with no edit is certified; nothing fails or stalls.
+//! - Ends: a built request filed the certificate, naming the fresh manifests, at the address of
+//!   the tree; a request after it with no edit is certified; nothing fails or stalls.
 //! - Refinement: `Resident` gives the same outcomes and leaves the same store as `RecordsOnly`.
 
-use std::{alloc::Global, collections::BTreeMap};
+use std::{
+    alloc::Global,
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+};
 
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
@@ -24,14 +32,16 @@ use hegel::generators as gs;
 
 use crate::{
     PLANT, Plant,
-    driver::{Config, Done, Driver, Effect, Input, Outcome, Plan, Ran, SURFACE_ITEM, Step, Task, UnitPlan},
+    driver::{Done, Driver, Effect, Input, NO_UNIT, Outcome, Plan, Ran, SURFACE_ITEM, Step, Task, UnitPlan},
+    exec::Local,
     kind::{
-        Body, BodyInputs, FileImage, FileInputs, Key, Kind, Late, LateRead, NameRead, Settings, Surface,
-        SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
+        Body, BodyInputs, Certificate, CertificateInputs, FileImage, FileInputs, Key, Kind, Late, LateRead, NameRead,
+        Namespace, Settings, Surface, SurfaceInputs, Tag, ToolId, UnitInputs, UnitManifest,
     },
     memo::{Memo, RecordsOnly, Resident},
-    planted,
+    outside, planted,
     pool::Ticket,
+    proof::{self, Checks, Snapshot},
     record::{self, Entry, Fact, FactKind, StableId, Traced},
     store::Put,
     text::{CrateNodes, Graph, NameHash, Node, name_of},
@@ -41,6 +51,8 @@ const NAMES: [&str; 5] = ["new", "a", "b", "from", "run"];
 const VARS: [&str; 2] = ["MODEL_A", "MODEL_B"];
 const DEPS: [&[u32]; 3] = [&[], &[0], &[0, 1]];
 const WORKERS: u32 = 2;
+/// The request's one outside ask, in the model's encoding: the whole tree.
+const SHAPE: &[u8] = b"the model's tree";
 
 struct Spec {
     name: usize,
@@ -59,9 +71,13 @@ const SPECS: [[Spec; 3]; 3] = [
     [spec(4, &[2, 3], None, false), spec(1, &[4], None, false), spec(2, &[0], Some(1), false)],
 ];
 
-const TOOL: ToolId = ToolId(ContentId([1; 32]));
+const TOOL: ToolId = ToolId { tool: ContentId([1; 32]), target: ContentId([4; 32]), namespace: Namespace::PUBLIC };
 const SETTINGS: Settings = Settings(ContentId([2; 32]));
 const SYSROOT: ContentId = ContentId([3; 32]);
+
+fn certificate() -> Key<Certificate> {
+    Certificate::key(&CertificateInputs { tool: TOOL, base: ContentId([5; 32]), of: PhantomData })
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Item {
@@ -119,11 +135,32 @@ struct FreshUnit {
     bodies: Vec<(usize, StableId, Key<Body>, Vec<u8>)>,
 }
 
+impl FreshUnit {
+    fn key_of(&self, item: StableId) -> Option<ContentId> {
+        if item == SURFACE_ITEM {
+            return Some(self.surface.id());
+        }
+        self.bodies.iter().find(|(_, id, ..)| *id == item).map(|(_, _, key, _)| key.id())
+    }
+}
+
 #[derive(Default)]
 struct Disk {
     records: BTreeMap<(u16, [u8; 32]), Aligned>,
-    cert: Option<ContentId>,
     last: Vec<Key<UnitManifest>>,
+}
+
+/// What one request has looked at so far: the verify-once oracle's state.
+#[derive(Default)]
+struct Seen {
+    gets: BTreeSet<(u32, u16, [u8; 32], [u8; 32])>,
+    verifies: BTreeSet<(u32, [u8; 32])>,
+    /// Items proved in this request: by a key hit or a verified read list.
+    proved: BTreeSet<(u32, [u8; 32])>,
+    /// Units whose manifest held.
+    settled: BTreeSet<u32>,
+    /// Per unit: its own text and its dependencies' surfaces are as the last answer had them.
+    unchanged: Vec<bool>,
 }
 
 struct Model {
@@ -132,16 +169,19 @@ struct Model {
     disk: Disk,
     meanings: BTreeMap<(u16, [u8; 32]), ContentId>,
     in_flight: u32,
+    seen: Seen,
+    last_own: Vec<ContentId>,
+    last_surfaces: Vec<Key<Surface>>,
 }
 
 enum Answer {
-    Certified(Ticket, bool),
     Got(Ticket, Option<Aligned>),
-    Verified(Ticket, bool),
+    Answers(Ticket, Vec<ContentId>),
+    Now(Ticket, Vec<Option<ContentId>>),
     Keyed(Ticket, Key<UnitManifest>, Key<Surface>, Vec<(StableId, Key<Body>)>),
     Wrote(Ticket, Aligned),
     Put(Ticket, Put),
-    Cert(Ticket),
+    Reads(Ticket, ContentId),
 }
 
 impl Model {
@@ -153,6 +193,9 @@ impl Model {
             disk: Disk::default(),
             meanings: BTreeMap::new(),
             in_flight: 0,
+            seen: Seen::default(),
+            last_own: Vec::new(),
+            last_surfaces: Vec::new(),
         }
     }
 
@@ -178,6 +221,22 @@ impl Model {
 
     fn file_bytes(&self, c: usize) -> Vec<u8> {
         self.items[c].iter().flat_map(|item| [item.present as u8, item.sig, item.param, item.body]).collect()
+    }
+
+    /// Unit `c`'s own inputs: its file and the variables its present items read.
+    fn own(&self, c: usize) -> ContentId {
+        let mut bytes = self.file_bytes(c);
+        for i in (0..3).filter(|&i| self.items[c][i].present) {
+            if let Some(v) = SPECS[c][i].env {
+                bytes.push(self.env[v].map_or(0, |value| value + 1));
+            }
+        }
+        digest(&bytes)
+    }
+
+    fn unchanged(&self, c: usize, fresh: &[FreshUnit]) -> bool {
+        self.last_own.get(c) == Some(&self.own(c))
+            && DEPS[c].iter().all(|&d| self.last_surfaces.get(d as usize) == Some(&fresh[d as usize].surface))
     }
 
     fn resolve(&self, c: usize, name: usize) -> Option<(usize, usize)> {
@@ -332,13 +391,17 @@ impl Model {
             }
             let bytes = self.file_bytes(c);
             let file = FileImage::key(&FileInputs { tool: TOOL, edition: 2024, bytes: &bytes });
-            let dep_manifests: Vec<Key<UnitManifest>> = DEPS[c].iter().map(|&d| units[d as usize].manifest).collect();
+            // The firewall: dependencies by surface; the plant keys them by manifest instead.
+            let deps: Vec<Key<Surface>> = match planted(Plant::UnitKeyedByDepManifests) {
+                true => DEPS[c].iter().map(|&d| Key::from_id(units[d as usize].manifest.id())).collect(),
+                false => dep_surfaces.clone(),
+            };
             let manifest = UnitManifest::key(&UnitInputs {
                 tool: TOOL,
                 settings: SETTINGS,
                 files: &[file],
                 late: &late_all,
-                deps: &dep_manifests,
+                deps: &deps,
             });
             let mut entries = vec![Entry { item: SURFACE_ITEM.0, key: surface.id(), tag: Surface::TAG.0, pad: 0 }];
             entries.extend(bodies.iter().map(|(_, item, key, _)| Entry { item: item.0, key: key.id(), tag: Body::TAG.0, pad: 0 }));
@@ -379,12 +442,41 @@ impl Model {
         }
     }
 
+    /// The verify-once oracle for a look at item `item` of unit `unit`.
+    fn examine(&self, unit: u32, item: StableId) -> Result<(), String> {
+        if self.seen.settled.contains(&unit) {
+            return Err(format!("a lookup under a held manifest: unit {unit}"));
+        }
+        if self.seen.unchanged.get(unit as usize) == Some(&true) {
+            return Err(format!("a dependent of an unchanged surface was examined: unit {unit}"));
+        }
+        if self.seen.proved.contains(&(unit, item.0.0)) {
+            return Err(format!("a check after a hit: unit {unit}"));
+        }
+        Ok(())
+    }
+
     fn perform(&mut self, effect: &Effect<'_>, fresh: &[FreshUnit]) -> Result<Answer, String> {
         Ok(match *effect {
-            Effect::Certify { ticket } => Answer::Certified(ticket, self.disk.cert == Some(self.world())),
-            Effect::Get { ticket, tag, key, .. } => {
+            Effect::Get { ticket, unit, item, tag, key, .. } => {
                 let record = self.disk.records.get(&(tag.0, key.0)).cloned();
-                if let Some(bytes) = &record {
+                if unit != NO_UNIT {
+                    if !self.seen.gets.insert((unit, tag.0, item.0.0, key.0)) {
+                        return Err(format!("an item looked up twice in one snapshot: unit {unit}, kind {}", tag.0));
+                    }
+                    let fresh_unit = &fresh[unit as usize];
+                    if tag == UnitManifest::TAG {
+                        if record.is_some() && key == fresh_unit.manifest.id() {
+                            self.seen.settled.insert(unit);
+                        }
+                    } else {
+                        self.examine(unit, item)?;
+                        if record.is_some() && fresh_unit.key_of(item) == Some(key) {
+                            self.seen.proved.insert((unit, item.0.0));
+                        }
+                    }
+                }
+                if let Some(bytes) = record.as_ref().filter(|_| tag != Certificate::TAG) {
                     self.check_meaning(tag, key, bytes, "a hit")?;
                     if tag == UnitManifest::TAG {
                         let root = record::open::<UnitManifest>(bytes, &Key::from_id(key)).map_err(|e| e.to_string())?;
@@ -397,12 +489,26 @@ impl Model {
                 }
                 Answer::Got(ticket, record)
             }
-            Effect::Verify { ticket, unit, reads, .. } => {
-                let now = self.facts_now(unit as usize);
-                let equal = reads.iter().all(|read| now.iter().any(|fact| fact == read));
-                Answer::Verified(ticket, equal)
+            Effect::Answer { ticket, tag, shape, .. } => {
+                if tag != Certificate::TAG || shape != SHAPE {
+                    return Err("an answer asked of a shape the model never filed".into());
+                }
+                Answer::Answers(ticket, vec![self.world()])
             }
-            Effect::Run { ticket, task } => {
+            Effect::Verify { ticket, unit, item, reads } => {
+                if !self.seen.verifies.insert((unit, item.0.0)) {
+                    return Err(format!("an item verified twice in one snapshot: unit {unit}"));
+                }
+                self.examine(unit, item)?;
+                let facts = self.facts_now(unit as usize);
+                let now: Vec<Option<ContentId>> =
+                    reads.iter().map(|read| facts.iter().find(|fact| fact.id == read.id).map(|fact| fact.digest)).collect();
+                if reads.iter().zip(&now).all(|(read, now)| *now == Some(read.digest)) {
+                    self.seen.proved.insert((unit, item.0.0));
+                }
+                Answer::Now(ticket, now)
+            }
+            Effect::Run { ticket, task, .. } => {
                 self.in_flight += 1;
                 if self.in_flight > WORKERS.max(1) {
                     return Err(format!("{} tasks run at once on {WORKERS} workers", self.in_flight));
@@ -432,10 +538,12 @@ impl Model {
                 }
             }
             Effect::Put { ticket, tag, key, bytes } => {
-                self.check_meaning(tag, key, bytes, "a put")?;
-                let put = match self.disk.records.get(&(tag.0, key.0)) {
-                    Some(held) if **held == *bytes => Put::Same,
-                    Some(_) => Put::Other,
+                if tag != Certificate::TAG {
+                    self.check_meaning(tag, key, bytes, "a put")?;
+                }
+                let put = match self.disk.records.get(&(tag.0, key.0)).map(|held| **held == *bytes) {
+                    Some(true) => Put::Same,
+                    Some(false) => Put::Other,
                     None => {
                         self.disk.records.insert((tag.0, key.0), Aligned::copy_from(bytes));
                         Put::Written
@@ -443,19 +551,15 @@ impl Model {
                 };
                 Answer::Put(ticket, put)
             }
-            Effect::WriteCertificate { ticket, units } => {
-                self.disk.cert = Some(self.world());
-                self.disk.last = units.to_vec();
-                Answer::Cert(ticket)
-            }
+            Effect::Reads { ticket } => Answer::Reads(ticket, self.world()),
         })
     }
 
-    fn deliver<M: Memo>(&mut self, driver: &mut Driver<'_, M, Global>, answer: Answer) {
+    fn deliver<M: Memo>(&mut self, driver: &mut Driver<'_, '_, M, Local, Global>, answer: Answer) {
         match answer {
-            Answer::Certified(ticket, hit) => driver.give(Input::Certified { ticket, hit }),
             Answer::Got(ticket, record) => driver.give(Input::Got { ticket, record: record.as_deref() }),
-            Answer::Verified(ticket, equal) => driver.give(Input::Verified { ticket, equal }),
+            Answer::Answers(ticket, now) => driver.give(Input::Answers { ticket, now: &now }),
+            Answer::Now(ticket, now) => driver.give(Input::Now { ticket, now: &now }),
             Answer::Keyed(ticket, manifest, surface, bodies) => {
                 self.in_flight -= 1;
                 let outcome = Ok(Done::Keyed { manifest, surface, bodies: &bodies });
@@ -466,7 +570,9 @@ impl Model {
                 driver.give(Input::Ran { ticket, outcome: Ok(Done::Wrote { record: &record }) });
             }
             Answer::Put(ticket, put) => driver.give(Input::Put { ticket, put: Ok(put) }),
-            Answer::Cert(ticket) => driver.give(Input::CertificateWritten { ticket, result: Ok(()) }),
+            Answer::Reads(ticket, world) => {
+                driver.give(Input::Reads { ticket, shape: SHAPE, then: &[world], now: &[world] });
+            }
         }
     }
 
@@ -475,10 +581,30 @@ impl Model {
         let fresh = self.fresh()?;
         self.register(&fresh)?;
         self.in_flight = 0;
-        let plans: Vec<UnitPlan<'_>> =
+        self.seen = Seen { unchanged: (0..3).map(|c| self.unchanged(c, &fresh)).collect(), ..Seen::default() };
+        let plans: Vec<UnitPlan<'static>> =
             (0..3).map(|c| UnitPlan { deps: DEPS[c], last: self.disk.last.get(c).copied() }).collect();
-        let mut driver = Driver::new(memo, Plan { units: &plans }, Config { workers: WORKERS }, Global)
-            .map_err(|error| format!("{error:?}"))?;
+        let outcome = proof::scope(|snap| self.drive(snap, memo, rng, kill, &fresh, &plans))?;
+        if let Some(outcome) = &outcome {
+            self.check_end(outcome, &fresh)?;
+            self.disk.last = fresh.iter().map(|unit| unit.manifest).collect();
+            self.last_own = (0..3).map(|c| self.own(c)).collect();
+            self.last_surfaces = fresh.iter().map(|unit| unit.surface).collect();
+        }
+        Ok(outcome)
+    }
+
+    fn drive<M: Memo>(
+        &mut self,
+        snap: Snapshot<'_>,
+        memo: &mut M,
+        rng: &mut SplitMix64,
+        kill: Option<u32>,
+        fresh: &[FreshUnit],
+        plans: &[UnitPlan<'_>],
+    ) -> Result<Option<Outcome>, String> {
+        let plan = Plan { certificate: certificate(), units: plans };
+        let mut driver = Driver::new(snap, memo, Local { workers: WORKERS }, plan, Global).map_err(|error| format!("{error:?}"))?;
         let mut queue: Vec<Answer> = Vec::new();
         let mut performed = 0u32;
         for _ in 0..20_000 {
@@ -499,13 +625,17 @@ impl Model {
                     if kill == Some(performed) {
                         return Ok(None);
                     }
-                    Act::Asked(self.perform(&effect, &fresh)?)
+                    Act::Asked(self.perform(&effect, fresh)?)
                 }
                 Step::Wait(_) => Act::Wait,
             };
             match act {
                 Act::Exit(outcome) => {
-                    self.check_end(&outcome, &fresh)?;
+                    if let Outcome::Certified { .. } = outcome
+                        && driver.certified().is_none()
+                    {
+                        return Err("a certified outcome with no certificate proof".into());
+                    }
                     return Ok(Some(outcome));
                 }
                 Act::Asked(answer) => queue.push(answer),
@@ -520,23 +650,30 @@ impl Model {
     }
 
     fn check_end(&self, outcome: &Outcome, fresh: &[FreshUnit]) -> Result<(), String> {
-        match outcome {
-            Outcome::Built { .. } | Outcome::Certified => {
-                if self.disk.cert != Some(self.world()) {
-                    return Err("an answer with no certificate of the tree".into());
-                }
-                for (c, unit) in fresh.iter().enumerate() {
-                    if self.disk.last.get(c) != Some(&unit.manifest) {
-                        return Err(format!("unit {c}'s filed manifest is not a fresh build's"));
-                    }
-                    if !self.disk.records.contains_key(&(UnitManifest::TAG.0, unit.manifest.id().0)) {
-                        return Err(format!("unit {c}'s manifest is not in the store"));
-                    }
-                }
-                Ok(())
-            }
-            other => Err(format!("the request ended {other:?}")),
+        let checks: Checks = match outcome {
+            Outcome::Built { ran } => ran.checks,
+            Outcome::Certified { checks } => *checks,
+            other => return Err(format!("the request ended {other:?}")),
+        };
+        if checks.rechecks != 0 {
+            return Err(format!("{} checks of an item already proved in this snapshot", checks.rechecks));
         }
+        let address = outside::address(certificate(), SHAPE, &[self.world()]);
+        let Some(bytes) = self.disk.records.get(&(Certificate::TAG.0, address.id().0)) else {
+            return Err("an answer with no certificate of the tree".into());
+        };
+        let root = record::open::<Certificate>(bytes, &address).map_err(|e| e.to_string())?;
+        let payload = root.payload.follow(bytes).map_err(|e| e.to_string())?;
+        let manifests: Vec<u8> = fresh.iter().flat_map(|unit| unit.manifest.id().0).collect();
+        if payload != &manifests[..] {
+            return Err("the certificate names other manifests than a fresh build's".into());
+        }
+        for (c, unit) in fresh.iter().enumerate() {
+            if !self.disk.records.contains_key(&(UnitManifest::TAG.0, unit.manifest.id().0)) {
+                return Err(format!("unit {c}'s manifest is not in the store"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -556,7 +693,7 @@ fn run<M: Memo>(ops: &[Op], seed: u64, plant: Plant, kills: bool, make: impl Fn(
                     let kill = kill.filter(|_| kills);
                     match model.request(&mut memo, &mut rng, kill)? {
                         Some(outcome) => {
-                            if last_built && outcome != Outcome::Certified {
+                            if last_built && !matches!(outcome, Outcome::Certified { .. }) {
                                 return Err(format!("a request with no edit after an answer ended {outcome:?}"));
                             }
                             last_built = true;
@@ -601,9 +738,9 @@ fn op(tc: &hegel::TestCase) -> Op {
 const CAP: u64 = 1 << 20;
 
 /// The invariant: under `RecordsOnly`, for any edits, restarts and kills in any order of the
-/// host's answers, every hit and every reuse is what a fresh build files, no task runs for a
-/// record the store holds, at most `max(workers, 1)` run, and a request after an answer with no
-/// edit is certified.
+/// host's answers, every hit and every reuse is what a fresh build files, every check is made
+/// once per request and none after a proof, no task runs for a record the store holds, at most
+/// `max(workers, 1)` run, and a request after an answer with no edit is certified.
 #[hegel::test(test_cases = 200)]
 fn a_hit_is_only_what_a_fresh_build_files(tc: hegel::TestCase) {
     let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
@@ -636,8 +773,9 @@ fn refines(ops: &[Op], seed: u64, plant: Plant) -> Result<(), String> {
     Ok(())
 }
 
-/// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes, the
-/// same tasks run and the same records written, for any edits and restarts.
+/// The refinement: `Resident` is observationally equal to `RecordsOnly`: the same outcomes (the
+/// check counters included), the same tasks run and the same records written, for any edits and
+/// restarts.
 #[hegel::test(test_cases = 200)]
 fn resident_refines_records_only(tc: hegel::TestCase) {
     let ops: Vec<Op> = tc.draw(gs::vecs(op()).max_size(30));
@@ -709,6 +847,29 @@ fn the_oracle_catches_a_stale_resident_entry() {
     caught(&ops, Plant::StaleResident, "", refines);
 }
 
+/// Body 1 of unit 2 is edited away and back while body 0 moves: its key hits the record of the
+/// first request while the last manifest names another; the planted driver still fetches and
+/// verifies that one.
+#[test]
+fn the_oracle_catches_a_check_after_a_hit() {
+    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), Op::Body(2, 0, 1), REQUEST];
+    caught(&ops, Plant::ChecksAfterHit, "a check after a hit", plain);
+}
+
+#[test]
+fn the_oracle_catches_a_lookup_under_a_held_manifest() {
+    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST];
+    caught(&ops, Plant::LooksUpUnderHeldManifest, "a lookup under a held manifest", plain);
+}
+
+/// A private body edit in unit 0 leaves its surface equal; keyed by unit 0's manifest, its
+/// dependents' manifests move and their records are examined.
+#[test]
+fn the_oracle_catches_a_dependent_examined_under_an_unchanged_surface() {
+    let ops = [REQUEST, Op::Body(0, 1, 5), REQUEST];
+    caught(&ops, Plant::UnitKeyedByDepManifests, "a dependent of an unchanged surface was examined", plain);
+}
+
 fn ran_of(ops: &[Op]) -> Ran {
     let (outcomes, _) = run(ops, 7, Plant::None, false, || RecordsOnly).unwrap();
     match outcomes.last() {
@@ -720,9 +881,17 @@ fn ran_of(ops: &[Op]) -> Ran {
 #[test]
 fn a_no_op_runs_no_task() {
     let (outcomes, _) = run(&[REQUEST, REQUEST], 1, Plant::None, false, || RecordsOnly).unwrap();
-    assert_eq!(outcomes.last(), Some(&Outcome::Certified));
+    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
     let (outcomes, _) = run(&[REQUEST, Op::Restart, REQUEST], 1, Plant::None, false, || RecordsOnly).unwrap();
-    assert_eq!(outcomes.last(), Some(&Outcome::Certified));
+    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
+}
+
+/// An edit undone finds its old certificate at the old address: certified, nothing run.
+#[test]
+fn an_undone_edit_is_certified() {
+    let ops = [REQUEST, Op::Body(2, 1, 5), REQUEST, Op::Body(2, 1, 0), REQUEST];
+    let (outcomes, _) = run(&ops, 3, Plant::None, false, || RecordsOnly).unwrap();
+    assert!(matches!(outcomes.last(), Some(Outcome::Certified { .. })), "{outcomes:?}");
 }
 
 /// A private body edit redoes that body alone: no surface, nothing reused, no other body.
@@ -732,6 +901,20 @@ fn a_private_body_edit_redoes_one_body() {
     assert_eq!((ran.bodies, ran.surfaces, ran.reused), (1, 0, 0), "{ran:?}");
 }
 
+/// A private body edit in the bottom unit examines no dependent: the certificate's shape, its
+/// address and the next empty slot (3 lookups); unit 0's manifest, its last manifest, its four
+/// records and the edited body's old record (7); one manifest hit for each dependent (2). One
+/// read list per stage: the certificate's answers, the edited body's (which differs at its first
+/// fact), the request's settle.
+#[test]
+fn a_private_body_edit_below_examines_no_dependent() {
+    let ran = ran_of(&[REQUEST, Op::Body(0, 1, 5), REQUEST]);
+    assert_eq!((ran.bodies, ran.surfaces, ran.manifests), (1, 0, 1), "{ran:?}");
+    let checks = ran.checks;
+    assert_eq!((checks.key_lookups, checks.read_lists, checks.facts_compared), (12, 3, 3), "{ran:?}");
+    assert_eq!((checks.records_run, checks.rechecks), (1, 0), "{ran:?}");
+}
+
 /// A parameter rename of an inline fn moves its callers' keys, and their read lists, which read
 /// only its signature, file the old results under the new keys.
 #[test]
@@ -739,6 +922,33 @@ fn a_parameter_rename_reuses_its_callers() {
     let ran = ran_of(&[REQUEST, Op::Param(0, 0, 3), REQUEST]);
     assert_eq!(ran.bodies, 1, "{ran:?}");
     assert!(ran.reused >= 3, "{ran:?}");
+}
+
+/// The outside form: a changed answer is a new address, the old one's value stays filed, and a
+/// filing after a miss reads no slot the lookup read.
+#[test]
+fn an_outside_value_moves_with_its_answers() {
+    proof::scope(|snap| {
+        let key = certificate();
+        let mut checks = Checks::default();
+        let mut lookup = outside::Lookup::new(snap, key);
+        assert!(matches!(lookup.want(), outside::Want::ReadShape(at) if at == outside::shape_slot(key, 0)));
+        assert_eq!(lookup.shape(None, &mut checks), Ok(None));
+        assert!(matches!(lookup.found(), Some(outside::Found::Miss)));
+        let then = [ContentId([7; 32])];
+        let settled = outside::settle(key, SHAPE, &then, &then, &mut checks).unwrap();
+        let filer = lookup.filer(settled, SHAPE).unwrap();
+        assert!(matches!(filer.want(), outside::Want::PutShape(at) if at == outside::shape_slot(key, 0)));
+        let moved = outside::address(key, SHAPE, &[ContentId([8; 32])]);
+        assert_ne!(moved, settled.address);
+        let raced = outside::settle(key, SHAPE, &then, &[ContentId([8; 32])], &mut checks);
+        assert!(matches!(raced, Err(outside::Raced { at: 0 })));
+    });
+}
+
+fn first_closure(identity: ContentId, nodes: &[Node<'_>]) -> ContentId {
+    let graph = Graph::build(&[CrateNodes { identity, nodes, deps: &[] }], Global).unwrap();
+    graph.closure(0, 0).unwrap()
 }
 
 /// The invariant: a name that appears under a body's reach moves the body's key.
@@ -751,10 +961,7 @@ fn an_added_name_moves_the_key() {
     let other = Node { piece: b"fn b", names: &[], keys: &b, always: false, coarse: false };
     let alone = [user];
     let both = [user, other];
-    let graph = |nodes: &[Node<'_>]| {
-        Graph::build(&[CrateNodes { identity, nodes, deps: &[] }], Global).unwrap().closure(0, 0).unwrap()
-    };
-    assert_ne!(graph(&alone), graph(&both));
+    assert_ne!(first_closure(identity, &alone), first_closure(identity, &both));
 }
 
 /// The invariant: the members of a cycle share one closure, and an edit to either moves both.

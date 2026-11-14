@@ -380,6 +380,49 @@ fn serving_a_signature_parses_nothing() {
     assert_eq!(parsed, Vec::<&String>::new(), "{executed:?}");
 }
 
+/// What a witnessed run of `read` read below `Durability::HIGH`, each read with its cause
+/// (`Witness::cause_text`), and whether the witness could name every read.
+fn below_high(db: &TestDB, read: impl FnOnce()) -> (Vec<String>, bool) {
+    let mut reads = Vec::new(); // alloc: a test's keys
+    let ((), witness) = blaze_query::db::witnessed(db, &mut reads, read);
+    let named = reads.iter().map(|&key| blaze_query::db::Witness::cause_text(db, key)).collect();
+    (named, witness.complete)
+}
+
+/// The invariant: a sealed crate's trait signature, served from its image (`served_trait`,
+/// through `TraitSignature::served`), reads nothing below `Durability::HIGH`, in a crate with a
+/// `#[path]` module and an `include!`d file: so a sealed crate's summary that reads it is shared
+/// (`hir_ty_pure`'s sealed table), not a row. The control: the signature of the workspace
+/// crate's `main`, whose file is at `LOW`, is a read below `HIGH` the witness names.
+#[test]
+fn a_sealed_trait_s_served_signature_reads_nothing_below_high() {
+    let _turn = turn();
+    let memory = stored(FIXTURE);
+    let db = served_db(FIXTURE, &memory, Mode::Serve);
+    let lib = crate_named(&db, "lib");
+    let traits: Vec<TraitId> = (declared(&db, lib).into_iter())
+        .filter_map(|it| match it {
+            Item::Trait(it) => Some(it),
+            _ => None,
+        })
+        .collect();
+    assert!(!traits.is_empty(), "the fixture declares `Shape`");
+    for trait_id in traits {
+        assert!(served_trait(&db, trait_id).is_some(), "`lib`'s trait is served from its image");
+        let (reads, complete) = below_high(&db, || _ = TraitSignature::of(&db, trait_id));
+        assert_eq!((reads, complete), (Vec::new(), true), "below `HIGH` in `{trait_id:?}`'s signature");
+    }
+
+    let main = (declared(&db, crate_named(&db, "main")).into_iter())
+        .find_map(|it| match it {
+            Item::Function(it) => Some(it),
+            _ => None,
+        })
+        .expect("the fixture's `main`");
+    let (reads, _) = below_high(&db, || _ = FunctionSignature::of(&db, main));
+    assert!(!reads.is_empty(), "the control: a workspace signature reads its `LOW` file");
+}
+
 #[test]
 fn finding_a_record_allocates_nothing() {
     let _turn = turn();

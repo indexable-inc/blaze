@@ -97,6 +97,7 @@ mod implicit_overflow;
 mod lossy_as;
 #[cfg(test)]
 mod implicit_overflow_tests;
+mod magic;
 mod many_bools;
 mod missing_size_hint;
 mod mut_ref;
@@ -150,6 +151,7 @@ mod std_use;
 mod std_use_tests;
 mod stdout_lock_in_loop;
 mod string_key;
+mod suspicious;
 mod struct_update;
 mod syscall_in_loop;
 mod test_code;
@@ -360,6 +362,28 @@ pub enum Lint {
     ProcessExit,
     PrintInLib,
     LockUnwrap,
+    // The suspicious-code lints (`suspicious`): what compiles and reads as right but leaves
+    // something implicit that the next reader reconstructs wrong.
+    SkippedPair,
+    HalfDone,
+    HiddenExit,
+    QuestionMarkConverts,
+    OptionQuestionMarkHides,
+    UnseenTarget,
+    GlobImport,
+    ShadowChangesMeaning,
+    VersionedName,
+    UnusedParameter,
+    Fallback,
+    PlaceholderBody,
+    TestAssertsNothing,
+    AssertionCannotFail,
+    TestMissesItsSubject,
+    IgnoredWithoutReason,
+    DocNamesNothing,
+    // The magic literals (`magic`): a number or a name stated in place of its one home.
+    MagicNumber,
+    MagicString,
 }
 
 /// Which workspaces a lint is for.
@@ -672,6 +696,25 @@ impl Lint {
         Lint::ProcessExit,
         Lint::PrintInLib,
         Lint::LockUnwrap,
+        Lint::SkippedPair,
+        Lint::HalfDone,
+        Lint::HiddenExit,
+        Lint::QuestionMarkConverts,
+        Lint::OptionQuestionMarkHides,
+        Lint::UnseenTarget,
+        Lint::GlobImport,
+        Lint::ShadowChangesMeaning,
+        Lint::VersionedName,
+        Lint::UnusedParameter,
+        Lint::Fallback,
+        Lint::PlaceholderBody,
+        Lint::TestAssertsNothing,
+        Lint::AssertionCannotFail,
+        Lint::TestMissesItsSubject,
+        Lint::IgnoredWithoutReason,
+        Lint::DocNamesNothing,
+        Lint::MagicNumber,
+        Lint::MagicString,
     ];
 
     /// Which workspaces the lint is for ([`Kind`]); written out per lint, so a new one chooses.
@@ -869,7 +912,26 @@ impl Lint {
             | Lint::RefcellBorrowAcrossCall
             | Lint::ProcessExit
             | Lint::PrintInLib
-            | Lint::LockUnwrap => Kind::Internal,
+            | Lint::LockUnwrap
+            | Lint::SkippedPair
+            | Lint::HalfDone
+            | Lint::HiddenExit
+            | Lint::QuestionMarkConverts
+            | Lint::OptionQuestionMarkHides
+            | Lint::UnseenTarget
+            | Lint::GlobImport
+            | Lint::ShadowChangesMeaning
+            | Lint::VersionedName
+            | Lint::UnusedParameter
+            | Lint::Fallback
+            | Lint::PlaceholderBody
+            | Lint::TestAssertsNothing
+            | Lint::AssertionCannotFail
+            | Lint::TestMissesItsSubject
+            | Lint::IgnoredWithoutReason
+            | Lint::DocNamesNothing
+            | Lint::MagicNumber
+            | Lint::MagicString => Kind::Internal,
             // docs/v2/plan/design/facts.md: the check of `#[blaze::program_lifetime]` and the
             // two lints that say where the attribute and `Ref32` would pay.
             Lint::ProgramLifetime | Lint::CouldBeProgramLifetime | Lint::CouldBeRef32 => {
@@ -1047,6 +1109,25 @@ impl Lint {
             Lint::ProcessExit => "process_exit",
             Lint::PrintInLib => "print_in_lib",
             Lint::LockUnwrap => "lock_unwrap",
+            Lint::SkippedPair => "skipped_pair",
+            Lint::HalfDone => "half_done",
+            Lint::HiddenExit => "hidden_exit",
+            Lint::QuestionMarkConverts => "question_mark_converts",
+            Lint::OptionQuestionMarkHides => "option_question_mark_hides",
+            Lint::UnseenTarget => "unseen_target",
+            Lint::GlobImport => "glob_import",
+            Lint::ShadowChangesMeaning => "shadow_changes_meaning",
+            Lint::VersionedName => "versioned_name",
+            Lint::UnusedParameter => "unused_parameter",
+            Lint::Fallback => "fallback",
+            Lint::PlaceholderBody => "placeholder_body",
+            Lint::TestAssertsNothing => "test_asserts_nothing",
+            Lint::AssertionCannotFail => "assertion_cannot_fail",
+            Lint::TestMissesItsSubject => "test_misses_its_subject",
+            Lint::IgnoredWithoutReason => "ignored_without_reason",
+            Lint::DocNamesNothing => "doc_names_nothing",
+            Lint::MagicNumber => "magic_number",
+            Lint::MagicString => "magic_string",
         }
     }
 
@@ -1199,6 +1280,25 @@ impl Lint {
             Lint::ProcessExit => concat!(docs!(), "#process_exit"),
             Lint::PrintInLib => concat!(docs!(), "#print_in_lib"),
             Lint::LockUnwrap => concat!(docs!(), "#lock_unwrap"),
+            Lint::SkippedPair => concat!(docs!(), "#skipped_pair"),
+            Lint::HalfDone => concat!(docs!(), "#half_done"),
+            Lint::HiddenExit => concat!(docs!(), "#hidden_exit"),
+            Lint::QuestionMarkConverts => concat!(docs!(), "#question_mark_converts"),
+            Lint::OptionQuestionMarkHides => concat!(docs!(), "#option_question_mark_hides"),
+            Lint::UnseenTarget => concat!(docs!(), "#unseen_target"),
+            Lint::GlobImport => concat!(docs!(), "#glob_import"),
+            Lint::ShadowChangesMeaning => concat!(docs!(), "#shadow_changes_meaning"),
+            Lint::VersionedName => concat!(docs!(), "#versioned_name"),
+            Lint::UnusedParameter => concat!(docs!(), "#unused_parameter"),
+            Lint::Fallback => concat!(docs!(), "#fallback"),
+            Lint::PlaceholderBody => concat!(docs!(), "#placeholder_body"),
+            Lint::TestAssertsNothing => concat!(docs!(), "#test_asserts_nothing"),
+            Lint::AssertionCannotFail => concat!(docs!(), "#assertion_cannot_fail"),
+            Lint::TestMissesItsSubject => concat!(docs!(), "#test_misses_its_subject"),
+            Lint::IgnoredWithoutReason => concat!(docs!(), "#ignored_without_reason"),
+            Lint::DocNamesNothing => concat!(docs!(), "#doc_names_nothing"),
+            Lint::MagicNumber => concat!(docs!(), "#magic_number"),
+            Lint::MagicString => concat!(docs!(), "#magic_string"),
             Lint::LoopTurnEffects | Lint::SyncOnAnswerPath => {
                 concat!(general_docs!(), "#loop_turn_effects-sync_on_answer_path")
             }
@@ -1377,6 +1477,63 @@ impl Lint {
             }
             Lint::LockUnwrap => {
                 "use a lock that does not poison (`parking_lot::Mutex`, `blaze_core::lock::Lock`), or handle the `PoisonError`: `into_inner` where the data is still whole after a panic, a typed error naming the lock where it is not"
+            }
+            Lint::SkippedPair => {
+                "make the second half the drop of a guard the first returns, or a `#[blaze::linear]` value that must be ended; then no exit can skip it"
+            }
+            Lint::HalfDone => {
+                "compute the new state first and commit it in one step after the last fallible call, or change a copy and swap it in"
+            }
+            Lint::HiddenExit => {
+                "make the exit visible at the call: have the macro produce a value (a `Result`, an `Option`, a `ControlFlow`) and write the `?`, `return` or `break` beside the call"
+            }
+            Lint::QuestionMarkConverts => {
+                "convert at the `?` with what the error is about: `.map_err(|source| Error::Variant { path, source })?`, a variant that carries the subject"
+            }
+            Lint::OptionQuestionMarkHides => {
+                "return a `Result` whose error names the key or text that was missing or did not parse; keep `Option` for an answer whose absence is normal"
+            }
+            Lint::UnseenTarget => {
+                "write the target where the conversion is: `.parse::<u32>()`, `.collect::<Vec<_>>()`, `let n: u64 = ...`"
+            }
+            Lint::GlobImport => {
+                "import each name the scope uses (`use a::{B, C};`); a trait used for its methods only is `Trait as _`"
+            }
+            Lint::ShadowChangesMeaning => {
+                "give each value its own name, or end the first one's scope with a block"
+            }
+            Lint::VersionedName => {
+                "keep one item under the plain name and move every caller to it (`.clippy.toml` ban, `blaze check --replace`); or name each for what it does differently"
+            }
+            Lint::UnusedParameter => {
+                "read the parameter again where the body lost its use, or remove it with its argument at every call; a signature fixed for a reason says it in an `#[expect(.., reason)]`"
+            }
+            Lint::Fallback => {
+                "return the error (with `?` and what it was about), or match the one error that has another route and say why it has one"
+            }
+            Lint::PlaceholderBody => {
+                "do what the signature and doc promise, or make the stub loud (`todo!()`, a typed `Unsupported` error naming the item); delete an override that repeats the trait's default"
+            }
+            Lint::TestAssertsNothing => {
+                "assert the result the test is for (`assert_eq!` against the expected value), or let it fail through `?` or `unwrap` where running without a panic is the claim"
+            }
+            Lint::AssertionCannotFail => {
+                "compare the value under test with an expected value computed another way; delete an assertion that cannot fail"
+            }
+            Lint::TestMissesItsSubject => {
+                "call the crate's code the test is named for; a test of a helper or of std belongs beside that code, or nowhere"
+            }
+            Lint::IgnoredWithoutReason => {
+                "say why and until when: `#[ignore = \"needs a network; runs in the nightly job\"]`"
+            }
+            Lint::DocNamesNothing => {
+                "write the path of an item that exists (`[`crate::store::Store`]`), or plain words for what is not an item"
+            }
+            Lint::MagicNumber => {
+                "derive the number from what it depends on (an array's `len()`, an enum's variant count, `size_of`, another `const`), or name it: a `const` whose doc comment says why that value, used everywhere the fact is used"
+            }
+            Lint::MagicString => {
+                "give the name one home: an enum where the set of names is closed, else a `const` (or a field of the typed settings) used everywhere the name is"
             }
             Lint::SpanFieldUnrecorded => {
                 "name the field for the column it fills (`function` for what the span is of, `awaits` for what it waits for), say it in the span's name, write it as an event inside the span (every field of an event is a row of `event_fields`), or make the span a kind with typed fields in `blaze_profile::span`"
@@ -1811,7 +1968,9 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     retry::check(cx, node);
     narrowed_len::check(cx, node);
     std_mistakes::check_node(cx, node);
+    suspicious::check_node(cx, node);
     if node == cx.root() && cx.in_file() {
+        suspicious::check_body(cx);
         error_debug::check(cx);
         dropped_error::check(cx);
         hash_order_output::check(cx);
@@ -1840,6 +1999,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         syscall_in_loop::check(cx);
         query_in_loop::check(cx);
         string_key::check(cx);
+        magic::check(cx);
         outline_generic_body::check(cx);
         cold_error::check(cx);
         small_map::check(cx);

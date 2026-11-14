@@ -1,0 +1,40 @@
+[package]
+name = "blaze-remote"
+description = "The shared cache: everything CI builds pushed to an object bucket (Cloudflare R2, S3-compatible) as the plain store's segments, signed and indexed, and pulled by anyone, anonymously for the public namespace; bundles of std and blaze-std per toolchain; the remote-execution action protocol. Sans-IO push and pull machines with a thin HTTP driver"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The plain store: its segment is the wire format; its `Source` and `Verifier` are the seam.
+blaze-cas.workspace = true
+# The core's vocabulary: `Origin`, `namespace_of` (privacy), `RecordRef` (actions).
+blaze-keyed.workspace = true
+# `ContentId` (BLAKE3 digests), CRC-32C.
+blaze-ids.workspace = true
+# Hex.
+blaze-format.workspace = true
+# Ed25519 (statements, roots, key lists), SHA-256 and HMAC (SigV4).
+ring.workspace = true
+# The HTTP driver: blaze-http's sans-IO client on its tokio driver.
+blaze-http = { workspace = true, features = ["tokio"] }
+http.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+# Settings and the commands' typed input.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+blaze-rng.workspace = true
+hegeltest.workspace = true
+
+[lints]
+workspace = true

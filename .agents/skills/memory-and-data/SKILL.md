@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -27,6 +27,23 @@ form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs
 shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
+
+## deterministic-output (rule 25)
+
+Nothing of the machine is in what is kept or shared: no absolute path, host name, user, time,
+address or thread order in a key, a record or an output. Two builders of one key, on any machine,
+produce byte-identical values: that is what lets a record be fetched from the shared cache instead
+of made, so it is a protocol requirement, and the CI push refuses a key whose bytes differ from the
+bucket's. How: make a path relative to its root (the workspace, the toolchain, the registry archive)
+before it enters a key; fill a time or an absolute position in only when printed; order by
+construction, never by arrival. No output (an object, a diagnostic's order, a store key, a profile
+row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
+Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths, literals),
+which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and nothing output
+depends on where a key lands, or `blaze_ids::index_key` of its content when an image lays it out; a
+hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run
+no honest keys make, then a random `SipKey` for good. Anything iterated into output is sorted or
+ordered by construction; a test builds twice and compares bytes.
 
 ## one-memory-measure (rule 50)
 
@@ -83,16 +100,58 @@ See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
 A command (`blaze build`, `run`, `check`, `test`) is one process: it checks the certificate, does
 the work on a pool bounded by cores, writes records and exits. Nothing is kept between requests that
-is not a record (`outputs-are-records`). `watch` and live runs (`run --live`) are the same binary
-staying alive: what they hold in memory (mapped pages, the edited crates' tables, interners and
-dense ids) is only what a restart could rebuild from records, so killing one loses nothing.
+is not a record (`outputs-are-records`). There is no `blaze watch` and nothing builds on save: an
+edit is often one of several that belong together (a transaction, as an agent makes them) and the
+states between are invalid, so a build happens only when asked. A build may leave a helper process
+behind when that makes the next build faster: it has an expiry, never builds on its own, and holds
+only what a fresh process could rebuild from records (mapped pages, the edited crates' tables,
+interners and dense ids), so killing it loses nothing. Live patching that keeps a running program's
+state is wanted later, not now: an edit patches the program's file and the program runs again.
 Interners and dense ids live for the process, a task's scratch for the task (`bump-allocate`).
 Today's daemon breaks this: its query graph kept across requests, its warm tables, process statics
 and images are to be deleted by the target design. Do not add state to it or anything like it: a
 cache, a warm table, a memo kept for the next request, or a decision that depends on what an earlier
-request left in memory is written as a record instead, or kept inside `watch` as a copy a restart
-rebuilds. The test: kill the process between any two requests, and the next answer equals the
-uninterrupted one byte for byte (`persisted-state-round-trips`).
+request left in memory is written as a record instead, or kept in the helper as a copy a fresh
+process rebuilds. The test: kill the process between any two requests, and the next answer equals
+the uninterrupted one byte for byte (`persisted-state-round-trips`).
+
+## verify-once (rule 74)
+
+Every check has one place where it happens and a value that proves it happened; code that needs the
+checked thing takes the proof, so checking twice cannot be written and skipping the check cannot
+either. (1) A proof is a type only its checker can make (`Verified<Segment>`, `Certified`,
+`Holds<K>`), branded with what it is valid for (the snapshot, the boot, the generation) so it cannot
+outlive it. Checking consumes the unchecked value and returns the proof; there is no way to ask for
+a check of something already proved. (2) A proof at a coarse level is the proof for everything under
+it: a certified request checks nothing below it; an unchanged crate surface means no dependent is
+looked at; a unit manifest that holds settles every body it names without a lookup each; only under
+a parent that moved is the next level compared. (3) An equal key is followed by no other check
+(`keys-cover-every-input` is what makes that sound). A read list is verified at most once per item
+and snapshot, and its result is filed under the new key so the next request hits by key. (4) Bytes
+are verified once per boot or fetch, never on each read: a segment this process wrote is trusted; a
+segment from an earlier boot is checked in full once and the result recorded in the manifest; a
+fetched segment's signature and digest are checked once at fetch and recorded; a read of a record in
+a verified segment checks nothing. (5) A file is hashed again only when its stat stamp moved (the
+racy-stamp rule decides the edge case); with a watcher journal, only the paths the journal names are
+looked at. (6) A put of bytes the store already holds writes nothing, and nothing syncs on the edit
+path. The counters that show it are checks per kind per request; a second check of one thing in one
+snapshot is a bug the simulation's oracle catches. This is `type-then-lint-then-rule` applied to
+verification: the type makes the second check impossible to write.
+
+See [docs/v2/plan/design/target.md](../../../docs/v2/plan/design/target.md).
+
+## work-once (rule 77)
+
+Work is done once, or not at all. Never compute at request time what a key computed before the work
+can skip (`granular-caching`): an equal key is a hit, with no other check. Never verify twice
+(`verify-once`): a check returns a proof and later code takes it, and a proof or an unchanged parent
+covers everything under it. Never rebuild what a record already holds (`outputs-are-records`): a
+result is filed once and read in place. Never hold in memory what a fresh process could rebuild from
+records (`no-state-between-requests`), and never write what the store already holds: an identical
+put writes nothing. How: for each step on a hot path, ask what makes it necessary on this request;
+if the answer is "it might have changed", find the key, stamp or proof that says whether it did and
+skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
+in one snapshot is an invariant the simulation's oracle checks.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

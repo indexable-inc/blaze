@@ -51,7 +51,54 @@ impl Witness {
         drop(barrier);
         text
     }
+
+    /// The chain of reads that put `key`, a key [`witnessed`] gave, below `Durability::HIGH`:
+    /// from `key`'s row its first edge below `HIGH`, from that one's row the same, down to an
+    /// input or tracked field (or a row that read nothing below `HIGH`, low for an untracked
+    /// read), each as [`Witness::read_text`] names it, joined by ` < `: what a span names as the
+    /// read's cause, so a profile says which input made a run low, not only which row it read.
+    /// At most 64 reads are followed (`CAUSE_DEPTH`); a longer chain ends in `< ...`. Written
+    /// under a barrier, as [`Witness::read_text`].
+    pub fn cause_text<D: Database>(db: &D, key: u64) -> String {
+        let storage = db.storage();
+        let barrier = local::barrier();
+        let mut text = super::node_text(storage, key);
+        let mut edges = Vec::new(); // alloc: one row's edges at a time, once a span's cause
+        let mut at = key;
+        for depth in 0.. {
+            let (index, id, _) = super::storage::key_parts(at);
+            // A field's key ends the chain: it is the input read.
+            let row = super::ingredient::vtable(index)
+                .is_some_and(|it| it.kind == super::ingredient::Kind::Function);
+            if !row {
+                break;
+            }
+            let Some(header) = super::function::header_of(storage, index, id) else { break };
+            storage.copy_edges(header.edges.load(std::sync::atomic::Ordering::Acquire), &mut edges);
+            let Some(low) = edges.iter().copied().find(|&node| {
+                durability_of(storage, node).is_some_and(|it| it < super::Durability::HIGH.0)
+            }) else {
+                break;
+            };
+            if depth == CAUSE_DEPTH {
+                text.push_str(" < ...");
+                break;
+            }
+            at = storage.key_of(low);
+            if at == 0 {
+                text.push_str(" < a node with no key");
+                break;
+            }
+            text.push_str(" < ");
+            text.push_str(&super::node_text(storage, at));
+        }
+        drop(barrier);
+        text
+    }
 }
+
+/// How many reads [`Witness::cause_text`] follows below the key it is given.
+const CAUSE_DEPTH: usize = 64;
 
 /// What a witness frame is named in a runaway or an error.
 const WITNESSED: &str = "a witnessed run";

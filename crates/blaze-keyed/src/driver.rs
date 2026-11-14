@@ -1,14 +1,24 @@
 //! The driver of one request: a sans-IO state machine. Its host performs each [`Effect`] (asks
-//! the store, runs a task on the pool, checks a read list against the current surfaces) and
+//! the store, runs a task on the pool, answers a read list or a shape against the facts now) and
 //! gives back the answer as an [`Input`], in any order.
 //!
-//! One request: check the certificate; on a hit, exit. On a miss, per unit in dependency order:
-//! key it (a task: file images, the text graph, every key, before any work); ask for its manifest
-//! by key, a hit meaning the whole unit is filed; else ask for each record (its surface, each
-//! body) by key; on a miss of a [`Trace::Reuse`](crate::kind::Trace::Reuse) record, ask for the
-//! record the last manifest names for the same item and check its read list: equal, and it is
-//! filed under the new key byte for byte; else the task runs. Each unit's manifest is filed
-//! after every record it names; the certificate after every manifest; then exit.
+//! One request, in one [`Snapshot`], every check made once and kept as its proof (decision 18):
+//!
+//! - The certificate, an outside record ([`crate::outside`]): per shape filed under the
+//!   request's base, the host answers its asks now, and a value at the address they make is
+//!   [`Certified`]: the request is answered and nothing below is checked.
+//! - Else, per unit in dependency order: key it (a task: file images, the text graph, every
+//!   key, before any work); ask for its manifest by key. A hit is a `Holds<UnitManifest>`, which
+//!   settles every record it names with no lookup each. A dependency whose surface is unchanged
+//!   leaves its dependents' manifest keys equal (they cover dependencies' surfaces only), so
+//!   none of their records is examined.
+//! - Else per record (its surface, each body) by key: a hit is a `Holds`, and nothing else is
+//!   asked for that item. On a miss of a [`Trace::Reuse`](crate::kind::Trace::Reuse) record,
+//!   the record the last manifest names for the same item is a candidate, and its read list is
+//!   checked once: equal, and it is filed under the new key byte for byte (so the next request
+//!   hits by key); else the task runs.
+//! - Each unit's manifest is filed after every record it names; the certificate after every
+//!   manifest, at the address of what the request read; then exit.
 //!
 //! Code (instances, programs) is blaze-program's, on the same vocabulary: `check` makes none.
 
@@ -22,10 +32,13 @@ use blaze_ids::ContentId;
 
 use crate::{
     Plant,
-    kind::{Body, Key, Kind, Layout, Surface, Tag, UnitManifest},
+    exec::{Executor, LOCAL_TASKS},
+    kind::{Body, Certificate, Key, Kind, Layout, Surface, Tag, UnitManifest},
     memo::{Arena, Memo},
+    outside::{self, Filer, Found, Lookup, OutsideError, Want},
     planted,
     pool::Ticket,
+    proof::{self, AnyHolds, Candidate, Certified, Checks, Holds, Snapshot, Verdict},
     record::{self, Entry, Fact, RecordError, StableId, Traced},
     store::Put,
 };
@@ -41,13 +54,9 @@ pub struct UnitPlan<'p> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Plan<'p> {
+    /// The request's base: the key its certificate's shapes are filed under.
+    pub certificate: Key<Certificate>,
     pub units: &'p [UnitPlan<'p>],
-}
-
-/// From the machine descriptor: how many tasks may run at once; 0 is the main thread alone.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Config {
-    pub workers: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,39 +104,53 @@ pub struct StoreFault {
 /// The answer to an effect. Record bytes are 16-aligned.
 #[derive(Clone, Copy, Debug)]
 pub enum Input<'a> {
-    Certified { ticket: Ticket, hit: bool },
+    /// To [`Effect::Get`].
     Got { ticket: Ticket, record: Option<&'a [u8]> },
-    Verified { ticket: Ticket, equal: bool },
+    /// To [`Effect::Answer`]: the answer now of each ask of the shape, in its order.
+    Answers { ticket: Ticket, now: &'a [ContentId] },
+    /// To [`Effect::Verify`]: the digest now of each read's fact, in order (`None`: gone).
+    Now { ticket: Ticket, now: &'a [Option<ContentId>] },
     Ran { ticket: Ticket, outcome: Result<Done<'a>, TaskFailed> },
     Put { ticket: Ticket, put: Result<Put, StoreFault> },
-    CertificateWritten { ticket: Ticket, result: Result<(), StoreFault> },
+    /// To [`Effect::Reads`]: the request's outside reads, as a shape (the asks' bytes), their
+    /// answers when the request began, and their answers now.
+    Reads { ticket: Ticket, shape: &'a [u8], then: &'a [ContentId], now: &'a [ContentId] },
 }
 
 impl Input<'_> {
     fn ticket(&self) -> Ticket {
         match *self {
-            Input::Certified { ticket, .. }
-            | Input::Got { ticket, .. }
-            | Input::Verified { ticket, .. }
+            Input::Got { ticket, .. }
+            | Input::Answers { ticket, .. }
+            | Input::Now { ticket, .. }
             | Input::Ran { ticket, .. }
             | Input::Put { ticket, .. }
-            | Input::CertificateWritten { ticket, .. } => ticket,
+            | Input::Reads { ticket, .. } => ticket,
         }
     }
 }
 
+/// The unit of an effect about the request itself (its certificate).
+pub const NO_UNIT: u32 = u32::MAX;
+
 /// What the host is to do.
 #[derive(Clone, Copy, Debug)]
 pub enum Effect<'d> {
-    Certify { ticket: Ticket },
-    /// Read the record of `tag`, `key`: by pread for a flat one, mapped for a plain one.
-    Get { ticket: Ticket, tag: Tag, key: ContentId, layout: Layout },
-    /// Check each read against the current facts of unit `unit`'s universe: `equal` when every
-    /// digest is the current one (a read of the item's own text against its text now).
+    /// Read the record of `tag`, `key`, for `item` of `unit` ([`NO_UNIT`] and [`SURFACE_ITEM`]
+    /// for the certificate; [`SURFACE_ITEM`] for a unit's manifest): by pread for a flat one,
+    /// mapped for a plain one.
+    Get { ticket: Ticket, unit: u32, item: StableId, tag: Tag, key: ContentId, layout: Layout },
+    /// Answer each ask of `shape`, a shape filed under the outside record `key` of kind `tag`,
+    /// as it is now: [`Input::Answers`].
+    Answer { ticket: Ticket, tag: Tag, key: ContentId, shape: &'d [u8] },
+    /// Give the digest now of each read's fact in unit `unit`'s universe: [`Input::Now`].
     Verify { ticket: Ticket, unit: u32, item: StableId, reads: &'d [Fact] },
-    Run { ticket: Ticket, task: Task },
+    /// Run `task`: on the local pool, or, when `remote`, through the executor's
+    /// [`RemoteService`](crate::exec::RemoteService) as an action over its inputs.
+    Run { ticket: Ticket, task: Task, remote: bool },
     Put { ticket: Ticket, tag: Tag, key: ContentId, bytes: &'d [u8] },
-    WriteCertificate { ticket: Ticket, units: &'d [Key<UnitManifest>] },
+    /// Give the request's outside reads: [`Input::Reads`].
+    Reads { ticket: Ticket },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +170,7 @@ pub struct Ran {
     /// Records filed under a moved key because their read list verified.
     pub reused: u32,
     pub manifests: u32,
+    pub checks: Checks,
 }
 
 /// Asks, which differ by memo.
@@ -164,14 +188,19 @@ pub enum Failure {
     Store(StoreFault),
     /// A record that is not what its key says.
     Record { tag: Tag, key: ContentId, why: RecordError },
+    /// The certificate's lookup or filing.
+    Outside(OutsideError),
+    /// An outside read of the request moved while it ran (ask `at` of its shape): nothing is
+    /// certified; the next request builds against what is there then.
+    Raced { at: u32 },
     /// The host broke the protocol: an answer to no effect, or of the wrong form.
     Misused(&'static str),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The certificate held: nothing ran.
-    Certified,
+    /// The certificate held: nothing ran, and nothing below it was checked.
+    Certified { checks: Checks },
     Built { ran: Ran },
     Failed { ran: Ran, why: Failure },
     /// Nothing ready and nothing asked: a bug of the driver, said by name.
@@ -180,7 +209,12 @@ pub enum Outcome {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Work {
-    Certify,
+    CertShape,
+    CertAnswers,
+    CertValue,
+    Reads,
+    FileRead,
+    FilePut,
     Key(u32),
     Manifest(u32),
     Last(u32),
@@ -190,7 +224,6 @@ enum Work {
     Run(u32, u32),
     Put(u32, u32),
     PutManifest(u32),
-    Certificate,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,7 +242,7 @@ enum SlotState {
     Done,
 }
 
-struct Slot {
+struct Slot<'s> {
     tag: Tag,
     item: StableId,
     key: ContentId,
@@ -217,14 +250,25 @@ struct Slot {
     state: SlotState,
     /// An old record whose reads are being checked, or the bytes being put.
     held: Option<Aligned>,
+    /// The old record, as a candidate for the new key, until its one check.
+    candidate: Option<Candidate<'s>>,
+    /// The record's proof in this snapshot, once made.
+    proved: Option<AnyHolds<'s>>,
 }
 
-struct Unit<A: Allocator> {
+impl<'s> Slot<'s> {
+    fn open(tag: Tag, item: StableId, key: ContentId) -> Slot<'s> {
+        Slot { tag, item, key, old: None, state: SlotState::Open, held: None, candidate: None, proved: None }
+    }
+}
+
+struct Unit<'s, A: Allocator> {
     state: UnitState,
     waiting: u32,
     last: Option<Key<UnitManifest>>,
     manifest: Option<Key<UnitManifest>>,
-    slots: Vec<Slot, A>,
+    proof: Option<Holds<'s, UnitManifest>>,
+    slots: Vec<Slot<'s>, A>,
     open: u32,
     last_entries: Vec<Entry, A>,
     manifest_bytes: Option<Aligned>,
@@ -238,24 +282,38 @@ enum Phase {
     Done(Outcome),
 }
 
-/// The item a unit's surface is filed under in its manifest.
+/// The driver's placement rule, whatever the executor: a key task, and every task while fewer
+/// than [`LOCAL_TASKS`] are queued or running (the edit loop), run locally; a round trip costs
+/// more than the task. Only a cold fan-out goes remote, in batches.
+pub fn stays_local(task: &Task, queued: u32) -> bool {
+    matches!(task, Task::Key { .. }) || queued < LOCAL_TASKS
+}
+
+/// The item a unit's surface is filed under in its manifest; also the item of a unit's manifest
+/// and of the certificate in [`Effect::Get`].
 pub const SURFACE_ITEM: StableId = StableId(ContentId([0; 32]));
 
-/// The driver of one request, over memo `M`, allocating in the request's frame `A`.
+/// The driver of one request in snapshot `'s`, over memo `M` and executor `X`, allocating in the
+/// request's frame `A`.
 ///
 /// The invariants (tests.rs):
 /// - A hit is only what a from-scratch build would file under the key; a record reused under a
 ///   moved key is byte for byte what redoing it would write.
+/// - Each item is looked up at most once and its read list verified at most once in a snapshot;
+///   nothing is checked after a hit; nothing under a held manifest is looked up; no dependent of
+///   an unchanged surface is examined; `checks.rechecks` is zero.
 /// - No task runs for a record the store or the memo holds.
 /// - At most `max(workers, 1)` tasks run at once.
 /// - A manifest is filed after every record it names, the certificate after every manifest.
 /// - Every request ends in an [`Outcome`]: the host's loop is bounded by the effects asked.
-pub struct Driver<'m, M: Memo, A: Allocator + Clone> {
+pub struct Driver<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> {
+    snap: Snapshot<'s>,
     memo: &'m mut M,
+    executor: X,
     workers: u32,
     running: u32,
     phase: Phase,
-    units: Vec<Unit<A>, A>,
+    units: Vec<Unit<'s, A>, A>,
     dependents: Vec<Vec<u32, A>, A>,
     ready: VecDeque<Work, A>,
     runs: VecDeque<Work, A>,
@@ -267,36 +325,61 @@ pub struct Driver<'m, M: Memo, A: Allocator + Clone> {
     asks: Asks,
     ended: bool,
     alloc: A,
+    certificate: Key<Certificate>,
+    lookup: Lookup<'s, Certificate>,
+    certified: Option<Certified<'s>>,
+    filer: Option<Filer<Certificate>>,
+    /// The shape being answered, then the request's own shape being filed.
+    cert_shape: Option<Aligned>,
+    cert_shape_record: Option<Aligned>,
+    cert_value: Option<Aligned>,
 }
 
-fn check<K: Kind>(bytes: &[u8], key: ContentId) -> Result<(), RecordError> {
-    record::open::<K>(bytes, &Key::from_id(key)).map(|_| ())
-}
-
-fn check_tag(tag: Tag, bytes: &[u8], key: ContentId) -> Result<(), RecordError> {
+/// The one key check of a record the driver asks, by its tag.
+fn hit_any<'s>(snap: Snapshot<'s>, tag: Tag, key: ContentId, bytes: &[u8]) -> Result<AnyHolds<'s>, RecordError> {
     match tag {
-        t if t == Surface::TAG => check::<Surface>(bytes, key),
-        t if t == Body::TAG => check::<Body>(bytes, key),
-        _ => check::<UnitManifest>(bytes, key),
+        t if t == Surface::TAG => proof::hit::<Surface>(snap, Key::from_id(key), bytes).map(|hit| hit.holds().into()),
+        t if t == Body::TAG => proof::hit::<Body>(snap, Key::from_id(key), bytes).map(|hit| hit.holds().into()),
+        found => Err(RecordError::Kind { found, wanted: Body::TAG }),
     }
 }
 
-/// The memo's answer for a record the driver asks, checked against its key. A branch on what is
-/// asked, never on the policy.
-fn memo_check<M: Memo>(memo: &M, tag: Tag, arena: Arena, key: ContentId) -> Option<Result<(), RecordError>> {
+fn candidate_any<'s>(snap: Snapshot<'s>, tag: Tag, new: ContentId, old: ContentId, bytes: &[u8]) -> Result<Candidate<'s>, RecordError> {
     match tag {
-        t if t == Surface::TAG => memo.get::<Surface>(arena, &Key::from_id(key)).map(|b| check::<Surface>(b, key)),
-        t if t == Body::TAG => memo.get::<Body>(arena, &Key::from_id(key)).map(|b| check::<Body>(b, key)),
-        _ => memo.get::<UnitManifest>(arena, &Key::from_id(key)).map(|b| check::<UnitManifest>(b, key)),
+        t if t == Surface::TAG => proof::candidate::<Surface>(snap, Key::from_id(new), Key::from_id(old), bytes),
+        t if t == Body::TAG => proof::candidate::<Body>(snap, Key::from_id(new), Key::from_id(old), bytes),
+        found => Err(RecordError::Kind { found, wanted: Body::TAG }),
     }
 }
 
-fn memo_keep<M: Memo>(memo: &mut M, tag: Tag, arena: Arena, key: ContentId, bytes: &[u8]) {
-    match tag {
-        t if t == Surface::TAG => memo.keep::<Surface>(arena, &Key::from_id(key), bytes),
-        t if t == Body::TAG => memo.keep::<Body>(arena, &Key::from_id(key), bytes),
-        _ => memo.keep::<UnitManifest>(arena, &Key::from_id(key), bytes),
+fn memo_keep<M: Memo>(memo: &mut M, arena: Arena, proved: AnyHolds<'_>, bytes: &[u8]) {
+    if let Some(holds) = proved.get::<Surface>() {
+        memo.keep(arena, &holds, bytes);
+    } else if let Some(holds) = proved.get::<Body>() {
+        memo.keep(arena, &holds, bytes);
+    } else if let Some(holds) = proved.get::<UnitManifest>() {
+        memo.keep(arena, &holds, bytes);
     }
+}
+
+/// A held manifest settles its unit: its slots become the records it names, each proved by it.
+fn settle_by_manifest<'s, A: Allocator>(
+    snap: Snapshot<'s>,
+    unit: &mut Unit<'s, A>,
+    key: Key<UnitManifest>,
+    bytes: &[u8],
+) -> Result<(), RecordError> {
+    let hit = proof::hit::<UnitManifest>(snap, key, bytes)?;
+    let named = hit.named()?;
+    unit.slots.clear();
+    for (item, proved) in named {
+        let mut slot = Slot::open(proved.tag(), item, proved.key_id());
+        slot.state = SlotState::Done;
+        slot.proved = Some(proved);
+        unit.slots.push(slot);
+    }
+    unit.proof = Some(hit.holds());
+    Ok(())
 }
 
 fn layout_of(tag: Tag) -> Layout {
@@ -307,8 +390,10 @@ fn layout_of(tag: Tag) -> Layout {
     }
 }
 
-impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
-    pub fn new(memo: &'m mut M, plan: Plan<'_>, config: Config, alloc: A) -> Result<Self, PlanError> {
+impl<'s, 'm, M: Memo, X: Executor, A: Allocator + Clone> Driver<'s, 'm, M, X, A> {
+    /// A driver of one request in `snap`, over memo `M` and executor `X`, both static policies;
+    /// at most `executor.capacity()` tasks run at once.
+    pub fn new(snap: Snapshot<'s>, memo: &'m mut M, executor: X, plan: Plan<'_>, alloc: A) -> Result<Self, PlanError> {
         let count = plan.units.len();
         let mut units = Vec::with_capacity_in(count, alloc.clone());
         let mut dependents = Vec::with_capacity_in(count, alloc.clone());
@@ -327,6 +412,7 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                 waiting: unit.deps.len() as u32,
                 last: unit.last,
                 manifest: None,
+                proof: None,
                 slots: Vec::new_in(alloc.clone()),
                 open: 0,
                 last_entries: Vec::new_in(alloc.clone()),
@@ -336,8 +422,10 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         let mut manifests = Vec::with_capacity_in(count, alloc.clone());
         manifests.resize(count, Key::from_id(ContentId([0; 32])));
         Ok(Driver {
+            snap,
             memo,
-            workers: config.workers.max(1),
+            workers: executor.capacity().max(1),
+            executor,
             running: 0,
             phase: Phase::Start,
             units,
@@ -352,7 +440,18 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
             asks: Asks::default(),
             ended: false,
             alloc,
+            certificate: plan.certificate,
+            lookup: Lookup::new(snap, plan.certificate),
+            certified: None,
+            filer: None,
+            cert_shape: None,
+            cert_shape_record: None,
+            cert_value: None,
         })
+    }
+
+    pub fn executor(&self) -> &X {
+        &self.executor
     }
 
     pub fn asks(&self) -> Asks {
@@ -361,6 +460,25 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
 
     pub fn ran(&self) -> Ran {
         self.ran
+    }
+
+    /// The certificate's proof, when it held.
+    pub fn certified(&self) -> Option<Certified<'s>> {
+        self.certified
+    }
+
+    /// Unit `unit`'s manifest's proof, once it is held or filed.
+    pub fn manifest(&self, unit: u32) -> Option<Holds<'s, UnitManifest>> {
+        self.units.get(unit as usize).and_then(|unit| unit.proof)
+    }
+
+    /// The records of unit `unit` proved so far, by item: what a later stage (blaze-program, an
+    /// action's reader) takes instead of checking again.
+    pub fn proofs(&self, unit: u32) -> impl Iterator<Item = (StableId, AnyHolds<'s>)> + '_ {
+        self.units
+            .get(unit as usize)
+            .into_iter()
+            .flat_map(|unit| unit.slots.iter().filter_map(|slot| slot.proved.map(|proved| (slot.item, proved))))
     }
 
     /// The next thing to do.
@@ -403,7 +521,7 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
             Phase::Done(_) => return None,
             Phase::Start => {
                 self.phase = Phase::Certifying;
-                return Some((Work::Certify, self.ticket(Work::Certify)));
+                self.cert_step();
             }
             _ => {}
         }
@@ -422,10 +540,13 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                     self.running += 1;
                     match work {
                         Work::Key(_) => self.ran.keyed += 1,
-                        Work::Run(unit, slot) => match self.units[unit as usize].slots[slot as usize].tag {
-                            t if t == Surface::TAG => self.ran.surfaces += 1,
-                            _ => self.ran.bodies += 1,
-                        },
+                        Work::Run(unit, slot) => {
+                            self.ran.checks.records_run += 1;
+                            match self.units[unit as usize].slots[slot as usize].tag {
+                                t if t == Surface::TAG => self.ran.surfaces += 1,
+                                _ => self.ran.bodies += 1,
+                            }
+                        }
                         _ => {}
                     }
                     return Some((work, self.ticket(work)));
@@ -433,72 +554,156 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
             }
             break;
         }
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && !matches!(self.phase, Phase::Done(_)) {
             let ran = self.ran;
             self.finish(Outcome::Stalled { ran });
         }
         None
     }
 
-    /// Whether `work` needs an effect; a memo hit is settled here.
+    /// Whether `work` needs an effect; a memo hit is settled here. Counts each lookup, and a
+    /// check of an item already proved (a bug: `rechecks`).
     fn begin(&mut self, work: Work) -> bool {
-        let (unit, tag, key) = match work {
-            Work::Manifest(unit) => match self.units[unit as usize].manifest {
-                Some(key) => (unit, UnitManifest::TAG, key.id()),
-                None => return true,
-            },
-            Work::Ask(unit, slot) => {
-                let slot = &self.units[unit as usize].slots[slot as usize];
-                (unit, slot.tag, slot.key)
+        match work {
+            Work::Manifest(unit) => {
+                let Some(key) = self.units[unit as usize].manifest else {
+                    return true;
+                };
+                self.ran.checks.key_lookups += 1;
+                let settled = match self.memo.get::<UnitManifest>(unit, &key) {
+                    None => None,
+                    Some(bytes) => Some(settle_by_manifest(self.snap, &mut self.units[unit as usize], key, bytes)),
+                };
+                match settled {
+                    None => {
+                        self.asks.gets += 1;
+                        true
+                    }
+                    Some(Ok(())) => {
+                        self.asks.memo_hits += 1;
+                        self.held_manifest(unit);
+                        false
+                    }
+                    Some(Err(why)) => {
+                        self.fail(Failure::Record { tag: UnitManifest::TAG, key: key.id(), why });
+                        false
+                    }
+                }
             }
-            _ => return true,
-        };
-        match memo_check(&*self.memo, tag, unit, key) {
-            None => {
-                self.asks.gets += 1;
+            Work::Ask(unit, at) => {
+                let (tag, key, proved) = {
+                    let slot = &self.units[unit as usize].slots[at as usize];
+                    (slot.tag, slot.key, slot.proved.is_some())
+                };
+                if proved {
+                    self.ran.checks.rechecks += 1;
+                }
+                self.ran.checks.key_lookups += 1;
+                let found = match tag {
+                    t if t == Surface::TAG => self.memo.get::<Surface>(unit, &Key::from_id(key)),
+                    t if t == Body::TAG => self.memo.get::<Body>(unit, &Key::from_id(key)),
+                    _ => None,
+                }
+                .map(|bytes| hit_any(self.snap, tag, key, bytes));
+                match found {
+                    None => {
+                        self.asks.gets += 1;
+                        true
+                    }
+                    Some(Ok(holds)) => {
+                        self.asks.memo_hits += 1;
+                        self.units[unit as usize].slots[at as usize].proved = Some(holds);
+                        self.slot_done(unit, at);
+                        false
+                    }
+                    Some(Err(why)) => {
+                        self.fail(Failure::Record { tag, key, why });
+                        false
+                    }
+                }
+            }
+            Work::Old(unit, at) | Work::Verify(unit, at) => {
+                if self.units[unit as usize].slots[at as usize].proved.is_some() {
+                    self.ran.checks.rechecks += 1;
+                }
+                if matches!(work, Work::Old(..)) {
+                    self.ran.checks.key_lookups += 1;
+                    self.asks.gets += 1;
+                }
                 true
             }
-            Some(Err(why)) => {
-                self.fail(Failure::Record { tag, key, why });
-                false
-            }
-            Some(Ok(())) => {
-                self.asks.memo_hits += 1;
-                match work {
-                    Work::Manifest(unit) => self.unit_complete(unit),
-                    Work::Ask(unit, slot) => self.slot_done(unit, slot),
-                    _ => {}
+            Work::Last(_) | Work::CertShape | Work::CertValue | Work::FileRead => {
+                self.asks.gets += 1;
+                if matches!(work, Work::Last(_)) {
+                    self.ran.checks.key_lookups += 1;
                 }
-                false
+                true
             }
+            _ => true,
         }
     }
 
     fn effect(&self, work: Work, ticket: Ticket) -> Effect<'_> {
         let slot = |unit: u32, slot: u32| &self.units[unit as usize].slots[slot as usize];
+        let manifest_get = |unit: u32, key: Option<Key<UnitManifest>>| Effect::Get {
+            ticket,
+            unit,
+            item: SURFACE_ITEM,
+            tag: UnitManifest::TAG,
+            key: key.map_or(ContentId([0; 32]), |key| key.id()),
+            layout: UnitManifest::LAYOUT,
+        };
+        let cert_get = |key: Key<Certificate>| Effect::Get {
+            ticket,
+            unit: NO_UNIT,
+            item: SURFACE_ITEM,
+            tag: Certificate::TAG,
+            key: key.id(),
+            layout: Certificate::LAYOUT,
+        };
+        let none = ContentId([0; 32]);
         match work {
-            Work::Certify => Effect::Certify { ticket },
-            Work::Key(unit) => Effect::Run { ticket, task: Task::Key { unit } },
-            Work::Manifest(unit) => Effect::Get {
-                ticket,
-                tag: UnitManifest::TAG,
-                key: self.units[unit as usize].manifest.map_or(ContentId([0; 32]), |key| key.id()),
-                layout: UnitManifest::LAYOUT,
+            Work::CertShape | Work::CertValue => match self.lookup.want() {
+                Want::ReadShape(at) | Want::ReadValue(at) => cert_get(at),
+                _ => cert_get(Key::from_id(none)),
             },
-            Work::Last(unit) => Effect::Get {
+            Work::CertAnswers => Effect::Answer {
                 ticket,
-                tag: UnitManifest::TAG,
-                key: self.units[unit as usize].last.map_or(ContentId([0; 32]), |key| key.id()),
-                layout: UnitManifest::LAYOUT,
+                tag: Certificate::TAG,
+                key: self.certificate.id(),
+                shape: self.cert_shape.as_deref().unwrap_or(&[]),
             },
+            Work::Reads => Effect::Reads { ticket },
+            Work::FileRead | Work::FilePut => {
+                let want = self.filer.as_ref().map_or(Want::Done, |filer| filer.want());
+                match want {
+                    Want::ReadShape(at) => cert_get(at),
+                    Want::PutShape(at) => Effect::Put {
+                        ticket,
+                        tag: Certificate::TAG,
+                        key: at.id(),
+                        bytes: self.cert_shape_record.as_deref().unwrap_or(&[]),
+                    },
+                    Want::PutValue(at) => Effect::Put {
+                        ticket,
+                        tag: Certificate::TAG,
+                        key: at.id(),
+                        bytes: self.cert_value.as_deref().unwrap_or(&[]),
+                    },
+                    _ => cert_get(Key::from_id(none)),
+                }
+            }
+            Work::Key(unit) => Effect::Run { ticket, task: Task::Key { unit }, remote: false },
+            Work::Manifest(unit) => manifest_get(unit, self.units[unit as usize].manifest),
+            Work::Last(unit) => manifest_get(unit, self.units[unit as usize].last),
             Work::Ask(unit, at) => {
                 let slot = slot(unit, at);
-                Effect::Get { ticket, tag: slot.tag, key: slot.key, layout: layout_of(slot.tag) }
+                Effect::Get { ticket, unit, item: slot.item, tag: slot.tag, key: slot.key, layout: layout_of(slot.tag) }
             }
             Work::Old(unit, at) => {
                 let slot = slot(unit, at);
                 let key = slot.old.unwrap_or(slot.key);
-                Effect::Get { ticket, tag: slot.tag, key, layout: layout_of(slot.tag) }
+                Effect::Get { ticket, unit, item: slot.item, tag: slot.tag, key, layout: layout_of(slot.tag) }
             }
             Work::Verify(unit, at) => {
                 let slot = slot(unit, at);
@@ -513,7 +718,8 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                     t if t == Surface::TAG => Task::Surface { unit, key: Key::from_id(slot.key) },
                     _ => Task::Body { unit, item: slot.item, key: Key::from_id(slot.key) },
                 };
-                Effect::Run { ticket, task }
+                let queued = self.runs.len() as u32 + self.running;
+                Effect::Run { ticket, task, remote: X::REMOTE && !stays_local(&task, queued) }
             }
             Work::Put(unit, at) => {
                 let slot = slot(unit, at);
@@ -525,11 +731,10 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                 Effect::Put {
                     ticket,
                     tag: UnitManifest::TAG,
-                    key: unit.manifest.map_or(ContentId([0; 32]), |key| key.id()),
+                    key: unit.manifest.map_or(none, |key| key.id()),
                     bytes: unit.manifest_bytes.as_deref().expect("a manifest is held while it is put"),
                 }
             }
-            Work::Certificate => Effect::WriteCertificate { ticket, units: &self.manifests },
         }
     }
 
@@ -544,8 +749,44 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         };
         let (_, work) = self.pending.remove(at);
         match (work, input) {
-            (Work::Certify, Input::Certified { hit: true, .. }) => self.finish(Outcome::Certified),
-            (Work::Certify, Input::Certified { hit: false, .. }) => self.start(),
+            (Work::CertShape, Input::Got { record, .. }) => match self.lookup.shape(record, &mut self.ran.checks) {
+                Ok(shape) => {
+                    self.cert_shape = shape.map(Aligned::copy_from);
+                    self.cert_step();
+                }
+                Err(why) => self.fail(Failure::Outside(why)),
+            },
+            (Work::CertAnswers, Input::Answers { now, .. }) => match self.lookup.answers(now, &mut self.ran.checks) {
+                Ok(()) => self.cert_step(),
+                Err(why) => self.fail(Failure::Outside(why)),
+            },
+            (Work::CertValue, Input::Got { record, .. }) => match self.lookup.value(record, &mut self.ran.checks) {
+                Ok(()) => self.cert_step(),
+                Err(why) => self.fail(Failure::Outside(why)),
+            },
+            (Work::Reads, Input::Reads { shape, then, now, .. }) => self.reads(shape, then, now),
+            (Work::FileRead, Input::Got { record, .. }) => {
+                let shape = self.cert_shape.as_deref().unwrap_or(&[]);
+                let read = match self.filer.as_mut() {
+                    Some(filer) => filer.read(record, shape, &mut self.ran.checks),
+                    None => Err(OutsideError::Misused("a certificate read with no filing")),
+                };
+                match read {
+                    Ok(()) => self.file_step(),
+                    Err(why) => self.fail(Failure::Outside(why)),
+                }
+            }
+            (Work::FilePut, Input::Put { put, .. }) => {
+                let filed = match (put, self.filer.as_mut()) {
+                    (Ok(put), Some(filer)) => filer.put(put).map_err(Failure::Outside),
+                    (Err(fault), _) => Err(Failure::Store(fault)),
+                    (_, None) => Err(Failure::Misused("a certificate put with no filing")),
+                };
+                match filed {
+                    Ok(()) => self.file_step(),
+                    Err(why) => self.fail(why),
+                }
+            }
             (Work::Key(unit), Input::Ran { outcome, .. }) => {
                 self.running -= 1;
                 match outcome {
@@ -558,18 +799,20 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
             (Work::Last(unit), Input::Got { record, .. }) => self.got_last(unit, record),
             (Work::Ask(unit, slot), Input::Got { record, .. }) => self.got_ask(unit, slot, record),
             (Work::Old(unit, slot), Input::Got { record, .. }) => self.got_old(unit, slot, record),
-            (Work::Verify(unit, slot), Input::Verified { equal, .. }) => self.verified(unit, slot, equal),
-            (Work::Run(unit, slot), Input::Ran { outcome, .. }) => {
+            (Work::Verify(unit, slot), Input::Now { now, .. }) => self.verified(unit, slot, now),
+            (Work::Run(unit, at), Input::Ran { outcome, .. }) => {
                 self.running -= 1;
                 let (tag, key) = {
-                    let slot = &self.units[unit as usize].slots[slot as usize];
+                    let slot = &self.units[unit as usize].slots[at as usize];
                     (slot.tag, slot.key)
                 };
                 match outcome {
-                    Ok(Done::Wrote { record }) => match check_tag(tag, record, key) {
-                        Ok(()) => {
-                            self.units[unit as usize].slots[slot as usize].held = Some(Aligned::copy_from(record));
-                            self.ready.push_back(Work::Put(unit, slot));
+                    Ok(Done::Wrote { record }) => match hit_any(self.snap, tag, key, record) {
+                        Ok(proved) => {
+                            let slot = &mut self.units[unit as usize].slots[at as usize];
+                            slot.held = Some(Aligned::copy_from(record));
+                            slot.proved = Some(proved);
+                            self.ready.push_back(Work::Put(unit, at));
                         }
                         Err(why) => self.fail(Failure::Record { tag, key, why }),
                     },
@@ -578,14 +821,14 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                 }
             }
             (Work::Put(unit, slot), Input::Put { put, .. }) => {
-                let (tag, key, held) = {
+                let (tag, key, held, proved) = {
                     let slot = &mut self.units[unit as usize].slots[slot as usize];
-                    (slot.tag, slot.key, slot.held.take())
+                    (slot.tag, slot.key, slot.held.take(), slot.proved)
                 };
                 match put {
                     Ok(Put::Written | Put::Same) => {
-                        if let Some(held) = held {
-                            memo_keep(&mut *self.memo, tag, unit, key, &held);
+                        if let (Some(held), Some(proved)) = (held, proved) {
+                            memo_keep(&mut *self.memo, unit, proved, &held);
                         }
                         self.slot_done(unit, slot);
                     }
@@ -594,14 +837,14 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                 }
             }
             (Work::PutManifest(unit), Input::Put { put, .. }) => {
-                let (key, held) = {
+                let (key, held, proof) = {
                     let unit = &mut self.units[unit as usize];
-                    (unit.manifest.map_or(ContentId([0; 32]), |key| key.id()), unit.manifest_bytes.take())
+                    (unit.manifest.map_or(ContentId([0; 32]), |key| key.id()), unit.manifest_bytes.take(), unit.proof)
                 };
                 match put {
                     Ok(Put::Written | Put::Same) => {
-                        if let Some(held) = held {
-                            memo_keep(&mut *self.memo, UnitManifest::TAG, unit, key, &held);
+                        if let (Some(held), Some(proof)) = (held, proof) {
+                            memo_keep(&mut *self.memo, unit, proof.into(), &held);
                         }
                         self.ran.manifests += 1;
                         self.unit_complete(unit);
@@ -610,14 +853,27 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
                     Err(fault) => self.fail(Failure::Store(fault)),
                 }
             }
-            (Work::Certificate, Input::CertificateWritten { result, .. }) => match result {
-                Ok(()) => {
-                    let ran = self.ran;
-                    self.finish(Outcome::Built { ran });
-                }
-                Err(fault) => self.fail(Failure::Store(fault)),
-            },
             _ => self.fail(Failure::Misused("an answer of another form than its effect")),
+        }
+    }
+
+    /// The certificate's lookup, one step: the next read or answer, or its end.
+    fn cert_step(&mut self) {
+        match self.lookup.want() {
+            Want::ReadShape(_) => self.ready.push_back(Work::CertShape),
+            Want::ReadValue(_) => self.ready.push_back(Work::CertValue),
+            Want::Answers => self.ready.push_back(Work::CertAnswers),
+            _ => match self.lookup.found() {
+                Some(Found::Hit(holds)) => {
+                    self.certified = Some(holds.certified());
+                    let checks = self.ran.checks;
+                    self.finish(Outcome::Certified { checks });
+                }
+                _ => {
+                    self.cert_shape = None;
+                    self.start();
+                }
+            },
         }
     }
 
@@ -631,7 +887,44 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         }
         if self.units.is_empty() {
             self.phase = Phase::Filing;
-            self.ready.push_back(Work::Certificate);
+            self.ready.push_back(Work::Reads);
+        }
+    }
+
+    /// The request's outside reads, settled: its certificate is filed at their address, its
+    /// value every unit's manifest key.
+    fn reads(&mut self, shape: &[u8], then: &[ContentId], now: &[ContentId]) {
+        let settled = match outside::settle(self.certificate, shape, then, now, &mut self.ran.checks) {
+            Ok(settled) => settled,
+            Err(raced) => return self.fail(Failure::Raced { at: raced.at }),
+        };
+        // The lookup missed in this snapshot: it read the slots, so filing reads none again.
+        let filer = match self.lookup.filer(settled, shape) {
+            Ok(filer) => filer,
+            Err(why) => return self.fail(Failure::Outside(why)),
+        };
+        let mut payload = Vec::with_capacity_in(self.manifests.len() * 32, self.alloc.clone());
+        self.manifests.iter().for_each(|key| payload.extend_from_slice(&key.id().0));
+        self.cert_value = Some(Aligned::copy_from(&outside::write_value(&settled.address, &[], &payload)));
+        self.cert_shape = Some(Aligned::copy_from(shape));
+        self.filer = Some(filer);
+        self.file_step();
+    }
+
+    fn file_step(&mut self) {
+        let want = self.filer.as_ref().map_or(Want::Done, |filer| filer.want());
+        match want {
+            Want::ReadShape(_) => self.ready.push_back(Work::FileRead),
+            Want::PutShape(at) => {
+                let shape = self.cert_shape.as_deref().unwrap_or(&[]);
+                self.cert_shape_record = Some(Aligned::copy_from(&outside::write_shape(&at, shape)));
+                self.ready.push_back(Work::FilePut);
+            }
+            Want::PutValue(_) => self.ready.push_back(Work::FilePut),
+            _ => {
+                let ran = self.ran;
+                self.finish(Outcome::Built { ran });
+            }
         }
     }
 
@@ -640,27 +933,39 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         this.manifest = Some(manifest);
         this.state = UnitState::Manifest;
         this.slots.clear();
-        let open = |tag: Tag, item: StableId, key: ContentId| Slot { tag, item, key, old: None, state: SlotState::Open, held: None };
-        this.slots.push(open(Surface::TAG, SURFACE_ITEM, surface.id()));
+        this.slots.push(Slot::open(Surface::TAG, SURFACE_ITEM, surface.id()));
         for &(item, key) in bodies {
-            this.slots.push(open(Body::TAG, item, key.id()));
+            this.slots.push(Slot::open(Body::TAG, item, key.id()));
         }
         self.ready.push_back(Work::Manifest(unit));
     }
 
+    /// A unit settled by its manifest: complete, with nothing it names looked up.
+    fn held_manifest(&mut self, unit: u32) {
+        if planted(Plant::LooksUpUnderHeldManifest) {
+            for slot in 0..self.units[unit as usize].slots.len() {
+                self.ready.push_back(Work::Ask(unit, slot as u32));
+            }
+        }
+        self.unit_complete(unit);
+    }
+
     fn got_manifest(&mut self, unit: u32, record: Option<&[u8]>) {
-        let this = &self.units[unit as usize];
-        let key = this.manifest.map_or(ContentId([0; 32]), |key| key.id());
+        let Some(key) = self.units[unit as usize].manifest else {
+            return self.fail(Failure::Misused("a manifest asked of a unit not keyed"));
+        };
         match record {
-            Some(bytes) => match check::<UnitManifest>(bytes, key) {
+            Some(bytes) => match settle_by_manifest(self.snap, &mut self.units[unit as usize], key, bytes) {
                 Ok(()) => {
-                    memo_keep(&mut *self.memo, UnitManifest::TAG, unit, key, bytes);
-                    self.unit_complete(unit);
+                    if let Some(proof) = self.units[unit as usize].proof {
+                        memo_keep(&mut *self.memo, unit, proof.into(), bytes);
+                    }
+                    self.held_manifest(unit);
                 }
-                Err(why) => self.fail(Failure::Record { tag: UnitManifest::TAG, key, why }),
+                Err(why) => self.fail(Failure::Record { tag: UnitManifest::TAG, key: key.id(), why }),
             },
-            None => match this.last {
-                Some(last) if last.id() != key => self.ready.push_back(Work::Last(unit)),
+            None => match self.units[unit as usize].last {
+                Some(last) if last != key => self.ready.push_back(Work::Last(unit)),
                 _ => self.start_checking(unit),
             },
         }
@@ -702,53 +1007,70 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         }
     }
 
-    fn got_ask(&mut self, unit: u32, slot: u32, record: Option<&[u8]>) {
+    fn got_ask(&mut self, unit: u32, at: u32, record: Option<&[u8]>) {
         let (tag, key, old) = {
-            let slot = &self.units[unit as usize].slots[slot as usize];
+            let slot = &self.units[unit as usize].slots[at as usize];
             (slot.tag, slot.key, slot.old)
         };
         match record {
-            Some(bytes) => match check_tag(tag, bytes, key) {
-                Ok(()) => {
-                    memo_keep(&mut *self.memo, tag, unit, key, bytes);
-                    self.slot_done(unit, slot);
+            Some(bytes) => match hit_any(self.snap, tag, key, bytes) {
+                Ok(proved) => {
+                    self.units[unit as usize].slots[at as usize].proved = Some(proved);
+                    memo_keep(&mut *self.memo, unit, proved, bytes);
+                    if planted(Plant::ChecksAfterHit) && old.is_some() {
+                        self.ready.push_back(Work::Old(unit, at));
+                    }
+                    self.slot_done(unit, at);
                 }
                 Err(why) => self.fail(Failure::Record { tag, key, why }),
             },
-            None if old.is_some() => self.ready.push_back(Work::Old(unit, slot)),
-            None => self.runs.push_back(Work::Run(unit, slot)),
+            None if old.is_some() => self.ready.push_back(Work::Old(unit, at)),
+            None => self.runs.push_back(Work::Run(unit, at)),
         }
     }
 
-    fn got_old(&mut self, unit: u32, slot: u32, record: Option<&[u8]>) {
-        let (tag, old) = {
-            let slot = &self.units[unit as usize].slots[slot as usize];
-            (slot.tag, slot.old.unwrap_or(slot.key))
+    fn got_old(&mut self, unit: u32, at: u32, record: Option<&[u8]>) {
+        let (tag, key, old) = {
+            let slot = &self.units[unit as usize].slots[at as usize];
+            (slot.tag, slot.key, slot.old.unwrap_or(slot.key))
         };
         let Some(bytes) = record else {
-            return self.runs.push_back(Work::Run(unit, slot));
+            return self.runs.push_back(Work::Run(unit, at));
         };
-        if let Err(why) = check_tag(tag, bytes, old) {
-            return self.fail(Failure::Record { tag, key: old, why });
+        match candidate_any(self.snap, tag, key, old, bytes) {
+            Ok(candidate) => {
+                let slot = &mut self.units[unit as usize].slots[at as usize];
+                slot.candidate = Some(candidate);
+                slot.held = Some(Aligned::copy_from(bytes));
+                self.ready.push_back(Work::Verify(unit, at));
+            }
+            Err(why) => self.fail(Failure::Record { tag, key: old, why }),
         }
-        self.units[unit as usize].slots[slot as usize].held = Some(Aligned::copy_from(bytes));
-        self.ready.push_back(Work::Verify(unit, slot));
     }
 
-    fn verified(&mut self, unit: u32, at: u32, equal: bool) {
+    fn verified(&mut self, unit: u32, at: u32, now: &[Option<ContentId>]) {
         let slot = &mut self.units[unit as usize].slots[at as usize];
-        let held = slot.held.take();
-        if !equal {
-            return self.runs.push_back(Work::Run(unit, at));
-        }
-        let reheaded = held.and_then(|old| record::reheaded(&old, slot.key));
-        match reheaded {
-            Some(bytes) => {
-                slot.held = Some(Aligned::copy_from(&bytes));
-                self.ran.reused += 1;
-                self.ready.push_back(Work::Put(unit, at));
-            }
-            None => self.fail(Failure::Misused("a verified record that has no head")),
+        let key = slot.key;
+        let (Some(candidate), Some(held)) = (slot.candidate.take(), slot.held.take()) else {
+            return self.fail(Failure::Misused("an answer to a read list with no candidate"));
+        };
+        let reads = match blaze_format::open::<Traced>(&held).and_then(|root| root.reads.follow(&held)) {
+            Ok(reads) => reads,
+            Err(error) => return self.fail(Failure::Record { tag: candidate.tag(), key, why: RecordError::Format(error) }),
+        };
+        match candidate.verify(reads, now, &mut self.ran.checks) {
+            Ok(Verdict::Holds(proved)) => match record::reheaded(&held, key) {
+                Some(bytes) => {
+                    let slot = &mut self.units[unit as usize].slots[at as usize];
+                    slot.held = Some(Aligned::copy_from(&bytes));
+                    slot.proved = Some(proved);
+                    self.ran.reused += 1;
+                    self.ready.push_back(Work::Put(unit, at));
+                }
+                None => self.fail(Failure::Misused("a verified record that has no head")),
+            },
+            Ok(Verdict::Redo { .. }) => self.runs.push_back(Work::Run(unit, at)),
+            Err(_) => self.fail(Failure::Misused("a read list answered with another number of facts than it has")),
         }
     }
 
@@ -773,7 +1095,12 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         };
         let mut entries = Vec::with_capacity_in(this.slots.len(), self.alloc.clone());
         entries.extend(this.slots.iter().map(|slot| Entry { item: slot.item.0, key: slot.key, tag: slot.tag.0, pad: 0 }));
-        this.manifest_bytes = Some(Aligned::copy_from(&record::write_manifest(&key, &entries)));
+        let bytes = Aligned::copy_from(&record::write_manifest(&key, &entries));
+        match proof::hit::<UnitManifest>(self.snap, key, &bytes) {
+            Ok(hit) => this.proof = Some(hit.holds()),
+            Err(why) => return self.fail(Failure::Record { tag: UnitManifest::TAG, key: key.id(), why }),
+        }
+        this.manifest_bytes = Some(bytes);
         this.state = UnitState::Writing;
         self.ready.push_back(Work::PutManifest(unit));
     }
@@ -799,7 +1126,7 @@ impl<'m, M: Memo, A: Allocator + Clone> Driver<'m, M, A> {
         }
         if self.complete as usize == self.units.len() {
             self.phase = Phase::Filing;
-            self.ready.push_back(Work::Certificate);
+            self.ready.push_back(Work::Reads);
         }
     }
 }

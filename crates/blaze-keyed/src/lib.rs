@@ -8,10 +8,17 @@
 //!   to, by content, as a Merkle closure over strongly connected components.
 //! - [`record`]: the head every record starts with, the roots, and the read list a record of a
 //!   traced kind carries.
-//! - [`store`]: the store's interface (segments, generations, the fetch-on-miss seam).
+//! - [`store`]: the store's interface (segments, generations, the `Source` and `Verifier`
+//!   seams of the shared cache).
+//! - [`exec`]: the executor, the driver's second static policy: an action is (kind, key,
+//!   inputs) and its task reads only those inputs, so it runs locally or remotely alike.
 //! - [`pool`]: the worker pool's interface.
 //! - [`machine`]: the machine descriptor everything is sized by.
 //! - [`memo`]: the session memo, a static policy: [`memo::RecordsOnly`] or [`memo::Resident`].
+//! - [`proof`]: proofs a check makes and code that needs the checked thing takes (decision 18):
+//!   [`proof::Holds`], [`proof::Certified`], the snapshot brand, the check counters.
+//! - [`outside`]: the two-level form of every outside kind (shapes at slots, values at
+//!   addresses) and its lookup, settle and filing machines.
 //! - [`driver`]: the sans-IO state machine of one request.
 //!
 //! Nothing here does IO, and nothing here depends on the daemon, the query engine or the old
@@ -23,10 +30,13 @@
 #![register_tool(blaze)]
 
 pub mod driver;
+pub mod exec;
 pub mod kind;
 pub mod machine;
 pub mod memo;
+pub mod outside;
 pub mod pool;
+pub mod proof;
 pub mod record;
 pub mod store;
 pub mod text;
@@ -53,6 +63,14 @@ pub enum Plant {
     /// [`memo::Resident`] answers a unit's manifest by the unit, not by the key: a resident entry
     /// that survives a change of its key's input.
     StaleResident,
+    /// The driver, after a record's key hit, still fetches and verifies the record the last
+    /// manifest named for the item: a check after a proof.
+    ChecksAfterHit,
+    /// The driver, after a unit's manifest hit, still looks up each record it names.
+    LooksUpUnderHeldManifest,
+    /// The simulation keys a unit's manifest by its dependencies' manifests, not their
+    /// surfaces: a dependency's private body edit makes every dependent be examined.
+    UnitKeyedByDepManifests,
 }
 
 #[cfg(test)]

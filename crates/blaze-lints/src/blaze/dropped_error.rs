@@ -20,7 +20,8 @@
 //! A place a clippy port reports when it is on is left to it, so no place is reported twice:
 //! `x.ok();` as a statement is `unused_result_ok`'s, `.map_err(|_| ..)` with a non-`move`
 //! closure whose parameter is exactly `_` is `map_err_ignore`'s, and `let _ = <Result>;` is
-//! `let_underscore_must_use`'s.
+//! `let_underscore_must_use`'s. An `Err` arm or an `.unwrap_or_else(|_| ..)` whose value is
+//! another route to the result ([`takes_other_route`]) is `fallback`'s when that lint is on.
 
 use blaze_hash::HashSet;
 use hir::HirDisplay as _;
@@ -78,6 +79,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
     let infer = analysis.infer();
     let is_result = |expr: ExprId| analysis.ty(infer.expr_ty(expr)).as_adt() == Some(result);
     let target = cx.krate().to_display_target(db);
+    // An `Err` branch that answers the failure by another route is `fallback`'s when it is on:
+    // the same place is not reported twice, and `fallback` says the sharper thing.
+    let fallback = cx.on_blaze(Lint::Fallback);
     let statements = shared.unused_result_ok.then(|| expression_statements(body));
     let error_of = |scrutinee: ExprId| {
         let ty = analysis.ty(infer.expr_ty(scrutinee));
@@ -96,6 +100,9 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                     }
                     let value_ty = analysis.ty(infer.expr_ty(value));
                     if value_ty.is_never() || value_ty.is_unit() {
+                        continue;
+                    }
+                    if fallback && takes_other_route(body, infer, value) {
                         continue;
                     }
                     let Some(range) = analysis.expr_range(value) else { continue };
@@ -185,7 +192,10 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
                 let dropped = match (name, args) {
                     ("ok", []) => !statements.as_ref().is_some_and(|it| it.contains(&id)),
                     ("unwrap_or" | "unwrap_or_default", _) => true,
-                    ("unwrap_or_else", [closure]) => ignores_param(body, *closure).is_some(),
+                    ("unwrap_or_else", [closure]) => {
+                        ignores_param(body, *closure).is_some()
+                            && !(fallback && closure_takes_other_route(body, infer, *closure))
+                    }
                     ("map_err", [closure]) => match ignores_param(body, *closure) {
                         Some(Ignored { wild: true, by_move: false }) => !shared.map_err_ignore,
                         Some(_) => true,
@@ -220,7 +230,7 @@ fn find(cx: &Cx<'_, '_>) -> Vec<Finding> {
 
 /// Whether `pat` is `Err(_)`, `Err(..)` or `Err(_name)`: the `Err` of a `Result` whose error is
 /// never bound to a name that is read.
-fn drops_err(
+pub(super) fn drops_err(
     body: &Body,
     infer: &InferenceResult<'_>,
     err: hir_def::EnumVariantId,
@@ -247,14 +257,56 @@ fn is_ignored(body: &Body, pat: PatId) -> bool {
 }
 
 /// How a closure ignores its one parameter.
-struct Ignored {
+pub(super) struct Ignored {
     /// The parameter is exactly `_`.
     wild: bool,
     by_move: bool,
 }
 
+/// Whether `value`, the value an `Err` branch gives in place of the `Ok`'s, is another route to
+/// the result: a call of a function or a method (past a block that is only its tail) that is
+/// not a default (`T::new()`, `Default::default()`, a call of no arguments by path) nor a copy
+/// (`.clone()`, `.to_owned()`, `.to_string()`, `.into()`). The one home of the rule
+/// `dropped_error` and `fallback` share: what this answers yes to is `fallback`'s, the rest of
+/// a dropped error is this lint's.
+pub(super) fn takes_other_route(
+    body: &Body,
+    infer: &InferenceResult<'_>,
+    value: ExprId,
+) -> bool {
+    let mut at = value;
+    for _ in 0..8 {
+        match body.expr(at) {
+            Expr::Block { statements, tail: Some(tail), .. } if statements.is_empty() => at = tail,
+            Expr::Call { callee, args } => {
+                let TyKind::FnDef(def, _) = infer.expr_ty(callee).kind() else { return false };
+                let hir_def::CallableDefId::FunctionId(_) = def.0 else { return false };
+                return !args.is_empty();
+            }
+            Expr::MethodCall { method_name, .. } => {
+                return !matches!(
+                    method_name.as_str(),
+                    "clone" | "to_owned" | "to_string" | "into" | "cloned" | "copied"
+                );
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// [`takes_other_route`] of the body of the closure `closure`.
+pub(super) fn closure_takes_other_route(
+    body: &Body,
+    infer: &InferenceResult<'_>,
+    closure: ExprId,
+) -> bool {
+    let Expr::Closure { body: inner, .. } = body.expr(closure) else { return false };
+    takes_other_route(body, infer, inner)
+}
+
 /// How the closure `expr` ignores its one parameter, if it is a closure of one that it does.
-fn ignores_param(body: &Body, expr: ExprId) -> Option<Ignored> {
+pub(super) fn ignores_param(body: &Body, expr: ExprId) -> Option<Ignored> {
     let Expr::Closure { args: [param], capture_by, .. } = body.expr(expr) else { return None };
     is_ignored(body, *param).then(|| Ignored {
         wild: matches!(body.pat(*param), Pat::Wild),
@@ -280,7 +332,7 @@ fn iterator_item<'q>(
 }
 
 /// Whether `f` is a method of `core::result::Result`'s own impl.
-fn of_result(db: &base_db::Db, f: hir_def::FunctionId, result: hir::Adt) -> bool {
+pub(super) fn of_result(db: &base_db::Db, f: hir_def::FunctionId, result: hir::Adt) -> bool {
     let ItemContainerId::ImplId(it) = f.loc(db).container else { return false };
     let imp = hir::Impl::from(it);
     imp.trait_(db).is_none() && imp.self_ty(db).as_adt() == Some(result)
