@@ -93,6 +93,8 @@
     {"name": "BlazeDiff.min_choice_is_supergradient", "package": "analysis", "module": "BlazeDiff.Kink", "says": "A choice in [0, 1] is a supergradient of min at a tie.", "row": "V10"},
     {"name": "BlazeDiff.sqrt_tangent_at_kink", "package": "analysis", "module": "BlazeDiff.Kink", "says": "At 0 the generated tangent of sqrt is the choice times the argument's tangent (a convention: there is no subgradient).", "row": "V10"},
     {"name": "BlazeDiff.select_tangent", "package": "analysis", "module": "BlazeDiff.Kink", "says": "The generated tangent of select is its taken arm's tangent.", "row": "V10"},
-    {"name": "BlazeDiff.rewrites_sound", "package": "analysis", "module": "BlazeDiff.RewriteProofs", "says": "Every fast_math rewrite of the simplifier is an identity over the reals under its stated condition.", "row": "V10"}
+    {"name": "BlazeDiff.rewrites_sound", "package": "analysis", "module": "BlazeDiff.RewriteProofs", "says": "Every fast_math rewrite of the simplifier is an identity over the reals under its stated condition.", "row": "V10"},
+    {"name": "theorems.bump_keeps_wf.spec.proof", "package": "core", "module": "BlazeModel.theorems.proved", "says": "The statement blaze generates from the theorem function bump_keeps_wf holds of its model: from a counter with hits at most its limit, bump does not panic and leaves hits at most the limit.", "row": "V12"},
+    {"name": "theorems.counting_ends.spec.proof", "package": "core", "module": "BlazeModel.theorems.proved", "says": "The statement blaze generates from the theorem function counting_ends holds of its model: for every n some fuel makes the loop return, with i equal to n.", "row": "V12"}
   ]
 }

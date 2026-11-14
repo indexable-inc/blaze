@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-90 theorems: 77 in `lean`, 13 in `lean/analysis`.
+92 theorems: 79 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -897,4 +897,18 @@ theorem removeDead_call (cert : List (List (List (List Local))))
 ```lean
 theorem removeDeadStoresChecked_preserves (cert : List (List (List (List Local)))) :
     PreservesWhen FrameZero (removeDeadStoresChecked cert)
+```
+
+## V12
+
+**`theorems.bump_keeps_wf.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function bump_keeps_wf holds of its model: from a counter with hits at most its limit, bump does not panic and leaves hits at most the limit.
+
+```lean
+theorem theorems.bump_keeps_wf.spec.proof : theorems.bump_keeps_wf.spec.statement
+```
+
+**`theorems.counting_ends.spec.proof`** (`BlazeModel.theorems.proved`, `lean`): The statement blaze generates from the theorem function counting_ends holds of its model: for every n some fuel makes the loop return, with i equal to n.
+
+```lean
+theorem theorems.counting_ends.spec.proof : theorems.counting_ends.spec.statement
 ```
