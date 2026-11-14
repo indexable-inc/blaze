@@ -12,7 +12,14 @@
 //!
 //! The tokens name no file, no crate and no syntax context: every span of a kept definition
 //! is of the root context of the file it is written in and relative to the definition's own
-//! ast id, so a span is two numbers and the reader gives the rest. A definition that is not
+//! ast id, so a span is two numbers and the reader gives the rest. Nor do they hold where a
+//! token is in the definition's text: the key is of the definition's tokens, never its
+//! whitespace and plain comments ([`index`]), so a span is kept as offsets in the text with
+//! those squeezed out ([`Squeeze`]), and read back to the definition's text as its file has
+//! it now, which the reader lexes from where the file's index places the definition. Two
+//! definitions of equal tokens, reindented or commented apart, are one key and equal bytes; a
+//! definition moved or reindented is found by its key and its spans point at its tokens where
+//! they are now. A definition that is not
 //! so (one a macro wrote, one whose spans have a wider anchor) is not kept and is made from
 //! its source, as before. A definition whose text names `cfg` (a `cfg_attr` deciding its
 //! transparency) is keyed by its crate's cfg too ([`cfg_part`]). Its content hash
@@ -20,9 +27,9 @@
 //! has a key ([`expansion`]).
 //!
 //! The invariant: equal keys are equal bytes; the tokens are a function of the definition's
-//! tree and its ast id alone.
+//! tokens and its ast id alone, never of its whitespace and plain comments.
 
-use std::sync::Arc;
+use std::{alloc::Global, sync::Arc};
 
 use base_db::{Crate, Db, EditionedFileId};
 use blaze_ids::{ContentId, Hasher};
@@ -43,8 +50,11 @@ pub mod index;
 
 /// The layout of both entries. Part of their keys, and the first word of the tokens. 2: the
 /// defining crate's cfg in the tokens' key where the definition's text names `cfg`, so a
-/// definition whose transparency a `cfg_attr` decides is kept too.
-pub const LAYOUT: u32 = 2;
+/// definition whose transparency a `cfg_attr` decides is kept too. 3: a span by its offsets in
+/// the definition's text with whitespace and plain comments squeezed out ([`Squeeze`]), where
+/// 2 held its offsets in the text, which the key (of tokens, index layout 4) does not cover:
+/// two definitions of equal tokens spaced apart were two values under one key.
+pub const LAYOUT: u32 = 3;
 
 /// The family of a definition's tokens.
 pub const TOKENS: &str = "macro def tokens";
@@ -217,14 +227,16 @@ pub(super) fn find(
     def_crate: Crate,
     hash: u128,
 ) -> Option<Def> {
+    // A definition with no row has no text to read its spans back to: none is kept of it
+    // ([`Writer::new`]).
+    let place = Place::of(db, file, ast, def_crate)?;
     let set = file_set(db, file);
     let def_edition = def_crate.data(db).edition;
     let cfg = cfg_part(db, file, ast, def_crate);
     let key = tokens_key(hash, ast, read_as(db, file), def_edition, cfg.as_ref());
-    let place = Place::of(db, file, ast);
     let mut def = None;
     kept.get(db, def_crate, TOKENS, &set, key, &mut |bytes| {
-        def = Some(decode(bytes, place)?);
+        def = Some(decode(bytes, &place)?);
         Ok(())
     });
     def
@@ -251,19 +263,88 @@ pub(super) fn keep(
 }
 
 /// What every span of a kept definition shares: the file, the definition as the anchor and
-/// the file's root context.
-#[derive(Clone, Copy)]
+/// the file's root context; and where its tokens are in its text ([`Squeeze`]).
+#[derive(Clone)]
 pub(super) struct Place {
     anchor: SpanAnchor,
     ctx: SyntaxContext,
+    squeeze: Squeeze,
 }
 
 impl Place {
-    pub(super) fn of(db: &Db, file: EditionedFileId, ast: ErasedFileAstId) -> Place {
-        Place {
+    /// The place of the definition `ast` of `file`: its text is where its file's index places
+    /// it (its node's range, where its anchor begins, so a span's offsets are in that text),
+    /// read from the file's text with no parse. `None` for a definition with no row (one in a
+    /// body, whose spans have another anchor and are not kept).
+    pub(super) fn of(
+        db: &Db,
+        file: EditionedFileId,
+        ast: ErasedFileAstId,
+        def_crate: Crate,
+    ) -> Option<Place> {
+        let range = index::of(db, file, def_crate).range(ast)?;
+        let text: &str = db.file_text(file.file_id(db)).text(db);
+        let text = text.get(std::ops::Range::<usize>::from(range))?;
+        Some(Place {
             anchor: SpanAnchor { file_id: file.span_file_id(db), ast_id: ast },
             ctx: SyntaxContext::root(file.edition(db)),
-        }
+            squeeze: Squeeze::of(text),
+        })
+    }
+}
+
+/// Where the tokens of a definition's text are: each token's start in the text, its start in
+/// the text with whitespace and plain comments squeezed out, and its length, in order. The
+/// tokens are those its row hashes ([`index::token_ranges`]), so the squeezed text is a
+/// function of the row's hash: equal keys squeeze to equal offsets.
+///
+/// An offset in a token maps to the same offset in it, squeezed, and back: a span within a
+/// token or from one token to another is kept exactly, and read back to where those tokens
+/// are now. A start is at a byte of a token, an end just past one; an offset in whitespace or a
+/// comment maps to none, and the definition is not kept ([`Writer::span`]).
+#[derive(Clone)]
+pub(super) struct Squeeze {
+    tokens: Vec<[u32; 3], Global>,
+}
+
+impl Squeeze {
+    /// The squeeze of `text`. One lex of the definition, one entry a token, on the global
+    /// heap: the place lives as long as the writer or the read that holds it.
+    pub(super) fn of(text: &str) -> Squeeze {
+        let mut tokens = Vec::new_in(Global);
+        let mut squeezed = 0u32;
+        index::token_ranges(text, |start, len| {
+            tokens.push([start, squeezed, len]);
+            squeezed += len;
+        });
+        Squeeze { tokens }
+    }
+
+    /// `at`, an offset on side `from` (0 the text, 1 the squeezed text), on the other side: as
+    /// a start (in a token) or an end (just past a byte of one). `None` elsewhere.
+    fn map(&self, at: u32, end: bool, from: usize) -> Option<u32> {
+        let to = 1 - from;
+        let i = self.tokens.partition_point(|t| {
+            let past = t[from] + t[2];
+            if end { past < at } else { past <= at }
+        });
+        let t = self.tokens.get(i)?;
+        let inside = if end { t[from] < at } else { t[from] <= at };
+        inside.then(|| t[to] + (at - t[from]))
+    }
+
+    /// The range `range` of the text, squeezed: `None` where an end is in no token.
+    fn squeeze(&self, range: TextRange) -> Option<(u32, u32)> {
+        let start = self.map(range.start().into(), false, 0)?;
+        let end = if range.is_empty() { start } else { self.map(range.end().into(), true, 0)? };
+        Some((start, end))
+    }
+
+    /// The squeezed range `start..end` in the text: `None` where an end is past every token.
+    fn unsqueeze(&self, start: u32, end: u32) -> Option<TextRange> {
+        let real = self.map(start, false, 1)?;
+        let real_end = if start == end { real } else { self.map(end, true, 1)? };
+        Some(TextRange::new(TextSize::new(real), TextSize::new(real_end)))
     }
 }
 
@@ -392,12 +473,23 @@ impl Writer {
         }
     }
 
+    /// A span as its offsets in the definition's text squeezed ([`Squeeze`]): the key holds
+    /// the tokens and not the spaces between them, so neither does the value. A span of
+    /// another anchor or context, or one that ends outside every token, is not the
+    /// definition's own, and the definition is not kept.
     fn span(&mut self, it: Span) {
         if it.anchor != self.place.anchor || it.ctx != self.place.ctx {
             self.own = false;
         }
-        self.u32(it.range.start().into());
-        self.u32(it.range.len().into());
+        let (start, end) = match self.place.squeeze.squeeze(it.range) {
+            Some(it) => it,
+            None => {
+                self.own = false;
+                (0, 0)
+            }
+        };
+        self.u32(start);
+        self.u32(end - start);
     }
 
     fn tree<A: std::alloc::Allocator>(&mut self, tt: &tt::TopSubtree<A>) {
@@ -450,7 +542,7 @@ impl Writer {
 /// Reads a tokens entry.
 struct In<'a> {
     bytes: &'a [u8],
-    place: Place,
+    place: &'a Place,
 }
 
 impl<'a> In<'a> {
@@ -479,15 +571,17 @@ impl<'a> In<'a> {
         Ok(Symbol::intern(text))
     }
 
+    /// A span kept squeezed ([`Writer::span`]), read back to where its tokens are in the
+    /// definition's text as its file has it now.
     fn span(&mut self) -> R<Span> {
         let start = self.u32()?;
         let len = self.u32()?;
         let end = start.checked_add(len).ok_or("a span past 4 GiB")?;
-        Ok(Span {
-            range: TextRange::new(TextSize::new(start), TextSize::new(end)),
-            anchor: self.place.anchor,
-            ctx: self.place.ctx,
-        })
+        let range = self.place.squeeze.unsqueeze(start, end).ok_or_else(|| {
+            // alloc: error path
+            format!("a span at {start}..{end} of the squeezed text, past the definition's tokens")
+        })?;
+        Ok(Span { range, anchor: self.place.anchor, ctx: self.place.ctx })
     }
 
     fn tree(&mut self) -> R<tt::TopSubtree> {
@@ -597,7 +691,7 @@ fn check_shape(tokens: &[tt::TokenTree]) -> R {
 
 /// Reads the tokens entry `bytes` of the definition at `place`. A layout of another blaze is
 /// refused by name.
-pub(super) fn decode(bytes: &[u8], place: Place) -> R<Def> {
+pub(super) fn decode(bytes: &[u8], place: &Place) -> R<Def> {
     let mut r = In { bytes, place };
     let layout = r.u32()?;
     if layout != LAYOUT {
@@ -636,15 +730,23 @@ mod tests {
 
     use super::*;
 
+    /// A place whose text is one identifier of 64 bytes: every offset of a span below is in
+    /// that token, and its squeeze is the identity.
     fn place(ast: u32) -> Place {
+        place_of(ast, &"a".repeat(64))
+    }
+
+    /// The place of a definition `ast` whose text is `text`.
+    fn place_of(ast: u32, text: &str) -> Place {
         let file = span::EditionedFileId::new(FileId::from_raw(7), Edition::Edition2021);
         Place {
             anchor: SpanAnchor { file_id: file, ast_id: ErasedFileAstId::from_raw(ast) },
             ctx: SyntaxContext::root(Edition::Edition2021),
+            squeeze: Squeeze::of(text),
         }
     }
 
-    fn span(place: Place, start: u32, len: u32) -> Span {
+    fn span(place: &Place, start: u32, len: u32) -> Span {
         Span {
             range: TextRange::new(TextSize::new(start), TextSize::new(start + len)),
             anchor: place.anchor,
@@ -653,7 +755,7 @@ mod tests {
     }
 
     /// `{ ($x:tt) => { [r#in, "s"suffix] } }` in shape, with every span of `spans`' place.
-    fn tree(place: Place, spans: Place) -> tt::TopSubtree {
+    fn tree(place: &Place, spans: &Place) -> tt::TopSubtree {
         let at = |start| span(spans, start, 1);
         let mut b = tt::TopSubtreeBuilder::new(tt::Delimiter {
             open: at(0),
@@ -673,8 +775,8 @@ mod tests {
         b.build()
     }
 
-    fn written(place: Place, tt: &tt::TopSubtree) -> Option<Vec<u8>> {
-        let mut w = Writer::new(place);
+    fn written(place: &Place, tt: &tt::TopSubtree) -> Option<Vec<u8>> {
+        let mut w = Writer::new(place.clone());
         w.transparency(Transparency::Opaque);
         w.macro2(Some(tt), tt);
         w.finish()
@@ -684,28 +786,28 @@ mod tests {
     #[test]
     fn a_macro_definition_read_from_its_tokens_is_the_one_written() {
         let place = place(11);
-        let tt = tree(place, place);
-        let bytes = written(place, &tt).expect("every span is the definition's own");
-        let def = decode(&bytes, place).expect("reads");
+        let tt = tree(&place, &place);
+        let bytes = written(&place, &tt).expect("every span is the definition's own");
+        let def = decode(&bytes, &place).expect("reads");
         assert_eq!(def.transparency, Transparency::Opaque);
         let Shape::Macro { args: Some(args), body } = &def.shape else {
             panic!("the shape written was args and a body: {def:?}");
         };
         assert_eq!((args, body), (&tt, &tt));
         // The same tokens are the same bytes, whatever wrote them.
-        assert_eq!(written(place, &tree(place, place)).as_deref(), Some(&*bytes));
+        assert_eq!(written(&place, &tree(&place, &place)).as_deref(), Some(&*bytes));
     }
 
     /// The control of the round trip: a changed token is other bytes and reads as another tree.
     #[test]
     fn a_changed_token_is_another_entry() {
         let place = place(11);
-        let tt = tree(place, place);
-        let mut other = tree(place, place);
-        other.set_token(2, tt::Leaf::Ident(tt::Ident::new("y", span(place, 2, 1))));
-        let (a, b) = (written(place, &tt).unwrap(), written(place, &other).unwrap());
+        let tt = tree(&place, &place);
+        let mut other = tree(&place, &place);
+        other.set_token(2, tt::Leaf::Ident(tt::Ident::new("y", span(&place, 2, 1))));
+        let (a, b) = (written(&place, &tt).unwrap(), written(&place, &other).unwrap());
         assert_ne!(a, b);
-        assert_ne!(decode(&a, place).unwrap(), decode(&b, place).unwrap());
+        assert_ne!(decode(&a, &place).unwrap(), decode(&b, &place).unwrap());
     }
 
     /// The invariant: the bytes are a function of the definition alone. A definition with a
@@ -713,23 +815,176 @@ mod tests {
     #[test]
     fn a_definition_with_a_span_that_is_not_its_own_is_not_kept() {
         let (own, wider) = (place(11), place(3));
-        assert!(written(own, &tree(own, own)).is_some());
-        assert!(written(own, &tree(own, wider)).is_none());
-        let mut w = Writer::new(own);
-        w.rules(Some(&tree(own, own)));
+        assert!(written(&own, &tree(&own, &own)).is_some());
+        assert!(written(&own, &tree(&own, &wider)).is_none());
+        let mut w = Writer::new(own.clone());
+        w.rules(Some(&tree(&own, &own)));
         w.disown();
         assert!(w.finish().is_none());
+    }
+
+    /// A span that begins in whitespace or a comment is no token's: the squeezed text has no
+    /// offset for it, so the definition is not kept. The control: the same span on a token is.
+    #[test]
+    fn a_span_in_whitespace_is_not_kept() {
+        let place = place_of(11, "a  /* c */ b");
+        let one = |start, len| {
+            let mut b = tt::TopSubtreeBuilder::new(tt::Delimiter {
+                open: span(&place, 0, 1),
+                close: span(&place, 11, 1),
+                kind: tt::DelimiterKind::Invisible,
+            });
+            b.push(tt::Leaf::Ident(tt::Ident::new("b", span(&place, start, len))));
+            let mut w = Writer::new(place.clone());
+            w.rules(Some(&b.build()));
+            w.finish()
+        };
+        assert!(one(1, 1).is_none(), "a space");
+        assert!(one(4, 1).is_none(), "a comment");
+        assert!(one(11, 1).is_some(), "the control: `b`");
+        // `a` to `b`, across the space and the comment, is kept and read back whole.
+        let bytes = one(0, 12).expect("from a token to a token");
+        let Shape::Rules(tt) = decode(&bytes, &place).expect("reads").shape else {
+            panic!("rules were written");
+        };
+        let found = tt.as_token_trees().iter_flat_tokens().find_map(|it| match it {
+            tt::TokenTree::Leaf(tt::Leaf::Ident(it)) => Some(it.span.range),
+            _ => None,
+        });
+        assert_eq!(found, Some(TextRange::new(TextSize::new(0), TextSize::new(12))));
+    }
+
+    /// The text of a `macro_rules!` written in a file: `text` with its tree made as
+    /// `decl_macro_expander` makes it, every span relative to the definition (its anchor), and
+    /// the definition's place, of ast id 11 in whichever file; and its row's `header`, the
+    /// content hash its tokens' key takes ([`def_hash`]).
+    fn made(text: &str) -> (Place, TextSize, tt::TopSubtree, u128) {
+        use syntax::{SourceFile, view::{self, AstNode as _, HasModuleItem as _}};
+
+        /// Spans as a file's span map gives a definition that is its own anchor.
+        struct Anchored {
+            start: TextSize,
+            anchor: SpanAnchor,
+            ctx: SyntaxContext,
+        }
+        impl syntax_bridge::SpanMapper for Anchored {
+            fn span_for(&self, range: TextRange) -> Span {
+                Span { range: range - self.start, anchor: self.anchor, ctx: self.ctx }
+            }
+        }
+
+        let parse = SourceFile::parse(text, Edition::Edition2021);
+        let file = view::SourceFile::cast(parse.root()).expect("a file");
+        let item = file.items().next().expect("an item");
+        let header = index::item_source(item).header;
+        let view::Item::MacroRules(rules) = item else {
+            panic!("a `macro_rules!` first in {text:?}");
+        };
+        let range = rules.syntax().text_range();
+        let place = place_of(11, &text[std::ops::Range::<usize>::from(range)]);
+        let map = Anchored { start: range.start(), anchor: place.anchor, ctx: place.ctx };
+        let call_site = syntax_bridge::SpanMapper::span_for(
+            &map,
+            rules.macro_rules_token().expect("the keyword").text_range(),
+        );
+        let tt = syntax_bridge::call_input(
+            rules.token_tree().expect("a tree").syntax(),
+            &map,
+            call_site,
+            syntax_bridge::DocCommentDesugarMode::Mbe,
+        );
+        (place, range.start(), tt, header)
+    }
+
+    fn rules_written(place: &Place, tt: &tt::TopSubtree) -> Vec<u8> {
+        let mut w = Writer::new(place.clone());
+        w.transparency(Transparency::SemiOpaque);
+        w.rules(Some(tt));
+        w.finish().expect("every span is the definition's own")
+    }
+
+    fn rules_read(bytes: &[u8], place: &Place) -> tt::TopSubtree {
+        match decode(bytes, place).expect("reads").shape {
+            Shape::Rules(tt) => tt,
+            other => panic!("rules were written: {other:?}"),
+        }
+    }
+
+    /// One definition as written, and the same tokens reindented, respaced, commented and
+    /// moved down their file.
+    const WRITTEN: &str = "macro_rules! m {\n    ($x:expr) => { boom($x) };\n}\n";
+    const MOVED: &str = "// moved down\n\nmacro_rules! m\n{\n        ( $x : expr ) =>\n            \
+                         { boom( $x ) } ; // a comment\n}\n";
+
+    /// The invariant: two definitions of equal tokens, spaced and commented apart (one key:
+    /// the row hashes tokens), are equal bytes, so no store holds two values under their
+    /// key. The control: their trees as made from their text differ, in their spans alone,
+    /// and those spans are what layout 2 wrote.
+    #[test]
+    fn two_definitions_of_equal_tokens_spaced_apart_are_equal_bytes() {
+        let ((a_place, _, a, a_hash), (b_place, _, b, b_hash)) = (made(WRITTEN), made(MOVED));
+        assert_eq!(a_hash, b_hash, "one key: the row hashes tokens");
+        assert_eq!(rules_written(&a_place, &a), rules_written(&b_place, &b));
+        assert_ne!(a, b, "the control: the spans as made differ");
+        // Layout 2's bytes were those spans as they are.
+        let raw = |tt: &tt::TopSubtree| {
+            let mut out = Vec::new_in(Global);
+            for token in tt.as_token_trees().iter_flat_tokens() {
+                if let tt::TokenTree::Leaf(tt::Leaf::Ident(it)) = token {
+                    out.push(it.span.range);
+                }
+            }
+            out
+        };
+        assert_ne!(raw(&a), raw(&b), "the control: layout 2 held these and differed");
+    }
+
+    /// A definition moved and reindented is found by its key (the bytes its old text wrote)
+    /// and read back to where its tokens are now: each tree read is the tree its own text
+    /// makes, spans and all, so an error in an expansion points at the token where it is. The
+    /// `boom` of the moved text, read from the bytes of the first, is at line 5, column 14.
+    #[test]
+    fn a_moved_definition_reads_back_to_where_its_tokens_are() {
+        let ((a_place, a_start, a, _), (b_place, b_start, b, _)) = (made(WRITTEN), made(MOVED));
+        let (a_bytes, b_bytes) = (rules_written(&a_place, &a), rules_written(&b_place, &b));
+        assert_eq!(rules_read(&a_bytes, &b_place), b);
+        assert_eq!(rules_read(&b_bytes, &a_place), a);
+
+        let boom = |tt: &tt::TopSubtree, start: TextSize| {
+            let range = tt
+                .as_token_trees()
+                .iter_flat_tokens()
+                .find_map(|it| match it {
+                    tt::TokenTree::Leaf(tt::Leaf::Ident(it)) if it.sym.as_str() == "boom" => {
+                        Some(it.span.range)
+                    }
+                    _ => None,
+                })
+                .expect("`boom`");
+            range + start
+        };
+        let at = boom(&rules_read(&a_bytes, &b_place), b_start);
+        let offset = usize::from(at.start());
+        assert_eq!(&MOVED[std::ops::Range::<usize>::from(at)], "boom");
+        let line = MOVED[..offset].matches('\n').count();
+        let column = offset - MOVED[..offset].rfind('\n').map_or(0, |it| it + 1);
+        assert_eq!((line, column), (5, 14));
+        // The control: where the first text has it, read from the bytes of the moved one.
+        let at = boom(&rules_read(&b_bytes, &a_place), a_start);
+        assert_eq!(&WRITTEN[std::ops::Range::<usize>::from(at)], "boom");
+        let offset = usize::from(at.start());
+        assert_eq!(WRITTEN[..offset].matches('\n').count(), 1);
     }
 
     /// A previous or foreign layout is refused by name, and bytes cut short say what is missing.
     #[test]
     fn a_previous_layout_of_macro_tokens_is_refused_by_name() {
         let place = place(11);
-        let mut bytes = written(place, &tree(place, place)).unwrap();
-        let cut = decode(&bytes[..bytes.len() - 3], place).unwrap_err();
+        let mut bytes = written(&place, &tree(&place, &place)).unwrap();
+        let cut = decode(&bytes[..bytes.len() - 3], &place).unwrap_err();
         assert!(cut.contains("bytes asked of the"), "{cut}");
         bytes[..4].copy_from_slice(&(LAYOUT + 1).to_le_bytes());
-        let why = decode(&bytes, place).unwrap_err();
+        let why = decode(&bytes, &place).unwrap_err();
         assert!(why.contains("macro def tokens of layout") && why.contains("this blaze reads"), "{why}");
     }
 
