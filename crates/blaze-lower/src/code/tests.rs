@@ -631,6 +631,29 @@ fn the_oracle_catches_an_item_level_call_taken_as_the_files_own() {
     }
 }
 
+/// A rule that writes a field or a type after a `:` and a plain macro's call (`inner: vec![]`,
+/// as nushell's `impl_from_value_for_uint!` does) calls the standard library's: a `:` alone ends
+/// no path. Two of them, spaced or not, do: `other::vec![]` calls another crate's `vec`, which
+/// keeps the crate unplain.
+#[test]
+fn a_rule_that_writes_a_field_before_a_plain_call_is_known() {
+    let known = "macro_rules! from {\n    ($t:ty) => {\n        impl F for $t {\n            fn f() -> S {\n                S { inner: vec![], msg: format!(\"x\") }\n            }\n        }\n    };\n}\nfrom!(u8);\n";
+    assert!(!code(known).unplain, "{known}");
+    for path in ["other::vec![]", "other :: vec![]", "other: :vec![]"] {
+        let text = format!("macro_rules! from {{\n    () => {{ const A: u8 = {path}; }};\n}}\nfrom!();\n");
+        assert!(code(&text).unplain, "{text}");
+    }
+}
+
+/// The control: with no `:` taken as a path's (the planted bug), a rule that calls another
+/// crate's `vec` by its path keeps its crate's surface.
+#[test]
+fn the_oracle_catches_a_path_taken_for_a_field() {
+    let text = "macro_rules! from {\n    () => { const A: u8 = other::vec![]; };\n}\nfrom!();\n";
+    assert!(code(text).unplain);
+    assert!(!planting(Plant::Colon, || code(text)).unplain);
+}
+
 /// What kind of item a generated file holds: what of it another crate's check reads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Kind {

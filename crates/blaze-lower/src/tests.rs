@@ -3462,3 +3462,112 @@ fn a_carried_surface_is_the_one_a_parse_gives() {
     };
     assert!(refused.contains("the surface a record carried of the crate"), "{refused}");
 }
+
+/// Whether `unit`'s crate has a surface of its own ([`crate::code::own_narrow`]), over the view
+/// with each of `changes` made.
+fn has_surface(unit: usize, changes: &[(&'static str, Option<&'static [u8]>)]) -> bool {
+    let front = front_over(changes);
+    let krate = front.krate(unit).unwrap_or_else(|| panic!("unit {unit} has no crate"));
+    crate::code::own_narrow(front.db(), krate).surface.is_some()
+}
+
+/// A file of the lib that imports a macro of a plain one's name from another crate.
+const SHADOWING: &[u8] = b"use other::vec;\n";
+
+/// A file only a `#[cfg(test)]` module is made from, and one no module is, is no file of a
+/// build of the lib without `test` ([`crate::code::built_from`]): its import of a macro of a
+/// plain one's name keeps no surface from the lib, and keeps one from the lib's test, whose
+/// settings have `test`. The same import in a module the lib is built from keeps it from both.
+#[test]
+fn a_file_no_build_of_the_crate_reads_takes_no_surface_away() {
+    let lib_test_only: &[u8] = b"#[cfg(test)]\nmod more;\npub fn gen() -> u8 {\n    1\n}\n";
+    let test_only = [("a/src/lib.rs", Some(lib_test_only)), ("a/src/more.rs", Some(SHADOWING))];
+    assert!(has_surface(LIB, &test_only));
+    assert!(!has_surface(LIB_TEST, &test_only));
+    let unread = [("a/src/lib.rs", Some(LIB_PLAIN)), ("a/src/more.rs", Some(SHADOWING))];
+    assert!(has_surface(LIB, &unread));
+    let lib_built: &[u8] = b"mod more;\npub fn gen() -> u8 {\n    1\n}\n";
+    let built = [("a/src/lib.rs", Some(lib_built)), ("a/src/more.rs", Some(SHADOWING))];
+    assert!(!has_surface(LIB, &built));
+    // Under an inline module, as `x/more.rs`.
+    let lib_inline: &[u8] = b"mod x {\n    mod more;\n}\npub fn gen() -> u8 {\n    1\n}\n";
+    let inline = [("a/src/lib.rs", Some(lib_inline)), ("a/src/x/more.rs", Some(SHADOWING))];
+    assert!(!has_surface(LIB, &inline));
+    // A module whose file is named by `#[path]`: which files are read is not followed.
+    let lib_path: &[u8] = b"#[path = \"elsewhere.rs\"]\nmod x;\npub fn gen() -> u8 {\n    1\n}\n";
+    let path = [("a/src/lib.rs", Some(lib_path)), ("a/src/more.rs", Some(SHADOWING))];
+    assert!(!has_surface(LIB, &path));
+}
+
+/// The control: with a module a feature may take away taken as one only a test is made from
+/// (the planted bug), the lib, built with that feature, keeps a surface though a file it is
+/// built from imports a macro of a plain one's name.
+#[test]
+fn the_oracle_catches_a_module_a_feature_keeps_taken_as_a_tests() {
+    let lib: &[u8] = b"#[cfg(feature = \"fast\")]\nmod more;\npub fn gen() -> u8 {\n    1\n}\n";
+    let changes = [("a/src/lib.rs", Some(lib)), ("a/src/more.rs", Some(SHADOWING))];
+    assert!(!has_surface(LIB, &changes));
+    assert!(crate::code::planting(crate::code::Plant::Dead, || has_surface(LIB, &changes)));
+}
+
+const MACRO_SHOUT: &[u8] = b"extern crate proc_macro;\n#[proc_macro]\npub fn shout(input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    input\n}\n#[proc_macro_derive(Shout, attributes(shout))]\npub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    input\n}\n";
+const MACRO_VEC: &[u8] = b"extern crate proc_macro;\n#[proc_macro]\npub fn vec(input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    input\n}\n";
+const MAIN_GLOB: &[u8] = b"pub use m::*;\nfn main() {}\n";
+
+/// A glob of a proc-macro crate none of whose macros has a plain one's name takes no surface
+/// away ([`crate::code::globs_known`]); one of a crate that makes `vec`, of a crate that is
+/// no proc-macro crate, or of a name an `extern crate` gives another crate does.
+#[test]
+fn a_glob_of_a_proc_macro_crate_whose_names_are_known_keeps_a_surface() {
+    assert!(has_surface(BIN, &[("b/src/main.rs", Some(MAIN_GLOB)), ("m/src/lib.rs", Some(MACRO_SHOUT))]));
+    assert!(!has_surface(BIN, &[("b/src/main.rs", Some(MAIN_GLOB)), ("m/src/lib.rs", Some(MACRO_VEC))]));
+    let library: &[u8] = b"pub use alpha::*;\nfn main() {}\n";
+    assert!(!has_surface(BIN, &[("b/src/main.rs", Some(library)), ("m/src/lib.rs", Some(MACRO_SHOUT))]));
+    let renamed: &[u8] = b"extern crate alpha as m;\npub use m::*;\nfn main() {}\n";
+    assert!(!has_surface(BIN, &[("b/src/main.rs", Some(renamed)), ("m/src/lib.rs", Some(MACRO_SHOUT))]));
+    // A macro of the proc-macro crate's root that could write a proc macro's function.
+    let made: &[u8] = b"extern crate proc_macro;\nmake!();\n";
+    assert!(!has_surface(BIN, &[("b/src/main.rs", Some(MAIN_GLOB)), ("m/src/lib.rs", Some(made))]));
+}
+
+/// The control: with a proc-macro crate's glob known whatever its macros are named (the
+/// planted bug), a glob of one that makes `vec` keeps the surface.
+#[test]
+fn the_oracle_catches_a_glob_known_whatever_it_brings_in() {
+    let changes = [("b/src/main.rs", Some(MAIN_GLOB)), ("m/src/lib.rs", Some(MACRO_VEC))];
+    assert!(!has_surface(BIN, &changes));
+    assert!(crate::code::planting(crate::code::Plant::Globs, || has_surface(BIN, &changes)));
+}
+
+/// The lib with an item-level call of a macro no text says, so no body of it may be left out,
+/// and the same with its body edited.
+const LIB_UNPLAIN: &[u8] = b"other!();\npub fn gen() -> u8 {\n    1\n}\n";
+const LIB_UNPLAIN_BODY: &[u8] = b"other!();\npub fn gen() -> u8 {\n    2\n}\n";
+
+/// A library with no surface stands in for one by its own code text and its dependencies'
+/// surfaces ([`super::narrow_of`]): a body edit of it moves the check and the library build
+/// above it, as every edit of it does.
+#[test]
+fn a_crate_with_no_surface_is_read_above_by_its_whole_code_text() {
+    let lib = |text: &'static [u8]| front_over(&[("a/src/lib.rs", Some(text))]);
+    let front = lib(LIB_UNPLAIN);
+    let krate = front.krate(LIB).expect("the lib's crate");
+    assert!(crate::code::own_narrow(front.db(), krate).surface.is_none());
+    let [_, (_, was)] = narrowed_over(LIB_UNPLAIN);
+    let [_, (_, now)] = narrowed_over(LIB_UNPLAIN_BODY);
+    assert_ne!(was.checked, now.checked);
+    assert_ne!(was.built, now.built);
+}
+
+/// The control: with the stand-in made of the dependencies' surfaces alone (the planted bug), a
+/// body edit of a crate with no surface moves no key of the bin's check above it: stale.
+#[test]
+fn the_oracle_catches_a_stand_in_without_its_own_code() {
+    let checked = || {
+        let [_, (_, was)] = narrowed_over(LIB_UNPLAIN);
+        let [_, (_, now)] = narrowed_over(LIB_UNPLAIN_BODY);
+        was.checked == now.checked
+    };
+    assert!(!checked());
+    assert!(crate::code::planting(crate::code::Plant::Standin, checked));
+}

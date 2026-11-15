@@ -71,7 +71,9 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 pub use self::answer::{SubRequest, SubResponse, answer};
-pub use self::code::{CodeText, code_identity, code_text_of, still_text, still_text_of};
+pub use self::code::{
+    CodeText, Construct, Denial, census_of, code_identity, code_text_of, still_text, still_text_of,
+};
 pub use self::crates::{lint_flags, local, target_data};
 pub use self::doctests::DoctestProgram;
 pub use self::harness::{Appended, edition_program, macros_loaded, wasm_macro};
@@ -2957,9 +2959,10 @@ struct Narrow {
     built: ContentId,
     /// What another crate's front end observes of it and, through it, of what it depends on,
     /// with no position but the ones a constant can hold: its surface text and its
-    /// dependencies' surfaces ([`code::CodeText::surface`]). `interface` where it has no
-    /// surface, or could hold a position its surface does not say (`locates` and its own
-    /// calls).
+    /// dependencies' surfaces ([`code::CodeText::surface`]). For a library with no surface
+    /// (no body of it may be left out), its code text and its dependencies' surfaces.
+    /// `interface` where it could hold a position its surface does not say (`locates` and its
+    /// own calls), and where it is made from Rust of another crate's file.
     surface: ContentId,
     /// Whether it or a crate it depends on could give a constant of a crate above its
     /// caller's position: it has a `#[track_caller]` `const fn` ([`code::CodeText::tracks`])
@@ -2979,6 +2982,9 @@ const NARROW_CHECKED: &str = "blaze v2 cargo unit narrow checked 3";
 /// 2: a dependency by its surface.
 const NARROW_BUILT: &str = "blaze v2 cargo unit narrow built 2";
 const NARROW_SURFACE: &str = "blaze v2 cargo unit narrow surface 1";
+/// What stands in for the surface of a crate with none: its own code text, and its
+/// dependencies' surfaces.
+const NARROW_SURFACE_OWN: &str = "blaze v2 cargo unit narrow surface by own code 1";
 
 /// [`Lowered::narrowed`] of `krate`, each crate of its closure worked out once into `known`,
 /// dependencies first, with a stack of its own; `whole` holds the whole identity
@@ -3079,16 +3085,27 @@ fn narrow_of(
         // A constant of this crate made by a call of a function that gives its caller's
         // position holds a position no token says: then the interface, which holds them all.
         let positioned = locates && own.calls && !code::planted(code::Plant::Located);
-        let surface = match own.surface {
-            Some(own_surface) if library && !extends && !positioned => {
-                folded(NARROW_SURFACE, own_surface, |it| it.surface)
-            }
-            _ => interface,
-        };
         // A crate made from Rust of another crate's source root holds that file's bodies, which
         // the other's surface leaves out: it is keyed by the code below it. Exact for a
         // workspace crate, by where each path it reads resolves ([`code::reaches_beyond`]).
         let reaches = own.reaches && (given.contains_key(&at) || code::reaches_beyond(db, at));
+        let surface = match own.surface {
+            Some(own_surface) if library && !extends && !positioned => {
+                folded(NARROW_SURFACE, own_surface, |it| it.surface)
+            }
+            // No body of it may be left out ([`code::CodeText::unplain`]): a front end above
+            // reads its whole code text, and of the crates below it, through it, what it
+            // reads of them, which their surfaces hold (by the same rule, below each), as
+            // its slot is ([`slot_of`]). Not one made from Rust of another crate's file,
+            // whose bodies are the other's and which no surface holds.
+            None if library && !extends && !positioned && !reaches => {
+                match code::planted(code::Plant::Standin) {
+                    true => folded(NARROW_SURFACE_OWN, ContentId([0; 32]), |it| it.surface),
+                    false => folded(NARROW_SURFACE_OWN, own_code, |it| it.surface),
+                }
+            }
+            _ => interface,
+        };
         let checked = match extends || reaches || code::planted(code::Plant::Deep) {
             true => code,
             false => folded(NARROW_CHECKED, own_code, |it| it.surface),

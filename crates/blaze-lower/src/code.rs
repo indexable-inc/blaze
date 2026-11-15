@@ -172,6 +172,12 @@ pub struct CodeText {
     /// `blaze why` to say ([`unplain_at`]). A line, not an offset: two texts of one still text
     /// ([`still_text_of`]) have it alike.
     pub unplain_line: Option<u32>,
+    /// Whether it is `unplain` by globs alone, each of a path whose first name is no module
+    /// declared beside it and none of the standard library's or the crate's, in a file of
+    /// uniform paths (edition 2018 and later): each such glob takes the names of the
+    /// dependency of that name, which its crate may know to be no plain macro's
+    /// ([`globs_known`]).
+    pub globbed: bool,
     /// Whether it names blaze's extensions (`blaze`, `fn_info`, `type_info`): what is proved
     /// of its code (an effect, a contract, a function's code identity) may read the bodies of
     /// the crates its crate depends on.
@@ -569,7 +575,186 @@ pub(crate) fn own_narrow(db: &Db, krate: Crate) -> OwnNarrow {
         krate,
         |file| code_text(db, EditionedFileId::new(db, file, data.edition)),
         || reads_root_alone(db, EditionedFileId::new(db, root_file, data.edition)),
+        |file| globs_known(db, krate, EditionedFileId::new(db, file, data.edition)),
+        || built_from(db, krate),
     )
+}
+
+/// The files of workspace crate `krate`'s source root its build may be made from: its root,
+/// and each file an out-of-line module of one of them may be (`mod x;` as `x.rs` or
+/// `x/mod.rs`, beside the file or under its stem's directory, under each inline module it is
+/// in), but under a `#[cfg(test)]` module, where its settings have no `test`. More files than
+/// the compiler reads, never fewer: none (every file may be) where a module is declared by
+/// anything but text this reads (a `#[path]` or a `cfg_attr` on a module, `include!`, a
+/// `macro_rules!` that writes `mod`, `proc_macro_hygiene`, under which a proc macro may write
+/// an out-of-line module), and where its settings have `test`. A file no root reaches
+/// (`tests/`, `examples/`, a build script) is none of them.
+fn built_from(db: &Db, krate: Crate) -> Option<Vec<base_db::FileId>> {
+    let data = krate.data(db);
+    let test = cfg::CfgAtom::Flag(intern::Symbol::intern("test"));
+    if krate.cfg_options(db).check_atom(&test) {
+        return None;
+    }
+    let root = db.source_root(db.file_source_root(data.root_file_id).source_root_id(db));
+    let set = root.source_root_ref(db);
+    // alloc: once per workspace crate a file of which is unplain, a file it is made from each
+    let mut built = Vec::new();
+    let mut stack = vec![data.root_file_id];
+    while let Some(file) = stack.pop() {
+        if built.contains(&file) {
+            continue;
+        }
+        built.push(file);
+        if !db.has_file_text(file) {
+            return None;
+        }
+        _ = db.file_text(file).text(db);
+        let tree = EditionedFileId::new(db, file, data.edition).parse(db).syntax_node();
+        let unread = tree.descendants_with_tokens().filter_map(NodeOrToken::into_token).any(|it| {
+            let written = || {
+                it.parent_ancestors().any(|it| {
+                    matches!(it.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)
+                })
+            };
+            (it.kind() == SyntaxKind::IDENT && it.text() == "include" && called_as_macro(&it))
+                || it.text() == "proc_macro_hygiene"
+                || (it.kind() == SyntaxKind::MOD_KW && written())
+        });
+        if unread {
+            return None;
+        }
+        let stem = set
+            .path_for_file(&file)
+            .and_then(|it| it.name_and_extension())
+            .map(|(name, _)| name.to_owned()); // alloc: a file's stem, once a file
+        for module in tree.descendants().filter(|it| it.kind() == SyntaxKind::MODULE) {
+            let out_of_line = !module.children().any(|it| it.kind() == SyntaxKind::ITEM_LIST);
+            let test_only = |module: &SyntaxNode| {
+                attrs(module).any(|attr| {
+                    matches!(attr.meta(), Some(ast::Meta::CfgMeta(_)))
+                        && (planted(Plant::Dead) || path_text(attr.syntax()) == "#[cfg(test)]")
+                })
+            };
+            let inline: Vec<SyntaxNode> =
+                module.ancestors().skip(1).filter(|it| it.kind() == SyntaxKind::MODULE).collect();
+            if test_only(&module) || inline.iter().any(test_only) {
+                continue;
+            }
+            if !out_of_line {
+                continue;
+            }
+            let named = |it: &SyntaxNode| {
+                it.children().find(|it| it.kind() == SyntaxKind::NAME).map(|it| it.text().to_string())
+            };
+            let path_attr = attrs(&module).any(|attr| {
+                !matches!(attr.meta(), Some(ast::Meta::CfgMeta(_)))
+                    && attr
+                        .syntax()
+                        .descendants_with_tokens()
+                        .any(|it| matches!(it.as_token().map(|it| it.text()), Some("path" | "cfg_attr")))
+            });
+            let Some(name) = named(&module) else { return None };
+            if path_attr {
+                return None;
+            }
+            // alloc: as above, a module's directory
+            let mut under = String::new();
+            for at in inline.iter().rev() {
+                let Some(name) = named(at) else { return None };
+                under.push_str(&name);
+                under.push('/');
+            }
+            let dirs = [Some(under.clone()), stem.as_ref().map(|stem| format!("{stem}/{under}"))];
+            for dir in dirs.into_iter().flatten() {
+                for path in [format!("{dir}{name}.rs"), format!("{dir}{name}/mod.rs")] {
+                    let path = base_db::AnchoredPath { anchor: file, path: &path };
+                    stack.extend(set.resolve_path(path));
+                }
+            }
+        }
+    }
+    built.sort_unstable();
+    Some(built)
+}
+
+/// Whether each glob of `file` (of a crate of uniform paths, [`CodeText::globbed`]) that takes
+/// names from outside the standard library and the crate takes them from a proc-macro crate
+/// `krate` depends on by the path's first name, none of whose macros has a plain macro's
+/// name ([`no_plain_macros`]), where no `extern crate` of `krate`'s root gives that name to
+/// another crate. The first name of such a path is that crate: a module or an import of the
+/// name where the glob is would make it ambiguous (E0659), which no crate that builds is.
+fn globs_known(db: &Db, krate: Crate, file: EditionedFileId) -> bool {
+    let data = krate.data(db);
+    let root = EditionedFileId::new(db, data.root_file_id, data.edition).parse(db).syntax_node();
+    // alloc: once a globbed file of a workspace crate keyed, its root's renamed crates
+    let renamed: Vec<String> = root
+        .children()
+        .filter(|it| it.kind() == SyntaxKind::EXTERN_CRATE)
+        .filter_map(|it| it.children().find(|it| it.kind() == SyntaxKind::RENAME))
+        .filter_map(|it| it.children().find(|it| it.kind() == SyntaxKind::NAME))
+        .map(|it| it.text().to_string())
+        .collect();
+    let tree = file.parse(db).syntax_node();
+    let uses = tree.descendants().filter(|it| it.kind() == SyntaxKind::USE);
+    let mut globs = uses.flat_map(|it| taken_from_outside(&it, true).collect::<Vec<_>>()); // alloc: a use's trees
+    globs.all(|taken| {
+        !taken.glob
+            || (!renamed.contains(&taken.first)
+                && data.dependencies.iter().any(|dep| {
+                    dep.name.symbol().as_str() == taken.first
+                        && (planted(Plant::Globs) || no_plain_macros(db, dep.crate_id))
+                }))
+    })
+}
+
+/// Whether `krate` is a proc-macro crate none of whose macros has a plain macro's name: its
+/// macros are its root's functions given `proc_macro`, `proc_macro_attribute` or
+/// `proc_macro_derive` (a proc-macro crate exports nothing else, and only from its root),
+/// each by its function's name or the names its attribute says. Not where an item of its root
+/// could be made by a macro (a call where items are but a plain one, an attribute that gives
+/// an item to a macro), or read from another file (`include!`).
+#[blaze_query::tracked(returns(copy))]
+fn no_plain_macros(db: &Db, krate: Crate) -> bool {
+    let data = krate.data(db);
+    if !matches!(data.target_kind, base_db::TargetKind::Lib { is_proc_macro: true }) {
+        return false;
+    }
+    let id = data.root_file_id;
+    if !db.has_file_text(id) {
+        _ = db.file_content(id);
+        return false;
+    }
+    let text = db.file_text(id);
+    // A full parse: a library source root's files are parsed as outlines.
+    let parse = syntax::SourceFile::parse(text.text(db), data.edition);
+    let root = parse.tree().syntax().clone();
+    let plain = |it: &SyntaxToken| it.kind() == SyntaxKind::IDENT && PLAIN_MACROS.contains(&it.text());
+    for item in root.children() {
+        if item.kind() == SyntaxKind::MACRO_CALL && !plain_call(&item) {
+            return false;
+        }
+        let mut proc_macro = false;
+        for attr in attrs(&item) {
+            // alloc: once a proc-macro crate's root, an attribute's tokens each
+            let tokens: Vec<SyntaxToken> =
+                attr.syntax().descendants_with_tokens().filter_map(NodeOrToken::into_token).collect();
+            let first = tokens.iter().find(|it| it.kind() == SyntaxKind::IDENT);
+            if first.is_some_and(|it| it.text().starts_with("proc_macro")) {
+                proc_macro = true;
+                if tokens.iter().any(plain) {
+                    return false;
+                }
+            } else if attr_seen(&attr) != Seen::No {
+                return false;
+            }
+        }
+        let name = item.children().find(|it| it.kind() == SyntaxKind::NAME);
+        if proc_macro && name.is_none_or(|it| PLAIN_MACROS.contains(&it.text().to_string().as_str())) {
+            return false;
+        }
+    }
+    let tokens = root.descendants_with_tokens().filter_map(NodeOrToken::into_token);
+    !tokens.into_iter().any(|it| it.text() == "include" && called_as_macro(&it))
 }
 
 /// Whether workspace crate `krate` may be made from Rust of another crate's source root
@@ -643,6 +828,8 @@ pub(crate) fn library_narrow(db: &Db, krate: Crate) -> OwnNarrow {
         krate,
         |file| whole_code_text(db, EditionedFileId::new(db, file, edition)),
         || false,
+        |_| false,
+        || None,
     )
 }
 
@@ -759,6 +946,8 @@ fn narrow_from(
     krate: Crate,
     text_of: impl Fn(base_db::FileId) -> Option<CodeText>,
     alone: impl FnOnce() -> bool,
+    globs: impl Fn(base_db::FileId) -> bool,
+    built: impl FnOnce() -> Option<Vec<base_db::FileId>>,
 ) -> OwnNarrow {
     let data = krate.data(db);
     let root_file = data.root_file_id;
@@ -799,7 +988,22 @@ fn narrow_from(
         return OwnNarrow { extends, reaches, tracks, names_location, calls, ..whole };
     }
     let strict = texts().any(|it| it.shadows);
-    let unplain = texts().any(|it| it.unplain);
+    // Unplain by a file the crate is built from ([`built_from`]: every file, where that is
+    // not known), whose globs of another crate are not known ([`globs_known`]).
+    let denied = |file: base_db::FileId, code: &CodeText| code.unplain && !(code.globbed && globs(file));
+    let unplain = denied(root_file, &root_text) || {
+        // alloc: once per workspace crate keyed, its unplain files
+        let denied: Vec<base_db::FileId> = files
+            .iter()
+            .filter(|it| it.2.as_ref().is_some_and(|code| denied(it.1, code)))
+            .map(|it| it.1)
+            .collect();
+        !denied.is_empty()
+            && match built() {
+                None => true,
+                Some(built) => denied.iter().any(|it| built.binary_search(it).is_ok()),
+            }
+    };
     // Which text of each file: 0 its code text, 1 its interface, 2 its surface.
     let hashed = |which: u8| {
         let pick = |code: &CodeText| match (which, strict) {
@@ -870,9 +1074,21 @@ pub(crate) fn unplain_at(db: &Db, krate: Crate) -> Option<String> {
     }
     let text_of = |file| code_text(db, EditionedFileId::new(db, file, data.edition));
     let alone = reads_root_alone(db, EditionedFileId::new(db, data.root_file_id, data.edition));
+    let built = built_from(db, krate);
+    // As [`narrow_from`] judges: a file the crate is built from, unplain by more than globs it
+    // knows.
+    let judged = |file: base_db::FileId| {
+        let denied = text_of(file).is_some_and(|it| {
+            it.unplain
+                && !(it.globbed && globs_known(db, krate, EditionedFileId::new(db, file, data.edition)))
+        });
+        denied
+            && (file == data.root_file_id
+                || built.as_ref().is_none_or(|built| built.binary_search(&file).is_ok()))
+    };
     // alloc: once a miss of a unit above an unplain crate, a file of the crate each
     let mut found: Vec<(Vec<u8>, base_db::FileId, u32)> = Vec::new();
-    for file in set.iter().filter(|it| !alone || *it == data.root_file_id) {
+    for file in set.iter().filter(|it| (!alone || *it == data.root_file_id) && judged(*it)) {
         let Some(path) = set.path_for_file(&file).and_then(|it| it.as_path()).map(|it| it.as_str())
         else {
             continue;
@@ -930,6 +1146,56 @@ fn code_text(db: &Db, file: EditionedFileId) -> Option<CodeText> {
 /// What of a file of text `text`, parsed as `root` in `edition`, its crate's code can observe
 /// (the module's docs).
 pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> CodeText {
+    walked(root, text, edition, None).0
+}
+
+/// What makes a file `unplain` ([`CodeText::unplain`]), one construct of the walk that judges
+/// it ([`Walk::deny`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Construct {
+    /// A glob import from a path that starts outside the standard library and the crate.
+    Glob,
+    /// An import of a name of a standard macro ([`PLAIN_MACROS`]) from outside them.
+    PlainNameImport,
+    /// `#[macro_use] extern crate` of a crate not the standard library's.
+    MacroUseExtern,
+    /// A macro defined with a standard macro's name, or with no name.
+    PlainNameMacro,
+    /// A macro whose rules write a macro definition.
+    MacroMakingMacro,
+    /// A call where items are of a macro by a path (`a::m!`, `$crate::m!`).
+    PathCall,
+    /// A call where items are of a macro this file defines, which [`local_call`] refuses.
+    LocalRefused,
+    /// A call where items are of a macro by its name alone that this file does not define.
+    NameCall,
+}
+
+/// One construct that makes a file `unplain`: its line (from 1), what it is, and the name of
+/// the macro a call calls or the first name of an import's path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Denial {
+    pub line: u32,
+    pub construct: Construct,
+    pub name: String,
+}
+
+/// [`code_text_of`], with every construct that makes the file `unplain` rather than the first
+/// alone: the same walk, for the census of what keeps crates from a surface
+/// (`examples/census.rs`).
+pub fn census_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> (CodeText, Vec<Denial>) {
+    // alloc: once per file of a census
+    let (code, found) = walked(root, text, edition, Some(Vec::new()));
+    (code, found.unwrap_or_default())
+}
+
+/// [`code_text_of`]'s walk, every denial gathered into `found` where it is given.
+fn walked(
+    root: &SyntaxNode,
+    text: &str,
+    edition: span::Edition,
+    found: Option<Vec<Denial>>,
+) -> (CodeText, Option<Vec<Denial>>) {
     let end = match planted(Plant::Bytes) {
         true => text.len(),
         false => code_end(root),
@@ -945,6 +1211,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> Co
         skip: (0, 0),
         unplain: false,
         unplain_line: None,
+        strong: false,
         defined: None,
         extends: false,
         reaches: false,
@@ -958,6 +1225,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> Co
         calls: false,
         // alloc: once per file keyed, a node of its depth each
         seen: Vec::new(),
+        found,
     };
     for event in root.preorder_with_tokens() {
         match event {
@@ -967,7 +1235,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> Co
             WalkEvent::Leave(NodeOrToken::Token(_)) => {}
         }
     }
-    CodeText {
+    let code = CodeText {
         inert: walk.inert.finish(text),
         strict: walk.strict.finish(text),
         shadows: walk.shadows,
@@ -976,6 +1244,7 @@ pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> Co
         interface_strict: walk.interface_strict.finish(text),
         unplain: walk.unplain,
         unplain_line: walk.unplain_line,
+        globbed: walk.unplain && !walk.strong,
         extends: walk.extends,
         reaches: walk.reaches,
         resolves: walk.resolves,
@@ -984,7 +1253,8 @@ pub fn code_text_of(root: &SyntaxNode, text: &str, edition: span::Edition) -> Co
         tracks: walk.tracks,
         names_location: walk.names_location,
         calls: walk.calls,
-    }
+    };
+    (code, walk.found)
 }
 
 const STILL_TEXT: &str = "blaze v2 file still text 1";
@@ -1243,6 +1513,8 @@ struct Walk<'a> {
     skip: (usize, usize),
     unplain: bool,
     unplain_line: Option<u32>,
+    /// Whether it is unplain by anything but a glob of another crate ([`CodeText::globbed`]).
+    strong: bool,
     /// The file's macro definitions, once a call where items are asks ([`local_call`]).
     defined: Option<Defined>,
     extends: bool,
@@ -1261,6 +1533,8 @@ struct Walk<'a> {
     /// Of each node entered and not left: whether a macro sees it, with the prelude's derives,
     /// `test` and `bench` inert, and not.
     seen: Vec<(bool, bool)>,
+    /// Every denial, for a census ([`census_of`]); none for a key.
+    found: Option<Vec<Denial>>,
 }
 
 /// A place in a file as the walk counts it: how many lines' ends are before it, and where its
@@ -1464,12 +1738,18 @@ impl Walk<'_> {
 
     /// The file is `unplain` if `denied`, by `node`, just entered: the first such node's line
     /// is kept ([`CodeText::unplain_line`]), the line its first token that is no comment is on.
-    fn deny(&mut self, node: &SyntaxNode, denied: bool) {
-        if denied && !self.unplain {
-            let line = self.solid(node).0.line + 1;
-            self.unplain_line = Some(u32::try_from(line).unwrap_or(u32::MAX));
+    fn deny(&mut self, node: &SyntaxNode, denied: Option<(Construct, &str)>) {
+        let Some((construct, name)) = denied else { return };
+        let line = u32::try_from(self.solid(node).0.line + 1).unwrap_or(u32::MAX);
+        if !self.unplain {
+            self.unplain_line = Some(line);
         }
-        self.unplain |= denied;
+        self.unplain = true;
+        // A glob is judged by the crate it starts at ([`globs_known`]), with uniform paths.
+        self.strong |= construct != Construct::Glob || !self.uniform;
+        if let Some(found) = &mut self.found {
+            found.push(Denial { line, construct, name: name.to_owned() }); // alloc: a census's
+        }
     }
 
     fn enter(&mut self, node: &SyntaxNode) {
@@ -1533,12 +1813,13 @@ impl Walk<'_> {
         match kind {
             SyntaxKind::USE => {
                 self.shadows |= use_shadows(node, self.uniform);
-                self.deny(node, use_takes(node, self.uniform, |it| PLAIN_MACROS.contains(&it)));
+                let denied = use_denial(node, self.uniform);
+                self.deny(node, denied.as_ref().map(|(it, first)| (*it, first.as_str())));
             }
             SyntaxKind::EXTERN_CRATE => {
                 let taken = macro_use_extern(node);
                 self.shadows |= taken;
-                self.deny(node, taken);
+                self.deny(node, taken.then_some((Construct::MacroUseExtern, "")));
             }
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
                 let name = node
@@ -1547,32 +1828,47 @@ impl Walk<'_> {
                     .map(|it| it.text().to_string()); // alloc: a macro's name, once per macro definition
                 self.shadows |= name.as_ref().is_some_and(|it| SHADOWABLE.contains(&it.as_str()));
                 // A macro of a standard macro's name, or one that could define a macro.
-                self.deny(
-                    node,
-                    name.is_none_or(|it| PLAIN_MACROS.contains(&it.as_str()))
-                        || node
-                            .children()
-                            .filter(|it| it.kind() == SyntaxKind::TOKEN_TREE)
-                            .flat_map(|it| it.descendants_with_tokens())
-                            .filter_map(NodeOrToken::into_token)
-                            .any(|it| {
-                                it.kind() == SyntaxKind::MACRO_KW || it.text() == "macro_rules"
-                            }),
-                );
+                let plain_name = name.as_ref().is_none_or(|it| PLAIN_MACROS.contains(&it.as_str()));
+                let makes = node
+                    .children()
+                    .filter(|it| it.kind() == SyntaxKind::TOKEN_TREE)
+                    .flat_map(|it| it.descendants_with_tokens())
+                    .filter_map(NodeOrToken::into_token)
+                    .any(|it| it.kind() == SyntaxKind::MACRO_KW || it.text() == "macro_rules");
+                let construct = match (plain_name, makes) {
+                    (true, _) => Some(Construct::PlainNameMacro),
+                    (false, true) => Some(Construct::MacroMakingMacro),
+                    (false, false) => None,
+                };
+                self.deny(node, construct.map(|it| (it, name.as_deref().unwrap_or(""))));
             }
             // A macro called where items are (never in a body, whose calls [`plain_body`]
             // judges) that is not one of the standard library's plain ones: what it makes is
             // not known, and it could define a macro of a standard macro's name. Unless it is
             // a macro of this file's whose expansion its text says ([`local_call`]).
             // Once unplain, the file stays so: no other call is looked into.
-            SyntaxKind::MACRO_CALL if at_items(node) && !self.unplain => {
+            // A census looks into every call.
+            SyntaxKind::MACRO_CALL if at_items(node) && (!self.strong || self.found.is_some()) => {
+                let defined = &mut self.defined;
                 let denied = !plain_call(node) && {
-                    let defined = self.defined.get_or_insert_with(|| {
+                    let defined = defined.get_or_insert_with(|| {
                         Defined::of(&node.ancestors().last().unwrap_or_else(|| node.clone()))
                     });
                     !local_call(node, defined)
                 };
-                self.deny(node, denied);
+                let construct = denied.then(|| {
+                    let path = node.children().find(|it| it.kind() == SyntaxKind::PATH);
+                    let name = path.map(|it| path_text(&it)).unwrap_or_default();
+                    let construct = match () {
+                        _ if name.contains(':') => Construct::PathCall,
+                        _ if defined.as_ref().is_some_and(|it| it.rules.iter().any(|r| r.0 == name)) => {
+                            Construct::LocalRefused
+                        }
+                        _ => Construct::NameCall,
+                    };
+                    (construct, name)
+                });
+                self.deny(node, construct.as_ref().map(|(it, name)| (*it, name.as_str())));
             }
             // A body no other crate's check can read, left out of the interface.
             SyntaxKind::BLOCK_EXPR if plain_body(node) => {
@@ -2050,12 +2346,20 @@ fn known_tokens(tree: &SyntaxNode, written: bool, called: &mut Vec<String>) -> b
                 match (after.map(|it| it.kind()), before) {
                     (Some(SyntaxKind::EQ), _) => true,
                     (_, Some(name)) if name.kind() == SyntaxKind::IDENT => {
-                        let path_or_metavariable = earlier.is_some_and(|it| {
-                            matches!(
-                                it.kind(),
-                                SyntaxKind::DOLLAR | SyntaxKind::COLON | SyntaxKind::COLON2
-                            )
-                        });
+                        // A path's `::` is two `:` in a token tree (or one `::`); a `:` with
+                        // no `:` before it is a field's or a type's (`inner: vec![]`), which
+                        // ends no path.
+                        let colon = |it: &SyntaxToken| match it.kind() {
+                            SyntaxKind::COLON2 => true,
+                            SyntaxKind::COLON => {
+                                !planted(Plant::Colon)
+                                    && solid(it.prev_token(), SyntaxToken::prev_token)
+                                        .is_some_and(|it| it.kind() == SyntaxKind::COLON)
+                            }
+                            _ => false,
+                        };
+                        let path_or_metavariable = earlier
+                            .is_some_and(|it| it.kind() == SyntaxKind::DOLLAR || colon(&it));
                         if path_or_metavariable {
                             false
                         } else if PLAIN_MACROS.contains(&name.text()) {
@@ -2162,6 +2466,21 @@ pub(crate) enum Plant {
     /// whose call may make a macro of a plain one's name keeps a surface that leaves out
     /// bodies that call it.
     Unresolved,
+    /// A library with no surface stands in for one by its dependencies' surfaces alone, not
+    /// its own code text: a body edit of it moves no key above it, a stale unit
+    /// ([`crate::Lowered::narrowed`]).
+    Standin,
+    /// Every `cfg` on a module is taken as `cfg(test)`: a file of a module a feature takes
+    /// away is no file the crate is built from, and its import of a macro of a plain one's
+    /// name is not looked at ([`built_from`]).
+    Dead,
+    /// A glob of a proc-macro crate is known whatever the crate's macros are named: one that
+    /// brings in a `vec` keeps its crate's surface ([`globs_known`]).
+    Globs,
+    /// A `:` before a macro's name in what a rule writes is never taken as a path's: a rule
+    /// that writes `other::vec![]` calls the macro `vec` of the crate `other`, whatever it
+    /// makes, and keeps its crate's surface ([`known_tokens`]).
+    Colon,
     /// A file of another crate's source root that a crate reads Rust of, by a path its text
     /// says, is taken as one of its own ([`reaches_beyond`]): what is built over it is keyed
     /// by that crate's surface, which leaves the file's bodies out, a stale unit.
@@ -2556,11 +2875,28 @@ fn use_shadows(node: &SyntaxNode, uniform: bool) -> bool {
 /// edition 2015, where it starts at the crate's root, which may hold an `extern crate` of the
 /// name; never one written `::attribute`, which names a crate.
 fn use_takes(node: &SyntaxNode, uniform: bool, named: impl Fn(&str) -> bool) -> bool {
-    node.descendants().filter(|it| it.kind() == SyntaxKind::USE_TREE).any(|tree| {
+    taken_from_outside(node, uniform).any(|it| it.glob || it.name.is_some_and(|it| named(it.as_str())))
+}
+
+/// What a tree of a `use` item takes from a path that starts outside the standard library and
+/// the crate ([`use_takes`]).
+struct Taken {
+    /// Whether it is a glob.
+    glob: bool,
+    /// The path's first name: the crate it starts at, with `uniform` paths.
+    first: String,
+    /// The name it brings in (its rename, or the path's last name).
+    name: Option<String>,
+}
+
+/// Each tree of the `use` item `node` that takes names from a path that starts outside the
+/// standard library and the crate ([`use_takes`]).
+fn taken_from_outside(node: &SyntaxNode, uniform: bool) -> impl Iterator<Item = Taken> + '_ {
+    node.descendants().filter(|it| it.kind() == SyntaxKind::USE_TREE).filter_map(move |tree| {
         let glob = tree.children_with_tokens().any(|it| it.kind() == SyntaxKind::STAR);
         let list = tree.children().any(|it| it.kind() == SyntaxKind::USE_TREE_LIST);
         if list && !glob {
-            return false;
+            return None;
         }
         // The path from the outermost tree in: its first segment is where the names come from.
         let mut first = None;
@@ -2584,14 +2920,33 @@ fn use_takes(node: &SyntaxNode, uniform: bool, named: impl Fn(&str) -> bool) -> 
         }
         let beside = |name: &str| uniform && !rooted && declares_module(node, name);
         let from_outside = !first.as_deref().is_some_and(|it| own_or_std(it) || beside(it));
+        if !from_outside {
+            return None;
+        }
         let renamed =
             tree.children().find(|it| it.kind() == SyntaxKind::RENAME).map(|it| path_text(&it));
         let name = match &renamed {
             Some(rename) => rename.strip_prefix("as").map(str::to_owned),
             None => last,
         };
-        from_outside && (glob || name.is_some_and(|it| named(it.as_str())))
+        Some(Taken { glob, first: first.unwrap_or_default(), name })
     })
+}
+
+/// What of the `use` item `node` makes its file unplain: an import of a plain macro's name from
+/// outside the standard library and the crate, else a glob from outside them.
+/// With the path's first name, for a census ([`Denial::name`]).
+fn use_denial(node: &SyntaxNode, uniform: bool) -> Option<(Construct, String)> {
+    let mut glob = None;
+    for taken in taken_from_outside(node, uniform) {
+        if !taken.glob && taken.name.is_some_and(|it| PLAIN_MACROS.contains(&it.as_str())) {
+            return Some((Construct::PlainNameImport, taken.first));
+        }
+        if taken.glob && glob.is_none() {
+            glob = Some((Construct::Glob, taken.first));
+        }
+    }
+    glob
 }
 
 /// Whether the list of items the `use` item `node` is in declares a module `name` that is
