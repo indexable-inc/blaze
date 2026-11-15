@@ -706,6 +706,17 @@ per head. `ed25519-dalek` does the checks (2.2 in the workspace today).
   sandboxed in the build job, [cargo.md](cargo.md#sandboxed-tests)) never run in a
   process that can read the key.
 
+### The settings, as built
+
+`crates/blaze-remote/src/settings.rs` reads what the cache is from `<root>/remote.json` and a
+writing machine's secrets from `<root>/remote-credentials.json` (owner-only, mode 0600). In CI the
+same come from the environment: `BLAZE_CACHE_ENDPOINT`, `BLAZE_CACHE_BUCKET`,
+`BLAZE_CACHE_PUBLIC_URL`, `BLAZE_CACHE_TRANSPORT`, `BLAZE_CACHE_PUBLIC_ANCHORS` (comma-separated
+hex), `BLAZE_CACHE_ACCESS_KEY_ID`, `BLAZE_CACHE_SECRET_ACCESS_KEY`, `BLAZE_CACHE_SIGNING_SEED` and
+`BLAZE_CACHE_KEY_LIST`; a value set both in a file and in the environment is refused, naming both.
+`blaze cache keys sign` signs a key list with the anchor seed, `BLAZE_CACHE_ANCHOR_SEED`, read
+from the environment only (`crates/blaze-remote/src/cmd.rs`).
+
 ### Rotation and revocation
 
 - **Rotation**, every few months or at will: add `blaze-ci-(N+1)` to the key list (root-signed, turn

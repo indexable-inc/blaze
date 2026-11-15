@@ -675,7 +675,7 @@ a `#![no_std]` library with a struct, a trait with a provided method and two imp
 through `dyn`, a generic, a `macro_rules!`-made module, a `cfg` pair and a feature pair, and a
 `main.rs`; and, each drawn, `up` with a generic `app` instantiates, `mid`, a library built over
 `up` whose text never changes while `up`'s bodies, lines, a signature and a method it selects do
-(early cutoff between crates: a record of `mid` found across an edit below it), `vendor/made` with a build
+(early cutoff between crates: a record of `mid` found across an edit below it), a vendored package `made` with a build
 script that reads two files, writes `OUT_DIR` for an `include!` and sets a `cfg`, and the proc
 macro `mac`) and one to five turns. A turn is up to two edits (a body, a signature, a layout, a
 trait impl, an override, the only `dyn` call, an item added or removed, a rename, a `cfg`, a

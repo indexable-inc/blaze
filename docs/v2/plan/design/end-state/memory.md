@@ -2,7 +2,7 @@
 status: superseded
 summary: End state for memory, admission and scheduling: the daemon holds no compiler state between requests; one gate every page commit passes makes the ceiling hold by construction; the give-back ladder and forecasts are deleted.
 date: 2026-11-12
-superseded_by: v2/plan/design/target.md
+superseded_by: ../target.md
 ---
 # Memory, admission and scheduling: the end state
 

@@ -650,7 +650,7 @@ impl<D, I> Clone for Column<D, I> {
     }
 }
 
-/// The invariant: two columns are equal when they map the same names to the same items, in
+/// Two columns are equal when they map the same names to the same items, in
 /// any order, as the `IndexMap` a column replaced was and as [`Keyed`] is. A column lists its
 /// names in the order they were added, which is the order imports happened to resolve in: a
 /// crate collected again (its proc macros given again, its dependencies' def maps ready this

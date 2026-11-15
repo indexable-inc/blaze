@@ -3559,7 +3559,7 @@ short context, has to keep in mind at once. Code: `crates/blaze-lints/src/blaze/
 Test code (`#[test]`, `#[cfg(test)]`) is not measured.
 
 All twelve are in `blaze::internal`. They are allowed by default and at `warn` in blaze's
-workspace until `crates/blaze-lints/baselines/items.tsv` holds every existing item at its
+workspace until `items.tsv` in `crates/blaze-lints/baselines/` holds every existing item at its
 value. That takes a bless, which needs the tree to check itself. Once baselined they go to
 `deny`: new code meets the bound, and existing code may only shrink.
 

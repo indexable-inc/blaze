@@ -2,7 +2,7 @@
 status: superseded
 summary: End state for build scripts, proc macros, the environment and outside files: one read form (ask, answer digest) over one Merkle tree kept by one watcher; runs and macro calls are records keyed before the work; no untraced class.
 date: 2026-11-12
-superseded_by: v2/plan/design/target.md
+superseded_by: ../target.md
 ---
 # Outside: build scripts, proc macros, the environment, files outside the workspace
 

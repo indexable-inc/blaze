@@ -538,7 +538,7 @@ does, when no daemon holds the home); a build's output does not warn with the ho
 guard is not called from a test that builds; `sources/` and `toolchains/` have no collector;
 a home made for a lane or a test has no lifetime. The design for the last: each home registers
 itself in the machine's list (`<machine>/homes.json`: path, creator, made, expires; written
-whole under the list's lock as a daemon first starts on the home; `BLAZE_HOME_EXPIRES` or a
+whole under the list's lock as a daemon first starts on the home; an expiry its creator gives or a
 default of 7 days for a home outside `~/.cache`, none for the user's own), `blaze cache homes`
 lists them with sizes and expiry, and a collection on any home removes a listed home that is
 past its expiry, whose collector lock is free and whose directory still carries the list's

@@ -2,7 +2,7 @@
 status: superseded
 summary: End state for the toolchain, std, bstd, editions and targets: everything pinned is a tree named by BLAKE3 mounted at a virtual root; std and bstd are plain crates with fetched records, so a new project compiles none of them; C inputs from a per-workspace tool table. Not yet reconciled with the shared page.
 date: 2026-11-12
-superseded_by: v2/plan/design/target.md
+superseded_by: ../target.md
 ---
 ---
 status: plan
