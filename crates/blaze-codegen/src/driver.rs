@@ -16,7 +16,7 @@
 //! [`Built::puts`]: what the build compiled, its keys. A store entry that fails to read is an
 //! error naming the unit, never a reason to compile again.
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -34,7 +34,8 @@ use blaze_mem::{Tag, frame};
 use crossbeam_queue::SegQueue;
 
 use crate::{
-    CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Static, Target, Unit,
+    CodegenError, CompiledFunction, Instance, InstanceKey, Linkage, Settings, Static, Target,
+    Unit,
     backend::{
         Address, Described, DescribedStatic, Emitted, FrontRef, Frontend, Import, Prepare, Shape,
         laid_out, release_refs,
@@ -69,12 +70,160 @@ impl Lookup for blaze_cas::Store {
     }
 }
 
-/// A value for the store.
-#[derive(PartialEq, Eq, Debug)]
+/// A value for the store. Two are equal when the store would keep the same: their key, kind
+/// and bytes; `of` describes how one was made and is no part of what is kept.
+#[derive(Debug)]
 pub struct Put {
     pub key: Key,
     pub kind: Kind,
     pub bytes: Vec<u8>,
+    /// What the value is and how it was made, carried from where it is made to the put: what
+    /// a refusal of the put names (rule 19). Set for every code value codegen makes (a
+    /// template, a launched function's bind record); `None` for a describe record, a side
+    /// table, a profile.
+    pub of: Option<Arc<PutOf>>,
+}
+
+impl PartialEq for Put {
+    fn eq(&self, other: &Put) -> bool {
+        (self.key, self.kind, &self.bytes) == (other.key, other.kind, &other.bytes)
+    }
+}
+
+impl Eq for Put {}
+
+/// What a code value for the store is ([`Put::of`]): the function or static it is of, as
+/// codegen spells it, the build mode that made it and how, and the parts of its key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PutOf {
+    /// Its path as codegen spells it ([`Described::name`]); `None` where the walk has no name
+    /// of what put it.
+    pub name: Option<String>,
+    /// The instance it was made for, and the item that instance is of.
+    pub instance: InstanceKey,
+    pub item: ItemKey,
+    pub made: MadeIn,
+    /// Whose code the describe it was made from is ([`Described::origin`]), where known.
+    pub origin: Option<Origin>,
+    /// Whether its template holds its own positions by table ([`Described::anchors`]): the
+    /// relative form, kept under its name-free [`Described::template_code`]; `None` where not
+    /// known.
+    pub relative: Option<bool>,
+    /// The parts of its key where it is a dev template ([`dev_template_key`]).
+    pub parts: Option<TemplateKeyParts>,
+}
+
+/// The build mode a code value was made in ([`PutOf::made`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MadeIn {
+    /// A walked build (whole, patched, or a lazy build's walk), as [`Out::finish`] names its
+    /// putter: `what` is which of its values (a function's template, a folded body, a static,
+    /// the memo's earlier template).
+    Walked { what: &'static str },
+    /// A lazy build's function compiled ahead ([`Build::run_later`]).
+    LazyAhead(How),
+    /// A lazy build's function on its first call ([`Later::compile_kept`]).
+    FirstCall(How),
+    /// A tier-up of a lazy run's function ([`Later::tier_up`]).
+    TierUp(How),
+    /// A launched run's function made alone, with no walk ([`Build::one`], [`Build::start`]).
+    Alone(How),
+    /// A launched run's bind record of a function or static (`blaze_launch_host::bind`).
+    BindRecord,
+}
+
+/// How a template made outside a walk came to be ([`MadeIn`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum How {
+    /// Compiled here, from this function's own IR.
+    Compiled,
+    /// Taken from the memo under this function's shape: compiled for another function of it.
+    Memo { shape: ContentId },
+    /// Taken from the memo under the shape another compile of its flight key landed.
+    Landed { shape: ContentId },
+}
+
+/// The parts of a dev template's key ([`dev_template_key`]), each by its hash: what the key
+/// is made of, in its order, so two keys or one key and its value can be compared part by part.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TemplateKeyParts {
+    /// The step's code: the toolchain's id.
+    pub toolchain: ContentId,
+    /// The template instance: its template code ([`Described::template_code`]), arguments and
+    /// settings.
+    pub template_code: CodeHash,
+    pub args: ContentId,
+    pub settings: Settings,
+    /// The instance key its function is compiled under (`own`).
+    pub own: InstanceKey,
+    /// How many bodies its code builds in, and [`stored`] of them.
+    pub built_in: usize,
+    pub stored: InstanceKey,
+    /// How many references it has, the place of the function itself among them, and
+    /// [`placed`] of their kinds: what the key is of.
+    pub refs: usize,
+    pub own_place: Option<u32>,
+    pub placed: InstanceKey,
+}
+
+impl std::fmt::Display for PutOf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.name {
+            Some(name) => write!(f, "`{name}`")?,
+            None => f.write_str("a value the walk has no name of")?,
+        }
+        write!(f, " (instance {:x}, item {:x}), made by ", self.instance.0, self.item.0)?;
+        match self.made {
+            MadeIn::Walked { what } => write!(f, "a walked build, as {what}")?,
+            MadeIn::LazyAhead(how) => write!(f, "a lazy build's compile ahead, {how}")?,
+            MadeIn::FirstCall(how) => write!(f, "a lazy run's first call, {how}")?,
+            MadeIn::TierUp(how) => write!(f, "a tier-up, {how}")?,
+            MadeIn::Alone(how) => write!(f, "a launched run's function made alone, {how}")?,
+            MadeIn::BindRecord => f.write_str("a launched run, as its bind record")?,
+        }
+        if let Some(origin) = &self.origin {
+            write!(f, ", for {origin:?}")?;
+        }
+        match self.relative {
+            Some(true) => f.write_str(", relative to its own anchors")?,
+            Some(false) => f.write_str(", its positions as compiled")?,
+            None => {}
+        }
+        if let Some(parts) = &self.parts {
+            let TemplateKeyParts {
+                toolchain,
+                template_code,
+                args,
+                settings,
+                own,
+                built_in,
+                stored,
+                refs,
+                own_place,
+                placed,
+            } = parts;
+            write!(
+                f,
+                "; its key's parts: the toolchain {:x}, template code {:x}, arguments {:x}, \
+                 settings {:x}, own {:x}, {built_in} built in (stored {:x}), {refs} references \
+                 with its own place {own_place:?} (placed {:x})",
+                toolchain, template_code.0, args, settings.0, own.0, stored.0, placed.0
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for How {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            How::Compiled => f.write_str("compiled"),
+            How::Memo { shape } => write!(f, "from the memo's template of its shape {shape:x}"),
+            How::Landed { shape } => {
+                write!(f, "from the memo's template of shape {shape:x}, landed by its flight")
+            }
+        }
+    }
 }
 
 /// One dev template a build took from the store or made, as the kernel keeps it: the entry of
@@ -430,8 +579,32 @@ pub fn dev_template_key(
     refs: &[Target],
     toolchain: &ContentId,
 ) -> Key {
-    let placed = placed(stored(instance.key(), built_in), refs, own_place(own, refs));
-    kernel::template(&placed, &instance.settings, toolchain)
+    let parts = template_key_parts(instance, own, built_in, refs, toolchain);
+    kernel::template(&parts.placed, &instance.settings, toolchain)
+}
+
+/// The parts [`dev_template_key`] makes its key of, each by its hash: the one formula of it.
+pub fn template_key_parts(
+    instance: &Instance,
+    own: InstanceKey,
+    built_in: &[InstanceKey],
+    refs: &[Target],
+    toolchain: &ContentId,
+) -> TemplateKeyParts {
+    let stored = stored(instance.key(), built_in);
+    let own_place = own_place(own, refs);
+    TemplateKeyParts {
+        toolchain: *toolchain,
+        template_code: instance.code,
+        args: instance.args,
+        settings: instance.settings,
+        own,
+        built_in: built_in.len(),
+        stored,
+        refs: refs.len(),
+        own_place,
+        placed: placed(stored, refs, own_place),
+    }
 }
 
 /// The references and the store key of the release compile of `instance` (its template
@@ -545,6 +718,22 @@ pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 2";
 /// thunk (`keys::thunk(key, stored)`) are its flight's. A landing is the memo holding exactly
 /// those, and a member edited in a body it builds in, its instance key and the group's key
 /// the same, asks for another thunk, so flies another merge.
+/// What a dev compile of the function kept as `stored` flies under ([`crate::flight`]):
+/// `stored` itself for a template whose positions are as compiled, and `stored` under
+/// [`RELATIVE_FLIGHT_DOMAIN`] for one `relative` to its own anchors ([`Described::anchors`]).
+/// The one formula of a function's flight key, whichever build flies it (a walk's
+/// [`FnNode::flight`], a lazy, tier-up or launched compile's `later::claimed`): a landing of
+/// one form handed to a compile of the other would be kept under the other's template key,
+/// whose template code holds the other form's inputs (rule 21).
+pub(crate) fn flight_key(stored: InstanceKey, relative: bool) -> InstanceKey {
+    if !relative {
+        return stored;
+    }
+    let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
+    hasher.id(&stored.0);
+    InstanceKey(hasher.finish())
+}
+
 fn group_flight(group: &Group) -> InstanceKey {
     let mut hasher = Hasher::new(GROUP_FLIGHT_DOMAIN);
     hasher.id(&group.key().0).update(&(group.members.len() as u64).to_le_bytes());
@@ -570,13 +759,27 @@ impl<I, S> FnNode<I, S> {
     /// template would keep another function's positions under a key with no name or place in
     /// it (rule 21), as [`Shape::relative`] keeps the two forms apart in the memo.
     fn flight(&self) -> InstanceKey {
-        let stored = self.stored();
-        if self.described.anchors.is_none() {
-            return stored;
-        }
-        let mut hasher = Hasher::new(RELATIVE_FLIGHT_DOMAIN);
-        hasher.id(&stored.0);
-        InstanceKey(hasher.finish())
+        flight_key(self.stored(), self.described.anchors.is_some())
+    }
+
+    /// What a code value made of it at `unit` (its own or a tier's, compiled at `toolchain`) by
+    /// `made` is ([`Put::of`]): its name, its origin, its form and its dev template key's parts.
+    fn put_of<A: Allocator + Clone>(&self, unit: &Unit, toolchain: &ContentId, made: MadeIn, alloc: A) -> Arc<PutOf, A> {
+        let instance = Instance { code: self.described.template_code, ..unit.instance };
+        let own = unit.instance.key();
+        Arc::new_in(
+            PutOf {
+                // clone: its path, once a code value made outside a walk
+                name: Some(self.described.name.clone()),
+                instance: own,
+                item: unit.item,
+                made,
+                origin: Some(self.described.origin),
+                relative: Some(self.described.anchors.is_some()),
+                parts: Some(template_key_parts(&instance, own, &self.built_in, &self.refs, toolchain)),
+            },
+            alloc,
+        )
     }
 
     /// The store key of its dev template: the kernel's entry of its stored key, of its
@@ -1217,7 +1420,7 @@ impl Out {
     }
 
     fn put(&mut self, by: By, key: Key, kind: Kind, bytes: Vec<u8>) {
-        self.puts.push((by, Put { key, kind, bytes }));
+        self.puts.push((by, Put { key, kind, bytes, of: None }));
     }
 
     /// A template that is no dev template of a function (a release compile, a folded body, a
@@ -1434,7 +1637,13 @@ impl Out {
                 }
                 _ => {
                     kept_by = Some(by);
-                    puts.push(put);
+                    // What a compile outside the walk said it is (a lazy build's ahead), else
+                    // what the walk names its putter.
+                    let of = match put.of {
+                        Some(of) => Some(of),
+                        None => (put.kind == Kind::Code).then(|| put_by(by, &name_of, Global)),
+                    };
+                    puts.push(Put { of, ..put });
                 }
             }
         }
@@ -1473,6 +1682,29 @@ where
         Of::Static(id) => statics?.get(&id).map(|it| it.described.name.as_str()),
         Of::Memo => None,
     }
+}
+
+/// What a walked build's code value put by `by` is ([`Put::of`]), named as [`put_twice`]
+/// names its putters.
+fn put_by<'n, A: Allocator + Clone>(by: By, name_of: &impl Fn(Of) -> Option<&'n str>, alloc: A) -> Arc<PutOf, A> {
+    let what = match by.of {
+        Of::Function(_) => "the function's template",
+        Of::Folded(_) => "the folded body of the group of the function",
+        Of::Static(_) => "the static's template",
+        Of::Memo => "the template the memo already kept under its key",
+    };
+    Arc::new_in(
+        PutOf {
+            name: name_of(by.of).map(str::to_owned),
+            instance: by.unit,
+            item: by.item,
+            made: MadeIn::Walked { what },
+            origin: None,
+            relative: None,
+            parts: None,
+        },
+        alloc,
+    )
 }
 
 /// A second put under `mismatch.key` in one build, by `then`, of another kind or other bytes
@@ -1522,6 +1754,37 @@ fn put_twice<'n>(
         who(then),
     );
     error(then.unit, then.item, what)
+}
+
+/// Where two code values put under one key (`kept`, the store's, and `given`, made now) first
+/// differ, for a refusal of the put (rule 19): both lengths, the offset of the first byte
+/// that differs and the part of a template it is in ([`blob::part_at`] of `given`, else of
+/// `kept`), then the first field of the template that differs ([`template_difference`]).
+/// Values that are no templates (a launched function's bind record) are named by offset and
+/// lengths alone here; their own format names its part. Made only by a refusal, and worked
+/// out only as it is printed: it holds the two values' bytes, borrowed.
+pub struct CodeDifference<'a> {
+    pub kept: &'a [u8],
+    pub given: &'a [u8],
+}
+
+impl std::fmt::Display for CodeDifference<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kept, given) = (self.kept, self.given);
+        let at = kept.iter().zip(given).position(|(a, b)| a != b).unwrap_or(kept.len().min(given.len()));
+        write!(
+            f,
+            "the kept value is {} bytes and the given {}, first differing at byte {at}",
+            kept.len(),
+            given.len()
+        )?;
+        match (blob::part_at(given, at), blob::part_at(kept, at)) {
+            (Ok(Some(part)), _) | (_, Ok(Some(part))) => write!(f, ", in {part} of the template")?,
+            (Err(why), _) => write!(f, " (the value made now is no template: {why})")?,
+            (Ok(None), _) => {}
+        }
+        f.write_str(&template_difference((Kind::Code, Kind::Code), kept, given))
+    }
 }
 
 /// Where two templates put under one key differ, for [`put_twice`]'s error: the first field
@@ -2163,7 +2426,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 counts.described();
                 let now = self.frontend.describe(instance, requester)?;
                 if let Some(bytes) = self.frontend.to_record(instance, requester, &now) {
-                    self.recorded.push(Put { key, kind: records::KIND, bytes });
+                    self.recorded.push(Put { key, kind: records::KIND, bytes, of: None });
                 }
                 Ok(now)
             }

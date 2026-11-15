@@ -29,12 +29,12 @@ fn with_rules(rules: &[(&str, &str)]) -> (base_db::Db, super::View) {
     view(&fixture, 0, &paths)
 }
 
-/// The error a query that must fail gives, shown.
+/// The error a query that must fail gives.
 #[track_caller]
-fn refused(db: &base_db::Db, files: &super::View, rules: &str) -> String {
+fn refused(db: &base_db::Db, files: &super::View, rules: &str) -> crate::Error {
     match query(db, files, rules) {
         Ok(rows) => panic!("the query ran: {:?}", rows.relations),
-        Err(error) => error.to_string(),
+        Err(error) => error,
     }
 }
 
@@ -71,7 +71,7 @@ fn a_file_two_includes_reach_is_read_once() {
 #[test]
 fn an_include_of_a_path_the_view_does_not_hold_names_the_path_and_the_including_line() {
     let (db, files) = with_rules(&[("rules/a.astlog", "\n(include \"rules/lib/gone.astlog\")\n")]);
-    let error = refused(&db, &files, "(include \"rules/a.astlog\")");
+    let error = refused(&db, &files, "(include \"rules/a.astlog\")").to_string();
     assert!(
         error.starts_with("rules/a.astlog:2: `(include \"rules/lib/gone.astlog\")`: there is no file"),
         "{error}"
@@ -82,9 +82,9 @@ fn an_include_of_a_path_the_view_does_not_hold_names_the_path_and_the_including_
         ("rules/lib/calls.astlog", CALLS),
         ("rules/a.astlog", "(include \"lib/calls.astlog\")\n"),
     ]);
-    let error = refused(&db, &files, "(include \"rules/a.astlog\")");
+    let error = refused(&db, &files, "(include \"rules/a.astlog\")").to_string();
     assert!(error.contains("there is no file at `lib/calls.astlog`"), "{error}");
-    let error = refused(&db, &files, "(include \"../rules/a.astlog\")");
+    let error = refused(&db, &files, "(include \"../rules/a.astlog\")").to_string();
     assert!(error.starts_with("rules:1: ") && error.contains("`..` segment"), "{error}");
 }
 
@@ -94,7 +94,7 @@ fn an_include_cycle_is_refused_naming_the_files_on_it_in_order() {
         ("rules/a.astlog", "(include \"rules/b.astlog\")\n"),
         ("rules/b.astlog", "(rule (b x) (expr x \"1\"))\n(include \"rules/a.astlog\")\n"),
     ]);
-    let error = refused(&db, &files, "(include \"rules/a.astlog\")");
+    let error = refused(&db, &files, "(include \"rules/a.astlog\")").to_string();
     assert_eq!(
         error,
         "rules/b.astlog:2: `(include \"rules/a.astlog\")` closes a cycle of includes: \
@@ -106,9 +106,9 @@ fn an_include_cycle_is_refused_naming_the_files_on_it_in_order() {
 fn an_error_inside_an_included_file_names_that_file_and_its_line() {
     let bad = "(rule (ok e) (expr e \"lib::old(1)\"))\n\n(rule (bad e) (expr e \"lib::nothing_here(\"))\n";
     let (db, files) = with_rules(&[("rules/lib/bad.astlog", bad)]);
-    let error = refused(&db, &files, "\n\n(include \"rules/lib/bad.astlog\")");
+    let error = refused(&db, &files, "\n\n(include \"rules/lib/bad.astlog\")").to_string();
     assert!(error.starts_with("rules/lib/bad.astlog:3: the expr pattern"), "{error}");
     let (db, files) = with_rules(&[("rules/lib/calls.astlog", CALLS)]);
-    let error = refused(&db, &files, "(include \"rules/lib/calls.astlog\")\n(rule (r x) (calls-old x))");
+    let error = refused(&db, &files, "(include \"rules/lib/calls.astlog\")\n(rule (r x) (calls-old x))").to_string();
     assert!(error.starts_with("rules:2: relation `calls-old` used with arity 1"), "{error}");
 }

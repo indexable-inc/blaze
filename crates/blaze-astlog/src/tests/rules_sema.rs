@@ -11,6 +11,7 @@
 //!
 //! `std` is [`STD`], the few items the fixtures name, with the paths the real one has.
 
+use std::alloc::{Allocator, Global};
 use std::path::{Path, PathBuf};
 
 use blaze_api::query::{Cell, Rows, Severity};
@@ -127,9 +128,9 @@ struct Krate {
     name: String,
 }
 
-/// Each crate of the fixture at `root`, the root first.
-fn crates(root: &Path) -> Vec<Krate> {
-    let mut out = Vec::new();
+/// Each crate of the fixture at `root`, the root first, in `alloc`.
+fn crates<A: Allocator>(root: &Path, alloc: A) -> Vec<Krate, A> {
+    let mut out = Vec::new_in(alloc);
     let mut stack = vec![PathBuf::new()];
     while let Some(dir) = stack.pop() {
         let at = root.join(&dir);
@@ -156,25 +157,23 @@ fn crates(root: &Path) -> Vec<Krate> {
     out
 }
 
-/// The pack's shared rules files, each as its path in blaze's checkout and its text.
-fn library() -> Vec<(String, String)> {
+/// Each of the pack's shared rules files, by its path in blaze's checkout, handed to `each` with
+/// its text, in path order.
+fn library(mut each: impl FnMut(&str, &str)) {
     let dir = Path::new(PACK).join("lib");
-    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
-        .unwrap()
-        .map(|it| it.unwrap().path())
-        .map(|it| {
-            let name = it.file_name().unwrap().to_str().unwrap().to_owned();
-            (format!("{PACK_IN_CHECKOUT}/lib/{name}"), std::fs::read_to_string(&it).unwrap())
-        })
-        .collect();
-    out.sort();
-    out
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().map(|it| it.unwrap().path()).collect();
+    names.sort();
+    for it in names {
+        let name = it.file_name().unwrap().to_str().unwrap();
+        each(&format!("{PACK_IN_CHECKOUT}/lib/{name}"), &std::fs::read_to_string(&it).unwrap());
+    }
 }
 
-/// The front end of `rule`'s fixture beside [`STD`] and the pack's library, and the rule's text.
-fn fixture(rule: &str) -> (base_db::Db, super::View, String) {
+/// The front end of `rule`'s fixture beside [`STD`] and the pack's library; the rule's text
+/// into `rules`.
+fn fixture<A: Allocator + Clone>(rule: &str, rules: &mut Vec<u8, A>) -> (base_db::Db, super::View) {
     let root = Path::new(PACK).join("tests").join(rule);
-    let crates = crates(&root);
+    let crates = crates(&root, rules.allocator().clone()); // clone: the caller's allocator handle
     assert!(!crates.is_empty(), "no fixture crate under {}", root.display());
     let mut text = STD.to_owned();
     let mut paths: Vec<String> = Vec::new();
@@ -192,19 +191,19 @@ fn fixture(rule: &str) -> (base_db::Db, super::View, String) {
         text.push_str(&format!("//- /{path} crate:{} deps:{} edition:2024\n{source}", krate.name, deps.join(",")));
         paths.push(path);
     }
-    for (path, rules) in library() {
+    library(|path, rules| {
         text.push_str(&format!("//- /{path}\n{rules}"));
-        paths.push(path);
-    }
+        paths.push(path.to_owned());
+    });
     let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
     let (db, files) = view(&text, 1, &paths);
-    let rules = std::fs::read_to_string(Path::new(PACK).join(format!("{rule}.astlog"))).unwrap();
-    (db, files, rules)
+    rules.extend_from_slice(&std::fs::read(Path::new(PACK).join(format!("{rule}.astlog"))).unwrap());
+    (db, files)
 }
 
-/// The findings as `blaze check --query` prints them ahead of the relations.
-fn shown(outcome: &Rows) -> String {
-    let mut out = String::new();
+/// Into `out`, the findings as `blaze check --query` prints them ahead of the relations.
+fn shown<A: Allocator>(outcome: &Rows, out: &mut Vec<u8, A>) {
+    use std::io::Write as _;
     for finding in &outcome.findings {
         let severity = match finding.severity {
             Severity::Error => "error",
@@ -215,25 +214,30 @@ fn shown(outcome: &Rows) -> String {
             Some(Cell::Expanded { call, .. }) => call.clone(),
             other => panic!("a finding at {other:?}"),
         };
-        out.push_str(&format!("{severity}: {}\n  --> {at}\n", finding.message));
+        write!(out, "{severity}: {}\n  --> {at}\n", finding.message).unwrap();
     }
-    out
 }
 
 /// `rule`'s findings over its fixture against `expected.txt`.
 fn lints(rule: &str) {
-    let (db, files, rules) = fixture(rule);
-    let outcome = query(&db, &files, &rules).unwrap_or_else(|error| panic!("{rule}: {error}"));
+    let mut rules = Vec::new_in(Global);
+    let (db, files) = fixture(rule, &mut rules);
+    let rules = std::str::from_utf8(&rules).unwrap();
+    let outcome = query(&db, &files, rules).unwrap_or_else(|error| panic!("{rule}: {error}"));
     let expected = Path::new(PACK).join("tests").join(rule).join("expected.txt");
     let want = std::fs::read_to_string(&expected).unwrap();
-    let got = shown(&outcome);
+    let mut got = Vec::new_in(Global);
+    shown(&outcome, &mut got);
+    let got = std::str::from_utf8(&got).unwrap();
     assert!(got == want, "{rule}: found\n{got}\nwhere {} has\n{want}", expected.display());
 }
 
 /// `rule`'s rewrites of its fixture's root crate against `fixed.rs`.
 fn rewrites(rule: &str) {
-    let (db, files, rules) = fixture(rule);
-    let applied = edit(&db, &files, &rules, &[]).unwrap_or_else(|error| panic!("{rule}: {error}"));
+    let mut rules = Vec::new_in(Global);
+    let (db, files) = fixture(rule, &mut rules);
+    let rules = std::str::from_utf8(&rules).unwrap();
+    let applied = edit(&db, &files, rules, &[]).unwrap_or_else(|error| panic!("{rule}: {error}"));
     let texts = after(&files, &applied.edited.ops);
     let got = &texts.iter().find(|it| it.0 == "src/lib.rs").expect("the root crate").1;
     let fixed = Path::new(PACK).join("tests").join(rule).join("fixed.rs");

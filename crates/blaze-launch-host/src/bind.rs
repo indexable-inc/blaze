@@ -36,15 +36,17 @@
 //!
 //! | input | covered by |
 //! |---|---|
-//! | the function's code, its debug name, its positions' lines, its callees and statics, its slot identity and code hash | `ask`: the key of its describe record (`Frontend::record_key`), which names every input of the describe |
+//! | the function's code, its debug name, its positions' lines, its callees and statics, its slot identity and code hash | `ask`: the key of its describe record (`Frontend::record_key`), which names every input of the describe but whose origin it is |
+//! | the origin in its slot identity (`subject`), and in each callee's, which is asked for by the same requester | `requester`: who asks for it, which with the instance decides its origin |
 //! | how it is compiled: the code generator's code identity, the target, the CPU, the profile | [`Under::policy`] (`Policy::id`, of `Toolchain`) |
 //! | the file names its positions carry, of its home crate and every crate it loads | `naming` (`HirFrontend::naming_of`) |
 //! | which of its `Extern` and `Weak` relocations are places the program's own symbol fills, and as what | [`Under::symbols`] ([`symbols_id`]) |
 //! | the code that makes a launch record of a compiled function and lays out this one | [`Under::maker`] and [`BIND_DOMAIN`] |
 //! | each callee's portable ask in the names | the callee's instance, which the describe names, written by the code `Under::maker`'s closure holds (hir-ty-codegen) |
-//! | each callee's and static's bind key in the names | the same four of the callee: a callee's describe is named by this one's, its crates are among this one's, and the build's policy, symbols and maker are one |
+//! | each callee's and static's bind key in the names | the same inputs of the callee: a callee's describe is named by this one's, it is asked for by this one's requester, its crates are among this one's, and the build's policy, symbols and maker are one |
 
 use blaze_cas::Key;
+use blaze_codegen::plan::Origin;
 use blaze_codegen::{InstanceKey, StaticId};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
@@ -56,7 +58,7 @@ use crate::program::Plant;
 use crate::record::{Made, Named};
 
 /// The domain of a bind key; another layout or another formula is another domain.
-pub const BIND_DOMAIN: &str = "blaze v2 launch bind 2";
+pub const BIND_DOMAIN: &str = "blaze v2 launch bind 3";
 
 const MAGIC: &[u8; 8] = b"bzbind02";
 
@@ -80,11 +82,30 @@ pub struct Under {
 }
 
 /// The store key of the bind record of the function or static whose describe record is
-/// under `ask`, whose crates the build names as `naming`, made `under` the build's policy,
-/// symbols and record maker.
-pub fn bind_key(ask: &Key, naming: &ContentId, under: &Under) -> Key {
+/// under `ask`, asked for by `requester` (a function's; `None` for a static), whose crates the
+/// build names as `naming`, made `under` the build's policy, symbols and record maker.
+///
+/// Why `requester`: a function's slot identity is its [`blaze_codegen::driver::subject`],
+/// whose origin is whoever asks for a generic instance (its crate's own for one that is not),
+/// while a describe record's key holds only what the requester's units give (`asked_as`), so
+/// two origins of equal units share one `ask`. Keyed by `ask` alone, the first of them a run
+/// met wrote the record and another run that met the other first wrote other bytes under the
+/// same key (ripgrep's `<NonNull<OsString> as PartialEq>::eq`, its slot identity at byte 568
+/// of 640, after a restart and an edit; rule 25). The requester and the instance (which `ask`
+/// names) decide the origin, so the key covers the slot identity.
+pub fn bind_key(ask: &Key, requester: Option<&Origin>, naming: &ContentId, under: &Under) -> Key {
     let mut hasher = Hasher::new(BIND_DOMAIN);
-    hasher.id(&ask.0).id(naming).id(&under.policy).id(&under.symbols).id(&under.maker);
+    hasher.id(&ask.0);
+    match requester {
+        Some(origin) => {
+            hasher.update(&[1]);
+            origin.hash_into(&mut hasher);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.id(naming).id(&under.policy).id(&under.symbols).id(&under.maker);
     Key(hasher.finish())
 }
 
@@ -224,6 +245,53 @@ pub fn encode(bound: &Bound) -> Vec<u8> {
 /// offset.
 pub fn decode(bytes: &[u8]) -> Result<Bound, String> {
     read(bytes, Plant::None)
+}
+
+/// The part of the bind record `bytes` that byte `offset` is in, in the layout of the module's
+/// documentation, for a refusal that names where two records under one key differ (rule 19);
+/// `None` past its end, or where `bytes` do not read as a bind record of this layout (why is
+/// [`decode`]'s to say, which the refusal that prints both records asks).
+pub fn part_at(bytes: &[u8], offset: usize) -> Option<&'static str> {
+    let mut from = Reader { bytes, at: 0, what: "a bind record" };
+    if from.take(8, "layout's name").ok()? != MAGIC {
+        return None;
+    }
+    let mut ends = [("", 0); 9];
+    let mut part = 0;
+    let mut ended = |at: usize, name: &'static str| {
+        ends[part] = (name, at);
+        part += 1;
+    };
+    ended(from.at, "its layout's name");
+    from.u8("kind").ok()?;
+    ended(from.at, "its kind");
+    let len = from.u32("record's length").ok()? as usize;
+    from.take(len, "launch record").ok()?;
+    ended(from.at, "its launch record");
+    from.u64("placed length").ok()?;
+    ended(from.at, "its placed length");
+    from.u32("alignment").ok()?;
+    ended(from.at, "its alignment");
+    from.id("slot identity").ok()?;
+    ended(from.at, "its slot identity");
+    from.id("code hash").ok()?;
+    ended(from.at, "its code hash");
+    let count = from.u32("count of names").ok()? as usize;
+    if count > bytes.len().saturating_sub(from.at) / 5 {
+        return None;
+    }
+    for _ in 0..count {
+        get_names(&mut from).ok()?;
+    }
+    ended(from.at, "its names (what each of its references binds to)");
+    ended(bytes.len(), "its anchors");
+    ends.iter().find(|(_, end)| offset < *end).map(|(name, _)| *name)
+}
+
+/// Whether `bytes` are in the layout of a bind record, by its name: what a refusal of two
+/// values under one key asks to name their parts by the right layout.
+pub fn is_bind_record(bytes: &[u8]) -> bool {
+    bytes.starts_with(MAGIC)
 }
 
 /// A reader of a bind record or a start image (`crate::start`): each read names what it
