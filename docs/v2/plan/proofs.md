@@ -13,7 +13,7 @@ refuses a `sorry` anywhere, and requires each theorem here to exist and to rest 
 [formal-verification.md](design/formal-verification.md) ("The trusted base"). A change to this file
 in a pull request is a theorem added, restated or dropped.
 
-133 theorems: 120 in `lean`, 13 in `lean/analysis`.
+135 theorems: 122 in `lean`, 13 in `lean/analysis`.
 
 ## V5
 
@@ -1224,4 +1224,18 @@ theorem blaze_core.wait.parking.a_park_keeps_its_deadline.spec.proof :
 ```lean
 theorem blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.proof :
     blaze_core.wait.parking.a_park_is_ready_exactly_for_a_token.spec.statement
+```
+
+**`blaze_core.handoff.no_hand_back_is_missed.spec.proof`** (`BlazeCore.Handoff`, `lean`): The statement blaze generates from the theorem function no_hand_back_is_missed holds of the models of the real Wake::wake and Wake::drain in the weak-memory world (Prog.valueWeak): a sender's relaxed store of its slot and its wake, the driver's drain and its relaxed read of the slot, as two threads on every schedule and with every value each read may see under its ordering: where both returned, the driver saw the slot or the sender was told to wake it. The first theorem of blaze's code against weak memory.
+
+```lean
+theorem blaze_core.handoff.no_hand_back_is_missed.spec.proof :
+    blaze_core.handoff.no_hand_back_is_missed.spec.statement
+```
+
+**`BlazeCore.HandoffModel.no_hand_back_is_missed`** (`BlazeCore.HandoffModel`, `lean`): The same of a hand-written model of the two threads whose swaps' ordering is a parameter, at AcqRel; with Relaxed the file has the run, by evaluation, in which a hand-back is missed (the control).
+
+```lean
+theorem no_hand_back_is_missed (schedule : List Step) (flagged : Bool) :
+    (hands .AcqRel schedule flagged).valueWeak = .ok true
 ```
