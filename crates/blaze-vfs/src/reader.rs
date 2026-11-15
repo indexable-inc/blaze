@@ -116,6 +116,18 @@ impl Pinned<'_> {
         Ok(Some((*table.id(node), mode, table.bytes(node)?)))
     }
 
+    /// The content id and mode of the file at `path`, read from the tree alone: its bytes are
+    /// not paged in from the store, so a walk of every file of a large tree under one pin reads
+    /// no text. `None` for none, a directory, or a root the tree does not have.
+    pub fn id_and_mode(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode)> {
+        let (node, mode) = self.walk(root, path)?;
+        let table = self.snapshot.table();
+        if table.shape(node).is_dir() {
+            return None;
+        }
+        Some((*table.id(node), mode))
+    }
+
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
     /// is a directory; `None` for none, a file, or a root the tree does not have.
     pub fn list(

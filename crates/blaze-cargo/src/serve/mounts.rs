@@ -386,7 +386,9 @@ fn commit_error(at: &str, error: &CommitError) -> String {
 }
 
 /// [`on_disk_id`] of the files under `root`, read from the tree without hashing their bytes
-/// again (a file's content id is the tree's); `None` when the tree has no such root.
+/// again (a file's content id is the tree's) and without reading them: a start walks every
+/// package mount so, under one pin, and a text paged in from the store holds a store pin until
+/// the start ends. `None` when the tree has no such root.
 fn tree_on_disk_id(reader: &blaze_vfs::Reader, root: ContentId) -> Option<ContentId> {
     let pinned = reader.pin();
     let mut files: Vec<(String, Mode, ContentId)> = Vec::new(); // alloc: once per package checked at a start
@@ -403,7 +405,7 @@ fn tree_on_disk_id(reader: &blaze_vfs::Reader, root: ContentId) -> Option<Conten
             match is_dir {
                 true => dirs.push(path),
                 false => {
-                    let (id, mode, _) = pinned.held(root, &path).ok()??;
+                    let (id, mode) = pinned.id_and_mode(root, &path)?;
                     files.push((path, mode, id));
                 }
             }
