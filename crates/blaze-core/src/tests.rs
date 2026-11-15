@@ -172,6 +172,12 @@ fn every_driver_ends_the_script_the_same() {
         let root = root.path();
         let ring = script(&mut crate::uring::Uring::new(&root).unwrap());
         assert_eq!(simulated, ring);
+        // The ring with no kernel thread, a thread's own (`crate::ThreadNative`): the other
+        // instantiation of `uring::Submission` ends it the same (rule 78).
+        let root = dir("uring-entered");
+        let root = root.path();
+        let entered = script(&mut crate::uring::Uring::entered(&root).unwrap());
+        assert_eq!(simulated, entered);
     }
 }
 
@@ -388,6 +394,9 @@ fn every_driver_reads_into_and_writes_from_memory_the_same() {
     {
         let native = memory_script(&mut crate::native(dir("memory-native").path(), 2).unwrap());
         assert_eq!(simulated, native);
+        // The driver a thread's own store reads run on (blaze-cargo's `serve::direct`).
+        let own = memory_script(&mut crate::thread_native(dir("memory-thread").path(), 2).unwrap());
+        assert_eq!(simulated, own);
     }
     // The read cut at the end of the file says how far it read.
     let tail = format!("{:?}", Done::ReadInto { len: crate::DIRECT_ALIGN as u32 + 100 });

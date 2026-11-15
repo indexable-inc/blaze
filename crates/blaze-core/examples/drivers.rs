@@ -1,13 +1,17 @@
 //! The drivers on the same effects, under a directory of the disk to measure:
 //!
-//!     cargo run --release -p blaze-core --example drivers -- DIR [threads N] [uring]
+//!     cargo run --release -p blaze-core --example drivers -- DIR [threads N] [uring] [uring-entered]
 //!
 //! `commit`: one append of 3 KB and its sync, then the next, as the journal commits one
 //! transaction at a time (2,000 of them; microseconds from the append asked to the sync done).
 //! `batch`: 64 appends of 4 KB to 8 files and a sync of each, all in flight together (200
 //! rounds; microseconds a round). `reads`: 4,096 reads of 4 KB at random places of a 64 MB
 //! file, all in flight (milliseconds for all, five times; the file is read once first, so they
-//! come from the page cache).
+//! come from the page cache). `serial`: 20,000 reads of 234 bytes from the page cache of a file
+//! kept open, each asked once the last ended (microseconds a read), as a task's store reads
+//! are. `uring` is the
+//! daemon's ring (a kernel thread takes its requests), `uring-entered` a thread's own (its
+//! `io_uring_enter` does).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::print_stdout)]
@@ -106,18 +110,45 @@ fn reads(driver: &mut impl Driver, dir: &std::path::Path) -> Vec<f64> {
         .collect()
 }
 
+/// 20,000 reads of 234 bytes from the page cache of a file the driver keeps open, one at a
+/// time, each asked once the last ended, as a task's store reads are (issue #2174; each one
+/// request on the ring): microseconds a read.
+fn serial(driver: &mut impl Driver) -> Vec<f64> {
+    let file = FileName::new("serial/pack").unwrap();
+    // Written by an append, so the driver keeps the file open and each read is one request.
+    let mut effects =
+        vec![Effect::Append { file: file.clone(), bytes: vec![5u8; 8 << 20], tag: Tag(0) }];
+    run_until_idle(driver, &mut effects, |done, _| check(&done)).expect("the effects end");
+    let mut rng = SplitMix64::new(0x2174);
+    (0..20_000)
+        .map(|n| {
+            let at = rng.below((8 << 20) - 234);
+            let mut effects = vec![Effect::Read { file: file.clone(), at, len: 234, tag: Tag(n) }];
+            let began = Instant::now();
+            run_until_idle(driver, &mut effects, |done, _| match &done.done {
+                Done::Read(bytes) => assert_eq!(bytes.len(), 234),
+                _ => check(&done),
+            }).expect("the effects end");
+            began.elapsed().as_secs_f64() * 1e6
+        })
+        .collect()
+}
+
 fn measure(name: &str, dir: &std::path::Path, driver: &mut impl Driver) {
     let mut commits = commit(driver);
     let mut batches = batch(driver);
     let mut read = reads(driver, dir);
+    let mut one = serial(driver);
     println!(
-        "{name:12} commit p50 {:7.1} us p99 {:7.1} us | batch p50 {:8.1} us p99 {:8.1} us | 4096 reads {:6.2} ms (best {:6.2})",
+        "{name:12} commit p50 {:7.1} us p99 {:7.1} us | batch p50 {:8.1} us p99 {:8.1} us | 4096 reads {:6.2} ms (best {:6.2}) | serial read p50 {:6.1} us p99 {:7.1} us",
         percentile(&mut commits, 0.5),
         percentile(&mut commits, 0.99),
         percentile(&mut batches, 0.5),
         percentile(&mut batches, 0.99),
         percentile(&mut read, 0.5),
         percentile(&mut read, 0.0),
+        percentile(&mut one, 0.5),
+        percentile(&mut one, 0.99),
     );
 }
 
@@ -135,12 +166,16 @@ fn main() {
                     .map_or(4, |it| it.parse().unwrap());
                 drivers.push((format!("threads {n}"), Some(n)));
             }
-            "uring" => drivers.push(("uring".to_owned(), None)),
+            "uring" | "uring-entered" => drivers.push((name.clone(), None)),
             other => panic!("no driver {other}"),
         }
     }
     if drivers.is_empty() {
-        drivers = vec![("threads 4".to_owned(), Some(4)), ("uring".to_owned(), None)];
+        drivers = vec![
+            ("threads 4".to_owned(), Some(4)),
+            ("uring".to_owned(), None),
+            ("uring-entered".to_owned(), None),
+        ];
     }
     for (name, threads) in drivers {
         let dir = root.join(name.replace(' ', "-"));
@@ -148,6 +183,10 @@ fn main() {
         std::fs::create_dir_all(&dir).unwrap();
         match threads {
             Some(n) => measure(&name, &dir, &mut Threads::new(&dir, n)),
+            #[cfg(target_os = "linux")]
+            None if name == "uring-entered" => {
+                measure(&name, &dir, &mut blaze_core::uring::Uring::entered(&dir).expect("a ring"))
+            }
             #[cfg(target_os = "linux")]
             None => measure(&name, &dir, &mut blaze_core::uring::Uring::new(&dir).expect("a ring")),
             #[cfg(not(target_os = "linux"))]

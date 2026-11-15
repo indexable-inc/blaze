@@ -90,7 +90,7 @@ mod windows;
 #[cfg(target_os = "linux")]
 pub use self::linux::sleep_until;
 #[cfg(target_os = "linux")]
-pub(crate) use self::linux::uring_enter;
+pub(crate) use self::linux::{Enter, enter_ring, uring_enter};
 #[cfg(target_os = "macos")]
 pub(crate) use self::macos::kevent;
 #[cfg(target_os = "macos")]

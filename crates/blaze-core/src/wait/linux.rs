@@ -51,64 +51,93 @@ pub(super) const WAITING_MASK: u64 = !(bit(libc::SIGINT)
     | bit(libc::SIGTRAP)
     | bit(libc::SIGSYS));
 
-/// One `io_uring_enter` on `ring` with `flags` (`IORING_ENTER_SQ_WAKEUP` or none), no
-/// submissions (the ring's submission thread takes them). With `wait`, it also waits for one
+/// One `io_uring_enter` with `flags` (`IORING_ENTER_SQ_WAKEUP`, `GETEVENTS` on a
+/// submission that posts what ended in it while waiting for none, or none), handing the
+/// kernel `to_submit` requests: none on a ring whose own kernel thread takes them (SQPOLL),
+/// every one written and not yet taken on one without. With `wait`, it also waits for one
 /// completion until that deadline on `clock` ([`Deadline::NEVER`]: no limit), the timeout
 /// recomputed on every entry and the asynchronous signals masked ([`WAITING_MASK`]); without,
-/// it only wakes the kernel's thread. `Ready` when a completion may be reaped (one posted, or
-/// the kernel held some back, EBUSY), `Deadline` when none came by then.
+/// it only submits or wakes the kernel's thread. `Ready` when a completion may be reaped (one
+/// posted, or the kernel held some back, EBUSY), and whenever it submitted any: the kernel then
+/// answers how many it took and not how its wait ended, so the caller looks and enters again
+/// (with none left to submit) if nothing came. `Deadline` when none came by then.
+///
+/// Each call is made by `call`, which answers what it returned or its errno: the kernel's own
+/// on a ring ([`enter_ring`]), or a model of the kernel (the entered ring's simulation,
+/// `uring/entered_sim.rs`). What is asked and how each answer ends or retries the wait are
+/// this function's.
 pub(crate) fn uring_enter(
     what: &'static str,
-    ring: RawFd,
+    to_submit: libc::c_uint,
     flags: u32,
     wait: Option<Deadline>,
     clock: &impl Clock,
+    mut call: impl FnMut(Enter) -> Result<u32, i32>,
 ) -> Result<Waited<()>, WaitError> {
-    let mask = WAITING_MASK;
     let (min_complete, flags, deadline): (libc::c_uint, u32, _) = match wait {
         Some(deadline) => (1, flags | ENTER_GETEVENTS | ENTER_EXT_ARG, deadline.finite()),
         None => (0, flags | ENTER_EXT_ARG, None),
     };
     until(what, clock, deadline, |left| {
-        let ts = left.map(|it| Timespec {
-            sec: i64::try_from(it.as_secs()).unwrap_or(i64::MAX),
-            nsec: it.subsec_nanos().into(),
-        });
-        let arg = GeteventsArg {
-            sigmask: ptr::from_ref(&mask) as u64,
-            sigmask_sz: KERNEL_SIGSET,
-            pad: 0,
-            ts: ts.as_ref().map_or(0, |it| ptr::from_ref(it) as u64),
-        };
-        // SAFETY: `arg`, the mask and the timespec it points at outlive the call, which reads
-        // them and keeps no pointer. With SQPOLL the kernel's thread submits; the call only
-        // wakes it and waits.
-        let entered = unsafe {
-            libc::syscall(
-                libc::SYS_io_uring_enter,
-                ring,
-                libc::c_uint::MIN,
-                min_complete,
-                flags,
-                &raw const arg,
-                size_of::<GeteventsArg>(),
-            )
-        };
-        if entered >= 0 {
-            return Ok(Once::Ready(()));
-        }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
+        match call(Enter { to_submit, min_complete, flags, left }) {
+            Ok(_) => Ok(Once::Ready(())),
             // A stop signal (the only ones the mask lets through) or a signal sent to this
             // thread alone: waited again for what is left.
-            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Err(libc::EINTR) => Ok(Once::Interrupted),
             // The timeout ran out with nothing done.
-            Some(libc::ETIME) => Ok(Once::TimedOut),
+            Err(libc::ETIME) => Ok(Once::TimedOut),
             // Completions to reap first.
-            Some(libc::EBUSY | libc::EAGAIN) => Ok(Once::Ready(())),
-            _ => Err(error),
+            Err(libc::EBUSY | libc::EAGAIN) => Ok(Once::Ready(())),
+            Err(errno) => Err(io::Error::from_raw_os_error(errno)),
         }
     })
+}
+
+/// One `io_uring_enter` call as [`uring_enter`] asks it: its `to_submit`, `min_complete` and
+/// `flags` arguments, and the time its timeout is given (none: no limit).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Enter {
+    pub(crate) to_submit: libc::c_uint,
+    pub(crate) min_complete: libc::c_uint,
+    pub(crate) flags: u32,
+    pub(crate) left: Option<std::time::Duration>,
+}
+
+/// The kernel's `io_uring_enter` on `ring`, asked as `enter` says, under [`WAITING_MASK`].
+pub(crate) fn enter_ring(ring: RawFd, enter: Enter) -> Result<u32, i32> {
+    let Enter { to_submit, min_complete, flags, left } = enter;
+    let mask = WAITING_MASK;
+    let ts = left.map(|it| Timespec {
+        sec: i64::try_from(it.as_secs()).unwrap_or(i64::MAX),
+        nsec: it.subsec_nanos().into(),
+    });
+    let arg = GeteventsArg {
+        sigmask: ptr::from_ref(&mask) as u64,
+        sigmask_sz: KERNEL_SIGSET,
+        pad: 0,
+        ts: ts.as_ref().map_or(0, |it| ptr::from_ref(it) as u64),
+    };
+    // SAFETY: `arg`, the mask and the timespec it points at outlive the call, which reads them
+    // and keeps no pointer. With SQPOLL the kernel's thread submits and `to_submit` is 0: the
+    // call only wakes it and waits. Without, the call takes `to_submit` requests the caller
+    // wrote and showed. An interruption or a timeout comes back as an error only where there
+    // was nothing to submit (a call that submits answers its count), so a retry is always a
+    // wait alone.
+    let entered = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_enter,
+            ring,
+            to_submit,
+            min_complete,
+            flags,
+            &raw const arg,
+            size_of::<GeteventsArg>(),
+        )
+    };
+    match entered {
+        0.. => Ok(entered as u32),
+        _ => Err(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)),
+    }
 }
 
 /// Sleeps until `deadline` on `clock`: a ring timeout (`IORING_OP_TIMEOUT` to an absolute

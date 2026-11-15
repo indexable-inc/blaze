@@ -91,7 +91,7 @@ fn on_path(kind: Kind) -> bool {
     )
 }
 
-impl Uring {
+impl<S: Submission> Uring<S> {
     /// Where the listen `listen` listens, while it does: the port a TCP listen of port 0 was
     /// given. `None` for a Unix socket's.
     pub fn local_addr(&self, listen: Tag) -> Option<std::net::SocketAddr> {
@@ -1423,7 +1423,7 @@ fn take_in(connection: &mut Connection, mut bytes: &[u8], ready: &mut Vec<Comple
     connection.inbox.extend(bytes);
 }
 
-impl Drop for Uring {
+impl<S: Submission> Drop for Uring<S> {
     /// Kills the processes of spawns in flight and takes back from the kernel every buffer
     /// it was lent (every request cancelled, its completions waited for), so none is freed
     /// while the kernel may still read or write it. What it does not give back in time is
