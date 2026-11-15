@@ -1,28 +1,63 @@
-# The profile gate's checks known to fail, or to be unable to run, on CI's self-build, each with
-# who owns it and why (harness/profile_gate.py; the checks: crates/blaze-profile/src/gate.rs).
+# The profile gate's checks known to fail, or to be unable to run, on CI's build, each with who
+# owns it and why (harness/profile_gate.py; the checks: crates/blaze-profile/src/gate.rs).
 #
-# CI's self-build is built by the release blaze (.github/blaze-version), so its history is that
-# release's: a check of rows a newer blaze writes cannot run until a release writes them. Each
-# entry is one check, `outcome` "failed" or "unchecked", and `platforms` (CI's platform names,
-# blaze.yaml) when it holds on some only. A check that does anything else fails the run: one
-# listed that passes (take it out), one listed "unchecked" that fails, one unlisted that does
-# not pass. The list only shrinks.
-
-[[known]]
-check = "cpu_matches_process"
-outcome = "unchecked"
-owner = "profile"
-cause = "the release blaze writes no `builds.daemon_user_ns`/`daemon_system_ns` (added with the profile-durability lanes); runs once a release writes them"
-
-[[known]]
-check = "merged_rows_match"
-outcome = "unchecked"
-owner = "profile"
-cause = "the release blaze's merges write no `blaze.merged_rows` (added with this gate); runs once a release writes it"
+# CI's build is stage 0's, the tree's blaze built by cargo (.github/actions/blaze), building the
+# scripts (harness/unittests.py's `build`) while blaze's build of itself does not fit a runner
+# (docs/contributing.md, "CI"). Each entry is one check, `outcome` "failed" or "unchecked", and
+# `platforms` (CI's platform names, blaze.yaml) when it holds on some only. A check that does
+# anything else fails the run: one listed that passes (take it out), one listed "unchecked" that
+# fails, one unlisted that does not pass. The list only shrinks.
+#
+# The "failed" entries below are findings about the tree's blaze that nobody saw while the gate
+# could not run (its fixtures had no schema version, and the release built CI's blaze), measured
+# on 2026-11-15 over stage 0's `blaze build --release -p scripts --bins` on an arm64 VM (32
+# vCPU): to fix, not behaviour accepted.
 
 [[known]]
 check = "blocks_in_waits"
-outcome = "unchecked"
-platforms = ["linux-x64", "linux-arm64"]
+outcome = "failed"
+platforms = ["linux-arm64"]
 owner = "profile"
-cause = "the release blaze's Linux sampler (perf_event) takes no off-CPU samples, so no sample says a worker blocked; the signal sampler that does (docs/profiling.md) runs once a release has it"
+cause = "50 or more of 66,165 off-CPU samples of a worker blocked outside every wait span (2026-11-15): some blocking call has no wait span around it"
+
+[[known]]
+check = "children_in_parents"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "33,783 of 1,857,263 child spans lie outside their parent by more than 10 us (2026-11-15), tasks overhanging their job by up to 14 s: a task span outlives the job span it was opened under"
+
+[[known]]
+check = "cpu_matches_process"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "spans' self CPU 749.8 s against the daemon's 794.2 s, 5.59% apart where the bound is 5% (2026-11-15): CPU outside every span"
+
+[[known]]
+check = "rows_lost"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "340,284 span rows a recorder ring wrote over (bound 0; none while the writer was behind) in a 65 s build (2026-11-15): the rings are too small for a 32-way build's span rate"
+
+[[known]]
+check = "samples_in_spans"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "96.21% of 87,958 worker samples name a span open as they were taken, where the bound is 99% (2026-11-15): worker time outside every span"
+
+[[known]]
+check = "self_cpu_in_duration"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "1 of 2,522,483 counted spans (`release summarize`: 209,882 ns of self CPU in 196,934 ns open) has self CPU above its duration (2026-11-15): the span's CPU and its clock are read at different moments"
+
+[[known]]
+check = "waits_say_what"
+outcome = "failed"
+platforms = ["linux-arm64"]
+owner = "profile"
+cause = "2 of 261,119 wait spans say nothing of what they await (2026-11-15)"
