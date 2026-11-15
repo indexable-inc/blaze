@@ -45,7 +45,10 @@ use blaze_cas::{Key as StoreKey, Kind as StoreKind, Mismatch, content_of};
 use blaze_front_items::{
     Reading,
     modules::{MODULES, Module, Status},
-    steps::{CrateKey, FileKey, Items, Lines, Modules, Parse, Source, reads},
+    steps::{
+        CrateKey, FileKey, Items, Lines, Modules, Parse, STEP_CODE_DOMAIN, Source, reads,
+        reads::EXISTS_DOMAIN,
+    },
     table::Table,
 };
 use blaze_ids::{ContentId, Hasher};
@@ -59,7 +62,6 @@ use cfg::{CfgExpr, CfgOptions};
 use syntax::{Edition, Extensions, view::AstNode as _};
 
 const PIN_DOMAIN: &str = "blaze v2 front carry pin 1";
-const EXISTS_DOMAIN: &str = "blaze v2 front carry exists 1";
 const CFG_DOMAIN: &str = "blaze v2 front carry cfg 1";
 const CFG_NAME_DOMAIN: &str = "blaze v2 front carry crate cfg 1";
 const VALUE_DOMAIN: &str = "blaze v2 front carry modules value 1";
@@ -71,7 +73,7 @@ const CODE: [(&str, u8); 4] = [("parse", 1), ("items", 1), ("lines", 1), ("modul
 
 fn code(step: usize) -> CodeId {
     let (name, version) = CODE[step];
-    let mut hasher = Hasher::new("blaze v2 front carry step code 1");
+    let mut hasher = Hasher::new(STEP_CODE_DOMAIN);
     hasher.part(name.as_bytes()).part(&[version]);
     CodeId(hasher.finish())
 }

@@ -1807,13 +1807,14 @@ fn config_id(encoded: &[u8]) -> ContentId {
 /// on and whatever else its environment holds. What a checkout keeps one plan
 /// ([`keep_plan`]) and one no-op answer ([`noop::Answers`]) of.
 fn shape_of(planned: &[u8]) -> ContentId {
+    const SHAPE_DOMAIN: &str = "blaze v2 serve request shape";
     // The planted bug of the no-op lane's control ([`noop::Plant::IgnoresConfig`]): every
     // request is of one shape, so a request of other features or another profile is asked of
     // the answer another config left.
     if noop::planted(noop::Plant::IgnoresConfig) {
-        return Hasher::new("blaze v2 serve request shape").finish();
+        return Hasher::new(SHAPE_DOMAIN).finish();
     }
-    Hasher::new("blaze v2 serve request shape").part(planned).finish()
+    Hasher::new(SHAPE_DOMAIN).part(planned).finish()
 }
 
 /// Whether a step of a build reads the variable `name` of its request's environment without

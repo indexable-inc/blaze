@@ -235,9 +235,9 @@ crates/harness/harness/src/archive.rs	SCHEMA	none
 crates/harness/harness/src/db.rs	SCHEMA	none
 crates/hir-def/src/deps/facts.rs	LAYOUT	test facts_of_a_previous_layout_are_made_again
 crates/hir-def/src/deps/found.rs	LAYOUT	test a_previous_or_foreign_layout_is_refused_by_name
-crates/hir-def/src/deps/image.rs	IMAGE_SCHEMA	none
+crates/hir-def/src/deps/image.rs	IMAGE_SCHEMA	test diagnostic_items_are_the_same_bytes_and_an_image_of_the_previous_schema_is_refused
 crates/hir-def/src/deps/image.rs	LAYOUT_3_SCHEMA	not persisted: version 3's schema, which a test writes to show an image of it is refused
-crates/hir-def/src/deps/image.rs	LAYOUT_7_SCHEMA	none
+crates/hir-def/src/deps/image.rs	LAYOUT_7_SCHEMA	test an_image_of_the_previous_layout_7_is_a_named_miss
 crates/hir-def/src/deps/reads.rs	VERSION	test reads_of_the_previous_layout_are_refused_by_name
 crates/hir-def/src/deps/signatures.rs	RECORD_SCHEMA	none
 crates/hir-def/src/deps/signatures.rs	SCHEMA	none

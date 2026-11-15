@@ -33,6 +33,9 @@ const _: () = {
     assert!(size_of::<Root>() == 40);
 };
 
+/// The domain of every layout's image schema below; the version after it tells them apart.
+const IMAGE_DOMAIN: &str = "blaze v2 dependency image";
+
 /// The schema of an image buffer: its root record's, and the version of what the parts are.
 /// Version 3: the def map is no part of it; a crate's def map is its pages, a record of its
 /// own (`super::serve::pages_key`), read a name at a time. Version 4: a third part, the
@@ -41,7 +44,7 @@ const _: () = {
 /// this schema), so an image of version 3 is never found; one read all the same is refused
 /// here by its schema, never read as an image with no diagnostic items.
 pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::Str(IMAGE_DOMAIN),
     SchemaPart::U64(4),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
@@ -50,7 +53,7 @@ pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 /// image of it is refused.
 #[cfg(test)]
 const LAYOUT_3_SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::Str(IMAGE_DOMAIN),
     SchemaPart::U64(3),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
@@ -59,7 +62,7 @@ const LAYOUT_3_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 /// parts, the first the crate's whole def map. Never read: an image of it found under a key is
 /// the named miss [`ImageRef::is_layout_7`] tells, its crate made again from source.
 const LAYOUT_7_SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency image"),
+    SchemaPart::Str(IMAGE_DOMAIN),
     SchemaPart::U64(2),
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);

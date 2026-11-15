@@ -2364,7 +2364,7 @@ fn a_served_crate_parses_no_file_and_decodes_no_def_map() {
 /// serve names it a miss of its layout ([`Served::old_layout`]), resolves the crate from
 /// source, and serves every other crate as before.
 #[test]
-fn a_layout_7_image_is_a_named_miss() {
+fn an_image_of_the_previous_layout_7_is_a_named_miss() {
     let _turn = TURN.lock();
     let (memory, stored) = stored(FIXTURE);
     let mut db = fixture::db(FIXTURE).into_db();
@@ -2695,7 +2695,7 @@ fn diagnostic_items_of_a_served_crate_are_read_from_its_image_and_equal_the_walk
 /// diagnostic items. Bytes of the part that do not decode stop the query with
 /// [`frozen::Unreadable`] naming the crate and the part, never a walk in their place.
 #[test]
-fn diagnostic_items_are_the_same_bytes_and_an_image_without_them_is_refused() {
+fn diagnostic_items_are_the_same_bytes_and_an_image_of_the_previous_schema_is_refused() {
     let _turn = TURN.lock();
     let [a, b] = [(); 2].map(|()| {
         let db = fixture::db(DIAGNOSTIC_ITEMS).into_db();

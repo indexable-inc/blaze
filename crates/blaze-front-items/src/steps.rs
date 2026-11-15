@@ -56,10 +56,17 @@ pub mod reads {
     /// read that saw nothing holds only while nothing is there, so creating the file reaches
     /// its readers.
     pub const EXISTS: ReadKind = ReadKind(0x0202);
+    /// The domain of an [`EXISTS`] read's hash, one for every world that answers the read (the
+    /// daemon's front carry and blaze-solo's), so they answer it alike.
+    pub const EXISTS_DOMAIN: &str = "blaze v2 front carry exists 1";
     /// Whether a cfg predicate holds for a crate; its key is the crate's stable name, a zero
     /// byte, and the predicate's tokens joined by one space.
     pub const CFG: ReadKind = ReadKind(0x0203);
 }
+
+/// The domain of these steps' code identity, a step's name and its version by hand hashed under
+/// it: one for the daemon's front carry and blaze-solo, so the two keep one set of entries.
+pub const STEP_CODE_DOMAIN: &str = "blaze v2 front carry step code 1";
 
 /// The world these steps read: the pinned file tree and the crates' cfg. A file's stable
 /// name is its path in the pinned tree, `/` between its parts: never a path in a checkout.

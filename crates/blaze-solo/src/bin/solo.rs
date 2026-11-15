@@ -138,7 +138,7 @@ fn name(path: &Path) -> Result<FileName, Failed> {
 /// then until `fn_info(..).code_id` gives each step its own (rule 52).
 fn codes() -> Codes {
     let code = |name: &str, version: u8| {
-        let mut hasher = Hasher::new("blaze v2 front carry step code 1");
+        let mut hasher = Hasher::new(blaze_front_items::steps::STEP_CODE_DOMAIN);
         hasher.part(name.as_bytes()).part(&[version]);
         CodeId(hasher.finish())
     };

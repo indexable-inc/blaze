@@ -36,11 +36,9 @@ use crate::table::{Kind, Row};
 
 const PIN_DOMAIN: &str = "blaze solo pin 1";
 
-/// The domain of an `EXISTS` read's hash: the daemon's
-/// (`EXISTS_DOMAIN`, crates/blaze-cargo/src/serve/front_carry.rs:60, private there), so the two
-/// answer a read alike. To move into `blaze_front_items::steps::reads` beside the kind it
-/// answers.
-pub const EXISTS_DOMAIN: &str = "blaze v2 front carry exists 1";
+/// The domain of an `EXISTS` read's hash: the daemon's, from beside the kind it answers, so the
+/// two answer a read alike.
+pub use blaze_front_items::steps::reads::EXISTS_DOMAIN;
 
 /// What an `EXISTS` read of a file that is there hashes to.
 pub fn there() -> ContentId {
