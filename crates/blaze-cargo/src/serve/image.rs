@@ -73,22 +73,30 @@ use blaze_vfs::{
 };
 
 /// The VFS's file texts in the daemon's store (/tmp/plan/vfs-image-next.md): a file's bytes
-/// under `Key::of(TEXT_SCHEMA, id, &[])`, kind [`Kind::Text`], read in place through the
-/// store's pool as a [`blaze_cas::Pinned`] (never an mmap of a store file), put through a
-/// writer of its own and durable at the store's next flush.
+/// under `Key::of(TEXT_SCHEMA, id, &[])`, kind [`Kind::Text`], read by the store's direct reads
+/// ([`super::direct::owned`]) into the VFS's own blocks, put through a writer of its own and
+/// durable at the store's next flush.
+///
+/// Never read through the store's pool: a pool read pins its pages until every task that
+/// could have read them has ended, against a bound every reader shares (half the pool's
+/// budget), and the first build after a start pages in a workspace's texts within one task,
+/// more of them than that bound on a large one.
 pub struct StoreTexts {
     handle: Handle,
+    /// The daemon's direct reads, which [`Texts::get`] reads the texts by.
+    stores: Arc<super::direct::Stores>,
     /// The puts not yet seen durable.
     pending: blaze_core::lock::Lock<Tickets>,
 }
 
 impl StoreTexts {
-    /// The texts of `store`, which must be open.
-    pub fn new(store: &mut Store) -> Arc<StoreTexts> {
+    /// The texts of `store`, which must be open, read by `stores`, the daemon's direct reads of
+    /// it.
+    pub(crate) fn new(store: &mut Store, stores: Arc<super::direct::Stores>) -> Arc<StoreTexts> {
         let handle = Handle::new(store, std::path::PathBuf::from("/"));
         let pending = blaze_core::lock::Lock::new("serve.image.texts", Tickets::default());
         // alloc: once a daemon, shared by the VFS and the image maker.
-        Arc::new(StoreTexts { handle, pending })
+        Arc::new(StoreTexts { handle, stores, pending })
     }
 
     fn key(id: &ContentId) -> Key {
@@ -98,13 +106,26 @@ impl StoreTexts {
 
 impl Texts for StoreTexts {
     fn get(&self, id: &ContentId) -> Result<Option<Bytes>, StoreFault> {
-        match self.handle.pinned(&StoreTexts::key(id)) {
-            Ok(pinned) => Ok(pinned.map(blaze_cas::Pinned::into_bytes)),
-            Err(corrupt) => {
-                tracing::error!(target: "blaze", file = %format!("{id:x}"), %corrupt, "the store's text of a VFS file failed its check");
-                Err(StoreFault { file: *id, why: FaultWhy::Corrupt })
+        let key = StoreTexts::key(id);
+        let read = match self.stores.reads() {
+            super::direct::Reads::Native { .. } => {
+                super::direct::owned(&self.stores, super::direct::Which::Home, &key)
+                    .map(|text| text.map(|it| Bytes::copy_kept(blaze_mem::Tag::Vfs, &it)))
+                    .map_err(|failed| failed.to_string()) // alloc: error path
             }
-        }
+            // The simulation's daemon lends its driver only to the tasks it runs in line and its
+            // own reads, and the VFS reads a text wherever a file is read: through the pool,
+            // whose bound the simulation's few small texts never reach.
+            super::direct::Reads::Lent => self
+                .handle
+                .pinned(&key)
+                .map(|pinned| pinned.map(blaze_cas::Pinned::into_bytes))
+                .map_err(|corrupt| corrupt.to_string()), // alloc: error path
+        };
+        read.map_err(|why| {
+            tracing::error!(target: "blaze", file = %format!("{id:x}"), %why, "the store's text of a VFS file failed its check");
+            StoreFault { file: *id, why: FaultWhy::Corrupt }
+        })
     }
 
     fn has(&self, id: &ContentId) -> bool {
