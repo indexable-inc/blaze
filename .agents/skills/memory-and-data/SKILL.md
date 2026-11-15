@@ -22,9 +22,14 @@ lifetime uses the request's allocator, what outlives the request is a record and
 `clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and
 an item that must keep an implied allocator says why with `#[expect(blaze::implicit_allocator,
 reason = "..")]`. `blaze::implicit_allocator` enforces this, with a fix to the explicit `Global`
-form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's
-`// alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
-shrinks.
+form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds, per crate,
+the `// alloc:` lines left to convert, the `expect`s, the lines naming `Global`, and the function
+signatures that fix the caller's allocator outside tests and in test code (the lint exempts no test
+helper) to a list that only shrinks; `global` may rise only by the crate's `// alloc:` lines
+converted and by lines added where no allocator can be taken (`fn main`, a trait impl's method,
+outside every function), and a `Global` added in any other function is refused: make that function
+generic over `A: Allocator + Clone`, take `alloc: A`, and let the caller that decides the lifetime
+name `Global`.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
