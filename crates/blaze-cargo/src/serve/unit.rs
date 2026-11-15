@@ -375,8 +375,13 @@ impl Steps for Real {
         run::launch::serve_needs(kept, &self.shared.launches, wanted)
             .into_iter()
             .map(|it| KeptPut {
+                // What a refusal of the put names (rule 19): a first call makes a handful of
+                // values, each named once.
+                what: match &it.of {
+                    Some(of) => Arc::from(format!("a launched run's first call: {of}")),
+                    None => Arc::from("a launched run's first call"),
+                },
                 put: Put { key: it.key, kind: it.kind, bytes: it.bytes },
-                what: Arc::from("a launched run's first call"),
                 into: super::work::PutInto::Home,
             })
             .collect()

@@ -213,8 +213,8 @@ fn a_function_is_described_while_one_reached_before_it_still_is() {
     assert!(waited.load(Ordering::Acquire), "f3's describe saw f4's before it ended");
 }
 
-/// A subscriber that keeps the last `done` and `known` recorded on any span: what a walk's
-/// span carries, as the profile's subscriber reads it.
+/// The last `done` and `known` recorded on any span of a [`Route`]: what a walk's span
+/// carries, as the profile's subscriber reads it.
 #[derive(Default)]
 struct Counts {
     done: std::sync::atomic::AtomicU64,
@@ -240,20 +240,91 @@ impl tracing::field::Visit for CountsOf<'_> {
     fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
 }
 
-struct Recorder(Arc<Counts>);
+/// The test binary's one subscriber, its global default: every callsite's interest is
+/// `sometimes`, so each span is asked of [`Router::enabled`] as it is made, and goes to the
+/// [`Counts`] the making thread routes to ([`Route`]), else nowhere.
+///
+/// The race it removes. The recorder was a scoped default (`with_default`), and what it
+/// counts is recorded on `codegen walk describe` (`driver.rs`), a callsite every walk in
+/// this crate hits, nearly all on threads with no subscriber. A callsite's interest is cached
+/// process-wide when it is first hit, and while one scoped dispatcher was the only live one
+/// `tracing-core` asked only the registering thread's default (`Rebuilder::JustOne`): a test
+/// that first hit that callsite then, on its own thread, cached it as never interesting, and
+/// the walk tests' spans were never made: "done 0, known 0", one parallel run in three. With
+/// one global dispatcher whose answer is never `never`, no thread's first hit can switch off
+/// another's recorder, whatever the order.
+struct Router;
 
-impl tracing::Subscriber for Recorder {
+/// Each live route's id and the counts it records into; no route has id 0.
+static ROUTES: blaze_core::lock::Lock<Vec<(u64, Arc<Counts>), std::alloc::Global>> =
+    blaze_core::lock::Lock::unrecorded("codegen.tests.walk.routes", Vec::new_in(std::alloc::Global));
+
+/// The id the next route takes.
+static NEXT_ROUTE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// [`Router`] made the global default, once a test binary.
+static ROUTER: std::sync::Once = std::sync::Once::new();
+
+thread_local! {
+    /// The route this thread's spans go to; 0 for none.
+    static ROUTE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, the spans this thread makes, and what is recorded on them from any thread,
+/// go to its counts.
+struct Route(u64);
+
+impl Route {
+    fn install(counts: &Arc<Counts>) -> Route {
+        ROUTER.call_once(|| {
+            if let Err(why) = tracing::subscriber::set_global_default(Router) {
+                panic!("the walk tests' router could not be the global subscriber: {why}");
+            }
+        });
+        let id = NEXT_ROUTE.fetch_add(1, Ordering::Relaxed);
+        ROUTES.lock().push((id, Arc::clone(counts)));
+        let was = ROUTE.with(|it| it.replace(id));
+        assert_eq!(was, 0, "a thread routes to one recorder at a time");
+        Route(id)
+    }
+}
+
+impl Drop for Route {
+    fn drop(&mut self) {
+        ROUTE.with(|it| it.set(0));
+        ROUTES.lock().retain(|it| it.0 != self.0);
+    }
+}
+
+impl Router {
+    /// The counts of route `id`, while it lives.
+    fn counts(id: u64) -> Option<Arc<Counts>> {
+        ROUTES.lock().iter().find(|it| it.0 == id).map(|it| Arc::clone(&it.1))
+    }
+}
+
+impl tracing::Subscriber for Router {
+    fn register_callsite(&self, _: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
+        ROUTE.with(std::cell::Cell::get) != 0
     }
 
+    /// Made only on a thread [`Self::enabled`] said yes to, so its route is not 0.
     fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        attributes.record(&mut CountsOf(&self.0));
-        tracing::span::Id::from_u64(1)
+        let route = ROUTE.with(std::cell::Cell::get);
+        if let Some(counts) = Self::counts(route) {
+            attributes.record(&mut CountsOf(&counts));
+        }
+        tracing::span::Id::from_u64(route)
     }
 
-    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        values.record(&mut CountsOf(&self.0));
+    fn record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        if let Some(counts) = Self::counts(id.into_u64()) {
+            values.record(&mut CountsOf(&counts));
+        }
     }
 
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
@@ -271,7 +342,8 @@ fn carried(program: &Program, workers: usize, bug: Option<Planted>) -> (u64, u64
     let counts = Arc::new(Counts::default());
     let pool = Pool::new(&Topology::flat(workers), false).unwrap();
     let items = pool.install(|| {
-        tracing::subscriber::with_default(Recorder(Arc::clone(&counts)), || {
+        let route = Route::install(&counts);
+        let items = {
             let policy = policy(OptLevel::O0, Mode::Output);
             let (machine, memo) = (Machine::default(), Memo::new());
             let build = Build::new(&machine, program, &policy, &memo);
@@ -291,7 +363,9 @@ fn carried(program: &Program, workers: usize, bug: Option<Planted>) -> (u64, u64
                 span.in_scope(|| build.walk(&roots, &STATIC_ROOTS, &[], None, &mut errors));
             assert!(errors.is_empty(), "{errors:?}");
             nodes.len() + statics.len()
-        })
+        };
+        drop(route);
+        items
     });
     (
         counts.done.load(Ordering::Acquire),
